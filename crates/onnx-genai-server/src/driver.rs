@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
 use anyhow::Context;
+use onnx_genai::text_to_audio::{SynthesizedAudio, TextToAudioRequest};
 use onnx_genai::text_to_image::{RenderedImage, TextToImageRequest};
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
@@ -9,6 +10,7 @@ use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
     GovernorSnapshot, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
 };
+use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::metrics::GenerationMetrics;
@@ -61,6 +63,11 @@ pub(crate) enum DriverCommand {
         pipeline_dir: PathBuf,
         request: Box<TextToImageRequest>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<RenderedImage>>>,
+    },
+    SynthesizeSpeech {
+        tokenizer: Arc<Tokenizer>,
+        request: Box<TextToAudioRequest>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<SynthesizedAudio>>,
     },
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
     SetVramLimit {
@@ -255,6 +262,36 @@ impl EngineDriver {
         rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
     }
 
+    /// Synthesize speech on the engine thread that owns the pipeline.
+    ///
+    /// Like image rendering, this is one long synchronous call rather than a
+    /// token stream, so it is a plain request/response command.
+    pub(crate) async fn synthesize_speech(
+        &self,
+        tokenizer: Arc<Tokenizer>,
+        request: TextToAudioRequest,
+    ) -> Result<anyhow::Result<SynthesizedAudio>, GenerateSubmitError> {
+        let _permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(DriverCommand::SynthesizeSpeech {
+                tokenizer,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
+    }
+
     pub(crate) async fn generate_fim(
         &self,
         prefix: String,
@@ -366,6 +403,15 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                     &pipeline_dir,
                     engine,
                     &request,
+                ));
+            }
+            DriverCommand::SynthesizeSpeech {
+                tokenizer,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(onnx_genai::text_to_audio::synthesize(
+                    engine, &tokenizer, &request,
                 ));
             }
             DriverCommand::CreateSession(response) => {
@@ -637,6 +683,13 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 "What: image generation was routed to a single-model engine. \
                  Why: only a declared diffusion pipeline can run a denoise loop. \
                  How: request a model whose package declares `strategy.denoiser`."
+            )));
+        }
+        DriverCommand::SynthesizeSpeech { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "What: speech synthesis was routed to a single-model engine. \
+                 Why: only a declared pipeline can run a post-decode vocoder stage. \
+                 How: request a model whose package declares a `run_on: final_only` waveform stage."
             )));
         }
         DriverCommand::ResourceSnapshot(reply) => {

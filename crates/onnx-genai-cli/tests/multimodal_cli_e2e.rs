@@ -320,3 +320,73 @@ fn version_reports_the_available_execution_providers() {
     assert!(report.contains("onnx-genai "), "{report}");
     assert!(report.contains("execution providers:"), "{report}");
 }
+
+#[test]
+fn generate_synthesizes_a_prompt_to_a_wav() {
+    let out = repository_root().join("target/test-fixtures/cli-speech.wav");
+    let _ = std::fs::remove_file(&out);
+
+    let output = run(&[
+        "generate",
+        fixture("tiny-tts").to_str().unwrap(),
+        "--prompt",
+        "hello there",
+        "--max-new-tokens",
+        "4",
+        "--output-audio",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(
+        output.status.success(),
+        "synthesis failed: {}",
+        stderr(&output)
+    );
+    // The package's declared sample rate must be reported and written.
+    assert!(stdout(&output).contains("16000 Hz"), "{}", stdout(&output));
+    let wav = std::fs::read(&out).expect("the CLI must write a WAV file");
+    assert_eq!(&wav[..4], b"RIFF");
+    let decoded = onnx_genai::preprocess::audio::decode_wav_pcm16(&wav)
+        .expect("the file must be readable PCM16 WAV");
+    assert_eq!(decoded.sample_rate, 16_000);
+    assert!(!decoded.samples.is_empty());
+}
+
+#[test]
+fn synthesizing_with_a_non_speech_model_explains_why() {
+    let out = repository_root().join("target/test-fixtures/cli-never-spoken.wav");
+    let output = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--output-audio",
+        out.to_str().unwrap(),
+    ]);
+
+    assert!(!output.status.success(), "a text model cannot synthesize");
+    let message = stderr(&output);
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+}
+
+#[test]
+fn image_and_audio_output_cannot_be_requested_together() {
+    let output = run(&[
+        "generate",
+        fixture("tiny-tts").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--output-image",
+        "/tmp/never.png",
+        "--output-audio",
+        "/tmp/never.wav",
+    ]);
+
+    assert!(!output.status.success(), "one invocation, one output");
+    assert!(
+        stderr(&output).contains("once per output"),
+        "message: {}",
+        stderr(&output)
+    );
+}

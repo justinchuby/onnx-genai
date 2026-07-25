@@ -402,6 +402,73 @@ pub struct ImageData {
     pub b64_json: String,
 }
 
+/// `POST /v1/audio/speech` request.
+///
+/// Mirrors OpenAI's speech API for the fields a local TTS package can honor.
+/// `voice` is accepted for client compatibility: which voice a package speaks
+/// with is a property of the exported model, not a request parameter.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeechRequest {
+    pub model: String,
+    pub input: String,
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<SpeechResponseFormat>,
+    /// Playback speed. Accepted only as 1.0; this server does not resample.
+    #[serde(default)]
+    pub speed: Option<f32>,
+
+    // ── onnx-genai extensions ──
+    /// Maximum audio tokens to decode. Defaults to the package's `max_tokens`.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Override for a package whose metadata omits `pipeline.audio.sample_rate`.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechResponseFormat {
+    #[default]
+    Wav,
+    /// Raw little-endian 16-bit PCM, without a container.
+    Pcm,
+    Mp3,
+    Opus,
+    Aac,
+    Flac,
+}
+
+impl SpeechResponseFormat {
+    /// The `Content-Type` for a supported format, or `None` when this server
+    /// cannot encode it.
+    pub fn content_type(self) -> Option<&'static str> {
+        match self {
+            Self::Wav => Some("audio/wav"),
+            Self::Pcm => Some("audio/L16"),
+            Self::Mp3 | Self::Opus | Self::Aac | Self::Flac => None,
+        }
+    }
+
+    /// Lowercase name, for error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wav => "wav",
+            Self::Pcm => "pcm",
+            Self::Mp3 => "mp3",
+            Self::Opus => "opus",
+            Self::Aac => "aac",
+            Self::Flac => "flac",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AudioTranscriptionResponse {
     pub text: String,

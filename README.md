@@ -142,6 +142,22 @@ declares. For packages whose pipeline stops at the latent instead of declaring
 a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
 `--vae-scaling-factor`).
 
+### Generate speech
+
+`generate --output-audio` synthesizes through a text-to-speech package — an
+autoregressive decoder that emits audio codes followed by a `run_on: final_only`
+vocoder stage:
+
+```bash
+./target/release/onnx-genai generate models/my-tts \
+  --prompt "Hello from onnx-genai." \
+  --output-audio speech.wav
+```
+
+The output sample rate is declared by the package as `pipeline.audio.sample_rate`
+rather than assumed; a package that omits it is rejected with an error rather
+than played back at a guessed pitch (pass `--sample-rate` to supply one).
+
 ### Run the OpenAI-compatible server
 
 ```bash
@@ -153,9 +169,10 @@ a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
 
 Available routes are `GET /health`, `GET /v1/models`,
 `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`,
-`POST /v1/audio/transcriptions`, `POST /v1/images/generations`,
-`POST /v1/sessions`, and `DELETE /v1/sessions/{id}`. Pass a session id as
-`X-Session-Id` on chat requests to reuse persistent context.
+`POST /v1/audio/transcriptions`, `POST /v1/audio/speech`,
+`POST /v1/images/generations`, `POST /v1/sessions`, and
+`DELETE /v1/sessions/{id}`. Pass a session id as `X-Session-Id` on chat
+requests to reuse persistent context.
 
 #### Multimodal chat
 
@@ -206,6 +223,21 @@ curl http://127.0.0.1:8080/v1/images/generations \
     "guidance_scale": 7.5,
     "seed": 0
   }'
+```
+
+#### Speech synthesis
+
+`POST /v1/audio/speech` returns the audio bytes directly, as OpenAI does.
+`max_tokens`, `temperature`, `seed`, and `sample_rate` are onnx-genai
+extensions. Only `wav` and `pcm` are offered: a compressed format is refused
+rather than silently substituted, so a client that asked for MP3 never receives
+WAV under an MP3 content type.
+
+```bash
+curl http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "my-tts", "input": "Hello from onnx-genai.", "response_format": "wav"}' \
+  --output speech.wav
 ```
 
 Chat with constrained JSON output (`"stream": true` enables SSE):

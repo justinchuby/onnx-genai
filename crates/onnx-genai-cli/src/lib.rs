@@ -36,6 +36,7 @@ use clap::{Args, Parser, Subcommand};
 use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
 use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer};
+use onnx_genai::text_to_audio::{self, TextToAudioRequest};
 use onnx_genai::text_to_image::{self, TextToImageRequest, VaeDecoder};
 use onnx_genai::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken,
@@ -663,6 +664,32 @@ impl ImageOutputArgs {
     }
 }
 
+/// Text-to-speech flags for `generate --output-audio`.
+#[derive(Debug, Args)]
+struct AudioOutputArgs {
+    /// Synthesize the prompt to this WAV file instead of generating text.
+    /// Requires a package whose pipeline ends in a waveform stage.
+    #[arg(long, value_name = "PATH")]
+    output_audio: Option<PathBuf>,
+
+    /// Override the package's declared output sample rate, in hertz. Only
+    /// needed for a package whose metadata omits `pipeline.audio.sample_rate`.
+    #[arg(long)]
+    sample_rate: Option<u32>,
+}
+
+impl AudioOutputArgs {
+    fn to_request(&self, text: String, sampling: &SamplingArgs) -> TextToAudioRequest {
+        TextToAudioRequest {
+            text,
+            max_new_tokens: sampling.max_new_tokens,
+            temperature: sampling.temperature,
+            sample_rate: self.sample_rate,
+            seed: None,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct GenerateArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
@@ -676,6 +703,9 @@ struct GenerateArgs {
 
     #[command(flatten)]
     image_output: ImageOutputArgs,
+
+    #[command(flatten)]
+    audio_output: AudioOutputArgs,
 
     /// Print generated tokens as they arrive.
     #[arg(long)]
@@ -761,8 +791,18 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 fn generate(args: GenerateArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
+    if args.image_output.output_image.is_some() && args.audio_output.output_audio.is_some() {
+        anyhow::bail!(
+            "What: --output-image and --output-audio were combined. \
+             Why: one invocation produces one kind of output. \
+             How: run the command once per output."
+        );
+    }
     if args.image_output.output_image.is_some() {
         return generate_image(&model_dir, args);
+    }
+    if args.audio_output.output_audio.is_some() {
+        return generate_audio(&model_dir, args);
     }
     let options = args.sampling.to_options();
 
@@ -844,6 +884,47 @@ fn generate_image(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
             image.height
         );
     }
+    Ok(())
+}
+
+/// Synthesize `--prompt` to a WAV file through the model's declared TTS pipeline.
+fn generate_audio(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
+    let output = args
+        .audio_output
+        .output_audio
+        .clone()
+        .expect("audio output path checked by the caller");
+    let setup = multimodal::load(model_dir)?.with_context(|| {
+        format!(
+            "What: {} could not be loaded as a speech pipeline. \
+             Why: it declares no `pipeline`, so it has no vocoder stage to run. \
+             How: point --output-audio at a text-to-speech package.",
+            model_dir.display()
+        )
+    })?;
+    let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).map_err(|error| {
+        anyhow::anyhow!(
+            "What: the package's tokenizer could not be loaded from {}. \
+             Why: {error}. \
+             How: verify the package ships a valid tokenizer.json.",
+            setup.tokenizer_path.display()
+        )
+    })?;
+    let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())?;
+
+    let request = args
+        .audio_output
+        .to_request(args.prompt.clone(), &args.sampling);
+    let audio = text_to_audio::synthesize(&mut engine, &tokenizer, &request)?;
+    text_to_audio::save_wav(&audio, &output)?;
+    println!(
+        "saved {} ({:.2}s, {} Hz, {} channel{})",
+        output.display(),
+        audio.duration_secs(),
+        audio.sample_rate,
+        audio.channels,
+        if audio.channels == 1 { "" } else { "s" }
+    );
     Ok(())
 }
 

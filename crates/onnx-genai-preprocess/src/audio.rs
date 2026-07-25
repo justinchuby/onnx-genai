@@ -221,6 +221,46 @@ pub fn decode_wav_pcm16(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessErr
     })
 }
 
+/// Encodes `[-1, 1]` float samples as 16-bit integer PCM WAV bytes.
+///
+/// The inverse of [`decode_wav_pcm16`], for handing a synthesized waveform back
+/// to a caller. `channels` interleaved frames are written as-is; values outside
+/// `[-1, 1]` are clamped rather than allowed to wrap.
+pub fn encode_wav_pcm16(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<u8>, AudioPreprocessError> {
+    if channels == 0 {
+        return Err(AudioPreprocessError::UnsupportedWav(
+            "channel count is zero".to_owned(),
+        ));
+    }
+    if sample_rate == 0 {
+        return Err(AudioPreprocessError::UnsupportedWav(
+            "sample rate is zero".to_owned(),
+        ));
+    }
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buffer = Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut buffer, spec)?;
+        for &sample in samples {
+            // i16::MIN..=i16::MAX is asymmetric, so scale by 32767 and clamp;
+            // scaling by 32768 would wrap a full-scale -1.0..1.0 signal.
+            let scaled = (sample.clamp(-1.0, 1.0) * 32767.0).round();
+            writer.write_sample(scaled as i16)?;
+        }
+        writer.finalize()?;
+    }
+    Ok(buffer.into_inner())
+}
+
 fn resample(
     samples: &[f32],
     input_rate: u32,

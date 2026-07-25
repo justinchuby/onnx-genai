@@ -1930,6 +1930,7 @@ dependencies = [
  "rand_distr",
  "serde_json",
  "tokenizers",
+ "tracing",
 ]
 
 [[package]]

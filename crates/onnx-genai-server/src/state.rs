@@ -267,6 +267,7 @@ impl AppState {
             pipeline: false,
             multimodal: None,
             text_to_image: false,
+            text_to_audio: false,
         });
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
@@ -373,6 +374,7 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
         pipeline: false,
         multimodal: None,
         text_to_image: false,
+        text_to_audio: false,
     }))
 }
 
@@ -393,8 +395,10 @@ fn build_pipeline_handle(
     let multimodal = crate::multimodal::build(&directory, &models)?;
     drop(models);
 
-    // A package that declares a denoise loop can serve image generation.
+    // A package that declares a denoise loop can serve image generation; one
+    // whose pipeline ends in a waveform stage can serve speech.
     let text_to_image = directory.spec.strategy.denoiser.is_some();
+    let text_to_audio = onnx_genai::text_to_audio::is_text_to_audio(&directory.spec);
     let engine = Engine::from_pipeline_dir(model_dir, config.engine_config.clone())?;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
@@ -407,5 +411,6 @@ fn build_pipeline_handle(
         pipeline: true,
         multimodal: Some(multimodal),
         text_to_image,
+        text_to_audio,
     }))
 }

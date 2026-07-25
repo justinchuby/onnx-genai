@@ -1251,6 +1251,28 @@ generated codes and the final tensor pool (see §20.4). `generate` still works o
 a TTS pipeline — it drives the AR loop and returns the code tokens only, without
 running the post-decode stages.
 
+##### Waveform contract and front ends
+
+`synthesize` returns a tensor pool, not audio bytes. Turning that into a file or
+an HTTP response needs two facts the tensor cannot carry, so both are **declared
+metadata** (`pipeline.audio`), never inferred:
+
+| field | meaning |
+|---|---|
+| `sample_rate` | Playback rate in hertz. A runtime cannot recover this from the samples; guessing changes pitch and duration, so a package that omits it is rejected rather than played back wrong. |
+| `output` | Endpoint carrying the waveform, e.g. `vocoder.audio`. Optional: when absent the sole output of the `run_on: final_only` component is used, which is unambiguous for the common single-vocoder shape. |
+| `channels` | Interleaved channel count. Defaults to 1 (mono). |
+
+`onnx_genai::text_to_audio` implements that contract once — resolving the
+endpoint, driving `synthesize`, and encoding PCM16 WAV — and is shared by
+`onnx-genai generate --output-audio` and the server's `POST /v1/audio/speech`.
+It also drives the `nested_autoregressive` shape below, because `synthesize`
+publishes the assembled codes into the shared pool either way.
+
+PCM encoding clamps to `[-1, 1]`. A vocoder that emits integer-ranged samples
+would otherwise be silently flattened into full-scale noise, so a waveform whose
+peak is far outside that range is reported as a warning naming the endpoint.
+
 #### Multi-decoder TTS (Qwen3-TTS-style) — `nested_autoregressive`
 
 The TTS example above is the **single-AR-decoder** shape (one code stream → vocoder).

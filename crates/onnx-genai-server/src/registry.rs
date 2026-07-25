@@ -51,6 +51,9 @@ pub(crate) struct ModelHandle {
     /// Whether the package declares a denoise loop, i.e. whether it can serve
     /// `POST /v1/images/generations`.
     pub(crate) text_to_image: bool,
+    /// Whether the package's pipeline ends in a waveform stage, i.e. whether it
+    /// can serve `POST /v1/audio/speech`.
+    pub(crate) text_to_audio: bool,
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
@@ -71,6 +74,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
     pub(crate) text_to_image: bool,
+    pub(crate) text_to_audio: bool,
 }
 
 impl ModelHandle {
@@ -86,6 +90,7 @@ impl ModelHandle {
             pipeline,
             multimodal,
             text_to_image,
+            text_to_audio,
         } = parts;
         Self {
             id,
@@ -98,6 +103,7 @@ impl ModelHandle {
             pipeline,
             multimodal,
             text_to_image,
+            text_to_audio,
             last_request_at: AtomicU64::new(now_millis()),
         }
     }
@@ -532,6 +538,7 @@ mod tests {
             pipeline: false,
             multimodal: None,
             text_to_image: false,
+            text_to_audio: false,
             last_request_at: AtomicU64::new(last_request_at),
         })
     }

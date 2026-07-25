@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
 };
 use base64::Engine as _;
+use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::TextToImageRequest;
 use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
@@ -43,7 +44,7 @@ use crate::{
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
         ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        StopInput, ToolChoice, ToolChoiceMode, Usage,
+        SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -1273,6 +1274,87 @@ async fn stream_completion(
 /// scheduler, and component wiring all come from its metadata. Only
 /// `b64_json` is offered because this server stores nothing and therefore has
 /// no URL to hand back.
+/// `POST /v1/audio/speech` — OpenAI-compatible text-to-speech.
+///
+/// Synthesizes through the package's own declared vocoder stage and returns the
+/// audio bytes directly, as OpenAI does. Only container formats this server can
+/// encode are offered; a compressed format is refused rather than silently
+/// substituted, because a caller that asked for MP3 must not receive WAV under
+/// an MP3 content type.
+pub(crate) async fn audio_speech(
+    State(_state): State<AppState>,
+    ApiJson(request): ApiJson<SpeechRequest>,
+) -> Result<Response, ApiError> {
+    let handle = resolve_model(&_state.registry, &request.model).await?;
+    if !handle.text_to_audio {
+        return Err(ApiError::bad_request(format!(
+            "What: speech synthesis was rejected for model '{}'. \
+             Why: its package declares no waveform stage (a `run_on: final_only` component fed by an autoregressive decoder), so it cannot produce audio. \
+             How: serve a text-to-speech package, or call /v1/chat/completions for text.",
+            handle.id
+        )));
+    }
+    if request.input.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "What: an empty `input` was rejected. \
+             Why: there is nothing to speak. \
+             How: send the text to synthesize in `input`.",
+        ));
+    }
+    let format = request.response_format.unwrap_or_default();
+    let content_type = format.content_type().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "What: response_format \"{}\" was rejected. \
+             Why: this server encodes only uncompressed audio, and returning WAV under an {} content type would mislabel the body. \
+             How: request response_format \"wav\" or \"pcm\".",
+            format.label(),
+            format.label()
+        ))
+    })?;
+    if let Some(speed) = request.speed
+        && (speed - 1.0).abs() > f32::EPSILON
+    {
+        return Err(ApiError::bad_request(format!(
+            "What: speed {speed} was rejected. \
+             Why: this server does not resample synthesized audio, so it cannot change playback rate. \
+             How: omit `speed`, or resample the returned audio yourself."
+        )));
+    }
+
+    let synthesis_request = TextToAudioRequest {
+        text: request.input.clone(),
+        max_new_tokens: request.max_tokens,
+        temperature: request.temperature,
+        seed: request.seed,
+        sample_rate: request.sample_rate,
+    };
+    let audio = handle
+        .engine
+        .synthesize_speech(handle.tokenizer.clone(), synthesis_request)
+        .await
+        .map_err(map_generate_submit_error)?
+        .map_err(|error| ApiError::bad_request(format!("speech synthesis failed: {error:#}")))?;
+
+    let body = match format {
+        SpeechResponseFormat::Pcm => audio.to_pcm16(),
+        _ => audio
+            .to_wav()
+            .map_err(|error| ApiError::internal(format!("audio encoding failed: {error:#}")))?,
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            // The rate is not in the body for raw PCM, so advertise it.
+            (
+                header::HeaderName::from_static("x-sample-rate"),
+                audio.sample_rate.to_string(),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 pub(crate) async fn image_generations(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<ImageGenerationRequest>,

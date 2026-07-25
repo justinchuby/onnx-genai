@@ -2791,3 +2791,134 @@ fn serde_position_suffixes_are_stripped_from_rejection_messages() {
         "What: something at line boundaries"
     );
 }
+
+// ── Text to speech ───────────────────────────────────────────────────────────
+
+fn tts_state() -> AppState {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-tts");
+    AppState::load(&model_dir, Some("tiny-tts".to_string())).expect("load the tiny TTS fixture")
+}
+
+async fn post_bytes(state: AppState, uri: &str, body: Value) -> (StatusCode, Vec<u8>, String) {
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, bytes.to_vec(), content_type)
+}
+
+#[tokio::test]
+async fn audio_speech_returns_a_playable_wav() {
+    let (status, body, content_type) = post_bytes(
+        tts_state(),
+        "/v1/audio/speech",
+        json!({"model": "tiny-tts", "input": "hello there"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "audio/wav");
+    assert_eq!(&body[..4], b"RIFF", "the body must be a WAV container");
+    // The fixture's declared 16 kHz rate must survive into the container.
+    let decoded = onnx_genai::preprocess::audio::decode_wav_pcm16(&body)
+        .expect("the response must decode as PCM16 WAV");
+    assert_eq!(decoded.sample_rate, 16_000);
+    assert!(!decoded.samples.is_empty());
+}
+
+#[tokio::test]
+async fn audio_speech_returns_raw_pcm_when_asked() {
+    let (status, body, content_type) = post_bytes(
+        tts_state(),
+        "/v1/audio/speech",
+        json!({"model": "tiny-tts", "input": "hi", "response_format": "pcm"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "audio/L16");
+    assert_ne!(&body[..4], b"RIFF", "raw PCM must carry no container");
+    assert_eq!(body.len() % 2, 0, "16-bit samples come in pairs of bytes");
+    assert!(!body.is_empty());
+}
+
+#[tokio::test]
+async fn audio_speech_refuses_formats_it_cannot_encode() {
+    for format in ["mp3", "opus", "aac", "flac"] {
+        let (status, body) = post_json(
+            tts_state(),
+            "/v1/audio/speech",
+            json!({"model": "tiny-tts", "input": "x", "response_format": format}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "format: {format}");
+        let message = error_message(&body);
+        assert_actionable(&message);
+        assert!(message.contains(format), "message: {message}");
+    }
+}
+
+#[tokio::test]
+async fn audio_speech_rejects_resampling_and_empty_input() {
+    let (status, body) = post_json(
+        tts_state(),
+        "/v1/audio/speech",
+        json!({"model": "tiny-tts", "input": "x", "speed": 2.0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_actionable(&error_message(&body));
+
+    let (status, body) = post_json(
+        tts_state(),
+        "/v1/audio/speech",
+        json!({"model": "tiny-tts", "input": "   "}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_actionable(&error_message(&body));
+}
+
+#[tokio::test]
+async fn audio_speech_rejects_a_model_without_a_waveform_stage() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/audio/speech",
+        json!({"model": "tiny-llm", "input": "hello"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = error_message(&body);
+    assert_actionable(&message);
+    assert!(message.contains("final_only"), "message: {message}");
+}
+
+#[tokio::test]
+async fn a_speech_model_is_not_offered_for_image_generation() {
+    let (status, body) = post_json(
+        tts_state(),
+        "/v1/images/generations",
+        json!({"model": "tiny-tts", "prompt": "a cat"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error_message(&body).contains("denoiser"));
+}
