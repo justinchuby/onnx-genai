@@ -1125,3 +1125,31 @@ Detailed measurements and parity evidence are in
   matches ORT CUDA for 128 greedy tokens, and has no observed unsupported op.
 - [x] **DeepSeek-V2 real-shape QMoE routing:** native CUDA loads and matches ORT
   for 32 greedy tokens; token-0 top-40 log-probability max error is 0.001409.
+
+## GLM native support gaps (2026-07-25)
+
+Detailed measurements, exact errors, and GPU-residency evidence are in
+[`glm-native-status-2026-07-25.md`](glm-native-status-2026-07-25.md).
+
+- [ ] **Restore GLM-5.2 dense q4 multi-token native decode:** the model loads and
+  emits token `110`, then fails at
+  `model/layers.0/self_attn/indexer/Add_node_70` because the growing logical
+  prefix (`[1,1,2]`, or `[1,1,5]` with a four-token prompt) cannot broadcast
+  with `[1,1,4096]`. This regresses the historical 148.58 tok/s end-to-end
+  result. Add a native-CUDA regression requiring at least two generated tokens.
+- [ ] **ORT-compatible GLM-4 partial-RoPE reference:** the available ORT CUDA
+  build rejects `rotary_embedding_dim` on
+  `com.microsoft::GroupQueryAttention`, so GLM-4 token/log-probability parity
+  and a legitimate native-vs-ORT throughput comparison remain unavailable.
+- [ ] **ORT-compatible GLM-5.2 QMoE reference:** ORT cannot load the conformance
+  model because `pkg.nxrt::IndexShare` is not registered. Export an equivalent
+  standard-op graph or provide an ORT custom op before making parity or speed
+  claims.
+- [ ] **Real-checkpoint GLM-5.2 QMoE validation:** the tiny random-weight model
+  confirms native DSA/`IndexShare`/`QMoE` execution at 176.66 tok/s but cannot
+  establish natural-language coherence or real-model performance.
+- [x] **GLM-4 native coherence:** native CUDA loads the real 9B int4 artifact,
+  matches the committed golden prefix, and emits coherent text at 108.78 tok/s.
+- [x] **GLM-5.2 tiny QMoE native execution:** native CUDA matches the committed
+  12-token CPU/CUDA anchor and completes deterministic 64-token decode without
+  an unsupported op or kernel failure.
