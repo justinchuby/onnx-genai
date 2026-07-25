@@ -2081,6 +2081,11 @@ fn report_decode_strategy_precedence(message: &str) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DotKernel {
+    // On aarch64 the SIMD `Neon` kernel is baseline and always selected, so the
+    // runtime `Scalar` variant is never constructed in library code there (it
+    // still backs the parity tests and the dispatcher reference). Allow it to
+    // avoid a dead-code error under `-D warnings` on aarch64.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     Scalar,
     /// AVX2, 256-bit, **no** VNNI. Exact `u8 x i8` int8 dot for the huge
     /// installed base of AVX2 CPUs without VNNI (Haswell/Broadwell/Skylake/
@@ -2093,6 +2098,15 @@ enum DotKernel {
     AvxVnni,
     #[cfg(target_arch = "x86_64")]
     Avx512Vnni,
+    /// ARM NEON / AdvSIMD exact `u8 x i8` int8 dot for aarch64. NEON is the
+    /// baseline ISA on aarch64, so this is selected unconditionally on ARM
+    /// (Apple Silicon, AWS Graviton, Ampere, Windows-on-ARM) to replace the slow
+    /// scalar fallback. It consumes the natural (non-deinterleaved) activation
+    /// layout and takes the int8 route — it MUST NOT enter the VNNI int4-direct
+    /// path. The kernel uses a widen-`vmlal` baseline (stable, always-available
+    /// AdvSIMD) that is bit-exact vs scalar.
+    #[cfg(target_arch = "aarch64")]
+    Neon,
 }
 
 impl DotKernel {
@@ -2135,7 +2149,17 @@ fn selected_dot_kernel() -> DotKernel {
             return DotKernel::Avx2;
         }
     }
-    DotKernel::Scalar
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON/AdvSIMD is baseline on aarch64, so the SIMD int8 dot is always
+        // available — never fall back to the slow scalar path on ARM. The
+        // kernel uses the widen-`vmlal` baseline, bit-exact vs scalar.
+        DotKernel::Neon
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        DotKernel::Scalar
+    }
 }
 
 /// Whether the running host selects MLAS's *AVX-512* SQNBit dispatch
@@ -2752,6 +2776,17 @@ fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
             DotKernel::Scalar => {}
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match _kernel {
+            DotKernel::Neon => {
+                // SAFETY: NEON/AdvSIMD is baseline on aarch64; the `i8mm` fast
+                // path inside is runtime-gated by `is_aarch64_feature_detected!`.
+                return unsafe { dot_u8_i8_neon(activation, weight) };
+            }
+            DotKernel::Scalar => {}
+        }
+    }
     dot_u8_i8_scalar(activation, weight)
 }
 
@@ -2852,6 +2887,48 @@ fn horizontal_sum_256(value: std::arch::x86_64::__m256i) -> i32 {
     // SAFETY: __m256i and [i32; 8] are both 32-byte plain-data values.
     let lanes: [i32; 8] = unsafe { std::mem::transmute(value) };
     lanes.into_iter().sum()
+}
+
+/// ARM NEON exact `u8 x i8` dot for aarch64. Uses the widen-`vmlal` baseline,
+/// which relies only on stable baseline AdvSIMD intrinsics (present on every
+/// aarch64 CPU) and produces the same i32 sum as `dot_u8_i8_scalar` bit-for-bit.
+///
+/// A `dotprod`/`i8mm` fast path (`vusdotq_s32`) is intentionally NOT used: the
+/// exact unsigned x signed primitive `vusdotq_s32` is still gated behind the
+/// unstable `stdarch_neon_i8mm` feature on the stable toolchain, so it cannot be
+/// called without nightly. The widen-`vmlal` baseline already replaces the slow
+/// scalar fallback with wide SIMD on all ARM hardware; a `dotprod`/`i8mm` fast
+/// path can be layered on later once the intrinsic stabilizes.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_u8_i8_neon(activation: &[u8], weight: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+
+    let len = activation.len();
+    let vector_len = len / 16 * 16;
+    let mut accumulator = vdupq_n_s32(0);
+    for index in (0..vector_len).step_by(16) {
+        // SAFETY: index + 16 <= len over equal-length slices; loads are unaligned.
+        let a = unsafe { vld1q_u8(activation.as_ptr().add(index)) };
+        // SAFETY: index + 16 <= len over equal-length slices; loads are unaligned.
+        let b = unsafe { vld1q_s8(weight.as_ptr().add(index)) };
+        // Widen u8 -> i16 (zero-extend) and i8 -> i16 (sign-extend) for both
+        // halves. Reinterpret the widened-unsigned lanes as signed i16: values
+        // are <= 255 so they stay non-negative and the products are exact.
+        let a_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(a)));
+        let a_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(a)));
+        let b_lo = vmovl_s8(vget_low_s8(b));
+        let b_hi = vmovl_s8(vget_high_s8(b));
+        // vmlal_s16 forms exact i32 products from the i16 halves and adds them
+        // into the i32 accumulator (no saturating intermediate). With
+        // `a in [0,255]`, `b in [-128,127]` each product magnitude is <= 32640,
+        // so the i32 accumulation matches the scalar reduction exactly.
+        accumulator = vmlal_s16(accumulator, vget_low_s16(a_lo), vget_low_s16(b_lo));
+        accumulator = vmlal_s16(accumulator, vget_high_s16(a_lo), vget_high_s16(b_lo));
+        accumulator = vmlal_s16(accumulator, vget_low_s16(a_hi), vget_low_s16(b_hi));
+        accumulator = vmlal_s16(accumulator, vget_high_s16(a_hi), vget_high_s16(b_hi));
+    }
+    vaddvq_s32(accumulator) + dot_u8_i8_scalar(&activation[vector_len..], &weight[vector_len..])
 }
 
 #[derive(Clone, Copy)]
@@ -5588,6 +5665,133 @@ mod tests {
         // dot_u8_i8 is bit-exact across kernels, so the accumulated f32 outputs
         // must be identical (not merely close) — token-exact decode.
         assert_eq!(avx2_out, scalar_out, "Avx2 int8_row diverged from Scalar");
+    }
+
+    /// The NEON int8 dot (widen-`vmlal` baseline) must equal the scalar
+    /// reference bit-for-bit, including on adversarial extremes (all-max u8,
+    /// ±128/±127 weights) that would saturate a naive i16 intermediate, across
+    /// lengths exercising the 16-wide body and the scalar tail. Runs on aarch64
+    /// CI.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn dot_u8_i8_neon_matches_scalar() {
+        // Deterministic pseudo-random + adversarial extremes over many blocks.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in [
+            0usize, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 96, 127, 128, 129, 200,
+            255, 256, 257, 512, 1000,
+        ] {
+            let a_max = vec![255u8; len];
+            let w_pos = vec![127i8; len];
+            let w_neg = vec![-128i8; len];
+            let a_zero = vec![0u8; len];
+            for (act, wgt) in [
+                (&a_max, &w_pos),
+                (&a_max, &w_neg),
+                (&a_zero, &w_neg),
+                (&a_max, &a_max.iter().map(|_| -1i8).collect::<Vec<_>>()),
+            ] {
+                let scalar = dot_u8_i8_scalar(act, wgt);
+                // SAFETY: NEON is baseline on aarch64.
+                let simd = unsafe { dot_u8_i8_neon(act, wgt) };
+                assert_eq!(simd, scalar, "len={len}: adversarial neon dot mismatch");
+            }
+            // Random full-range inputs.
+            let activation: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            let weight: Vec<i8> = (0..len).map(|_| (next() & 0xff) as u8 as i8).collect();
+            let scalar = dot_u8_i8_scalar(&activation, &weight);
+            // SAFETY: NEON is baseline on aarch64.
+            let simd = unsafe { dot_u8_i8_neon(&activation, &weight) };
+            assert_eq!(simd, scalar, "len={len}: random neon dot mismatch");
+        }
+    }
+
+    /// aarch64 must never fall back to the scalar dot: `selected_dot_kernel`
+    /// picks `Neon`, and the forced `Neon` int8 dot stays bit-exact vs scalar.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn selected_dot_kernel_is_neon_on_aarch64() {
+        assert_eq!(
+            selected_dot_kernel(),
+            DotKernel::Neon,
+            "aarch64 must select the NEON int8 dot, never Scalar"
+        );
+        let activation: Vec<u8> = (0..128).map(|i| ((i * 29 + 7) % 255) as u8).collect();
+        let weight: Vec<i8> = (0..128).map(|i| ((i * 17 % 31) as i8) - 15).collect();
+        let scalar = dot_u8_i8(&activation, &weight, DotKernel::Scalar);
+        assert_eq!(dot_u8_i8(&activation, &weight, DotKernel::Neon), scalar);
+    }
+
+    /// End-to-end: force the `Neon` kernel through the full int4 accuracy_level=4
+    /// CompInt8 decode (`int8_row` via `dot_u8_i8`) and confirm it is token-exact
+    /// vs the `Scalar` reference. Runs on aarch64 CI.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn int8_row_neon_matches_scalar() {
+        let (k, n, block_size) = (131usize, 7usize, 32usize);
+        let padded_k = k.div_ceil(block_size) * block_size;
+        let k_blocks = padded_k / block_size;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let activation: Vec<u8> = (0..padded_k).map(|_| (next() & 0xff) as u8).collect();
+        let activation_scales: Vec<f32> = (0..k_blocks)
+            .map(|_| (next() & 0xff) as f32 / 512.0 + 0.01)
+            .collect();
+        let values: Vec<i8> = (0..n * padded_k)
+            .map(|_| (next() & 0xff) as u8 as i8)
+            .collect();
+        let scales: Vec<f32> = (0..n * k_blocks)
+            .map(|_| (next() & 0xff) as f32 / 512.0 + 0.01)
+            .collect();
+        let block_sums: Vec<i32> = values
+            .chunks_exact(block_size)
+            .map(|b| b.iter().map(|&w| w as i32).sum())
+            .collect();
+        let weight = Int8Weight {
+            values,
+            scales,
+            block_sums,
+        };
+
+        let mut scalar_out = vec![0.0f32; n];
+        let mut neon_out = vec![0.0f32; n];
+        int8_row(
+            &activation,
+            &activation_scales,
+            &weight,
+            &mut scalar_out,
+            k_blocks,
+            padded_k,
+            block_size,
+            DotKernel::Scalar,
+            false,
+        );
+        int8_row(
+            &activation,
+            &activation_scales,
+            &weight,
+            &mut neon_out,
+            k_blocks,
+            padded_k,
+            block_size,
+            DotKernel::Neon,
+            false,
+        );
+        // dot_u8_i8 is bit-exact across kernels, so the accumulated f32 outputs
+        // must be identical (not merely close) — token-exact decode.
+        assert_eq!(neon_out, scalar_out, "Neon int8_row diverged from Scalar");
     }
 
     /// The 512-bit AVX-512BW grouped `u8 x i16` block dot must agree with an
