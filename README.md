@@ -90,6 +90,15 @@ cargo build --release -p onnx-genai -p onnx-genai-server
   --prompt "Write a short Rust hello-world program."
 ```
 
+On a shared machine, add `--cpu-cores N` to `generate` or `run` to cap native
+CPU decode to N workers (for example, `--cpu-cores 8`); where supported, those
+workers are pinned to at most N allowed CPUs. The equivalent environment
+variable is `ONNX_GENAI_CPU_DECODE_THREADS=N`; precedence is CLI flag >
+environment variable > automatic sizing. Omitting both preserves the full
+peak-throughput default. This is a decode-worker budget, not a hard cpuset for
+prefill or ONNX Runtime threads; combine it with an OS cpuset/taskset when the
+entire process must be confined.
+
 ### Run the OpenAI-compatible server
 
 ```bash
