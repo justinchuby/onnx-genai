@@ -113,6 +113,16 @@ impl VisionInputSpec {
         })
     }
 
+    /// The placeholder token this package expects, one per image.
+    ///
+    /// Front ends use it to insert placeholders a caller did not write, so a
+    /// user never has to know a model's private placeholder spelling.
+    pub fn placeholder_token_id(&self) -> Option<u32> {
+        self.expansion
+            .as_ref()
+            .and_then(|expansion| u32::try_from(expansion.placeholder_token_id).ok())
+    }
+
     pub fn expand_prompt(
         &self,
         prompt_token_ids: &[u32],

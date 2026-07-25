@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
+
+mod profile;
 use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
 use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer};
@@ -42,11 +44,12 @@ use onnx_genai::preprocess::audio::{
 use onnx_genai::text_to_audio::{self, TextToAudioRequest};
 use onnx_genai::text_to_image::{self, TextToImageRequest, VaeDecoder};
 use onnx_genai::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken,
-    GenerateTokenCallback, StopSequence,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateToken, GenerateTokenCallback, StopSequence,
 };
 use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
 use onnx_genai_server::{ServeArgs, from_models_dir, run_serve};
+use profile::RunProfile;
 
 /// Process exit code for termination via SIGINT (Ctrl-C), matching the POSIX
 /// convention of `128 + SIGINT`.
@@ -270,11 +273,19 @@ impl Backend {
     }
 
     /// Run one turn, streaming tokens through `callback`.
+    /// Number of tokens the prompt occupies, when the backend can tell.
+    fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
+        match self {
+            Self::Text(engine) => engine.tokenize(prompt).ok().map(|ids| ids.len()),
+            Self::Pipeline(pipeline) => pipeline.tokenizer.encode(prompt).ok().map(|ids| ids.len()),
+        }
+    }
+
     fn generate(
         &mut self,
         turn: TurnInput,
         callback: &mut GenerateTokenCallback<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<GenerateResult> {
         multimodal::admit_attachments(
             self.multimodal(),
             "the loaded model",
@@ -287,8 +298,7 @@ impl Backend {
                     prompt: GeneratePrompt::Text(turn.prompt),
                     options: turn.options,
                 };
-                engine.generate_with_callback(request, Some(callback))?;
-                Ok(())
+                engine.generate_with_callback(request, Some(callback))
             }
             Self::Pipeline(pipeline) => {
                 let attachments = turn.images.len() + turn.audio.len();
@@ -306,8 +316,7 @@ impl Backend {
                              How: attach one with `/{modality} <path>` in the REPL, or `--{modality} <path>` on the command line."
                         )),
                         _ => error,
-                    })?;
-                Ok(())
+                    })
             }
         }
     }
@@ -410,15 +419,21 @@ fn run_generation_turn(
     backend: &mut Backend,
     turn: TurnInput,
     stream: bool,
+    profile: Option<&mut RunProfile>,
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
 
     let mut output = String::new();
+    let mut timings = profile::TokenTimings::default();
+    timings.start();
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Interrupted));
         }
+        // Timed here, at the point the token reaches the caller, because that
+        // is the latency a user actually experiences.
+        timings.token();
         output.push_str(&token.text);
         if stream {
             print!("{}", token.text);
@@ -429,6 +444,14 @@ fn run_generation_turn(
 
     let result = backend.generate(turn, &mut callback);
     GENERATING.store(false, Ordering::SeqCst);
+    timings.finish();
+    if let Some(profile) = profile {
+        profile.timings = timings;
+        if let Ok(result) = &result {
+            profile.finish_reason = Some(format!("{:?}", result.finish_reason));
+            profile.prefix_cache_hit = Some(result.prefix_cache_hit_len);
+        }
+    }
     result?;
     Ok(output)
 }
@@ -507,6 +530,9 @@ fn parse_repl_line(line: &str) -> ReplLine {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    #[command(flatten)]
+    profiling: ProfileArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -574,6 +600,90 @@ impl SamplingArgs {
         }
         options.stop_sequences = self.stop.iter().cloned().map(StopSequence::Text).collect();
         options
+    }
+}
+
+/// Shared profiling flags.
+#[derive(Debug, Args, Default, Clone)]
+struct ProfileArgs {
+    /// Report timing and throughput to stderr after the run: time to first
+    /// token, decode tok/s, inter-token latency percentiles, and per-phase time.
+    #[arg(long)]
+    profile: bool,
+
+    /// Also write the report as one JSON object, for diffing runs or plotting.
+    /// Use `-` for stdout.
+    #[arg(long, value_name = "PATH")]
+    profile_json: Option<PathBuf>,
+
+    /// Write a Chrome Trace Event timeline, viewable at https://ui.perfetto.dev.
+    #[arg(long, value_name = "PATH")]
+    profile_trace: Option<PathBuf>,
+}
+
+impl ProfileArgs {
+    /// Whether anything at all was requested.
+    fn requested(&self) -> bool {
+        self.profile || self.profile_json.is_some() || self.profile_trace.is_some()
+    }
+
+    /// Turn on the engine's stage profiler and timeline tracer.
+    ///
+    /// Both are read once from the environment by the runtime config, so this
+    /// must run before any engine call. It is called from `run` before the
+    /// command dispatches, while the process is still single-threaded.
+    fn install(&self) {
+        if !self.requested() {
+            return;
+        }
+        // SAFETY: called at startup from the single-threaded argument-parsing
+        // path, before any engine, driver, or runtime thread exists.
+        unsafe {
+            if self.profile || self.profile_json.is_some() {
+                std::env::set_var("ONNX_GENAI_PROFILE", "1");
+            }
+            if let Some(path) = &self.profile_trace {
+                std::env::set_var("ONNX_GENAI_TRACE", path);
+            }
+        }
+    }
+
+    /// Emit whatever the caller asked for.
+    fn emit(&self, profile: &RunProfile) -> anyhow::Result<()> {
+        if self.profile {
+            eprint!("{}", profile.to_text());
+        }
+        if let Some(path) = &self.profile_json {
+            let json = format!("{}\n", profile.to_json());
+            if path.as_os_str() == "-" {
+                print!("{json}");
+                io::stdout().flush()?;
+            } else {
+                std::fs::write(path, json).map_err(|error| {
+                    anyhow::anyhow!(
+                        "What: the profile report could not be written to {}. \
+                         Why: {error}. \
+                         How: choose a path in a writable directory.",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+        if let Some(path) = &self.profile_trace {
+            onnx_genai::ort::profile::write_trace().map_err(|error| {
+                anyhow::anyhow!(
+                    "What: the timeline trace could not be written to {}. \
+                     Why: {error}. \
+                     How: choose a path in a writable directory.",
+                    path.display()
+                )
+            })?;
+            eprintln!(
+                "[profile] wrote {} (open it at https://ui.perfetto.dev)",
+                path.display()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -842,14 +952,16 @@ fn init_tracing() {
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse_from(args);
+    cli.profiling.install();
+    let profiling = cli.profiling;
     match cli.command {
         Commands::Serve(serve_args) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(run_serve(serve_args))
         }
-        Commands::Generate(generate_args) => generate(generate_args),
-        Commands::Run(run_args) => run_repl(run_args),
-        Commands::Transcribe(transcribe_args) => transcribe(transcribe_args),
+        Commands::Generate(generate_args) => generate(generate_args, &profiling),
+        Commands::Run(run_args) => run_repl(run_args, &profiling),
+        Commands::Transcribe(transcribe_args) => transcribe(transcribe_args, &profiling),
         Commands::Show(show_args) => show(&show_args.model),
         Commands::List(list_args) => list(&list_args.models_dir),
         Commands::Version => {
@@ -859,9 +971,10 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
-fn generate(args: GenerateArgs) -> anyhow::Result<()> {
+fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
+    let mut profile = RunProfile::new(model_dir.display().to_string());
     if args.image_output.output_image.is_some() && args.audio_output.output_audio.is_some() {
         anyhow::bail!(
             "What: --output-image and --output-audio were combined. \
@@ -870,10 +983,10 @@ fn generate(args: GenerateArgs) -> anyhow::Result<()> {
         );
     }
     if args.image_output.output_image.is_some() {
-        return generate_image(&model_dir, args);
+        return generate_image(&model_dir, args, profiling, profile);
     }
     if args.audio_output.output_audio.is_some() {
-        return generate_audio(&model_dir, args);
+        return generate_audio(&model_dir, args, profiling, profile);
     }
     let options = args.sampling.to_options();
 
@@ -887,14 +1000,18 @@ fn generate(args: GenerateArgs) -> anyhow::Result<()> {
         options,
     };
 
+    let load_started = std::time::Instant::now();
     let mut backend = Backend::load(&model_dir)?;
-    match run_generation_turn(&mut backend, turn, args.stream) {
+    profile.phase("model load", load_started.elapsed());
+    profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
+    match run_generation_turn(&mut backend, turn, args.stream, Some(&mut profile)) {
         Ok(output) => {
             if args.stream {
                 println!();
             } else {
                 println!("{output}");
             }
+            profiling.emit(&profile)?;
             Ok(())
         }
         Err(error) if is_interrupt_error(&error) => {
@@ -907,13 +1024,19 @@ fn generate(args: GenerateArgs) -> anyhow::Result<()> {
 }
 
 /// Render `--prompt` to PNG(s) through the model's declared diffusion pipeline.
-fn generate_image(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
+fn generate_image(
+    model_dir: &Path,
+    args: GenerateArgs,
+    profiling: &ProfileArgs,
+    mut profile: RunProfile,
+) -> anyhow::Result<()> {
     let output = args
         .image_output
         .output_image
         .clone()
         .expect("image output path checked by the caller");
     let request = args.image_output.to_request(args.prompt.clone());
+    let load_started = std::time::Instant::now();
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())
         .map_err(|error| {
             anyhow::anyhow!(
@@ -924,7 +1047,21 @@ fn generate_image(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
             )
         })?;
 
+    profile.phase("model load", load_started.elapsed());
+    let render_started = std::time::Instant::now();
     let images = text_to_image::render(model_dir, &mut engine, &request)?;
+    let render_elapsed = render_started.elapsed();
+    profile.phase("render", render_elapsed);
+    if let Some(steps) = request.steps.or(engine.spec().strategy.num_steps) {
+        profile.counter("denoise steps", steps as f64, "steps");
+        if steps > 0 {
+            profile.counter(
+                "per step",
+                render_elapsed.as_secs_f64() * 1000.0 / steps as f64,
+                "ms",
+            );
+        }
+    }
     if images.is_empty() {
         anyhow::bail!(
             "What: no image was produced. \
@@ -955,11 +1092,17 @@ fn generate_image(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
             image.height
         );
     }
+    profiling.emit(&profile)?;
     Ok(())
 }
 
 /// Synthesize `--prompt` to a WAV file through the model's declared TTS pipeline.
-fn generate_audio(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
+fn generate_audio(
+    model_dir: &Path,
+    args: GenerateArgs,
+    profiling: &ProfileArgs,
+    mut profile: RunProfile,
+) -> anyhow::Result<()> {
     let output = args
         .audio_output
         .output_audio
@@ -981,12 +1124,25 @@ fn generate_audio(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
             setup.tokenizer_path.display()
         )
     })?;
+    let load_started = std::time::Instant::now();
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())?;
+    profile.phase("model load", load_started.elapsed());
 
     let request = args
         .audio_output
         .to_request(args.prompt.clone(), &args.sampling);
+    let synthesis_started = std::time::Instant::now();
     let audio = text_to_audio::synthesize(&mut engine, &tokenizer, &request)?;
+    let synthesis_elapsed = synthesis_started.elapsed();
+    profile.phase("synthesis", synthesis_elapsed);
+    profile.counter("audio produced", audio.duration_secs() as f64, "s");
+    if audio.duration_secs() > 0.0 {
+        profile.counter(
+            "real-time factor",
+            synthesis_elapsed.as_secs_f64() / audio.duration_secs() as f64,
+            "x",
+        );
+    }
     text_to_audio::save_wav(&audio, &output)?;
     println!(
         "saved {} ({:.2}s, {} Hz, {} channel{})",
@@ -996,13 +1152,16 @@ fn generate_audio(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
         audio.channels,
         if audio.channels == 1 { "" } else { "s" }
     );
+    profiling.emit(&profile)?;
     Ok(())
 }
 
-fn run_repl(args: RunArgs) -> anyhow::Result<()> {
+fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
+    let load_started = std::time::Instant::now();
     let mut backend = Backend::load(&model_dir)?;
+    let load_elapsed = load_started.elapsed();
     let mut raw_mode = args.sampling.raw;
     let mut template = load_chat_template(&model_dir, raw_mode);
 
@@ -1124,10 +1283,16 @@ fn run_repl(args: RunArgs) -> anyhow::Result<()> {
             options: args.sampling.to_options(),
         };
 
-        match run_generation_turn(&mut backend, turn, true) {
+        let mut profile = RunProfile::new(model_dir.display().to_string());
+        profile.phase("model load", load_elapsed);
+        profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
+        match run_generation_turn(&mut backend, turn, true, Some(&mut profile)) {
             Ok(output) => {
                 println!();
                 history.push(ChatMessage::assistant(output));
+                // Report per turn: in a session the interesting comparison is
+                // between turns, not a single number at exit.
+                profiling.emit(&profile)?;
             }
             Err(error) if is_interrupt_error(&error) => {
                 // Drop the interrupted turn from history so a partial/aborted
@@ -1348,10 +1513,13 @@ impl Transcriber {
     }
 }
 
-fn transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
+fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
+    let mut profile = RunProfile::new(model_dir.display().to_string());
+    let load_started = std::time::Instant::now();
     let mut transcriber = Transcriber::load(&model_dir, &args)?;
+    profile.phase("model load", load_started.elapsed());
 
     let window = transcriber.window_seconds();
     let segment_seconds = args.segment_seconds.unwrap_or(window);
@@ -1372,9 +1540,17 @@ fn transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
         args.audio.clone()
     };
     let mut index = 0;
+    let mut totals = TranscriptionTotals::default();
     for source in &sources {
         if source.as_os_str() == "-" {
-            index = transcribe_stream(&mut transcriber, &args, segment_seconds, &writer, index)?;
+            index = transcribe_stream(
+                &mut transcriber,
+                &args,
+                segment_seconds,
+                &writer,
+                index,
+                &mut totals,
+            )?;
         } else {
             index = transcribe_file(
                 &mut transcriber,
@@ -1383,10 +1559,51 @@ fn transcribe(args: TranscribeArgs) -> anyhow::Result<()> {
                 segment_seconds,
                 &writer,
                 index,
+                &mut totals,
             )?;
         }
     }
+    totals.record(&mut profile);
+    profiling.emit(&profile)?;
     Ok(())
+}
+
+/// Running totals across every transcribed source, for the profile report.
+#[derive(Debug, Default)]
+struct TranscriptionTotals {
+    audio_seconds: f32,
+    compute: std::time::Duration,
+    segments: usize,
+    /// Wall time spent transcribing each segment, for the latency tail.
+    segment_latencies: Vec<std::time::Duration>,
+}
+
+impl TranscriptionTotals {
+    fn record(&self, profile: &mut RunProfile) {
+        if self.segments == 0 {
+            return;
+        }
+        profile.phase("transcription", self.compute);
+        profile.counter("audio transcribed", self.audio_seconds as f64, "s");
+        profile.counter("segments", self.segments as f64, "segments");
+        if self.audio_seconds > 0.0 {
+            // Below 1.0 means the model keeps up with a live stream.
+            profile.counter(
+                "real-time factor",
+                self.compute.as_secs_f64() / self.audio_seconds as f64,
+                "x",
+            );
+        }
+        let mut latencies: Vec<f64> = self
+            .segment_latencies
+            .iter()
+            .map(|latency| latency.as_secs_f64() * 1000.0)
+            .collect();
+        latencies.sort_by(|left, right| left.total_cmp(right));
+        if let Some(worst) = latencies.last() {
+            profile.counter("slowest segment", *worst, "ms");
+        }
+    }
 }
 
 /// Build the segmenter for a stream at `sample_rate`.
@@ -1419,13 +1636,20 @@ fn drain(
     sample_rate: u32,
     writer: &TranscriptWriter,
     index: &mut usize,
+    totals: &mut TranscriptionTotals,
 ) -> anyhow::Result<f32> {
     let mut audio_seconds = 0.0;
     for segment in segments {
         let start = segment.start_sample as f32 / sample_rate as f32;
         let duration = segment.samples.len() as f32 / sample_rate as f32;
         audio_seconds += duration;
+        let segment_started = std::time::Instant::now();
         let text = transcriber.transcribe(&segment.samples, sample_rate)?;
+        let latency = segment_started.elapsed();
+        totals.audio_seconds += duration;
+        totals.compute += latency;
+        totals.segments += 1;
+        totals.segment_latencies.push(latency);
         if text.is_empty() {
             continue;
         }
@@ -1447,6 +1671,7 @@ fn transcribe_file(
     segment_seconds: f32,
     writer: &TranscriptWriter,
     mut index: usize,
+    totals: &mut TranscriptionTotals,
 ) -> anyhow::Result<usize> {
     let bytes = std::fs::read(path).map_err(|error| {
         anyhow::anyhow!(
@@ -1473,6 +1698,7 @@ fn transcribe_file(
         audio.sample_rate,
         writer,
         &mut index,
+        totals,
     )?;
     audio_seconds += drain(
         transcriber,
@@ -1480,6 +1706,7 @@ fn transcribe_file(
         audio.sample_rate,
         writer,
         &mut index,
+        totals,
     )?;
     report_realtime_factor(started.elapsed().as_secs_f32(), audio_seconds);
     Ok(index)
@@ -1491,6 +1718,7 @@ fn transcribe_stream(
     segment_seconds: f32,
     writer: &TranscriptWriter,
     mut index: usize,
+    totals: &mut TranscriptionTotals,
 ) -> anyhow::Result<usize> {
     let stdin = io::stdin();
     let mut reader = PcmStreamReader::new(stdin.lock(), args.sample_rate, args.channels)?;
@@ -1516,6 +1744,7 @@ fn transcribe_stream(
             sample_rate,
             writer,
             &mut index,
+            totals,
         )?;
     }
     audio_seconds += drain(
@@ -1524,6 +1753,7 @@ fn transcribe_stream(
         sample_rate,
         writer,
         &mut index,
+        totals,
     )?;
     report_realtime_factor(started.elapsed().as_secs_f32(), audio_seconds);
     Ok(index)

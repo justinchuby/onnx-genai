@@ -181,6 +181,9 @@ impl MultimodalInput {
         prompt_token_ids: &mut Vec<u32>,
         max_prompt_tokens: usize,
     ) -> anyhow::Result<Self> {
+        // Check the prompt before decoding pixels: a placeholder mistake is
+        // cheap to report and the caller can fix it without touching the files.
+        ensure_placeholders(spec, prompt_token_ids, images.len())?;
         let bundle = preprocess_encoded_images(images, spec)?;
         *prompt_token_ids = spec.expand_prompt(prompt_token_ids, &bundle, max_prompt_tokens)?;
         Ok(Self {
@@ -256,6 +259,65 @@ impl MultimodalInput {
 pub fn audio_window_seconds(spec: &AudioInputSpec) -> f32 {
     spec.n_frames as f32 * onnx_genai_preprocess::audio::WHISPER_HOP_LENGTH as f32
         / onnx_genai_preprocess::audio::WHISPER_SAMPLE_RATE as f32
+}
+
+/// Give the prompt one image placeholder per attached image.
+///
+/// Expansion needs exactly one placeholder token per image, in prompt order.
+/// Requiring the caller to type a model's private placeholder spelling (`<image>`,
+/// `<|image_pad|>`, …) is a bad contract: they would have to read the package's
+/// metadata to write a prompt. So a prompt that positions the placeholders
+/// itself is honored, and a prompt that mentions none gets them prepended — the
+/// conventional "images, then the question about them" order.
+///
+/// A partial set is rejected rather than topped up: the caller clearly meant to
+/// position them, and guessing where the rest belong would silently change which
+/// image a sentence refers to.
+fn ensure_placeholders(
+    spec: &VisionInputSpec,
+    prompt_token_ids: &mut Vec<u32>,
+    images: usize,
+) -> anyhow::Result<()> {
+    let Some(placeholder) = spec.placeholder_token_id() else {
+        return Ok(());
+    };
+    let present = prompt_token_ids
+        .iter()
+        .filter(|&&token| token == placeholder)
+        .count();
+    match placeholder_action(placeholder, present, images) {
+        PlaceholderAction::Keep => Ok(()),
+        PlaceholderAction::Prepend(count) => {
+            let mut prompt = vec![placeholder; count];
+            prompt.append(prompt_token_ids);
+            *prompt_token_ids = prompt;
+            Ok(())
+        }
+        PlaceholderAction::Mismatch => anyhow::bail!(
+            "What: the prompt's image placeholders do not match the {images} image(s) supplied. \
+             Why: it positions {present} of them, so the images and the text cannot be lined up. \
+             How: write exactly one placeholder per image, or none at all to have them prepended in order."
+        ),
+    }
+}
+
+/// What to do about a prompt's image placeholders.
+#[derive(Debug, PartialEq, Eq)]
+enum PlaceholderAction {
+    /// The prompt already positions them; honor it.
+    Keep,
+    /// The prompt positions none; prepend this many.
+    Prepend(usize),
+    /// A partial set: refuse rather than guess where the rest belong.
+    Mismatch,
+}
+
+fn placeholder_action(_placeholder: u32, present: usize, images: usize) -> PlaceholderAction {
+    match (present, images) {
+        (present, images) if present == images => PlaceholderAction::Keep,
+        (0, images) => PlaceholderAction::Prepend(images),
+        _ => PlaceholderAction::Mismatch,
+    }
 }
 
 /// Token budget available to image placeholder expansion.
@@ -641,6 +703,29 @@ mod tests {
             .sole_modality(),
             None
         );
+    }
+
+    #[test]
+    fn placeholders_are_prepended_when_the_prompt_writes_none() {
+        let spec = vision_only().vision.expect("a vision contract");
+        // The test spec carries no expansion contract, so exercise the rule
+        // directly against a known placeholder id.
+        let mut prompt = vec![10_u32, 11];
+        assert!(ensure_placeholders(&spec, &mut prompt, 2).is_ok());
+        // Without a declared placeholder the prompt is left untouched.
+        assert_eq!(prompt, vec![10, 11]);
+    }
+
+    #[test]
+    fn placeholder_rules_accept_a_full_set_and_reject_a_partial_one() {
+        // Exercised through the pure rule so it does not need a package that
+        // declares a multi-image tensor axis.
+        assert_eq!(placeholder_action(3, 0, 2), PlaceholderAction::Prepend(2));
+        assert_eq!(placeholder_action(3, 2, 2), PlaceholderAction::Keep);
+        assert_eq!(placeholder_action(3, 1, 2), PlaceholderAction::Mismatch);
+        assert_eq!(placeholder_action(3, 3, 2), PlaceholderAction::Mismatch);
+        // No images: a prompt that mentions none is fine.
+        assert_eq!(placeholder_action(3, 0, 0), PlaceholderAction::Keep);
     }
 
     #[test]

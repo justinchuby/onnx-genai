@@ -123,6 +123,75 @@ Audio is transcription: the model's own decoder prompt replaces the typed text,
 because the clip carries the content. A model that declares neither contract
 rejects the attachment with an error naming what it does accept.
 
+You do not have to know a model's image placeholder token. Pass the images and
+write the prompt normally — one placeholder per image is prepended for you:
+
+```bash
+onnx-genai generate models/my-vlm \
+  --image left.png --image right.png \
+  --prompt "What changed between these two photos?"
+```
+
+To control where each image sits in the sentence, write the placeholders
+yourself and they are honored verbatim:
+
+```bash
+onnx-genai generate models/my-vlm --image cat.png --image dog.png \
+  --prompt "The first <image> is a cat and the second <image> is a dog. Compare them."
+```
+
+A *partial* set is rejected rather than topped up: once you start positioning
+placeholders, guessing where the rest belong would silently change which image a
+sentence refers to.
+
+### Profiling
+
+`--profile` reports where the time went. It works on every subcommand:
+
+```bash
+onnx-genai --profile generate models/qwen2.5-0.5b --prompt "..." --max-new-tokens 40
+```
+
+```text
+── profile ──────────────────────────────────
+model                    models/qwen2.5-0.5b
+execution provider       cpu
+model load                   3598.2 ms
+prompt tokens                    36
+generated tokens                 20
+time to first token           116.3 ms
+generation wall time          599.9 ms
+decode throughput             39.28 tok/s
+end-to-end throughput         33.34 tok/s
+inter-token latency      mean 24.2 / p50 23.0 / p90 27.5 / p99 36.5 / max 36.5 ms
+finish reason            MaxTokens
+
+per-stage breakdown:
+stage                          total_ms      calls        us/call     us/token
+------------------------------------------------------------------------------
+ort.session_run                 890.337         36       24731.57     25438.19
+ort.sampling                     53.813         35        1537.52      1537.52
+...
+```
+
+Decode throughput excludes the prefill wait, and end-to-end includes it, because
+a long prompt inflates the second without the model decoding any faster.
+Percentiles sit next to the mean because a run that averages 24 ms/token but
+stalls for 400 ms mid-sentence feels broken, and only the tail shows it. The
+per-stage table answers "ORT kernels or our orchestration?".
+
+Each mode adds its own counters: denoise steps and ms/step for `--output-image`,
+audio produced and real-time factor for `--output-audio`, and segments, audio
+transcribed, real-time factor and slowest segment for `transcribe`.
+
+```bash
+# Machine-readable, for diffing runs or plotting in CI (`-` writes to stdout)
+onnx-genai --profile-json bench.json generate models/qwen2.5-0.5b --prompt "..."
+
+# Chrome Trace Event timeline, viewable at https://ui.perfetto.dev
+onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "..."
+```
+
 ### Generate images
 
 `generate --output-image` renders a prompt through a diffusion package (see
