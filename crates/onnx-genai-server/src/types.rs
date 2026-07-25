@@ -277,14 +277,27 @@ fn content_part(index: usize, value: serde_json::Value) -> Result<ChatMessageCon
 
 impl ChatMessageContent {
     pub(crate) fn text(&self) -> String {
+        self.render(None)
+    }
+
+    /// Render the parts as prompt text, writing `image_placeholder` wherever an
+    /// image sits.
+    ///
+    /// OpenAI content parts are ordered, and that order carries meaning: in
+    /// "compare [A] with [B]" the images belong where they are written.
+    /// Dropping them and re-attaching the placeholders elsewhere would silently
+    /// re-associate the text with the wrong picture, so each image is rendered
+    /// in place. Without a placeholder (a model with no image contract) the
+    /// parts are dropped as before — the request is rejected shortly after.
+    pub(crate) fn render(&self, image_placeholder: Option<&str>) -> String {
         match self {
             Self::Text(text) => text.clone(),
             Self::Parts(parts) => parts
                 .iter()
                 .filter_map(|part| match part {
                     ChatMessageContentPart::Text { text } => Some(text.as_str()),
-                    ChatMessageContentPart::ImageUrl { .. }
-                    | ChatMessageContentPart::InputAudio { .. } => None,
+                    ChatMessageContentPart::ImageUrl { .. } => image_placeholder,
+                    ChatMessageContentPart::InputAudio { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(""),

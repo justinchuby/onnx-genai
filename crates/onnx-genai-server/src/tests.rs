@@ -2928,3 +2928,78 @@ async fn a_speech_model_is_not_offered_for_image_generation() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(error_message(&body).contains("denoiser"));
 }
+
+#[tokio::test]
+async fn interleaved_image_parts_keep_their_position_in_the_prompt() {
+    // "compare [A] with [B]" — the images belong where they are written. If the
+    // parts were stripped and the placeholders re-attached elsewhere, the text
+    // would be re-associated with the wrong picture.
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
+    let state = AppState::load(&model_dir, Some("tiny-vlm".to_string()))
+        .expect("load the vision-input fixture");
+
+    // The placeholder is decoded from the package's declared token id, so it
+    // must round-trip back to that id when the prompt is tokenized.
+    let handle = state
+        .registry
+        .resolve("tiny-vlm")
+        .expect("fixture has a default model");
+    let placeholder = crate::routes::image_placeholder_text(&handle)
+        .expect("the fixture declares an image placeholder");
+    let token = handle
+        .multimodal
+        .as_ref()
+        .and_then(|multimodal| multimodal.vision.as_ref())
+        .and_then(|vision| vision.placeholder_token_id())
+        .expect("declared placeholder token");
+    assert_eq!(
+        handle.tokenizer.encode(&placeholder).expect("re-encode"),
+        vec![token],
+        "the rendered placeholder must tokenize back to the declared id"
+    );
+    let (status, body) = post_json(
+        state,
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-vlm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe "},
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}},
+                    {"type": "text", "text": " closely"}
+                ]
+            }],
+            "max_tokens": 2
+        }),
+    )
+    .await;
+
+    // The fixture's encoder accepts exactly one image, so a successful run
+    // proves the placeholder was rendered in position and matched the image.
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+}
+
+#[test]
+fn content_parts_render_images_where_they_were_written() {
+    use crate::types::ChatMessageContent;
+
+    let content: ChatMessageContent = serde_json::from_value(json!([
+        {"type": "text", "text": "compare "},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+        {"type": "text", "text": " with "},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BB"}},
+        {"type": "text", "text": "."}
+    ]))
+    .expect("content parts parse");
+
+    assert_eq!(
+        content.render(Some("<image>")),
+        "compare <image> with <image>.",
+        "each image must be written where it appeared"
+    );
+    // Without an image contract the parts are dropped, as before; such a
+    // request is rejected moments later by the admission check.
+    assert_eq!(content.render(None), "compare  with .");
+}

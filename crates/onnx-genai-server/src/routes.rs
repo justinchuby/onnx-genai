@@ -1517,11 +1517,13 @@ async fn run_chat_completion(
         .logprobs
         .then_some(request.top_logprobs.unwrap_or(0));
     let tokenizer = handle.tokenizer.clone();
+    let placeholder = positional_image_placeholder(&request, &handle);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
         handle.chat_template.as_deref(),
         client_session_id.is_some(),
+        placeholder.as_deref(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -1668,11 +1670,13 @@ async fn stream_chat_completion(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
+    let placeholder = positional_image_placeholder(&request, &handle);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
         handle.chat_template.as_deref(),
         client_session_id.is_some(),
+        placeholder.as_deref(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -2288,16 +2292,52 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
     options
 }
 
+/// The text spelling of this model's image placeholder, if it declares one.
+///
+/// Decoded from the declared token id rather than hardcoded, so the prompt
+/// carries whatever token this package actually uses. It re-tokenizes to the
+/// same id because a placeholder is always a distinct vocabulary entry.
+pub(crate) fn image_placeholder_text(handle: &ModelHandle) -> Option<String> {
+    let token = handle
+        .multimodal
+        .as_ref()
+        .and_then(|multimodal| multimodal.vision.as_ref())
+        .and_then(|vision| vision.placeholder_token_id())?;
+    handle.tokenizer.decode_with_special_tokens(&[token]).ok()
+}
+
+/// The placeholder to render at each image part's position, or `None` when the
+/// request positions its images some other way.
+///
+/// A caller who writes the placeholder into the text has already said where the
+/// images go; rendering another one per image part would double the count and
+/// the request would be rejected. So a hand-written placeholder wins, and
+/// automatic positioning applies only when the text contains none.
+fn positional_image_placeholder(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+) -> Option<String> {
+    let placeholder = image_placeholder_text(handle)?;
+    let already_positioned = request.messages.iter().any(|message| {
+        message
+            .content
+            .as_ref()
+            .is_some_and(|content| content.render(None).contains(&placeholder))
+    });
+    (!already_positioned).then_some(placeholder)
+}
+
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
     chat_template: Option<&ChatTemplate>,
     session: bool,
+    image_placeholder: Option<&str>,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
-        build_session_prompt(&request.messages)
+        build_session_prompt(&request.messages, image_placeholder)
     } else {
-        render_prompt(request, chat_template)?
+        render_prompt(request, chat_template, image_placeholder)?
     };
     let token_ids = tokenizer
         .encode(&prompt)
@@ -2436,17 +2476,18 @@ fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTo
     request.tools.as_ref().filter(|tools| !tools.is_empty())
 }
 
-fn build_session_prompt(messages: &[ChatMessage]) -> String {
+fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str>) -> String {
     messages
         .last()
         .and_then(|message| message.content.as_ref())
-        .map(ChatMessageContent::text)
+        .map(|content| content.render(image_placeholder))
         .unwrap_or_default()
 }
 
 fn render_prompt(
     request: &ChatCompletionRequest,
     chat_template: Option<&ChatTemplate>,
+    image_placeholder: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(chat_template) = chat_template {
         let messages = request
@@ -2458,7 +2499,7 @@ fn render_prompt(
                     message
                         .content
                         .as_ref()
-                        .map(ChatMessageContent::text)
+                        .map(|content| content.render(image_placeholder))
                         .unwrap_or_default(),
                 );
                 if let Some(tool_calls) = &message.tool_calls {
