@@ -31,7 +31,7 @@
 //! `activation` is one of `none` (passthrough), `silu` or `swish` (both apply
 //! `x·sigmoid(x)`; the op has no learnable Swish β, so they are identical). The
 //! SiLU pass reuses the shared MLAS-backed [`silu_f32_slice`], matching ORT's
-//! logistic numerics (RULES.md §4).
+//! fused SiLU numerics (RULES.md §4).
 //!
 //! Compute is in `f32` (ORT's CPU kernel is `float`-only); `f16`/`bf16`
 //! activations are widened to `f32` and the results narrowed back so the kernel
@@ -264,7 +264,7 @@ impl Kernel for CausalConvWithStateKernel {
         }
 
         if self.activation == ConvActivation::Silu {
-            // SiLU over the dense output (MLAS logistic where available,
+            // SiLU over the dense output (MLAS fused SiLU where available,
             // matching ORT's activation numerics).
             let mut activated = vec![0.0f32; out.len()];
             silu_f32_slice(out, &mut activated);
