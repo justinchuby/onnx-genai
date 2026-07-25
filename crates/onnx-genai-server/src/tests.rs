@@ -903,8 +903,14 @@ async fn image_decode_and_preprocessing_use_pipeline_tensor_shape() {
 
 #[tokio::test]
 async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image() {
+    // `vlm-complete` is deliberately rank-mismatched: it exists so
+    // `pipeline_genai_fallback` can assert admission rejects it. This test needs
+    // a package that actually loads, so it uses the consistent one, where the
+    // vision encoder emits flat `[num_image_tokens, hidden]` features and the
+    // embedding graph raises them to `inputs_embeds` — the shape real packages
+    // use (Mobius Gemma4, onnxruntime-genai).
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../onnx-genai-genai-config/tests/fixtures/vlm-complete");
+        .join("../onnx-genai-genai-config/tests/fixtures/vlm-executable");
     let handle = crate::state::build_handle(
         &ModelSpec {
             id: "compat-vlm".to_owned(),
