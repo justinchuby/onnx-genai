@@ -51,7 +51,11 @@ To isolate the kernel change, separate release binaries were built from the
 commit immediately before #148 (`04c85242`) and the exact #148 commit
 (`7a2cd87d`). Native-only runs were performed back-to-back on the same idle
 GPU, with implementation order alternated across models. Token IDs were
-identical before and after #148 for all three models.
+identical before and after #148 for all three models. The A/B held the model,
+prompt, 128 generated tokens, two warmups, three measured runs, steady-decode
+window (first eight tokens excluded), CPU-1 `taskset` pinning, and physical GPU
+constant; the only executable change was #148's `down_tpl<COLS>` grid-fill
+kernel.
 
 | Model | Pre-#148 native | Exact #148 native | Change | Verdict |
 |---|---:|---:|---:|---|
@@ -62,6 +66,15 @@ identical before and after #148 for all three models.
 The result confirms that the SM-count-selected down-GEMV grid-fill is not
 7B-specific. It strongly helps the 1.5B Qwen shape, reproduces the expected
 approximately 2.1% 7B gain, and is effectively inert on Phi-4-mini.
+
+The ordering is physically plausible rather than an ORT-jitter artifact: this
+is a native-only, same-GPU A/B, and the smaller Qwen1.5B down projection has
+smaller K/N and therefore fewer baseline 8-column CTAs than 7B. It is more
+grid-starved on a many-SM H200, so splitting `down_tpl<COLS>` into more CTAs
+can hide more latency and produce a larger relative gain. The 10.52% result is
+nevertheless awaiting one additional clean-idle-GPU confirmation; the review
+fleet was busy when this scorecard was reviewed, so no contended rerun was
+attempted.
 
 For context, versus the earlier scorecard's separate pre-#148 session, native
 changed from 322.04 to 321.91 tok/s on Phi, 632.62 to 700.88 on Qwen 1.5B,
