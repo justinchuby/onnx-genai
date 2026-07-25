@@ -22,6 +22,16 @@ const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
 const GEMV_INT8_F32_ENTRY: &str = "matmul_nbits_gemv_int8_f32";
 const QUANTIZE_ACCURACY4_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32";
 const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
+// General-block-size fp32-activation accuracy_level=4 decode entries. These give
+// the fp32 `run` path the same "quantize the activation to int8 once, then run a
+// parallelized GEMV" treatment the block-32 path already enjoys, but for any
+// power-of-two block_size and for the asymmetric (zero-point) int4 layout. They
+// are bit-for-bit identical to the grid-starved `matmul_nbits_accuracy4` tiled
+// GEMM (same per-K-block int8 activation quantization, same per-block integer
+// dot, same sequential fp32 block accumulation) — only the parallelization
+// differs, so decode tokens are unchanged.
+const QUANTIZE_ACCURACY4_BLOCKWISE_ENTRY: &str = "matmul_nbits_quantize_accuracy4_blockwise";
+const GEMV_ACCURACY4_BLOCKWISE_ENTRY: &str = "matmul_nbits_gemv_accuracy4_blockwise";
 const ACCURACY4_MODULE: &str = "matmul_nbits_accuracy4";
 const ACCURACY4_ENTRY: &str = "matmul_nbits_accuracy4";
 const BLOCK_THREADS: u32 = 256;
@@ -408,6 +418,129 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
 
     value = warp_sum(value);
     if (lane == 0 && column < n) {
+        output[column] = bias ? __fadd_rn(value, bias[column]) : value;
+    }
+}
+
+// Per-K-block int8 activation quantization for ANY power-of-two block_size. One
+// warp (CUDA block) owns one K-block and emits that block's own int8 scale,
+// exactly matching the per-block quantization the tiled `matmul_nbits_accuracy4`
+// reference performs inline (block_max / 127, symmetric round-to-nearest). The
+// block-32 entry above hard-codes 32 lanes == 32 depths; this generalization
+// strides each of the 32 lanes across the block so a single warp covers
+// block_size (e.g. 128) depths. Padded tail depths (depth >= k in a partial
+// final block) quantize to zero so they contribute nothing to the GEMV.
+extern "C" __global__ void matmul_nbits_quantize_accuracy4_blockwise(
+    const float* activation,
+    signed char* quantized_activation,
+    float* activation_scale_out,
+    const int k,
+    const int block_size,
+    const int padded_k)
+{
+    (void)padded_k;
+    const int block = (int)blockIdx.x;
+    const int lane = (int)threadIdx.x;
+    const int begin = block * block_size;
+
+    float max_abs = 0.0f;
+    for (int within = lane; within < block_size; within += 32) {
+        const int depth = begin + within;
+        const float value = (depth < k) ? activation[depth] : 0.0f;
+        max_abs = fmaxf(max_abs, fabsf(value));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(max_abs,
+            __shfl_down_sync(0xffffffffu, max_abs, offset));
+    }
+    max_abs = __shfl_sync(0xffffffffu, max_abs, 0);
+
+    const float activation_scale = max_abs == 0.0f ? 0.0f : max_abs / 127.0f;
+    const float inverse_scale =
+        activation_scale == 0.0f ? 0.0f : 1.0f / activation_scale;
+    if (lane == 0) {
+        activation_scale_out[block] = activation_scale;
+    }
+    for (int within = lane; within < block_size; within += 32) {
+        const int depth = begin + within;
+        int quantized = 0;
+        if (depth < k && activation_scale != 0.0f) {
+            quantized = (int)roundf(fminf(127.0f, fmaxf(-127.0f,
+                activation[depth] * inverse_scale)));
+        }
+        quantized_activation[depth] = (signed char)quantized;
+    }
+}
+
+// General-block-size int4 accuracy_level=4 decode GEMV over the pre-quantized
+// int8 activation. One warp reduces one output column; the 32 lanes cooperate
+// across the block_size depths of each K-block. The per-block integer dot is
+// computed as sum(qa * qw) - zero_point * sum(qa), which is exactly the tiled
+// reference's sum(qa * (qw - zero_point)); the fp32 block products are then
+// accumulated by lane 0 in ascending block order with the same __fmul_rn /
+// __fadd_rn rounding the tiled kernel uses, so the result is bit-for-bit
+// identical. Symmetric int4 uses the default zero point 8; asymmetric int4
+// reads the packed per-block nibble zero point. The grid width (warps per CTA)
+// is chosen host-side from the device multiprocessor count so the launch fills
+// consumer and datacenter GPUs alike.
+extern "C" __global__ void matmul_nbits_gemv_accuracy4_blockwise(
+    const signed char* quantized_activation,
+    const float* activation_scale_ptr,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int block_size,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    (void)k;
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int column = (int)blockIdx.x * (int)(blockDim.x >> 5) + warp;
+    if (column >= n) {
+        return;
+    }
+
+    float value = 0.0f;
+    for (int block = 0; block < k_blocks; ++block) {
+        const int begin = block * block_size;
+        const long blob_base = ((long)column * k_blocks + block) * blob_size;
+        int weighted = 0;
+        int activation_sum = 0;
+        for (int within = lane; within < block_size; within += 32) {
+            const int quantized_activation_value =
+                (int)quantized_activation[begin + within];
+            const unsigned char byte = packed[blob_base + (within >> 1)];
+            const int quantized_weight =
+                (within & 1) ? (byte >> 4) : (byte & 15);
+            weighted += quantized_activation_value * quantized_weight;
+            activation_sum += quantized_activation_value;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            weighted += __shfl_down_sync(0xffffffffu, weighted, offset);
+            activation_sum +=
+                __shfl_down_sync(0xffffffffu, activation_sum, offset);
+        }
+        if (lane == 0) {
+            int zero_point = 8;
+            if (zero_points) {
+                const unsigned char zp =
+                    zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+            }
+            const int dot = weighted - zero_point * activation_sum;
+            const float combined_scale = __fmul_rn(
+                activation_scale_ptr[block],
+                scales[(long)column * k_blocks + block]);
+            value = __fadd_rn(value, __fmul_rn((float)dot, combined_scale));
+        }
+    }
+    if (lane == 0) {
         output[column] = bias ? __fadd_rn(value, bias[column]) : value;
     }
 }
@@ -2863,6 +2996,39 @@ fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static 
     (2usize, GEMV_F16_DOWN_C2_ENTRY)
 }
 
+/// Per-SM CTA target for the fp32-activation accuracy_level=4 blockwise GEMV.
+/// This is a dependent-global-load latency-bound M=1 GEMV, so — like the
+/// down-projection launch — it keeps improving past one wave; aim for ~2 waves
+/// of resident CTAs.
+const ACCURACY4_GEMV_FILL_CTAS_PER_SM: usize = 12;
+
+/// Warps-per-CTA (one warp reduces one output column) for the accuracy_level=4
+/// blockwise GEMV, chosen so the `ceil(N / warps)` grid fills the device. The
+/// grid-starved tiled `matmul_nbits_accuracy4` fallback issued only
+/// `ceil(M*N / 256)` CTAs (4 CTAs for a 1024-wide decode projection); here each
+/// output column is a warp, so an 8-warp CTA already emits `ceil(N/8)` CTAs. On
+/// narrow projections a many-SM device would still be under the ~2-wave target,
+/// so the warp count is halved (down to a single warp) until the grid fills.
+/// Keying only on `N` and the SM count keeps the choice a launch-time constant
+/// that is stable across CUDA-graph replays and never hard-codes a GPU.
+fn select_accuracy4_gemv_warps(n: usize, multiprocessor_count: u32) -> u32 {
+    if let Some(forced) = std::env::var("ONNX_GENAI_ACC4_WARPS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|warps| matches!(warps, 1 | 2 | 4 | 8))
+    {
+        return forced;
+    }
+    let target =
+        (multiprocessor_count.max(1) as usize).saturating_mul(ACCURACY4_GEMV_FILL_CTAS_PER_SM);
+    for warps in [8usize, 4, 2] {
+        if n.div_ceil(warps) >= target {
+            return warps as u32;
+        }
+    }
+    1
+}
+
 /// Optional developer override for the down-projection columns-per-CTA, used to
 /// A/B the grid-fill variants. `ONNX_GENAI_DOWN_COLS=8|4|2` forces that width;
 /// any other/unset value keeps the device-driven [`select_down_columns`] choice.
@@ -2912,10 +3078,11 @@ impl KernelFactory for MatMulNBitsFactory {
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
-        let accuracy4_workspace = if bits == 4 && accuracy_level == 4 && block_size == 32 {
+        let accuracy4_workspace = if bits == 4 && accuracy_level == 4 {
             Some(Mutex::new(Accuracy4Workspace::new(
                 self.runtime.clone(),
                 k,
+                block_size,
             )?))
         } else {
             None
@@ -2958,10 +3125,10 @@ struct Accuracy4Workspace {
 }
 
 impl Accuracy4Workspace {
-    fn new(runtime: Arc<CudaRuntime>, k: usize) -> Result<Self> {
-        let padded_k = k.div_ceil(32) * 32;
-        // Per-K-block int8 activation scales: one f32 per block-32.
-        let k_blocks = padded_k / 32;
+    fn new(runtime: Arc<CudaRuntime>, k: usize, block_size: usize) -> Result<Self> {
+        let padded_k = k.div_ceil(block_size) * block_size;
+        // Per-K-block int8 activation scales: one f32 per weight block.
+        let k_blocks = padded_k / block_size;
         let scale_bytes = k_blocks * std::mem::size_of::<f32>();
         let quantized_activation = runtime.alloc_raw(padded_k + scale_bytes)?;
         Ok(Self {
@@ -3178,6 +3345,26 @@ impl MatMulNBitsKernel {
                     bias,
                     &mut outputs[0],
                     k_blocks,
+                );
+            }
+            if self.bits == 4 && self.accuracy_level == 4 {
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_accuracy4_blockwise_int8",
+                    "M==1 decode: bits=4, accuracy_level==4, block_size={} → int8-quantized \
+                     activation quantized ONCE then parallelized blockwise GEMV (grid filled \
+                     from the device SM count; bit-identical to the tiled accuracy4 GEMM)",
+                    self.block_size
+                );
+                return self.launch_accuracy4_gemv_blockwise(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                    blob_size,
+                    zp_row_bytes,
                 );
             }
             if self.accuracy_level != 4 {
@@ -4613,9 +4800,7 @@ impl MatMulNBitsKernel {
         let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
         let bits = as_i32("bits", self.bits)?;
         let (threads, columns_per_block, shared_mem_bytes) = match selection.variant {
-            F16GemvVariant::DownProjection => {
-                (GEMV_F16_DOWN_THREADS, down_choice.0, 0)
-            }
+            F16GemvVariant::DownProjection => (GEMV_F16_DOWN_THREADS, down_choice.0, 0),
             F16GemvVariant::General => {
                 let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
                     GEMV_F16_SMALL_THREADS
@@ -4985,6 +5170,116 @@ impl MatMulNBitsKernel {
         }
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 GEMV", err))
+    }
+
+    /// General-block-size fp32-activation accuracy_level=4 decode GEMV. Quantizes
+    /// the fp32 activation to int8 ONCE per K-block into the persistent workspace
+    /// (matching the tiled reference's per-block quantization), then runs a
+    /// warp-per-column blockwise GEMV whose grid width is chosen from the device
+    /// multiprocessor count so it fills consumer and datacenter GPUs alike. This
+    /// replaces the grid-starved tiled `matmul_nbits_accuracy4` fallback for M==1
+    /// int4 decode (any power-of-two block_size, symmetric or asymmetric),
+    /// bit-for-bit identically, and eliminates the per-output re-quantization.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_accuracy4_gemv_blockwise(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+        blob_size: usize,
+        zp_row_bytes: usize,
+    ) -> Result<()> {
+        let workspace = self
+            .accuracy4_workspace
+            .as_ref()
+            .ok_or_else(|| error("accuracy_level=4 GEMV workspace is unavailable"))?
+            .lock()
+            .map_err(|_| error("accuracy_level=4 GEMV workspace lock poisoned"))?;
+        let quantize_function = self.runtime.nvrtc_function(
+            GEMV_MODULE,
+            GEMV_SRC,
+            QUANTIZE_ACCURACY4_BLOCKWISE_ENTRY,
+        )?;
+        let gemv_function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_BLOCKWISE_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let block_size = as_i32("block_size", self.block_size)?;
+        let k_blocks_arg = as_i32("K block count", k_blocks)?;
+        let blob_size_arg = as_i32("block blob size", blob_size)?;
+        let zp_row_bytes_arg = as_i32("zero-point row size", zp_row_bytes)?;
+        let padded_k = as_i32("padded K", workspace.padded_k)?;
+
+        let mut quantize_builder = self.runtime.stream().launch_builder(&quantize_function);
+        quantize_builder
+            .arg(&activation_ptr)
+            .arg(&workspace.quantized_activation)
+            .arg(&workspace.activation_scale)
+            .arg(&k)
+            .arg(&block_size)
+            .arg(&padded_k);
+        // SAFETY: the persistent workspace covers padded_k int8 values plus one
+        // f32 scale per K-block, and the scalar ABI matches the quantization
+        // entry point. One warp (CUDA block) quantizes one K-block.
+        unsafe {
+            quantize_builder.launch(LaunchConfig {
+                grid_dim: (k_blocks as u32, 1, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|err| {
+            driver_err(
+                "launch MatMulNBits accuracy_level=4 blockwise quantization",
+                err,
+            )
+        })?;
+
+        let warps =
+            select_accuracy4_gemv_warps(self.n, self.runtime.capabilities().multiprocessor_count());
+        let grid = self.n.div_ceil(warps as usize) as u32;
+        let mut gemv_builder = self.runtime.stream().launch_builder(&gemv_function);
+        gemv_builder
+            .arg(&workspace.quantized_activation)
+            .arg(&workspace.activation_scale)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks_arg)
+            .arg(&block_size)
+            .arg(&blob_size_arg)
+            .arg(&zp_row_bytes_arg);
+        // SAFETY: the persistent quantized activation is initialized by the
+        // preceding stream launch, the scalar ABI matches the blockwise GEMV
+        // entry point, and each warp reduces exactly one output column.
+        unsafe {
+            gemv_builder.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (warps * 32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits accuracy_level=4 blockwise GEMV", err))
     }
 
     #[allow(clippy::too_many_arguments)]

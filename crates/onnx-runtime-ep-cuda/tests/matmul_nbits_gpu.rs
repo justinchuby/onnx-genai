@@ -1321,6 +1321,127 @@ fn matmul_nbits_gpu_accuracy4_block32_decode_matches_quantized_reference() {
     eprintln!("verified accuracy_level=4 packed-int4 CUDA GEMV semantics");
 }
 
+/// Per-K-block int8 activation quantization reference with asymmetric (packed
+/// nibble) int4 zero points, matching the tiled `matmul_nbits_accuracy4`
+/// reference the general blockwise decode GEMV replaces.
+fn accuracy4_reference_asymmetric(
+    activations: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    zero_points: &[u8],
+    k: usize,
+    n: usize,
+    block_size: usize,
+) -> Vec<f32> {
+    let blocks = k.div_ceil(block_size);
+    let blob_size = block_size / 2;
+    let zp_row_bytes = blocks.div_ceil(2);
+    (0..n)
+        .map(|column| {
+            let mut value = 0.0f32;
+            for block in 0..blocks {
+                let begin = block * block_size;
+                let end = (begin + block_size).min(k);
+                let block_max = activations[begin..end]
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0f32, f32::max);
+                if block_max == 0.0 {
+                    continue;
+                }
+                let activation_scale = block_max / 127.0;
+                let inverse_scale = activation_scale.recip();
+                let zp_byte = zero_points[column * zp_row_bytes + block / 2];
+                let zero_point = i32::from(if block % 2 == 1 {
+                    zp_byte >> 4
+                } else {
+                    zp_byte & 0x0f
+                });
+                let mut dot = 0i32;
+                for depth in begin..end {
+                    let within = depth - begin;
+                    let quantized_activation = (activations[depth] * inverse_scale)
+                        .round()
+                        .clamp(-127.0, 127.0) as i32;
+                    let byte = packed[(column * blocks + block) * blob_size + within / 2];
+                    let quantized_weight = if within % 2 == 0 {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    dot += quantized_activation * (i32::from(quantized_weight) - zero_point);
+                }
+                value += dot as f32 * activation_scale * scales[column * blocks + block];
+            }
+            value
+        })
+        .collect()
+}
+
+/// The fp32-activation accuracy_level=4 decode path routes any block size other
+/// than 32 (and any asymmetric int4) through the general "quantize once, then a
+/// grid-filling blockwise GEMV" kernels rather than the grid-starved tiled GEMM.
+/// This exercises that path at block_size=128 for both symmetric and asymmetric
+/// int4, including a non-multiple-of-128 K (partial final block), and checks it
+/// against the per-K-block int8 reference the tiled kernel implements.
+#[test]
+fn matmul_nbits_gpu_accuracy4_blockwise_block128_matches_quantized_reference() {
+    let Some(ep) = gpu() else { return };
+    for &(k, n) in &[(256usize, 37usize), (300, 19), (896, 1152)] {
+        let block_size = 128usize;
+        let activations: Vec<f32> = (0..k)
+            .map(|index| ((index * 23 % 53) as f32 - 26.0) / 17.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|index| ((index * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+
+        let (packed, scales, _) = quantize(&weights, n, k, block_size, false);
+        let expected = accuracy4_reference(&activations, &packed, &scales, k, n, block_size);
+        let actual = run_case(
+            &ep,
+            &[1, k],
+            &activations,
+            &packed,
+            &scales,
+            None,
+            k,
+            n,
+            block_size,
+            4,
+        )
+        .unwrap();
+        assert_close(&actual, &expected);
+
+        let (packed_zp, scales_zp, zero_points) = quantize(&weights, n, k, block_size, true);
+        let zero_points = zero_points.expect("asymmetric quantize emits zero points");
+        let expected_zp = accuracy4_reference_asymmetric(
+            &activations,
+            &packed_zp,
+            &scales_zp,
+            &zero_points,
+            k,
+            n,
+            block_size,
+        );
+        let actual_zp = run_case(
+            &ep,
+            &[1, k],
+            &activations,
+            &packed_zp,
+            &scales_zp,
+            Some(&zero_points),
+            k,
+            n,
+            block_size,
+            4,
+        )
+        .unwrap();
+        assert_close(&actual_zp, &expected_zp);
+    }
+    eprintln!("verified accuracy_level=4 blockwise block128 symmetric + asymmetric CUDA GEMV");
+}
+
 #[test]
 fn matmul_nbits_gpu_accuracy4_offending_decode_shape_stays_within_cpu_vnni_tolerance() {
     let Some(ep) = gpu() else { return };
