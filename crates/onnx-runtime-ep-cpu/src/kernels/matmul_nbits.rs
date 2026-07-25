@@ -982,6 +982,7 @@ impl MatMulNBitsKernel {
                     mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
                 },
             );
+            spmd.probe_empty_barriers(crate::decode_spmd::superstep_probe_barriers());
             return;
         }
         let base = result.as_mut_ptr();
@@ -1821,6 +1822,11 @@ where
         #[cfg(test)]
         SPMD_TEST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         spmd.dispatch_output_rows(result, k, &compute);
+        // In-situ barrier probe: inject extra empty fork/join barriers in the
+        // exact position of real per-op ones so an A/B over
+        // `ONNX_GENAI_DECODE_SUPERSTEP=N` measures the true marginal barrier cost
+        // inside a live decode step (token-exact: empty barriers touch no tensor).
+        spmd.probe_empty_barriers(crate::decode_spmd::superstep_probe_barriers());
         return;
     }
     let chunk = output_chunk_len(result.len(), k);

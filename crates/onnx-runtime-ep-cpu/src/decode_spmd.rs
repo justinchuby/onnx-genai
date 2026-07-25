@@ -398,6 +398,22 @@ impl SpmdDecodePools {
         self.shared.panic_if_poisoned();
     }
 
+    /// Diagnostic: issue `n` extra **empty** publish/wait barriers on the hot
+    /// worker set. Used by the `ONNX_GENAI_DECODE_SUPERSTEP` in-situ barrier
+    /// probe (see [`superstep_probe_barriers`]) to measure the *real* marginal
+    /// cost of a per-op fork/join inside a live decode step -- the exact overhead
+    /// the whole-step SPMD closure would remove. Empty jobs change no tensor, so
+    /// this is token-exact by construction; it only spends time.
+    pub fn probe_empty_barriers(&self, n: usize) {
+        if n == 0 || self.total_workers <= 1 {
+            return;
+        }
+        let empty = |_global_index: usize| {};
+        for _ in 0..n {
+            self.dispatch(&empty);
+        }
+    }
+
     /// Split `n` output rows across the node groups proportionally to their
     /// worker counts (contiguous, non-overlapping, last node absorbs the
     /// remainder), matching [`crate::decode_numa`] so weight placement and
@@ -847,6 +863,29 @@ pub fn pools() -> Option<&'static SpmdDecodePools> {
     POOLS
         .get_or_init(|| build_from_env(default_threads()))
         .as_ref()
+}
+
+/// Number of extra empty fork/join barriers to inject per real SPMD decode
+/// dispatch, parsed once from `ONNX_GENAI_DECODE_SUPERSTEP`.
+///
+/// This is the **in-situ barrier probe** for the whole-step-closure spike: with
+/// the persistent pool forced on, setting `ONNX_GENAI_DECODE_SUPERSTEP=N` makes
+/// every real MatMulNBits/GQA dispatch issue `N` additional *empty* publish/wait
+/// barriers in the exact position real ones occur. Comparing decode throughput
+/// at `N = 0, 1, 4, ...` measures the true marginal cost of a per-op fork/join
+/// inside a live decode step (including real cache/parking effects the isolated
+/// microbench cannot capture), which is precisely the overhead a whole-step SPMD
+/// closure would remove. Empty barriers change no tensor, so the emitted tokens
+/// are identical for any `N` -- the flag only spends time. Unset or `0` disables
+/// the probe (the production per-op path, unchanged).
+pub fn superstep_probe_barriers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ONNX_GENAI_DECODE_SUPERSTEP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Signal the persistent pool's workers to stop and **join** them, if the pool
@@ -1381,6 +1420,91 @@ mod tests {
             workers,
         }];
         SpmdDecodePools::build(&shards)
+    }
+
+    /// Microbenchmark: measure the *pure fork/join barrier* cost of one
+    /// `publish` + `wait` cycle (empty job) on the hot, spinning worker set.
+    ///
+    /// This isolates the per-op dispatch overhead that the whole-step SPMD
+    /// closure aims to eliminate: a native 0.6B decode step issues ~196 of these
+    /// barriers (one per MatMulNBits projection, plus a few GQA row-block
+    /// dispatches). Multiplying the per-barrier latency measured here by that op
+    /// count gives the barrier tax paid inside the 99%-MatMulNBits envelope.
+    ///
+    /// Run with (workers default 32, override via env):
+    /// `ONNX_GENAI_BARRIER_BENCH_WORKERS=32 cargo test -p onnx-runtime-ep-cpu \
+    ///   --features mlas -- --ignored --nocapture bench_empty_barrier_cost`
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_empty_barrier_cost() {
+        let workers: usize = std::env::var("ONNX_GENAI_BARRIER_BENCH_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32);
+        let ops_per_step: usize = std::env::var("ONNX_GENAI_BARRIER_BENCH_OPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(196);
+        let pool = single_group_pool(workers);
+        // An empty job: workers just observe the publish, run nothing, and
+        // acknowledge. This is the irreducible wake -> (no compute) -> join
+        // latency of one persistent-SPMD barrier.
+        let empty = |_global_index: usize| {};
+        // Warm up: let the workers reach the spinning state and prime caches.
+        for _ in 0..2_000 {
+            pool.dispatch(&empty);
+        }
+        let samples = 200_000usize;
+        let start = std::time::Instant::now();
+        for _ in 0..samples {
+            pool.dispatch(&empty);
+        }
+        let elapsed = start.elapsed();
+        let per_barrier_ns = elapsed.as_nanos() as f64 / samples as f64;
+        let per_step_us = per_barrier_ns * ops_per_step as f64 / 1_000.0;
+        println!(
+            "SPMD empty-barrier microbench: workers={workers} samples={samples} \
+             total={:?} per_barrier={per_barrier_ns:.1}ns \
+             est_barrier_tax_per_step({ops_per_step} ops)={per_step_us:.1}us",
+            elapsed
+        );
+    }
+
+    /// Companion to [`bench_empty_barrier_cost`]: measure the barrier cost when a
+    /// gap between dispatches lets workers fall through spin -> yield -> **park**,
+    /// so each `publish` must issue a real `unpark` (futex wake) to every parked
+    /// worker. This bounds the WORST-case per-op tax and decides whether the win
+    /// is "keep workers hot" (a small change) or "collapse the barriers"
+    /// (the whole-step rewrite). A serial inter-op gap is simulated by busy-work
+    /// on the dispatcher between dispatches.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_parked_barrier_cost() {
+        let workers: usize = std::env::var("ONNX_GENAI_BARRIER_BENCH_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32);
+        let gap_us: u64 = std::env::var("ONNX_GENAI_BARRIER_BENCH_GAP_US")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2_000);
+        let pool = single_group_pool(workers);
+        let empty = |_global_index: usize| {};
+        let samples = 2_000usize;
+        let mut total = Duration::ZERO;
+        for _ in 0..samples {
+            // Sleep long enough that workers pass YIELD_BEFORE_PARK and park.
+            std::thread::sleep(Duration::from_micros(gap_us));
+            let start = std::time::Instant::now();
+            pool.dispatch(&empty);
+            total += start.elapsed();
+        }
+        let per_barrier_ns = total.as_nanos() as f64 / samples as f64;
+        println!(
+            "SPMD PARKED-barrier microbench: workers={workers} gap={gap_us}us \
+             samples={samples} per_barrier={per_barrier_ns:.1}ns \
+             (worst-case wake+join latency)"
+        );
     }
 
     #[test]

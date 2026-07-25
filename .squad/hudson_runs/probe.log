@@ -1,0 +1,10 @@
+[probe] round 1: N0=88.02  N1=84.90  N4=37.60
+[probe] round 2: N0=86.27  N1=82.40  N4=75.75
+[probe] round 3: N0=84.27  N1=83.99  N4=37.17
+[probe] round 4: N0=45.47  N1=83.12  N4=73.86
+[probe] round 5: N0=86.11  N1=84.39  N4=72.77
+[probe] === MEDIANS (n=5, 32 workers) ===
+[probe] N=0 (0 extra/step)   = 86.11 tok/s   samples: 88.02 86.27 84.27 45.47 86.11
+[probe] N=1 (~196 extra/step)= 83.99 tok/s   samples: 84.90 82.40 83.99 83.12 84.39
+[probe] N=4 (~784 extra/step)= 72.77 tok/s   samples: 37.60 75.75 37.17 73.86 72.77
+[probe] token-exact N0==N1: YES  N0==N4: YES
