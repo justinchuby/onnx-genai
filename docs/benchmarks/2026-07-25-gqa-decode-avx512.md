@@ -82,16 +82,23 @@ disqualified.
 
 ## End-to-end (inconclusive by construction)
 
-- The only local "0.6B" artifact, `/home/tlwu/test/models/Qwen3-0.6B`, is a
-  **dense fp16** export (1.2 GB `.data`, 197 `MatMul`, **0** `MatMulNBits`), not
-  the int4 decode regime the 74.79 tok/s baseline refers to. Its decode is
-  ~1.4 tok/s (weight-bandwidth-bound) and irrelevant to the GQA lever.
-- On the int4 `qwen2.5-0.5b-int4-onnx` the native decode is **MatMulNBits-bound**
-  (prior profiling: MatMulNBits ≈ 82 % of node time; GQA a minor slice), and
-  steady tok/s varied run-to-run by ±30 % under shared-host load (other users'
-  `ncu`/`clamscan`). A ~1 % GQA-attributable change is **below the measurement
-  noise floor**, so no honest end-to-end delta can be claimed. Reported for
-  transparency, not as a result.
+- The correct baseline 0.6B artifact is the int4-quantized
+  `Microsoft/qwen3-0.6b-generic-cpu-4/v4/model.onnx` (524 MB, weights embedded):
+  **197 `MatMulNBits` + 28 `GroupQueryAttention` + 57 `SimplifiedLayerNormalization`
+  + 56 `SkipSimplifiedLayerNormalization` + 28 `Sigmoid`/`Mul` (SiLU)**. The clean
+  post-#154 decode profile is **MatMulNBits 51 % / GQA 24 % / norm+elementwise
+  20 % / glue 1 %** (Ripley), and the ORT-vs-native per-op diff attributes
+  **Attention+norm/elementwise = 61 %** of the native-vs-ORT gap versus only 34 %
+  for MatMulNBits. So attention is the #1 lever, but the GQA cost is a *structural*
+  kernel-shape difference, not SIMD width (see the micro-bench above: widening the
+  dot buys ≈5 %, the AXPY nothing).
+- Steady end-to-end tok/s varied run-to-run by ±30 % under shared-host load (other
+  users' `ncu`/`clamscan`), and a ≈5 %-on-the-dot change to a component that is a
+  minority of decode time is **below the measurement noise floor** — so no honest
+  end-to-end delta can be claimed for this reverted change. Reported for
+  transparency, not as a result. (An earlier probe against an unrelated 1.2 GB
+  dense-fp16 Qwen3-0.6B export under a contaminated host produced a nonsense
+  ~1.4 tok/s; that file is **not** the baseline model and its number is discarded.)
 
 ## Decision
 
@@ -105,5 +112,7 @@ If the ORT GQA-decode gap is revisited, target ORT's *kernel structure*
 (fused/flash-style single-pass softmax without score materialization, blocked KV
 streaming) rather than SIMD width — but note the online-softmax rewrite carries
 **higher** argmax risk than the reduction-grouping change already shown to flip a
-token here, so it must be argmax-validated against ORT on real models before any
-adoption.
+token here, so it must be argmax-validated before any adoption. Because the gap
+is structural (attention+norm/elementwise ≈ 61 % of the native-vs-ORT gap), the
+real attention lever is a flash/online-softmax GQA decode rewrite validated
+against the **f64 scalar reference** (not ORT), which is tracked separately.
