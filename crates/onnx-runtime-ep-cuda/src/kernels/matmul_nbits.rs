@@ -113,6 +113,15 @@ const RMSNORM_PREFILL_ENTRY: &str = "matmul_nbits_rmsnorm_f16_warp_half4";
 /// One warp (32 lanes) normalizes one token row in the prefill prologue.
 const RMSNORM_PREFILL_THREADS: u32 = 32;
 const GEMV_F16_DOWN_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down";
+/// Grid-fill specializations of [`GEMV_F16_DOWN_ENTRY`]: identical numerics with
+/// 4 / 2 columns per CTA instead of 8, so the launch grid grows 2x / 4x to fill
+/// the multiprocessors on grid-starved (small-N) tall-skinny down projections.
+/// Every output column is still reduced entirely within one CTA in the same
+/// order, so the fp32 accumulation is bit-identical to the 8-column entry — only
+/// the CTA count changes. Selected by [`select_down_columns`] from the device
+/// multiprocessor count.
+const GEMV_F16_DOWN_C4_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down_c4";
+const GEMV_F16_DOWN_C2_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_down_c2";
 const GEMM_F16_TILE: usize = 16;
 const GEMV_F16_SMALL_THREADS: u32 = 64;
 const GEMV_F16_LARGE_THREADS: u32 = 256;
@@ -2386,38 +2395,46 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
     matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
-// Down projection specialization: a 256-thread CTA computes eight columns and
-// parallelizes over block-32 K tiles. Each thread loads its assigned activation
-// block directly into registers and reuses it across all eight columns.
-extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
+// Down projection specialization: a 256-thread CTA (8 warps) computes `COLS`
+// columns and parallelizes over block-32 K tiles. Each thread loads its assigned
+// activation block directly into registers and reuses it across all `COLS`
+// columns, then the 8 warps combine their per-column partials through shared
+// memory.
+//
+// `COLS` is a pure grid-fill knob: every output column is still reduced
+// *entirely within one CTA* by all 256 threads striding the same K tiles in the
+// same order, so the fp32 accumulation is bit-identical regardless of `COLS` —
+// only the CTA count (grid = ceil(N / COLS)) changes. Tall-skinny down/output
+// projections have a small N, so on many-SM devices the default 8-column launch
+// underfills the machine (e.g. Qwen2.5-7B down: N=3584 -> 448 CTAs, ~0.57
+// waves/SM on an H200). Halving `COLS` doubles the grid to fill the idle SMs on
+// this latency-bound M=1 GEMV without changing the numerics; the host picks
+// `COLS` from the device multiprocessor count (see `select_down_columns`).
+template <int COLS>
+__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_down_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
     const void* __restrict__ scales_raw,
-    const unsigned char* __restrict__ zero_points,
     const __half* __restrict__ bias,
     __half* __restrict__ output,
-    const int k,
     const int n,
-    const int block_size,
     const int k_blocks,
     const int blob_size,
-    const int zp_row_bytes,
-    const int scales_fp16,
     const int bias_post_round)
 {
-    (void)block_size;
-    (void)zero_points;
-    (void)zp_row_bytes;
-    (void)scales_fp16;
-    __shared__ float warp_sums[8][8];
+    __shared__ float warp_sums[8][COLS];
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int column_base = (int)blockIdx.x * 8;
+    const int column_base = (int)blockIdx.x * COLS;
 
-    float values[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float values[COLS];
+#pragma unroll
+    for (int i = 0; i < COLS; ++i) {
+        values[i] = 0.0f;
+    }
     for (int block = tid; block < k_blocks; block += (int)blockDim.x) {
         const __half* activation_block = activation + block * 32;
         const uint4 activation0 = permute_activation_f16x8(activation_block);
@@ -2425,7 +2442,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
         const uint4 activation2 = permute_activation_f16x8(activation_block + 16);
         const uint4 activation3 = permute_activation_f16x8(activation_block + 24);
 #pragma unroll
-        for (int tile_column = 0; tile_column < 8; ++tile_column) {
+        for (int tile_column = 0; tile_column < COLS; ++tile_column) {
             const int column = column_base + tile_column;
             if (column < n) {
                 const long packed_start =
@@ -2445,7 +2462,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     }
 
 #pragma unroll
-    for (int tile_column = 0; tile_column < 8; ++tile_column) {
+    for (int tile_column = 0; tile_column < COLS; ++tile_column) {
         const float value = warp_sum(values[tile_column]);
         if (lane == 0) {
             warp_sums[warp][tile_column] = value;
@@ -2453,7 +2470,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
     }
     __syncthreads();
 
-    if (warp == 0 && lane < 8) {
+    if (warp == 0 && lane < COLS) {
         const int column = column_base + lane;
         float value = warp_sums[0][lane];
         value += warp_sums[1][lane];
@@ -2463,8 +2480,92 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
         value += warp_sums[5][lane];
         value += warp_sums[6][lane];
         value += warp_sums[7][lane];
-        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+        if (column < n) {
+            output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+        }
     }
+}
+
+// Default 8-column down projection (grid = ceil(N/8)).
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    (void)k;
+    (void)block_size;
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)scales_fp16;
+    matmul_nbits_gemv_f16_scales_f16_down_tpl<8>(
+        activation, packed, scales_raw, bias, output, n, k_blocks, blob_size,
+        bias_post_round);
+}
+
+// Grid-fill down projection variants: fewer columns per CTA -> proportionally
+// larger grid, bit-identical output. Selected on grid-starved (small-N) down
+// shapes to fill the multiprocessors on latency-bound decode.
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_c4(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    (void)k;
+    (void)block_size;
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)scales_fp16;
+    matmul_nbits_gemv_f16_scales_f16_down_tpl<4>(
+        activation, packed, scales_raw, bias, output, n, k_blocks, blob_size,
+        bias_post_round);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_c2(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    (void)k;
+    (void)block_size;
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)scales_fp16;
+    matmul_nbits_gemv_f16_scales_f16_down_tpl<2>(
+        activation, packed, scales_raw, bias, output, n, k_blocks, blob_size,
+        bias_post_round);
 }
 
 // Model-agnostic fp16 int4/int8 decode GEMV supporting any power-of-two
@@ -2721,6 +2822,56 @@ fn select_f16_gemv_variant(
                  scales=fp16 & K%32==0)"
             },
         }
+    }
+}
+
+/// Per-SM CTA target used to size the down-projection launch. The tuned down
+/// kernel is register-limited to ~6 resident CTAs/SM on sm_90, so `SM_count * 6`
+/// is roughly one wave. This latency-bound M=1 GEMV keeps improving past one
+/// wave — more resident CTAs hide the dependent global-load latency — so we aim
+/// for ~2 waves. Measured on Qwen2.5-7B down (K=18944, N=3584) on an H200 (132
+/// SMs): 8 cols/CTA = 448 CTAs (~0.57 waves) = 301.9 tok/s; 4 cols = 896
+/// (~1.1 waves) = 305.8; 2 cols = 1792 (~2.3 waves) = 308.5 (+2.2%); 1 col =
+/// 3584 (~4.5 waves) fell back to ~302 as 8x activation re-reads and CTA
+/// oversubscription cancelled the occupancy gain. So 2 waves is the sweet spot
+/// and `COLS` is floored at 2.
+const DOWN_FILL_CTAS_PER_SM: usize = 12;
+
+/// Pick the down-projection columns-per-CTA (8, 4, or 2) and matching kernel
+/// entry to fill the multiprocessors. The base 8-column launch emits `ceil(N/8)`
+/// CTAs; on tall-skinny down/output projections `N` is small, so a many-SM
+/// device is left grid-starved (well under one wave) on this latency-bound M=1
+/// GEMV. Halving the columns-per-CTA doubles the grid with bit-identical
+/// numerics (each column is still reduced entirely within one CTA in the same
+/// order). We keep the largest `COLS` whose grid already meets the ~2-wave
+/// per-SM CTA target, so wide down projections retain the cheaper 8-column
+/// launch while narrow ones split just enough to fill; `COLS` never drops below
+/// 2 (a 1-column launch over-subscribes and re-reads the activation 8x, erasing
+/// the gain). Keys only on `N` and the SM count — no per-model magic — and
+/// returns a launch-time constant that is stable across CUDA-graph replays.
+fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static str) {
+    let target =
+        (multiprocessor_count.max(1) as usize).saturating_mul(DOWN_FILL_CTAS_PER_SM);
+    for (cols, entry) in [
+        (GEMV_F16_DOWN_COLUMNS_PER_BLOCK, GEMV_F16_DOWN_ENTRY),
+        (4usize, GEMV_F16_DOWN_C4_ENTRY),
+    ] {
+        if n.div_ceil(cols) >= target {
+            return (cols, entry);
+        }
+    }
+    (2usize, GEMV_F16_DOWN_C2_ENTRY)
+}
+
+/// Optional developer override for the down-projection columns-per-CTA, used to
+/// A/B the grid-fill variants. `ONNX_GENAI_DOWN_COLS=8|4|2` forces that width;
+/// any other/unset value keeps the device-driven [`select_down_columns`] choice.
+fn down_columns_override() -> Option<(usize, &'static str)> {
+    match std::env::var("ONNX_GENAI_DOWN_COLS").ok()?.as_str() {
+        "8" => Some((GEMV_F16_DOWN_COLUMNS_PER_BLOCK, GEMV_F16_DOWN_ENTRY)),
+        "4" => Some((4, GEMV_F16_DOWN_C4_ENTRY)),
+        "2" => Some((2, GEMV_F16_DOWN_C2_ENTRY)),
+        _ => None,
     }
 }
 
@@ -4382,6 +4533,13 @@ impl MatMulNBitsKernel {
             // Split-K needs >= K_SPLIT warps/block; the small-shape path uses only
             // 64 threads (2 warps), so restrict to the 256-thread large path.
             && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX);
+        // Down projection grid-fill: choose columns-per-CTA (8/4/2) from the
+        // device SM count so a small-N (grid-starved) down launch splits enough
+        // to fill the multiprocessors, bit-identically. A developer env override
+        // is honored for A/B measurement.
+        let down_choice = down_columns_override().unwrap_or_else(|| {
+            select_down_columns(self.n, self.runtime.capabilities().multiprocessor_count())
+        });
         let entry = if self.block_size != 32 {
             // Any non-block-32 layout uses the model-agnostic general kernel; the
             // tuned DownProjection / scales_f16 / general entries bake in the
@@ -4393,7 +4551,7 @@ impl MatMulNBitsKernel {
             GEMV_F16_GENERAL_BS_ENTRY
         } else {
             match selection.variant {
-                F16GemvVariant::DownProjection => GEMV_F16_DOWN_ENTRY,
+                F16GemvVariant::DownProjection => down_choice.1,
                 // The vectorized `scales_f16` kernel is compiled in two
                 // specializations: the symmetric entry (`HasZp == false`) folds
                 // the subtrahend to the constant fp16 8.0 with zero extra memory
@@ -4444,7 +4602,7 @@ impl MatMulNBitsKernel {
         let bits = as_i32("bits", self.bits)?;
         let (threads, columns_per_block, shared_mem_bytes) = match selection.variant {
             F16GemvVariant::DownProjection => {
-                (GEMV_F16_DOWN_THREADS, GEMV_F16_DOWN_COLUMNS_PER_BLOCK, 0)
+                (GEMV_F16_DOWN_THREADS, down_choice.0, 0)
             }
             F16GemvVariant::General => {
                 let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
@@ -5808,7 +5966,13 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         // Prove the specialization matches the general GEMV bit-numerically for
         // the Qwen down shape AND an unrelated non-Qwen tall-skinny shape, so
         // the generalized selection is correct beyond one architecture.
-        for (k, n) in [(QWEN_DOWN_K, QWEN_DOWN_N), (5632usize, 2048usize)] {
+        for (k, n) in [
+            (QWEN_DOWN_K, QWEN_DOWN_N),
+            (5632usize, 2048usize),
+            // K=16384, N=8192 selects the 4-column grid-fill entry on a 132-SM
+            // device, so this covers the `_c4` variant bit-exactly too.
+            (16_384usize, 8192usize),
+        ] {
             assert_eq!(
                 select_f16_gemv_variant(k, n, 32, true, false).variant,
                 F16GemvVariant::DownProjection,
@@ -6046,14 +6210,45 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     }
 
     #[test]
+    fn down_columns_fill_the_device_and_never_undersplit() {
+        // Wide down projection: the 8-column grid already clears the ~2-wave
+        // target, so keep the cheapest 8-column launch.
+        assert_eq!(
+            select_down_columns(65_536, 132),
+            (8, GEMV_F16_DOWN_ENTRY),
+            "a wide down projection must keep the 8-column launch"
+        );
+        // Mid-width: 8-column grid underfills but the 4-column one clears it.
+        assert_eq!(
+            select_down_columns(8192, 132),
+            (4, GEMV_F16_DOWN_C4_ENTRY),
+            "a mid-width down projection must split to 4 columns/CTA"
+        );
+        // Grid-starved (Qwen2.5-7B down N=3584 on an H200's 132 SMs): split to
+        // the measured-optimal 2 columns/CTA.
+        assert_eq!(
+            select_down_columns(3584, 132),
+            (2, GEMV_F16_DOWN_C2_ENTRY),
+            "a grid-starved down projection must split to 2 columns/CTA"
+        );
+        // Even a tiny N never drops below 2 columns/CTA (1-column launches
+        // over-subscribe and re-read the activation 8x, erasing the gain).
+        assert_eq!(select_down_columns(64, 132).0, 2);
+        // A tiny/degenerate device (clamped to >=1 SM) has a small target, so a
+        // wide-enough N stays on the cheapest 8-column launch instead of
+        // over-splitting.
+        assert_eq!(select_down_columns(3584, 0), (8, GEMV_F16_DOWN_ENTRY));
+    }
+
+    #[test]
     fn fp16_down_projection_loads_activation_directly_into_registers() {
         let start = GEMV_F16_SRC
-            .find("extern \"C\" __global__ void matmul_nbits_gemv_f16_scales_f16_down")
-            .expect("down-projection entry must exist");
+            .find("void matmul_nbits_gemv_f16_scales_f16_down_tpl")
+            .expect("down-projection template must exist");
         let body = &GEMV_F16_SRC[start..];
         let end = body
-            .find("\n}\n\n// Model-agnostic fp16 int4/int8 decode GEMV")
-            .expect("down-projection entry must have a bounded body");
+            .find("\n}\n\n// Default 8-column down projection")
+            .expect("down-projection template must have a bounded body");
         let body = &body[..end];
 
         assert!(
