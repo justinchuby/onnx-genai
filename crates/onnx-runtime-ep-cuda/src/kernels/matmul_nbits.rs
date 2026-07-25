@@ -363,6 +363,23 @@ __device__ __forceinline__ int unpack_int4x4(unsigned int packed, int offset)
         | ((w3 & 255) << 24);
 }
 
+__device__ __forceinline__ int dot_int8x4(int lhs, int rhs, int accumulator)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(lhs, rhs, accumulator);
+#else
+#pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+        int lhs_value = ((unsigned int)lhs >> (byte * 8)) & 255u;
+        int rhs_value = ((unsigned int)rhs >> (byte * 8)) & 255u;
+        lhs_value = lhs_value >= 128 ? lhs_value - 256 : lhs_value;
+        rhs_value = rhs_value >= 128 ? rhs_value - 256 : rhs_value;
+        accumulator += lhs_value * rhs_value;
+    }
+    return accumulator;
+#endif
+}
+
 extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
     const signed char* quantized_activation,
     const float* activation_scale_ptr,
@@ -406,8 +423,8 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
                     *reinterpret_cast<const int*>(activation_block + word * 8);
                 const int activation1 =
                     *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
-                dot = __dp4a(activation0, unpack_int4x4(words[word], 0), dot);
-                dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
+                dot = dot_int8x4(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = dot_int8x4(activation1, unpack_int4x4(words[word], 16), dot);
             }
             // Per-block int8 activation scale times the per-block weight scale.
             const float block_scale = __fmul_rn(
@@ -470,8 +487,8 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32_stage64(
                     *reinterpret_cast<const int*>(activation_block + word * 8);
                 const int activation1 =
                     *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
-                dot = __dp4a(activation0, unpack_int4x4(words[word], 0), dot);
-                dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
+                dot = dot_int8x4(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = dot_int8x4(activation1, unpack_int4x4(words[word], 16), dot);
             }
             const float block_scale = __fmul_rn(
                 activation_scale_ptr[block],
@@ -541,9 +558,12 @@ extern "C" __global__ void matmul_nbits_quantize_accuracy4_blockwise(
 // int8 activation. One warp reduces one output column; the 32 lanes cooperate
 // across the block_size depths of each K-block. The per-block integer dot is
 // computed as sum(qa * qw) - zero_point * sum(qa), which is exactly the tiled
-// reference's sum(qa * (qw - zero_point)); the fp32 block products are then
-// accumulated by lane 0 in ascending block order with the same __fmul_rn /
-// __fadd_rn rounding the tiled kernel uses, so the result is bit-for-bit
+// reference's sum(qa * (qw - zero_point)). Block-128 uses two packed dp4a
+// instructions per lane (one for each integer sum) on sm_61+, while older
+// architectures and other block sizes retain the scalar loop. Padded tail
+// activations are zero, so packed tail lanes remain exact no-ops. The fp32 block
+// products are then accumulated by lane 0 in ascending block order with the same
+// __fmul_rn / __fadd_rn rounding the tiled kernel uses, so the result is bit-for-bit
 // identical. Symmetric int4 uses the default zero point 8; asymmetric int4
 // reads the packed per-block nibble zero point. The grid width (warps per CTA)
 // is chosen host-side from the device multiprocessor count so the launch fills
@@ -577,14 +597,34 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_blockwise(
         const long blob_base = ((long)column * k_blocks + block) * blob_size;
         int weighted = 0;
         int activation_sum = 0;
-        for (int within = lane; within < block_size; within += 32) {
-            const int quantized_activation_value =
-                (int)quantized_activation[begin + within];
-            const unsigned char byte = packed[blob_base + (within >> 1)];
-            const int quantized_weight =
-                (within & 1) ? (byte >> 4) : (byte & 15);
-            weighted += quantized_activation_value * quantized_weight;
-            activation_sum += quantized_activation_value;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+        if (block_size == 128) {
+            const int within = lane * 4;
+            const int activation_pack = *reinterpret_cast<const int*>(
+                quantized_activation + begin + within);
+            const unsigned int packed_weights =
+                (unsigned int)*reinterpret_cast<const unsigned short*>(
+                    packed + blob_base + (within >> 1));
+            const unsigned int even_weights = packed_weights & 0x0f0fu;
+            const unsigned int odd_weights = (packed_weights >> 4) & 0x0f0fu;
+            const unsigned int weight_pack =
+                __byte_perm(even_weights, odd_weights, 0x5140);
+            weighted = dot_int8x4(
+                activation_pack, (int)weight_pack, weighted);
+            activation_sum = dot_int8x4(
+                activation_pack, 0x01010101, activation_sum);
+        } else
+#endif
+        {
+            for (int within = lane; within < block_size; within += 32) {
+                const int quantized_activation_value =
+                    (int)quantized_activation[begin + within];
+                const unsigned char byte = packed[blob_base + (within >> 1)];
+                const int quantized_weight =
+                    (within & 1) ? (byte >> 4) : (byte & 15);
+                weighted += quantized_activation_value * quantized_weight;
+                activation_sum += quantized_activation_value;
+            }
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             weighted += __shfl_down_sync(0xffffffffu, weighted, offset);
