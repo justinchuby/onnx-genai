@@ -108,7 +108,7 @@ doing work and the latency-bound GEMV hides more of its dependent-load latency.
   reduction order unchanged).
 - `fp16_down_projection_is_bit_exact_to_staged_kernel` extended to a
   `_c4`-selecting shape (K=16384, N=8192); it already exercised the `_c2` path.
-  All 20 `matmul_nbits` lib tests pass, plus a new pure `select_down_columns`
+  All 19 `matmul_nbits` lib tests pass, plus a new pure `select_down_columns`
   heuristic test.
 - Pre-existing, unrelated: two `int8_block32` GPU tolerance tests fail on the
   clean base commit too (an int8 rounding tolerance issue on this toolchain);
