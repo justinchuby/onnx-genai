@@ -1115,9 +1115,12 @@ Detailed measurements and parity evidence are in
   shows 0% sustained GPU utilization, and runs at 2.45 tok/s, so it cannot be
   used for a native-vs-ORT performance claim.
 - [ ] **DeepSeek-R1 numerical parity policy:** preserve the existing fp32-oracle
-  regression lock and explicitly report that native and ORT CUDA can diverge
-  at close MatMulNBits decisions. On the 2026-07-25 prompt, native chose token
-  374 by +0.0625 while ORT CUDA chose token 594 by +0.015625.
+  regression lock (`deepseek_r1_1_5b_divergence.rs`, which adjudicates the
+  `"capital of France"` prompt: native picks oracle-correct 374, ORT CUDA flips
+  to 315) and explicitly report that native and ORT CUDA can diverge at close
+  MatMulNBits decisions. On the 2026-07-25 benchmark prompt native chose token
+  374 by +0.0625 while ORT CUDA chose token 594 by +0.015625 — a *different*,
+  not-yet-oracle-adjudicated divergence; extend the fp32 oracle to that prompt.
 - [x] **DeepSeek-Coder dense int4:** native CUDA loads, emits coherent code,
   matches ORT CUDA for 128 greedy tokens, and has no observed unsupported op.
 - [x] **DeepSeek-V2 real-shape QMoE routing:** native CUDA loads and matches ORT

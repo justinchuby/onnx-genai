@@ -52,13 +52,26 @@ conformance model. No native unsupported op or kernel error was observed.
 - At the shared teacher-forced prefix, native favors `374` over `594` by
   **0.0625 log-probability/logit units** (`-0.882679` vs `-0.945179`);
   ORT CUDA favors `594` by **0.015625** (`-0.896112` vs `-0.911737`).
-- This is an already characterized accuracy-level difference, not evidence of
-  a native regression: `deepseek_r1_1_5b_divergence.rs` records an independent
-  fp32 CPU oracle where native selects the oracle-correct token while ORT CUDA
-  flips the argmax.
+- This is consistent with an already characterized accuracy-level phenomenon,
+  not evidence of a native regression. `deepseek_r1_1_5b_divergence.rs` locks a
+  **different** prompt/divergence with an independent fp32 CPU oracle: with the
+  chat-template prompt `"The capital of France is"`, native and ORT CUDA agree
+  for seven tokens, then native selects the oracle-correct token `374` while ORT
+  CUDA flips to `315`. That test proves native is *more accurate* than ORT CUDA
+  at that decision.
+- **Caveat (honest scope):** the benchmark divergence documented above (token 16,
+  native `374` vs ORT CUDA `594`) is a *separate* run and is **not itself**
+  fp32-oracle-adjudicated. The 0.0625 / 0.015625 numbers are each backend's own
+  margin for its own choice — they show the two backends disagree, not that
+  native is more accurate on this specific prompt. It is consistent with the
+  locked accuracy-level phenomenon, but proving native-more-accurate here
+  requires extending the fp32 oracle to this prompt (see gap 3).
 
-**Result:** native decode is coherent and faster, but byte-for-byte ORT CUDA
-parity is intentionally absent at close MatMulNBits decisions.
+**Result:** native decode is coherent and faster. Byte-for-byte ORT CUDA parity
+is intentionally absent at close MatMulNBits decisions; native is proven more
+accurate than ORT CUDA for the oracle-locked `"capital of France"` prompt, and
+the benchmark-prompt divergence is consistent with — but not yet independently
+adjudicated by — that same phenomenon.
 
 ## DeepSeek-Coder-1.3B (dense int4)
 
@@ -83,4 +96,8 @@ parity is intentionally absent at close MatMulNBits decisions.
    The present artifact is suitable for numerical comparison but not speed.
 3. Keep the DeepSeek-R1 MatMulNBits accuracy-level divergence documented and
    regression-tested; parity claims must distinguish oracle accuracy from
-   byte-identical ORT CUDA output.
+   byte-identical ORT CUDA output. The committed `deepseek_r1_1_5b_divergence.rs`
+   oracle covers only the `"capital of France"` prompt (token 8, native 374 vs
+   ORT 315); **extend the fp32 oracle to the status-doc benchmark prompt** so the
+   token-16 (374 vs 594) divergence is independently adjudicated rather than
+   argued by analogy.
