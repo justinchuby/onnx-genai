@@ -452,7 +452,7 @@ impl Kernel for MatMulNBitsKernel {
             && self.block_size == 32
             && zero_points.is_none()
             && group_indices.is_none()
-            && dot_kernel != DotKernel::Scalar
+            && dot_kernel.uses_vnni_int4_direct()
         {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -2082,10 +2082,34 @@ fn report_decode_strategy_precedence(message: &str) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DotKernel {
     Scalar,
+    /// AVX2, 256-bit, **no** VNNI. Exact `u8 x i8` int8 dot for the huge
+    /// installed base of AVX2 CPUs without VNNI (Haswell/Broadwell/Skylake/
+    /// Cascade-Lake client, all AMD Zen1/Zen2, most pre-Ice-Lake cloud
+    /// instances). Consumes the natural (non-deinterleaved) activation layout —
+    /// it MUST NOT be routed into the VNNI int4-direct path.
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
     #[cfg(target_arch = "x86_64")]
     AvxVnni,
     #[cfg(target_arch = "x86_64")]
     Avx512Vnni,
+}
+
+impl DotKernel {
+    /// Whether this kernel consumes the VNNI-only *deinterleaved* int4
+    /// activation layout and may take the int4-direct decode path. `Scalar`
+    /// and `Avx2` use the natural layout / int8 route, so they must NOT enter
+    /// that path (a wrong classification silently corrupts decode).
+    fn uses_vnni_int4_direct(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            matches!(self, DotKernel::AvxVnni | DotKernel::Avx512Vnni)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
 }
 
 fn selected_dot_kernel() -> DotKernel {
@@ -2103,6 +2127,12 @@ fn selected_dot_kernel() -> DotKernel {
             && std::arch::is_x86_feature_detected!("avxvnni")
         {
             return DotKernel::AvxVnni;
+        }
+        // AVX2 without any VNNI: still far faster than scalar for the int8
+        // decode dot. Covers the large pre-VNNI installed base instead of
+        // silently falling back to `Scalar`.
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return DotKernel::Avx2;
         }
     }
     DotKernel::Scalar
@@ -2197,7 +2227,7 @@ fn int4_matmul_m1(
     // deinterleave; the scalar reference keeps natural order. Deinterleave once
     // here, amortized over all N output rows.
     #[cfg(target_arch = "x86_64")]
-    let use_simd = matches!(dot_kernel, DotKernel::AvxVnni | DotKernel::Avx512Vnni);
+    let use_simd = dot_kernel.uses_vnni_int4_direct();
     #[cfg(not(target_arch = "x86_64"))]
     let use_simd = false;
     let deinterleaved;
@@ -2262,6 +2292,11 @@ fn int4_dot_row(
     #[cfg(target_arch = "x86_64")]
     {
         match _kernel {
+            // Avx2 never reaches int4_matmul_m1 (gated to the int8 route by
+            // `uses_vnni_int4_direct`); if it ever did, `use_simd` is false so
+            // the activation is in natural order and the scalar reference below
+            // is the correct decode.
+            DotKernel::Avx2 => {}
             DotKernel::AvxVnni => {
                 // SAFETY: selected_dot_kernel checked AVX2 and AVX-VNNI.
                 return unsafe {
@@ -2702,6 +2737,10 @@ fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
         match _kernel {
+            DotKernel::Avx2 => {
+                // SAFETY: selected_dot_kernel checked AVX2 at runtime.
+                return unsafe { dot_u8_i8_avx2(activation, weight) };
+            }
             DotKernel::AvxVnni => {
                 // SAFETY: selected_dot_kernel checked AVX-VNNI at runtime.
                 return unsafe { dot_u8_i8_avxvnni(activation, weight) };
@@ -2722,6 +2761,42 @@ fn dot_u8_i8_scalar(activation: &[u8], weight: &[i8]) -> i32 {
         .zip(weight)
         .map(|(&activation, &weight)| activation as i32 * weight as i32)
         .sum()
+}
+
+/// AVX2 (256-bit, **no** VNNI) exact `u8 x i8` dot for the pre-VNNI installed
+/// base. Correctness is the hard part: `_mm256_maddubs_epi16` forms
+/// `a0*b0 + a1*b1` per i16 lane with **signed saturation** to i16, and with
+/// `a in [0,255]`, `b in [-128,127]` a two-product partial sum spans
+/// `[-65280, +64770]`, which overflows i16 and saturates — diverging from the
+/// scalar reference. To stay bit-exact we instead widen each 8-bit lane to
+/// 16-bit (u8 zero-extends via `cvtepu8`, i8 sign-extends via `cvtepi8`) and use
+/// `_mm256_madd_epi16`, which forms the same adjacent-pair products directly in
+/// **32-bit** lanes with no saturating intermediate. Each product magnitude is
+/// <= 32640 and a lane sum <= 65280, so the i32 accumulation never overflows and
+/// equals the scalar i32 reduction exactly. Throughput is 16 elements/iter
+/// (half of VNNI's 32) but still several times faster than scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_u8_i8_avx2(activation: &[u8], weight: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = activation.len();
+    let vector_len = len / 16 * 16;
+    let mut accumulator = _mm256_setzero_si256();
+    for index in (0..vector_len).step_by(16) {
+        // SAFETY: index + 16 <= len over equal-length slices; loadu allows unaligned.
+        let a8 = unsafe { _mm_loadu_si128(activation.as_ptr().add(index).cast()) };
+        // SAFETY: index + 16 <= len over equal-length slices; loadu allows unaligned.
+        let b8 = unsafe { _mm_loadu_si128(weight.as_ptr().add(index).cast()) };
+        // Widen to 16-bit lanes so products stay exact (no saturating i16
+        // maddubs intermediate): u8 zero-extends, i8 sign-extends.
+        let a16 = _mm256_cvtepu8_epi16(a8);
+        let b16 = _mm256_cvtepi8_epi16(b8);
+        // madd_epi16 forms exact adjacent-pair products in i32 lanes.
+        accumulator = _mm256_add_epi32(accumulator, _mm256_madd_epi16(a16, b16));
+    }
+    horizontal_sum_256(accumulator)
+        + dot_u8_i8_scalar(&activation[vector_len..], &weight[vector_len..])
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3978,7 +4053,7 @@ mod tests {
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
-        let direct_int4 = selected_dot_kernel() != DotKernel::Scalar;
+        let direct_int4 = selected_dot_kernel().uses_vnni_int4_direct();
         let cached = if direct_int4 {
             kernel
                 .packed_int4_weight
@@ -4027,6 +4102,18 @@ mod tests {
             );
         }
         assert_eq!(dot_u8_i8(&activation, &weight, selected), scalar);
+
+        // Any AVX2 host (VNNI or not) must select a real SIMD kernel, never
+        // Scalar, and the forced Avx2 dot must stay bit-exact vs Scalar.
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            assert_ne!(
+                selected,
+                DotKernel::Scalar,
+                "an AVX2 CPU must not select Scalar"
+            );
+            assert_eq!(dot_u8_i8(&activation, &weight, DotKernel::Avx2), scalar);
+        }
 
         let activations: Vec<f32> = (0..256)
             .map(|i| ((i * 23 % 53) as f32 - 26.0) / 17.0)
@@ -4410,7 +4497,13 @@ mod tests {
                 values: packed.clone(),
                 scales: scales.clone(),
             };
-            for kernel in [DotKernel::Scalar, selected_dot_kernel()] {
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+            let mut kernels = vec![DotKernel::Scalar, selected_dot_kernel()];
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                kernels.push(DotKernel::Avx2);
+            }
+            for kernel in kernels {
                 let mut native = vec![0.0; n];
                 int4_matmul_m1(&activations, &packed_weight, &mut native, k, n, kernel);
                 assert_eq!(
@@ -5373,6 +5466,128 @@ mod tests {
             let wide = unsafe { dot_u8_i8_avx512vnni(&activation, &weight) };
             assert_eq!(wide, scalar, "len={len}: avx512 u8xi8 dot mismatch");
         }
+    }
+
+    /// The AVX2 (non-VNNI) `u8 x i8` dot MUST equal the scalar reduction
+    /// bit-exactly. This is the correctness proof that the saturation-safe
+    /// widen + `madd_epi16` sequence avoids the `maddubs` i16-saturation error.
+    /// Adversarial inputs (0/255 activations, ±128/±127 weights) drive the
+    /// two-product partial sums to the values that WOULD saturate a naive
+    /// `maddubs`, across lengths exercising the 16-wide body and the scalar tail.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_u8_i8_avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Deterministic pseudo-random + adversarial extremes over many blocks.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in [
+            0usize, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 96, 127, 128, 129, 200,
+            255, 256, 257, 512, 1000,
+        ] {
+            // Case A: worst-case saturation drivers (all-max u8, weights that
+            // maximize |a0*b0 + a1*b1| both positive and negative).
+            let a_max = vec![255u8; len];
+            let w_pos = vec![127i8; len];
+            let w_neg = vec![-128i8; len];
+            let a_zero = vec![0u8; len];
+            for (act, wgt) in [
+                (&a_max, &w_pos),
+                (&a_max, &w_neg),
+                (&a_zero, &w_neg),
+                (&a_max, &a_max.iter().map(|_| -1i8).collect::<Vec<_>>()),
+            ] {
+                let scalar = dot_u8_i8_scalar(act, wgt);
+                // SAFETY: avx2 confirmed above.
+                let simd = unsafe { dot_u8_i8_avx2(act, wgt) };
+                assert_eq!(simd, scalar, "len={len}: adversarial avx2 dot mismatch");
+            }
+            // Case B: random full-range inputs.
+            let activation: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+            let weight: Vec<i8> = (0..len).map(|_| (next() & 0xff) as u8 as i8).collect();
+            let scalar = dot_u8_i8_scalar(&activation, &weight);
+            // SAFETY: avx2 confirmed above.
+            let simd = unsafe { dot_u8_i8_avx2(&activation, &weight) };
+            assert_eq!(simd, scalar, "len={len}: random avx2 dot mismatch");
+        }
+    }
+
+    /// End-to-end: force the `Avx2` kernel through the full int4 accuracy_level=4
+    /// CompInt8 decode (`int8_row` via `dot_u8_i8`) and confirm it is token-exact
+    /// vs the `Scalar` reference. `selected_dot_kernel()` picks `Avx512Vnni` on
+    /// this host, so we force `Avx2` explicitly to cover the path on VNNI hosts
+    /// too (it is the only way CI on this box exercises the AVX2 dot).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int8_row_avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (k, n, block_size) = (131usize, 7usize, 32usize);
+        let padded_k = k.div_ceil(block_size) * block_size;
+        let k_blocks = padded_k / block_size;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let activation: Vec<u8> = (0..padded_k).map(|_| (next() & 0xff) as u8).collect();
+        let activation_scales: Vec<f32> = (0..k_blocks)
+            .map(|_| (next() & 0xff) as f32 / 512.0 + 0.01)
+            .collect();
+        let values: Vec<i8> = (0..n * padded_k)
+            .map(|_| (next() & 0xff) as u8 as i8)
+            .collect();
+        let scales: Vec<f32> = (0..n * k_blocks)
+            .map(|_| (next() & 0xff) as f32 / 512.0 + 0.01)
+            .collect();
+        let block_sums: Vec<i32> = values
+            .chunks_exact(block_size)
+            .map(|b| b.iter().map(|&w| w as i32).sum())
+            .collect();
+        let weight = Int8Weight {
+            values,
+            scales,
+            block_sums,
+        };
+
+        let mut scalar_out = vec![0.0f32; n];
+        let mut avx2_out = vec![0.0f32; n];
+        int8_row(
+            &activation,
+            &activation_scales,
+            &weight,
+            &mut scalar_out,
+            k_blocks,
+            padded_k,
+            block_size,
+            DotKernel::Scalar,
+            false,
+        );
+        int8_row(
+            &activation,
+            &activation_scales,
+            &weight,
+            &mut avx2_out,
+            k_blocks,
+            padded_k,
+            block_size,
+            DotKernel::Avx2,
+            false,
+        );
+        // dot_u8_i8 is bit-exact across kernels, so the accumulated f32 outputs
+        // must be identical (not merely close) — token-exact decode.
+        assert_eq!(avx2_out, scalar_out, "Avx2 int8_row diverged from Scalar");
     }
 
     /// The 512-bit AVX-512BW grouped `u8 x i16` block dot must agree with an
