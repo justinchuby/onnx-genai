@@ -31,16 +31,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
-use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer, Value};
+use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer};
 use onnx_genai::text_to_image::{self, TextToImageRequest, VaeDecoder};
 use onnx_genai::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken,
     GenerateTokenCallback, StopSequence,
 };
-use onnx_genai_server::multimodal::{self, MultimodalSpecs};
+use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
 use onnx_genai_server::{ServeArgs, from_models_dir, run_serve};
 
 /// Process exit code for termination via SIGINT (Ctrl-C), matching the POSIX
@@ -240,55 +241,28 @@ impl Backend {
         }
     }
 
+    /// Declared input contracts, or `None` for a single decoder graph.
+    fn multimodal(&self) -> Option<&MultimodalSpecs> {
+        match self {
+            Self::Text(_) => None,
+            Self::Pipeline(pipeline) => Some(&pipeline.multimodal),
+        }
+    }
+
     /// Human-readable summary of the modalities this model accepts.
     fn accepted_modalities(&self) -> String {
-        let mut modalities = vec!["text"];
-        if let Self::Pipeline(pipeline) = self {
-            let multimodal = &pipeline.multimodal;
-            if multimodal.vision.is_some() {
-                modalities.push("image");
-            }
-            if multimodal.audio.is_some() {
-                modalities.push("audio");
-            }
-        }
-        modalities.join(" + ")
+        self.multimodal()
+            .map_or_else(|| "text".to_string(), MultimodalSpecs::accepted_modalities)
     }
 
     fn supports_images(&self) -> bool {
-        matches!(self, Self::Pipeline(pipeline) if pipeline.multimodal.vision.is_some())
+        self.multimodal()
+            .is_some_and(|multimodal| multimodal.vision.is_some())
     }
 
     fn supports_audio(&self) -> bool {
-        matches!(self, Self::Pipeline(pipeline) if pipeline.multimodal.audio.is_some())
-    }
-
-    /// Reject an attachment the loaded model cannot consume, naming what it does accept.
-    fn reject_unsupported(&self, turn: &TurnInput) -> anyhow::Result<()> {
-        if !turn.images.is_empty() && !self.supports_images() {
-            anyhow::bail!(
-                "What: the staged image input was rejected. \
-                 Why: this model accepts {} input; its metadata declares no image preprocessing program (`preprocessing.image` + `pipeline.vision`). \
-                 How: load a vision-language package, or send the prompt without /image.",
-                self.accepted_modalities()
-            );
-        }
-        if !turn.audio.is_empty() && !self.supports_audio() {
-            anyhow::bail!(
-                "What: the staged audio input was rejected. \
-                 Why: this model accepts {} input; no pipeline component declares an `input_features` audio input. \
-                 How: load a speech package, or send the prompt without /audio.",
-                self.accepted_modalities()
-            );
-        }
-        if !turn.images.is_empty() && !turn.audio.is_empty() {
-            anyhow::bail!(
-                "What: the staged attachments were rejected. \
-                 Why: image and audio inputs cannot be combined in one turn. \
-                 How: send them as separate turns, or /reset to clear the staged attachments."
-            );
-        }
-        Ok(())
+        self.multimodal()
+            .is_some_and(|multimodal| multimodal.audio.is_some())
     }
 
     /// Run one turn, streaming tokens through `callback`.
@@ -297,7 +271,12 @@ impl Backend {
         turn: TurnInput,
         callback: &mut GenerateTokenCallback<'_>,
     ) -> anyhow::Result<()> {
-        self.reject_unsupported(&turn)?;
+        multimodal::admit_attachments(
+            self.multimodal(),
+            "the loaded model",
+            turn.images.len(),
+            turn.audio.len(),
+        )?;
         match self {
             Self::Text(engine) => {
                 let request = GenerateRequest {
@@ -309,7 +288,7 @@ impl Backend {
             }
             Self::Pipeline(pipeline) => {
                 let attachments = turn.images.len() + turn.audio.len();
-                let required = sole_modality(&pipeline.multimodal);
+                let required = pipeline.multimodal.sole_modality();
                 let request =
                     build_pipeline_request(&pipeline.tokenizer, &pipeline.multimodal, turn)?;
                 pipeline
@@ -330,18 +309,6 @@ impl Backend {
     }
 }
 
-/// The single non-text modality this package declares, if exactly one.
-///
-/// Used to turn a bare "missing required pipeline input" into advice about the
-/// attachment flag the user most likely forgot.
-fn sole_modality(multimodal: &MultimodalSpecs) -> Option<&'static str> {
-    match (multimodal.vision.is_some(), multimodal.audio.is_some()) {
-        (true, false) => Some("image"),
-        (false, true) => Some("audio"),
-        _ => None,
-    }
-}
-
 /// Turn a prompt plus its attachments into a pipeline generation request.///
 /// Audio replaces the prompt entirely: the transcription decoder is seeded with
 /// the model's own transcription token sequence because the spoken audio, not
@@ -359,36 +326,28 @@ fn build_pipeline_request(
         options,
     } = turn;
 
-    if let Some(audio_path) = audio.first() {
+    if let Some(path) = audio.first() {
         let spec = multimodal
             .audio
             .as_ref()
             .expect("audio support checked before building the request");
-        let bytes = std::fs::read(audio_path).map_err(|error| {
-            anyhow::anyhow!(
-                "What: the audio file {} could not be read. \
-                 Why: {error}. \
-                 How: check the path and that the file is readable.",
-                audio_path.display()
-            )
-        })?;
-        let tensor = multimodal::preprocess_wav(&bytes, spec).map_err(|error| {
-            anyhow::anyhow!(
-                "What: the audio file {} could not be preprocessed. \
-                 Why: {error:#}. \
-                 How: provide a PCM16 WAV file.",
-                audio_path.display()
-            )
-        })?;
+        let input = MultimodalInput::from_wav(spec, &read_attachment(path, "audio")?)
+            .with_context(|| {
+                format!(
+                    "What: the audio file {} could not be preprocessed. \
+                     Why: it is not usable as this model's declared audio input. \
+                     How: provide a PCM16 WAV file.",
+                    path.display()
+                )
+            })?;
+        // Audio replaces the prompt: the transcription decoder is seeded with
+        // the model's own token sequence because the clip, not the typed text,
+        // carries the content.
         let token_ids = multimodal::audio_decoder_prompt(tokenizer, None)?;
-        let request = GenerateRequest {
+        return input.bind(PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
             options,
-        };
-        return Ok(PipelineGenerateRequest::new(request).with_input(
-            tensor.endpoint,
-            Value::from_vec_f32(tensor.data, &tensor.shape)?,
-        ));
+        }));
     }
 
     let mut token_ids = tokenizer.encode(&prompt).map_err(|error| {
@@ -398,38 +357,42 @@ fn build_pipeline_request(
              How: verify the package's tokenizer.json matches its decoder."
         )
     })?;
-    let mut request = PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(Vec::new()),
+    let input = match multimodal.vision.as_ref().filter(|_| !images.is_empty()) {
+        None => None,
+        Some(spec) => {
+            let mut encoded = Vec::with_capacity(images.len());
+            for path in &images {
+                encoded.push(read_attachment(path, "image")?);
+            }
+            Some(MultimodalInput::from_images(
+                spec,
+                &encoded,
+                &mut token_ids,
+                multimodal::MAX_EXPANDED_PROMPT_TOKENS,
+            )?)
+        }
+    };
+
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(token_ids),
         options,
     });
-
-    if !images.is_empty() {
-        let spec = multimodal
-            .vision
-            .as_ref()
-            .expect("image support checked before building the request");
-        let mut encoded = Vec::with_capacity(images.len());
-        for path in &images {
-            encoded.push(std::fs::read(path).map_err(|error| {
-                anyhow::anyhow!(
-                    "What: the image file {} could not be read. \
-                     Why: {error}. \
-                     How: check the path and that the file is readable.",
-                    path.display()
-                )
-            })?);
-        }
-        let bundle = multimodal::preprocess_encoded_images(&encoded, spec)?;
-        token_ids =
-            spec.expand_prompt(&token_ids, &bundle, multimodal::MAX_EXPANDED_PROMPT_TOKENS)?;
-        for tensor in bundle.tensors {
-            let endpoint = tensor.endpoint.clone();
-            request = request.with_input(endpoint, multimodal::image_tensor_value(tensor)?);
-        }
+    match input {
+        Some(input) => input.bind(request),
+        None => Ok(request),
     }
+}
 
-    request.request.prompt = GeneratePrompt::TokenIds(token_ids);
-    Ok(request)
+/// Read an attachment file, naming it and its modality on failure.
+fn read_attachment(path: &Path, kind: &str) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        anyhow::anyhow!(
+            "What: the {kind} file {} could not be read. \
+             Why: {error}. \
+             How: check the path and that the file is readable.",
+            path.display()
+        )
+    })
 }
 
 /// Run one generation turn, streaming tokens through the terminal and returning
@@ -839,13 +802,6 @@ fn generate_image(model_dir: &Path, args: GenerateArgs) -> anyhow::Result<()> {
         .output_image
         .clone()
         .expect("image output path checked by the caller");
-    if args.image_output.batch_size == 0 {
-        anyhow::bail!(
-            "What: --batch-size 0 was rejected. \
-             Why: at least one image must be rendered. \
-             How: pass --batch-size 1 or more."
-        );
-    }
     let request = args.image_output.to_request(args.prompt.clone());
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())
         .map_err(|error| {

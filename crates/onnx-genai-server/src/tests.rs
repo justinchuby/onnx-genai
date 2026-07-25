@@ -721,9 +721,12 @@ async fn transcription_multipart_against_non_audio_model_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        body["error"]["message"],
-        "this model does not support audio transcription"
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("What:"), "message: {message}");
+    assert!(message.contains("How:"), "message: {message}");
+    assert!(
+        message.contains("input_features"),
+        "the missing contract must be named: {message}"
     );
 }
 
@@ -914,8 +917,9 @@ async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preproces
 
     assert!(handle.pipeline);
     let vision = handle
-        .vision_input
+        .multimodal
         .as_ref()
+        .and_then(|multimodal| multimodal.vision.as_ref())
         .expect("server constructed executable vision preprocessing");
     let tensor = crate::image_input::load_and_preprocess(&[tiny_png_data_uri()], vision)
         .await
@@ -1655,30 +1659,45 @@ async fn stalled_output_route_does_not_block_another_completion() {
     assert_eq!(fast_result.token_ids.len(), 2);
 }
 
-#[test]
-fn pipeline_input_tensor_carries_num_tiles_for_image() {
-    use crate::driver::PipelineInputTensor;
+#[tokio::test]
+async fn multimodal_input_expands_the_prompt_and_binds_the_declared_endpoint() {
+    use onnx_genai::engine::{GeneratePrompt, GenerateRequest, PipelineGenerateRequest};
 
-    let tensor = PipelineInputTensor {
-        endpoint: "encoder.pixel_values".to_string(),
-        data: vec![0.0; 12],
-        shape: vec![1, 3, 2, 2],
-        num_tiles: Some(4),
-    };
-    assert_eq!(tensor.num_tiles, Some(4));
-}
+    // The one implementation the CLI and the HTTP API both go through.
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-vlm-image-input");
+    let setup = crate::multimodal::load(&model_dir)
+        .expect("the fixture declares a pipeline")
+        .expect("the fixture declares a pipeline");
+    let spec = setup
+        .multimodal
+        .vision
+        .as_ref()
+        .expect("the fixture declares an image contract");
+    let images = crate::image_input::fetch_images(&[tiny_png_data_uri()])
+        .await
+        .expect("the data URI decodes");
 
-#[test]
-fn pipeline_input_tensor_num_tiles_none_for_audio() {
-    use crate::driver::PipelineInputTensor;
+    // Token 3 is the fixture's image placeholder; it expands to token 4.
+    let mut token_ids = vec![2_u32, 3];
+    let input = crate::multimodal::MultimodalInput::from_images(spec, &images, &mut token_ids, 64)
+        .expect("preprocessing and expansion succeed");
+    assert_eq!(
+        token_ids,
+        vec![2, 4],
+        "the placeholder must be replaced by the declared image token run"
+    );
 
-    let tensor = PipelineInputTensor {
-        endpoint: "encoder.audio_features".to_string(),
-        data: vec![0.0; 8],
-        shape: vec![1, 2, 4],
-        num_tiles: None,
-    };
-    assert_eq!(tensor.num_tiles, None);
+    let request = input
+        .bind(PipelineGenerateRequest::new(GenerateRequest::new(
+            GeneratePrompt::TokenIds(token_ids),
+        )))
+        .expect("binding succeeds");
+    assert!(
+        request.inputs.contains_key("encoder.pixel_values"),
+        "the declared endpoint must be bound: {:?}",
+        request.inputs.keys().collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -2429,11 +2448,11 @@ async fn images_generations_rejects_url_response_format_and_bad_size_and_n() {
         ),
         (
             json!({"model": "tiny-txt2img", "prompt": "x", "n": 0}),
-            "n=0",
+            "batch of 0",
         ),
         (
             json!({"model": "tiny-txt2img", "prompt": "x", "n": 99}),
-            "n=99",
+            "batch of 99",
         ),
     ] {
         let (status, response) = post_json(txt2img_state(), "/v1/images/generations", body).await;
@@ -2592,7 +2611,10 @@ async fn mixed_image_and_audio_parts_are_rejected_with_guidance() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let message = error_message(&body);
     assert_actionable(&message);
-    assert!(message.contains("separate requests"), "message: {message}");
+    assert!(
+        message.contains("send them separately"),
+        "message: {message}"
+    );
 }
 
 #[tokio::test]

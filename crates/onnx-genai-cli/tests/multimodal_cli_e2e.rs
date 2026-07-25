@@ -143,8 +143,14 @@ fn a_text_only_model_rejects_attachments_by_naming_what_it_accepts() {
 
     assert!(!output.status.success(), "a text model must reject images");
     let message = stderr(&output);
+    // The wording comes from the shared admission policy the server uses too,
+    // so the CLI and the HTTP API reject the same input the same way.
     assert!(
-        message.contains("this model accepts text input"),
+        message.contains("it accepts text input"),
+        "message: {message}"
+    );
+    assert!(
+        message.contains("single decoder graph"),
         "message: {message}"
     );
     assert!(message.contains("How:"), "message: {message}");

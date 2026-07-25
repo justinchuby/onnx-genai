@@ -265,8 +265,7 @@ impl AppState {
             model_max_context,
             fim_config,
             pipeline: false,
-            vision_input: None,
-            audio_input: None,
+            multimodal: None,
             text_to_image: false,
         });
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
@@ -372,8 +371,7 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
         model_max_context,
         fim_config,
         pipeline: false,
-        vision_input: None,
-        audio_input: None,
+        multimodal: None,
         text_to_image: false,
     }))
 }
@@ -392,10 +390,7 @@ fn build_pipeline_handle(
 
     let models = PipelineModels::load(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to inspect pipeline models: {e}"))?;
-    let crate::multimodal::MultimodalSpecs {
-        vision: vision_input,
-        audio: audio_input,
-    } = crate::multimodal::build(&directory, &models)?;
+    let multimodal = crate::multimodal::build(&directory, &models)?;
     drop(models);
 
     // A package that declares a denoise loop can serve image generation.
@@ -410,8 +405,7 @@ fn build_pipeline_handle(
         model_max_context,
         fim_config: None,
         pipeline: true,
-        vision_input,
-        audio_input,
+        multimodal: Some(multimodal),
         text_to_image,
     }))
 }

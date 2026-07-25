@@ -441,22 +441,27 @@ impl VisionExpansionSpec {
     }
 }
 
-/// Fetch every `data:`/`http(s):` image URL and run the typed preprocessing program.
+/// Fetch every `data:`/`http(s):` image URL into encoded bytes, in order.
 ///
 /// Only remote and inline sources are accepted; local filesystem paths are
-/// deliberately unsupported here so an HTTP request can never read server-local
+/// deliberately unsupported so an HTTP request can never read server-local
 /// files. In-process callers that already hold image bytes (for example the
-/// CLI, which reads a user-supplied local path) call
-/// [`preprocess_encoded_images`] directly.
-pub(crate) async fn load_and_preprocess(
-    urls: &[String],
-    spec: &VisionInputSpec,
-) -> anyhow::Result<ImageBundle> {
+/// CLI, which reads a user-supplied local path) skip this and go straight to
+/// [`preprocess_encoded_images`].
+pub(crate) async fn fetch_images(urls: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut images = Vec::with_capacity(urls.len());
     for url in urls {
         images.push(load_image_bytes(url).await?);
     }
-    preprocess_encoded_images(&images, spec)
+    Ok(images)
+}
+
+#[cfg(test)]
+pub(crate) async fn load_and_preprocess(
+    urls: &[String],
+    spec: &VisionInputSpec,
+) -> anyhow::Result<ImageBundle> {
+    preprocess_encoded_images(&fetch_images(urls).await?, spec)
 }
 
 /// Run the typed image preprocessing program over already-loaded encoded images

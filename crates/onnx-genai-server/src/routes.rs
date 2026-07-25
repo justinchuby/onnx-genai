@@ -27,10 +27,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{
-        DriverEvent, EngineDriver, GenerateSubmitError, PipelineInputBundle, PipelineInputTensor,
-        PipelineTensor,
-    },
+    driver::{DriverEvent, EngineDriver, GenerateSubmitError},
+    multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
     sse::{
@@ -990,10 +988,18 @@ pub(crate) async fn audio_transcriptions(
         ));
     }
     let spec = handle
-        .audio_input
+        .multimodal
         .as_ref()
-        .ok_or_else(|| ApiError::bad_request("this model does not support audio transcription"))?;
-    let input = crate::audio_input::preprocess_wav(&bytes, spec)
+        .and_then(|multimodal| multimodal.audio.as_ref())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "What: audio transcription was rejected for model '{}'. \
+                 Why: no component of its package declares an `input_features` audio input. \
+                 How: serve a speech package.",
+                handle.id
+            ))
+        })?;
+    let input = MultimodalInput::from_wav(spec, &bytes)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
     let max_tokens = spec
         .max_tokens
@@ -1013,18 +1019,7 @@ pub(crate) async fn audio_transcriptions(
     let result = collect_generation_result(
         handle
             .engine
-            .generate_pipeline(
-                request,
-                Some(PipelineInputBundle {
-                    tensors: vec![PipelineTensor::Fp32(PipelineInputTensor {
-                        endpoint: input.endpoint,
-                        data: input.data,
-                        shape: input.shape,
-                        num_tiles: None,
-                    })],
-                    image_summaries: Vec::new(),
-                }),
-            )
+            .generate_pipeline(request, Some(input))
             .await
             .map_err(map_generate_submit_error)?,
     )
@@ -1272,9 +1267,6 @@ async fn stream_completion(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
-/// Maximum images one request may render, bounding a single request's cost.
-const MAX_IMAGES_PER_REQUEST: usize = 4;
-
 /// `POST /v1/images/generations` — OpenAI-compatible text-to-image.
 ///
 /// Renders through the model package's own declared denoise loop; the sampler,
@@ -1302,13 +1294,9 @@ pub(crate) async fn image_generations(
         ));
     }
     let count = request.n.unwrap_or(1);
-    if count == 0 || count > MAX_IMAGES_PER_REQUEST {
-        return Err(ApiError::bad_request(format!(
-            "What: n={count} was rejected. \
-             Why: each request renders between 1 and {MAX_IMAGES_PER_REQUEST} images. \
-             How: request n between 1 and {MAX_IMAGES_PER_REQUEST}."
-        )));
-    }
+    // The bound is the renderer's policy, so the CLI and this endpoint agree.
+    onnx_genai::text_to_image::validate_batch_size(count)
+        .map_err(|error| ApiError::bad_request(format!("{error:#} (field: n)")))?;
     let (width, height) = parse_image_size(request.size.as_deref())?;
 
     let render_request = TextToImageRequest {
@@ -1401,47 +1389,16 @@ pub(crate) async fn chat_completions(
     }
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
-    if !image_urls.is_empty() && !input_audio.is_empty() {
-        return Err(ApiError::bad_request(
-            "What: the request mixed image and audio content parts. \
-             Why: a pipeline consumes one non-text modality per generation, so the server cannot bind both. \
-             How: send the image and the audio as separate requests.",
-        ));
-    }
-    if input_audio.len() > 1 {
-        return Err(ApiError::bad_request(format!(
-            "What: {} input_audio content parts were rejected. \
-             Why: an audio pipeline transcribes one clip per generation. \
-             How: send one input_audio part per request.",
-            input_audio.len()
-        )));
-    }
-    if !image_urls.is_empty() && handle.vision_input.is_none() {
-        return Err(ApiError::bad_request(format!(
-            "What: image input was rejected for model '{}'. \
-             Why: {}. \
-             How: serve a vision-language package, or send the message as text only.",
-            handle.id,
-            if handle.pipeline {
-                "its package declares no image preprocessing program (`preprocessing.image` bound to a component input, plus `pipeline.vision`)"
-            } else {
-                "it is a single decoder graph, not a multi-component pipeline, so it has no image encoder to bind"
-            }
-        )));
-    }
-    if !input_audio.is_empty() && handle.audio_input.is_none() {
-        return Err(ApiError::bad_request(format!(
-            "What: audio input was rejected for model '{}'. \
-             Why: {}. \
-             How: serve a speech package, or send the message as text only.",
-            handle.id,
-            if handle.pipeline {
-                "no component of its package declares an `input_features` audio input"
-            } else {
-                "it is a single decoder graph, not a multi-component pipeline, so it has no audio encoder to bind"
-            }
-        )));
-    }
+    // One admission policy, shared with the CLI, so both front ends accept and
+    // reject the same inputs with the same explanation.
+    crate::multimodal::admit_attachments(
+        handle.multimodal.as_ref(),
+        &format!("model '{}'", handle.id),
+        image_urls.len(),
+        input_audio.len(),
+    )
+    .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+
     if request.stream {
         Ok(
             stream_chat_completion(state, handle, request, session_id, image_urls, input_audio)
@@ -1486,8 +1443,9 @@ async fn run_chat_completion(
             preprocess_chat_images(
                 &image_urls,
                 handle
-                    .vision_input
+                    .multimodal
                     .as_ref()
+                    .and_then(|multimodal| multimodal.vision.as_ref())
                     .expect("vision input checked before generation"),
                 &mut prepared,
                 handle.model_max_context,
@@ -1636,8 +1594,9 @@ async fn stream_chat_completion(
             preprocess_chat_images(
                 &image_urls,
                 handle
-                    .vision_input
+                    .multimodal
                     .as_ref()
+                    .and_then(|multimodal| multimodal.vision.as_ref())
                     .expect("vision input checked before generation"),
                 &mut prepared,
                 handle.model_max_context,
@@ -1861,77 +1820,44 @@ pub(crate) async fn collect_generation_result(
 fn preprocess_chat_audio(
     input: &InputAudio,
     handle: &ModelHandle,
-) -> Result<PipelineInputBundle, ApiError> {
+) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
     let spec = handle
-        .audio_input
+        .multimodal
         .as_ref()
+        .and_then(|multimodal| multimodal.audio.as_ref())
         .expect("audio input checked before generation");
-    let input = crate::audio_input::preprocess_wav(&bytes, spec)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
-    Ok(PipelineInputBundle {
-        tensors: vec![PipelineTensor::Fp32(PipelineInputTensor {
-            endpoint: input.endpoint,
-            shape: input.shape,
-            data: input.data,
-            num_tiles: None,
-        })],
-        image_summaries: Vec::new(),
-    })
+    MultimodalInput::from_wav(spec, &bytes)
+        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))
 }
 
 async fn preprocess_chat_images(
     image_urls: &[String],
-    spec: &crate::image_input::VisionInputSpec,
+    spec: &crate::multimodal::VisionInputSpec,
     prepared: &mut PreparedGenerateRequest,
     model_max_context: Option<usize>,
     max_tokens: usize,
-) -> Result<PipelineInputBundle, ApiError> {
-    let context_prompt_limit = model_max_context
-        .map(|max_context| {
-            max_context.checked_sub(max_tokens).ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "What: image request cannot fit within the model context. \
-                     Why: max_tokens ({max_tokens}) already exceeds the model context limit ({max_context}) before prompt and image tokens are counted. \
-                     How: reduce max_tokens below the model context limit."
-                ))
-            })
-        })
-        .transpose()?
-        .unwrap_or(crate::image_input::MAX_EXPANDED_PROMPT_TOKENS);
+) -> Result<MultimodalInput, ApiError> {
     let max_prompt_tokens =
-        context_prompt_limit.min(crate::image_input::MAX_EXPANDED_PROMPT_TOKENS);
-    let bundle = crate::image_input::load_and_preprocess(image_urls, spec)
+        crate::multimodal::expansion_token_budget(model_max_context, max_tokens)
+            .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let images = crate::image_input::fetch_images(image_urls)
         .await
         .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
-    let token_ids = match &prepared.request.prompt {
-        GeneratePrompt::TokenIds(token_ids) => token_ids,
-        GeneratePrompt::Text(_) => {
-            return Err(ApiError::internal(
-                "What: image placeholder expansion received an untokenized prompt. Why: the server preprocessing order was violated. How: tokenize before preprocessing and expansion.",
-            ));
-        }
+    let GeneratePrompt::TokenIds(mut token_ids) = std::mem::replace(
+        &mut prepared.request.prompt,
+        GeneratePrompt::TokenIds(Vec::new()),
+    ) else {
+        return Err(ApiError::internal(
+            "What: image placeholder expansion received an untokenized prompt. Why: the server preprocessing order was violated. How: tokenize before preprocessing and expansion.",
+        ));
     };
-    let expanded = spec
-        .expand_prompt(token_ids, &bundle, max_prompt_tokens)
+    let input = MultimodalInput::from_images(spec, &images, &mut token_ids, max_prompt_tokens)
         .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
-    prepared.prompt_tokens = expanded.len();
-    prepared.request.prompt = GeneratePrompt::TokenIds(expanded);
-    Ok(PipelineInputBundle {
-        tensors: bundle
-            .tensors
-            .into_iter()
-            .map(|tensor| PipelineTensor::Typed {
-                endpoint: tensor.endpoint,
-                expected_dtype: tensor.expected_dtype,
-                expected_shape: tensor.expected_shape,
-                shape: tensor.shape,
-                data: tensor.data,
-            })
-            .collect(),
-        image_summaries: bundle.images,
-    })
+    prepared.prompt_tokens = token_ids.len();
+    prepared.request.prompt = GeneratePrompt::TokenIds(token_ids);
+    Ok(input)
 }
 
 fn prepare_audio_generate_request(

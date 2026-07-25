@@ -52,6 +52,24 @@ pub const VAE_DOWNSCALE: usize = 8;
 /// the package's `run.json` does not declare `latent_channels`.
 pub const DEFAULT_LATENT_CHANNELS: usize = 4;
 
+/// Largest batch one render may produce, bounding a single request's cost.
+///
+/// Owned here rather than by each front end so the CLI and the HTTP API accept
+/// exactly the same range.
+pub const MAX_BATCH_SIZE: usize = 4;
+
+/// Validate a requested batch size against [`MAX_BATCH_SIZE`].
+pub fn validate_batch_size(batch_size: usize) -> Result<()> {
+    if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
+        bail!(
+            "What: a batch of {batch_size} images was rejected. \
+             Why: each render produces between 1 and {MAX_BATCH_SIZE} images. \
+             How: request a batch between 1 and {MAX_BATCH_SIZE}."
+        );
+    }
+    Ok(())
+}
+
 /// Standalone VAE decoder for packages whose pipeline ends at the latent.
 #[derive(Debug, Clone)]
 pub struct VaeDecoder {
@@ -467,7 +485,8 @@ pub fn render(
             request.width
         );
     }
-    let batch_size = request.batch_size.max(1);
+    validate_batch_size(request.batch_size)?;
+    let batch_size = request.batch_size;
     let endpoints = resolve_endpoints(engine.spec())?;
     let guidance_scale = request
         .guidance_scale

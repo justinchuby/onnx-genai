@@ -13,10 +13,9 @@ use onnx_genai_engine::FimConfig;
 use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
-    audio_input::AudioInputSpec,
     driver::EngineDriver,
-    image_input::VisionInputSpec,
     models_config::ModelSpec,
+    multimodal::MultimodalSpecs,
     state::{ServerConfig, build_handle},
 };
 
@@ -46,8 +45,9 @@ pub(crate) struct ModelHandle {
     pub(crate) model_max_context: Option<usize>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
-    pub(crate) vision_input: Option<VisionInputSpec>,
-    pub(crate) audio_input: Option<AudioInputSpec>,
+    /// Declared image/audio input contracts, or `None` for a single decoder
+    /// graph. Shared with the CLI so both front ends admit the same inputs.
+    pub(crate) multimodal: Option<MultimodalSpecs>,
     /// Whether the package declares a denoise loop, i.e. whether it can serve
     /// `POST /v1/images/generations`.
     pub(crate) text_to_image: bool,
@@ -69,8 +69,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) model_max_context: Option<usize>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
-    pub(crate) vision_input: Option<VisionInputSpec>,
-    pub(crate) audio_input: Option<AudioInputSpec>,
+    pub(crate) multimodal: Option<MultimodalSpecs>,
     pub(crate) text_to_image: bool,
 }
 
@@ -85,8 +84,7 @@ impl ModelHandle {
             model_max_context,
             fim_config,
             pipeline,
-            vision_input,
-            audio_input,
+            multimodal,
             text_to_image,
         } = parts;
         Self {
@@ -98,8 +96,7 @@ impl ModelHandle {
             model_max_context,
             fim_config,
             pipeline,
-            vision_input,
-            audio_input,
+            multimodal,
             text_to_image,
             last_request_at: AtomicU64::new(now_millis()),
         }
@@ -533,8 +530,7 @@ mod tests {
             model_max_context: None,
             fim_config: None,
             pipeline: false,
-            vision_input: None,
-            audio_input: None,
+            multimodal: None,
             text_to_image: false,
             last_request_at: AtomicU64::new(last_request_at),
         })

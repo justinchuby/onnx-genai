@@ -9,37 +9,12 @@ use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
     GovernorSnapshot, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
 };
-use onnx_genai_ort::{DataType, Value};
-use onnx_genai_preprocess::image::packed::{ImageExpansionSummary, ImageTensorData};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::metrics::GenerationMetrics;
+use crate::multimodal::MultimodalInput;
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
-
-pub(crate) struct PipelineInputTensor {
-    pub(crate) endpoint: String,
-    pub(crate) data: Vec<f32>,
-    pub(crate) shape: Vec<i64>,
-    pub(crate) num_tiles: Option<usize>,
-}
-
-pub(crate) struct PipelineInputBundle {
-    pub(crate) tensors: Vec<PipelineTensor>,
-    /// Full prompt-order-preserving summaries retained across the server/driver seam.
-    pub(crate) image_summaries: Vec<ImageExpansionSummary>,
-}
-
-pub(crate) enum PipelineTensor {
-    Fp32(PipelineInputTensor),
-    Typed {
-        endpoint: String,
-        expected_dtype: DataType,
-        expected_shape: Vec<i64>,
-        shape: Vec<i64>,
-        data: ImageTensorData,
-    },
-}
 
 #[derive(Clone)]
 pub(crate) struct EngineDriver {
@@ -65,7 +40,7 @@ pub(crate) enum DriverCommand {
     },
     GeneratePipeline {
         request: Box<GenerateRequest>,
-        input: Option<PipelineInputBundle>,
+        input: Option<MultimodalInput>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -224,7 +199,7 @@ impl EngineDriver {
     pub(crate) async fn generate_pipeline(
         &self,
         request: GenerateRequest,
-        input: Option<PipelineInputBundle>,
+        input: Option<MultimodalInput>,
     ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
         let permit = self
             .generation_capacity
@@ -679,39 +654,21 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
 fn run_pipeline_generation(
     engine: &mut PipelineEngine,
     request: GenerateRequest,
-    input: Option<PipelineInputBundle>,
+    input: Option<MultimodalInput>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
     let mut metrics = GenerationMetrics::start();
-    let pipeline_request = match input {
-        Some(input) => {
-            if let Err(err) = validate_image_summaries(&input.image_summaries) {
-                let _ = events.try_send(DriverEvent::Error(err.to_string()));
-                return;
-            }
-            let mut req = PipelineGenerateRequest::new(request);
-            let mut endpoints = std::collections::HashSet::with_capacity(input.tensors.len());
-            for tensor in input.tensors {
-                let endpoint = tensor.endpoint().to_string();
-                if !endpoints.insert(endpoint.clone()) {
-                    let _ = events.try_send(DriverEvent::Error(format!(
-                        "What: pipeline tensor injection rejected a duplicate endpoint. Why: '{}' was supplied more than once. How: declare each preprocessing output endpoint exactly once.",
-                        endpoint
-                    )));
-                    return;
-                }
-                match pipeline_value(tensor) {
-                    Ok(value) => req = req.with_input(endpoint, value),
-                    Err(err) => {
-                        let _ = events.try_send(DriverEvent::Error(err.to_string()));
-                        return;
-                    }
-                }
-            }
-            req
+    let pipeline_request = match input
+        .map(|input| input.bind(PipelineGenerateRequest::new(request.clone())))
+        .transpose()
+    {
+        Ok(Some(bound)) => bound,
+        Ok(None) => PipelineGenerateRequest::new(request),
+        Err(error) => {
+            let _ = events.try_send(DriverEvent::Error(format!("{error:#}")));
+            return;
         }
-        None => PipelineGenerateRequest::new(request),
     };
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
@@ -727,61 +684,6 @@ fn run_pipeline_generation(
         Err(err) => {
             let _ = events.try_send(DriverEvent::Error(err.to_string()));
         }
-    }
-}
-
-fn validate_image_summaries(summaries: &[ImageExpansionSummary]) -> anyhow::Result<()> {
-    for (prompt_index, summary) in summaries.iter().enumerate() {
-        if summary.image_index != prompt_index {
-            anyhow::bail!(
-                "What: pipeline image admission ordering is inconsistent. \
-                 Why: prompt image {prompt_index} carries expansion summary index {}. \
-                 How: preserve image content parts, tensor packing, and summaries in prompt order.",
-                summary.image_index
-            );
-        }
-    }
-    Ok(())
-}
-
-impl PipelineTensor {
-    fn endpoint(&self) -> &str {
-        match self {
-            Self::Fp32(tensor) => &tensor.endpoint,
-            Self::Typed { endpoint, .. } => endpoint,
-        }
-    }
-}
-
-fn pipeline_value(tensor: PipelineTensor) -> anyhow::Result<Value> {
-    match tensor {
-        PipelineTensor::Fp32(tensor) => {
-            if tensor.num_tiles.is_some() {
-                anyhow::bail!(
-                    "What: legacy aggregate image input '{}' was rejected. Why: num_tiles cannot preserve per-image placeholder ordering. How: use the typed image tensor bundle and expansion summaries.",
-                    tensor.endpoint
-                );
-            }
-            Value::from_vec_f32(tensor.data, &tensor.shape).with_context(|| {
-                format!(
-                    "What: pipeline endpoint '{}' tensor construction failed. Why: expected Float32 shape {:?}. How: correct the processor output shape/data length.",
-                    tensor.endpoint, tensor.shape
-                )
-            })
-        }
-        PipelineTensor::Typed {
-            endpoint,
-            expected_dtype,
-            expected_shape,
-            shape,
-            data,
-        } => crate::image_input::image_tensor_value(crate::image_input::ImageTensor {
-            endpoint,
-            expected_dtype,
-            expected_shape,
-            shape,
-            data,
-        }),
     }
 }
 
