@@ -128,7 +128,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 .enumerate()
             {
                 let square_sum =
-                    assemble_sum_and_sum_squares(input_row, skip_row, bias.as_deref(), sum_row);
+                    crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
+                        input_row,
+                        skip_row,
+                        bias.as_deref(),
+                        sum_row,
+                    );
                 let variance = square_sum / hidden as f32;
                 let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
                 if let Some(values) = inv_std_vars.as_mut() {
@@ -166,7 +171,7 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         for group in 0..groups {
             let base = group * hidden;
             let row = &sum[base..base + hidden];
-            let variance = sum_squares(row) / hidden as f32;
+            let variance = crate::kernels::simd_sumsq::sum_of_squares(row) / hidden as f32;
             let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
             if let Some(values) = inv_std_vars.as_mut() {
                 values[group] = inv_std_var;
@@ -193,69 +198,6 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
 }
 
 const SIMD_LANES: usize = 8;
-
-fn assemble_sum_and_sum_squares(
-    input: &[f32],
-    skip: &[f32],
-    bias: Option<&[f32]>,
-    sum: &mut [f32],
-) -> f32 {
-    debug_assert_eq!(input.len(), skip.len());
-    debug_assert_eq!(input.len(), sum.len());
-    debug_assert!(bias.is_none_or(|bias| bias.len() == input.len()));
-
-    let mut lane_sums = [0.0f32; SIMD_LANES];
-    let bulk_len = input.len() / SIMD_LANES * SIMD_LANES;
-    let mut base = 0;
-    if let Some(bias) = bias {
-        while base < bulk_len {
-            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
-                let index = base + lane;
-                let value = input[index] + skip[index] + bias[index];
-                sum[index] = value;
-                *lane_sum += value * value;
-            }
-            base += SIMD_LANES;
-        }
-    } else {
-        while base < bulk_len {
-            for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
-                let index = base + lane;
-                let value = input[index] + skip[index];
-                sum[index] = value;
-                *lane_sum += value * value;
-            }
-            base += SIMD_LANES;
-        }
-    }
-
-    let mut square_sum = lane_sums.into_iter().sum::<f32>();
-    for index in bulk_len..input.len() {
-        let value = input[index] + skip[index] + bias.map_or(0.0, |bias| bias[index]);
-        sum[index] = value;
-        square_sum += value * value;
-    }
-    square_sum
-}
-
-fn sum_squares(values: &[f32]) -> f32 {
-    let mut lane_sums = [0.0f32; SIMD_LANES];
-    let bulk_len = values.len() / SIMD_LANES * SIMD_LANES;
-    let mut base = 0;
-    while base < bulk_len {
-        for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
-            let value = values[base + lane];
-            *lane_sum += value * value;
-        }
-        base += SIMD_LANES;
-    }
-
-    let mut square_sum = lane_sums.into_iter().sum::<f32>();
-    for &value in &values[bulk_len..] {
-        square_sum += value * value;
-    }
-    square_sum
-}
 
 fn normalize_and_scale(sum: &[f32], output: &mut [f32], inv_std: f32, gamma: &[f32]) {
     debug_assert_eq!(sum.len(), output.len());
