@@ -11,7 +11,7 @@ skipped tokens.
 |---|---:|---:|---|---|
 | GLM-4-9B int4 CUDA | 108.78 tok/s | Cannot load | Not testable: ORT rejects partial-RoPE GQA | Coherent natural-language/math continuation |
 | GLM-5.2 tiny QMoE | 176.66 tok/s | Cannot load | Not testable: ORT lacks `pkg.nxrt::IndexShare` | Structurally valid deterministic decimal-token stream |
-| GLM-5.2 tiny q4 | Decode fails after token 0 | 1,182.89 tok/s* | Token 0 matches (`110`); subsequent parity blocked | Not assessable on native because decode stops at token 1 |
+| GLM-5.2 tiny q4 | Decodes (eager, no CUDA-graph capture) — see fix note below | 1,182.89 tok/s* | Token 0 matches (`110`); tiny random weights, full parity oracle N/A | Structurally valid deterministic decimal-token stream |
 
 \* This tiny-model ORT number is GPU-resident but is not representative of a
 real GLM checkpoint. A sustained 50-run probe reached 75% sampled GPU
@@ -71,6 +71,21 @@ artifact contains a native-only `pkg.nxrt::IndexShare` op.
 
 ## GLM-5.2 tiny dense q4
 
+> **Update (fix `fix/glm52-decode-mask-capacity`):** this decode-token-1 broadcast
+> failure is **resolved**. The single-token `attention_mask` exposure is now routed
+> by *consumer class*: a mask binding whose value feeds a non-capacity-aware
+> consumer (the indexer `Cast → Add` arithmetic, i.e. anything outside the
+> `Shape`/`ReduceSum` padded-capacity allowlist) exposes its **logical** valid
+> length instead of the frozen physical capacity (`max_len`). Because that mask
+> then grows per step, such models decode **eagerly and forfeit CUDA-graph
+> capture** on every decode step — the same trade-off the eager prefill path
+> already makes. This is a correctness-over-throughput trade that applies **only**
+> to indexer/logical-mask exports; capacity-safe masks (Qwen, DeepSeek, GLM-4)
+> keep the frozen fast path and CUDA-graph capture, verified byte-identical to the
+> pre-fix baseline. Native CUDA now decodes both `[123]` and `[1,2,3,4]` past
+> token 1 (regression locked by `glm_tiny_quant_native_cuda_e2e.rs`). The failing
+> behaviour below is the pre-fix state, retained for provenance.
+
 - Artifact: `~/glm-e2e-artifacts/glm-5.2-tiny-q4`
 - Native CUDA loads and emits the first greedy token `110`, but the next decode
   step fails. With prompt token `123`, the exact error is:
@@ -112,15 +127,18 @@ oracle is not applicable until the binding policy is fixed.
 
 ## Current gaps
 
-1. Restore native GLM-5.2 tiny-q4 multi-token decode by changing the CUDA
-   single-token `attention_mask` exposure policy: retain its logical length
-   when a mask-dependent non-Attention consumer reaches the GLM indexer score
-   path, rather than always exposing the fixed 4096 capacity. The relevant
-   implementation is `DecodeCudaState::extend_mask` in
-   `crates/onnx-genai-engine/src/native_decode.rs`; the runtime must then keep
-   `Add_node_70` operands at the same logical prefix (`2`, `5`, ...). Add a
-   native-CUDA regression that requires more than one generated token, with
-   both `[123]` and `[1,2,3,4]` prompts.
+1. ~~Restore native GLM-5.2 tiny-q4 multi-token decode by changing the CUDA
+   single-token `attention_mask` exposure policy~~ **(DONE — fix
+   `fix/glm52-decode-mask-capacity`).** The mask now retains its logical length
+   whenever a mask-dependent, non-capacity-aware consumer (outside the
+   `Shape`/`ReduceSum` allowlist) reaches the GLM indexer score path, rather than
+   always exposing the fixed 4096 capacity; `Add_node_70` operands stay at the
+   same logical prefix (`2`, `5`, ...). Implemented via
+   `DeviceIoBinding::exposes_logical_input_shape` +
+   `DecodeCudaState::decode_mask_expose_len` in `native_decode.rs`; such models
+   decode eagerly (no CUDA-graph capture). The native-CUDA regression requiring
+   more than one generated token, with both `[123]` and `[1,2,3,4]` prompts, is
+   `glm_tiny_quant_native_cuda_e2e.rs`.
 2. Obtain an ORT-compatible GLM-4 export/runtime supporting the
    `GroupQueryAttention.rotary_embedding_dim` partial-RoPE schema. Until then,
    GLM-4 parity, log-probability comparison, and native-vs-ORT speed claims are
