@@ -326,6 +326,37 @@ DequantizeExtensible(W) → MatMul(X, W_dequant)
 
 This preserves compatibility with existing ops while enabling quantized fast paths.
 
+### 4.5 CUSTOM_QUANT and Gather (MoE Support)
+
+MoE models store expert weights in `[num_experts, H, I]` tensors. After routing
+selects top-k experts, the runtime needs to gather only those experts' packed
+weights without dequantizing all of them.
+
+**Rule:** `Gather` on `CUSTOM_QUANT` tensors is valid when the gather axis is
+block-boundary aligned. Expert dimension (axis=0) always qualifies.
+
+```
+expert_weights: CUSTOM_QUANT [num_experts, hidden, intermediate]
+routing_indices: int64 [top_k]
+
+selected = Gather(expert_weights, routing_indices, axis=0)
+    # → CUSTOM_QUANT [top_k, hidden, intermediate]
+dequant = DequantizeExtensible(selected, scales[routing_indices])
+output = MatMul(tokens, dequant)
+```
+
+**EP fusion pattern:**
+```
+Gather(CUSTOM_QUANT) → DequantizeExtensible → MatMul
+→ fused: QuantizedMoEMatMul(packed_experts, indices, tokens, gate_scores)
+```
+
+This aligns with the onnx-genai MoE architecture where expert dispatch happens
+at the runtime session level — each session loads only its assigned experts, and
+block-aligned gather works identically for single-node and distributed MoE.
+
+Non-block-aligned Gather on CUSTOM_QUANT is undefined behavior.
+
 ## 5. EP Negotiation
 
 ### 5.1 EP Interface

@@ -300,6 +300,35 @@ DequantizeExtensible(W) → MatMul(X, W_dequant)
 → fused: QuantizedMatMul(X, W_packed)
 ```
 
+### CUSTOM_QUANT and Gather (MoE Support)
+
+Mixture-of-Experts models store all expert weights in a single tensor
+(`[num_experts, hidden, intermediate]`) and dynamically select a subset via
+routing. This requires `Gather` on quantized tensors.
+
+**Rule:** `Gather` on a `CUSTOM_QUANT` tensor is valid when the gather axis is
+**block-boundary aligned** — i.e., slicing along that axis produces complete
+blocks with no partial-block splits. The expert dimension (axis=0) always
+qualifies.
+
+```
+expert_weights: CUSTOM_QUANT [num_experts, hidden, intermediate]
+routing_indices: int64 [top_k]
+
+selected = Gather(expert_weights, routing_indices, axis=0)
+    # → CUSTOM_QUANT [top_k, hidden, intermediate]
+dequant = DequantizeExtensible(selected, scales[routing_indices])
+output = MatMul(tokens, dequant)
+```
+
+**Fusion:** EPs SHOULD recognize:
+```
+Gather(CUSTOM_QUANT) → DequantizeExtensible → MatMul
+→ fused: QuantizedMoEMatMul(packed_experts, indices, tokens, gate_scores)
+```
+
+Non-block-aligned Gather on CUSTOM_QUANT is undefined behavior.
+
 ### Backward Compatibility
 
 - Models without `quant_type_uri` are unaffected
