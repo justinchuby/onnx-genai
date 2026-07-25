@@ -20,10 +20,9 @@ use onnx_genai_ort::{
 };
 use onnx_genai_preprocess::image::packed::ImageExpansionSummary;
 
-use crate::audio_input::AudioInputSpec;
 use crate::image_input::{VisionOutputBinding, metadata_dtype};
 
-pub use crate::audio_input::{AudioTensor, preprocess_wav};
+pub use crate::audio_input::{AudioInputSpec, AudioTensor, preprocess_samples, preprocess_wav};
 pub use crate::image_input::{
     ImageBundle, ImageTensor, MAX_EXPANDED_PROMPT_TOKENS, VisionInputSpec, image_tensor_value,
     preprocess_encoded_images,
@@ -202,6 +201,22 @@ impl MultimodalInput {
         })
     }
 
+    /// Preprocess raw `[-1, 1]` mono samples, for callers streaming audio.
+    pub fn from_samples(
+        spec: &AudioInputSpec,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            tensors: vec![PreparedTensor::Audio(preprocess_samples(
+                samples,
+                sample_rate,
+                spec,
+            )?)],
+            image_summaries: Vec::new(),
+        })
+    }
+
     /// Bind every prepared tensor onto `request`, failing closed on a duplicate
     /// endpoint or an image ordering that no longer matches the prompt.
     pub fn bind(
@@ -232,6 +247,15 @@ impl MultimodalInput {
         }
         Ok(request)
     }
+}
+
+/// Longest audio, in seconds, the model's declared input window accepts.
+///
+/// Derived from the declared frame count at Whisper's 10 ms hop, so the caller
+/// never has to assume a 30-second window.
+pub fn audio_window_seconds(spec: &AudioInputSpec) -> f32 {
+    spec.n_frames as f32 * onnx_genai_preprocess::audio::WHISPER_HOP_LENGTH as f32
+        / onnx_genai_preprocess::audio::WHISPER_SAMPLE_RATE as f32
 }
 
 /// Token budget available to image placeholder expansion.

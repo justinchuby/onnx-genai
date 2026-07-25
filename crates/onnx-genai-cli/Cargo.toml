@@ -50,6 +50,7 @@ mlas = ["onnx-genai-server/mlas"]
 
 [dependencies]
 onnx-genai = { workspace = true }
+serde_json = { workspace = true }
 onnx-genai-engine = { workspace = true }
 onnx-genai-server = { workspace = true }
 clap = { workspace = true }
@@ -62,6 +63,7 @@ tracing-subscriber = { workspace = true }
 # The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
 image = { version = "0.25", default-features = false, features = ["png"] }
 onnx-genai = { workspace = true }
+serde_json = { workspace = true }
 
 [dependencies.pyo3]
 version = "0.29"

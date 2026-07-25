@@ -142,6 +142,38 @@ declares. For packages whose pipeline stops at the latent instead of declaring
 a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
 `--vae-scaling-factor`).
 
+### Transcribe speech
+
+`transcribe` turns speech into text, from files or a live stream:
+
+```bash
+# One or more WAV files
+onnx-genai transcribe models/whisper-tiny talk.wav --format srt
+
+# Live: transcribed as it arrives, one segment at a time
+ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 -f wav - 2>/dev/null \
+  | onnx-genai transcribe models/whisper-tiny -
+
+# Headerless PCM16 works too, e.g. from arecord
+arecord -f S16_LE -r 16000 -c 1 -t raw \
+  | onnx-genai transcribe models/whisper-tiny - --sample-rate 16000
+```
+
+A speech encoder consumes a bounded window, so long audio is cut into segments:
+at a silence when there is one, and at the model's declared window otherwise.
+Each segment is printed as soon as it is recognized, which is what makes the
+live path usable — latency is one segment, not one recording. Silence between
+segments is skipped rather than transcribed, and the timestamps reflect that.
+
+`--format json` emits one object per segment (`index`, `start`, `end`, `text`);
+`--format srt` emits subtitles. Diagnostics, including a real-time factor
+showing whether the model keeps up with live audio, go to stderr so stdout stays
+a clean transcript. Tune segmentation with `--segment-seconds`,
+`--silence-seconds`, `--silence-threshold`, and `--min-segment-seconds`.
+
+Whole-file transcription is also available over HTTP as
+`POST /v1/audio/transcriptions`.
+
 ### Generate speech
 
 `generate --output-audio` synthesizes through a text-to-speech package — an
