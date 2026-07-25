@@ -4,9 +4,34 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-24T23:15:00Z_
+_Last updated: 2026-07-25T01:15:00Z_
 
-**Current `origin/main` implementation HEAD:** `9271c881` (opt-in fp16-fused decode precision mode).
+**Current `origin/main` implementation HEAD:** `9f1618bb`.
+
+## 2026-07-25 — Uncontended H200 acc-4/fp16/ORT sweep
+
+- **Trustworthy quiet-GPU validation for #123 and #127:** on physical H200 GPU
+  6 (0 MiB, 0% utilization before every configuration), the accuracy-level-4
+  native `model` path reached **193.31 tok/s** on Phi-3.5-mini and **159.10
+  tok/s** on Qwen2.5-Coder-7B. Opt-in fp16 reached **378.89** and **300.87
+  tok/s**, respectively: **1.960×** and **1.891×** over the corrected fp32
+  activation path. This replaces the prior contended-host caveat for those
+  native absolute rates.
+- **Native beat ORT on both CUDA-targeted artifacts:** Qwen2.5-0.5B measured
+  **907.87 vs. 583.31 tok/s (1.556×)**, and DeepSeek-R1-Distill-Qwen-1.5B
+  measured **633.69 vs. 445.92 tok/s (1.421×)**. Their fp16 option was the
+  expected no-op because the graphs already use fp16 activation/scales.
+- **Invalid ORT baseline for generic-CPU artifacts (not a "vs ORT" claim):**
+  Phi and Coder measured native-model/ORT ratios of 25.302× and 5.357×, but ORT
+  appended the CUDA EP yet could not place the `generic-cpu` graph on the GPU
+  (67/57 inserted `Memcpy` nodes; partial CUDA EP assignment), so ORT ran
+  largely on the CPU. Those ratios compare native CUDA against a broken
+  CPU-fallback baseline and are **excluded from any headline vs-ORT claim**; the
+  only valid native-vs-ORT rows are the CUDA-targeted Qwen2.5-0.5B (1.556×) and
+  DeepSeek (1.421×) above. Generated text was readable; Qwen2.5-Coder-7B had an
+  identical backend-neutral EOS/newline tail. Full medians, spreads, commands,
+  host state, and sanity notes:
+  `docs/benchmarks/2026-07-25-uncontended-native-vs-ort-sweep.md`.
 
 ## 2026-07-24 — Accuracy-level-4 correctness and opt-in fp16 decode payoff
 
