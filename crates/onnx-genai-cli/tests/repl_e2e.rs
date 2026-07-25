@@ -313,3 +313,63 @@ fn two_ctrl_c_presses_are_needed_to_exit_an_idle_prompt() {
         "the second press must exit with 128 + SIGINT"
     );
 }
+
+/// A copy of the tiny text model whose chat template declares reasoning
+/// delimiters, the way a reasoning model's template does.
+#[cfg(unix)]
+fn reasoning_model() -> PathBuf {
+    let source = fixture("tiny-llm");
+    let dir = repository_root().join("target/test-fixtures/tiny-llm-reasoning");
+    std::fs::create_dir_all(&dir).unwrap();
+    for entry in std::fs::read_dir(&source).unwrap().flatten() {
+        let name = entry.file_name();
+        if name != "tokenizer_config.json" {
+            let _ = std::fs::copy(entry.path(), dir.join(&name));
+        }
+    }
+    // The template opens the span after the generation prompt, which is how
+    // reasoning templates are written: the model only ever emits the close.
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        r#"{"chat_template":"{% for m in messages %}<|{{ m.role }}|>\n{{ m.content }}\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n<think>\n{% endif %}"}"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer() {
+    // Two tokens cannot reach the closing delimiter, so the turn genuinely has
+    // no answer to remember — and the REPL must say so rather than silently
+    // storing an empty assistant message.
+    let output = text(&repl(
+        &reasoning_model(),
+        &["--max-new-tokens", "2"],
+        "hello\n\n",
+    ));
+
+    assert!(
+        output.contains("stopped inside the model's reasoning"),
+        "the truncated turn must be reported: {output}"
+    );
+    assert!(
+        output.contains("--max-new-tokens"),
+        "the fix must be named: {output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_model_without_reasoning_delimiters_reports_nothing_about_them() {
+    let output = text(&repl(
+        &text_model(),
+        &["--max-new-tokens", "2"],
+        "hello\n\n",
+    ));
+
+    assert!(
+        !output.contains("reasoning"),
+        "a plain model must not mention reasoning: {output}"
+    );
+}

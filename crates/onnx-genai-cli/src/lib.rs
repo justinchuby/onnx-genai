@@ -26,7 +26,7 @@
 //!   the Python entry point is how the wheel finds ONNX Runtime at exec time.
 
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +42,7 @@ use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Token
 use onnx_genai::preprocess::audio::{
     AudioSegment, SegmentConfig, StreamSegmenter, decode_wav_pcm16,
 };
+use onnx_genai::reasoning::{ReasoningMarkers, ReasoningStream};
 use onnx_genai::text_to_audio::{self, TextToAudioRequest};
 use onnx_genai::text_to_image::{self, TextToImageRequest, VaeDecoder};
 use onnx_genai::{
@@ -157,6 +158,32 @@ fn install_ctrlc_handler() {
             eprintln!("warning: could not install Ctrl-C handler: {error}");
         }
     });
+}
+
+/// The reasoning convention a loaded model declares.
+#[derive(Debug, Clone)]
+struct ReasoningConfig {
+    markers: ReasoningMarkers,
+    /// True when the template writes the opening delimiter itself, so the
+    /// model's output begins inside the span and never emits an opener.
+    opened_by_template: bool,
+}
+
+/// Reasoning delimiters this model declares through its chat template, if any.
+fn detect_reasoning(template: Option<&ChatTemplate>) -> Option<ReasoningConfig> {
+    let template = template?;
+    let source = template.source();
+    let markers = ReasoningMarkers::from_chat_template(source)?;
+    // The opener appearing after the assistant generation prompt means the
+    // template opens the span for the model.
+    let opened_by_template = source
+        .rsplit_once("assistant")
+        .map(|(_, tail)| tail.contains(&markers.start))
+        .unwrap_or(false);
+    Some(ReasoningConfig {
+        markers,
+        opened_by_template,
+    })
 }
 
 /// Load the model's chat template unless `raw` is set. On a load failure this
@@ -457,6 +484,7 @@ fn run_generation_turn(
     turn: TurnInput,
     stream: bool,
     profile: Option<&mut RunProfile>,
+    reasoning: Option<&ReasoningConfig>,
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
@@ -464,6 +492,13 @@ fn run_generation_turn(
     let mut output = String::new();
     let mut timings = profile::TokenTimings::default();
     timings.start();
+    // Reasoning is dimmed as it streams so a reader can tell a model's thinking
+    // from its answer. Only on a terminal: escape codes in a pipe would corrupt
+    // the text a caller is parsing.
+    let dim_reasoning = stream && reasoning.is_some() && io::stdout().is_terminal();
+    let mut reasoning_stream = reasoning
+        .map(|config| ReasoningStream::new(config.markers.clone(), config.opened_by_template));
+    let mut dimmed = false;
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Interrupted));
@@ -473,6 +508,14 @@ fn run_generation_turn(
         timings.token();
         output.push_str(&token.text);
         if stream {
+            let is_reasoning = reasoning_stream
+                .as_mut()
+                .map(|tracker| tracker.push(&token.text))
+                .unwrap_or(false);
+            if dim_reasoning && is_reasoning != dimmed {
+                print!("{}", if is_reasoning { "\x1b[2m" } else { "\x1b[0m" });
+                dimmed = is_reasoning;
+            }
             print!("{}", token.text);
             io::stdout().flush()?;
         }
@@ -480,6 +523,10 @@ fn run_generation_turn(
     };
 
     let result = backend.generate(turn, &mut callback);
+    if dimmed {
+        print!("\x1b[0m");
+        let _ = io::stdout().flush();
+    }
     GENERATING.store(false, Ordering::SeqCst);
     timings.finish();
     if let Some(profile) = profile {
@@ -572,12 +619,14 @@ struct Cli {
     profiling: ProfileArgs,
 }
 
+// `Serve` and `Generate` carry much larger argument structs than the rest, so
+// the variants are boxed to keep the enum from being sized by its widest arm.
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Start an OpenAI-compatible HTTP server.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Generate text from a single prompt and exit.
-    Generate(GenerateArgs),
+    Generate(Box<GenerateArgs>),
     /// Start an interactive generation REPL (one prompt per line).
     Run(RunArgs),
     /// Show a model's resolved files and metadata.
@@ -586,7 +635,7 @@ enum Commands {
     #[command(alias = "ls")]
     List(ListArgs),
     /// Transcribe speech to text, from files or a live stream.
-    Transcribe(TranscribeArgs),
+    Transcribe(Box<TranscribeArgs>),
     /// Print version and available execution providers.
     Version,
 }
@@ -1049,11 +1098,11 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     match cli.command {
         Commands::Serve(serve_args) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(run_serve(serve_args))
+            runtime.block_on(run_serve(*serve_args))
         }
-        Commands::Generate(generate_args) => generate(generate_args, &profiling),
+        Commands::Generate(generate_args) => generate(*generate_args, &profiling),
         Commands::Run(run_args) => run_repl(run_args, &profiling),
-        Commands::Transcribe(transcribe_args) => transcribe(transcribe_args, &profiling),
+        Commands::Transcribe(transcribe_args) => transcribe(*transcribe_args, &profiling),
         Commands::Show(show_args) => show(&show_args.model),
         Commands::List(list_args) => list(&list_args.models_dir),
         Commands::Version => {
@@ -1100,7 +1149,14 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
         profile.memory = memory;
     }
     let pages_before = backend.page_stats();
-    match run_generation_turn(&mut backend, turn, args.stream, Some(&mut profile)) {
+    let reasoning = detect_reasoning(template.as_ref());
+    match run_generation_turn(
+        &mut backend,
+        turn,
+        args.stream,
+        Some(&mut profile),
+        reasoning.as_ref(),
+    ) {
         Ok(output) => {
             if args.stream {
                 println!();
@@ -1263,6 +1319,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     let load_elapsed = load_started.elapsed();
     let mut raw_mode = args.sampling.raw;
     let mut template = load_chat_template(&model_dir, raw_mode);
+    let mut reasoning = detect_reasoning(template.as_ref());
 
     eprintln!(
         "onnx-genai interactive session ({} input). Enter a prompt, or an empty line / Ctrl-D to exit.\n\
@@ -1309,6 +1366,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             ReplLine::Command(ReplCommand::ToggleRaw) => {
                 raw_mode = !raw_mode;
                 template = load_chat_template(&model_dir, raw_mode);
+                reasoning = detect_reasoning(template.as_ref());
                 println!("raw mode {}", if raw_mode { "enabled" } else { "disabled" });
                 None
             }
@@ -1389,10 +1447,31 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             profile.memory = memory;
         }
         let pages_before = backend.page_stats();
-        match run_generation_turn(&mut backend, turn, true, Some(&mut profile)) {
+        match run_generation_turn(
+            &mut backend,
+            turn,
+            true,
+            Some(&mut profile),
+            reasoning.as_ref(),
+        ) {
             Ok(output) => {
                 println!();
-                history.push(ChatMessage::assistant(output));
+                // Reasoning models are trained with earlier turns' thinking
+                // removed, so replaying it degrades quality and inflates the
+                // context. Only the answer becomes history.
+                let reply = match reasoning.as_ref() {
+                    Some(config) => {
+                        let split = config.markers.split(&output, config.opened_by_template);
+                        if !split.complete {
+                            eprintln!(
+                                "note: generation stopped inside the model's reasoning, so this turn has no answer to remember. Raise --max-new-tokens."
+                            );
+                        }
+                        split.answer.to_string()
+                    }
+                    None => output,
+                };
+                history.push(ChatMessage::assistant(reply));
                 if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
                     profile.pages = Some(profile::PageActivity::since(before, after));
                 }
@@ -2130,7 +2209,7 @@ fn read_wav_stream_header<R: BufRead>(reader: &mut R) -> anyhow::Result<StreamHe
             // Skip any other chunk (LIST, fact, ...), padded to even length.
             // Discarded in bounded blocks: the declared size is untrusted, so it
             // must never become an allocation.
-            let padded = u64::from(size as u64) + u64::from(size as u64 % 2);
+            let padded = size as u64 + (size as u64 % 2);
             let mut remaining = padded;
             let mut sink = [0_u8; 8192];
             while remaining > 0 {

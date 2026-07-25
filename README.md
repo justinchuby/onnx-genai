@@ -287,6 +287,27 @@ declares. For packages whose pipeline stops at the latent instead of declaring
 a final VAE phase, add `--vae-decoder <latent-to-image.onnx>` (and
 `--vae-scaling-factor`).
 
+### Reasoning models
+
+Models that emit a chain of thought before the answer are handled automatically.
+The delimiters are read from the package's own chat template — a template that
+writes `<think>` is declaring the convention — so nothing is keyed off a model
+name and a package that declares none is untouched.
+
+In `run`, reasoning is dimmed as it streams (on a terminal only, so a piped
+transcript stays clean), and **only the answer becomes conversation history**.
+These models are trained with earlier turns' thinking removed: replaying it
+degrades quality and inflates the context, since the reasoning of a long session
+can dwarf the conversation itself.
+
+If the decode budget runs out inside the reasoning, the turn genuinely has no
+answer, and the REPL says so rather than silently storing an empty reply:
+
+```text
+note: generation stopped inside the model's reasoning, so this turn has no
+answer to remember. Raise --max-new-tokens.
+```
+
 ### Transcribe speech
 
 `transcribe` turns speech into text, from files or a live stream:
