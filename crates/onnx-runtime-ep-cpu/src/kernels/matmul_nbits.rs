@@ -505,22 +505,61 @@ impl Kernel for MatMulNBitsKernel {
                 owned_weight = numa_place_int8(built, self.n);
                 &owned_weight
             };
-            let mut matmul = || {
-                int8_matmul(
-                    &activations,
-                    int8_weight,
-                    result,
-                    m,
-                    self.k,
-                    self.n,
-                    self.block_size,
-                    dot_kernel,
-                );
-            };
             if m == 1 {
-                with_decode_pool(matmul)?;
+                with_decode_pool(|| {
+                    int8_matmul(
+                        &activations,
+                        int8_weight,
+                        result,
+                        m,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                })?;
             } else {
-                matmul();
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if m >= amx::AMX_PREFILL_MIN_M
+                        && amx::amx_block_size_supported(self.block_size)
+                        && amx::amx_int8_available()
+                    {
+                        amx::int8_matmul_amx(
+                            &activations,
+                            int8_weight,
+                            result,
+                            m,
+                            self.k,
+                            self.n,
+                            self.block_size,
+                        );
+                    } else {
+                        int8_matmul(
+                            &activations,
+                            int8_weight,
+                            result,
+                            m,
+                            self.k,
+                            self.n,
+                            self.block_size,
+                            dot_kernel,
+                        );
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    int8_matmul(
+                        &activations,
+                        int8_weight,
+                        result,
+                        m,
+                        self.k,
+                        self.n,
+                        self.block_size,
+                        dot_kernel,
+                    );
+                }
             }
         } else if self.bits == 8 && m == 1 && group_indices.is_none() {
             // 8-bit decode GEMV: keep the weight at one byte per element and
@@ -2756,6 +2795,312 @@ fn int8_row(
     }
 }
 
+/// Intel AMX INT8 tile GEMM fast path for int4 `MatMulNBits` **prefill** (M > 1).
+///
+/// Decode (`M == 1`) is a GEMV and AMX (which multiplies 16-row A tiles) cannot
+/// help it, so this is scoped to prefill. It reproduces the exact `int8_row`
+/// arithmetic — per-K-block `u8 x i8` dot, the `- 128 * block_sum` unsigned->
+/// signed correction, and the per-block `f32` scale accumulation — but computes
+/// each 16xN x block int8 dot with an AMX `tdpbusd` (exact `u8 x i8 -> i32`
+/// tile MAC, no saturating intermediate) instead of a scalar/VNNI reduction.
+/// Because `tdpbusd` accumulates in i32 with no rounding and the f32 scaling is
+/// applied in the same block order as the scalar reference, the result is
+/// **bit-identical** to `int8_matmul`'s `DotKernel::Scalar` path.
+///
+/// Everything is gated on runtime AMX detection ([`amx_int8_available`]) and a
+/// worthwhile `M` ([`AMX_PREFILL_MIN_M`]); non-AMX hosts, decode, and other
+/// accuracy levels never reach here and are byte-for-byte unaffected.
+#[cfg(target_arch = "x86_64")]
+mod amx {
+    use std::arch::asm;
+    use std::sync::OnceLock;
+
+    use rayon::prelude::*;
+
+    use super::{Int8Weight, quantize_activation};
+
+    /// Minimum prefill `M` before the AMX tile GEMM is worth its fixed setup
+    /// (tile config + one-time VNNI4 weight repack). AMX consumes A in 16-row
+    /// tiles, so below one full tile there is no tile to fill; the existing
+    /// VNNI/scalar prefill path handles `M < AMX_PREFILL_MIN_M`. Tunable.
+    pub(super) const AMX_PREFILL_MIN_M: usize = 16;
+
+    /// 64-byte `TILECFG` operand for `ldtilecfg` (palette 1). Only tiles 0..=2
+    /// are used: tmm0 = C (i32 accumulator), tmm1 = A (u8 activations), tmm2 =
+    /// B (i8 weights, VNNI4-packed).
+    #[repr(C, align(64))]
+    struct TileConfig {
+        palette: u8,
+        start_row: u8,
+        reserved: [u8; 14],
+        colsb: [u16; 16],
+        rows: [u8; 16],
+    }
+
+    impl TileConfig {
+        /// Build the config for a `ksub`-wide K sub-tile (`ksub` is the bytes of
+        /// K consumed per `tdpbusd`, `<= 64` and a multiple of 4).
+        fn new(ksub: usize) -> Self {
+            let mut cfg = TileConfig {
+                palette: 1,
+                start_row: 0,
+                reserved: [0; 14],
+                colsb: [0; 16],
+                rows: [0; 16],
+            };
+            // tmm0 = C: 16 rows x 16 i32 columns (64 bytes/row).
+            cfg.rows[0] = 16;
+            cfg.colsb[0] = 64;
+            // tmm1 = A: 16 rows x `ksub` u8 columns.
+            cfg.rows[1] = 16;
+            cfg.colsb[1] = ksub as u16;
+            // tmm2 = B (VNNI4): `ksub/4` rows x 16 columns x 4 bytes = 64 bytes.
+            cfg.rows[2] = (ksub / 4) as u8;
+            cfg.colsb[2] = 64;
+            cfg
+        }
+    }
+
+    /// Request permission to use AMX tile data (`XFEATURE_XTILEDATA`) from the
+    /// Linux kernel via `arch_prctl(ARCH_REQ_XCOMP_PERM, ...)`. Without this the
+    /// first tile instruction `#GP`-faults. The grant is process-wide, so a
+    /// single successful call enables every current and future thread. Returns
+    /// `true` on success (`rax == 0`).
+    fn request_amx_tile_permission() -> bool {
+        const SYS_ARCH_PRCTL: i64 = 158;
+        const ARCH_REQ_XCOMP_PERM: i64 = 0x1023;
+        const XFEATURE_XTILEDATA: i64 = 18;
+        let ret: i64;
+        // SAFETY: a plain `arch_prctl` syscall with constant, valid arguments;
+        // it only toggles this process's AMX permission and clobbers the
+        // syscall-clobbered `rcx`/`r11`.
+        unsafe {
+            asm!(
+                "syscall",
+                inlateout("rax") SYS_ARCH_PRCTL => ret,
+                in("rdi") ARCH_REQ_XCOMP_PERM,
+                in("rsi") XFEATURE_XTILEDATA,
+                out("rcx") _,
+                out("r11") _,
+                options(nostack),
+            );
+        }
+        ret == 0
+    }
+
+    /// Runtime AMX-INT8 capability, detected once and cached.
+    ///
+    /// Requires CPUID leaf 7 sub-leaf 0 `EDX[24]` (AMX-TILE) and `EDX[25]`
+    /// (AMX-INT8) **and** a successful tile-data permission request. The
+    /// unstable `is_x86_feature_detected!("amx-int8")` macro is unavailable on
+    /// stable Rust, so this reads CPUID directly (the same bits it would check).
+    pub(super) fn amx_int8_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            // CPUID leaf 7 is present on every x86_64 CPU that reaches this
+            // crate; `__cpuid_count` only reads processor feature flags.
+            let leaf7 = std::arch::x86_64::__cpuid_count(7, 0);
+            let has_amx_tile = (leaf7.edx >> 24) & 1 == 1;
+            let has_amx_int8 = (leaf7.edx >> 25) & 1 == 1;
+            has_amx_tile && has_amx_int8 && request_amx_tile_permission()
+        })
+    }
+
+    /// Whether a `block_size` maps cleanly onto AMX K sub-tiles: K per
+    /// `tdpbusd` is `min(block_size, 64)` and must be a positive multiple of 4,
+    /// and a `> 64` block must be a whole number of 64-wide sub-tiles. Every
+    /// spec-legal power-of-two `MatMulNBits` block size (16/32/64/128/256/...)
+    /// qualifies; the guard keeps any exotic size on the scalar/VNNI path.
+    pub(super) fn amx_block_size_supported(block_size: usize) -> bool {
+        let ksub = block_size.min(64);
+        ksub >= 4 && ksub.is_multiple_of(4) && block_size.is_multiple_of(ksub)
+    }
+
+    /// One K-block of the tile GEMM for a fixed 16-row A tile and 16-column B
+    /// tile: zero the C accumulator, run `steps` `tdpbusd`s over the block's K
+    /// (advancing the A and B pointers between sub-tiles), and store the i32
+    /// result into `c_buf` (16x16, row stride 64 bytes).
+    ///
+    /// # Safety
+    /// - AMX must be available and `ldtilecfg` already loaded for `(16, ksub)`
+    ///   tiles on this thread.
+    /// - `a_ptr` must address at least 16 rows at stride `a_stride`, each with
+    ///   `steps * ksub` valid bytes from `a_ptr`; `b_ptr` likewise `steps`
+    ///   contiguous VNNI4 sub-tiles; `c_buf` must hold 256 `i32`s.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn amx_block(
+        a_ptr: *const u8,
+        a_stride: u64,
+        a_advance: u64,
+        b_ptr: *const i8,
+        b_advance: u64,
+        steps: u64,
+        c_buf: *mut i32,
+    ) {
+        // SAFETY: caller guarantees the tile config and buffer extents; the tmm
+        // registers are the only AMX state touched and are marked clobbered.
+        unsafe {
+            asm!(
+                "tilezero tmm0",
+                "2:",
+                "tileloadd tmm1, [{a} + {a_stride}]",
+                "tileloadd tmm2, [{b} + {b_stride}]",
+                "tdpbusd tmm0, tmm1, tmm2",
+                "add {a}, {a_advance}",
+                "add {b}, {b_advance}",
+                "dec {steps}",
+                "jnz 2b",
+                "tilestored [{c} + {c_stride}], tmm0",
+                a = inout(reg) a_ptr => _,
+                b = inout(reg) b_ptr => _,
+                steps = inout(reg) steps => _,
+                a_stride = in(reg) a_stride,
+                b_stride = in(reg) 64u64,
+                a_advance = in(reg) a_advance,
+                b_advance = in(reg) b_advance,
+                c = in(reg) c_buf,
+                c_stride = in(reg) 64u64,
+                out("tmm0") _,
+                out("tmm1") _,
+                out("tmm2") _,
+                options(nostack),
+            );
+        }
+    }
+
+    /// Repack the whole int8 weight `[N, padded_k]` into the AMX B-tile "VNNI4"
+    /// layout, padding `N` up to a multiple of 16 with zero columns.
+    ///
+    /// For output column `n` and K index `k`, `weight.values[n * padded_k + k]`
+    /// lands at `packed[n_tile * n_tile_stride + (k/4) * 64 + (n%16) * 4 + k%4]`,
+    /// where `n_tile = n / 16`. A B sub-tile for `(n_tile, k0)` is then the
+    /// contiguous 64-byte-per-row block at `n_tile * n_tile_stride + (k0/4)*64`.
+    fn pack_b_vnni4(weight: &Int8Weight, n: usize, padded_k: usize) -> Vec<i8> {
+        let n_tiles = n.div_ceil(16);
+        let n_tile_stride = (padded_k / 4) * 64;
+        let mut packed = vec![0i8; n_tiles * n_tile_stride];
+        for col in 0..n {
+            let n_tile = col / 16;
+            let nn = col % 16;
+            let src = &weight.values[col * padded_k..(col + 1) * padded_k];
+            let base = n_tile * n_tile_stride + nn * 4;
+            for (k, &value) in src.iter().enumerate() {
+                packed[base + (k / 4) * 64 + (k % 4)] = value;
+            }
+        }
+        packed
+    }
+
+    /// AMX INT8 tile GEMM for int4 `MatMulNBits` prefill; bit-identical to
+    /// [`super::int8_matmul`]'s scalar path (see the module doc comment).
+    ///
+    /// `result` is the row-major `[M, N]` output; `activations` is `[M, K]`
+    /// f32. Parallelism is over 16-row M-tiles (each writes a disjoint,
+    /// contiguous slice of `result`), which keeps the shared VNNI4 weight repack
+    /// one-time and avoids any cross-thread output aliasing.
+    pub(super) fn int8_matmul_amx(
+        activations: &[f32],
+        weight: &Int8Weight,
+        result: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        block_size: usize,
+    ) {
+        let k_blocks = k.div_ceil(block_size);
+        let padded_k = k_blocks * block_size;
+        debug_assert_eq!(result.len(), m * n);
+        debug_assert_eq!(weight.values.len(), n * padded_k);
+        debug_assert_eq!(weight.scales.len(), n * k_blocks);
+        debug_assert_eq!(weight.block_sums.len(), n * k_blocks);
+
+        let ksub = block_size.min(64);
+        let steps = (block_size / ksub) as u64;
+        let a_advance = ksub as u64;
+        let b_advance = (ksub / 4 * 64) as u64;
+        let n_tiles = n.div_ceil(16);
+        let n_tile_stride = (padded_k / 4) * 64;
+
+        // One-time VNNI4 repack of the weight, shared read-only by every worker.
+        let b_packed = pack_b_vnni4(weight, n, padded_k);
+
+        // Process 16 output rows per parallel task. `par_chunks_mut(16 * n)`
+        // yields contiguous, disjoint row bands (last band may be short), so no
+        // unsafe aliasing is needed and each task owns its output rows.
+        result
+            .par_chunks_mut(16 * n)
+            .enumerate()
+            .for_each(|(m_tile, out_rows)| {
+                let m0 = m_tile * 16;
+                let mr = out_rows.len() / n; // valid rows in this band (<= 16)
+
+                // Quantize this band's activations into a 16-row-padded buffer so
+                // A tiles always load 16 whole rows (padding rows read as 128 =
+                // signed 0 and are never written back).
+                let mut act = vec![128u8; 16 * padded_k];
+                let mut act_scales = vec![0.0f32; 16 * k_blocks];
+                for row in 0..mr {
+                    let (q, s) = quantize_activation(
+                        &activations[(m0 + row) * k..(m0 + row + 1) * k],
+                        padded_k,
+                        block_size,
+                    );
+                    act[row * padded_k..(row + 1) * padded_k].copy_from_slice(&q);
+                    act_scales[row * k_blocks..(row + 1) * k_blocks].copy_from_slice(&s);
+                }
+
+                let cfg = TileConfig::new(ksub);
+                // SAFETY: AMX availability was verified before dispatch; the
+                // config describes only tmm0..=2 with in-range rows/colsb.
+                unsafe { asm!("ldtilecfg [{0}]", in(reg) &cfg, options(nostack, readonly)) };
+
+                let mut c_buf = [0i32; 16 * 16];
+                for n_tile in 0..n_tiles {
+                    let n0 = n_tile * 16;
+                    let nr = (n - n0).min(16);
+                    let b_tile_base = n_tile * n_tile_stride;
+                    let mut acc = [0.0f32; 16 * 16];
+                    for block in 0..k_blocks {
+                        let k0 = block * block_size;
+                        // SAFETY: `act` holds 16 rows of `padded_k`, `b_packed`
+                        // holds this tile's `steps` sub-tiles, `c_buf` is 256
+                        // i32; pointers/extents are all in bounds.
+                        unsafe {
+                            amx_block(
+                                act.as_ptr().add(k0),
+                                padded_k as u64,
+                                a_advance,
+                                b_packed.as_ptr().add(b_tile_base + (k0 / 4) * 64),
+                                b_advance,
+                                steps,
+                                c_buf.as_mut_ptr(),
+                            );
+                        }
+                        for i in 0..mr {
+                            let activation_scale = act_scales[i * k_blocks + block];
+                            for j in 0..nr {
+                                let weight_index = (n0 + j) * k_blocks + block;
+                                let signed_dot =
+                                    c_buf[i * 16 + j] - 128 * weight.block_sums[weight_index];
+                                acc[i * 16 + j] += signed_dot as f32
+                                    * (activation_scale * weight.scales[weight_index]);
+                            }
+                        }
+                    }
+                    for i in 0..mr {
+                        for j in 0..nr {
+                            out_rows[i * n + n0 + j] = acc[i * 16 + j];
+                        }
+                    }
+                }
+
+                // SAFETY: releases this thread's tile state after all tile ops.
+                unsafe { asm!("tilerelease", options(nostack)) };
+            });
+    }
+}
+
 fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     debug_assert_eq!(activation.len(), weight.len());
     #[cfg(target_arch = "x86_64")]
@@ -4228,6 +4573,103 @@ mod tests {
             selected,
         );
         assert_close(&selected_output, &scalar_output);
+    }
+
+    /// End-to-end forced-AMX parity: drive the int4 `accuracy_level=4` CompInt8
+    /// prefill (`M > 1`) through the AMX INT8 tile GEMM and confirm it is
+    /// **bit-identical** to the `DotKernel::Scalar` reference across block sizes
+    /// (32/64/128) and tile-unaligned `M`/`N`/`K` tails. AMX `tdpbusd` performs
+    /// exact `u8 x i8 -> i32` tile MACs and the per-block `f32` scaling is
+    /// applied in the same order as the scalar path, so the outputs must match
+    /// exactly (not merely `assert_close`). Mirrors the forced-Avx2/Neon dot
+    /// parity tests. Skipped on hosts without AMX (e.g. pre-Sapphire-Rapids CI).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int8_matmul_amx_matches_scalar_prefill() {
+        if !amx::amx_int8_available() {
+            eprintln!("skipping: AMX-INT8 not available on this host");
+            return;
+        }
+
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // (m, k, n, block_size): full tiles, M/N tails, K tails within a block,
+        // multi-sub-tile blocks (128), and a large multi-tile shape.
+        let cases = [
+            (16usize, 64usize, 16usize, 32usize),
+            (17, 128, 20, 32),
+            (33, 96, 7, 32),
+            (64, 256, 64, 64),
+            (128, 512, 100, 128),
+            (200, 100, 48, 32),
+            (16, 33, 16, 32),
+            (48, 130, 40, 64),
+        ];
+
+        for &(m, k, n, block_size) in &cases {
+            assert!(amx::amx_block_size_supported(block_size));
+            let k_blocks = k.div_ceil(block_size);
+            let padded_k = k_blocks * block_size;
+
+            let activations: Vec<f32> = (0..m * k)
+                .map(|_| ((next() % 4000) as f32 - 2000.0) / 173.0)
+                .collect();
+            // Weight values: random int8 in the valid K range, zero in the
+            // per-row padded tail (exactly how `prepack_int8_weight` fills it).
+            let values: Vec<i8> = (0..n * padded_k)
+                .map(|index| {
+                    let col = index % padded_k;
+                    if col >= k {
+                        0
+                    } else {
+                        ((next() % 15) as i8) - 7
+                    }
+                })
+                .collect();
+            let scales: Vec<f32> = (0..n * k_blocks)
+                .map(|_| (next() % 100) as f32 / 5000.0 + 0.001)
+                .collect();
+            let block_sums: Vec<i32> = (0..n * k_blocks)
+                .map(|index| {
+                    let start = index * block_size;
+                    values[start..start + block_size]
+                        .iter()
+                        .map(|&w| w as i32)
+                        .sum()
+                })
+                .collect();
+            let weight = Int8Weight {
+                values,
+                scales,
+                block_sums,
+            };
+
+            let mut scalar_out = vec![0.0f32; m * n];
+            int8_matmul(
+                &activations,
+                &weight,
+                &mut scalar_out,
+                m,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+
+            let mut amx_out = vec![0.0f32; m * n];
+            amx::int8_matmul_amx(&activations, &weight, &mut amx_out, m, k, n, block_size);
+
+            assert_eq!(
+                amx_out, scalar_out,
+                "AMX prefill diverged from scalar for m={m} k={k} n={n} block_size={block_size}"
+            );
+        }
     }
 
     #[test]
