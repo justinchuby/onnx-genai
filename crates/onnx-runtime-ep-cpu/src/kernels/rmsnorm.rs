@@ -176,14 +176,29 @@ pub(crate) fn rms_norm_dense(
     };
 
     let mut y = vec![0.0f32; x.len()];
-    for g in 0..num_groups {
-        let base = g * norm_size;
-        let slice = &x[base..base + norm_size];
-        let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
-        let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
-        for e in 0..norm_size {
-            let idx = base + e;
-            y[idx] = x[idx] * inv_rms * scale[scale_index(idx)];
+    if scale.len() == norm_size {
+        for g in 0..num_groups {
+            let base = g * norm_size;
+            let slice = &x[base..base + norm_size];
+            let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
+            let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
+            crate::kernels::simd_normalize::normalize_and_scale(
+                slice,
+                &mut y[base..base + norm_size],
+                inv_rms,
+                scale,
+            );
+        }
+    } else {
+        for g in 0..num_groups {
+            let base = g * norm_size;
+            let slice = &x[base..base + norm_size];
+            let mean_sq = crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
+            let inv_rms = 1.0 / (mean_sq + epsilon).sqrt();
+            for e in 0..norm_size {
+                let idx = base + e;
+                y[idx] = x[idx] * inv_rms * scale[scale_index(idx)];
+            }
         }
     }
 
