@@ -329,7 +329,8 @@ impl Kernel for SimplifiedLayerNormKernel {
             let inv_std = (0..num_groups)
                 .map(|g| {
                     let slice = &x[g * norm_size..g * norm_size + norm_size];
-                    let mean_sq = slice.iter().map(|&v| v * v).sum::<f32>() / norm_size as f32;
+                    let mean_sq =
+                        crate::kernels::simd_sumsq::sum_of_squares(slice) / norm_size as f32;
                     1.0 / (mean_sq + self.epsilon).sqrt()
                 })
                 .collect::<Vec<_>>();
