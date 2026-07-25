@@ -4497,6 +4497,7 @@ mod tests {
                 values: packed.clone(),
                 scales: scales.clone(),
             };
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut kernels = vec![DotKernel::Scalar, selected_dot_kernel()];
             #[cfg(target_arch = "x86_64")]
             if std::arch::is_x86_feature_detected!("avx2") {
