@@ -31,4 +31,36 @@ All 128 generated greedy token IDs matched. The 20 targeted CUDA
 
 Verdict: do not ship fused split-K. Repeating the full RMSNorm reduction and
 normalized-activation staging in twice as many CTAs costs more than the added
-latency hiding saves. The production kernel remains unchanged.
+latency hiding saves.
+
+## Attempt 2: normalize once, then split-K
+
+A second implementation moved RMSNorm into the existing standalone
+`matmul_nbits_rmsnorm_f16_warp_half4` kernel, writing one persistent K-element
+fp16 scratch buffer. The following non-fused INT8 GEMV consumed that buffer
+with fp32 partial accumulation. Its split factor was selected from live
+SM/thread/block limits plus K and N; the modeled 28-46 SM consumer cases again
+selected one partition and retained the fused production path.
+
+Nsight Compute confirmed the target split launch was 1,280 blocks and 1.21
+waves/SM, with 71.82% achieved occupancy. The extra pre-pass was about 5.76 us
+in the Nsight Systems timeline, so removing repeated normalization did not make
+the two-launch path cheaper than the original fused kernel.
+
+The final uncontended alternating median-of-three pair was:
+
+| Variant | Median tok/s | Intra-group spread |
+|---|---:|---:|
+| Baseline | 320.46 | 0.09 tok/s |
+| RMSNorm pre-pass + split-K | 316.53 | 2.97 tok/s |
+
+This is a 1.23% decode regression. The preceding alternating pair independently
+gave 321.87 versus 314.25 tok/s (-2.37%), with spreads of 0.68 and 1.98 tok/s.
+All 128 greedy token IDs matched, and all 20 targeted CUDA `MatMulNBits` tests
+passed under the same tolerance quoted above.
+
+Definitive verdict: drop split-K for this fused kernel. Attempt 1 loses to
+duplicated RMSNorm work; attempt 2 removes that duplication but the standalone
+normalization launch and K-element global round-trip still exceed the grid-fill
+benefit. Both implementations were reverted; the production kernel remains
+unchanged.
