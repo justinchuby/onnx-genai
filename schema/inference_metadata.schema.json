@@ -3025,7 +3025,7 @@
           ]
         },
         "prediction_type": {
-          "description": "Model output parameterization; `\"epsilon\"` is supported (default).",
+          "description": "Model output parameterization: `\"epsilon\"` (default, noise prediction),\n`\"v_prediction\"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or\n`\"sample\"`/`\"x0\"` (the model predicts the clean sample directly). All\nbuilt-in continuous schedulers (`ddim`, `euler`, `euler_ancestral`,\n`dpmpp_2m`) support every parameterization.",
           "type": [
             "string",
             "null"

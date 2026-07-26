@@ -2966,33 +2966,22 @@ impl SchedulerRegistry {
         factories.insert(
             "ddim".to_string(),
             Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
-                if let Some(prediction) = cfg.prediction_type.as_deref()
-                    && prediction != "epsilon"
-                {
-                    anyhow::bail!(
-                        "unsupported ddim prediction_type '{prediction}' (only 'epsilon')"
-                    );
-                }
+                let prediction = PredictionType::parse(cfg.prediction_type.as_deref())?;
                 let sched = DdimSchedule::with_schedule(
                     cfg.num_train_timesteps.unwrap_or(1000),
                     cfg.beta_start.unwrap_or(0.00085),
                     cfg.beta_end.unwrap_or(0.012),
                     cfg.beta_schedule.as_deref().unwrap_or("linear"),
                     num_steps,
-                )?;
+                )?
+                .with_prediction(prediction);
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
         );
         factories.insert(
             "euler".to_string(),
             Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
-                if let Some(prediction) = cfg.prediction_type.as_deref()
-                    && prediction != "epsilon"
-                {
-                    anyhow::bail!(
-                        "unsupported euler prediction_type '{prediction}' (only 'epsilon')"
-                    );
-                }
+                let prediction = PredictionType::parse(cfg.prediction_type.as_deref())?;
                 let sched = EulerSchedule::with_schedule(
                     cfg.num_train_timesteps.unwrap_or(1000),
                     cfg.beta_start.unwrap_or(0.00085),
@@ -3000,20 +2989,15 @@ impl SchedulerRegistry {
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
                     sigma_spacing(cfg)?,
-                )?;
+                )?
+                .with_prediction(prediction);
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
         );
         factories.insert(
             "euler_ancestral".to_string(),
             Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
-                if let Some(prediction) = cfg.prediction_type.as_deref()
-                    && prediction != "epsilon"
-                {
-                    anyhow::bail!(
-                        "unsupported euler_ancestral prediction_type '{prediction}' (only 'epsilon')"
-                    );
-                }
+                let prediction = PredictionType::parse(cfg.prediction_type.as_deref())?;
                 let sched = EulerAncestral::with_schedule(
                     cfg.num_train_timesteps.unwrap_or(1000),
                     cfg.beta_start.unwrap_or(0.00085),
@@ -3021,20 +3005,15 @@ impl SchedulerRegistry {
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
                     sigma_spacing(cfg)?,
-                )?;
+                )?
+                .with_prediction(prediction);
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
         );
         factories.insert(
             "dpmpp_2m".to_string(),
             Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
-                if let Some(prediction) = cfg.prediction_type.as_deref()
-                    && prediction != "epsilon"
-                {
-                    anyhow::bail!(
-                        "unsupported dpmpp_2m prediction_type '{prediction}' (only 'epsilon')"
-                    );
-                }
+                let prediction = PredictionType::parse(cfg.prediction_type.as_deref())?;
                 let sched = Dpmpp2m::with_schedule(
                     cfg.num_train_timesteps.unwrap_or(1000),
                     cfg.beta_start.unwrap_or(0.00085),
@@ -3042,7 +3021,8 @@ impl SchedulerRegistry {
                     cfg.beta_schedule.as_deref().unwrap_or("scaled_linear"),
                     num_steps,
                     sigma_spacing(cfg)?,
-                )?;
+                )?
+                .with_prediction(prediction);
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
         );
@@ -3430,7 +3410,88 @@ fn unmask_uniform(step: usize, position: usize) -> f64 {
     rng.random::<f64>()
 }
 
-/// DDIM (η = 0, epsilon-prediction) noise schedule, precomputed per inference
+/// The parameterization the denoiser was trained with, i.e. what the model's
+/// raw output represents. All built-in schedulers internally drive an
+/// epsilon/x0 update, so a model output in any of these parameterizations is
+/// first converted to epsilon (and/or x0) via [`epsilon_from_model_output`] /
+/// [`x0_from_model_output`] before the existing step math runs. This keeps the
+/// `epsilon` path byte-identical while adding `v_prediction` and `sample`/`x0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PredictionType {
+    /// The model predicts the noise `epsilon` (Stable Diffusion 1.x default).
+    Epsilon,
+    /// The model predicts the velocity `v` (Salimans & Ho 2022; SD 2.x, SDXL
+    /// refiner, many fine-tunes).
+    VPrediction,
+    /// The model predicts the clean sample `x0` directly (`sample`/`x0`).
+    Sample,
+}
+
+impl PredictionType {
+    /// Parse a scheduler/diffusion-config `prediction_type` string. `None` and
+    /// the empty string default to `epsilon` (diffusers' default). Both the
+    /// diffusers spelling `sample` and the common alias `x0` map to
+    /// [`PredictionType::Sample`].
+    fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.unwrap_or("epsilon") {
+            "epsilon" => Ok(Self::Epsilon),
+            "v_prediction" => Ok(Self::VPrediction),
+            "sample" | "x0" => Ok(Self::Sample),
+            other => anyhow::bail!(
+                "unsupported prediction_type '{other}' (expected 'epsilon', 'v_prediction', or 'sample'/'x0')"
+            ),
+        }
+    }
+}
+
+/// Convert one model-output element to the epsilon (noise) the epsilon-form step
+/// math expects, given the DDPM per-timestep `alpha_t = sqrt(alpha_cumprod_t)`
+/// and `sigma_t = sqrt(1 - alpha_cumprod_t)` and the current noisy sample `x_t`.
+///
+/// Matches diffusers' `DDIMScheduler` conventions
+/// (`beta_prod_t = 1 - alpha_prod_t`, `sigma_t = beta_prod_t ** 0.5`):
+/// - `epsilon`:      `eps = model_out`                       (identity)
+/// - `v_prediction`: `eps = alpha_t * model_out + sigma_t * x_t`
+/// - `sample`/`x0`:  `eps = (x_t - alpha_t * model_out) / sigma_t`
+#[inline]
+fn epsilon_from_model_output(
+    model_out: f32,
+    x_t: f32,
+    alpha_t: f32,
+    sigma_t: f32,
+    prediction: PredictionType,
+) -> f32 {
+    match prediction {
+        PredictionType::Epsilon => model_out,
+        PredictionType::VPrediction => alpha_t * model_out + sigma_t * x_t,
+        PredictionType::Sample => (x_t - alpha_t * model_out) / sigma_t,
+    }
+}
+
+/// Convert one model-output element to the clean-sample estimate `x0`
+/// (`pred_original_sample`), given the DDPM per-timestep `alpha_t` / `sigma_t`
+/// (see [`epsilon_from_model_output`]) and the current noisy sample `x_t`.
+///
+/// Matches diffusers' `DPMSolverMultistepScheduler.convert_model_output`:
+/// - `epsilon`:      `x0 = (x_t - sigma_t * model_out) / alpha_t`
+/// - `v_prediction`: `x0 = alpha_t * x_t - sigma_t * model_out`
+/// - `sample`/`x0`:  `x0 = model_out`                        (identity)
+#[inline]
+fn x0_from_model_output(
+    model_out: f32,
+    x_t: f32,
+    alpha_t: f32,
+    sigma_t: f32,
+    prediction: PredictionType,
+) -> f32 {
+    match prediction {
+        PredictionType::Epsilon => (x_t - sigma_t * model_out) / alpha_t,
+        PredictionType::VPrediction => alpha_t * x_t - sigma_t * model_out,
+        PredictionType::Sample => model_out,
+    }
+}
+
+/// DDIM (η = 0) noise schedule, precomputed per inference
 /// step as `(alpha_cumprod_t, alpha_cumprod_prev)`.
 ///
 /// Diffusion-standard update for a model that predicts noise `eps`:
@@ -3440,6 +3501,7 @@ fn unmask_uniform(step: usize, position: usize) -> f64 {
 struct DdimSchedule {
     steps: Vec<(f32, f32)>,
     timesteps: Vec<f32>,
+    prediction: PredictionType,
 }
 
 impl DdimSchedule {
@@ -3493,16 +3555,28 @@ impl DdimSchedule {
             };
             steps.push((a_t, a_prev));
         }
-        Ok(Self { steps, timesteps })
+        Ok(Self {
+            steps,
+            timesteps,
+            prediction: PredictionType::Epsilon,
+        })
     }
 
-    /// Apply one DDIM step to `sample` given the model's noise prediction `eps`.
-    fn step(&self, k: usize, sample: &[f32], eps: &[f32]) -> anyhow::Result<Vec<f32>> {
-        if sample.len() != eps.len() {
+    /// Set the model parameterization (`epsilon` by default).
+    fn with_prediction(mut self, prediction: PredictionType) -> Self {
+        self.prediction = prediction;
+        self
+    }
+
+    /// Apply one DDIM step to `sample` given the raw `model_out`. The model
+    /// output is first converted to epsilon per [`Self::prediction`], then the
+    /// epsilon-form DDIM update runs (byte-identical for `epsilon`).
+    fn step(&self, k: usize, sample: &[f32], model_out: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if sample.len() != model_out.len() {
             anyhow::bail!(
-                "scheduler sample/eps length mismatch: {} vs {}",
+                "scheduler sample/model_output length mismatch: {} vs {}",
                 sample.len(),
-                eps.len()
+                model_out.len()
             );
         }
         let (a_t, a_prev) = self.steps[k];
@@ -3512,8 +3586,15 @@ impl DdimSchedule {
         let sqrt_one_minus_a_prev = (1.0 - a_prev).sqrt();
         Ok(sample
             .iter()
-            .zip(eps)
-            .map(|(&x, &e)| {
+            .zip(model_out)
+            .map(|(&x, &m)| {
+                let e = epsilon_from_model_output(
+                    m,
+                    x,
+                    sqrt_a_t,
+                    sqrt_one_minus_a_t,
+                    self.prediction,
+                );
                 let x0_hat = (x - sqrt_one_minus_a_t * e) / sqrt_a_t;
                 sqrt_a_prev * x0_hat + sqrt_one_minus_a_prev * e
             })
@@ -3556,6 +3637,8 @@ struct EulerSchedule {
     sigmas: Vec<f32>,
     /// Per-step denoiser timesteps (fractional), length `num_steps`.
     timesteps: Vec<f32>,
+    /// Model parameterization (`epsilon` by default).
+    prediction: PredictionType,
 }
 
 impl EulerSchedule {
@@ -3586,7 +3669,11 @@ impl EulerSchedule {
                 .iter()
                 .map(|&s| sigma_to_t(&train, s))
                 .collect();
-            return Ok(Self { sigmas, timesteps });
+            return Ok(Self {
+                sigmas,
+                timesteps,
+                prediction: PredictionType::Epsilon,
+            });
         }
         let denom = (num_train_timesteps - 1) as f32;
         let (lo, hi, square) = match beta_schedule {
@@ -3629,7 +3716,17 @@ impl EulerSchedule {
             sigmas.push(interp(t));
         }
         sigmas.push(0.0);
-        Ok(Self { sigmas, timesteps })
+        Ok(Self {
+            sigmas,
+            timesteps,
+            prediction: PredictionType::Epsilon,
+        })
+    }
+
+    /// Set the model parameterization (`epsilon` by default).
+    fn with_prediction(mut self, prediction: PredictionType) -> Self {
+        self.prediction = prediction;
+        self
     }
 
     /// `x / sqrt(sigma^2 + 1)` — scale the raw sample for the denoiser input.
@@ -3638,17 +3735,33 @@ impl EulerSchedule {
         sample.iter().map(|&x| x / factor).collect()
     }
 
-    /// `x_next = x + eps * (sigma_next - sigma)` on the raw sample.
-    fn step_vec(&self, step: usize, sample: &[f32], eps: &[f32]) -> anyhow::Result<Vec<f32>> {
-        if sample.len() != eps.len() {
+    /// `x_next = x + eps * (sigma_next - sigma)` on the raw sample. The raw
+    /// `model_out` is first converted to the epsilon derivative per
+    /// [`Self::prediction`] (byte-identical for `epsilon`).
+    fn step_vec(&self, step: usize, sample: &[f32], model_out: &[f32]) -> anyhow::Result<Vec<f32>> {
+        if sample.len() != model_out.len() {
             anyhow::bail!(
-                "scheduler sample/eps length mismatch: {} vs {}",
+                "scheduler sample/model_output length mismatch: {} vs {}",
                 sample.len(),
-                eps.len()
+                model_out.len()
             );
         }
+        let sigma = self.sigmas[step];
+        // Convert to DDPM alpha/sigma: alpha_t = 1/sqrt(sigma^2+1),
+        // sigma_t = sigma * alpha_t, and the DDPM latent x_t = alpha_t * sample.
+        // The epsilon derivative diffusers feeds is `(sample - x0) / sigma`,
+        // which equals the DDPM epsilon; it reduces to `model_out` for epsilon.
+        let alpha_t = 1.0 / (sigma * sigma + 1.0).sqrt();
+        let sigma_t = sigma * alpha_t;
         let dt = self.sigmas[step + 1] - self.sigmas[step];
-        Ok(sample.iter().zip(eps).map(|(&x, &e)| x + e * dt).collect())
+        Ok(sample
+            .iter()
+            .zip(model_out)
+            .map(|(&x, &m)| {
+                let e = epsilon_from_model_output(m, alpha_t * x, alpha_t, sigma_t, self.prediction);
+                x + e * dt
+            })
+            .collect())
     }
 }
 
@@ -3701,6 +3814,7 @@ impl Scheduler for EulerSchedule {
 struct EulerAncestral {
     sigmas: Vec<f32>,
     timesteps: Vec<f32>,
+    prediction: PredictionType,
 }
 
 impl EulerAncestral {
@@ -3724,7 +3838,14 @@ impl EulerAncestral {
         Ok(Self {
             sigmas: euler.sigmas,
             timesteps: euler.timesteps,
+            prediction: PredictionType::Epsilon,
         })
+    }
+
+    /// Set the model parameterization (`epsilon` by default).
+    fn with_prediction(mut self, prediction: PredictionType) -> Self {
+        self.prediction = prediction;
+        self
     }
 }
 
@@ -3753,7 +3874,7 @@ impl Scheduler for EulerAncestral {
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
         let x = sample.to_vec_f32_lossy()?;
-        let eps = model_output.to_vec_f32_lossy()?;
+        let model_out = model_output.to_vec_f32_lossy()?;
         let sigma_from = self.sigmas[step];
         let sigma_to = self.sigmas[step + 1];
         let sigma_up = (sigma_to * sigma_to * (sigma_from * sigma_from - sigma_to * sigma_to)
@@ -3762,6 +3883,9 @@ impl Scheduler for EulerAncestral {
             .sqrt();
         let sigma_down = (sigma_to * sigma_to - sigma_up * sigma_up).max(0.0).sqrt();
         let dt = sigma_down - sigma_from;
+        // DDPM alpha/sigma for the current sigma; DDPM latent x_t = alpha_t * x.
+        let alpha_t = 1.0 / (sigma_from * sigma_from + 1.0).sqrt();
+        let sigma_t = sigma_from * alpha_t;
         let noise = noise
             .context("euler_ancestral requires per-step noise")?
             .to_vec_f32_lossy()?;
@@ -3773,7 +3897,16 @@ impl Scheduler for EulerAncestral {
             );
         }
         let out: Vec<f32> = (0..x.len())
-            .map(|i| x[i] + eps[i] * dt + noise[i] * sigma_up)
+            .map(|i| {
+                let e = epsilon_from_model_output(
+                    model_out[i],
+                    alpha_t * x[i],
+                    alpha_t,
+                    sigma_t,
+                    self.prediction,
+                );
+                x[i] + e * dt + noise[i] * sigma_up
+            })
             .collect();
         Value::from_slice_f32(&out, &shape).map_err(Into::into)
     }
@@ -3819,6 +3952,8 @@ struct Dpmpp2m {
     /// Previous step's data prediction (`x0`) for the multistep update. Reset at
     /// step 0 of each denoise loop; interior-mutable so `step` keeps `&self`.
     prev_x0: Mutex<Option<Vec<f32>>>,
+    /// Model parameterization (`epsilon` by default).
+    prediction: PredictionType,
 }
 
 impl Dpmpp2m {
@@ -3853,6 +3988,7 @@ impl Dpmpp2m {
                 sigmas,
                 timesteps,
                 prev_x0: Mutex::new(None),
+                prediction: PredictionType::Epsilon,
             });
         }
         let denom = (num_train_timesteps - 1) as f32;
@@ -3891,7 +4027,14 @@ impl Dpmpp2m {
             sigmas,
             timesteps,
             prev_x0: Mutex::new(None),
+            prediction: PredictionType::Epsilon,
         })
+    }
+
+    /// Set the model parameterization (`epsilon` by default).
+    fn with_prediction(mut self, prediction: PredictionType) -> Self {
+        self.prediction = prediction;
+        self
     }
 }
 
@@ -4062,22 +4205,23 @@ impl Scheduler for Dpmpp2m {
     ) -> anyhow::Result<Value> {
         let shape = sample.shape().to_vec();
         let x = sample.to_vec_f32_lossy()?;
-        let eps = model_output.to_vec_f32_lossy()?;
-        if x.len() != eps.len() {
+        let model_out = model_output.to_vec_f32_lossy()?;
+        if x.len() != model_out.len() {
             anyhow::bail!(
-                "dpm++ sample/eps length mismatch: {} vs {}",
+                "dpm++ sample/model_output length mismatch: {} vs {}",
                 x.len(),
-                eps.len()
+                model_out.len()
             );
         }
 
         let sigma = self.sigmas[step];
         let (alpha_t0, sigma_t0) = dpm_alpha_sigma(sigma);
-        // Data prediction (x0) from the epsilon output: (x - sigma_t*eps)/alpha_t.
+        // Data prediction (x0) from the raw model output per the parameterization.
+        // For epsilon this is the byte-identical (x - sigma_t*eps)/alpha_t.
         let x0: Vec<f32> = x
             .iter()
-            .zip(&eps)
-            .map(|(&xi, &ei)| (xi - sigma_t0 * ei) / alpha_t0)
+            .zip(&model_out)
+            .map(|(&xi, &mi)| x0_from_model_output(mi, xi, alpha_t0, sigma_t0, self.prediction))
             .collect();
 
         let s_next = self.sigmas[step + 1];
@@ -5026,6 +5170,180 @@ mod tests {
             "{}",
             n1[0]
         );
+    }
+
+    #[test]
+    fn prediction_type_parse_accepts_known_aliases() {
+        assert_eq!(
+            PredictionType::parse(None).unwrap(),
+            PredictionType::Epsilon
+        );
+        assert_eq!(
+            PredictionType::parse(Some("epsilon")).unwrap(),
+            PredictionType::Epsilon
+        );
+        assert_eq!(
+            PredictionType::parse(Some("v_prediction")).unwrap(),
+            PredictionType::VPrediction
+        );
+        assert_eq!(
+            PredictionType::parse(Some("sample")).unwrap(),
+            PredictionType::Sample
+        );
+        assert_eq!(
+            PredictionType::parse(Some("x0")).unwrap(),
+            PredictionType::Sample
+        );
+        assert!(PredictionType::parse(Some("nonsense")).is_err());
+    }
+
+    #[test]
+    fn model_output_conversion_matches_diffusers_formulas() {
+        // Representative mid-timestep with alpha_cumprod = 0.5 so
+        // alpha_t = sqrt(0.5) and sigma_t = sqrt(1 - 0.5) = sqrt(0.5).
+        let alpha_t = 0.5f32.sqrt();
+        let sigma_t = (1.0f32 - 0.5).sqrt();
+        let x_t = 0.7f32;
+        let model_out = 0.3f32;
+
+        // epsilon: both conversions reduce to the diffusers closed form and the
+        // epsilon path is the identity.
+        assert!(
+            (epsilon_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::Epsilon)
+                - model_out)
+                .abs()
+                < 1e-6
+        );
+        let x0_eps = x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::Epsilon);
+        assert!((x0_eps - (x_t - sigma_t * model_out) / alpha_t).abs() < 1e-6);
+
+        // v_prediction: diffusers DDIMScheduler v_prediction branch.
+        //   pred_epsilon = alpha_t * model_out + sigma_t * x_t
+        //   pred_x0      = alpha_t * x_t - sigma_t * model_out
+        let eps_v =
+            epsilon_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction);
+        assert!((eps_v - (alpha_t * model_out + sigma_t * x_t)).abs() < 1e-6);
+        let x0_v =
+            x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction);
+        assert!((x0_v - (alpha_t * x_t - sigma_t * model_out)).abs() < 1e-6);
+        // Internal consistency: eps and x0 satisfy x_t = alpha_t*x0 + sigma_t*eps.
+        assert!((alpha_t * x0_v + sigma_t * eps_v - x_t).abs() < 1e-6);
+
+        // sample / x0: model_out IS x0, and eps = (x_t - alpha_t*x0)/sigma_t.
+        let x0_s = x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::Sample);
+        assert!((x0_s - model_out).abs() < 1e-6);
+        let eps_s =
+            epsilon_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::Sample);
+        assert!((eps_s - (x_t - alpha_t * model_out) / sigma_t).abs() < 1e-6);
+        assert!((alpha_t * x0_s + sigma_t * eps_s - x_t).abs() < 1e-6);
+    }
+
+    #[test]
+    fn model_output_conversion_endpoints() {
+        // alpha_cumprod -> 1 (t = 0): alpha_t = 1, sigma_t = 0. eps == model_out
+        // for epsilon and v_prediction (the sigma_t term vanishes); x0 == x_t for
+        // v_prediction.
+        let (alpha_t, sigma_t) = (1.0f32, 0.0f32);
+        let x_t = 0.9f32;
+        let model_out = -0.4f32;
+        assert!(
+            (epsilon_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction)
+                - model_out)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction)
+                - x_t)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn v_prediction_epsilon_path_stays_byte_identical() {
+        // A scheduler built with prediction_type=epsilon must produce EXACTLY the
+        // same bytes as before the v-prediction change (regression guard).
+        let registry = SchedulerRegistry::builtin();
+        for kind in ["ddim", "euler", "dpmpp_2m"] {
+            let eps_spec = SchedulerSpec {
+                kind: kind.to_string(),
+                prediction_type: Some("epsilon".to_string()),
+                ..SchedulerSpec::default()
+            };
+            let default_spec = SchedulerSpec {
+                kind: kind.to_string(),
+                prediction_type: None,
+                ..SchedulerSpec::default()
+            };
+            let eps = registry.build(&eps_spec, 6).expect("epsilon builds");
+            let dflt = registry.build(&default_spec, 6).expect("default builds");
+            let sample = Value::from_slice_f32(&[0.1, -0.2, 0.3, 0.4], &[1, 4]).unwrap();
+            let model_out = Value::from_slice_f32(&[0.5, 0.6, -0.7, 0.8], &[1, 4]).unwrap();
+            eps.reset();
+            dflt.reset();
+            let a = eps.step(0, 6, &sample, &model_out).unwrap();
+            let b = dflt.step(0, 6, &sample, &model_out).unwrap();
+            assert_eq!(
+                a.to_vec_f32_lossy().unwrap(),
+                b.to_vec_f32_lossy().unwrap(),
+                "{kind}: explicit epsilon must equal the default"
+            );
+        }
+    }
+
+    #[test]
+    fn v_prediction_schedulers_construct_and_step_finite() {
+        // Previously each scheduler hard-rejected v_prediction. Now they must
+        // construct and produce finite, shape-preserving latent updates over a
+        // couple of synthetic steps with random-ish model output.
+        let registry = SchedulerRegistry::builtin();
+        let num_steps = 4usize;
+        let shape = [1i64, 2, 2, 2];
+        let elems = 8usize;
+        for kind in ["ddim", "euler", "euler_ancestral", "dpmpp_2m"] {
+            for prediction in ["v_prediction", "x0", "sample"] {
+                let spec = SchedulerSpec {
+                    kind: kind.to_string(),
+                    prediction_type: Some(prediction.to_string()),
+                    num_train_timesteps: Some(1000),
+                    ..SchedulerSpec::default()
+                };
+                let sched = registry
+                    .build(&spec, num_steps)
+                    .unwrap_or_else(|e| panic!("{kind}/{prediction} must construct: {e}"));
+                sched.reset();
+                let init = sched.init_noise_sigma();
+                let mut latent: Vec<f32> = (0..elems)
+                    .map(|i| ((i as f32 * 0.37).sin()) * init)
+                    .collect();
+                for step in 0..num_steps {
+                    let sample = Value::from_slice_f32(&latent, &shape).unwrap();
+                    let model_out: Vec<f32> = (0..elems)
+                        .map(|i| ((step as f32 + 1.0) * 0.11 + i as f32 * 0.19).cos())
+                        .collect();
+                    let model_value = Value::from_slice_f32(&model_out, &shape).unwrap();
+                    let noise = Value::from_slice_f32(
+                        &(0..elems)
+                            .map(|i| ((i as f32 + step as f32) * 0.53).sin())
+                            .collect::<Vec<_>>(),
+                        &shape,
+                    )
+                    .unwrap();
+                    let next = sched
+                        .step_with_noise(step, num_steps, &sample, &model_value, Some(&noise))
+                        .unwrap_or_else(|e| panic!("{kind}/{prediction} step {step}: {e}"));
+                    assert_eq!(next.shape(), shape, "{kind}/{prediction} preserves shape");
+                    latent = next.to_vec_f32_lossy().unwrap();
+                    for (i, v) in latent.iter().enumerate() {
+                        assert!(
+                            v.is_finite(),
+                            "{kind}/{prediction} step {step} elem {i} non-finite: {v}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
