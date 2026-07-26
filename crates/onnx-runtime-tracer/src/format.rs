@@ -69,6 +69,47 @@ pub enum TraceVerbosity {
 }
 
 impl TraceVerbosity {
+    /// Encode as a small integer, for storing in an atomic.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            TraceVerbosity::Decisions => 0,
+            TraceVerbosity::Ops => 1,
+            TraceVerbosity::Full => 2,
+        }
+    }
+
+    /// Decode from [`as_u8`](TraceVerbosity::as_u8), saturating at the most
+    /// detailed level so an unknown value never silently drops events.
+    #[must_use]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => TraceVerbosity::Decisions,
+            1 => TraceVerbosity::Ops,
+            _ => TraceVerbosity::Full,
+        }
+    }
+
+    /// Parse a level name, as accepted on the command line and in the
+    /// environment. Returns `None` for anything unrecognised so the caller can
+    /// report the valid set.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "decisions" => Some(TraceVerbosity::Decisions),
+            "ops" => Some(TraceVerbosity::Ops),
+            "full" => Some(TraceVerbosity::Full),
+            _ => None,
+        }
+    }
+
+    /// Every level, most detailed last — for listing the choices in a message.
+    pub const ALL: [TraceVerbosity; 3] = [
+        TraceVerbosity::Decisions,
+        TraceVerbosity::Ops,
+        TraceVerbosity::Full,
+    ];
+
     /// Whether a trace at `self` should include events tagged at `other`.
     ///
     /// True when `other` is no more detailed than `self` (e.g. a `Full` trace
