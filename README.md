@@ -79,8 +79,10 @@ MOBIUS_DIR=/path/to/mobius STATIC_CACHE=1 MAX_SEQ_LEN=8192 scripts/build_qwen.sh
 
 ### Run the CLI
 
+The `onnx-genai` binary lives in the `onnx-genai-cli` package:
+
 ```bash
-cargo build --release -p onnx-genai -p onnx-genai-server
+cargo build --release -p onnx-genai-cli
 
 ./target/release/onnx-genai generate \
   models/qwen2.5-0.5b \
@@ -197,6 +199,10 @@ multimodal prefix reuse          613 tokens
 
 `EngineConfig::pipeline_cache_bytes` bounds the memoized encoder outputs
 (512 MiB by default; `0` turns the cache off).
+
+Every command here can be run without installing anything, against the tiny
+ONNX fixtures in `tests/fixtures/`; see
+[the CLI crate's README](crates/onnx-genai-cli/README.md#running-from-source).
 
 ### Profiling
 

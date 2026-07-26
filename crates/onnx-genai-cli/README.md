@@ -52,3 +52,95 @@ Choose an execution provider at runtime with `ONNX_GENAI_EP` (e.g. `cpu`,
 installed by default.
 
 Python 3.11+ is required (the `onnxruntime` dependency ships no earlier wheels).
+
+## Running from source
+
+The binary is `onnx-genai` in the `onnx-genai-cli` package, so everything above
+works under `cargo run` with a `--` separating cargo's flags from the tool's:
+
+```bash
+cargo run -p onnx-genai-cli --bin onnx-genai -- version
+```
+
+Add `--release` for anything where speed matters — a debug build decodes orders
+of magnitude slower, which makes `--profile` numbers meaningless:
+
+```bash
+cargo run --release -p onnx-genai-cli --bin onnx-genai -- \
+  generate ./model --prompt "Hello" --max-new-tokens 64
+```
+
+### Trying it without downloading a model
+
+The repository's test fixtures are tiny hand-built ONNX models. They generate
+nonsense, but they exercise every code path end to end and need no network, so
+they are the fastest way to check that a change works. Run these from the
+repository root:
+
+```bash
+# Text generation, and the interactive REPL
+cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  generate tests/fixtures/tiny-llm --prompt "hello" --max-new-tokens 5 --raw
+cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm
+
+# Image input (the prompt needs one <image> placeholder per image)
+cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  generate tests/fixtures/tiny-vlm-image-input \
+  --image path/to/any.png --prompt "describe <image>" --max-new-tokens 3 --raw
+
+# Image generation. This fixture's VAE is 8x8, hence the explicit size
+cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  generate tests/fixtures/tiny-txt2img \
+  --prompt "a cat" --output-image out.png --steps 2 --width 8 --height 8
+
+# Speech synthesis, then transcription of what it produced
+cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  generate tests/fixtures/tiny-tts --prompt "hello" --output-audio out.wav
+cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  transcribe tests/fixtures/tiny-whisper out.wav
+
+# The OpenAI-compatible server
+cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  serve --model tests/fixtures/tiny-llm --addr 127.0.0.1:8123
+curl localhost:8123/v1/models
+```
+
+Model loading logs to stderr; append `2>/dev/null` when you only want the
+generated text.
+
+### Checking the REPL's live view
+
+`/stats` renders the reply and its live numbers together, and that path is only
+taken when stdout is a real terminal. It therefore cannot be seen through a pipe
+— run the REPL directly in a terminal and type `/stats`, then a prompt:
+
+```bash
+cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm --max-new-tokens 5
+```
+
+```text
+>>> /stats
+per-turn stats enabled
+>>> hello
+dogtok29over,dog
+[ 7 in · 5 out · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
+```
+
+Piping a script into the REPL exercises the plain-text fallback instead, which is
+what the tests do:
+
+```bash
+printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \
+  run tests/fixtures/tiny-llm --max-new-tokens 5
+```
+
+### Tests
+
+Always name packages explicitly. A bare `--workspace` pulls in `mlas-sys`, whose
+build script is x86-64-Linux-only, and `onnx-runtime-cpuinfo`, which needs its
+git submodule checked out:
+
+```bash
+cargo test -p onnx-genai-cli
+cargo test -p onnx-genai-cli --test repl_e2e
+```
