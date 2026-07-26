@@ -431,7 +431,11 @@ fn resolve_cross_kv_pairs(
                     );
                 }
             }
-            Ok(inputs.iter().cloned().zip(outputs.iter().cloned()).collect())
+            Ok(inputs
+                .iter()
+                .cloned()
+                .zip(outputs.iter().cloned())
+                .collect())
         }
         (None, None) => Ok(Vec::new()),
         _ => anyhow::bail!(

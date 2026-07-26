@@ -169,8 +169,7 @@ impl PipelineModelDirectory {
         };
         let config = onnx_genai_genai_config::load(&genai_path)
             .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-        let is_vision_language =
-            config.model.vision.is_some() && config.model.embedding.is_some();
+        let is_vision_language = config.model.vision.is_some() && config.model.embedding.is_some();
         // A transducer (RNN-T) also declares `model.encoder`, but it is a
         // distinct, not-yet-executable family — exclude it so it is never
         // recognized as a loadable encoder-decoder pipeline and silently
@@ -470,15 +469,16 @@ fn load_encoder_decoder_compatibility_pipeline(
         encoder: inspect_model_graph(&encoder_filename, "encoder")?,
         decoder: inspect_model_graph(&decoder_filename, "decoder")?,
     };
-    let metadata =
-        onnx_genai_genai_config::encoder_decoder_pipeline_inference_metadata_from_dir(root, &graphs)
-            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
-            .ok_or_else(|| {
-                incomplete_compatibility_error(
-                    root,
-                    "an encoder-decoder genai_config.json with encoder and decoder components",
-                )
-            })?;
+    let metadata = onnx_genai_genai_config::encoder_decoder_pipeline_inference_metadata_from_dir(
+        root, &graphs,
+    )
+    .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
+    .ok_or_else(|| {
+        incomplete_compatibility_error(
+            root,
+            "an encoder-decoder genai_config.json with encoder and decoder components",
+        )
+    })?;
     let preprocessing = metadata.preprocessing;
     let spec = metadata
         .pipeline

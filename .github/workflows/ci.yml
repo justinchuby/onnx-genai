@@ -25,10 +25,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      # Formatting is the one tracked quality-gate exception while the repo-wide
-      # fmt sweep is in flight; warnings are blocking below.
+      # Blocking, like the clippy gate below. The sweep this exception was
+      # waiting on has landed, so an unformatted tree is now a failure rather
+      # than a note nobody reads.
       - name: Check formatting
-        continue-on-error: true
         run: cargo fmt --all -- --check
 
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
