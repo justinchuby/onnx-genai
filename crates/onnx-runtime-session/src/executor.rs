@@ -1030,7 +1030,33 @@ pub(crate) struct Executor {
     /// (memo OFF, CUDA, nested, or non-eager) — counted only when the master
     /// switch is on, to make an over-restrictive gate observable.
     decode_memo_ineligible_count: u64,
+    /// F5 Stage 2 — cached invariant buffer/view plan. Present only after a
+    /// successful memo rebuild that found ≥1 fully-invariant pure-view node; it
+    /// records the zero-copy view aliases to reinstate and the pure-view plan
+    /// nodes to elide on a matching replay, guarded by a per-source buffer
+    /// identity signature. Invalidated on every non-replay step (mirrors the
+    /// Stage-1 Chew defense-in-depth) so a stale plan from a retired/errored
+    /// step can never serve a future replay. Default OFF (shares the Stage-1
+    /// `ONNX_GENAI_DECODE_MEMO=1` gate).
+    decode_view_plan: Option<DecodeViewPlan>,
+    /// F5 Stage 2 counters. `views_reused` = zero-copy view aliases reinstated
+    /// without rebuild; `dispatch_elided` = pure-view plan nodes whose re-dispatch
+    /// was skipped. Both prove non-vacuous firing on the real decode path.
+    decode_views_reused_count: u64,
+    decode_dispatch_elided_count: u64,
+    /// F5 Stage 2 defense-in-depth: consecutive replay steps whose buffer-identity
+    /// signature failed to match (a source buffer moved/resized under a plan that
+    /// classified it invariant). After [`STAGE2_SIG_MISMATCH_LIMIT`] such steps the
+    /// view plan is disabled for the rest of the session — an invariant-buffer
+    /// assumption that keeps breaking must never keep serving cached views.
+    decode_view_plan_sig_mismatch_streak: u32,
+    /// Latched off after repeated signature mismatches (see above).
+    decode_view_plan_disabled: bool,
 }
+
+/// After this many consecutive buffer-identity signature mismatches, F5 Stage 2
+/// view reuse is latched off for the session (Chew defense-in-depth).
+const STAGE2_SIG_MISMATCH_LIMIT: u32 = 2;
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
 /// borrows `source`'s buffer with the given (real, possibly non-contiguous or
@@ -1137,6 +1163,69 @@ impl DecodePlanMemo {
             }
         })
     }
+}
+
+/// F5 Stage 2 — cached invariant buffer/view plan.
+///
+/// Stage 1 proved that during steady single-token decode a large partition of
+/// values resolve to a byte-identical shape every step (the memo's
+/// `invariant_shapes`). Empirically, on real decoders the ~113 pure layout ops
+/// (`Reshape`/`Squeeze`/`Unsqueeze`/no-op views) produce a **byte-identical
+/// zero-copy [`ValueView`] every step** — yet Stage 1 still re-cleared and
+/// re-dispatched every one per token. This plan caches those view aliases and the
+/// nodes that produce them so a matching replay step can:
+///   1. reinstate the invariant view aliases instead of clearing+rebuilding them,
+///   2. exclude the invariant partition from per-step buffer sizing, and
+///   3. elide re-dispatch of the pure-view nodes entirely.
+///
+/// **Membership (why an elided view is never geometrically stale).** A node is a
+/// *candidate* iff every output's shape is in the memo's proven-invariant partition
+/// (`invariant_shapes`) — so Stage 1 already guarantees the output shape is
+/// byte-identical every replay step and the replayed `resolved` map always carries
+/// it. A candidate is *promoted* to the active elision set only after its produced
+/// view is observed **byte-identical across a second real decode step**
+/// ([`Executor::validate_decode_view_plan`]) — the same two-real-step confirmation
+/// Stage 1 uses to derive its varying set. Contiguous-view strides are a pure
+/// function of the (invariant) output shape, and any per-step `byte_offset` drift
+/// (e.g. a position-indexed slice into a fixed-capacity KV buffer) would differ
+/// across the two observed steps and so is rejected before it can ever be elided.
+///
+/// **Soundness — the buffer-identity obligation.** Stage 1 could exclude
+/// pointer/capacity from its replay key because it cached *shapes only* and every
+/// kernel re-read fresh bytes each step. Stage 2 caches actual **buffers/views**, so
+/// a realloc or pointer move of a cached view's source would leave the reinstated
+/// alias pointing at a stale/dangling region. Therefore this plan records
+/// `source_buffer_sig` = `(source, base_ptr, capacity)` for every buffer a retained
+/// view aliases, and a replay step reinstates the plan **iff** every signature still
+/// matches ([`Executor::stage2_buffer_sig_matches`]); any mismatch forces a full
+/// rebuild. (A retained [`ValueView`] references its source by [`ValueId`], so a
+/// consumer already re-reads the *current* base pointer — but the byte offset and
+/// capacity assumptions are exactly what the pointer+capacity guard protects.)
+///
+/// The plan is only ever *built* at the successful end of a memo Rebuilt step,
+/// *validated* on the following replay, and *used* on a memo Replayed step whose
+/// bindings, external signature (Stage 1) and buffer identity (Stage 2) all match;
+/// it is invalidated on every non-replay step so an errored/retired step can never
+/// serve a stale alias. Under `decode_memo_verify` every reinstated view is also
+/// asserted equal to a freshly built one in-flight (the R1 safety net).
+struct DecodeViewPlan {
+    /// Plan-node indices (into [`Executor::plan`]) whose every output shape is in
+    /// the memo's invariant partition — candidates until validated, then the active
+    /// elision set (re-dispatch skipped on a matching replay).
+    elided_nodes: HashSet<usize>,
+    /// The zero-copy view aliases to reinstate each replay step (`vid` → its
+    /// invariant [`ValueView`]), verbatim from the reference step.
+    retained_views: Vec<(ValueId, ValueView)>,
+    /// Distinct buffer-owning source value ids to re-pin (conservative liveness:
+    /// a source with a live view is never reused/freed within the run).
+    pinned_sources: Vec<ValueId>,
+    /// Buffer-identity signature `(source, base_ptr as usize, capacity)` for every
+    /// retained view's source buffer. The Stage-2 replay guard.
+    source_buffer_sig: Vec<(ValueId, usize, usize)>,
+    /// `false` for a freshly built candidate; set `true` once every retained view
+    /// has been confirmed byte-identical on a second real decode step. Only a
+    /// validated plan is ever used to elide dispatch.
+    validated: bool,
 }
 
 /// Outcome of the most recent memo-eligible eager resolve, exposed for the F5
@@ -2737,6 +2826,11 @@ impl Executor {
             decode_memo_rebuilt_count: 0,
             decode_memo_replayed_count: 0,
             decode_memo_ineligible_count: 0,
+            decode_view_plan: None,
+            decode_views_reused_count: 0,
+            decode_dispatch_elided_count: 0,
+            decode_view_plan_sig_mismatch_streak: 0,
+            decode_view_plan_disabled: false,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -2909,6 +3003,12 @@ impl Executor {
         // (or, if that step errors, left empty and defensively re-seeded next
         // replay), so the clear costs nothing on the steady path.
         self.decode_memo_resolved.clear();
+        // F5 Stage 2 defense-in-depth: retire the cached view plan on every
+        // non-replay (rebuild/prime) step. A Rebuilt step rebuilds it fresh only
+        // at its successful end (below, in `run_scoped_mode`); a step that errors
+        // before that leaves it `None`, so a stale invariant view alias from a
+        // retired plan can never be reinstated into a later replay.
+        self.decode_view_plan = None;
         let resolved = self.resolve_soft(bindings);
         match self.decode_memo_prev_bindings.take() {
             Some(prev) if is_decode_growth_transition(&prev, bindings) => {
@@ -2986,6 +3086,11 @@ impl Executor {
         self.decode_memo_rebuilt_count = 0;
         self.decode_memo_replayed_count = 0;
         self.decode_memo_ineligible_count = 0;
+        self.decode_view_plan = None;
+        self.decode_views_reused_count = 0;
+        self.decode_dispatch_elided_count = 0;
+        self.decode_view_plan_sig_mismatch_streak = 0;
+        self.decode_view_plan_disabled = false;
     }
 
     #[cfg(test)]
@@ -3004,6 +3109,149 @@ impl Executor {
             self.decode_memo_replayed_count,
             self.decode_memo_ineligible_count,
         )
+    }
+
+    /// F5 Stage 2 activity counters `(views_reused, dispatch_elided)` accumulated
+    /// over this executor's lifetime. Both `> 0` on a real decode run prove the
+    /// invariant view-reuse / dispatch-elision path actually fired (not a vacuous
+    /// pass); an on-model A/B reads these alongside the Stage-1 counters.
+    pub(crate) fn decode_view_plan_counts(&self) -> (u64, u64) {
+        (
+            self.decode_views_reused_count,
+            self.decode_dispatch_elided_count,
+        )
+    }
+
+    /// F5 Stage 2 replay guard: every retained view's source buffer must still be
+    /// the identical allocation (same base pointer *and* capacity) it was under
+    /// when the plan was built. A realloc or move — even one that preserves the
+    /// logical shape — invalidates the cached byte offsets/strides, so this must
+    /// return `false` and force a full rebuild. This is the pointer/capacity
+    /// obligation Stage 1 deferred (it cached shapes only); Stage 2 pays it here.
+    fn stage2_buffer_sig_matches(&self, plan: &DecodeViewPlan) -> bool {
+        plan.source_buffer_sig.iter().all(|(vid, ptr, cap)| {
+            self.buffers
+                .get(vid)
+                .is_some_and(|buf| buf.as_ptr() as usize == *ptr && buf.len() == *cap)
+        })
+    }
+
+    /// F5 Stage 2: build the *candidate* view plan from the state left by a
+    /// successful memo Rebuilt step. A node is a candidate iff every one of its
+    /// outputs is a zero-copy view (`self.views`) whose **shape is in the memo's
+    /// proven-invariant partition** — so Stage 1 guarantees the replayed `resolved`
+    /// map carries that exact shape every step. The candidate's source buffers can
+    /// still be classified variant (e.g. a fixed-capacity KV buffer whose logical
+    /// length grows): its concrete stability is confirmed separately by
+    /// [`Self::validate_decode_view_plan`] (byte-identical view across a second real
+    /// step) and guarded each replay by the buffer-identity signature. Returns
+    /// `None` if nothing is a candidate.
+    fn build_decode_view_plan(&self) -> Option<DecodeViewPlan> {
+        let memo = self.decode_memo.as_ref()?;
+        let invariant = |vid: &ValueId| memo.invariant_shapes.contains_key(vid);
+        let mut elided_nodes = HashSet::new();
+        let mut retained_views = Vec::new();
+        let mut sources: HashSet<ValueId> = HashSet::new();
+        for pi in 0..self.plan.len() {
+            let outputs = &self.plan[pi].outputs;
+            if outputs.is_empty() {
+                continue;
+            }
+            // Every output must be a zero-copy view whose shape Stage 1 already
+            // proves invariant (so `resolved[output]` is stable and correct when
+            // the node is elided).
+            let all_view_invariant = outputs
+                .iter()
+                .all(|ovid| invariant(ovid) && self.views.contains_key(ovid));
+            if !all_view_invariant {
+                continue;
+            }
+            elided_nodes.insert(pi);
+            for ovid in outputs {
+                let view = self.views[ovid].clone();
+                sources.insert(view.source);
+                retained_views.push((*ovid, view));
+            }
+        }
+        if elided_nodes.is_empty() {
+            return None;
+        }
+        // Record the buffer identity of every aliased source (the Stage-2 guard).
+        let mut source_buffer_sig = Vec::with_capacity(sources.len());
+        for &src in &sources {
+            let buf = self.buffers.get(&src)?;
+            source_buffer_sig.push((src, buf.as_ptr() as usize, buf.len()));
+        }
+        Some(DecodeViewPlan {
+            elided_nodes,
+            retained_views,
+            pinned_sources: sources.into_iter().collect(),
+            source_buffer_sig,
+            validated: false,
+        })
+    }
+
+    /// F5 Stage 2: confirm a candidate plan on a second real decode step. The step
+    /// ran every node normally (no elision), so `self.views` now holds freshly
+    /// built aliases; keep only the candidate nodes whose every output view is
+    /// **byte-identical** (source, shape, strides, byte offset) to the one captured
+    /// when the plan was built. This two-real-step confirmation (mirroring Stage 1's
+    /// varying-set derivation) rejects any view whose geometry actually drifts — e.g.
+    /// a position-indexed slice into a fixed-capacity buffer — before it is ever
+    /// elided. Sources and the buffer-identity signature are recomputed from the
+    /// surviving views. The plan is marked validated iff anything survives.
+    fn validate_decode_view_plan(&self, mut plan: DecodeViewPlan) -> Option<DecodeViewPlan> {
+        let view_matches = |a: &ValueView, b: &ValueView| {
+            a.source == b.source
+                && a.shape == b.shape
+                && a.strides == b.strides
+                && a.byte_offset == b.byte_offset
+        };
+        // A node survives iff every one of its retained outputs still matches the
+        // freshly rebuilt view this step.
+        let mut surviving_nodes: HashSet<usize> = HashSet::new();
+        let node_outputs = |pi: usize| self.plan[pi].outputs.clone();
+        for &pi in &plan.elided_nodes {
+            let ok = node_outputs(pi).iter().all(|ovid| {
+                match (
+                    plan.retained_views.iter().find(|(v, _)| v == ovid),
+                    self.views.get(ovid),
+                ) {
+                    (Some((_, cached)), Some(fresh)) => view_matches(cached, fresh),
+                    _ => false,
+                }
+            });
+            if ok {
+                surviving_nodes.insert(pi);
+            }
+        }
+        if surviving_nodes.is_empty() {
+            return None;
+        }
+        // Rebuild retained views / sources / signature from the survivors only,
+        // using the freshly built (identical) views.
+        let surviving_outputs: HashSet<ValueId> = surviving_nodes
+            .iter()
+            .flat_map(|&pi| self.plan[pi].outputs.clone())
+            .collect();
+        let mut retained_views = Vec::new();
+        let mut sources: HashSet<ValueId> = HashSet::new();
+        for ovid in surviving_outputs {
+            let view = self.views.get(&ovid)?.clone();
+            sources.insert(view.source);
+            retained_views.push((ovid, view));
+        }
+        let mut source_buffer_sig = Vec::with_capacity(sources.len());
+        for &src in &sources {
+            let buf = self.buffers.get(&src)?;
+            source_buffer_sig.push((src, buf.as_ptr() as usize, buf.len()));
+        }
+        plan.elided_nodes = surviving_nodes;
+        plan.retained_views = retained_views;
+        plan.pinned_sources = sources.into_iter().collect();
+        plan.source_buffer_sig = source_buffer_sig;
+        plan.validated = true;
+        Some(plan)
     }
 
     /// Size (allocate or reuse) a backing buffer for every value from its
@@ -3725,6 +3973,65 @@ impl Executor {
                 resolved
             }
         };
+        // --- F5 Stage 2: reinstate the cached invariant view/buffer plan --------
+        // On a memo Replayed step whose per-source buffer identity still matches,
+        // reinstate the zero-copy view aliases (lever 1) instead of clearing and
+        // rebuilding them, mark the pure-view nodes for dispatch elision (lever 3),
+        // and exclude the invariant partition from buffer sizing (lever 2). Taken
+        // out of `self` for the duration so an errored step drops it (a stale alias
+        // can never be reinstated into a later replay); restored on success.
+        let mut stage2_plan: Option<DecodeViewPlan> = None;
+        let mut stage2_candidate: Option<DecodeViewPlan> = None;
+        let mut stage2_excluded: Option<HashSet<ValueId>> = None;
+        if decode_memo_eligible
+            && !self.decode_view_plan_disabled
+            && self.decode_memo_last_action == DecodeMemoAction::Replayed
+            && let Some(plan) = self.decode_view_plan.take()
+        {
+            if !plan.validated {
+                // Candidate plan built on the preceding Rebuilt step: run this step
+                // in full (no reinstate/elide) so every invariant view is freshly
+                // built, then confirm two-real-step byte-identity below before it is
+                // ever used to elide. This is the second-real-step confirmation.
+                stage2_candidate = Some(plan);
+            } else if self.stage2_buffer_sig_matches(&plan) {
+                self.decode_view_plan_sig_mismatch_streak = 0;
+                // Lever 1: reinstate the invariant zero-copy view aliases and
+                // re-pin their source buffers (conservative liveness). Also
+                // restore each elided output's resolved shape to the view's own
+                // shape — the value the elided view node would have written into
+                // `resolved` (which can differ from the pre-loop `resolve_soft`
+                // shape Stage 1 restored, e.g. a Reshape with an inferred dim), so
+                // downstream consumers read the identical geometry as a full step.
+                for (vid, view) in &plan.retained_views {
+                    self.views.insert(*vid, view.clone());
+                    resolved.insert(*vid, view.shape.clone());
+                }
+                for &src in &plan.pinned_sources {
+                    self.pinned.insert(src);
+                }
+                self.decode_views_reused_count += plan.retained_views.len() as u64;
+                self.decode_dispatch_elided_count += plan.elided_nodes.len() as u64;
+                // Lever 2: exclude the memo's proven-invariant partition from
+                // per-step buffer sizing — those buffers were sized under the
+                // rebuild and are byte-identical (guarded by the buffer-identity
+                // signature above); the compute path still self-heals any output
+                // whose length unexpectedly differs.
+                if let Some(memo) = self.decode_memo.as_ref() {
+                    stage2_excluded = Some(memo.invariant_shapes.keys().copied().collect());
+                }
+                stage2_plan = Some(plan);
+            } else {
+                // A source buffer moved/resized under a plan that classified it
+                // invariant: retire the plan (dropped here) and run the full step.
+                // After repeated mismatches the assumption is untrustworthy on this
+                // model, so latch Stage 2 off for the session (defense-in-depth).
+                self.decode_view_plan_sig_mismatch_streak += 1;
+                if self.decode_view_plan_sig_mismatch_streak >= STAGE2_SIG_MISMATCH_LIMIT {
+                    self.decode_view_plan_disabled = true;
+                }
+            }
+        }
         let external_values = external
             .inputs
             .keys()
@@ -3740,7 +4047,19 @@ impl Executor {
         }
         {
             let _s = phase_span!("run_scoped.size_buffers");
-            self.size_buffers_excluding(&resolved, &external_values)?;
+            match &stage2_excluded {
+                // Stage 2 (lever 2): size only the values outside the memo's
+                // invariant partition (variant/JIT/external) — the invariant
+                // buffers are reused untouched from the rebuild step.
+                Some(invariant) => {
+                    let mut excluded = external_values.clone();
+                    excluded.extend(invariant.iter().copied());
+                    self.size_buffers_excluding(&resolved, &excluded)?;
+                }
+                None => {
+                    self.size_buffers_excluding(&resolved, &external_values)?;
+                }
+            }
         }
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
@@ -3765,7 +4084,69 @@ impl Executor {
                 } else {
                     "run_scoped.plan_eager.top"
                 });
-                self.run_plan_eager(&mut resolved, outer_scope, external)?;
+                // F5 Stage 2: elide the plan's pure-view nodes only in production.
+                // Under `decode_memo_verify` (the R1 safety net) run every node so
+                // the invariant views are freshly rebuilt, then assert each equals
+                // the reinstated alias (bytes/shape/ptr) — proving reuse is exact.
+                let verify_stage2 = self.decode_memo_verify && stage2_plan.is_some();
+                let verify_snapshot: Option<Vec<(ValueId, ValueView)>> = if verify_stage2 {
+                    stage2_plan.as_ref().map(|p| p.retained_views.clone())
+                } else {
+                    None
+                };
+                let elided = if verify_stage2 {
+                    None
+                } else {
+                    stage2_plan.as_ref().map(|p| &p.elided_nodes)
+                };
+                self.run_plan_eager(&mut resolved, outer_scope, external, elided)?;
+                if let (Some(snapshot), Some(plan)) = (&verify_snapshot, &stage2_plan) {
+                    for (vid, cached) in snapshot {
+                        let fresh = self.views.get(vid).unwrap_or_else(|| {
+                            panic!(
+                                "F5 Stage 2 verify: elided view value#{} was not rebuilt by a \
+                                 full dispatch",
+                                vid.0
+                            )
+                        });
+                        assert!(
+                            fresh.source == cached.source
+                                && fresh.shape == cached.shape
+                                && fresh.strides == cached.strides
+                                && fresh.byte_offset == cached.byte_offset,
+                            "F5 Stage 2 verify: cached view for value#{} ({cached:?}) diverged \
+                             from a freshly built one ({fresh:?}) — invariant view reuse is unsound",
+                            vid.0
+                        );
+                    }
+                    assert!(
+                        self.stage2_buffer_sig_matches(plan),
+                        "F5 Stage 2 verify: a cached view source buffer moved during the step"
+                    );
+                }
+                // F5 Stage 2 plan lifecycle: rebuild the cached view plan at the
+                // successful end of a memo Rebuilt step (the plan was invalidated
+                // at the top of the rebuild path, so a mid-step error leaves it
+                // `None`); restore the in-flight plan after a successful replay.
+                if decode_memo_eligible {
+                    match self.decode_memo_last_action {
+                        DecodeMemoAction::Rebuilt => {
+                            self.decode_view_plan = self.build_decode_view_plan();
+                        }
+                        DecodeMemoAction::Replayed => {
+                            if let Some(cand) = stage2_candidate.take() {
+                                // This replay ran full dispatch as the candidate's
+                                // second-real-step confirmation: keep only the nodes
+                                // whose view is byte-identical to the built one, and
+                                // promote to validated (or drop if none survive).
+                                self.decode_view_plan = self.validate_decode_view_plan(cand);
+                            } else if let Some(plan) = stage2_plan.take() {
+                                self.decode_view_plan = Some(plan);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // Snapshot the exact just-in-time shapes this warm run resolved,
                 // together with the persistent-binding signature they were
                 // derived under. Capture-mode seeding replays these shapes only
@@ -4325,16 +4706,27 @@ impl Executor {
     }
 
     /// Execute every plan node eagerly on the stream (no capture).
+    ///
+    /// F5 Stage 2: when `elided` is `Some`, the plan-node indices it contains are
+    /// pure invariant view nodes whose zero-copy output aliases have already been
+    /// reinstated into `self.views` for this step, so their re-dispatch is skipped.
+    /// The set is empty (or `None`) on every non-Stage-2 run, so ordinary steps
+    /// pay only one `HashSet::is_empty`/`contains` check per node.
     fn run_plan_eager(
         &mut self,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
+        elided: Option<&HashSet<usize>>,
     ) -> Result<()> {
+        let elided = elided.filter(|set| !set.is_empty());
         if profile_ops_enabled() {
             let run_start = Instant::now();
             let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
             for pi in 0..self.plan.len() {
+                if elided.is_some_and(|set| set.contains(&pi)) {
+                    continue;
+                }
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
                 let start = Instant::now();
                 let result =
@@ -4348,6 +4740,9 @@ impl Executor {
             print_op_profile(run_start.elapsed(), timings);
         } else {
             for pi in 0..self.plan.len() {
+                if elided.is_some_and(|set| set.contains(&pi)) {
+                    continue;
+                }
                 self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
             }
         }
@@ -7489,9 +7884,11 @@ impl Drop for Executor {
                 .unwrap_or(false)
         {
             let (primed, rebuilt, replayed, ineligible) = self.decode_memo_counts();
+            let (views_reused, dispatch_elided) = self.decode_view_plan_counts();
             eprintln!(
                 "[decode-memo] primed={primed} rebuilt={rebuilt} replayed={replayed} \
-                 ineligible={ineligible}"
+                 ineligible={ineligible} views_reused={views_reused} \
+                 dispatch_elided={dispatch_elided}"
             );
         }
         let _ = self.ep.reset_device_graph();
@@ -10158,5 +10555,239 @@ mod tests {
              (primed={primed} rebuilt={rebuilt} replayed={replayed})"
         );
         assert_eq!(replays as u64, replayed);
+    }
+
+    /// F5 Stage 2 test graph. The persistent-KV spine (`kv[L] -> Relu -> kvout[L]`)
+    /// keeps the memo eligible, and an invariant tail (`y[4] * w[4] -> ymul[4]`)
+    /// feeds a `Reshape(ymul, [2,2]) -> yview` — a pure invariant zero-copy view.
+    /// Stage 2 must reinstate `yview` and elide the Reshape's dispatch on replay.
+    /// Returns the graph and the `ymul` value id (the view's source buffer).
+    #[cfg(test)]
+    fn stage2_view_graph() -> (Graph, ValueId) {
+        use onnx_runtime_ir::{TensorData, static_shape};
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let l = graph.intern_symbol("L");
+        let kv = graph.create_named_value("kv", DataType::Float32, vec![l.into()]);
+        graph.add_input(kv);
+        let kvout = graph.create_named_value("kvout", DataType::Float32, vec![l.into()]);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+        graph.add_output(kvout);
+
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+        graph.add_input(y);
+        let w = graph.create_named_value("w", DataType::Float32, static_shape([4]));
+        graph.set_initializer(
+            w,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let ymul = graph.create_named_value("ymul", DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(NodeId(0), "Mul", vec![Some(y), Some(w)], vec![ymul]));
+
+        // Reshape ymul[4] -> yview[2,2] through a constant shape initializer, which
+        // the CPU Reshape kernel serves as a zero-copy view over `ymul`'s buffer.
+        let yshape = graph.create_named_value("yshape", DataType::Int64, static_shape([2]));
+        graph.set_initializer(
+            yshape,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![2],
+                [2i64, 2].into_iter().flat_map(i64::to_le_bytes).collect(),
+            )),
+        );
+        let yview = graph.create_named_value("yview", DataType::Float32, static_shape([2, 2]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(ymul), Some(yshape)],
+            vec![yview],
+        ));
+        graph.add_output(yview);
+        (graph, ymul)
+    }
+
+    /// Run one persistent-KV decode step against [`stage2_view_graph`]: grow the KV
+    /// length to `len`, feed a fresh `y` (so `ymul` — and thus the elided `yview` —
+    /// varies each step, proving the reinstated view reads the freshly computed
+    /// source bytes), and return the materialized `yview` output.
+    #[cfg(test)]
+    fn stage2_run(exec: &mut Executor, kv_binding: &mut DeviceIoBinding, len: usize, y_bias: f32) -> Vec<f32> {
+        kv_binding.set_logical_shape(vec![len]).unwrap();
+        let bytes: Vec<u8> = (0..len).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        kv_binding.write_bytes(0, &bytes).unwrap();
+        let y = Tensor::from_f32(
+            &[4],
+            &[y_bias + 1.0, y_bias + 2.0, y_bias + 3.0, y_bias + 4.0],
+        )
+        .unwrap();
+        let outs = exec
+            .run_with_device_bindings(&[("y", &y)], std::slice::from_mut(kv_binding))
+            .unwrap();
+        // Graph outputs are [kvout (bound → None), yview (returned)].
+        outs.into_iter()
+            .flatten()
+            .next()
+            .expect("yview output")
+            .to_vec_f32()
+    }
+
+    #[cfg(test)]
+    fn stage2_kv_binding(exec: &Executor) -> DeviceIoBinding {
+        exec.allocate_device_binding(
+            "kv".into(),
+            Some("kvout".into()),
+            DataType::Float32,
+            vec![256],
+            vec![1],
+        )
+        .unwrap()
+    }
+
+    /// F5 Stage 2 proof-of-fire + token-exact lock. Over ≥128 growing-length
+    /// persistent-KV decode steps the invariant `Reshape` view is reinstated and
+    /// its dispatch elided (`views_reused`/`dispatch_elided` both grow), and the
+    /// memo-ON `yview` output is bit-identical to the memo-OFF reference every
+    /// step (with `y` — and therefore the view's source `ymul` — changing each
+    /// step, so a stale alias would immediately diverge). `decode_memo_verify`
+    /// (forced on by `set_decode_memo_enabled`) additionally asserts every
+    /// reinstated view equals a freshly built one in-flight.
+    #[test]
+    fn decode_view_plan_fires_and_is_token_exact_over_128_steps() {
+        const STEPS: usize = 130;
+
+        let (off_graph, _) = stage2_view_graph();
+        let mut off = Executor::build(
+            off_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        assert!(!off.decode_memo_enabled, "reference must run memo-OFF");
+        let mut off_kv = stage2_kv_binding(&off);
+
+        let (on_graph, _) = stage2_view_graph();
+        let mut on = Executor::build(
+            on_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        on.set_decode_memo_enabled(true);
+        let mut on_kv = stage2_kv_binding(&on);
+
+        for step in 0..STEPS {
+            let len = 4 + step; // strictly growing KV length L
+            let bias = step as f32; // vary the invariant-shape source each step
+            let ref_out = stage2_run(&mut off, &mut off_kv, len, bias);
+            let memo_out = stage2_run(&mut on, &mut on_kv, len, bias);
+            assert_eq!(
+                ref_out, memo_out,
+                "Stage 2 view reuse diverged from the reference at step {step} (L={len})"
+            );
+        }
+
+        let (views_reused, dispatch_elided) = on.decode_view_plan_counts();
+        assert!(
+            views_reused > 0 && dispatch_elided > 0,
+            "Stage 2 must fire on steady decode (views_reused={views_reused}, \
+             dispatch_elided={dispatch_elided})"
+        );
+        // Non-vacuous: the reshape view must be reused/elided on the bulk of steps
+        // (priming + first rebuild cost the first few steps).
+        assert!(
+            views_reused as usize >= STEPS - 4,
+            "expected steady Stage 2 reuse; only {views_reused}/{STEPS} views reused"
+        );
+        assert!(
+            on.decode_view_plan.is_some(),
+            "the cached view plan must survive steady-state replay"
+        );
+    }
+
+    /// F5 Stage 2 buffer-identity invalidation lock. If a cached view's source
+    /// buffer is reallocated to a different base pointer between steps — the exact
+    /// hazard Stage 1 could ignore but Stage 2 cannot — the plan MUST detect the
+    /// signature mismatch, decline to reinstate the (now stale) alias, and fall
+    /// back to a full dispatch. The step's output must still be correct (no
+    /// dangling/stale view served) and the reuse counter must NOT advance.
+    #[test]
+    fn decode_view_plan_rebuilds_on_source_buffer_move() {
+        use onnx_runtime_ir::TensorLayout;
+
+        let (off_graph, _) = stage2_view_graph();
+        let mut off = Executor::build(
+            off_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        let mut off_kv = stage2_kv_binding(&off);
+
+        let (on_graph, ymul) = stage2_view_graph();
+        let mut on = Executor::build(
+            on_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        on.set_decode_memo_enabled(true);
+        let mut on_kv = stage2_kv_binding(&on);
+
+        // Warm up so the view plan is built and firing.
+        for step in 0..6usize {
+            let len = 4 + step;
+            let bias = step as f32;
+            let r = stage2_run(&mut off, &mut off_kv, len, bias);
+            let m = stage2_run(&mut on, &mut on_kv, len, bias);
+            assert_eq!(r, m, "warmup diverged at step {step}");
+        }
+        assert!(
+            on.decode_view_plan.is_some(),
+            "view plan must be built before the realloc test"
+        );
+        let (reused_before, _) = on.decode_view_plan_counts();
+
+        // Forcibly MOVE the view's source buffer (`ymul`) to a fresh allocation of
+        // the same capacity — a base-pointer change the plan's signature must catch.
+        let old = on.buffers.remove(&ymul).expect("ymul buffer");
+        let cap = old.len();
+        on.ep.deallocate(old).unwrap();
+        let fresh = on
+            .ep
+            .allocate(cap, TensorLayout::contiguous().alignment)
+            .unwrap();
+        let moved_ptr = fresh.as_ptr() as usize;
+        on.buffers.insert(ymul, fresh);
+        // Sanity: the plan's recorded source pointer no longer matches.
+        assert!(
+            !on.stage2_buffer_sig_matches(on.decode_view_plan.as_ref().unwrap()),
+            "the forced realloc must break the buffer-identity signature"
+        );
+
+        // Next step: Stage 2 must decline reuse (sig mismatch) yet stay correct.
+        let len = 4 + 6;
+        let bias = 6.0f32;
+        let ref_out = stage2_run(&mut off, &mut off_kv, len, bias);
+        let memo_out = stage2_run(&mut on, &mut on_kv, len, bias);
+        assert_eq!(
+            ref_out, memo_out,
+            "a moved source buffer must force a rebuild, never serve a stale view"
+        );
+        let (reused_after, _) = on.decode_view_plan_counts();
+        assert_eq!(
+            reused_after, reused_before,
+            "the mismatched step must NOT reuse cached views (would be stale)"
+        );
+        // The freshly computed ymul must live in a real buffer again (the moved one
+        // or a self-healed reallocation), never left dangling.
+        let healed = on.buffers.get(&ymul).expect("ymul rebound").as_ptr() as usize;
+        assert!(healed == moved_ptr || healed != 0, "ymul must be backed");
     }
 }

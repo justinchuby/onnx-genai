@@ -923,6 +923,15 @@ impl InferenceSession {
         self.exec.decode_memo_counts()
     }
 
+    /// F5 Stage 2 view-plan activity counters `(views_reused, dispatch_elided)`
+    /// over this session's lifetime. Both `> 0` after a decode run prove the
+    /// invariant zero-copy view reuse and pure-view dispatch elision actually
+    /// fired on the real path (not a vacuous pass); an on-model A/B reads this
+    /// alongside [`Self::decode_memo_counts`].
+    pub fn decode_view_plan_counts(&self) -> (u64, u64) {
+        self.exec.decode_view_plan_counts()
+    }
+
     /// Run with persistent device allocations supplying graph inputs and,
     /// optionally, aliasing graph outputs. Bound outputs are returned as `None`
     /// because their bytes remain resident in the caller-owned allocation.
