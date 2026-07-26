@@ -1244,6 +1244,11 @@ impl Engine {
     ///
     /// Evictions or allocation failures mean the KV pool is under pressure,
     /// which no per-token latency figure explains on its own.
+    /// What the KV page pool is holding right now.
+    pub fn page_usage(&self) -> onnx_genai_kv::PageUsage {
+        self.kv_cache.page_table.usage()
+    }
+
     pub fn page_stats(&self) -> onnx_genai_kv::PageStats {
         self.kv_cache.page_table.stats()
     }

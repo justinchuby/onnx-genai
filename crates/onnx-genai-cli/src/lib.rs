@@ -38,6 +38,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod live_turn;
 mod memory;
+mod pages;
 mod profile;
 use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
@@ -450,6 +451,14 @@ impl Backend {
         })
     }
 
+    /// What the KV page pool holds right now, when the backend pages its KV.
+    fn page_usage(&self) -> Option<onnx_genai::kv::PageUsage> {
+        match self {
+            Self::Text(engine) => Some(engine.page_usage()),
+            Self::Pipeline(pipeline) => pipeline.engine.page_usage(),
+        }
+    }
+
     /// Cumulative KV page counters, when the backend keeps a page pool.
     fn page_stats(&self) -> Option<onnx_genai::kv::PageStats> {
         match self {
@@ -723,6 +732,8 @@ enum ReplCommand {
     Reset,
     ToggleRaw,
     ToggleStats,
+    /// Show what the KV page pool is holding.
+    Pages,
     /// Turn the profile report on or off, or report its state.
     Profile(Option<String>),
     /// Load a different model, or report the current one.
@@ -855,6 +866,7 @@ fn parse_repl_line(line: &str) -> ReplLine {
         "reset" => ReplCommand::Reset,
         "raw" => ReplCommand::ToggleRaw,
         "stats" => ReplCommand::ToggleStats,
+        "pages" => ReplCommand::Pages,
         "profile" => ReplCommand::Profile(argument_of(arguments)),
         "model" => ReplCommand::Model(argument_of(arguments)),
         "ep" => ReplCommand::ExecutionProvider(argument_of(arguments)),
@@ -1670,7 +1682,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             ReplLine::Prompt(prompt) => Some(prompt),
             ReplLine::Command(ReplCommand::Help) => {
                 println!(
-                    "/help\n/reset\n/raw\n/stats\n/profile [on|off]\n/model [path]\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+                    "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off]\n/model [path]\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
                 );
                 None
             }
@@ -1792,6 +1804,16 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                         Err(error) => eprintln!("error: {error}"),
                     },
                     None => println!("{}", settings.describe()),
+                }
+                None
+            }
+            ReplLine::Command(ReplCommand::Pages) => {
+                match backend.page_usage() {
+                    Some(usage) => print!("{}", pages::render(&usage)),
+                    // Absent rather than an empty pool: this decoder's KV is not
+                    // paged at all, which is a different thing from holding
+                    // nothing.
+                    None => println!("this model's KV is not paged, so there are no pages to show"),
                 }
                 None
             }

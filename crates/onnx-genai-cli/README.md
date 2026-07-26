@@ -163,6 +163,32 @@ All but `/profile` reload the model and clear the conversation. A selection that
 fails to load is reported and the previous session keeps running, so an
 unavailable provider does not end the session.
 
+### Seeing what the KV cache holds
+
+`/pages` shows the page pool as it stands, which is the view you want when a
+pool is filling up and the question is whether that is one long conversation or
+many that should be sharing:
+
+```text
+kv pages   ▓▓▓▓████················  38%
+           38 of 100 pages held · 16 tokens/page
+           512 of 608 token slots used (84% of held pages)
+           9 shared (23%) — pages more than one sequence or cached prefix holds
+
+references per page
+    1x      29 pages
+    2x       7 pages
+    3x       2 pages
+
+live sequences
+  sequence     pages   tokens   shared
+  7               12      190        5
+```
+
+Shared pages are drawn first (`▓`) because they are the ones that would
+otherwise have been duplicated. A model whose KV is not paged says so, rather
+than reporting an empty pool.
+
 ### Tests
 
 Always name packages explicitly. A bare `--workspace` pulls in `mlas-sys`, whose

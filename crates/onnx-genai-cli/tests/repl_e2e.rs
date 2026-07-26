@@ -634,3 +634,29 @@ fn the_provider_menu_comes_from_the_runtime_not_the_cli() {
         );
     }
 }
+
+#[test]
+fn pages_reports_the_pool_or_says_the_model_has_none() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/pages\n\n",
+    ));
+
+    // Either shape is correct depending on the model's KV layout; what must not
+    // happen is a bare zero that reads as "an empty pool" when there is no pool.
+    assert!(
+        output.contains("kv pages") || output.contains("KV is not paged"),
+        "{output}"
+    );
+}
+
+#[test]
+fn pages_is_offered_in_help() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/help\n\n",
+    ));
+    assert!(output.contains("/pages"), "{output}");
+}

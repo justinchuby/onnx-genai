@@ -5,7 +5,7 @@ use crate::{
     fp8::{Fp8Format, decode_f32 as decode_fp8, encode_f32 as encode_fp8},
 };
 use onnx_genai_metadata::{KvCacheSpec, KvComponentTolerance, LayerPrecisionOverride};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Unique page identifier.
 pub type PageId = u32;
@@ -547,6 +547,45 @@ pub struct PageStats {
     pub prefix_evictions: u64,
 }
 
+/// A readable picture of what the page pool currently holds.
+///
+/// Cumulative counters answer "what has happened"; this answers "what is here
+/// now", which is the question when a pool is filling up and you want to know
+/// whether it is one runaway conversation or many small ones sharing badly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageUsage {
+    pub page_size: usize,
+    /// Pages the pool can hand out before it has to evict.
+    pub capacity: usize,
+    /// Pages currently referenced by a sequence or a cached prefix.
+    pub in_use: usize,
+    /// Pages on the free list of the hot tier.
+    pub free: usize,
+    /// Token slots actually filled across in-use pages, against the slots those
+    /// pages could hold. The gap is the cost of paging: partially filled pages.
+    pub filled_slots: usize,
+    pub slot_capacity: usize,
+    /// In-use pages with more than one reference, i.e. genuinely shared.
+    pub shared: usize,
+    /// How many in-use pages carry each reference count, ascending.
+    pub references: Vec<(u32, usize)>,
+    /// Live sequences and what they hold.
+    pub sequences: Vec<SequenceUsage>,
+    /// Pages per tier, for pools that spill beyond the hot tier.
+    pub tiers: Vec<(Device, usize)>,
+}
+
+/// One live sequence's share of the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceUsage {
+    pub sequence: SequenceId,
+    pub pages: usize,
+    pub tokens: usize,
+    /// Of this sequence's pages, how many it shares with someone else. A
+    /// conversation that attached to a cached prefix is mostly shared.
+    pub shared: usize,
+}
+
 pub struct PageTable {
     /// Logical sequence → ordered list of page IDs.
     pub sequences: HashMap<SequenceId, Vec<PageId>>,
@@ -776,6 +815,56 @@ impl PageTable {
     }
 
     /// Cumulative page activity since this table was created.
+    /// Summarize what the pool is holding right now.
+    pub fn usage(&self) -> PageUsage {
+        let mut references: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut tiers: Vec<(Device, usize)> = Vec::new();
+        let mut in_use = 0;
+        let mut filled_slots = 0;
+        for page in self.pages.values() {
+            if page.ref_count == 0 {
+                continue;
+            }
+            in_use += 1;
+            filled_slots += page.filled;
+            *references.entry(page.ref_count).or_default() += 1;
+            match tiers.iter_mut().find(|(device, _)| *device == page.device) {
+                Some((_, count)) => *count += 1,
+                None => tiers.push((page.device, 1)),
+            }
+        }
+        let mut sequences = self
+            .sequences
+            .iter()
+            .map(|(sequence, pages)| SequenceUsage {
+                sequence: *sequence,
+                pages: pages.len(),
+                tokens: self.sequence_lengths.get(sequence).copied().unwrap_or(0),
+                shared: pages
+                    .iter()
+                    .filter(|page| self.pages.get(page).is_some_and(|page| page.ref_count > 1))
+                    .count(),
+            })
+            .collect::<Vec<_>>();
+        sequences.sort_by_key(|usage| (std::cmp::Reverse(usage.pages), usage.sequence));
+        PageUsage {
+            page_size: self.page_size,
+            capacity: self.hot_capacity,
+            in_use,
+            free: self.free_count(Device::Gpu(0)),
+            filled_slots,
+            slot_capacity: in_use * self.page_size,
+            shared: references
+                .iter()
+                .filter(|(count, _)| **count > 1)
+                .map(|(_, pages)| *pages)
+                .sum(),
+            references: references.into_iter().collect(),
+            sequences,
+            tiers,
+        }
+    }
+
     pub fn stats(&self) -> PageStats {
         self.stats
     }

@@ -453,3 +453,49 @@ fn many_distinct_conversations_do_not_exhaust_the_page_pool() -> anyhow::Result<
     }
     Ok(())
 }
+
+#[test]
+fn page_usage_shows_what_conversations_share() -> anyhow::Result<()> {
+    // The snapshot exists to answer "is this pool full of one conversation, or
+    // many that should be sharing and are not", so it has to actually show the
+    // sharing.
+    let mut engine = load()?;
+    let head = vec![3, 7, 0, 5, 6, 1];
+
+    let mut first = head.clone();
+    first.push(2);
+    turn(&mut engine, first, 0.0, 2)?;
+
+    let mut second = head.clone();
+    second.push(4);
+    turn(&mut engine, second, 0.0, 2)?;
+
+    let usage = engine.page_usage().expect("this decoder pages its KV");
+    assert!(usage.page_size > 0, "a page holds tokens: {usage:?}");
+    assert!(
+        usage.in_use > 0,
+        "the cached prefixes still hold pages after both turns: {usage:?}"
+    );
+    assert!(
+        usage.shared > 0,
+        "the two conversations open the same way, so some pages must be shared: {usage:?}"
+    );
+    assert!(
+        usage.shared <= usage.in_use,
+        "shared pages are a subset of held pages: {usage:?}"
+    );
+    assert!(
+        usage.filled_slots <= usage.slot_capacity,
+        "filled slots cannot exceed the slots those pages hold: {usage:?}"
+    );
+    assert_eq!(
+        usage
+            .references
+            .iter()
+            .map(|(_, pages)| *pages)
+            .sum::<usize>(),
+        usage.in_use,
+        "every held page appears exactly once in the reference histogram: {usage:?}"
+    );
+    Ok(())
+}

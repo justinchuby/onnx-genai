@@ -2356,6 +2356,13 @@ impl PipelineEngine {
             .map(|paged| paged.cache.page_table.stats())
     }
 
+    /// What the KV page pool is holding right now, when the decoder pages.
+    pub fn page_usage(&self) -> Option<onnx_genai_kv::PageUsage> {
+        self.paged
+            .as_ref()
+            .map(|paged| paged.cache.page_table.usage())
+    }
+
     /// Counters describing what the pipeline's reuse caches did.
     pub fn cache_stats(&self) -> PipelineCacheStats {
         self.component_cache.borrow().stats()
