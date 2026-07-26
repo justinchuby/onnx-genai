@@ -610,6 +610,25 @@ impl RunProfile {
 
         // The per-stage breakdown (ORT kernels versus our own orchestration)
         // only exists when the engine's stage profiler was enabled.
+        // The native executor's own phase profiler is a separate registry behind
+        // a separate switch, so its rows are appended rather than interleaved:
+        // presenting them as one table would imply they were measured together.
+        let executor_phases = onnx_genai::engine::executor_phase_stats();
+        if !executor_phases.is_empty() {
+            let _ = writeln!(out, "\nnative executor phases:");
+            let _ = writeln!(out, "{:<34} {:>12} {:>10}", "phase", "total_ms", "calls");
+            let _ = writeln!(out, "{}", "-".repeat(58));
+            for (phase, total_ns, calls) in executor_phases {
+                let _ = writeln!(
+                    out,
+                    "{:<34} {:>12.3} {:>10}",
+                    phase,
+                    total_ns as f64 / 1e6,
+                    calls
+                );
+            }
+        }
+
         let stages = onnx_genai::ort::profile::report(self.timings.tokens() as u64);
         if stages.lines().count() > 2 {
             let _ = writeln!(out, "\nper-stage breakdown:");

@@ -226,6 +226,35 @@ pub fn reset() {
 /// Render the accumulated per-stage statistics as a text table.
 ///
 /// `tokens` scales the per-token column; pass the number of generated tokens.
+/// One stage's accumulated cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageSnapshot {
+    pub stage: &'static str,
+    pub total_ns: u128,
+    pub calls: u64,
+}
+
+/// Every recorded stage, most expensive first.
+///
+/// The structured counterpart to [`report`], so callers that are not writing to
+/// a terminal — an HTTP endpoint, a JSON report — do not have to parse a table
+/// that exists for human eyes.
+pub fn snapshot() -> Vec<StageSnapshot> {
+    let Ok(reg) = registry().lock() else {
+        return Vec::new();
+    };
+    let mut rows = reg
+        .iter()
+        .map(|(name, stat)| StageSnapshot {
+            stage: name,
+            total_ns: stat.total_ns,
+            calls: stat.count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total_ns));
+    rows
+}
+
 pub fn report(tokens: u64) -> String {
     let reg = match registry().lock() {
         Ok(reg) => reg,

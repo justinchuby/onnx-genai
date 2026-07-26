@@ -60,6 +60,29 @@ pub use onnx_genai_scheduler::{
 };
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;
+
+/// Executor phase costs from the native runtime, as `(phase, total_ns, calls)`.
+///
+/// The native executor keeps its own profiler — it attributes control-flow
+/// overhead (`exec_if`, `run_subgraph`, child setup) that the stage profiler
+/// folds into one bucket — and cannot report through the shared registry
+/// without depending on the ONNX Runtime crate. This engine depends on both, so
+/// it is where the two are joined.
+///
+/// Empty unless the native backend is compiled in *and* `NXRT_EXEC_PHASE_PROFILE`
+/// is set. It stays behind its own switch because the per-phase timing is
+/// deliberately fine-grained enough to perturb what it measures.
+pub fn executor_phase_stats() -> Vec<(&'static str, u128, u64)> {
+    #[cfg(feature = "native-backend")]
+    {
+        onnx_runtime_session::exec_phase_stats()
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        Vec::new()
+    }
+}
+
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{

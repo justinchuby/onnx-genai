@@ -193,6 +193,25 @@ pub(crate) struct DebugTraceResponse {
     /// Discovery info for the Perfetto (Chrome Trace Event Format) export.
     perfetto_export: PerfettoExportInfo,
     otlp_export: &'static str,
+    /// Where to get stage totals instead of a full timeline.
+    aggregate_profile: &'static str,
+}
+
+/// Aggregate decode-stage costs for this process.
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugProfileResponse {
+    /// Whether stages are being accumulated at all.
+    collecting: bool,
+    note: &'static str,
+    stages: Vec<ProfileStage>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileStage {
+    stage: &'static str,
+    total_ms: f64,
+    calls: u64,
+    us_per_call: f64,
 }
 
 /// Discovery payload describing the downloadable Perfetto trace export.
@@ -608,6 +627,38 @@ pub(crate) async fn admin_set_vram_limit(
     Ok(Json(snapshot.into()))
 }
 
+/// `GET /v1/debug/profile` — where the server's decode time went.
+///
+/// The aggregate counterpart to the Perfetto export: a trace answers "what
+/// happened, when", which needs a viewer and a full timeline, while this answers
+/// "which stages cost what", which is the question you ask a running server.
+///
+/// Stages are whatever the active decode path recorded — `ort.*` under ONNX
+/// Runtime, `native.*` under the native runtime — so the shape of the answer
+/// follows the backend without this endpoint knowing which one is in use.
+/// Empty until `ONNX_GENAI_PROFILE` is set, and empty is reported as empty
+/// rather than fabricated.
+pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
+    let stages = onnx_genai_ort::profile::snapshot()
+        .into_iter()
+        .map(|stage| ProfileStage {
+            stage: stage.stage,
+            total_ms: stage.total_ns as f64 / 1e6,
+            calls: stage.calls,
+            us_per_call: if stage.calls > 0 {
+                (stage.total_ns as f64 / 1e3) / stage.calls as f64
+            } else {
+                0.0
+            },
+        })
+        .collect::<Vec<_>>();
+    Json(DebugProfileResponse {
+        collecting: onnx_genai_ort::profile::enabled(),
+        note: "Stage totals accumulate across every request this process has served. Run with ONNX_GENAI_PROFILE=1 to collect them.",
+        stages,
+    })
+}
+
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
     let latest_trace_id = crate::metrics::latest_trace_id();
     let recorded_events = onnx_genai_ort::profile::trace_event_count();
@@ -622,6 +673,7 @@ pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
             note: "GET the endpoint for a Chrome Trace Event Format document (open in https://ui.perfetto.dev). Run with ONNX_GENAI_TRACE set to collect decode spans.",
         },
         otlp_export: OTLP_EXPORT_STATUS,
+        aggregate_profile: "/v1/debug/profile",
     })
 }
 

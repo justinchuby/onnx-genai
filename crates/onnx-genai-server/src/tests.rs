@@ -3003,3 +3003,55 @@ fn content_parts_render_images_where_they_were_written() {
     // request is rejected moments later by the admission check.
     assert_eq!(content.render(None), "compare  with .");
 }
+
+async fn get_body(uri: &str) -> Value {
+    let response = app(tiny_state_with_debug())
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn debug_profile_reports_stage_totals() {
+    // Asking a running server where its time went should not require a trace
+    // viewer, so the aggregate is served as data.
+    let body = get_body("/v1/debug/profile").await;
+
+    assert!(body["stages"].is_array(), "body: {body}");
+    assert!(
+        body["collecting"].is_boolean(),
+        "whether anything is being collected must be stated, not inferred from \
+         an empty list: {body}"
+    );
+    assert!(
+        body["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("ONNX_GENAI_PROFILE")),
+        "an empty profile must say how to fill it: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_uncollected_profile_is_empty_rather_than_invented() {
+    // Tests run without ONNX_GENAI_PROFILE, so this is the real state.
+    let body = get_body("/v1/debug/profile").await;
+    assert_eq!(body["collecting"], false, "nothing enabled it: {body}");
+    assert_eq!(
+        body["stages"].as_array().map(Vec::len),
+        Some(0),
+        "an uncollected profile must be empty, not fabricated: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_trace_endpoint_points_at_the_aggregate_profile() {
+    // A caller who found the trace endpoint should be able to discover the
+    // cheaper question from it.
+    let body = get_body("/v1/debug/trace").await;
+    assert_eq!(
+        body["aggregate_profile"], "/v1/debug/profile",
+        "body: {body}"
+    );
+}

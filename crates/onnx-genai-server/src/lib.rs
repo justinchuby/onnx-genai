@@ -79,6 +79,7 @@ pub fn app(state: AppState) -> Router {
             .route("/v1/debug/sessions", get(routes::debug_sessions))
             .route("/v1/debug/kv", get(routes::debug_kv))
             .route("/v1/debug/trace", get(routes::debug_trace))
+            .route("/v1/debug/profile", get(routes::debug_profile))
             .route(
                 "/v1/debug/trace/perfetto",
                 get(routes::debug_trace_perfetto),

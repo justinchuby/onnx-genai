@@ -89,7 +89,7 @@ fn profile_ops_enabled() -> bool {
 /// entry point is a single relaxed-atomic load and an early return, so the
 /// production decode hot path pays no measurable cost. When enabled it
 /// accumulates wall-clock nanoseconds and a call count per named phase, which
-/// [`phase_profile_report`] renders to stderr. This exists to attribute the
+/// [`executor_phase_stats`] exposes. This exists to attribute the
 /// per-decode-step control-flow overhead (`exec_if` / `run_subgraph` / child
 /// setup) that the op-level profiler folds into the single `If` bucket.
 mod phase_profile {
@@ -149,6 +149,24 @@ mod phase_profile {
             entry.total_ns += nanos;
             entry.count += 1;
         }
+    }
+
+    /// Every recorded phase, most expensive first.
+    ///
+    /// Exposed as data rather than rendered here: this crate has no dependency
+    /// on the process-wide stage profiler that everything else reports through,
+    /// and reversing that would point the native runtime at the ONNX Runtime
+    /// crate. The caller that already depends on both does the merging.
+    pub fn all_stats() -> Vec<(&'static str, u128, u64)> {
+        let Ok(reg) = registry().lock() else {
+            return Vec::new();
+        };
+        let mut rows = reg
+            .iter()
+            .map(|(phase, stat)| (*phase, stat.total_ns, stat.count))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+        rows
     }
 
     /// Scoped timer that records its lifetime to `phase` on drop.
@@ -235,6 +253,17 @@ macro_rules! phase_span {
 }
 
 /// Public re-export so the bench/profile harness can dump the phase table.
+/// Accumulated executor phase costs as `(phase, total_ns, calls)`, most
+/// expensive first.
+///
+/// Empty unless `NXRT_EXEC_PHASE_PROFILE` is set. Kept separate from the
+/// process-wide stage profiler because this crate cannot depend on it without
+/// pointing the native runtime at the ONNX Runtime crate; the caller that
+/// depends on both merges the two.
+pub fn exec_phase_stats() -> Vec<(&'static str, u128, u64)> {
+    phase_profile::all_stats()
+}
+
 pub fn print_exec_phase_profile() {
     phase_profile::report_to_stderr();
 }
