@@ -1875,6 +1875,49 @@ pub fn decode_parallel_output_row_blocks<F>(
         .for_each(|(row_index, row)| compute(row_index, row));
 }
 
+/// Fan `num_tasks` independent decode subtasks out across the active decode
+/// workers, running `compute(task_index)` on each.
+///
+/// Tasks are handed out in contiguous index ranges, mirroring
+/// [`decode_parallel_output_row_blocks`] but *without* partitioning a shared
+/// result buffer — each `compute` writes into its own disjoint scratch region,
+/// an invariant the caller owns. This is the scheduling primitive
+/// `GroupQueryAttention` flash-decoding uses to spread its
+/// `attention_rows × split_count` KV-chunk partials across otherwise-idle cores
+/// (when `attention_rows` alone cannot fill the pool). Routing keys off which
+/// decode scope is active, never off op or model identity, exactly like
+/// [`decode_parallel_output_row_blocks`].
+pub fn decode_parallel_index_tasks<F>(num_tasks: usize, compute: F)
+where
+    F: Fn(usize) + Sync + Send,
+{
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_index_tasks(num_tasks, &compute);
+        return;
+    }
+    // numa-split and flat decode scopes run the forward on a bounded Rayon pool,
+    // so this parallel iterator uses that pool rather than the global one.
+    (0..num_tasks).into_par_iter().for_each(compute);
+}
+
+/// Effective number of decode workers on the active decode scope.
+///
+/// Used to decide whether attention has idle cores to exploit for flash-decoding
+/// KV splitting: when the worker count exceeds `attention_rows` (16 query heads
+/// in decode), the surplus cores would otherwise sit idle during the attention
+/// reduction. Returns the persistent SPMD or `numa-split` worker count when one
+/// of those scopes is active, otherwise the current Rayon pool width (the flat
+/// decode pool the forward is installed on).
+pub fn active_decode_worker_count() -> usize {
+    if let Some(numa) = numa_decode_active() {
+        return numa.total_workers();
+    }
+    if let Some(spmd) = spmd_decode_active() {
+        return spmd.total_workers();
+    }
+    rayon::current_num_threads()
+}
+
 /// First-touch each row-major weight component on the NUMA node that will read
 /// it under `numa-split` or the persistent SPMD pool, so each node's workers
 /// stream node-local memory. A no-op (returns the input) when neither node-aware
