@@ -7,6 +7,9 @@ use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
+use onnx_genai_ort::decode_contract::{
+    KvNamingConvention, has_past_prefix, has_present_prefix, matching_past_input,
+};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -2958,26 +2961,15 @@ fn optional_declared_or_detected_output(
 }
 
 fn is_past_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("past_key_values.") || lower.starts_with("past.")
+    has_past_prefix(name, KvNamingConvention::Dotted)
 }
 
 fn is_present_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("present_key_values.") || lower.starts_with("present.")
+    has_present_prefix(name, KvNamingConvention::Dotted)
 }
 
 fn matching_past_name(output: &str, inputs: &[String]) -> Option<String> {
-    let lower = output.to_ascii_lowercase();
-    let suffix = lower
-        .strip_prefix("present_key_values.")
-        .or_else(|| lower.strip_prefix("present."))?;
-    inputs.iter().find_map(|input| {
-        let input_lower = input.to_ascii_lowercase();
-        (input_lower.strip_prefix("past_key_values.") == Some(suffix)
-            || input_lower.strip_prefix("past.") == Some(suffix))
-        .then(|| input.clone())
-    })
+    matching_past_input(output, inputs, KvNamingConvention::Dotted).cloned()
 }
 
 fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {

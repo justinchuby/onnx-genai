@@ -16,6 +16,9 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 use crate::device_sampler::{CudaSampler, DeviceSampler};
+use crate::decode_contract::{
+    KvNamingConvention, kv_suffix, name_contains_present_key_value,
+};
 use crate::{
     DataType, IoBinding, MemoryInfo, OrtError, Result, RunPhaseError, Session, TensorInfo, Value,
 };
@@ -3731,16 +3734,15 @@ fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
     let input_names = session.input_names();
     let mut pairs = Vec::new();
     for output in session.outputs() {
-        if !is_present_output(&output.name) {
+        if !name_contains_present_key_value(&output.name) {
             continue;
         }
-        let Some(suffix) = kv_suffix(&output.name) else {
+        let Some(suffix) = kv_suffix(&output.name, KvNamingConvention::Dotted) else {
             continue;
         };
-        let Some(past_name) = input_names
-            .iter()
-            .find(|input| kv_suffix(input).as_deref() == Some(suffix.as_str()))
-        else {
+        let Some(past_name) = input_names.iter().find(|input| {
+            kv_suffix(input, KvNamingConvention::Dotted).as_deref() == Some(suffix.as_str())
+        }) else {
             continue;
         };
         let input = session
@@ -3836,26 +3838,6 @@ fn clone_value_to_owned(value: &Value) -> Result<Value> {
             "cannot export/clone KV tensor with dtype {dtype:?}"
         ))),
     }
-}
-
-fn is_present_output(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("present") && (lower.contains("key") || lower.contains("value"))
-}
-
-fn kv_suffix(name: &str) -> Option<String> {
-    let lower = name.to_ascii_lowercase();
-    for prefix in [
-        "past_key_values.",
-        "present_key_values.",
-        "past.",
-        "present.",
-    ] {
-        if let Some(suffix) = lower.strip_prefix(prefix) {
-            return Some(suffix.to_string());
-        }
-    }
-    None
 }
 
 fn detect_static_cache(
