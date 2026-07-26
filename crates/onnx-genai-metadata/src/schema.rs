@@ -1756,7 +1756,11 @@ pub struct SchedulerSpec {
     /// Diffusion).
     pub beta_schedule: Option<String>,
 
-    /// Model output parameterization; `"epsilon"` is supported (default).
+    /// Model output parameterization: `"epsilon"` (default, noise prediction),
+    /// `"v_prediction"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or
+    /// `"sample"`/`"x0"` (the model predicts the clean sample directly). All
+    /// built-in continuous schedulers (`ddim`, `euler`, `euler_ancestral`,
+    /// `dpmpp_2m`) support every parameterization.
     pub prediction_type: Option<String>,
 
     /// Mask token id for a `masked_diffusion` (language-diffusion) scheduler:
