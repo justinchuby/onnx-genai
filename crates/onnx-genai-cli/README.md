@@ -16,7 +16,7 @@ uses whichever execution providers you installed.
 
 ```bash
 onnx-genai serve --models-dir ./models       # OpenAI-compatible HTTP server
-onnx-genai generate ./model --prompt "Hello"  # one-shot generation
+onnx-genai generate ./model --prompt "Hello"  # one-shot generation (-p is short for --prompt)
 onnx-genai run ./model                       # interactive REPL
 onnx-genai show ./model                       # resolved files + metadata
 onnx-genai list --models-dir ./models         # list models
@@ -25,6 +25,13 @@ onnx-genai version                            # version + execution providers
 
 `generate`, `run`, and `show` accept either a model directory or a config file
 inside it (a file resolves to its parent directory).
+
+### Interactive REPL controls
+
+In `onnx-genai run`, press **Ctrl-C** while a response is generating to cancel
+that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
+**Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
+run is also cancelled by **Ctrl-C** mid-generation.
 
 ### Polite CPU decode
 
