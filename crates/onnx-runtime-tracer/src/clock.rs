@@ -11,43 +11,110 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// This library's fixed tie between the monotonic clock and absolute UNIX time.
+/// Microseconds on the operating system's own monotonic clock.
 ///
-/// Sampled once, on first use. Every later reading adds monotonic elapsed time
-/// to it, so readings are monotonic *and* absolute.
-fn origin() -> &'static (Instant, u64) {
-    static ORIGIN: OnceLock<(Instant, u64)> = OnceLock::new();
-    ORIGIN.get_or_init(|| {
-        let instant = Instant::now();
-        let unix_us = SystemTime::now()
+/// The origin is whatever the OS counts from -- boot, on both platforms here.
+/// That is the point: it is the *same* origin for every library, thread and
+/// process on the machine, so two readings are comparable because they are
+/// readings of one clock, with nothing sampled or agreed between them.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn monotonic_now_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes a `timespec` through the pointer given and
+    // touches nothing else; `ts` is a live local of exactly that type. The call
+    // borrows nothing and can fail only by returning non-zero, which is checked.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if read != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((ts.tv_nsec as u64) / 1_000)
+}
+
+/// Microseconds on the operating system's own monotonic clock (Windows).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn monotonic_now_us() -> u64 {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let mut frequency = 0i64;
+    let mut counter = 0i64;
+    // SAFETY: both calls write a single `i64` through the pointer given and
+    // touch nothing else; both locals are live and of exactly that type. Each
+    // returns zero on failure, which is checked before the value is used.
+    let ok = unsafe {
+        QueryPerformanceFrequency(&mut frequency) != 0 && QueryPerformanceCounter(&mut counter) != 0
+    };
+    if !ok || frequency <= 0 {
+        return 0;
+    }
+    ((i128::from(counter) * 1_000_000) / i128::from(frequency)) as u64
+}
+
+/// Where this library first saw the monotonic and wall clocks agree.
+///
+/// Sampled once, and used only to present timestamps as dates.
+fn unix_anchor() -> &'static (u64, u64) {
+    static ANCHOR: OnceLock<(u64, u64)> = OnceLock::new();
+    ANCHOR.get_or_init(|| {
+        let monotonic = monotonic_now_us();
+        let unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|since| since.as_micros() as u64)
             .unwrap_or(0);
-        (instant, unix_us)
+        (monotonic, unix)
     })
 }
 
-/// The current time in **absolute UNIX microseconds**, on a monotonic basis.
+/// Present a trace timestamp as wall-clock UNIX microseconds.
 ///
-/// This is the one time base every layer stamps against, and the reason a trace
-/// from the host and a trace from a plugin execution provider can be read on a
-/// single timeline without negotiating an offset.
+/// For display only. The mapping is sampled once per library, so two libraries
+/// can disagree by that sampling gap and by any wall-clock adjustment between
+/// their first reads. Alignment deliberately does not depend on it.
+#[must_use]
+pub fn monotonic_to_unix_us(trace_us: u64) -> u64 {
+    let (anchor_monotonic, anchor_unix) = *unix_anchor();
+    // Signed, because the anchor is established on first use and a trace is
+    // normally converted *after* it was captured -- so most timestamps are
+    // behind the anchor, not ahead of it. Subtracting with saturation instead
+    // clamped every one of those to the anchor itself, collapsing a 55ms span
+    // to 28us.
+    let offset = i128::from(trace_us) - i128::from(anchor_monotonic);
+    let unix = i128::from(anchor_unix) + offset;
+    u64::try_from(unix.max(0)).unwrap_or(u64::MAX)
+}
+
+/// The current time on the shared trace axis, in microseconds.
 ///
-/// A plain [`Instant`] epoch cannot do that job. `Instant` is monotonic but its
-/// origin is arbitrary and private to whoever called [`Instant::now`], and a
-/// plugin loaded as a dynamic library links its own copy of this crate with its
-/// own statics — so a process-global epoch would still not be shared. Anchoring
-/// to UNIX time gives every copy the same origin.
+/// The one time base every layer stamps against, and the reason a trace from
+/// the host and one from a plugin execution provider can be read together with
+/// no offset to negotiate. It reads the operating system's monotonic clock, so
+/// the origin belongs to the machine rather than to whoever initialised first.
 ///
-/// Elapsed time still comes from the monotonic clock, so durations are immune
-/// to wall-clock adjustments; only the origin is absolute. The two clocks are
-/// read one after the other when [`origin`] initialises, so independently
-/// initialised copies can disagree by that sampling gap — well under a
-/// microsecond, against spans measured in microseconds and up.
+/// Both alternatives were tried and are worse:
+///
+/// * An [`Instant`] epoch is monotonic but its origin is private to the caller.
+///   A plugin dylib links its own copy of this crate with its own statics, so
+///   even a process-global epoch is not shared with it.
+/// * Anchoring each copy to UNIX time by sampling both clocks makes them agree
+///   only while the wall clock behaves. Step it between two libraries' first
+///   reads -- one NTP correction -- and they disagree by that step for the life
+///   of the process. That was the previous implementation.
+///
+/// Handing an offset across the plugin ABI fixes neither, because a provider
+/// loaded by ONNX Runtime is reached through no interface of ours at all.
+///
+/// Timestamps are microseconds since boot, not since the UNIX epoch; use
+/// [`monotonic_to_unix_us`] to show them as dates.
 #[must_use]
 pub fn absolute_now_us() -> u64 {
-    let (instant, unix_us) = origin();
-    unix_us.saturating_add(instant.elapsed().as_micros() as u64)
+    monotonic_now_us()
 }
 
 /// A monotonic clock anchored at a fixed epoch, shared across a trace.
@@ -163,4 +230,89 @@ pub fn thread_lane_id() -> u64 {
         static LANE: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
     }
     LANE.with(|lane| *lane)
+}
+
+#[cfg(test)]
+mod shared_axis_tests {
+    use super::*;
+
+    /// The axis must advance, and must do so at wall-clock rate.
+    #[test]
+    fn the_trace_axis_advances_in_real_microseconds() {
+        let before = absolute_now_us();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let after = absolute_now_us();
+        let elapsed = after.saturating_sub(before);
+        assert!(
+            (15_000..500_000).contains(&elapsed),
+            "20ms of sleep measured as {elapsed}us on the trace axis"
+        );
+    }
+
+    /// Readings must be comparable no matter who takes them.
+    ///
+    /// This is the property the whole design exists for: a plugin execution
+    /// provider links its own copy of this crate with its own statics, so any
+    /// per-copy epoch would put its spans somewhere else entirely. Threads are
+    /// the closest a unit test can get to that; the real check is that nothing
+    /// here is per-copy state.
+    #[test]
+    fn readings_from_different_threads_share_one_origin() {
+        let start = absolute_now_us();
+        let from_thread = std::thread::spawn(absolute_now_us)
+            .join()
+            .expect("the reading thread must not panic");
+        let end = absolute_now_us();
+        assert!(
+            start <= from_thread && from_thread <= end,
+            "a reading from another thread ({from_thread}) fell outside the \
+             interval it was taken in ({start}..{end}), so the two are not on \
+             one axis"
+        );
+    }
+
+    /// Converting must preserve intervals on both sides of the anchor.
+    ///
+    /// The anchor is established on first use, so a trace exported after
+    /// capture has *every* timestamp behind it. Saturating subtraction sent
+    /// all of those to the anchor itself, turning a 55ms span into 28us --
+    /// a timeline where nothing appeared to take any time.
+    #[test]
+    fn converting_preserves_intervals_before_and_after_the_anchor() {
+        let early = absolute_now_us();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // First conversion, which is what establishes the anchor.
+        let mapped_early = monotonic_to_unix_us(early);
+        let late = absolute_now_us();
+        let mapped_late = monotonic_to_unix_us(late);
+
+        let raw_gap = late - early;
+        let mapped_gap = mapped_late - mapped_early;
+        assert!(
+            mapped_gap.abs_diff(raw_gap) <= 2,
+            "a {raw_gap}us interval converted to {mapped_gap}us; conversion \
+             must not compress time"
+        );
+        assert!(
+            mapped_early < mapped_late,
+            "conversion reordered two timestamps"
+        );
+    }
+
+    /// The wall-clock mapping is for display, and must round-trip its anchor.
+    #[test]
+    fn the_unix_mapping_lands_near_the_present() {
+        let now = absolute_now_us();
+        let as_unix = monotonic_to_unix_us(now);
+        let actual = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock must be after 1970")
+            .as_micros() as u64;
+        let skew = as_unix.abs_diff(actual);
+        assert!(
+            skew < 5_000_000,
+            "the trace axis mapped to {as_unix}, {skew}us away from the wall \
+             clock's {actual}"
+        );
+    }
 }

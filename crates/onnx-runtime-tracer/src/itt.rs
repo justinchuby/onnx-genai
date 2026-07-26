@@ -18,7 +18,7 @@
 //! path needs **no `unsafe` in this crate at all**. `ittapi` links the static
 //! `ittnotify` C library (compiled from vendored source by `ittapi-sys`, no
 //! system dependency) and exposes a safe [`Domain`]/[`Task`] surface. The crate
-//! keeps `#![forbid(unsafe_code)]` active for `--features itt` builds; all FFI is
+//! keeps `unsafe_code` denied for `--features itt` builds; all FFI is
 //! confined to the upstream `ittapi` crate.
 //!
 //! ## Event → ITT mapping

@@ -6,14 +6,25 @@
 //! consume those events is a configuration choice expressed as a
 //! [`TraceCollector`] (or a [`CompositeCollector`] fan-out to several at once).
 //!
-//! It is a **foundational** crate, like [`onnx-runtime-ir`]: pure, safe Rust
-//! (`#![forbid(unsafe_code)]` on every default build) with no dependency on the
-//! ORT / genai stack, so any layer (runtime executor, EPs, or the genai engine)
-//! can adopt it and share the exact same [`TraceContext`] type and one timeline
-//! (§48.2). The one exception is the optional `cupti` feature, whose GPU-kernel
-//! collector needs `unsafe` FFI/dlopen; enabling it relaxes the crate attribute
-//! to `#![cfg_attr(not(feature = "cupti"), forbid(unsafe_code))]`, confining all
-//! `unsafe` to [`cupti`].
+//! It is a **foundational** crate, like [`onnx-runtime-ir`]: safe Rust with no
+//! dependency on the ORT / genai stack, so any layer (runtime executor, EPs, or
+//! the genai engine) can adopt it and share the exact same [`TraceContext`] type
+//! and one timeline (§48.2).
+//!
+//! `unsafe` is denied rather than forbidden, and confined to two places:
+//!
+//! * [`clock`], two leaf FFI calls reading the operating system's monotonic
+//!   clock, each exempt at function scope. This is what
+//!   lets a host trace and a trace from a plugin execution provider be read
+//!   together: they are readings of one clock, rather than two epochs that have
+//!   to be reconciled. A plugin dylib links its own copy of this crate with its
+//!   own statics, so nothing in-process can be shared with it, and a provider
+//!   loaded by ONNX Runtime is reached through no interface of ours at all --
+//!   an offset cannot be handed over even in principle.
+//! * [`cupti`], whose GPU-kernel collector needs FFI and `dlopen` (optional
+//!   feature). This one is exempt at module scope rather than per call, so
+//!   `unsafe` added inside it in future is not linted -- a narrower exemption
+//!   would be better, and its 32 sites are why it has not been done yet.
 //!
 //! ## Architecture
 //!
@@ -102,7 +113,7 @@
 //!
 //! [`onnx-runtime-ir`]: https://docs.rs/onnx-runtime-ir
 
-#![cfg_attr(not(feature = "cupti"), forbid(unsafe_code))]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod args;
@@ -119,7 +130,13 @@ pub mod jsonl;
 #[cfg(feature = "itt")]
 pub mod itt;
 
+// The one module allowed to use `unsafe`, and only when its feature is on:
+// CUPTI is a C library reached by dlopen. `deny` above stays in force for
+// everything else, which is the point of using `deny` rather than a
+// crate-wide `cfg_attr` that switched the lint off entirely whenever this
+// feature was enabled.
 #[cfg(feature = "cupti")]
+#[allow(unsafe_code)]
 pub mod cupti;
 
 #[cfg(feature = "perfetto")]
@@ -130,7 +147,9 @@ pub use args::{
     ARG_CAPTURE_REJECTED_REASON, ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON,
     ARG_OPTIMIZED_CANDIDATE, ARG_SOURCE, Args, capture_rejected,
 };
-pub use clock::{TraceClock, TraceSessionId, absolute_now_us, process_id, thread_lane_id};
+pub use clock::{
+    TraceClock, TraceSessionId, absolute_now_us, monotonic_to_unix_us, process_id, thread_lane_id,
+};
 pub use collector::{
     CompositeCollector, DEFAULT_MAX_EVENTS, FileCollector, MemoryCollector, NoopCollector,
     TraceCollector,

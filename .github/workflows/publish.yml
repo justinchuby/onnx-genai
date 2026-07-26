@@ -153,6 +153,14 @@ jobs:
           # Crates are published in topological (dependency-first) order so every
           # `=<version>` path dependency already exists on crates.io. Regenerate
           # with the workspace's cargo-metadata graph after adding/moving a crate.
+          # These two come first because nothing in the workspace precedes
+          # them and much of it follows: the loader, optimizer, session and
+          # ep-api all depend on the tracer, and ep-api needs the ORT ABI
+          # bindings. The tracer used to sit mid-list, which was fine until
+          # startup tracing gave the loader a dependency on it -- after which
+          # publishing failed on the first crate wanting a version not yet up.
+          publish_crate onnx-runtime-tracer
+          publish_crate onnx-genai-ort-sys
           publish_crate onnx-runtime-ir
           publish_crate onnx-runtime-shape-inference
           publish_crate onnx-runtime-loader
@@ -160,7 +168,6 @@ jobs:
           publish_crate onnx-runtime-optimizer
           publish_crate onnx-runtime-cpuinfo
           publish_crate onnx-runtime-memory
-          publish_crate onnx-runtime-tracer
           publish_crate onnx-runtime-ep-api
           publish_crate mlas-sys
           publish_crate onnx-runtime-quantization
@@ -168,7 +175,6 @@ jobs:
           publish_crate onnx-runtime-eager
           publish_crate onnx-runtime-ep-cuda
           publish_crate onnx-genai-metadata
-          publish_crate onnx-genai-ort-sys
           publish_crate onnx-genai-runtime-config
           publish_crate onnx-runtime-session
           publish_crate onnx-runtime-capi
