@@ -263,6 +263,18 @@ pub(crate) struct ResolvedIo {
     pub(crate) kv_pairs: Vec<(String, String)>,
     /// Fixed loop-carried `(input, output)` pairs with replace semantics.
     pub(crate) state_pairs: Vec<(String, String)>,
+    /// Encoder-decoder cross-attention `(decoder_input, encoder_output)` pairs.
+    ///
+    /// The `input` is the decoder's `past_*_cross_%d` graph input; the `output`
+    /// names the ENCODER graph output (`present_*_cross_%d`) that produces the
+    /// value. The encoder runs once as a prompt-phase prologue and its cross-KV
+    /// outputs are STATIC for the whole decode: they encode the full audio/text
+    /// prompt and never grow or change across autoregressive steps, so the
+    /// pipeline binds them once and re-supplies the same tensors every step.
+    /// The output side is therefore intentionally NOT validated against the
+    /// decoder graph here (it is an encoder port, resolved from the shared pool
+    /// by the pipeline).
+    pub(crate) cross_kv_pairs: Vec<(String, String)>,
 }
 
 fn resolve_state_pairs(
@@ -385,18 +397,28 @@ fn resolve_state_pairs(
     Ok(resolved)
 }
 
-fn validate_declared_port_pairs(
+/// Resolve encoder-decoder cross-attention KV bindings into
+/// `(decoder_input, encoder_output)` pairs.
+///
+/// `inputs` are the decoder's `past_*_cross_%d` graph inputs and are validated
+/// against the decoder graph. `outputs` name the ENCODER graph outputs
+/// (`present_*_cross_%d`) that supply each value; they are deliberately NOT
+/// validated against the decoder graph here because they belong to a different
+/// component. The pipeline resolves them from the shared tensor pool after the
+/// encoder prologue and binds the resulting tensors as static decoder inputs on
+/// every step. Cross-KV is computed once from the whole prompt and never
+/// changes across decode steps, which is why it is carried separately from the
+/// growing self-attention `kv_pairs`.
+fn resolve_cross_kv_pairs(
     session: &Session,
-    input_label: &str,
     inputs: Option<&[String]>,
-    output_label: &str,
     outputs: Option<&[String]>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String)>> {
     match (inputs, outputs) {
         (Some(inputs), Some(outputs)) => {
             if inputs.len() != outputs.len() {
                 anyhow::bail!(
-                    "{input_label} ({}) and {output_label} ({}) must have equal length for positional pairing",
+                    "io.cross_kv_inputs ({}) and io.cross_kv_outputs ({}) must have equal length for positional pairing",
                     inputs.len(),
                     outputs.len()
                 );
@@ -404,26 +426,18 @@ fn validate_declared_port_pairs(
             for input in inputs {
                 if !session.inputs().iter().any(|info| info.name == *input) {
                     anyhow::bail!(
-                        "{input_label} declares input '{input}' but the graph does not expose it; graph inputs: {:?}",
+                        "io.cross_kv_inputs declares decoder input '{input}' but the graph does not expose it; graph inputs: {:?}",
                         session.input_names()
                     );
                 }
             }
-            for output in outputs {
-                if !session.outputs().iter().any(|info| info.name == *output) {
-                    anyhow::bail!(
-                        "{output_label} declares output '{output}' but the graph does not expose it; graph outputs: {:?}",
-                        session.output_names()
-                    );
-                }
-            }
+            Ok(inputs.iter().cloned().zip(outputs.iter().cloned()).collect())
         }
-        (None, None) => {}
+        (None, None) => Ok(Vec::new()),
         _ => anyhow::bail!(
-            "{input_label} and {output_label} must be declared together for positional pairing"
+            "io.cross_kv_inputs and io.cross_kv_outputs must be declared together for positional pairing"
         ),
     }
-    Ok(())
 }
 
 fn resolve_position_program(
@@ -637,11 +651,9 @@ impl ResolvedIo {
                 "io.kv_update declares unsupported update '{update}'; supported KV updates: append, shared_buffer"
             );
         }
-        validate_declared_port_pairs(
+        let cross_kv_pairs = resolve_cross_kv_pairs(
             session,
-            "io.cross_kv_inputs",
             io.cross_kv_inputs.as_deref(),
-            "io.cross_kv_outputs",
             io.cross_kv_outputs.as_deref(),
         )?;
 
@@ -658,6 +670,7 @@ impl ResolvedIo {
             hidden_output: io.hidden_output.clone(),
             kv_pairs,
             state_pairs,
+            cross_kv_pairs,
         })
     }
 
@@ -1974,16 +1987,14 @@ pub(crate) fn run_decode_step_with_extra(
     for info in session.inputs() {
         let lower = info.name.to_ascii_lowercase();
         if decode_state.io.is_token_input(&info.name, &lower) {
-            ensure_i64(info)?;
             owned_inputs.push((
                 info.name.clone(),
-                Value::from_slice_i64(&input_ids, &[1, seq_len as i64])?,
+                build_int_input(&input_ids, &[1, seq_len as i64], info)?,
             ));
         } else if decode_state.io.is_attention_mask_input(&info.name, &lower) {
-            ensure_i64(info)?;
             owned_inputs.push((
                 info.name.clone(),
-                Value::from_slice_i64(&attention_mask, &[1, total_len as i64])?,
+                build_int_input(&attention_mask, &[1, total_len as i64], info)?,
             ));
         } else if decode_state.io.is_position_ids_input(&info.name, &lower) {
             if position_step.is_none() {
@@ -2572,6 +2583,29 @@ fn ensure_i64(info: &TensorInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build an integer graph input (token ids / attention mask) in the dtype the
+/// graph declares. Most decoders take `Int64`, but encoder-decoder decoders such
+/// as Whisper declare `Int32` `input_ids`; both are materialized from the same
+/// `i64` host values so the caller stays dtype-agnostic.
+fn build_int_input(values: &[i64], shape: &[i64], info: &TensorInfo) -> anyhow::Result<Value> {
+    match info.dtype {
+        DataType::Int64 => Value::from_slice_i64(values, shape)
+            .map_err(|e| anyhow::anyhow!("failed to build Int64 input '{}': {e}", info.name)),
+        DataType::Int32 => {
+            let bytes = values
+                .iter()
+                .flat_map(|&value| (value as i32).to_le_bytes())
+                .collect::<Vec<u8>>();
+            Value::from_raw_bytes(bytes, shape, DataType::Int32)
+                .map_err(|e| anyhow::anyhow!("failed to build Int32 input '{}': {e}", info.name))
+        }
+        other => anyhow::bail!(
+            "input '{}' must be Int64 or Int32, got {other:?}",
+            info.name
+        ),
+    }
+}
+
 pub(crate) fn is_token_input_name(lower_name: &str) -> bool {
     lower_name == "input_ids"
         || lower_name == "decoder_input_ids"
@@ -2804,6 +2838,14 @@ fn kv_suffix(name: &str) -> Option<String> {
         "present_key_values.",
         "past.",
         "present.",
+        // Encoder-decoder self-attention KV (e.g. Whisper `past_key_self_%d` /
+        // `present_key_self_%d`). Generic `past_`/`present_` stripping pairs the
+        // self-KV past input with its present output while giving cross-attention
+        // ports (`past_key_cross_%d`) a distinct suffix so they are never matched
+        // as a growing self-KV layer. Checked last so the dotted conventions
+        // above keep their existing, more specific pairing.
+        "past_",
+        "present_",
     ] {
         if let Some(suffix) = lower.strip_prefix(prefix) {
             return Some(suffix.to_string());
