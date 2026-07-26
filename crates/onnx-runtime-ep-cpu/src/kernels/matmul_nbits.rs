@@ -1452,21 +1452,25 @@ fn configured_decode_threads() -> Option<usize> {
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
 /// the variable is unset it uses a *different, higher* default than the flat
-/// pool: [`default_persistent_threads`] (about half the logical CPUs) instead of
-/// the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
-/// because its per-op fork/join regresses beyond that; the persistent pool
-/// replaces that fork/join with one hot broadcast barrier, so it keeps scaling
-/// with cores until it hits the memory-bandwidth knee (measured plateau ~half
-/// the logical CPUs on a 2-socket Xeon 8480C). Sizing it from the flat default
-/// would leave the out-of-box path at the flat pool's throughput and defeat the
-/// point of making it the default.
+/// pool: [`default_persistent_threads`] fills **one NUMA node** (the largest node
+/// the process may run on) instead of the flat pool's eight-worker ceiling. The
+/// flat Rayon pool caps at eight because its per-op fork/join regresses beyond
+/// that; the persistent pool replaces that fork/join with one hot broadcast
+/// barrier pinned to a single node, so it keeps scaling with cores until it hits
+/// that node's memory-bandwidth knee. Filling the node (rather than the earlier
+/// half-the-logical-CPUs policy) matches ORT's full-core intent while
+/// [`crate::decode_spmd::node_shards`] keeps the pool node-local so it never
+/// collapses across sockets; co-tenant politeness is opt-in via `--cpu-cores N`.
 pub fn configured_persistent_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
+    let node_capacity =
+        crate::decode_affinity::largest_allowed_node_cpus().unwrap_or(available);
     resolve_persistent_decode_threads_with_override(
         decode_threads_override(),
         value.as_deref(),
         available,
+        node_capacity,
     )
 }
 
@@ -1600,37 +1604,51 @@ pub fn bound_process_to_decode_budget() {
     }
 }
 
-/// Default persistent-pool worker count for `available` logical CPUs: half of
-/// them (at least one), derived purely from topology (Rule 2).
+/// Default persistent-pool worker count: **fill one NUMA node**.
 ///
-/// Half leaves a full set of hardware threads free for the dispatcher (which
-/// runs the forward inline and spins on the completion counters), the prefill
-/// global Rayon pool, and co-tenants on a shared box. Because the SPMD workers
-/// *spin* before parking, a fully-subscribed pool starves the dispatcher and
-/// collapses throughput (measured 1.4 tok/s at 96 workers vs 28.7 at 48 on a
-/// 96-logical-CPU host); half sits at the measured plateau while avoiding that
-/// cliff, and on SMT hosts it maps to roughly the physical-core count.
-fn default_persistent_threads(available: usize) -> Option<usize> {
-    let available = std::num::NonZeroUsize::new(available)?.get();
-    Some((available / 2).max(1))
+/// The persistent SPMD pool pins every worker to a single node (see
+/// [`crate::decode_spmd::node_shards`]), so its safe, throughput-maximising
+/// default is one node's CPUs -- `node_capacity` -- not half the machine and not
+/// the whole allowed set. `node_capacity` is the largest NUMA node the process
+/// may run on (see [`crate::decode_affinity::largest_allowed_node_cpus`]), or the
+/// logical-CPU count on a single-node / topology-unknown host. The single
+/// dispatcher core is reserved later, in [`crate::decode_spmd::node_shards`], so
+/// this returns the full node here.
+///
+/// This replaces the earlier `available / 2` policy: on a 2-socket host the two
+/// happen to coincide (48 of 96), but `available / 2` badly under-fills a cpuset
+/// pinned to one socket (`taskset`/`--cpu-cores` to 32 cores -> only 16 workers,
+/// ~40% of the socket idle). Filling the node instead reaches ORT parity/better
+/// under a core cap while the collapse-safe single-node confinement in
+/// `node_shards` keeps the full-machine case stable. Co-tenant politeness is
+/// opt-in via `--cpu-cores N` / `ONNX_GENAI_CPU_DECODE_THREADS=N`, which confine
+/// both the process cpuset and this default.
+fn default_persistent_threads(node_capacity: usize) -> Option<usize> {
+    std::num::NonZeroUsize::new(node_capacity).map(std::num::NonZeroUsize::get)
 }
 
 /// Resolve the persistent-pool worker count from the raw `ONNX_GENAI_CPU_DECODE_THREADS`
-/// value and the host's logical CPU count. `Some("0")` opts out (`None`); an
-/// explicit positive count is honored (clamped to `available`); an unset or
-/// unparseable value falls back to [`default_persistent_threads`].
+/// value, the host's logical CPU count, and the largest NUMA node's CPU count.
+/// `Some("0")` opts out (`None`); an explicit positive count is honored (clamped
+/// to `available`); an unset or unparseable value falls back to
+/// [`default_persistent_threads`] (fill one node).
 #[cfg(test)]
-fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
-    resolve_persistent_decode_threads_with_override(None, raw, available)
+fn resolve_persistent_decode_threads(
+    raw: Option<&str>,
+    available: usize,
+    node_capacity: usize,
+) -> Option<usize> {
+    resolve_persistent_decode_threads_with_override(None, raw, available, node_capacity)
 }
 
 fn resolve_persistent_decode_threads_with_override(
     override_threads: Option<usize>,
     raw: Option<&str>,
     available: usize,
+    node_capacity: usize,
 ) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    let default = default_persistent_threads(available)?;
+    let default = default_persistent_threads(node_capacity)?;
     let threads = match override_threads {
         Some(threads) => threads,
         None => match raw {
@@ -1867,14 +1885,14 @@ thread_local! {
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
 /// requested or the host cannot be split (fallback, logged once).
 ///
-/// It is sized from [`configured_persistent_decode_threads`] (about half the
-/// logical CPUs), *not* the flat pool's eight-worker ceiling. `numa-split` is
-/// the two-level, node-pinned mirror of the persistent SPMD pool (see
+/// It is sized from [`configured_persistent_decode_threads`] (one NUMA node's
+/// CPUs), *not* the flat pool's eight-worker ceiling. `numa-split` is the
+/// two-level, node-pinned mirror of the persistent SPMD pool (see
 /// [`crate::decode_spmd`]) and its whole purpose is to reach *both* sockets'
 /// memory bandwidth; the eight-worker flat ceiling would leave only ~four
 /// row-sharded workers per node, far too few to saturate either memory
 /// controller, so it could never realize the bandwidth win the layout exists
-/// for. Half the logical CPUs, split across the nodes, lands each per-node
+/// for. One node's worth of workers, split across the nodes, lands each per-node
 /// sub-pool at the measured bandwidth knee while leaving cores for the
 /// dispatcher and co-tenants (a *fully*-subscribed split oversubscribes the
 /// cores and collapses throughput). `ONNX_GENAI_CPU_DECODE_THREADS` still
@@ -2286,6 +2304,14 @@ pub fn with_decode_pool_scope<R: Send>(
 fn with_spmd_decode_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     let _spmd_guard = SpmdScopeGuard::enter();
     let _decode_guard = DecodeResidencyGuard::enter();
+    // Co-locate the inline dispatcher with the single-node workers: it runs the
+    // forward inline and spins on the per-node completion counters, so a
+    // dispatcher scheduled onto the remote socket makes every barrier read cross
+    // the inter-socket link and collapses throughput. The guard only narrows the
+    // thread onto the workers' node (never widens a tighter `--cpu-cores` mask)
+    // and restores the previous affinity on drop.
+    let _dispatcher_affinity = crate::decode_spmd::pools()
+        .and_then(crate::decode_spmd::SpmdDecodePools::dispatcher_affinity_guard);
     f()
 }
 
@@ -6757,38 +6783,45 @@ mod tests {
     }
 
     #[test]
-    fn persistent_decode_thread_default_is_half_the_logical_cpus() {
-        // The persistent pool scales past the flat pool's 8-worker ceiling: unset
-        // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
-        assert_eq!(default_persistent_threads(96), Some(48));
-        assert_eq!(default_persistent_threads(8), Some(4));
-        assert_eq!(default_persistent_threads(4), Some(2));
-        assert_eq!(default_persistent_threads(2), Some(1));
+    fn persistent_decode_thread_default_fills_one_numa_node() {
+        // The persistent pool pins every worker to a single NUMA node, so the
+        // unset default fills that node (its CPU count), not half the logical
+        // CPUs and not the flat pool's 8-worker cap. The dispatcher core is
+        // reserved later in `decode_spmd::node_shards`, so the full node is
+        // returned here.
+        assert_eq!(default_persistent_threads(48), Some(48));
+        assert_eq!(default_persistent_threads(32), Some(32));
+        assert_eq!(default_persistent_threads(8), Some(8));
+        assert_eq!(default_persistent_threads(2), Some(2));
         assert_eq!(default_persistent_threads(1), Some(1));
         assert_eq!(default_persistent_threads(0), None);
-        // Distinct from the flat default on a big host (48 vs 8) -- proving the
+        // Distinct from the flat default on a big node (48 vs 8) -- proving the
         // persistent path does not inherit the fork/join-bound cap.
-        assert_ne!(default_persistent_threads(96), default_decode_threads(96));
+        assert_ne!(default_persistent_threads(48), default_decode_threads(96));
     }
 
     #[test]
     fn persistent_decode_threads_honor_env_and_opt_out() {
-        // Unset -> the persistent default (half cores), not the flat cap.
-        assert_eq!(resolve_persistent_decode_threads(None, 96), Some(48));
-        assert_eq!(resolve_persistent_decode_threads(Some(""), 96), Some(48));
+        // Unset -> fill one node (here a 48-CPU node on a 96-logical host), not
+        // the flat cap.
+        assert_eq!(resolve_persistent_decode_threads(None, 96, 48), Some(48));
+        assert_eq!(resolve_persistent_decode_threads(Some(""), 96, 48), Some(48));
+        // A cpuset pinned to one 32-CPU socket fills that socket (32), not 16.
+        assert_eq!(resolve_persistent_decode_threads(None, 32, 32), Some(32));
         // Explicit `0` opts out of the bounded pool (flat legacy path).
-        assert_eq!(resolve_persistent_decode_threads(Some("0"), 96), None);
-        // An explicit positive count is honored and clamped to the host.
-        assert_eq!(resolve_persistent_decode_threads(Some("32"), 96), Some(32));
-        assert_eq!(resolve_persistent_decode_threads(Some("1"), 96), Some(1));
+        assert_eq!(resolve_persistent_decode_threads(Some("0"), 96, 48), None);
+        // An explicit positive count is honored and clamped to the host (not the
+        // node): an explicit oversized budget may still span nodes by request.
+        assert_eq!(resolve_persistent_decode_threads(Some("64"), 96, 48), Some(64));
+        assert_eq!(resolve_persistent_decode_threads(Some("1"), 96, 48), Some(1));
         assert_eq!(
-            resolve_persistent_decode_threads(Some("1000"), 96),
+            resolve_persistent_decode_threads(Some("1000"), 96, 48),
             Some(96)
         );
-        // Unparseable/negative values fall back to the persistent default.
-        assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
-        assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
-        assert_eq!(resolve_persistent_decode_threads(Some("8"), 0), None);
+        // Unparseable/negative values fall back to the fill-one-node default.
+        assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96, 48), Some(48));
+        assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8, 8), Some(8));
+        assert_eq!(resolve_persistent_decode_threads(Some("8"), 0, 0), None);
     }
 
     #[test]
@@ -6824,7 +6857,7 @@ mod tests {
             Some(6)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96),
+            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96, 48),
             Some(8)
         );
         assert_eq!(
@@ -6832,9 +6865,9 @@ mod tests {
             Some(12)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(None, None, 96),
+            resolve_persistent_decode_threads_with_override(None, None, 96, 48),
             Some(48),
-            "the uncapped automatic default must remain unchanged"
+            "the uncapped automatic default must fill one NUMA node"
         );
     }
 
@@ -6857,7 +6890,7 @@ mod tests {
         assert_ne!(default_dense_decode_threads(96), default_decode_threads(96));
         assert_ne!(
             default_dense_decode_threads(96),
-            default_persistent_threads(96)
+            default_persistent_threads(48)
         );
     }
 

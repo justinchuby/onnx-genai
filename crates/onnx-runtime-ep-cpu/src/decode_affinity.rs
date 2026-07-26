@@ -288,6 +288,16 @@ impl NumaTopology {
         self.nodes.len()
     }
 
+    /// The CPU count of the largest single NUMA node, or `0` when the topology
+    /// is empty. Used to size a single-node-confined decode pool: the persistent
+    /// SPMD pool pins every worker to one node (see `decode_spmd::node_shards`),
+    /// so its safe worker ceiling is one node's CPU count minus a dispatcher
+    /// core, never the whole machine (a pool split across sockets shares a
+    /// cross-node completion barrier that collapses under contention).
+    pub fn largest_node_cpus(&self) -> usize {
+        self.nodes.values().map(Vec::len).max().unwrap_or(0)
+    }
+
     /// The CPUs belonging to `node`, if it exists.
     pub fn cpus_for_node(&self, node: usize) -> Option<&[usize]> {
         self.nodes.get(&node).map(Vec::as_slice)
@@ -604,6 +614,24 @@ pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
     let allowed = allowed_cpus();
     let restricted = NumaTopology::detect().map(|t| t.restrict_to_allowed(allowed.as_deref()));
     choose_budget_cpus(restricted.as_ref(), allowed.as_deref(), count)
+}
+
+/// The CPU count of the largest NUMA node the process may run on, or `None`
+/// when no multi-node topology is discoverable (a single-node host, a cpuset
+/// restricted to one node, or an unsupported OS -- in which case the caller
+/// sizes the pool from the logical-CPU count instead).
+///
+/// This is the "fill one node" sizing input for the persistent SPMD decode
+/// pool: because every worker is pinned to a single node, the pool's safe,
+/// stable worker ceiling is one node's CPUs minus a dispatcher core -- not half
+/// the machine and not the full allowed set. Sizing across both sockets shares a
+/// cross-node barrier that collapses throughput under co-tenant load (measured
+/// 2B decode falling to ~1 tok/s split vs ~24 single-node).
+pub fn largest_allowed_node_cpus() -> Option<usize> {
+    let allowed = allowed_cpus();
+    let restricted = NumaTopology::detect()?.restrict_to_allowed(allowed.as_deref());
+    let largest = restricted.largest_node_cpus();
+    (largest > 0).then_some(largest)
 }
 
 /// The CPUs the current process is actually permitted to run on, or `None` when

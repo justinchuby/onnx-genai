@@ -22,17 +22,25 @@
 //! the counter if a worker panics, poisons the pool, and makes the dispatcher
 //! report an actionable panic instead of hanging.
 //!
-//! # Two-level, NUMA-aware (mirrors `numa-split`)
+//! # Single-node by default, NUMA-aware (rule 2)
 //!
-//! To use both sockets' memory bandwidth without a toxic flat cross-socket
-//! barrier, workers are split into per-node groups (16+16 on a 2-node host),
-//! each pinned to its node and reading a node-local first-touched weight shard,
-//! exactly like [`crate::decode_numa`]. Row-sharding a GEMV is exactly
-//! associative -- each output row is an independent dot product over the whole K
-//! dimension -- so concatenating the per-worker row slices reproduces the flat
-//! result bit-for-bit, with no cross-row/-node reduction. The only cross-socket
-//! traffic per op is the dispatcher reading each node's own completion counter
-//! (one line per node), not an N-way shared barrier.
+//! The pool pins every worker to **one** NUMA node and sizes its default to fill
+//! that node (see [`node_shards`] and
+//! [`crate::kernels::matmul_nbits::default_persistent_threads`]). A single-node
+//! pool shares one completion counter and one socket's memory controllers, so
+//! the dispatcher's barrier spin and the streamed int4 weights all stay
+//! node-local. Splitting workers across sockets instead shares a cross-node
+//! completion barrier whose counters bounce over the inter-socket link every one
+//! of the ~141 per-token ops; under co-tenant load that collapses throughput
+//! (measured 0.6B decode falling to ~1-15 tok/s and 2B to ~1 tok/s split across
+//! both sockets vs a stable ~24-118 tok/s confined to one node). The pool only
+//! splits across nodes when an explicit `ONNX_GENAI_CPU_DECODE_THREADS=N` asks
+//! for more workers than any single node holds; then, like
+//! [`crate::decode_numa`], each node-pinned group reads a node-local
+//! first-touched weight shard. Row-sharding a GEMV is exactly associative -- each
+//! output row is an independent dot product over the whole K dimension -- so
+//! concatenating the per-worker row slices reproduces the flat result
+//! bit-for-bit, with no cross-row/-node reduction.
 //!
 //! # Generality (rule 2)
 //!
@@ -65,8 +73,8 @@
 //! This makes "never regress vs the flat path under load" a *measured* property
 //! rather than a heuristic hope, while still winning out-of-the-box on an idle
 //! host. The forced worker count is
-//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (about
-//! half the logical CPUs); a `THREADS=0` opt-out leaves the decode path unchanged.
+//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (fills
+//! one NUMA node); a `THREADS=0` opt-out leaves the decode path unchanged.
 //!
 //! # Precedence when forced (`=1`) vs the affinity control
 //!
@@ -91,7 +99,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::decode_affinity::{NodeShard, NumaTopology};
+use crate::decode_affinity::{DecodeAffinity, NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len;
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
@@ -245,6 +253,32 @@ pub struct SpmdDecodePools {
     /// order (workers `0..counts[0]` are node 0, and so on).
     node_worker_counts: Vec<usize>,
     total_workers: usize,
+    /// CPUs the inline dispatcher must stay on when the pool is confined to a
+    /// single NUMA node: the worker node's CPU list (including the reserved
+    /// headroom core). `Some` only for a single-node pinned layout; `None` for
+    /// an unpinned pool or a cross-node split (whose dispatcher is central to
+    /// both sockets and stays unpinned). The dispatcher runs the forward inline
+    /// and spins on the per-node completion counters, so a dispatcher scheduled
+    /// onto the *remote* socket makes every barrier read cross the inter-socket
+    /// link and collapses throughput; pinning it to the workers' node keeps the
+    /// whole barrier node-local. See [`SpmdDecodePools::dispatcher_affinity_guard`].
+    dispatcher_cpus: Option<Vec<usize>>,
+}
+
+/// RAII guard that restores the inline dispatcher thread's CPU affinity mask
+/// when a persistent SPMD decode step ends. Created by
+/// [`SpmdDecodePools::dispatcher_affinity_guard`], which narrows the thread onto
+/// the workers' NUMA node for the duration of the step.
+pub struct DispatcherAffinityGuard {
+    previous: Vec<usize>,
+}
+
+impl Drop for DispatcherAffinityGuard {
+    fn drop(&mut self) {
+        // Best-effort restore: if it fails the dispatcher simply stays confined
+        // to the workers' node, which is harmless for subsequent decode steps.
+        let _ = crate::decode_affinity::set_current_thread_affinity(&self.previous);
+    }
 }
 
 impl SpmdDecodePools {
@@ -314,18 +348,58 @@ impl SpmdDecodePools {
         // keep the owning join handles behind a `Mutex` for teardown.
         let worker_threads = handles.iter().map(|h| h.thread().clone()).collect();
 
+        // Confine the inline dispatcher to the workers' node only when the whole
+        // pool lives on one node *and* those CPUs are pinned (a cross-node split
+        // keeps its central dispatcher unpinned; an unpinned pool has no node to
+        // pin to).
+        let dispatcher_cpus = match shards {
+            [only] if !only.cpus.is_empty() => Some(only.cpus.clone()),
+            _ => None,
+        };
+
         Self {
             shared,
             worker_threads,
             join_handles: Mutex::new(handles),
             node_worker_counts,
             total_workers,
+            dispatcher_cpus,
         }
     }
 
     /// Total decode workers across all node groups.
     pub fn total_workers(&self) -> usize {
         self.total_workers
+    }
+
+    /// Pin the calling (inline dispatcher) thread to the workers' NUMA node for
+    /// the duration of a decode step, returning an RAII guard that restores the
+    /// thread's previous affinity mask on drop. A no-op (`None`) when the pool is
+    /// not single-node-pinned, when the thread mask cannot be read/written, or
+    /// when the dispatcher is already confined within the target node.
+    ///
+    /// The target is intersected with the thread's *current* mask, so this only
+    /// ever narrows the dispatcher onto the workers' socket -- it never widens a
+    /// tighter cpuset (`--cpu-cores N` / `taskset` confinement is preserved). Two
+    /// affinity syscalls per token are negligible against a multi-millisecond
+    /// decode step, and they remove the remote-socket dispatcher collapse
+    /// (measured 0.6B decode ~15 tok/s unpinned dispatcher vs ~118 node-local).
+    pub fn dispatcher_affinity_guard(&self) -> Option<DispatcherAffinityGuard> {
+        let target = self.dispatcher_cpus.as_ref()?;
+        let previous = crate::decode_affinity::allowed_cpus()?;
+        let previous_set: std::collections::BTreeSet<usize> = previous.iter().copied().collect();
+        let confined: Vec<usize> = target
+            .iter()
+            .copied()
+            .filter(|cpu| previous_set.contains(cpu))
+            .collect();
+        // Nothing to do if the intersection is empty (target outside the cpuset)
+        // or already equals the current mask (dispatcher already node-local).
+        if confined.is_empty() || confined.len() == previous.len() {
+            return None;
+        }
+        crate::decode_affinity::set_current_thread_affinity(&confined).ok()?;
+        Some(DispatcherAffinityGuard { previous })
     }
 
     /// Number of node groups in the layout.
@@ -905,7 +979,7 @@ pub fn shutdown_pools() {
 
 /// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
 /// when set (`0` opts out); when unset it uses the persistent-specific default
-/// (about half the logical CPUs), *not* the flat pool's eight-worker ceiling --
+/// (fills one NUMA node), *not* the flat pool's eight-worker ceiling --
 /// see [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
 fn default_threads() -> Option<usize> {
     crate::kernels::matmul_nbits::configured_persistent_decode_threads()
@@ -1034,10 +1108,24 @@ fn explicit_decode_affinity_set() -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-/// Resolve the node shards for `total` workers: the multi-node split when the
-/// (cpuset-restricted) topology exposes >=2 nodes, otherwise a single group.
+/// Resolve the node shards for `total` workers.
 ///
-/// In both cases the pinned-worker count is capped so the inline dispatcher
+/// The pool is confined to a **single** NUMA node whenever the requested worker
+/// count fits on one (`total <= largest node's CPUs`): a single-node pool shares
+/// one completion counter and one socket's memory controllers, so the inline
+/// dispatcher's barrier spin and the streamed int4 weights all stay node-local.
+/// Splitting the pool across sockets instead shares a cross-node completion
+/// barrier whose counters bounce over the inter-socket link every one of the
+/// ~141 per-token ops; under co-tenant load that collapses throughput (measured
+/// 0.6B decode dropping to ~1-15 tok/s and 2B to ~1 tok/s split across both
+/// sockets vs a stable ~24-118 tok/s confined to one node). The default worker
+/// count already fills exactly one node (see
+/// [`crate::kernels::matmul_nbits::default_persistent_threads`]), so the common
+/// path is always single-node; only an explicit
+/// `ONNX_GENAI_CPU_DECODE_THREADS=N` larger than any one node still splits across
+/// nodes (the caller asked for more workers than a socket holds).
+///
+/// In every case the pinned-worker count is capped so the inline dispatcher
 /// always keeps at least one allowed CPU free (see [`DISPATCHER_RESERVED_CPUS`]
 /// and [`reserve_single_group_headroom`] / [`reserve_split_headroom`]). Without
 /// that reservation a fully-subscribed cpuset (workers == allowed CPUs) pins a
@@ -1047,6 +1135,20 @@ fn node_shards(total: usize) -> Vec<NodeShard> {
     let allowed = crate::decode_affinity::allowed_cpus();
     if let Some(topology) = NumaTopology::detect() {
         let topology = topology.restrict_to_allowed(allowed.as_deref());
+        // Prefer a single node when the pool fits on one: `Compact` returns the
+        // smallest-index node whose CPU count covers `total`, so a hit means the
+        // whole pool stays node-local. Only fall through to the cross-node split
+        // when no single node is large enough (an explicit oversized budget).
+        if let Ok(Some(node_cpus)) = topology.cpus_for(&DecodeAffinity::Compact, total)
+            && node_cpus.len() >= total
+        {
+            let workers = reserve_single_group_headroom(total, node_cpus.len());
+            return vec![NodeShard {
+                index: 0,
+                cpus: node_cpus,
+                workers,
+            }];
+        }
         if let Some(mut shards) = topology.split_workers(total) {
             // Reserve a dispatcher core on every node so the engine thread has a
             // free core on whichever socket the scheduler places it, and each
@@ -1074,9 +1176,9 @@ fn node_shards(total: usize) -> Vec<NodeShard> {
 /// globally guarantees the spare core lands on whichever socket the scheduler
 /// places the dispatcher on, and keeps every node's completion-counter reads
 /// unblocked on a NUMA-split layout. One is enough because the workers already
-/// plateau around half the logical CPUs (memory-bandwidth bound), so giving up
-/// the single highest-index core costs nothing measurable while removing the
-/// starvation cliff.
+/// plateau at one node's memory-bandwidth knee, so giving up the single
+/// highest-index core costs nothing measurable while removing the starvation
+/// cliff.
 const DISPATCHER_RESERVED_CPUS: usize = 1;
 
 /// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]
