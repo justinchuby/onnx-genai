@@ -28,7 +28,7 @@
 //! parity contract, not a universal greedy-token identity guarantee; model-level
 //! greedy parity is established empirically by profiling.
 
-use super::sdpa::{SoftmaxExp, sdpa_decode_row};
+use super::sdpa::{DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_partial, sdpa_decode_row};
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -37,6 +37,69 @@ use onnx_runtime_ir::Node;
 // Below this many row × key × head-dimension elements, Rayon synchronization
 // costs more than the attention work on the decode pool.
 const MIN_PARALLEL_ATTENTION_WORK: usize = 160 * 1024;
+
+// Flash-decoding (split-KV) engages only when a single head's attended KV window
+// is at least this long: below it the per-head path already parallelizes well
+// enough that the split's extra fork-join, per-call scratch allocation, and
+// combine cost is not worth paying (measured: a slight regression at a ~1024
+// window on a single memory-bandwidth-bound socket, a clear win from ~2048 up).
+const SPLIT_MIN_KV: usize = 1536;
+
+// Minimum KV rows per split chunk. Splitting finer than this lets fork-join
+// overhead (~50µs per decode dispatch) dominate the per-chunk streaming work, so
+// the split count is capped so every chunk still streams at least this many KV
+// rows.
+const SPLIT_MIN_CHUNK: usize = 512;
+
+/// Whether flash-decoding KV splitting is enabled (default on). Set
+/// `ONNX_GENAI_ATTENTION_SPLIT=0` (or `false`/`off`) to force the per-head decode
+/// path — used to A/B the split against the baseline on the same binary.
+fn attention_split_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ONNX_GENAI_ATTENTION_SPLIT") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Count of decode attention forwards that engaged the flash-decoding split
+/// path. Cheap observability for A/B runs; read via [`attention_split_count`].
+static ATTENTION_SPLIT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of decode forwards that took the flash-decoding split path so far.
+pub fn attention_split_count() -> usize {
+    ATTENTION_SPLIT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Contiguous `[start, end)` bounds of chunk `chunk` when the KV window
+/// `[lo, hi)` is split into `split_count` even contiguous pieces (the earlier
+/// chunks absorb the remainder). A `split_count` larger than the window length
+/// leaves the trailing chunks empty (`start == end`), which
+/// [`sdpa_decode_partial`] and [`combine_decode_partials`] both handle.
+fn split_chunk_bounds(lo: usize, hi: usize, split_count: usize, chunk: usize) -> (usize, usize) {
+    let length = hi - lo;
+    let base = length / split_count;
+    let remainder = length % split_count;
+    let start = lo + chunk * base + chunk.min(remainder);
+    let end = start + base + usize::from(chunk < remainder);
+    (start, end)
+}
+
+/// Raw, `Sync` view over the flash-decoding partial scratch. Each KV-chunk task
+/// writes only its own `task_index` slot, so the shared `*mut` never aliases.
+struct SplitPartialScratch {
+    partials: *mut DecodePartial,
+    outputs: *mut f64,
+}
+
+// SAFETY: the scheduler runs each task index exactly once, and every task writes
+// only `partials[task_index]` and `outputs[task_index * v_head_size ..]`, so no
+// two workers ever touch the same element.
+unsafe impl Sync for SplitPartialScratch {}
 
 pub struct GroupQueryAttentionKernel {
     num_heads: usize,
@@ -962,7 +1025,104 @@ impl Kernel for GroupQueryAttentionKernel {
         let attention_work = attention_rows
             .saturating_mul(total_sequence_length)
             .saturating_mul(cache_dim);
-        if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
+        // Flash-decoding (split-KV): when the attended window is long and the
+        // decode pool has more workers than query heads, the per-head schedule
+        // leaves cores idle (it parallelizes only over `attention_rows`). Split
+        // each head's window into `split_count` contiguous KV chunks so those
+        // idle cores stream the KV cache in parallel, then combine the per-chunk
+        // softmax partials with the online-rescale reduction.
+        let worker_count = crate::kernels::matmul_nbits::active_decode_worker_count();
+        let split_count = if attention_split_enabled()
+            && attention_rows >= 1
+            && worker_count > attention_rows
+            && total_sequence_length >= SPLIT_MIN_KV
+        {
+            // One idle-core budget per head (floored): only split when there is
+            // real headroom past the per-head schedule.
+            let cores_per_head = worker_count / attention_rows;
+            // Keep each chunk above the fork-join grain floor.
+            let grain_limit = (total_sequence_length / SPLIT_MIN_CHUNK).max(1);
+            cores_per_head.min(grain_limit)
+        } else {
+            1
+        };
+        if split_count > 1 {
+            ATTENTION_SPLIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let v_head_size = v.dim;
+            let num_tasks = attention_rows * split_count;
+            let mut partials = vec![
+                DecodePartial {
+                    max: f64::NEG_INFINITY,
+                    sum: 0.0,
+                };
+                num_tasks
+            ];
+            let mut partial_outputs = vec![0.0f64; num_tasks * v_head_size];
+            let scratch = SplitPartialScratch {
+                partials: partials.as_mut_ptr(),
+                outputs: partial_outputs.as_mut_ptr(),
+            };
+            let scratch = &scratch;
+            let softcap = (self.softcap != 0.0).then_some(self.softcap);
+            crate::kernels::matmul_nbits::decode_parallel_index_tasks(
+                num_tasks,
+                |task_index| {
+                    let row_index = task_index / split_count;
+                    let chunk = task_index % split_count;
+                    let b = row_index / (self.num_heads * q.seq);
+                    let row_in_batch = row_index % (self.num_heads * q.seq);
+                    let qh = row_in_batch / q.seq;
+                    let qs = row_in_batch % q.seq;
+                    let kvh = qh / group;
+                    let causal_limit = query_starts[b] + qs;
+                    let local_start = if self.local_window_size > 0 {
+                        (causal_limit + 1).saturating_sub(self.local_window_size as usize)
+                    } else {
+                        0
+                    };
+                    let (chunk_lo, chunk_hi) =
+                        split_chunk_bounds(local_start, causal_limit + 1, split_count, chunk);
+                    let q_base = ((b * self.num_heads + qh) * q.seq + qs) * cache_dim;
+                    let q_row = &q.data[q_base..q_base + cache_dim];
+                    let kv_head_base = (b * self.kv_num_heads + kvh) * present_sequence_length;
+                    let k_head = &present_k[kv_head_base * cache_dim
+                        ..(kv_head_base + present_sequence_length) * cache_dim];
+                    let v_head = &present_v[kv_head_base * v_head_size
+                        ..(kv_head_base + present_sequence_length) * v_head_size];
+                    // SAFETY: this task owns slot `task_index` exclusively (each
+                    // index runs once), so these writes never alias another task.
+                    let partial_output = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            scratch.outputs.add(task_index * v_head_size),
+                            v_head_size,
+                        )
+                    };
+                    let partial = sdpa_decode_partial(
+                        q_row,
+                        k_head,
+                        v_head,
+                        present_sequence_length,
+                        chunk_lo,
+                        chunk_hi,
+                        scale,
+                        softcap,
+                        partial_output,
+                    );
+                    unsafe {
+                        *scratch.partials.add(task_index) = partial;
+                    }
+                },
+            );
+            for row_index in 0..attention_rows {
+                let base = row_index * split_count;
+                combine_decode_partials(
+                    &partials[base..base + split_count],
+                    &partial_outputs[base * v_head_size..(base + split_count) * v_head_size],
+                    v_head_size,
+                    &mut y_bhsd[row_index * v_head_size..(row_index + 1) * v_head_size],
+                );
+            }
+        } else if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
             // Route through the active decode pool (the same resident workers the
             // MatMulNBits projections use). Under the persistent SPMD scope this
             // avoids falling to the global Rayon pool, which would contend with
