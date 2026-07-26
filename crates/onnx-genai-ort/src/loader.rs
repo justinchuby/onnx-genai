@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use onnx_genai_genai_config::{
-    GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo, pipeline_inference_metadata_from_dir,
+    EncoderDecoderGraphInfo, GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo,
+    pipeline_inference_metadata_from_dir,
 };
 use onnx_genai_metadata::{
     PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator, load_metadata,
@@ -103,8 +104,10 @@ impl PipelineModelDirectory {
     /// Resolve a pipeline only when the package structurally declares one.
     ///
     /// Native metadata is authoritative. Without native metadata, a compatibility
-    /// package is considered a pipeline only when it explicitly declares both
-    /// vision and embedding components.
+    /// package is considered a pipeline only when it explicitly declares a
+    /// recognized multi-component shape: a vision-language model (both vision and
+    /// embedding components) or an encoder-decoder model (an `model.encoder`
+    /// section feeding a cross-attention decoder, e.g. Whisper).
     pub fn load_if_declared(root: impl AsRef<Path>) -> Result<Option<Self>> {
         let root = root.as_ref();
         if !root.is_dir() {
@@ -127,7 +130,10 @@ impl PipelineModelDirectory {
         };
         let config = onnx_genai_genai_config::load(&genai_path)
             .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
-        if config.model.vision.is_none() || config.model.embedding.is_none() {
+        let is_vision_language =
+            config.model.vision.is_some() && config.model.embedding.is_some();
+        let is_encoder_decoder = config.model.encoder.is_some();
+        if !is_vision_language && !is_encoder_decoder {
             return Ok(None);
         }
         Self::load(root).map(Some)
@@ -343,6 +349,9 @@ fn load_compatibility_pipeline(
     })?;
     let config = onnx_genai_genai_config::load(&genai_path)
         .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+    if config.model.encoder.is_some() {
+        return load_encoder_decoder_compatibility_pipeline(root, &config);
+    }
     let vision =
         config.model.vision.as_ref().ok_or_else(|| {
             incomplete_compatibility_error(root, "model.vision in genai_config.json")
@@ -375,6 +384,45 @@ fn load_compatibility_pipeline(
                 "a multimodal genai_config.json with vision, embedding, and decoder components",
             )
         })?;
+    let preprocessing = metadata.preprocessing;
+    let spec = metadata
+        .pipeline
+        .ok_or_else(|| incomplete_compatibility_error(root, "the synthesized metadata pipeline"))?;
+    onnx_genai_metadata::validate_pipeline_spec(&spec)
+        .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+    Ok((None, spec, preprocessing))
+}
+
+/// Synthesize an encoder-decoder (audio/text sequence-to-sequence, e.g. Whisper)
+/// compatibility pipeline from a genai_config package that declares
+/// `model.encoder` + `model.decoder` but no vision/embedding front-end.
+fn load_encoder_decoder_compatibility_pipeline(
+    root: &Path,
+    config: &onnx_genai_genai_config::GenAiConfig,
+) -> Result<(Option<PathBuf>, PipelineSpec, Option<PreprocessingSpec>)> {
+    let encoder = config.model.encoder.as_ref().ok_or_else(|| {
+        incomplete_compatibility_error(root, "model.encoder in genai_config.json")
+    })?;
+    let encoder_filename =
+        compatibility_filename(root, encoder.filename.as_deref(), "model.encoder.filename")?;
+    let decoder_filename = compatibility_filename(
+        root,
+        config.model.decoder.filename.as_deref(),
+        "model.decoder.filename",
+    )?;
+    let graphs = EncoderDecoderGraphInfo {
+        encoder: inspect_model_graph(&encoder_filename, "encoder")?,
+        decoder: inspect_model_graph(&decoder_filename, "decoder")?,
+    };
+    let metadata =
+        onnx_genai_genai_config::encoder_decoder_pipeline_inference_metadata_from_dir(root, &graphs)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?
+            .ok_or_else(|| {
+                incomplete_compatibility_error(
+                    root,
+                    "an encoder-decoder genai_config.json with encoder and decoder components",
+                )
+            })?;
     let preprocessing = metadata.preprocessing;
     let spec = metadata
         .pipeline

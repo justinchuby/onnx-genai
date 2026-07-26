@@ -3649,6 +3649,7 @@ mod tests {
             kv_inputs: Some(vec!["cache_key".into()]),
             kv_outputs: Some(vec!["next_key".into()]),
             encoder_hidden_states_input: None,
+            audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
             kv_update: None,
@@ -3782,6 +3783,7 @@ mod tests {
             kv_outputs: (kv_ownership == KvOwnership::Owned)
                 .then(|| vec!["next_key".into(), "next_value".into()]),
             encoder_hidden_states_input: None,
+            audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
             kv_update: None,
