@@ -444,6 +444,11 @@ impl Kernel for PluginCompiledKernel {
             states.insert(thread_id, state);
             state
         };
+        // Released before calling into the plugin. The map only guards *state
+        // lookup*; holding it across Compute would serialise every fused
+        // subgraph in the process behind one lock, which is the opposite of
+        // why the state is per-thread in the first place.
+        drop(states);
         let mut context = HostKernelContext::new(inputs, outputs)?;
         let bytes = context.byte_size();
         let _span = onnx_runtime_tracer::global_context().map(|trace| {
@@ -877,6 +882,14 @@ struct HostNode {
     inputs: Vec<*const ort::OrtValueInfo>,
     outputs: Vec<*const ort::OrtValueInfo>,
     attrs: Vec<HostOpAttr>,
+    /// Value infos this node's `inputs`/`outputs` point into.
+    ///
+    /// Held here rather than leaked. The boxes must outlive the pointers we
+    /// hand the plugin, and tying them to the node does that exactly: they die
+    /// when the node does, which is when the compiled plan is dropped. Leaking
+    /// them was also correct in the narrow sense and grew without bound in a
+    /// process that builds sessions repeatedly.
+    owned_values: Vec<Box<HostValueInfo>>,
 }
 
 #[repr(C)]
@@ -1043,6 +1056,9 @@ impl HostGraph {
                         })
                     })
                     .collect::<std::result::Result<Vec<_>, String>>()?,
+                // Empty: these point into `HostGraph::values`, which outlives the
+                // node, so the node owns nothing of its own here.
+                owned_values: Vec::new(),
             });
             let node_ptr = (&*host_node as *const HostNode).cast::<ort::OrtNode>();
             for &output in &node.outputs {
@@ -1135,19 +1151,21 @@ impl HostNode {
         for value in owned_values.iter().skip(claim.input_values.len()) {
             outputs.push(value_ptr(value));
         }
-        // Leak the value infos for the duration of Compile. Compile is the only
-        // consumer of the fused node projection and plugins must copy anything
-        // they retain, so a tiny process-lifetime leak avoids dangling pointers.
-        std::mem::forget(owned_values);
+        // `owned_values` moves into the node below, so the pointers just taken
+        // stay valid for exactly as long as the node that holds them.
         let mut node = Box::new(Self {
             id: NodeId(index as u32),
             name: CString::new(format!("native_plugin_fused_{index}")).unwrap(),
             op_type: c"NativePluginFused".to_owned(),
-            domain: c"com.microsoft".to_owned(),
+            // Our own domain: this operator is invented here and Microsoft
+            // never specified it. Matches `onnx_runtime_ir::RUNTIME_DOMAIN`,
+            // spelled literally because a C string is needed here.
+            domain: c"pkg.nxrt".to_owned(),
             since_version: 1,
             inputs,
             outputs,
             attrs: Vec::new(),
+            owned_values,
         });
         node.attrs.push(HostOpAttr {
             name: c"native_plugin_fusion_id".to_owned(),

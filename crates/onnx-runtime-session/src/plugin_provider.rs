@@ -15,6 +15,13 @@ use onnx_runtime_tracer::{Args, annotate_current_span_with};
 
 /// Synthetic op type used after a plugin EP compiles and replaces a claimed subgraph.
 pub(crate) const PLUGIN_FUSED_OP: &str = "NativePluginFused";
+
+/// The device a plugin runs on when its configured name is not one we know.
+///
+/// One owner for the fallback, so the node's placement and the provider's
+/// reported `device_type` cannot drift apart and describe the same work as
+/// running in two places.
+const UNKNOWN_PLUGIN_DEVICE: DeviceType = DeviceType::Custom(0);
 /// Our own domain, not `com.microsoft`.
 ///
 /// This operator is invented here -- it stands for "a subgraph some plugin
@@ -73,7 +80,7 @@ impl ExecutionProvider for PluginExecutionProvider {
         // span for work the plugin ran on an accelerator onto the host's
         // device in the trace. Unrecognised names stay `Custom`, which is
         // honest about not knowing rather than wrong about knowing.
-        DeviceType::from_trace_name(&self.device_label).unwrap_or(DeviceType::Custom(0))
+        DeviceType::from_trace_name(&self.device_label).unwrap_or(UNKNOWN_PLUGIN_DEVICE)
     }
 
     fn device_id(&self) -> DeviceId {
@@ -378,8 +385,16 @@ impl OptimizationPass for PluginFusionPass {
             // the accelerator that did it. Left unset, the executor records no
             // device at all and the whole fused subgraph -- which is most of
             // the model -- shows up unattributed.
-            node.device = DeviceType::from_trace_name(&self.device_label)
-                .map(|device_type| DeviceId::new(device_type, 0));
+            //
+            // Always set, including for a device label we do not recognise:
+            // that resolves to `Custom(0)`, which says "some device we cannot
+            // name" and is strictly more informative than silence. Resolved
+            // the same way the provider resolves its own `device_type`, so the
+            // node and the provider cannot disagree about where work ran.
+            node.device = Some(DeviceId::new(
+                DeviceType::from_trace_name(&self.device_label).unwrap_or(UNKNOWN_PLUGIN_DEVICE),
+                0,
+            ));
             groups.push((claim.node_ids.clone(), node));
             accepted.push(ClaimDecisionAudit {
                 estimate,
