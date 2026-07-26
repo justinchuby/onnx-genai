@@ -22,6 +22,20 @@ fn renders_qwen_chatml_with_generation_prompt() {
 }
 
 #[test]
+fn renders_deepseek_template_with_assistant_generation_prompt() {
+    let template =
+        ChatTemplate::from_model_dir(std::path::Path::new("tests/fixtures/deepseek")).unwrap();
+    let rendered = template
+        .render(&[ChatMessage::user("Explain recursion.")], None, true)
+        .unwrap();
+
+    assert_eq!(
+        rendered,
+        "<｜begin▁of▁sentence｜><｜User｜>Explain recursion.<｜Assistant｜><think>\n"
+    );
+}
+
+#[test]
 fn renders_tools_for_qwen_template() {
     let template =
         ChatTemplate::from_model_dir(std::path::Path::new("tests/fixtures/chatml")).unwrap();
