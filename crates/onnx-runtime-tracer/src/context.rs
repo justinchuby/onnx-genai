@@ -506,7 +506,6 @@ impl SpanGuard {
     /// information, while still costing bytes on each one — suppressing it on
     /// the executor's per-operator span cut a real trace by 22%. Only use this
     /// where the span already identifies itself some better way.
-    #[must_use]
     pub fn without_source(mut self) -> Self {
         if let Some(state) = self.state.as_mut() {
             state.location = None;
