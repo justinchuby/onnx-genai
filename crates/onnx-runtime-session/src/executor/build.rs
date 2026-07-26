@@ -1408,13 +1408,15 @@ impl Executor {
         });
         DeviceIoBinding::allocate(
             self.ep.clone(),
-            input_name,
-            true,
-            output_name,
-            dtype,
-            physical_shape,
-            logical_shape,
-            expose_logical_input_shape,
+            DeviceBindingSpec {
+                input_name,
+                bind_input: true,
+                output_name,
+                dtype,
+                physical_shape,
+                logical_shape,
+                expose_logical_input_shape,
+            },
         )
     }
 
@@ -1427,13 +1429,15 @@ impl Executor {
     ) -> Result<DeviceIoBinding> {
         DeviceIoBinding::allocate(
             self.ep.clone(),
-            String::new(),
-            false,
-            Some(output_name),
-            dtype,
-            physical_shape,
-            logical_shape,
-            false,
+            DeviceBindingSpec {
+                input_name: String::new(),
+                bind_input: false,
+                output_name: Some(output_name),
+                dtype,
+                physical_shape,
+                logical_shape,
+                expose_logical_input_shape: false,
+            },
         )
     }
 

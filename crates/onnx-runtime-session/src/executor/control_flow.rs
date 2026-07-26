@@ -982,6 +982,10 @@ impl Executor {
         Ok(())
     }
 
+    // The Scan operator's body specs derive from these independent ONNX
+    // attributes/inputs; bundling them into a context struct belongs with the
+    // control-flow decomposition (Dallas #6).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_body_specs(
         &self,
         node: &Node,

@@ -74,7 +74,7 @@ use crate::error::{Result, SessionError};
 use crate::sequence::{
     ConcatPlan, SeqTensor, SequenceError, SequenceValue, SplitSpec, split_tensor, stack_new_axis,
 };
-use crate::tensor::{DeviceIoBinding, SharedTensorBuffer, Tensor};
+use crate::tensor::{DeviceBindingSpec, DeviceIoBinding, SharedTensorBuffer, Tensor};
 
 fn profile_ops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

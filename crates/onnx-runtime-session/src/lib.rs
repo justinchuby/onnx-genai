@@ -17,8 +17,6 @@
 // SessionError intentionally preserves rich, structured diagnostics in the
 // public API; boxing it would be an API and behavior change rather than a lint fix.
 #![allow(clippy::result_large_err)]
-// Executor calls mirror graph/operator contracts with independently meaningful inputs.
-#![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -44,6 +44,10 @@ impl KernelCache {
     /// EP support and compiling+inserting it on a miss. The EP support check
     /// lives on the miss path so a re-planned shape is re-validated exactly
     /// once per distinct shape.
+    // Each argument is an independent part of the kernel-cache key or the EP
+    // contract; bundling them into a context struct is tracked separately
+    // (Dallas #5, kernel-dispatch decomposition).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn get_or_create(
         &mut self,
         node_id: NodeId,
