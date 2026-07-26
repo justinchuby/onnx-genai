@@ -359,6 +359,7 @@ pub fn text_encode(
     input_ids: &[i64],
     batch_size: usize,
 ) -> Result<Vec<f32>> {
+    let _span = onnx_genai_ort::prof_span!("diffusion.text_encode");
     let session = Session::new(environment, text_encoder_path, SessionOptions::default())
         .with_context(|| {
             format!(
@@ -400,6 +401,7 @@ pub fn vae_decode(
     latent: &[f32],
     shape: &[i64],
 ) -> Result<(Vec<f32>, usize, usize)> {
+    let _span = onnx_genai_ort::prof_span!("diffusion.vae_decode");
     let session = Session::new(environment, vae_decoder_path, SessionOptions::default())
         .with_context(|| {
             format!(

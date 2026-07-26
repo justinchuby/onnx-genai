@@ -1581,21 +1581,27 @@ impl PipelineEngine {
         // outputs live in a separate `loop_state`, keyed by output port.
         let mut constants = self.prepare_request_tensors(request.inputs, &present)?;
         let mut stage_timings: Vec<serde_json::Value> = Vec::new();
-        self.run_prompt_phase_components(
-            &plan.prompt_components,
-            &mut constants,
-            "encode",
-            &present,
-            Some(&mut stage_timings),
-        )?;
-        if !self.plan.component_is_present(&plan.denoiser, &present) {
+        {
+            let _span = onnx_genai_ort::prof_span!("diffusion.text_encode");
             self.run_prompt_phase_components(
-                &plan.final_components,
+                &plan.prompt_components,
                 &mut constants,
-                "decode",
+                "encode",
                 &present,
                 Some(&mut stage_timings),
             )?;
+        }
+        if !self.plan.component_is_present(&plan.denoiser, &present) {
+            {
+                let _span = onnx_genai_ort::prof_span!("diffusion.vae_decode");
+                self.run_prompt_phase_components(
+                    &plan.final_components,
+                    &mut constants,
+                    "decode",
+                    &present,
+                    Some(&mut stage_timings),
+                )?;
+            }
             dump_stage_timings(&stage_timings);
             return Ok(constants);
         }
@@ -1675,96 +1681,63 @@ impl PipelineEngine {
         // Partial (img2img) loops start at `start_step`; the seed is then the
         // encoded image already noised to `timesteps[start_step]`.
         let denoise_start = std::time::Instant::now();
-        for step in start_step..num_steps {
-            let step_start = std::time::Instant::now();
-            let is_first = step == start_step;
-            // Timestep/sigma for this step: explicit plan schedule when provided,
-            // else the scheduler's timesteps, else the 0-based step index.
-            let timestep = plan
-                .timesteps
-                .as_ref()
-                .or(scheduler_timesteps.as_ref())
-                .and_then(|ts| ts.get(step).copied())
-                .unwrap_or(step as f32);
+        {
+            let _denoise_loop_span = onnx_genai_ort::prof_span!("diffusion.denoise_loop");
+            for step in start_step..num_steps {
+                let _step_span =
+                    onnx_genai_ort::prof_span!("diffusion.denoise_step", "step" => step);
+                let step_start = std::time::Instant::now();
+                let is_first = step == start_step;
+                // Timestep/sigma for this step: explicit plan schedule when provided,
+                // else the scheduler's timesteps, else the 0-based step index.
+                let timestep = plan
+                    .timesteps
+                    .as_ref()
+                    .or(scheduler_timesteps.as_ref())
+                    .and_then(|ts| ts.get(step).copied())
+                    .unwrap_or(step as f32);
 
-            // Raw (unscaled) loop-carried sample feeding each loop input this
-            // step: the seed on the first step, otherwise the value carried from
-            // the previous step. The scheduler's `step` consumes these raw samples.
-            let mut raw_samples: HashMap<String, Value> = HashMap::new();
-            for (_, in_port) in &plan.loop_edges {
-                let raw = if is_first {
-                    let endpoint = format!("{}.{}", plan.denoiser, in_port);
-                    constants.get(&endpoint).with_context(|| {
-                        format!("missing iterative pipeline seed '{endpoint}' at start step")
-                    })?
-                } else {
-                    carried.get(in_port).with_context(|| {
-                        format!(
-                            "loop-carried input '{}.{in_port}' was not produced",
-                            plan.denoiser
-                        )
-                    })?
-                };
-                raw_samples.insert(in_port.clone(), clone_value(raw)?);
-            }
-
-            // Some schedulers (e.g. Euler) scale the loop-carried sample before
-            // it reaches the denoiser. Compute those scaled values once and feed
-            // them as per-port overrides; schedulers that don't scale (DDIM,
-            // masked diffusion) leave the raw sample untouched.
-            let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
-            if let Some(scheduler) = scheduler {
+                // Raw (unscaled) loop-carried sample feeding each loop input this
+                // step: the seed on the first step, otherwise the value carried from
+                // the previous step. The scheduler's `step` consumes these raw samples.
+                let mut raw_samples: HashMap<String, Value> = HashMap::new();
                 for (_, in_port) in &plan.loop_edges {
-                    let raw = &raw_samples[in_port];
-                    if let Some(scaled) = scheduler.scale_input(step, num_steps, raw)? {
-                        scaled_inputs.insert(in_port.clone(), scaled);
-                    }
+                    let raw = if is_first {
+                        let endpoint = format!("{}.{}", plan.denoiser, in_port);
+                        constants.get(&endpoint).with_context(|| {
+                            format!("missing iterative pipeline seed '{endpoint}' at start step")
+                        })?
+                    } else {
+                        carried.get(in_port).with_context(|| {
+                            format!(
+                                "loop-carried input '{}.{in_port}' was not produced",
+                                plan.denoiser
+                            )
+                        })?
+                    };
+                    raw_samples.insert(in_port.clone(), clone_value(raw)?);
                 }
-            }
-            let scale_overrides: Vec<(&str, &Value)> = scaled_inputs
-                .iter()
-                .map(|(port, value)| (port.as_str(), value))
-                .collect();
 
-            // Conditional pass (all inputs as declared, plus any input scaling).
-            let cond_out = self.run_denoiser_pass(
-                denoiser,
-                plan,
-                start_step,
-                &constants,
-                &carried,
-                step,
-                timestep,
-                &scale_overrides,
-            )?;
-
-            // Classifier-free guidance: run an unconditional pass with the
-            // conditioning replaced by the unconditional embedding, then combine
-            // per output port:  pred = uncond + scale * (cond - uncond).
-            let out_map = if let Some(scale) = guidance {
-                let mut cfg_overrides = scale_overrides.clone();
-                for (port, value) in &cfg_uncond {
-                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
-                    cfg_overrides.push((port.as_str(), value));
-                }
-                // Language-diffusion CFG: the unconditional pass feeds the
-                // loop-carried input with its prompt tokens re-masked. Computed
-                // per step from the current sample (owned here so its references
-                // live through the unconditional denoiser pass).
-                let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
+                // Some schedulers (e.g. Euler) scale the loop-carried sample before
+                // it reaches the denoiser. Compute those scaled values once and feed
+                // them as per-port overrides; schedulers that don't scale (DDIM,
+                // masked diffusion) leave the raw sample untouched.
+                let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
                 if let Some(scheduler) = scheduler {
                     for (_, in_port) in &plan.loop_edges {
                         let raw = &raw_samples[in_port];
-                        if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
-                            prompt_masked_inputs.push((in_port.clone(), uncond_sample));
+                        if let Some(scaled) = scheduler.scale_input(step, num_steps, raw)? {
+                            scaled_inputs.insert(in_port.clone(), scaled);
                         }
                     }
                 }
-                for (port, value) in &prompt_masked_inputs {
-                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
-                    cfg_overrides.push((port.as_str(), value));
-                }
-                let uncond_out = self.run_denoiser_pass(
+                let scale_overrides: Vec<(&str, &Value)> = scaled_inputs
+                    .iter()
+                    .map(|(port, value)| (port.as_str(), value))
+                    .collect();
+
+                // Conditional pass (all inputs as declared, plus any input scaling).
+                let cond_out = self.run_denoiser_pass(
                     denoiser,
                     plan,
                     start_step,
@@ -1772,77 +1745,117 @@ impl PipelineEngine {
                     &carried,
                     step,
                     timestep,
-                    &cfg_overrides,
+                    &scale_overrides,
                 )?;
-                let mut combined: HashMap<String, Value> = HashMap::new();
-                for (port, cond_value) in &cond_out {
-                    let uncond_value = uncond_out.get(port).with_context(|| {
-                        format!(
-                            "unconditional pass did not produce '{}.{port}'",
-                            plan.denoiser
-                        )
-                    })?;
-                    let cond_v = cond_value.to_vec_f32_lossy()?;
-                    let uncond_v = uncond_value.to_vec_f32_lossy()?;
-                    let guided: Vec<f32> = uncond_v
-                        .iter()
-                        .zip(&cond_v)
-                        .map(|(u, c)| u + scale * (c - u))
-                        .collect();
-                    combined.insert(
-                        port.clone(),
-                        Value::from_slice_f32(&guided, cond_value.shape())?,
-                    );
-                }
-                combined
-            } else {
-                cond_out
-            };
 
-            // Compute the next value for each loop-carried input. Without a
-            // scheduler this is identity feedback (output -> input). With a
-            // scheduler the output is a noise prediction and the next sample is
-            // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
-            for (out_port, in_port) in &plan.loop_edges {
-                let model_output = out_map.get(out_port).with_context(|| {
-                    format!(
-                        "denoiser did not produce loop output '{}.{out_port}'",
-                        plan.denoiser
-                    )
-                })?;
-                let next = if let Some(scheduler) = scheduler {
-                    let sample = raw_samples.get(in_port).with_context(|| {
+                // Classifier-free guidance: run an unconditional pass with the
+                // conditioning replaced by the unconditional embedding, then combine
+                // per output port:  pred = uncond + scale * (cond - uncond).
+                let out_map = if let Some(scale) = guidance {
+                    let mut cfg_overrides = scale_overrides.clone();
+                    for (port, value) in &cfg_uncond {
+                        cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                        cfg_overrides.push((port.as_str(), value));
+                    }
+                    // Language-diffusion CFG: the unconditional pass feeds the
+                    // loop-carried input with its prompt tokens re-masked. Computed
+                    // per step from the current sample (owned here so its references
+                    // live through the unconditional denoiser pass).
+                    let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
+                    if let Some(scheduler) = scheduler {
+                        for (_, in_port) in &plan.loop_edges {
+                            let raw = &raw_samples[in_port];
+                            if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
+                                prompt_masked_inputs.push((in_port.clone(), uncond_sample));
+                            }
+                        }
+                    }
+                    for (port, value) in &prompt_masked_inputs {
+                        cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                        cfg_overrides.push((port.as_str(), value));
+                    }
+                    let uncond_out = self.run_denoiser_pass(
+                        denoiser,
+                        plan,
+                        start_step,
+                        &constants,
+                        &carried,
+                        step,
+                        timestep,
+                        &cfg_overrides,
+                    )?;
+                    let mut combined: HashMap<String, Value> = HashMap::new();
+                    for (port, cond_value) in &cond_out {
+                        let uncond_value = uncond_out.get(port).with_context(|| {
+                            format!(
+                                "unconditional pass did not produce '{}.{port}'",
+                                plan.denoiser
+                            )
+                        })?;
+                        let cond_v = cond_value.to_vec_f32_lossy()?;
+                        let uncond_v = uncond_value.to_vec_f32_lossy()?;
+                        let guided: Vec<f32> = uncond_v
+                            .iter()
+                            .zip(&cond_v)
+                            .map(|(u, c)| u + scale * (c - u))
+                            .collect();
+                        combined.insert(
+                            port.clone(),
+                            Value::from_slice_f32(&guided, cond_value.shape())?,
+                        );
+                    }
+                    combined
+                } else {
+                    cond_out
+                };
+
+                // Compute the next value for each loop-carried input. Without a
+                // scheduler this is identity feedback (output -> input). With a
+                // scheduler the output is a noise prediction and the next sample is
+                // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
+                for (out_port, in_port) in &plan.loop_edges {
+                    let model_output = out_map.get(out_port).with_context(|| {
                         format!(
-                            "missing loop-carried sample for '{}.{in_port}'",
+                            "denoiser did not produce loop output '{}.{out_port}'",
                             plan.denoiser
                         )
                     })?;
-                    if scheduler.needs_noise() {
-                        let noise =
-                            self.step_noise(plan, num_steps, &constants, in_port, step, sample)?;
-                        scheduler.step_with_noise(
-                            step,
-                            num_steps,
-                            sample,
-                            model_output,
-                            Some(&noise),
-                        )?
+                    let next = if let Some(scheduler) = scheduler {
+                        let _scheduler_span =
+                            onnx_genai_ort::prof_span!("diffusion.scheduler_step", "step" => step);
+                        let sample = raw_samples.get(in_port).with_context(|| {
+                            format!(
+                                "missing loop-carried sample for '{}.{in_port}'",
+                                plan.denoiser
+                            )
+                        })?;
+                        if scheduler.needs_noise() {
+                            let noise = self
+                                .step_noise(plan, num_steps, &constants, in_port, step, sample)?;
+                            scheduler.step_with_noise(
+                                step,
+                                num_steps,
+                                sample,
+                                model_output,
+                                Some(&noise),
+                            )?
+                        } else {
+                            scheduler.step(step, num_steps, sample, model_output)?
+                        }
                     } else {
-                        scheduler.step(step, num_steps, sample, model_output)?
-                    }
-                } else {
-                    clone_value(model_output)?
-                };
-                dump_iterative_step(
-                    &plan.denoiser,
-                    in_port,
-                    step,
-                    &next,
-                    step_start.elapsed().as_secs_f64() * 1e3,
-                );
-                carried.insert(in_port.clone(), next);
+                        clone_value(model_output)?
+                    };
+                    dump_iterative_step(
+                        &plan.denoiser,
+                        in_port,
+                        step,
+                        &next,
+                        step_start.elapsed().as_secs_f64() * 1e3,
+                    );
+                    carried.insert(in_port.clone(), next);
+                }
+                last_outputs = out_map;
             }
-            last_outputs = out_map;
         }
         let denoise_ms = denoise_start.elapsed().as_secs_f64() * 1e3;
         stage_timings.push(serde_json::json!({
@@ -1862,13 +1875,16 @@ impl PipelineEngine {
         for (in_port, value) in carried {
             tensors.insert(format!("{}.{}", plan.denoiser, in_port), value);
         }
-        self.run_prompt_phase_components(
-            &plan.final_components,
-            &mut tensors,
-            "decode",
-            &present,
-            Some(&mut stage_timings),
-        )?;
+        {
+            let _span = onnx_genai_ort::prof_span!("diffusion.vae_decode");
+            self.run_prompt_phase_components(
+                &plan.final_components,
+                &mut tensors,
+                "decode",
+                &present,
+                Some(&mut stage_timings),
+            )?;
+        }
         dump_stage_timings(&stage_timings);
         Ok(tensors)
     }
@@ -1942,6 +1958,7 @@ impl PipelineEngine {
             .iter()
             .map(|(name, value)| (name.as_str(), value))
             .collect::<Vec<_>>();
+        let _span = onnx_genai_ort::prof_span!("diffusion.denoiser_pass", "step" => step);
         let outputs = denoiser.run(&refs).map_err(|e| {
             anyhow::anyhow!(
                 "ORT denoiser '{}' failed at step {step}: {e}",

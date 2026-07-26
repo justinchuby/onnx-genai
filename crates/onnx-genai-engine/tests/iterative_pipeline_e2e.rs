@@ -84,6 +84,53 @@ fn iterative_diffusion_pipeline_runs_denoise_loop_and_final_vae() -> anyhow::Res
 }
 
 #[test]
+fn iterative_diffusion_trace_spans_when_enabled() -> anyhow::Result<()> {
+    if !onnx_genai_ort::profile::tracing_enabled() {
+        return Ok(());
+    }
+    onnx_genai_ort::profile::reset();
+
+    let mut engine = Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
+    let request = empty_request()
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
+        .with_input(
+            "denoiser.cond",
+            Value::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4])?,
+        );
+
+    let _ = engine.run_pipeline(request)?;
+    let document = onnx_genai_ort::profile::trace_document();
+    let events = document["traceEvents"]
+        .as_array()
+        .expect("traceEvents is an array");
+
+    for name in [
+        "diffusion.text_encode",
+        "diffusion.denoise_loop",
+        "diffusion.denoise_step",
+        "diffusion.denoiser_pass",
+        "diffusion.vae_decode",
+    ] {
+        assert!(
+            events.iter().any(|event| event["name"] == name),
+            "missing trace span {name}: {events:?}"
+        );
+    }
+
+    let steps = events
+        .iter()
+        .filter(|event| event["name"] == "diffusion.denoise_step")
+        .map(|event| event["args"]["step"].as_u64().expect("step arg"))
+        .collect::<Vec<_>>();
+    assert_eq!(steps, vec![0, 1, 2]);
+    onnx_genai_ort::profile::write_trace()?;
+    Ok(())
+}
+
+#[test]
 fn generate_rejects_iterative_pipeline_with_clear_error() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
     let err = engine
