@@ -164,7 +164,10 @@ fn projection_fusion_runs_after_silu_rewrite() {
     let bytes = model_bytes("decomposed");
     let session = build(&bytes, true);
     assert_eq!(count(session.graph(), "Sigmoid"), 0);
-    assert_eq!(count(session.graph(), "Silu"), 1);
+    // The normalized `Silu` (from the Sigmoid+Mul rewrite) is then folded into
+    // the always-on `SiluMul` fusion, so no standalone `Silu` remains.
+    assert_eq!(count(session.graph(), "Silu"), 0);
+    assert_eq!(count(session.graph(), "SiluMul"), 1);
     assert_eq!(count(session.graph(), "MatMulNBits"), 1);
     assert_eq!(count(session.graph(), "Split"), 1);
 }
@@ -175,9 +178,14 @@ fn projection_fusion_flag_off_is_noop() {
     let bytes = model_bytes("valid");
     let (loaded, _) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".").unwrap();
     let session = build(&bytes, false);
-    assert_eq!(session.graph().num_nodes(), loaded.num_nodes());
+    // Projection fusion is off, so the two `MatMulNBits` projections stay split
+    // and no `Split` is introduced. The always-on `SiluMul` fusion still folds
+    // the SwiGLU `Silu`+`Mul` into one node, dropping the node count by one.
+    assert_eq!(session.graph().num_nodes(), loaded.num_nodes() - 1);
     assert_eq!(count(session.graph(), "MatMulNBits"), 2);
     assert_eq!(count(session.graph(), "Split"), 0);
+    assert_eq!(count(session.graph(), "Silu"), 0);
+    assert_eq!(count(session.graph(), "SiluMul"), 1);
 }
 
 #[test]
@@ -205,7 +213,10 @@ fn projection_fusion_skips_projection_with_external_consumer() {
     let bytes = model_bytes("extra_consumer");
     let (loaded, _) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".").unwrap();
     let session = build(&bytes, true);
-    assert_eq!(session.graph().num_nodes(), loaded.num_nodes());
+    // The escaping gate projection blocks projection fusion (both `MatMulNBits`
+    // stay split, no `Split`), but the always-on `SiluMul` fusion still folds
+    // the SwiGLU `Silu`+`Mul`, dropping the node count by one.
+    assert_eq!(session.graph().num_nodes(), loaded.num_nodes() - 1);
     assert_eq!(count(session.graph(), "MatMulNBits"), 2);
     assert_eq!(count(session.graph(), "Split"), 0);
 }

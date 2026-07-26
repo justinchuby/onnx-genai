@@ -2,7 +2,8 @@ use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
-    OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
+    FusionPattern, OpFusion, OptimizationPass, OptimizerError, PassContext,
+    Result as OptimizerResult,
 };
 
 const PROJECTION_FUSION_ENV: &str = "ONNX_GENAI_PROJECTION_FUSION";
@@ -41,6 +42,20 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     if projection_fusion.enabled() {
         passes.push(Box::new(projection_fusion));
     }
+    // Always-on, byte-identical SwiGLU gate fold: `Mul(Silu(gate), up)` becomes
+    // the fused `com.microsoft::SiluMul` kernel, eliminating the separate `Silu`
+    // and `Mul` graph dispatch. This runs unconditionally on the CPU EP so the
+    // native decode path fires it without depending on the session-level
+    // `"optimization"` option (which defaults to `None`). The single-consumer
+    // safety rule in `FusionPattern` keeps it bit-identical, and it fuses *only*
+    // Silu+Mul — no other numerics-visible rewrite is pulled in. It runs after
+    // `fuse_silu_patterns` (executor) has already normalized `x*Sigmoid(x)` to
+    // `com.microsoft::Silu`, so both SwiGLU shapes are matchable here.
+    passes.push(Box::new(OpFusion::with_patterns(vec![FusionPattern::new(
+        "Silu+Mul",
+        &["Silu", "Mul"],
+        "SiluMul",
+    )])));
     // Always-on, byte-identical bias fold: `Add(MatMulNBits, [N]-bias)` becomes
     // the `MatMulNBits` optional bias input, which the kernel adds inside the
     // MLAS GEMV epilogue instead of paying for a standalone element-wise `Add`.
