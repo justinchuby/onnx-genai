@@ -13,14 +13,17 @@
 //! to this fork-join glue, and it is exactly the term that makes >32 cross-socket
 //! threads regress.
 //!
-//! This module keeps a fixed set of worker threads parked-and-hot and drives
-//! them with a hand-rolled **broadcast + counting barrier**: one atomic sequence
-//! bump publishes the op, workers observe it, run their pre-assigned output-row
-//! shard, and decrement a per-node completion counter; the dispatcher spins on
-//! those counters. No per-op allocation, no deque, no epoch GC -- just a handful
-//! of atomics per projection. An unwind-only completion guard still decrements
-//! the counter if a worker panics, poisons the pool, and makes the dispatcher
-//! report an actionable panic instead of hanging.
+//! This module keeps a fixed set of worker threads hot-then-parked and drives
+//! them with a hand-rolled **sense-reversing broadcast + counting barrier**: a
+//! per-node sense counter bump publishes the op, workers observe their node's
+//! sense advance, run their pre-assigned output-row shard, and decrement a
+//! per-node completion counter; the dispatcher spins on those counters. Workers
+//! wait with a KMP_BLOCKTIME-style bounded active spin then park on a futex
+//! (`atomic-wait`), so a single `wake` per node releases the whole node in one
+//! syscall and idle workers yield the CPU. No per-op allocation, no deque, no
+//! epoch GC -- just a handful of atomics per projection. An unwind-only
+//! completion guard still decrements the counter if a worker panics, poisons the
+//! pool, and makes the dispatcher report an actionable panic instead of hanging.
 //!
 //! # Two-level, NUMA-aware (mirrors `numa-split`)
 //!
@@ -86,10 +89,10 @@
 //!    SPMD pool against the flat path only.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len;
@@ -105,18 +108,62 @@ use crate::kernels::matmul_nbits::output_chunk_len;
 /// See `.squad/decisions.md` (Voight 2026-07-24; Hudson 2026-07-24 auto-enable).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 
-/// Spin iterations a worker or the dispatcher busy-waits before yielding /
-/// parking. Sized so back-to-back decode projections (microseconds apart) are
-/// always caught while spinning; only genuinely idle gaps fall through to park.
-const SPIN_BEFORE_YIELD: u32 = 1 << 12;
-const YIELD_BEFORE_PARK: u32 = 1 << 6;
-/// Bounded park so a (rare, off-hot-path) lost wakeup self-heals rather than
-/// hanging. It is only a backstop: dispatch wakes parked workers with an explicit
-/// `unpark` (SeqCst-paired below), so this timeout never fires on the hot path.
-/// An idle worker re-parks on each timeout WITHOUT re-running the spin cycle (see
-/// `worker_loop`), so a longer timeout simply means fewer idle futex wakeups; it
-/// is kept modest so a theoretical lost wakeup still self-heals quickly.
-const PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+/// Bounded active-spin window before a worker parks, mirroring the
+/// **LLVM/Intel OpenMP runtime `KMP_BLOCKTIME`** design: after a fork/join the
+/// worker busy-waits ("blocktime") for the next barrier release, and only sleeps
+/// on a futex once genuinely idle for longer than the window. This is the gold
+/// standard for exactly this OMP-style fine-grained fork/join HPC workload.
+///
+/// The window is **load-bearing, not a bad habit**: decode fires ~400 fork/join
+/// barriers per token, microseconds apart, so a worker must catch the next
+/// barrier while spinning. Parking inside the active path would pay a futex wake
+/// (~1-5 us) on every barrier and tank throughput. The window is sized to span
+/// the inter-op / inter-token gaps of tight decode (so workers effectively never
+/// park mid-generation) yet expire quickly once a generation ends, so idle CPU
+/// returns to ~0 between requests -- the spin is bounded to genuinely-active
+/// decode, not "unconditional". Tunable via [`decode_blocktime`].
+///
+/// Default 500 us: comfortably longer than the ~microsecond inter-op gap and the
+/// serial dispatcher glue between barriers, and shorter than any human-scale idle
+/// gap between requests. Analogous to (though far shorter than) OpenMP's 200 ms
+/// default, which targets coarse parallel regions rather than per-token decode.
+const DEFAULT_BLOCKTIME: Duration = Duration::from_micros(500);
+
+/// Pure `spin_loop` iterations at the start of the active window before the
+/// worker begins yielding the core to co-tenants between clock checks. A
+/// crossbeam-`Backoff`-style ramp: hammer the sense line first to catch the
+/// common immediately-ready case with the lowest latency, then relax to
+/// `yield_now` so a busy host can schedule other work while we finish out the
+/// blocktime window. Sized (~4096 spins, a few microseconds) to cover the
+/// typical inter-op dispatcher gap so back-to-back decode barriers are caught by
+/// pure spinning and only genuinely idle gaps ramp into yielding then parking.
+const SPIN_LOOP_BUDGET: u32 = 1 << 12;
+
+/// Spin iterations between wall-clock checks, so `Instant::now()` (a vDSO read,
+/// ~20 ns) is amortised over the hot spin loop rather than read every iteration.
+const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
+
+/// KMP_BLOCKTIME analog: the active-spin window a worker holds a core before
+/// parking on the futex, read once. `ONNX_GENAI_CPU_DECODE_BLOCKTIME_US` sets it
+/// in microseconds; `0` parks as soon as the sense line is not already advanced
+/// (maximally polite, higher wake latency). Unset uses [`DEFAULT_BLOCKTIME`].
+fn decode_blocktime() -> Duration {
+    static V: OnceLock<Duration> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("ONNX_GENAI_CPU_DECODE_BLOCKTIME_US") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(us) => Duration::from_micros(us),
+            Err(_) => DEFAULT_BLOCKTIME,
+        },
+        Err(_) => DEFAULT_BLOCKTIME,
+    })
+}
+
+/// Spin iterations the (single, never-idle) dispatcher busy-waits on the
+/// completion counters before yielding. The dispatcher runs the barrier inline
+/// and needs the workers' results the instant they land, so it spins rather than
+/// parks; the yield after the budget only lets a descheduled straggler worker get
+/// a core under oversubscription.
+const DISPATCHER_SPIN_BEFORE_YIELD: u32 = 1 << 12;
 
 /// Cache-line pad so per-node completion counters and per-worker park flags do
 /// not false-share (which would reintroduce cross-socket coherency traffic).
@@ -135,20 +182,25 @@ struct Job {
 /// State shared between the dispatcher (the engine thread running the forward)
 /// and the persistent worker threads.
 struct SharedState {
-    /// Bumped once per dispatched op; workers wait for it to change.
-    sequence: Padded<AtomicUsize>,
-    /// The current op, published before `sequence` bumps and read after the
-    /// bump is observed (release/acquire pairing on `sequence`).
+    /// Per-node sense counter, bumped once per dispatched op; a node's workers
+    /// wait for *their* node's counter to advance. This is a **sense-reversing
+    /// barrier** generalised from a 1-bit phase to a monotonic `u32`: each op has
+    /// a strictly-increasing sense value, so barrier reuse across the ~400
+    /// barriers/token can never race (no ABA -- wrap needs 2^32 barriers while a
+    /// worker sleeps through exactly that many, which is impossible). Splitting it
+    /// **per node** is the key locality fix: every worker spins on / futex-waits
+    /// on its own node's line, so there is no single shared cache line ping-ponging
+    /// across the UPI link between sockets.
+    node_sense: Vec<Padded<AtomicU32>>,
+    /// The current op, published before the sense counters bump and read after the
+    /// bump is observed (release/acquire pairing on `node_sense`).
     job: UnsafeCell<Option<Job>>,
     /// Outstanding worker acknowledgements for the current op, one counter per
     /// node so the dispatcher only reads each node's own (mostly node-local)
     /// line instead of an N-way shared barrier.
     node_pending: Vec<Padded<AtomicUsize>>,
-    /// Per-worker park flags: the dispatcher only issues an `unpark` syscall to
-    /// workers actually parked, so the hot back-to-back path costs zero syscalls.
-    parked: Vec<Padded<AtomicBool>>,
     /// The node each global worker index belongs to (drives which pending
-    /// counter it decrements).
+    /// counter it decrements and which sense line it waits on).
     worker_node: Vec<usize>,
     /// Count of workers that have entered their loop and are ready to receive
     /// ops. `build` blocks until this reaches `total_workers` so no dispatch can
@@ -163,40 +215,45 @@ struct SharedState {
 }
 
 // SAFETY: `job` is a raw pointer guarded by the publish/observe protocol on
-// `sequence`; it is only read by workers while the dispatcher blocks in
+// `node_sense`; it is only read by workers while the dispatcher blocks in
 // `dispatch`, so the pointee outlives every access. All other fields are atomics.
 unsafe impl Sync for SharedState {}
 unsafe impl Send for SharedState {}
 
 impl SharedState {
-    /// Publish `job` for `node_pending[node] = counts[node]` workers and wake any
-    /// parked worker. Must be paired with [`SharedState::wait`].
-    fn publish(&self, job: Job, counts: &[usize], threads: &[thread::Thread]) {
-        // Publish the job pointer, then the per-node counts, before the sequence
-        // bump makes them visible to workers.
+    /// Publish `job` for `node_pending[node] = counts[node]` workers, then wake
+    /// each node's sleeping workers with a single futex `wake` per node. Must be
+    /// paired with [`SharedState::wait`].
+    fn publish(&self, job: Job, counts: &[usize]) {
+        // Publish the job pointer, then the per-node counts, before the sense
+        // bumps make them visible to workers.
         unsafe {
             *self.job.get() = Some(job);
         }
         for (counter, &count) in self.node_pending.iter().zip(counts) {
             counter.0.store(count, Ordering::Release);
         }
-        // SeqCst so this bump and the parked-flag read below share one total
-        // order with the worker's SeqCst park guard (store parked, then load
-        // sequence): that pairing is what guarantees a parking worker is always
-        // either seen here (and unparked) or observes this bump itself and skips
-        // parking -- no lost wakeup. Off the hot path (one atomic per op).
-        self.sequence.0.fetch_add(1, Ordering::SeqCst);
-        // Wake only workers that actually parked (SeqCst load pairs with the
-        // worker's SeqCst park-guard store to avoid a lost wakeup; on the hot
-        // path every flag is false so this issues no syscalls).
-        for (index, parked) in self.parked.iter().enumerate() {
-            if parked.0.load(Ordering::SeqCst) {
-                threads[index].unpark();
+        // Advance each node's sense (Release) so the job + count writes above are
+        // visible to any worker that observes the new sense (Acquire), then wake
+        // that node's parked workers. `wake` is a single futex_wake(i32::MAX) per
+        // node -- one syscall releases the whole node, not an O(workers) unpark
+        // fan-out. A worker that raced into parking re-checks the sense under the
+        // futex guard, so this ordering (bump-then-wake) loses no wakeup: if the
+        // worker armed `wait(last_seen)` before this bump it wakes here; if it
+        // armed after, `wait` sees the advanced sense and returns without sleeping.
+        for (node, sense) in self.node_sense.iter().enumerate() {
+            if counts.get(node).copied().unwrap_or(0) == 0 {
+                continue;
             }
+            sense.0.fetch_add(1, Ordering::Release);
+            atomic_wait::wake_all(&sense.0);
         }
     }
 
-    /// Spin-wait until every node's workers have finished the published op.
+    /// Spin-wait until every node's workers have finished the published op. The
+    /// dispatcher is a single, never-idle thread that needs the results the
+    /// instant they land, so it spins (with a yield backstop for stragglers under
+    /// oversubscription) rather than parking.
     fn wait(&self) {
         let mut spins = 0u32;
         loop {
@@ -209,9 +266,54 @@ impl SharedState {
             }
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
-            if spins >= SPIN_BEFORE_YIELD {
+            if spins >= DISPATCHER_SPIN_BEFORE_YIELD {
                 thread::yield_now();
             }
+        }
+    }
+
+    /// Wait for the next op published to `node` (its sense advancing past
+    /// `last_seen`) or for shutdown, then return the observed sense value; the
+    /// caller re-checks `shutdown`.
+    ///
+    /// KMP_BLOCKTIME-style bounded active spin then futex park. Phase 1 busy-waits
+    /// (crossbeam-`Backoff`-style `spin_loop` ramp into `yield_now`) for up to
+    /// `blocktime`, catching the common immediately-ready barrier release with the
+    /// lowest latency. Phase 2 parks on the futex once idle past the window.
+    ///
+    /// No lost wakeup: `atomic_wait::wait(sense, last_seen)` sleeps only while the
+    /// sense still equals `last_seen`; the kernel re-checks it under the futex
+    /// bucket lock, so a [`SharedState::publish`] bump that races the arm makes
+    /// `wait` return immediately instead of sleeping. The Acquire load pairs with
+    /// publish's Release bump to make the job pointer and pending counts visible.
+    fn worker_wait(&self, node: usize, last_seen: u32, blocktime: Duration) -> u32 {
+        let sense = &self.node_sense[node].0;
+        // Phase 1: bounded active spin (blocktime), spin_loop ramping into yield.
+        let mut spins = 0u32;
+        let start = Instant::now();
+        loop {
+            let current = sense.load(Ordering::Acquire);
+            if current != last_seen || self.shutdown.load(Ordering::Acquire) {
+                return current;
+            }
+            spins = spins.wrapping_add(1);
+            if spins < SPIN_LOOP_BUDGET {
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+                if spins.is_multiple_of(CLOCK_CHECK_STRIDE) && start.elapsed() >= blocktime {
+                    break;
+                }
+            }
+        }
+        // Phase 2: park on the futex until the sense advances (or shutdown wakes
+        // us via its own sense bump). Re-check under the guard for no lost wakeup.
+        loop {
+            let current = sense.load(Ordering::Acquire);
+            if current != last_seen || self.shutdown.load(Ordering::Acquire) {
+                return current;
+            }
+            atomic_wait::wait(sense, last_seen);
         }
     }
 
@@ -232,10 +334,6 @@ impl SharedState {
 /// state that drives them.
 pub struct SpmdDecodePools {
     shared: Arc<SharedState>,
-    /// Cloned worker `Thread` handles for the hot dispatch path: `publish` only
-    /// needs these to `unpark` a parked worker, so keeping them in a plain slice
-    /// keeps dispatch lock-free (no `Mutex` on the decode path).
-    worker_threads: Vec<thread::Thread>,
     /// Owned join handles, held behind a `Mutex` so [`SpmdDecodePools::shutdown`]
     /// can join the workers through a shared `&self` (the pool is reached as a
     /// `&'static` through [`pools`]). Only touched at teardown, never on the hot
@@ -268,13 +366,10 @@ impl SpmdDecodePools {
         let total_workers = assignment.len();
 
         let shared = Arc::new(SharedState {
-            sequence: Padded(AtomicUsize::new(0)),
+            node_sense: (0..node_count).map(|_| Padded(AtomicU32::new(0))).collect(),
             job: UnsafeCell::new(None),
             node_pending: (0..node_count)
                 .map(|_| Padded(AtomicUsize::new(0)))
-                .collect(),
-            parked: (0..total_workers)
-                .map(|_| Padded(AtomicBool::new(false)))
                 .collect(),
             worker_node,
             ready: AtomicUsize::new(0),
@@ -310,13 +405,10 @@ impl SpmdDecodePools {
             std::hint::spin_loop();
         }
 
-        // Snapshot the worker `Thread`s for the lock-free hot-path `unpark`, and
-        // keep the owning join handles behind a `Mutex` for teardown.
-        let worker_threads = handles.iter().map(|h| h.thread().clone()).collect();
-
+        // Snapshot the worker `Thread`s for teardown join only; the hot dispatch
+        // path wakes workers via the per-node futex, not per-thread `unpark`.
         Self {
             shared,
-            worker_threads,
             join_handles: Mutex::new(handles),
             node_worker_counts,
             total_workers,
@@ -355,14 +447,15 @@ impl SpmdDecodePools {
         if handles.is_empty() {
             return;
         }
-        // Publish the stop flag, then bump the sequence so a spinning worker
-        // observes the change and re-checks `shutdown`, and unpark any parked
-        // worker so it leaves `park_timeout`. SeqCst mirrors the publish path so
-        // the flag/sequence pairing wakes a worker that raced into parking.
+        // Publish the stop flag, then bump every node's sense so spinning workers
+        // observe the change and re-check `shutdown`, and futex-wake any parked
+        // worker so it leaves the park. The bump-then-wake ordering (mirroring the
+        // dispatch path) wakes a worker that raced into parking: it either sees
+        // the advanced sense under the futex guard or is woken by `wake_all`.
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        self.shared.sequence.0.fetch_add(1, Ordering::SeqCst);
-        for thread in &self.worker_threads {
-            thread.unpark();
+        for sense in &self.shared.node_sense {
+            sense.0.fetch_add(1, Ordering::Release);
+            atomic_wait::wake_all(&sense.0);
         }
         for handle in handles {
             let _ = handle.join();
@@ -392,8 +485,7 @@ impl SpmdDecodePools {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
         };
-        self.shared
-            .publish(job, &self.node_worker_counts, &self.worker_threads);
+        self.shared.publish(job, &self.node_worker_counts);
         self.shared.wait();
         self.shared.panic_if_poisoned();
     }
@@ -798,59 +890,29 @@ impl Drop for WorkerCompletion<'_> {
 /// shard, acknowledge, repeat until shutdown.
 fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     let node = shared.worker_node[global_index];
-    // Start from the pre-dispatch baseline (sequence is 0 until the first op),
-    // then announce readiness. The dispatcher blocks in `build` until every
-    // worker has done this, so no op can be published before this worker is
-    // waiting for it.
-    let mut local_seq = 0usize;
+    // Track this node's sense line: 0 until the first op is published. Announce
+    // readiness only after establishing the baseline; the dispatcher blocks in
+    // `build` until every worker has done this, so no op can be published before
+    // this worker is waiting for it.
+    let mut last_seen: u32 = 0;
+    let blocktime = decode_blocktime();
     shared.ready.fetch_add(1, Ordering::AcqRel);
     loop {
-        let mut spins = 0u32;
-        let mut yields = 0u32;
-        // Wait for a new op (or shutdown).
-        let new_seq = loop {
-            if shared.shutdown.load(Ordering::Acquire) {
-                return;
-            }
-            let seq = shared.sequence.0.load(Ordering::Acquire);
-            if seq != local_seq {
-                break seq;
-            }
-            std::hint::spin_loop();
-            spins = spins.wrapping_add(1);
-            if spins >= SPIN_BEFORE_YIELD {
-                yields = yields.wrapping_add(1);
-                if yields >= YIELD_BEFORE_PARK {
-                    // Deep idle: park and STAY parked, re-parking on each spurious
-                    // or timeout wake, until a real op arrives (or shutdown). This
-                    // is critical for `Auto` mode: while the flat path is
-                    // committed the pool is idle for the whole generation, and an
-                    // idle worker that re-ran the spin cycle every timeout would
-                    // burn cycles and contend with the flat path -- polluting the
-                    // calibration probe and regressing committed-flat decode under
-                    // load (the exact bug that made Auto mis-commit to the pool).
-                    // `parked` stays true for the whole loop so the dispatcher's
-                    // unpark always lands. Publish the park intent, then re-check
-                    // the sequence (SeqCst) so a wakeup that raced the flag store
-                    // is not lost; the bounded timeout is a final backstop.
-                    shared.parked[global_index].0.store(true, Ordering::SeqCst);
-                    while shared.sequence.0.load(Ordering::SeqCst) == local_seq
-                        && !shared.shutdown.load(Ordering::SeqCst)
-                    {
-                        thread::park_timeout(PARK_TIMEOUT);
-                    }
-                    shared.parked[global_index].0.store(false, Ordering::SeqCst);
-                    yields = 0;
-                }
-                spins = 0;
-            }
-        };
-        local_seq = new_seq;
+        // Bounded active spin (blocktime) then futex park; returns the observed
+        // sense, or an unchanged value if shutdown was seen (re-checked below).
+        let current = shared.worker_wait(node, last_seen, blocktime);
         if shared.shutdown.load(Ordering::Acquire) {
             return;
         }
-        // Read and run the published op. The acquire on `sequence` above
-        // established visibility of the job pointer and the pending counts.
+        if current == last_seen {
+            // Woken without a new op and not shutting down (spurious futex wake);
+            // resume waiting on the same sense.
+            continue;
+        }
+        last_seen = current;
+        // Read and run the published op. The acquire on the node sense in
+        // `worker_wait` established visibility of the job pointer and the pending
+        // counts.
         // SAFETY: the dispatcher keeps the pointee alive until every node
         // counter reaches zero, i.e. until after this worker acknowledges below.
         let job = unsafe { (*shared.job.get()).expect("published SPMD job") };

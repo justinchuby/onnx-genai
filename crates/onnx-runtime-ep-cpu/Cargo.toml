@@ -29,6 +29,12 @@ thiserror = { workspace = true }
 half = "2"
 rayon = "1"
 libc = "0.2"
+# Cross-platform futex (Linux FUTEX_WAIT/WAKE, macOS __ulock, Windows
+# WaitOnAddress, spin fallback elsewhere) for the persistent SPMD decode pool's
+# bounded-spin-then-park barrier: one `wake(&addr)` releases all a node's sleeping
+# workers in a single syscall, instead of an O(workers) `unpark` fan-out. Vetted,
+# ~200-line crate by the author of "Rust Atomics and Locks".
+atomic-wait = "1"
 # Pure-Rust libm (no FFI, no `cc`): supplies the correctly-rounded `erf` used by
 # the `Erf` op and the fused `Gelu` kernel. A polynomial approximation was ~1e-9
 # off near zero and failed the upstream conformance suite's tight tolerance.
