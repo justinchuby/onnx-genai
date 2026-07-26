@@ -108,7 +108,15 @@ current generation; two in a row exit. Slash commands control the session:
 >>> /image ./cat.png What is in this image?
 >>> /audio ./speech.wav
 >>> /raw
+>>> /stats
 >>> /reset
+```
+
+`/stats` toggles a one-line summary after each reply, for watching throughput and
+cache behavior without the full `--profile` report:
+
+```text
+[ 613 in · 64 out · 41.2 tok/s · ttft 116 ms · 598 reused · encoder 1/1 · rss 2.5 GiB ]
 ```
 
 ### Image and audio input
@@ -167,7 +175,12 @@ Attach a *different* image and both are recomputed, because that digest is part
 of the cache key. It has to be: placeholder expansion makes two different
 photographs produce byte-identical token sequences, so a cache keyed on tokens
 alone would answer fluently about a picture the model was never shown.
-`--profile` shows what was skipped:
+A prompt that diverges from the previous turn — a forked conversation, an edited
+question, a reasoning model's stripped history — keeps the head it still shares
+rather than starting over. The same applies across *different* conversations on
+the server: many agents running under one long system prompt each reuse it,
+because reuse is computed over the common prefix rather than requiring the new
+prompt to extend the old one. `--profile` shows what was skipped:
 
 ```text
 encoder cache                     1 hit / 0 run
@@ -339,10 +352,10 @@ note: generation stopped inside the model's reasoning, so this turn is not
 kept. Raise --max-new-tokens.
 ```
 
-One trade-off worth knowing: because the thinking is stripped before history is
-replayed, a follow-up prompt is *not* a continuation of what the model last had
-in its KV cache. Multimodal KV reuse therefore misses for reasoning models (the
-encoder cache still hits). That is the price of not replaying chain-of-thought.
+Because the thinking is stripped before history is replayed, a follow-up prompt
+diverges from what the model last held in its KV cache, at the point the
+thinking began. Reuse covers everything before that, so the conversation and any
+attached image are still reused; only the discarded reasoning is recomputed.
 
 ### Transcribe speech
 

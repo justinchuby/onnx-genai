@@ -180,6 +180,60 @@ pub(crate) struct MultimodalReuse {
     pub(crate) prefill_tokens: u64,
 }
 
+impl RunProfile {
+    /// One line of per-turn numbers for an interactive session.
+    ///
+    /// The full report is a page long and ends in a per-stage table, which is
+    /// the wrong shape to print after every REPL turn. This keeps the numbers a
+    /// reader actually watches turn to turn — how much went in, how much came
+    /// out, how fast, and how much was not recomputed — on a single line.
+    ///
+    /// Fields that were never measured are omitted rather than shown as zero.
+    pub(crate) fn to_stats_line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(prompt_tokens) = self.prompt_tokens {
+            parts.push(format!("{prompt_tokens} in"));
+        }
+        if self.timings.tokens() > 0 {
+            parts.push(format!("{} out", self.timings.tokens()));
+        }
+        if let Some(rate) = self.timings.decode_tokens_per_second() {
+            parts.push(format!("{rate:.1} tok/s"));
+        }
+        if let Some(ttft) = self.timings.time_to_first_token() {
+            parts.push(format!("ttft {:.0} ms", ttft.as_secs_f64() * 1000.0));
+        }
+
+        // Reuse is the whole point of the cache, so it is reported whenever
+        // there was any, from whichever cache served it.
+        let reused = self.prefix_cache_hit.unwrap_or(0) as u64
+            + self
+                .multimodal_reuse
+                .map_or(0, |reuse| reuse.prefix_reused_tokens);
+        if reused > 0 {
+            parts.push(format!("{reused} reused"));
+        }
+        if let Some(reuse) = self.multimodal_reuse
+            && reuse.encoder_hits + reuse.encoder_misses > 0
+        {
+            parts.push(format!(
+                "encoder {}/{}",
+                reuse.encoder_hits,
+                reuse.encoder_hits + reuse.encoder_misses
+            ));
+        }
+        if let Some(peak) = self.memory.peak_resident_bytes {
+            parts.push(format!("rss {}", format_bytes(peak)));
+        }
+
+        if parts.is_empty() {
+            "[ no measurements for this turn ]".to_string()
+        } else {
+            format!("[ {} ]", parts.join(" · "))
+        }
+    }
+}
+
 impl MultimodalReuse {
     fn is_idle(&self) -> bool {
         self.encoder_hits == 0 && self.encoder_misses == 0 && self.prefix_reused_tokens == 0

@@ -391,24 +391,30 @@ pub struct RetainedContext {
 impl RetainedContext {
     /// How many leading tokens of `tokens` the retained KV can serve.
     ///
-    /// Reuse requires the retained context to be a *prefix* of the new one.
-    /// A divergence part-way through would mean discarding the tail of the KV,
-    /// which this decoder state cannot do: pipeline components hold their past
-    /// as opaque per-graph tensors with no declared sequence axis, so there is
-    /// nothing sound to truncate along. Recomputing is the honest fallback, and
-    /// the append-only case it does cover is exactly the multi-turn
-    /// conversation this exists for.
+    /// This is the length of the common prefix, so a prompt that *diverges*
+    /// from the retained context still reuses the part it shares. That is what
+    /// makes forking a conversation, editing an earlier turn, or a reasoning
+    /// model reuse anything at all — a reasoning model's replayed history drops
+    /// the thinking the KV still contains, so its prompts always diverge.
+    ///
+    /// When the answer is shorter than the retained context, the caller must
+    /// first truncate the KV to match; that can fail, and recomputing is the
+    /// fallback.
+    ///
+    /// Zero when the attachments differ at all: identical tokens over a
+    /// different image are a different computation, and tokens alone cannot say
+    /// so.
     ///
     /// At least one token is always left to prefill, since a decode step needs
     /// an input to produce logits from.
     pub fn reusable_prefix(&self, inputs: Digest, tokens: &[TokenId]) -> usize {
-        if self.inputs != inputs || self.tokens.len() >= tokens.len() {
+        if self.inputs != inputs {
             return 0;
         }
-        if tokens[..self.tokens.len()] != self.tokens[..] {
-            return 0;
-        }
-        self.tokens.len()
+        let limit = tokens.len().saturating_sub(1).min(self.tokens.len());
+        (0..limit)
+            .take_while(|&index| tokens[index] == self.tokens[index])
+            .count()
     }
 }
 
@@ -646,13 +652,26 @@ mod tests {
     }
 
     #[test]
-    fn a_diverging_prompt_reuses_nothing() {
+    fn a_diverging_prompt_reuses_what_it_still_shares() {
+        // Forking a conversation, editing an earlier turn, and replaying a
+        // reasoning model's history all look like this: a common head, then a
+        // different tail. The shared head is still worth keeping.
         let inputs = digest_of("pixels", &[1.0]);
         let retained = RetainedContext {
             inputs,
             tokens: vec![1, 2, 3],
         };
-        assert_eq!(retained.reusable_prefix(inputs, &[1, 2, 9, 4]), 0);
+        assert_eq!(retained.reusable_prefix(inputs, &[1, 2, 9, 4]), 2);
+    }
+
+    #[test]
+    fn a_prompt_sharing_nothing_reuses_nothing() {
+        let inputs = digest_of("pixels", &[1.0]);
+        let retained = RetainedContext {
+            inputs,
+            tokens: vec![1, 2, 3],
+        };
+        assert_eq!(retained.reusable_prefix(inputs, &[9, 2, 3, 4]), 0);
     }
 
     #[test]
@@ -664,7 +683,7 @@ mod tests {
         };
         assert_eq!(
             retained.reusable_prefix(inputs, &[1, 2, 3]),
-            0,
+            2,
             "a decode step needs at least one input token to produce logits from"
         );
     }

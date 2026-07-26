@@ -355,14 +355,39 @@ Two reuses follow from that key:
 * **Decoder KV prefix reuse.** The decoder keeps the KV from the previous
   generation and prefills only the tokens the new prompt added.
 
-Reuse of the decoder KV requires the retained context to be a strict **prefix**
-of the new prompt. A prompt that diverges part-way is recomputed rather than
-partially rewound: pipeline components hold their past as opaque per-graph
-tensors with no declared sequence axis, so there is nothing sound to truncate
-along. The append-only case it does cover is exactly the multi-turn conversation
-it exists for. Reuse is also skipped when the decoder's position ids arrive over
-a `dataflow` edge, since such a tensor covers the whole prompt and prefilling
-only a suffix would hand the decoder positions for tokens it is not being given.
+Reuse covers the **common prefix**, so a prompt that diverges part-way still
+keeps the head it shares — which is what makes forking a conversation, editing
+an earlier turn, or replaying a reasoning model's history (with the thinking the
+KV still holds stripped out) reuse anything at all. Divergence requires
+truncating the retained KV, and a pipeline component's past is an opaque
+per-graph tensor with no declared sequence axis, so the axis is identified by
+extent: the one dimension equal to the current KV length. Truncation declines,
+and the turn recomputes, when
+
+* more than one axis matches, since choosing between them is a guess and
+  guessing wrong corrupts attention silently;
+* the decoder carries fixed loop-carried state, which advances with the sequence
+  but exposes no position to rewind to; or
+* position ids are not a plain `linear_increment` of the absolute past length,
+  because a carried or externally supplied coordinate would resume from
+  positions describing tokens that no longer exist.
+
+Reuse is also skipped entirely when the decoder's position ids arrive over a
+`dataflow` edge, since such a tensor covers the whole prompt and prefilling only
+a suffix would hand the decoder positions for tokens it is not being given.
+
+Only one context is retained at a time, but because reuse is computed over the
+common prefix rather than requiring an extension, that single slot still serves
+**interleaved conversations that share a head** — the server's normal workload,
+and the fan-out case where many agents run under one long system prompt. Each
+request truncates the retained KV back to what it shares with the previous one
+and extends from there, so a shared system prompt is prefilled once and then
+reused by every later request regardless of who it belonged to.
+
+What a single slot does cost is each conversation's *own* tail: request B
+truncates away the part of A that B does not share, so when A comes back it
+reuses only the common head, not its own history. Holding several contexts would
+fix that at the price of a full KV allocation per slot.
 
 Memoization additionally requires the component's graph to contain only
 deterministic operators. A declared phase says *when* a component runs, never
@@ -382,11 +407,11 @@ Two further consequences worth knowing:
 * **Reuse stops one token short of the previous turn's output.** The last
   sampled token is appended to the context but never fed back to the decoder, so
   no KV exists for it and the next turn prefills it.
-* **Reasoning models reuse little or nothing.** Earlier turns' thinking is
-  stripped from the conversation before it is replayed (see the CLI's multi-turn
-  behavior), so the next prompt is not a strict extension of the retained
-  context. The encoder memoization still applies; the KV reuse does not. This is
-  the cost of not replaying chain-of-thought, not a defect.
+* **Reasoning models reuse only up to their divergence.** Earlier turns'
+  thinking is stripped before the conversation is replayed (see the CLI's
+  multi-turn behavior), so the next prompt diverges from the retained context
+  where the thinking began. Everything before that — including the whole
+  expanded image — is still reused.
 
 `--profile` reports both as `encoder cache` (hits / runs) and
 `multimodal prefix reuse` (tokens carried over).

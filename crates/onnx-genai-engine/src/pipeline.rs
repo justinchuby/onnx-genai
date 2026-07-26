@@ -690,6 +690,22 @@ impl PipelineEngine {
         Ok((result, tensors))
     }
 
+    /// Whether position ids are a plain function of the absolute past length,
+    /// and so can be rebuilt after the KV is truncated.
+    fn positions_are_linear(&self) -> bool {
+        self.models
+            .directory
+            .spec
+            .positions
+            .as_ref()
+            .is_none_or(|program| {
+                program
+                    .continuation
+                    .as_deref()
+                    .is_none_or(|continuation| continuation == "linear_increment")
+            })
+    }
+
     /// Whether the decoder's position ids are supplied by a dataflow edge
     /// rather than derived from the absolute past length.
     fn decoder_positions_are_routed(&self, decoder_in_edges: &[(String, String)]) -> bool {
@@ -708,18 +724,49 @@ impl PipelineEngine {
     /// How many leading prompt tokens the retained decoder KV can serve.
     ///
     /// Zero whenever anything about the request's identity changed, whenever
-    /// the prompt is not a strict extension of the retained context, or whenever
-    /// the attachments could not be digested.
-    fn reusable_prefix_len(&self, inputs: Option<Digest>, prompt_tokens: &[TokenId]) -> usize {
-        let (Some(inputs), Some(retained), Some(state)) =
-            (inputs, self.retained.as_ref(), self.decoder_state.as_ref())
-        else {
+    /// the prompt shares no leading token with the retained context, or
+    /// whenever the attachments could not be digested.
+    ///
+    /// When the prompt diverges part-way, the retained KV is first truncated to
+    /// the shared head. Truncation can decline — an opaque past with no
+    /// identifiable sequence axis, or fixed loop-carried state — in which case
+    /// nothing is reused and the turn is recomputed.
+    fn reusable_prefix_len(&mut self, inputs: Option<Digest>, prompt_tokens: &[TokenId]) -> usize {
+        let (Some(inputs), Some(retained)) = (inputs, self.retained.as_ref()) else {
             return 0;
         };
-        if !state.use_kv {
+        let retained_len = retained.tokens.len();
+        let shared = retained.reusable_prefix(inputs, prompt_tokens);
+        let Some(state) = self.decoder_state.as_mut() else {
+            return 0;
+        };
+        if !state.use_kv || shared == 0 {
             return 0;
         }
-        retained.reusable_prefix(inputs, prompt_tokens)
+        if shared == retained_len {
+            return shared;
+        }
+        // Extending keeps the carried position state valid; truncating does not,
+        // and only a linear continuation can be rebuilt from the absolute past
+        // length alone. A model that carries or is handed its coordinates would
+        // resume from positions describing tokens that no longer exist.
+        if !self.positions_are_linear() {
+            self.decoder_state = None;
+            return 0;
+        }
+        let Some(state) = self.decoder_state.as_mut() else {
+            return 0;
+        };
+        match state.truncate_past(retained_len, shared) {
+            Ok(true) => shared,
+            // Declining to truncate is a normal outcome, and so is a failed
+            // slice: either way the KV is no longer trustworthy for reuse, so
+            // the state is dropped and the turn recomputes from scratch.
+            _ => {
+                self.decoder_state = None;
+                0
+            }
+        }
     }
 
     /// Post-decode counterpart to [`synthesize`](Self::synthesize) for a

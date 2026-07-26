@@ -170,21 +170,56 @@ fn a_follow_up_turn_prefills_only_the_tokens_it_added() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_prompt_that_diverges_from_the_retained_context_is_recomputed() -> anyhow::Result<()> {
+fn a_prompt_sharing_no_leading_token_is_recomputed() -> anyhow::Result<()> {
     let mut engine = load()?;
 
     turn(&mut engine, vec![3, 7], 0.0, 4)?;
     engine.reset_cache_stats();
-    // Shares no leading token with the retained context.
+    // Differs from the very first token.
     let warm = turn(&mut engine, vec![5, 7, 1], 0.0, 3)?;
     assert_eq!(
         engine.cache_stats().prefix_reused_tokens,
         0,
-        "a divergent prompt cannot reuse KV computed for other tokens"
+        "there is no shared head to keep"
     );
 
     let mut fresh = load()?;
     assert_eq!(warm, turn(&mut fresh, vec![5, 7, 1], 0.0, 3)?);
+    Ok(())
+}
+
+#[test]
+fn a_forked_conversation_reuses_the_head_it_still_shares() -> anyhow::Result<()> {
+    // Branching from an earlier turn — or replaying a reasoning model's history
+    // with the thinking stripped out — produces a prompt that shares a head
+    // with the retained context and then diverges. The expensive shared part,
+    // which for a VLM includes the whole expanded image, is still reusable.
+    let mut engine = load()?;
+
+    let generated = turn(&mut engine, vec![3, 7], 0.0, 4)?;
+    let mut branch = vec![3, 7];
+    branch.extend_from_slice(&generated[..2]);
+    branch.push(1);
+    branch.push(2);
+
+    engine.reset_cache_stats();
+    let warm = turn(&mut engine, branch.clone(), 0.0, 3)?;
+    // The retained context is [3, 7, g0, g1, g2]; the branch replaces g2, so
+    // exactly the four shared tokens survive. Anything less than the full four
+    // means the KV was thrown away instead of truncated.
+    assert_eq!(
+        engine.cache_stats().prefix_reused_tokens,
+        4,
+        "the shared head must be truncated to, not discarded"
+    );
+
+    // The only thing that matters: reusing must not change the answer.
+    let mut fresh = load()?;
+    assert_eq!(
+        warm,
+        turn(&mut fresh, branch, 0.0, 3)?,
+        "a truncated-and-extended KV must produce exactly what recomputing produces"
+    );
     Ok(())
 }
 
@@ -210,5 +245,62 @@ fn a_zero_budget_disables_reuse_without_changing_results() -> anyhow::Result<()>
         turn(&mut enabled, vec![3, 7], 0.0, 4)?,
         "the cache must be invisible in the output"
     );
+    Ok(())
+}
+
+#[test]
+fn subagents_sharing_a_system_prompt_each_reuse_it() -> anyhow::Result<()> {
+    // The server's real workload: many independent conversations that share a
+    // long system prompt and then diverge, arriving interleaved. Each one must
+    // reuse the shared head rather than re-prefilling it, even though the
+    // request before it belonged to someone else.
+    let mut engine = load()?;
+    let system = vec![3, 7, 0, 5];
+
+    let mut reuse_per_request = Vec::new();
+    for question in [6u32, 1, 6, 2] {
+        let mut prompt = system.clone();
+        prompt.push(question);
+        engine.reset_cache_stats();
+        turn(&mut engine, prompt, 0.0, 2)?;
+        reuse_per_request.push(engine.cache_stats().prefix_reused_tokens as usize);
+    }
+
+    // The first request has nothing retained; every later one, each following a
+    // *different* conversation, still keeps the shared system prompt.
+    assert_eq!(reuse_per_request[0], 0, "nothing is retained yet");
+    for (index, reused) in reuse_per_request.iter().enumerate().skip(1) {
+        assert_eq!(
+            *reused,
+            system.len(),
+            "request {index} must reuse the whole shared system prompt"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn interleaved_conversations_do_not_corrupt_each_other() -> anyhow::Result<()> {
+    // Reuse across conversations is only worth having if it is invisible.
+    let mut engine = load()?;
+    let system = vec![3, 7, 0, 5];
+
+    let mut shared = Vec::new();
+    for question in [6u32, 1, 2] {
+        let mut prompt = system.clone();
+        prompt.push(question);
+        shared.push(turn(&mut engine, prompt, 0.0, 3)?);
+    }
+
+    for (index, question) in [6u32, 1, 2].into_iter().enumerate() {
+        let mut prompt = system.clone();
+        prompt.push(question);
+        let mut isolated = load()?;
+        assert_eq!(
+            shared[index],
+            turn(&mut isolated, prompt, 0.0, 3)?,
+            "conversation {index} must not be affected by the ones interleaved with it"
+        );
+    }
     Ok(())
 }

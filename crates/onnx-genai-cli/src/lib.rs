@@ -205,6 +205,18 @@ fn load_chat_template(model_dir: &Path, raw: bool) -> Option<ChatTemplate> {
     }
 }
 
+/// Print the compact per-turn stats line, if the session asked for it.
+///
+/// Suppressed while `--profile` is on, which already prints every one of these
+/// numbers and more; printing both would just repeat the turn twice.
+fn emit_stats_line(show_stats: bool, profiling: &ProfileArgs, profile: &mut RunProfile) {
+    if !show_stats || profiling.profile {
+        return;
+    }
+    profile.memory.sample_peak();
+    eprintln!("{}", profile.to_stats_line());
+}
+
 /// Build the prompt string sent to the engine for the current turn.
 ///
 /// With a chat `template`, the full `history` (all prior turns plus the current
@@ -571,6 +583,7 @@ enum ReplCommand {
     Help,
     Reset,
     ToggleRaw,
+    ToggleStats,
     System(Option<String>),
     Image {
         path: Option<String>,
@@ -623,6 +636,7 @@ fn parse_repl_line(line: &str) -> ReplLine {
         "help" => ReplCommand::Help,
         "reset" => ReplCommand::Reset,
         "raw" => ReplCommand::ToggleRaw,
+        "stats" => ReplCommand::ToggleStats,
         "system" => ReplCommand::System((!arguments.is_empty()).then(|| arguments.to_string())),
         "image" => attachment_command(true),
         "audio" => attachment_command(false),
@@ -1381,6 +1395,9 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
     let load_elapsed = load_started.elapsed();
     let mut raw_mode = args.sampling.raw;
+    // Per-turn numbers are opt-in: a line after every reply is noise until a
+    // reader is actually watching throughput or cache behavior.
+    let mut show_stats = false;
     let mut template = load_chat_template(&model_dir, raw_mode);
     let mut reasoning = detect_reasoning(template.as_ref());
 
@@ -1415,7 +1432,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             ReplLine::Prompt(prompt) => Some(prompt),
             ReplLine::Command(ReplCommand::Help) => {
                 println!(
-                    "/help\n/reset\n/raw\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+                    "/help\n/reset\n/raw\n/stats\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
                 );
                 None
             }
@@ -1424,6 +1441,14 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                 image_attachments.clear();
                 audio_attachments.clear();
                 println!("conversation history and pending attachments cleared");
+                None
+            }
+            ReplLine::Command(ReplCommand::ToggleStats) => {
+                show_stats = !show_stats;
+                println!(
+                    "per-turn stats {}",
+                    if show_stats { "enabled" } else { "disabled" }
+                );
                 None
             }
             ReplLine::Command(ReplCommand::ToggleRaw) => {
@@ -1535,6 +1560,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                             );
                             history.pop();
                             profiling.emit(&mut profile)?;
+                            emit_stats_line(show_stats, profiling, &mut profile);
                             continue;
                         }
                         split.answer.to_string()
@@ -1548,6 +1574,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                 // Report per turn: in a session the interesting comparison is
                 // between turns, not a single number at exit.
                 profiling.emit(&mut profile)?;
+                emit_stats_line(show_stats, profiling, &mut profile);
             }
             Err(error) if is_interrupt_error(&error) => {
                 // Drop the interrupted turn from history so a partial/aborted

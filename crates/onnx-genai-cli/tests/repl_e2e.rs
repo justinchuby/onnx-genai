@@ -419,3 +419,39 @@ fn a_second_question_about_the_same_image_reuses_the_encoder() {
         "the follow-up turn must hit the memoized encoder output: {text}"
     );
 }
+
+#[test]
+fn stats_reports_per_turn_numbers_without_the_full_profile() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "3"],
+        "/stats\nhello\n\n",
+    ));
+
+    assert!(output.contains("per-turn stats enabled"), "{output}");
+    assert!(
+        output.contains(" in · ") && output.contains(" out"),
+        "the stats line must report input and output tokens: {output}"
+    );
+    assert!(
+        output.contains("tok/s"),
+        "the stats line must report throughput: {output}"
+    );
+    assert!(
+        !output.contains("per-stage breakdown"),
+        "the compact line must not drag in the full profile report: {output}"
+    );
+}
+
+#[test]
+fn stats_is_off_until_asked_for() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "3"],
+        "hello\n\n",
+    ));
+    assert!(
+        !output.contains("tok/s"),
+        "an unasked-for stats line would be noise: {output}"
+    );
+}
