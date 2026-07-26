@@ -292,8 +292,12 @@ struct SamplingArgs {
 struct CpuArgs {
     /// Cap native CPU decode to N worker cores. Overrides
     /// ONNX_GENAI_CPU_DECODE_THREADS; when neither is set, automatic sizing is
-    /// unchanged. Where supported, persistent workers are pinned to at most N
-    /// allowed CPUs.
+    /// unchanged. Setting N now also bounds prefill/MLAS: the global Rayon pool
+    /// is built with N workers (not all logical CPUs) and, on Linux, the process
+    /// is pinned to N CPUs (packed on one NUMA node where possible), so
+    /// `--cpu-cores N` alone makes the engine coexist with other programs -- no
+    /// external `taskset` needed. An explicit ONNX_GENAI_CPU_DECODE_AFFINITY
+    /// still wins over the automatic pinning.
     #[arg(long, value_name = "N")]
     cpu_cores: Option<NonZeroUsize>,
 }

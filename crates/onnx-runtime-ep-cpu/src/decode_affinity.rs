@@ -476,6 +476,134 @@ pub const fn pinning_supported() -> bool {
     cfg!(any(target_os = "linux", target_os = "windows"))
 }
 
+/// Build a kernel CPU affinity mask with a bit set for every CPU in `cpus`.
+///
+/// Multi-CPU sibling of [`build_cpu_mask`]: the mask is sized from the largest
+/// CPU index so a CPU at or above the fixed `CPU_SETSIZE` (1024) grows the
+/// allocation to cover it instead of writing out of bounds. Returns `None` when
+/// `cpus` is empty or the required word count overflows `usize`.
+#[cfg(target_os = "linux")]
+fn build_cpu_mask_multi(cpus: &[usize]) -> Option<Vec<libc::c_ulong>> {
+    let bits_per_word = 8 * std::mem::size_of::<libc::c_ulong>();
+    let max_cpu = *cpus.iter().max()?;
+    let len = (max_cpu / bits_per_word).checked_add(1)?;
+    let mut mask = vec![0 as libc::c_ulong; len];
+    for &cpu in cpus {
+        mask[cpu / bits_per_word] |= (1 as libc::c_ulong) << (cpu % bits_per_word);
+    }
+    Some(mask)
+}
+
+/// Confine the calling thread (and, because threads inherit their creator's
+/// affinity mask on Linux, every thread it later spawns) to the CPUs in `cpus`.
+///
+/// This is the process-wide "good citizen" mask applied once, early, before any
+/// worker pool is built, so the Rayon global pool and the SPMD decode workers
+/// all inherit the restricted set. Best-effort: a failure (e.g. a restricted
+/// cgroup) is reported so the caller can log it, but never aborts inference.
+#[cfg(target_os = "linux")]
+pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), String> {
+    if cpus.is_empty() {
+        return Err("cannot set CPU affinity to an empty CPU set".to_string());
+    }
+    let mask = build_cpu_mask_multi(cpus)
+        .ok_or_else(|| "CPU indices are too large to build a CPU affinity mask".to_string())?;
+    let byte_len = mask.len() * std::mem::size_of::<libc::c_ulong>();
+    // SAFETY: `mask` is a live, `byte_len`-sized allocation of `unsigned long`
+    // words in the exact layout `sched_setaffinity` expects; we pass its true
+    // byte length and set affinity for the current thread (`pid == 0`). The
+    // pointer is only read for the call and the `Vec` outlives it.
+    let result =
+        unsafe { libc::sched_setaffinity(0, byte_len, mask.as_ptr() as *const libc::cpu_set_t) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "sched_setaffinity(cpus={cpus:?}) failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// Non-Linux hosts have no process-wide CPU affinity mask applied here (Windows
+/// per-thread pinning is handled by the SPMD pool; macOS and others cannot pin),
+/// so this is a documented no-op that reports the reason for the caller to log.
+#[cfg(not(target_os = "linux"))]
+pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), String> {
+    let _ = cpus;
+    Err("process-wide CPU affinity masking is only implemented on Linux (no-op)".to_string())
+}
+
+/// Whether the user explicitly requested a decode affinity via
+/// [`DECODE_AFFINITY_ENV`] (a non-empty value). When set, the automatic
+/// good-citizen process mask stands down so the user's affinity choice wins.
+pub fn explicit_decode_affinity_requested() -> bool {
+    std::env::var(DECODE_AFFINITY_ENV)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Pick `count` CPUs to confine the whole process to, preferring CPUs packed on
+/// a single NUMA node for memory-bandwidth and barrier locality.
+///
+/// Pure and platform-independent so it is unit-testable without touching the
+/// kernel. `topology` is expected to already be restricted to the process's
+/// allowed CPU set; `allowed` is the raw allowed list used both to keep the
+/// result within the process cpuset and to top up the selection when no single
+/// node covers `count`. The result never exceeds `count`, never contains a CPU
+/// outside `allowed` (when `allowed` is known), and is returned in ascending
+/// order. Returns `None` when `count` is zero or no usable CPU can be chosen.
+fn choose_budget_cpus(
+    topology: Option<&NumaTopology>,
+    allowed: Option<&[usize]>,
+    count: usize,
+) -> Option<Vec<usize>> {
+    if count == 0 {
+        return None;
+    }
+    let allowed_set: Option<std::collections::BTreeSet<usize>> =
+        allowed.map(|a| a.iter().copied().collect());
+    let mut selected: Vec<usize> = Vec::new();
+    if let Some(topology) = topology
+        && let Ok(Some(node_cpus)) = topology.cpus_for(&DecodeAffinity::Compact, count)
+    {
+        selected = node_cpus;
+    }
+    if let Some(set) = &allowed_set {
+        selected.retain(|cpu| set.contains(cpu));
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    selected.truncate(count);
+    if selected.len() < count && let Some(allowed) = allowed {
+        let mut extra: Vec<usize> = allowed
+            .iter()
+            .copied()
+            .filter(|cpu| !selected.contains(cpu))
+            .collect();
+        extra.sort_unstable();
+        for cpu in extra {
+            if selected.len() >= count {
+                break;
+            }
+            selected.push(cpu);
+        }
+    }
+    selected.sort_unstable();
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// Resolve the `count` CPUs the process should be confined to on the running
+/// host: detect NUMA topology, intersect it with the process's allowed CPU set,
+/// and pick CPUs packed on a single node where possible (see
+/// [`choose_budget_cpus`]). Returns `None` when no usable CPU set can be
+/// determined (e.g. the allowed set is unknown and no topology is discoverable).
+pub fn select_budget_cpus(count: usize) -> Option<Vec<usize>> {
+    let allowed = allowed_cpus();
+    let restricted = NumaTopology::detect().map(|t| t.restrict_to_allowed(allowed.as_deref()));
+    choose_budget_cpus(restricted.as_ref(), allowed.as_deref(), count)
+}
+
 /// The CPUs the current process is actually permitted to run on, or `None` when
 /// the allowed set cannot be determined on this platform.
 ///
@@ -1180,5 +1308,49 @@ mod tests {
             pinning_supported(),
             cfg!(any(target_os = "linux", target_os = "windows"))
         );
+    }
+
+    #[test]
+    fn choose_budget_cpus_prefers_a_single_node() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        // Four CPUs fit inside node 0, so all four come from the smallest-index
+        // node that covers the count -- packed on one node for locality.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 4).unwrap();
+        assert_eq!(chosen, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn choose_budget_cpus_tops_up_across_nodes_when_no_node_covers_count() {
+        let topology = two_node_topology();
+        let allowed: Vec<usize> = (0..16).collect();
+        // Twelve exceeds either 8-CPU node, so the largest node fills first and
+        // the rest are topped up from the allowed set, never exceeding count.
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 12).unwrap();
+        assert_eq!(chosen.len(), 12);
+        assert!(chosen.iter().all(|cpu| allowed.contains(cpu)));
+    }
+
+    #[test]
+    fn choose_budget_cpus_never_exceeds_allowed_set() {
+        let topology = two_node_topology();
+        // The process is only allowed on four CPUs; a larger request is clamped
+        // to exactly those CPUs and never pins outside the cpuset.
+        let allowed = vec![8, 9, 10, 11];
+        let chosen = choose_budget_cpus(Some(&topology), Some(&allowed), 8).unwrap();
+        assert_eq!(chosen, vec![8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn choose_budget_cpus_without_topology_uses_allowed_prefix() {
+        let allowed = vec![2, 3, 5, 7, 11];
+        let chosen = choose_budget_cpus(None, Some(&allowed), 3).unwrap();
+        assert_eq!(chosen, vec![2, 3, 5]);
+    }
+
+    #[test]
+    fn choose_budget_cpus_returns_none_without_any_usable_cpu() {
+        assert!(choose_budget_cpus(None, None, 4).is_none());
+        assert!(choose_budget_cpus(Some(&two_node_topology()), Some(&[0]), 0).is_none());
     }
 }
