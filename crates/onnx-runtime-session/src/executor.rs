@@ -4914,6 +4914,10 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
     ) -> Result<()> {
+        // Whole-node dispatch span: its lifetime minus `exec_kernel.compute` is
+        // the serial per-node dispatch glue (shape resolve, input/output view
+        // build, kernel-cache lookup) the F5 Stage 3 record would elide.
+        let _node_span = phase_span!("exec_kernel.node");
         // Borrow the plan facts in place rather than cloning them per node per
         // token: `self.plan` is a distinct field from the buffer/view/cache
         // fields mutated below, so these shared borrows coexist with the
@@ -5090,6 +5094,7 @@ impl Executor {
         // Resolve each input's real geometry (root buffer + strides/offset) and
         // bounds-check it. View inputs read through their recorded strides.
         let mut in_infos: Vec<InInfo> = Vec::with_capacity(inputs.len());
+        let _build_inputs_span = phase_span!("exec_kernel.build_inputs");
         for (i, slot) in inputs.iter().enumerate() {
             let Some(vid) = *slot else {
                 in_infos.push(InInfo {
@@ -5213,6 +5218,7 @@ impl Executor {
                 root_len,
             });
         }
+        drop(_build_inputs_span);
 
         let ep = self.ep.clone();
 
@@ -5260,15 +5266,18 @@ impl Executor {
                 })
             })
             .collect();
-        let kernel = cache.get_or_create(
-            node_id,
-            node,
-            input_shapes,
-            input_dtypes,
-            &constant_inputs,
-            opset,
-            ep.as_ref(),
-        )?;
+        let kernel = {
+            let _s = phase_span!("exec_kernel.get_kernel");
+            cache.get_or_create(
+                node_id,
+                node,
+                input_shapes,
+                input_dtypes,
+                &constant_inputs,
+                opset,
+                ep.as_ref(),
+            )?
+        };
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
@@ -5526,9 +5535,12 @@ impl Executor {
                 })
                 .collect::<Vec<_>>()
         });
-        let execution = match &kernel_inputs {
-            Some(inputs) => kernel.execute_with_inputs(inputs, &mut outs),
-            None => kernel.execute(&views, &mut outs),
+        let execution = {
+            let _s = phase_span!("exec_kernel.compute");
+            match &kernel_inputs {
+                Some(inputs) => kernel.execute_with_inputs(inputs, &mut outs),
+                None => kernel.execute(&views, &mut outs),
+            }
         };
         execution.map_err(|error| {
                 let input_types = views.iter().map(|view| view.dtype).collect::<Vec<_>>();
