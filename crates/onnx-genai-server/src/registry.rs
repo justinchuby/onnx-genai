@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
+    fmt,
     path::PathBuf,
     sync::{
-        Arc, RwLock,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -133,6 +134,17 @@ struct RegistryInner {
     available: HashMap<String, ModelSpec>,
 }
 
+#[derive(Debug)]
+pub(crate) struct RegistryError;
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("registry lock poisoned")
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
 /// Registry of models, providing runtime load / unload / lazy-load with LRU
 /// eviction.
 ///
@@ -228,51 +240,47 @@ impl ModelRegistry {
     /// Returns `None` if the target is not currently loaded (either unknown or a
     /// lazy/unloaded model).  Callers wanting lazy loading use
     /// `routes::resolve_model`, which falls through to [`ModelRegistry::load`].
-    pub(crate) fn resolve(&self, requested: &str) -> Option<Arc<ModelHandle>> {
-        let inner = self.inner.read().expect("registry lock poisoned");
+    pub(crate) fn resolve(
+        &self,
+        requested: &str,
+    ) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
+        let inner = self.read()?;
         let handle = if !requested.trim().is_empty() {
-            inner.models.get(requested)?
+            inner.models.get(requested)
         } else {
-            let default = inner.default_id.as_deref()?;
-            inner.models.get(default)?
+            inner
+                .default_id
+                .as_deref()
+                .and_then(|default| inner.models.get(default))
+        };
+        let Some(handle) = handle else {
+            return Ok(None);
         };
         handle
             .last_request_at
             .store(now_millis(), Ordering::Relaxed);
-        Some(Arc::clone(handle))
+        Ok(Some(Arc::clone(handle)))
     }
 
     /// Returns `true` if `id` is a configured model (loaded or not).
-    pub(crate) fn contains_available(&self, id: &str) -> bool {
-        self.inner
-            .read()
-            .expect("registry lock poisoned")
-            .available
-            .contains_key(id)
+    pub(crate) fn contains_available(&self, id: &str) -> Result<bool, RegistryError> {
+        Ok(self.read()?.available.contains_key(id))
     }
 
     /// Returns the ids of all currently loaded models in insertion order.
-    pub(crate) fn ids(&self) -> Vec<String> {
-        self.inner
-            .read()
-            .expect("registry lock poisoned")
-            .order
-            .clone()
+    pub(crate) fn ids(&self) -> Result<Vec<String>, RegistryError> {
+        Ok(self.read()?.order.clone())
     }
 
     /// Returns the id of the default model, or `None` if none is configured.
-    pub(crate) fn default_id(&self) -> Option<String> {
-        self.inner
-            .read()
-            .expect("registry lock poisoned")
-            .default_id
-            .clone()
+    pub(crate) fn default_id(&self) -> Result<Option<String>, RegistryError> {
+        Ok(self.read()?.default_id.clone())
     }
 
     /// Snapshot of every configured model with its loaded/available status,
     /// ordered by configured id for determinism.
-    pub(crate) fn statuses(&self) -> Vec<ModelStatus> {
-        let inner = self.inner.read().expect("registry lock poisoned");
+    pub(crate) fn statuses(&self) -> Result<Vec<ModelStatus>, RegistryError> {
+        let inner = self.read()?;
         let default = inner.default_id.as_deref();
         let mut statuses: Vec<ModelStatus> = inner
             .available
@@ -288,7 +296,7 @@ impl ModelRegistry {
             })
             .collect();
         statuses.sort_by(|a, b| a.id.cmp(&b.id));
-        statuses
+        Ok(statuses)
     }
 
     /// Load (or return the already-loaded) model for `id`.
@@ -299,12 +307,12 @@ impl ModelRegistry {
     /// concurrent loads of the same id so the model is built only once.
     pub(crate) async fn load(&self, id: &str) -> anyhow::Result<Arc<ModelHandle>> {
         // Fast path: already loaded.
-        if let Some(handle) = self.get_loaded(id) {
+        if let Some(handle) = self.get_loaded(id)? {
             return Ok(handle);
         }
         // Validate the id is configured before doing any work.
         let spec = self
-            .spec_for(id)
+            .spec_for(id)?
             .ok_or_else(|| anyhow::anyhow!("unknown model id '{id}'"))?;
 
         // Serialise concurrent loads of the same id.
@@ -312,7 +320,7 @@ impl ModelRegistry {
         let _held = guard.lock().await;
 
         // Re-check after acquiring the guard: another waiter may have loaded it.
-        if let Some(handle) = self.get_loaded(id) {
+        if let Some(handle) = self.get_loaded(id)? {
             return Ok(handle);
         }
 
@@ -333,7 +341,7 @@ impl ModelRegistry {
 
         // Insert + evict under the write lock (no await held).
         {
-            let mut inner = self.inner.write().expect("registry lock poisoned");
+            let mut inner = self.write()?;
             inner.insert_loaded(Arc::clone(&handle));
             inner.enforce_eviction(self.config.max_loaded_models, id);
         }
@@ -346,7 +354,7 @@ impl ModelRegistry {
     ///
     /// Returns an error if the id is not currently loaded (mapped to 404).
     pub(crate) fn unload(&self, id: &str) -> anyhow::Result<()> {
-        let mut inner = self.inner.write().expect("registry lock poisoned");
+        let mut inner = self.write()?;
         if inner.remove_loaded(id) {
             tracing::info!(id = %id, "unloaded model");
             Ok(())
@@ -355,22 +363,20 @@ impl ModelRegistry {
         }
     }
 
-    fn get_loaded(&self, id: &str) -> Option<Arc<ModelHandle>> {
-        self.inner
-            .read()
-            .expect("registry lock poisoned")
-            .models
-            .get(id)
-            .map(Arc::clone)
+    fn get_loaded(&self, id: &str) -> Result<Option<Arc<ModelHandle>>, RegistryError> {
+        Ok(self.read()?.models.get(id).map(Arc::clone))
     }
 
-    fn spec_for(&self, id: &str) -> Option<ModelSpec> {
-        self.inner
-            .read()
-            .expect("registry lock poisoned")
-            .available
-            .get(id)
-            .cloned()
+    fn spec_for(&self, id: &str) -> Result<Option<ModelSpec>, RegistryError> {
+        Ok(self.read()?.available.get(id).cloned())
+    }
+
+    fn read(&self) -> Result<RwLockReadGuard<'_, RegistryInner>, RegistryError> {
+        self.inner.read().map_err(|_| RegistryError)
+    }
+
+    fn write(&self) -> Result<RwLockWriteGuard<'_, RegistryInner>, RegistryError> {
+        self.inner.write().map_err(|_| RegistryError)
     }
 
     /// Get-or-create the per-id async load guard.
@@ -559,10 +565,13 @@ mod tests {
             registry.insert_for_test(stub_handle(id, Arc::clone(&tokenizer)));
         }
 
-        let resolved = registry.resolve("").expect("resolve empty should succeed");
+        let resolved = registry
+            .resolve("")
+            .expect("registry lock must be available")
+            .expect("resolve empty should succeed");
         assert_eq!(resolved.id, "gamma");
-        assert_eq!(registry.default_id().as_deref(), Some("gamma"));
-        assert_eq!(registry.ids(), ids);
+        assert_eq!(registry.default_id().unwrap().as_deref(), Some("gamma"));
+        assert_eq!(registry.ids().unwrap(), ids);
     }
 
     #[test]
@@ -573,8 +582,8 @@ mod tests {
         registry.insert_for_test(stub_handle("x", Arc::clone(&tokenizer)));
         registry.insert_for_test(stub_handle("y", Arc::clone(&tokenizer)));
 
-        assert_eq!(registry.ids(), vec!["x", "y"]);
-        assert_eq!(registry.default_id().as_deref(), Some("x"));
+        assert_eq!(registry.ids().unwrap(), vec!["x", "y"]);
+        assert_eq!(registry.default_id().unwrap().as_deref(), Some("x"));
     }
 
     /// Eviction must remove the least-recently-used **non-default** model first.
@@ -591,7 +600,7 @@ mod tests {
         // even though the default "a" has an older timestamp.
         registry.enforce_eviction_for_test(Some(2), "b");
 
-        let mut ids = registry.ids();
+        let mut ids = registry.ids().unwrap();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"], "LRU non-default 'c' should be evicted");
     }
@@ -607,7 +616,11 @@ mod tests {
 
         // Cap at 1 while loading "b": the only evictable candidate is default "a".
         registry.enforce_eviction_for_test(Some(1), "b");
-        assert_eq!(registry.ids(), vec!["b"], "default evicted as last resort");
+        assert_eq!(
+            registry.ids().unwrap(),
+            vec!["b"],
+            "default evicted as last resort"
+        );
     }
 
     #[test]
@@ -618,8 +631,26 @@ mod tests {
         registry.insert_for_test(stub_handle("b", Arc::clone(&tokenizer)));
 
         registry.unload("b").expect("unload loaded model");
-        assert_eq!(registry.ids(), vec!["a"]);
+        assert_eq!(registry.ids().unwrap(), vec!["a"]);
         // Unloading an id that is not loaded is an error (mapped to 404).
         assert!(registry.unload("b").is_err());
+    }
+
+    #[test]
+    fn poisoned_lock_returns_an_error() {
+        let registry = ModelRegistry::new_for_test();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.inner.write().expect("new lock must be available");
+            panic!("poison registry lock");
+        }));
+
+        assert_eq!(
+            registry
+                .resolve("")
+                .err()
+                .expect("poisoned lock must fail")
+                .to_string(),
+            "registry lock poisoned"
+        );
     }
 }

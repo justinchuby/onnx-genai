@@ -281,6 +281,8 @@ impl AppState {
     pub fn model_id(&self) -> String {
         self.registry
             .default_id()
+            .ok()
+            .flatten()
             .unwrap_or_else(|| "onnx-genai-model".to_string())
     }
 }
