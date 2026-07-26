@@ -128,7 +128,13 @@ pub mod jsonl;
 #[cfg(feature = "itt")]
 pub mod itt;
 
+// The one module allowed to use `unsafe`, and only when its feature is on:
+// CUPTI is a C library reached by dlopen. `deny` above stays in force for
+// everything else, which is the point of using `deny` rather than a
+// crate-wide `cfg_attr` that switched the lint off entirely whenever this
+// feature was enabled.
 #[cfg(feature = "cupti")]
+#[allow(unsafe_code)]
 pub mod cupti;
 
 #[cfg(feature = "perfetto")]
