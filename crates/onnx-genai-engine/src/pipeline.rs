@@ -555,6 +555,19 @@ impl PipelineEngine {
             )?
         });
 
+        // Encoder-decoder pipelines bind the encoder's static cross-attention KV
+        // to the decoder every step. Resolve it once here, after the prompt-phase
+        // encoder prologue has published its `present_*_cross_%d` outputs into the
+        // shared pool; the tensors are invariant across the decode loop.
+        let cross_kv_pairs = self
+            .decoder_state
+            .as_ref()
+            .expect("autoregressive pipeline has decode state")
+            .io
+            .cross_kv_pairs
+            .clone();
+        let static_cross_kv = self.static_cross_kv_bindings(&cross_kv_pairs, &tensors)?;
+
         let decoder = self
             .models
             .session(&ar.decoder)
@@ -588,6 +601,7 @@ impl PipelineEngine {
             pool: &mut tensors,
             step_components,
             decoder_in_edges,
+            static_cross_kv,
             context_tokens: prompt_tokens,
             prompt_len: 0,
             generated_count: 0,
@@ -2007,6 +2021,49 @@ impl PipelineEngine {
         Ok(())
     }
 
+    /// Resolve the STATIC encoder-produced cross-attention KV tensors that feed
+    /// the autoregressive decoder on every step.
+    ///
+    /// For an encoder-decoder (e.g. Whisper) pipeline the encoder runs once as a
+    /// prompt-phase prologue and publishes its `present_*_cross_%d` outputs into
+    /// the shared pool as `{encoder}.present_*_cross_%d`. Those tensors encode
+    /// the whole audio/text prompt and are STATIC for the entire decode: they
+    /// never grow or change across autoregressive steps (unlike the decoder's
+    /// self-attention KV cache). They are therefore cloned once here and re-bound
+    /// verbatim to the decoder's `past_*_cross_%d` inputs on every step, rather
+    /// than recomputed. The pairing comes from the decoder's declared
+    /// `cross_kv_inputs`/`cross_kv_outputs` (resolved into `cross_kv_pairs`),
+    /// keyed off the encoder-decoder pipeline shape, not any model name.
+    fn static_cross_kv_bindings(
+        &self,
+        cross_kv_pairs: &[(String, String)],
+        tensors: &PipelineTensors,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        let mut bindings = Vec::with_capacity(cross_kv_pairs.len());
+        for (decoder_input, encoder_output) in cross_kv_pairs {
+            let suffix = format!(".{encoder_output}");
+            let mut matches = tensors
+                .iter()
+                .filter(|(key, _)| key.ends_with(&suffix) || key.as_str() == encoder_output);
+            let (_, value) = matches.next().with_context(|| {
+                format!(
+                    "encoder-decoder cross-attention: no pooled encoder output '{encoder_output}' \
+                     to bind decoder input '{decoder_input}'; the encoder prologue must run and \
+                     publish it before decode"
+                )
+            })?;
+            if matches.next().is_some() {
+                anyhow::bail!(
+                    "encoder-decoder cross-attention: multiple pooled tensors match encoder output \
+                     '{encoder_output}' for decoder input '{decoder_input}'; the producing \
+                     component is ambiguous"
+                );
+            }
+            bindings.push((decoder_input.clone(), clone_value(value)?));
+        }
+        Ok(bindings)
+    }
+
     /// Precompute the static routing edges feeding the autoregressive `decoder`.
     ///
     /// Returns `(source_endpoint, decoder_input_port)` for every dataflow edge
@@ -2302,6 +2359,11 @@ struct PipelineDecodeLoopBackend<'a> {
     step_components: Vec<(StepComponentBinding, &'a Session)>,
     /// `(source_endpoint, decoder_input_port)` routing recomputed each step.
     decoder_in_edges: Vec<(String, String)>,
+    /// Static encoder-produced cross-attention KV bound to the decoder every
+    /// step: `(decoder_input_port, value)`. Cloned once from the encoder
+    /// prologue outputs; invariant across the decode loop (see
+    /// `PipelineEngine::static_cross_kv_bindings`).
+    static_cross_kv: Vec<(String, Value)>,
     context_tokens: Vec<TokenId>,
     prompt_len: usize,
     generated_count: usize,
@@ -2360,13 +2422,18 @@ impl PipelineDecodeLoopBackend<'_> {
 
     /// Build this step's decoder extra inputs by re-reading every routed source
     /// endpoint from the shared pool. `every_step` outputs are already fresh
-    /// (just re-run); cached `prompt_only` conditioning is simply re-read.
+    /// (just re-run); cached `prompt_only` conditioning is simply re-read. The
+    /// static encoder cross-attention KV (resolved once from the prologue) is
+    /// appended verbatim so the decoder's `past_*_cross_%d` inputs are bound.
     fn decoder_extras(&self) -> anyhow::Result<Vec<(String, Value)>> {
-        let mut extras = Vec::with_capacity(self.decoder_in_edges.len());
+        let mut extras = Vec::with_capacity(self.decoder_in_edges.len() + self.static_cross_kv.len());
         for (from, port) in &self.decoder_in_edges {
             let value = self.pool.get(from).with_context(|| {
                 format!("missing routed pipeline tensor '{from}' for decoder input '{port}'")
             })?;
+            extras.push((port.clone(), clone_value(value)?));
+        }
+        for (port, value) in &self.static_cross_kv {
             extras.push((port.clone(), clone_value(value)?));
         }
         Ok(extras)
