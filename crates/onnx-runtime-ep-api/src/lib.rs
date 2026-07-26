@@ -19,6 +19,19 @@
 //! * [`weight`] — capability-negotiated lazy [`WeightHandle`] delivery.
 //! * [`abi`] — ORT graph ABI bridge for legacy plugin EPs (Phase 2).
 
+// This crate hands raw pointers across an FFI boundary, so keeping a Rust
+// value alive past its scope is a recurring temptation. It is almost never the
+// answer: a pointer that outlives its owner needs the *owner* moved somewhere
+// longer-lived, not its destructor skipped.
+//
+// `HostNode::fused` learned this the hard way. It built value infos, took raw
+// pointers into them, and called `mem::forget` so the pointers could not
+// dangle -- reasoning that the leak was "tiny". It was tiny per call, and the
+// call happens once per session, so a long-lived server leaked forever. The
+// fix was to give the node ownership of the boxes its pointers reference,
+// which is exactly what `HostGraph` a hundred lines away had always done.
+#![deny(clippy::mem_forget)]
+
 pub mod abi;
 pub mod epcontext;
 pub mod kernel;
