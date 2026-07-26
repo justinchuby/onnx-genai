@@ -96,6 +96,7 @@ pub mod sdpa;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
+pub mod silu_mul;
 pub mod simd_normalize;
 pub mod simd_quant;
 pub mod simd_sumsq;
@@ -430,6 +431,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("Silu", "com.microsoft", 1),
         Box::new(activations::SiluFactory),
+    );
+    reg.register(
+        OpKey::new("SiluMul", "com.microsoft", 1),
+        Box::new(silu_mul::SiluMulFactory),
     );
     reg.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
@@ -1641,7 +1646,7 @@ mod tests {
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed).
         let mlas_registrations = if cfg!(feature = "mlas") { 7 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 93 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 94 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }

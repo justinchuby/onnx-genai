@@ -302,9 +302,11 @@ impl FusionPattern {
         affected.into_iter().collect()
     }
 
-    /// Whether `node` is a standard-domain op named `op`.
+    /// Whether `node` is an op named `op` in the domain expected by a fusion.
     fn op_matches(node: &Node, op: &str) -> bool {
-        node.op_type == op && matches!(node.domain.as_str(), "" | "ai.onnx")
+        node.op_type == op
+            && (matches!(node.domain.as_str(), "" | "ai.onnx")
+                || (op == "Silu" && node.domain == CONTRIB_DOMAIN))
     }
 
     /// The first consumer of `value` whose op is `op` (standard domain).
@@ -1036,6 +1038,8 @@ impl FusionPattern {
                 // structural rewrites are unconstrained.
                 if self.replacement == "FusedMatMulBias" || self.replacement == "FusedGemm" {
                     self.matmul_bias_broadcast_ok(graph, m)
+                } else if self.replacement == "SiluMul" {
+                    self.silu_mul_shape_ok(graph, m)
                 } else {
                     true
                 }
@@ -1092,6 +1096,29 @@ impl FusionPattern {
             return false;
         }
         true
+    }
+
+    /// `SiluMul` is deliberately a same-shape operation.  Keeping the fusion to
+    /// contiguous elementwise semantics avoids changing ONNX `Mul` broadcasting
+    /// behavior and lets the CPU kernel make exactly one fused elementwise pass.
+    fn silu_mul_shape_ok(&self, graph: &Graph, m: &PatternMatch) -> bool {
+        let (Some(&silu_id), Some(&mul_id)) = (m.nodes.first(), m.nodes.get(1)) else {
+            return false;
+        };
+        let silu = graph.node(silu_id);
+        let mul = graph.node(mul_id);
+        if silu.inputs.len() != 1 || silu.outputs.len() != 1 || mul.inputs.len() != 2 {
+            return false;
+        }
+        let Some(x) = silu.inputs[0] else {
+            return false;
+        };
+        let Some(y) = mul.input_values().find(|&value| value != silu.outputs[0]) else {
+            return false;
+        };
+        let output = mul.outputs[0];
+        graph.value(x).shape == graph.value(y).shape
+            && graph.value(x).shape == graph.value(output).shape
     }
 
     /// Apply a match: remove the matched nodes and insert the replacement,
@@ -1343,6 +1370,7 @@ pub fn default_fusion_patterns() -> Vec<FusionPattern> {
         FusionPattern::new("MatMul+Bias+Relu", &["MatMul", "Add", "Relu"], "FusedGemm"),
         FusionPattern::layernorm(),
         FusionPattern::gelu(),
+        FusionPattern::new("Silu+Mul", &["Silu", "Mul"], "SiluMul"),
         FusionPattern::new("MatMul+Bias", &["MatMul", "Add"], "FusedMatMulBias"),
     ]
 }
@@ -1497,6 +1525,60 @@ mod tests {
         ));
         g.add_output(out);
         g
+    }
+
+    fn silu_mul_graph(silu_is_rhs: bool, extra_silu_consumer: bool) -> Graph {
+        let mut g = Graph::new();
+        g.opset_imports.insert(String::new(), 17);
+        g.opset_imports.insert(CONTRIB_DOMAIN.into(), 1);
+        let x = val(&mut g, "x");
+        let y = val(&mut g, "y");
+        g.add_input(x);
+        g.add_input(y);
+        let silu_out = val(&mut g, "silu_out");
+        let mut silu = Node::new(NodeId(0), "Silu", vec![Some(x)], vec![silu_out]);
+        silu.domain = CONTRIB_DOMAIN.into();
+        g.insert_node(silu);
+        let out = val(&mut g, "out");
+        let inputs = if silu_is_rhs {
+            vec![Some(y), Some(silu_out)]
+        } else {
+            vec![Some(silu_out), Some(y)]
+        };
+        g.insert_node(Node::new(NodeId(0), "Mul", inputs, vec![out]));
+        g.add_output(out);
+        if extra_silu_consumer {
+            let escaped = val(&mut g, "escaped");
+            g.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(silu_out)],
+                vec![escaped],
+            ));
+            g.add_output(escaped);
+        }
+        g
+    }
+
+    #[test]
+    fn fuses_silu_mul_regardless_of_mul_operand_order() {
+        for silu_is_rhs in [false, true] {
+            let mut g = silu_mul_graph(silu_is_rhs, false);
+            OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+            assert_eq!(g.num_nodes(), 1);
+            let fused = g.nodes.values().next().unwrap();
+            assert_eq!(fused.op_type, "SiluMul");
+            assert_eq!(fused.domain, CONTRIB_DOMAIN);
+            assert_eq!(fused.inputs.len(), 2);
+        }
+    }
+
+    #[test]
+    fn does_not_fuse_silu_mul_when_silu_output_has_another_consumer() {
+        let mut g = silu_mul_graph(false, true);
+        OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+        assert_eq!(g.num_nodes(), 3);
+        assert!(g.nodes.values().all(|node| node.op_type != "SiluMul"));
     }
 
     #[test]
@@ -3525,7 +3607,7 @@ mod tests {
                 .successors(add_id)
                 .iter()
                 .any(|&successor| graph.node(successor).op_type == "Relu");
-            let pattern = if has_relu { &patterns[1] } else { &patterns[4] };
+            let pattern = if has_relu { &patterns[1] } else { &patterns[5] };
             assert!(
                 starts
                     .iter()
@@ -3545,7 +3627,7 @@ mod tests {
     #[test]
     fn resumable_scan_matches_restart_reference_on_randomized_graphs() {
         const TRIALS: usize = 5_000;
-        const REGISTERED_PATTERNS: usize = 5;
+        const REGISTERED_PATTERNS: usize = 6;
         let mut rng = FusionTestRng(0x6a09_e667_f3bc_c909);
         let patterns = differential_patterns();
         assert_eq!(default_fusion_patterns().len(), REGISTERED_PATTERNS);
@@ -3558,7 +3640,12 @@ mod tests {
                 "invalid input graph on trial {trial}"
             );
 
-            for pattern in &patterns[..REGISTERED_PATTERNS] {
+            // The adversarial graph generator predates SiluMul and deliberately
+            // does not include a contrib-domain SiLU node.
+            for pattern in patterns
+                .iter()
+                .filter(|pattern| pattern.pattern_name() != "Silu+Mul")
+            {
                 assert!(
                     pattern.find_match(&graph).is_some(),
                     "{} was not exercised on trial {trial}",
