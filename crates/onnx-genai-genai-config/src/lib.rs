@@ -70,6 +70,23 @@ pub enum GenAiConfigError {
         /// Missing or inconsistent semantic facts.
         missing: String,
     },
+    /// The package describes a valid model family that the current
+    /// inference-metadata contract cannot execute (e.g. an RNN-T transducer).
+    /// Declined honestly rather than mis-bound as a supported shape.
+    #[error(
+        "unsupported pipeline family: {family}. {reason}. \
+         Why: this family is structurally distinct from every executable shape \
+         (single-decoder, multimodal, encoder-decoder, decoder-pipeline) and the \
+         loader will not fabricate bindings it cannot honor. How to fix: add native \
+         support for this family, or supply a native inference_metadata.json that \
+         declares an executable pipeline"
+    )]
+    UnsupportedPipelineFamily {
+        /// Human-readable family name (e.g. `"RNN-T transducer"`).
+        family: String,
+        /// What makes it unexecutable and what it would take to support it.
+        reason: String,
+    },
 }
 
 /// Forward-compatible view of an onnxruntime-genai `genai_config.json`.
@@ -129,6 +146,15 @@ pub struct GenAiModel {
     /// Optional speech / audio-embedding graph.
     #[serde(default)]
     pub speech: Option<GenAiSpeech>,
+    /// Optional RNN-T joint (joiner) network fusing encoder + prediction-network
+    /// outputs into per-step logits. Its presence marks a transducer topology,
+    /// which is NOT an encoder-decoder (cross-attention) model.
+    #[serde(default)]
+    pub joiner: Option<GenAiJoiner>,
+    /// Optional voice-activity-detection graph (e.g. Silero VAD) used by
+    /// streaming transducer packages for segmentation.
+    #[serde(default)]
+    pub vad: Option<GenAiVad>,
 }
 
 /// `eos_token_id` accepts either a scalar or an array; both normalize to a list.
@@ -194,6 +220,13 @@ pub struct DecoderInputs {
     pub cross_past_key_names: Option<String>,
     pub cross_past_value_names: Option<String>,
     pub encoder_hidden_states: Option<String>,
+    /// RNN-T prediction-network label input (previous non-blank token). Present
+    /// instead of `input_ids` in transducer prediction networks.
+    pub targets: Option<String>,
+    /// RNN-T prediction-network LSTM hidden state input (`h_in`).
+    pub lstm_hidden_state: Option<String>,
+    /// RNN-T prediction-network LSTM cell state input (`c_in`).
+    pub lstm_cell_state: Option<String>,
 }
 
 /// Decoder graph output port names (values are graph tensor names).
@@ -239,6 +272,48 @@ pub struct EncoderOutputs {
     pub encoder_hidden_states: Option<String>,
     pub cross_present_key_names: Option<String>,
     pub cross_present_value_names: Option<String>,
+}
+
+/// The `model.joiner` section (RNN-T joint network).
+///
+/// The joint network combines the encoder output and the prediction-network
+/// (decoder) output into per-step logits over the vocabulary plus a blank
+/// symbol. It has no analog in a cross-attention encoder-decoder model, so its
+/// mere presence identifies a transducer package. Only the fields needed to
+/// DETECT and describe the family are parsed; the joint is not yet executable.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GenAiJoiner {
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub inputs: JoinerInputs,
+    #[serde(default)]
+    pub outputs: JoinerOutputs,
+}
+
+/// Joint-network graph input port names.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct JoinerInputs {
+    pub encoder_outputs: Option<String>,
+    pub decoder_outputs: Option<String>,
+}
+
+/// Joint-network graph output port names.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct JoinerOutputs {
+    pub logits: Option<String>,
+}
+
+/// The `model.vad` section (voice-activity-detection front-end, e.g. Silero).
+///
+/// Only parsed so streaming transducer packages describe cleanly; VAD
+/// segmentation is not part of the current inference-metadata contract.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GenAiVad {
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// The `model.embedding` section (multimodal token embedder).
@@ -465,6 +540,11 @@ enum ModelShape {
     Multimodal,
     /// Encoder + cross-attention decoder (ASR / whisper).
     EncoderDecoder,
+    /// RNN-T transducer: streaming encoder + LSTM prediction network + joint
+    /// network (+ optional VAD / streaming caches). A DISTINCT pipeline family
+    /// the current inference-metadata contract does not execute. Recognized so
+    /// it is never silently mis-bound as an encoder-decoder model.
+    Transducer,
     /// A single decoder split into an ordered set of sub-graphs.
     DecoderPipeline,
 }
@@ -513,7 +593,17 @@ impl GenAiConfig {
     }
 
     fn shape(&self) -> ModelShape {
-        if self.model.encoder.is_some() {
+        // Recognize the RNN-T transducer family BEFORE the encoder check: a
+        // transducer also declares `model.encoder`, but its encoder is a
+        // streaming Conformer with cache state (not a Whisper encoder emitting
+        // cross-KV), its decoder is an LSTM prediction network (no attention KV),
+        // and it carries a joint network. Classifying it as EncoderDecoder here
+        // would silently fabricate Whisper-style cross-KV bindings that do not
+        // exist. Detection is structural (joint network / LSTM decoder states),
+        // never keyed on `model.type` or a model name.
+        if self.is_transducer() {
+            ModelShape::Transducer
+        } else if self.model.encoder.is_some() {
             ModelShape::EncoderDecoder
         } else if self.model.embedding.is_some()
             || self.model.vision.is_some()
@@ -527,6 +617,32 @@ impl GenAiConfig {
         }
     }
 
+    /// Whether this package describes an RNN-T transducer (e.g. Nemotron speech:
+    /// Conformer encoder + LSTM prediction network + joint network + VAD).
+    ///
+    /// Detected purely from structure — never from `model.type` or a model name:
+    /// a transducer declares a `model.joiner` joint network, and/or its decoder
+    /// is an LSTM prediction network driven by `targets` + LSTM hidden/cell state
+    /// with no attention KV. Either signal is sufficient. This is a DISTINCT
+    /// pipeline family the current inference-metadata contract cannot execute;
+    /// it must not be classified or bound as an encoder-decoder model.
+    pub fn is_transducer(&self) -> bool {
+        self.model.joiner.is_some() || self.decoder_is_lstm_prediction_network()
+    }
+
+    /// Whether the decoder graph is an LSTM prediction network (RNN-T) rather
+    /// than an attention transformer decoder: it consumes LSTM hidden/cell state
+    /// and exposes no self- or cross-attention KV ports.
+    fn decoder_is_lstm_prediction_network(&self) -> bool {
+        let inputs = &self.model.decoder.inputs;
+        (inputs.lstm_hidden_state.is_some() || inputs.lstm_cell_state.is_some())
+            && inputs.past_key_names.is_none()
+            && inputs.past_value_names.is_none()
+            && inputs.past_names.is_none()
+            && inputs.cross_past_key_names.is_none()
+            && inputs.cross_past_value_names.is_none()
+    }
+
     /// Convert into native [`InferenceMetadata`].
     ///
     /// `kv_native_dtype` is the KV cache scalar dtype read from the ONNX graph by
@@ -537,11 +653,18 @@ impl GenAiConfig {
     /// sequence length, and a share-buffer-compatible KV dtype is provided.
     ///
     /// NOTE: shapes/tensors the native spec cannot yet represent are intentionally
-    /// skipped (loading never fails on them): RNN-T joiner graphs, VAD, Conformer
-    /// NeMo `cache_last_channel`/`cache_last_time` state, LSTM/RNN decoder states
+    /// skipped (loading never fails on them): VAD, Conformer NeMo
+    /// `cache_last_channel`/`cache_last_time` state, LSTM/RNN decoder states
     /// (`rnn_states`, `lstm_hidden_state`, `lstm_cell_state`), paged-attention
     /// `block_table`, beam `cache_indirection`, `output_cross_qk`, and the
     /// per-session `session_options`/`run_options`.
+    ///
+    /// EXCEPTION: an RNN-T transducer package (joint/joiner network and/or an
+    /// LSTM prediction network) is NOT skipped-into an encoder-decoder spec — it
+    /// is recognized by [`Self::is_transducer`] and declined with an explicit
+    /// [`GenAiConfigError::UnsupportedPipelineFamily`], because silently emitting
+    /// a Whisper-style cross-attention spec for it would fabricate bindings the
+    /// graphs do not expose.
     pub fn to_inference_metadata(
         &self,
         kv_native_dtype: Option<&str>,
@@ -571,6 +694,12 @@ impl GenAiConfig {
         decoder_graph: Option<&ModelGraphInfo>,
     ) -> Result<InferenceMetadata, GenAiConfigError> {
         let shape = self.shape();
+
+        // Decline the transducer family up front: it has no executable
+        // representation, so there is nothing honest to synthesize.
+        if shape == ModelShape::Transducer {
+            return Err(transducer_unsupported());
+        }
 
         let mut model = Map::new();
         model.insert("attention".into(), self.attention_json());
@@ -603,6 +732,8 @@ impl GenAiConfig {
             ModelShape::DecoderPipeline => {
                 root.insert("pipeline".into(), self.decoder_pipeline_json());
             }
+            // Declined above; unreachable but kept explicit for exhaustiveness.
+            ModelShape::Transducer => return Err(transducer_unsupported()),
         }
 
         if let Some(generation) = self.generation_json() {
@@ -1091,7 +1222,9 @@ pub fn pipeline_inference_metadata_from_dir(
 /// semantic contract while `graphs` provides the authoritative ONNX port list,
 /// rank, shape, and dtype facts. Nothing is inferred from `model.type` or a
 /// model name: the encoder-decoder shape is recognized only from the declared
-/// `model.encoder` section. Returns `Ok(None)` when the directory has no
+/// `model.encoder` section, and an RNN-T transducer (which also declares an
+/// encoder) is declined with [`GenAiConfigError::UnsupportedPipelineFamily`]
+/// rather than mis-bound. Returns `Ok(None)` when the directory has no
 /// `genai_config.json` or the config does not describe an encoder-decoder model.
 pub fn encoder_decoder_pipeline_inference_metadata_from_dir(
     model_dir: &Path,
@@ -1101,6 +1234,12 @@ pub fn encoder_decoder_pipeline_inference_metadata_from_dir(
         return Ok(None);
     };
     let config = load(&path)?;
+    // A transducer also declares `model.encoder`; decline it explicitly with the
+    // honest family error rather than returning `Ok(None)` (which would surface a
+    // misleading "not an encoder-decoder" fall-through) or fabricating a spec.
+    if config.is_transducer() {
+        return Err(transducer_unsupported());
+    }
     if config.shape() != ModelShape::EncoderDecoder {
         return Ok(None);
     }
@@ -1816,6 +1955,26 @@ impl GenAiConfig {
 fn incomplete(missing: impl Into<String>) -> GenAiConfigError {
     GenAiConfigError::IncompletePipeline {
         missing: missing.into(),
+    }
+}
+
+/// Honest decline for an RNN-T transducer package. The transducer family
+/// (streaming Conformer encoder with cache state + LSTM prediction network +
+/// joint network + optional VAD, driven by a blank-symbol greedy transducer
+/// loop) has no representation in the current inference-metadata contract, so
+/// the loader declines with a descriptive reason instead of fabricating a
+/// Whisper-style cross-attention encoder-decoder spec that does not match the
+/// graphs.
+fn transducer_unsupported() -> GenAiConfigError {
+    GenAiConfigError::UnsupportedPipelineFamily {
+        family: "RNN-T transducer".into(),
+        reason: "the package declares a joint (joiner) network and/or an LSTM prediction \
+                 network (targets + lstm_hidden_state/lstm_cell_state, no attention KV), i.e. a \
+                 Conformer-Transducer topology. Executing it needs a joint-network greedy \
+                 transducer decode loop (blank_id / max_symbols_per_step), streaming encoder \
+                 cache state (cache_last_channel/cache_last_time), and VAD segmentation — none of \
+                 which the encoder-decoder cross-attention contract models"
+            .into(),
     }
 }
 
@@ -3152,6 +3311,173 @@ mod tests {
             pipeline.strategy.kind,
             onnx_genai_metadata::PipelineStrategyKind::Composite
         ));
+    }
+
+    // A faithful, trimmed synthetic derived from the real Microsoft
+    // `nemotron_speech` genai_config.json (Conformer-Transducer / RNN-T):
+    // a streaming Conformer encoder with cache state, an LSTM prediction
+    // network (`targets` + `lstm_hidden_state`/`lstm_cell_state`, no attention
+    // KV), a joint (joiner) network, and a Silero VAD. The multi-GB .onnx
+    // weights are not needed — recognition is driven from the JSON alone.
+    const NEMOTRON_TRANSDUCER_JSON: &str = r#"{
+        "model": {
+            "type": "nemotron_speech",
+            "vocab_size": 13088,
+            "subsampling_factor": 8,
+            "blank_id": 13087,
+            "max_symbols_per_step": 10,
+            "encoder": {
+                "filename": "encoder.onnx",
+                "hidden_size": 1024,
+                "num_hidden_layers": 24,
+                "inputs": {
+                    "audio_features": "audio_signal",
+                    "cache_last_channel": "cache_last_channel",
+                    "cache_last_time": "cache_last_time",
+                    "cache_last_channel_len": "cache_last_channel_len",
+                    "lang_id": "lang_id"
+                },
+                "outputs": {
+                    "encoder_outputs": "outputs",
+                    "output_lengths": "encoded_lengths",
+                    "cache_last_channel_next": "cache_last_channel_next",
+                    "cache_last_time_next": "cache_last_time_next",
+                    "cache_last_channel_len_next": "cache_last_channel_len_next"
+                }
+            },
+            "decoder": {
+                "filename": "decoder.onnx",
+                "hidden_size": 640,
+                "num_hidden_layers": 2,
+                "inputs": {
+                    "targets": "targets",
+                    "lstm_hidden_state": "h_in",
+                    "lstm_cell_state": "c_in"
+                },
+                "outputs": {
+                    "outputs": "decoder_output",
+                    "lstm_hidden_state": "h_out",
+                    "lstm_cell_state": "c_out"
+                }
+            },
+            "joiner": {
+                "filename": "joint.onnx",
+                "inputs": {
+                    "encoder_outputs": "encoder_output",
+                    "decoder_outputs": "decoder_output"
+                },
+                "outputs": { "logits": "joint_output" }
+            },
+            "vad": {
+                "filename": "silero_vad.onnx",
+                "threshold": 0.3
+            }
+        }
+    }"#;
+
+    #[test]
+    fn nemotron_transducer_is_not_encoder_decoder() {
+        let cfg: GenAiConfig = serde_json::from_str(NEMOTRON_TRANSDUCER_JSON).unwrap();
+        // Detected structurally as a transducer even though it declares
+        // `model.encoder` (which alone would look like an encoder-decoder).
+        assert!(cfg.is_transducer());
+        assert_eq!(cfg.shape(), ModelShape::Transducer);
+        assert_ne!(cfg.shape(), ModelShape::EncoderDecoder);
+    }
+
+    #[test]
+    fn nemotron_transducer_declines_instead_of_fabricating_cross_kv() {
+        let cfg: GenAiConfig = serde_json::from_str(NEMOTRON_TRANSDUCER_JSON).unwrap();
+        // The non-strict synthesis path (the auto-detection fallback) must NOT
+        // fabricate a Whisper-style encoder-decoder spec (with default
+        // `input_ids`/`logits` ports and non-existent `past_key_values.*` /
+        // `present.*` cross/self KV). It declines with the honest family error.
+        let error = cfg
+            .to_inference_metadata(None)
+            .expect_err("transducer must not synthesize a pipeline");
+        match error {
+            GenAiConfigError::UnsupportedPipelineFamily { family, .. } => {
+                assert_eq!(family, "RNN-T transducer");
+            }
+            other => panic!("expected UnsupportedPipelineFamily, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nemotron_transducer_strict_from_dir_declines() {
+        // The strict encoder-decoder loader entry point declines a transducer
+        // directory explicitly rather than returning Ok(None) or fabricating.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!(
+                "nemotron_transducer_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(GENAI_CONFIG_FILE), NEMOTRON_TRANSDUCER_JSON).unwrap();
+        let graphs = EncoderDecoderGraphInfo::default();
+        let result = encoder_decoder_pipeline_inference_metadata_from_dir(&dir, &graphs);
+        std::fs::remove_dir_all(&dir).ok();
+        match result {
+            Err(GenAiConfigError::UnsupportedPipelineFamily { family, .. }) => {
+                assert_eq!(family, "RNN-T transducer");
+            }
+            other => panic!("expected UnsupportedPipelineFamily, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transducer_detected_from_lstm_decoder_without_joiner() {
+        // Even without a `joiner` section, an LSTM prediction network (targets +
+        // LSTM hidden/cell state, no attention KV) is a transducer signal.
+        let json = r#"{
+            "model": {
+                "type": "some_transducer",
+                "encoder": {
+                    "filename": "encoder.onnx",
+                    "inputs": { "audio_features": "audio_signal" },
+                    "outputs": { "encoder_outputs": "outputs" }
+                },
+                "decoder": {
+                    "filename": "decoder.onnx",
+                    "num_hidden_layers": 2,
+                    "inputs": {
+                        "targets": "targets",
+                        "lstm_hidden_state": "h_in",
+                        "lstm_cell_state": "c_in"
+                    },
+                    "outputs": { "outputs": "decoder_output" }
+                }
+            }
+        }"#;
+        let cfg: GenAiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.is_transducer());
+        assert_eq!(cfg.shape(), ModelShape::Transducer);
+    }
+
+    #[test]
+    fn whisper_still_classifies_as_encoder_decoder_not_transducer() {
+        // No regression: a real cross-attention encoder-decoder (Whisper) is
+        // still EncoderDecoder and is never mistaken for a transducer.
+        let cfg: GenAiConfig = serde_json::from_str(WHISPER_JSON).unwrap();
+        assert!(!cfg.is_transducer());
+        assert_eq!(cfg.shape(), ModelShape::EncoderDecoder);
+    }
+
+    #[test]
+    fn phi3v_and_decoder_pipeline_are_not_transducers() {
+        // No regression for the other shapes.
+        let vlm: GenAiConfig = serde_json::from_str(PHI3V_JSON).unwrap();
+        assert!(!vlm.is_transducer());
+        assert_eq!(vlm.shape(), ModelShape::Multimodal);
+        let pipe: GenAiConfig = serde_json::from_str(DECODER_PIPELINE_JSON).unwrap();
+        assert!(!pipe.is_transducer());
+        assert_eq!(pipe.shape(), ModelShape::DecoderPipeline);
     }
 
     #[test]
