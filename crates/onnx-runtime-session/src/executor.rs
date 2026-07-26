@@ -994,8 +994,8 @@ pub(crate) struct Executor {
     /// read within that same call — never aliased or carried across nodes.
     scratch_input_shapes: Vec<Vec<usize>>,
     /// F5 Stage 1 — master switch for the steady-state decode-plan memo. Default
-    /// OFF; enabled by `ONNX_GENAI_DECODE_MEMO=1`. Only ever consulted on the
-    /// top-level CPU eager path with owned (no persistent device I/O) bindings.
+    /// OFF; enabled by `ONNX_GENAI_DECODE_MEMO=1`. Consulted on the top-level CPU
+    /// eager decode path — including the normal persistent-KV-binding case.
     decode_memo_enabled: bool,
     /// When set (`ONNX_GENAI_DECODE_MEMO_VERIFY=1`, or always under
     /// `debug_assertions`), every memo replay is asserted equal to a fresh
@@ -1019,6 +1019,17 @@ pub(crate) struct Executor {
     /// allocation-amortized (Stage 1's whole purpose) rather than a per-token
     /// `HashMap`/`Vec` rebuild.
     decode_memo_resolved: HashMap<ValueId, Vec<usize>>,
+    /// Diagnostic counters (proof the memo actually fires on the real path, so a
+    /// gate that silently excludes it is never shipped again). Incremented per
+    /// memo-eligible eager step; a summary is emitted on drop when
+    /// `ONNX_GENAI_DECODE_MEMO_STATS=1`.
+    decode_memo_primed_count: u64,
+    decode_memo_rebuilt_count: u64,
+    decode_memo_replayed_count: u64,
+    /// Steps that routed through the memo path but were structurally ineligible
+    /// (memo OFF, CUDA, nested, or non-eager) — counted only when the master
+    /// switch is on, to make an over-restrictive gate observable.
+    decode_memo_ineligible_count: u64,
 }
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
@@ -1076,13 +1087,45 @@ struct DecodePlanMemo {
     /// strip the previous step's just-in-time (data-dependent) entries from the
     /// persistent working map before replay, so the run loop recomputes them.
     canonical: HashSet<ValueId>,
+    /// L-abstracted structural fingerprint of the persistent device-I/O binding
+    /// set the memo was built under. Pure-L KV growth leaves this unchanged (so
+    /// the step replays); a binding appearing/disappearing, a role flip, or a
+    /// dtype change alters it and forces a rebuild. See [`DecodeBindingSig`].
+    reference_external_sig: Vec<DecodeBindingSig>,
+}
+
+/// L-abstracted structural fingerprint of one persistent (device-bound) I/O
+/// binding, for the decode-plan memo replay guard.
+///
+/// Unlike [`ExternalCaptureSig`] — which is pointer/capacity- and concrete-shape-
+/// exact for CUDA capture seeding — this abstracts the growing length symbol `L`
+/// to its symbolic identity by fingerprinting the binding's *declared* (symbolic)
+/// shape (`value_shapes[vid]`, which is graph-static). Two decode steps that
+/// differ only by KV length therefore compare **equal** and replay, while a
+/// structural change (a binding added/removed, an input/output role flip, or a
+/// dtype change) compares unequal and forces a rebuild. Pointer and byte capacity
+/// are deliberately **excluded**: Stage 1 memoizes shape resolution only (buffers
+/// are re-sized every step outside the memo), so a KV-cache realloc must not
+/// invalidate the plan — including `ptr`/`len` here would force a rebuild on every
+/// growth-driven reallocation and leave the memo perpetually dead on the real
+/// decode path.
+#[derive(Clone, PartialEq, Eq)]
+struct DecodeBindingSig {
+    vid: ValueId,
+    is_input: bool,
+    dtype: DataType,
+    decl_shape: Shape,
 }
 
 impl DecodePlanMemo {
     /// A step is a plan-match (may replay) iff it binds exactly the same symbol
-    /// set as the reference and agrees with it on every non-varying symbol.
-    /// Only the varying (length / past-length) symbols may differ.
-    fn matches(&self, bindings: &HashMap<SymbolId, usize>) -> bool {
+    /// set as the reference and agrees with it on every non-varying symbol (only
+    /// the varying length / past-length symbols may differ) **and** presents the
+    /// same L-abstracted persistent-binding signature.
+    fn matches(&self, bindings: &HashMap<SymbolId, usize>, external_sig: &[DecodeBindingSig]) -> bool {
+        if external_sig != self.reference_external_sig {
+            return false;
+        }
         if bindings.len() != self.reference_bindings.len() {
             return false;
         }
@@ -2690,6 +2733,10 @@ impl Executor {
             decode_memo_prev_bindings: None,
             decode_memo_last_action: DecodeMemoAction::Disabled,
             decode_memo_resolved: HashMap::new(),
+            decode_memo_primed_count: 0,
+            decode_memo_rebuilt_count: 0,
+            decode_memo_replayed_count: 0,
+            decode_memo_ineligible_count: 0,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -2787,17 +2834,21 @@ impl Executor {
     fn resolve_soft_decode_memo(
         &mut self,
         bindings: &HashMap<SymbolId, usize>,
+        external: &ExternalBindings,
     ) -> HashMap<ValueId, Vec<usize>> {
-        // --- Fast path: an active memo whose non-varying bindings are unchanged.
-        //     Replays the invariant partition with ZERO allocation: the
-        //     persistent working map is taken in place, the previous step's
-        //     just-in-time entries are stripped, invariant entries are left
-        //     untouched (byte-identical by construction), and only the variant
-        //     tail is re-substituted into its existing `Vec`s.
+        // L-abstracted fingerprint of the persistent binding set (KV cache). Pure
+        // length growth leaves it unchanged; a structural change forces a rebuild.
+        let external_sig = self.decode_external_signature(external);
+        // --- Fast path: an active memo whose non-varying bindings and binding
+        //     signature are unchanged. Replays the invariant partition with ZERO
+        //     allocation: the persistent working map is taken in place, the
+        //     previous step's just-in-time entries are stripped, invariant entries
+        //     are left untouched (byte-identical by construction), and only the
+        //     variant tail is re-substituted into its existing `Vec`s.
         if self
             .decode_memo
             .as_ref()
-            .is_some_and(|memo| memo.matches(bindings))
+            .is_some_and(|memo| memo.matches(bindings, &external_sig))
         {
             // Own the memo for the duration so `self.value_shapes` /
             // `decode_memo_resolved` can be borrowed disjointly; restored below.
@@ -2841,6 +2892,7 @@ impl Executor {
             }
             self.decode_memo = Some(memo);
             self.decode_memo_last_action = DecodeMemoAction::Replayed;
+            self.decode_memo_replayed_count += 1;
             self.decode_memo_prev_bindings = Some(bindings.clone());
             return resolved;
         }
@@ -2849,6 +2901,14 @@ impl Executor {
         //     this step with the previous eligible step (two real steps, R1) —
         //     but only for a steady single-token-decode growth transition (M==1
         //     gate), so the memo never activates on prefill.
+        //
+        // Defense-in-depth (Chew): drop the persistent working map on every
+        // non-replay step so a stale invariant `Vec` from a retired plan can
+        // never leak into a future replay (e.g. if a run errored before the
+        // end-of-step persist-back). It is repopulated by this step's persist-back
+        // (or, if that step errors, left empty and defensively re-seeded next
+        // replay), so the clear costs nothing on the steady path.
+        self.decode_memo_resolved.clear();
         let resolved = self.resolve_soft(bindings);
         match self.decode_memo_prev_bindings.take() {
             Some(prev) if is_decode_growth_transition(&prev, bindings) => {
@@ -2874,8 +2934,10 @@ impl Executor {
                     invariant_shapes,
                     variant_values,
                     canonical,
+                    reference_external_sig: external_sig,
                 });
                 self.decode_memo_last_action = DecodeMemoAction::Rebuilt;
+                self.decode_memo_rebuilt_count += 1;
             }
             _ => {
                 // First observation of a regime, a bound-symbol-set change, or a
@@ -2883,10 +2945,33 @@ impl Executor {
                 // wait for the next steady-decode step to diff against.
                 self.decode_memo = None;
                 self.decode_memo_last_action = DecodeMemoAction::Primed;
+                self.decode_memo_primed_count += 1;
             }
         }
         self.decode_memo_prev_bindings = Some(bindings.clone());
         resolved
+    }
+
+    /// L-abstracted structural fingerprint of the persistent device-I/O binding
+    /// set (see [`DecodeBindingSig`]). Order-independent; the declared symbolic
+    /// shape (graph-static) stands in for the concrete one, so pure-L KV growth
+    /// yields an unchanged signature while a binding added/removed, a role flip,
+    /// or a dtype change yields a different one.
+    fn decode_external_signature(&self, external: &ExternalBindings) -> Vec<DecodeBindingSig> {
+        let mut sig: Vec<DecodeBindingSig> = external
+            .inputs
+            .keys()
+            .map(|&vid| (vid, true))
+            .chain(external.outputs.keys().map(|&vid| (vid, false)))
+            .map(|(vid, is_input)| DecodeBindingSig {
+                vid,
+                is_input,
+                dtype: self.value_dtypes[&vid],
+                decl_shape: self.value_shapes[&vid].clone(),
+            })
+            .collect();
+        sig.sort_by_key(|s| (s.vid.0, s.is_input));
+        sig
     }
 
     #[cfg(test)]
@@ -2897,11 +2982,28 @@ impl Executor {
         self.decode_memo_prev_bindings = None;
         self.decode_memo_resolved.clear();
         self.decode_memo_last_action = DecodeMemoAction::Disabled;
+        self.decode_memo_primed_count = 0;
+        self.decode_memo_rebuilt_count = 0;
+        self.decode_memo_replayed_count = 0;
+        self.decode_memo_ineligible_count = 0;
     }
 
     #[cfg(test)]
     fn decode_memo_action(&self) -> DecodeMemoAction {
         self.decode_memo_last_action
+    }
+
+    /// F5 Stage 1 memo activity counters `(primed, rebuilt, replayed, ineligible)`
+    /// accumulated over this executor's lifetime. `replayed > 0` on a real decode
+    /// run is the proof the memo actually fires (not silently gated out); the
+    /// coordinator's on-model A/B reads these to reject a vacuous pass.
+    pub(crate) fn decode_memo_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.decode_memo_primed_count,
+            self.decode_memo_rebuilt_count,
+            self.decode_memo_replayed_count,
+            self.decode_memo_ineligible_count,
+        )
     }
 
     /// Size (allocate or reuse) a backing buffer for every value from its
@@ -3567,22 +3669,39 @@ impl Executor {
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
         //
-        // F5 Stage 1: on the top-level CPU eager, owned-binding decode path the
-        // steady-state decode-plan memo replays the length-invariant partition of
-        // this map instead of rebuilding it every token. It is a pure
-        // optimization of `resolve_soft` (a function of `bindings` only), gated
-        // OFF by default and asserted byte-identical under `decode_memo_verify`.
+        // F5 Stage 1: on the top-level CPU eager decode path the steady-state
+        // decode-plan memo replays the length-invariant partition of this map
+        // instead of rebuilding it every token. It is a pure optimization of
+        // `resolve_soft` (a function of `bindings` only, since on the eager path
+        // no external/control-flow/warm seeding runs — that is Capture/Replay
+        // only), gated OFF by default and asserted byte-identical under
+        // `decode_memo_verify`.
+        //
+        // Persistent device-I/O bindings (the KV cache) are the NORMAL decode
+        // case, not an exclusion: the real native decode path always carries them
+        // (ext_in/ext_out non-empty), and `bind_symbols` already folds every
+        // external *input* binding's shape into `bindings`, so the growing KV
+        // length symbol L is captured by the replay guard exactly like any other
+        // varying symbol. The memo additionally fingerprints the external binding
+        // set (`decode_external_signature`) with L abstracted to its symbolic
+        // identity, so pure-L growth replays while any structural change (binding
+        // added/removed, role flip, dtype change) forces a rebuild.
         let decode_memo_eligible = self.decode_memo_enabled
             && mode == RunMode::Eager
             && !nested
-            && external.inputs.is_empty()
-            && external.outputs.is_empty()
             && self.ep.device_type() != DeviceType::Cuda;
         let mut resolved = {
             let _s = phase_span!("run_scoped.resolve_soft");
             if decode_memo_eligible {
-                self.resolve_soft_decode_memo(&bindings)
+                self.resolve_soft_decode_memo(&bindings, external)
             } else {
+                // Observability: if the master switch is on but this step is
+                // structurally ineligible (CUDA, nested, non-eager), count it so
+                // an over-restrictive gate silently excluding the real decode path
+                // is never shipped again (the F5 regression Ripley caught).
+                if self.decode_memo_enabled && !nested {
+                    self.decode_memo_ineligible_count += 1;
+                }
                 let mut resolved = self.resolve_soft(&bindings);
                 if mode != RunMode::Eager {
                     // Persistent bindings seed the kernel-visible geometry selected by
@@ -7361,6 +7480,20 @@ impl TensorStackAccumulator {
 
 impl Drop for Executor {
     fn drop(&mut self) {
+        // Observability (F5): a one-line memo activity summary when
+        // `ONNX_GENAI_DECODE_MEMO_STATS=1`, so an on-model A/B can confirm the
+        // memo actually fired (`replayed>0`) rather than being silently gated out.
+        if self.decode_memo_enabled
+            && std::env::var("ONNX_GENAI_DECODE_MEMO_STATS")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+                .unwrap_or(false)
+        {
+            let (primed, rebuilt, replayed, ineligible) = self.decode_memo_counts();
+            eprintln!(
+                "[decode-memo] primed={primed} rebuilt={rebuilt} replayed={replayed} \
+                 ineligible={ineligible}"
+            );
+        }
         let _ = self.ep.reset_device_graph();
         self.device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
@@ -9926,5 +10059,104 @@ mod tests {
             replays >= STEPS - 2,
             "expected the memo to replay in steady state; only {replays}/{STEPS} replays"
         );
+    }
+
+    /// Proof-of-fire (F5 Stage 1): a PERSISTENT device-I/O binding shaped like a
+    /// KV cache — input+output aliased, length `L` growing by one each step —
+    /// must PRIME then REPLAY under the memo. This is the regression lock for
+    /// Ripley's finding that the memo reported `primed=0 rebuilt=0 replayed=0` on
+    /// the real native decode path because the old gate excluded any run carrying
+    /// external bindings. With `decode_memo_verify` on (forced by
+    /// `set_decode_memo_enabled`), every replay is also asserted byte-identical to
+    /// a fresh `resolve_soft`, so this doubles as a token-exact lock on the
+    /// persistent-binding path.
+    #[test]
+    fn decode_plan_memo_fires_on_persistent_kv_bindings() {
+        use onnx_runtime_ir::{TensorData, static_shape};
+
+        // KV-like length-variant spine: kv[L] -> Relu -> kvout[L], aliased into
+        // one persistent device buffer. Static invariant tail: y[4] * w[4].
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let l = graph.intern_symbol("L");
+        let kv = graph.create_named_value("kv", DataType::Float32, vec![l.into()]);
+        graph.add_input(kv);
+        let kvout = graph.create_named_value("kvout", DataType::Float32, vec![l.into()]);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+        graph.add_output(kvout);
+
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+        graph.add_input(y);
+        let w = graph.create_named_value("w", DataType::Float32, static_shape([4]));
+        graph.set_initializer(
+            w,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let ymul = graph.create_named_value("ymul", DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(NodeId(0), "Mul", vec![Some(y), Some(w)], vec![ymul]));
+        graph.add_output(ymul);
+
+        let mut exec = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        exec.set_decode_memo_enabled(true);
+
+        // Pre-allocate the KV buffer to a fixed capacity (stable pointer) and grow
+        // only the logical length each step — the pre-allocated-KV-cache case.
+        const CAP: usize = 128;
+        let mut kv_binding = exec
+            .allocate_device_binding(
+                "kv".into(),
+                Some("kvout".into()),
+                DataType::Float32,
+                vec![CAP],
+                vec![1],
+            )
+            .unwrap();
+        let ptr0 = kv_binding.device_ptr();
+        let y_tensor = Tensor::from_f32(&[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+
+        let mut replays = 0usize;
+        for step in 0..8usize {
+            let len = 4 + step; // strictly growing KV length L
+            kv_binding.set_logical_shape(vec![len]).unwrap();
+            let bytes: Vec<u8> = (0..len).flat_map(|i| (i as f32).to_le_bytes()).collect();
+            kv_binding.write_bytes(0, &bytes).unwrap();
+            exec.run_with_device_bindings(
+                &[("y", &y_tensor)],
+                std::slice::from_mut(&mut kv_binding),
+            )
+            .unwrap();
+            if exec.decode_memo_action() == DecodeMemoAction::Replayed {
+                replays += 1;
+            }
+        }
+
+        // The pointer stayed stable (a growing-length view, not a realloc), so
+        // the memo must not have been invalidated by capacity noise.
+        assert_eq!(kv_binding.device_ptr(), ptr0);
+
+        let (primed, rebuilt, replayed, ineligible) = exec.decode_memo_counts();
+        assert_eq!(
+            ineligible, 0,
+            "persistent-KV decode must be memo-eligible, not excluded (the F5 regression)"
+        );
+        assert!(primed >= 1, "the first decode step must prime the memo");
+        assert!(
+            replayed >= 1,
+            "steady persistent-KV decode must replay the memo \
+             (primed={primed} rebuilt={rebuilt} replayed={replayed})"
+        );
+        assert_eq!(replays as u64, replayed);
     }
 }
