@@ -355,6 +355,14 @@ struct PluginKernelShared {
         *mut ort::OrtKernelContext,
     ) -> *mut ort::OrtStatus,
     release_state: Option<unsafe extern "C" fn(*mut ort::OrtNodeComputeInfo, *mut c_void)>,
+    /// Plugin state, one per thread that has executed this kernel.
+    ///
+    /// Per-thread because a plugin may be thread-affine -- the MLX one is, and
+    /// reusing its state from a second thread fails on the next token. The
+    /// entries are bounded by [`MAX_PLUGIN_THREAD_STATES`]: the decode path
+    /// uses a small fixed set of threads, so exceeding it means threads are
+    /// being created per call, and quietly accumulating plugin state for each
+    /// would be a leak that only shows up as memory growth much later.
     states: Mutex<HashMap<std::thread::ThreadId, *mut c_void>>,
     index: usize,
     calls: AtomicU64,
@@ -365,6 +373,16 @@ unsafe impl Send for PluginKernelShared {}
 unsafe impl Sync for PluginKernelShared {}
 
 impl Drop for PluginKernelShared {
+    /// Release every per-thread state.
+    ///
+    /// Known limitation: these are released on whichever thread drops the
+    /// session, not on the thread that created each one. For a plugin that is
+    /// merely thread-affine for *execution* that is fine, and it is what the
+    /// one plugin exercised here does; for a plugin whose teardown is also
+    /// thread-affine it is not, and the fix is to own the executing threads so
+    /// each state can be released on its own. Left as is because the executor
+    /// does not own those threads today, and leaking state instead would be a
+    /// worse trade.
     fn drop(&mut self) {
         if let Some(release_state) = self.release_state {
             if let Ok(states) = self.states.get_mut() {
@@ -395,6 +413,21 @@ impl Kernel for PluginCompiledKernel {
         let state = if let Some(&state) = states.get(&thread_id) {
             state
         } else {
+            // Bounded, because each entry holds plugin-side resources until the
+            // session ends. Decode runs on a small fixed set of threads, so
+            // passing this means threads are being created per call and the map
+            // would grow without limit -- better to say so than to leak.
+            if states.len() >= MAX_PLUGIN_THREAD_STATES {
+                return Err(EpError::KernelFailed(format!(
+                    "the execution provider plugin has been asked to run fused subgraph {} from \
+                     more than {MAX_PLUGIN_THREAD_STATES} threads, and it holds per-thread state \
+                     for each. Why: plugin state is created per executing thread because plugins \
+                     may be thread-affine, so a caller creating a fresh thread per call would \
+                     grow it without bound. Fix by running generation from a bounded thread pool, \
+                     or set ONNX_GENAI_BACKEND=ort to run without the plugin",
+                    self.shared.index
+                )));
+            }
             let mut state: *mut c_void = ptr::null_mut();
             // SAFETY: `info` was allocated by the plugin and remains owned by
             // `shared.runtime`; the native bridge does not expose a compute
@@ -438,11 +471,11 @@ impl Kernel for PluginCompiledKernel {
                 (&mut context as *mut HostKernelContext).cast::<ort::OrtKernelContext>(),
             )
         };
-        check_status(
-            &self.shared.runtime.path,
-            "OrtNodeComputeInfo.Compute",
-            status,
-        )?;
+        // Not `check_status`: that reports a load failure and tells the reader
+        // to check plugin compatibility and ORT_API_VERSION, which is exactly
+        // wrong once the plugin has already loaded, compiled and run. A
+        // failure here is about this call.
+        check_compute_status(&self.shared.runtime.path, self.shared.index, status)?;
         self.shared.calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -545,10 +578,71 @@ impl<'a> OrtGraphView<'a> {
         }
 
         let factory = factories[0];
+
+        // Ask the factory which devices it supports, and hand exactly those
+        // back when creating the provider.
+        //
+        // An earlier version passed `num_devices = 1` with both arrays null,
+        // which happened to work because the one plugin tested does not
+        // dereference them. The contract says these are the devices the
+        // provider "was selected to use", so any plugin is entitled to read
+        // them, and a count that describes no array is a crash waiting for a
+        // different plugin.
+        let mut ep_devices: [*mut ort::OrtEpDevice; MAX_PLUGIN_EP_DEVICES] =
+            [ptr::null_mut(); MAX_PLUGIN_EP_DEVICES];
+        let mut num_ep_devices = 0usize;
+        // SAFETY: the factory came from the plugin; the out-array and count
+        // reference live stack storage sized by `max_ep_devices`. The input
+        // device list is empty, which the API permits: a plugin that owns its
+        // own hardware (rather than describing one ORT enumerated) creates its
+        // devices here.
+        let status = unsafe {
+            let get_devices =
+                (*factory)
+                    .GetSupportedDevices
+                    .ok_or_else(|| EpError::EpLoadFailed {
+                        path: library_path.to_path_buf(),
+                        reason: "OrtEpFactory.GetSupportedDevices is null; fix by using a \
+                                 complete plugin EP factory"
+                            .into(),
+                    })?;
+            get_devices(
+                factory,
+                ptr::null(),
+                0,
+                ep_devices.as_mut_ptr(),
+                ep_devices.len(),
+                &mut num_ep_devices,
+            )
+        };
+        check_status(library_path, "OrtEpFactory.GetSupportedDevices", status)?;
+        if num_ep_devices == 0 {
+            return Err(EpError::EpLoadFailed {
+                path: library_path.to_path_buf(),
+                reason: "the plugin reported no supported devices; fix by checking that its \
+                         hardware is present and its driver is installed"
+                    .into(),
+            });
+        }
+        let num_ep_devices = num_ep_devices.min(ep_devices.len());
+
+        // Unpack each OrtEpDevice into the hardware device and metadata that
+        // CreateEp wants, keeping the two arrays index-aligned.
+        let mut hardware: Vec<*const ort::OrtHardwareDevice> = Vec::with_capacity(num_ep_devices);
+        let mut metadata: Vec<*const ort::OrtKeyValuePairs> = Vec::with_capacity(num_ep_devices);
+        for device in ep_devices.iter().take(num_ep_devices) {
+            // SAFETY: each entry was written by the factory above and is
+            // non-null for indices below `num_ep_devices`. The accessors are
+            // pure reads on the plugin-owned device.
+            unsafe {
+                hardware.push(ep_device_hardware(*device));
+                metadata.push(ep_device_metadata(*device));
+            }
+        }
+
         let mut ep: *mut ort::OrtEp = ptr::null_mut();
-        // SAFETY: The factory pointer came from the plugin. MLX's factory only
-        // requires exactly one device count for Stage 1 and does not dereference
-        // the device arrays in CreateEp.
+        // SAFETY: the factory came from the plugin, and the two arrays are
+        // index-aligned and exactly `num_ep_devices` long, matching the count.
         let status = unsafe {
             let create_ep = (*factory).CreateEp.ok_or_else(|| EpError::EpLoadFailed {
                 path: library_path.to_path_buf(),
@@ -557,9 +651,9 @@ impl<'a> OrtGraphView<'a> {
             })?;
             create_ep(
                 factory,
-                ptr::null(),
-                ptr::null(),
-                1,
+                hardware.as_ptr(),
+                metadata.as_ptr(),
+                num_ep_devices,
                 ptr::null(),
                 ptr::null(),
                 &mut ep,
@@ -663,10 +757,10 @@ impl HostOrtValue {
         match &mut self.storage {
             HostOrtValueStorage::Owned(data) => data.as_mut_ptr().cast(),
             HostOrtValueStorage::Borrowed { ptr, .. } => *ptr,
-            // Initializers are read-only. A plugin asking to write one is a
-            // bug in the plugin, and handing back a null pointer is how the
-            // ORT C API says "not available" -- far better than aliasing a
-            // shared, read-only mapping mutably.
+            // No mutable pointer exists for a shared, read-only mapping, and
+            // aliasing one mutably to satisfy a caller would be worse than
+            // refusing. The accessor turns this into an error status rather
+            // than reporting success with a null pointer.
             HostOrtValueStorage::Mapped { .. } => ptr::null_mut(),
         }
     }
@@ -1124,6 +1218,51 @@ fn graph_from_ptr<'a>(graph: *const ort::OrtGraph) -> &'a HostGraph {
     unsafe { &*(graph.cast::<HostGraph>()) }
 }
 
+/// Upper bound on devices accepted from a plugin factory.
+///
+/// A fixed buffer keeps the call allocation-free; the API reports how many it
+/// wanted, and taking the first few of an implausibly long list is better than
+/// trusting a length to size a heap allocation.
+const MAX_PLUGIN_EP_DEVICES: usize = 16;
+
+/// Upper bound on threads holding per-thread plugin state for one kernel.
+///
+/// Generous against a decode loop, which uses a handful of threads, and small
+/// enough that a caller spawning a thread per call is reported rather than
+/// silently accumulating plugin resources.
+const MAX_PLUGIN_THREAD_STATES: usize = 64;
+
+/// The hardware device an `OrtEpDevice` describes.
+///
+/// # Safety
+///
+/// `device` must be a live `OrtEpDevice` returned by a plugin factory.
+unsafe fn ep_device_hardware(device: *mut ort::OrtEpDevice) -> *const ort::OrtHardwareDevice {
+    // SAFETY: `ort_api` returns our own process-lifetime vtable, and the
+    // accessor is a pure read on the plugin-owned device the caller vouched for.
+    unsafe {
+        match (*ort_api()).EpDevice_Device {
+            Some(accessor) => accessor(device),
+            None => ptr::null(),
+        }
+    }
+}
+
+/// The provider metadata an `OrtEpDevice` carries.
+///
+/// # Safety
+///
+/// `device` must be a live `OrtEpDevice` returned by a plugin factory.
+unsafe fn ep_device_metadata(device: *mut ort::OrtEpDevice) -> *const ort::OrtKeyValuePairs {
+    // SAFETY: as above -- our own vtable, and a pure read on a live device.
+    unsafe {
+        match (*ort_api()).EpDevice_EpMetadata {
+            Some(accessor) => accessor(device),
+            None => ptr::null(),
+        }
+    }
+}
+
 fn support_from_ptr<'a>(support: *mut ort::OrtEpGraphSupportInfo) -> &'a mut HostSupportInfo {
     // SAFETY: The support pointer passed to the plugin is a mutable HostSupportInfo.
     unsafe { &mut *(support.cast::<HostSupportInfo>()) }
@@ -1138,22 +1277,52 @@ fn support_from_ptr<'a>(support: *mut ort::OrtEpGraphSupportInfo) -> &'a mut Hos
 /// something that had not finished after eight minutes. Mapping is also what
 /// the loader does with the same files, so the pages are shared rather than
 /// duplicated per tensor.
-static MAPPED_WEIGHTS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mmap>>>> = OnceLock::new();
+static MAPPED_WEIGHTS: OnceLock<Mutex<HashMap<PathBuf, MappedWeightFile>>> = OnceLock::new();
+
+/// A mapping plus enough of the file's identity to notice it was replaced.
+struct MappedWeightFile {
+    map: Arc<Mmap>,
+    /// Modification time and length at the moment it was mapped.
+    ///
+    /// Keyed by path alone, the cache would hand a later session the previous
+    /// model's weights after a file at the same path was rebuilt -- wrong
+    /// numbers, no error. Cheap to check and it makes the cache safe to keep
+    /// process-wide.
+    identity: (Option<std::time::SystemTime>, u64),
+}
+
+fn weight_file_identity(path: &Path) -> (Option<std::time::SystemTime>, u64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => (meta.modified().ok(), meta.len()),
+        Err(_) => (None, 0),
+    }
+}
 
 fn mapped_weight_file(path: &Path) -> Option<Arc<Mmap>> {
+    let identity = weight_file_identity(path);
     let cache = MAPPED_WEIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(map) = cache.get(path) {
-        return Some(Arc::clone(map));
+    if let Some(entry) = cache.get(path)
+        && entry.identity == identity
+    {
+        return Some(Arc::clone(&entry.map));
     }
     let file = std::fs::File::open(path).ok()?;
     // SAFETY: the file is opened read-only and the mapping is never handed out
-    // mutably. A weight file changing underneath a loaded model would be a
-    // problem for the loader's own mappings first; this adds no new exposure.
+    // mutably. A weight file rewritten under a live mapping would be a problem
+    // for the loader's own mapping of the same file first; this adds no new
+    // exposure, and the identity check above stops a *new* session inheriting
+    // a stale one.
     let map = Arc::new(unsafe { Mmap::map(&file) }.ok()?);
-    cache.insert(path.to_path_buf(), Arc::clone(&map));
+    cache.insert(
+        path.to_path_buf(),
+        MappedWeightFile {
+            map: Arc::clone(&map),
+            identity,
+        },
+    );
     Some(map)
 }
 
@@ -1332,6 +1501,32 @@ fn status_error(message: &str) -> *mut ort::OrtStatus {
         msg: c,
     }))
     .cast::<ort::OrtStatus>()
+}
+
+/// Translate a status from executing a fused subgraph.
+///
+/// Separate from [`check_status`] because the remedies are different: a load
+/// or compile failure points at plugin compatibility, while a failure here
+/// means a subgraph the plugin already accepted did not run.
+fn check_compute_status(
+    path: &Path,
+    fusion_index: usize,
+    status: *mut ort::OrtStatus,
+) -> Result<()> {
+    if status.is_null() {
+        return Ok(());
+    }
+    // SAFETY: Plugin statuses in this bridge are created by our CreateStatus callback.
+    let boxed = unsafe { Box::from_raw(status.cast::<HostStatus>()) };
+    Err(EpError::KernelFailed(format!(
+        "the execution provider plugin at {} failed to run fused subgraph {fusion_index} with \
+         ORT error code {}: {}. The plugin loaded and accepted this subgraph, so this is a \
+         failure of the call rather than of loading; fix by checking the inputs the model feeds \
+         this subgraph, or set ONNX_GENAI_BACKEND=ort to run without the plugin",
+        path.display(),
+        boxed.code,
+        boxed.msg.to_string_lossy(),
+    )))
 }
 
 fn check_status(path: &Path, action: &str, status: *mut ort::OrtStatus) -> Result<()> {
@@ -1531,10 +1726,21 @@ unsafe extern "C" fn host_get_tensor_mutable_data(
             "GetTensorMutableData failed: null value/output pointer; fix the plugin to pass valid ORT pointers",
         );
     }
-    // SAFETY: Stage 1 exposes initializer bytes read-only in practice. The MLX
-    // EP uses this function for scalar reads; it must not write through it.
+    let data = ort_value_from_mut_ptr(value).data_mut_ptr();
+    if data.is_null() {
+        // Reporting success while handing back null would invite the caller to
+        // dereference it: a null status means the out-pointer is usable. This
+        // is reached for an initializer served straight from the mapped weight
+        // file, which has no writable storage to offer.
+        return status_error(
+            "GetTensorMutableData failed: this tensor is a read-only initializer backed by the \
+             model's weight file, so it has no mutable storage; fix by reading it with \
+             GetTensorData instead of asking for a mutable pointer",
+        );
+    }
+    // SAFETY: `out` is non-null, checked above.
     unsafe {
-        *out = ort_value_from_mut_ptr(value).data_mut_ptr();
+        *out = data;
     }
     ptr::null_mut()
 }
