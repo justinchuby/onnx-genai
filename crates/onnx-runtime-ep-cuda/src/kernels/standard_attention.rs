@@ -530,20 +530,19 @@ pub struct StandardAttentionKernel {
     /// The registered opset version this kernel serves (23, or 24 for 24–26).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
-    /// Persistent device scratch for the fixed-capacity, device-valid-length
-    /// decode path so the captured hot path performs no per-op allocation.
-    /// Reserved lazily during the eager warmup step and reused (never grown)
-    /// during CUDA-graph capture/replay. Unused by the eager/dense/growing
-    /// paths, which keep their per-op scratch.
+    /// Persistent device scratch for capture-eligible single-token decode paths
+    /// so the captured hot path performs no per-op allocation. Reserved lazily
+    /// during the eager warmup step and reused (never grown) during CUDA-graph
+    /// capture/replay.
     workspace: Mutex<StdAttnWorkspace>,
-    /// Set to the fixed-capacity decode signature after a successful
+    /// Set to the single-token decode signature after a successful
     /// capture-eligible call; gates [`Self::capture_support`] to Supported only
     /// once such a step has been warmed (mirrors GroupQueryAttention).
     last_capture_safe_signature: Mutex<Option<StdAttnCaptureSignature>>,
 }
 
-/// Fixed-capacity decode signature warmed as capture-safe. A subsequent capture
-/// pass reuses the workspace slots sized for this shape.
+/// Decode signature warmed as capture-safe. A subsequent capture pass reuses
+/// the workspace slots sized for this shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StdAttnCaptureSignature {
     dtype: DataType,
@@ -560,7 +559,9 @@ const WS_SCORES: usize = 0;
 const WS_DEV_LEN: usize = 1;
 const WS_OFFSETS: usize = 2;
 const WS_PAD_LIMITS: usize = 3;
-const WS_COUNT: usize = 4;
+const WS_STAGE_KEY: usize = 4;
+const WS_STAGE_VALUE: usize = 5;
+const WS_COUNT: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct StdWorkspaceSlot {
@@ -1313,25 +1314,6 @@ impl Kernel for StandardAttentionKernel {
             let capacity_value = kv_frozen || value_cap > value_total_seq;
             let stage_key = alias_key && !capacity_key;
             let stage_value = alias_value && !capacity_value;
-            let key_kv_ptr = if stage_key {
-                alloc(
-                    &self.runtime,
-                    &mut owned,
-                    present_key_expected * element_bytes,
-                )?
-            } else {
-                present_key_ptr
-            };
-            let value_kv_ptr = if stage_value {
-                alloc(
-                    &self.runtime,
-                    &mut owned,
-                    present_value_expected * element_bytes,
-                )?
-            } else {
-                present_value_ptr
-            };
-
             // On-device valid length ABI for default-domain Attention: derive
             // the valid attended length from the attention-mask frontier so the
             // kernel reads it from device memory instead of host shape metadata
@@ -1351,13 +1333,16 @@ impl Kernel for StandardAttentionKernel {
                 && alias_key
                 && alias_value;
 
-            // Fixed-capacity + device-length decode is the capture-safe path: its
-            // launch geometry is host-constant, so its scratch lives in a
-            // persistent per-kernel workspace (reserved during the eager warmup
-            // step, reused with no allocation during capture/replay) rather than
-            // per-op allocations. Every other path keeps its per-op scratch.
+            // Single-token fixed-capacity decode and the staged dense growth path
+            // can be captured once warmed. Both have host-static launch geometry
+            // for a given step; retain every scratch allocation in the per-kernel
+            // workspace so capture records only device work. The staged path needs
+            // dedicated K/V slots because its source must remain disjoint from the
+            // aliased present/past destination.
             let capturing = self.runtime.is_capturing()?;
-            let mut ws = if dev_length_eligible {
+            let staged_decode_eligible = (stage_key || stage_value) && batch == 1 && q_seq == 1;
+            let capture_workspace_eligible = dev_length_eligible || staged_decode_eligible;
+            let mut ws = if capture_workspace_eligible {
                 Some(self.workspace.lock().map_err(|_| {
                     EpError::KernelFailed("Attention: workspace lock poisoned".into())
                 })?)
@@ -1367,6 +1352,32 @@ impl Kernel for StandardAttentionKernel {
             let scores_ptr = match ws.as_mut() {
                 Some(ws) => ws.reserve(WS_SCORES, qk_expected * 4)?,
                 None => alloc(&self.runtime, &mut owned, qk_expected * 4)?,
+            };
+            let key_kv_ptr = if stage_key {
+                match ws.as_mut() {
+                    Some(ws) => ws.reserve(WS_STAGE_KEY, present_key_expected * element_bytes)?,
+                    None => alloc(
+                        &self.runtime,
+                        &mut owned,
+                        present_key_expected * element_bytes,
+                    )?,
+                }
+            } else {
+                present_key_ptr
+            };
+            let value_kv_ptr = if stage_value {
+                match ws.as_mut() {
+                    Some(ws) => {
+                        ws.reserve(WS_STAGE_VALUE, present_value_expected * element_bytes)?
+                    }
+                    None => alloc(
+                        &self.runtime,
+                        &mut owned,
+                        present_value_expected * element_bytes,
+                    )?,
+                }
+            } else {
+                present_value_ptr
             };
             let dev_len_ptr = if dev_length_eligible {
                 let ptr = match ws.as_mut() {
@@ -1571,7 +1582,7 @@ impl Kernel for StandardAttentionKernel {
             // single-token step has run through the device-length workspace path
             // with no per-op allocation or synchronize. `capture_support` gates
             // on this so the session only captures a warmed decode shape.
-            if dev_length_eligible && batch == 1 && q_seq == 1 {
+            if capture_workspace_eligible {
                 let signature = StdAttnCaptureSignature {
                     dtype,
                     batch,
@@ -1604,15 +1615,13 @@ impl Kernel for StandardAttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // Eligible once a fixed-capacity, device-valid-length, single-token
-        // decode step has been warmed (its scratch reserved in the persistent
-        // workspace and its control uploads done outside capture). Until then —
-        // or for the eager/dense/growing paths, which never set the signature —
-        // capture is declined so those steps run eagerly.
+        // Eligible once a single-token decode step has been warmed with all
+        // scratch reserved in the persistent workspace and its control uploads
+        // done outside capture.
         match self.last_capture_safe_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed fixed-capacity device-valid-length single-token decode step",
+                "requires a warmed capture-eligible single-token decode step",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "Attention capture signature is unavailable because its state lock was poisoned",
