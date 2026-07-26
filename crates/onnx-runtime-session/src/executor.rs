@@ -67,7 +67,7 @@ use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy, NodeIo, ShapeData,
     SymbolInterner, TypeInfo,
 };
-use onnx_runtime_tracer::{Args, TraceContext, annotate_current_span_with};
+use onnx_runtime_tracer::{Args, SpanGuard, TraceContext, annotate_current_span_with};
 
 use crate::SessionOutput;
 use crate::error::{Result, SessionError};
@@ -250,6 +250,12 @@ macro_rules! phase_span {
     ($phase:expr) => {
         phase_profile::PhaseSpan::new($phase)
     };
+}
+
+fn trace_span(name: &'static str, cat: &'static str) -> Option<SpanGuard> {
+    onnx_runtime_tracer::global_context()
+        .filter(|trace| trace.is_enabled())
+        .map(|trace| trace.span(name, cat))
 }
 
 /// Public re-export so the bench/profile harness can dump the phase table.
@@ -2268,6 +2274,12 @@ impl Executor {
         mut ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
     ) -> Result<Self> {
+        let mut placement_span = trace_span("session.node_placement", "session");
+        let requested_provider = placement_span.as_ref().map(|_| ep.name().to_string());
+        let requested_device = placement_span
+            .as_ref()
+            .map(|_| ep.device_type().trace_name().into_owned());
+        let nodes_before_placement = graph.num_nodes();
         // Reject incompatible control-flow signatures before EP optimizers run:
         // optimizer postconditions recursively validate subgraphs and can
         // otherwise obscure the actionable If diagnostic with a structural
@@ -2281,10 +2293,15 @@ impl Executor {
         // control-flow signature check above.
         graph.topological_order()?;
         reject_unsupported_operators(&graph, ep.as_ref())?;
-        fuse_silu_patterns(&mut graph);
+        let silu_fused = fuse_silu_patterns(&mut graph);
         let graph_before_ep_passes = graph.clone();
+        let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
+        let ep_pass_nodes_after = graph.num_nodes();
         let mut execution_provider_fallback_report = cuda_fallback_report(&graph, ep.as_ref());
+        let fallback_declines = execution_provider_fallback_report
+            .as_ref()
+            .map_or(0, |report| report.declines.len());
         if let Some(report) = &mut execution_provider_fallback_report {
             if require_cuda {
                 return Err(SessionError::HeterogeneousPlacementRequired {
@@ -2301,9 +2318,43 @@ impl Executor {
                 "[onnx-genai-warning] {report}. Set ONNX_GENAI_REQUIRE_CUDA=1 to reject this fallback"
             );
         }
+        if let Some(span) = placement_span.as_mut() {
+            let mut assigned_ops = BTreeSet::new();
+            let assigned_nodes = collect_executable_ops(&graph, &mut assigned_ops);
+            span.set_args(
+                Args::new()
+                    .with("requested_provider", requested_provider.unwrap_or_default())
+                    .with("requested_device", requested_device.unwrap_or_default())
+                    .with("selected_provider", ep.name().to_string())
+                    .with(
+                        "selected_device",
+                        ep.device_type().trace_name().into_owned(),
+                    )
+                    .with("nodes_before", nodes_before_placement as u64)
+                    .with("nodes_after", graph.num_nodes() as u64)
+                    .with("ep_pass_nodes_before", ep_pass_nodes_before as u64)
+                    .with("ep_pass_nodes_after", ep_pass_nodes_after as u64)
+                    .with("silu_fused", silu_fused as u64)
+                    .with("assigned_nodes", assigned_nodes as u64)
+                    .with("assigned_op_classes", assigned_ops.len() as u64)
+                    .with("fallback_declines", fallback_declines as u64),
+            );
+        }
+        drop(placement_span);
         // Topological order up front: also validates the selected graph is a DAG.
         let order = graph.topological_order()?;
-        let weight_handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
+        let weight_handles = {
+            let mut span = trace_span("session.lazy_weight_handles", "session");
+            let handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("handles", handles.len() as u64)
+                        .with("initializers", graph.initializers.len() as u64),
+                );
+            }
+            handles
+        };
 
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
         let mut value_dtypes: HashMap<ValueId, DataType> = HashMap::new();
@@ -2318,17 +2369,30 @@ impl Executor {
         //    eager buffer is shared by every consumer. Host mmap bytes retain the
         //    existing zero-copy borrow path.
         let init_align = TensorLayout::contiguous().alignment;
+        let mut initializer_span = trace_span("session.initializer_buffers", "session");
+        let mut initializer_count = 0_u64;
+        let mut initializer_bytes = 0_u64;
+        let mut borrowed_initializers = 0_u64;
+        let mut copied_initializers = 0_u64;
+        let mut lazy_initializers = 0_u64;
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
             value_dtypes.insert(vid, dtype);
             value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
             if !ep.device_id().is_host_accessible() && weight_handles.contains_key(&vid) {
+                if initializer_span.is_some() {
+                    lazy_initializers += 1;
+                }
                 continue;
             }
             let bytes = weights.bytes(weight).ok_or_else(|| {
                 SessionError::Internal(format!("weight bytes unavailable for value#{}", vid.0))
             })?;
+            if initializer_span.is_some() {
+                initializer_count += 1;
+                initializer_bytes += bytes.len() as u64;
+            }
             // Only borrow when the value has NO producer. The borrowed
             // `DeviceBuffer` aliases read-only mmap/inline storage, so it must
             // never be written. A legitimate initializer always has
@@ -2348,6 +2412,9 @@ impl Executor {
                 && !bytes.is_empty()
                 && (bytes.as_ptr() as usize).is_multiple_of(borrow_align)
             {
+                if initializer_span.is_some() {
+                    borrowed_initializers += 1;
+                }
                 // Zero-copy: alias the suitably aligned initializer bytes. For
                 // external data this is only the dtype alignment; inline data
                 // retains the EP allocation alignment requirement.
@@ -2364,12 +2431,26 @@ impl Executor {
                     )
                 }
             } else {
+                if initializer_span.is_some() {
+                    copied_initializers += 1;
+                }
                 let mut owned = ep.allocate(bytes.len().max(1), init_align)?;
                 ep.copy_from_host(bytes, &mut owned)?;
                 owned
             };
             buffer_shapes.insert(vid, dims);
             buffers.insert(vid, buf);
+        }
+        if let Some(span) = initializer_span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("initializers", initializer_count)
+                    .with("bytes", initializer_bytes)
+                    .with("borrowed_initializers", borrowed_initializers)
+                    .with("copied_initializers", copied_initializers)
+                    .with("lazy_initializers", lazy_initializers)
+                    .with("buffers", buffers.len() as u64),
+            );
         }
 
         // 2) Record the loader shape + dtype of every remaining value (graph
@@ -2420,7 +2501,9 @@ impl Executor {
         }
 
         // 3) Build the structural per-node plan.
+        let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
+        let mut skipped_epcontext = 0_u64;
         for &nid in &order {
             let node = graph.node(nid);
             // EPContext nodes are pre-compiled: they bypass placement and were
@@ -2429,6 +2512,9 @@ impl Executor {
             // kernels — the CPU EP has no `EPContext` kernel — so skip them
             // here.
             if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
+                if plan_span.is_some() {
+                    skipped_epcontext += 1;
+                }
                 continue;
             }
             // Preserve positional input arity: keep interior `None` (omitted
@@ -2456,6 +2542,18 @@ impl Executor {
                 input_dtypes,
                 output_dtypes,
             });
+        }
+        if let Some(span) = plan_span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("topological_nodes", order.len() as u64)
+                    .with("plan_len", plan.len() as u64)
+                    .with("skipped_epcontext_nodes", skipped_epcontext)
+                    .with("values", graph.values.len() as u64)
+                    .with("inputs", graph.inputs.len() as u64)
+                    .with("outputs", graph.outputs.len() as u64)
+                    .with("has_symbols", has_symbols),
+            );
         }
 
         // 4) name → value id and the set of caller-required inputs.
@@ -2523,10 +2621,20 @@ impl Executor {
         //    hits. Symbolic graphs cannot be sized until a `run` fixes their
         //    shapes, so their buffers/kernels are created on first use.
         if !exec.has_symbols {
+            let mut span = trace_span("session.static_materialize", "session");
             let empty = HashMap::new();
             let resolved = exec.resolve_all(&empty)?;
             exec.size_buffers(&resolved)?;
             exec.compile_all(&resolved)?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("resolved_values", resolved.len() as u64)
+                        .with("buffers", exec.buffers.len() as u64)
+                        .with("plan_len", exec.plan.len() as u64)
+                        .with("cache_entries", exec.cache.stats().entries as u64),
+                );
+            }
         }
         Ok(exec)
     }
@@ -2649,6 +2757,11 @@ impl Executor {
 
     /// Populate the kernel cache for the compiled plan against `resolved` shapes.
     fn compile_all(&mut self, resolved: &HashMap<ValueId, Vec<usize>>) -> Result<()> {
+        let mut span = trace_span("session.kernel_compile_plan", "session");
+        let cache_entries_before = self.cache.stats().entries;
+        let mut compiled_nodes = 0_u64;
+        let mut skipped_control_flow = 0_u64;
+        let mut skipped_sequence = 0_u64;
         for i in 0..self.plan.len() {
             let node_id = self.plan[i].node_id;
             let node = self.graph.node(node_id);
@@ -2656,13 +2769,22 @@ impl Executor {
             // nested subgraphs through the executor's own path, so they have no
             // entry in the EP kernel registry and must not be compiled here.
             if is_control_flow_op(&node.op_type, &node.domain) {
+                if span.is_some() {
+                    skipped_control_flow += 1;
+                }
                 continue;
             }
             // Sequence ops are executor-handled (they operate on sequence-of-
             // tensor values, not tensor views) — they have no EP kernel and must
             // not be compiled here, exactly like control-flow ops.
             if is_sequence_op(&node.op_type, &node.domain) {
+                if span.is_some() {
+                    skipped_sequence += 1;
+                }
                 continue;
+            }
+            if span.is_some() {
+                compiled_nodes += 1;
             }
             let input_shapes = Self::node_input_shapes(&self.plan[i], resolved);
             let input_dtypes = self.plan[i].input_dtypes.clone();
@@ -2682,6 +2804,17 @@ impl Executor {
                 opset,
                 self.ep.as_ref(),
             )?;
+        }
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("plan_len", self.plan.len() as u64)
+                    .with("compiled_nodes", compiled_nodes)
+                    .with("skipped_control_flow", skipped_control_flow)
+                    .with("skipped_sequence", skipped_sequence)
+                    .with("cache_entries_before", cache_entries_before as u64)
+                    .with("cache_entries_after", self.cache.stats().entries as u64),
+            );
         }
         Ok(())
     }

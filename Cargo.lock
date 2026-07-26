@@ -2379,7 +2379,10 @@ dependencies = [
 name = "onnx-runtime-ep-api"
 version = "0.1.0-dev.4"
 dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
  "onnx-runtime-ir",
+ "onnx-runtime-loader",
  "onnx-runtime-optimizer",
  "onnx-runtime-tracer",
  "thiserror 2.0.19",
@@ -2435,6 +2438,7 @@ dependencies = [
  "memmap2",
  "onnx-runtime-ir",
  "onnx-runtime-shape-inference",
+ "onnx-runtime-tracer",
  "prost",
  "prost-build",
  "prost-reflect",
@@ -2456,6 +2460,7 @@ version = "0.1.0-dev.4"
 dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-tracer",
  "thiserror 2.0.19",
 ]
 

@@ -433,10 +433,15 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        let model_directory = ModelDirectory::load(model_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
-        let decode_backend =
-            resolve_decode_backend(&model_directory.model_path, config.decode_backend)?;
+        let model_directory = {
+            let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
+            ModelDirectory::load(model_dir)
+                .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?
+        };
+        let decode_backend = {
+            let _span = onnx_genai_ort::prof_span!("engine.resolve_decode_backend");
+            resolve_decode_backend(&model_directory.model_path, config.decode_backend)?
+        };
         if decode_backend == EngineDecodeBackend::Native {
             return augment_backend_error(
                 Self::from_native_model_directory(model_directory, config, &session_options),
@@ -450,17 +455,23 @@ impl Engine {
         let mut session_options = session_options;
         configure_ort_cuda_graph(&mut session_options, &model_directory.model_path);
 
-        let environment = Environment::new("onnx-genai-engine")
-            .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
-        let session = augment_backend_error(
-            Session::new(
-                &environment,
-                &model_directory.model_path,
-                session_options.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e)),
-            EngineDecodeBackend::Ort,
-        )?;
+        let environment = {
+            let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
+            Environment::new("onnx-genai-engine")
+                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?
+        };
+        let session = {
+            let _span = onnx_genai_ort::prof_span!("engine.ort_session_load");
+            augment_backend_error(
+                Session::new(
+                    &environment,
+                    &model_directory.model_path,
+                    session_options.clone(),
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e)),
+                EngineDecodeBackend::Ort,
+            )?
+        };
 
         // Resolve inference metadata. Our own `inference_metadata.yaml` is the
         // canonical source of truth. When a model ships without it (e.g. the
@@ -468,18 +479,22 @@ impl Engine {
         // `genai_config.json`), fall back to converting that config into native
         // metadata so share-buffer-capable GQA models still get the O(1)/token
         // decode path instead of the growing rebind path.
-        let metadata = if let Some(metadata_path) = &model_directory.metadata_path {
-            onnx_genai_metadata::load_metadata(metadata_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
-        } else if let Some(compat) = genai_config_compat_metadata(&model_directory.root, &session)?
-        {
-            tracing::info!(
-                "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
-            );
-            compat
-        } else {
-            tracing::warn!("No inference metadata found, using defaults");
-            default_inference_metadata()
+        let metadata = {
+            let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
+            if let Some(metadata_path) = &model_directory.metadata_path {
+                onnx_genai_metadata::load_metadata(metadata_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
+            } else if let Some(compat) =
+                genai_config_compat_metadata(&model_directory.root, &session)?
+            {
+                tracing::info!(
+                    "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
+                );
+                compat
+            } else {
+                tracing::warn!("No inference metadata found, using defaults");
+                default_inference_metadata()
+            }
         };
 
         // Validate capabilities
@@ -511,25 +526,37 @@ impl Engine {
             .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
         let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
         let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
-        let decode_path = detect_model_decode_path(
-            &session,
-            metadata_max_context,
-            shared_kv_max_len,
-            sliding_window,
-            sink_tokens,
-        )?;
-        let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let decode_path = {
+            let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
+            detect_model_decode_path(
+                &session,
+                metadata_max_context,
+                shared_kv_max_len,
+                sliding_window,
+                sink_tokens,
+            )?
+        };
+        let tokenizer = {
+            let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
+            Tokenizer::from_file(&model_directory.tokenizer_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?
+        };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
-        let kv_model = infer_kv_model_info(&session, config.page_size, config.kv_cache_dtype)?;
+        let kv_model = {
+            let _span = onnx_genai_ort::prof_span!("engine.kv_model_info");
+            infer_kv_model_info(&session, config.page_size, config.kv_cache_dtype)?
+        };
         let governor_kv_config = governor_kv_config(kv_model.as_ref(), &config)?;
-        let governor = EngineResourceGovernor::new(
-            config.limits.clone(),
-            config.allow_runtime_override,
-            governor_kv_config,
-            onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?;
+        let governor = {
+            let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
+            EngineResourceGovernor::new(
+                config.limits.clone(),
+                config.allow_runtime_override,
+                governor_kv_config,
+                onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
+        };
         let mut scheduler_config = config.scheduler.clone();
         if scheduler_config.bytes_per_token.is_none() {
             scheduler_config.bytes_per_token = Some(
@@ -586,6 +613,10 @@ impl Engine {
             None
         };
         let kv_cache = if let Some(kv_model) = &kv_model {
+            let mut span = onnx_genai_ort::prof_span!("engine.kv_cache_alloc");
+            span.set_arg("page_size", kv_model.tensor_config.page_size as u64);
+            span.set_arg("num_gpu_pages", config.num_gpu_pages as u64);
+            span.set_arg("layers", kv_model.layer_configs.len() as u64);
             // The paged tensor layout is derived from present-KV outputs: each
             // layer has key/value tensors shaped like [batch, kv_heads, seq, head_dim].
             // Per-layer geometry (heterogeneous head_dim across layers, e.g. the
@@ -598,6 +629,9 @@ impl Engine {
                 config.num_gpu_pages,
             )
         } else {
+            let mut span = onnx_genai_ort::prof_span!("engine.kv_cache_alloc");
+            span.set_arg("page_size", config.page_size as u64);
+            span.set_arg("num_gpu_pages", config.num_gpu_pages as u64);
             PagedKvCache::new(config.page_size, config.num_gpu_pages)
         };
 
@@ -930,8 +964,10 @@ impl Engine {
             None
         };
 
-        let connector =
-            build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?;
+        let connector = {
+            let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
+            build_connector_bridge(&config.kv_connector, &model_directory, kv_model.as_ref())?
+        };
 
         Ok(Self {
             decode_backend,
@@ -980,34 +1016,43 @@ impl Engine {
         }
         let native_device = resolve_native_decode_device(config.native_device, session_options)?;
 
-        let metadata = if let Some(metadata_path) = &model_directory.metadata_path {
-            onnx_genai_metadata::load_metadata(metadata_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
-        } else if let Some(compat) = genai_config_compat_metadata_from_model_path(
-            &model_directory.root,
-            &model_directory.model_path,
-        )? {
-            compat
-        } else {
-            tracing::warn!("No inference metadata found, using defaults");
-            default_inference_metadata()
+        let metadata = {
+            let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
+            if let Some(metadata_path) = &model_directory.metadata_path {
+                onnx_genai_metadata::load_metadata(metadata_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
+            } else if let Some(compat) = genai_config_compat_metadata_from_model_path(
+                &model_directory.root,
+                &model_directory.model_path,
+            )? {
+                compat
+            } else {
+                tracing::warn!("No inference metadata found, using defaults");
+                default_inference_metadata()
+            }
         };
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
         if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
             anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
         }
 
-        let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        let tokenizer = {
+            let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
+            Tokenizer::from_file(&model_directory.tokenizer_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?
+        };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let governor_kv_config = governor_kv_config(None, &config)?;
-        let governor = EngineResourceGovernor::new(
-            config.limits.clone(),
-            config.allow_runtime_override,
-            governor_kv_config,
-            onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?;
+        let governor = {
+            let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
+            EngineResourceGovernor::new(
+                config.limits.clone(),
+                config.allow_runtime_override,
+                governor_kv_config,
+                onnx_genai_ort::model_weight_bytes(&model_directory.model_path),
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
+        };
         let mut scheduler_config = config.scheduler.clone();
         if scheduler_config.bytes_per_token.is_none() {
             scheduler_config.bytes_per_token = Some(
@@ -1017,8 +1062,15 @@ impl Engine {
             );
         }
         let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
-        let connector = build_connector_bridge(&config.kv_connector, &model_directory, None)?;
-        let native_session =
+        let connector = {
+            let _span = onnx_genai_ort::prof_span!("engine.connector_bridge");
+            build_connector_bridge(&config.kv_connector, &model_directory, None)?
+        };
+        let startup_trace = onnx_genai_ort::profile::tracing_enabled()
+            .then(crate::runtime_trace::context)
+            .flatten();
+        let native_session = {
+            let _span = onnx_genai_ort::prof_span!("engine.native_session_load");
             crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
                 &model_directory.model_path,
                 native_device,
@@ -1026,18 +1078,23 @@ impl Engine {
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                 config.decode_precision,
             )
-            .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
+            .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
+        };
         let mut native_session = native_session;
         // Join the runtime and its execution providers to the engine's timeline.
         // Without this their spans are recorded into a disabled context and
         // `native.session_run` exports as one opaque block.
-        if let Some(trace) = crate::runtime_trace::context() {
+        let trace = startup_trace.or_else(crate::runtime_trace::context);
+        if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
         let (native_shared_kv_proposer, speculative_mode) =
             load_native_shared_kv_proposer(&metadata, &model_directory.root, native_device)?;
-        let environment = Environment::new("onnx-genai-engine")
-            .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?;
+        let environment = {
+            let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
+            Environment::new("onnx-genai-engine")
+                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?
+        };
 
         Ok(Self {
             decode_backend: EngineDecodeBackend::Native,

@@ -11,6 +11,7 @@ categories = ["science", "parser-implementations"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }
+onnx-runtime-tracer = { workspace = true }
 thiserror = { workspace = true }
 prost = "0.13"
 prost-reflect = { version = "0.14", features = ["text-format"] }

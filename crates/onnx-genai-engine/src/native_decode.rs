@@ -715,6 +715,7 @@ impl NativeDecodeSession {
         cuda_options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
     ) -> anyhow::Result<Self> {
+        let mut io_span = onnx_genai_ort::prof_span!("native.inspect_decode_io");
         let input_names = session
             .inputs()
             .iter()
@@ -927,6 +928,11 @@ impl NativeDecodeSession {
                 "native target decoder metadata sequence_source '{sequence_source:?}' has no matching declared graph input"
             );
         }
+        io_span.set_arg("inputs", input_names.len() as u64);
+        io_span.set_arg("outputs", output_names.len() as u64);
+        io_span.set_arg("kv_pairs", present_to_past.len() as u64);
+        io_span.set_arg("step_inputs", step_inputs.len() as u64);
+        drop(io_span);
 
         let cuda = if session.device_id().device_type == DeviceType::Cuda {
             if sequence_source != SequenceInputKind::TokenIds
@@ -962,6 +968,10 @@ impl NativeDecodeSession {
                     kv_ownership,
                 },
             );
+            let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
+            span.set_arg("max_len", max_len as u64);
+            span.set_arg("kv_pairs", present_to_past.len() as u64);
+            span.set_arg("graph_capture", graph_enabled);
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
@@ -983,16 +993,20 @@ impl NativeDecodeSession {
         // cannot be appended in place) running on the CPU device. Gated behind
         // `ONNX_GENAI_CPU_INPLACE_KV` (default on; set to 0 to force the legacy
         // host round-trip). Any ineligible KV geometry disables it transparently.
-        let cpu_kv = if session.device_id().device_type != DeviceType::Cuda
-            && state_pairs.is_empty()
-        {
-            match cpu_inplace_kv_max_len_from_env()? {
-                Some(max_len) => DecodeCpuKvState::new(&mut session, &present_to_past, max_len)?,
-                None => None,
-            }
-        } else {
-            None
-        };
+        let cpu_kv =
+            if session.device_id().device_type != DeviceType::Cuda && state_pairs.is_empty() {
+                match cpu_inplace_kv_max_len_from_env()? {
+                    Some(max_len) => {
+                        let mut span = onnx_genai_ort::prof_span!("native.cpu_kv_alloc");
+                        span.set_arg("max_len", max_len as u64);
+                        span.set_arg("kv_pairs", present_to_past.len() as u64);
+                        DecodeCpuKvState::new(&mut session, &present_to_past, max_len)?
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
 
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
