@@ -26,7 +26,7 @@ use crate::event::{TraceEvent, TracePhase};
 use crate::format::{TraceFormat, TraceVerbosity};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -130,7 +130,9 @@ struct Inner {
     session_id: TraceSessionId,
     collector: Arc<dyn TraceCollector>,
     format: TraceFormat,
-    verbosity: TraceVerbosity,
+    /// Stored as an integer so it can be changed while tracing is live — an
+    /// interactive session turns detail up and down between turns.
+    verbosity: AtomicU8,
     pid: u64,
     /// Maps each OS thread to a small, stable, per-context numeric lane id.
     tids: Mutex<HashMap<ThreadId, u64>>,
@@ -160,7 +162,7 @@ impl TraceContext {
                 session_id: TraceSessionId::next(),
                 collector,
                 format,
-                verbosity: TraceVerbosity::default(),
+                verbosity: AtomicU8::new(TraceVerbosity::default().as_u8()),
                 pid: std::process::id() as u64,
                 tids: Mutex::new(HashMap::new()),
             }),
@@ -181,7 +183,7 @@ impl TraceContext {
                 session_id: TraceSessionId::next(),
                 collector: Arc::new(NoopCollector),
                 format: TraceFormat::ChromeJson,
-                verbosity: TraceVerbosity::default(),
+                verbosity: AtomicU8::new(TraceVerbosity::default().as_u8()),
                 pid: std::process::id() as u64,
                 tids: Mutex::new(HashMap::new()),
             }),
@@ -214,11 +216,17 @@ impl TraceContext {
     /// Set the capture verbosity, consuming and returning the context for
     /// chaining. No-op if the context is already shared.
     #[must_use]
-    pub fn with_verbosity(mut self, verbosity: TraceVerbosity) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.verbosity = verbosity;
-        }
+    pub fn with_verbosity(self, verbosity: TraceVerbosity) -> Self {
+        self.set_verbosity(verbosity);
         self
+    }
+
+    /// Change the capture verbosity. Safe to call while tracing is live and
+    /// from any thread; shared clones see the new level.
+    pub fn set_verbosity(&self, verbosity: TraceVerbosity) {
+        self.inner
+            .verbosity
+            .store(verbosity.as_u8(), Ordering::Relaxed);
     }
 
     /// Whether recording is currently enabled.
@@ -248,7 +256,7 @@ impl TraceContext {
     /// The capture verbosity.
     #[must_use]
     pub fn verbosity(&self) -> TraceVerbosity {
-        self.inner.verbosity
+        TraceVerbosity::from_u8(self.inner.verbosity.load(Ordering::Relaxed))
     }
 
     /// The shared clock.

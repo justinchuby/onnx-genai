@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 
 use onnx_genai_runtime_config::runtime_config;
 
+/// How much detail a timeline records. Re-exported so callers can name a level
+/// without depending on the tracer crate directly.
+pub use onnx_runtime_tracer::TraceVerbosity;
+
 /// Returns whether profiling is enabled, reading `ONNX_GENAI_PROFILE` once.
 pub fn enabled() -> bool {
     runtime_config().profile
@@ -49,8 +53,43 @@ pub fn record(stage: &'static str, nanos: u128) {
 /// Path to write a Chrome Trace Event (Perfetto) timeline to, from
 /// `ONNX_GENAI_TRACE`. When set, each [`Span`] emits one timestamped
 /// `complete` event so the run can be opened in <https://ui.perfetto.dev>.
-fn trace_path() -> Option<&'static std::path::Path> {
-    runtime_config().trace.as_deref()
+/// A destination set after startup, taking precedence over the environment.
+///
+/// The environment is read once into a `OnceLock`, which is right for a
+/// one-shot run but wrong for an interactive session: a user who decides
+/// mid-conversation that they want a timeline cannot restart the process to
+/// get one. This is the override that lets them ask for it in place.
+static RUNTIME_TRACE_PATH: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+/// Fast path for [`trace_path`] so an untraced run never takes the lock.
+static RUNTIME_TRACE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Direct the timeline to `path` from now on, or back to the environment's
+/// setting with `None`.
+pub fn set_trace_path(path: Option<std::path::PathBuf>) {
+    let set = path.is_some();
+    *RUNTIME_TRACE_PATH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+    RUNTIME_TRACE_SET.store(set, std::sync::atomic::Ordering::Release);
+}
+
+/// Where the timeline will be written, if anywhere.
+#[must_use]
+pub fn trace_destination() -> Option<std::path::PathBuf> {
+    if RUNTIME_TRACE_SET.load(std::sync::atomic::Ordering::Acquire)
+        && let Some(path) = RUNTIME_TRACE_PATH
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    {
+        return Some(path);
+    }
+    runtime_config().trace.clone()
+}
+
+fn trace_path() -> Option<std::path::PathBuf> {
+    trace_destination()
 }
 
 /// Whether timeline tracing is enabled (a non-empty `ONNX_GENAI_TRACE`).

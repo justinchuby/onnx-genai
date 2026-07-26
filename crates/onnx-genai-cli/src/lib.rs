@@ -29,6 +29,8 @@ use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+
+use onnx_genai::ort::profile::TraceVerbosity;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -863,6 +865,95 @@ fn parse_toggle(setting: Option<&str>) -> Result<Option<bool>, String> {
     }
 }
 
+/// What `/profile <rest>` asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum ProfileSetting {
+    /// Report the current state.
+    Show,
+    /// Turn the report and the timeline on or off together.
+    Toggle(bool),
+    /// Write the timeline here from now on.
+    Trace(PathBuf),
+    /// Stop writing a timeline, keeping the report.
+    NoTrace,
+    /// Record this much detail.
+    Verbosity(TraceVerbosity),
+}
+
+/// Parse the argument to `/profile`.
+///
+/// Turning profiling on turns the timeline on with it, at the most detailed
+/// level: someone who asks to profile interactively wants to see everything,
+/// and can turn detail down afterwards. The one-shot flags keep their own
+/// defaults, where the cost matters more and the intent is stated up front.
+fn parse_profile_setting(argument: Option<&str>) -> Result<ProfileSetting, String> {
+    let Some(argument) = argument.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Ok(ProfileSetting::Show);
+    };
+    let (word, rest) = match argument.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim()),
+        None => (argument, ""),
+    };
+    match word {
+        "on" | "off" => Ok(ProfileSetting::Toggle(word == "on")),
+        "trace" => {
+            if rest.is_empty() {
+                return Err("What: /profile trace needs a file to write to. \
+                     Why: the timeline is a document, so it has to go somewhere. \
+                     How: write /profile trace run.perfetto.json, or /profile trace off to stop \
+                     writing one."
+                    .to_string());
+            }
+            if rest == "off" {
+                return Ok(ProfileSetting::NoTrace);
+            }
+            Ok(ProfileSetting::Trace(PathBuf::from(rest)))
+        }
+        "verbosity" | "detail" => {
+            let levels = TraceVerbosity::ALL
+                .iter()
+                .map(|level| level.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if rest.is_empty() {
+                return Err(format!(
+                    "What: /profile {word} needs a level. \
+                     Why: it chooses how much the timeline records. \
+                     How: one of {levels} -- for example /profile {word} full."
+                ));
+            }
+            TraceVerbosity::parse(rest)
+                .map(ProfileSetting::Verbosity)
+                .ok_or_else(|| {
+                    format!(
+                        "What: {rest:?} is not a detail level. \
+                     Why: the timeline records one of a fixed set of levels. \
+                     How: use one of {levels}."
+                    )
+                })
+        }
+        other => Err(format!(
+            "What: {other:?} is not a /profile setting. \
+             Why: /profile takes on, off, trace <path>, or verbosity <level>, or nothing to \
+             report the current state. \
+             How: try /profile on, or /profile trace run.perfetto.json."
+        )),
+    }
+}
+
+/// Start or stop timeline recording at the given detail.
+///
+/// A no-op without the native backend, whose runtime the tracer records; the
+/// ORT-hosted path records its own spans through the profiler either way.
+fn set_trace_recording(enabled: bool, verbosity: TraceVerbosity) {
+    #[cfg(feature = "native-backend")]
+    onnx_genai::engine::runtime_trace::set_recording(enabled, verbosity);
+    #[cfg(not(feature = "native-backend"))]
+    {
+        let _ = (enabled, verbosity);
+    }
+}
+
 /// A command's single optional argument, with blank treated as absent so
 /// `/ep` reports the current provider and `/ep cuda` sets one.
 fn argument_of(arguments: &str) -> Option<String> {
@@ -905,7 +996,7 @@ fn parse_repl_line(line: &str) -> ReplLine {
         "raw" => ReplCommand::ToggleRaw,
         "stats" => ReplCommand::ToggleStats,
         "pages" => ReplCommand::Pages,
-        "profile" => ReplCommand::Profile(argument_of(arguments)),
+        "profile" => ReplCommand::Profile((!arguments.is_empty()).then(|| arguments.to_string())),
         "model" => ReplCommand::Model(argument_of(arguments)),
         "ep" => ReplCommand::ExecutionProvider(argument_of(arguments)),
         "backend" => ReplCommand::DecodeBackend(argument_of(arguments)),
@@ -1148,7 +1239,11 @@ impl ProfileArgs {
                 })?;
             }
         }
-        if let Some(path) = &self.profile_trace {
+        // Not `self.profile_trace`: an interactive session can choose a
+        // destination after startup with `/profile trace`, and the startup flag
+        // sets the same place, so asking where the timeline goes covers both.
+        if let Some(path) = onnx_genai::ort::profile::trace_destination() {
+            let path = path.as_path();
             write_merged_trace(path).map_err(|error| {
                 anyhow::anyhow!(
                     "What: the timeline trace could not be written to {}. \
@@ -1680,6 +1775,12 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     let mut model_dir = settings.model_dir.clone();
     let mut raw_mode = args.sampling.raw;
     let mut show_profile = profiling.profile;
+    // A session that asks to profile wants to see everything; detail can be
+    // turned down afterwards. One-shot runs keep their own default, where the
+    // intent is stated up front and the cost matters more.
+    let mut trace_verbosity = TraceVerbosity::Full;
+    // Where `/profile on` puts a timeline when the user has not named a file.
+    let default_trace_path = PathBuf::from("onnx-genai-session.perfetto.json");
     // Per-turn numbers are opt-in: a line after every reply is noise until a
     // reader is actually watching throughput or cache behavior.
     let mut show_stats = false;
@@ -1720,7 +1821,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             ReplLine::Prompt(prompt) => Some(prompt),
             ReplLine::Command(ReplCommand::Help) => {
                 println!(
-                    "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off]\n/model [path]\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+                    "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
                 );
                 None
             }
@@ -1732,10 +1833,36 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                 None
             }
             ReplLine::Command(ReplCommand::Profile(setting)) => {
-                match parse_toggle(setting.as_deref()) {
-                    Ok(Some(on)) => {
+                match parse_profile_setting(setting.as_deref()) {
+                    Ok(ProfileSetting::Show) => {
+                        println!("profile report {}", if show_profile { "on" } else { "off" });
+                        match onnx_genai::ort::profile::trace_destination() {
+                            Some(path) => println!(
+                                "timeline {} -> {} ({} detail)",
+                                if show_profile { "on" } else { "off" },
+                                path.display(),
+                                trace_verbosity
+                            ),
+                            None => println!("timeline off"),
+                        }
+                    }
+                    Ok(ProfileSetting::Toggle(on)) => {
                         show_profile = on;
+                        if on && onnx_genai::ort::profile::trace_destination().is_none() {
+                            onnx_genai::ort::profile::set_trace_path(Some(
+                                default_trace_path.clone(),
+                            ));
+                        }
+                        set_trace_recording(on, trace_verbosity);
                         println!("profile report {}", if on { "on" } else { "off" });
+                        match (on, onnx_genai::ort::profile::trace_destination()) {
+                            (true, Some(path)) => println!(
+                                "timeline on -> {} ({} detail); written when the session ends",
+                                path.display(),
+                                trace_verbosity
+                            ),
+                            _ => println!("timeline off"),
+                        }
                         // The engine's per-stage breakdown is switched on from
                         // the environment before any thread starts, and cannot
                         // be turned on later. Say so rather than print a report
@@ -1746,8 +1873,31 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                             );
                         }
                     }
-                    Ok(None) => {
-                        println!("profile report {}", if show_profile { "on" } else { "off" })
+                    Ok(ProfileSetting::Trace(path)) => {
+                        onnx_genai::ort::profile::set_trace_path(Some(path.clone()));
+                        set_trace_recording(true, trace_verbosity);
+                        println!(
+                            "timeline -> {} ({} detail)",
+                            path.display(),
+                            trace_verbosity
+                        );
+                    }
+                    Ok(ProfileSetting::NoTrace) => {
+                        set_trace_recording(false, trace_verbosity);
+                        onnx_genai::ort::profile::set_trace_path(None);
+                        println!("timeline off");
+                    }
+                    Ok(ProfileSetting::Verbosity(level)) => {
+                        trace_verbosity = level;
+                        let recording =
+                            onnx_genai::ort::profile::trace_destination().is_some() && show_profile;
+                        set_trace_recording(recording, trace_verbosity);
+                        println!("timeline detail {level}");
+                        if matches!(level, TraceVerbosity::Full) {
+                            println!(
+                                "note: full detail adds a span per worker thread per operator; measured about 4% slower"
+                            );
+                        }
                     }
                     Err(error) => eprintln!("error: {error}"),
                 }
@@ -3348,4 +3498,58 @@ fn _onnx_genai_server(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::
 
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_setting_tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_profile_setting_and_explains_the_rest() {
+        assert_eq!(parse_profile_setting(None), Ok(ProfileSetting::Show));
+        assert_eq!(parse_profile_setting(Some("  ")), Ok(ProfileSetting::Show));
+        assert_eq!(
+            parse_profile_setting(Some("on")),
+            Ok(ProfileSetting::Toggle(true))
+        );
+        assert_eq!(
+            parse_profile_setting(Some("off")),
+            Ok(ProfileSetting::Toggle(false))
+        );
+        assert_eq!(
+            parse_profile_setting(Some("trace  run.json")),
+            Ok(ProfileSetting::Trace(PathBuf::from("run.json")))
+        );
+        assert_eq!(
+            parse_profile_setting(Some("trace off")),
+            Ok(ProfileSetting::NoTrace)
+        );
+        assert_eq!(
+            parse_profile_setting(Some("verbosity full")),
+            Ok(ProfileSetting::Verbosity(TraceVerbosity::Full))
+        );
+        assert_eq!(
+            parse_profile_setting(Some("detail DECISIONS")),
+            Ok(ProfileSetting::Verbosity(TraceVerbosity::Decisions))
+        );
+
+        // A path with spaces survives, since the rest of the line is the path.
+        assert_eq!(
+            parse_profile_setting(Some("trace my traces/run.json")),
+            Ok(ProfileSetting::Trace(PathBuf::from("my traces/run.json")))
+        );
+
+        // Every rejection names the valid choices rather than only refusing.
+        let unknown = parse_profile_setting(Some("bogus")).unwrap_err();
+        assert!(unknown.contains("trace <path>"), "{unknown}");
+        assert!(unknown.contains("verbosity <level>"), "{unknown}");
+
+        let bad_level = parse_profile_setting(Some("verbosity loud")).unwrap_err();
+        for level in ["decisions", "ops", "full"] {
+            assert!(bad_level.contains(level), "{bad_level} should list {level}");
+        }
+
+        let no_path = parse_profile_setting(Some("trace")).unwrap_err();
+        assert!(no_path.contains("needs a file"), "{no_path}");
+    }
 }

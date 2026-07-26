@@ -53,15 +53,20 @@ fn verbosity() -> TraceVerbosity {
 pub fn context() -> Option<TraceContext> {
     CONTEXT
         .get_or_init(|| {
-            if !onnx_genai_ort::profile::tracing_enabled() {
-                return None;
-            }
             let collector = COLLECTOR.get_or_init(|| Arc::new(MemoryCollector::new()));
             let context = TraceContext::with_collector(
                 collector.clone() as Arc<dyn onnx_runtime_tracer::TraceCollector>,
                 TraceFormat::ChromeJson,
             )
             .with_verbosity(verbosity());
+            // Installed whether or not tracing is on right now, and switched
+            // later with `set_recording`. A session that started untraced
+            // would otherwise hold a no-op context for its whole life, so
+            // turning tracing on mid-session would produce a timeline with no
+            // operator spans in it — and an interactive session is exactly
+            // where someone decides they want a timeline only after seeing
+            // something odd. A disabled context costs one relaxed atomic load.
+            context.set_enabled(onnx_genai_ort::profile::tracing_enabled());
             // Publish it as the ambient context so provider worker threads —
             // which have neither an active span nor a handle to pass one
             // through — can open spans on their own lanes.
@@ -80,4 +85,23 @@ pub fn collected_events() -> Vec<onnx_runtime_tracer::TraceEvent> {
         .get()
         .map(|collector| collector.events())
         .unwrap_or_default()
+}
+
+/// Start or stop recording, and choose how much detail to record.
+///
+/// Takes effect immediately on the live context, so an interactive session can
+/// turn a timeline on between turns without reloading the model.
+pub fn set_recording(enabled: bool, verbosity: TraceVerbosity) {
+    if let Some(context) = context() {
+        context.set_verbosity(verbosity);
+        context.set_enabled(enabled);
+    }
+}
+
+/// Discard everything recorded so far, so the next export covers only what
+/// follows it.
+pub fn reset() {
+    if let Some(collector) = COLLECTOR.get() {
+        collector.clear();
+    }
 }

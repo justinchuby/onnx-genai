@@ -608,13 +608,66 @@ fn profile_can_be_turned_on_for_a_session_that_did_not_start_with_it() {
 }
 
 #[test]
-fn profile_rejects_a_setting_that_is_not_on_or_off() {
+fn profile_rejects_a_setting_it_does_not_offer_and_says_what_it_does() {
     let output = text(&repl(
         &fixture("tiny-llm"),
         &["--max-new-tokens", "2"],
         "/profile maybe\n\n",
     ));
-    assert!(output.contains("is not a setting"), "{output}");
+    assert!(output.contains("is not a /profile setting"), "{output}");
+    // Refusing is not enough; the message has to name the alternatives.
+    assert!(output.contains("trace <path>"), "{output}");
+    assert!(output.contains("verbosity <level>"), "{output}");
+}
+
+/// `/profile on` must produce a timeline, not only a text report.
+///
+/// The trace destination used to be fixed from the environment before any
+/// thread started, so an interactive session could never ask for a timeline
+/// after the fact — exactly when someone decides they want one.
+#[test]
+fn profile_on_writes_a_timeline_to_a_chosen_path() {
+    // Unique per test process/thread: cargo runs these in parallel and a
+    // shared path would let one test read what another is still writing.
+    let directory = repository_root().join("target/test-fixtures");
+    std::fs::create_dir_all(&directory).expect("fixture directory");
+    let trace = directory.join(format!(
+        "repl-trace-{}-{:?}.perfetto.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&trace);
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        &format!("/profile on\n/profile trace {}\nhello\n\n", trace.display()),
+    ));
+    assert!(
+        output.contains("full detail"),
+        "asking to profile should start at the most detailed level: {output}"
+    );
+    assert!(trace.is_file(), "no timeline was written: {output}");
+
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&trace).expect("read trace")).expect("parse trace");
+    let events = document["traceEvents"]
+        .as_array()
+        .expect("traceEvents array");
+    assert!(!events.is_empty(), "the timeline recorded nothing");
+}
+
+#[test]
+fn profile_reports_and_changes_the_detail_level() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/profile verbosity ops\n/profile verbosity loud\n\n",
+    ));
+    assert!(output.contains("timeline detail ops"), "{output}");
+    assert!(output.contains("is not a detail level"), "{output}");
+    for level in ["decisions", "ops", "full"] {
+        assert!(output.contains(level), "{output} should list {level}");
+    }
 }
 
 #[test]
