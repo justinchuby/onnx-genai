@@ -208,6 +208,7 @@ pub struct NativeDecodeSession {
     current_len: usize,
     last_hidden: Option<Vec<f32>>,
     uses_decode_pool: bool,
+    has_plugin_fused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,6 +259,7 @@ pub(crate) struct NativeProposerSession {
     past: HashMap<String, Tensor>,
     current_len: usize,
     uses_decode_pool: bool,
+    has_plugin_fused: bool,
 }
 
 impl NativeProposerSession {
@@ -414,6 +416,7 @@ impl NativeProposerSession {
             }
         };
 
+        let has_plugin_fused = graph_has_plugin_fused(session.graph());
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
             session,
@@ -429,6 +432,7 @@ impl NativeProposerSession {
             past: HashMap::new(),
             current_len: 0,
             uses_decode_pool,
+            has_plugin_fused,
         })
     }
 
@@ -573,7 +577,7 @@ impl NativeProposerSession {
             .collect::<Vec<_>>();
         let run_single_token = sequence_len == 1;
         let uses_decode_pool = self.uses_decode_pool;
-        let outputs = if run_single_token {
+        let outputs = if run_single_token && !self.has_plugin_fused {
             onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                 self.session.run(&bindings).map_err(anyhow::Error::from)
             })
@@ -1055,6 +1059,7 @@ impl NativeDecodeSession {
                 None
             };
 
+        let has_plugin_fused = graph_has_plugin_fused(session.graph());
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
             session,
@@ -1070,6 +1075,7 @@ impl NativeDecodeSession {
             current_len: 0,
             last_hidden: None,
             uses_decode_pool,
+            has_plugin_fused,
         })
     }
 
@@ -2462,7 +2468,7 @@ impl NativeDecodeSession {
 
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
-            if token_ids.len() == 1 {
+            if token_ids.len() == 1 && !self.has_plugin_fused {
                 let uses_decode_pool = self.uses_decode_pool;
                 onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session.run(&bindings).map_err(anyhow::Error::from)
@@ -2656,7 +2662,7 @@ impl NativeDecodeSession {
             .expect("decode_cpu_inplace requires CPU KV state");
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
-            if token_ids.len() == 1 {
+            if token_ids.len() == 1 && !self.has_plugin_fused {
                 onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session
                         .run_with_device_bindings(&bindings, &mut state.bindings)
@@ -3346,6 +3352,9 @@ fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tens
 /// scanned too so control-flow-wrapped decoders are classified correctly.
 fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
     for (_, node) in graph.nodes.iter() {
+        if onnx_runtime_session::is_plugin_fused_node(node) {
+            return false;
+        }
         if matches!(node.op_type.as_str(), "MatMulNBits" | "QMoE") {
             return true;
         }
@@ -3358,6 +3367,15 @@ fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
         }
     }
     false
+}
+
+fn graph_has_plugin_fused(graph: &onnx_runtime_ir::Graph) -> bool {
+    graph.nodes.iter().any(|(_, node)| {
+        onnx_runtime_session::is_plugin_fused_node(node)
+            || node.attributes.values().any(|attr| {
+                matches!(attr, onnx_runtime_ir::Attribute::Graph(subgraph) if graph_has_plugin_fused(subgraph))
+            })
+    })
 }
 
 fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {

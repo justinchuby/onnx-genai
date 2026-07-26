@@ -16,6 +16,7 @@ use onnx_runtime_optimizer::{OptimizationPass, OptimizerError, PassContext};
 pub(crate) const PLUGIN_FUSED_OP: &str = "NativePluginFused";
 pub(crate) const PLUGIN_FUSED_DOMAIN: &str = "com.microsoft";
 const FUSION_ID_ATTR: &str = "native_plugin_fusion_id";
+pub(crate) const FUSION_SHAPE_GRAPH_ATTR: &str = "native_plugin_shape_graph";
 
 /// A native execution provider that dispatches plugin-claimed fused subgraphs
 /// through ORT's plugin-EP ABI and delegates all unclaimed nodes to the CPU EP.
@@ -60,7 +61,12 @@ impl ExecutionProvider for PluginExecutionProvider {
     }
 
     fn device_type(&self) -> DeviceType {
-        DeviceType::Custom(0)
+        // Derived from the device name the provider was configured with, not
+        // hardcoded: reporting `Cpu` (or an opaque `Custom`) would put every
+        // span for work the plugin ran on an accelerator onto the host's
+        // device in the trace. Unrecognised names stay `Custom`, which is
+        // honest about not knowing rather than wrong about knowing.
+        DeviceType::from_trace_name(&self.device_label).unwrap_or(DeviceType::Custom(0))
     }
 
     fn device_id(&self) -> DeviceId {
@@ -204,6 +210,7 @@ impl OptimizationPass for PluginFusionPass {
 
         let mut groups = Vec::new();
         for (index, claim) in claims.iter().enumerate() {
+            let shape_graph = shape_graph_for_claim(graph, claim)?;
             if claim.node_ids.is_empty() {
                 continue;
             }
@@ -217,6 +224,16 @@ impl OptimizationPass for PluginFusionPass {
             node.name = format!("native_plugin_fused_{index}");
             node.attributes
                 .insert(FUSION_ID_ATTR.to_string(), Attribute::Int(index as i64));
+            node.attributes.insert(
+                FUSION_SHAPE_GRAPH_ATTR.to_string(),
+                Attribute::Graph(Box::new(shape_graph)),
+            );
+            // Placed on the plugin's device, so a trace attributes this work to
+            // the accelerator that did it. Left unset, the executor records no
+            // device at all and the whole fused subgraph -- which is most of
+            // the model -- shows up unattributed.
+            node.device = DeviceType::from_trace_name(&self.device_label)
+                .map(|device_type| DeviceId::new(device_type, 0));
             groups.push((claim.node_ids.clone(), node));
         }
         if groups.is_empty() {
@@ -236,8 +253,42 @@ impl OptimizationPass for PluginFusionPass {
     }
 }
 
-fn is_plugin_fused(node: &Node) -> bool {
+fn shape_graph_for_claim(
+    graph: &Graph,
+    claim: &onnx_runtime_ep_api::SubgraphClaim,
+) -> onnx_runtime_optimizer::Result<Graph> {
+    let selected: HashSet<_> = claim.node_ids.iter().copied().collect();
+    let mut shape_graph = graph.clone();
+    shape_graph.set_inputs(claim.input_values.clone());
+    shape_graph.set_outputs(claim.output_values.clone());
+    let remove = shape_graph
+        .nodes
+        .keys()
+        .filter(|node| !selected.contains(node))
+        .collect::<Vec<_>>();
+    shape_graph.remove_nodes(&remove);
+    let live_values = shape_graph.values.keys().collect::<HashSet<_>>();
+    shape_graph
+        .initializers
+        .retain(|value, _| live_values.contains(value));
+    shape_graph.topological_order().map_err(|err| {
+        OptimizerError::Fusion(format!(
+            "cannot build shape replay graph for plugin claim because it is not a DAG: {err}"
+        ))
+    })?;
+    Ok(shape_graph)
+}
+
+/// Identify the native runtime's synthetic plugin-fused node.
+///
+/// Callers outside this module use this to avoid treating the shape-replay
+/// subgraph metadata as executable host work.
+pub fn is_plugin_fused_node(node: &Node) -> bool {
     node.domain == PLUGIN_FUSED_DOMAIN && node.op_type == PLUGIN_FUSED_OP
+}
+
+fn is_plugin_fused(node: &Node) -> bool {
+    is_plugin_fused_node(node)
 }
 
 fn fusion_id(node: &Node) -> onnx_runtime_ep_api::Result<usize> {

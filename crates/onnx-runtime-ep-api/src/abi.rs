@@ -175,21 +175,15 @@ impl PluginExecutionPlan {
                     "OrtNodeComputeInfo[{index}].Compute is null; fix the plugin compute-info callbacks"
                 ),
             })?;
-            let mut state: *mut c_void = ptr::null_mut();
-            // SAFETY: `info` was allocated by the plugin and remains owned by
-            // `inner`; this host does not expose a compute context yet, and the
-            // MLX plugin's CreateState does not dereference it.
-            let status = unsafe { create_state(info, ptr::null_mut(), &mut state) };
-            check_status(library_path, "OrtNodeComputeInfo.CreateState", status)?;
             kernels.push(Arc::new(PluginKernelShared {
                 runtime: Arc::clone(&inner),
                 info,
+                create_state,
                 compute,
                 release_state: unsafe { (*info).ReleaseState },
-                state,
+                states: Mutex::new(HashMap::new()),
                 index,
                 calls: AtomicU64::new(0),
-                lock: Mutex::new(()),
                 device_label: Arc::clone(&device_label),
             }));
         }
@@ -350,16 +344,20 @@ impl Drop for PluginRuntime {
 struct PluginKernelShared {
     runtime: Arc<PluginRuntime>,
     info: *mut ort::OrtNodeComputeInfo,
+    create_state: unsafe extern "C" fn(
+        *mut ort::OrtNodeComputeInfo,
+        *mut ort::OrtNodeComputeContext,
+        *mut *mut c_void,
+    ) -> *mut ort::OrtStatus,
     compute: unsafe extern "C" fn(
         *mut ort::OrtNodeComputeInfo,
         *mut c_void,
         *mut ort::OrtKernelContext,
     ) -> *mut ort::OrtStatus,
     release_state: Option<unsafe extern "C" fn(*mut ort::OrtNodeComputeInfo, *mut c_void)>,
-    state: *mut c_void,
+    states: Mutex<HashMap<std::thread::ThreadId, *mut c_void>>,
     index: usize,
     calls: AtomicU64,
-    lock: Mutex<()>,
     device_label: Arc<str>,
 }
 
@@ -369,9 +367,14 @@ unsafe impl Sync for PluginKernelShared {}
 impl Drop for PluginKernelShared {
     fn drop(&mut self) {
         if let Some(release_state) = self.release_state {
-            // SAFETY: `state` was returned by this compute-info's CreateState and
-            // is released before PluginRuntime releases the compute infos.
-            unsafe { release_state(self.info, self.state) };
+            if let Ok(states) = self.states.get_mut() {
+                for (_, state) in states.drain() {
+                    // SAFETY: each state was returned by this compute-info's
+                    // CreateState and is released before PluginRuntime releases
+                    // the compute infos.
+                    unsafe { release_state(self.info, state) };
+                }
+            }
         }
     }
 }
@@ -383,11 +386,31 @@ pub struct PluginCompiledKernel {
 
 impl Kernel for PluginCompiledKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let _guard = self.shared.lock.lock().map_err(|_| {
+        let mut states = self.shared.states.lock().map_err(|_| {
             EpError::KernelFailed(
-                "plugin fused-subgraph mutex was poisoned; recreate the session".into(),
+                "plugin fused-subgraph state mutex was poisoned; recreate the session".into(),
             )
         })?;
+        let thread_id = std::thread::current().id();
+        let state = if let Some(&state) = states.get(&thread_id) {
+            state
+        } else {
+            let mut state: *mut c_void = ptr::null_mut();
+            // SAFETY: `info` was allocated by the plugin and remains owned by
+            // `shared.runtime`; the native bridge does not expose a compute
+            // context to CreateState. Creating the state on the executing thread
+            // preserves plugins whose sessions are thread-affine.
+            let status = unsafe {
+                (self.shared.create_state)(self.shared.info, ptr::null_mut(), &mut state)
+            };
+            check_status(
+                &self.shared.runtime.path,
+                "OrtNodeComputeInfo.CreateState",
+                status,
+            )?;
+            states.insert(thread_id, state);
+            state
+        };
         let mut context = HostKernelContext::new(inputs, outputs)?;
         let bytes = context.byte_size();
         let _span = onnx_runtime_tracer::global_context().map(|trace| {
@@ -411,7 +434,7 @@ impl Kernel for PluginCompiledKernel {
         let status = unsafe {
             (self.shared.compute)(
                 self.shared.info,
-                self.shared.state,
+                state,
                 (&mut context as *mut HostKernelContext).cast::<ort::OrtKernelContext>(),
             )
         };
