@@ -19,11 +19,22 @@ fn fixture(name: &str) -> PathBuf {
 
 /// A 4x4 solid-color PNG written to the target directory.
 fn sample_png() -> PathBuf {
-    let path = repository_root().join("target/test-fixtures/repl-sample.png");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let directory = repository_root().join("target/test-fixtures");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("repl-sample.png");
+    // Several tests want this file and cargo runs them in parallel, so it is
+    // written to a per-test temporary and renamed into place. Writing the shared
+    // path directly lets one test read what another is still writing, which
+    // surfaces as "the image format could not be determined".
+    let staging = directory.join(format!(
+        "repl-sample-{}-{:?}.png",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     image::RgbImage::from_pixel(4, 4, image::Rgb([10, 200, 90]))
-        .save(&path)
+        .save(&staging)
         .expect("the sample PNG must be written");
+    std::fs::rename(&staging, &path).expect("the sample PNG must be published atomically");
     path
 }
 

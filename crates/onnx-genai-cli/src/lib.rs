@@ -313,17 +313,42 @@ impl SessionSettings {
         }
     }
 
+    /// The providers a session built from these settings actually runs on, in
+    /// priority order.
+    ///
+    /// Resolved rather than echoed back: with no explicit choice the provider
+    /// comes from the environment *or* from platform auto-selection (Metal on
+    /// Apple Silicon), and reporting the request instead of the result would
+    /// name CPU for a session running on the GPU.
+    fn resolved_providers(&self) -> String {
+        let options = self.to_session_options();
+        let names = options
+            .execution_providers
+            .iter()
+            .map(|provider| provider.selection.name.as_str())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            "cpu".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self.decode_backend {
+            EngineDecodeBackend::Auto => "auto",
+            EngineDecodeBackend::Ort => "ort",
+            EngineDecodeBackend::Native => "native",
+        }
+    }
+
     /// How the current selection reads back to a user.
     fn describe(&self) -> String {
         format!(
             "model {} · ep {} · backend {}",
             self.model_dir.display(),
-            self.execution_provider.as_deref().unwrap_or("auto"),
-            match self.decode_backend {
-                EngineDecodeBackend::Auto => "auto",
-                EngineDecodeBackend::Ort => "ort",
-                EngineDecodeBackend::Native => "native",
-            }
+            self.resolved_providers(),
+            self.backend_name()
         )
     }
 }
@@ -732,6 +757,22 @@ enum ReplLine {
 /// user should be able to try `cuda`, be told it is unavailable, and carry on.
 fn reload(settings: &SessionSettings) -> anyhow::Result<Backend> {
     Backend::open(settings)
+}
+
+/// Providers a default session resolves to, for commands that do not let the
+/// user choose one mid-run.
+fn resolved_default_providers() -> String {
+    let options = SessionOptions::default();
+    let names = options
+        .execution_providers
+        .iter()
+        .map(|provider| provider.selection.name.as_str())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "cpu".to_string()
+    } else {
+        names.join(", ")
+    }
 }
 
 /// Execution providers this build can select.
@@ -1382,6 +1423,7 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     args.cpu.apply()?;
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
+    profile.execution_provider = resolved_default_providers();
     if args.image_output.output_image.is_some() && args.audio_output.output_audio.is_some() {
         anyhow::bail!(
             "What: --output-image and --output-audio were combined. \
@@ -1839,6 +1881,8 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
         };
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
+        profile.execution_provider = settings.resolved_providers();
+        profile.decode_backend = Some(settings.backend_name().to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
         if let Some(memory) = backend.kv_usage() {
@@ -2116,6 +2160,7 @@ fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyhow::Result<(
     install_ctrlc_handler();
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
+    profile.execution_provider = resolved_default_providers();
     let load_started = std::time::Instant::now();
     let mut transcriber = Transcriber::load(&model_dir, &args)?;
     profile.phase("model load", load_started.elapsed());

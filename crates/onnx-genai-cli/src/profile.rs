@@ -154,6 +154,8 @@ pub(crate) struct Counter {
 pub(crate) struct RunProfile {
     pub(crate) model: String,
     pub(crate) execution_provider: String,
+    /// Decode backend actually in use (`ort`, `native`, or `auto`'s choice).
+    pub(crate) decode_backend: Option<String>,
     pub(crate) phases: Vec<Phase>,
     pub(crate) counters: Vec<Counter>,
     pub(crate) timings: TokenTimings,
@@ -373,8 +375,9 @@ impl RunProfile {
     pub(crate) fn new(model: String) -> Self {
         Self {
             model,
-            execution_provider: std::env::var("ONNX_GENAI_EP")
-                .unwrap_or_else(|_| "cpu (default)".to_string()),
+            // Filled in by the caller, which knows what was actually resolved:
+            // the environment is only one of the inputs to that decision.
+            execution_provider: "cpu".to_string(),
             ..Self::default()
         }
     }
@@ -397,6 +400,9 @@ impl RunProfile {
             "{:<24} {}",
             "execution provider", self.execution_provider
         );
+        if let Some(backend) = &self.decode_backend {
+            let _ = writeln!(out, "{:<24} {:>10}", "decode backend", backend);
+        }
 
         for phase in &self.phases {
             let _ = writeln!(
