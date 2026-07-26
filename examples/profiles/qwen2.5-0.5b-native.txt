@@ -1,14 +1,14 @@
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b
 execution provider       cpu
-model load                    131.3 ms
+model load                    130.6 ms
 prompt tokens                    40
 generated tokens                 48
-time to first token          2414.2 ms
-generation wall time        16246.9 ms
-decode throughput              3.40 tok/s
-end-to-end throughput          2.95 tok/s
-inter-token latency      mean 294.3 / p50 267.5 / p90 293.3 / p99 1259.8 / max 1259.8 ms
+time to first token          2218.6 ms
+generation wall time        15522.5 ms
+decode throughput              3.53 tok/s
+end-to-end throughput          3.09 tok/s
+inter-token latency      mean 283.1 / p50 266.3 / p90 271.0 / p99 1050.9 / max 1050.9 ms
 finish reason            MaxTokens
 peak resident memory        3.1 GiB
 kv cache budget             5.4 GiB (5746063200 tokens)
@@ -21,13 +21,25 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-loop.step                     16246.848         48      338475.99    338475.99
-loop.next_logits              16246.285         48      338464.27    338464.27
-native.session_run            16237.662         48      338284.62    338284.62
-native.logits_fetch               7.411         48         154.40       154.40
-native.sampling                   6.797         48         141.60       141.60
-loop.commit_selected              0.541         48          11.27        11.27
-native.prepare_inputs             0.475         48           9.90         9.90
-loop.detokenize                   0.470         48           9.80         9.80
-native.kv_update                  0.014         48           0.30         0.30
-loop.commit_token                 0.002         48           0.04         0.04
+loop.next_logits              15521.911         48      323373.15    323373.15
+native.session_run            15513.448         48      323196.84    323196.84
+loop.step                     13303.889         47      283061.48    277164.36
+loop.prefill                   2218.505          1     2218505.29     46218.86
+engine.tokenizer_load           104.467          1      104466.62      2176.39
+engine.native_session_load        9.933          1        9932.58       206.93
+engine.ort_environment            9.189          1        9188.92       191.44
+native.logits_fetch               7.293         48         151.93       151.93
+native.sampling                   6.662         48         138.80       138.80
+engine.metadata_load              6.502          1        6502.00       135.46
+loop.commit_selected              0.453         48           9.45         9.45
+loop.commit_selected_token        0.435         48           9.06         9.06
+native.prepare_inputs             0.433         48           9.03         9.03
+loop.detokenize                   0.379         48           7.89         7.89
+engine.resolve_model_directory        0.093          1          93.29         1.94
+engine.resource_governor          0.091          1          90.62         1.89
+native.kv_update                  0.017         48           0.36         0.36
+native.inspect_decode_io          0.015          1          15.25         0.32
+native.cpu_kv_alloc               0.013          1          12.88         0.27
+engine.resolve_decode_backend        0.007          1           7.46         0.16
+loop.commit_token                 0.003         48           0.06         0.06
+engine.connector_bridge           0.000          1           0.21         0.00
