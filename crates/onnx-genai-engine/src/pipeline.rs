@@ -1,8 +1,8 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, clone_value, extract_next_token_logits_with_io, is_present_output,
-    run_decode_step_with_extra,
+    DecodeState, apply_paged_sliding_window, clone_value, extract_next_token_logits_with_io,
+    is_present_output, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -178,6 +178,13 @@ pub struct PipelineEngine {
 struct PipelinePagedKv {
     kv_model: KvModelInfo,
     cache: PagedKvCache,
+    /// Sequence claimed for the generation in flight.
+    ///
+    /// A generation can fail at any `?` between claiming a sequence and
+    /// publishing it, and an abandoned sequence keeps its pages referenced
+    /// forever. Recording it here means the next admission — or the explicit
+    /// discard on the error path — can always find and free it.
+    active: Option<SequenceId>,
     /// Radix trie over prefix keys. The keys are not bare prompts: each carries
     /// a digest of the request's attachments ahead of its tokens, because image
     /// expansion makes different pictures produce identical token sequences and
@@ -425,16 +432,22 @@ impl PipelineEngine {
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
                 let fixed_state_budget_bytes =
                     resolved_host_ram_budget(&config, kv_model.as_ref())?;
-                paged = kv_model.map(|kv_model| PipelinePagedKv {
-                    cache: PagedKvCache::new_with_layer_tensor_configs(
-                        kv_model.tensor_config.page_size,
-                        kv_model.tensor_config.dtype,
-                        kv_model.layer_configs.clone(),
-                        config.num_gpu_pages,
-                    ),
-                    kv_model,
-                    prefix: PrefixCache::new(),
-                });
+                // A zero page size makes `div_ceil` panic and the page-boundary
+                // walk below produce zeros forever, so it is refused rather than
+                // carried into arithmetic that assumes it is positive.
+                paged = kv_model
+                    .filter(|kv_model| kv_model.tensor_config.page_size > 0)
+                    .map(|kv_model| PipelinePagedKv {
+                        cache: PagedKvCache::new_with_layer_tensor_configs(
+                            kv_model.tensor_config.page_size,
+                            kv_model.tensor_config.dtype,
+                            kv_model.layer_configs.clone(),
+                            config.num_gpu_pages,
+                        ),
+                        kv_model,
+                        prefix: PrefixCache::new(),
+                        active: None,
+                    });
                 let decoder_io = models
                     .directory
                     .spec
@@ -757,6 +770,9 @@ impl PipelineEngine {
         backend.prompt_len = backend.context_tokens.len() - backend.retained_len;
         let prefilled = backend.prompt_len;
         let mut loop_state = DecodeLoopState::new(reused, options.seed, options.top_logprobs);
+        // Taken without `?` so a failed generation still releases its sequence
+        // below: an abandoned sequence holds its pages out of the pool for the
+        // life of the process.
         let result = run_decode_loop(
             &mut backend,
             &mut loop_state,
@@ -765,7 +781,7 @@ impl PipelineEngine {
             tokenizer,
             None,
             callback,
-        )?;
+        );
         // Exactly the tokens whose KV the decoder now holds. Truncated to
         // `kv_len` rather than taken whole: the last sampled token was committed
         // to the context but never fed to the decoder, so its KV does not exist
@@ -773,6 +789,15 @@ impl PipelineEngine {
         let mut final_context = backend.context_tokens.clone();
         final_context.truncate(backend.kv_len);
         let retains_kv = backend.decoder_state.use_kv;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(paged) = self.paged.as_mut() {
+                    paged.discard_active();
+                }
+                return Err(error);
+            }
+        };
 
         self.component_cache
             .borrow_mut()
@@ -829,8 +854,17 @@ impl PipelineEngine {
         inputs: Digest,
         prompt_tokens: &[TokenId],
     ) -> anyhow::Result<(SequenceId, usize)> {
+        // Free anything a previous generation abandoned, then make room for this
+        // one, before claiming any pages.
+        paged.discard_active();
+        paged.evict_until_free(
+            prompt_tokens
+                .len()
+                .div_ceil(paged.cache.page_table.page_size),
+        );
         let key = prefix_key(inputs, prompt_tokens);
         let seq = paged.cache.create_sequence();
+        paged.active = Some(seq);
         let matched = paged
             .prefix
             .lookup_shared(&key, &mut paged.cache.page_table);
@@ -907,6 +941,9 @@ impl PipelineEngine {
             paged
                 .prefix
                 .insert_pages(&key, &pages, &mut paged.cache.page_table);
+        }
+        if paged.active == Some(seq) {
+            paged.active = None;
         }
         for page_id in paged.cache.page_table.remove_sequence(seq) {
             paged.cache.page_table.free(page_id);
@@ -2788,6 +2825,39 @@ struct StepComponentInput {
     missing_message: String,
 }
 
+impl PipelinePagedKv {
+    /// Release the in-flight sequence, if any, returning its pages to the pool.
+    ///
+    /// Pages the prefix cache published are retained by it, so this frees only
+    /// what nothing else refers to.
+    fn discard_active(&mut self) {
+        let Some(seq) = self.active.take() else {
+            return;
+        };
+        for page_id in self.cache.page_table.remove_sequence(seq) {
+            self.cache.page_table.free(page_id);
+        }
+    }
+
+    /// Return pages to the pool by evicting unreferenced cached prefixes,
+    /// least-recently-used first.
+    ///
+    /// Without this the cache would hold every prefix it ever published and the
+    /// pool would run dry after enough distinct conversations. Only prefixes no
+    /// live sequence is borrowing can go.
+    fn evict_until_free(&mut self, wanted_pages: usize) {
+        let free = self
+            .cache
+            .page_table
+            .free_count(onnx_genai_kv::Device::Gpu(0));
+        if free >= wanted_pages {
+            return;
+        }
+        self.prefix
+            .evict_lru(wanted_pages - free, &mut self.cache.page_table);
+    }
+}
+
 /// Where a decode step's KV is written so later requests can share it.
 struct PagedMirror<'a> {
     kv_model: &'a KvModelInfo,
@@ -2938,14 +3008,29 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         // a later request opening with the same prefix can attach these pages
         // instead of recomputing them.
         if let Some(paged) = self.paged.as_mut() {
+            // A windowed decoder's present tensor is indexed in *retained*
+            // buffer space, not absolute position space: once the window has
+            // evicted anything, an absolute index reads the wrong rows or runs
+            // off the end. This is the same conversion the single-model decode
+            // step does before mirroring.
+            let retained_past_len = self.decoder_state.retained_kv_len(past_len);
             mirror_present_kv_to_pages(
                 self.decoder,
                 paged.kv_model,
                 paged.cache,
                 paged.seq,
                 &outputs,
-                past_len,
+                retained_past_len,
                 input_tokens.len(),
+            )?;
+            // Keep the paged sequence's window in step with the decoder's, so
+            // the pages published for reuse describe what the decoder can
+            // actually attend to.
+            apply_paged_sliding_window(
+                paged.cache,
+                paged.seq,
+                self.decoder_state.sliding_window(),
+                self.decoder_state.sink_tokens(),
             )?;
         }
         extract_next_token_logits_with_io(

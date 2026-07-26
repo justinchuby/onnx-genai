@@ -385,3 +385,71 @@ fn pages_are_shared_rather_than_copied_between_conversations() -> anyhow::Result
     );
     Ok(())
 }
+
+#[test]
+fn a_failed_generation_returns_its_pages_to_the_pool() -> anyhow::Result<()> {
+    // A generation can fail after it has claimed a sequence — a user pressing
+    // Ctrl-C is exactly this — and an abandoned sequence holds its pages out of
+    // the pool for the life of the process. Repeated failures must not drain it.
+    let mut engine = load()?;
+    turn(&mut engine, vec![3, 7, 0, 5], 0.0, 2)?;
+    let baseline = engine.page_stats().expect("this decoder pages its KV");
+    let live = |stats: onnx_genai_kv::PageStats| stats.allocations - stats.frees;
+
+    for _ in 0..12 {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![3, 7, 0, 5, 6]));
+        request.options = GenerateOptions {
+            max_new_tokens: 8,
+            temperature: 0.0,
+            stop_on_eos: false,
+            ..GenerateOptions::default()
+        };
+        let request = PipelineGenerateRequest::new(request)
+            .with_input("vision_encoder.pixel_values", pixels(0.0)?);
+        let mut seen = 0;
+        let mut callback = move |_token: onnx_genai_engine::GenerateToken| {
+            seen += 1;
+            if seen >= 2 {
+                anyhow::bail!("interrupted");
+            }
+            Ok(())
+        };
+        assert!(
+            engine
+                .generate_with_callback(request, Some(&mut callback))
+                .is_err(),
+            "the interrupted generation must fail"
+        );
+    }
+
+    let after = engine.page_stats().expect("this decoder pages its KV");
+    assert_eq!(
+        live(after),
+        live(baseline),
+        "every interrupted generation must give its pages back"
+    );
+    Ok(())
+}
+
+#[test]
+fn many_distinct_conversations_do_not_exhaust_the_page_pool() -> anyhow::Result<()> {
+    // The prefix cache retains a page for everything it publishes. Without
+    // eviction the pool drains and generation eventually fails outright, so the
+    // real assertion is that it keeps working.
+    let mut engine = Engine::from_pipeline_dir(
+        &fixture_dir(),
+        EngineConfig {
+            page_size: 2,
+            // Deliberately small: enough for a few conversations, not for fifty.
+            num_gpu_pages: 24,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    for conversation in 0..50u32 {
+        let prompt = vec![3, 7, conversation % 8, (conversation / 8) % 8, 5];
+        turn(&mut engine, prompt, 0.0, 2)
+            .map_err(|error| anyhow::anyhow!("conversation {conversation} failed: {error:#}"))?;
+    }
+    Ok(())
+}
