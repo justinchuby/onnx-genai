@@ -30,8 +30,35 @@
 | Coco | Metal/MPS Kernel Engineer | .squad/agents/coco/charter.md | 🍎 Metal |
 | Freysa | MPS Perf & Testing | .squad/agents/freysa/charter.md | 🍎 Metal |
 | Sebastian | Performance Engineer | .squad/agents/sebastian/charter.md | ⚙️ Perf |
+| Isidore | Mobile & Bindings Engineer | .squad/agents/isidore/charter.md | 🔌 Bindings |
+| Iran | Mac CPU Optimization Engineer | .squad/agents/iran/charter.md | 🧮 Mac CPU |
+| Resch | Intel CPU Optimization Engineer | .squad/agents/resch/charter.md | 🧮 Intel CPU |
+| Luba | ARM CPU / QNN EP Engineer | .squad/agents/luba/charter.md | 📱 ARM/QNN |
 | Holden | Security Engineer | .squad/agents/holden/charter.md | 🔒 Security |
 | Scribe | Session Logger | .squad/agents/scribe/charter.md | 📋 Scribe |
 | Ralph | Work Monitor | .squad/agents/ralph/charter.md | 🔄 Monitor |
 | Rai | RAI Reviewer | .squad/agents/rai/charter.md | 🛡️ RAI |
 | Fact Checker | Fact Checker | .squad/agents/fact-checker/charter.md | 🔍 Verifier |
+
+## Sub-Teams (Pods)
+
+The team is organized into specialized pods. The coordinator routes by pod first,
+then to the owning member. Roy (Lead) spans all pods; Scribe/Ralph/Rai/Fact Checker
+are cross-pod built-ins. Members may act as liaisons into another pod (noted below).
+
+| Pod | Focus | Members |
+|-----|-------|---------|
+| 🚀 **CUDA & Perf** | CUDA EP kernels, decode engine, KV/buffers, throughput vs ORT — *primary front* | Deckard, Batty, Leon, Sebastian |
+| 🧩 **Models & Export** | GLM/DeepSeek/Gemma4/Phi native enablement, Mobius export, preprocessing, metadata | Sapper (+ Deckard/Batty collaborate) |
+| 🍎 **Metal / MPS** | Metal EP integration + MPS compute/data kernels + E2E/bench (`../onnxruntime-mlx`) | Nabil, Mariette, Coco, Freysa |
+| 🧮 **CPU & Edge** | CPU EP perf across Intel/ARM/Apple Silicon, QNN NPU EP, language bindings & mobile packaging | Resch (Intel), Iran (Mac), Luba (ARM/QNN), Isidore (Bindings) |
+| 🌐 **Server / API** | HTTP server, OpenAI-compatible API, streaming | Rachael, Zhora |
+| 🔎 **Quality & Safety** | Tests, code review, numerics, security, RAI, verification | Pris, Gaff, Luv, Chew, Holden, Rai, Fact Checker |
+
+**Cross-pod liaisons**
+- **Chew** (Quality/Numerics) is the standing precision gate for 🚀 CUDA & Perf and 🧮 CPU & Edge quant work.
+- **Pris** (Quality) pairs with the owning dev on any hot-path change to produce the benchmark.
+- **Isidore** (CPU & Edge/Bindings) pairs with **Luba** on ARM/Windows-on-ARM cross-compilation and with **Rachael/Zhora** on server-side binding surfaces.
+- **Sebastian** (CUDA & Perf) advises 🧮 CPU & Edge on benchmark methodology and portability gates.
+
+**Portability rule (all perf pods):** optimizations must help consumer/edge hardware, not just H200 — every perf claim is backed by a benchmark, and SIMD/NPU/kernel paths must match the scalar/f64 reference within a justified tolerance and be locked with a regression test.
