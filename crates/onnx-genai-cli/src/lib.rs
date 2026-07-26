@@ -31,10 +31,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 
+mod live_turn;
 mod memory;
 mod profile;
 use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
@@ -204,6 +206,10 @@ fn load_chat_template(model_dir: &Path, raw: bool) -> Option<ChatTemplate> {
         }
     }
 }
+
+/// How often the live status is refreshed while a reply streams. Fast enough to
+/// look continuous, slow enough that redrawing is not part of the measurement.
+const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Print the compact per-turn stats line, if the session asked for it.
 ///
@@ -521,6 +527,7 @@ fn run_generation_turn(
     stream: bool,
     profile: Option<&mut RunProfile>,
     reasoning: Option<&ReasoningConfig>,
+    live: Option<&mut live_turn::LiveTurn>,
 ) -> anyhow::Result<String> {
     INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     GENERATING.store(true, Ordering::SeqCst);
@@ -536,6 +543,11 @@ fn run_generation_turn(
     let mut reasoning_stream = reasoning
         .map(|config| ReasoningStream::new(config.markers.clone(), config.opened_by_template));
     let mut dimmed = false;
+    let mut live = live.filter(|live| stream && live.is_active());
+    // Numbers move faster than a reader can follow, and every update costs a
+    // frame, so the status is refreshed on a timer rather than per token.
+    let mut last_status = Instant::now();
+    let mut live_frames = 0usize;
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Interrupted));
@@ -549,12 +561,26 @@ fn run_generation_turn(
                 .as_mut()
                 .map(|tracker| tracker.push(&token.text))
                 .unwrap_or(false);
-            if dim_reasoning && is_reasoning != dimmed {
-                print!("{}", if is_reasoning { "\x1b[2m" } else { "\x1b[0m" });
-                dimmed = is_reasoning;
+            if let Some(live) = live.as_deref_mut() {
+                let first = live_frames == 0;
+                live.push(&token.text, is_reasoning)?;
+                live_frames += 1;
+                // The first token draws immediately so the line is never empty
+                // while a reply is on screen; after that the numbers are
+                // throttled, since they move faster than they can be read and
+                // every update costs a frame.
+                if first || last_status.elapsed() >= STATUS_REFRESH {
+                    live.set_status(timings.live_summary())?;
+                    last_status = Instant::now();
+                }
+            } else {
+                if dim_reasoning && is_reasoning != dimmed {
+                    print!("{}", if is_reasoning { "\x1b[2m" } else { "\x1b[0m" });
+                    dimmed = is_reasoning;
+                }
+                print!("{}", token.text);
+                io::stdout().flush()?;
             }
-            print!("{}", token.text);
-            io::stdout().flush()?;
         }
         Ok(())
     };
@@ -563,6 +589,9 @@ fn run_generation_turn(
     if dimmed {
         print!("\x1b[0m");
         let _ = io::stdout().flush();
+    }
+    if let Some(live) = live {
+        live.finish()?;
     }
     GENERATING.store(false, Ordering::SeqCst);
     timings.finish();
@@ -1232,6 +1261,7 @@ fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
         args.stream,
         Some(&mut profile),
         reasoning.as_ref(),
+        None,
     ) {
         Ok(output) => {
             if args.stream {
@@ -1398,6 +1428,9 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     // Per-turn numbers are opt-in: a line after every reply is noise until a
     // reader is actually watching throughput or cache behavior.
     let mut show_stats = false;
+    // Inert unless stdout is a terminal, so a piped session is byte-for-byte
+    // what it was before.
+    let mut live = live_turn::LiveTurn::new();
     let mut template = load_chat_template(&model_dir, raw_mode);
     let mut reasoning = detect_reasoning(template.as_ref());
 
@@ -1541,9 +1574,15 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             true,
             Some(&mut profile),
             reasoning.as_ref(),
+            // Live rendering follows `/stats`: it is what puts moving numbers
+            // under the reply, and a session that did not ask for them keeps the
+            // plain streaming path untouched.
+            show_stats.then_some(&mut live),
         ) {
             Ok(output) => {
-                println!();
+                if !live.is_active() {
+                    println!();
+                }
                 // Reasoning models are trained with earlier turns' thinking
                 // removed, so replaying it degrades quality and inflates the
                 // context. Only the answer becomes history.

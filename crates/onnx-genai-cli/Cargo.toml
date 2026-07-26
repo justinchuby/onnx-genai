@@ -58,6 +58,7 @@ ctrlc = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # getrusage for the peak-RSS probe; Linux reads /proc/self/status instead.

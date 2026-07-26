@@ -112,12 +112,20 @@ current generation; two in a row exit. Slash commands control the session:
 >>> /reset
 ```
 
-`/stats` toggles a one-line summary after each reply, for watching throughput and
-cache behavior without the full `--profile` report:
+`/stats` toggles per-turn numbers, for watching throughput and cache behavior
+without the full `--profile` report. While a reply streams, the numbers update
+live beneath it; when the turn ends they settle into one line:
 
 ```text
 [ 613 in · 64 out · 41.2 tok/s · ttft 116 ms · 598 reused · encoder 1/1 · rss 2.5 GiB ]
 ```
+
+The live view is drawn with [ratatui](https://ratatui.rs) into an *inline*
+viewport rather than an alternate screen, so finished lines spill into the
+terminal's own scrollback and the conversation stays selectable, copyable, and
+present after the session ends. It is used only on a terminal and only once
+`/stats` is on: a piped session, and any session that did not ask for numbers,
+gets exactly the plain streaming output it got before.
 
 ### Image and audio input
 

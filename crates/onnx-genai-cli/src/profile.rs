@@ -180,6 +180,26 @@ pub(crate) struct MultimodalReuse {
     pub(crate) prefill_tokens: u64,
 }
 
+impl TokenTimings {
+    /// The numbers worth watching while a reply is still being written.
+    ///
+    /// Only what is already known mid-turn: totals that need the turn to finish
+    /// are left to the summary line printed afterwards.
+    pub(crate) fn live_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.tokens() > 0 {
+            parts.push(format!("{} tok", self.tokens()));
+        }
+        if let Some(rate) = self.decode_tokens_per_second() {
+            parts.push(format!("{rate:.1} tok/s"));
+        }
+        if let Some(ttft) = self.time_to_first_token() {
+            parts.push(format!("ttft {:.0} ms", ttft.as_secs_f64() * 1000.0));
+        }
+        parts.join(" · ")
+    }
+}
+
 impl RunProfile {
     /// One line of per-turn numbers for an interactive session.
     ///
