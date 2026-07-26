@@ -3562,14 +3562,43 @@ impl MatMulNBitsKernel {
                 );
             }
             if self.bits == 4 && self.accuracy_level == 4 {
+                if self.block_size == 32 {
+                    onnx_runtime_ep_api::record_kernel_variant!(
+                        "gemv_accuracy4_blockwise_int8",
+                        "M==1 decode: bits=4, accuracy_level==4, block_size=32 → int8-quantized \
+                         activation quantized ONCE then parallelized blockwise GEMV (grid filled \
+                         from the device SM count; bit-identical to the tiled accuracy4 GEMM)"
+                    );
+                    return self.launch_accuracy4_gemv_blockwise(
+                        &inputs[0],
+                        &inputs[1],
+                        &inputs[2],
+                        zero_points,
+                        bias,
+                        &mut outputs[0],
+                        k_blocks,
+                        blob_size,
+                        zp_row_bytes,
+                    );
+                }
+                // accuracy_level 4 requests int8-quantized activations, but the
+                // int8 activation quantum is only calibrated at block_size=32
+                // (the size the blockwise/tiled accuracy4 kernels bake in). At
+                // larger block sizes (e.g. 128) quantizing the activations to
+                // int8 discards enough precision to flip razor-thin decode logit
+                // ties and diverge from the fp32 reference, so accumulate the
+                // activations in fp32 instead. This mirrors the int8/non-block-32
+                // path above and the int8/block-128 specialization: fp32
+                // activations are strictly higher precision than the
+                // int8-activation reference and match the fp32 oracle stream.
                 onnx_runtime_ep_api::record_kernel_variant!(
-                    "gemv_accuracy4_blockwise_int8",
-                    "M==1 decode: bits=4, accuracy_level==4, block_size={} → int8-quantized \
-                     activation quantized ONCE then parallelized blockwise GEMV (grid filled \
-                     from the device SM count; bit-identical to the tiled accuracy4 GEMM)",
+                    "gemv_f32_general_bs_int4",
+                    "M==1 decode: bits=4, accuracy_level==4, block_size={} (≠32) → \
+                     model-agnostic f32 GEMV (fp32 activations, higher precision than the \
+                     int8-activation reference)",
                     self.block_size
                 );
-                return self.launch_accuracy4_gemv_blockwise(
+                return self.launch_f32_gemv(
                     &inputs[0],
                     &inputs[1],
                     &inputs[2],
@@ -3600,10 +3629,15 @@ impl MatMulNBitsKernel {
                 );
             }
         }
-        if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
+        if self.bits == 4
+            && self.accuracy_level == 4
+            && self.block_size == 32
+            && group_indices.is_none()
+        {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemm_tiled_accuracy4",
-                "M={} (GEMV requires M==1), accuracy_level==4, no g_idx → tiled accuracy4 GEMM",
+                "M={} (GEMV requires M==1), accuracy_level==4, block_size=32, no g_idx → \
+                 tiled accuracy4 GEMM (int8-quantized activations)",
                 m
             );
             return self.launch_accuracy4(
