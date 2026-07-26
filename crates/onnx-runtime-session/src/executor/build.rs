@@ -1,5 +1,464 @@
 use super::*;
 
+/// Lower an exact `x * Sigmoid(x)` pair to the CPU EP's fused SiLU kernel.
+///
+/// The Sigmoid result must have exactly one consumer and must not be a graph
+/// output, so removing its materialized value cannot change observable behavior.
+pub(super) fn fuse_silu_patterns(graph: &mut Graph) -> usize {
+    let sigmoid_ids: Vec<NodeId> = graph
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            (node.op_type == "Sigmoid"
+                && node.is_default_domain()
+                && node.inputs.len() == 1
+                && node.outputs.len() == 1)
+                .then_some(id)
+        })
+        .collect();
+    let mut fused = 0;
+
+    for sigmoid_id in sigmoid_ids {
+        let Some(sigmoid) = graph.try_node(sigmoid_id) else {
+            continue;
+        };
+        let Some(x) = sigmoid.inputs[0] else {
+            continue;
+        };
+        let sigmoid_output = sigmoid.outputs[0];
+        if graph.outputs.contains(&sigmoid_output) {
+            continue;
+        }
+        let consumers = graph.consumers(sigmoid_output);
+        if consumers.len() != 1 {
+            continue;
+        }
+        let mul_id = consumers[0];
+        let mul = graph.node(mul_id);
+        if mul.op_type != "Mul"
+            || !mul.is_default_domain()
+            || mul.inputs.len() != 2
+            || mul.outputs.len() != 1
+            || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
+                || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
+        {
+            continue;
+        }
+
+        let mut silu = mul.clone();
+        silu.op_type = "Silu".to_string();
+        silu.domain = "com.microsoft".to_string();
+        silu.inputs = vec![Some(x)];
+        silu.attributes.clear();
+        graph.replace_node(mul_id, silu);
+        graph.remove_node(sigmoid_id);
+        fused += 1;
+    }
+
+    if fused != 0 {
+        graph
+            .opset_imports
+            .entry("com.microsoft".to_string())
+            .or_insert(1);
+    }
+    fused
+}
+
+pub(super) struct WeightStoreInitializerResolver(Arc<WeightStore>);
+
+impl InitializerResolver for WeightStoreInitializerResolver {
+    fn bytes<'a>(&'a self, weight: &'a onnx_runtime_ir::WeightRef) -> Option<&'a [u8]> {
+        self.0.bytes(weight)
+    }
+}
+
+pub(super) fn run_ep_scoped_passes(
+    graph: &mut Graph,
+    weights: &Arc<WeightStore>,
+    ep: &dyn ExecutionProvider,
+) -> Result<()> {
+    let passes = ep.custom_passes();
+    if passes.is_empty() {
+        return Ok(());
+    }
+
+    let resolver = Arc::new(WeightStoreInitializerResolver(Arc::clone(weights)));
+    let context = onnx_runtime_optimizer::PassContext::new().with_initializer_resolver(resolver);
+    onnx_runtime_optimizer::run_passes(graph, &passes, &context)?;
+
+    // Best-effort shape refresh: the passes may have rewritten nodes whose
+    // output shapes downstream reads. A *data-dependent* invalidity (e.g. a
+    // `Slice` with step 0) is the runtime kernel's contract to reject, not a
+    // load-time error — before EP passes existed this re-inference did not run,
+    // so the graph built and the actionable diagnostic surfaced at `run`.
+    // Re-infer on a clone and adopt the refreshed shapes only on success so such
+    // a failure neither aborts the build nor leaves the graph partially updated;
+    // the executor's own resolution still validates shapes at run time.
+    let registry = InferenceRegistry::default_registry();
+    let opset_imports = graph.opset_imports.clone();
+    let mut refreshed = graph.clone();
+    if registry
+        .infer_graph(&mut refreshed, &opset_imports, MergePolicy::Permissive)
+        .is_ok()
+    {
+        *graph = refreshed;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_if_branch_outputs(graph: &Graph, node: &Node) -> Result<()> {
+    let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".to_string())) else {
+        return Ok(());
+    };
+    let Some(else_branch) = graph.subgraphs.get(&(node.id, "else_branch".to_string())) else {
+        return Ok(());
+    };
+
+    if then_branch.outputs.len() != else_branch.outputs.len() {
+        return Err(SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "branches declare different output counts: then_branch has {}, \
+                 else_branch has {}",
+                then_branch.outputs.len(),
+                else_branch.outputs.len()
+            ),
+        });
+    }
+    if then_branch.outputs.len() != node.outputs.len() {
+        return Err(SessionError::ControlFlow {
+            op: "If".to_string(),
+            reason: format!(
+                "node declares {} output(s), but each branch declares {}",
+                node.outputs.len(),
+                then_branch.outputs.len()
+            ),
+        });
+    }
+    for (index, (&then_output, &else_output)) in then_branch
+        .outputs
+        .iter()
+        .zip(&else_branch.outputs)
+        .enumerate()
+    {
+        if then_branch.value_type_is_known(then_output)
+            && else_branch.value_type_is_known(else_output)
+        {
+            let then_dtype = then_branch.value(then_output).dtype;
+            let else_dtype = else_branch.value(else_output).dtype;
+            if then_dtype != else_dtype {
+                return Err(SessionError::ControlFlow {
+                    op: "If".to_string(),
+                    reason: format!(
+                        "branches declare different dtypes for output {index}: \
+                         then_branch is {then_dtype:?}, else_branch is {else_dtype:?}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
+    for (_, node) in graph.nodes.iter() {
+        if node.op_type == "If" && matches!(node.domain.as_str(), "" | "ai.onnx") {
+            validate_if_branch_outputs(graph, node)?;
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        validate_control_flow_signatures(subgraph)?;
+    }
+    Ok(())
+}
+
+/// Reject operators no execution provider can run, before EP optimizer passes
+/// run. An optimizer pass's postcondition validation walks the whole graph and
+/// would otherwise surface a less actionable structural error (e.g. an
+/// opset-import invariant) instead of the actionable unsupported-operator
+/// diagnostic callers rely on.
+///
+/// A CUDA graph may legitimately delegate unsupported nodes to a CPU fallback
+/// (see [`cuda_fallback_report`]), so an unsupported op is not fatal there; the
+/// check is limited to the terminal (non-CUDA) EP. Only nodes with fully static
+/// declared input shapes are pre-validated: a symbolic/data-dependent shape is
+/// resolved and validated at run time, so pre-checking a contrib op whose
+/// support is shape-conditional would change behavior for valid graphs.
+pub(super) fn reject_unsupported_operators(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+    if ep.device_type() == DeviceType::Cuda {
+        return Ok(());
+    }
+    for (node_id, node) in graph.nodes.iter() {
+        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+            || is_control_flow_op(&node.op_type, &node.domain)
+            || is_sequence_op(&node.op_type, &node.domain)
+        {
+            continue;
+        }
+
+        let shapes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        // Defer nodes with any non-static declared input shape to the run-time
+        // kernel gate, which sees concrete shapes.
+        if !shapes.iter().all(|shape| as_static_shape(shape).is_some()) {
+            continue;
+        }
+        let input_dtypes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        let layouts = vec![TensorLayout::contiguous(); shapes.len()];
+        let opset = effective_opset(graph, node);
+        if let KernelMatch::Unsupported { reason } =
+            ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
+        {
+            return Err(SessionError::unsupported_op(
+                node,
+                node_id,
+                opset,
+                ep.name(),
+                reason,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn cuda_fallback_report(
+    graph: &Graph,
+    ep: &dyn ExecutionProvider,
+) -> Option<ExecutionProviderFallbackReport> {
+    if ep.device_type() != DeviceType::Cuda {
+        return None;
+    }
+
+    let mut issues = Vec::new();
+    collect_cuda_coverage_issues(graph, graph, ep, "graph", &mut issues);
+    if issues.is_empty() {
+        return None;
+    }
+
+    let mut assigned_ops = BTreeSet::new();
+    let assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);
+    Some(ExecutionProviderFallbackReport {
+        requested_provider: ep.name().to_string(),
+        fallback_provider: "cpu_ep".to_string(),
+        assigned_node_count,
+        assigned_ops: assigned_ops.into_iter().collect(),
+        declines: issues,
+    })
+}
+
+pub(super) fn collect_executable_ops(graph: &Graph, ops: &mut BTreeSet<String>) -> usize {
+    let mut count = 0;
+    for (_, node) in graph.nodes.iter() {
+        if !onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
+            count += 1;
+            ops.insert(format!("{}::{}", canonical_domain(node), node.op_type));
+        }
+    }
+    for subgraph in graph.subgraphs.values() {
+        count += collect_executable_ops(subgraph, ops);
+    }
+    count
+}
+
+pub(super) fn format_cuda_coverage_issues(issues: &[ExecutionProviderDecline]) -> String {
+    const MAX_EXAMPLES_PER_CLASS: usize = 3;
+
+    let mut groups: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    for issue in issues {
+        groups
+            .entry((
+                issue.domain.clone(),
+                issue.op_type.clone(),
+                issue.reason.clone(),
+            ))
+            .or_default()
+            .push(issue.node.clone());
+    }
+
+    groups
+        .into_iter()
+        .map(|((domain, op_type, reason), mut nodes)| {
+            nodes.sort();
+            let count = nodes.len();
+            nodes.truncate(MAX_EXAMPLES_PER_CLASS);
+            format!(
+                "{domain}::{op_type}: {reason} [count={count}; examples: {}]",
+                nodes.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+pub(super) fn collect_cuda_coverage_issues(
+    graph: &Graph,
+    opset_graph: &Graph,
+    ep: &dyn ExecutionProvider,
+    scope: &str,
+    issues: &mut Vec<ExecutionProviderDecline>,
+) {
+    for (node_id, node) in graph.nodes.iter() {
+        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain)
+            || is_control_flow_op(&node.op_type, &node.domain)
+            || is_sequence_op(&node.op_type, &node.domain)
+        {
+            continue;
+        }
+
+        let shapes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let layouts = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).layout.clone())
+                    .unwrap_or_else(TensorLayout::contiguous)
+            })
+            .collect::<Vec<_>>();
+        let input_dtypes = node
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| graph.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+
+        let opset = effective_opset(opset_graph, node);
+        if let KernelMatch::Unsupported { reason } =
+            ep.supports_op(node, opset, &shapes, &input_dtypes, &layouts)
+        {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: reason.into_owned(),
+            });
+            continue;
+        }
+
+        let Some(concrete_shapes) = shapes
+            .iter()
+            .map(|shape| as_static_shape(shape))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if let Err(error) = ep.get_kernel(node, &concrete_shapes, opset) {
+            issues.push(ExecutionProviderDecline {
+                node: format_node_identity(scope, node_id, node),
+                domain: canonical_domain(node),
+                op_type: node.op_type.clone(),
+                reason: format!("kernel creation failed: {error}"),
+            });
+        }
+    }
+
+    for ((node_id, attribute), subgraph) in &graph.subgraphs {
+        let sub_scope = format!("{scope}/node#{}/{}", node_id.0, attribute);
+        collect_cuda_coverage_issues(subgraph, opset_graph, ep, &sub_scope, issues);
+    }
+}
+
+pub(super) fn canonical_domain(node: &Node) -> String {
+    if node.domain.is_empty() {
+        "ai.onnx".to_string()
+    } else {
+        node.domain.clone()
+    }
+}
+
+pub(super) fn format_node_identity(scope: &str, node_id: NodeId, node: &Node) -> String {
+    if node.name.is_empty() {
+        format!("{scope}/node#{}", node_id.0)
+    } else {
+        format!("{scope}/node#{} {:?}", node_id.0, node.name)
+    }
+}
+
+pub(super) fn build_lazy_weight_handles(
+    graph: &Graph,
+    weights: &Arc<WeightStore>,
+    ep: &dyn ExecutionProvider,
+) -> Result<HashMap<ValueId, WeightHandle>> {
+    let capabilities = ep.capabilities();
+    if !capabilities.advertises(onnx_runtime_ep_api::NXRT_WEIGHT_PAGING_CAPABILITY) {
+        return Ok(HashMap::new());
+    }
+
+    let boundary = LazyWeightBoundary::BlockQuantizedMoe;
+    let mut handles = HashMap::new();
+    for (&value, weight) in &graph.initializers {
+        let graph_value = graph.value(value);
+        let consumers = graph.consumers(value);
+        let lazy_only = graph_value.producer.is_none()
+            && !graph.outputs.contains(&value)
+            && !consumers.is_empty()
+            && consumers.into_iter().all(|consumer| {
+                let node = graph.node(consumer);
+                boundary.matches(&node.domain, &node.op_type)
+            });
+        if !lazy_only {
+            continue;
+        }
+        let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
+            continue;
+        };
+        let region = ExternalMmapRegion {
+            mapping_id,
+            offset,
+            len,
+        };
+        let dtype = weight.dtype();
+        let shape = weight.dims().to_vec();
+        let weight = weight.clone();
+        let store = Arc::clone(weights);
+        let lazy = LazyWeight::block_quantized_moe(vec![region], move || {
+            let bytes = store.bytes(&weight).ok_or_else(|| {
+                onnx_runtime_ep_api::WeightHandleError::InvalidResident(
+                    "external weight bytes are no longer available".into(),
+                )
+            })?;
+            ResidentWeight::new(dtype, shape.clone(), Arc::<[u8]>::from(bytes))
+        })
+        .map_err(|error| {
+            SessionError::Internal(format!(
+                "cannot create lazy weight handle for value#{}: {error}",
+                value.0
+            ))
+        })?;
+        handles.insert(value, WeightHandle::Lazy(lazy));
+    }
+    Ok(handles)
+}
+
+
+
+
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
     pub(crate) fn build(

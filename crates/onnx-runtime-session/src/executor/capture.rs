@@ -1,5 +1,435 @@
 use super::*;
 
+/// Print, to stderr, how the capture pass split a claimed subgraph into captured
+/// device-graph segments and eager seam nodes, and why each seam exists. Gated
+/// by `ONNX_GENAI_LOG_CAPTURE_SEGMENTS` for transparency into segmentation.
+pub(super) fn log_capture_segmentation(schedule: &CaptureSchedule) {
+    let captured = schedule.captured_segments();
+    let seams = schedule.segments.len() - captured;
+    eprintln!(
+        "[onnx-genai-capture] segmented CUDA graph: {captured} captured segment(s), \
+         {seams} eager seam(s)"
+    );
+    for boundary in &schedule.boundaries {
+        match boundary.node_id {
+            Some(id) => {
+                let seam_label = boundary
+                    .seam_reason
+                    .map(SeamReason::label)
+                    .unwrap_or("unclassified-seam");
+                eprintln!(
+                    "[onnx-genai-capture]   seam node {id} ({}::{}) [{seam_label}] ran eagerly: {}",
+                    boundary.domain, boundary.op_type, boundary.reason
+                );
+            }
+            None => eprintln!(
+                "[onnx-genai-capture]   seam ({}): {}",
+                boundary.op_type, boundary.reason
+            ),
+        }
+    }
+}
+
+/// Observable control-flow executor statistics. These counters make subgraph
+/// reuse deterministic to test without relying on timing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlFlowStats {
+    /// Child executors built, including shape-signature rebuilds.
+    pub subgraph_builds: u64,
+    /// Child subgraph invocations served by those executors.
+    pub subgraph_runs: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceAllocationCounts {
+    pub allocations: u64,
+    pub frees: u64,
+}
+
+/// Structural execution path used by a node during a captured run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePathKind {
+    /// Recorded into a device graph and replayed.
+    CaptureRegion,
+    /// Dispatched eagerly while remaining on the device.
+    EagerDeviceSeam,
+    /// Host-driven work or a host round-trip between captured regions.
+    HostSeam,
+}
+
+impl CapturePathKind {
+    /// Stable short label used by capture diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CaptureRegion => "capture-region",
+            Self::EagerDeviceSeam => "eager-device-seam",
+            Self::HostSeam => "host-seam",
+        }
+    }
+}
+
+/// Structural reason a node forms an eager seam during device-graph capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeamReason {
+    /// Host-driven control-flow or sequence semantics.
+    HostControlFlowOrSequence,
+    /// A data-dependent output shape was unresolved before capture.
+    UnresolvedOutputShape,
+    /// A data-dependent input shape was unresolved before capture.
+    UnresolvedInputShape,
+    /// The requested concrete kernel shape has not completed warmup.
+    KernelNotWarmed,
+    /// The selected device kernel explicitly opts out of capture.
+    KernelCaptureUnsupported,
+    /// The kernel aborted device-graph *recording* (e.g. it advertised capture
+    /// support but issued a stream synchronize, which CUDA rejects mid-capture)
+    /// and was quarantined to a forced eager seam so the rest of the graph can
+    /// still be captured.
+    CaptureRecordingFailed,
+}
+
+impl SeamReason {
+    /// Execution path implied by this structural seam cause.
+    pub const fn path_kind(self) -> CapturePathKind {
+        match self {
+            Self::HostControlFlowOrSequence => CapturePathKind::HostSeam,
+            Self::UnresolvedOutputShape
+            | Self::UnresolvedInputShape
+            | Self::KernelNotWarmed
+            | Self::CaptureRecordingFailed
+            | Self::KernelCaptureUnsupported => CapturePathKind::EagerDeviceSeam,
+        }
+    }
+
+    /// Stable short path-kind label used by capture diagnostics.
+    pub const fn label(self) -> &'static str {
+        self.path_kind().label()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// One actionable reason a device-graph capture attempt was rejected.
+pub struct CaptureDecline {
+    /// Graph node id, or `None` for graph/capture-lifecycle requirements.
+    pub node_id: Option<u32>,
+    /// ONNX operator type, or `"<graph>"` for graph-level requirements.
+    pub op_type: String,
+    /// Canonical ONNX domain (`"ai.onnx"` by default), or `"nxrt"` graph-level.
+    pub domain: String,
+    /// Failed precondition and, where applicable, how to reach the capture path.
+    pub reason: String,
+    /// Structural seam classification, or `None` for graph-level hard preconditions.
+    pub seam_reason: Option<SeamReason>,
+}
+
+impl CaptureDecline {
+    pub(super) fn node(
+        node_id: NodeId,
+        node: &Node,
+        seam_reason: SeamReason,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            node_id: Some(node_id.0),
+            op_type: node.op_type.clone(),
+            domain: canonical_domain(node),
+            reason: reason.into(),
+            seam_reason: Some(seam_reason),
+        }
+    }
+
+    pub(super) fn graph(reason: impl Into<String>) -> Self {
+        Self {
+            node_id: None,
+            op_type: "<graph>".to_string(),
+            domain: "nxrt".to_string(),
+            reason: reason.into(),
+            seam_reason: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Structured reasons a device graph could not be captured.
+pub struct CaptureDeclineReport {
+    /// All graph- and node-level declines found by the pre-capture audit.
+    pub entries: Vec<CaptureDecline>,
+}
+
+impl CaptureDeclineReport {
+    pub(super) fn one(decline: CaptureDecline) -> Self {
+        Self {
+            entries: vec![decline],
+        }
+    }
+
+    /// Whether the capture audit found no declines.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// One node-level reason the requested execution provider declined placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProviderDecline {
+    /// Stable graph/subgraph node identity used in diagnostics.
+    pub node: String,
+    /// Canonical ONNX domain (`"ai.onnx"` for the default domain).
+    pub domain: String,
+    /// ONNX operator type.
+    pub op_type: String,
+    /// Actionable reason returned by [`ExecutionProvider::supports_op`].
+    pub reason: String,
+}
+
+/// Structured report for an accelerator request that executes on CPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionProviderFallbackReport {
+    /// Requested provider name, such as `"cuda_ep"`.
+    pub requested_provider: String,
+    /// Provider that will execute the graph.
+    pub fallback_provider: String,
+    /// Number of executable graph/subgraph nodes assigned to the fallback EP.
+    pub assigned_node_count: usize,
+    /// Sorted distinct `domain::op` classes assigned to the fallback EP.
+    pub assigned_ops: Vec<String>,
+    /// Nodes the requested provider did not claim, with colocated reasons.
+    pub declines: Vec<ExecutionProviderDecline>,
+}
+
+impl std::fmt::Display for ExecutionProviderFallbackReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} nodes assigned to CPU (ops: {}) — GPU EP {} did not claim {} node(s): {}. \
+             Heterogeneous CUDA+CPU placement is unavailable, so the whole session uses {}",
+            self.assigned_node_count,
+            self.assigned_ops.join(", "),
+            self.requested_provider,
+            self.declines.len(),
+            format_cuda_coverage_issues(&self.declines),
+            self.fallback_provider,
+        )
+    }
+}
+
+impl std::fmt::Display for CaptureDeclineReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CUDA graph capture rejected")?;
+        for (index, decline) in self.entries.iter().enumerate() {
+            if index == 0 {
+                write!(f, ": ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+            match decline.node_id {
+                Some(node_id) => write!(
+                    f,
+                    "node {node_id} ({}::{}) — {}",
+                    decline.domain, decline.op_type, decline.reason
+                )?,
+                None => write!(f, "{} — {}", decline.op_type, decline.reason)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+pub enum DeviceGraphCaptureResult {
+    Captured(Vec<Option<Tensor>>),
+    NotCapturable(CaptureDeclineReport),
+}
+
+pub(super) enum ScopedRunResult {
+    Executed(Vec<Option<SessionOutput>>),
+    NotCapturable(CaptureDeclineReport),
+}
+
+pub(super) fn kernel_capture_decline(
+    node_id: NodeId,
+    node: &Node,
+    kernel: &dyn Kernel,
+) -> Option<CaptureDecline> {
+    kernel.capture_support().reason().map(|reason| {
+        CaptureDecline::node(node_id, node, SeamReason::KernelCaptureUnsupported, reason)
+    })
+}
+
+pub(super) fn structural_capture_decline(
+    node_id: NodeId,
+    node: &Node,
+    decline: StructuralCaptureDecline,
+) -> CaptureDecline {
+    let seam_reason = match decline {
+        StructuralCaptureDecline::HostControlFlowOrSequence => {
+            SeamReason::HostControlFlowOrSequence
+        }
+        StructuralCaptureDecline::UnresolvedOutputShape => SeamReason::UnresolvedOutputShape,
+        StructuralCaptureDecline::UnresolvedInputShape => SeamReason::UnresolvedInputShape,
+    };
+    CaptureDecline::node(node_id, node, seam_reason, decline.reason())
+}
+
+/// Whether verbose segmented-capture diagnostics are printed to stderr.
+///
+/// Gated identically to op profiling so a run can surface exactly where the
+/// CUDA EP split a claimed subgraph into captured segments and eager seam nodes.
+pub(super) fn capture_segmentation_logging_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_LOG_CAPTURE_SEGMENTS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// How a scoped run drives the device-graph lifecycle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RunMode {
+    /// No capture: execute every node eagerly on the stream.
+    Eager,
+    /// First capture pass: partition the plan into segments, record each
+    /// capturable segment into its own device graph, and run the non-capturable
+    /// seam nodes eagerly in between.
+    Capture,
+    /// Subsequent steps: replay each captured segment graph in order, re-running
+    /// only the eager seam nodes.
+    Replay,
+}
+
+/// The device-graph capture disposition of a single op, used to annotate its
+/// trace span with **why** it was or was not captured. Carries a borrowed
+/// reason string rather than an owned one so an untraced run never allocates.
+#[derive(Clone, Copy)]
+pub(super) enum OpCaptureTrace<'a> {
+    /// Plain eager run — no capture attempt is in progress for this op.
+    Eager,
+    /// The op was recorded into a captured device-graph segment.
+    Captured,
+    /// The op runs eagerly as a capture seam; `reason` explains why it could
+    /// not be recorded into a device graph (which kernel/predicate declined).
+    Rejected(&'a str),
+}
+
+/// Trace-arg key: whether an op was captured into a device graph.
+pub(super) const ARG_CAPTURE_STATUS: &str = "capture_status";
+/// Trace-arg key: why an op was not captured into a device graph.
+pub(super) const ARG_CAPTURE_REASON: &str = "capture_reason";
+
+impl OpCaptureTrace<'_> {
+    /// Annotate the active op-span with this capture disposition. A no-op for
+    /// [`OpCaptureTrace::Eager`] (nothing was being captured) and when no span
+    /// is active.
+    pub(super) fn annotate(self) {
+        match self {
+            OpCaptureTrace::Eager => {}
+            OpCaptureTrace::Captured => {
+                annotate_current_span_with(|| {
+                    onnx_runtime_tracer::Args::new().with(ARG_CAPTURE_STATUS, "captured")
+                });
+            }
+            OpCaptureTrace::Rejected(reason) => {
+                annotate_current_span_with(|| {
+                    onnx_runtime_tracer::Args::new()
+                        .with(ARG_CAPTURE_STATUS, "rejected")
+                        .with(ARG_CAPTURE_REASON, reason)
+                });
+            }
+        }
+    }
+}
+
+/// Scope guard that guarantees an in-progress segment capture is always ended
+/// before its enclosing function returns.
+///
+/// During [`RunMode::Capture`], nodes are recorded between
+/// `begin_device_graph_capture` and `end_device_graph_capture`. If a node fails
+/// mid-record, the `?` early return would otherwise skip the end call and leave
+/// the CUDA stream wedged in capture mode — the caller's
+/// `reset_device_graph()` is then a no-op (reset is rejected while capturing),
+/// so every later eager/replay launch fails with `STREAM_CAPTURE_INVALIDATED`.
+///
+/// While armed, [`Drop`] aborts the capture (ending stream capture and
+/// discarding the half-recorded graph). The success path calls [`disarm`] and
+/// then ends the capture normally via `end_device_graph_capture`.
+///
+/// [`disarm`]: SegmentCaptureGuard::disarm
+pub(super) struct SegmentCaptureGuard<'a> {
+    pub(super) ep: &'a dyn ExecutionProvider,
+    pub(super) armed: bool,
+}
+
+impl<'a> SegmentCaptureGuard<'a> {
+    pub(super) fn arm(ep: &'a dyn ExecutionProvider) -> Self {
+        Self { ep, armed: true }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SegmentCaptureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort: the abort itself may fail, but the caller is already
+            // unwinding a capture failure and will reset the lifecycle next.
+            let _ = self.ep.abort_device_graph_capture();
+        }
+    }
+}
+
+/// One contiguous run of plan nodes that either share a captured device graph or
+/// all execute eagerly (a non-capturable seam).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ScheduledSegment {
+    /// First plan index (inclusive).
+    pub(super) start: usize,
+    /// One past the last plan index (exclusive).
+    pub(super) end: usize,
+    /// `true` when `[start, end)` is captured into a device graph; `false` for an
+    /// eager seam of non-capturable (but still device-placed or CPU) nodes.
+    pub(super) captured: bool,
+    /// Capture-order index of this segment's graph in the EP, set only when
+    /// `captured`.
+    pub(super) graph_index: usize,
+}
+
+/// The plan's partition into captured segments and eager seams, plus the
+/// structured reason each segment boundary exists (which node forced the split).
+///
+/// Recorded once during the capture pass and reused for every subsequent replay
+/// so the interleaving of graph replays and eager seam execution is stable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct CaptureSchedule {
+    pub(super) segments: Vec<ScheduledSegment>,
+    /// One entry per non-capturable seam node, explaining why it forced a
+    /// boundary (its `CaptureSupport::Unsupported` reason or structural cause).
+    pub(super) boundaries: Vec<CaptureDecline>,
+}
+
+impl CaptureSchedule {
+    /// Number of captured device-graph segments (1 for a whole-subgraph capture).
+    pub(super) fn captured_segments(&self) -> usize {
+        self.segments.iter().filter(|seg| seg.captured).count()
+    }
+
+    /// Whether the whole plan captured as a single graph (no eager seams).
+    pub(super) fn is_single_graph(&self) -> bool {
+        self.segments.len() == 1 && self.segments[0].captured
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DeviceBindingSignature {
+    pub(super) input_name: String,
+    pub(super) binds_input: bool,
+    pub(super) output_name: Option<String>,
+    pub(super) dtype: DataType,
+    pub(super) physical_shape: Vec<usize>,
+    pub(super) device_ptr: usize,
+}
+
+
 impl Executor {
 
     /// Classify why one plan node cannot be recorded into a device graph, or
