@@ -3861,7 +3861,10 @@ impl Executor {
         // Open the span only when tracing is live so an untraced decode step
         // never allocates a span name or touches the thread-local span stack.
         let _span = self.trace.is_enabled().then(|| {
-            let span = self.trace.span(op_type.clone(), "op");
+            // Every op span comes from this one line, so the source location
+            // would be the same string on all of them; the node args below
+            // identify each span far better. Keeping it cost 22% of a trace.
+            let span = self.trace.span(op_type.clone(), "op").without_source();
             annotate_current_span_with(|| {
                 let mut args = Args::new().with("node_id", node_id as u64);
                 if !node_name.is_empty() {

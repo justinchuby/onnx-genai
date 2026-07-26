@@ -128,7 +128,7 @@ pub mod perfetto;
 pub use args::{
     ARG_CAPTURE_REJECTED_DOMAIN, ARG_CAPTURE_REJECTED_NODE, ARG_CAPTURE_REJECTED_OP,
     ARG_CAPTURE_REJECTED_REASON, ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON,
-    ARG_OPTIMIZED_CANDIDATE, Args, capture_rejected,
+    ARG_OPTIMIZED_CANDIDATE, ARG_SOURCE, Args, capture_rejected,
 };
 pub use clock::{TraceClock, TraceSessionId, absolute_now_us};
 pub use collector::{
