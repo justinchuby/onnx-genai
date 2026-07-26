@@ -104,6 +104,92 @@ mod mm_profile {
     }
 }
 
+/// Env-gated (`NXRT_PATH_PROFILE=1`) per-dispatch-path accounting for the M=1
+/// `MatMulNBits` decode: which concrete kernel each node lands on, its summed
+/// wall-time, and the weight bytes it streams. Purely diagnostic; no effect
+/// unless the environment variable is set. Emits a running summary to stderr
+/// every 512 recorded calls so a harness can tail the final line.
+mod path_profile {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub struct Bucket {
+        pub ns: AtomicU64,
+        pub bytes: AtomicU64,
+        pub calls: AtomicU64,
+    }
+    impl Bucket {
+        const fn new() -> Self {
+            Self {
+                ns: AtomicU64::new(0),
+                bytes: AtomicU64::new(0),
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    /// 4-bit nodes routed to MLAS SQNBit (`run_mlas_shards`, `m == 1`).
+    pub static MLAS4: Bucket = Bucket::new();
+    /// 4-bit nodes repacked to int8 and run on the hand `int8_matmul` GEMV.
+    pub static HAND_INT8: Bucket = Bucket::new();
+    /// 8-bit nodes on the hand `gemv_nk_u8`/`gemv_nk_u8_i16` GEMV.
+    pub static U8_8BIT: Bucket = Bucket::new();
+
+    static TOTAL_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| {
+            std::env::var("NXRT_PATH_PROFILE").is_ok_and(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+        })
+    }
+
+    /// Time `f` (the whole dispatch, pool fan-out included) and attribute its
+    /// wall-nanoseconds + streamed weight `bytes` to `bucket`.
+    #[inline]
+    pub fn record<T>(bucket: &Bucket, bytes: usize, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let start = Instant::now();
+        let out = f();
+        bucket
+            .ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        bucket.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        bucket.calls.fetch_add(1, Ordering::Relaxed);
+        if TOTAL_CALLS.fetch_add(1, Ordering::Relaxed) % 512 == 511 {
+            dump();
+        }
+        out
+    }
+
+    pub fn dump() {
+        for (name, b) in [
+            ("mlas4", &MLAS4),
+            ("hand_int8_from_int4", &HAND_INT8),
+            ("u8_8bit", &U8_8BIT),
+        ] {
+            let calls = b.calls.load(Ordering::Relaxed);
+            if calls == 0 {
+                continue;
+            }
+            let ns = b.ns.load(Ordering::Relaxed);
+            let bytes = b.bytes.load(Ordering::Relaxed);
+            let ms = ns as f64 / 1e6;
+            // bytes / ns == GB/s (1 byte/ns = 1e9 B/s = 1 GB/s).
+            let gbps = if ns > 0 { bytes as f64 / ns as f64 } else { 0.0 };
+            eprintln!(
+                "[nxrt-path] {name}: calls={calls} total={ms:.1}ms bytes={bytes} eff={gbps:.1}GB/s"
+            );
+        }
+    }
+}
+
 /// Overrides the bounded M=1 decode pool size; set to `0` to use the global
 /// Rayon pool as an escape hatch.
 const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
@@ -510,17 +596,19 @@ impl Kernel for MatMulNBitsKernel {
                 &owned_weight
             };
             if m == 1 {
-                with_decode_pool(|| {
-                    int8_matmul(
-                        &activations,
-                        int8_weight,
-                        result,
-                        m,
-                        self.k,
-                        self.n,
-                        self.block_size,
-                        dot_kernel,
-                    );
+                path_profile::record(&path_profile::HAND_INT8, int8_weight.values.len(), || {
+                    with_decode_pool(|| {
+                        int8_matmul(
+                            &activations,
+                            int8_weight,
+                            result,
+                            m,
+                            self.k,
+                            self.n,
+                            self.block_size,
+                            dot_kernel,
+                        );
+                    })
                 })?;
             } else {
                 #[cfg(target_arch = "x86_64")]
@@ -589,7 +677,8 @@ impl Kernel for MatMulNBitsKernel {
                 &owned_weight
             };
             with_decode_pool(|| {
-                if eight_bit_int16_activation() {
+                path_profile::record(&path_profile::U8_8BIT, weight_u8.values.len(), || {
+                    if eight_bit_int16_activation() {
                     // int16-activation fast path: quantize the activation to
                     // int16 per K-block and reduce against the u8 weight with a
                     // SIMD int16 dot product. int16 keeps enough precision to
@@ -618,6 +707,7 @@ impl Kernel for MatMulNBitsKernel {
                         self.block_size,
                     );
                 }
+                })
             })?;
         } else if m == 1 {
             let owned_weight;
@@ -968,20 +1058,22 @@ impl MatMulNBitsKernel {
         result: &mut [f32],
     ) {
         if let Some(spmd) = (m == 1).then(spmd_decode_active).flatten() {
-            spmd.dispatch_output_rows_indexed(
-                result,
-                MLAS_SQNBIT_DECODE_SHARD_ALIGN,
-                &|global_index, start, outputs| {
-                    let Some(shard) = shards.get(global_index).and_then(Option::as_ref) else {
-                        return;
-                    };
-                    debug_assert_eq!(shard.start, start);
-                    debug_assert_eq!(shard.len, outputs.len());
-                    let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
-                    // m == 1: `outputs` is this shard's contiguous output row.
-                    mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
-                },
-            );
+            path_profile::record(&path_profile::MLAS4, self.n * self.k / 2, || {
+                spmd.dispatch_output_rows_indexed(
+                    result,
+                    MLAS_SQNBIT_DECODE_SHARD_ALIGN,
+                    &|global_index, start, outputs| {
+                        let Some(shard) = shards.get(global_index).and_then(Option::as_ref) else {
+                            return;
+                        };
+                        debug_assert_eq!(shard.start, start);
+                        debug_assert_eq!(shard.len, outputs.len());
+                        let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
+                        // m == 1: `outputs` is this shard's contiguous output row.
+                        mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
+                    },
+                );
+            });
             return;
         }
         let base = result.as_mut_ptr();
@@ -3763,6 +3855,14 @@ fn gemv_nk_u8_i16(
         block_activation_sums[block] = activation[start..end].iter().sum();
     }
 
+    // Per-block accumulation for one output row, in ascending block order,
+    // streaming each row's weights as one contiguous sequential run. A cold M=1
+    // decode reads each weight matrix once from DRAM; the row-major layout makes
+    // this a prefetcher-friendly sequential stream. (A measured negative:
+    // interleaving several rows per block to raise memory-level parallelism
+    // STRIDES this stream and regresses cold bandwidth ~25-35% single-core --
+    // see the `u8_i16_cold_gemv_bandwidth` probe -- so the row-at-a-time stream
+    // is kept.)
     let compute = |output_start: usize, outputs: &mut [f32]| {
         for (index, output) in outputs.iter_mut().enumerate() {
             let row = output_start + index;
@@ -5719,6 +5819,73 @@ mod tests {
             );
         }
     }
+
+    /// Token-exactness guard for `gemv_nk_u8_i16`: the full-matrix output must be
+    /// BIT-IDENTICAL to computing each row on its own (`n = 1`). The activation
+    /// quantization, `group_scales` and `block_activation_sums` depend only on the
+    /// activation (not `n`), so any per-row bit difference would be a real
+    /// accumulation-order change that could flip a decode argmax. Guards the
+    /// per-row independence of the row-at-a-time GEMV across partial final K
+    /// blocks and non-power-of-two row counts.
+    #[test]
+    fn gemv_nk_u8_i16_full_matrix_matches_per_row() {
+        for &(n, k, block_size) in &[
+            (4usize, 256usize, 128usize),
+            (7, 256, 128),
+            (9, 200, 128),
+            (13, 384, 128),
+            (16, 128, 128),
+        ] {
+            let k_blocks = k.div_ceil(block_size);
+            let activation: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.031 + 0.1).sin() * 0.9)
+                .collect();
+            let values: Vec<u8> = (0..n * k).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+            let scales: Vec<f32> = (0..n * k_blocks)
+                .map(|i| ((i % 23) + 1) as f32 / 700.0)
+                .collect();
+            let scaled_zero_points: Vec<f32> = (0..n * k_blocks)
+                .map(|i| scales[i] * (120 + (i % 17)) as f32)
+                .collect();
+
+            let mut full = vec![0.0f32; n];
+            gemv_nk_u8_i16(
+                &activation,
+                &values,
+                &scales,
+                &scaled_zero_points,
+                &mut full,
+                k,
+                n,
+                block_size,
+            );
+            for row in 0..n {
+                let row_values = &values[row * k..row * k + k];
+                let row_scales = &scales[row * k_blocks..row * k_blocks + k_blocks];
+                let row_zps = &scaled_zero_points[row * k_blocks..row * k_blocks + k_blocks];
+                let mut single = [0.0f32; 1];
+                gemv_nk_u8_i16(
+                    &activation,
+                    row_values,
+                    row_scales,
+                    row_zps,
+                    &mut single,
+                    k,
+                    1,
+                    block_size,
+                );
+                assert_eq!(
+                    full[row].to_bits(),
+                    single[0].to_bits(),
+                    "n={n} k={k} row={row}: tiled {} != single-row {} (not bit-identical)",
+                    full[row],
+                    single[0],
+                );
+            }
+        }
+    }
+
+
 
     /// Regression for the qwen3 "massive activation channel" failure mode: a
     /// near-tie between two output rows decided by many small activation
@@ -9122,6 +9289,179 @@ mod tests {
             }
         }
     }
+
+    /// Isolated COLD single-core M=1 8-bit GEMV bandwidth probe. The live
+    /// qwen3-0.6B decode reads each 8-bit weight matrix exactly ONCE per token,
+    /// cold from DRAM, so the kernel is memory-latency-bound: throughput is set
+    /// by how many independent outstanding cache-line loads the core keeps in
+    /// flight. This probe defeats the cache with a working set far larger than
+    /// LLC (many non-reused matrices) and single-threads (pure per-core
+    /// bandwidth, no pool) to A/B the two accumulation structures directly.
+    ///
+    /// `row_outer` computes one output row at a time with a single accumulator
+    /// (the shipped structure): each row's weights are one contiguous sequential
+    /// DRAM run, ideal for the hardware prefetcher. `block_outer` interleaves
+    /// `U8_ROW_TILE` rows with the block in the outer loop (the rejected
+    /// memory-level-parallelism tile): several rows' cache lines are outstanding
+    /// at once, but the accesses stride across rows and defeat the prefetcher.
+    /// Both use the identical per-(row,block) `block_dot_u8_i16`, so any GB/s
+    /// delta is the memory access pattern, not compute. Run pinned to one core:
+    ///
+    /// `taskset -c 0 cargo test -p onnx-runtime-ep-cpu --features mlas --release
+    /// u8_i16_cold_gemv_bandwidth -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf probe; run explicitly with --ignored --nocapture"]
+    fn u8_i16_cold_gemv_bandwidth() {
+        use std::time::Instant;
+
+        // Rows interleaved per block in the `block_outer` variant (the rejected
+        // memory-level-parallelism tile).
+        const U8_ROW_TILE: usize = 4;
+
+        // qwen3-0.6B 8-bit shapes are k=1024, block_size=128 (k_blocks=8). Use a
+        // representative projection width and enough independent matrices that the
+        // total weight footprint dwarfs LLC (~100 MB here) -- every sweep streams
+        // cold from DRAM.
+        let (k, n, block_size) = (1024usize, 1024usize, 128usize);
+        let k_blocks = k.div_ceil(block_size);
+        let group = activation_quant_group().min(block_size.max(1));
+        let k_groups = k.div_ceil(group);
+        let bytes_per_matrix = n * k; // u8 weights streamed per GEMV
+        let target_footprint = 640 * 1024 * 1024usize; // 640 MB >> LLC
+        let num_matrices = target_footprint / bytes_per_matrix;
+
+        // Distinct pseudo-random weights per matrix so nothing is reused/prefetched
+        // across matrices; scales/zero-points are tiny and shared (weights dominate
+        // the stream, exactly as in decode).
+        let mut weights: Vec<Vec<u8>> = Vec::with_capacity(num_matrices);
+        for m in 0..num_matrices {
+            let mut w = vec![0u8; n * k];
+            let mut state = 0x9e3779b9u32.wrapping_add(m as u32);
+            for byte in w.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = (state >> 24) as u8;
+            }
+            weights.push(w);
+        }
+        let scales: Vec<f32> = (0..n * k_blocks).map(|i| ((i % 23) + 1) as f32 / 700.0).collect();
+        let scaled_zero_points: Vec<f32> =
+            (0..n * k_blocks).map(|i| scales[i] * (120 + (i % 17)) as f32).collect();
+
+        // Quantize the (tiny, cache-resident) activation once; both variants pay
+        // the identical negligible cost, so the measured delta is weight-stream
+        // memory-level parallelism.
+        let activation: Vec<f32> = (0..k).map(|i| (i as f32 * 0.031 + 0.1).sin() * 0.9).collect();
+        let mut quantized = vec![0i16; k];
+        let mut group_scales = vec![0.0f32; k_groups];
+        #[allow(clippy::needless_range_loop)]
+        for grp in 0..k_groups {
+            let start = grp * group;
+            let end = (start + group).min(k);
+            group_scales[grp] = quantize_block_i16(&activation[start..end], &mut quantized[start..end]);
+        }
+        let mut block_activation_sums = vec![0.0f32; k_blocks];
+        #[allow(clippy::needless_range_loop)]
+        for block in 0..k_blocks {
+            let start = block * block_size;
+            let end = (start + block_size).min(k);
+            block_activation_sums[block] = activation[start..end].iter().sum();
+        }
+
+        let dot_one = |w: &[u8], row: usize, block: usize| -> f32 {
+            let block_start = block * block_size;
+            let block_end = (block_start + block_size).min(k);
+            let first_group = block_start / group;
+            let last_group = (block_end - 1) / group;
+            block_dot_u8_i16(
+                &w[row * k + block_start..row * k + block_end],
+                &quantized[block_start..block_end],
+                &group_scales[first_group..=last_group],
+                group,
+            )
+        };
+
+        let mut out = vec![0.0f32; n];
+        let row_outer = |weights: &[Vec<u8>], out: &mut [f32]| -> f32 {
+            let mut checksum = 0.0f32;
+            for w in weights {
+                for row in 0..n {
+                    let mut acc = 0.0f32;
+                    for block in 0..k_blocks {
+                        acc += scales[row * k_blocks + block] * dot_one(w, row, block)
+                            - scaled_zero_points[row * k_blocks + block] * block_activation_sums[block];
+                    }
+                    out[row] = acc;
+                }
+                checksum += out[0] + out[n - 1];
+            }
+            checksum
+        };
+        let block_outer = |weights: &[Vec<u8>], out: &mut [f32]| -> f32 {
+            let mut checksum = 0.0f32;
+            for w in weights {
+                let mut index = 0usize;
+                while index + U8_ROW_TILE <= n {
+                    let mut acc = [0.0f32; U8_ROW_TILE];
+                    for block in 0..k_blocks {
+                        let activation_sum = block_activation_sums[block];
+                        #[allow(clippy::needless_range_loop)]
+                        for row_offset in 0..U8_ROW_TILE {
+                            let row = index + row_offset;
+                            acc[row_offset] += scales[row * k_blocks + block] * dot_one(w, row, block)
+                                - scaled_zero_points[row * k_blocks + block] * activation_sum;
+                        }
+                    }
+                    out[index..index + U8_ROW_TILE].copy_from_slice(&acc);
+                    index += U8_ROW_TILE;
+                }
+                for row in index..n {
+                    let mut acc = 0.0f32;
+                    for block in 0..k_blocks {
+                        acc += scales[row * k_blocks + block] * dot_one(w, row, block)
+                            - scaled_zero_points[row * k_blocks + block] * block_activation_sums[block];
+                    }
+                    out[row] = acc;
+                }
+                checksum += out[0] + out[n - 1];
+            }
+            checksum
+        };
+
+        let total_bytes = (num_matrices * bytes_per_matrix) as f64;
+        fn median_gbs<F: FnMut(&mut [f32]) -> f32>(
+            total_bytes: f64,
+            mut run: F,
+            out: &mut [f32],
+        ) -> f64 {
+            let mut sink = 0.0f32;
+            sink += run(out); // warm the code path (weights still cold each sweep)
+            let mut samples = [0.0f64; 5];
+            for s in samples.iter_mut() {
+                let start = Instant::now();
+                sink += run(out);
+                let secs = start.elapsed().as_secs_f64();
+                *s = total_bytes / secs / 1e9;
+            }
+            std::hint::black_box(sink);
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[2]
+        }
+
+        eprintln!(
+            "cold 8-bit M=1 GEMV: {num_matrices} matrices x {}KB = {:.0}MB working set, k={k} n={n} block={block_size}, U8_ROW_TILE={U8_ROW_TILE}, median-of-5",
+            bytes_per_matrix / 1024,
+            total_bytes / 1e6,
+        );
+        let ro = median_gbs(total_bytes, |o| row_outer(&weights, o), &mut out);
+        let bo = median_gbs(total_bytes, |o| block_outer(&weights, o), &mut out);
+        eprintln!(
+            "row_outer(baseline) {ro:6.1} GB/s | block_outer(tiled) {bo:6.1} GB/s | speedup {:.2}x",
+            bo / ro
+        );
+    }
+
 
     /// Full M=1 decode-step probe at real 7B (Qwen2.5-Coder-7B) projection
     /// shapes: replays the exact per-token MatMulNBits op sequence (qkv, o,
