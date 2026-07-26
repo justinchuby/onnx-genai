@@ -744,6 +744,8 @@ impl PipelineEngine {
             })?;
         let paged_mirror = match (paged_session, self.paged.as_mut()) {
             (Some((seq, _)), Some(paged)) => Some(PagedMirror {
+                mirrored_tokens: 0,
+                exhausted: false,
                 kv_model: &paged.kv_model,
                 cache: &mut paged.cache,
                 seq,
@@ -789,6 +791,13 @@ impl PipelineEngine {
         let mut final_context = backend.context_tokens.clone();
         final_context.truncate(backend.kv_len);
         let retains_kv = backend.decoder_state.use_kv;
+        // How far mirroring actually got. Equal to the context length unless
+        // the page pool ran dry, in which case only this prefix may be
+        // published for reuse.
+        let mirrored_tokens = backend
+            .paged
+            .as_ref()
+            .map_or(0, |mirror| mirror.mirrored_tokens);
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -805,7 +814,9 @@ impl PipelineEngine {
         match paged_session {
             // Publish what this generation computed so the next request can
             // attach to it, then let go of the sequence.
-            Some((seq, inputs)) => self.retire_paged_sequence(seq, inputs, &final_context)?,
+            Some((seq, inputs)) => {
+                self.retire_paged_sequence(seq, inputs, &final_context, mirrored_tokens)?
+            }
             None => {
                 if retains_kv && let Some(inputs) = inputs_digest {
                     self.retained = Some(RetainedContext {
@@ -911,10 +922,15 @@ impl PipelineEngine {
         seq: SequenceId,
         inputs: Digest,
         tokens: &[TokenId],
+        mirrored_tokens: usize,
     ) -> anyhow::Result<()> {
         let Some(paged) = self.paged.as_mut() else {
             return Ok(());
         };
+        // Never publish past what was mirrored. If the pool ran dry mid-decode
+        // the later pages were never written, and a key covering them would
+        // hand a future request KV that does not exist.
+        let tokens = &tokens[..tokens.len().min(mirrored_tokens)];
         // Publish at every page boundary, not only at the full length.
         //
         // The trie only reports a match where something was inserted, so a
@@ -2849,6 +2865,19 @@ struct StepComponentInput {
     missing_message: String,
 }
 
+/// Whether this error is the KV page pool being full, rather than a fault.
+///
+/// A full pool is a capacity condition the caller can degrade around; anything
+/// else means the mirror is broken and must not be swallowed.
+fn is_kv_out_of_memory(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<onnx_genai_kv::KvError>(),
+            Some(onnx_genai_kv::KvError::OutOfMemory { .. })
+        )
+    })
+}
+
 impl PipelinePagedKv {
     /// Release the in-flight sequence, if any, returning its pages to the pool.
     ///
@@ -2887,6 +2916,15 @@ struct PagedMirror<'a> {
     kv_model: &'a KvModelInfo,
     cache: &'a mut PagedKvCache,
     seq: SequenceId,
+    /// Tokens whose KV actually reached the pages so far.
+    ///
+    /// Mirroring can stop early when the pool runs dry, and only this many
+    /// tokens may then be published — the pages beyond it do not exist, and a
+    /// key claiming them would hand a later request KV that was never written.
+    mirrored_tokens: usize,
+    /// Set once the pool refused a page, after which mirroring stops for the
+    /// rest of this generation.
+    exhausted: bool,
 }
 
 struct PipelineDecodeLoopBackend<'a> {
@@ -3031,14 +3069,14 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         // Mirror this step's KV into pages before the outputs are consumed, so
         // a later request opening with the same prefix can attach these pages
         // instead of recomputing them.
-        if let Some(paged) = self.paged.as_mut() {
+        if let Some(paged) = self.paged.as_mut().filter(|paged| !paged.exhausted) {
             // A windowed decoder's present tensor is indexed in *retained*
             // buffer space, not absolute position space: once the window has
             // evicted anything, an absolute index reads the wrong rows or runs
             // off the end. This is the same conversion the single-model decode
             // step does before mirroring.
             let retained_past_len = self.decoder_state.retained_kv_len(past_len);
-            mirror_present_kv_to_pages(
+            match mirror_present_kv_to_pages(
                 self.decoder,
                 paged.kv_model,
                 paged.cache,
@@ -3046,7 +3084,23 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
                 &outputs,
                 retained_past_len,
                 input_tokens.len(),
-            )?;
+            ) {
+                Ok(()) => paged.mirrored_tokens = past_len + input_tokens.len(),
+                // Mirroring exists so a *later* request can reuse this KV. The
+                // pool running dry says nothing about whether this generation
+                // is valid, so failing it would punish the caller for a cache
+                // being full. Stop mirroring and keep decoding; only the
+                // tokens already mirrored get published.
+                Err(error) if is_kv_out_of_memory(&error) => {
+                    paged.exhausted = true;
+                    tracing::debug!(
+                        "KV page pool exhausted after {} token(s); this generation stops \
+                         publishing KV for reuse but continues normally ({error})",
+                        paged.mirrored_tokens
+                    );
+                }
+                Err(error) => return Err(error),
+            }
             // Keep the paged sequence's window in step with the decoder's, so
             // the pages published for reuse describe what the decoder can
             // actually attend to.

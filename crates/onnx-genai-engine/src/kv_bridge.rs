@@ -250,7 +250,10 @@ pub(crate) fn mirror_present_kv_to_pages(
             .collect::<Vec<_>>();
         kv_cache
             .append_token_kv(seq, &borrowed)
-            .map_err(|e| anyhow::anyhow!("Failed to mirror present KV into pages: {}", e))?;
+            // Keep the `KvError` as the source rather than flattening it to a
+            // string: callers distinguish a full pool (recoverable — stop
+            // mirroring) from a real fault (not recoverable) by downcasting.
+            .context("Failed to mirror present KV into pages")?;
     }
     Ok(())
 }
@@ -502,14 +505,21 @@ pub(crate) fn sequence_pages_for_len(
     len: usize,
 ) -> anyhow::Result<Vec<PageId>> {
     let pages_needed = len.div_ceil(kv_cache.page_table.page_size);
-    Ok(kv_cache
+    let pages = kv_cache
         .page_table
         .get_sequence(seq)
-        .with_context(|| format!("sequence {seq} not found"))?
-        .iter()
-        .copied()
-        .take(pages_needed)
-        .collect())
+        .with_context(|| format!("sequence {seq} not found"))?;
+    // Refuse to hand back a short list. These pages get published under a key
+    // that says they hold `len` tokens, so silently returning fewer would let a
+    // later request attach pages missing the KV they claim to have and decode
+    // from whatever those pages held before — wrong output, no error anywhere.
+    if pages.len() < pages_needed {
+        anyhow::bail!(
+            "What: cannot collect {pages_needed} KV page(s) covering {len} token(s) for sequence              {seq}; it holds only {}.              Why: the sequence was not mirrored to that length, so publishing it would claim KV              that was never written.              Fix: publish only the mirrored prefix, or raise the KV page budget so mirroring can              keep up.",
+            pages.len()
+        );
+    }
+    Ok(pages.iter().copied().take(pages_needed).collect())
 }
 
 struct KvTensorAxes {
@@ -1066,6 +1076,38 @@ mod tests {
         assert!(attach_pages_to_sequence(&mut cache, 999, &source_pages, 3).is_err());
         assert!(sequence_pages_for_len(&cache, 999, 1).is_err());
         Ok(())
+    }
+
+    /// Asking for more tokens than a sequence holds must fail loudly.
+    ///
+    /// These pages are published under a key saying they cover that many
+    /// tokens. Returning a short list instead would let a later request attach
+    /// pages missing the KV they claim and decode from stale contents — wrong
+    /// output with nothing in the logs. A sequence can be short whenever the
+    /// page pool ran dry mid-generation and mirroring stopped early.
+    #[test]
+    fn refuses_to_collect_more_pages_than_a_sequence_holds() {
+        let mut cache = PagedKvCache::new_with_tensor_config(tensor_config(), 8);
+        let seq = cache.create_sequence();
+        for base in [0.0, 10.0, 20.0] {
+            append_token(&mut cache, seq, base);
+        }
+
+        // 3 tokens at 2 tokens/page is 2 pages; asking for 9 needs 5.
+        let error = sequence_pages_for_len(&cache, seq, 9)
+            .expect_err("collecting more pages than the sequence holds must fail")
+            .to_string();
+        assert!(
+            error.contains("cannot collect 5 KV page(s) covering 9 token(s)"),
+            "error should say how many pages were wanted: {error}"
+        );
+        assert!(
+            error.contains("it holds only 2"),
+            "error should say how many pages exist: {error}"
+        );
+
+        // The exactly-covering length still works.
+        assert_eq!(sequence_pages_for_len(&cache, seq, 3).unwrap().len(), 2);
     }
 
     fn rewinds_materialized_ort_past_and_handles_edge_branches() -> anyhow::Result<()> {
