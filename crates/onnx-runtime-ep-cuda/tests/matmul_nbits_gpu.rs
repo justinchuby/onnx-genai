@@ -891,6 +891,11 @@ fn run_int8_f64_reference_parity(explicit_zero_points: bool) {
              int16_quantization_bound={cpu_tolerance:e}, CUDA={gpu}"
         );
     }
+    // Absolute regression tripwire complementing the conditioning-scaled f64 bound.
+    assert!(
+        max_gpu_f64 < 1e-5,
+        "CUDA/f64 max_abs_diff={max_gpu_f64:e} exceeds the 1e-5 regression guard"
+    );
     let (max_abs, max_ulp) = error_metrics(&actual, &expected);
     eprintln!(
         "MatMulNBits int8 block32 explicit_zp={explicit_zero_points}: \
