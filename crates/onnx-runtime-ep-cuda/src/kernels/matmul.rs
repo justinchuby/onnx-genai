@@ -423,6 +423,13 @@ impl MatMulKernel {
                 outputs[0].shape
             )));
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            crate::trace::product(plan.batch_shape.iter().copied())
+                .saturating_mul(plan.m as u64)
+                .saturating_mul(plan.n as u64)
+                .saturating_mul(plan.k as u64)
+                .saturating_mul(2)
+        });
 
         // Device pointers (byte_offset applied). These are opaque CUDA
         // addresses, never dereferenced on the host.

@@ -1,18 +1,18 @@
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b
 execution provider       metal
-model load                    500.3 ms
+model load                    600.3 ms
 prompt tokens                    40
-generated tokens                 64
-time to first token           512.6 ms
-generation wall time         2391.5 ms
-decode throughput             34.14 tok/s
-end-to-end throughput         26.76 tok/s
-inter-token latency      mean 29.3 / p50 31.2 / p90 34.5 / p99 64.2 / max 64.2 ms
+generated tokens                 48
+time to first token           690.3 ms
+generation wall time         1402.2 ms
+decode throughput             67.44 tok/s
+end-to-end throughput         34.23 tok/s
+inter-token latency      mean 14.8 / p50 14.7 / p90 15.3 / p99 17.5 / max 17.5 ms
 finish reason            MaxTokens
 kv page activity:
-  allocated                       7
-  freed                           7
+  allocated                       6
+  freed                           6
 peak resident memory        5.4 GiB
 kv cache budget             5.4 GiB (233792 tokens)
 device memory breakdown:
@@ -24,15 +24,15 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-ort.session_run                2383.594         65       36670.68     37243.65
-loop.step                      2357.916         64       36842.44     36842.44
-loop.next_logits               2357.406         64       36834.47     36834.47
-ort.bind_inputs                   2.515         65          38.69        39.29
-ort.extract_outputs               2.207         65          33.96        34.49
-ort.sampling                      1.177         64          18.38        18.38
-loop.commit_selected              0.470         64           7.35         7.35
-loop.detokenize                   0.395         64           6.18         6.18
-engine.kv_bookkeeping             0.392         64           6.13         6.13
-engine.logits_to_vec              0.211          1         210.79         3.29
-engine.ort_prepare_inputs         0.029         64           0.45         0.45
-loop.commit_token                 0.024         64           0.37         0.37
+ort.session_run                1395.835         49       28486.43     29079.90
+loop.step                      1386.952         48       28894.83     28894.83
+loop.next_logits               1386.496         48       28885.33     28885.33
+ort.bind_inputs                   1.986         49          40.53        41.37
+ort.extract_outputs               1.701         49          34.71        35.43
+ort.sampling                      0.888         48          18.50        18.50
+loop.commit_selected              0.414         48           8.62         8.62
+loop.detokenize                   0.348         48           7.24         7.24
+engine.kv_bookkeeping             0.304         48           6.33         6.33
+engine.logits_to_vec              0.132          1         132.17         2.75
+loop.commit_token                 0.025         48           0.53         0.53
+engine.ort_prepare_inputs         0.020         48           0.42         0.42

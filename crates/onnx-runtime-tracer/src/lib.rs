@@ -130,13 +130,14 @@ pub use args::{
     ARG_CAPTURE_REJECTED_REASON, ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON,
     ARG_OPTIMIZED_CANDIDATE, Args, capture_rejected,
 };
-pub use clock::{TraceClock, TraceSessionId};
+pub use clock::{TraceClock, TraceSessionId, absolute_now_us};
 pub use collector::{
     CompositeCollector, DEFAULT_MAX_EVENTS, FileCollector, MemoryCollector, NoopCollector,
     TraceCollector,
 };
 pub use context::{
-    SpanGuard, TraceContext, annotate_current_span, annotate_current_span_with, tracing_active,
+    SpanGuard, TraceContext, annotate_current_span, annotate_current_span_with, global_context,
+    set_global_context, tracing_active,
 };
 pub use diagnose::{
     AutoDiagnosis, BoundType, DiagnosedIssue, DiagnosisConfig, IssueCategory, KernelSample,

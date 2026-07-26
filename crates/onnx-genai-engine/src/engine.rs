@@ -1027,6 +1027,13 @@ impl Engine {
                 config.decode_precision,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?;
+        let mut native_session = native_session;
+        // Join the runtime and its execution providers to the engine's timeline.
+        // Without this their spans are recorded into a disabled context and
+        // `native.session_run` exports as one opaque block.
+        if let Some(trace) = crate::runtime_trace::context() {
+            native_session.set_trace_context(trace);
+        }
         let (native_shared_kv_proposer, speculative_mode) =
             load_native_shared_kv_proposer(&metadata, &model_directory.root, native_device)?;
         let environment = Environment::new("onnx-genai-engine")

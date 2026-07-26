@@ -208,14 +208,17 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
     // and reads shared, immutable `a`/`b`, so there is no aliasing. Size the
     // blocks from the Rayon pool: prefill commonly has fewer rows than cores,
     // while large matrices retain MR-row reuse and bounded task counts.
-    c.par_chunks_mut(mc * n)
-        .enumerate()
-        .for_each(|(blk, c_block)| {
+    // `for_each_init` rather than `for_each` so a worker-lane span covers this
+    // worker's whole row block instead of being reopened per block.
+    c.par_chunks_mut(mc * n).enumerate().for_each_init(
+        || crate::trace::worker_span("MatMul.row_block"),
+        |_span, (blk, c_block)| {
             let i0 = blk * mc;
             let rows = c_block.len() / n; // last block may be short
             let a_block = &a[i0 * k..i0 * k + rows * k];
             gemm_block(a_block, b, c_block, rows, k, n);
-        });
+        },
+    );
 }
 
 /// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row

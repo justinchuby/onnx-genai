@@ -65,6 +65,7 @@ pub mod kernels;
 mod optimizer;
 pub mod provider;
 pub mod runtime;
+mod trace;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 pub use kernels::attention::AttentionKernel;

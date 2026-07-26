@@ -67,7 +67,7 @@ use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MAX_SHAPE_DATA_ELEMS, MergePolicy, NodeIo, ShapeData,
     SymbolInterner, TypeInfo,
 };
-use onnx_runtime_tracer::{TraceContext, annotate_current_span_with};
+use onnx_runtime_tracer::{Args, TraceContext, annotate_current_span_with};
 
 use crate::SessionOutput;
 use crate::error::{Result, SessionError};
@@ -3844,10 +3844,40 @@ impl Executor {
         let node = self.graph.node(self.plan[pi].node_id);
         let op_type = node.op_type.clone();
         let domain = node.domain.clone();
+        // Identify *which* node this is. The span name stays the bare op type so
+        // Perfetto still aggregates all `MatMul`s together; the identity rides
+        // along as args. A model has hundreds of same-typed nodes, and without
+        // this a slow one cannot be told from a fast one.
+        let node_name = node.name.clone();
+        let node_id = self.plan[pi].node_id.0;
+        // Stamped here rather than by each kernel. Kernels have to opt in to
+        // annotating themselves, and in practice most never do — the CPU
+        // provider annotates 11 of its 122 kernels and the CUDA provider
+        // annotated none — so a per-kernel convention leaves most of a trace
+        // unlabelled. The node's placement is known here for every node on
+        // every provider, so recording it at dispatch makes the coverage
+        // structural instead of a thing each kernel must remember.
+        let device = node.device.map(|device| device.device_type.trace_name());
         // Open the span only when tracing is live so an untraced decode step
         // never allocates a span name or touches the thread-local span stack.
         let _span = self.trace.is_enabled().then(|| {
             let span = self.trace.span(op_type.clone(), "op");
+            annotate_current_span_with(|| {
+                let mut args = Args::new().with("node_id", node_id as u64);
+                if !node_name.is_empty() {
+                    args = args.with("node", node_name.clone());
+                }
+                // Only non-default domains are worth the bytes: `Attention` and
+                // `MatMulNBits` exist in both the default and `com.microsoft`
+                // domains, so the op type alone is ambiguous for custom ops.
+                if !domain.is_empty() {
+                    args = args.with("domain", domain.clone());
+                }
+                if let Some(device) = device.clone() {
+                    args = args.with(onnx_runtime_ep_api::ARG_DEVICE, device.into_owned());
+                }
+                args
+            });
             // Span is now active on this thread; stamp the capture disposition
             // (and let the kernel below stamp its selected variant).
             capture.annotate();

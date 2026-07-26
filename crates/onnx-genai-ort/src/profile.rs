@@ -58,11 +58,16 @@ pub fn tracing_enabled() -> bool {
     trace_path().is_some()
 }
 
-/// The common time origin for trace timestamps, fixed on first use so the
-/// first recorded event starts near t=0 on the Perfetto timeline.
-fn trace_epoch() -> Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
+/// Convert a monotonic [`Instant`] to the shared absolute trace axis.
+///
+/// These spans share a timeline with the ones the runtime and its execution
+/// providers record through `onnx-runtime-tracer`, so they have to be stamped
+/// against the same origin rather than a private one. This module used to fix
+/// its own epoch on first use; that only ever agreed with the runtime's by
+/// coincidence, because both happened to be created near process start.
+fn absolute_us(at: Instant) -> u64 {
+    let ago = Instant::now().saturating_duration_since(at).as_micros() as u64;
+    onnx_runtime_tracer::absolute_now_us().saturating_sub(ago)
 }
 
 /// One recorded timeline event, rendered later as a Chrome `X` (complete) event.
@@ -71,6 +76,9 @@ struct TraceEvent {
     tid: u64,
     ts_us: u64,
     dur_us: u64,
+    /// Perfetto `args` for this event. Usually empty: only spans that carry
+    /// something a reader cannot infer from the name populate it.
+    args: Vec<(&'static str, serde_json::Value)>,
 }
 
 /// Bound on retained events so a very long run cannot grow memory without limit.
@@ -91,16 +99,22 @@ fn thread_trace_id() -> u64 {
 }
 
 /// Record a single timeline event. No-op unless tracing is enabled.
-fn record_trace(stage: &'static str, start: Instant, dur: Duration) {
+fn record_trace(
+    stage: &'static str,
+    start: Instant,
+    dur: Duration,
+    args: Vec<(&'static str, serde_json::Value)>,
+) {
     if !tracing_enabled() {
         return;
     }
-    let ts_us = start.saturating_duration_since(trace_epoch()).as_micros() as u64;
+    let ts_us = absolute_us(start);
     let event = TraceEvent {
         name: stage,
         tid: thread_trace_id(),
         ts_us,
         dur_us: dur.as_micros() as u64,
+        args,
     };
     if let Ok(mut sink) = trace_sink().lock() {
         if sink.len() >= MAX_TRACE_EVENTS {
@@ -131,7 +145,7 @@ pub fn trace_document() -> serde_json::Value {
             .iter()
             .map(|event| {
                 let category = event.name.split('.').next().unwrap_or(event.name);
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "name": event.name,
                     "cat": category,
                     "ph": "X",
@@ -139,7 +153,16 @@ pub fn trace_document() -> serde_json::Value {
                     "dur": event.dur_us,
                     "pid": 1,
                     "tid": event.tid,
-                })
+                });
+                if !event.args.is_empty() {
+                    let args: serde_json::Map<String, serde_json::Value> = event
+                        .args
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), value.clone()))
+                        .collect();
+                    value["args"] = serde_json::Value::Object(args);
+                }
+                value
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -175,6 +198,9 @@ pub struct Span {
     aggregate: bool,
     /// Whether timeline tracing (`ONNX_GENAI_TRACE`) is active.
     trace: bool,
+    /// Metadata to attach to this span. An empty `Vec` does not allocate, so
+    /// the untraced path is unaffected by this field existing.
+    args: Vec<(&'static str, serde_json::Value)>,
 }
 
 impl Span {
@@ -186,7 +212,29 @@ impl Span {
             start: Instant::now(),
             aggregate: enabled(),
             trace: tracing_enabled(),
+            args: Vec::new(),
         }
+    }
+
+    /// Attach a key/value to this span, to be emitted as a Perfetto `arg`.
+    ///
+    /// For facts a reader cannot recover from the span's name and timing — the
+    /// token a decode step produced, say. Ignored unless timeline tracing is
+    /// on, so `value` should be cheap to produce; build anything expensive
+    /// behind [`Span::is_tracing`].
+    pub fn set_arg(&mut self, key: &'static str, value: impl Into<serde_json::Value>) {
+        if !self.trace {
+            return;
+        }
+        self.args.push((key, value.into()));
+    }
+
+    /// Whether this span will actually be recorded to the timeline.
+    ///
+    /// Guard the construction of expensive argument values with this.
+    #[must_use]
+    pub fn is_tracing(&self) -> bool {
+        self.trace
     }
 }
 
@@ -200,7 +248,12 @@ impl Drop for Span {
             record(self.stage, elapsed.as_nanos());
         }
         if self.trace {
-            record_trace(self.stage, self.start, elapsed);
+            record_trace(
+                self.stage,
+                self.start,
+                elapsed,
+                std::mem::take(&mut self.args),
+            );
         }
     }
 }
@@ -211,6 +264,11 @@ macro_rules! prof_span {
     ($stage:expr) => {
         $crate::profile::Span::new($stage)
     };
+    ($stage:expr, $key:expr => $value:expr) => {{
+        let mut span = $crate::profile::Span::new($stage);
+        span.set_arg($key, $value);
+        span
+    }};
 }
 
 /// Clear all accumulated stage statistics and any recorded timeline events.
@@ -285,4 +343,28 @@ pub fn report(tokens: u64) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_document_renders_event_args() {
+        reset();
+        trace_sink().lock().unwrap().push(TraceEvent {
+            name: "diffusion.denoise_step",
+            tid: 7,
+            ts_us: 123,
+            dur_us: 45,
+            args: vec![("step", serde_json::json!(3_u64))],
+        });
+
+        let document = trace_document();
+        let event = &document["traceEvents"][0];
+        assert_eq!(event["cat"], "diffusion");
+        assert_eq!(event["name"], "diffusion.denoise_step");
+        assert_eq!(event["args"]["step"], 3);
+        reset();
+    }
 }

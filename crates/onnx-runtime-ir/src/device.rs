@@ -19,6 +19,26 @@ pub enum DeviceType {
 }
 
 impl DeviceType {
+    /// The canonical lower-case name used in traces and diagnostics.
+    ///
+    /// One owner for these spellings so a trace produced by any execution
+    /// provider labels its device the same way. `Custom` keeps its opaque id
+    /// rather than collapsing every vendor backend to one indistinguishable
+    /// name.
+    pub fn trace_name(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            DeviceType::Cpu => "cpu".into(),
+            DeviceType::Cuda => "cuda".into(),
+            DeviceType::Rocm => "rocm".into(),
+            DeviceType::CoreMl => "coreml".into(),
+            DeviceType::Mlx => "mlx".into(),
+            DeviceType::WebGpu => "webgpu".into(),
+            DeviceType::Qnn => "qnn".into(),
+            DeviceType::OpenVino => "openvino".into(),
+            DeviceType::Custom(id) => format!("custom:{id}").into(),
+        }
+    }
+
     /// Whether tensors on this device share the host address space and can be
     /// accessed by CPU code without an explicit copy.
     pub fn is_host_accessible(self) -> bool {

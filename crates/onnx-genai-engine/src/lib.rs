@@ -26,6 +26,8 @@ pub(crate) mod native_speculative;
 pub mod pipeline;
 pub mod pipeline_cache;
 pub(crate) mod processors;
+#[cfg(feature = "native-backend")]
+pub mod runtime_trace;
 pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;

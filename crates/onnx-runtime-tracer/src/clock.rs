@@ -7,8 +7,48 @@
 //! [`TraceSessionId`] tags every context so traces from separate runs stay
 //! distinguishable when merged.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// This library's fixed tie between the monotonic clock and absolute UNIX time.
+///
+/// Sampled once, on first use. Every later reading adds monotonic elapsed time
+/// to it, so readings are monotonic *and* absolute.
+fn origin() -> &'static (Instant, u64) {
+    static ORIGIN: OnceLock<(Instant, u64)> = OnceLock::new();
+    ORIGIN.get_or_init(|| {
+        let instant = Instant::now();
+        let unix_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_micros() as u64)
+            .unwrap_or(0);
+        (instant, unix_us)
+    })
+}
+
+/// The current time in **absolute UNIX microseconds**, on a monotonic basis.
+///
+/// This is the one time base every layer stamps against, and the reason a trace
+/// from the host and a trace from a plugin execution provider can be read on a
+/// single timeline without negotiating an offset.
+///
+/// A plain [`Instant`] epoch cannot do that job. `Instant` is monotonic but its
+/// origin is arbitrary and private to whoever called [`Instant::now`], and a
+/// plugin loaded as a dynamic library links its own copy of this crate with its
+/// own statics — so a process-global epoch would still not be shared. Anchoring
+/// to UNIX time gives every copy the same origin.
+///
+/// Elapsed time still comes from the monotonic clock, so durations are immune
+/// to wall-clock adjustments; only the origin is absolute. The two clocks are
+/// read one after the other when [`origin`] initialises, so independently
+/// initialised copies can disagree by that sampling gap — well under a
+/// microsecond, against spans measured in microseconds and up.
+#[must_use]
+pub fn absolute_now_us() -> u64 {
+    let (instant, unix_us) = origin();
+    unix_us.saturating_add(instant.elapsed().as_micros() as u64)
+}
 
 /// A monotonic clock anchored at a fixed epoch, shared across a trace.
 ///
@@ -35,19 +75,26 @@ impl TraceClock {
         self.epoch
     }
 
-    /// Microseconds elapsed from the epoch to *now*.
+    /// The current time on the shared absolute axis, in microseconds.
+    ///
+    /// Reports [`absolute_now_us`] rather than time since this clock's own
+    /// construction, so two clocks built at different moments — in the host and
+    /// in a plugin execution provider — still place the same instant at the
+    /// same number.
     #[must_use]
     pub fn now_micros(&self) -> u64 {
-        self.micros_at(Instant::now())
+        absolute_now_us()
     }
 
-    /// Microseconds elapsed from the epoch to `at`.
+    /// The time of `at` on the shared absolute axis, in microseconds.
     ///
-    /// Saturates at zero for the (impossible for a monotonic clock, but
-    /// defensive) case of an instant before the epoch.
+    /// `at` must come from this process's monotonic clock; it is converted by
+    /// how long ago it was, so it lands on the same axis as [`now_micros`].
     #[must_use]
     pub fn micros_at(&self, at: Instant) -> u64 {
-        at.saturating_duration_since(self.epoch).as_micros() as u64
+        let now = Instant::now();
+        let ago = now.saturating_duration_since(at).as_micros() as u64;
+        absolute_now_us().saturating_sub(ago)
     }
 }
 

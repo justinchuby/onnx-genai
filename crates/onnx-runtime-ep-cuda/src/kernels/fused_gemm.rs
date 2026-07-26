@@ -214,6 +214,20 @@ impl FusedEpilogueKernel {
                 self.op_name, self.beta
             )));
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (plan.m as u64)
+                .saturating_mul(plan.n as u64)
+                .saturating_mul(plan.k as u64)
+                .saturating_mul(2)
+                .saturating_add((plan.m as u64).saturating_mul(plan.n as u64));
+            let elements = (plan.m as u64).saturating_mul(plan.n as u64);
+            flops = match self.epilogue {
+                GemmEpilogueKind::Bias => flops,
+                GemmEpilogueKind::ReluBias => flops.saturating_add(elements),
+                GemmEpilogueKind::GeluBias => flops.saturating_add(elements.saturating_mul(6)),
+            };
+            flops
+        });
 
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);

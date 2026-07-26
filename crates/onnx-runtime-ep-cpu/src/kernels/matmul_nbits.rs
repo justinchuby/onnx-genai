@@ -1867,10 +1867,14 @@ pub fn decode_parallel_output_row_blocks<F>(
     }
     // numa-split and flat decode scopes run the forward on a bounded Rayon pool,
     // so this `par_chunks_mut` uses that pool rather than the global one.
-    result
-        .par_chunks_mut(row_len)
-        .enumerate()
-        .for_each(|(row_index, row)| compute(row_index, row));
+    //
+    // `for_each_init` rather than `for_each` so the trace span is opened once
+    // per Rayon job — that is, once per worker per contiguous slice of rows —
+    // instead of once per row. A row is far too small to carry a span.
+    result.par_chunks_mut(row_len).enumerate().for_each_init(
+        || crate::trace::worker_span("MatMulNBits.decode_rows"),
+        |_span, (row_index, row)| compute(row_index, row),
+    );
 }
 
 /// First-touch each row-major weight component on the NUMA node that will read
@@ -3167,10 +3171,9 @@ mod amx {
         // Process 16 output rows per parallel task. `par_chunks_mut(16 * n)`
         // yields contiguous, disjoint row bands (last band may be short), so no
         // unsafe aliasing is needed and each task owns its output rows.
-        result
-            .par_chunks_mut(16 * n)
-            .enumerate()
-            .for_each(|(m_tile, out_rows)| {
+        result.par_chunks_mut(16 * n).enumerate().for_each_init(
+            || crate::trace::worker_span("MatMulNBits.prefill_tiles"),
+            |_span, (m_tile, out_rows)| {
                 let m0 = m_tile * 16;
                 let mr = out_rows.len() / n; // valid rows in this band (<= 16)
 
@@ -3236,7 +3239,8 @@ mod amx {
 
                 // SAFETY: releases this thread's tile state after all tile ops.
                 unsafe { asm!("tilerelease", options(nostack)) };
-            });
+            },
+        );
     }
 }
 

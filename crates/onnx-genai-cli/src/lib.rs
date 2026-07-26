@@ -213,6 +213,44 @@ fn load_chat_template(model_dir: &Path, raw: bool) -> Option<ChatTemplate> {
 /// look continuous, slow enough that redrawing is not part of the measurement.
 const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Write one timeline holding both the engine's spans and the runtime's.
+///
+/// The engine records through the ORT profiler while the native runtime and its
+/// execution providers record through `onnx-runtime-tracer`. Exporting only the
+/// first is what left `native.session_run` an opaque block, so the two event
+/// lists are concatenated here — the one place that already sees both. They
+/// share a process and each thread keeps its own lane, so Perfetto nests the
+/// runtime's per-operator spans inside the engine's step spans on its own.
+fn write_merged_trace(path: &Path) -> anyhow::Result<()> {
+    let mut document = onnx_genai::ort::profile::trace_document();
+    let runtime_events = runtime_trace_events();
+    if !runtime_events.is_empty()
+        && let Some(events) = document
+            .get_mut("traceEvents")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        events.extend(runtime_events);
+    }
+    std::fs::write(path, serde_json::to_vec(&document)?)?;
+    Ok(())
+}
+
+/// The native runtime's spans as Chrome trace events, or empty when the native
+/// backend is not compiled in.
+fn runtime_trace_events() -> Vec<serde_json::Value> {
+    #[cfg(feature = "native-backend")]
+    {
+        onnx_genai::engine::runtime_trace::collected_events()
+            .into_iter()
+            .filter_map(|event| serde_json::to_value(&event).ok())
+            .collect()
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Print the compact per-turn stats line, if the session asked for it.
 ///
 /// Suppressed while `--profile` is on, which already prints every one of these
@@ -1111,7 +1149,7 @@ impl ProfileArgs {
             }
         }
         if let Some(path) = &self.profile_trace {
-            onnx_genai::ort::profile::write_trace().map_err(|error| {
+            write_merged_trace(path).map_err(|error| {
                 anyhow::anyhow!(
                     "What: the timeline trace could not be written to {}. \
                      Why: {error}. \

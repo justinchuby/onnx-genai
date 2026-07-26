@@ -1172,6 +1172,17 @@ impl LayerNormKernel {
         if num_groups == 0 {
             return Ok(());
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = x.numel() as u64;
+            let groups = num_groups as u64;
+            let mut flops = elements
+                .saturating_mul(7)
+                .saturating_add(groups.saturating_mul(5));
+            if bias.is_some() {
+                flops = flops.saturating_add(elements);
+            }
+            flops
+        });
 
         // Optional Mean / InvStdDev outputs (per group). Validate dtype only when
         // present; their length is num_groups.
@@ -1380,6 +1391,12 @@ impl RmsNormKernel {
         if num_groups == 0 {
             return Ok(());
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = x.numel() as u64;
+            elements
+                .saturating_mul(4)
+                .saturating_add((num_groups as u64).saturating_mul(4))
+        });
 
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let scale_ptr = cuptr(scale.data_ptr::<u8>() as *const c_void);
@@ -1664,6 +1681,17 @@ impl SkipSimplifiedLayerNormKernel {
         if num_groups == 0 {
             return Ok(());
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = input.numel() as u64;
+            let groups = num_groups as u64;
+            let mut flops = elements
+                .saturating_mul(5)
+                .saturating_add(groups.saturating_mul(4));
+            if bias.is_some() {
+                flops = flops.saturating_add(elements);
+            }
+            flops
+        });
 
         // Optional Mean/InvStdDev stat outputs may be f16 in a half graph (they
         // are typically unused). Track their precision so the kernel narrows.
@@ -1914,6 +1942,20 @@ impl SkipLayerNormKernel {
         if num_groups == 0 {
             return Ok(());
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let elements = input.numel() as u64;
+            let groups = num_groups as u64;
+            let mut flops = elements
+                .saturating_mul(8)
+                .saturating_add(groups.saturating_mul(5));
+            if beta_ptr != 0 {
+                flops = flops.saturating_add(elements);
+            }
+            if bias_ptr != 0 {
+                flops = flops.saturating_add(elements);
+            }
+            flops
+        });
 
         let input_ptr = cuptr(input.data_ptr::<u8>() as *const c_void);
         let skip_ptr = cuptr(skip.data_ptr::<u8>() as *const c_void);

@@ -35,6 +35,46 @@ thread_local! {
     static ACTIVE_SPANS: RefCell<Vec<Weak<Mutex<Args>>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// The process-wide ambient context, installed by whoever turns tracing on.
+///
+/// Thread-local span state cannot reach a worker thread: when a kernel fans a
+/// node out over a thread pool, the pool's threads have no active span and no
+/// way to obtain a [`TraceContext`] short of threading one through every kernel
+/// signature. An execution provider therefore needs *some* ambient handle to
+/// open spans on its own worker lanes. This is that handle.
+static GLOBAL_CONTEXT: Mutex<Option<TraceContext>> = Mutex::new(None);
+/// Fast path for [`global_context`] so the common (untraced) case never locks.
+static GLOBAL_CONTEXT_SET: AtomicBool = AtomicBool::new(false);
+
+/// Install the ambient [`TraceContext`] returned by [`global_context`].
+///
+/// Call once when tracing is enabled, before the traced work starts. Passing
+/// `None` clears it, which callers should do when a traced run ends so a later
+/// untraced run does not keep recording.
+pub fn set_global_context(context: Option<TraceContext>) {
+    let set = context.is_some();
+    *GLOBAL_CONTEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = context;
+    GLOBAL_CONTEXT_SET.store(set, Ordering::Release);
+}
+
+/// The ambient [`TraceContext`], if tracing has been turned on.
+///
+/// Returns `None` on the untraced path after a single relaxed atomic load, so
+/// worker-lane instrumentation costs nothing when tracing is off.
+#[must_use]
+#[inline]
+pub fn global_context() -> Option<TraceContext> {
+    if !GLOBAL_CONTEXT_SET.load(Ordering::Acquire) {
+        return None;
+    }
+    GLOBAL_CONTEXT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Whether the current thread has an active tracing span.
 ///
 /// This is a cheap thread-local check with no allocation, locking, or argument

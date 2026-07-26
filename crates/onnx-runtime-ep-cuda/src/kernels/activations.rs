@@ -315,6 +315,14 @@ impl ActivationKernel {
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let per_element = match self.op {
+                ActivationOp::LeakyRelu { .. } | ActivationOp::Clip { .. } => 1,
+                ActivationOp::HardSigmoid { .. } | ActivationOp::Softsign => 3,
+                ActivationOp::Elu { .. } | ActivationOp::Selu { .. } => 4,
+            };
+            (n as u64).saturating_mul(per_element)
+        });
         let mut builder = self.runtime.stream().launch_builder(&func);
         builder.arg(&x_ptr).arg(&y_ptr).arg(&n_i).arg(&p0).arg(&p1);
         // SAFETY: every entry in SRC has the same (x, y, n, p0, p1) signature;

@@ -2225,6 +2225,7 @@ dependencies = [
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
  "onnx-runtime-loader",
+ "onnx-runtime-tracer",
  "onnx-std",
  "serde",
  "serde_json",
