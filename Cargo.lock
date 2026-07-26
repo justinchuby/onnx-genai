@@ -2524,10 +2524,12 @@ name = "onnx-runtime-tracer"
 version = "0.1.0-dev.4"
 dependencies = [
  "ittapi",
+ "libc",
  "libloading 0.8.9",
  "prost",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
