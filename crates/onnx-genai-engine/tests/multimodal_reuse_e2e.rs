@@ -21,7 +21,16 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn load() -> anyhow::Result<PipelineEngine> {
-    Engine::from_pipeline_dir(&fixture_dir(), EngineConfig::default())
+    // A small page keeps the fixture's handful-of-token prompts spanning several
+    // pages, so page-granular sharing is exercised at all. Real models reach a
+    // page boundary long before their system prompt ends.
+    Engine::from_pipeline_dir(
+        &fixture_dir(),
+        EngineConfig {
+            page_size: 2,
+            ..EngineConfig::default()
+        },
+    )
 }
 
 /// `pixel_values[1,3,2,2]`, scaled so each `bias` yields a distinct image.
@@ -302,5 +311,77 @@ fn interleaved_conversations_do_not_corrupt_each_other() -> anyhow::Result<()> {
             "conversation {index} must not be affected by the ones interleaved with it"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn a_conversation_gets_its_own_history_back_after_another_one_ran() -> anyhow::Result<()> {
+    // The thing a single retained context cannot do. Two conversations share a
+    // head and then diverge; when the first one comes back, it must reuse *its
+    // own* tail, not merely the part it has in common with the other. That only
+    // works if both are still held, which is what paging the KV buys.
+    let mut engine = load()?;
+    let head = vec![3, 7, 0, 5];
+
+    let mut a = head.clone();
+    a.extend_from_slice(&[6, 1]);
+    let mut b = head.clone();
+    b.extend_from_slice(&[2, 4]);
+
+    turn(&mut engine, a.clone(), 0.0, 2)?; // conversation A
+    turn(&mut engine, b.clone(), 0.0, 2)?; // conversation B evicts nothing
+
+    // A continues, extending its own prompt.
+    let mut a_next = a.clone();
+    a_next.push(4);
+    engine.reset_cache_stats();
+    let warm = turn(&mut engine, a_next.clone(), 0.0, 2)?;
+    let reused = engine.cache_stats().prefix_reused_tokens as usize;
+
+    assert!(
+        reused > head.len(),
+        "A must reuse past the head it shares with B (got {reused}, head is {})",
+        head.len()
+    );
+
+    let mut fresh = load()?;
+    assert_eq!(
+        warm,
+        turn(&mut fresh, a_next, 0.0, 2)?,
+        "reusing another conversation's neighbour must not change the answer"
+    );
+    Ok(())
+}
+
+#[test]
+fn pages_are_shared_rather_than_copied_between_conversations() -> anyhow::Result<()> {
+    // Two conversations over the same long head must not cost two copies of its
+    // KV. Measured as pages in use, which is the resource that would blow up.
+    let mut engine = load()?;
+    let head: Vec<u32> = vec![3, 7, 0, 5, 6, 1, 2, 4];
+
+    let mut first = head.clone();
+    first.push(6);
+    turn(&mut engine, first, 0.0, 2)?;
+    let after_one = engine
+        .page_stats()
+        .expect("this decoder pages its KV")
+        .allocations;
+
+    let mut second = head.clone();
+    second.push(1);
+    turn(&mut engine, second, 0.0, 2)?;
+    let after_two = engine
+        .page_stats()
+        .expect("this decoder pages its KV")
+        .allocations;
+
+    assert!(
+        after_two - after_one < after_one,
+        "the second conversation must allocate fewer pages than the first by \
+         attaching to the shared head, got {} then {}",
+        after_one,
+        after_two - after_one
+    );
     Ok(())
 }

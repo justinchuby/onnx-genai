@@ -376,18 +376,23 @@ Reuse is also skipped entirely when the decoder's position ids arrive over a
 `dataflow` edge, since such a tensor covers the whole prompt and prefilling only
 a suffix would hand the decoder positions for tokens it is not being given.
 
-Only one context is retained at a time, but because reuse is computed over the
-common prefix rather than requiring an extension, that single slot still serves
-**interleaved conversations that share a head** — the server's normal workload,
-and the fan-out case where many agents run under one long system prompt. Each
-request truncates the retained KV back to what it shares with the previous one
-and extends from there, so a shared system prompt is prefilled once and then
-reused by every later request regardless of who it belonged to.
+When the decoder's `present.*` outputs describe a layout the page table can
+address, the KV is **paged** — the same reference-counted page table, radix
+prefix trie, and copy-on-write sharing the single-model engine uses. Many
+prefixes are then held at once, so interleaved conversations do not evict each
+other: several agents running under one long system prompt hold *one* copy of
+its KV between them, and a conversation resumed after others have run still
+finds its own tail.
 
-What a single slot does cost is each conversation's *own* tail: request B
-truncates away the part of A that B does not share, so when A comes back it
-reuses only the common head, not its own history. Holding several contexts would
-fix that at the price of a full KV allocation per slot.
+Sharing is **page-granular**. The trie only reports a match where something was
+published, so each finished generation is published at every page boundary as
+well as at its full length; a prompt that diverges then matches up to the last
+page they had in common. A prefix shorter than one page cannot be shared, which
+in practice only affects prompts shorter than `page_size`.
+
+A decoder whose KV cannot be paged falls back to retaining a single context,
+truncated to the common prefix. That serves a shared head across conversations
+but not each conversation's own tail, since there is only one slot.
 
 Memoization additionally requires the component's graph to contain only
 deterministic operators. A declared phase says *when* a component runs, never

@@ -44,6 +44,42 @@ use crate::decode::clone_value;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct Digest(u128);
 
+impl Digest {
+    /// The digest as four little-endian 32-bit words.
+    ///
+    /// [`PrefixCache`](crate::PrefixCache) is a radix trie over token ids, so
+    /// the only way to make an attachment part of a prefix key is to spell the
+    /// digest in the same alphabet and put it in front of the tokens. Four words
+    /// carry all 128 bits, so two requests share a cached prefix only if their
+    /// attachments were bit-identical — which is the whole point, since
+    /// placeholder expansion makes different images produce identical tokens.
+    pub fn words(&self) -> [u32; 4] {
+        [
+            self.0 as u32,
+            (self.0 >> 32) as u32,
+            (self.0 >> 64) as u32,
+            (self.0 >> 96) as u32,
+        ]
+    }
+}
+
+/// Elements a [`prefix_key`] prepends before the prompt tokens.
+pub const PREFIX_KEY_PREAMBLE: usize = 4;
+
+/// The key a multimodal prompt is cached under: its attachments, then its
+/// tokens.
+///
+/// Without the preamble two different photographs would share a cache entry,
+/// because expansion replaces each image with the same repeated placeholder
+/// token. With it, a changed attachment diverges at the first element and
+/// nothing is shared.
+pub fn prefix_key(inputs: Digest, tokens: &[TokenId]) -> Vec<TokenId> {
+    let mut key = Vec::with_capacity(PREFIX_KEY_PREAMBLE + tokens.len());
+    key.extend_from_slice(&inputs.words());
+    key.extend_from_slice(tokens);
+    key
+}
+
 const FNV_OFFSET_BASIS_128: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
 const FNV_PRIME_128: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
@@ -522,6 +558,45 @@ mod tests {
             // load long before this mattered.
             assert!(graph_is_deterministic(&ModelProto::default()));
         }
+    }
+
+    #[test]
+    fn a_prefix_key_carries_the_attachment_ahead_of_the_tokens() {
+        let inputs = digest_of("pixels", &[1.0]);
+        let key = prefix_key(inputs, &[7, 8, 9]);
+        assert_eq!(key.len(), PREFIX_KEY_PREAMBLE + 3);
+        assert_eq!(&key[PREFIX_KEY_PREAMBLE..], &[7, 8, 9]);
+        assert_eq!(&key[..PREFIX_KEY_PREAMBLE], &inputs.words());
+    }
+
+    #[test]
+    fn the_same_tokens_over_a_different_attachment_share_no_key_prefix() {
+        // The trap this exists for: expansion makes these token sequences
+        // identical, so only the preamble can keep the pictures apart.
+        let left = prefix_key(digest_of("pixels", &[1.0]), &[7, 7, 7]);
+        let right = prefix_key(digest_of("pixels", &[2.0]), &[7, 7, 7]);
+        assert_ne!(left[0..PREFIX_KEY_PREAMBLE], right[0..PREFIX_KEY_PREAMBLE]);
+        let shared = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
+        assert_eq!(shared, 0, "they must diverge at the very first element");
+    }
+
+    #[test]
+    fn the_same_attachment_shares_everything_up_to_the_prompt_divergence() {
+        let inputs = digest_of("pixels", &[1.0]);
+        let left = prefix_key(inputs, &[1, 2, 3, 4]);
+        let right = prefix_key(inputs, &[1, 2, 9]);
+        let shared = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
+        assert_eq!(shared, PREFIX_KEY_PREAMBLE + 2);
+    }
+
+    #[test]
+    fn all_128_bits_reach_the_key() {
+        // A digest differing only in its high bits must still change the key,
+        // or half the hash would be decoration.
+        let low = Digest(1);
+        let high = Digest(1u128 << 100);
+        assert_ne!(low.words(), high.words());
+        assert_ne!(prefix_key(low, &[5]), prefix_key(high, &[5]));
     }
 
     #[test]

@@ -9,17 +9,21 @@ use crate::engine::{
     Engine, EngineConfig, model_requires_native_backend, requested_decode_backend,
     resolved_host_ram_budget,
 };
-use crate::kv_bridge::infer_kv_model_info;
+use crate::kv_bridge::{
+    KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
+    mirror_present_kv_to_pages, sequence_pages_for_len,
+};
 use crate::logits::TokenId;
 use crate::pipeline_cache::{
-    ComponentOutputCache, Digest, DigestBuilder, PipelineCacheStats, RetainedContext, absorb_value,
-    digest_named_values, graph_is_deterministic,
+    ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
+    RetainedContext, absorb_value, digest_named_values, graph_is_deterministic, prefix_key,
 };
 use crate::processors::build_processor_chain;
 use crate::{
     EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
 };
 use anyhow::Context;
+use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
     AbsentInputKind, DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy,
     PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, TensorDimension,
@@ -156,7 +160,29 @@ pub struct PipelineEngine {
     memoizable_components: BTreeSet<String>,
     /// Decoder KV left over from the previous generation, and the identity of
     /// the prompt and attachments that produced it.
+    ///
+    /// Only used when the decoder's KV cannot be paged; the paged cache below
+    /// supersedes it, because it holds many prefixes instead of one.
     retained: Option<RetainedContext>,
+    /// Paged KV for the decoder, when its `present.*` outputs describe a layout
+    /// the page table can address.
+    paged: Option<PipelinePagedKv>,
+}
+
+/// Paged KV storage for an autoregressive pipeline decoder.
+///
+/// This is the same machinery the single-model engine uses, which is the point:
+/// pages are reference-counted, so several conversations that open with the same
+/// system prompt hold *one* copy of its KV between them rather than one each.
+/// A single retained context can only ever serve whoever spoke last.
+struct PipelinePagedKv {
+    kv_model: KvModelInfo,
+    cache: PagedKvCache,
+    /// Radix trie over prefix keys. The keys are not bare prompts: each carries
+    /// a digest of the request's attachments ahead of its tokens, because image
+    /// expansion makes different pictures produce identical token sequences and
+    /// a bare-token key would hand one image's KV to another.
+    prefix: PrefixCache,
 }
 
 /// The concrete backend a pipeline runs on. A pipeline never mixes backends:
@@ -389,6 +415,7 @@ impl PipelineEngine {
         // Only autoregressive pipelines drive a token-by-token decode loop and
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
+        let mut paged: Option<PipelinePagedKv> = None;
         let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
@@ -398,6 +425,16 @@ impl PipelineEngine {
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
                 let fixed_state_budget_bytes =
                     resolved_host_ram_budget(&config, kv_model.as_ref())?;
+                paged = kv_model.map(|kv_model| PipelinePagedKv {
+                    cache: PagedKvCache::new_with_layer_tensor_configs(
+                        kv_model.tensor_config.page_size,
+                        kv_model.tensor_config.dtype,
+                        kv_model.layer_configs.clone(),
+                        config.num_gpu_pages,
+                    ),
+                    kv_model,
+                    prefix: PrefixCache::new(),
+                });
                 let decoder_io = models
                     .directory
                     .spec
@@ -448,6 +485,7 @@ impl PipelineEngine {
             )),
             memoizable_components,
             retained: None,
+            paged,
         })
     }
 
@@ -587,7 +625,14 @@ impl PipelineEngine {
         // keep before anything is rebuilt, because the answer decides whether
         // the decode state is recreated or carried over.
         let inputs_digest = Self::digest_request_identity(&pipeline_request);
-        let reused = self.reusable_prefix_len(inputs_digest, &prompt_tokens);
+        // The paged cache supersedes the single retained context wherever it is
+        // available: it holds many prefixes rather than only the last one.
+        let paged_enabled = self.paged.is_some() && inputs_digest.is_some();
+        let reused = if paged_enabled {
+            0
+        } else {
+            self.reusable_prefix_len(inputs_digest, &prompt_tokens)
+        };
         // Any failure below leaves the decoder KV in an unknown state, so the
         // retention is dropped now and only re-established on success.
         self.retained = None;
@@ -624,27 +669,40 @@ impl PipelineEngine {
             reused
         };
 
+        let positions_routed = self.decoder_positions_are_routed(&decoder_in_edges);
+        // A paged sequence starts from a fresh decode state, because the shared
+        // prefix is loaded into it wholesale rather than carried over.
+        let mut paged_session = None;
+        let mut reused = reused;
+        if paged_enabled && !positions_routed {
+            self.decoder_state = Some(Self::new_decoder_state(
+                &self.models,
+                &ar.decoder,
+                self.fixed_state_budget_bytes,
+            )?);
+            let inputs = inputs_digest.expect("paged_enabled implies a digest");
+            let decoder = self
+                .models
+                .session(&ar.decoder)
+                .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
+            let paged = self.paged.as_mut().expect("paged_enabled implies storage");
+            let state = self
+                .decoder_state
+                .as_mut()
+                .expect("the decode state was just built");
+            let (seq, shared) =
+                Self::admit_paged_sequence(paged, state, decoder, inputs, &prompt_tokens)?;
+            paged_session = Some((seq, inputs));
+            reused = shared;
+        }
+
         let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        if reused == 0 {
-            self.decoder_state = Some({
-                let decoder = self
-                    .models
-                    .session(&ar.decoder)
-                    .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-                let decoder_io = self
-                    .models
-                    .directory
-                    .spec
-                    .models
-                    .get(&ar.decoder)
-                    .and_then(|component| component.io.as_ref());
-                DecodeState::new_with_io_positions_and_state_budget(
-                    decoder,
-                    decoder_io,
-                    self.models.directory.spec.positions.as_ref(),
-                    self.fixed_state_budget_bytes,
-                )?
-            });
+        if reused == 0 && paged_session.is_none() {
+            self.decoder_state = Some(Self::new_decoder_state(
+                &self.models,
+                &ar.decoder,
+                self.fixed_state_budget_bytes,
+            )?);
         }
 
         let decoder = self
@@ -671,12 +729,21 @@ impl PipelineEngine {
             .with_context(|| {
                 format!("no tokenizer available for '{}'", self.tokenizer_component)
             })?;
+        let paged_mirror = match (paged_session, self.paged.as_mut()) {
+            (Some((seq, _)), Some(paged)) => Some(PagedMirror {
+                kv_model: &paged.kv_model,
+                cache: &mut paged.cache,
+                seq,
+            }),
+            _ => None,
+        };
         let mut backend = PipelineDecodeLoopBackend {
             decoder,
             decoder_state: self
                 .decoder_state
                 .as_mut()
                 .expect("autoregressive pipeline has decode state"),
+            paged: paged_mirror,
             pool: &mut tensors,
             step_components,
             decoder_in_edges,
@@ -710,13 +777,141 @@ impl PipelineEngine {
         self.component_cache
             .borrow_mut()
             .note_prefix_reuse(reused, prefilled);
-        if retains_kv && let Some(inputs) = inputs_digest {
-            self.retained = Some(RetainedContext {
-                inputs,
-                tokens: final_context,
-            });
+        match paged_session {
+            // Publish what this generation computed so the next request can
+            // attach to it, then let go of the sequence.
+            Some((seq, inputs)) => self.retire_paged_sequence(seq, inputs, &final_context)?,
+            None => {
+                if retains_kv && let Some(inputs) = inputs_digest {
+                    self.retained = Some(RetainedContext {
+                        inputs,
+                        tokens: final_context,
+                    });
+                }
+            }
         }
         Ok((result, tensors))
+    }
+
+    /// A fresh decode state for `decoder`.
+    fn new_decoder_state(
+        models: &PipelineModels,
+        decoder: &str,
+        fixed_state_budget_bytes: u64,
+    ) -> anyhow::Result<DecodeState> {
+        let session = models
+            .session(decoder)
+            .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
+        let decoder_io = models
+            .directory
+            .spec
+            .models
+            .get(decoder)
+            .and_then(|component| component.io.as_ref());
+        DecodeState::new_with_io_positions_and_state_budget(
+            session,
+            decoder_io,
+            models.directory.spec.positions.as_ref(),
+            fixed_state_budget_bytes,
+        )
+    }
+
+    /// Claim a paged sequence for this request, seeded with whatever cached
+    /// prefix its attachments and tokens already share with earlier requests.
+    ///
+    /// Returns the sequence id and how many leading tokens the sequence already
+    /// holds KV for. The reuse always stops at least one token short of the
+    /// prompt, since a decode step needs an input to produce logits from.
+    fn admit_paged_sequence(
+        paged: &mut PipelinePagedKv,
+        state: &mut DecodeState,
+        decoder: &Session,
+        inputs: Digest,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<(SequenceId, usize)> {
+        let key = prefix_key(inputs, prompt_tokens);
+        let seq = paged.cache.create_sequence();
+        let matched = paged
+            .prefix
+            .lookup_shared(&key, &mut paged.cache.page_table);
+
+        // A match shorter than the preamble cannot happen — every stored key
+        // begins with one — but treat it as no match rather than trusting it.
+        let reusable = matched
+            .matched_tokens
+            .saturating_sub(PREFIX_KEY_PREAMBLE)
+            .min(prompt_tokens.len().saturating_sub(1));
+        if matched.matched_tokens > 0 {
+            let pages = matched
+                .page_ids
+                .iter()
+                .copied()
+                .take(reusable.div_ceil(paged.cache.page_table.page_size))
+                .collect::<Vec<_>>();
+            for &page_id in &pages {
+                paged.cache.page_table.retain(page_id);
+            }
+            paged
+                .prefix
+                .release_shared(&key, matched.matched_tokens, &mut paged.cache.page_table);
+            if reusable > 0 {
+                attach_pages_to_sequence(&mut paged.cache, seq, &pages, reusable)?;
+                let materialized = paged
+                    .cache
+                    .materialize_sequence(seq)
+                    .map_err(|e| anyhow::anyhow!("failed to materialize the shared prefix: {e}"))?;
+                load_materialized_past(decoder, &paged.kv_model, state, &materialized)?;
+                return Ok((seq, reusable));
+            }
+        }
+        Ok((seq, 0))
+    }
+
+    /// Record this generation's KV under its prefix key and release the
+    /// sequence.
+    ///
+    /// Pages the prefix cache kept are retained by it, so freeing the sequence
+    /// returns only what nothing else refers to.
+    fn retire_paged_sequence(
+        &mut self,
+        seq: SequenceId,
+        inputs: Digest,
+        tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        let Some(paged) = self.paged.as_mut() else {
+            return Ok(());
+        };
+        // Publish at every page boundary, not only at the full length.
+        //
+        // The trie only reports a match where something was inserted, so a
+        // prompt that diverges from this one matches nothing unless the shared
+        // part was itself published. Page boundaries are the natural granularity:
+        // a page is the smallest unit the table can hand to another sequence, so
+        // publishing there is what lets two conversations share the head they
+        // have in common rather than only exact repeats.
+        let page_size = paged.cache.page_table.page_size;
+        let mut lengths = (1..)
+            .map(|pages| pages * page_size)
+            .take_while(|&len| len < tokens.len())
+            .collect::<Vec<_>>();
+        lengths.push(tokens.len());
+        for len in lengths {
+            if len == 0 {
+                continue;
+            }
+            let key = prefix_key(inputs, &tokens[..len]);
+            if paged.prefix.lookup(&key).0 == key.len() {
+                continue;
+            }
+            let pages = sequence_pages_for_len(&paged.cache, seq, len)?;
+            paged
+                .prefix
+                .insert_pages(&key, &pages, &mut paged.cache.page_table);
+        }
+        for page_id in paged.cache.page_table.remove_sequence(seq) {
+            paged.cache.page_table.free(page_id);
+        }
+        Ok(())
     }
 
     /// Whether position ids are a plain function of the absolute past length,
@@ -2114,6 +2309,16 @@ impl PipelineEngine {
         Ok(())
     }
 
+    /// KV page counters, when the decoder's KV is paged.
+    ///
+    /// `None` for a decoder whose KV cannot be paged, rather than zeros, which
+    /// would read as "a page pool that did nothing".
+    pub fn page_stats(&self) -> Option<onnx_genai_kv::PageStats> {
+        self.paged
+            .as_ref()
+            .map(|paged| paged.cache.page_table.stats())
+    }
+
     /// Counters describing what the pipeline's reuse caches did.
     pub fn cache_stats(&self) -> PipelineCacheStats {
         self.component_cache.borrow().stats()
@@ -2583,6 +2788,13 @@ struct StepComponentInput {
     missing_message: String,
 }
 
+/// Where a decode step's KV is written so later requests can share it.
+struct PagedMirror<'a> {
+    kv_model: &'a KvModelInfo,
+    cache: &'a mut PagedKvCache,
+    seq: SequenceId,
+}
+
 struct PipelineDecodeLoopBackend<'a> {
     decoder: &'a Session,
     decoder_state: &'a mut DecodeState,
@@ -2600,6 +2812,9 @@ struct PipelineDecodeLoopBackend<'a> {
     retained_len: usize,
     prompt_len: usize,
     generated_count: usize,
+    /// Paged KV to mirror each step's `present.*` outputs into, when the
+    /// decoder's KV can be paged.
+    paged: Option<PagedMirror<'a>>,
     /// Tokens the decoder has actually run, and therefore the exact length its
     /// KV covers.
     ///
@@ -2719,6 +2934,20 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             &extras,
         )?;
         self.kv_len = past_len + input_tokens.len();
+        // Mirror this step's KV into pages before the outputs are consumed, so
+        // a later request opening with the same prefix can attach these pages
+        // instead of recomputing them.
+        if let Some(paged) = self.paged.as_mut() {
+            mirror_present_kv_to_pages(
+                self.decoder,
+                paged.kv_model,
+                paged.cache,
+                paged.seq,
+                &outputs,
+                past_len,
+                input_tokens.len(),
+            )?;
+        }
         extract_next_token_logits_with_io(
             self.decoder,
             outputs,
