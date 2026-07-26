@@ -329,6 +329,14 @@ pub struct PipelineGraphInfo {
     pub decoder: ModelGraphInfo,
 }
 
+/// ONNX graph inventories required to synthesize a strict encoder-decoder
+/// (audio/text sequence-to-sequence) pipeline, e.g. Whisper.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncoderDecoderGraphInfo {
+    pub encoder: ModelGraphInfo,
+    pub decoder: ModelGraphInfo,
+}
+
 /// The `model.speech` section (audio embedder).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenAiSpeech {
@@ -1076,6 +1084,31 @@ pub fn pipeline_inference_metadata_from_dir(
     Ok(Some(config.to_strict_pipeline_metadata(model_dir, graphs)?))
 }
 
+/// Strict compatibility conversion for an existing encoder-decoder ORT-GenAI
+/// package (audio/text sequence-to-sequence, e.g. Whisper).
+///
+/// Like [`pipeline_inference_metadata_from_dir`], the JSON files provide the
+/// semantic contract while `graphs` provides the authoritative ONNX port list,
+/// rank, shape, and dtype facts. Nothing is inferred from `model.type` or a
+/// model name: the encoder-decoder shape is recognized only from the declared
+/// `model.encoder` section. Returns `Ok(None)` when the directory has no
+/// `genai_config.json` or the config does not describe an encoder-decoder model.
+pub fn encoder_decoder_pipeline_inference_metadata_from_dir(
+    model_dir: &Path,
+    graphs: &EncoderDecoderGraphInfo,
+) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
+    let Some(path) = find_in_dir(model_dir) else {
+        return Ok(None);
+    };
+    let config = load(&path)?;
+    if config.shape() != ModelShape::EncoderDecoder {
+        return Ok(None);
+    }
+    Ok(Some(
+        config.to_strict_encoder_decoder_pipeline_metadata(graphs)?,
+    ))
+}
+
 impl GenAiConfig {
     fn to_strict_pipeline_metadata(
         &self,
@@ -1397,6 +1430,239 @@ impl GenAiConfig {
         Ok(metadata)
     }
 
+    /// Strict encoder-decoder pipeline synth (audio/text sequence-to-sequence).
+    ///
+    /// Recognized purely from the encoder-decoder SHAPE of `genai_config.json`
+    /// (a declared `model.encoder` with cross-attention KV outputs feeding the
+    /// decoder's cross-attention KV inputs), never from `model.type` or a model
+    /// name, so any encoder-decoder family (Whisper audio, and other
+    /// sequence-to-sequence encoders) synthesizes the same way. Every port,
+    /// rank, and dtype fact is validated against the authoritative ONNX graphs.
+    fn to_strict_encoder_decoder_pipeline_metadata(
+        &self,
+        graphs: &EncoderDecoderGraphInfo,
+    ) -> Result<InferenceMetadata, GenAiConfigError> {
+        let encoder = required_ref(self.model.encoder.as_ref(), "model.encoder")?;
+        let decoder = &self.model.decoder;
+        let encoder_filename = required_str(encoder.filename.as_deref(), "model.encoder.filename")?;
+        let decoder_filename =
+            required_str(decoder.filename.as_deref(), "model.decoder.filename")?;
+
+        // Encoder prompt input, keyed off the declared input SHAPE, not a model
+        // name: audio front-ends declare `audio_features`, text encoders declare
+        // `input_ids`. Exactly one must be present.
+        let (encoder_input_field, encoder_input) =
+            match (encoder.inputs.audio_features.as_deref(), encoder.inputs.input_ids.as_deref()) {
+                (Some(audio), None) => ("model.encoder.inputs.audio_features", audio),
+                (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids),
+                (Some(_), Some(_)) => {
+                    return Err(incomplete(
+                        "model.encoder declares both audio_features and input_ids; exactly one encoder prompt input is required",
+                    ));
+                }
+                (None, None) => {
+                    return Err(incomplete(
+                        "model.encoder.inputs.audio_features or model.encoder.inputs.input_ids",
+                    ));
+                }
+            };
+        let encoder_input = required_str(Some(encoder_input), encoder_input_field)?;
+        require_graph_input(&graphs.encoder, encoder_input, "encoder")?;
+
+        let encoder_hidden = required_str(
+            encoder.outputs.encoder_hidden_states.as_deref(),
+            "model.encoder.outputs.encoder_hidden_states",
+        )?;
+        require_graph_output(&graphs.encoder, encoder_hidden, "encoder")?;
+
+        let token = required_str(decoder.inputs.input_ids.as_deref(), "model.decoder.inputs.input_ids")?;
+        require_graph_input(&graphs.decoder, token, "decoder")?;
+        let logits =
+            required_str(decoder.outputs.logits.as_deref(), "model.decoder.outputs.logits")?;
+        require_graph_output(&graphs.decoder, logits, "decoder")?;
+
+        // Self-attention KV: the growing per-step cache. Matched by pattern
+        // against the decoder graph so only the ports the graph truly exposes are
+        // declared, paired positionally as `[key_i, value_i, ...]`.
+        let (self_input_indices, self_kv_inputs, self_input_dtype) = strict_indexed_kv(
+            &graphs.decoder.inputs,
+            required_str(
+                decoder.inputs.past_key_names.as_deref(),
+                "model.decoder.inputs.past_key_names",
+            )?,
+            required_str(
+                decoder.inputs.past_value_names.as_deref(),
+                "model.decoder.inputs.past_value_names",
+            )?,
+            "decoder self-attention past key/value",
+        )?;
+        let (self_output_indices, self_kv_outputs, self_output_dtype) = strict_indexed_kv(
+            &graphs.decoder.outputs,
+            required_str(
+                decoder.outputs.present_key_names.as_deref(),
+                "model.decoder.outputs.present_key_names",
+            )?,
+            required_str(
+                decoder.outputs.present_value_names.as_deref(),
+                "model.decoder.outputs.present_value_names",
+            )?,
+            "decoder self-attention present key/value",
+        )?;
+        if self_input_indices != self_output_indices {
+            return Err(incomplete(
+                "decoder self-attention past/present KV do not have identical layer indices",
+            ));
+        }
+        if self_input_dtype != self_output_dtype {
+            return Err(incomplete(format!(
+                "decoder self-attention past KV dtype {self_input_dtype} does not match present KV dtype {self_output_dtype}"
+            )));
+        }
+
+        // Cross-attention KV static routing. The encoder computes the cross KV
+        // ONCE from the audio/text prompt and emits `present_*_cross_%d`; those
+        // feed the decoder's `past_*_cross_%d` inputs and never grow or update
+        // across decode steps. This is why they are wired as pipeline dataflow
+        // edges from the encoder to the decoder (a prompt-time prologue result),
+        // distinct from the growing self-attention cache the decoder owns.
+        let (cross_input_indices, cross_kv_inputs, cross_input_dtype) = strict_indexed_kv(
+            &graphs.decoder.inputs,
+            required_str(
+                decoder.inputs.cross_past_key_names.as_deref(),
+                "model.decoder.inputs.cross_past_key_names",
+            )?,
+            required_str(
+                decoder.inputs.cross_past_value_names.as_deref(),
+                "model.decoder.inputs.cross_past_value_names",
+            )?,
+            "decoder cross-attention past key/value",
+        )?;
+        let (cross_output_indices, cross_kv_outputs, cross_output_dtype) = strict_indexed_kv(
+            &graphs.encoder.outputs,
+            required_str(
+                encoder.outputs.cross_present_key_names.as_deref(),
+                "model.encoder.outputs.cross_present_key_names",
+            )?,
+            required_str(
+                encoder.outputs.cross_present_value_names.as_deref(),
+                "model.encoder.outputs.cross_present_value_names",
+            )?,
+            "encoder cross-attention present key/value",
+        )?;
+        if cross_input_indices != cross_output_indices {
+            return Err(incomplete(
+                "encoder-produced and decoder-consumed cross-attention KV do not have identical layer indices",
+            ));
+        }
+        if cross_input_dtype != cross_output_dtype {
+            return Err(incomplete(format!(
+                "encoder cross-attention KV dtype {cross_output_dtype} does not match decoder cross-attention KV dtype {cross_input_dtype}"
+            )));
+        }
+        // Cross-attention KV static routing is declared through the decoder's
+        // paired `cross_kv_inputs` (the decoder's `past_*_cross_%d` ports) and
+        // `cross_kv_outputs` (the encoder's `present_*_cross_%d` ports), matched
+        // positionally per layer. The runtime binds these encoder-produced KV
+        // tensors as stateful decoder inputs computed ONCE at prompt time, so
+        // they are NOT wired as per-step dataflow edges (doing so would
+        // double-bind the port). `dataflow` carries only genuine per-invocation
+        // tensor edges, e.g. the encoder hidden-states edge below when present.
+        let mut dataflow: Vec<Value> = Vec::new();
+
+        let mut decoder_io = Map::new();
+        decoder_io.insert("token_input".into(), json!(token));
+        if let Some(mask) = decoder.inputs.attention_mask.as_deref() {
+            require_graph_input(&graphs.decoder, mask, "decoder")?;
+            decoder_io.insert("attention_mask_input".into(), json!(mask));
+        }
+        if let Some(position) = decoder.inputs.position_ids.as_deref() {
+            require_graph_input(&graphs.decoder, position, "decoder")?;
+            decoder_io.insert("position_ids_input".into(), json!(position));
+        }
+        // Some encoder-decoder decoders also consume the encoder hidden states
+        // directly (computing cross KV internally); route it only when declared
+        // AND actually present as a decoder graph input.
+        if let Some(decoder_hidden) = decoder.inputs.encoder_hidden_states.as_deref()
+            && require_graph_input(&graphs.decoder, decoder_hidden, "decoder").is_ok()
+        {
+            decoder_io.insert("encoder_hidden_states_input".into(), json!(decoder_hidden));
+            dataflow.push(edge_with_dtype(
+                &format!("encoder.{encoder_hidden}"),
+                &format!("decoder.{decoder_hidden}"),
+                &cross_output_dtype,
+            ));
+        }
+        decoder_io.insert("logits_output".into(), json!(logits));
+        decoder_io.insert("kv_inputs".into(), json!(self_kv_inputs));
+        decoder_io.insert("kv_outputs".into(), json!(self_kv_outputs));
+        decoder_io.insert("kv_update".into(), json!("append"));
+        decoder_io.insert("cross_kv_inputs".into(), json!(cross_kv_inputs));
+        decoder_io.insert("cross_kv_outputs".into(), json!(cross_kv_outputs));
+
+        let mut encoder_io = Map::new();
+        // Audio front-ends declare the mel `audio_features` input; text encoders
+        // reuse the ordinary `token_input`. Keyed off the encoder-input SHAPE
+        // resolved above, never the model name.
+        let encoder_input_role = if encoder_input_field.ends_with("audio_features") {
+            "audio_features_input"
+        } else {
+            "token_input"
+        };
+        encoder_io.insert(encoder_input_role.into(), json!(encoder_input));
+
+        let mut models = Map::new();
+        models.insert(
+            "encoder".into(),
+            component_json(
+                encoder_filename.to_owned(),
+                "encoder",
+                Some(Value::Object(encoder_io)),
+            ),
+        );
+        models.insert(
+            "decoder".into(),
+            component_json(
+                decoder_filename.to_owned(),
+                "decoder",
+                Some(Value::Object(decoder_io)),
+            ),
+        );
+
+        let mut phases = Map::new();
+        phases.insert("encoder".into(), run_on("prompt_only"));
+        phases.insert("decoder".into(), run_on("every_step"));
+
+        let strategy = composite_encode_decode(Some("encoder"), "decoder");
+
+        let mut pipeline = Map::new();
+        pipeline.insert("models".into(), Value::Object(models));
+        pipeline.insert("dataflow".into(), Value::Array(dataflow));
+        pipeline.insert("strategy".into(), strategy);
+        pipeline.insert("phases".into(), Value::Object(phases));
+
+        let mut model = Map::new();
+        model.insert("attention".into(), self.attention_json());
+        insert_usize(
+            &mut model,
+            "max_sequence_length",
+            self.max_sequence_length(),
+        );
+        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
+
+        let mut root = Map::new();
+        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+        root.insert("model".into(), Value::Object(model));
+        root.insert("pipeline".into(), Value::Object(pipeline));
+        if let Some(generation) = self.generation_json() {
+            root.insert("generation".into(), generation);
+        }
+        if let Some(tokens) = self.tokens_json() {
+            root.insert("tokens".into(), tokens);
+        }
+
+        Ok(serde_json::from_value(Value::Object(root))?)
+    }
+
     fn strict_decoder_state(
         &self,
         graph: &ModelGraphInfo,
@@ -1628,6 +1894,55 @@ fn require_same_dtype(
             left.name, left.dtype, right.name, right.dtype
         )))
     }
+}
+
+/// Match a paired key/value `%d` name pattern against `tensors` and return the
+/// ordered layer index set, the interleaved `[key_0, value_0, key_1, ...]`
+/// names verified to exist in the graph, and the single shared cache dtype.
+///
+/// Unlike [`GenAiConfig::strict_decoder_state`], this does not require the key
+/// and value patterns to share a common textual prefix (Whisper self/cross KV
+/// use distinct `..._key_self_%d` / `..._value_self_%d` prefixes), and it does
+/// not derive any fixed-state `state_pairs`, so encoder-decoder cross-attention
+/// and cross-QK ports are never misread as recurrent state.
+fn strict_indexed_kv(
+    tensors: &[GraphTensorInfo],
+    key_pattern: &str,
+    value_pattern: &str,
+    description: &str,
+) -> Result<(Vec<usize>, Vec<String>, String), GenAiConfigError> {
+    let keys = match_indexed_tensors(tensors, key_pattern)?;
+    let values = match_indexed_tensors(tensors, value_pattern)?;
+    let indices = exact_index_set(&[&keys, &values], description)?;
+    if indices.is_empty() {
+        return Err(incomplete(format!(
+            "at least one {description} graph-port pair"
+        )));
+    }
+    let mut names = Vec::with_capacity(indices.len() * 2);
+    let mut dtype: Option<String> = None;
+    for index in &indices {
+        let key = keys[index];
+        let value = values[index];
+        require_same_dtype(key, value, description)?;
+        match dtype.as_deref() {
+            Some(canonical) if canonical != key.dtype => {
+                return Err(incomplete(format!(
+                    "all {description} tensors must use one dtype: canonical dtype is {canonical}, but '{}' is {}",
+                    key.name, key.dtype
+                )));
+            }
+            None => dtype = Some(key.dtype.clone()),
+            _ => {}
+        }
+        names.push(key.name.clone());
+        names.push(value.name.clone());
+    }
+    Ok((
+        indices,
+        names,
+        dtype.expect("non-empty KV indices establish a dtype"),
+    ))
 }
 
 fn processor_program_json(
@@ -2712,6 +3027,131 @@ mod tests {
         assert_eq!(generation.max_length, Some(448));
         assert_eq!(generation.do_sample, Some(false));
         assert_eq!(generation.num_beams, Some(1));
+    }
+
+    #[test]
+    fn whisper_strict_encoder_decoder_synth_routes_cross_kv() {
+        // Strict, graph-verified encoder-decoder synth (the path the ORT compat
+        // loader uses). Unlike the pattern-expanded `to_inference_metadata`, the
+        // cross-attention KV is wired as explicit encoder->decoder dataflow edges
+        // (static, computed once by the encoder), and the audio prompt input is
+        // surfaced on the encoder component.
+        let cfg: GenAiConfig = serde_json::from_str(WHISPER_JSON).unwrap();
+        let graphs = EncoderDecoderGraphInfo {
+            encoder: ModelGraphInfo {
+                inputs: vec![hybrid_graph_tensor(
+                    "audio_features",
+                    "float32",
+                    &[Some(1), Some(80), Some(3000)],
+                )],
+                outputs: vec![
+                    hybrid_graph_tensor(
+                        "encoder_hidden_states",
+                        "float32",
+                        &[Some(1), Some(1500), Some(384)],
+                    ),
+                    hybrid_graph_tensor(
+                        "present_key_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "present_value_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                ],
+            },
+            decoder: ModelGraphInfo {
+                inputs: vec![
+                    hybrid_graph_tensor("input_ids", "int64", &[Some(1), None]),
+                    hybrid_graph_tensor(
+                        "past_key_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "past_value_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "past_key_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "past_value_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                ],
+                outputs: vec![
+                    hybrid_graph_tensor("logits", "float32", &[Some(1), None, Some(51865)]),
+                    hybrid_graph_tensor(
+                        "present_key_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "present_value_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                ],
+            },
+        };
+
+        let metadata = cfg
+            .to_strict_encoder_decoder_pipeline_metadata(&graphs)
+            .expect("strict encoder-decoder synth");
+        let pipeline = metadata.pipeline.as_ref().expect("pipeline");
+        onnx_genai_metadata::validate_pipeline_spec(pipeline).expect("valid pipeline spec");
+
+        // Encoder + decoder components.
+        assert_eq!(pipeline.models["encoder"].role, "encoder");
+        assert_eq!(pipeline.models["decoder"].role, "decoder");
+
+        // Audio prompt input surfaced on the encoder.
+        let encoder_io = pipeline.models["encoder"].io.as_ref().expect("encoder io");
+        assert_eq!(encoder_io.audio_features_input.as_deref(), Some("audio_features"));
+
+        // Decoder self-KV grows; cross-KV is present as static routing.
+        let decoder_io = pipeline.models["decoder"].io.as_ref().expect("decoder io");
+        assert_eq!(decoder_io.logits_output.as_deref(), Some("logits"));
+        assert_eq!(decoder_io.kv_update.as_deref(), Some("append"));
+        assert_eq!(
+            decoder_io.kv_inputs.as_deref(),
+            Some(&["past_key_self_0", "past_value_self_0"].map(String::from)[..])
+        );
+        assert_eq!(
+            decoder_io.kv_outputs.as_deref(),
+            Some(&["present_key_self_0", "present_value_self_0"].map(String::from)[..])
+        );
+        assert_eq!(
+            decoder_io.cross_kv_inputs.as_deref(),
+            Some(&["past_key_cross_0", "past_value_cross_0"].map(String::from)[..])
+        );
+        assert_eq!(
+            decoder_io.cross_kv_outputs.as_deref(),
+            Some(&["present_key_cross_0", "present_value_cross_0"].map(String::from)[..])
+        );
+
+        // Cross-attention KV static routing is declared by the positional pairing
+        // of the decoder's cross_kv_inputs (past_*_cross) with cross_kv_outputs
+        // (the encoder-produced present_*_cross), computed ONCE by the encoder —
+        // NOT recomputed each step and NOT a per-step dataflow edge. This decoder
+        // has no encoder_hidden_states input, so no dataflow edge is synthesized.
+        assert!(
+            pipeline.dataflow.is_empty(),
+            "cross-KV is stateful routing, not per-step edges: {:?}",
+            pipeline.dataflow
+        );
+
+        assert!(matches!(
+            pipeline.strategy.kind,
+            onnx_genai_metadata::PipelineStrategyKind::Composite
+        ));
     }
 
     #[test]
