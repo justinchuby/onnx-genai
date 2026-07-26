@@ -2038,7 +2038,7 @@ impl PipelineEngine {
         &self,
         cross_kv_pairs: &[(String, String)],
         tensors: &PipelineTensors,
-    ) -> anyhow::Result<Vec<(String, Value)>> {
+    ) -> anyhow::Result<Vec<(String, Arc<Value>)>> {
         let mut bindings = Vec::with_capacity(cross_kv_pairs.len());
         for (decoder_input, encoder_output) in cross_kv_pairs {
             let suffix = format!(".{encoder_output}");
@@ -2059,7 +2059,13 @@ impl PipelineEngine {
                      component is ambiguous"
                 );
             }
-            bindings.push((decoder_input.clone(), clone_value(value)?));
+            // `Arc<Value>` mirrors the shared-ownership convention the ORT
+            // decode paths already use for per-step-invariant tensors; `Value`
+            // is neither `Send` nor `Sync`, so the lint is suppressed here as it
+            // is in `onnx-genai-ort`.
+            #[allow(clippy::arc_with_non_send_sync)]
+            let shared = Arc::new(clone_value(value)?);
+            bindings.push((decoder_input.clone(), shared));
         }
         Ok(bindings)
     }
@@ -2360,10 +2366,11 @@ struct PipelineDecodeLoopBackend<'a> {
     /// `(source_endpoint, decoder_input_port)` routing recomputed each step.
     decoder_in_edges: Vec<(String, String)>,
     /// Static encoder-produced cross-attention KV bound to the decoder every
-    /// step: `(decoder_input_port, value)`. Cloned once from the encoder
-    /// prologue outputs; invariant across the decode loop (see
-    /// `PipelineEngine::static_cross_kv_bindings`).
-    static_cross_kv: Vec<(String, Value)>,
+    /// step: `(decoder_input_port, shared_value)`. Resolved once from the encoder
+    /// prologue outputs and held behind an `Arc` so each step re-binds it as a
+    /// no-copy alias (O(1)) rather than deep-copying the large invariant buffer
+    /// (see `PipelineEngine::static_cross_kv_bindings`).
+    static_cross_kv: Vec<(String, Arc<Value>)>,
     context_tokens: Vec<TokenId>,
     prompt_len: usize,
     generated_count: usize,
@@ -2434,7 +2441,11 @@ impl PipelineDecodeLoopBackend<'_> {
             extras.push((port.clone(), clone_value(value)?));
         }
         for (port, value) in &self.static_cross_kv {
-            extras.push((port.clone(), clone_value(value)?));
+            // The static cross-KV buffer is invariant across the decode loop, so
+            // re-bind it as a no-copy alias over the shared owner instead of
+            // deep-copying the (large) tensor every step.
+            let aliased = Value::alias_with_shape(Arc::clone(value), value.shape())?;
+            extras.push((port.clone(), aliased));
         }
         Ok(extras)
     }
