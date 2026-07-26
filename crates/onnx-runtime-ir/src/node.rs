@@ -9,6 +9,16 @@ use crate::shape::Shape;
 use crate::tensor::{SparseTensorData, TensorData, TypeProto};
 use crate::value::ValueId;
 
+/// The operator domain for operators this runtime defines itself.
+///
+/// Anything we invent goes here, and nothing we invent goes in `com.microsoft`
+/// or the default ONNX domain: those namespaces belong to their owners, and an
+/// operator placed in one of them claims a provenance and a specification it
+/// does not have. Consumers reading a graph use the domain to decide whose
+/// definition applies, so getting it wrong is a factual error about the model,
+/// not a naming preference.
+pub const RUNTIME_DOMAIN: &str = "pkg.nxrt";
+
 /// Unique identifier for a [`Node`] within a [`Graph`](crate::Graph).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId(pub u32);

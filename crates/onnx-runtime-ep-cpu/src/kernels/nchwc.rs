@@ -30,7 +30,7 @@ use crate::dtype::to_dense_f32_widen;
 use crate::strided::numel;
 
 /// The private domain the layout pass emits its blocked ops under.
-pub const NCHWC_DOMAIN: &str = "pkg.nxrt";
+pub const NCHWC_DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 
 pub const REORDER_TO_BLOCKED_OP: &str = "NchwcReorderToBlocked";
 pub const REORDER_TO_NCHW_OP: &str = "NchwcReorderToNchw";

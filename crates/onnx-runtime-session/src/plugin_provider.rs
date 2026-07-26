@@ -14,7 +14,13 @@ use onnx_runtime_optimizer::{OptimizationPass, OptimizerError, PassContext};
 
 /// Synthetic op type used after a plugin EP compiles and replaces a claimed subgraph.
 pub(crate) const PLUGIN_FUSED_OP: &str = "NativePluginFused";
-pub(crate) const PLUGIN_FUSED_DOMAIN: &str = "com.microsoft";
+/// Our own domain, not `com.microsoft`.
+///
+/// This operator is invented here -- it stands for "a subgraph some plugin
+/// claimed" and has no meaning outside this runtime. Putting it in Microsoft's
+/// namespace would assert a specification that does not exist, and would
+/// collide the moment they define something by this name.
+pub(crate) const PLUGIN_FUSED_DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 const FUSION_ID_ATTR: &str = "native_plugin_fusion_id";
 pub(crate) const FUSION_SHAPE_GRAPH_ATTR: &str = "native_plugin_shape_graph";
 
@@ -242,6 +248,15 @@ impl OptimizationPass for PluginFusionPass {
             ));
         }
         let graph_outputs = graph.outputs.iter().copied().collect::<HashSet<_>>();
+        // Declare the domain these fused nodes live in. While they were
+        // (wrongly) in `com.microsoft` this was covered by the import the
+        // contrib fusions already record; our own domain has no such
+        // coincidence to rely on, and a graph carrying operators from a domain
+        // it never imported is not self-consistent.
+        graph
+            .opset_imports
+            .entry(PLUGIN_FUSED_DOMAIN.to_string())
+            .or_insert(1);
         graph.replace_node_groups(groups, &graph_outputs);
         let mut guard = self.compiled.lock().map_err(|_| {
             OptimizerError::Fusion(
@@ -300,4 +315,28 @@ fn fusion_id(node: &Node) -> onnx_runtime_ep_api::Result<usize> {
                 "plugin fused node is missing a valid native_plugin_fusion_id attribute; fix the plugin fusion pass".into(),
             )
         })
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    /// The fused operator must live in our domain, not someone else's.
+    ///
+    /// It is invented here and means "a subgraph some plugin claimed"; it has
+    /// no meaning outside this runtime and no specification anyone else wrote.
+    /// Putting it in `com.microsoft` — which it was, briefly — asserts a
+    /// provenance that does not exist and collides the moment they define an
+    /// operator by this name. A reader uses the domain to decide whose
+    /// definition applies, so this is a factual claim about the graph.
+    #[test]
+    fn the_fused_operator_is_in_this_runtimes_own_domain() {
+        assert_eq!(PLUGIN_FUSED_DOMAIN, onnx_runtime_ir::RUNTIME_DOMAIN);
+        assert_ne!(PLUGIN_FUSED_DOMAIN, "com.microsoft");
+        assert_ne!(
+            PLUGIN_FUSED_DOMAIN, "",
+            "the default ONNX domain belongs to the spec, not to us"
+        );
+        assert_ne!(PLUGIN_FUSED_DOMAIN, "ai.onnx");
+    }
 }
