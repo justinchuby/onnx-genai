@@ -1372,8 +1372,8 @@ impl Calibrator {
         // slow block (genuine sustained load) is NOT flagged, so a loaded host
         // still commits flat exactly as before -- this only ever avoids acting on
         // a burst-poisoned probe, so it cannot regress a clean measurement.
-        let contended = block_contended(pool, &self.pool_ns)
-            || block_contended(flat, &self.flat_ns);
+        let contended =
+            block_contended(pool, &self.pool_ns) || block_contended(flat, &self.flat_ns);
         if contended && self.reprobes_left > 0 {
             self.reprobes_left -= 1;
             if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
@@ -2026,7 +2026,10 @@ mod tests {
         // the block's stored samples.
         let mut feed = std::iter::once(9_999u64).chain(pool_block.iter().copied());
         while calib.phase == CalibPhase::ProbePool {
-            calib.record(AutoPath::Pool, feed.next().unwrap_or(pool_block[pool_block.len() - 1]));
+            calib.record(
+                AutoPath::Pool,
+                feed.next().unwrap_or(pool_block[pool_block.len() - 1]),
+            );
         }
         calib
     }
@@ -2051,7 +2054,11 @@ mod tests {
         // pool block, inflating its median above the pool's true (fast) cost. The
         // calibrator must NOT lock in a decision from that block -- it re-probes.
         let mut calib = probe_once(100, &[300, 300, 420, 420, 420]);
-        assert_eq!(calib.phase, CalibPhase::ProbeFlat, "must re-probe, not commit");
+        assert_eq!(
+            calib.phase,
+            CalibPhase::ProbeFlat,
+            "must re-probe, not commit"
+        );
         assert_eq!(calib.reprobes_left, CALIB_MAX_REPROBES - 1);
         // A clean re-probe now measures the pool as genuinely faster and adopts it,
         // recovering the throughput the poisoned probe would have thrown away.
@@ -2068,7 +2075,10 @@ mod tests {
         let calib = probe_once(100, &[300, 300, 300, 300, 300]);
         assert_eq!(calib.phase, CalibPhase::Committed);
         assert_eq!(calib.committed, AutoPath::Flat);
-        assert_eq!(calib.reprobes_left, CALIB_MAX_REPROBES, "no re-probe was spent");
+        assert_eq!(
+            calib.reprobes_left, CALIB_MAX_REPROBES,
+            "no re-probe was spent"
+        );
     }
 
     #[test]
