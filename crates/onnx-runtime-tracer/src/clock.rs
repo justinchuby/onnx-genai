@@ -80,7 +80,14 @@ fn unix_anchor() -> &'static (u64, u64) {
 #[must_use]
 pub fn monotonic_to_unix_us(trace_us: u64) -> u64 {
     let (anchor_monotonic, anchor_unix) = *unix_anchor();
-    anchor_unix.saturating_add(trace_us.saturating_sub(anchor_monotonic))
+    // Signed, because the anchor is established on first use and a trace is
+    // normally converted *after* it was captured -- so most timestamps are
+    // behind the anchor, not ahead of it. Subtracting with saturation instead
+    // clamped every one of those to the anchor itself, collapsing a 55ms span
+    // to 28us.
+    let offset = i128::from(trace_us) - i128::from(anchor_monotonic);
+    let unix = i128::from(anchor_unix) + offset;
+    u64::try_from(unix.max(0)).unwrap_or(u64::MAX)
 }
 
 /// The current time on the shared trace axis, in microseconds.
@@ -261,6 +268,34 @@ mod shared_axis_tests {
             "a reading from another thread ({from_thread}) fell outside the \
              interval it was taken in ({start}..{end}), so the two are not on \
              one axis"
+        );
+    }
+
+    /// Converting must preserve intervals on both sides of the anchor.
+    ///
+    /// The anchor is established on first use, so a trace exported after
+    /// capture has *every* timestamp behind it. Saturating subtraction sent
+    /// all of those to the anchor itself, turning a 55ms span into 28us --
+    /// a timeline where nothing appeared to take any time.
+    #[test]
+    fn converting_preserves_intervals_before_and_after_the_anchor() {
+        let early = absolute_now_us();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // First conversion, which is what establishes the anchor.
+        let mapped_early = monotonic_to_unix_us(early);
+        let late = absolute_now_us();
+        let mapped_late = monotonic_to_unix_us(late);
+
+        let raw_gap = late - early;
+        let mapped_gap = mapped_late - mapped_early;
+        assert!(
+            mapped_gap.abs_diff(raw_gap) <= 2,
+            "a {raw_gap}us interval converted to {mapped_gap}us; conversion \
+             must not compress time"
+        );
+        assert!(
+            mapped_early < mapped_late,
+            "conversion reordered two timestamps"
         );
     }
 

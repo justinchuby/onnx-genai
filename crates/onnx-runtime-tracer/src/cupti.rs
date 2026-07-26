@@ -41,7 +41,8 @@
 //! ## Safety
 //!
 //! This is the **only** module in the crate permitted to use `unsafe` — the
-//! crate keeps `#![forbid(unsafe_code)]` for every build that does not enable
+//! crate denies `unsafe_code` everywhere this module is not, for every build
+//! that does not enable
 //! `cupti` (see `lib.rs`). All FFI, dlopen, and raw activity-record parsing is
 //! confined here.
 
