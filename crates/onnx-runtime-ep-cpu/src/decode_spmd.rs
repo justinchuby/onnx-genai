@@ -108,8 +108,40 @@ pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 /// Spin iterations a worker or the dispatcher busy-waits before yielding /
 /// parking. Sized so back-to-back decode projections (microseconds apart) are
 /// always caught while spinning; only genuinely idle gaps fall through to park.
+///
+/// This long active-spin window is **load-bearing, not a bad habit**: a worker
+/// must catch the next op while spinning, because parking in the active path
+/// pays a per-op wake (and the dispatcher's serial `unpark` fan-out) on every one
+/// of the ~400 decode barriers per token. Measured on a 0.6B decode at 47 workers
+/// (taskset one socket, median-of-5): parking after ~1024 spins instead of the
+/// default ~262144 collapses throughput 124 -> 26 tok/s (~5x). Idle workers still
+/// park (deep-idle backstop below), so idle CPU returns to ~0 between requests --
+/// the spin is bounded to genuinely-active decode, not "unconditional".
 const SPIN_BEFORE_YIELD: u32 = 1 << 12;
 const YIELD_BEFORE_PARK: u32 = 1 << 6;
+
+/// Diagnostic-only overrides for the worker spin-before-park window, read once.
+/// `NXRT_SPMD_SPIN_BEFORE_YIELD` / `NXRT_SPMD_YIELD_BEFORE_PARK` let a sweep retune
+/// how long a worker busy-waits for the next op before parking without a rebuild.
+/// Unset uses the compiled defaults above (production behaviour). These exist to
+/// keep the spin-window measurement reproducible; **shortening them regresses
+/// active decode ~5x and does NOT cure the cross-socket collapse** (which is a
+/// two-socket spinning-barrier effect, not idle-spin starvation -- see the
+/// decode-spin-then-park decision record), so leave them unset in production.
+fn spin_before_yield() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| env_u32("NXRT_SPMD_SPIN_BEFORE_YIELD", SPIN_BEFORE_YIELD))
+}
+fn yield_before_park() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| env_u32("NXRT_SPMD_YIELD_BEFORE_PARK", YIELD_BEFORE_PARK))
+}
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
 /// Bounded park so a (rare, off-hot-path) lost wakeup self-heals rather than
 /// hanging. It is only a backstop: dispatch wakes parked workers with an explicit
 /// `unpark` (SeqCst-paired below), so this timeout never fires on the hot path.
@@ -804,6 +836,8 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     // waiting for it.
     let mut local_seq = 0usize;
     shared.ready.fetch_add(1, Ordering::AcqRel);
+    let spin_budget = spin_before_yield();
+    let yield_budget = yield_before_park();
     loop {
         let mut spins = 0u32;
         let mut yields = 0u32;
@@ -818,9 +852,9 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
             }
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
-            if spins >= SPIN_BEFORE_YIELD {
+            if spins >= spin_budget {
                 yields = yields.wrapping_add(1);
-                if yields >= YIELD_BEFORE_PARK {
+                if yields >= yield_budget {
                     // Deep idle: park and STAY parked, re-parking on each spurious
                     // or timeout wake, until a real op arrives (or shutdown). This
                     // is critical for `Auto` mode: while the flat path is
