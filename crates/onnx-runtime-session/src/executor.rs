@@ -985,6 +985,14 @@ pub(crate) struct Executor {
     /// span per executed op so kernels can attach kernel-variant and
     /// capture-rejection reasons via [`annotate_current_span_with`].
     trace: TraceContext,
+    /// Reusable scratch for the resolved input shapes of the node currently
+    /// being dispatched by [`Self::exec_kernel_node`]. Refilled (truncate +
+    /// refill, retaining inner `Vec` capacity) once per node via
+    /// [`Self::refill_input_shapes`], so a steady-state decode step performs no
+    /// per-node `Vec<Vec<usize>>` allocation for shape lookup. Reuse invariant:
+    /// it is fully rewritten at the top of each `exec_kernel_node` call and only
+    /// read within that same call — never aliased or carried across nodes.
+    scratch_input_shapes: Vec<Vec<usize>>,
 }
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
@@ -2487,6 +2495,7 @@ impl Executor {
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
             trace: TraceContext::noop(),
+            scratch_input_shapes: Vec::new(),
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -3812,21 +3821,31 @@ impl Executor {
         external: &ExternalBindings,
         capture: OpCaptureTrace<'_>,
     ) -> Result<()> {
-        let node = self.graph.node(self.plan[pi].node_id);
-        let op_type = node.op_type.clone();
-        let domain = node.domain.clone();
-        // Open the span only when tracing is live so an untraced decode step
-        // never allocates a span name or touches the thread-local span stack.
-        let _span = self.trace.is_enabled().then(|| {
-            let span = self.trace.span(op_type.clone(), "op");
-            // Span is now active on this thread; stamp the capture disposition
-            // (and let the kernel below stamp its selected variant).
-            capture.annotate();
-            span
-        });
-        if is_control_flow_op(&op_type, &domain) {
+        // Dispatch by op-type/domain borrowed straight from the node, so a
+        // steady-state decode step compares `&str`s and never clones the
+        // op-type/domain `String`s per node. The immutable borrow of
+        // `self.graph` is confined to this block and dropped before the
+        // `&mut self` dispatch below; the span guard it yields owns its name
+        // (and a cheap `Arc`-clone of the trace context), so it borrows nothing
+        // from `self` and can stay live across the dispatch.
+        let (is_control_flow, is_sequence, _span) = {
+            let node = self.graph.node(self.plan[pi].node_id);
+            let is_control_flow = is_control_flow_op(&node.op_type, &node.domain);
+            let is_sequence = is_sequence_op(&node.op_type, &node.domain);
+            // Open the span only when tracing is live so an untraced decode step
+            // never allocates a span name or touches the thread-local span stack.
+            let span = self.trace.is_enabled().then(|| {
+                let span = self.trace.span(node.op_type.clone(), "op");
+                // Span is now active on this thread; stamp the capture disposition
+                // (and let the kernel below stamp its selected variant).
+                capture.annotate();
+                span
+            });
+            (is_control_flow, is_sequence, span)
+        };
+        if is_control_flow {
             self.exec_control_flow(pi, resolved, outer_scope)
-        } else if is_sequence_op(&op_type, &domain) {
+        } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {
             self.exec_kernel_node(pi, resolved, external)
@@ -3980,6 +3999,34 @@ impl Executor {
         Ok(!invalidated)
     }
 
+    /// Refill [`Self::scratch_input_shapes`] with the resolved shapes of plan
+    /// node `pi`'s inputs, so the dispatch path reads shapes from a reused buffer
+    /// instead of allocating a fresh `Vec<Vec<usize>>` per node per token.
+    ///
+    /// The scratch is truncated to the node's arity and each inner `Vec` is
+    /// cleared and refilled in place (retaining its heap capacity), so a
+    /// steady-state decode step — a fixed sequence of fixed-arity nodes — does
+    /// zero shape-vector allocation after warmup. An omitted optional input
+    /// (`None` slot) yields an empty inner shape, exactly as the previous
+    /// `.unwrap_or_default()` collect did. `self.plan` and
+    /// `self.scratch_input_shapes` are disjoint fields, so the shared read of the
+    /// former coexists with the `&mut` refill of the latter.
+    fn refill_input_shapes(&mut self, pi: usize, resolved: &HashMap<ValueId, Vec<usize>>) {
+        let inputs = &self.plan[pi].inputs;
+        let scratch = &mut self.scratch_input_shapes;
+        scratch.truncate(inputs.len());
+        for (i, slot) in inputs.iter().enumerate() {
+            if i < scratch.len() {
+                scratch[i].clear();
+            } else {
+                scratch.push(Vec::new());
+            }
+            if let Some(vid) = slot {
+                scratch[i].extend_from_slice(&resolved[vid]);
+            }
+        }
+    }
+
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
     /// output shapes, size buffers, build the input/output views (with Holden's
     /// bounds gate), resolve the shape-keyed kernel, and dispatch it.
@@ -3989,21 +4036,24 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
     ) -> Result<()> {
-        // Small owned copies of the plan facts so the buffer/view/cache fields
-        // can be mutated below without fighting a borrow of `self.plan`.
+        // Borrow the plan facts in place rather than cloning them per node per
+        // token: `self.plan` is a distinct field from the buffer/view/cache
+        // fields mutated below, so these shared borrows coexist with the
+        // disjoint `&mut self.<field>` borrows the compute path takes (the
+        // dispatch never goes through a `&mut self` method while they are held).
         let node_id = self.plan[pi].node_id;
-        let inputs = self.plan[pi].inputs.clone();
-        let outputs = self.plan[pi].outputs.clone();
-        let input_dtypes = self.plan[pi].input_dtypes.clone();
-        let output_dtypes = self.plan[pi].output_dtypes.clone();
-
-        let input_shapes: Vec<Vec<usize>> = inputs
-            .iter()
-            .map(|v| v.map(|vid| resolved[&vid].clone()).unwrap_or_default())
-            .collect();
+        // Refill the reusable per-executor input-shape scratch first (before the
+        // shared borrows below), so a steady-state decode step allocates no
+        // fresh `Vec<Vec<usize>>` for shape lookup — see `refill_input_shapes`.
+        self.refill_input_shapes(pi, resolved);
+        let inputs = &self.plan[pi].inputs;
+        let outputs = &self.plan[pi].outputs;
+        let input_dtypes = &self.plan[pi].input_dtypes;
+        let output_dtypes = &self.plan[pi].output_dtypes;
+        let input_shapes = &self.scratch_input_shapes;
 
         let node = self.graph.node(node_id);
-        if let Some(output_shape) = runtime_elementwise_output_shape(node, &input_shapes) {
+        if let Some(output_shape) = runtime_elementwise_output_shape(node, input_shapes) {
             let output_shape = output_shape.map_err(|_| {
                 let node_name = if node.name.is_empty() {
                     format!("<unnamed node #{}>", node_id.0)
@@ -4014,7 +4064,7 @@ impl Executor {
                     node: node_name,
                     domain: canonical_domain(node),
                     op_type: node.op_type.clone(),
-                    input_shapes: input_shapes.clone(),
+                    input_shapes: input_shapes.to_vec(),
                 }
             })?;
             if outputs.len() != 1 {
@@ -4065,8 +4115,8 @@ impl Executor {
                 .collect();
             let out_shapes = dynamic_output_shapes(
                 node,
-                &input_shapes,
-                &input_dtypes,
+                input_shapes,
+                input_dtypes,
                 &input_values,
                 &input_float_values,
                 opset,
@@ -4335,8 +4385,8 @@ impl Executor {
         let kernel = cache.get_or_create(
             node_id,
             node,
-            &input_shapes,
-            &input_dtypes,
+            input_shapes,
+            input_dtypes,
             &constant_inputs,
             opset,
             ep.as_ref(),
@@ -4544,7 +4594,7 @@ impl Executor {
             device: onnx_runtime_ir::DeviceId,
         }
         let mut out_bufs: Vec<OutBacking> = Vec::with_capacity(outputs.len());
-        for &vid in &outputs {
+        for &vid in outputs {
             if let Some(value) = external.outputs.get(&vid) {
                 out_bufs.push(OutBacking {
                     vid,
