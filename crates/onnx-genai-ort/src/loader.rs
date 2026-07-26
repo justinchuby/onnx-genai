@@ -132,7 +132,11 @@ impl PipelineModelDirectory {
             .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
         let is_vision_language =
             config.model.vision.is_some() && config.model.embedding.is_some();
-        let is_encoder_decoder = config.model.encoder.is_some();
+        // A transducer (RNN-T) also declares `model.encoder`, but it is a
+        // distinct, not-yet-executable family — exclude it so it is never
+        // recognized as a loadable encoder-decoder pipeline and silently
+        // mis-bound with Whisper-style cross-attention bindings.
+        let is_encoder_decoder = config.model.encoder.is_some() && !config.is_transducer();
         if !is_vision_language && !is_encoder_decoder {
             return Ok(None);
         }
@@ -349,6 +353,19 @@ fn load_compatibility_pipeline(
     })?;
     let config = onnx_genai_genai_config::load(&genai_path)
         .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+    // Decline the RNN-T transducer family explicitly. It declares `model.encoder`
+    // but is structurally distinct from a cross-attention encoder-decoder; the
+    // genai-config synthesis returns an UnsupportedPipelineFamily error rather
+    // than fabricating a spec, and surfacing it here gives a precise message
+    // instead of the misleading "model.vision missing" fall-through below.
+    if config.is_transducer() {
+        let reason = config
+            .to_inference_metadata(None)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unsupported RNN-T transducer package".to_owned());
+        return Err(OrtError::InvalidArgument(reason));
+    }
     if config.model.encoder.is_some() {
         return load_encoder_decoder_compatibility_pipeline(root, &config);
     }
