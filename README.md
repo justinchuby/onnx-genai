@@ -99,6 +99,13 @@ peak-throughput default. This is a decode-worker budget, not a hard cpuset for
 prefill or ONNX Runtime threads; combine it with an OS cpuset/taskset when the
 entire process must be confined.
 
+The native CPU decode path also enables a steady-state **decode-plan memo** by
+default: it caches the per-step shape/buffer plan and replays it token-to-token
+(token-exact by construction, with an in-flight verify net and a graceful fall
+back to rebuilding on any model where invariance can't be proven). Disable it
+with `ONNX_GENAI_DECODE_MEMO=0` (also `false`/`off`) on resource-constrained
+hosts or for debugging; any other value, including unset, keeps it on.
+
 ### Run the OpenAI-compatible server
 
 ```bash

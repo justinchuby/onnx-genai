@@ -51,6 +51,17 @@ peak-throughput automatic default is unchanged. This controls native decode
 workers; use an OS cpuset/taskset as well when the entire process, including
 prefill or ONNX Runtime work, must be hard-confined.
 
+### Decode-plan memo (default on)
+
+On the native CPU decode path, a steady-state decode-plan memo caches the
+per-step shape/buffer plan and replays it token-to-token, which is token-exact
+by construction (shape-only bookkeeping, an in-flight verify net, and a
+graceful fall back to rebuilding every step on any model where invariance can't
+be proven). It is **on by default**. To disable it — for example on a
+resource-constrained host or when debugging — set `ONNX_GENAI_DECODE_MEMO=0`
+(also accepts `false`/`off`, case-insensitive). Any other value, including
+unset, keeps it on.
+
 ## Runtime selection
 
 Choose an execution provider at runtime with `ONNX_GENAI_EP` (e.g. `cpu`,
