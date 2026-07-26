@@ -915,6 +915,14 @@ impl InferenceSession {
         self.exec.run_outputs(inputs)
     }
 
+    /// F5 Stage 1 decode-plan memo activity counters `(primed, rebuilt, replayed,
+    /// ineligible)` over this session's lifetime. `replayed > 0` after a decode
+    /// run proves the memo actually engaged on the real (persistent-KV-binding)
+    /// path; the coordinator's on-model A/B reads this to reject a vacuous pass.
+    pub fn decode_memo_counts(&self) -> (u64, u64, u64, u64) {
+        self.exec.decode_memo_counts()
+    }
+
     /// Run with persistent device allocations supplying graph inputs and,
     /// optionally, aliasing graph outputs. Bound outputs are returned as `None`
     /// because their bytes remain resident in the caller-owned allocation.
