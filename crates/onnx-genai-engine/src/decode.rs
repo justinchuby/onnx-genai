@@ -2660,6 +2660,12 @@ fn empty_past_value(info: &TensorInfo) -> anyhow::Result<Value> {
 }
 
 pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
+    // Per-step-invariant, read-only inputs (e.g. an encoder-decoder's static
+    // cross-attention KV) are bound as no-copy aliases over a shared owner.
+    // Re-alias them in O(1) instead of deep-copying the underlying buffer.
+    if let Some(aliased) = value.try_alias_clone() {
+        return aliased.map_err(|e| anyhow::anyhow!("Failed to alias-clone ORT value: {}", e));
+    }
     match value.dtype() {
         DataType::Float32 => Value::from_slice_f32(&value.to_vec_f32()?, value.shape())
             .map_err(|e| anyhow::anyhow!("Failed to clone Float32 ORT value: {}", e)),
