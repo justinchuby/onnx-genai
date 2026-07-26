@@ -1192,6 +1192,22 @@ const CALIB_SWITCH_MARGIN_PCT: u64 = 8;
 /// flat while pool workers are still hot makes flat look slow and would bias the
 /// choice *toward* the pool (the regression). See the block-ordered probe below.
 const CALIB_PROBE_DISCARD: usize = 1;
+/// A probe block is treated as **contended** (a co-tenant burst landed on it, so
+/// its median overstates that path's true cost) when its fast-half spread
+/// `(median - min) / median` exceeds this percent. Every decode step does the
+/// identical M=1 work, so an *uncontended* block -- whether uniformly fast (idle)
+/// or uniformly slow (sustained load) -- has a tiny spread; only a transient burst
+/// that hits some, but not all, of the block's steps inflates it. Sized above the
+/// observed clean-block jitter (flat blocks measured ~1-7%; a burst-poisoned pool
+/// block measured ~28%) so sustained load is *not* misread as a burst (it commits
+/// flat as before) while a transient burst *is* caught.
+const CALIB_CONTENDED_SPREAD_PCT: u64 = 15;
+/// Maximum times a single recalibration re-collects its probe when a block looks
+/// contended before giving up and committing on the (possibly noisy) median. A
+/// small bound guarantees the calibrator always commits within a handful of
+/// probes -- a genuinely (uniformly) loaded host re-probes at most this many times
+/// then correctly commits flat, so re-probing can never loop or sustain overhead.
+const CALIB_MAX_REPROBES: u32 = 3;
 
 /// The calibration probe measures the two paths in **separate contiguous blocks**
 /// (all flat, then all pool) rather than interleaving them, so a just-finished
@@ -1231,9 +1247,17 @@ enum CalibPhase {
 ///   possibly-slower steps -- never a sustained regression.
 /// * Re-probing lets a host that *becomes* loaded mid-generation fall back within
 ///   one recalibration window, and a host that *becomes* idle adopt the pool.
+/// * A probe block hit by a *transient* co-tenant burst (non-uniform samples --
+///   see [`block_contended`]) is discarded and re-collected (bounded by
+///   [`CALIB_MAX_REPROBES`]) rather than committed, so a momentary spike on the
+///   pool block no longer locks the slower flat path in for a whole window. A
+///   *uniformly* slow block (genuine sustained load) is never flagged, so this
+///   only ever avoids acting on unreliable data -- it cannot regress a clean or a
+///   steadily-loaded measurement.
 ///
-/// The logic is pure (no threads, no clock, no env), so it is unit-tested
-/// deterministically by feeding synthetic per-path samples.
+/// The decision logic is pure (no threads, no clock; the only env read is an
+/// optional `NXRT_CALIB_DEBUG` diagnostic print that never affects the choice), so
+/// it is unit-tested deterministically by feeding synthetic per-path samples.
 struct Calibrator {
     phase: CalibPhase,
     warmup_left: u64,
@@ -1242,6 +1266,7 @@ struct Calibrator {
     flat_ns: Vec<u64>,
     committed: AutoPath,
     committed_left: u64,
+    reprobes_left: u32,
 }
 
 impl Calibrator {
@@ -1256,6 +1281,7 @@ impl Calibrator {
             // host which never lets the pool win keeps forever.
             committed: AutoPath::Flat,
             committed_left: 0,
+            reprobes_left: CALIB_MAX_REPROBES,
         }
     }
 
@@ -1336,6 +1362,31 @@ impl Calibrator {
     fn commit_from_samples(&mut self) {
         let pool = median_ns(&mut self.pool_ns);
         let flat = median_ns(&mut self.flat_ns);
+        // A transient co-tenant burst that lands on part of a probe block inflates
+        // that block's median above the path's true cost, which can lock in the
+        // wrong path for the whole recalibration period (observed: a burst on the
+        // pool block poisoned its median and stuck decode on the flat path for 600
+        // steps). When a block looks contended (non-uniform -- see
+        // `CALIB_CONTENDED_SPREAD_PCT`) and re-probe budget remains, discard this
+        // probe and re-collect rather than commit on unreliable data. A uniformly
+        // slow block (genuine sustained load) is NOT flagged, so a loaded host
+        // still commits flat exactly as before -- this only ever avoids acting on
+        // a burst-poisoned probe, so it cannot regress a clean measurement.
+        let contended = block_contended(pool, &self.pool_ns)
+            || block_contended(flat, &self.flat_ns);
+        if contended && self.reprobes_left > 0 {
+            self.reprobes_left -= 1;
+            if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+                eprintln!(
+                    "NXRT_CALIB: contended probe (pool_median={}us flat_median={}us) -> re-probe ({} left)",
+                    pool / 1000,
+                    flat / 1000,
+                    self.reprobes_left,
+                );
+            }
+            self.enter_flat_probe();
+            return;
+        }
         // Adopt the pool only when it is at least CALIB_SWITCH_MARGIN_PCT faster:
         // pool <= flat * (100 - margin) / 100. Use u128 so the multiply cannot
         // overflow for pathologically large samples.
@@ -1346,11 +1397,40 @@ impl Calibrator {
         } else {
             AutoPath::Flat
         };
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!(
+                "NXRT_CALIB: pool_median={}us flat_median={}us margin={}% -> {:?} (pool_samples={:?} flat_samples={:?})",
+                pool / 1000,
+                flat / 1000,
+                CALIB_SWITCH_MARGIN_PCT,
+                self.committed,
+                self.pool_ns.iter().map(|n| n / 1000).collect::<Vec<_>>(),
+                self.flat_ns.iter().map(|n| n / 1000).collect::<Vec<_>>(),
+            );
+        }
         self.phase = CalibPhase::Committed;
         self.committed_left = CALIB_RECAL_PERIOD;
+        self.reprobes_left = CALIB_MAX_REPROBES;
         self.pool_ns.clear();
         self.flat_ns.clear();
     }
+}
+
+/// Whether a probe block was contended by a *transient* burst: its fast-half
+/// spread `(median - min) / median` exceeds [`CALIB_CONTENDED_SPREAD_PCT`]. Every
+/// M=1 decode step does identical work, so an uncontended block -- uniformly fast
+/// (idle) or uniformly slow (sustained load) -- has a tiny spread; only a burst
+/// that hits some steps but not others pulls the median well above the min. Empty
+/// or single-sample blocks are never flagged (no spread to measure). Pure, so the
+/// gate is unit-tested without a clock.
+fn block_contended(median: u64, samples: &[u64]) -> bool {
+    let Some(&min) = samples.iter().min() else {
+        return false;
+    };
+    if median <= min {
+        return false;
+    }
+    u128::from(median - min) * 100 > u128::from(median) * u128::from(CALIB_CONTENDED_SPREAD_PCT)
 }
 
 /// Median of the samples (upper-middle for an even count). `u64::MAX` for an empty
@@ -1928,6 +2008,96 @@ mod tests {
             calib.record(AutoPath::Pool, pool_samples.next().unwrap_or(80));
         }
         assert_eq!(calib.committed, AutoPath::Pool);
+    }
+
+    /// Drive a fresh calibrator through warmup + a flat block (all `flat`) + a pool
+    /// block whose *stored* samples are `pool_block` (a leading discard sample is
+    /// fed automatically). Returns the calibrator after the single probe resolves
+    /// (either committed or bounced back to `ProbeFlat` by a re-probe).
+    fn probe_once(flat: u64, pool_block: &[u64]) -> Calibrator {
+        let mut calib = Calibrator::new();
+        for _ in 0..CALIB_WARMUP_STEPS {
+            calib.record(AutoPath::Pool, 1_000);
+        }
+        while calib.phase == CalibPhase::ProbeFlat {
+            calib.record(AutoPath::Flat, flat);
+        }
+        // The first pool record is the discarded transition sample; the rest are
+        // the block's stored samples.
+        let mut feed = std::iter::once(9_999u64).chain(pool_block.iter().copied());
+        while calib.phase == CalibPhase::ProbePool {
+            calib.record(AutoPath::Pool, feed.next().unwrap_or(pool_block[pool_block.len() - 1]));
+        }
+        calib
+    }
+
+    #[test]
+    fn block_contended_flags_a_nonuniform_block_only() {
+        // Uniformly fast (idle) or uniformly slow (sustained load) blocks have a
+        // tiny fast-half spread and are NOT flagged; a burst that inflates some
+        // samples above the min pushes (median - min)/median over the threshold.
+        assert!(!block_contended(100, &[100, 100, 100, 100, 100]));
+        assert!(!block_contended(300, &[300, 300, 300, 300, 300])); // sustained load
+        assert!(!block_contended(100, &[100, 100, 100, 100, 100_000])); // lone high outlier
+        assert!(block_contended(420, &[300, 300, 420, 420, 420])); // 28% spread
+        // Empty / single-sample blocks have no spread to measure.
+        assert!(!block_contended(u64::MAX, &[]));
+        assert!(!block_contended(50, &[50]));
+    }
+
+    #[test]
+    fn calibrator_reprobes_a_burst_contaminated_pool_block_instead_of_committing() {
+        // The observed failure: a transient co-tenant burst lands on part of the
+        // pool block, inflating its median above the pool's true (fast) cost. The
+        // calibrator must NOT lock in a decision from that block -- it re-probes.
+        let mut calib = probe_once(100, &[300, 300, 420, 420, 420]);
+        assert_eq!(calib.phase, CalibPhase::ProbeFlat, "must re-probe, not commit");
+        assert_eq!(calib.reprobes_left, CALIB_MAX_REPROBES - 1);
+        // A clean re-probe now measures the pool as genuinely faster and adopts it,
+        // recovering the throughput the poisoned probe would have thrown away.
+        drive_to_commit(&mut calib, 80, 100);
+        assert_eq!(calib.committed, AutoPath::Pool);
+    }
+
+    #[test]
+    fn calibrator_commits_flat_under_uniform_sustained_load_without_reprobing() {
+        // No-regression guarantee: genuine sustained load makes every pool step
+        // uniformly slow (low spread), so the block is NOT treated as a burst -- the
+        // calibrator commits flat immediately, exactly as before this robustness
+        // change. Sustained load can never be misread as a transient burst.
+        let calib = probe_once(100, &[300, 300, 300, 300, 300]);
+        assert_eq!(calib.phase, CalibPhase::Committed);
+        assert_eq!(calib.committed, AutoPath::Flat);
+        assert_eq!(calib.reprobes_left, CALIB_MAX_REPROBES, "no re-probe was spent");
+    }
+
+    #[test]
+    fn calibrator_reprobe_budget_is_bounded_and_then_commits() {
+        // A pathologically noisy host that never yields a clean probe must still
+        // commit within CALIB_MAX_REPROBES re-probes (here on the median, which is
+        // pool-slow -> flat), so re-probing can never loop or stall decode.
+        let mut calib = Calibrator::new();
+        for _ in 0..CALIB_WARMUP_STEPS {
+            calib.record(AutoPath::Pool, 1_000);
+        }
+        let mut reprobes = 0u32;
+        // Keep feeding contended blocks; count the re-probes until it commits.
+        for _ in 0..(CALIB_MAX_REPROBES + 5) {
+            while calib.phase == CalibPhase::ProbeFlat {
+                calib.record(AutoPath::Flat, 100);
+            }
+            let mut feed = [9_999u64, 300, 300, 420, 420, 420].into_iter();
+            while calib.phase == CalibPhase::ProbePool {
+                calib.record(AutoPath::Pool, feed.next().unwrap_or(420));
+            }
+            if calib.phase == CalibPhase::Committed {
+                break;
+            }
+            reprobes += 1;
+        }
+        assert_eq!(calib.phase, CalibPhase::Committed);
+        assert_eq!(reprobes, CALIB_MAX_REPROBES);
+        assert_eq!(calib.committed, AutoPath::Flat);
     }
 
     #[test]
