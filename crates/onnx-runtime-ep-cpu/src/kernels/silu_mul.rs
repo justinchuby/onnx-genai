@@ -110,10 +110,14 @@ mod tests {
             .collect()
     }
 
-    fn assert_fused_matches_unfused(dtype: DataType) {
+    fn assert_fused_matches_unfused(dtype: DataType, aliased_operand: bool) {
         let mut x_values = random_values(257);
         x_values.extend_from_slice(&[-100.0, -18.5, -0.0, 0.0, 18.5, 100.0]);
-        let y_values = random_values(x_values.len());
+        let y_values = if aliased_operand {
+            x_values.clone()
+        } else {
+            random_values(x_values.len())
+        };
         let x = match dtype {
             DataType::Float16 => Owned::f16(&[x_values.len()], &x_values),
             DataType::BFloat16 => Owned::bf16(&[x_values.len()], &x_values),
@@ -151,7 +155,14 @@ mod tests {
     #[test]
     fn silu_mul_is_byte_identical_to_silu_then_mul() {
         for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float32] {
-            assert_fused_matches_unfused(dtype);
+            assert_fused_matches_unfused(dtype, false);
+        }
+    }
+
+    #[test]
+    fn aliased_silu_mul_is_byte_identical_to_silu_then_mul() {
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float32] {
+            assert_fused_matches_unfused(dtype, true);
         }
     }
 }

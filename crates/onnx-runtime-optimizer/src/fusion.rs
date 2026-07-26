@@ -929,6 +929,35 @@ impl FusionPattern {
         Some((vec![Some(p.x)], HashMap::new()))
     }
 
+    /// Extract the logical `[x, y]` operands for `Silu(x) * y`.
+    ///
+    /// This must not use the matched region's deduplicated external-input list:
+    /// for `Silu(x) * x`, both logical operands intentionally reference `x`.
+    fn silu_mul_spec(&self, graph: &Graph, m: &PatternMatch) -> Option<FusedNodeSpec> {
+        let (&silu_id, &mul_id) = (m.nodes.first()?, m.nodes.get(1)?);
+        let silu = graph.node(silu_id);
+        let mul = graph.node(mul_id);
+        let [Some(x)] = silu.inputs.as_slice() else {
+            return None;
+        };
+        let [lhs, rhs] = mul.inputs.as_slice() else {
+            return None;
+        };
+        let silu_output = *silu.outputs.first()?;
+        let y = match (*lhs, *rhs) {
+            (Some(value), Some(y)) if value == silu_output && y != silu_output => y,
+            (Some(y), Some(value)) if value == silu_output && y != silu_output => y,
+            _ => return None,
+        };
+        let output = mul.outputs.first().copied()?;
+        if graph.value(*x).shape != graph.value(y).shape
+            || graph.value(*x).shape != graph.value(output).shape
+        {
+            return None;
+        }
+        Some((vec![Some(*x), Some(y)], HashMap::new()))
+    }
+
     /// Attempt to grow a match whose first node is `start`.
     fn try_match_from(&self, graph: &Graph, start: NodeId) -> Option<PatternMatch> {
         let start_node = graph.try_node(start)?;
@@ -1039,7 +1068,7 @@ impl FusionPattern {
                 if self.replacement == "FusedMatMulBias" || self.replacement == "FusedGemm" {
                     self.matmul_bias_broadcast_ok(graph, m)
                 } else if self.replacement == "SiluMul" {
-                    self.silu_mul_shape_ok(graph, m)
+                    self.silu_mul_spec(graph, m).is_some()
                 } else {
                     true
                 }
@@ -1098,29 +1127,6 @@ impl FusionPattern {
         true
     }
 
-    /// `SiluMul` is deliberately a same-shape operation.  Keeping the fusion to
-    /// contiguous elementwise semantics avoids changing ONNX `Mul` broadcasting
-    /// behavior and lets the CPU kernel make exactly one fused elementwise pass.
-    fn silu_mul_shape_ok(&self, graph: &Graph, m: &PatternMatch) -> bool {
-        let (Some(&silu_id), Some(&mul_id)) = (m.nodes.first(), m.nodes.get(1)) else {
-            return false;
-        };
-        let silu = graph.node(silu_id);
-        let mul = graph.node(mul_id);
-        if silu.inputs.len() != 1 || silu.outputs.len() != 1 || mul.inputs.len() != 2 {
-            return false;
-        }
-        let Some(x) = silu.inputs[0] else {
-            return false;
-        };
-        let Some(y) = mul.input_values().find(|&value| value != silu.outputs[0]) else {
-            return false;
-        };
-        let output = mul.outputs[0];
-        graph.value(x).shape == graph.value(y).shape
-            && graph.value(x).shape == graph.value(output).shape
-    }
-
     /// Apply a match: remove the matched nodes and insert the replacement,
     /// reusing `m.output` so downstream consumers and graph outputs stay wired.
     pub fn apply_fusion(&self, graph: &mut Graph, m: &PatternMatch) -> Result<()> {
@@ -1133,6 +1139,9 @@ impl FusionPattern {
         // For schema-aware rewrites, extract the kernel-signature inputs and
         // attributes *before* the matched nodes are removed.
         let (inputs, attributes) = match self.kind {
+            RewriteKind::Structural if self.replacement == "SiluMul" => self
+                .silu_mul_spec(graph, m)
+                .ok_or_else(|| crate::error::OptimizerError::Fusion(self.name.clone()))?,
             RewriteKind::Structural => (
                 m.external_inputs.iter().map(|&v| Some(v)).collect(),
                 HashMap::new(),
@@ -1527,14 +1536,20 @@ mod tests {
         g
     }
 
-    fn silu_mul_graph(silu_is_rhs: bool, extra_silu_consumer: bool) -> Graph {
+    fn silu_mul_graph(
+        silu_is_rhs: bool,
+        extra_silu_consumer: bool,
+        aliased_operand: bool,
+    ) -> Graph {
         let mut g = Graph::new();
         g.opset_imports.insert(String::new(), 17);
         g.opset_imports.insert(CONTRIB_DOMAIN.into(), 1);
         let x = val(&mut g, "x");
-        let y = val(&mut g, "y");
+        let y = if aliased_operand { x } else { val(&mut g, "y") };
         g.add_input(x);
-        g.add_input(y);
+        if !aliased_operand {
+            g.add_input(y);
+        }
         let silu_out = val(&mut g, "silu_out");
         let mut silu = Node::new(NodeId(0), "Silu", vec![Some(x)], vec![silu_out]);
         silu.domain = CONTRIB_DOMAIN.into();
@@ -1563,7 +1578,7 @@ mod tests {
     #[test]
     fn fuses_silu_mul_regardless_of_mul_operand_order() {
         for silu_is_rhs in [false, true] {
-            let mut g = silu_mul_graph(silu_is_rhs, false);
+            let mut g = silu_mul_graph(silu_is_rhs, false, false);
             OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
             assert_eq!(g.num_nodes(), 1);
             let fused = g.nodes.values().next().unwrap();
@@ -1574,8 +1589,22 @@ mod tests {
     }
 
     #[test]
+    fn fuses_silu_mul_with_aliased_operand_as_two_logical_inputs() {
+        for silu_is_rhs in [false, true] {
+            let mut g = silu_mul_graph(silu_is_rhs, false, true);
+            let x = g.inputs[0];
+            OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
+            assert_eq!(g.num_nodes(), 1);
+            let fused = g.nodes.values().next().unwrap();
+            assert_eq!(fused.op_type, "SiluMul");
+            assert_eq!(fused.inputs, vec![Some(x), Some(x)]);
+            assert!(g.validate().is_ok());
+        }
+    }
+
+    #[test]
     fn does_not_fuse_silu_mul_when_silu_output_has_another_consumer() {
-        let mut g = silu_mul_graph(false, true);
+        let mut g = silu_mul_graph(false, true, false);
         OpFusion::new().run(&mut g, &PassContext::new()).unwrap();
         assert_eq!(g.num_nodes(), 3);
         assert!(g.nodes.values().all(|node| node.op_type != "SiluMul"));
