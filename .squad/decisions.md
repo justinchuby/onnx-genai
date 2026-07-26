@@ -3722,3 +3722,240 @@ These now surface their true kernel decline (they were previously hidden as unre
 
 **Review outcome:** PRs #122, #124, and #125 landed on main at `3f30f92`.
 
+<!-- scribe-merge-2026-07-26T19-45-52Z-cuda-perf-and-capture-regression -->
+## 2026-07-26 — CUDA perf next-wave and #193 capture-regression reconciliation
+
+Decision archive gate checked at 2026-07-26T19:45:52Z: active ledger was 381527 bytes and exceeded 51200 bytes. No dated active-ledger entries older than 2026-07-19 were present, so no archive file was changed.
+
+<!-- merged from .squad/decisions/inbox/hicks-repl-commands.md -->
+### 2026-07-24: REPL multimodal slash-command grammar
+**By:** hicks
+**What:** Added pure parsing for `/help`, `/reset`, `/raw`, `/system [text]`, `/image <path> [prompt text]`, and `/audio <path> [prompt text]`. Attachments stage for the next text turn, while single-line attachment commands immediately send their text. Missing paths warn without crashing; Phase 1 reports staged modalities and sends text only.
+**Why:** This makes multimodal REPL input testable and extensible while honestly deferring engine-side image and audio execution to Phase 2.
+
+<!-- merged from .squad/decisions/inbox/sapper-pr129-revision.md -->
+### 2026-07-24: PR #129 Nemotron revision (transpose gap + README fix)
+**By:** sapper
+**What:** Removed the unsupported `prediction_network.decoder_output` to `joiner.decoder_output` dataflow edge and documented the required transpose as a metadata-contract gap. Corrected the streaming-chunk configuration attribution in the README.
+**Why:** `decoder.onnx` emits f32 `[batch, 640, target_len]`, while `joint.onnx` accepts `decoder_output` as f32 `[batch, target_len, 640]`; `DataflowEdge` only supports endpoints, dtype, and device transfer, not layout adaptation. The cached package grep finds `chunk_samples: 8960` in `v3/genai_config.json`, not `audio_processor_config.json`.
+
+<!-- merged from .squad/decisions/inbox/hicks-glm-review.md -->
+# Hicks GLM native-validation review — 2026-07-25
+
+**Verdict: 🟡 (mergeable after this review's documentation correction).**
+
+The two ORT non-load claims were reproduced against the CUDA-enabled linked
+ORT: GLM-4 fails load at
+`GroupQueryAttention_node_19` with unrecognized
+`rotary_embedding_dim`; GLM-5.2 QMoE fails load because
+`pkg.nxrt:IndexShare(-1)` is unregistered. The q4 ORT number is explicitly
+qualified and GPU-residency evidence is recorded, so it is not presented as a
+CPU-fallback comparison. A 16-token native CUDA greedy GLM-4 run from
+`Hello` produced `", I am a 3rd year student at the University of Waterloo. I"`.
+
+## q4 triage
+
+**Severity: high correctness regression; effort: small-to-medium, localized
+native CUDA decode binding fix (roughly 1–3 days including regressions).**
+
+Reproduction on CUDA with prompt `123` fails on decode token 1:
+
+```text
+model/layers.0/self_attn/indexer/Add_node_70:
+[[1, 1, 2], [1, 1, 4096]] are not broadcast-compatible
+```
+
+The `[1,2,3,4]` control fails at the same node with `[1,1,5]` versus
+`[1,1,4096]`; CPU completes eight tokens, and ORT CUDA completes decode.
+This excludes token corruption, a generic operator/kernel gap, and an export
+artifact.
+
+Despite the `indexer` name, q4 contains **zero** `pkg.nxrt::IndexShare` nodes
+and two standard `ai.onnx::Attention` nodes. `Add_node_70` combines the
+logical-width indexer score (`ReduceSum_67`) with a cast/squeezed
+`attention_mask`. On CUDA, `DecodeCudaState::extend_mask`
+(`crates/onnx-genai-engine/src/native_decode.rs`) intentionally exposes the
+single-token mask at `max_len=4096`; that capacity leaks through the indexer
+mask branch while the score remains logical width. This is category **(c)**:
+a decode-time mask/capacity binding bug, not the IndexShare DSA kernel.
+
+Dispatch to **native CUDA decode/engine owner** (the agent responsible for
+`onnx-genai-engine` fixed-capacity KV and `onnx-runtime-session` device
+bindings), not the IndexShare-kernel owner. Fix the physical-mask exposure
+policy only for proven-safe topology; preserve logical mask shape when
+non-Attention mask consumers reach prefix-sensitive indexer arithmetic. Add
+CUDA regressions for prompts `[123]` and `[1,2,3,4]` across at least two
+generated tokens.
+
+<!-- merged from .squad/decisions/inbox/hudson-deepseek-status.md -->
+### 2026-07-25: DeepSeek native CUDA validation status
+**By:** Hudson
+**What:** Native CUDA loads all three exercised DeepSeek artifacts. DeepSeek-V2
+QMoE matches ORT for 32 greedy tokens and token-0 top-40 log-probabilities
+(max absolute delta 0.001409); DeepSeek-Coder matches for 128 tokens.
+DeepSeek-R1 diverges at generated token 16 (native 374, ORT CUDA 594) on the
+benchmark prompt; this is consistent with the committed fp32-oracle finding
+(`deepseek_r1_1_5b_divergence.rs`, which locks the separate `"capital of France"`
+prompt where native picks oracle-correct 374 vs ORT CUDA 315). The benchmark
+token-16 divergence is not itself oracle-adjudicated yet. Stable
+native/ORT rates were 629.31/442.76 tok/s for R1 and 798.44/623.51 tok/s for
+Coder. The QMoE ORT run was CPU-heavy (four Memcpy nodes, 0% observed GPU,
+2.45 tok/s), so it is not a valid GPU speed baseline.
+**Why:** The durable status must distinguish numerical correctness from an
+invalid ORT performance baseline. Top remaining gaps are full-model QMoE
+language-coherence validation, a GPU-resident ORT QMoE reference, and continued
+explicit handling of DeepSeek-R1 MatMulNBits accuracy-level divergence.
+
+<!-- merged from .squad/decisions/inbox/pris-pr168-test-fix.md -->
+### 2026-07-25: Cover the second AVX-512 vector's final lane
+**By:** Pris
+**What:** Corrected PR #168's two-vector NaN test to use a 32-element block and place the NaN at index 31.
+**Why:** The prior test wrote index 15, which only exercised the first vector's final lane and did not cover non-finite detection in the second vector.
+
+<!-- merged from .squad/decisions/inbox/ripley-core-budget.md -->
+### 2026-07-25: Keep peak default and add an explicit CPU decode budget
+**By:** Ripley
+**What:** `onnx-genai generate` and `onnx-genai run` expose `--cpu-cores N`, mapped to the native decode worker-count mechanism with precedence CLI > `ONNX_GENAI_CPU_DECODE_THREADS` > AUTO. The uncapped automatic worker count is unchanged.
+**Why:** Shared-machine users need a first-class good-citizen control, while the measured 48-worker default remains the best dedicated-host peak. Persistent workers already pin one worker per selected allowed CPU, so the budget bounds their affinity footprint without requiring a hand-written `taskset`.
+
+<!-- merged from .squad/decisions/inbox/ripley-legit-cuda-sweep.md -->
+### 2026-07-25: Require observed GPU execution for native-vs-ORT headlines
+**By:** Ripley
+**What:** Treat Phi-4-mini, Qwen2.5-1.5B, and Qwen2.5-7B as valid native-CUDA
+versus ORT-CUDA comparisons for their Foundry `cuda-gpu` artifacts. Their ORT
+runs had no inserted-Memcpy warning and were independently observed at 86–91%
+H200 utilization. Report the real native wins as 1.385×, 1.452×, and 1.100×.
+**Why:** Selecting the CUDA EP is insufficient proof by itself. A valid
+competitive claim requires a CUDA-targeted artifact, absence of fallback-copy
+thrash, and direct evidence that model compute exercised the selected GPU.
+
+<!-- merged from .squad/decisions/inbox/ripley-uncontended-sweep.md -->
+### 2026-07-25: Treat CUDA-targeted rows as the clean native-vs-ORT comparison
+**By:** Ripley
+**What:** The uncontended H200 sweep records all four requested three-way
+measurements, but uses Qwen2.5-0.5B and DeepSeek-R1-Distill-Qwen-1.5B as the
+clean competitive native-vs-ORT rows. Phi-3.5-mini and Qwen2.5-Coder-7B ratios
+remain explicitly artifact-specific because their generic-CPU exports caused
+ORT to insert 67/57 memcpy nodes and partially assign the CUDA EP.
+**Why:** GPU 6 was idle throughout, making absolute CUDA rates trustworthy, but
+an idle GPU does not remove graph-export and execution-provider assignment
+confounds. The distinction preserves the credible 1.556× and 1.421× native
+wins without overstating the much larger generic-CPU-artifact ratios.
+
+<!-- merged from .squad/decisions/inbox/roy-pr167-guard-fix.md -->
+### 2026-07-25: Gate RMSNorm SIMD scaling on exact-identity scale shape
+**By:** Roy
+**What:** The contiguous normalize-and-scale path now requires the right-aligned scale shape to exactly equal `x_shape[axis..]`. SkipSimplifiedLayerNormalization applies the same identity-shape check to gamma.
+**Why:** Equal element counts do not prove identity indexing: for `X=[2,2]`, `axis=1`, and `scale=[2,1]`, the scale varies by group while broadcasting along the normalized axis. Such broadcasts must use the scalar `scale_index` path.
+
+<!-- merged from .squad/decisions/inbox/deckard-down-gemv-validate.md -->
+### 2026-07-26: Down-GEMV register-reuse validation stopped as duplicate
+**By:** Deckard
+**What:** Do not open a new PR for `1e2b02b9`. Its exact patch already exists on `origin/main` as `720fa032`; the requested validation worktree and branch were removed.
+**Why:** Both commits have stable patch ID `8950d3c0064da12e6edb023baef742552fa0e95b`, identical parent file content, and identical resulting `matmul_nbits.rs`. Cherry-picking onto current main conflicted because later work generalized the already-landed register-reuse kernel to adaptive 2/4/8-column CTAs and added subsequent specializations/tests. Keeping current main would make the cherry-pick empty, so candidate versus main has no performance delta and cannot pass the required positive-win gate. No build, CUDA test, golden-lock, benchmark, push, or PR was run because there is no candidate code difference to validate or merge.
+
+<!-- merged from .squad/decisions/inbox/sapper-glm52-land.md -->
+### 2026-07-26: GLM-5.2 IndexShare landing is superseded
+**By:** Sapper
+**What:** Do not cherry-pick `528b0f28ebd39df8b27ff34f765190fcb3a26351` or open a PR. `origin/main` already contains the same shape-inference implementation and CUDA E2E under `6fdc8742`, with later fixture-backed eager-decode strengthening.
+**Why:** `6fdc8742` is an ancestor of `origin/main`; its IndexShare handler and shape tests match `528b0f28` exactly, while its only initial difference was rustfmt in the E2E test. Main subsequently added the committed tiny fixture and strengthened the test through `7c212bc7` and `ec4b62bf`, so landing the old commit would duplicate and regress the current coverage.
+
+<!-- merged from .squad/decisions/inbox/batty-dsmla-copyback.md -->
+### 2026-07-26: Land DeepSeek MLA Attention KV copy-back stream ordering
+**By:** Batty
+**What:** Cherry-picked `de5188cce0390f9cd381289e5aec20f1c52a9682` onto current `origin/main` as `36751857` on `perf/deepseek-mla-capture-copyback` and opened PR #193.
+**Why:** Current main still used synchronous `runtime.dtod` for staged dense Attention KV copy-back. Switching both key and value copies to same-stream `dtod_async` preserves producer/copy/consumer ordering without capture-illegal device synchronization. Build, focused Attention/GQA tests, the Foundry Qwen3 24-token golden lock, and the CUDA EP suite excluding the four known missing-cuDNN cases passed.
+
+<!-- merged from .squad/decisions/inbox/luv-review-193.md -->
+# Decision: PR #193 review (Luv, Code Reviewer)
+
+- **PR:** #193 — perf(cuda): stream-order Attention KV-growth copy-back (capture-safe)
+- **Author:** Batty (locked out of revisions)
+- **Reviewer:** Luv (independent)
+- **Date:** 2026-07-26T18:00:58Z
+- **Verdict:** APPROVE
+
+## Change
+Two `self.runtime.dtod(...)` → `self.runtime.dtod_async(...)` in
+`crates/onnx-runtime-ep-cuda/src/kernels/standard_attention.rs` (the staged
+dense KV copy-back), plus a comment. Full branch diff vs `origin/main` is
+exactly +8/-3 in that one file — nothing hidden. `dtod_async` and its ordering
+unit test already exist on `main` (used by movement.rs, indexing.rs).
+
+## Concurrency analysis (correctness)
+- **Stream ordering preserved.** `dtod_async` enqueues on `self.stream`
+  (EP compute stream, runtime.rs:849). `launch_build_kv` (producer) and the
+  next step's `build_kv` (consumer) both launch on `self.runtime.stream()`
+  (standard_attention.rs:862). Producer → async copy → consumer are all on the
+  one EP stream, so the copy is implicitly ordered without a host sync. No new
+  race.
+- **Capture-safe.** The old sync `dtod` (runtime.rs:828) issued an *ungated*
+  host `self.synchronize()` — illegal during CUDA-graph capture. The codebase
+  otherwise gates every host sync on `!is_capturing()` (execute entry line 937,
+  exit line 1562). `dtod_async` removes the illegal host sync and records the
+  copy into the captured graph on the stream. Matches the established pattern.
+- **Blocking semantics retained.** The execute-exit `synchronize()` (gated on
+  `!is_capturing()`, line 1562) still drains the async copy for eager callers.
+- **Disjoint staging intact.** When `stage_key`/`stage_value`, `key_kv_ptr` is a
+  fresh `alloc` (line 1316) distinct from the aliased `present_key_ptr`; src/dst
+  never overlap, so async copy is safe.
+- **No collateral.** Other `dtod`/`dtod_async` callers (provider, csa_checkpoint,
+  reduce) untouched.
+
+## Independent validation (GPU 3, taskset -c 1)
+- Build `onnx-runtime-ep-cuda`: OK.
+- `standard_attention_gpu` 24/24; `standard_attention_bf16_gpu` 2/2;
+  `group_query_attention_gpu` 25/25 (+1 ignored). Repeated standard x3 more:
+  deterministic, no race flakiness.
+- `dtod_async_is_ordered_after_same_stream_producer` unit test: PASS (directly
+  validates the same-stream ordering invariant with a spinning producer kernel).
+
+## Golden lock — pre-existing/environmental, NOT a regression
+- Qwen3-0.6B foundry native-CUDA lock FAILED, but produces **byte-identical**
+  tokens on `origin/main` AND the PR branch (all 24 tokens equal between them) —
+  so it is not a PR regression; PR output == main output exactly.
+- Root cause: the only model artifact available in this env
+  (`/home/justinchu/mobius/.scratch/qwen3-0.6b-int4-cuda`) uses
+  `com.microsoft.GroupQueryAttention` (140 nodes), not default-domain Attention,
+  so it (a) never exercises the changed `StandardAttentionKernel` staged path
+  and (b) does not match the golden `EXPECTED_TOKENS` (locked against the Foundry
+  `generic-cpu-4` artifact, which is not downloaded here — HF cache has no
+  snapshot). The lock neither validates nor invalidates this PR.
+
+## Coverage note (non-blocking, pre-existing)
+No test dynamically exercises the aliased default-domain Attention staged
+copy-back (stage_key/stage_value require present aliased onto past + dense mode);
+the op-level harness allocates fresh present buffers. This is a pre-existing
+coverage gap, not a PR defect. Correctness here rests on the static concurrency
+analysis + the passing same-stream ordering unit test. Suggest a follow-up e2e
+test on a default-domain-Attention dense-KV model (e.g. the DeepSeek-MLA path the
+branch name references).
+
+## Final
+APPROVE. Coordinator to merge. Do not push to branch.
+
+<!-- merged from .squad/decisions/inbox/gorman-post148-review.md -->
+# Gorman review: post-#148 native-vs-ORT scorecard
+
+**Verdict: 🟡 — mergeable after the review documentation update in this commit.**
+
+All displayed arithmetic recomputes correctly: native/ORT is 1.385930
+(1.386×), 1.605277 (1.605×), and 1.122583 (1.123×); the native leads are
+38.593%, 60.528%, and 12.258%. The A/B changes are -0.08695%, +10.52325%,
+and +2.07008%, respectively.
+
+The ORT evidence is sufficient: CUDAExecutionProvider, 86–91% peak GPU
+utilization, multi-GiB allocations, and no inserted-Memcpy warning are
+recorded, with the intentional shape-node CPU notice distinguished from
+partial-EP fallback. The A/B now explicitly records fixed prompt, tokens,
+warmups, runs, steady window, CPU pinning, and GPU, with only #148 differing.
+
+The larger Qwen1.5B gain is physically plausible: its smaller down-projection
+K/N yields fewer baseline 8-column CTAs, hence greater H200 grid starvation;
+the grid multiplier has more latency hiding to recover than for 7B. This is a
+native-only A/B, not ORT jitter. GPU re-confirmation was not run: GPU 1 is
+reserved (0% utilization but 129589 MiB allocated) and every other GPU was
+98–99% utilized. The scorecard now states that a clean-idle-GPU Qwen1.5B
+confirmation remains pending.
+
+<!-- scribe-merge-2026-07-26T19-45-52Z-cuda-perf-and-capture-regression-end -->

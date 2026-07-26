@@ -12,3 +12,7 @@
 
 ## 2026-07-18T01:20:34Z — PR #25 and CUDA SparseKvGather archive
 - Merged seven decision notes, wrote orchestration/session logs, and updated progress. Ash and Hudson remain in flight.
+
+## 2026-07-26T19:45:52Z — Scribe update
+
+- Merged 14 decision inbox notes, wrote Deckard/Leon orchestration logs, updated session focus, and checked archive/history gates; no history file exceeded 15 KB.

@@ -107,3 +107,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-24T15:10:00Z — Phi decode-correctness lock
 
 Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. Following Holden's review, Pris environment-gated and generalized shared `common/decode_lock.rs`; Leon co-owns this Qwen/Phi helper with Batty and Pris.
+
+## 2026-07-26T19:45:52Z — Scribe update
+
+- Spawned as leon-10 on `test/attention-default-domain-capture` for PR #193 default-domain Attention capture-path regression and revert-check; outcome pending.
