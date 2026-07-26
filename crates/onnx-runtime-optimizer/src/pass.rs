@@ -128,7 +128,7 @@ pub fn run_passes(
         #[cfg(debug_assertions)]
         pass.postconditions(graph)?;
         if let Some(span) = span.as_mut() {
-            span.set_args(
+            span.merge_args(
                 Args::new()
                     .with("pass", pass.name().to_string())
                     .with("nodes_before", nodes_before as u64)

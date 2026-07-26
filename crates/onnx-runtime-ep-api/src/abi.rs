@@ -384,14 +384,14 @@ impl Drop for PluginKernelShared {
     /// does not own those threads today, and leaking state instead would be a
     /// worse trade.
     fn drop(&mut self) {
-        if let Some(release_state) = self.release_state {
-            if let Ok(states) = self.states.get_mut() {
-                for (_, state) in states.drain() {
-                    // SAFETY: each state was returned by this compute-info's
-                    // CreateState and is released before PluginRuntime releases
-                    // the compute infos.
-                    unsafe { release_state(self.info, state) };
-                }
+        if let Some(release_state) = self.release_state
+            && let Ok(states) = self.states.get_mut()
+        {
+            for (_, state) in states.drain() {
+                // SAFETY: each state was returned by this compute-info's
+                // CreateState and is released before PluginRuntime releases
+                // the compute infos.
+                unsafe { release_state(self.info, state) };
             }
         }
     }
