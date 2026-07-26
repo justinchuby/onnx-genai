@@ -994,7 +994,7 @@ pub(crate) struct Executor {
     /// read within that same call — never aliased or carried across nodes.
     scratch_input_shapes: Vec<Vec<usize>>,
     /// F5 Stage 1 — master switch for the steady-state decode-plan memo. Default
-    /// OFF; enabled by `ONNX_GENAI_DECODE_MEMO=1`. Consulted on the top-level CPU
+    /// ON; disabled by `ONNX_GENAI_DECODE_MEMO=0`. Consulted on the top-level CPU
     /// eager decode path — including the normal persistent-KV-binding case.
     decode_memo_enabled: bool,
     /// When set (`ONNX_GENAI_DECODE_MEMO_VERIFY=1`, or always under
@@ -1036,8 +1036,8 @@ pub(crate) struct Executor {
     /// nodes to elide on a matching replay, guarded by a per-source buffer
     /// identity signature. Invalidated on every non-replay step (mirrors the
     /// Stage-1 Chew defense-in-depth) so a stale plan from a retired/errored
-    /// step can never serve a future replay. Default OFF (shares the Stage-1
-    /// `ONNX_GENAI_DECODE_MEMO=1` gate).
+    /// step can never serve a future replay. Default ON (shares the Stage-1
+    /// `ONNX_GENAI_DECODE_MEMO` gate; set =0 to disable).
     decode_view_plan: Option<DecodeViewPlan>,
     /// F5 Stage 2 counters. `views_reused` = zero-copy view aliases reinstated
     /// without rebuild; `dispatch_elided` = pure-view plan nodes whose re-dispatch
@@ -1285,13 +1285,24 @@ fn shape_references_any(shape: &Shape, symbols: &HashSet<SymbolId>) -> bool {
         .any(|d| matches!(d, Dim::Symbolic(s) if symbols.contains(s)))
 }
 
-/// Whether the decode-plan memo master switch (`ONNX_GENAI_DECODE_MEMO`) is set.
-/// Default OFF: the memo runs only when explicitly enabled.
+/// Whether the decode-plan memo master switch (`ONNX_GENAI_DECODE_MEMO`) is on.
+/// Default ON; set `ONNX_GENAI_DECODE_MEMO=0` to disable.
+///
+/// The explicit OFF values are `0`, `false`, and `off` (case-insensitive,
+/// surrounding whitespace trimmed). Every other state — unset, empty, or an
+/// unrecognized value — enables the memo, so parsing fails safe toward the
+/// validated fast path (worst case: rebuild every step, no speedup, never
+/// wrong). Ripley's authoritative A/B recorded 0 token flips and a non-negative
+/// speedup at every tested core count, so default-ON is token-exact by
+/// construction.
 fn decode_memo_env_enabled() -> bool {
-    matches!(
-        std::env::var("ONNX_GENAI_DECODE_MEMO").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
-    )
+    match std::env::var("ONNX_GENAI_DECODE_MEMO") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Whether the opt-in per-step replay verification (`ONNX_GENAI_DECODE_MEMO_VERIFY`)
@@ -10122,6 +10133,13 @@ mod tests {
             auto_detect_cpu_ep().unwrap(),
         )
         .unwrap();
+        // Warm-decode capture-shape seeding is a device-graph-capture concern
+        // (capture-capable EPs only), where the decode-plan memo is disabled by
+        // construction (`device_type() != Cuda` gate). The memo-eligible CPU
+        // eager path deliberately skips recording `capture_warm_shapes` (it never
+        // captures). Disable the now-default-ON memo so this executor records the
+        // warm shapes exactly as a capture-capable EP would at runtime.
+        exec.set_decode_memo_enabled(false);
 
         let zero = Tensor::from_raw(DataType::Int64, vec![], &0i64.to_le_bytes()).unwrap();
         let four = Tensor::from_raw(DataType::Int64, vec![], &4i64.to_le_bytes()).unwrap();
@@ -10356,6 +10374,55 @@ mod tests {
             .collect()
     }
 
+    /// The default-ON master switch (Ripley's authoritative GO): the memo is
+    /// enabled unless `ONNX_GENAI_DECODE_MEMO` is an explicit OFF value
+    /// (`0`/`false`/`off`, case-insensitive, whitespace-trimmed). Unset, empty,
+    /// and unrecognized values all fail safe toward the validated fast path (ON).
+    #[test]
+    fn decode_memo_env_default_on_unless_explicitly_disabled() {
+        use std::ffi::OsString;
+        use std::sync::{Mutex, OnceLock};
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("decode-memo env lock");
+
+        struct RestoreEnv(Option<OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    // SAFETY: this test serializes all env mutations via ENV_LOCK.
+                    Some(value) => unsafe {
+                        std::env::set_var("ONNX_GENAI_DECODE_MEMO", value)
+                    },
+                    None => unsafe { std::env::remove_var("ONNX_GENAI_DECODE_MEMO") },
+                }
+            }
+        }
+        let _restore = RestoreEnv(std::env::var_os("ONNX_GENAI_DECODE_MEMO"));
+
+        // Unset ⇒ ON (default).
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::remove_var("ONNX_GENAI_DECODE_MEMO") };
+        assert!(decode_memo_env_enabled(), "unset must default ON");
+
+        // Explicit OFF values (case-insensitive, trimmed) ⇒ OFF.
+        for off in ["0", "false", "off", "FALSE", "Off", "  0  ", "\tOFF\n"] {
+            // SAFETY: guarded by ENV_LOCK above.
+            unsafe { std::env::set_var("ONNX_GENAI_DECODE_MEMO", off) };
+            assert!(!decode_memo_env_enabled(), "{off:?} must disable the memo");
+        }
+
+        // Explicit ON values and any unrecognized/empty value ⇒ ON (fail-safe).
+        for on in ["1", "true", "on", "ON", "True", " on ", "", "  ", "yes", "2", "banana"] {
+            // SAFETY: guarded by ENV_LOCK above.
+            unsafe { std::env::set_var("ONNX_GENAI_DECODE_MEMO", on) };
+            assert!(decode_memo_env_enabled(), "{on:?} must keep the memo ON");
+        }
+    }
+
     /// Plan-invalidation unit test (F5 Stage 1 merge gate #2): prefill→decode
     /// rebuilds (signature changed), pure length growth replays (signature
     /// stable), and a batch change rebuilds.
@@ -10425,7 +10492,8 @@ mod tests {
             auto_detect_cpu_ep().unwrap(),
         )
         .unwrap();
-        // Memo is default-OFF; assert it and leave it off for the reference.
+        // Memo is default-ON now; explicitly disable it for the reference run.
+        off.set_decode_memo_enabled(false);
         assert!(!off.decode_memo_enabled);
 
         let (on_graph, _) = decode_memo_test_graph();
@@ -10669,6 +10737,8 @@ mod tests {
             auto_detect_cpu_ep().unwrap(),
         )
         .unwrap();
+        // Memo is default-ON now; explicitly disable it for the reference run.
+        off.set_decode_memo_enabled(false);
         assert!(!off.decode_memo_enabled, "reference must run memo-OFF");
         let mut off_kv = stage2_kv_binding(&off);
 
