@@ -351,7 +351,7 @@ struct GenerateArgs {
     stream: bool,
 
     /// Prompt text.
-    #[arg(long)]
+    #[arg(long, short = 'p')]
     prompt: String,
 }
 
@@ -686,6 +686,20 @@ mod tests {
     fn generate_accepts_positional_model_and_prompt_flag() {
         let parsed_command_line =
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.model, PathBuf::from("./m"));
+                assert_eq!(args.prompt, "hi");
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_accepts_prompt_short_flag() {
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "-p", "hi"]).unwrap();
 
         match parsed_command_line.command {
             Commands::Generate(args) => {
