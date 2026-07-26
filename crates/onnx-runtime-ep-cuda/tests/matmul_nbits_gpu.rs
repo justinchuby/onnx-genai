@@ -1977,6 +1977,42 @@ fn matmul_nbits_gpu_fp16_vectorized_block32_matches_reference() {
 }
 
 #[test]
+fn matmul_nbits_gpu_fp16_symmetric_splitk_matches_f64_reference() {
+    let Some(ep) = gpu() else { return };
+    let (k, n) = (896usize, 1152usize);
+    let blocks = k / 32;
+    let activations: Vec<f16> = (0..k)
+        .map(|index| f16::from_f32(((index * 29 % 257) as f32 - 128.0) / 97.0))
+        .collect();
+    let packed: Vec<u8> = (0..n * blocks * 16)
+        .map(|index| ((index * 37 + index / 11 + 19) & 255) as u8)
+        .collect();
+    let scales: Vec<f16> = (0..n * blocks)
+        .map(|index| f16::from_f32(0.008 + (index * 17 % 31) as f32 * 0.0007))
+        .collect();
+    let actual = run_f16_case(&ep, &activations, &packed, &scales, k, n).unwrap();
+    let expected = f16_prefill_reference(
+        &activations,
+        &packed,
+        F16TestScales::F16(&scales),
+        None,
+        1,
+        k,
+        n,
+        4,
+    );
+    for (column, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+        let want = f16::from_f32(want).to_f32();
+        let difference = (got.to_f32() - want).abs();
+        assert!(
+            difference <= 0.04,
+            "column {column}: got={} f64_reference={want} difference={difference}",
+            got.to_f32()
+        );
+    }
+}
+
+#[test]
 fn matmul_nbits_gpu_fp16_lm_head_width_is_deterministic() {
     let Some(ep) = gpu() else { return };
     let (k, n) = (64usize, 151_936usize);
