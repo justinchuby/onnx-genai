@@ -1979,7 +1979,7 @@ fn matmul_nbits_gpu_fp16_vectorized_block32_matches_reference() {
 #[test]
 fn matmul_nbits_gpu_fp16_symmetric_splitk_matches_f64_reference() {
     let Some(ep) = gpu() else { return };
-    let (k, n) = (896usize, 97usize);
+    let (k, n) = (896usize, 1152usize);
     let blocks = k / 32;
     let activations: Vec<f16> = (0..k)
         .map(|index| f16::from_f32(((index * 29 % 257) as f32 - 128.0) / 97.0))
