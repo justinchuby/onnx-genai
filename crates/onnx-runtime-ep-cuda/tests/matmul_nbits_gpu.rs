@@ -751,7 +751,55 @@ fn random_u32(state: &mut u64) -> u32 {
     (*state >> 32) as u32
 }
 
-fn run_int8_cpu_gpu_parity(explicit_zero_points: bool) {
+fn int8_f64_reference(
+    activations: &[f32],
+    packed: &[u8],
+    scales: &[f32],
+    zero_points: Option<&[u8]>,
+    k: usize,
+    n: usize,
+    block_size: usize,
+) -> Vec<(f64, f64, f64, f64)> {
+    let blocks = k.div_ceil(block_size);
+    (0..n)
+        .map(|column| {
+            (0..k).fold(
+                (0.0, 0.0, 0.0, 0.0),
+                |(sum, sum_abs, cpu_quant_bound, cpu_sum_abs), depth| {
+                    let block = depth / block_size;
+                    let within = depth % block_size;
+                    let quantized =
+                        f64::from(packed[(column * blocks + block) * block_size + within]);
+                    let zero_point = zero_points
+                        .map(|values| values[column * blocks + block])
+                        .unwrap_or(128);
+                    let activation = f64::from(activations[depth]);
+                    let scale = f64::from(scales[column * blocks + block]);
+                    let term = activation * (quantized - f64::from(zero_point)) * scale;
+                    let begin = block * block_size;
+                    let end = (begin + block_size).min(k);
+                    let activation_quantum = activations[begin..end]
+                        .iter()
+                        .map(|value| value.abs())
+                        .fold(0.0f32, f32::max)
+                        / 32767.0;
+                    let quantization_error_bound =
+                        0.5 * f64::from(activation_quantum) * quantized * scale;
+                    let cpu_terms = (activation * quantized * scale).abs()
+                        + (activation * f64::from(zero_point) * scale).abs();
+                    (
+                        sum + term,
+                        sum_abs + term.abs(),
+                        cpu_quant_bound + quantization_error_bound,
+                        cpu_sum_abs + cpu_terms,
+                    )
+                },
+            )
+        })
+        .collect()
+}
+
+fn run_int8_f64_reference_parity(explicit_zero_points: bool) {
     let Some(ep) = gpu() else { return };
     let (m, k, n, block_size, bits) = (1usize, 77usize, 19usize, 32usize, 8usize);
     let blocks = k.div_ceil(block_size);
@@ -801,22 +849,69 @@ fn run_int8_cpu_gpu_parity(explicit_zero_points: bool) {
         4,
     )
     .unwrap();
-    assert_close(&actual, &expected);
+    let reference = int8_f64_reference(
+        &activations,
+        &packed,
+        &scales,
+        zero_points.as_deref(),
+        k,
+        n,
+        block_size,
+    );
+    let mut max_gpu_f64 = 0.0f64;
+    let mut max_cpu_f64 = 0.0f64;
+    for (index, ((&gpu, &cpu), &(reference, sum_abs, cpu_quant_bound, cpu_sum_abs))) in
+        actual.iter().zip(&expected).zip(&reference).enumerate()
+    {
+        let gpu_error = (f64::from(gpu) - reference).abs();
+        let cpu_error = (f64::from(cpu) - reference).abs();
+        max_gpu_f64 = max_gpu_f64.max(gpu_error);
+        max_cpu_f64 = max_cpu_f64.max(cpu_error);
+
+        // CUDA evaluates each term directly and reduces 256 lanes in an 8-step
+        // tree, so two products plus the tree are bounded by 10 roundings; retain
+        // two epsilons of margin for contraction/codegen differences across SMs.
+        let tolerance = (sum_abs * f64::from(f32::EPSILON) * 12.0).max(1e-7);
+        assert!(
+            gpu_error <= tolerance,
+            "index {index}: CUDA={gpu}, f64={reference}, error={gpu_error:e}, \
+             roundoff_bound={tolerance:e}, CPU={cpu}, CPU_error={cpu_error:e}"
+        );
+
+        // CPU decode defaults to per-block int16 activation quantization. Each
+        // activation moves by at most half a quantum; the zero-point correction
+        // uses the original f32 activation sum, so only q*activation contributes
+        // quantization error. This bound remains valid for AVX2, AVX-512, and the
+        // scalar fallback despite their different reduction orders. The 40-epsilon
+        // term covers each 32-wide block reduction plus scale/subtract operations.
+        let cpu_tolerance = cpu_quant_bound + cpu_sum_abs * f64::from(f32::EPSILON) * 40.0;
+        assert!(
+            cpu_error <= cpu_tolerance,
+            "index {index}: CPU={cpu}, f64={reference}, error={cpu_error:e}, \
+             int16_quantization_bound={cpu_tolerance:e}, CUDA={gpu}"
+        );
+    }
+    // Absolute regression tripwire complementing the conditioning-scaled f64 bound.
+    assert!(
+        max_gpu_f64 < 1e-5,
+        "CUDA/f64 max_abs_diff={max_gpu_f64:e} exceeds the 1e-5 regression guard"
+    );
     let (max_abs, max_ulp) = error_metrics(&actual, &expected);
     eprintln!(
-        "MatMulNBits int8 block32 CPU/CUDA parity explicit_zp={explicit_zero_points} \
-         max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}"
+        "MatMulNBits int8 block32 explicit_zp={explicit_zero_points}: \
+         CPU/CUDA max_abs_diff={max_abs:e} max_ulp_diff={max_ulp}; \
+         CUDA/f64 max_abs_diff={max_gpu_f64:e}; CPU/f64 max_abs_diff={max_cpu_f64:e}"
     );
 }
 
 #[test]
-fn matmul_nbits_gpu_int8_block32_default_zero_point_matches_cpu() {
-    run_int8_cpu_gpu_parity(false);
+fn matmul_nbits_gpu_int8_block32_default_zero_point_matches_f64_reference() {
+    run_int8_f64_reference_parity(false);
 }
 
 #[test]
-fn matmul_nbits_gpu_int8_block32_explicit_zero_points_match_cpu() {
-    run_int8_cpu_gpu_parity(true);
+fn matmul_nbits_gpu_int8_block32_explicit_zero_points_match_f64_reference() {
+    run_int8_f64_reference_parity(true);
 }
 
 #[test]
