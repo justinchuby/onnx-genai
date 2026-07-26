@@ -775,15 +775,15 @@ fn resolved_default_providers() -> String {
     }
 }
 
-/// Execution providers this build can select.
+/// Execution providers this session can be switched to.
 ///
-/// Compiled-in rather than probed: a provider whose support was not built
-/// cannot be selected at runtime no matter what the machine has.
+/// Delegated rather than listed here: the runtime owns the mapping from
+/// provider names to behavior, and a menu kept in the CLI would drift from it —
+/// as it did, by omitting the Metal plugin that macOS auto-selects and then
+/// refusing `/ep metal` on a machine already running on it.
 fn available_execution_providers() -> Vec<&'static str> {
-    let mut providers = vec!["auto", "cpu"];
-    if cfg!(feature = "cuda") {
-        providers.push("cuda");
-    }
+    let mut providers = vec!["auto"];
+    providers.extend(onnx_genai::ort::selectable_execution_providers());
     providers
 }
 
@@ -1765,7 +1765,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                     }
                     None => println!(
                         "execution provider {} (available: {})",
-                        settings.execution_provider.as_deref().unwrap_or("auto"),
+                        settings.resolved_providers(),
                         available_execution_providers().join(", ")
                     ),
                 }

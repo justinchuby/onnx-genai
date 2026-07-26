@@ -548,6 +548,9 @@ fn ep_lists_what_this_build_can_select() {
 
     assert!(output.contains("execution provider"), "{output}");
     assert!(output.contains("cpu"), "cpu is always available: {output}");
+    // Which providers appear beyond cpu depends on the build and the machine —
+    // CUDA on a CUDA build, Metal where its plugin is configured — so only the
+    // always-present one is asserted.
 }
 
 #[test]
@@ -612,4 +615,22 @@ fn profile_rejects_a_setting_that_is_not_on_or_off() {
         "/profile maybe\n\n",
     ));
     assert!(output.contains("is not a setting"), "{output}");
+}
+
+#[test]
+fn the_provider_menu_comes_from_the_runtime_not_the_cli() {
+    // The CLI kept its own list once and it drifted: macOS auto-selects the
+    // Metal plugin, but `/ep metal` was refused on a machine already running on
+    // it. The menu is now whatever the runtime says it can resolve.
+    let listed = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/ep\n\n",
+    ));
+    for provider in onnx_genai::ort::selectable_execution_providers() {
+        assert!(
+            listed.contains(provider),
+            "the runtime offers {provider}, so the menu must list it: {listed}"
+        );
+    }
 }

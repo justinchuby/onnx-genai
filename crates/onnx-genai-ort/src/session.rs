@@ -13,6 +13,7 @@ use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, R
 
 pub use ep_compat::{
     EpCapabilities, HardwareKind, ResolvedEp, capability, resolve_execution_provider,
+    selectable_execution_providers,
 };
 
 /// Convenience constructor for an [`EpSelection`] from a bare provider name.
@@ -194,6 +195,35 @@ pub mod ep_compat {
                 )
             }
         }
+    }
+
+    /// Provider names this build can resolve to something real, in the order a
+    /// user would try them.
+    ///
+    /// Lives here because this module is the only place that knows EP names — a
+    /// caller offering a menu of providers would otherwise keep its own copy and
+    /// let it drift from the table below. Names appear only when they can
+    /// actually be selected: `cuda` needs the feature compiled in, and `metal`
+    /// needs its plugin library configured, so a machine with neither is not
+    /// offered a provider that would fail to load.
+    ///
+    /// Other names still work — the table falls back to appending them to ONNX
+    /// Runtime by name — so this is a menu, not a whitelist.
+    #[must_use]
+    pub fn selectable_execution_providers() -> Vec<&'static str> {
+        let mut names = vec!["cpu"];
+        if cfg!(feature = "cuda") {
+            names.push("cuda");
+        }
+        if cfg!(target_os = "macos")
+            && runtime_config()
+                .metal_ep_lib
+                .as_ref()
+                .is_some_and(|library| library.is_file())
+        {
+            names.push("metal");
+        }
+        names
     }
 
     /// Resolve an [`EpSelection`] into capabilities and an append strategy.

@@ -147,6 +147,18 @@ backend, and switch models outright:
 >>> /profile on             # report timings, memory, and cache reuse per turn
 ```
 
+On Apple Silicon the MLX/Metal execution provider is offered — and
+auto-selected — when its plugin library is configured, which the Python packages
+do for you. From a source build, point at it yourself:
+
+```bash
+ONNX_GENAI_METAL_EP_LIB=$(python -c 'import onnxruntime_mlx, os;
+print(os.path.join(os.path.dirname(onnxruntime_mlx.__file__), "libonnxruntime_mlx_ep.dylib"))') cargo run -p onnx-genai-cli --bin onnx-genai -- run ./model
+```
+
+`/ep` then lists `metal` and `--profile` reports it. Selection is non-strict: if
+the plugin fails to load, the session falls back to CPU rather than failing.
+
 All but `/profile` reload the model and clear the conversation. A selection that
 fails to load is reported and the previous session keeps running, so an
 unavailable provider does not end the session.
