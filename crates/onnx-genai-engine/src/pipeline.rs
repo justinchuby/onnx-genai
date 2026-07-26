@@ -746,6 +746,7 @@ impl PipelineEngine {
             (Some((seq, _)), Some(paged)) => Some(PagedMirror {
                 mirrored_tokens: 0,
                 exhausted: false,
+                windowed: false,
                 kv_model: &paged.kv_model,
                 cache: &mut paged.cache,
                 seq,
@@ -794,10 +795,13 @@ impl PipelineEngine {
         // How far mirroring actually got. Equal to the context length unless
         // the page pool ran dry, in which case only this prefix may be
         // published for reuse.
-        let mirrored_tokens = backend
-            .paged
-            .as_ref()
-            .map_or(0, |mirror| mirror.mirrored_tokens);
+        let mirrored_tokens = backend.paged.as_ref().map_or(0, |mirror| {
+            if mirror.windowed {
+                0
+            } else {
+                mirror.mirrored_tokens
+            }
+        });
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -2925,6 +2929,13 @@ struct PagedMirror<'a> {
     /// Set once the pool refused a page, after which mirroring stops for the
     /// rest of this generation.
     exhausted: bool,
+    /// Set once the sliding window dropped pages from this sequence.
+    ///
+    /// What remains is then `[sinks | recent window]`, which is not a prefix of
+    /// anything. Publishing it under a key that says "the first N tokens" would
+    /// hand a later request pages with a hole in the middle, so nothing from a
+    /// sequence that has been windowed may be published at all.
+    windowed: bool,
 }
 
 struct PipelineDecodeLoopBackend<'a> {
@@ -3104,12 +3115,28 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             // Keep the paged sequence's window in step with the decoder's, so
             // the pages published for reuse describe what the decoder can
             // actually attend to.
+            let pages_before = paged
+                .cache
+                .page_table
+                .get_sequence(paged.seq)
+                .map_or(0, <[_]>::len);
             apply_paged_sliding_window(
                 paged.cache,
                 paged.seq,
                 self.decoder_state.sliding_window(),
                 self.decoder_state.sink_tokens(),
             )?;
+            let pages_after = paged
+                .cache
+                .page_table
+                .get_sequence(paged.seq)
+                .map_or(0, <[_]>::len);
+            // Compared rather than inferred from the window size: only an
+            // actual drop makes the sequence non-contiguous, so a windowed
+            // model whose conversation still fits its window keeps publishing.
+            if pages_after < pages_before {
+                paged.windowed = true;
+            }
         }
         extract_next_token_logits_with_io(
             self.decoder,

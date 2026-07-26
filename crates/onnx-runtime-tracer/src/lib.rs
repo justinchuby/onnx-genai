@@ -130,7 +130,7 @@ pub use args::{
     ARG_CAPTURE_REJECTED_REASON, ARG_CHOSEN_KERNEL, ARG_FASTPATH_REJECTED_REASON,
     ARG_OPTIMIZED_CANDIDATE, ARG_SOURCE, Args, capture_rejected,
 };
-pub use clock::{TraceClock, TraceSessionId, absolute_now_us};
+pub use clock::{TraceClock, TraceSessionId, absolute_now_us, process_id, thread_lane_id};
 pub use collector::{
     CompositeCollector, DEFAULT_MAX_EVENTS, FileCollector, MemoryCollector, NoopCollector,
     TraceCollector,

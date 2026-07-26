@@ -25,10 +25,8 @@ use crate::error::Result;
 use crate::event::{TraceEvent, TracePhase};
 use crate::format::{TraceFormat, TraceVerbosity};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 thread_local! {
@@ -134,8 +132,6 @@ struct Inner {
     /// interactive session turns detail up and down between turns.
     verbosity: AtomicU8,
     pid: u64,
-    /// Maps each OS thread to a small, stable, per-context numeric lane id.
-    tids: Mutex<HashMap<ThreadId, u64>>,
 }
 
 /// The shared tracing context (§48.3).
@@ -163,8 +159,7 @@ impl TraceContext {
                 collector,
                 format,
                 verbosity: AtomicU8::new(TraceVerbosity::default().as_u8()),
-                pid: std::process::id() as u64,
-                tids: Mutex::new(HashMap::new()),
+                pid: crate::process_id(),
             }),
         }
     }
@@ -184,8 +179,7 @@ impl TraceContext {
                 collector: Arc::new(NoopCollector),
                 format: TraceFormat::ChromeJson,
                 verbosity: AtomicU8::new(TraceVerbosity::default().as_u8()),
-                pid: std::process::id() as u64,
-                tids: Mutex::new(HashMap::new()),
+                pid: crate::process_id(),
             }),
         }
     }
@@ -277,20 +271,15 @@ impl TraceContext {
         self.inner.pid
     }
 
-    /// The stable lane id assigned to the current OS thread by this context.
+    /// The stable lane id assigned to the current OS thread.
     ///
-    /// The first thread to touch a given context gets `0`, the next `1`, and so
-    /// on; repeat calls from the same thread return the same id.
+    /// Process-wide rather than per-context ([`crate::thread_lane_id`]): a
+    /// context that numbered its own threads from zero would put a thread on a
+    /// different lane than another sink gave it, so one thread would show up as
+    /// two and two as one.
     #[must_use]
     pub fn current_tid(&self) -> u64 {
-        let id = std::thread::current().id();
-        let mut tids = self
-            .inner
-            .tids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let next = tids.len() as u64;
-        *tids.entry(id).or_insert(next)
+        crate::thread_lane_id()
     }
 
     /// Flush the underlying collector, persisting any buffered events.

@@ -656,6 +656,66 @@ fn profile_on_writes_a_timeline_to_a_chosen_path() {
     assert!(!events.is_empty(), "the timeline recorded nothing");
 }
 
+/// `/profile trace <path>` on its own must write the file.
+///
+/// Kept separate from the test that turns the report on first: that one passed
+/// while this was broken, because asking for a report was what made anything
+/// get emitted at all. Naming a destination is its own request.
+#[test]
+fn profile_trace_alone_writes_a_timeline() {
+    let directory = repository_root().join("target/test-fixtures");
+    std::fs::create_dir_all(&directory).expect("fixture directory");
+    let trace = directory.join(format!(
+        "repl-trace-only-{}-{:?}.perfetto.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&trace);
+
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        &format!("/profile trace {}\nhello\n\n", trace.display()),
+    ));
+    assert!(
+        trace.is_file(),
+        "naming a destination did not produce one: {output}"
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&trace).expect("read trace")).expect("parse trace");
+    assert!(
+        !document["traceEvents"]
+            .as_array()
+            .expect("traceEvents array")
+            .is_empty(),
+        "the timeline recorded nothing"
+    );
+}
+
+/// `/profile trace off` must override a destination named at startup.
+#[test]
+fn profile_trace_off_overrides_a_startup_destination() {
+    let directory = repository_root().join("target/test-fixtures");
+    std::fs::create_dir_all(&directory).expect("fixture directory");
+    let trace = directory.join(format!(
+        "repl-trace-off-{}-{:?}.perfetto.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&trace);
+
+    let output = text(&repl_with_global_flags(
+        &fixture("tiny-llm"),
+        &["--profile-trace", trace.to_str().expect("utf-8 path")],
+        &["--max-new-tokens", "2"],
+        "/profile trace off\nhello\n\n",
+    ));
+    assert!(
+        !trace.exists(),
+        "turning the timeline off still wrote the startup destination: {output}"
+    );
+}
+
 #[test]
 fn profile_reports_and_changes_the_detail_level() {
     let output = text(&repl(

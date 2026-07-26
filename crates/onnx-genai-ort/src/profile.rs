@@ -12,7 +12,7 @@
 //! detokenization). See `docs/benchmarks` and the CPU profiling decision note.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -59,31 +59,48 @@ pub fn record(stage: &'static str, nanos: u128) {
 /// one-shot run but wrong for an interactive session: a user who decides
 /// mid-conversation that they want a timeline cannot restart the process to
 /// get one. This is the override that lets them ask for it in place.
-static RUNTIME_TRACE_PATH: std::sync::RwLock<Option<std::path::PathBuf>> =
+/// `None` = no override (use the environment); `Some(None)` = explicitly off;
+/// `Some(Some(path))` = write there.
+static RUNTIME_TRACE_PATH: std::sync::RwLock<Option<Option<std::path::PathBuf>>> =
     std::sync::RwLock::new(None);
 /// Fast path for [`trace_path`] so an untraced run never takes the lock.
 static RUNTIME_TRACE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Direct the timeline to `path` from now on, or back to the environment's
-/// setting with `None`.
+/// Direct the timeline to `path` from now on.
+///
+/// Three states, not two. `Some(path)` writes there; `None` turns the timeline
+/// off *even when the environment asked for one*, because a session that says
+/// "off" means off and would otherwise keep writing the startup destination;
+/// [`clear_trace_override`] is how you go back to the environment's setting.
 pub fn set_trace_path(path: Option<std::path::PathBuf>) {
-    let set = path.is_some();
-    *RUNTIME_TRACE_PATH
+    // Written under the same lock that guards the value, so a concurrent
+    // setter cannot leave the flag describing a different write's value.
+    let mut guard = RUNTIME_TRACE_PATH
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
-    RUNTIME_TRACE_SET.store(set, std::sync::atomic::Ordering::Release);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(path);
+    RUNTIME_TRACE_SET.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Forget any runtime destination, deferring to the environment again.
+pub fn clear_trace_override() {
+    let mut guard = RUNTIME_TRACE_PATH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+    RUNTIME_TRACE_SET.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Where the timeline will be written, if anywhere.
 #[must_use]
 pub fn trace_destination() -> Option<std::path::PathBuf> {
     if RUNTIME_TRACE_SET.load(std::sync::atomic::Ordering::Acquire)
-        && let Some(path) = RUNTIME_TRACE_PATH
+        && let Some(override_value) = RUNTIME_TRACE_PATH
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     {
-        return Some(path);
+        return override_value;
     }
     runtime_config().trace.clone()
 }
@@ -129,12 +146,13 @@ fn trace_sink() -> &'static Mutex<Vec<TraceEvent>> {
 }
 
 /// A small, stable per-thread id for the trace's thread lanes.
+///
+/// Deliberately the tracer's allocator rather than one of our own. These
+/// events share a document with the ones the runtime and its providers record,
+/// and a Chrome trace groups lanes by `pid` then `tid`: numbering threads
+/// separately put the same thread on two lanes and two threads on one.
 fn thread_trace_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    thread_local! {
-        static TID: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
-    }
-    TID.with(|id| *id)
+    onnx_runtime_tracer::thread_lane_id()
 }
 
 /// Record a single timeline event. No-op unless tracing is enabled.
@@ -190,7 +208,7 @@ pub fn trace_document() -> serde_json::Value {
                     "ph": "X",
                     "ts": event.ts_us,
                     "dur": event.dur_us,
-                    "pid": 1,
+                    "pid": onnx_runtime_tracer::process_id(),
                     "tid": event.tid,
                 });
                 if !event.args.is_empty() {

@@ -24,11 +24,12 @@
 
 use serde_json::{Map, Value};
 
+/// Trace-argument key carrying the `file:line` that opened a span.
+pub const ARG_SOURCE: &str = "source";
+
 /// Trace-arg key naming the optimized kernel that *could* have run for an op
 /// but was not selected — the "missed fast path" contract (§46.6). See
 /// [`Args::missed_fastpath`].
-/// Trace-argument key carrying the `file:line` that opened a span.
-pub const ARG_SOURCE: &str = "source";
 pub const ARG_OPTIMIZED_CANDIDATE: &str = "optimized_candidate";
 
 /// Trace-arg key carrying **why** an optimized fast path was rejected (§46.6).

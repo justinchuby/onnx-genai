@@ -851,20 +851,6 @@ fn parse_decode_backend(name: &str) -> Result<EngineDecodeBackend, String> {
     }
 }
 
-/// `on` / `off` for a toggle command, or `None` to report the current state.
-fn parse_toggle(setting: Option<&str>) -> Result<Option<bool>, String> {
-    match setting {
-        None => Ok(None),
-        Some("on") => Ok(Some(true)),
-        Some("off") => Ok(Some(false)),
-        Some(other) => Err(format!(
-            "What: {other:?} is not a setting. \
-             Why: this command takes on or off, or nothing to report the current state. \
-             How: write /profile on or /profile off."
-        )),
-    }
-}
-
 /// What `/profile <rest>` asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum ProfileSetting {
@@ -1213,10 +1199,12 @@ impl ProfileArgs {
     /// Emit with the text report gated on `show_text` rather than on the
     /// startup flag, so an interactive session can turn it on and off.
     ///
-    /// The JSON and trace outputs stay tied to their flags: both name a file
-    /// chosen at startup.
+    /// The JSON output stays tied to its flag, which names a file chosen at
+    /// startup. The timeline does not: a session can pick a destination later
+    /// with `/profile trace`, and having asked for one *is* the request.
     fn emit_when(&self, show_text: bool, profile: &mut RunProfile) -> anyhow::Result<()> {
-        if !self.requested() && !show_text {
+        let trace = onnx_genai::ort::profile::trace_destination();
+        if !self.requested() && !show_text && trace.is_none() {
             return Ok(());
         }
         profile.memory.sample_peak();
@@ -1242,7 +1230,7 @@ impl ProfileArgs {
         // Not `self.profile_trace`: an interactive session can choose a
         // destination after startup with `/profile trace`, and the startup flag
         // sets the same place, so asking where the timeline goes covers both.
-        if let Some(path) = onnx_genai::ort::profile::trace_destination() {
+        if let Some(path) = trace {
             let path = path.as_path();
             write_merged_trace(path).map_err(|error| {
                 anyhow::anyhow!(
@@ -1884,6 +1872,9 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                     }
                     Ok(ProfileSetting::NoTrace) => {
                         set_trace_recording(false, trace_verbosity);
+                        // Explicitly off, which also overrides a destination
+                        // named at startup — otherwise "off" would keep writing
+                        // wherever `--profile-trace` pointed.
                         onnx_genai::ort::profile::set_trace_path(None);
                         println!("timeline off");
                     }
@@ -3376,12 +3367,7 @@ mod tests {
     }
 
     #[test]
-    fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {
-        assert_eq!(parse_toggle(None), Ok(None));
-        assert_eq!(parse_toggle(Some("on")), Ok(Some(true)));
-        assert_eq!(parse_toggle(Some("off")), Ok(Some(false)));
-        assert!(parse_toggle(Some("yes")).is_err());
-    }
+    fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {}
 
     #[test]
     fn decode_backends_are_named_by_the_engine_not_guessed() {

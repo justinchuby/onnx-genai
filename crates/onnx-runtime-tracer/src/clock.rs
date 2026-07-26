@@ -139,3 +139,28 @@ impl std::fmt::Display for TraceSessionId {
         write!(f, "{}", self.0)
     }
 }
+
+/// The process id every sink stamps on its events.
+///
+/// A Chrome trace groups lanes by `pid` first, so two sinks that disagree here
+/// render as two unrelated processes and one cannot be shown nested inside the
+/// other — however well their timestamps line up. This is the single answer,
+/// so an engine span and an operator span land in the same process.
+#[must_use]
+pub fn process_id() -> u64 {
+    u64::from(std::process::id())
+}
+
+/// A small, stable lane number for the calling OS thread.
+///
+/// Shared for the same reason as [`process_id`]: two sinks numbering threads
+/// independently both start at 0, so unrelated threads collide on one lane and
+/// the same thread appears as two.
+#[must_use]
+pub fn thread_lane_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static LANE: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    LANE.with(|lane| *lane)
+}
