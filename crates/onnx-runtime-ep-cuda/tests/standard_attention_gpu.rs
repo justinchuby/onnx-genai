@@ -37,37 +37,67 @@ fn tensor<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor {
 fn standard_attention_and_rope_claim_supported_dtypes_and_require_contiguous_inputs() {
     let ep = CudaExecutionProvider::new_default().expect("CUDA runtime must be available");
 
-    // RotaryEmbedding still rejects bf16; Attention now accepts it (claimed
-    // separately below), so it is no longer in this rejection check.
     {
         let op_type = "RotaryEmbedding";
         let opset = 23;
-        let dtype = DataType::BFloat16;
-        let expected_reason = "RotaryEmbedding: dtype bf16";
         let mut graph = Graph::new();
         let inputs = (0..3)
             .map(|i| {
-                graph.create_named_value(format!("input_{i}"), dtype, static_shape([1, 1, 1, 2]))
+                graph.create_named_value(
+                    format!("input_{i}"),
+                    DataType::Float32,
+                    static_shape([1, 1, 1, 2]),
+                )
             })
             .collect::<Vec<_>>();
-        let output = graph.create_named_value("output", dtype, static_shape([1, 1, 1, 2]));
+        let output =
+            graph.create_named_value("output", DataType::Float32, static_shape([1, 1, 1, 2]));
         let node = Node::new(
             NodeId(0),
             op_type,
             inputs.into_iter().map(Some).collect(),
             vec![output],
         );
-        let input_dtypes = [dtype; 3];
-        assert!(matches!(
-            ep.supports_op(&node, opset, &[], &input_dtypes, &[]),
-            KernelMatch::Unsupported { ref reason } if reason.contains(expected_reason)
-        ));
-
-        let f32_dtypes = [DataType::Float32; 3];
-        assert!(
-            ep.supports_op(&node, opset, &[], &f32_dtypes, &[])
-                .is_supported()
-        );
+        for dtype in [
+            DataType::Undefined,
+            DataType::Float32,
+            DataType::Uint8,
+            DataType::Int8,
+            DataType::Uint16,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::String,
+            DataType::Bool,
+            DataType::Float16,
+            DataType::Float64,
+            DataType::Uint32,
+            DataType::Uint64,
+            DataType::Complex64,
+            DataType::Complex128,
+            DataType::BFloat16,
+            DataType::Float8E4M3FN,
+            DataType::Float8E4M3FNUZ,
+            DataType::Float8E5M2,
+            DataType::Float8E5M2FNUZ,
+            DataType::Uint4,
+            DataType::Int4,
+            DataType::Float4E2M1,
+            DataType::Float8E8M0,
+            DataType::Uint2,
+            DataType::Int2,
+        ] {
+            let expected = matches!(
+                dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32
+            );
+            assert_eq!(
+                ep.supports_op(&node, opset, &[], &[dtype; 3], &[])
+                    .is_supported(),
+                expected,
+                "unexpected RotaryEmbedding claim for {dtype:?}"
+            );
+        }
         let kernel = ep.get_kernel(&node, &[], opset).unwrap();
         assert!(
             !kernel.supports_strided_input(0),
