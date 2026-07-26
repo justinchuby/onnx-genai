@@ -11083,12 +11083,23 @@ mod tests {
         // the same capacity — a base-pointer change the plan's signature must catch.
         let old = on.buffers.remove(&ymul).expect("ymul buffer");
         let cap = old.len();
-        on.ep.deallocate(old).unwrap();
+        // Allocate the replacement *before* releasing the original, so the two
+        // cannot share an address. Freeing first and allocating the same size
+        // is exactly the request an allocator satisfies from its free list by
+        // handing back the block just released, which left the pointer
+        // unchanged and made this test fail wherever that happened.
         let fresh = on
             .ep
             .allocate(cap, TensorLayout::contiguous().alignment)
             .unwrap();
         let moved_ptr = fresh.as_ptr() as usize;
+        assert_ne!(
+            moved_ptr,
+            old.as_ptr() as usize,
+            "the replacement buffer must not reuse the original address, or the \
+             signature check below is not being exercised"
+        );
+        on.ep.deallocate(old).unwrap();
         on.buffers.insert(ymul, fresh);
         // Sanity: the plan's recorded source pointer no longer matches.
         assert!(
