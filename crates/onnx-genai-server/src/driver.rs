@@ -1,6 +1,8 @@
-use std::{collections::HashMap, sync::Arc, thread};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
 use anyhow::Context;
+use onnx_genai::text_to_audio::{SynthesizedAudio, TextToAudioRequest};
+use onnx_genai::text_to_image::{RenderedImage, TextToImageRequest};
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -8,37 +10,13 @@ use onnx_genai_engine::{
     ContinuousBatchEvent, ContinuousBatchManager, EmbeddingOptions, EngineGovernorError, FimConfig,
     GovernorSnapshot, PipelineEngine, PipelineGenerateRequest, ResourceLimit,
 };
-use onnx_genai_ort::{DataType, Value};
-use onnx_genai_preprocess::image::packed::{ImageExpansionSummary, ImageTensorData};
+use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::metrics::GenerationMetrics;
+use crate::multimodal::MultimodalInput;
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
-
-pub(crate) struct PipelineInputTensor {
-    pub(crate) endpoint: String,
-    pub(crate) data: Vec<f32>,
-    pub(crate) shape: Vec<i64>,
-    pub(crate) num_tiles: Option<usize>,
-}
-
-pub(crate) struct PipelineInputBundle {
-    pub(crate) tensors: Vec<PipelineTensor>,
-    /// Full prompt-order-preserving summaries retained across the server/driver seam.
-    pub(crate) image_summaries: Vec<ImageExpansionSummary>,
-}
-
-pub(crate) enum PipelineTensor {
-    Fp32(PipelineInputTensor),
-    Typed {
-        endpoint: String,
-        expected_dtype: DataType,
-        expected_shape: Vec<i64>,
-        shape: Vec<i64>,
-        data: ImageTensorData,
-    },
-}
 
 #[derive(Clone)]
 pub(crate) struct EngineDriver {
@@ -64,7 +42,7 @@ pub(crate) enum DriverCommand {
     },
     GeneratePipeline {
         request: Box<GenerateRequest>,
-        input: Option<PipelineInputBundle>,
+        input: Option<MultimodalInput>,
         events: mpsc::Sender<DriverEvent>,
         permit: OwnedSemaphorePermit,
     },
@@ -80,6 +58,16 @@ pub(crate) enum DriverCommand {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
+    },
+    RenderImages {
+        pipeline_dir: PathBuf,
+        request: Box<TextToImageRequest>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<RenderedImage>>>,
+    },
+    SynthesizeSpeech {
+        tokenizer: Arc<Tokenizer>,
+        request: Box<TextToAudioRequest>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<SynthesizedAudio>>,
     },
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
     SetVramLimit {
@@ -218,7 +206,7 @@ impl EngineDriver {
     pub(crate) async fn generate_pipeline(
         &self,
         request: GenerateRequest,
-        input: Option<PipelineInputBundle>,
+        input: Option<MultimodalInput>,
     ) -> Result<mpsc::Receiver<DriverEvent>, GenerateSubmitError> {
         let permit = self
             .generation_capacity
@@ -242,6 +230,66 @@ impl EngineDriver {
             return Err(GenerateSubmitError::DriverStopped);
         }
         Ok(rx)
+    }
+
+    /// Render images on the engine thread that owns the pipeline.
+    ///
+    /// Diffusion is a single long synchronous call rather than a token stream,
+    /// so this is a plain request/response command instead of an event channel.
+    pub(crate) async fn render_images(
+        &self,
+        pipeline_dir: PathBuf,
+        request: TextToImageRequest,
+    ) -> Result<anyhow::Result<Vec<RenderedImage>>, GenerateSubmitError> {
+        let _permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(DriverCommand::RenderImages {
+                pipeline_dir,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
+    }
+
+    /// Synthesize speech on the engine thread that owns the pipeline.
+    ///
+    /// Like image rendering, this is one long synchronous call rather than a
+    /// token stream, so it is a plain request/response command.
+    pub(crate) async fn synthesize_speech(
+        &self,
+        tokenizer: Arc<Tokenizer>,
+        request: TextToAudioRequest,
+    ) -> Result<anyhow::Result<SynthesizedAudio>, GenerateSubmitError> {
+        let _permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(DriverCommand::SynthesizeSpeech {
+                tokenizer,
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Err(GenerateSubmitError::DriverStopped);
+        }
+        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
     }
 
     pub(crate) async fn generate_fim(
@@ -346,6 +394,26 @@ fn run_pipeline_driver(engine: &mut PipelineEngine, mut rx: mpsc::Receiver<Drive
                 events,
                 permit,
             } => run_pipeline_generation(engine, *request, input, events, permit),
+            DriverCommand::RenderImages {
+                pipeline_dir,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(onnx_genai::text_to_image::render(
+                    &pipeline_dir,
+                    engine,
+                    &request,
+                ));
+            }
+            DriverCommand::SynthesizeSpeech {
+                tokenizer,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(onnx_genai::text_to_audio::synthesize(
+                    engine, &tokenizer, &request,
+                ));
+            }
             DriverCommand::CreateSession(response) => {
                 let _ = response.send(Err(anyhow::anyhow!(
                     "sessions are not supported by pipeline models"
@@ -610,6 +678,20 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
         }
+        DriverCommand::RenderImages { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "What: image generation was routed to a single-model engine. \
+                 Why: only a declared diffusion pipeline can run a denoise loop. \
+                 How: request a model whose package declares `strategy.denoiser`."
+            )));
+        }
+        DriverCommand::SynthesizeSpeech { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "What: speech synthesis was routed to a single-model engine. \
+                 Why: only a declared pipeline can run a post-decode vocoder stage. \
+                 How: request a model whose package declares a `run_on: final_only` waveform stage."
+            )));
+        }
         DriverCommand::ResourceSnapshot(reply) => {
             let _ = reply.send(Ok(engine.resource_snapshot()));
         }
@@ -625,39 +707,21 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
 fn run_pipeline_generation(
     engine: &mut PipelineEngine,
     request: GenerateRequest,
-    input: Option<PipelineInputBundle>,
+    input: Option<MultimodalInput>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
 ) {
     let mut metrics = GenerationMetrics::start();
-    let pipeline_request = match input {
-        Some(input) => {
-            if let Err(err) = validate_image_summaries(&input.image_summaries) {
-                let _ = events.try_send(DriverEvent::Error(err.to_string()));
-                return;
-            }
-            let mut req = PipelineGenerateRequest::new(request);
-            let mut endpoints = std::collections::HashSet::with_capacity(input.tensors.len());
-            for tensor in input.tensors {
-                let endpoint = tensor.endpoint().to_string();
-                if !endpoints.insert(endpoint.clone()) {
-                    let _ = events.try_send(DriverEvent::Error(format!(
-                        "What: pipeline tensor injection rejected a duplicate endpoint. Why: '{}' was supplied more than once. How: declare each preprocessing output endpoint exactly once.",
-                        endpoint
-                    )));
-                    return;
-                }
-                match pipeline_value(tensor) {
-                    Ok(value) => req = req.with_input(endpoint, value),
-                    Err(err) => {
-                        let _ = events.try_send(DriverEvent::Error(err.to_string()));
-                        return;
-                    }
-                }
-            }
-            req
+    let pipeline_request = match input
+        .map(|input| input.bind(PipelineGenerateRequest::new(request.clone())))
+        .transpose()
+    {
+        Ok(Some(bound)) => bound,
+        Ok(None) => PipelineGenerateRequest::new(request),
+        Err(error) => {
+            let _ = events.try_send(DriverEvent::Error(format!("{error:#}")));
+            return;
         }
-        None => PipelineGenerateRequest::new(request),
     };
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         metrics.token();
@@ -674,106 +738,6 @@ fn run_pipeline_generation(
             let _ = events.try_send(DriverEvent::Error(err.to_string()));
         }
     }
-}
-
-fn validate_image_summaries(summaries: &[ImageExpansionSummary]) -> anyhow::Result<()> {
-    for (prompt_index, summary) in summaries.iter().enumerate() {
-        if summary.image_index != prompt_index {
-            anyhow::bail!(
-                "What: pipeline image admission ordering is inconsistent. \
-                 Why: prompt image {prompt_index} carries expansion summary index {}. \
-                 How: preserve image content parts, tensor packing, and summaries in prompt order.",
-                summary.image_index
-            );
-        }
-    }
-    Ok(())
-}
-
-impl PipelineTensor {
-    fn endpoint(&self) -> &str {
-        match self {
-            Self::Fp32(tensor) => &tensor.endpoint,
-            Self::Typed { endpoint, .. } => endpoint,
-        }
-    }
-}
-
-fn pipeline_value(tensor: PipelineTensor) -> anyhow::Result<Value> {
-    let (endpoint, expected_dtype, expected_shape, shape, data) = match tensor {
-        PipelineTensor::Fp32(tensor) => {
-            if tensor.num_tiles.is_some() {
-                anyhow::bail!(
-                    "What: legacy aggregate image input '{}' was rejected. Why: num_tiles cannot preserve per-image placeholder ordering. How: use the typed image tensor bundle and expansion summaries.",
-                    tensor.endpoint
-                );
-            }
-            return Value::from_vec_f32(tensor.data, &tensor.shape)
-                .with_context(|| {
-                    format!(
-                        "What: pipeline endpoint '{}' tensor construction failed. Why: expected Float32 shape {:?}. How: correct the processor output shape/data length.",
-                        tensor.endpoint, tensor.shape
-                    )
-                });
-        }
-        PipelineTensor::Typed {
-            endpoint,
-            expected_dtype,
-            expected_shape,
-            shape,
-            data,
-        } => (endpoint, expected_dtype, expected_shape, shape, data),
-    };
-    let actual_dtype = match &data {
-        ImageTensorData::Fp32(_) => DataType::Float32,
-        ImageTensorData::Fp16(_) => DataType::Float16,
-        ImageTensorData::Bf16(_) => DataType::BFloat16,
-        ImageTensorData::Int64(_) => DataType::Int64,
-        ImageTensorData::Int32(_) => DataType::Int32,
-        ImageTensorData::Int8(_) => DataType::Int8,
-        ImageTensorData::Uint8(_) => DataType::Uint8,
-        ImageTensorData::Bool(_) => DataType::Bool,
-    };
-    if actual_dtype != expected_dtype || !shape_matches(&expected_shape, &shape) {
-        anyhow::bail!(
-            "What: pipeline endpoint '{}' could not be injected. \
-             Why: expected dtype {:?} shape {:?}, got dtype {:?} shape {:?}. \
-             How: correct the typed preprocessing output and its endpoint binding.",
-            endpoint,
-            expected_dtype,
-            expected_shape,
-            actual_dtype,
-            shape
-        );
-    }
-    let value = match data {
-        ImageTensorData::Fp32(data) => Value::from_vec_f32(data, &shape),
-        ImageTensorData::Fp16(data) => Value::from_vec_f16_bits(data, &shape),
-        ImageTensorData::Bf16(data) => Value::from_vec_bf16_bits(data, &shape),
-        ImageTensorData::Int64(data) => Value::from_vec_i64(data, &shape),
-        ImageTensorData::Int32(_)
-        | ImageTensorData::Int8(_)
-        | ImageTensorData::Uint8(_)
-        | ImageTensorData::Bool(_) => anyhow::bail!(
-            "What: pipeline endpoint '{endpoint}' could not be materialized. \
-             Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, but onnx-genai-ort has no owned Value constructor for this typed processor output. \
-             How: add the matching Value constructor operation before serving this metadata contract."
-        ),
-    }
-    .with_context(|| {
-        format!(
-            "What: pipeline endpoint '{endpoint}' tensor construction failed. Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, received shape {shape:?}. How: correct the processor output shape/data length."
-        )
-    })?;
-    Ok(value)
-}
-
-fn shape_matches(expected: &[i64], actual: &[i64]) -> bool {
-    expected.len() == actual.len()
-        && expected
-            .iter()
-            .zip(actual)
-            .all(|(&expected, &actual)| expected < 0 || expected == actual)
 }
 
 fn run_fallback_generation(

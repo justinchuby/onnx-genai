@@ -575,7 +575,9 @@ fn choose_budget_cpus(
     selected.sort_unstable();
     selected.dedup();
     selected.truncate(count);
-    if selected.len() < count && let Some(allowed) = allowed {
+    if selected.len() < count
+        && let Some(allowed) = allowed
+    {
         let mut extra: Vec<usize> = allowed
             .iter()
             .copied()

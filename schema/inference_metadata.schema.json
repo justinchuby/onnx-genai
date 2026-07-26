@@ -1974,6 +1974,38 @@
       ],
       "type": "string"
     },
+    "PipelineAudioConfig": {
+      "description": "Waveform contract for a pipeline stage that emits audio.\n\nArchitecture-neutral: the endpoint is an arbitrary `component.output` name\ncarried in the package's metadata, and the sample rate is a declared number.\nNeither is inferred from a model or vendor name.",
+      "properties": {
+        "channels": {
+          "description": "Number of interleaved channels in the waveform. Defaults to 1 (mono).",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Endpoint carrying the waveform, in `component.output` form.\n\nWhen absent, the runtime uses the sole output of the final-phase\ncomponent, which is unambiguous for the common single-vocoder shape.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sample_rate": {
+          "description": "Sample rate, in hertz, of the waveform the pipeline emits.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "PipelineComponentSpec": {
       "description": "One executable ONNX model in a pipeline.",
       "properties": {
@@ -2070,6 +2102,17 @@
     "PipelineSpec": {
       "description": "Multi-model pipeline represented as a directed acyclic dataflow graph.",
       "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PipelineAudioConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Waveform contract for a pipeline whose final stage emits audio.\n\nPresent for text-to-speech and any other package that produces sound.\nThe sample rate is model DATA: a runtime cannot infer it from a tensor,\nand guessing it silently changes playback pitch and duration."
+        },
         "dataflow": {
           "description": "Directed tensor or data edges between component ports.",
           "items": {

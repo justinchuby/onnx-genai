@@ -507,6 +507,16 @@ impl UnaryKernel {
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let per_element = match self.op {
+                UnaryOp::Relu => 1,
+                UnaryOp::Sqrt | UnaryOp::Erf | UnaryOp::Tanh => 1,
+                UnaryOp::Sigmoid | UnaryOp::Silu => 4,
+                UnaryOp::Gelu => 6,
+                UnaryOp::GeluTanh => 9,
+            };
+            (n as u64).saturating_mul(per_element)
+        });
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder.arg(&x_ptr).arg(&y_ptr).arg(&n_u64);
@@ -766,6 +776,14 @@ impl BinaryKernel {
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let per_element = match self.op {
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => 1,
+                BinaryOp::Min | BinaryOp::Max => 1,
+                BinaryOp::Pow => 2,
+            };
+            (n as u64).saturating_mul(per_element)
+        });
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         builder
@@ -880,6 +898,7 @@ impl SiluMulKernel {
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
+        crate::trace::record_kernel_metrics(inputs, outputs, || (n as u64).saturating_mul(5));
         onnx_runtime_ep_api::record_kernel_variant!(
             "silu_mul_fused",
             "equal-shape {:?} Mul(Silu(gate), up) uses one capture-safe pointwise launch; fp16 uses aligned half2 with a scalar tail",

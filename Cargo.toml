@@ -143,7 +143,12 @@ onnx-runtime-comm = { path = "crates/onnx-runtime-comm", version = "=0.1.0-dev.4
 onnx-std = { path = "crates/onnx-std", version = "=0.1.0-dev.4" }
 
 # External
-tokenizers = "0.21"
+# `default` pulls `onig` (a vendored C regex engine), `esaxx_fast` (a C++ suffix
+# array), and `progressbar` (indicatif). None are reachable from how this
+# workspace uses tokenizers, and the two native builds cost more than the Rust
+# crate itself. `fancy-regex` is the pure-Rust regex backend, which is what
+# llguidance's `toktrie_hf_tokenizers` already selects.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 async-trait = "0.1"

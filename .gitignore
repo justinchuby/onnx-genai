@@ -68,3 +68,7 @@ htmlcov/
 .squad/.cache/
 # Squad: SubSquad activation file (local to this machine)
 .squad-workstream
+
+# Timeline written by `/profile on` when no destination is named. The curated
+# samples under examples/traces/ are committed deliberately and are not this.
+onnx-genai-session.perfetto.json

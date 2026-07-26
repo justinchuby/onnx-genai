@@ -40,8 +40,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use onnx_runtime_ir::Graph;
+use onnx_runtime_ir::{Graph, WeightRef};
 use onnx_runtime_shape_inference::{InferenceRegistry, MergePolicy};
+use onnx_runtime_tracer::{Args, SpanGuard};
 
 use crate::graph_builder::BuiltGraph;
 
@@ -68,6 +69,12 @@ pub use weights::{
     NonPageableReason, Pageability, WeightRegionCatalog, WeightStore,
 };
 pub use writer::{EpContextDumpConfig, EpContextPartition, dump_ep_context};
+
+fn trace_span(name: &'static str, cat: &'static str) -> Option<SpanGuard> {
+    onnx_runtime_tracer::global_context()
+        .filter(|trace| trace.is_enabled())
+        .map(|trace| trace.span(name, cat))
+}
 
 mod error {
     use std::path::PathBuf;
@@ -327,15 +334,35 @@ pub fn load_model_with_weights(
 /// textproto fixtures must inline all initializer data.
 pub fn read_model_binary(path: impl AsRef<Path>) -> Result<Vec<u8>, LoaderError> {
     let path = path.as_ref();
+    let mut span = trace_span("load.read_model_binary", "load");
     let raw = std::fs::read(path).map_err(|source| LoaderError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    let raw_len = raw.len();
     if is_textproto_path(path) {
         let text = String::from_utf8(raw)
             .map_err(|e| LoaderError::TextProtoParse(format!("model is not valid UTF-8: {e}")))?;
-        proto::textproto_to_binary(&text)
+        let binary = proto::textproto_to_binary(&text)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .bytes(binary.len() as u64)
+                    .with("raw_bytes", raw_len as u64)
+                    .with("textproto", true)
+                    .with("path", path.display().to_string()),
+            );
+        }
+        Ok(binary)
     } else {
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .bytes(raw_len as u64)
+                    .with("textproto", false)
+                    .with("path", path.display().to_string()),
+            );
+        }
         Ok(raw)
     }
 }
@@ -364,18 +391,80 @@ fn build_from_bytes_with_weights(
     bytes: &[u8],
     model_dir: &Path,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
-    let model = proto::decode_model(bytes)?;
-    validate_model_proto(&model)?;
+    let model = {
+        let mut span = trace_span("load.parse_model", "load");
+        let model = proto::decode_model(bytes)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(Args::new().bytes(bytes.len() as u64));
+        }
+        model
+    };
+    {
+        let mut span = trace_span("load.validate_model_proto", "load");
+        validate_model_proto(&model)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("graph_count", if model.graph.is_some() { 1_u64 } else { 0 })
+                    .with("metadata_props", model.metadata_props.len() as u64),
+            );
+        }
+    }
     let BuiltGraph {
         mut graph,
         name_map,
-    } = graph_builder::build_graph(&model)?;
+    } = {
+        let mut span = trace_span("load.build_graph", "load");
+        let built = graph_builder::build_graph(&model)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("nodes", built.graph.num_nodes() as u64)
+                    .with("values", built.graph.values.len() as u64)
+                    .with("inputs", built.graph.inputs.len() as u64)
+                    .with("outputs", built.graph.outputs.len() as u64)
+                    .with("initializers", built.graph.initializers.len() as u64),
+            );
+        }
+        built
+    };
 
     // Fail-fast legality check that needs no weights: reject illegal opset
     // imports before we touch the (potentially large) weight files.
     validate_opset_imports(&graph)?;
 
-    let store = weights::load_weights(&model, model_dir, &name_map)?;
+    let store = {
+        let mut span = trace_span("load.external_weights", "load");
+        let store = weights::load_weights(&model, model_dir, &name_map)?;
+        if let Some(span) = span.as_mut() {
+            let mut inline_count = 0_u64;
+            let mut inline_bytes = 0_u64;
+            let mut external_count = 0_u64;
+            let mut external_bytes = 0_u64;
+            for weight in store.weights.values() {
+                match weight {
+                    WeightRef::Inline(tensor) => {
+                        inline_count += 1;
+                        inline_bytes += tensor.data.len() as u64;
+                    }
+                    WeightRef::External { length, .. } => {
+                        external_count += 1;
+                        external_bytes += *length as u64;
+                    }
+                }
+            }
+            span.set_args(
+                Args::new()
+                    .with("initializers", store.weights.len() as u64)
+                    .with("inline_initializers", inline_count)
+                    .with("inline_bytes", inline_bytes)
+                    .with("external_initializers", external_count)
+                    .with("external_bytes", external_bytes)
+                    .with("model_dir", model_dir.display().to_string()),
+            );
+        }
+        store
+    };
     // Copy descriptors into the graph; the store's mmaps stay alive via Arc.
     for (&vid, weight) in &store.weights {
         graph.set_initializer(vid, weight.clone());
@@ -388,15 +477,32 @@ fn build_from_bytes_with_weights(
     // graph output (constant pass-through) or a pre-IR-4 graph input that is
     // also an initializer as a producer-less `MissingProducer`. Validating the
     // fully-assembled graph recognizes those values as initializer sources.
-    graph
-        .validate()
-        .map_err(|errs| LoaderError::GraphBuild(format!("{errs:?}")))?;
+    {
+        let mut span = trace_span("load.validate_graph", "load");
+        graph
+            .validate()
+            .map_err(|errs| LoaderError::GraphBuild(format!("{errs:?}")))?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("nodes", graph.num_nodes() as u64)
+                    .with("values", graph.values.len() as u64)
+                    .with("initializers", graph.initializers.len() as u64),
+            );
+        }
+    }
 
     // Full fail-fast validation once initializers are attached (so
     // initializer-backed values are recognized as sourced). Rejects
     // statically-knowable unsupported/illegal constructs before shape
     // inference or execution — see [`validate_model`].
-    validate_model(&graph)?;
+    {
+        let mut span = trace_span("load.validate_model", "load");
+        validate_model(&graph)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(Args::new().with("nodes", graph.num_nodes() as u64));
+        }
+    }
 
     // Static/symbolic shape inference (the loader owns this seam). Run the
     // extensible per-op registry over the fully-built graph — inputs,
@@ -408,7 +514,18 @@ fn build_from_bytes_with_weights(
     // fallback to resolve at run time.
     let registry = InferenceRegistry::default_registry();
     let opset_imports = graph.opset_imports.clone();
-    registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+    {
+        let mut span = trace_span("load.shape_inference", "load");
+        registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("nodes", graph.num_nodes() as u64)
+                    .with("values", graph.values.len() as u64)
+                    .with("opset_domains", graph.opset_imports.len() as u64),
+            );
+        }
+    }
 
     Ok((graph, Arc::new(store)))
 }

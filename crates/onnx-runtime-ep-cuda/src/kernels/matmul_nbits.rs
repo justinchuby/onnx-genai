@@ -3529,6 +3529,16 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (m as u64)
+                .saturating_mul(self.n as u64)
+                .saturating_mul(self.k as u64)
+                .saturating_mul(2);
+            if bias.is_some() {
+                flops = flops.saturating_add((m as u64).saturating_mul(self.n as u64));
+            }
+            flops
+        });
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
@@ -3891,6 +3901,22 @@ impl MatMulNBitsKernel {
         }
 
         let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (m as u64)
+                .saturating_mul(self.n as u64)
+                .saturating_mul(self.k as u64)
+                .saturating_mul(2);
+            if bias.is_some() {
+                flops = flops.saturating_add((m as u64).saturating_mul(self.n as u64));
+            }
+            if self.rmsnorm_prologue {
+                let elements = (m as u64).saturating_mul(self.k as u64);
+                flops = flops
+                    .saturating_add(elements.saturating_mul(4))
+                    .saturating_add((m as u64).saturating_mul(4));
+            }
+            flops
+        });
         // Non-block-32 layouts are served by the model-agnostic general-block-size
         // fp16 kernels (int4/int8 decode GEMV + int4/int8 prefill GEMM). The tuned
         // block-32 fusions (rmsnorm prologue, gate/up SwiGLU, down-projection) are
@@ -4555,6 +4581,21 @@ impl MatMulNBitsKernel {
                 )));
             }
         }
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let rows = m as u64;
+            let mut flops = rows
+                .saturating_mul(self.n as u64)
+                .saturating_mul(self.k as u64)
+                .saturating_mul(4)
+                .saturating_add(rows.saturating_mul(self.n as u64).saturating_mul(5));
+            if self.rmsnorm_prologue {
+                let elements = rows.saturating_mul(self.k as u64);
+                flops = flops
+                    .saturating_add(elements.saturating_mul(4))
+                    .saturating_add(rows.saturating_mul(4));
+            }
+            flops
+        });
 
         if m == 0 {
             self.last_call_capture_safe.store(false, Ordering::Relaxed);

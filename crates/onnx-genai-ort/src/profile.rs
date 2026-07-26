@@ -12,11 +12,15 @@
 //! detokenization). See `docs/benchmarks` and the CPU profiling decision note.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use onnx_genai_runtime_config::runtime_config;
+
+/// How much detail a timeline records. Re-exported so callers can name a level
+/// without depending on the tracer crate directly.
+pub use onnx_runtime_tracer::TraceVerbosity;
 
 /// Returns whether profiling is enabled, reading `ONNX_GENAI_PROFILE` once.
 pub fn enabled() -> bool {
@@ -49,8 +53,60 @@ pub fn record(stage: &'static str, nanos: u128) {
 /// Path to write a Chrome Trace Event (Perfetto) timeline to, from
 /// `ONNX_GENAI_TRACE`. When set, each [`Span`] emits one timestamped
 /// `complete` event so the run can be opened in <https://ui.perfetto.dev>.
-fn trace_path() -> Option<&'static std::path::Path> {
-    runtime_config().trace.as_deref()
+/// A destination set after startup, taking precedence over the environment.
+///
+/// The environment is read once into a `OnceLock`, which is right for a
+/// one-shot run but wrong for an interactive session: a user who decides
+/// mid-conversation that they want a timeline cannot restart the process to
+/// get one. This is the override that lets them ask for it in place.
+/// `None` = no override (use the environment); `Some(None)` = explicitly off;
+/// `Some(Some(path))` = write there.
+static RUNTIME_TRACE_PATH: std::sync::RwLock<Option<Option<std::path::PathBuf>>> =
+    std::sync::RwLock::new(None);
+/// Fast path for [`trace_path`] so an untraced run never takes the lock.
+static RUNTIME_TRACE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Direct the timeline to `path` from now on.
+///
+/// Three states, not two. `Some(path)` writes there; `None` turns the timeline
+/// off *even when the environment asked for one*, because a session that says
+/// "off" means off and would otherwise keep writing the startup destination;
+/// [`clear_trace_override`] is how you go back to the environment's setting.
+pub fn set_trace_path(path: Option<std::path::PathBuf>) {
+    // Written under the same lock that guards the value, so a concurrent
+    // setter cannot leave the flag describing a different write's value.
+    let mut guard = RUNTIME_TRACE_PATH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(path);
+    RUNTIME_TRACE_SET.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Forget any runtime destination, deferring to the environment again.
+pub fn clear_trace_override() {
+    let mut guard = RUNTIME_TRACE_PATH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+    RUNTIME_TRACE_SET.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Where the timeline will be written, if anywhere.
+#[must_use]
+pub fn trace_destination() -> Option<std::path::PathBuf> {
+    if RUNTIME_TRACE_SET.load(std::sync::atomic::Ordering::Acquire)
+        && let Some(override_value) = RUNTIME_TRACE_PATH
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    {
+        return override_value;
+    }
+    runtime_config().trace.clone()
+}
+
+fn trace_path() -> Option<std::path::PathBuf> {
+    trace_destination()
 }
 
 /// Whether timeline tracing is enabled (a non-empty `ONNX_GENAI_TRACE`).
@@ -58,11 +114,16 @@ pub fn tracing_enabled() -> bool {
     trace_path().is_some()
 }
 
-/// The common time origin for trace timestamps, fixed on first use so the
-/// first recorded event starts near t=0 on the Perfetto timeline.
-fn trace_epoch() -> Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
+/// Convert a monotonic [`Instant`] to the shared absolute trace axis.
+///
+/// These spans share a timeline with the ones the runtime and its execution
+/// providers record through `onnx-runtime-tracer`, so they have to be stamped
+/// against the same origin rather than a private one. This module used to fix
+/// its own epoch on first use; that only ever agreed with the runtime's by
+/// coincidence, because both happened to be created near process start.
+fn absolute_us(at: Instant) -> u64 {
+    let ago = Instant::now().saturating_duration_since(at).as_micros() as u64;
+    onnx_runtime_tracer::absolute_now_us().saturating_sub(ago)
 }
 
 /// One recorded timeline event, rendered later as a Chrome `X` (complete) event.
@@ -71,6 +132,9 @@ struct TraceEvent {
     tid: u64,
     ts_us: u64,
     dur_us: u64,
+    /// Perfetto `args` for this event. Usually empty: only spans that carry
+    /// something a reader cannot infer from the name populate it.
+    args: Vec<(&'static str, serde_json::Value)>,
 }
 
 /// Bound on retained events so a very long run cannot grow memory without limit.
@@ -82,25 +146,32 @@ fn trace_sink() -> &'static Mutex<Vec<TraceEvent>> {
 }
 
 /// A small, stable per-thread id for the trace's thread lanes.
+///
+/// Deliberately the tracer's allocator rather than one of our own. These
+/// events share a document with the ones the runtime and its providers record,
+/// and a Chrome trace groups lanes by `pid` then `tid`: numbering threads
+/// separately put the same thread on two lanes and two threads on one.
 fn thread_trace_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    thread_local! {
-        static TID: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
-    }
-    TID.with(|id| *id)
+    onnx_runtime_tracer::thread_lane_id()
 }
 
 /// Record a single timeline event. No-op unless tracing is enabled.
-fn record_trace(stage: &'static str, start: Instant, dur: Duration) {
+fn record_trace(
+    stage: &'static str,
+    start: Instant,
+    dur: Duration,
+    args: Vec<(&'static str, serde_json::Value)>,
+) {
     if !tracing_enabled() {
         return;
     }
-    let ts_us = start.saturating_duration_since(trace_epoch()).as_micros() as u64;
+    let ts_us = absolute_us(start);
     let event = TraceEvent {
         name: stage,
         tid: thread_trace_id(),
         ts_us,
         dur_us: dur.as_micros() as u64,
+        args,
     };
     if let Ok(mut sink) = trace_sink().lock() {
         if sink.len() >= MAX_TRACE_EVENTS {
@@ -131,15 +202,24 @@ pub fn trace_document() -> serde_json::Value {
             .iter()
             .map(|event| {
                 let category = event.name.split('.').next().unwrap_or(event.name);
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "name": event.name,
                     "cat": category,
                     "ph": "X",
                     "ts": event.ts_us,
                     "dur": event.dur_us,
-                    "pid": 1,
+                    "pid": onnx_runtime_tracer::process_id(),
                     "tid": event.tid,
-                })
+                });
+                if !event.args.is_empty() {
+                    let args: serde_json::Map<String, serde_json::Value> = event
+                        .args
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), value.clone()))
+                        .collect();
+                    value["args"] = serde_json::Value::Object(args);
+                }
+                value
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -175,18 +255,52 @@ pub struct Span {
     aggregate: bool,
     /// Whether timeline tracing (`ONNX_GENAI_TRACE`) is active.
     trace: bool,
+    /// Metadata to attach to this span. An empty `Vec` does not allocate, so
+    /// the untraced path is unaffected by this field existing.
+    args: Vec<(&'static str, serde_json::Value)>,
+    /// Where this span was opened; a compile-time `&'static`.
+    location: &'static std::panic::Location<'static>,
 }
 
 impl Span {
     /// Start a span. Cheap and inert when neither profiling nor tracing is on.
+    ///
+    /// Records the source location that opened it. `#[track_caller]` resolves
+    /// that at compile time, so it costs nothing at run time — unlike a real
+    /// backtrace, which measures 5.1us unresolved and 26.7us symbolised
+    /// against the ~0.3ns this takes.
     #[must_use]
+    #[track_caller]
     pub fn new(stage: &'static str) -> Self {
         Self {
             stage,
             start: Instant::now(),
             aggregate: enabled(),
             trace: tracing_enabled(),
+            args: Vec::new(),
+            location: std::panic::Location::caller(),
         }
+    }
+
+    /// Attach a key/value to this span, to be emitted as a Perfetto `arg`.
+    ///
+    /// For facts a reader cannot recover from the span's name and timing — the
+    /// token a decode step produced, say. Ignored unless timeline tracing is
+    /// on, so `value` should be cheap to produce; build anything expensive
+    /// behind [`Span::is_tracing`].
+    pub fn set_arg(&mut self, key: &'static str, value: impl Into<serde_json::Value>) {
+        if !self.trace {
+            return;
+        }
+        self.args.push((key, value.into()));
+    }
+
+    /// Whether this span will actually be recorded to the timeline.
+    ///
+    /// Guard the construction of expensive argument values with this.
+    #[must_use]
+    pub fn is_tracing(&self) -> bool {
+        self.trace
     }
 }
 
@@ -200,7 +314,16 @@ impl Drop for Span {
             record(self.stage, elapsed.as_nanos());
         }
         if self.trace {
-            record_trace(self.stage, self.start, elapsed);
+            let mut args = std::mem::take(&mut self.args);
+            args.push((
+                "source",
+                serde_json::Value::from(format!(
+                    "{}:{}",
+                    self.location.file(),
+                    self.location.line()
+                )),
+            ));
+            record_trace(self.stage, self.start, elapsed, args);
         }
     }
 }
@@ -211,6 +334,11 @@ macro_rules! prof_span {
     ($stage:expr) => {
         $crate::profile::Span::new($stage)
     };
+    ($stage:expr, $key:expr => $value:expr) => {{
+        let mut span = $crate::profile::Span::new($stage);
+        span.set_arg($key, $value);
+        span
+    }};
 }
 
 /// Clear all accumulated stage statistics and any recorded timeline events.
@@ -226,6 +354,35 @@ pub fn reset() {
 /// Render the accumulated per-stage statistics as a text table.
 ///
 /// `tokens` scales the per-token column; pass the number of generated tokens.
+/// One stage's accumulated cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageSnapshot {
+    pub stage: &'static str,
+    pub total_ns: u128,
+    pub calls: u64,
+}
+
+/// Every recorded stage, most expensive first.
+///
+/// The structured counterpart to [`report`], so callers that are not writing to
+/// a terminal — an HTTP endpoint, a JSON report — do not have to parse a table
+/// that exists for human eyes.
+pub fn snapshot() -> Vec<StageSnapshot> {
+    let Ok(reg) = registry().lock() else {
+        return Vec::new();
+    };
+    let mut rows = reg
+        .iter()
+        .map(|(name, stat)| StageSnapshot {
+            stage: name,
+            total_ns: stat.total_ns,
+            calls: stat.count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total_ns));
+    rows
+}
+
 pub fn report(tokens: u64) -> String {
     let reg = match registry().lock() {
         Ok(reg) => reg,
@@ -256,4 +413,28 @@ pub fn report(tokens: u64) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_document_renders_event_args() {
+        reset();
+        trace_sink().lock().unwrap().push(TraceEvent {
+            name: "diffusion.denoise_step",
+            tid: 7,
+            ts_us: 123,
+            dur_us: 45,
+            args: vec![("step", serde_json::json!(3_u64))],
+        });
+
+        let document = trace_document();
+        let event = &document["traceEvents"][0];
+        assert_eq!(event["cat"], "diffusion");
+        assert_eq!(event["name"], "diffusion.denoise_step");
+        assert_eq!(event["args"]["step"], 3);
+        reset();
+    }
 }

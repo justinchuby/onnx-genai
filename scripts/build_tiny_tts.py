@@ -343,6 +343,9 @@ pipeline:
       run_on: every_step
     vocoder:
       run_on: final_only
+  audio:
+    sample_rate: 16000
+    output: vocoder.audio
 """
     )
 

@@ -95,8 +95,7 @@ fn assemble_and_sum_of_squares_scalar(
     while base < bulk {
         for (lane, lane_sum) in lane_sums.iter_mut().enumerate() {
             let index = base + lane;
-            let value =
-                input[index] + skip[index] + bias.map_or(0.0, |bias| bias[index]);
+            let value = input[index] + skip[index] + bias.map_or(0.0, |bias| bias[index]);
             sum[index] = value;
             *lane_sum += value * value;
         }
@@ -195,8 +194,10 @@ unsafe fn assemble_and_sum_of_squares_avx512(
 
         let mut i = 0;
         while i + 32 <= n {
-            let mut v0 =
-                _mm512_add_ps(_mm512_loadu_ps(in_ptr.add(i)), _mm512_loadu_ps(skip_ptr.add(i)));
+            let mut v0 = _mm512_add_ps(
+                _mm512_loadu_ps(in_ptr.add(i)),
+                _mm512_loadu_ps(skip_ptr.add(i)),
+            );
             let mut v1 = _mm512_add_ps(
                 _mm512_loadu_ps(in_ptr.add(i + 16)),
                 _mm512_loadu_ps(skip_ptr.add(i + 16)),
@@ -212,8 +213,10 @@ unsafe fn assemble_and_sum_of_squares_avx512(
             i += 32;
         }
         while i + 16 <= n {
-            let mut v =
-                _mm512_add_ps(_mm512_loadu_ps(in_ptr.add(i)), _mm512_loadu_ps(skip_ptr.add(i)));
+            let mut v = _mm512_add_ps(
+                _mm512_loadu_ps(in_ptr.add(i)),
+                _mm512_loadu_ps(skip_ptr.add(i)),
+            );
             if let Some(bias_ptr) = bias_ptr {
                 v = _mm512_add_ps(v, _mm512_loadu_ps(bias_ptr.add(i)));
             }
@@ -279,7 +282,9 @@ mod tests {
     fn sum_of_squares_matches_and_is_closer_to_f64_than_serial_scalar() {
         // Cover non-multiples of 16 (mask tail) and multiples across the
         // realistic hidden-size range for the 0.6B model (1024) and others.
-        let sizes = [1, 3, 7, 15, 16, 17, 31, 32, 63, 64, 127, 128, 512, 896, 1024, 1536, 4096];
+        let sizes = [
+            1, 3, 7, 15, 16, 17, 31, 32, 63, 64, 127, 128, 512, 896, 1024, 1536, 4096,
+        ];
         for &len in &sizes {
             for seed in 0..8u64 {
                 let row = make_row(len, seed);
@@ -325,12 +330,14 @@ mod tests {
                 let mut expected_sum = vec![0.0f32; len];
                 let mut f64_ref = 0.0f64;
                 for index in 0..len {
-                    let value =
-                        input[index] + skip[index] + bias_opt.map_or(0.0, |b| b[index]);
+                    let value = input[index] + skip[index] + bias_opt.map_or(0.0, |b| b[index]);
                     expected_sum[index] = value;
                     f64_ref += (value as f64) * (value as f64);
                 }
-                assert_eq!(sum, expected_sum, "len {len} use_bias {use_bias}: sum row differs");
+                assert_eq!(
+                    sum, expected_sum,
+                    "len {len} use_bias {use_bias}: sum row differs"
+                );
 
                 let tol = 1e-4 + 1e-5 * f64_ref.abs();
                 assert!(
@@ -368,9 +375,7 @@ mod tests {
                     all_closer = false;
                 }
             }
-            println!(
-                "{len:5} | {max_vec:.4e} | {max_serial:.4e} | {max_rel:.3e} | {all_closer}"
-            );
+            println!("{len:5} | {max_vec:.4e} | {max_serial:.4e} | {max_rel:.3e} | {all_closer}");
         }
     }
 

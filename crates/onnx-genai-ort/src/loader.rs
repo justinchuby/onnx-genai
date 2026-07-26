@@ -67,6 +67,45 @@ impl ModelDirectory {
     }
 }
 
+/// Bytes the model's graph and weights occupy on disk.
+///
+/// ONNX keeps large initializers in a sibling *external data* file rather than
+/// inside the `.onnx` protobuf, so the graph file alone understates a model's
+/// weights by orders of magnitude — a 2 GB model can have a 300 KB `.onnx`.
+/// The sibling is found by the ecosystem's file-naming convention
+/// (`<model>.onnx.data`, `<model>.onnx_data`, …), which is a property of the
+/// ONNX format, not of any model family.
+///
+/// Reads directory metadata only; it never opens the weights themselves.
+pub fn model_weight_bytes(model_path: &Path) -> u64 {
+    let Some(file_name) = model_path.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+    let graph_bytes = std::fs::metadata(model_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let Some(directory) = model_path.parent() else {
+        return graph_bytes;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return graph_bytes;
+    };
+    // External data is named after the graph file it belongs to, so a directory
+    // holding several models still attributes each blob to the right one.
+    let external: u64 = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let is_external =
+                name != file_name && name.starts_with(file_name) && !name.ends_with(".onnx");
+            is_external.then(|| entry.metadata().ok()).flatten()
+        })
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum();
+    graph_bytes.saturating_add(external)
+}
+
 /// Resolved tokenizer files for a pipeline model directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineTokenizerPaths {
@@ -584,5 +623,60 @@ mod tests {
         prefer_binary_onnx_twins(&mut paths);
 
         assert_eq!(paths, vec![binary]);
+    }
+}
+
+#[cfg(test)]
+mod weight_bytes_tests {
+    use super::*;
+    use std::fs;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("onnx-genai-weights-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn external_data_counts_toward_the_weight_total() {
+        let dir = scratch("external");
+        fs::write(dir.join("model.onnx"), vec![0_u8; 100]).unwrap();
+        // The ONNX external-data convention: initializers live beside the graph.
+        fs::write(dir.join("model.onnx.data"), vec![0_u8; 4_000]).unwrap();
+        // Unrelated package files must not be counted as weights.
+        fs::write(dir.join("tokenizer.json"), vec![0_u8; 900]).unwrap();
+
+        assert_eq!(model_weight_bytes(&dir.join("model.onnx")), 4_100);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_model_in_the_directory_keeps_its_own_weights() {
+        let dir = scratch("two-models");
+        fs::write(dir.join("decoder.onnx"), vec![0_u8; 10]).unwrap();
+        fs::write(dir.join("decoder.onnx.data"), vec![0_u8; 1_000]).unwrap();
+        fs::write(dir.join("encoder.onnx"), vec![0_u8; 20]).unwrap();
+        fs::write(dir.join("encoder.onnx.data"), vec![0_u8; 2_000]).unwrap();
+
+        assert_eq!(model_weight_bytes(&dir.join("decoder.onnx")), 1_010);
+        assert_eq!(model_weight_bytes(&dir.join("encoder.onnx")), 2_020);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_self_contained_model_reports_its_own_size() {
+        let dir = scratch("self-contained");
+        fs::write(dir.join("model.onnx"), vec![0_u8; 512]).unwrap();
+
+        assert_eq!(model_weight_bytes(&dir.join("model.onnx")), 512);
+        // A missing file is zero rather than an error: the reservation is an
+        // input to budgeting, not a correctness gate.
+        assert_eq!(model_weight_bytes(&dir.join("absent.onnx")), 0);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

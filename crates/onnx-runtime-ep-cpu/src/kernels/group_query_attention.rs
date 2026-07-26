@@ -28,7 +28,9 @@
 //! parity contract, not a universal greedy-token identity guarantee; model-level
 //! greedy parity is established empirically by profiling.
 
-use super::sdpa::{DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_partial, sdpa_decode_row};
+use super::sdpa::{
+    DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_partial, sdpa_decode_row,
+};
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -1064,55 +1066,52 @@ impl Kernel for GroupQueryAttentionKernel {
             };
             let scratch = &scratch;
             let softcap = (self.softcap != 0.0).then_some(self.softcap);
-            crate::kernels::matmul_nbits::decode_parallel_index_tasks(
-                num_tasks,
-                |task_index| {
-                    let row_index = task_index / split_count;
-                    let chunk = task_index % split_count;
-                    let b = row_index / (self.num_heads * q.seq);
-                    let row_in_batch = row_index % (self.num_heads * q.seq);
-                    let qh = row_in_batch / q.seq;
-                    let qs = row_in_batch % q.seq;
-                    let kvh = qh / group;
-                    let causal_limit = query_starts[b] + qs;
-                    let local_start = if self.local_window_size > 0 {
-                        (causal_limit + 1).saturating_sub(self.local_window_size as usize)
-                    } else {
-                        0
-                    };
-                    let (chunk_lo, chunk_hi) =
-                        split_chunk_bounds(local_start, causal_limit + 1, split_count, chunk);
-                    let q_base = ((b * self.num_heads + qh) * q.seq + qs) * cache_dim;
-                    let q_row = &q.data[q_base..q_base + cache_dim];
-                    let kv_head_base = (b * self.kv_num_heads + kvh) * present_sequence_length;
-                    let k_head = &present_k[kv_head_base * cache_dim
-                        ..(kv_head_base + present_sequence_length) * cache_dim];
-                    let v_head = &present_v[kv_head_base * v_head_size
-                        ..(kv_head_base + present_sequence_length) * v_head_size];
-                    // SAFETY: this task owns slot `task_index` exclusively (each
-                    // index runs once), so these writes never alias another task.
-                    let partial_output = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            scratch.outputs.add(task_index * v_head_size),
-                            v_head_size,
-                        )
-                    };
-                    let partial = sdpa_decode_partial(
-                        q_row,
-                        k_head,
-                        v_head,
-                        present_sequence_length,
-                        chunk_lo,
-                        chunk_hi,
-                        scale,
-                        softcap,
-                        partial_output,
-                    );
-                    unsafe {
-                        *scratch.partials.add(task_index) = partial;
-                    }
-                },
-            );
+            crate::kernels::matmul_nbits::decode_parallel_index_tasks(num_tasks, |task_index| {
+                let row_index = task_index / split_count;
+                let chunk = task_index % split_count;
+                let b = row_index / (self.num_heads * q.seq);
+                let row_in_batch = row_index % (self.num_heads * q.seq);
+                let qh = row_in_batch / q.seq;
+                let qs = row_in_batch % q.seq;
+                let kvh = qh / group;
+                let causal_limit = query_starts[b] + qs;
+                let local_start = if self.local_window_size > 0 {
+                    (causal_limit + 1).saturating_sub(self.local_window_size as usize)
+                } else {
+                    0
+                };
+                let (chunk_lo, chunk_hi) =
+                    split_chunk_bounds(local_start, causal_limit + 1, split_count, chunk);
+                let q_base = ((b * self.num_heads + qh) * q.seq + qs) * cache_dim;
+                let q_row = &q.data[q_base..q_base + cache_dim];
+                let kv_head_base = (b * self.kv_num_heads + kvh) * present_sequence_length;
+                let k_head = &present_k[kv_head_base * cache_dim
+                    ..(kv_head_base + present_sequence_length) * cache_dim];
+                let v_head = &present_v[kv_head_base * v_head_size
+                    ..(kv_head_base + present_sequence_length) * v_head_size];
+                // SAFETY: this task owns slot `task_index` exclusively (each
+                // index runs once), so these writes never alias another task.
+                let partial_output = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        scratch.outputs.add(task_index * v_head_size),
+                        v_head_size,
+                    )
+                };
+                let partial = sdpa_decode_partial(
+                    q_row,
+                    k_head,
+                    v_head,
+                    present_sequence_length,
+                    chunk_lo,
+                    chunk_hi,
+                    scale,
+                    softcap,
+                    partial_output,
+                );
+                unsafe {
+                    *scratch.partials.add(task_index) = partial;
+                }
+            });
             for row_index in 0..attention_rows {
                 let base = row_index * split_count;
                 combine_decode_partials(

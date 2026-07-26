@@ -618,6 +618,16 @@ impl Kernel for BlockQuantizedMatMulKernel {
         let grid_x = as_grid_x("N", n)?;
         let blocks = as_i32("block count", blocks)?;
         let block_bytes = as_i32("block byte count", self.format.block_bytes())?;
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (m as u64)
+                .saturating_mul(self.n as u64)
+                .saturating_mul(self.k as u64)
+                .saturating_mul(2);
+            if bias.is_some() {
+                flops = flops.saturating_add((m as u64).saturating_mul(self.n as u64));
+            }
+            flops
+        });
         if m == 0 {
             return Ok(());
         }

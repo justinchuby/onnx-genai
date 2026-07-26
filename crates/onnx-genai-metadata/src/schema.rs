@@ -990,6 +990,14 @@ pub struct PipelineSpec {
     #[serde(default)]
     pub vision: Option<PipelineVisionConfig>,
 
+    /// Waveform contract for a pipeline whose final stage emits audio.
+    ///
+    /// Present for text-to-speech and any other package that produces sound.
+    /// The sample rate is model DATA: a runtime cannot infer it from a tensor,
+    /// and guessing it silently changes playback pitch and duration.
+    #[serde(default)]
+    pub audio: Option<PipelineAudioConfig>,
+
     /// Declared position-id generation and prefill→decode continuation program.
     ///
     /// Generic and architecture-neutral: parameterized by rank, axis labels, and
@@ -997,6 +1005,30 @@ pub struct PipelineSpec {
     /// rank-N multimodal coordinates as data — never a model-family branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub positions: Option<PositionProgram>,
+}
+
+/// Waveform contract for a pipeline stage that emits audio.
+///
+/// Architecture-neutral: the endpoint is an arbitrary `component.output` name
+/// carried in the package's metadata, and the sample rate is a declared number.
+/// Neither is inferred from a model or vendor name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct PipelineAudioConfig {
+    /// Sample rate, in hertz, of the waveform the pipeline emits.
+    #[schemars(range(min = 1))]
+    pub sample_rate: Option<u32>,
+
+    /// Endpoint carrying the waveform, in `component.output` form.
+    ///
+    /// When absent, the runtime uses the sole output of the final-phase
+    /// component, which is unambiguous for the common single-vocoder shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+
+    /// Number of interleaved channels in the waveform. Defaults to 1 (mono).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub channels: Option<u16>,
 }
 
 /// Declared position-id program for a decoder graph.

@@ -513,6 +513,12 @@ pub struct EngineConfig {
     pub limits: ResourceLimits,
     /// Permit programmatic resource-limit changes after engine initialization.
     pub allow_runtime_override: bool,
+    /// Byte budget for a pipeline's memoized prompt-phase (encoder) outputs.
+    ///
+    /// Re-asking about the same picture should not re-run the vision encoder,
+    /// so its outputs are kept, keyed by the exact bytes that produced them.
+    /// `0` disables the cache and every turn recomputes.
+    pub pipeline_cache_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -533,6 +539,10 @@ impl Default for EngineConfig {
             kv_connector: KvConnectorConfig::default(),
             limits: ResourceLimits::default(),
             allow_runtime_override: false,
+            // One encoder output for a handful of attachments. Big enough that
+            // a conversation about a few images keeps all of them, small enough
+            // to be an unremarkable line in a process's memory profile.
+            pipeline_cache_bytes: 512 * 1024 * 1024,
         }
     }
 }

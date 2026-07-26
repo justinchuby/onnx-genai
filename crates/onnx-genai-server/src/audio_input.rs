@@ -7,15 +7,15 @@ use onnx_genai_preprocess::audio::{
 use crate::types::InputAudio;
 
 #[derive(Clone, Debug)]
-pub(crate) struct AudioInputSpec {
-    pub(crate) endpoint: String,
-    pub(crate) n_mels: usize,
-    pub(crate) n_frames: usize,
-    pub(crate) max_tokens: Option<usize>,
+pub struct AudioInputSpec {
+    pub endpoint: String,
+    pub n_mels: usize,
+    pub n_frames: usize,
+    pub max_tokens: Option<usize>,
 }
 
 impl AudioInputSpec {
-    pub(crate) fn from_input(
+    pub fn from_input(
         endpoint: String,
         shape: &[i64],
         max_tokens: Option<usize>,
@@ -51,10 +51,10 @@ impl AudioInputSpec {
 }
 
 #[derive(Debug)]
-pub(crate) struct AudioTensor {
-    pub(crate) endpoint: String,
-    pub(crate) data: Vec<f32>,
-    pub(crate) shape: Vec<i64>,
+pub struct AudioTensor {
+    pub endpoint: String,
+    pub data: Vec<f32>,
+    pub shape: Vec<i64>,
 }
 
 pub(crate) fn decode_chat_audio(input: &InputAudio) -> anyhow::Result<Vec<u8>> {
@@ -67,13 +67,26 @@ pub(crate) fn decode_chat_audio(input: &InputAudio) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-pub(crate) fn preprocess_wav(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
+pub fn preprocess_wav(bytes: &[u8], spec: &AudioInputSpec) -> anyhow::Result<AudioTensor> {
     let audio = decode_wav_pcm16(bytes)?;
+    preprocess_samples(&audio.samples, audio.sample_rate, spec)
+}
+
+/// Extract the model's declared audio features from raw `[-1, 1]` mono samples.
+///
+/// The counterpart to [`preprocess_wav`] for callers that already hold samples
+/// — a live stream segment, for instance — so a waveform never has to be
+/// re-encoded into a WAV container just to be transcribed.
+pub fn preprocess_samples(
+    samples: &[f32],
+    sample_rate: u32,
+    spec: &AudioInputSpec,
+) -> anyhow::Result<AudioTensor> {
     let extractor = LogMelExtractor::new(spec.n_mels, WHISPER_SAMPLE_RATE)?;
     let features = if spec.n_frames == WHISPER_N_FRAMES {
-        extractor.extract_padded(&audio.samples, audio.sample_rate)?
+        extractor.extract_padded(samples, sample_rate)?
     } else {
-        extractor.extract(&audio.samples, audio.sample_rate)?
+        extractor.extract(samples, sample_rate)?
     };
     let data = resize_feature_frames(
         &features.data,

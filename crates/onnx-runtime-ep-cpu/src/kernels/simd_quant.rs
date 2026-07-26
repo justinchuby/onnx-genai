@@ -222,7 +222,10 @@ unsafe fn max_abs_avx512(src: &[f32]) -> MaxAbsReduction {
             max_abs = max_abs.max(magnitude);
             i += 1;
         }
-        MaxAbsReduction { max_abs, all_finite }
+        MaxAbsReduction {
+            max_abs,
+            all_finite,
+        }
     }
 }
 
@@ -235,9 +238,7 @@ unsafe fn max_abs_avx512(src: &[f32]) -> MaxAbsReduction {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[inline]
-unsafe fn round_half_away_avx512(
-    values: std::arch::x86_64::__m512,
-) -> std::arch::x86_64::__m512 {
+unsafe fn round_half_away_avx512(values: std::arch::x86_64::__m512) -> std::arch::x86_64::__m512 {
     use std::arch::x86_64::*;
     // SAFETY: the caller guarantees `avx512f`.
     unsafe {
@@ -300,7 +301,9 @@ unsafe fn quantize_block_i8_avx512(src: &[f32], out: &mut [i8]) -> f32 {
             i += 16;
         }
         while i < n {
-            *out_ptr.add(i) = (*src_ptr.add(i) * inverse_scale).round().clamp(-127.0, 127.0) as i8;
+            *out_ptr.add(i) = (*src_ptr.add(i) * inverse_scale)
+                .round()
+                .clamp(-127.0, 127.0) as i8;
             i += 1;
         }
         scale
@@ -351,8 +354,9 @@ unsafe fn quantize_block_u8_offset_avx512(src: &[f32], out: &mut [u8]) -> f32 {
             i += 16;
         }
         while i < n {
-            let signed =
-                (*src_ptr.add(i) * inverse_scale).round().clamp(-127.0, 127.0) as i8;
+            let signed = (*src_ptr.add(i) * inverse_scale)
+                .round()
+                .clamp(-127.0, 127.0) as i8;
             *out_ptr.add(i) = (signed as i16 + 128) as u8;
             i += 1;
         }
@@ -402,8 +406,9 @@ unsafe fn quantize_block_i16_avx512(src: &[f32], out: &mut [i16]) -> f32 {
             i += 16;
         }
         while i < n {
-            *out_ptr.add(i) =
-                (*src_ptr.add(i) * inverse_scale).round().clamp(-32767.0, 32767.0) as i16;
+            *out_ptr.add(i) = (*src_ptr.add(i) * inverse_scale)
+                .round()
+                .clamp(-32767.0, 32767.0) as i16;
             i += 1;
         }
         scale
@@ -436,8 +441,9 @@ mod tests {
 
     /// Lengths spanning block/group sizes (32, 128), sub-16 tails, and the 0.6B
     /// hidden size, including non-multiples of 16 to exercise the scalar tail.
-    const LENGTHS: [usize; 16] =
-        [1, 2, 3, 7, 15, 16, 17, 31, 32, 33, 48, 64, 127, 128, 129, 1024];
+    const LENGTHS: [usize; 16] = [
+        1, 2, 3, 7, 15, 16, 17, 31, 32, 33, 48, 64, 127, 128, 129, 1024,
+    ];
 
     #[test]
     fn quantize_block_i8_simd_matches_scalar_bit_identical() {
@@ -448,7 +454,11 @@ mod tests {
                 let mut scalar = vec![7i8; len];
                 let scale_simd = quantize_block_i8(&row, &mut simd);
                 let scale_scalar = quantize_block_i8_scalar(&row, &mut scalar);
-                assert_eq!(scale_simd.to_bits(), scale_scalar.to_bits(), "len {len} seed {seed}");
+                assert_eq!(
+                    scale_simd.to_bits(),
+                    scale_scalar.to_bits(),
+                    "len {len} seed {seed}"
+                );
                 assert_eq!(simd, scalar, "len {len} seed {seed}");
             }
         }
@@ -463,7 +473,11 @@ mod tests {
                 let mut scalar = vec![7u8; len];
                 let scale_simd = quantize_block_u8_offset(&row, &mut simd);
                 let scale_scalar = quantize_block_u8_offset_scalar(&row, &mut scalar);
-                assert_eq!(scale_simd.to_bits(), scale_scalar.to_bits(), "len {len} seed {seed}");
+                assert_eq!(
+                    scale_simd.to_bits(),
+                    scale_scalar.to_bits(),
+                    "len {len} seed {seed}"
+                );
                 assert_eq!(simd, scalar, "len {len} seed {seed}");
             }
         }
@@ -478,7 +492,11 @@ mod tests {
                 let mut scalar = vec![7i16; len];
                 let scale_simd = quantize_block_i16(&row, &mut simd);
                 let scale_scalar = quantize_block_i16_scalar(&row, &mut scalar);
-                assert_eq!(scale_simd.to_bits(), scale_scalar.to_bits(), "len {len} seed {seed}");
+                assert_eq!(
+                    scale_simd.to_bits(),
+                    scale_scalar.to_bits(),
+                    "len {len} seed {seed}"
+                );
                 assert_eq!(simd, scalar, "len {len} seed {seed}");
             }
         }
@@ -494,7 +512,11 @@ mod tests {
         rows.push(vec![5.0; 40]);
         rows.push(vec![-5.0; 40]);
         // Mixed signs with the max at both ends.
-        rows.push((0..40).map(|i| if i % 2 == 0 { 3.0 } else { -3.0 }).collect());
+        rows.push(
+            (0..40)
+                .map(|i| if i % 2 == 0 { 3.0 } else { -3.0 })
+                .collect(),
+        );
         // A single outlier forcing tiny codes elsewhere.
         {
             let mut row = vec![0.01f32; 40];
@@ -584,7 +606,11 @@ mod tests {
         rows.push(vec![-inf; 20]);
         // (e) Signed zeros (finite: exercises the fast path, must match too).
         rows.push(vec![-0.0f32; 40]);
-        rows.push((0..40).map(|i| if i % 2 == 0 { -0.0 } else { 0.0 }).collect());
+        rows.push(
+            (0..40)
+                .map(|i| if i % 2 == 0 { -0.0 } else { 0.0 })
+                .collect(),
+        );
         // Mixed NaN, inf, signed zero, and finite values in one block.
         {
             let mut row = vec![0.0f32; 33];
@@ -604,21 +630,33 @@ mod tests {
             let mut i8_scalar = vec![0i8; len];
             let s8_simd = quantize_block_i8(row, &mut i8_simd);
             let s8_scalar = quantize_block_i8_scalar(row, &mut i8_scalar);
-            assert_eq!(s8_simd.to_bits(), s8_scalar.to_bits(), "i8 scale, len {len}");
+            assert_eq!(
+                s8_simd.to_bits(),
+                s8_scalar.to_bits(),
+                "i8 scale, len {len}"
+            );
             assert_eq!(i8_simd, i8_scalar, "i8 codes, len {len}");
 
             let mut u8_simd = vec![0u8; len];
             let mut u8_scalar = vec![0u8; len];
             let su_simd = quantize_block_u8_offset(row, &mut u8_simd);
             let su_scalar = quantize_block_u8_offset_scalar(row, &mut u8_scalar);
-            assert_eq!(su_simd.to_bits(), su_scalar.to_bits(), "u8 scale, len {len}");
+            assert_eq!(
+                su_simd.to_bits(),
+                su_scalar.to_bits(),
+                "u8 scale, len {len}"
+            );
             assert_eq!(u8_simd, u8_scalar, "u8 codes, len {len}");
 
             let mut i16_simd = vec![0i16; len];
             let mut i16_scalar = vec![0i16; len];
             let s16_simd = quantize_block_i16(row, &mut i16_simd);
             let s16_scalar = quantize_block_i16_scalar(row, &mut i16_scalar);
-            assert_eq!(s16_simd.to_bits(), s16_scalar.to_bits(), "i16 scale, len {len}");
+            assert_eq!(
+                s16_simd.to_bits(),
+                s16_scalar.to_bits(),
+                "i16 scale, len {len}"
+            );
             assert_eq!(i16_simd, i16_scalar, "i16 codes, len {len}");
         }
     }

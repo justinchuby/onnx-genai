@@ -5,8 +5,15 @@
 use std::sync::Arc;
 
 use onnx_runtime_ir::{Graph, WeightRef};
+use onnx_runtime_tracer::{Args, SpanGuard};
 
 use crate::error::{OptimizerError, Result};
+
+fn optimizer_span(pass_name: &str) -> Option<SpanGuard> {
+    onnx_runtime_tracer::global_context()
+        .filter(|trace| trace.is_enabled())
+        .map(|trace| trace.span(format!("optimize.{pass_name}"), "optimize"))
+}
 
 /// Resolves graph initializer descriptors to their backing bytes.
 pub trait InitializerResolver: Send + Sync {
@@ -106,9 +113,34 @@ pub fn run_passes(
     ctx: &PassContext,
 ) -> Result<()> {
     for pass in passes {
+        let nodes_before = graph.num_nodes();
+        let values_before = graph.values.len();
+        let mut span = optimizer_span(pass.name());
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("pass", pass.name().to_string())
+                    .with("nodes_before", nodes_before as u64)
+                    .with("values_before", values_before as u64),
+            );
+        }
         pass.run(graph, ctx)?;
         #[cfg(debug_assertions)]
         pass.postconditions(graph)?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("pass", pass.name().to_string())
+                    .with("nodes_before", nodes_before as u64)
+                    .with("nodes_after", graph.num_nodes() as u64)
+                    .with(
+                        "nodes_delta",
+                        graph.num_nodes() as i64 - nodes_before as i64,
+                    )
+                    .with("values_before", values_before as u64)
+                    .with("values_after", graph.values.len() as u64),
+            );
+        }
     }
     Ok(())
 }

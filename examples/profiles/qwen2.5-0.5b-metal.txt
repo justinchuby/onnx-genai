@@ -1,0 +1,38 @@
+── profile ──────────────────────────────────
+model                    models/qwen2.5-0.5b
+execution provider       metal
+model load                    600.3 ms
+prompt tokens                    40
+generated tokens                 48
+time to first token           690.3 ms
+generation wall time         1402.2 ms
+decode throughput             67.44 tok/s
+end-to-end throughput         34.23 tok/s
+inter-token latency      mean 14.8 / p50 14.7 / p90 15.3 / p99 17.5 / max 17.5 ms
+finish reason            MaxTokens
+kv page activity:
+  allocated                       6
+  freed                           6
+peak resident memory        5.4 GiB
+kv cache budget             5.4 GiB (233792 tokens)
+device memory breakdown:
+  model weights             1.8 GiB   25.7%
+  kv cache                  5.4 GiB   74.3%
+  kv pages                    14612 x 384.0 KiB
+  (activations and runtime overhead not yet measured by the engine)
+
+per-stage breakdown:
+stage                          total_ms      calls        us/call     us/token
+------------------------------------------------------------------------------
+ort.session_run                1395.835         49       28486.43     29079.90
+loop.step                      1386.952         48       28894.83     28894.83
+loop.next_logits               1386.496         48       28885.33     28885.33
+ort.bind_inputs                   1.986         49          40.53        41.37
+ort.extract_outputs               1.701         49          34.71        35.43
+ort.sampling                      0.888         48          18.50        18.50
+loop.commit_selected              0.414         48           8.62         8.62
+loop.detokenize                   0.348         48           7.24         7.24
+engine.kv_bookkeeping             0.304         48           6.33         6.33
+engine.logits_to_vec              0.132          1         132.17         2.75
+loop.commit_token                 0.025         48           0.53         0.53
+engine.ort_prepare_inputs         0.020         48           0.42         0.42

@@ -30,9 +30,10 @@ pub mod weight;
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
 pub use kernel::{
-    ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON, CaptureSupport, Cost, Kernel, KernelInput,
-    KernelMatch, KernelVariantSelection, ViewOutput, kernel_variant_tracing_enabled,
-    record_kernel_variant_selection, record_kernel_variant_stage_selection,
+    ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
+    CAT_KERNEL_WORKER, CaptureSupport, Cost, Kernel, KernelInput, KernelMatch,
+    KernelVariantSelection, ViewOutput, kernel_variant_tracing_enabled, kernel_worker_span,
+    record_kernel_metrics, record_kernel_variant_selection, record_kernel_variant_stage_selection,
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{

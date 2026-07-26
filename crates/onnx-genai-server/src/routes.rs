@@ -7,10 +7,13 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json,
-    extract::{Multipart, Path as AxumPath, State},
+    extract::{FromRequest, Multipart, Path as AxumPath, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
+use base64::Engine as _;
+use onnx_genai::text_to_audio::TextToAudioRequest;
+use onnx_genai::text_to_image::TextToImageRequest;
 use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
@@ -25,10 +28,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    driver::{
-        DriverEvent, EngineDriver, GenerateSubmitError, PipelineInputBundle, PipelineInputTensor,
-        PipelineTensor,
-    },
+    driver::{DriverEvent, EngineDriver, GenerateSubmitError},
+    multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
     sse::{
@@ -41,8 +42,9 @@ use crate::{
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
-        StopInput, ToolChoice, ToolChoiceMode, Usage,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
+        ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
+        SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -191,6 +193,25 @@ pub(crate) struct DebugTraceResponse {
     /// Discovery info for the Perfetto (Chrome Trace Event Format) export.
     perfetto_export: PerfettoExportInfo,
     otlp_export: &'static str,
+    /// Where to get stage totals instead of a full timeline.
+    aggregate_profile: &'static str,
+}
+
+/// Aggregate decode-stage costs for this process.
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugProfileResponse {
+    /// Whether stages are being accumulated at all.
+    collecting: bool,
+    note: &'static str,
+    stages: Vec<ProfileStage>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileStage {
+    stage: &'static str,
+    total_ms: f64,
+    calls: u64,
+    us_per_call: f64,
 }
 
 /// Discovery payload describing the downloadable Perfetto trace export.
@@ -320,6 +341,67 @@ impl ApiError {
             message: message.into(),
             retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
         }
+    }
+}
+
+/// JSON body extractor that reports rejections as OpenAI-shaped [`ApiError`]s.
+///
+/// Axum's stock `Json` rejection returns a 422 whose body is a bare
+/// "Failed to deserialize the JSON body into the target type: ..." string. That
+/// loses the what/why/how contract every user-facing failure owes the caller,
+/// so this wrapper re-frames the rejection — and passes through the detailed
+/// messages the multimodal content-part parser already produces.
+pub(crate) struct ApiJson<T>(pub(crate) T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
+        }
+    }
+}
+
+/// Drop serde's trailing " at line N column M", which points into a body the
+/// caller cannot see and only dilutes the actionable message.
+pub(crate) fn strip_serde_position(message: &str) -> &str {
+    match message.rfind(" at line ") {
+        Some(index) if message[index..].ends_with(char::is_numeric) => message[..index].trim_end(),
+        _ => message,
+    }
+}
+
+/// Turn an axum JSON rejection into an actionable message.
+fn describe_json_rejection(rejection: &JsonRejection) -> String {
+    let text = rejection.body_text();
+    // Content-part rejections are already what/why/how; surface them verbatim
+    // rather than burying them behind axum's generic prefix.
+    if let Some(start) = text.find("What: ") {
+        return strip_serde_position(&text[start..]).to_string();
+    }
+    match rejection {
+        JsonRejection::MissingJsonContentType(_) => {
+            "What: the request was rejected before parsing. \
+             Why: it did not declare `Content-Type: application/json`. \
+             How: send the header `Content-Type: application/json` with a JSON body."
+                .to_string()
+        }
+        JsonRejection::JsonSyntaxError(_) => format!(
+            "What: the request body could not be parsed as JSON. \
+             Why: {text}. \
+             How: send a well-formed JSON object."
+        ),
+        _ => format!(
+            "What: the request body did not match this endpoint's schema. \
+             Why: {text}. \
+             How: check the field names and types against the OpenAI API reference for this endpoint."
+        ),
     }
 }
 
@@ -545,6 +627,38 @@ pub(crate) async fn admin_set_vram_limit(
     Ok(Json(snapshot.into()))
 }
 
+/// `GET /v1/debug/profile` — where the server's decode time went.
+///
+/// The aggregate counterpart to the Perfetto export: a trace answers "what
+/// happened, when", which needs a viewer and a full timeline, while this answers
+/// "which stages cost what", which is the question you ask a running server.
+///
+/// Stages are whatever the active decode path recorded — `ort.*` under ONNX
+/// Runtime, `native.*` under the native runtime — so the shape of the answer
+/// follows the backend without this endpoint knowing which one is in use.
+/// Empty until `ONNX_GENAI_PROFILE` is set, and empty is reported as empty
+/// rather than fabricated.
+pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
+    let stages = onnx_genai_ort::profile::snapshot()
+        .into_iter()
+        .map(|stage| ProfileStage {
+            stage: stage.stage,
+            total_ms: stage.total_ns as f64 / 1e6,
+            calls: stage.calls,
+            us_per_call: if stage.calls > 0 {
+                (stage.total_ns as f64 / 1e3) / stage.calls as f64
+            } else {
+                0.0
+            },
+        })
+        .collect::<Vec<_>>();
+    Json(DebugProfileResponse {
+        collecting: onnx_genai_ort::profile::enabled(),
+        note: "Stage totals accumulate across every request this process has served. Run with ONNX_GENAI_PROFILE=1 to collect them.",
+        stages,
+    })
+}
+
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
     let latest_trace_id = crate::metrics::latest_trace_id();
     let recorded_events = onnx_genai_ort::profile::trace_event_count();
@@ -559,6 +673,7 @@ pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
             note: "GET the endpoint for a Chrome Trace Event Format document (open in https://ui.perfetto.dev). Run with ONNX_GENAI_TRACE set to collect decode spans.",
         },
         otlp_export: OTLP_EXPORT_STATUS,
+        aggregate_profile: "/v1/debug/profile",
     })
 }
 
@@ -772,7 +887,7 @@ pub(crate) async fn delete_session(
 pub(crate) async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    ApiJson(request): ApiJson<CompletionRequest>,
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     if handle.pipeline {
@@ -804,7 +919,7 @@ pub(crate) async fn completions(
 
 pub(crate) async fn embeddings(
     State(state): State<AppState>,
-    Json(request): Json<EmbeddingRequest>,
+    ApiJson(request): ApiJson<EmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_embedding_request(&request, &handle.tokenizer)?;
@@ -926,10 +1041,18 @@ pub(crate) async fn audio_transcriptions(
         ));
     }
     let spec = handle
-        .audio_input
+        .multimodal
         .as_ref()
-        .ok_or_else(|| ApiError::bad_request("this model does not support audio transcription"))?;
-    let input = crate::audio_input::preprocess_wav(&bytes, spec)
+        .and_then(|multimodal| multimodal.audio.as_ref())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "What: audio transcription was rejected for model '{}'. \
+                 Why: no component of its package declares an `input_features` audio input. \
+                 How: serve a speech package.",
+                handle.id
+            ))
+        })?;
+    let input = MultimodalInput::from_wav(spec, &bytes)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
     let max_tokens = spec
         .max_tokens
@@ -949,18 +1072,7 @@ pub(crate) async fn audio_transcriptions(
     let result = collect_generation_result(
         handle
             .engine
-            .generate_pipeline(
-                request,
-                Some(PipelineInputBundle {
-                    tensors: vec![PipelineTensor::Fp32(PipelineInputTensor {
-                        endpoint: input.endpoint,
-                        data: input.data,
-                        shape: input.shape,
-                        num_tiles: None,
-                    })],
-                    image_summaries: Vec::new(),
-                }),
-            )
+            .generate_pipeline(request, Some(input))
             .await
             .map_err(map_generate_submit_error)?,
     )
@@ -1208,10 +1320,205 @@ async fn stream_completion(
     Ok(Sse::new(ReceiverStream::new(rx)))
 }
 
+/// `POST /v1/images/generations` — OpenAI-compatible text-to-image.
+///
+/// Renders through the model package's own declared denoise loop; the sampler,
+/// scheduler, and component wiring all come from its metadata. Only
+/// `b64_json` is offered because this server stores nothing and therefore has
+/// no URL to hand back.
+/// `POST /v1/audio/speech` — OpenAI-compatible text-to-speech.
+///
+/// Synthesizes through the package's own declared vocoder stage and returns the
+/// audio bytes directly, as OpenAI does. Only container formats this server can
+/// encode are offered; a compressed format is refused rather than silently
+/// substituted, because a caller that asked for MP3 must not receive WAV under
+/// an MP3 content type.
+pub(crate) async fn audio_speech(
+    State(_state): State<AppState>,
+    ApiJson(request): ApiJson<SpeechRequest>,
+) -> Result<Response, ApiError> {
+    let handle = resolve_model(&_state.registry, &request.model).await?;
+    if !handle.text_to_audio {
+        return Err(ApiError::bad_request(format!(
+            "What: speech synthesis was rejected for model '{}'. \
+             Why: its package declares no waveform stage (a `run_on: final_only` component fed by an autoregressive decoder), so it cannot produce audio. \
+             How: serve a text-to-speech package, or call /v1/chat/completions for text.",
+            handle.id
+        )));
+    }
+    if request.input.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "What: an empty `input` was rejected. \
+             Why: there is nothing to speak. \
+             How: send the text to synthesize in `input`.",
+        ));
+    }
+    let format = request.response_format.unwrap_or_default();
+    let content_type = format.content_type().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "What: response_format \"{}\" was rejected. \
+             Why: this server encodes only uncompressed audio, and returning WAV under an {} content type would mislabel the body. \
+             How: request response_format \"wav\" or \"pcm\".",
+            format.label(),
+            format.label()
+        ))
+    })?;
+    if let Some(speed) = request.speed
+        && (speed - 1.0).abs() > f32::EPSILON
+    {
+        return Err(ApiError::bad_request(format!(
+            "What: speed {speed} was rejected. \
+             Why: this server does not resample synthesized audio, so it cannot change playback rate. \
+             How: omit `speed`, or resample the returned audio yourself."
+        )));
+    }
+
+    let synthesis_request = TextToAudioRequest {
+        text: request.input.clone(),
+        max_new_tokens: request.max_tokens,
+        temperature: request.temperature,
+        seed: request.seed,
+        sample_rate: request.sample_rate,
+    };
+    let audio = handle
+        .engine
+        .synthesize_speech(handle.tokenizer.clone(), synthesis_request)
+        .await
+        .map_err(map_generate_submit_error)?
+        .map_err(|error| ApiError::bad_request(format!("speech synthesis failed: {error:#}")))?;
+
+    let body = match format {
+        SpeechResponseFormat::Pcm => audio.to_pcm16(),
+        _ => audio
+            .to_wav()
+            .map_err(|error| ApiError::internal(format!("audio encoding failed: {error:#}")))?,
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            // The rate is not in the body for raw PCM, so advertise it.
+            (
+                header::HeaderName::from_static("x-sample-rate"),
+                audio.sample_rate.to_string(),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+pub(crate) async fn image_generations(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<ImageGenerationRequest>,
+) -> Result<Response, ApiError> {
+    let handle = resolve_model(&state.registry, &request.model).await?;
+    if !handle.text_to_image {
+        return Err(ApiError::bad_request(format!(
+            "What: image generation was rejected for model '{}'. \
+             Why: its package declares no denoise loop (`pipeline.strategy.denoiser`), so it cannot produce images. \
+             How: serve a diffusion package, or call /v1/chat/completions for text.",
+            handle.id
+        )));
+    }
+    if let Some(ImageResponseFormat::Url) = request.response_format {
+        return Err(ApiError::bad_request(
+            "What: response_format \"url\" was rejected. \
+             Why: this server does not host generated images, so it has no URL to return. \
+             How: request response_format \"b64_json\" and decode the base64 PNG yourself.",
+        ));
+    }
+    let count = request.n.unwrap_or(1);
+    // The bound is the renderer's policy, so the CLI and this endpoint agree.
+    onnx_genai::text_to_image::validate_batch_size(count)
+        .map_err(|error| ApiError::bad_request(format!("{error:#} (field: n)")))?;
+    let (width, height) = parse_image_size(request.size.as_deref())?;
+    // Bounded before anything is allocated: size and steps are caller-supplied.
+    onnx_genai::text_to_image::validate_image_size(width, height)
+        .map_err(|error| ApiError::bad_request(format!("{error:#} (field: size)")))?;
+    if let Some(steps) = request.steps {
+        onnx_genai::text_to_image::validate_steps(steps)
+            .map_err(|error| ApiError::bad_request(format!("{error:#} (field: steps)")))?;
+    }
+
+    let render_request = TextToImageRequest {
+        prompt: request.prompt.clone(),
+        negative_prompt: request.negative_prompt.clone().unwrap_or_default(),
+        steps: request.steps,
+        guidance_scale: request.guidance_scale,
+        start_step: None,
+        seed: request.seed.unwrap_or(0),
+        width,
+        height,
+        batch_size: count,
+        tokenizer_path: None,
+        text_encoder_path: None,
+        vae_decoder: None,
+    };
+    let images = handle
+        .engine
+        .render_images(handle.model_dir.clone(), render_request)
+        .await
+        .map_err(map_generate_submit_error)?
+        .map_err(|error| ApiError::bad_request(format!("image generation failed: {error:#}")))?;
+
+    let data = images
+        .iter()
+        .map(|image| encode_png_base64(image).map(|b64_json| ImageData { b64_json }))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error: anyhow::Error| {
+            ApiError::internal(format!("image encoding failed: {error:#}"))
+        })?;
+    if data.is_empty() {
+        return Err(ApiError::internal(
+            "What: image generation returned nothing. \
+             Why: the pipeline produced fewer images than the requested batch. \
+             How: retry with n=1, or report this as a pipeline output-shape bug.",
+        ));
+    }
+
+    Ok(Json(ImageGenerationResponse {
+        created: now_unix(),
+        data,
+    })
+    .into_response())
+}
+
+/// Parse OpenAI's `"<width>x<height>"` size, defaulting to 512x512.
+fn parse_image_size(size: Option<&str>) -> Result<(usize, usize), ApiError> {
+    const DEFAULT_SIDE: usize = 512;
+    let Some(size) = size
+        .map(str::trim)
+        .filter(|size| !size.is_empty() && *size != "auto")
+    else {
+        return Ok((DEFAULT_SIDE, DEFAULT_SIDE));
+    };
+    let reject = || {
+        ApiError::bad_request(format!(
+            "What: size \"{size}\" was rejected. \
+             Why: it is not a \"<width>x<height>\" pair of positive integers. \
+             How: send a size such as \"512x512\" or \"768x512\", or omit it for 512x512."
+        ))
+    };
+    let (width, height) = size.split_once(['x', 'X']).ok_or_else(reject)?;
+    let width: usize = width.trim().parse().map_err(|_| reject())?;
+    let height: usize = height.trim().parse().map_err(|_| reject())?;
+    if width == 0 || height == 0 {
+        return Err(reject());
+    }
+    Ok((width, height))
+}
+
+/// Encode one rendered image as a base64 PNG.
+fn encode_png_base64(image: &onnx_genai::text_to_image::RenderedImage) -> anyhow::Result<String> {
+    let mut png = Vec::new();
+    onnx_genai::text_to_image::write_png(image, &mut png)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
 pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    ApiJson(request): ApiJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     let handle = resolve_model(&state.registry, &request.model).await?;
     validate_request(&request, &state.config)?;
@@ -1223,36 +1530,16 @@ pub(crate) async fn chat_completions(
     }
     let image_urls = request.image_urls();
     let input_audio = request.input_audio();
-    if !image_urls.is_empty() && !input_audio.is_empty() {
-        return Err(ApiError::bad_request(
-            "image and audio inputs cannot be combined in one request",
-        ));
-    }
-    if input_audio.len() > 1 {
-        return Err(ApiError::bad_request(
-            "only one input_audio content part is supported per request",
-        ));
-    }
-    if !image_urls.is_empty() && !handle.pipeline {
-        return Err(ApiError::bad_request(
-            "this model does not support image input",
-        ));
-    }
-    if !image_urls.is_empty() && handle.vision_input.is_none() {
-        return Err(ApiError::bad_request(
-            "this pipeline model does not support image input",
-        ));
-    }
-    if !input_audio.is_empty() && !handle.pipeline {
-        return Err(ApiError::bad_request(
-            "this model does not support audio input",
-        ));
-    }
-    if !input_audio.is_empty() && handle.audio_input.is_none() {
-        return Err(ApiError::bad_request(
-            "this pipeline model does not support audio input",
-        ));
-    }
+    // One admission policy, shared with the CLI, so both front ends accept and
+    // reject the same inputs with the same explanation.
+    crate::multimodal::admit_attachments(
+        handle.multimodal.as_ref(),
+        &format!("model '{}'", handle.id),
+        image_urls.len(),
+        input_audio.len(),
+    )
+    .map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+
     if request.stream {
         Ok(
             stream_chat_completion(state, handle, request, session_id, image_urls, input_audio)
@@ -1282,11 +1569,13 @@ async fn run_chat_completion(
         .logprobs
         .then_some(request.top_logprobs.unwrap_or(0));
     let tokenizer = handle.tokenizer.clone();
+    let placeholder = positional_image_placeholder(&request, &handle);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
         handle.chat_template.as_deref(),
         client_session_id.is_some(),
+        placeholder.as_deref(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -1297,8 +1586,9 @@ async fn run_chat_completion(
             preprocess_chat_images(
                 &image_urls,
                 handle
-                    .vision_input
+                    .multimodal
                     .as_ref()
+                    .and_then(|multimodal| multimodal.vision.as_ref())
                     .expect("vision input checked before generation"),
                 &mut prepared,
                 handle.model_max_context,
@@ -1432,11 +1722,13 @@ async fn stream_chat_completion(
         .clone()
         .map(StopInput::into_texts)
         .unwrap_or_default();
+    let placeholder = positional_image_placeholder(&request, &handle);
     let mut prepared = prepare_generate_request(
         &request,
         &handle.tokenizer,
         handle.chat_template.as_deref(),
         client_session_id.is_some(),
+        placeholder.as_deref(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -1447,8 +1739,9 @@ async fn stream_chat_completion(
             preprocess_chat_images(
                 &image_urls,
                 handle
-                    .vision_input
+                    .multimodal
                     .as_ref()
+                    .and_then(|multimodal| multimodal.vision.as_ref())
                     .expect("vision input checked before generation"),
                 &mut prepared,
                 handle.model_max_context,
@@ -1672,77 +1965,44 @@ pub(crate) async fn collect_generation_result(
 fn preprocess_chat_audio(
     input: &InputAudio,
     handle: &ModelHandle,
-) -> Result<PipelineInputBundle, ApiError> {
+) -> Result<MultimodalInput, ApiError> {
     let bytes = crate::audio_input::decode_chat_audio(input)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
     let spec = handle
-        .audio_input
+        .multimodal
         .as_ref()
+        .and_then(|multimodal| multimodal.audio.as_ref())
         .expect("audio input checked before generation");
-    let input = crate::audio_input::preprocess_wav(&bytes, spec)
-        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))?;
-    Ok(PipelineInputBundle {
-        tensors: vec![PipelineTensor::Fp32(PipelineInputTensor {
-            endpoint: input.endpoint,
-            shape: input.shape,
-            data: input.data,
-            num_tiles: None,
-        })],
-        image_summaries: Vec::new(),
-    })
+    MultimodalInput::from_wav(spec, &bytes)
+        .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))
 }
 
 async fn preprocess_chat_images(
     image_urls: &[String],
-    spec: &crate::image_input::VisionInputSpec,
+    spec: &crate::multimodal::VisionInputSpec,
     prepared: &mut PreparedGenerateRequest,
     model_max_context: Option<usize>,
     max_tokens: usize,
-) -> Result<PipelineInputBundle, ApiError> {
-    let context_prompt_limit = model_max_context
-        .map(|max_context| {
-            max_context.checked_sub(max_tokens).ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "What: image request cannot fit within the model context. \
-                     Why: max_tokens ({max_tokens}) already exceeds the model context limit ({max_context}) before prompt and image tokens are counted. \
-                     How: reduce max_tokens below the model context limit."
-                ))
-            })
-        })
-        .transpose()?
-        .unwrap_or(crate::image_input::MAX_EXPANDED_PROMPT_TOKENS);
+) -> Result<MultimodalInput, ApiError> {
     let max_prompt_tokens =
-        context_prompt_limit.min(crate::image_input::MAX_EXPANDED_PROMPT_TOKENS);
-    let bundle = crate::image_input::load_and_preprocess(image_urls, spec)
+        crate::multimodal::expansion_token_budget(model_max_context, max_tokens)
+            .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
+    let images = crate::image_input::fetch_images(image_urls)
         .await
         .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
-    let token_ids = match &prepared.request.prompt {
-        GeneratePrompt::TokenIds(token_ids) => token_ids,
-        GeneratePrompt::Text(_) => {
-            return Err(ApiError::internal(
-                "What: image placeholder expansion received an untokenized prompt. Why: the server preprocessing order was violated. How: tokenize before preprocessing and expansion.",
-            ));
-        }
+    let GeneratePrompt::TokenIds(mut token_ids) = std::mem::replace(
+        &mut prepared.request.prompt,
+        GeneratePrompt::TokenIds(Vec::new()),
+    ) else {
+        return Err(ApiError::internal(
+            "What: image placeholder expansion received an untokenized prompt. Why: the server preprocessing order was violated. How: tokenize before preprocessing and expansion.",
+        ));
     };
-    let expanded = spec
-        .expand_prompt(token_ids, &bundle, max_prompt_tokens)
+    let input = MultimodalInput::from_images(spec, &images, &mut token_ids, max_prompt_tokens)
         .map_err(|err| ApiError::bad_request(format!("invalid image input: {err:#}")))?;
-    prepared.prompt_tokens = expanded.len();
-    prepared.request.prompt = GeneratePrompt::TokenIds(expanded);
-    Ok(PipelineInputBundle {
-        tensors: bundle
-            .tensors
-            .into_iter()
-            .map(|tensor| PipelineTensor::Typed {
-                endpoint: tensor.endpoint,
-                expected_dtype: tensor.expected_dtype,
-                expected_shape: tensor.expected_shape,
-                shape: tensor.shape,
-                data: tensor.data,
-            })
-            .collect(),
-        image_summaries: bundle.images,
-    })
+    prepared.prompt_tokens = token_ids.len();
+    prepared.request.prompt = GeneratePrompt::TokenIds(token_ids);
+    Ok(input)
 }
 
 fn prepare_audio_generate_request(
@@ -1764,26 +2024,8 @@ fn audio_decoder_prompt(
     tokenizer: &Tokenizer,
     language: Option<&str>,
 ) -> Result<Vec<u32>, ApiError> {
-    let mut token_ids = vec![
-        tokenizer
-            .token_id("<|startoftranscript|>")
-            .or_else(|| tokenizer.eos_token_id())
-            .unwrap_or(0),
-    ];
-    if let Some(language) = language.filter(|value| !value.is_empty()) {
-        let token = format!("<|{}|>", language.to_ascii_lowercase());
-        token_ids.push(tokenizer.token_id(&token).ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "language '{language}' is not supported by this model tokenizer"
-            ))
-        })?);
-    }
-    for token in ["<|transcribe|>", "<|notimestamps|>"] {
-        if let Some(token_id) = tokenizer.token_id(token) {
-            token_ids.push(token_id);
-        }
-    }
-    Ok(token_ids)
+    crate::multimodal::audio_decoder_prompt(tokenizer, language)
+        .map_err(|error| ApiError::bad_request(format!("{error:#}")))
 }
 
 fn validate_request(
@@ -2102,16 +2344,52 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
     options
 }
 
+/// The text spelling of this model's image placeholder, if it declares one.
+///
+/// Decoded from the declared token id rather than hardcoded, so the prompt
+/// carries whatever token this package actually uses. It re-tokenizes to the
+/// same id because a placeholder is always a distinct vocabulary entry.
+pub(crate) fn image_placeholder_text(handle: &ModelHandle) -> Option<String> {
+    let token = handle
+        .multimodal
+        .as_ref()
+        .and_then(|multimodal| multimodal.vision.as_ref())
+        .and_then(|vision| vision.placeholder_token_id())?;
+    handle.tokenizer.decode_with_special_tokens(&[token]).ok()
+}
+
+/// The placeholder to render at each image part's position, or `None` when the
+/// request positions its images some other way.
+///
+/// A caller who writes the placeholder into the text has already said where the
+/// images go; rendering another one per image part would double the count and
+/// the request would be rejected. So a hand-written placeholder wins, and
+/// automatic positioning applies only when the text contains none.
+fn positional_image_placeholder(
+    request: &ChatCompletionRequest,
+    handle: &ModelHandle,
+) -> Option<String> {
+    let placeholder = image_placeholder_text(handle)?;
+    let already_positioned = request.messages.iter().any(|message| {
+        message
+            .content
+            .as_ref()
+            .is_some_and(|content| content.render(None).contains(&placeholder))
+    });
+    (!already_positioned).then_some(placeholder)
+}
+
 fn prepare_generate_request(
     request: &ChatCompletionRequest,
     tokenizer: &Tokenizer,
     chat_template: Option<&ChatTemplate>,
     session: bool,
+    image_placeholder: Option<&str>,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
-        build_session_prompt(&request.messages)
+        build_session_prompt(&request.messages, image_placeholder)
     } else {
-        render_prompt(request, chat_template)?
+        render_prompt(request, chat_template, image_placeholder)?
     };
     let token_ids = tokenizer
         .encode(&prompt)
@@ -2250,17 +2528,18 @@ fn tools_offered_to_model(request: &ChatCompletionRequest) -> Option<&Vec<ChatTo
     request.tools.as_ref().filter(|tools| !tools.is_empty())
 }
 
-fn build_session_prompt(messages: &[ChatMessage]) -> String {
+fn build_session_prompt(messages: &[ChatMessage], image_placeholder: Option<&str>) -> String {
     messages
         .last()
         .and_then(|message| message.content.as_ref())
-        .map(ChatMessageContent::text)
+        .map(|content| content.render(image_placeholder))
         .unwrap_or_default()
 }
 
 fn render_prompt(
     request: &ChatCompletionRequest,
     chat_template: Option<&ChatTemplate>,
+    image_placeholder: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(chat_template) = chat_template {
         let messages = request
@@ -2272,7 +2551,7 @@ fn render_prompt(
                     message
                         .content
                         .as_ref()
-                        .map(ChatMessageContent::text)
+                        .map(|content| content.render(image_placeholder))
                         .unwrap_or_default(),
                 );
                 if let Some(tool_calls) = &message.tool_calls {

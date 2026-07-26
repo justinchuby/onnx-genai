@@ -1232,7 +1232,10 @@ mod tests {
             -1
         };
         eprintln!("selected f32 GEMM kernel id = {id}; expected {expected} for host ISA");
-        assert_eq!(id, expected, "MLAS f32 GEMM dispatch did not match host ISA");
+        assert_eq!(
+            id, expected,
+            "MLAS f32 GEMM dispatch did not match host ISA"
+        );
     }
 
     /// Single-thread performance probe for the medium f32 MatMul shape

@@ -240,7 +240,10 @@ async fn two_images_follow_prompt_order() {
 }
 
 #[tokio::test]
-async fn missing_placeholder_has_what_why_how_error() {
+async fn a_prompt_that_writes_no_placeholder_has_the_image_positioned_for_it() {
+    // The placeholder spelling is the package's private business, so a caller
+    // who writes none still gets a working request: the image part is rendered
+    // where it was written.
     let fixture = FixtureDir::new(64);
     let (status, body) = chat(
         &fixture,
@@ -252,12 +255,11 @@ async fn missing_placeholder_has_what_why_how_error() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_structured_error(&body, "placeholder");
+    assert_eq!(status, StatusCode::OK, "{body:#}");
 }
 
 #[tokio::test]
-async fn wrong_image_count_has_what_why_how_error() {
+async fn a_hand_written_placeholder_that_undercounts_the_images_is_rejected() {
     let fixture = FixtureDir::new(64);
     let (status, body) = chat(
         &fixture,
@@ -270,8 +272,11 @@ async fn wrong_image_count_has_what_why_how_error() {
     )
     .await;
 
+    // Writing the placeholder yourself means you positioned the images; one
+    // placeholder for two images leaves the second one homeless, and guessing
+    // where it belongs would silently change what the sentence refers to.
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_structured_error(&body, "count mismatch");
+    assert_structured_error(&body, "do not match the 2 image(s)");
 }
 
 #[tokio::test]

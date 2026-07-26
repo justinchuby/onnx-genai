@@ -608,6 +608,22 @@ impl AttentionKernel {
             AttentionMode::Fused => fused_supported,
             AttentionMode::Phase2a => false,
         };
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let score_elements = (batch as u64)
+                .saturating_mul(self.num_heads as u64)
+                .saturating_mul(sq as u64)
+                .saturating_mul(sk as u64);
+            let qk_flops = score_elements.saturating_mul(d as u64).saturating_mul(2);
+            let pv_flops = score_elements.saturating_mul(d as u64).saturating_mul(2);
+            let softmax_flops = score_elements.saturating_mul(4).saturating_add(
+                (batch as u64)
+                    .saturating_mul(self.num_heads as u64)
+                    .saturating_mul(sq as u64),
+            );
+            qk_flops
+                .saturating_add(pv_flops)
+                .saturating_add(softmax_flops)
+        });
         if use_fused {
             flash_attention::run(
                 &self.runtime,

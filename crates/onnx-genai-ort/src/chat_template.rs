@@ -121,6 +121,15 @@ impl ChatMessage {
 }
 
 impl ChatTemplate {
+    /// The template source this model ships.
+    ///
+    /// Exposed so a front end can read the conventions a package declares —
+    /// reasoning delimiters, for instance — from the model's own data rather
+    /// than inferring them from its name.
+    pub fn source(&self) -> &str {
+        &self.template
+    }
+
     /// A `ChatTemplate` backed by the built-in default (`DEFAULT_CHAT_TEMPLATE`).
     ///
     /// Model-independent — needs no model directory. Rendering this template is

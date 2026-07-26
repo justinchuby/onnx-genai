@@ -186,6 +186,81 @@ impl KernelVariantSelection {
 pub const ARG_KERNEL_VARIANT: &str = "kernel_variant";
 /// Trace-argument key carrying why the kernel variant was selected.
 pub const ARG_KERNEL_VARIANT_REASON: &str = "kernel_variant_reason";
+/// Trace-argument key naming the device a kernel ran on (`cpu`, `cuda`, ...).
+pub const ARG_DEVICE: &str = "device";
+/// Trace-argument key carrying bytes moved by a kernel (inputs plus outputs).
+pub const ARG_BYTES: &str = "bytes";
+/// Trace-argument key carrying a kernel's floating-point operation count.
+pub const ARG_FLOPS: &str = "flops";
+/// Trace category for a span covering one worker's slice of a fanned-out node.
+pub const CAT_KERNEL_WORKER: &str = "op.worker";
+
+/// Record the standard per-kernel metrics on the active executor op-span.
+///
+/// This is the one implementation every execution provider shares, so a trace
+/// means the same thing whichever provider produced it: `device` names where
+/// the kernel ran, `bytes` is inputs plus outputs (absent inputs excluded), and
+/// `flops` is the provider's own estimate. Providers previously each owned a
+/// private copy of this, which is how the CUDA provider ended up recording
+/// nothing at all.
+///
+/// `flops` is a closure so the estimate is never computed on the untraced path.
+#[inline]
+pub fn record_kernel_metrics(
+    device: &'static str,
+    inputs: &[TensorView<'_>],
+    outputs: &[TensorMut<'_>],
+    flops: impl FnOnce() -> u64,
+) {
+    if !kernel_variant_tracing_enabled() {
+        return;
+    }
+    onnx_runtime_tracer::annotate_current_span_with(|| {
+        let input_bytes = inputs
+            .iter()
+            .filter(|input| !input.is_absent())
+            .fold(0_u64, |total, input| {
+                total.saturating_add(input.byte_size() as u64)
+            });
+        let bytes = outputs.iter().fold(input_bytes, |total, output| {
+            total.saturating_add(output.byte_size() as u64)
+        });
+        onnx_runtime_tracer::Args::new()
+            .with(ARG_DEVICE, device)
+            .with(ARG_BYTES, bytes)
+            .with(ARG_FLOPS, flops())
+    });
+}
+
+/// Open a span covering one worker's slice of a node that was fanned out across
+/// a thread pool or stream, returning `None` when it should not be recorded.
+///
+/// The executor's op-span lives on the thread that dispatched the node, and
+/// thread-local span state does not follow work onto a pool's threads. A worker
+/// must therefore open its own span, which is what this does: it lands on that
+/// worker's own trace lane and shows the parallel decomposition that the single
+/// op-span flattens away.
+///
+/// Two things keep this affordable. It is gated at [`TraceVerbosity::Full`], so
+/// the default op-level trace is unaffected; and a span costs a few hundred
+/// nanoseconds, which is noise against a slice of a node but *not* against an
+/// inner loop iteration. **Wrap a worker's whole chunk of work, never an inner
+/// loop.**
+///
+/// `label` should identify the partitioned work (typically the op type), not
+/// the worker: the worker is already identified by the lane the span lands on.
+#[must_use]
+#[inline]
+pub fn kernel_worker_span(label: &'static str) -> Option<onnx_runtime_tracer::SpanGuard> {
+    let context = onnx_runtime_tracer::global_context()?;
+    if !context
+        .verbosity()
+        .includes(onnx_runtime_tracer::TraceVerbosity::Full)
+    {
+        return None;
+    }
+    Some(context.span(label, CAT_KERNEL_WORKER))
+}
 
 /// Whether kernel-variant trace annotations would currently be recorded.
 ///
@@ -657,5 +732,42 @@ mod tests {
 
         kernel.execute_with_inputs(&inputs, &mut []).unwrap();
         assert!(called.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod trace_standard_tests {
+    use super::*;
+    use onnx_runtime_tracer::{TraceContext, TraceVerbosity, set_global_context};
+
+    /// Worker spans are the expensive tier and must stay off unless asked for.
+    #[test]
+    fn worker_span_is_gated_on_full_verbosity() {
+        set_global_context(None);
+        assert!(
+            kernel_worker_span("probe").is_none(),
+            "a worker span opened with no ambient context installed"
+        );
+
+        let (context, _collector) = TraceContext::in_memory();
+        set_global_context(Some(context.with_verbosity(TraceVerbosity::Ops)));
+        assert!(
+            kernel_worker_span("probe").is_none(),
+            "a worker span opened at Ops verbosity, which would put the \
+             per-worker cost on every ordinary traced run"
+        );
+
+        let (context, collector) = TraceContext::in_memory();
+        set_global_context(Some(context.with_verbosity(TraceVerbosity::Full)));
+        {
+            let span = kernel_worker_span("probe");
+            assert!(span.is_some(), "no worker span at Full verbosity");
+        }
+        let events = collector.events();
+        assert_eq!(events.len(), 1, "expected exactly one recorded worker span");
+        assert_eq!(events[0].cat, CAT_KERNEL_WORKER);
+        assert_eq!(events[0].name, "probe");
+
+        set_global_context(None);
     }
 }

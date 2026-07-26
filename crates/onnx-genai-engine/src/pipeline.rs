@@ -1,21 +1,29 @@
 //! Multi-model pipeline orchestrator.
 
 use crate::decode::{
-    DecodeState, clone_value, extract_next_token_logits_with_io, is_present_output,
-    run_decode_step_with_extra,
+    DecodeState, apply_paged_sliding_window, clone_value, extract_next_token_logits_with_io,
+    is_present_output, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
     Engine, EngineConfig, model_requires_native_backend, requested_decode_backend,
     resolved_host_ram_budget,
 };
-use crate::kv_bridge::infer_kv_model_info;
+use crate::kv_bridge::{
+    KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
+    mirror_present_kv_to_pages, sequence_pages_for_len,
+};
 use crate::logits::TokenId;
+use crate::pipeline_cache::{
+    ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
+    RetainedContext, absorb_value, digest_named_values, graph_is_deterministic, prefix_key,
+};
 use crate::processors::build_processor_chain;
 use crate::{
     EngineDecodeBackend, GeneratePrompt, GenerateRequest, GenerateResult, GenerateTokenCallback,
 };
 use anyhow::Context;
+use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
     AbsentInputKind, DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy,
     PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, TensorDimension,
@@ -23,6 +31,7 @@ use onnx_genai_metadata::{
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -142,6 +151,45 @@ pub struct PipelineEngine {
     decoder_state: Option<DecodeState>,
     tokenizer_component: String,
     fixed_state_budget_bytes: u64,
+    /// Memoized prompt-phase component outputs, so a repeated attachment does
+    /// not re-run its encoder. Behind a `RefCell` because the prompt phase runs
+    /// from `&self` paths (single-pass, iterative) as well as `&mut self` ones.
+    component_cache: RefCell<ComponentOutputCache>,
+    /// Components whose graphs contain only deterministic operators, and whose
+    /// outputs may therefore be memoized. Computed once at load.
+    memoizable_components: BTreeSet<String>,
+    /// Decoder KV left over from the previous generation, and the identity of
+    /// the prompt and attachments that produced it.
+    ///
+    /// Only used when the decoder's KV cannot be paged; the paged cache below
+    /// supersedes it, because it holds many prefixes instead of one.
+    retained: Option<RetainedContext>,
+    /// Paged KV for the decoder, when its `present.*` outputs describe a layout
+    /// the page table can address.
+    paged: Option<PipelinePagedKv>,
+}
+
+/// Paged KV storage for an autoregressive pipeline decoder.
+///
+/// This is the same machinery the single-model engine uses, which is the point:
+/// pages are reference-counted, so several conversations that open with the same
+/// system prompt hold *one* copy of its KV between them rather than one each.
+/// A single retained context can only ever serve whoever spoke last.
+struct PipelinePagedKv {
+    kv_model: KvModelInfo,
+    cache: PagedKvCache,
+    /// Sequence claimed for the generation in flight.
+    ///
+    /// A generation can fail at any `?` between claiming a sequence and
+    /// publishing it, and an abandoned sequence keeps its pages referenced
+    /// forever. Recording it here means the next admission — or the explicit
+    /// discard on the error path — can always find and free it.
+    active: Option<SequenceId>,
+    /// Radix trie over prefix keys. The keys are not bare prompts: each carries
+    /// a digest of the request's attachments ahead of its tokens, because image
+    /// expansion makes different pictures produce identical token sequences and
+    /// a bare-token key would hand one image's KV to another.
+    prefix: PrefixCache,
 }
 
 /// The concrete backend a pipeline runs on. A pipeline never mixes backends:
@@ -245,6 +293,27 @@ fn build_native_pipeline_components(
     Ok(components)
 }
 
+/// Components whose graphs contain only deterministic operators.
+///
+/// Read once at load, because a component's declared phase says when it runs,
+/// never that it is pure — a graph with `RandomNormal` in it would otherwise be
+/// memoized and hand back the same draw forever. A model that cannot be read or
+/// parsed is simply left out: declining to cache is always safe, and refusing to
+/// load a pipeline over a cache optimization would not be.
+fn deterministic_components(directory: &PipelineModelDirectory) -> BTreeSet<String> {
+    directory
+        .model_paths
+        .iter()
+        .filter(|(_, path)| {
+            onnx_runtime_loader::read_model_binary(path)
+                .ok()
+                .and_then(|bytes| onnx_runtime_loader::proto::decode_model(&bytes).ok())
+                .is_some_and(|model| graph_is_deterministic(&model))
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 impl Engine {
     /// Load a metadata-declared pipeline directory.
     ///
@@ -278,6 +347,26 @@ impl PipelineEngine {
         Self::from_dir_with_schedulers(pipeline_dir, config, &SchedulerRegistry::builtin())
     }
 
+    /// Load a pipeline with explicit session options, chiefly to pin the
+    /// execution provider.
+    ///
+    /// [`SessionOptions::default`] resolves the provider from the process
+    /// environment, which is read once and cached; a caller that wants to choose
+    /// a provider *after* startup — an interactive session switching devices —
+    /// has to pass one in instead.
+    pub fn from_dir_with_session_options(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            pipeline_dir,
+            config,
+            &SchedulerRegistry::builtin(),
+            session_options,
+        )
+    }
+
     /// Load a pipeline with a **custom [`SchedulerRegistry`]**, so a user can
     /// plug in their own [`Scheduler`] implementations (referenced by
     /// `scheduler_config.kind` in the pipeline metadata) alongside the built-in
@@ -286,6 +375,15 @@ impl PipelineEngine {
         pipeline_dir: &Path,
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
+    ) -> anyhow::Result<Self> {
+        Self::build(pipeline_dir, config, schedulers, SessionOptions::default())
+    }
+
+    fn build(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        schedulers: &SchedulerRegistry,
+        session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
         let decode_backend = requested_decode_backend(config.decode_backend)?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
@@ -317,12 +415,14 @@ impl PipelineEngine {
                 return Err(build_native_pipeline_and_report_gap(&directory, &config));
             }
         }
-        let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
+        let models = PipelineModels::load_with_options(pipeline_dir, session_options)
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
+        let memoizable_components = deterministic_components(&models.directory);
         // Only autoregressive pipelines drive a token-by-token decode loop and
         // therefore need a `DecodeState` + KV model info. Single-pass and
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
+        let mut paged: Option<PipelinePagedKv> = None;
         let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
@@ -332,6 +432,22 @@ impl PipelineEngine {
                     infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
                 let fixed_state_budget_bytes =
                     resolved_host_ram_budget(&config, kv_model.as_ref())?;
+                // A zero page size makes `div_ceil` panic and the page-boundary
+                // walk below produce zeros forever, so it is refused rather than
+                // carried into arithmetic that assumes it is positive.
+                paged = kv_model
+                    .filter(|kv_model| kv_model.tensor_config.page_size > 0)
+                    .map(|kv_model| PipelinePagedKv {
+                        cache: PagedKvCache::new_with_layer_tensor_configs(
+                            kv_model.tensor_config.page_size,
+                            kv_model.tensor_config.dtype,
+                            kv_model.layer_configs.clone(),
+                            config.num_gpu_pages,
+                        ),
+                        kv_model,
+                        prefix: PrefixCache::new(),
+                        active: None,
+                    });
                 let decoder_io = models
                     .directory
                     .spec
@@ -377,6 +493,12 @@ impl PipelineEngine {
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,
+            component_cache: RefCell::new(ComponentOutputCache::new(
+                usize::try_from(config.pipeline_cache_bytes).unwrap_or(usize::MAX),
+            )),
+            memoizable_components,
+            retained: None,
+            paged,
         })
     }
 
@@ -512,6 +634,22 @@ impl PipelineEngine {
             self.models.directory.spec.vision.as_ref(),
         )?;
 
+        // Decide how much of the previous turn's decoder KV this prompt can
+        // keep before anything is rebuilt, because the answer decides whether
+        // the decode state is recreated or carried over.
+        let inputs_digest = Self::digest_request_identity(&pipeline_request);
+        // The paged cache supersedes the single retained context wherever it is
+        // available: it holds many prefixes rather than only the last one.
+        let paged_enabled = self.paged.is_some() && inputs_digest.is_some();
+        let reused = if paged_enabled {
+            0
+        } else {
+            self.reusable_prefix_len(inputs_digest, &prompt_tokens)
+        };
+        // Any failure below leaves the decoder KV in an unknown state, so the
+        // retention is dropped now and only re-established on success.
+        self.retained = None;
+
         let mut tensors = self.prepare_request_tensors(pipeline_request.inputs, &present)?;
         // Seed the prompt token ids into the shared pool so a prompt-phase
         // component that consumes `input_ids` (e.g. a text encoder) can run.
@@ -534,26 +672,51 @@ impl PipelineEngine {
         // used to enumerate graph ports is released first.
         let step_bindings = self.build_step_bindings(&ar.step_components, &present)?;
 
-        let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
-        self.decoder_state = Some({
+        // A decoder whose position ids arrive over a dataflow edge receives one
+        // tensor covering the whole prompt. Prefilling only a suffix would hand
+        // it positions for tokens it is not being given, so such a pipeline
+        // recomputes rather than reuses.
+        let reused = if reused > 0 && self.decoder_positions_are_routed(&decoder_in_edges) {
+            0
+        } else {
+            reused
+        };
+
+        let positions_routed = self.decoder_positions_are_routed(&decoder_in_edges);
+        // A paged sequence starts from a fresh decode state, because the shared
+        // prefix is loaded into it wholesale rather than carried over.
+        let mut paged_session = None;
+        let mut reused = reused;
+        if paged_enabled && !positions_routed {
+            self.decoder_state = Some(Self::new_decoder_state(
+                &self.models,
+                &ar.decoder,
+                self.fixed_state_budget_bytes,
+            )?);
+            let inputs = inputs_digest.expect("paged_enabled implies a digest");
             let decoder = self
                 .models
                 .session(&ar.decoder)
                 .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-            let decoder_io = self
-                .models
-                .directory
-                .spec
-                .models
-                .get(&ar.decoder)
-                .and_then(|component| component.io.as_ref());
-            DecodeState::new_with_io_positions_and_state_budget(
-                decoder,
-                decoder_io,
-                self.models.directory.spec.positions.as_ref(),
+            let paged = self.paged.as_mut().expect("paged_enabled implies storage");
+            let state = self
+                .decoder_state
+                .as_mut()
+                .expect("the decode state was just built");
+            let (seq, shared) =
+                Self::admit_paged_sequence(paged, state, decoder, inputs, &prompt_tokens)?;
+            paged_session = Some((seq, inputs));
+            reused = shared;
+        }
+
+        let chain = build_processor_chain(&options, Some(self.tokenizer()?))?;
+        if reused == 0 && paged_session.is_none() {
+            self.decoder_state = Some(Self::new_decoder_state(
+                &self.models,
+                &ar.decoder,
                 self.fixed_state_budget_bytes,
-            )?
-        });
+            )?);
+        }
 
         // Encoder-decoder pipelines bind the encoder's static cross-attention KV
         // to the decoder every step. Resolve it once here, after the prompt-phase
@@ -592,22 +755,41 @@ impl PipelineEngine {
             .with_context(|| {
                 format!("no tokenizer available for '{}'", self.tokenizer_component)
             })?;
+        let paged_mirror = match (paged_session, self.paged.as_mut()) {
+            (Some((seq, _)), Some(paged)) => Some(PagedMirror {
+                mirrored_tokens: 0,
+                exhausted: false,
+                windowed: false,
+                kv_model: &paged.kv_model,
+                cache: &mut paged.cache,
+                seq,
+            }),
+            _ => None,
+        };
         let mut backend = PipelineDecodeLoopBackend {
             decoder,
             decoder_state: self
                 .decoder_state
                 .as_mut()
                 .expect("autoregressive pipeline has decode state"),
+            paged: paged_mirror,
             pool: &mut tensors,
             step_components,
             decoder_in_edges,
             static_cross_kv,
             context_tokens: prompt_tokens,
+            retained_len: reused,
             prompt_len: 0,
             generated_count: 0,
+            kv_len: reused,
         };
-        backend.prompt_len = backend.context_tokens.len();
-        let mut loop_state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
+        // Prefill only what the retained KV does not already cover.
+        backend.prompt_len = backend.context_tokens.len() - backend.retained_len;
+        let prefilled = backend.prompt_len;
+        let mut loop_state = DecodeLoopState::new(reused, options.seed, options.top_logprobs);
+        // Taken without `?` so a failed generation still releases its sequence
+        // below: an abandoned sequence holds its pages out of the pool for the
+        // life of the process.
         let result = run_decode_loop(
             &mut backend,
             &mut loop_state,
@@ -616,8 +798,270 @@ impl PipelineEngine {
             tokenizer,
             None,
             callback,
-        )?;
+        );
+        // Exactly the tokens whose KV the decoder now holds. Truncated to
+        // `kv_len` rather than taken whole: the last sampled token was committed
+        // to the context but never fed to the decoder, so its KV does not exist
+        // and the next turn must prefill it.
+        let mut final_context = backend.context_tokens.clone();
+        final_context.truncate(backend.kv_len);
+        let retains_kv = backend.decoder_state.use_kv;
+        // How far mirroring actually got. Equal to the context length unless
+        // the page pool ran dry, in which case only this prefix may be
+        // published for reuse.
+        let mirrored_tokens = backend.paged.as_ref().map_or(0, |mirror| {
+            if mirror.windowed {
+                0
+            } else {
+                mirror.mirrored_tokens
+            }
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(paged) = self.paged.as_mut() {
+                    paged.discard_active();
+                }
+                return Err(error);
+            }
+        };
+
+        self.component_cache
+            .borrow_mut()
+            .note_prefix_reuse(reused, prefilled);
+        match paged_session {
+            // Publish what this generation computed so the next request can
+            // attach to it, then let go of the sequence.
+            Some((seq, inputs)) => {
+                self.retire_paged_sequence(seq, inputs, &final_context, mirrored_tokens)?
+            }
+            None => {
+                if retains_kv && let Some(inputs) = inputs_digest {
+                    self.retained = Some(RetainedContext {
+                        inputs,
+                        tokens: final_context,
+                    });
+                }
+            }
+        }
         Ok((result, tensors))
+    }
+
+    /// A fresh decode state for `decoder`.
+    fn new_decoder_state(
+        models: &PipelineModels,
+        decoder: &str,
+        fixed_state_budget_bytes: u64,
+    ) -> anyhow::Result<DecodeState> {
+        let session = models
+            .session(decoder)
+            .with_context(|| format!("pipeline decoder '{decoder}' was not loaded"))?;
+        let decoder_io = models
+            .directory
+            .spec
+            .models
+            .get(decoder)
+            .and_then(|component| component.io.as_ref());
+        DecodeState::new_with_io_positions_and_state_budget(
+            session,
+            decoder_io,
+            models.directory.spec.positions.as_ref(),
+            fixed_state_budget_bytes,
+        )
+    }
+
+    /// Claim a paged sequence for this request, seeded with whatever cached
+    /// prefix its attachments and tokens already share with earlier requests.
+    ///
+    /// Returns the sequence id and how many leading tokens the sequence already
+    /// holds KV for. The reuse always stops at least one token short of the
+    /// prompt, since a decode step needs an input to produce logits from.
+    fn admit_paged_sequence(
+        paged: &mut PipelinePagedKv,
+        state: &mut DecodeState,
+        decoder: &Session,
+        inputs: Digest,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<(SequenceId, usize)> {
+        // Free anything a previous generation abandoned, then make room for this
+        // one, before claiming any pages.
+        paged.discard_active();
+        paged.evict_until_free(
+            prompt_tokens
+                .len()
+                .div_ceil(paged.cache.page_table.page_size),
+        );
+        let key = prefix_key(inputs, prompt_tokens);
+        let seq = paged.cache.create_sequence();
+        paged.active = Some(seq);
+        let matched = paged
+            .prefix
+            .lookup_shared(&key, &mut paged.cache.page_table);
+
+        // A match shorter than the preamble cannot happen — every stored key
+        // begins with one — but treat it as no match rather than trusting it.
+        let reusable = matched
+            .matched_tokens
+            .saturating_sub(PREFIX_KEY_PREAMBLE)
+            .min(prompt_tokens.len().saturating_sub(1));
+        if matched.matched_tokens > 0 {
+            let pages = matched
+                .page_ids
+                .iter()
+                .copied()
+                .take(reusable.div_ceil(paged.cache.page_table.page_size))
+                .collect::<Vec<_>>();
+            for &page_id in &pages {
+                paged.cache.page_table.retain(page_id);
+            }
+            paged
+                .prefix
+                .release_shared(&key, matched.matched_tokens, &mut paged.cache.page_table);
+            if reusable > 0 {
+                attach_pages_to_sequence(&mut paged.cache, seq, &pages, reusable)?;
+                let materialized = paged
+                    .cache
+                    .materialize_sequence(seq)
+                    .map_err(|e| anyhow::anyhow!("failed to materialize the shared prefix: {e}"))?;
+                load_materialized_past(decoder, &paged.kv_model, state, &materialized)?;
+                return Ok((seq, reusable));
+            }
+        }
+        Ok((seq, 0))
+    }
+
+    /// Record this generation's KV under its prefix key and release the
+    /// sequence.
+    ///
+    /// Pages the prefix cache kept are retained by it, so freeing the sequence
+    /// returns only what nothing else refers to.
+    fn retire_paged_sequence(
+        &mut self,
+        seq: SequenceId,
+        inputs: Digest,
+        tokens: &[TokenId],
+        mirrored_tokens: usize,
+    ) -> anyhow::Result<()> {
+        let Some(paged) = self.paged.as_mut() else {
+            return Ok(());
+        };
+        // Never publish past what was mirrored. If the pool ran dry mid-decode
+        // the later pages were never written, and a key covering them would
+        // hand a future request KV that does not exist.
+        let tokens = &tokens[..tokens.len().min(mirrored_tokens)];
+        // Publish at every page boundary, not only at the full length.
+        //
+        // The trie only reports a match where something was inserted, so a
+        // prompt that diverges from this one matches nothing unless the shared
+        // part was itself published. Page boundaries are the natural granularity:
+        // a page is the smallest unit the table can hand to another sequence, so
+        // publishing there is what lets two conversations share the head they
+        // have in common rather than only exact repeats.
+        let page_size = paged.cache.page_table.page_size;
+        let mut lengths = (1..)
+            .map(|pages| pages * page_size)
+            .take_while(|&len| len < tokens.len())
+            .collect::<Vec<_>>();
+        lengths.push(tokens.len());
+        for len in lengths {
+            if len == 0 {
+                continue;
+            }
+            let key = prefix_key(inputs, &tokens[..len]);
+            if paged.prefix.lookup(&key).0 == key.len() {
+                continue;
+            }
+            let pages = sequence_pages_for_len(&paged.cache, seq, len)?;
+            paged
+                .prefix
+                .insert_pages(&key, &pages, &mut paged.cache.page_table);
+        }
+        if paged.active == Some(seq) {
+            paged.active = None;
+        }
+        for page_id in paged.cache.page_table.remove_sequence(seq) {
+            paged.cache.page_table.free(page_id);
+        }
+        Ok(())
+    }
+
+    /// Whether position ids are a plain function of the absolute past length,
+    /// and so can be rebuilt after the KV is truncated.
+    fn positions_are_linear(&self) -> bool {
+        self.models
+            .directory
+            .spec
+            .positions
+            .as_ref()
+            .is_none_or(|program| {
+                program
+                    .continuation
+                    .as_deref()
+                    .is_none_or(|continuation| continuation == "linear_increment")
+            })
+    }
+
+    /// Whether the decoder's position ids are supplied by a dataflow edge
+    /// rather than derived from the absolute past length.
+    fn decoder_positions_are_routed(&self, decoder_in_edges: &[(String, String)]) -> bool {
+        let Some(position_input) = self
+            .decoder_state
+            .as_ref()
+            .and_then(|state| state.io.position_ids_input.as_deref())
+        else {
+            return false;
+        };
+        decoder_in_edges
+            .iter()
+            .any(|(_, port)| port == position_input)
+    }
+
+    /// How many leading prompt tokens the retained decoder KV can serve.
+    ///
+    /// Zero whenever anything about the request's identity changed, whenever
+    /// the prompt shares no leading token with the retained context, or
+    /// whenever the attachments could not be digested.
+    ///
+    /// When the prompt diverges part-way, the retained KV is first truncated to
+    /// the shared head. Truncation can decline — an opaque past with no
+    /// identifiable sequence axis, or fixed loop-carried state — in which case
+    /// nothing is reused and the turn is recomputed.
+    fn reusable_prefix_len(&mut self, inputs: Option<Digest>, prompt_tokens: &[TokenId]) -> usize {
+        let (Some(inputs), Some(retained)) = (inputs, self.retained.as_ref()) else {
+            return 0;
+        };
+        let retained_len = retained.tokens.len();
+        let shared = retained.reusable_prefix(inputs, prompt_tokens);
+        let Some(state) = self.decoder_state.as_mut() else {
+            return 0;
+        };
+        if !state.use_kv || shared == 0 {
+            return 0;
+        }
+        if shared == retained_len {
+            return shared;
+        }
+        // Extending keeps the carried position state valid; truncating does not,
+        // and only a linear continuation can be rebuilt from the absolute past
+        // length alone. A model that carries or is handed its coordinates would
+        // resume from positions describing tokens that no longer exist.
+        if !self.positions_are_linear() {
+            self.decoder_state = None;
+            return 0;
+        }
+        let Some(state) = self.decoder_state.as_mut() else {
+            return 0;
+        };
+        match state.truncate_past(retained_len, shared) {
+            Ok(true) => shared,
+            // Declining to truncate is a normal outcome, and so is a failed
+            // slice: either way the KV is no longer trustworthy for reuse, so
+            // the state is dropped and the turn recomputes from scratch.
+            _ => {
+                self.decoder_state = None;
+                0
+            }
+        }
     }
 
     /// Post-decode counterpart to [`synthesize`](Self::synthesize) for a
@@ -1171,21 +1615,27 @@ impl PipelineEngine {
         // outputs live in a separate `loop_state`, keyed by output port.
         let mut constants = self.prepare_request_tensors(request.inputs, &present)?;
         let mut stage_timings: Vec<serde_json::Value> = Vec::new();
-        self.run_prompt_phase_components(
-            &plan.prompt_components,
-            &mut constants,
-            "encode",
-            &present,
-            Some(&mut stage_timings),
-        )?;
-        if !self.plan.component_is_present(&plan.denoiser, &present) {
+        {
+            let _span = onnx_genai_ort::prof_span!("diffusion.text_encode");
             self.run_prompt_phase_components(
-                &plan.final_components,
+                &plan.prompt_components,
                 &mut constants,
-                "decode",
+                "encode",
                 &present,
                 Some(&mut stage_timings),
             )?;
+        }
+        if !self.plan.component_is_present(&plan.denoiser, &present) {
+            {
+                let _span = onnx_genai_ort::prof_span!("diffusion.vae_decode");
+                self.run_prompt_phase_components(
+                    &plan.final_components,
+                    &mut constants,
+                    "decode",
+                    &present,
+                    Some(&mut stage_timings),
+                )?;
+            }
             dump_stage_timings(&stage_timings);
             return Ok(constants);
         }
@@ -1265,96 +1715,63 @@ impl PipelineEngine {
         // Partial (img2img) loops start at `start_step`; the seed is then the
         // encoded image already noised to `timesteps[start_step]`.
         let denoise_start = std::time::Instant::now();
-        for step in start_step..num_steps {
-            let step_start = std::time::Instant::now();
-            let is_first = step == start_step;
-            // Timestep/sigma for this step: explicit plan schedule when provided,
-            // else the scheduler's timesteps, else the 0-based step index.
-            let timestep = plan
-                .timesteps
-                .as_ref()
-                .or(scheduler_timesteps.as_ref())
-                .and_then(|ts| ts.get(step).copied())
-                .unwrap_or(step as f32);
+        {
+            let _denoise_loop_span = onnx_genai_ort::prof_span!("diffusion.denoise_loop");
+            for step in start_step..num_steps {
+                let _step_span =
+                    onnx_genai_ort::prof_span!("diffusion.denoise_step", "step" => step);
+                let step_start = std::time::Instant::now();
+                let is_first = step == start_step;
+                // Timestep/sigma for this step: explicit plan schedule when provided,
+                // else the scheduler's timesteps, else the 0-based step index.
+                let timestep = plan
+                    .timesteps
+                    .as_ref()
+                    .or(scheduler_timesteps.as_ref())
+                    .and_then(|ts| ts.get(step).copied())
+                    .unwrap_or(step as f32);
 
-            // Raw (unscaled) loop-carried sample feeding each loop input this
-            // step: the seed on the first step, otherwise the value carried from
-            // the previous step. The scheduler's `step` consumes these raw samples.
-            let mut raw_samples: HashMap<String, Value> = HashMap::new();
-            for (_, in_port) in &plan.loop_edges {
-                let raw = if is_first {
-                    let endpoint = format!("{}.{}", plan.denoiser, in_port);
-                    constants.get(&endpoint).with_context(|| {
-                        format!("missing iterative pipeline seed '{endpoint}' at start step")
-                    })?
-                } else {
-                    carried.get(in_port).with_context(|| {
-                        format!(
-                            "loop-carried input '{}.{in_port}' was not produced",
-                            plan.denoiser
-                        )
-                    })?
-                };
-                raw_samples.insert(in_port.clone(), clone_value(raw)?);
-            }
-
-            // Some schedulers (e.g. Euler) scale the loop-carried sample before
-            // it reaches the denoiser. Compute those scaled values once and feed
-            // them as per-port overrides; schedulers that don't scale (DDIM,
-            // masked diffusion) leave the raw sample untouched.
-            let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
-            if let Some(scheduler) = scheduler {
+                // Raw (unscaled) loop-carried sample feeding each loop input this
+                // step: the seed on the first step, otherwise the value carried from
+                // the previous step. The scheduler's `step` consumes these raw samples.
+                let mut raw_samples: HashMap<String, Value> = HashMap::new();
                 for (_, in_port) in &plan.loop_edges {
-                    let raw = &raw_samples[in_port];
-                    if let Some(scaled) = scheduler.scale_input(step, num_steps, raw)? {
-                        scaled_inputs.insert(in_port.clone(), scaled);
-                    }
+                    let raw = if is_first {
+                        let endpoint = format!("{}.{}", plan.denoiser, in_port);
+                        constants.get(&endpoint).with_context(|| {
+                            format!("missing iterative pipeline seed '{endpoint}' at start step")
+                        })?
+                    } else {
+                        carried.get(in_port).with_context(|| {
+                            format!(
+                                "loop-carried input '{}.{in_port}' was not produced",
+                                plan.denoiser
+                            )
+                        })?
+                    };
+                    raw_samples.insert(in_port.clone(), clone_value(raw)?);
                 }
-            }
-            let scale_overrides: Vec<(&str, &Value)> = scaled_inputs
-                .iter()
-                .map(|(port, value)| (port.as_str(), value))
-                .collect();
 
-            // Conditional pass (all inputs as declared, plus any input scaling).
-            let cond_out = self.run_denoiser_pass(
-                denoiser,
-                plan,
-                start_step,
-                &constants,
-                &carried,
-                step,
-                timestep,
-                &scale_overrides,
-            )?;
-
-            // Classifier-free guidance: run an unconditional pass with the
-            // conditioning replaced by the unconditional embedding, then combine
-            // per output port:  pred = uncond + scale * (cond - uncond).
-            let out_map = if let Some(scale) = guidance {
-                let mut cfg_overrides = scale_overrides.clone();
-                for (port, value) in &cfg_uncond {
-                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
-                    cfg_overrides.push((port.as_str(), value));
-                }
-                // Language-diffusion CFG: the unconditional pass feeds the
-                // loop-carried input with its prompt tokens re-masked. Computed
-                // per step from the current sample (owned here so its references
-                // live through the unconditional denoiser pass).
-                let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
+                // Some schedulers (e.g. Euler) scale the loop-carried sample before
+                // it reaches the denoiser. Compute those scaled values once and feed
+                // them as per-port overrides; schedulers that don't scale (DDIM,
+                // masked diffusion) leave the raw sample untouched.
+                let mut scaled_inputs: HashMap<String, Value> = HashMap::new();
                 if let Some(scheduler) = scheduler {
                     for (_, in_port) in &plan.loop_edges {
                         let raw = &raw_samples[in_port];
-                        if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
-                            prompt_masked_inputs.push((in_port.clone(), uncond_sample));
+                        if let Some(scaled) = scheduler.scale_input(step, num_steps, raw)? {
+                            scaled_inputs.insert(in_port.clone(), scaled);
                         }
                     }
                 }
-                for (port, value) in &prompt_masked_inputs {
-                    cfg_overrides.retain(|(p, _)| *p != port.as_str());
-                    cfg_overrides.push((port.as_str(), value));
-                }
-                let uncond_out = self.run_denoiser_pass(
+                let scale_overrides: Vec<(&str, &Value)> = scaled_inputs
+                    .iter()
+                    .map(|(port, value)| (port.as_str(), value))
+                    .collect();
+
+                // Conditional pass (all inputs as declared, plus any input scaling).
+                let cond_out = self.run_denoiser_pass(
                     denoiser,
                     plan,
                     start_step,
@@ -1362,77 +1779,117 @@ impl PipelineEngine {
                     &carried,
                     step,
                     timestep,
-                    &cfg_overrides,
+                    &scale_overrides,
                 )?;
-                let mut combined: HashMap<String, Value> = HashMap::new();
-                for (port, cond_value) in &cond_out {
-                    let uncond_value = uncond_out.get(port).with_context(|| {
-                        format!(
-                            "unconditional pass did not produce '{}.{port}'",
-                            plan.denoiser
-                        )
-                    })?;
-                    let cond_v = cond_value.to_vec_f32_lossy()?;
-                    let uncond_v = uncond_value.to_vec_f32_lossy()?;
-                    let guided: Vec<f32> = uncond_v
-                        .iter()
-                        .zip(&cond_v)
-                        .map(|(u, c)| u + scale * (c - u))
-                        .collect();
-                    combined.insert(
-                        port.clone(),
-                        Value::from_slice_f32(&guided, cond_value.shape())?,
-                    );
-                }
-                combined
-            } else {
-                cond_out
-            };
 
-            // Compute the next value for each loop-carried input. Without a
-            // scheduler this is identity feedback (output -> input). With a
-            // scheduler the output is a noise prediction and the next sample is
-            // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
-            for (out_port, in_port) in &plan.loop_edges {
-                let model_output = out_map.get(out_port).with_context(|| {
-                    format!(
-                        "denoiser did not produce loop output '{}.{out_port}'",
-                        plan.denoiser
-                    )
-                })?;
-                let next = if let Some(scheduler) = scheduler {
-                    let sample = raw_samples.get(in_port).with_context(|| {
+                // Classifier-free guidance: run an unconditional pass with the
+                // conditioning replaced by the unconditional embedding, then combine
+                // per output port:  pred = uncond + scale * (cond - uncond).
+                let out_map = if let Some(scale) = guidance {
+                    let mut cfg_overrides = scale_overrides.clone();
+                    for (port, value) in &cfg_uncond {
+                        cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                        cfg_overrides.push((port.as_str(), value));
+                    }
+                    // Language-diffusion CFG: the unconditional pass feeds the
+                    // loop-carried input with its prompt tokens re-masked. Computed
+                    // per step from the current sample (owned here so its references
+                    // live through the unconditional denoiser pass).
+                    let mut prompt_masked_inputs: Vec<(String, Value)> = Vec::new();
+                    if let Some(scheduler) = scheduler {
+                        for (_, in_port) in &plan.loop_edges {
+                            let raw = &raw_samples[in_port];
+                            if let Some(uncond_sample) = scheduler.cfg_uncond_sample(raw)? {
+                                prompt_masked_inputs.push((in_port.clone(), uncond_sample));
+                            }
+                        }
+                    }
+                    for (port, value) in &prompt_masked_inputs {
+                        cfg_overrides.retain(|(p, _)| *p != port.as_str());
+                        cfg_overrides.push((port.as_str(), value));
+                    }
+                    let uncond_out = self.run_denoiser_pass(
+                        denoiser,
+                        plan,
+                        start_step,
+                        &constants,
+                        &carried,
+                        step,
+                        timestep,
+                        &cfg_overrides,
+                    )?;
+                    let mut combined: HashMap<String, Value> = HashMap::new();
+                    for (port, cond_value) in &cond_out {
+                        let uncond_value = uncond_out.get(port).with_context(|| {
+                            format!(
+                                "unconditional pass did not produce '{}.{port}'",
+                                plan.denoiser
+                            )
+                        })?;
+                        let cond_v = cond_value.to_vec_f32_lossy()?;
+                        let uncond_v = uncond_value.to_vec_f32_lossy()?;
+                        let guided: Vec<f32> = uncond_v
+                            .iter()
+                            .zip(&cond_v)
+                            .map(|(u, c)| u + scale * (c - u))
+                            .collect();
+                        combined.insert(
+                            port.clone(),
+                            Value::from_slice_f32(&guided, cond_value.shape())?,
+                        );
+                    }
+                    combined
+                } else {
+                    cond_out
+                };
+
+                // Compute the next value for each loop-carried input. Without a
+                // scheduler this is identity feedback (output -> input). With a
+                // scheduler the output is a noise prediction and the next sample is
+                // `scheduler.step(raw_sample, prediction)` (raw = unscaled).
+                for (out_port, in_port) in &plan.loop_edges {
+                    let model_output = out_map.get(out_port).with_context(|| {
                         format!(
-                            "missing loop-carried sample for '{}.{in_port}'",
+                            "denoiser did not produce loop output '{}.{out_port}'",
                             plan.denoiser
                         )
                     })?;
-                    if scheduler.needs_noise() {
-                        let noise =
-                            self.step_noise(plan, num_steps, &constants, in_port, step, sample)?;
-                        scheduler.step_with_noise(
-                            step,
-                            num_steps,
-                            sample,
-                            model_output,
-                            Some(&noise),
-                        )?
+                    let next = if let Some(scheduler) = scheduler {
+                        let _scheduler_span =
+                            onnx_genai_ort::prof_span!("diffusion.scheduler_step", "step" => step);
+                        let sample = raw_samples.get(in_port).with_context(|| {
+                            format!(
+                                "missing loop-carried sample for '{}.{in_port}'",
+                                plan.denoiser
+                            )
+                        })?;
+                        if scheduler.needs_noise() {
+                            let noise = self
+                                .step_noise(plan, num_steps, &constants, in_port, step, sample)?;
+                            scheduler.step_with_noise(
+                                step,
+                                num_steps,
+                                sample,
+                                model_output,
+                                Some(&noise),
+                            )?
+                        } else {
+                            scheduler.step(step, num_steps, sample, model_output)?
+                        }
                     } else {
-                        scheduler.step(step, num_steps, sample, model_output)?
-                    }
-                } else {
-                    clone_value(model_output)?
-                };
-                dump_iterative_step(
-                    &plan.denoiser,
-                    in_port,
-                    step,
-                    &next,
-                    step_start.elapsed().as_secs_f64() * 1e3,
-                );
-                carried.insert(in_port.clone(), next);
+                        clone_value(model_output)?
+                    };
+                    dump_iterative_step(
+                        &plan.denoiser,
+                        in_port,
+                        step,
+                        &next,
+                        step_start.elapsed().as_secs_f64() * 1e3,
+                    );
+                    carried.insert(in_port.clone(), next);
+                }
+                last_outputs = out_map;
             }
-            last_outputs = out_map;
         }
         let denoise_ms = denoise_start.elapsed().as_secs_f64() * 1e3;
         stage_timings.push(serde_json::json!({
@@ -1452,13 +1909,16 @@ impl PipelineEngine {
         for (in_port, value) in carried {
             tensors.insert(format!("{}.{}", plan.denoiser, in_port), value);
         }
-        self.run_prompt_phase_components(
-            &plan.final_components,
-            &mut tensors,
-            "decode",
-            &present,
-            Some(&mut stage_timings),
-        )?;
+        {
+            let _span = onnx_genai_ort::prof_span!("diffusion.vae_decode");
+            self.run_prompt_phase_components(
+                &plan.final_components,
+                &mut tensors,
+                "decode",
+                &present,
+                Some(&mut stage_timings),
+            )?;
+        }
         dump_stage_timings(&stage_timings);
         Ok(tensors)
     }
@@ -1532,6 +1992,7 @@ impl PipelineEngine {
             .iter()
             .map(|(name, value)| (name.as_str(), value))
             .collect::<Vec<_>>();
+        let _span = onnx_genai_ort::prof_span!("diffusion.denoiser_pass", "step" => step);
         let outputs = denoiser.run(&refs).map_err(|e| {
             anyhow::anyhow!(
                 "ORT denoiser '{}' failed at step {step}: {e}",
@@ -1863,6 +2324,46 @@ impl PipelineEngine {
                 .session(component)
                 .with_context(|| format!("pipeline component '{component}' was not loaded"))?;
             let inputs = self.component_inputs(component, session, tensors, present)?;
+
+            // A prompt-phase component is a pure function of its inputs — that
+            // is what separates it from an `every_step` component — so identical
+            // input bytes mean identical outputs. Re-asking about the same image
+            // then costs a hash instead of a vision encoder forward pass.
+            let memoizable = self.component_cache.borrow().is_enabled()
+                && self.memoizable_components.contains(component);
+            let key = memoizable.then(|| {
+                digest_named_values(
+                    component,
+                    inputs.iter().map(|(name, value)| (name.as_str(), value)),
+                )
+            });
+            let key = match key {
+                Some(Some(key)) => Some(key),
+                // Enabled but undigestible: run without touching the cache
+                // rather than key on a partial description of the inputs.
+                Some(None) => {
+                    self.component_cache.borrow_mut().note_unkeyable();
+                    None
+                }
+                None => None,
+            };
+            if let Some(key) = key
+                && let Some(cached) = self.component_cache.borrow_mut().get(key)
+            {
+                if let Some(sink) = timings.as_deref_mut() {
+                    sink.push(serde_json::json!({
+                        "component": component,
+                        "phase": phase,
+                        "ms": 0.0,
+                        "cached": true,
+                    }));
+                }
+                for (name, value) in cached {
+                    tensors.insert(format!("{component}.{name}"), value);
+                }
+                continue;
+            }
+
             let refs = inputs
                 .iter()
                 .map(|(name, value)| (name.as_str(), value))
@@ -1878,11 +2379,88 @@ impl PipelineEngine {
                     "ms": started.elapsed().as_secs_f64() * 1e3,
                 }));
             }
-            for (name, value) in session.output_names().iter().zip(outputs) {
+            let named = session
+                .output_names()
+                .iter()
+                .cloned()
+                .zip(outputs)
+                .collect::<Vec<_>>();
+            if let Some(key) = key {
+                let mut cache = self.component_cache.borrow_mut();
+                cache.note_miss();
+                cache.insert(key, &named);
+            }
+            for (name, value) in named {
                 tensors.insert(format!("{component}.{name}"), value);
             }
         }
         Ok(())
+    }
+
+    /// KV page counters, when the decoder's KV is paged.
+    ///
+    /// `None` for a decoder whose KV cannot be paged, rather than zeros, which
+    /// would read as "a page pool that did nothing".
+    pub fn page_stats(&self) -> Option<onnx_genai_kv::PageStats> {
+        self.paged
+            .as_ref()
+            .map(|paged| paged.cache.page_table.stats())
+    }
+
+    /// What the KV page pool is holding right now, when the decoder pages.
+    pub fn page_usage(&self) -> Option<onnx_genai_kv::PageUsage> {
+        self.paged
+            .as_ref()
+            .map(|paged| paged.cache.page_table.usage())
+    }
+
+    /// Counters describing what the pipeline's reuse caches did.
+    pub fn cache_stats(&self) -> PipelineCacheStats {
+        self.component_cache.borrow().stats()
+    }
+
+    /// Clear the per-generation counters reported by [`cache_stats`](Self::cache_stats).
+    pub fn reset_cache_stats(&self) {
+        self.component_cache.borrow_mut().reset_stats();
+    }
+
+    /// Digest everything about a request that changes what the decoder computes.
+    ///
+    /// This is the part of a multimodal prompt's identity that token ids cannot
+    /// express: placeholder expansion turns any image into the same repeated
+    /// token, so two different pictures produce byte-identical prompts. Without
+    /// this digest in the key, retained KV for one photo would be served for
+    /// another and the model would answer confidently about a picture it never
+    /// saw.
+    ///
+    /// Covers the bound tensors, the presence keys, and the tile count.
+    ///
+    /// `None` when some input cannot be digested, which disables reuse for the
+    /// request rather than keying it on an incomplete description.
+    fn digest_request_identity(request: &PipelineGenerateRequest) -> Option<Digest> {
+        let mut builder = DigestBuilder::new();
+
+        // Presence keys gate which components run and which optional decoder
+        // inputs are bound, so the same tensors under different presence keys
+        // are a different computation and must not share KV.
+        builder.absorb_u64(request.present.len() as u64);
+        for key in &request.present {
+            builder.absorb_str(key);
+        }
+        // Tile count drives placeholder expansion for encoder-free multimodal
+        // pipelines, and so the meaning of the prompt's placeholder run.
+        builder.absorb_u64(request.num_image_tiles.unwrap_or(0) as u64);
+
+        let mut endpoints = request.inputs.keys().collect::<Vec<_>>();
+        endpoints.sort();
+        builder.absorb_u64(endpoints.len() as u64);
+        for endpoint in endpoints {
+            builder.absorb_str(endpoint);
+            if !absorb_value(&mut builder, &request.inputs[endpoint]) {
+                return None;
+            }
+        }
+        Some(builder.finish())
     }
 
     fn component_inputs(
@@ -2354,6 +2932,75 @@ struct StepComponentInput {
     missing_message: String,
 }
 
+/// Whether this error is the KV page pool being full, rather than a fault.
+///
+/// A full pool is a capacity condition the caller can degrade around; anything
+/// else means the mirror is broken and must not be swallowed.
+fn is_kv_out_of_memory(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<onnx_genai_kv::KvError>(),
+            Some(onnx_genai_kv::KvError::OutOfMemory { .. })
+        )
+    })
+}
+
+impl PipelinePagedKv {
+    /// Release the in-flight sequence, if any, returning its pages to the pool.
+    ///
+    /// Pages the prefix cache published are retained by it, so this frees only
+    /// what nothing else refers to.
+    fn discard_active(&mut self) {
+        let Some(seq) = self.active.take() else {
+            return;
+        };
+        for page_id in self.cache.page_table.remove_sequence(seq) {
+            self.cache.page_table.free(page_id);
+        }
+    }
+
+    /// Return pages to the pool by evicting unreferenced cached prefixes,
+    /// least-recently-used first.
+    ///
+    /// Without this the cache would hold every prefix it ever published and the
+    /// pool would run dry after enough distinct conversations. Only prefixes no
+    /// live sequence is borrowing can go.
+    fn evict_until_free(&mut self, wanted_pages: usize) {
+        let free = self
+            .cache
+            .page_table
+            .free_count(onnx_genai_kv::Device::Gpu(0));
+        if free >= wanted_pages {
+            return;
+        }
+        self.prefix
+            .evict_lru(wanted_pages - free, &mut self.cache.page_table);
+    }
+}
+
+/// Where a decode step's KV is written so later requests can share it.
+struct PagedMirror<'a> {
+    kv_model: &'a KvModelInfo,
+    cache: &'a mut PagedKvCache,
+    seq: SequenceId,
+    /// Tokens whose KV actually reached the pages so far.
+    ///
+    /// Mirroring can stop early when the pool runs dry, and only this many
+    /// tokens may then be published — the pages beyond it do not exist, and a
+    /// key claiming them would hand a later request KV that was never written.
+    mirrored_tokens: usize,
+    /// Set once the pool refused a page, after which mirroring stops for the
+    /// rest of this generation.
+    exhausted: bool,
+    /// Set once the sliding window dropped pages from this sequence.
+    ///
+    /// What remains is then `[sinks | recent window]`, which is not a prefix of
+    /// anything. Publishing it under a key that says "the first N tokens" would
+    /// hand a later request pages with a hole in the middle, so nothing from a
+    /// sequence that has been windowed may be published at all.
+    windowed: bool,
+}
+
 struct PipelineDecodeLoopBackend<'a> {
     decoder: &'a Session,
     decoder_state: &'a mut DecodeState,
@@ -2372,8 +3019,23 @@ struct PipelineDecodeLoopBackend<'a> {
     /// (see `PipelineEngine::static_cross_kv_bindings`).
     static_cross_kv: Vec<(String, Arc<Value>)>,
     context_tokens: Vec<TokenId>,
+    /// Leading tokens whose KV was carried over from the previous generation and
+    /// so must not be prefilled again.
+    retained_len: usize,
     prompt_len: usize,
     generated_count: usize,
+    /// Paged KV to mirror each step's `present.*` outputs into, when the
+    /// decoder's KV can be paged.
+    paged: Option<PagedMirror<'a>>,
+    /// Tokens the decoder has actually run, and therefore the exact length its
+    /// KV covers.
+    ///
+    /// Tracked rather than derived from `context_tokens`, because the two differ:
+    /// `commit_token` appends the sampled token, but that token is not fed to the
+    /// decoder until the *next* step, so at the end of a generation the context
+    /// is one token longer than the KV. Retaining the context length would claim
+    /// KV that does not exist and corrupt the next turn's attention.
+    kv_len: usize,
 }
 
 impl PipelineDecodeLoopBackend<'_> {
@@ -2472,10 +3134,13 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
         } else {
             0
         };
+        // On the first step feed only the tokens not already covered by
+        // retained KV (`prompt_len` is the uncovered suffix, and equals the
+        // whole prompt when nothing was retained); afterwards, the running token.
         let input_tokens = if self.decoder_state.use_kv && self.generated_count > 0 {
             self.context_tokens[self.context_tokens.len() - 1..].to_vec()
         } else {
-            self.context_tokens.clone()
+            self.context_tokens[self.retained_len..].to_vec()
         };
         // Refresh every `every_step` component over exactly the tokens the
         // decoder is about to consume, then route their (and any cached) outputs
@@ -2489,6 +3154,68 @@ impl DecodeLoopBackend for PipelineDecodeLoopBackend<'_> {
             past_len,
             &extras,
         )?;
+        self.kv_len = past_len + input_tokens.len();
+        // Mirror this step's KV into pages before the outputs are consumed, so
+        // a later request opening with the same prefix can attach these pages
+        // instead of recomputing them.
+        if let Some(paged) = self.paged.as_mut().filter(|paged| !paged.exhausted) {
+            // A windowed decoder's present tensor is indexed in *retained*
+            // buffer space, not absolute position space: once the window has
+            // evicted anything, an absolute index reads the wrong rows or runs
+            // off the end. This is the same conversion the single-model decode
+            // step does before mirroring.
+            let retained_past_len = self.decoder_state.retained_kv_len(past_len);
+            match mirror_present_kv_to_pages(
+                self.decoder,
+                paged.kv_model,
+                paged.cache,
+                paged.seq,
+                &outputs,
+                retained_past_len,
+                input_tokens.len(),
+            ) {
+                Ok(()) => paged.mirrored_tokens = past_len + input_tokens.len(),
+                // Mirroring exists so a *later* request can reuse this KV. The
+                // pool running dry says nothing about whether this generation
+                // is valid, so failing it would punish the caller for a cache
+                // being full. Stop mirroring and keep decoding; only the
+                // tokens already mirrored get published.
+                Err(error) if is_kv_out_of_memory(&error) => {
+                    paged.exhausted = true;
+                    tracing::debug!(
+                        "KV page pool exhausted after {} token(s); this generation stops \
+                         publishing KV for reuse but continues normally ({error})",
+                        paged.mirrored_tokens
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+            // Keep the paged sequence's window in step with the decoder's, so
+            // the pages published for reuse describe what the decoder can
+            // actually attend to.
+            let pages_before = paged
+                .cache
+                .page_table
+                .get_sequence(paged.seq)
+                .map_or(0, <[_]>::len);
+            apply_paged_sliding_window(
+                paged.cache,
+                paged.seq,
+                self.decoder_state.sliding_window(),
+                self.decoder_state.sink_tokens(),
+            )?;
+            let pages_after = paged
+                .cache
+                .page_table
+                .get_sequence(paged.seq)
+                .map_or(0, <[_]>::len);
+            // Compared rather than inferred from the window size: only an
+            // actual drop makes the sequence non-contiguous, so a windowed
+            // model whose conversation still fits its window keeps publishing.
+            if pages_after < pages_before {
+                paged.windowed = true;
+            }
+        }
         extract_next_token_logits_with_io(
             self.decoder,
             outputs,
@@ -5573,6 +6300,7 @@ pipeline:
     #[test]
     fn plan_routes_prompt_encoder_outputs_to_decoder_inputs() -> anyhow::Result<()> {
         let spec = PipelineSpec {
+            audio: None,
             models: BTreeMap::from([
                 ("vision_encoder".to_string(), component("encoder")),
                 ("decoder".to_string(), component("decoder")),
@@ -5748,6 +6476,7 @@ pipeline:
     fn plan_builds_composite_single_pass_stages() -> anyhow::Result<()> {
         // Audio-to-audio codec: encoder -> decoder, both single-pass stages.
         let spec = PipelineSpec {
+            audio: None,
             models: BTreeMap::from([
                 ("encoder".to_string(), component("encoder")),
                 ("decoder".to_string(), component("decoder")),
@@ -5797,6 +6526,7 @@ pipeline:
     #[test]
     fn composite_iterative_stage_is_rejected_for_now() {
         let spec = PipelineSpec {
+            audio: None,
             models: BTreeMap::from([("encoder".to_string(), component("encoder"))]),
             dataflow: vec![],
             strategy: PipelineStrategy {
@@ -5920,5 +6650,73 @@ pipeline:
             err.to_string().contains("empty token sequence"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The reuse key must separate requests that compute different things, not
+    /// just requests with different attachments.
+    mod request_identity {
+        use super::super::*;
+
+        fn request() -> PipelineGenerateRequest {
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1, 2])))
+        }
+
+        fn pixels(value: f32) -> Value {
+            Value::from_slice_f32(&[value; 4], &[1, 4]).expect("build a test tensor")
+        }
+
+        #[test]
+        fn identical_requests_share_a_key() {
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request().with_input("encoder.pixel_values", pixels(1.0));
+            assert_eq!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn a_different_attachment_changes_the_key() {
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request().with_input("encoder.pixel_values", pixels(2.0));
+            assert_ne!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn presence_keys_change_the_key() {
+            // Presence gates which components run and which optional decoder
+            // inputs are bound, so the same tensors under different presence
+            // keys describe a different computation.
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request()
+                .with_input("encoder.pixel_values", pixels(1.0))
+                .with_presence("audio");
+            assert_ne!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn the_image_tile_count_changes_the_key() {
+            let left = request().with_input("encoder.pixel_values", pixels(1.0));
+            let right = request()
+                .with_input("encoder.pixel_values", pixels(1.0))
+                .with_image_tile_count(4);
+            assert_ne!(
+                PipelineEngine::digest_request_identity(&left),
+                PipelineEngine::digest_request_identity(&right)
+            );
+        }
+
+        #[test]
+        fn an_undigestible_request_disables_reuse() {
+            // Nothing bound is still a well-defined identity; the `None` case is
+            // reserved for tensors whose bytes cannot be read.
+            assert!(PipelineEngine::digest_request_identity(&request()).is_some());
+        }
     }
 }

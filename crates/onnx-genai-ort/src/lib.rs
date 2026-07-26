@@ -44,7 +44,10 @@ pub use eagle3::{
 };
 pub use env::Environment;
 pub use error::{OrtError, Result};
-pub use loader::{ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths};
+pub use loader::{
+    ModelDirectory, PipelineModelDirectory, PipelineModels, PipelineTokenizerPaths,
+    model_weight_bytes,
+};
 pub use mtp::{
     MtpDecodeOptions, MtpDecodeSession, MtpDraftKvMode, MtpHeadSignature, MtpStepOutput,
 };
@@ -59,7 +62,7 @@ pub use onnx_genai_runtime_config::EpSelection;
 pub use session::{
     CudaAttentionMode, EpCapabilities, HardwareKind, ResolvedEp, RunPhaseError, Session,
     SessionOptions, TensorInfo, available_execution_providers, capability, ep_selection,
-    resolve_execution_provider,
+    resolve_execution_provider, selectable_execution_providers,
 };
 pub use shared_kv_proposer::{
     SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,

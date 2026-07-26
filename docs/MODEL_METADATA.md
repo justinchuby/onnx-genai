@@ -248,3 +248,179 @@ pub enum MetadataWarning {
     ConflictingForce { node: String, source_a: HintSource, source_b: HintSource },
 }
 ```
+
+## Multimodal input: the placeholder contract
+
+A vision-language package declares two things, and the runtime derives everything
+else from them. Neither is inferred from a model or vendor name.
+
+**1. How pixels become a tensor** — `preprocessing.image`, a transform program
+(decode → resize → rescale → normalize → tile/patchify) whose `outputs` bind
+produced tensors to exact `component.input` endpoints:
+
+```yaml
+preprocessing:
+  image:
+    transforms:
+      - {op: decode, outputs: [decoded]}
+      - {op: convert_rgb, inputs: [decoded], outputs: [rgb]}
+      - {op: resize, inputs: [rgb], outputs: [resized], size: 336, mode: fixed}
+      - {op: rescale, inputs: [resized], outputs: [rescaled], scale: 0.00392156862745098}
+      - {op: normalize, inputs: [rescaled], outputs: [normalized], mean: [0.5, 0.5, 0.5], std: [0.5, 0.5, 0.5]}
+    outputs:
+      - {source: normalized, name: vision_encoder.pixel_values, content: pixels, dtype: float32}
+```
+
+**2. Where the image sits in the text** — `pipeline.vision`, the placeholder
+expansion contract:
+
+```yaml
+pipeline:
+  vision:
+    image_placeholder_token_id: 262144   # marks WHERE to expand
+    image_token_id: 262145               # what is written into the expansion
+    token_count_source: per_tile         # per_tile | per_patch | from_grid
+    tokens_per_tile: 256
+```
+
+The prompt must carry exactly one `image_placeholder_token_id` per image, in
+prompt order. Before KV sizing, each placeholder is replaced by the declared run
+of `image_token_id`, whose length comes from `token_count_source`.
+
+### Callers do not write placeholders by hand
+
+Requiring a caller to type a model's private placeholder spelling would mean
+reading this file to write a prompt. Both front ends therefore insert them:
+
+- a prompt that already positions placeholders is honored verbatim;
+- a prompt that positions none gets one per image **prepended**, in the
+  conventional "images, then the question about them" order;
+- a *partial* set is rejected. The caller clearly meant to position them, and
+  guessing where the rest belong would silently change which image a sentence
+  refers to.
+
+The rule lives in `onnx_genai_server::multimodal`, shared by the CLI and
+`/v1/chat/completions`.
+
+### Audio input: two different shapes
+
+Audio arrives in one of two shapes, and only the first is implemented today.
+
+**Encoder-decoder speech recognition** (Whisper-style) — supported. A component
+declares an `input_features` input; the runtime extracts log-mel features into
+it and seeds the decoder with the model's own transcription prompt. The spoken
+audio *is* the content, so it replaces the text prompt rather than sitting
+inside it. This is what `onnx-genai transcribe`, `generate --audio`, and
+`/v1/audio/transcriptions` drive.
+
+**Audio as an embedded modality in an omni LLM** (Gemma-3n/4-style, where audio
+tokens are interleaved with text like image tokens) — **not yet implemented**.
+Structurally it is the vision contract with a different encoder: it needs an
+`audio_placeholder_token_id` / `audio_token_id` expansion contract alongside
+`pipeline.vision`, plus a `preprocessing.audio` program binding features to the
+encoder endpoint. The engine's dataflow already expresses the graph; what is
+missing is the declared contract and its expansion, not the execution. Adding it
+should generalize the existing expansion rather than duplicate it, so a package
+declares *modality → placeholder → token count* once per modality.
+
+### Prefix caching and multimodal prompts
+
+An image costs a turn twice: the encoder forward pass, and a prompt in which
+that one image has expanded into hundreds or thousands of placeholder tokens.
+A conversation that keeps referring to the same picture would pay both on every
+turn. `PipelineEngine` removes both repeats.
+
+**Why the single-model prefix cache cannot simply be reused.** That cache is a
+**token-id trie**, and a token-id key is unsound the moment embeddings enter the
+prompt from anywhere but the token embedding table. Placeholder expansion
+replaces an image with a run of one repeated `image_token_id`, so two entirely
+different photographs produce *byte-identical* token sequences. Keyed on tokens
+alone, a cache would serve the first photograph's KV for the second, and the
+model would answer fluently about a picture it was never shown.
+
+**The key is therefore tokens plus a digest of every bound input tensor.** The
+digest is a 128-bit content hash over each `component.input` endpoint's dtype,
+shape, and element bytes. Change the picture and the digest changes, the prefix
+stops matching, and the turn is recomputed. 128 bits rather than 64 because
+nothing verifies a hit.
+
+Two reuses follow from that key:
+
+* **Encoder memoization.** A prompt-phase component is a pure function of its
+  inputs — that is what distinguishes it from an `every_step` component — so its
+  outputs are memoized under the digest of those inputs. Re-asking about the
+  same attachment costs a hash instead of a vision or audio encoder pass. The
+  budget is `EngineConfig::pipeline_cache_bytes` (default 512 MiB, `0` disables);
+  entries are evicted least-recently-used.
+* **Decoder KV prefix reuse.** The decoder keeps the KV from the previous
+  generation and prefills only the tokens the new prompt added.
+
+Reuse covers the **common prefix**, so a prompt that diverges part-way still
+keeps the head it shares — which is what makes forking a conversation, editing
+an earlier turn, or replaying a reasoning model's history (with the thinking the
+KV still holds stripped out) reuse anything at all. Divergence requires
+truncating the retained KV, and a pipeline component's past is an opaque
+per-graph tensor with no declared sequence axis, so the axis is identified by
+extent: the one dimension equal to the current KV length. Truncation declines,
+and the turn recomputes, when
+
+* more than one axis matches, since choosing between them is a guess and
+  guessing wrong corrupts attention silently;
+* the decoder carries fixed loop-carried state, which advances with the sequence
+  but exposes no position to rewind to; or
+* position ids are not a plain `linear_increment` of the absolute past length,
+  because a carried or externally supplied coordinate would resume from
+  positions describing tokens that no longer exist.
+
+Reuse is also skipped entirely when the decoder's position ids arrive over a
+`dataflow` edge, since such a tensor covers the whole prompt and prefilling only
+a suffix would hand the decoder positions for tokens it is not being given.
+
+When the decoder's `present.*` outputs describe a layout the page table can
+address, the KV is **paged** — the same reference-counted page table, radix
+prefix trie, and copy-on-write sharing the single-model engine uses. Many
+prefixes are then held at once, so interleaved conversations do not evict each
+other: several agents running under one long system prompt hold *one* copy of
+its KV between them, and a conversation resumed after others have run still
+finds its own tail.
+
+Sharing is **page-granular**. The trie only reports a match where something was
+published, so each finished generation is published at every page boundary as
+well as at its full length; a prompt that diverges then matches up to the last
+page they had in common. A prefix shorter than one page cannot be shared, which
+in practice only affects prompts shorter than `page_size`.
+
+A decoder whose KV cannot be paged falls back to retaining a single context,
+truncated to the common prefix. That serves a shared head across conversations
+but not each conversation's own tail, since there is only one slot.
+
+Memoization additionally requires the component's graph to contain only
+deterministic operators. A declared phase says *when* a component runs, never
+that it is pure, so purity is read off the graph rather than assumed: memoizing
+a graph containing `RandomNormal` would freeze its first draw and return it
+forever. Everything the runtime will execute is checked — subgraphs of `Loop`
+and `If`, and model-local functions, whose calling node's `op_type` reveals
+nothing about the body that gets inlined.
+
+The check covers the standard ONNX operator set, where which operators are
+random is fixed by the specification. A custom-domain operator is taken at face
+value; a package whose encoder contains a non-deterministic custom operator
+should set `pipeline_cache_bytes` to `0`.
+
+Two further consequences worth knowing:
+
+* **Reuse stops one token short of the previous turn's output.** The last
+  sampled token is appended to the context but never fed back to the decoder, so
+  no KV exists for it and the next turn prefills it.
+* **Reasoning models reuse only up to their divergence.** Earlier turns'
+  thinking is stripped before the conversation is replayed (see the CLI's
+  multi-turn behavior), so the next prompt diverges from the retained context
+  where the thinking began. Everything before that — including the whole
+  expanded image — is still reused.
+
+`--profile` reports both as `encoder cache` (hits / runs) and
+`multimodal prefix reuse` (tokens carried over).
+
+Text-only prompts continue to use the single-model token-id prefix cache,
+including across CLI REPL turns: a second turn reuses the first turn's prompt
+*and* its generated tokens.

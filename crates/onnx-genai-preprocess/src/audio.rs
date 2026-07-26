@@ -221,6 +221,206 @@ pub fn decode_wav_pcm16(bytes: &[u8]) -> Result<DecodedAudio, AudioPreprocessErr
     })
 }
 
+/// How a waveform is cut into transcribable segments.
+///
+/// A speech encoder consumes a bounded window, so a long recording — or a live
+/// stream that never ends — must be split before it can be transcribed. Cutting
+/// at a silence keeps words intact; the window bound is the hard limit.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentConfig {
+    /// Hard cap on one segment, in samples: the model's own input window.
+    pub max_samples: usize,
+    /// Consecutive silent samples that end a segment early. Zero disables
+    /// silence cutting, leaving fixed-size windows.
+    pub silence_samples: usize,
+    /// Mean-square amplitude at or below which a window counts as silence.
+    /// Compared against squared amplitude to avoid a square root per window.
+    pub silence_mean_square: f32,
+    /// Segments shorter than this are held back rather than transcribed, so a
+    /// lone click between two silences is not sent to the model.
+    pub min_samples: usize,
+}
+
+impl SegmentConfig {
+    /// Build a configuration from durations in seconds.
+    pub fn from_seconds(
+        sample_rate: u32,
+        max_seconds: f32,
+        silence_seconds: f32,
+        silence_rms: f32,
+        min_seconds: f32,
+    ) -> Result<Self, AudioPreprocessError> {
+        if sample_rate == 0 {
+            return Err(AudioPreprocessError::InvalidSampleRate);
+        }
+        let samples = |seconds: f32| (seconds.max(0.0) * sample_rate as f32).round() as usize;
+        let max_samples = samples(max_seconds);
+        if max_samples == 0 {
+            return Err(AudioPreprocessError::InvalidConfig(
+                "maximum segment length rounds to zero samples".to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_samples,
+            silence_samples: samples(silence_seconds),
+            silence_mean_square: silence_rms.max(0.0) * silence_rms.max(0.0),
+            min_samples: samples(min_seconds).min(max_samples),
+        })
+    }
+}
+
+/// One transcribable span of audio.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioSegment {
+    pub samples: Vec<f32>,
+    /// Index of this segment's first sample within the whole stream, for timestamps.
+    pub start_sample: usize,
+}
+
+/// Cuts a growing waveform into segments, incrementally.
+///
+/// Feed it whatever arrives with [`push`](Self::push) — a whole file or one
+/// read from a pipe — and it returns the segments that are final. Nothing is
+/// buffered beyond the current segment, so a stream of any length runs in
+/// bounded memory. [`flush`](Self::flush) emits the trailing partial segment
+/// once the input ends.
+#[derive(Debug)]
+pub struct StreamSegmenter {
+    config: SegmentConfig,
+    pending: Vec<f32>,
+    /// Stream position of `pending[0]`.
+    pending_start: usize,
+    /// Consecutive silent samples at the tail of `pending`.
+    trailing_silence: usize,
+    /// True while sitting in the gap that ended the previous segment, so the
+    /// gap is discarded as it arrives instead of becoming the next segment's
+    /// leading silence (which would report a timestamp before the speech).
+    in_gap: bool,
+}
+
+impl StreamSegmenter {
+    pub fn new(config: SegmentConfig) -> Self {
+        Self {
+            config,
+            pending: Vec::new(),
+            pending_start: 0,
+            trailing_silence: 0,
+            in_gap: false,
+        }
+    }
+
+    /// Absorb `samples` and return every segment that became final.
+    pub fn push(&mut self, samples: &[f32]) -> Vec<AudioSegment> {
+        let mut finalized = Vec::new();
+        for &sample in samples {
+            let silent = sample * sample <= self.config.silence_mean_square;
+            if self.in_gap {
+                if silent {
+                    // Still in the gap: drop it, but keep the stream position.
+                    self.pending_start += 1;
+                    continue;
+                }
+                self.in_gap = false;
+            }
+
+            self.pending.push(sample);
+            if silent {
+                self.trailing_silence += 1;
+            } else {
+                self.trailing_silence = 0;
+            }
+
+            let hit_window = self.pending.len() >= self.config.max_samples;
+            let hit_silence = self.config.silence_samples > 0
+                && self.trailing_silence >= self.config.silence_samples;
+            if hit_window || hit_silence {
+                finalized.extend(self.take(hit_window));
+                // Once the pending buffer is drained, any further silence is a
+                // gap rather than part of a segment.
+                self.in_gap = self.config.silence_samples > 0 && self.pending.is_empty();
+            }
+        }
+        finalized
+    }
+
+    /// Emit the trailing audio, if it is long enough to be worth transcribing.
+    pub fn flush(&mut self) -> Option<AudioSegment> {
+        self.take(false)
+    }
+
+    /// Split off the pending audio.
+    ///
+    /// `forced` marks a cut made by the window bound rather than by a silence:
+    /// that audio is emitted whole, because there is no boundary to trim and no
+    /// later chance to emit it. Otherwise the trailing silence is dropped — it
+    /// is a boundary, not content — and the stream position advances past it so
+    /// the next segment's timestamp points at speech.
+    fn take(&mut self, forced: bool) -> Option<AudioSegment> {
+        let voiced = self.pending.len().saturating_sub(self.trailing_silence);
+        let keep = if forced { self.pending.len() } else { voiced };
+        if keep == 0 || (!forced && keep < self.config.min_samples) {
+            // Nothing worth transcribing. A silence boundary means the burst is
+            // over, so a sub-minimum one is dropped here rather than held:
+            // keeping it would let a click merge with unrelated speech that
+            // arrives later, and would report a start time from before the gap.
+            self.pending_start += self.pending.len();
+            self.pending.clear();
+            self.trailing_silence = 0;
+            return None;
+        }
+        let start_sample = self.pending_start;
+        let mut samples = std::mem::take(&mut self.pending);
+        let dropped = samples.len() - keep;
+        samples.truncate(keep);
+        self.pending_start = start_sample + keep + dropped;
+        self.trailing_silence = 0;
+        Some(AudioSegment {
+            samples,
+            start_sample,
+        })
+    }
+}
+
+/// Encodes `[-1, 1]` float samples as 16-bit integer PCM WAV bytes.
+///
+/// The inverse of [`decode_wav_pcm16`], for handing a synthesized waveform back
+/// to a caller. `channels` interleaved frames are written as-is; values outside
+/// `[-1, 1]` are clamped rather than allowed to wrap.
+pub fn encode_wav_pcm16(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<u8>, AudioPreprocessError> {
+    if channels == 0 {
+        return Err(AudioPreprocessError::UnsupportedWav(
+            "channel count is zero".to_owned(),
+        ));
+    }
+    if sample_rate == 0 {
+        return Err(AudioPreprocessError::UnsupportedWav(
+            "sample rate is zero".to_owned(),
+        ));
+    }
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buffer = Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut buffer, spec)?;
+        for &sample in samples {
+            // i16::MIN..=i16::MAX is asymmetric, so scale by 32767 and clamp;
+            // scaling by 32768 would wrap a full-scale -1.0..1.0 signal.
+            let scaled = (sample.clamp(-1.0, 1.0) * 32767.0).round();
+            writer.write_sample(scaled as i16)?;
+        }
+        writer.finalize()?;
+    }
+    Ok(buffer.into_inner())
+}
+
 fn resample(
     samples: &[f32],
     input_rate: u32,
@@ -425,5 +625,163 @@ mod tests {
 
         assert_eq!(output.len(), 160);
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+}
+
+#[cfg(test)]
+mod segmenter_tests {
+    use super::*;
+
+    const RATE: u32 = 16_000;
+
+    fn config(max_seconds: f32, silence_seconds: f32) -> SegmentConfig {
+        SegmentConfig::from_seconds(RATE, max_seconds, silence_seconds, 0.01, 0.0)
+            .expect("a valid segment configuration")
+    }
+
+    fn tone(samples: usize) -> Vec<f32> {
+        (0..samples)
+            .map(|index| if index % 2 == 0 { 0.5 } else { -0.5 })
+            .collect()
+    }
+
+    fn silence(samples: usize) -> Vec<f32> {
+        vec![0.0; samples]
+    }
+
+    #[test]
+    fn a_stream_is_cut_at_the_model_window() {
+        // No silence cutting: segments are exactly one window long.
+        let mut segmenter = StreamSegmenter::new(config(1.0, 0.0));
+
+        let segments = segmenter.push(&tone(RATE as usize * 2 + 5));
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].samples.len(), RATE as usize);
+        assert_eq!(segments[0].start_sample, 0);
+        assert_eq!(segments[1].start_sample, RATE as usize);
+        // The remainder stays pending until the stream ends.
+        assert_eq!(segmenter.flush().expect("trailing audio").samples.len(), 5);
+    }
+
+    #[test]
+    fn silence_cuts_a_segment_early_and_is_not_transcribed() {
+        let mut segmenter = StreamSegmenter::new(config(10.0, 0.1));
+
+        let mut samples = tone(4_000);
+        samples.extend(silence(3_000));
+        let segments = segmenter.push(&samples);
+
+        assert_eq!(segments.len(), 1);
+        // The trailing silence is a boundary, not content.
+        assert_eq!(segments[0].samples.len(), 4_000);
+        assert_eq!(segments[0].start_sample, 0);
+    }
+
+    #[test]
+    fn segments_report_their_position_in_the_stream() {
+        let mut segmenter = StreamSegmenter::new(config(10.0, 0.1));
+
+        let mut samples = tone(2_000);
+        samples.extend(silence(2_000));
+        samples.extend(tone(3_000));
+        samples.extend(silence(2_000));
+        let segments = segmenter.push(&samples);
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start_sample, 0);
+        assert_eq!(segments[0].samples.len(), 2_000);
+        // The second segment starts after the first plus its silence.
+        assert_eq!(segments[1].start_sample, 4_000);
+        assert_eq!(segments[1].samples.len(), 3_000);
+    }
+
+    #[test]
+    fn pushing_in_arbitrary_chunks_gives_the_same_result() {
+        let mut samples = tone(2_000);
+        samples.extend(silence(2_000));
+        samples.extend(tone(3_000));
+
+        let mut whole = StreamSegmenter::new(config(10.0, 0.1));
+        let mut expected = whole.push(&samples);
+        expected.extend(whole.flush());
+
+        // A live stream arrives in whatever sizes the pipe hands over.
+        let mut chunked = StreamSegmenter::new(config(10.0, 0.1));
+        let mut actual = Vec::new();
+        for chunk in samples.chunks(37) {
+            actual.extend(chunked.push(chunk));
+        }
+        actual.extend(chunked.flush());
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn unbroken_silence_is_discarded_rather_than_buffered() {
+        let mut segmenter = StreamSegmenter::new(config(10.0, 0.1));
+
+        for _ in 0..5 {
+            assert!(segmenter.push(&silence(RATE as usize)).is_empty());
+            assert!(
+                segmenter.pending.len() <= segmenter.config.silence_samples,
+                "an idle stream must not buffer without bound: {} samples pending",
+                segmenter.pending.len()
+            );
+        }
+        assert!(segmenter.flush().is_none());
+    }
+
+    #[test]
+    fn segments_shorter_than_the_minimum_are_held_back() {
+        let config = SegmentConfig::from_seconds(RATE, 10.0, 0.05, 0.01, 0.5)
+            .expect("a valid segment configuration");
+        let mut segmenter = StreamSegmenter::new(config);
+
+        // A click far shorter than the 0.5s minimum, between two silences.
+        let mut samples = silence(1_000);
+        samples.extend(tone(100));
+        samples.extend(silence(2_000));
+        assert!(segmenter.push(&samples).is_empty());
+    }
+
+    #[test]
+    fn a_sub_minimum_burst_is_dropped_at_its_silence_boundary() {
+        let config = SegmentConfig::from_seconds(RATE, 10.0, 0.05, 0.01, 0.5)
+            .expect("a valid segment configuration");
+        let mut segmenter = StreamSegmenter::new(config);
+
+        // A click, then a long silence: the click is discarded at the boundary
+        // rather than buffered until the window bound flushes it with silence.
+        let mut samples = tone(100);
+        samples.extend(silence(RATE as usize * 3));
+        assert!(segmenter.push(&samples).is_empty());
+        assert!(
+            segmenter.pending.len() <= segmenter.config.silence_samples,
+            "a dropped burst must not keep accumulating: {} pending",
+            segmenter.pending.len()
+        );
+
+        // Real speech afterwards must not be merged with the discarded click,
+        // and must report its own start time.
+        let speech_start = samples.len();
+        let mut later = tone(RATE as usize);
+        later.extend(silence(2_000));
+        let segments = segmenter.push(&later);
+
+        assert_eq!(segments.len(), 1, "{segments:?}");
+        assert_eq!(segments[0].samples.len(), RATE as usize);
+        assert_eq!(
+            segments[0].start_sample, speech_start,
+            "the timestamp must point at the speech, not before the discarded click"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_window_is_rejected() {
+        let error = SegmentConfig::from_seconds(RATE, 0.0, 0.1, 0.01, 0.0)
+            .expect_err("a zero-length window must fail closed");
+
+        assert!(error.to_string().contains("zero samples"), "{error}");
     }
 }

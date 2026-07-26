@@ -143,7 +143,17 @@ pub(crate) fn step_decode_loop<B: DecodeLoopBackend>(
     max_context: Option<usize>,
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<GenerateResult>> {
-    let _step_span = onnx_genai_ort::prof_span!("loop.step");
+    // Name the first step differently. It is the one that runs the prompt
+    // through the model, and prefill costs orders of magnitude more than a
+    // decode step, so averaging the two together produced a per-call mean that
+    // described neither — the aggregate table showed 28.9 ms/step for a run
+    // that decoded at 14.8 ms/token. Separate names keep both the timeline and
+    // the aggregate table honest.
+    let _step_span = if state.generated_tokens.is_empty() {
+        onnx_genai_ort::prof_span!("loop.prefill")
+    } else {
+        onnx_genai_ort::prof_span!("loop.step")
+    };
     if reached_context_limit(backend.context_len(), max_context) {
         ensure_constrained_finish(options, &state.generated_text, FinishReason::Length)?;
         return finish_result(
@@ -277,6 +287,13 @@ pub(crate) fn commit_selected_token(
     callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
     state.generated_tokens.push(token_id);
+    // Which token this step produced. Without it a timeline shows that a step
+    // happened but not what came out of it, so a stall cannot be tied to the
+    // text being generated at the time. The text is whatever the loop already
+    // decoded — tracing does not run the tokenizer itself, so a traced run
+    // decodes exactly as often as an untraced one.
+    let mut commit_span = onnx_genai_ort::prof_span!("loop.commit_selected_token");
+    commit_span.set_arg("token_id", token_id);
     let token_text = if callback.is_some() || !chain.is_empty() {
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         tokenizer
@@ -285,6 +302,9 @@ pub(crate) fn commit_selected_token(
     } else {
         String::new()
     };
+    if !token_text.is_empty() {
+        commit_span.set_arg("token", token_text.clone());
+    }
     if !chain.is_empty() {
         state.generated_text.push_str(&token_text);
     }

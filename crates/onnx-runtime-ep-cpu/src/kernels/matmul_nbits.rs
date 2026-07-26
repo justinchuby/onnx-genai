@@ -1480,9 +1480,7 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
 /// global (prefill/MLAS) Rayon pool and, on Linux, the process CPU affinity to
 /// the budget (see [`bound_process_to_decode_budget`]), so the budget governs
 /// the whole engine -- not just the steady-decode SPMD pool.
-pub fn set_decode_thread_budget(
-    threads: Option<usize>,
-) -> std::result::Result<(), &'static str> {
+pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(), &'static str> {
     if threads == Some(0) {
         return Err("CPU decode thread budget must be greater than zero");
     }
@@ -1981,10 +1979,14 @@ pub fn decode_parallel_output_row_blocks<F>(
     }
     // numa-split and flat decode scopes run the forward on a bounded Rayon pool,
     // so this `par_chunks_mut` uses that pool rather than the global one.
-    result
-        .par_chunks_mut(row_len)
-        .enumerate()
-        .for_each(|(row_index, row)| compute(row_index, row));
+    //
+    // `for_each_init` rather than `for_each` so the trace span is opened once
+    // per Rayon job — that is, once per worker per contiguous slice of rows —
+    // instead of once per row. A row is far too small to carry a span.
+    result.par_chunks_mut(row_len).enumerate().for_each_init(
+        || crate::trace::worker_span("MatMulNBits.decode_rows"),
+        |_span, (row_index, row)| compute(row_index, row),
+    );
 }
 
 /// Fan `num_tasks` independent decode subtasks out across the active decode
@@ -3307,10 +3309,9 @@ mod amx {
         // Process 16 output rows per parallel task. `par_chunks_mut(16 * n)`
         // yields contiguous, disjoint row bands (last band may be short), so no
         // unsafe aliasing is needed and each task owns its output rows.
-        result
-            .par_chunks_mut(16 * n)
-            .enumerate()
-            .for_each(|(m_tile, out_rows)| {
+        result.par_chunks_mut(16 * n).enumerate().for_each_init(
+            || crate::trace::worker_span("MatMulNBits.prefill_tiles"),
+            |_span, (m_tile, out_rows)| {
                 let m0 = m_tile * 16;
                 let mr = out_rows.len() / n; // valid rows in this band (<= 16)
 
@@ -3376,7 +3377,8 @@ mod amx {
 
                 // SAFETY: releases this thread's tile state after all tile ops.
                 unsafe { asm!("tilerelease", options(nostack)) };
-            });
+            },
+        );
     }
 }
 
@@ -5838,7 +5840,13 @@ mod tests {
             for _ in 0..iters {
                 // SAFETY: avx512 features confirmed above.
                 acc += unsafe {
-                    int4_dot_row_avx512vnni(&activation_deint, &packed, &scales, &ascales, &act_sum8)
+                    int4_dot_row_avx512vnni(
+                        &activation_deint,
+                        &packed,
+                        &scales,
+                        &ascales,
+                        &act_sum8,
+                    )
                 };
             }
             std::hint::black_box(acc);
@@ -6032,7 +6040,8 @@ mod tests {
         let act_sum8 = activation_block_sums8(&activation_deint, blocks);
         // SAFETY: features asserted above.
         let old0 = unsafe { int4_dot_row_avx512vnni_old(&activation, ps, ss, &ascales) };
-        let new0 = unsafe { int4_dot_row_avx512vnni(&activation_deint, ps, ss, &ascales, &act_sum8) };
+        let new0 =
+            unsafe { int4_dot_row_avx512vnni(&activation_deint, ps, ss, &ascales, &act_sum8) };
         assert!(
             (old0 - new0).abs() <= 1e-4 * old0.abs().max(1.0),
             "old {old0} new {new0}"
@@ -6791,7 +6800,10 @@ mod tests {
         // The programmatic override (`--cpu-cores N`) bounds the pool to N,
         // clamped to the host, and takes precedence over the environment.
         assert_eq!(resolve_rayon_global_threads(Some(8), None, 96), Some(8));
-        assert_eq!(resolve_rayon_global_threads(Some(8), Some("2"), 96), Some(8));
+        assert_eq!(
+            resolve_rayon_global_threads(Some(8), Some("2"), 96),
+            Some(8)
+        );
         assert_eq!(resolve_rayon_global_threads(Some(1000), None, 96), Some(96));
         // A positive env value bounds the pool when no override is set.
         assert_eq!(resolve_rayon_global_threads(None, Some("8"), 96), Some(8));

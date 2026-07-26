@@ -4,9 +4,7 @@
 //! Prints the greedy-decoded generated token ids as a JSON array so a
 //! BEFORE/AFTER diff is exact and load-independent.
 
-use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-};
+use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

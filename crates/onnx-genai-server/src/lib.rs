@@ -25,6 +25,7 @@ mod driver;
 mod image_input;
 mod metrics;
 mod models_config;
+pub mod multimodal;
 mod registry;
 mod routes;
 mod session;
@@ -34,6 +35,7 @@ mod types;
 
 pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
+pub use multimodal::MultimodalSpecs;
 pub use registry::EvictionPolicy;
 pub use routes::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
@@ -48,8 +50,10 @@ pub use types::{
     ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatToolFunction, ChatTopLogprob,
     CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
     EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
-    EmbeddingVector, ImageUrl, InputAudio, ResponseFormat, ResponseFormatType, StopInput,
-    ToolChoice, ToolChoiceFunction, ToolChoiceMode, ToolChoiceSpecific, Usage,
+    EmbeddingVector, ImageData, ImageGenerationRequest, ImageGenerationResponse,
+    ImageResponseFormat, ImageUrl, InputAudio, ResponseFormat, ResponseFormatType, SpeechRequest,
+    SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
+    ToolChoiceSpecific, Usage,
 };
 
 pub fn app(state: AppState) -> Router {
@@ -66,13 +70,16 @@ pub fn app(state: AppState) -> Router {
             "/v1/audio/transcriptions",
             post(routes::audio_transcriptions).layer(DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
-        .route("/v1/chat/completions", post(routes::chat_completions));
+        .route("/v1/chat/completions", post(routes::chat_completions))
+        .route("/v1/images/generations", post(routes::image_generations))
+        .route("/v1/audio/speech", post(routes::audio_speech));
     if state.config.enable_debug_endpoints {
         router = router
             .route("/v1/debug/config", get(routes::debug_config))
             .route("/v1/debug/sessions", get(routes::debug_sessions))
             .route("/v1/debug/kv", get(routes::debug_kv))
             .route("/v1/debug/trace", get(routes::debug_trace))
+            .route("/v1/debug/profile", get(routes::debug_profile))
             .route(
                 "/v1/debug/trace/perfetto",
                 get(routes::debug_trace_perfetto),

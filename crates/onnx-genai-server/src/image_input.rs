@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use onnx_genai_metadata::ImagePreprocessingProgram;
-use onnx_genai_ort::DataType;
+use onnx_genai_ort::{DataType, Value};
 use onnx_genai_preprocess::image::{
     ImagePreprocessor, ThumbnailPosition,
     packed::{ImageExpansionSummary, ImageTensorDType, ImageTensorData},
@@ -11,22 +11,22 @@ use onnx_genai_preprocess::image::{
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_BASE64_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
-pub(crate) const MAX_EXPANDED_PROMPT_TOKENS: usize = 1024 * 1024;
+pub const MAX_EXPANDED_PROMPT_TOKENS: usize = 1024 * 1024;
 
 #[derive(Debug)]
-pub(crate) struct ImageTensor {
-    pub(crate) endpoint: String,
-    pub(crate) expected_dtype: DataType,
-    pub(crate) expected_shape: Vec<i64>,
-    pub(crate) shape: Vec<i64>,
-    pub(crate) data: ImageTensorData,
+pub struct ImageTensor {
+    pub endpoint: String,
+    pub expected_dtype: DataType,
+    pub expected_shape: Vec<i64>,
+    pub shape: Vec<i64>,
+    pub data: ImageTensorData,
 }
 
 #[derive(Debug)]
-pub(crate) struct ImageBundle {
-    pub(crate) tensors: Vec<ImageTensor>,
-    pub(crate) images: Vec<ImageExpansionSummary>,
-    pub(crate) thumbnail_position: ThumbnailPosition,
+pub struct ImageBundle {
+    pub tensors: Vec<ImageTensor>,
+    pub images: Vec<ImageExpansionSummary>,
+    pub thumbnail_position: ThumbnailPosition,
     /// Compatibility view of the first fp32 tensor for existing unit tests.
     #[cfg(test)]
     pub(crate) shape: Vec<i64>,
@@ -39,12 +39,12 @@ pub(crate) struct ImageBundle {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct VisionOutputBinding {
-    pub(crate) metadata_name: String,
-    pub(crate) endpoint: String,
-    pub(crate) content: String,
-    pub(crate) dtype: DataType,
-    pub(crate) shape: Vec<i64>,
+pub struct VisionOutputBinding {
+    pub metadata_name: String,
+    pub endpoint: String,
+    pub content: String,
+    pub dtype: DataType,
+    pub shape: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +66,7 @@ struct VisionExpansionSpec {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct VisionInputSpec {
+pub struct VisionInputSpec {
     bindings: Vec<VisionOutputBinding>,
     preprocessor: ImagePreprocessor,
     expansion: Option<VisionExpansionSpec>,
@@ -74,7 +74,7 @@ pub(crate) struct VisionInputSpec {
 
 impl VisionInputSpec {
     #[cfg(test)]
-    pub(crate) fn from_input(endpoint: String, shape: &[i64]) -> anyhow::Result<Self> {
+    pub fn from_input(endpoint: String, shape: &[i64]) -> anyhow::Result<Self> {
         let preprocessor = ImagePreprocessor::from_input(shape)
             .with_context(|| format!("invalid preprocessing for vision input '{endpoint}'"))?;
         Ok(Self {
@@ -90,7 +90,7 @@ impl VisionInputSpec {
         })
     }
 
-    pub(crate) fn from_program(
+    pub fn from_program(
         bindings: Vec<VisionOutputBinding>,
         pixel_shape: &[i64],
         program: &ImagePreprocessingProgram,
@@ -113,7 +113,17 @@ impl VisionInputSpec {
         })
     }
 
-    pub(crate) fn expand_prompt(
+    /// The placeholder token this package expects, one per image.
+    ///
+    /// Front ends use it to insert placeholders a caller did not write, so a
+    /// user never has to know a model's private placeholder spelling.
+    pub fn placeholder_token_id(&self) -> Option<u32> {
+        self.expansion
+            .as_ref()
+            .and_then(|expansion| u32::try_from(expansion.placeholder_token_id).ok())
+    }
+
+    pub fn expand_prompt(
         &self,
         prompt_token_ids: &[u32],
         bundle: &ImageBundle,
@@ -441,17 +451,38 @@ impl VisionExpansionSpec {
     }
 }
 
-pub(crate) async fn load_and_preprocess(
-    urls: &[String],
-    spec: &VisionInputSpec,
-) -> anyhow::Result<ImageBundle> {
+/// Fetch every `data:`/`http(s):` image URL into encoded bytes, in order.
+///
+/// Only remote and inline sources are accepted; local filesystem paths are
+/// deliberately unsupported so an HTTP request can never read server-local
+/// files. In-process callers that already hold image bytes (for example the
+/// CLI, which reads a user-supplied local path) skip this and go straight to
+/// [`preprocess_encoded_images`].
+pub(crate) async fn fetch_images(urls: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut images = Vec::with_capacity(urls.len());
     for url in urls {
         images.push(load_image_bytes(url).await?);
     }
+    Ok(images)
+}
+
+#[cfg(test)]
+pub(crate) async fn load_and_preprocess(
+    urls: &[String],
+    spec: &VisionInputSpec,
+) -> anyhow::Result<ImageBundle> {
+    preprocess_encoded_images(&fetch_images(urls).await?, spec)
+}
+
+/// Run the typed image preprocessing program over already-loaded encoded images
+/// (PNG/JPEG/… bytes), producing the pipeline tensors and expansion summaries.
+pub fn preprocess_encoded_images(
+    images: &[Vec<u8>],
+    spec: &VisionInputSpec,
+) -> anyhow::Result<ImageBundle> {
     let bundle = spec
         .preprocessor
-        .preprocess_encoded(&images)
+        .preprocess_encoded(images)
         .context("What: image preprocessing failed. Why: encoded image data did not satisfy the typed preprocessing program. How: inspect preprocessing.image transforms, output dtypes, and endpoint shapes.")?;
 
     let mut tensors = Vec::with_capacity(spec.bindings.len());
@@ -513,7 +544,7 @@ pub(crate) async fn load_and_preprocess(
     })
 }
 
-pub(crate) fn metadata_dtype(value: &str) -> anyhow::Result<DataType> {
+pub fn metadata_dtype(value: &str) -> anyhow::Result<DataType> {
     match value {
         "float32" | "fp32" => Ok(DataType::Float32),
         "float16" | "fp16" | "half" => Ok(DataType::Float16),
@@ -527,6 +558,54 @@ pub(crate) fn metadata_dtype(value: &str) -> anyhow::Result<DataType> {
             "What: image output dtype metadata is unsupported. Why: '{other}' has no typed tensor mapping. How: declare float32, float16, bfloat16, int64, int32, int8, uint8, or bool."
         ),
     }
+}
+
+/// Materialize a preprocessed image tensor as an ONNX Runtime [`Value`],
+/// failing closed when it does not match the endpoint's declared dtype/shape.
+pub fn image_tensor_value(tensor: ImageTensor) -> anyhow::Result<Value> {
+    let ImageTensor {
+        endpoint,
+        expected_dtype,
+        expected_shape,
+        shape,
+        data,
+    } = tensor;
+    let actual_dtype = ort_dtype(match &data {
+        ImageTensorData::Fp32(_) => ImageTensorDType::Fp32,
+        ImageTensorData::Fp16(_) => ImageTensorDType::Fp16,
+        ImageTensorData::Bf16(_) => ImageTensorDType::Bf16,
+        ImageTensorData::Int64(_) => ImageTensorDType::Int64,
+        ImageTensorData::Int32(_) => ImageTensorDType::Int32,
+        ImageTensorData::Int8(_) => ImageTensorDType::Int8,
+        ImageTensorData::Uint8(_) => ImageTensorDType::Uint8,
+        ImageTensorData::Bool(_) => ImageTensorDType::Bool,
+    });
+    if actual_dtype != expected_dtype || !shape_matches(&expected_shape, &shape) {
+        anyhow::bail!(
+            "What: pipeline endpoint '{endpoint}' could not be injected. \
+             Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, got dtype {actual_dtype:?} shape {shape:?}. \
+             How: correct the typed preprocessing output and its endpoint binding."
+        );
+    }
+    match data {
+        ImageTensorData::Fp32(data) => Value::from_vec_f32(data, &shape),
+        ImageTensorData::Fp16(data) => Value::from_vec_f16_bits(data, &shape),
+        ImageTensorData::Bf16(data) => Value::from_vec_bf16_bits(data, &shape),
+        ImageTensorData::Int64(data) => Value::from_vec_i64(data, &shape),
+        ImageTensorData::Int32(_)
+        | ImageTensorData::Int8(_)
+        | ImageTensorData::Uint8(_)
+        | ImageTensorData::Bool(_) => anyhow::bail!(
+            "What: pipeline endpoint '{endpoint}' could not be materialized. \
+             Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, but onnx-genai-ort has no owned Value constructor for this typed processor output. \
+             How: add the matching Value constructor operation before serving this metadata contract."
+        ),
+    }
+    .with_context(|| {
+        format!(
+            "What: pipeline endpoint '{endpoint}' tensor construction failed. Why: expected dtype {expected_dtype:?} shape {expected_shape:?}, received shape {shape:?}. How: correct the processor output shape/data length."
+        )
+    })
 }
 
 fn ort_dtype(dtype: ImageTensorDType) -> DataType {

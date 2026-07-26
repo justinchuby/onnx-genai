@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -12,10 +13,9 @@ use onnx_genai_engine::FimConfig;
 use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
-    audio_input::AudioInputSpec,
     driver::EngineDriver,
-    image_input::VisionInputSpec,
     models_config::ModelSpec,
+    multimodal::MultimodalSpecs,
     state::{ServerConfig, build_handle},
 };
 
@@ -36,42 +36,74 @@ pub enum EvictionPolicy {
 /// by Axum's `State` extractor.
 pub(crate) struct ModelHandle {
     pub(crate) id: String,
+    /// Directory the model was loaded from, needed by routes that resolve
+    /// package-relative files (the diffusion tokenizer and prompt encoder).
+    pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
     pub(crate) model_max_context: Option<usize>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
-    pub(crate) vision_input: Option<VisionInputSpec>,
-    pub(crate) audio_input: Option<AudioInputSpec>,
+    /// Declared image/audio input contracts, or `None` for a single decoder
+    /// graph. Shared with the CLI so both front ends admit the same inputs.
+    pub(crate) multimodal: Option<MultimodalSpecs>,
+    /// Whether the package declares a denoise loop, i.e. whether it can serve
+    /// `POST /v1/images/generations`.
+    pub(crate) text_to_image: bool,
+    /// Whether the package's pipeline ends in a waveform stage, i.e. whether it
+    /// can serve `POST /v1/audio/speech`.
+    pub(crate) text_to_audio: bool,
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
 }
 
+/// Everything needed to construct a [`ModelHandle`].
+///
+/// A struct rather than a long positional argument list: the fields are mostly
+/// optional and same-typed, so positional construction was easy to get wrong.
+pub(crate) struct ModelHandleParts {
+    pub(crate) id: String,
+    pub(crate) model_dir: PathBuf,
+    pub(crate) engine: EngineDriver,
+    pub(crate) tokenizer: Arc<Tokenizer>,
+    pub(crate) chat_template: Option<Arc<ChatTemplate>>,
+    pub(crate) model_max_context: Option<usize>,
+    pub(crate) fim_config: Option<FimConfig>,
+    pub(crate) pipeline: bool,
+    pub(crate) multimodal: Option<MultimodalSpecs>,
+    pub(crate) text_to_image: bool,
+    pub(crate) text_to_audio: bool,
+}
+
 impl ModelHandle {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        id: String,
-        engine: EngineDriver,
-        tokenizer: Arc<Tokenizer>,
-        chat_template: Option<Arc<ChatTemplate>>,
-        model_max_context: Option<usize>,
-        fim_config: Option<FimConfig>,
-        pipeline: bool,
-        vision_input: Option<VisionInputSpec>,
-        audio_input: Option<AudioInputSpec>,
-    ) -> Self {
-        Self {
+    pub(crate) fn new(parts: ModelHandleParts) -> Self {
+        let ModelHandleParts {
             id,
+            model_dir,
             engine,
             tokenizer,
             chat_template,
             model_max_context,
             fim_config,
             pipeline,
-            vision_input,
-            audio_input,
+            multimodal,
+            text_to_image,
+            text_to_audio,
+        } = parts;
+        Self {
+            id,
+            model_dir,
+            engine,
+            tokenizer,
+            chat_template,
+            model_max_context,
+            fim_config,
+            pipeline,
+            multimodal,
+            text_to_image,
+            text_to_audio,
             last_request_at: AtomicU64::new(now_millis()),
         }
     }
@@ -472,7 +504,7 @@ impl ModelRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::sync::Arc;
 
     use tokio::sync::{Semaphore, mpsc};
 
@@ -494,6 +526,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         Arc::new(ModelHandle {
             id: id.to_string(),
+            model_dir: PathBuf::new(),
             engine: EngineDriver {
                 commands: tx,
                 generation_capacity: Arc::new(Semaphore::new(0)),
@@ -503,8 +536,9 @@ mod tests {
             model_max_context: None,
             fim_config: None,
             pipeline: false,
-            vision_input: None,
-            audio_input: None,
+            multimodal: None,
+            text_to_image: false,
+            text_to_audio: false,
             last_request_at: AtomicU64::new(last_request_at),
         })
     }

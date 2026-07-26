@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use onnx_runtime_ir::{DataType, DeviceType, Shape};
+use onnx_runtime_tracer::{Args, SpanGuard};
 
 pub use epcontext::{
     CompiledPartition, EpContextPlacement, dump_session_ep_context, load_ep_context_nodes,
@@ -32,7 +33,7 @@ pub use error::SessionError;
 pub use executor::{
     CacheStats, CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
     DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
-    ExecutionProviderFallbackReport, SeamReason, print_exec_phase_profile,
+    ExecutionProviderFallbackReport, SeamReason, exec_phase_stats, print_exec_phase_profile,
 };
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
@@ -44,6 +45,12 @@ mod executor;
 mod fp16_decode;
 pub mod sequence;
 mod tensor;
+
+fn trace_span(name: &'static str, cat: &'static str) -> Option<SpanGuard> {
+    onnx_runtime_tracer::global_context()
+        .filter(|trace| trace.is_enabled())
+        .map(|trace| trace.span(name, cat))
+}
 
 /// A graph output produced by the runtime.
 #[derive(Debug)]
@@ -604,13 +611,35 @@ impl SessionBuilder {
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| PathBuf::from("."));
                     let bytes = onnx_runtime_loader::read_model_binary(&path)?;
-                    let metadata = model_metadata_from_bytes(&bytes)?;
+                    let metadata = {
+                        let mut span = trace_span("load.model_metadata", "load");
+                        let metadata = model_metadata_from_bytes(&bytes)?;
+                        if let Some(span) = span.as_mut() {
+                            span.set_args(
+                                Args::new()
+                                    .bytes(bytes.len() as u64)
+                                    .with("metadata_props", metadata.metadata_props.len() as u64),
+                            );
+                        }
+                        metadata
+                    };
                     let (g, w) =
                         onnx_runtime_loader::load_model_bytes_with_weights(&bytes, &model_dir)?;
                     (g, w, model_dir, metadata)
                 }
                 (None, Some(bytes)) => {
-                    let metadata = model_metadata_from_bytes(&bytes)?;
+                    let metadata = {
+                        let mut span = trace_span("load.model_metadata", "load");
+                        let metadata = model_metadata_from_bytes(&bytes)?;
+                        if let Some(span) = span.as_mut() {
+                            span.set_args(
+                                Args::new()
+                                    .bytes(bytes.len() as u64)
+                                    .with("metadata_props", metadata.metadata_props.len() as u64),
+                            );
+                        }
+                        metadata
+                    };
                     let (g, w) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")?;
                     (g, w, PathBuf::from("."), metadata)
                 }
@@ -624,18 +653,42 @@ impl SessionBuilder {
         // `DecodePrecision::Model`, for non-GPU devices, and for any graph that
         // is not an fp32-activation quantized decoder, so the default path and
         // native fp16 models stay bit-identical.
-        fp16_decode::maybe_convert_decode_fp16(
-            &mut graph,
-            &weights,
-            self.decode_precision,
-            device_preference_is_gpu(&self.device),
-        );
+        {
+            let nodes_before = graph.num_nodes();
+            let mut span = trace_span("session.fp16_decode", "session");
+            fp16_decode::maybe_convert_decode_fp16(
+                &mut graph,
+                &weights,
+                self.decode_precision,
+                device_preference_is_gpu(&self.device),
+            );
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("nodes_before", nodes_before as u64)
+                        .with("nodes_after", graph.num_nodes() as u64)
+                        .with("device_gpu", device_preference_is_gpu(&self.device)),
+                );
+            }
+        }
 
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
-        let ep = match self.execution_provider {
-            Some(ep) => ep,
-            None => select_execution_provider(&self.device)?,
+        let ep = {
+            let mut span = trace_span("session.select_execution_provider", "session");
+            let ep = match self.execution_provider {
+                Some(ep) => ep,
+                None => select_execution_provider(&self.device)?,
+            };
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("provider", ep.name().to_string())
+                        .with("device", ep.device_type().trace_name().into_owned())
+                        .with("device_index", ep.device_id().index as u64),
+                );
+            }
+            ep
         };
 
         let mut session = InferenceSession::from_parts(
@@ -647,7 +700,11 @@ impl SessionBuilder {
             ep,
         )?;
         if !self.warmup_shapes.is_empty() {
+            let mut span = trace_span("session.warmup", "session");
             session.warmup(&self.warmup_shapes)?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(Args::new().with("shape_count", self.warmup_shapes.len() as u64));
+            }
         }
         Ok(session)
     }
@@ -767,11 +824,23 @@ fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) 
         return Ok(());
     }
 
-    onnx_runtime_optimizer::run_passes(
-        graph,
-        &passes,
-        &onnx_runtime_optimizer::PassContext::new(),
-    )?;
+    {
+        let nodes_before = graph.num_nodes();
+        let mut span = trace_span("session.optimize_graph", "session");
+        onnx_runtime_optimizer::run_passes(
+            graph,
+            &passes,
+            &onnx_runtime_optimizer::PassContext::new(),
+        )?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("passes", passes.len() as u64)
+                    .with("nodes_before", nodes_before as u64)
+                    .with("nodes_after_passes", graph.num_nodes() as u64),
+            );
+        }
+    }
 
     // Fusion emits fused ops in the `com.microsoft` contrib domain; make sure
     // that domain is imported so shape-inference and kernel dispatch pick the
@@ -786,11 +855,21 @@ fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) 
     // value whose producer changed) must be re-resolved before compile.
     let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
     let opset_imports = graph.opset_imports.clone();
-    registry.infer_graph(
-        graph,
-        &opset_imports,
-        onnx_runtime_shape_inference::MergePolicy::Permissive,
-    )?;
+    {
+        let mut span = trace_span("session.optimize_shape_inference", "session");
+        registry.infer_graph(
+            graph,
+            &opset_imports,
+            onnx_runtime_shape_inference::MergePolicy::Permissive,
+        )?;
+        if let Some(span) = span.as_mut() {
+            span.set_args(
+                Args::new()
+                    .with("nodes", graph.num_nodes() as u64)
+                    .with("opset_domains", opset_imports.len() as u64),
+            );
+        }
+    }
 
     Ok(())
 }
@@ -864,12 +943,33 @@ impl InferenceSession {
         // the default ONNX domain is `""`, never `"ai.onnx"`. The executor and
         // validators rely on this, comparing `domain.is_empty()` directly.
         let mut graph = graph;
-        graph.normalize_domains();
+        {
+            let mut span = trace_span("session.normalize_validate", "session");
+            graph.normalize_domains();
 
-        onnx_runtime_loader::validate_model(&graph)?;
+            onnx_runtime_loader::validate_model(&graph)?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("nodes", graph.num_nodes() as u64)
+                        .with("values", graph.values.len() as u64),
+                );
+            }
+        }
 
-        let inputs = io_meta(&graph, &graph.inputs);
-        let outputs = io_meta(&graph, &graph.outputs);
+        let (inputs, outputs) = {
+            let mut span = trace_span("session.io_meta", "session");
+            let inputs = io_meta(&graph, &graph.inputs);
+            let outputs = io_meta(&graph, &graph.outputs);
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("inputs", inputs.len() as u64)
+                        .with("outputs", outputs.len() as u64),
+                );
+            }
+            (inputs, outputs)
+        };
         // EPContext consume path (§55.3): restore any pre-compiled EP contexts
         // before building the executor. Dispatch is a pure `source`-key lookup
         // over the session's selected EP, so a model carrying EPContext nodes
@@ -880,9 +980,26 @@ impl InferenceSession {
             onnx_runtime_ep_api::EpId,
             &dyn onnx_runtime_ep_api::ExecutionProvider,
         ); 1] = [(onnx_runtime_ep_api::EpId(0), ep.as_ref())];
-        epcontext::load_ep_context_nodes(&graph, model_dir, &eps)?;
+        {
+            let mut span = trace_span("session.epcontext_restore", "session");
+            epcontext::load_ep_context_nodes(&graph, model_dir, &eps)?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("provider", ep.name().to_string())
+                        .with("model_dir", model_dir.display().to_string()),
+                );
+            }
+        }
 
-        let exec = executor::Executor::build(graph, weights, ep)?;
+        let exec = {
+            let mut span = trace_span("session.executor_build", "session");
+            let exec = executor::Executor::build(graph, weights, ep)?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(Args::new().with("cache_entries", exec.cache_stats().entries as u64));
+            }
+            exec
+        };
         Ok(Self {
             inputs,
             outputs,

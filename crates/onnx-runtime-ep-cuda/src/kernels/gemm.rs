@@ -246,6 +246,20 @@ impl GemmKernel {
                 Some((c, rs, cs))
             }
         };
+        crate::trace::record_kernel_metrics(inputs, outputs, || {
+            let mut flops = (plan.m as u64)
+                .saturating_mul(plan.n as u64)
+                .saturating_mul(plan.k as u64)
+                .saturating_mul(2);
+            if bias_plan.is_some() && self.beta != 0.0 {
+                flops = flops.saturating_add(
+                    (plan.m as u64)
+                        .saturating_mul(plan.n as u64)
+                        .saturating_mul(2),
+                );
+            }
+            flops
+        });
 
         let a_ptr = cuptr(a.data_ptr::<u8>() as *const c_void);
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
