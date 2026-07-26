@@ -70,6 +70,23 @@ pub enum GenAiConfigError {
         /// Missing or inconsistent semantic facts.
         missing: String,
     },
+    /// The package describes a valid model family that the current
+    /// inference-metadata contract cannot execute (e.g. an RNN-T transducer).
+    /// Declined honestly rather than mis-bound as a supported shape.
+    #[error(
+        "unsupported pipeline family: {family}. {reason}. \
+         Why: this family is structurally distinct from every executable shape \
+         (single-decoder, multimodal, encoder-decoder, decoder-pipeline) and the \
+         loader will not fabricate bindings it cannot honor. How to fix: add native \
+         support for this family, or supply a native inference_metadata.json that \
+         declares an executable pipeline"
+    )]
+    UnsupportedPipelineFamily {
+        /// Human-readable family name (e.g. `"RNN-T transducer"`).
+        family: String,
+        /// What makes it unexecutable and what it would take to support it.
+        reason: String,
+    },
 }
 
 /// Forward-compatible view of an onnxruntime-genai `genai_config.json`.
@@ -129,6 +146,15 @@ pub struct GenAiModel {
     /// Optional speech / audio-embedding graph.
     #[serde(default)]
     pub speech: Option<GenAiSpeech>,
+    /// Optional RNN-T joint (joiner) network fusing encoder + prediction-network
+    /// outputs into per-step logits. Its presence marks a transducer topology,
+    /// which is NOT an encoder-decoder (cross-attention) model.
+    #[serde(default)]
+    pub joiner: Option<GenAiJoiner>,
+    /// Optional voice-activity-detection graph (e.g. Silero VAD) used by
+    /// streaming transducer packages for segmentation.
+    #[serde(default)]
+    pub vad: Option<GenAiVad>,
 }
 
 /// `eos_token_id` accepts either a scalar or an array; both normalize to a list.
@@ -194,6 +220,13 @@ pub struct DecoderInputs {
     pub cross_past_key_names: Option<String>,
     pub cross_past_value_names: Option<String>,
     pub encoder_hidden_states: Option<String>,
+    /// RNN-T prediction-network label input (previous non-blank token). Present
+    /// instead of `input_ids` in transducer prediction networks.
+    pub targets: Option<String>,
+    /// RNN-T prediction-network LSTM hidden state input (`h_in`).
+    pub lstm_hidden_state: Option<String>,
+    /// RNN-T prediction-network LSTM cell state input (`c_in`).
+    pub lstm_cell_state: Option<String>,
 }
 
 /// Decoder graph output port names (values are graph tensor names).
@@ -239,6 +272,48 @@ pub struct EncoderOutputs {
     pub encoder_hidden_states: Option<String>,
     pub cross_present_key_names: Option<String>,
     pub cross_present_value_names: Option<String>,
+}
+
+/// The `model.joiner` section (RNN-T joint network).
+///
+/// The joint network combines the encoder output and the prediction-network
+/// (decoder) output into per-step logits over the vocabulary plus a blank
+/// symbol. It has no analog in a cross-attention encoder-decoder model, so its
+/// mere presence identifies a transducer package. Only the fields needed to
+/// DETECT and describe the family are parsed; the joint is not yet executable.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GenAiJoiner {
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub inputs: JoinerInputs,
+    #[serde(default)]
+    pub outputs: JoinerOutputs,
+}
+
+/// Joint-network graph input port names.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct JoinerInputs {
+    pub encoder_outputs: Option<String>,
+    pub decoder_outputs: Option<String>,
+}
+
+/// Joint-network graph output port names.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct JoinerOutputs {
+    pub logits: Option<String>,
+}
+
+/// The `model.vad` section (voice-activity-detection front-end, e.g. Silero).
+///
+/// Only parsed so streaming transducer packages describe cleanly; VAD
+/// segmentation is not part of the current inference-metadata contract.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GenAiVad {
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 /// The `model.embedding` section (multimodal token embedder).
@@ -326,6 +401,14 @@ pub struct ModelGraphInfo {
 pub struct PipelineGraphInfo {
     pub vision: ModelGraphInfo,
     pub embedding: ModelGraphInfo,
+    pub decoder: ModelGraphInfo,
+}
+
+/// ONNX graph inventories required to synthesize a strict encoder-decoder
+/// (audio/text sequence-to-sequence) pipeline, e.g. Whisper.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EncoderDecoderGraphInfo {
+    pub encoder: ModelGraphInfo,
     pub decoder: ModelGraphInfo,
 }
 
@@ -457,6 +540,11 @@ enum ModelShape {
     Multimodal,
     /// Encoder + cross-attention decoder (ASR / whisper).
     EncoderDecoder,
+    /// RNN-T transducer: streaming encoder + LSTM prediction network + joint
+    /// network (+ optional VAD / streaming caches). A DISTINCT pipeline family
+    /// the current inference-metadata contract does not execute. Recognized so
+    /// it is never silently mis-bound as an encoder-decoder model.
+    Transducer,
     /// A single decoder split into an ordered set of sub-graphs.
     DecoderPipeline,
 }
@@ -505,7 +593,17 @@ impl GenAiConfig {
     }
 
     fn shape(&self) -> ModelShape {
-        if self.model.encoder.is_some() {
+        // Recognize the RNN-T transducer family BEFORE the encoder check: a
+        // transducer also declares `model.encoder`, but its encoder is a
+        // streaming Conformer with cache state (not a Whisper encoder emitting
+        // cross-KV), its decoder is an LSTM prediction network (no attention KV),
+        // and it carries a joint network. Classifying it as EncoderDecoder here
+        // would silently fabricate Whisper-style cross-KV bindings that do not
+        // exist. Detection is structural (joint network / LSTM decoder states),
+        // never keyed on `model.type` or a model name.
+        if self.is_transducer() {
+            ModelShape::Transducer
+        } else if self.model.encoder.is_some() {
             ModelShape::EncoderDecoder
         } else if self.model.embedding.is_some()
             || self.model.vision.is_some()
@@ -519,6 +617,32 @@ impl GenAiConfig {
         }
     }
 
+    /// Whether this package describes an RNN-T transducer (e.g. Nemotron speech:
+    /// Conformer encoder + LSTM prediction network + joint network + VAD).
+    ///
+    /// Detected purely from structure — never from `model.type` or a model name:
+    /// a transducer declares a `model.joiner` joint network, and/or its decoder
+    /// is an LSTM prediction network driven by `targets` + LSTM hidden/cell state
+    /// with no attention KV. Either signal is sufficient. This is a DISTINCT
+    /// pipeline family the current inference-metadata contract cannot execute;
+    /// it must not be classified or bound as an encoder-decoder model.
+    pub fn is_transducer(&self) -> bool {
+        self.model.joiner.is_some() || self.decoder_is_lstm_prediction_network()
+    }
+
+    /// Whether the decoder graph is an LSTM prediction network (RNN-T) rather
+    /// than an attention transformer decoder: it consumes LSTM hidden/cell state
+    /// and exposes no self- or cross-attention KV ports.
+    fn decoder_is_lstm_prediction_network(&self) -> bool {
+        let inputs = &self.model.decoder.inputs;
+        (inputs.lstm_hidden_state.is_some() || inputs.lstm_cell_state.is_some())
+            && inputs.past_key_names.is_none()
+            && inputs.past_value_names.is_none()
+            && inputs.past_names.is_none()
+            && inputs.cross_past_key_names.is_none()
+            && inputs.cross_past_value_names.is_none()
+    }
+
     /// Convert into native [`InferenceMetadata`].
     ///
     /// `kv_native_dtype` is the KV cache scalar dtype read from the ONNX graph by
@@ -529,11 +653,18 @@ impl GenAiConfig {
     /// sequence length, and a share-buffer-compatible KV dtype is provided.
     ///
     /// NOTE: shapes/tensors the native spec cannot yet represent are intentionally
-    /// skipped (loading never fails on them): RNN-T joiner graphs, VAD, Conformer
-    /// NeMo `cache_last_channel`/`cache_last_time` state, LSTM/RNN decoder states
+    /// skipped (loading never fails on them): VAD, Conformer NeMo
+    /// `cache_last_channel`/`cache_last_time` state, LSTM/RNN decoder states
     /// (`rnn_states`, `lstm_hidden_state`, `lstm_cell_state`), paged-attention
     /// `block_table`, beam `cache_indirection`, `output_cross_qk`, and the
     /// per-session `session_options`/`run_options`.
+    ///
+    /// EXCEPTION: an RNN-T transducer package (joint/joiner network and/or an
+    /// LSTM prediction network) is NOT skipped-into an encoder-decoder spec — it
+    /// is recognized by [`Self::is_transducer`] and declined with an explicit
+    /// [`GenAiConfigError::UnsupportedPipelineFamily`], because silently emitting
+    /// a Whisper-style cross-attention spec for it would fabricate bindings the
+    /// graphs do not expose.
     pub fn to_inference_metadata(
         &self,
         kv_native_dtype: Option<&str>,
@@ -563,6 +694,12 @@ impl GenAiConfig {
         decoder_graph: Option<&ModelGraphInfo>,
     ) -> Result<InferenceMetadata, GenAiConfigError> {
         let shape = self.shape();
+
+        // Decline the transducer family up front: it has no executable
+        // representation, so there is nothing honest to synthesize.
+        if shape == ModelShape::Transducer {
+            return Err(transducer_unsupported());
+        }
 
         let mut model = Map::new();
         model.insert("attention".into(), self.attention_json());
@@ -595,6 +732,8 @@ impl GenAiConfig {
             ModelShape::DecoderPipeline => {
                 root.insert("pipeline".into(), self.decoder_pipeline_json());
             }
+            // Declined above; unreachable but kept explicit for exhaustiveness.
+            ModelShape::Transducer => return Err(transducer_unsupported()),
         }
 
         if let Some(generation) = self.generation_json() {
@@ -1076,6 +1215,39 @@ pub fn pipeline_inference_metadata_from_dir(
     Ok(Some(config.to_strict_pipeline_metadata(model_dir, graphs)?))
 }
 
+/// Strict compatibility conversion for an existing encoder-decoder ORT-GenAI
+/// package (audio/text sequence-to-sequence, e.g. Whisper).
+///
+/// Like [`pipeline_inference_metadata_from_dir`], the JSON files provide the
+/// semantic contract while `graphs` provides the authoritative ONNX port list,
+/// rank, shape, and dtype facts. Nothing is inferred from `model.type` or a
+/// model name: the encoder-decoder shape is recognized only from the declared
+/// `model.encoder` section, and an RNN-T transducer (which also declares an
+/// encoder) is declined with [`GenAiConfigError::UnsupportedPipelineFamily`]
+/// rather than mis-bound. Returns `Ok(None)` when the directory has no
+/// `genai_config.json` or the config does not describe an encoder-decoder model.
+pub fn encoder_decoder_pipeline_inference_metadata_from_dir(
+    model_dir: &Path,
+    graphs: &EncoderDecoderGraphInfo,
+) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
+    let Some(path) = find_in_dir(model_dir) else {
+        return Ok(None);
+    };
+    let config = load(&path)?;
+    // A transducer also declares `model.encoder`; decline it explicitly with the
+    // honest family error rather than returning `Ok(None)` (which would surface a
+    // misleading "not an encoder-decoder" fall-through) or fabricating a spec.
+    if config.is_transducer() {
+        return Err(transducer_unsupported());
+    }
+    if config.shape() != ModelShape::EncoderDecoder {
+        return Ok(None);
+    }
+    Ok(Some(
+        config.to_strict_encoder_decoder_pipeline_metadata(graphs)?,
+    ))
+}
+
 impl GenAiConfig {
     fn to_strict_pipeline_metadata(
         &self,
@@ -1397,6 +1569,239 @@ impl GenAiConfig {
         Ok(metadata)
     }
 
+    /// Strict encoder-decoder pipeline synth (audio/text sequence-to-sequence).
+    ///
+    /// Recognized purely from the encoder-decoder SHAPE of `genai_config.json`
+    /// (a declared `model.encoder` with cross-attention KV outputs feeding the
+    /// decoder's cross-attention KV inputs), never from `model.type` or a model
+    /// name, so any encoder-decoder family (Whisper audio, and other
+    /// sequence-to-sequence encoders) synthesizes the same way. Every port,
+    /// rank, and dtype fact is validated against the authoritative ONNX graphs.
+    fn to_strict_encoder_decoder_pipeline_metadata(
+        &self,
+        graphs: &EncoderDecoderGraphInfo,
+    ) -> Result<InferenceMetadata, GenAiConfigError> {
+        let encoder = required_ref(self.model.encoder.as_ref(), "model.encoder")?;
+        let decoder = &self.model.decoder;
+        let encoder_filename = required_str(encoder.filename.as_deref(), "model.encoder.filename")?;
+        let decoder_filename =
+            required_str(decoder.filename.as_deref(), "model.decoder.filename")?;
+
+        // Encoder prompt input, keyed off the declared input SHAPE, not a model
+        // name: audio front-ends declare `audio_features`, text encoders declare
+        // `input_ids`. Exactly one must be present.
+        let (encoder_input_field, encoder_input) =
+            match (encoder.inputs.audio_features.as_deref(), encoder.inputs.input_ids.as_deref()) {
+                (Some(audio), None) => ("model.encoder.inputs.audio_features", audio),
+                (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids),
+                (Some(_), Some(_)) => {
+                    return Err(incomplete(
+                        "model.encoder declares both audio_features and input_ids; exactly one encoder prompt input is required",
+                    ));
+                }
+                (None, None) => {
+                    return Err(incomplete(
+                        "model.encoder.inputs.audio_features or model.encoder.inputs.input_ids",
+                    ));
+                }
+            };
+        let encoder_input = required_str(Some(encoder_input), encoder_input_field)?;
+        require_graph_input(&graphs.encoder, encoder_input, "encoder")?;
+
+        let encoder_hidden = required_str(
+            encoder.outputs.encoder_hidden_states.as_deref(),
+            "model.encoder.outputs.encoder_hidden_states",
+        )?;
+        require_graph_output(&graphs.encoder, encoder_hidden, "encoder")?;
+
+        let token = required_str(decoder.inputs.input_ids.as_deref(), "model.decoder.inputs.input_ids")?;
+        require_graph_input(&graphs.decoder, token, "decoder")?;
+        let logits =
+            required_str(decoder.outputs.logits.as_deref(), "model.decoder.outputs.logits")?;
+        require_graph_output(&graphs.decoder, logits, "decoder")?;
+
+        // Self-attention KV: the growing per-step cache. Matched by pattern
+        // against the decoder graph so only the ports the graph truly exposes are
+        // declared, paired positionally as `[key_i, value_i, ...]`.
+        let (self_input_indices, self_kv_inputs, self_input_dtype) = strict_indexed_kv(
+            &graphs.decoder.inputs,
+            required_str(
+                decoder.inputs.past_key_names.as_deref(),
+                "model.decoder.inputs.past_key_names",
+            )?,
+            required_str(
+                decoder.inputs.past_value_names.as_deref(),
+                "model.decoder.inputs.past_value_names",
+            )?,
+            "decoder self-attention past key/value",
+        )?;
+        let (self_output_indices, self_kv_outputs, self_output_dtype) = strict_indexed_kv(
+            &graphs.decoder.outputs,
+            required_str(
+                decoder.outputs.present_key_names.as_deref(),
+                "model.decoder.outputs.present_key_names",
+            )?,
+            required_str(
+                decoder.outputs.present_value_names.as_deref(),
+                "model.decoder.outputs.present_value_names",
+            )?,
+            "decoder self-attention present key/value",
+        )?;
+        if self_input_indices != self_output_indices {
+            return Err(incomplete(
+                "decoder self-attention past/present KV do not have identical layer indices",
+            ));
+        }
+        if self_input_dtype != self_output_dtype {
+            return Err(incomplete(format!(
+                "decoder self-attention past KV dtype {self_input_dtype} does not match present KV dtype {self_output_dtype}"
+            )));
+        }
+
+        // Cross-attention KV static routing. The encoder computes the cross KV
+        // ONCE from the audio/text prompt and emits `present_*_cross_%d`; those
+        // feed the decoder's `past_*_cross_%d` inputs and never grow or update
+        // across decode steps. This is why they are wired as pipeline dataflow
+        // edges from the encoder to the decoder (a prompt-time prologue result),
+        // distinct from the growing self-attention cache the decoder owns.
+        let (cross_input_indices, cross_kv_inputs, cross_input_dtype) = strict_indexed_kv(
+            &graphs.decoder.inputs,
+            required_str(
+                decoder.inputs.cross_past_key_names.as_deref(),
+                "model.decoder.inputs.cross_past_key_names",
+            )?,
+            required_str(
+                decoder.inputs.cross_past_value_names.as_deref(),
+                "model.decoder.inputs.cross_past_value_names",
+            )?,
+            "decoder cross-attention past key/value",
+        )?;
+        let (cross_output_indices, cross_kv_outputs, cross_output_dtype) = strict_indexed_kv(
+            &graphs.encoder.outputs,
+            required_str(
+                encoder.outputs.cross_present_key_names.as_deref(),
+                "model.encoder.outputs.cross_present_key_names",
+            )?,
+            required_str(
+                encoder.outputs.cross_present_value_names.as_deref(),
+                "model.encoder.outputs.cross_present_value_names",
+            )?,
+            "encoder cross-attention present key/value",
+        )?;
+        if cross_input_indices != cross_output_indices {
+            return Err(incomplete(
+                "encoder-produced and decoder-consumed cross-attention KV do not have identical layer indices",
+            ));
+        }
+        if cross_input_dtype != cross_output_dtype {
+            return Err(incomplete(format!(
+                "encoder cross-attention KV dtype {cross_output_dtype} does not match decoder cross-attention KV dtype {cross_input_dtype}"
+            )));
+        }
+        // Cross-attention KV static routing is declared through the decoder's
+        // paired `cross_kv_inputs` (the decoder's `past_*_cross_%d` ports) and
+        // `cross_kv_outputs` (the encoder's `present_*_cross_%d` ports), matched
+        // positionally per layer. The runtime binds these encoder-produced KV
+        // tensors as stateful decoder inputs computed ONCE at prompt time, so
+        // they are NOT wired as per-step dataflow edges (doing so would
+        // double-bind the port). `dataflow` carries only genuine per-invocation
+        // tensor edges, e.g. the encoder hidden-states edge below when present.
+        let mut dataflow: Vec<Value> = Vec::new();
+
+        let mut decoder_io = Map::new();
+        decoder_io.insert("token_input".into(), json!(token));
+        if let Some(mask) = decoder.inputs.attention_mask.as_deref() {
+            require_graph_input(&graphs.decoder, mask, "decoder")?;
+            decoder_io.insert("attention_mask_input".into(), json!(mask));
+        }
+        if let Some(position) = decoder.inputs.position_ids.as_deref() {
+            require_graph_input(&graphs.decoder, position, "decoder")?;
+            decoder_io.insert("position_ids_input".into(), json!(position));
+        }
+        // Some encoder-decoder decoders also consume the encoder hidden states
+        // directly (computing cross KV internally); route it only when declared
+        // AND actually present as a decoder graph input.
+        if let Some(decoder_hidden) = decoder.inputs.encoder_hidden_states.as_deref()
+            && require_graph_input(&graphs.decoder, decoder_hidden, "decoder").is_ok()
+        {
+            decoder_io.insert("encoder_hidden_states_input".into(), json!(decoder_hidden));
+            dataflow.push(edge_with_dtype(
+                &format!("encoder.{encoder_hidden}"),
+                &format!("decoder.{decoder_hidden}"),
+                &cross_output_dtype,
+            ));
+        }
+        decoder_io.insert("logits_output".into(), json!(logits));
+        decoder_io.insert("kv_inputs".into(), json!(self_kv_inputs));
+        decoder_io.insert("kv_outputs".into(), json!(self_kv_outputs));
+        decoder_io.insert("kv_update".into(), json!("append"));
+        decoder_io.insert("cross_kv_inputs".into(), json!(cross_kv_inputs));
+        decoder_io.insert("cross_kv_outputs".into(), json!(cross_kv_outputs));
+
+        let mut encoder_io = Map::new();
+        // Audio front-ends declare the mel `audio_features` input; text encoders
+        // reuse the ordinary `token_input`. Keyed off the encoder-input SHAPE
+        // resolved above, never the model name.
+        let encoder_input_role = if encoder_input_field.ends_with("audio_features") {
+            "audio_features_input"
+        } else {
+            "token_input"
+        };
+        encoder_io.insert(encoder_input_role.into(), json!(encoder_input));
+
+        let mut models = Map::new();
+        models.insert(
+            "encoder".into(),
+            component_json(
+                encoder_filename.to_owned(),
+                "encoder",
+                Some(Value::Object(encoder_io)),
+            ),
+        );
+        models.insert(
+            "decoder".into(),
+            component_json(
+                decoder_filename.to_owned(),
+                "decoder",
+                Some(Value::Object(decoder_io)),
+            ),
+        );
+
+        let mut phases = Map::new();
+        phases.insert("encoder".into(), run_on("prompt_only"));
+        phases.insert("decoder".into(), run_on("every_step"));
+
+        let strategy = composite_encode_decode(Some("encoder"), "decoder");
+
+        let mut pipeline = Map::new();
+        pipeline.insert("models".into(), Value::Object(models));
+        pipeline.insert("dataflow".into(), Value::Array(dataflow));
+        pipeline.insert("strategy".into(), strategy);
+        pipeline.insert("phases".into(), Value::Object(phases));
+
+        let mut model = Map::new();
+        model.insert("attention".into(), self.attention_json());
+        insert_usize(
+            &mut model,
+            "max_sequence_length",
+            self.max_sequence_length(),
+        );
+        insert_usize(&mut model, "vocab_size", self.model.vocab_size);
+
+        let mut root = Map::new();
+        root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+        root.insert("model".into(), Value::Object(model));
+        root.insert("pipeline".into(), Value::Object(pipeline));
+        if let Some(generation) = self.generation_json() {
+            root.insert("generation".into(), generation);
+        }
+        if let Some(tokens) = self.tokens_json() {
+            root.insert("tokens".into(), tokens);
+        }
+
+        Ok(serde_json::from_value(Value::Object(root))?)
+    }
+
     fn strict_decoder_state(
         &self,
         graph: &ModelGraphInfo,
@@ -1553,6 +1958,26 @@ fn incomplete(missing: impl Into<String>) -> GenAiConfigError {
     }
 }
 
+/// Honest decline for an RNN-T transducer package. The transducer family
+/// (streaming Conformer encoder with cache state + LSTM prediction network +
+/// joint network + optional VAD, driven by a blank-symbol greedy transducer
+/// loop) has no representation in the current inference-metadata contract, so
+/// the loader declines with a descriptive reason instead of fabricating a
+/// Whisper-style cross-attention encoder-decoder spec that does not match the
+/// graphs.
+fn transducer_unsupported() -> GenAiConfigError {
+    GenAiConfigError::UnsupportedPipelineFamily {
+        family: "RNN-T transducer".into(),
+        reason: "the package declares a joint (joiner) network and/or an LSTM prediction \
+                 network (targets + lstm_hidden_state/lstm_cell_state, no attention KV), i.e. a \
+                 Conformer-Transducer topology. Executing it needs a joint-network greedy \
+                 transducer decode loop (blank_id / max_symbols_per_step), streaming encoder \
+                 cache state (cache_last_channel/cache_last_time), and VAD segmentation — none of \
+                 which the encoder-decoder cross-attention contract models"
+            .into(),
+    }
+}
+
 fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, GenAiConfigError> {
     value
         .filter(|value| !value.trim().is_empty())
@@ -1628,6 +2053,55 @@ fn require_same_dtype(
             left.name, left.dtype, right.name, right.dtype
         )))
     }
+}
+
+/// Match a paired key/value `%d` name pattern against `tensors` and return the
+/// ordered layer index set, the interleaved `[key_0, value_0, key_1, ...]`
+/// names verified to exist in the graph, and the single shared cache dtype.
+///
+/// Unlike [`GenAiConfig::strict_decoder_state`], this does not require the key
+/// and value patterns to share a common textual prefix (Whisper self/cross KV
+/// use distinct `..._key_self_%d` / `..._value_self_%d` prefixes), and it does
+/// not derive any fixed-state `state_pairs`, so encoder-decoder cross-attention
+/// and cross-QK ports are never misread as recurrent state.
+fn strict_indexed_kv(
+    tensors: &[GraphTensorInfo],
+    key_pattern: &str,
+    value_pattern: &str,
+    description: &str,
+) -> Result<(Vec<usize>, Vec<String>, String), GenAiConfigError> {
+    let keys = match_indexed_tensors(tensors, key_pattern)?;
+    let values = match_indexed_tensors(tensors, value_pattern)?;
+    let indices = exact_index_set(&[&keys, &values], description)?;
+    if indices.is_empty() {
+        return Err(incomplete(format!(
+            "at least one {description} graph-port pair"
+        )));
+    }
+    let mut names = Vec::with_capacity(indices.len() * 2);
+    let mut dtype: Option<String> = None;
+    for index in &indices {
+        let key = keys[index];
+        let value = values[index];
+        require_same_dtype(key, value, description)?;
+        match dtype.as_deref() {
+            Some(canonical) if canonical != key.dtype => {
+                return Err(incomplete(format!(
+                    "all {description} tensors must use one dtype: canonical dtype is {canonical}, but '{}' is {}",
+                    key.name, key.dtype
+                )));
+            }
+            None => dtype = Some(key.dtype.clone()),
+            _ => {}
+        }
+        names.push(key.name.clone());
+        names.push(value.name.clone());
+    }
+    Ok((
+        indices,
+        names,
+        dtype.expect("non-empty KV indices establish a dtype"),
+    ))
 }
 
 fn processor_program_json(
@@ -2712,6 +3186,298 @@ mod tests {
         assert_eq!(generation.max_length, Some(448));
         assert_eq!(generation.do_sample, Some(false));
         assert_eq!(generation.num_beams, Some(1));
+    }
+
+    #[test]
+    fn whisper_strict_encoder_decoder_synth_routes_cross_kv() {
+        // Strict, graph-verified encoder-decoder synth (the path the ORT compat
+        // loader uses). Unlike the pattern-expanded `to_inference_metadata`, the
+        // cross-attention KV is wired as explicit encoder->decoder dataflow edges
+        // (static, computed once by the encoder), and the audio prompt input is
+        // surfaced on the encoder component.
+        let cfg: GenAiConfig = serde_json::from_str(WHISPER_JSON).unwrap();
+        let graphs = EncoderDecoderGraphInfo {
+            encoder: ModelGraphInfo {
+                inputs: vec![hybrid_graph_tensor(
+                    "audio_features",
+                    "float32",
+                    &[Some(1), Some(80), Some(3000)],
+                )],
+                outputs: vec![
+                    hybrid_graph_tensor(
+                        "encoder_hidden_states",
+                        "float32",
+                        &[Some(1), Some(1500), Some(384)],
+                    ),
+                    hybrid_graph_tensor(
+                        "present_key_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "present_value_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                ],
+            },
+            decoder: ModelGraphInfo {
+                inputs: vec![
+                    hybrid_graph_tensor("input_ids", "int64", &[Some(1), None]),
+                    hybrid_graph_tensor(
+                        "past_key_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "past_value_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "past_key_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "past_value_cross_0",
+                        "float32",
+                        &[Some(1), Some(6), Some(1500), Some(64)],
+                    ),
+                ],
+                outputs: vec![
+                    hybrid_graph_tensor("logits", "float32", &[Some(1), None, Some(51865)]),
+                    hybrid_graph_tensor(
+                        "present_key_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                    hybrid_graph_tensor(
+                        "present_value_self_0",
+                        "float32",
+                        &[Some(1), Some(6), None, Some(64)],
+                    ),
+                ],
+            },
+        };
+
+        let metadata = cfg
+            .to_strict_encoder_decoder_pipeline_metadata(&graphs)
+            .expect("strict encoder-decoder synth");
+        let pipeline = metadata.pipeline.as_ref().expect("pipeline");
+        onnx_genai_metadata::validate_pipeline_spec(pipeline).expect("valid pipeline spec");
+
+        // Encoder + decoder components.
+        assert_eq!(pipeline.models["encoder"].role, "encoder");
+        assert_eq!(pipeline.models["decoder"].role, "decoder");
+
+        // Audio prompt input surfaced on the encoder.
+        let encoder_io = pipeline.models["encoder"].io.as_ref().expect("encoder io");
+        assert_eq!(encoder_io.audio_features_input.as_deref(), Some("audio_features"));
+
+        // Decoder self-KV grows; cross-KV is present as static routing.
+        let decoder_io = pipeline.models["decoder"].io.as_ref().expect("decoder io");
+        assert_eq!(decoder_io.logits_output.as_deref(), Some("logits"));
+        assert_eq!(decoder_io.kv_update.as_deref(), Some("append"));
+        assert_eq!(
+            decoder_io.kv_inputs.as_deref(),
+            Some(&["past_key_self_0", "past_value_self_0"].map(String::from)[..])
+        );
+        assert_eq!(
+            decoder_io.kv_outputs.as_deref(),
+            Some(&["present_key_self_0", "present_value_self_0"].map(String::from)[..])
+        );
+        assert_eq!(
+            decoder_io.cross_kv_inputs.as_deref(),
+            Some(&["past_key_cross_0", "past_value_cross_0"].map(String::from)[..])
+        );
+        assert_eq!(
+            decoder_io.cross_kv_outputs.as_deref(),
+            Some(&["present_key_cross_0", "present_value_cross_0"].map(String::from)[..])
+        );
+
+        // Cross-attention KV static routing is declared by the positional pairing
+        // of the decoder's cross_kv_inputs (past_*_cross) with cross_kv_outputs
+        // (the encoder-produced present_*_cross), computed ONCE by the encoder —
+        // NOT recomputed each step and NOT a per-step dataflow edge. This decoder
+        // has no encoder_hidden_states input, so no dataflow edge is synthesized.
+        assert!(
+            pipeline.dataflow.is_empty(),
+            "cross-KV is stateful routing, not per-step edges: {:?}",
+            pipeline.dataflow
+        );
+
+        assert!(matches!(
+            pipeline.strategy.kind,
+            onnx_genai_metadata::PipelineStrategyKind::Composite
+        ));
+    }
+
+    // A faithful, trimmed synthetic derived from the real Microsoft
+    // `nemotron_speech` genai_config.json (Conformer-Transducer / RNN-T):
+    // a streaming Conformer encoder with cache state, an LSTM prediction
+    // network (`targets` + `lstm_hidden_state`/`lstm_cell_state`, no attention
+    // KV), a joint (joiner) network, and a Silero VAD. The multi-GB .onnx
+    // weights are not needed — recognition is driven from the JSON alone.
+    const NEMOTRON_TRANSDUCER_JSON: &str = r#"{
+        "model": {
+            "type": "nemotron_speech",
+            "vocab_size": 13088,
+            "subsampling_factor": 8,
+            "blank_id": 13087,
+            "max_symbols_per_step": 10,
+            "encoder": {
+                "filename": "encoder.onnx",
+                "hidden_size": 1024,
+                "num_hidden_layers": 24,
+                "inputs": {
+                    "audio_features": "audio_signal",
+                    "cache_last_channel": "cache_last_channel",
+                    "cache_last_time": "cache_last_time",
+                    "cache_last_channel_len": "cache_last_channel_len",
+                    "lang_id": "lang_id"
+                },
+                "outputs": {
+                    "encoder_outputs": "outputs",
+                    "output_lengths": "encoded_lengths",
+                    "cache_last_channel_next": "cache_last_channel_next",
+                    "cache_last_time_next": "cache_last_time_next",
+                    "cache_last_channel_len_next": "cache_last_channel_len_next"
+                }
+            },
+            "decoder": {
+                "filename": "decoder.onnx",
+                "hidden_size": 640,
+                "num_hidden_layers": 2,
+                "inputs": {
+                    "targets": "targets",
+                    "lstm_hidden_state": "h_in",
+                    "lstm_cell_state": "c_in"
+                },
+                "outputs": {
+                    "outputs": "decoder_output",
+                    "lstm_hidden_state": "h_out",
+                    "lstm_cell_state": "c_out"
+                }
+            },
+            "joiner": {
+                "filename": "joint.onnx",
+                "inputs": {
+                    "encoder_outputs": "encoder_output",
+                    "decoder_outputs": "decoder_output"
+                },
+                "outputs": { "logits": "joint_output" }
+            },
+            "vad": {
+                "filename": "silero_vad.onnx",
+                "threshold": 0.3
+            }
+        }
+    }"#;
+
+    #[test]
+    fn nemotron_transducer_is_not_encoder_decoder() {
+        let cfg: GenAiConfig = serde_json::from_str(NEMOTRON_TRANSDUCER_JSON).unwrap();
+        // Detected structurally as a transducer even though it declares
+        // `model.encoder` (which alone would look like an encoder-decoder).
+        assert!(cfg.is_transducer());
+        assert_eq!(cfg.shape(), ModelShape::Transducer);
+        assert_ne!(cfg.shape(), ModelShape::EncoderDecoder);
+    }
+
+    #[test]
+    fn nemotron_transducer_declines_instead_of_fabricating_cross_kv() {
+        let cfg: GenAiConfig = serde_json::from_str(NEMOTRON_TRANSDUCER_JSON).unwrap();
+        // The non-strict synthesis path (the auto-detection fallback) must NOT
+        // fabricate a Whisper-style encoder-decoder spec (with default
+        // `input_ids`/`logits` ports and non-existent `past_key_values.*` /
+        // `present.*` cross/self KV). It declines with the honest family error.
+        let error = cfg
+            .to_inference_metadata(None)
+            .expect_err("transducer must not synthesize a pipeline");
+        match error {
+            GenAiConfigError::UnsupportedPipelineFamily { family, .. } => {
+                assert_eq!(family, "RNN-T transducer");
+            }
+            other => panic!("expected UnsupportedPipelineFamily, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nemotron_transducer_strict_from_dir_declines() {
+        // The strict encoder-decoder loader entry point declines a transducer
+        // directory explicitly rather than returning Ok(None) or fabricating.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!(
+                "nemotron_transducer_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(GENAI_CONFIG_FILE), NEMOTRON_TRANSDUCER_JSON).unwrap();
+        let graphs = EncoderDecoderGraphInfo::default();
+        let result = encoder_decoder_pipeline_inference_metadata_from_dir(&dir, &graphs);
+        std::fs::remove_dir_all(&dir).ok();
+        match result {
+            Err(GenAiConfigError::UnsupportedPipelineFamily { family, .. }) => {
+                assert_eq!(family, "RNN-T transducer");
+            }
+            other => panic!("expected UnsupportedPipelineFamily, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transducer_detected_from_lstm_decoder_without_joiner() {
+        // Even without a `joiner` section, an LSTM prediction network (targets +
+        // LSTM hidden/cell state, no attention KV) is a transducer signal.
+        let json = r#"{
+            "model": {
+                "type": "some_transducer",
+                "encoder": {
+                    "filename": "encoder.onnx",
+                    "inputs": { "audio_features": "audio_signal" },
+                    "outputs": { "encoder_outputs": "outputs" }
+                },
+                "decoder": {
+                    "filename": "decoder.onnx",
+                    "num_hidden_layers": 2,
+                    "inputs": {
+                        "targets": "targets",
+                        "lstm_hidden_state": "h_in",
+                        "lstm_cell_state": "c_in"
+                    },
+                    "outputs": { "outputs": "decoder_output" }
+                }
+            }
+        }"#;
+        let cfg: GenAiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.is_transducer());
+        assert_eq!(cfg.shape(), ModelShape::Transducer);
+    }
+
+    #[test]
+    fn whisper_still_classifies_as_encoder_decoder_not_transducer() {
+        // No regression: a real cross-attention encoder-decoder (Whisper) is
+        // still EncoderDecoder and is never mistaken for a transducer.
+        let cfg: GenAiConfig = serde_json::from_str(WHISPER_JSON).unwrap();
+        assert!(!cfg.is_transducer());
+        assert_eq!(cfg.shape(), ModelShape::EncoderDecoder);
+    }
+
+    #[test]
+    fn phi3v_and_decoder_pipeline_are_not_transducers() {
+        // No regression for the other shapes.
+        let vlm: GenAiConfig = serde_json::from_str(PHI3V_JSON).unwrap();
+        assert!(!vlm.is_transducer());
+        assert_eq!(vlm.shape(), ModelShape::Multimodal);
+        let pipe: GenAiConfig = serde_json::from_str(DECODER_PIPELINE_JSON).unwrap();
+        assert!(!pipe.is_transducer());
+        assert_eq!(pipe.shape(), ModelShape::DecoderPipeline);
     }
 
     #[test]

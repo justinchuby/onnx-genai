@@ -16,7 +16,7 @@ uses whichever execution providers you installed.
 
 ```bash
 onnx-genai serve --models-dir ./models       # OpenAI-compatible HTTP server
-onnx-genai generate ./model --prompt "Hello"  # one-shot generation
+onnx-genai generate ./model --prompt "Hello"  # one-shot generation (-p is short for --prompt)
 onnx-genai run ./model                       # interactive REPL
 onnx-genai show ./model                       # resolved files + metadata
 onnx-genai list --models-dir ./models         # list models
@@ -25,6 +25,13 @@ onnx-genai version                            # version + execution providers
 
 `generate`, `run`, and `show` accept either a model directory or a config file
 inside it (a file resolves to its parent directory).
+
+### Interactive REPL controls
+
+In `onnx-genai run`, press **Ctrl-C** while a response is generating to cancel
+that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
+**Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
+run is also cancelled by **Ctrl-C** mid-generation.
 
 ### Polite CPU decode
 
@@ -43,6 +50,17 @@ environment variable > automatic sizing. With neither setting, the
 peak-throughput automatic default is unchanged. This controls native decode
 workers; use an OS cpuset/taskset as well when the entire process, including
 prefill or ONNX Runtime work, must be hard-confined.
+
+### Decode-plan memo (default on)
+
+On the native CPU decode path, a steady-state decode-plan memo caches the
+per-step shape/buffer plan and replays it token-to-token, which is token-exact
+by construction (shape-only bookkeeping, an in-flight verify net, and a
+graceful fall back to rebuilding every step on any model where invariance can't
+be proven). It is **on by default**. To disable it — for example on a
+resource-constrained host or when debugging — set `ONNX_GENAI_DECODE_MEMO=0`
+(also accepts `false`/`off`, case-insensitive). Any other value, including
+unset, keeps it on.
 
 ## Runtime selection
 

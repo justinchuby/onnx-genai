@@ -1063,8 +1063,12 @@ struct SamplingArgs {
 struct CpuArgs {
     /// Cap native CPU decode to N worker cores. Overrides
     /// ONNX_GENAI_CPU_DECODE_THREADS; when neither is set, automatic sizing is
-    /// unchanged. Where supported, persistent workers are pinned to at most N
-    /// allowed CPUs.
+    /// unchanged. Setting N now also bounds prefill/MLAS: the global Rayon pool
+    /// is built with N workers (not all logical CPUs) and, on Linux, the process
+    /// is pinned to N CPUs (packed on one NUMA node where possible), so
+    /// `--cpu-cores N` alone makes the engine coexist with other programs -- no
+    /// external `taskset` needed. An explicit ONNX_GENAI_CPU_DECODE_AFFINITY
+    /// still wins over the automatic pinning.
     #[arg(long, value_name = "N")]
     cpu_cores: Option<NonZeroUsize>,
 }
@@ -1395,7 +1399,7 @@ struct GenerateArgs {
     stream: bool,
 
     /// Prompt text.
-    #[arg(long)]
+    #[arg(long, short = 'p')]
     prompt: String,
 }
 
@@ -2960,6 +2964,20 @@ mod tests {
     fn generate_accepts_positional_model_and_prompt_flag() {
         let parsed_command_line =
             Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.model, PathBuf::from("./m"));
+                assert_eq!(args.prompt, "hi");
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn generate_accepts_prompt_short_flag() {
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "-p", "hi"]).unwrap();
 
         match parsed_command_line.command {
             Commands::Generate(args) => {

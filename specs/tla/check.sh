@@ -54,3 +54,5 @@ run_model KvAdmission
 expect_violation KvAdmission KvAdmissionUnguarded ProgressPossible
 run_model NodeFailure
 expect_violation NodeFailure NodeFailureUnguarded FailedNodeStopsAtFault
+run_model CoResidency
+expect_violation CoResidency CoResidencyUnguarded NoWastedResidency

@@ -137,6 +137,35 @@ executing queued work and must violate `FailedNodeStopsAtFault`.
 The module does not assert failure-detection latency or replanning. Heartbeat
 policy and epoch handoff are covered by deterministic conformance campaigns.
 
+### `CoResidency.tla`
+
+Models several models served from one device. Each model occupies its weights
+plus a preallocated KV arena while resident, so making room for one means
+evicting others, and the question is not whether a single request fits but
+whether every model can still be made resident at all.
+
+Checked invariants:
+
+- `CapacityRespected`: the device never holds more than it has.
+- `ProgressPossible`: every model that still has work can be made resident,
+  either already, or because it fits, or because evicting unpinned models
+  would free enough room. Admission is closed against configurations where
+  that fails, which is the residency analogue of `KvAdmission`.
+- `NoWastedResidency`: a model is only evicted once it has retired a request
+  since it was loaded. An eviction discards the KV arena, so evicting earlier
+  throws the work away and the device can load and evict a model forever
+  without ever finishing it. Gating on merely having run a batch is not
+  enough; the guard has to be a retired request.
+- `PinnedStaysResident` and `ServedOnlyWhenResident`: pinned models are never
+  evicted, and the device only computes for a model it is holding.
+
+`CoResidencyUnguarded.cfg` is a negative model that allows eviction before a
+model has retired anything and must violate `NoWastedResidency`.
+
+The module does not assert which model the device serves next, or how
+transfers overlap compute. Those are scheduler obligations covered by
+deterministic conformance campaigns.
+
 ## Running
 
 Install [TLA+ tools](https://github.com/tlaplus/tlaplus/releases), then run from
@@ -161,4 +190,5 @@ constants is useful, but does not replace implementation trace conformance.
 - `docs/DISTRIBUTED_RUNTIME.md` section 8.1 (rank-local DAG scheduling)
 - `docs/MEMORY_ARCHITECTURE.md` KV cache pool sizing and admission
 - `docs/DISTRIBUTED_RUNTIME.md` node failure, abort, and quiescence
+- `docs/MEMORY_ARCHITECTURE.md` model residency and eviction
 - `REFINEMENT.md` (implementation linearization and verification gates)

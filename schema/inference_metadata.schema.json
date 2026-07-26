@@ -1668,6 +1668,14 @@
             "null"
           ]
         },
+        "audio_features_input": {
+          "description": "Raw audio-feature prompt input for an encoder-decoder encoder graph\n(e.g. Whisper `audio_features`, a log-mel `[batch, mels, frames]`\ntensor). Declared on the encoder component; a text encoder-decoder uses\n`token_input` instead.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "cross_kv_inputs": {
           "description": "Cross-attention past-KV cache inputs for an encoder-decoder decoder, in\nthe SAME order as `cross_kv_outputs`. These are the encoder-derived KV\ntensors, distinct from the self-attention `kv_inputs`.",
           "items": {
@@ -3060,7 +3068,7 @@
           ]
         },
         "prediction_type": {
-          "description": "Model output parameterization; `\"epsilon\"` is supported (default).",
+          "description": "Model output parameterization: `\"epsilon\"` (default, noise prediction),\n`\"v_prediction\"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or\n`\"sample\"`/`\"x0\"` (the model predicts the clean sample directly). All\nbuilt-in continuous schedulers (`ddim`, `euler`, `euler_ancestral`,\n`dpmpp_2m`) support every parameterization.",
           "type": [
             "string",
             "null"

@@ -110,7 +110,12 @@ impl ExecutionProvider for CpuExecutionProvider {
     }
 
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
-        // Pure-Rust kernels need no device resources or external libraries.
+        // Pure-Rust kernels need no device resources or external libraries. This
+        // is the earliest per-session hook that runs before any GEMM, so it is
+        // where the explicit decode budget is turned into a process-wide bound
+        // on prefill/MLAS Rayon parallelism (and, on Linux, CPU affinity) -- a
+        // no-op unless a budget is set.
+        crate::kernels::matmul_nbits::bound_process_to_decode_budget();
         self.initialized = true;
         Ok(())
     }

@@ -1475,6 +1475,11 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
 /// This is the programmatic equivalent of `ONNX_GENAI_CPU_DECODE_THREADS`, with
 /// higher precedence. Call it before constructing a native decode session; pools
 /// are initialized lazily and retain their initial size for the process lifetime.
+///
+/// When an explicit budget is set, native CPU EP initialization also bounds the
+/// global (prefill/MLAS) Rayon pool and, on Linux, the process CPU affinity to
+/// the budget (see [`bound_process_to_decode_budget`]), so the budget governs
+/// the whole engine -- not just the steady-decode SPMD pool.
 pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(), &'static str> {
     if threads == Some(0) {
         return Err("CPU decode thread budget must be greater than zero");
@@ -1486,6 +1491,113 @@ pub fn set_decode_thread_budget(threads: Option<usize>) -> std::result::Result<(
 fn decode_threads_override() -> Option<usize> {
     std::num::NonZeroUsize::new(DECODE_THREADS_OVERRIDE.load(Ordering::Acquire))
         .map(std::num::NonZeroUsize::get)
+}
+
+/// Resolve the number of worker threads the **global Rayon pool** (which drives
+/// prefill and every MLAS GEMM through the `mlas-sys` parallel-for backend)
+/// should be built with, given the explicit decode budget.
+///
+/// Only an *explicit* budget bounds the global pool: the process-local override
+/// (from [`set_decode_thread_budget`]) or a positive `ONNX_GENAI_CPU_DECODE_THREADS`.
+/// An unset budget returns `None` so the default `available_parallelism()`
+/// sizing is left untouched (no regression to the out-of-box path); the opt-out
+/// `ONNX_GENAI_CPU_DECODE_THREADS=0` and any unparseable value likewise return
+/// `None`. The result is clamped to `available` so a budget larger than the host
+/// never over-subscribes.
+fn resolve_rayon_global_threads(
+    override_threads: Option<usize>,
+    raw: Option<&str>,
+    available: usize,
+) -> Option<usize> {
+    let available = std::num::NonZeroUsize::new(available)?.get();
+    let requested = match override_threads {
+        Some(threads) if threads > 0 => threads,
+        Some(_) => return None,
+        None => match raw?.trim().parse::<usize>() {
+            Ok(0) => return None,
+            Ok(threads) => threads,
+            Err(_) => return None,
+        },
+    };
+    Some(requested.min(available))
+}
+
+/// Guards the one-shot process-wide "good CPU citizen" bounding so it runs at
+/// most once and only its first attempt logs.
+static PROCESS_BUDGET_BOUND: OnceLock<()> = OnceLock::new();
+
+/// Confine the whole process to the explicit decode budget so a user who caps
+/// cores (via `--cpu-cores N`, `ONNX_GENAI_CPU_DECODE_THREADS=N`, or
+/// [`set_decode_thread_budget`]) disturbs at most `N` CPUs -- covering prefill
+/// and every MLAS GEMM, not just the steady-decode SPMD pool.
+///
+/// Two mechanisms, applied once, early (at CPU EP initialization, before any
+/// GEMM builds the lazily-initialized global Rayon pool):
+///
+/// 1. **Rayon global-pool size.** The pool is built with `N` threads instead of
+///    `available_parallelism()`, so `mlas-sys`'s `rayon_max_threads` reports `N`
+///    and MLAS partitions each GEMM into `N` tiles. The pool is fixed for the
+///    process lifetime and `build_global` fails if it already exists, so this
+///    must run before the first Rayon use; if the pool was already built we log
+///    once and leave it (a no-op with warning).
+/// 2. **(Linux) process CPU affinity.** The calling (main) thread is confined to
+///    `N` CPUs packed on a single NUMA node where possible; threads spawned
+///    afterwards (the Rayon pool, the SPMD decode pool) inherit the mask, so the
+///    process stays on `N` CPUs without an external `taskset`. This composes
+///    with the existing decode-affinity control: if the user set an explicit
+///    `ONNX_GENAI_CPU_DECODE_AFFINITY`, their choice wins and the auto-mask
+///    stands down. Non-Linux hosts skip affinity (the Rayon-count bound still
+///    applies).
+///
+/// A no-op when no explicit budget is set, so the default sizing is unchanged.
+pub fn bound_process_to_decode_budget() {
+    if PROCESS_BUDGET_BOUND.set(()).is_err() {
+        return;
+    }
+    let raw = std::env::var(DECODE_THREADS_ENV).ok();
+    let available = available_parallelism();
+    let Some(threads) =
+        resolve_rayon_global_threads(decode_threads_override(), raw.as_deref(), available)
+    else {
+        return;
+    };
+
+    // Apply the process CPU affinity mask *before* building the Rayon global
+    // pool so its worker threads inherit the restricted CPU set.
+    #[cfg(target_os = "linux")]
+    if crate::decode_affinity::explicit_decode_affinity_requested() {
+        eprintln!(
+            "onnx-genai: CPU decode budget {threads} bounds the prefill/MLAS Rayon pool; \
+             process CPU affinity is left to the explicit ONNX_GENAI_CPU_DECODE_AFFINITY setting"
+        );
+    } else if let Some(cpus) = crate::decode_affinity::select_budget_cpus(threads) {
+        match crate::decode_affinity::set_current_thread_affinity(&cpus) {
+            Ok(()) => eprintln!(
+                "onnx-genai: CPU decode budget {threads} confined the process to {count} CPUs \
+                 {cpus:?} (prefill/MLAS + decode stay off the rest of the machine)",
+                count = cpus.len()
+            ),
+            Err(message) => eprintln!(
+                "onnx-genai: CPU decode budget {threads}: could not apply process CPU affinity \
+                 ({message}); the Rayon thread-count bound still applies"
+            ),
+        }
+    }
+
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+    {
+        Ok(()) => eprintln!(
+            "onnx-genai: CPU decode budget {threads} bounded the global Rayon pool \
+             (prefill/MLAS parallelism capped at {threads} workers)"
+        ),
+        Err(err) => eprintln!(
+            "onnx-genai: CPU decode budget {threads}: the global Rayon pool was already built \
+             and cannot be resized ({err}); set the budget before the first inference to bound \
+             prefill/MLAS parallelism"
+        ),
+    }
 }
 
 /// Default persistent-pool worker count for `available` logical CPUs: half of
@@ -1875,6 +1987,49 @@ pub fn decode_parallel_output_row_blocks<F>(
         || crate::trace::worker_span("MatMulNBits.decode_rows"),
         |_span, (row_index, row)| compute(row_index, row),
     );
+}
+
+/// Fan `num_tasks` independent decode subtasks out across the active decode
+/// workers, running `compute(task_index)` on each.
+///
+/// Tasks are handed out in contiguous index ranges, mirroring
+/// [`decode_parallel_output_row_blocks`] but *without* partitioning a shared
+/// result buffer — each `compute` writes into its own disjoint scratch region,
+/// an invariant the caller owns. This is the scheduling primitive
+/// `GroupQueryAttention` flash-decoding uses to spread its
+/// `attention_rows × split_count` KV-chunk partials across otherwise-idle cores
+/// (when `attention_rows` alone cannot fill the pool). Routing keys off which
+/// decode scope is active, never off op or model identity, exactly like
+/// [`decode_parallel_output_row_blocks`].
+pub fn decode_parallel_index_tasks<F>(num_tasks: usize, compute: F)
+where
+    F: Fn(usize) + Sync + Send,
+{
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_index_tasks(num_tasks, &compute);
+        return;
+    }
+    // numa-split and flat decode scopes run the forward on a bounded Rayon pool,
+    // so this parallel iterator uses that pool rather than the global one.
+    (0..num_tasks).into_par_iter().for_each(compute);
+}
+
+/// Effective number of decode workers on the active decode scope.
+///
+/// Used to decide whether attention has idle cores to exploit for flash-decoding
+/// KV splitting: when the worker count exceeds `attention_rows` (16 query heads
+/// in decode), the surplus cores would otherwise sit idle during the attention
+/// reduction. Returns the persistent SPMD or `numa-split` worker count when one
+/// of those scopes is active, otherwise the current Rayon pool width (the flat
+/// decode pool the forward is installed on).
+pub fn active_decode_worker_count() -> usize {
+    if let Some(numa) = numa_decode_active() {
+        return numa.total_workers();
+    }
+    if let Some(spmd) = spmd_decode_active() {
+        return spmd.total_workers();
+    }
+    rayon::current_num_threads()
 }
 
 /// First-touch each row-major weight component on the NUMA node that will read
@@ -2321,16 +2476,7 @@ fn quantize_activation_signed(
             continue;
         }
         let src = &activation[start..real_end];
-        let max_abs = src.iter().map(|value| value.abs()).fold(0.0, f32::max);
-        if max_abs == 0.0 {
-            continue;
-        }
-        // Match MLAS bit-for-bit: scale = max_abs/127, inverse = 127/max_abs.
-        *scale = max_abs / 127.0;
-        let inverse_scale = 127.0 / max_abs;
-        for (out, &value) in out_block.iter_mut().zip(src) {
-            *out = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
-        }
+        *scale = crate::kernels::simd_quant::quantize_block_i8(src, &mut out_block[..src.len()]);
     }
     (quantized, scales)
 }
@@ -2829,16 +2975,8 @@ fn quantize_activation(
             continue;
         }
         let src = &activation[start..real_end];
-        let max_abs = src.iter().map(|value| value.abs()).fold(0.0, f32::max);
-        if max_abs == 0.0 {
-            continue;
-        }
-        *scale = max_abs / 127.0;
-        let inverse_scale = 127.0 / max_abs;
-        for (out, &value) in out_block.iter_mut().zip(src) {
-            let signed = (value * inverse_scale).round().clamp(-127.0, 127.0) as i8;
-            *out = (signed as i16 + 128) as u8;
-        }
+        *scale =
+            crate::kernels::simd_quant::quantize_block_u8_offset(src, &mut out_block[..src.len()]);
     }
     (quantized, scales)
 }
@@ -3552,23 +3690,7 @@ fn eight_bit_int16_activation() -> bool {
 /// scale 0 and all-zero codes.
 fn quantize_block_i16(activation: &[f32], out: &mut [i16]) -> f32 {
     debug_assert_eq!(activation.len(), out.len());
-    let mut amax = 0.0f32;
-    for &value in activation {
-        amax = amax.max(value.abs());
-    }
-    if amax == 0.0 {
-        out.fill(0);
-        return 0.0;
-    }
-    let scale = amax / 32767.0;
-    let inv_scale = 32767.0 / amax;
-    for (code, &value) in out.iter_mut().zip(activation) {
-        // amax is the block max, so value * inv_scale is in [-32767, 32767];
-        // round-half-away and clamp defensively against fp rounding at the edge.
-        let scaled = (value * inv_scale).round();
-        *code = scaled.clamp(-32767.0, 32767.0) as i16;
-    }
-    scale
+    crate::kernels::simd_quant::quantize_block_i16(activation, out)
 }
 
 /// Activation quantization granularity (elements per int16 scale) for the 8-bit
@@ -6667,6 +6789,32 @@ mod tests {
         assert_eq!(resolve_persistent_decode_threads(Some("abc"), 96), Some(48));
         assert_eq!(resolve_persistent_decode_threads(Some("-4"), 8), Some(4));
         assert_eq!(resolve_persistent_decode_threads(Some("8"), 0), None);
+    }
+
+    #[test]
+    fn rayon_global_threads_bound_only_by_an_explicit_budget() {
+        // Unset budget -> None: the default `available_parallelism()` sizing of
+        // the global (prefill/MLAS) Rayon pool is left untouched (no regression).
+        assert_eq!(resolve_rayon_global_threads(None, None, 96), None);
+        assert_eq!(resolve_rayon_global_threads(None, Some(""), 96), None);
+        // The programmatic override (`--cpu-cores N`) bounds the pool to N,
+        // clamped to the host, and takes precedence over the environment.
+        assert_eq!(resolve_rayon_global_threads(Some(8), None, 96), Some(8));
+        assert_eq!(
+            resolve_rayon_global_threads(Some(8), Some("2"), 96),
+            Some(8)
+        );
+        assert_eq!(resolve_rayon_global_threads(Some(1000), None, 96), Some(96));
+        // A positive env value bounds the pool when no override is set.
+        assert_eq!(resolve_rayon_global_threads(None, Some("8"), 96), Some(8));
+        assert_eq!(resolve_rayon_global_threads(None, Some(" 8 "), 96), Some(8));
+        // The `=0` opt-out and unparseable values leave the default sizing.
+        assert_eq!(resolve_rayon_global_threads(None, Some("0"), 96), None);
+        assert_eq!(resolve_rayon_global_threads(None, Some("abc"), 96), None);
+        // A zero override is not an explicit budget (the setter rejects 0).
+        assert_eq!(resolve_rayon_global_threads(Some(0), Some("8"), 96), None);
+        // A degenerate host reports no parallelism to bound.
+        assert_eq!(resolve_rayon_global_threads(Some(8), None, 0), None);
     }
 
     #[test]

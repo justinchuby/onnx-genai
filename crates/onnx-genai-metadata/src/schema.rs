@@ -595,6 +595,14 @@ pub struct ModelIoSpec {
     #[schemars(length(min = 1))]
     pub encoder_hidden_states_input: Option<String>,
 
+    /// Raw audio-feature prompt input for an encoder-decoder encoder graph
+    /// (e.g. Whisper `audio_features`, a log-mel `[batch, mels, frames]`
+    /// tensor). Declared on the encoder component; a text encoder-decoder uses
+    /// `token_input` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub audio_features_input: Option<String>,
+
     /// Cross-attention past-KV cache inputs for an encoder-decoder decoder, in
     /// the SAME order as `cross_kv_outputs`. These are the encoder-derived KV
     /// tensors, distinct from the self-attention `kv_inputs`.
@@ -1780,7 +1788,11 @@ pub struct SchedulerSpec {
     /// Diffusion).
     pub beta_schedule: Option<String>,
 
-    /// Model output parameterization; `"epsilon"` is supported (default).
+    /// Model output parameterization: `"epsilon"` (default, noise prediction),
+    /// `"v_prediction"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or
+    /// `"sample"`/`"x0"` (the model predicts the clean sample directly). All
+    /// built-in continuous schedulers (`ddim`, `euler`, `euler_ancestral`,
+    /// `dpmpp_2m`) support every parameterization.
     pub prediction_type: Option<String>,
 
     /// Mask token id for a `masked_diffusion` (language-diffusion) scheduler:

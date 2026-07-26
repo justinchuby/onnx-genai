@@ -605,6 +605,38 @@ impl SpmdDecodePools {
         self.dispatch(&job);
     }
 
+    /// Run `num_tasks` independent subtasks across the resident workers under one
+    /// lightweight barrier: each worker runs a contiguous range of task indices
+    /// and invokes `compute(task_index)` for each.
+    ///
+    /// Unlike [`Self::dispatch_output_row_blocks`] this partitions only the
+    /// *index space*, not a shared result buffer — the caller's closure is
+    /// responsible for writing disjoint scratch per task index (flash-decoding
+    /// writes one `(max, sum, value-accumulator)` partial per task). The
+    /// contiguous, non-overlapping partition is exactly
+    /// [`Self::worker_row_segments`], so every index in `0..num_tasks` runs on
+    /// exactly one worker, once.
+    pub fn dispatch_index_tasks<F>(&self, num_tasks: usize, compute: &F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        if self.total_workers <= 1 || num_tasks <= 1 {
+            for task in 0..num_tasks {
+                compute(task);
+            }
+            return;
+        }
+        let segments = self.worker_row_segments(num_tasks);
+        let segments = &segments;
+        let job = move |global_index: usize| {
+            let (start, len) = segments[global_index];
+            for task in start..start + len {
+                compute(task);
+            }
+        };
+        self.dispatch(&job);
+    }
+
     /// Broadcast the output-row shards to every worker under one barrier,
     /// unconditionally (no serial-threshold check). The public
     /// [`Self::dispatch_output_rows`] applies the threshold before calling this;

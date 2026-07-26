@@ -20,8 +20,21 @@ const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
 const GEMV_MODULE: &str = "matmul_nbits_gemv";
 const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
 const GEMV_INT8_F32_ENTRY: &str = "matmul_nbits_gemv_int8_f32";
+/// Structurally-selected int4 / `block_size == 128` / asymmetric fp32-activation
+/// decode GEMV. It preserves the generic f32 GEMV's per-thread accumulation and
+/// reduction order while folding block arithmetic and vectorizing packed-nibble
+/// loads.
+const GEMV_INT4_F32_BLOCK128_ENTRY: &str = "matmul_nbits_gemv_int4_f32_block128";
+/// Structurally-selected int8 / `block_size == 128` / asymmetric fp32-activation
+/// decode GEMV. Bit-for-bit identical to the generic [`GEMV_F32_ENTRY`] path
+/// (same per-thread depth stride, same per-element expression, same fp32
+/// reduction) but with `block_size == 128` folded into a shift (`>> 7`) so the
+/// per-weight division/modulo, the runtime bit-width branch, and the repeated
+/// `column * k_blocks` scale/zero-point base recomputation all drop out.
+const GEMV_INT8_F32_BLOCK128_ENTRY: &str = "matmul_nbits_gemv_int8_f32_block128";
 const QUANTIZE_ACCURACY4_ENTRY: &str = "matmul_nbits_quantize_accuracy4_block32";
 const GEMV_ACCURACY4_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32";
+const GEMV_ACCURACY4_STAGE64_ENTRY: &str = "matmul_nbits_gemv_accuracy4_block32_stage64";
 // General-block-size fp32-activation accuracy_level=4 decode entries. These give
 // the fp32 `run` path the same "quantize the activation to int8 once, then run a
 // parallelized GEMV" treatment the block-32 path already enjoys, but for any
@@ -38,6 +51,7 @@ const BLOCK_THREADS: u32 = 256;
 const GEMV_ACCURACY4_THREADS: u32 = 256;
 const GEMV_ACCURACY4_COLUMNS_PER_BLOCK: usize = 8;
 const GEMV_ACCURACY4_SHARED_BYTES: u32 = 32 * 32;
+const GEMV_ACCURACY4_STAGE64_SHARED_BYTES: u32 = 64 * 32;
 const GEMV_F16_MODULE: &str = "matmul_nbits_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_nbits_gemv_f16";
 const GEMV_INT8_F16_ENTRY: &str = "matmul_nbits_gemv_int8_f16";
@@ -312,6 +326,108 @@ extern "C" __global__ void matmul_nbits_gemv_int8_f32(
     }
 }
 
+// Structurally-selected int8 / block_size == 128 / asymmetric fp32-activation
+// decode GEMV. This is a specialization of `matmul_nbits_gemv_f32` for the
+// generic block-128 int8 loop that dominates Qwen3-0.6B decode. It is
+// BIT-FOR-BIT IDENTICAL to that kernel: each thread walks the same depth stride
+// (grid-stride by blockDim), evaluates the same per-element expression
+// `activation * ((float)quantized - (float)zero_point) * scale`, and reduces in
+// the same block_sum order — only the address arithmetic is cheaper.
+//
+// With block_size == 128 the block index is a shift (`depth >> 7`) instead of an
+// integer divide, and the packed-byte address collapses: for blob_size == 128,
+//   (column*k_blocks + block)*128 + (depth - block*128) == column*k_blocks*128 + depth,
+// so `within` (the modulo) disappears entirely. The `column * k_blocks` base is
+// hoisted once into `col_kb` for the scale and zero-point rows, and the runtime
+// `bits == 8` branch of the generic kernel is gone. The `zero_points ? : 128`
+// selection is retained (uniform across the CTA, effectively free) so the result
+// stays identical whether or not zero points are present; dispatch restricts
+// this entry to the asymmetric case in practice.
+extern "C" __global__ void matmul_nbits_gemv_int8_f32_block128(
+    const float* activation,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    const int column = (int)blockIdx.x;
+    if (column >= n) {
+        return;
+    }
+
+    const long col_kb = (long)column * k_blocks;
+    const long packed_row = col_kb << 7;  // k_blocks * 128 bytes per weight row
+    const float* col_scales = scales + col_kb;
+    const unsigned char* col_zp = zero_points ? zero_points + col_kb : (const unsigned char*)0;
+
+    float value = 0.0f;
+    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+        const int block = depth >> 7;
+        const int quantized = (int)packed[packed_row + depth];
+        const int zero_point = col_zp ? (int)col_zp[block] : 128;
+        value += activation[depth] * ((float)quantized - (float)zero_point)
+            * col_scales[block];
+    }
+
+    value = block_sum(value);
+    if (threadIdx.x == 0) {
+        output[column] = value + (bias ? bias[column] : 0.0f);
+    }
+}
+
+// Int4 counterpart of the block-128 int8 specialization above. Each warp owns
+// 32 consecutive depths, hence 16 aligned packed bytes. Four lanes load one
+// aligned 32-bit word each and shuffle it to the eight lanes consuming its
+// nibbles. This removes duplicate scalar byte loads without changing any
+// thread's depth sequence or fp32 arithmetic.
+extern "C" __global__ void matmul_nbits_gemv_int4_f32_block128(
+    const float* activation,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    const int column = (int)blockIdx.x;
+    if (column >= n) {
+        return;
+    }
+
+    const int lane = (int)threadIdx.x & 31;
+    const long col_kb = (long)column * k_blocks;
+    const long packed_row = col_kb << 6;  // k_blocks * 64 bytes per weight row
+    const float* col_scales = scales + col_kb;
+    const unsigned char* col_zp =
+        zero_points + (long)column * ((k_blocks + 1) >> 1);
+
+    float value = 0.0f;
+    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+        const int block = depth >> 7;
+        const int warp_depth = depth - lane;
+        const unsigned int* packed_words =
+            (const unsigned int*)(packed + packed_row + (warp_depth >> 1));
+        unsigned int packed_word = lane < 4 ? packed_words[lane] : 0;
+        packed_word = __shfl_sync(__activemask(), packed_word, lane >> 3);
+        const int quantized = (int)((packed_word >> ((lane & 7) << 2)) & 15);
+        const unsigned char zp_byte = col_zp[block >> 1];
+        const int zero_point = (block & 1) ? (zp_byte >> 4) : (zp_byte & 15);
+        value += activation[depth] * ((float)quantized - (float)zero_point)
+            * col_scales[block];
+    }
+
+    value = block_sum(value);
+    if (threadIdx.x == 0) {
+        output[column] = value + (bias ? bias[column] : 0.0f);
+    }
+}
+
 // Per-K-block (block-32) int8 activation quantization. One warp (CUDA block) owns
 // one K-block and emits that block's own int8 scale, matching ORT/MLAS CompInt8
 // and the CPU native path. A single per-row scale is dominated by activation
@@ -361,6 +477,23 @@ __device__ __forceinline__ int unpack_int4x4(unsigned int packed, int offset)
         | ((w3 & 255) << 24);
 }
 
+__device__ __forceinline__ int dot_int8x4(int lhs, int rhs, int accumulator)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(lhs, rhs, accumulator);
+#else
+#pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+        int lhs_value = ((unsigned int)lhs >> (byte * 8)) & 255u;
+        int rhs_value = ((unsigned int)rhs >> (byte * 8)) & 255u;
+        lhs_value = lhs_value >= 128 ? lhs_value - 256 : lhs_value;
+        rhs_value = rhs_value >= 128 ? rhs_value - 256 : rhs_value;
+        accumulator += lhs_value * rhs_value;
+    }
+    return accumulator;
+#endif
+}
+
 extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
     const signed char* quantized_activation,
     const float* activation_scale_ptr,
@@ -404,10 +537,73 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32(
                     *reinterpret_cast<const int*>(activation_block + word * 8);
                 const int activation1 =
                     *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
-                dot = __dp4a(activation0, unpack_int4x4(words[word], 0), dot);
-                dot = __dp4a(activation1, unpack_int4x4(words[word], 16), dot);
+                dot = dot_int8x4(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = dot_int8x4(activation1, unpack_int4x4(words[word], 16), dot);
             }
             // Per-block int8 activation scale times the per-block weight scale.
+            const float block_scale = __fmul_rn(
+                activation_scale_ptr[block],
+                scales[(long)column * k_blocks + block]);
+            value = __fadd_rn(value, __fmul_rn((float)dot, block_scale));
+        }
+        __syncthreads();
+    }
+
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = bias ? __fadd_rn(value, bias[column]) : value;
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_accuracy4_block32_stage64(
+    const signed char* quantized_activation,
+    const float* activation_scale_ptr,
+    const unsigned char* packed,
+    const float* scales,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    extern __shared__ signed char activation_tile[];
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int column = (int)blockIdx.x * 8 + warp;
+
+    float value = 0.0f;
+    for (int tile_block = 0; tile_block < k_blocks; tile_block += 64) {
+        const int tile_blocks = min(64, k_blocks - tile_block);
+        const int tile_depths = tile_blocks * 32;
+        for (int depth = tid; depth < tile_depths; depth += (int)blockDim.x) {
+            activation_tile[depth] =
+                quantized_activation[tile_block * 32 + depth];
+        }
+        __syncthreads();
+
+        for (int tile_offset = lane; tile_offset < tile_blocks; tile_offset += 32) {
+            const int block = tile_block + tile_offset;
+            if (column >= n) {
+                continue;
+            }
+            const long packed_start = ((long)column * k_blocks + block) * 16;
+            const uint4 packed_weights =
+                *reinterpret_cast<const uint4*>(packed + packed_start);
+            const unsigned int words[4] = {
+                packed_weights.x, packed_weights.y, packed_weights.z, packed_weights.w
+            };
+            const signed char* activation_block = activation_tile + tile_offset * 32;
+            int dot = 0;
+#pragma unroll
+            for (int word = 0; word < 4; ++word) {
+                const int activation0 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8);
+                const int activation1 =
+                    *reinterpret_cast<const int*>(activation_block + word * 8 + 4);
+                dot = dot_int8x4(activation0, unpack_int4x4(words[word], 0), dot);
+                dot = dot_int8x4(activation1, unpack_int4x4(words[word], 16), dot);
+            }
             const float block_scale = __fmul_rn(
                 activation_scale_ptr[block],
                 scales[(long)column * k_blocks + block]);
@@ -476,9 +672,12 @@ extern "C" __global__ void matmul_nbits_quantize_accuracy4_blockwise(
 // int8 activation. One warp reduces one output column; the 32 lanes cooperate
 // across the block_size depths of each K-block. The per-block integer dot is
 // computed as sum(qa * qw) - zero_point * sum(qa), which is exactly the tiled
-// reference's sum(qa * (qw - zero_point)); the fp32 block products are then
-// accumulated by lane 0 in ascending block order with the same __fmul_rn /
-// __fadd_rn rounding the tiled kernel uses, so the result is bit-for-bit
+// reference's sum(qa * (qw - zero_point)). Block-128 uses two packed dp4a
+// instructions per lane (one for each integer sum) on sm_61+, while older
+// architectures and other block sizes retain the scalar loop. Padded tail
+// activations are zero, so packed tail lanes remain exact no-ops. The fp32 block
+// products are then accumulated by lane 0 in ascending block order with the same
+// __fmul_rn / __fadd_rn rounding the tiled kernel uses, so the result is bit-for-bit
 // identical. Symmetric int4 uses the default zero point 8; asymmetric int4
 // reads the packed per-block nibble zero point. The grid width (warps per CTA)
 // is chosen host-side from the device multiprocessor count so the launch fills
@@ -512,14 +711,34 @@ extern "C" __global__ void matmul_nbits_gemv_accuracy4_blockwise(
         const long blob_base = ((long)column * k_blocks + block) * blob_size;
         int weighted = 0;
         int activation_sum = 0;
-        for (int within = lane; within < block_size; within += 32) {
-            const int quantized_activation_value =
-                (int)quantized_activation[begin + within];
-            const unsigned char byte = packed[blob_base + (within >> 1)];
-            const int quantized_weight =
-                (within & 1) ? (byte >> 4) : (byte & 15);
-            weighted += quantized_activation_value * quantized_weight;
-            activation_sum += quantized_activation_value;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+        if (block_size == 128) {
+            const int within = lane * 4;
+            const int activation_pack = *reinterpret_cast<const int*>(
+                quantized_activation + begin + within);
+            const unsigned int packed_weights =
+                (unsigned int)*reinterpret_cast<const unsigned short*>(
+                    packed + blob_base + (within >> 1));
+            const unsigned int even_weights = packed_weights & 0x0f0fu;
+            const unsigned int odd_weights = (packed_weights >> 4) & 0x0f0fu;
+            const unsigned int weight_pack =
+                __byte_perm(even_weights, odd_weights, 0x5140);
+            weighted = dot_int8x4(
+                activation_pack, (int)weight_pack, weighted);
+            activation_sum = dot_int8x4(
+                activation_pack, 0x01010101, activation_sum);
+        } else
+#endif
+        {
+            for (int within = lane; within < block_size; within += 32) {
+                const int quantized_activation_value =
+                    (int)quantized_activation[begin + within];
+                const unsigned char byte = packed[blob_base + (within >> 1)];
+                const int quantized_weight =
+                    (within & 1) ? (byte >> 4) : (byte & 15);
+                weighted += quantized_activation_value * quantized_weight;
+                activation_sum += quantized_activation_value;
+            }
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             weighted += __shfl_down_sync(0xffffffffu, weighted, offset);
@@ -3028,6 +3247,29 @@ fn select_accuracy4_gemv_warps(n: usize, multiprocessor_count: u32) -> u32 {
     1
 }
 
+/// Select the wider activation stage only when the fixed 8-warp block-32 launch
+/// does not provide one resident CTA wave. The estimate uses architectural warp
+/// limits: datacenter sm_80/sm_90 parts expose 64 warps/SM, while sm_86/sm_89
+/// consumer parts expose 48. Hudson's general blockwise path keeps its separate
+/// device-derived warp-width selection.
+fn use_accuracy4_stage64(
+    n: usize,
+    multiprocessor_count: u32,
+    compute_capability: (u32, u32),
+    max_shared_memory_per_block: u32,
+) -> bool {
+    if max_shared_memory_per_block < GEMV_ACCURACY4_STAGE64_SHARED_BYTES {
+        return false;
+    }
+    let resident_warps = match compute_capability {
+        (8, 0) | (9.., _) => 64usize,
+        _ => 48usize,
+    };
+    let resident_ctas = resident_warps / (GEMV_ACCURACY4_THREADS as usize / 32);
+    let one_wave = (multiprocessor_count.max(1) as usize).saturating_mul(resident_ctas);
+    n.div_ceil(GEMV_ACCURACY4_COLUMNS_PER_BLOCK) < one_wave
+}
+
 /// Optional developer override for the down-projection columns-per-CTA, used to
 /// A/B the grid-fill variants. `ONNX_GENAI_DOWN_COLS=8|4|2` forces that width;
 /// any other/unset value keeps the device-driven [`select_down_columns`] choice.
@@ -3300,6 +3542,57 @@ impl MatMulNBitsKernel {
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
+            if self.bits == 4
+                && self.block_size == 128
+                && let Some(zero_points) = zero_points
+            {
+                // The asymmetric int4/block-128 fp32 path is the dominant Qwen3
+                // decode kernel. Its specialized entry preserves the generic
+                // GEMV's arithmetic and reduction order while replacing block
+                // division/modulo with shifts, hoisting metadata row bases, and
+                // loading each warp's packed nibbles as four aligned u32 words.
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_int4_f32_block128",
+                    "M==1 decode: bits=4, block_size=128, asymmetric → specialized \
+                     shift-indexed int4 f32 GEMV (bit-identical to the generic path)"
+                );
+                return self.launch_int4_f32_gemv_block128(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                );
+            }
+            if self.bits == 8 && self.block_size == 128 && zero_points.is_some() {
+                // Qwen3-0.6B's dominant decode kernel: int8, block-128,
+                // asymmetric (per-block byte zero point), fp32 activations. The
+                // generic f32 GEMV below handles this correctly but pays a
+                // per-weight integer divide/modulo, a runtime bit-width branch,
+                // and repeated scale/zero-point base recomputation. This
+                // specialization folds block_size=128 into a shift and hoists the
+                // per-column base while preserving each thread's depth order and
+                // fp32 reduction, so its output is bit-for-bit identical. Launch
+                // geometry is unchanged (one CTA per column, BLOCK_THREADS lanes,
+                // no shared memory or arch-specific instructions) so it stays
+                // capture-safe and portable across SM counts and CCs.
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_int8_f32_block128",
+                    "M==1 decode: bits=8, block_size=128, asymmetric → specialized \
+                     shift-indexed int8 f32 GEMV (bit-identical to the generic path)"
+                );
+                return self.launch_int8_f32_gemv_block128(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                );
+            }
             if self.bits == 8 && self.block_size == 32 {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemv_int8_f32",
@@ -3357,14 +3650,43 @@ impl MatMulNBitsKernel {
                 );
             }
             if self.bits == 4 && self.accuracy_level == 4 {
+                if self.block_size == 32 {
+                    onnx_runtime_ep_api::record_kernel_variant!(
+                        "gemv_accuracy4_blockwise_int8",
+                        "M==1 decode: bits=4, accuracy_level==4, block_size=32 → int8-quantized \
+                         activation quantized ONCE then parallelized blockwise GEMV (grid filled \
+                         from the device SM count; bit-identical to the tiled accuracy4 GEMM)"
+                    );
+                    return self.launch_accuracy4_gemv_blockwise(
+                        &inputs[0],
+                        &inputs[1],
+                        &inputs[2],
+                        zero_points,
+                        bias,
+                        &mut outputs[0],
+                        k_blocks,
+                        blob_size,
+                        zp_row_bytes,
+                    );
+                }
+                // accuracy_level 4 requests int8-quantized activations, but the
+                // int8 activation quantum is only calibrated at block_size=32
+                // (the size the blockwise/tiled accuracy4 kernels bake in). At
+                // larger block sizes (e.g. 128) quantizing the activations to
+                // int8 discards enough precision to flip razor-thin decode logit
+                // ties and diverge from the fp32 reference, so accumulate the
+                // activations in fp32 instead. This mirrors the int8/non-block-32
+                // path above and the int8/block-128 specialization: fp32
+                // activations are strictly higher precision than the
+                // int8-activation reference and match the fp32 oracle stream.
                 onnx_runtime_ep_api::record_kernel_variant!(
-                    "gemv_accuracy4_blockwise_int8",
-                    "M==1 decode: bits=4, accuracy_level==4, block_size={} → int8-quantized \
-                     activation quantized ONCE then parallelized blockwise GEMV (grid filled \
-                     from the device SM count; bit-identical to the tiled accuracy4 GEMM)",
+                    "gemv_f32_general_bs_int4",
+                    "M==1 decode: bits=4, accuracy_level==4, block_size={} (≠32) → \
+                     model-agnostic f32 GEMV (fp32 activations, higher precision than the \
+                     int8-activation reference)",
                     self.block_size
                 );
-                return self.launch_accuracy4_gemv_blockwise(
+                return self.launch_f32_gemv(
                     &inputs[0],
                     &inputs[1],
                     &inputs[2],
@@ -3395,10 +3717,15 @@ impl MatMulNBitsKernel {
                 );
             }
         }
-        if self.bits == 4 && self.accuracy_level == 4 && group_indices.is_none() {
+        if self.bits == 4
+            && self.accuracy_level == 4
+            && self.block_size == 32
+            && group_indices.is_none()
+        {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "gemm_tiled_accuracy4",
-                "M={} (GEMV requires M==1), accuracy_level==4, no g_idx → tiled accuracy4 GEMM",
+                "M={} (GEMV requires M==1), accuracy_level==4, block_size=32, no g_idx → \
+                 tiled accuracy4 GEMM (int8-quantized activations)",
                 m
             );
             return self.launch_accuracy4(
@@ -5069,6 +5396,119 @@ impl MatMulNBitsKernel {
         .map_err(|err| driver_err("launch MatMulNBits int8 f32 GEMV", err))
     }
 
+    /// Specialized asymmetric int4 / `block_size == 128` fp32-activation decode
+    /// GEMV. The fixed layout makes `blob_size == 64` and
+    /// `zp_row_bytes == ceil(k_blocks / 2)`, so neither is passed at runtime.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int4_f32_gemv_block128(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_INT4_F32_BLOCK128_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = cuptr(zero_points.data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks);
+        // SAFETY: validation guarantees the asymmetric int4 block-128 layout.
+        // The fixed one-CTA-per-column launch has no allocation, synchronization,
+        // or architecture-specific launch geometry, so it is capture-safe.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n as u32, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits int4 f32 block-128 GEMV", err))
+    }
+
+    /// Specialized int8 / `block_size == 128` / asymmetric fp32-activation decode
+    /// GEMV. Structurally selected from [`Self::launch_f32_gemv`] and bit-for-bit
+    /// identical to it; see [`GEMV_INT8_F32_BLOCK128_ENTRY`] for the kernel-level
+    /// rationale. Only `k`, `n`, and `k_blocks` are passed because `block_size`,
+    /// `blob_size`, `zp_row_bytes`, and `bits` are all fixed by the structural
+    /// dispatch (128 / 128 / `k_blocks` / 8).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int8_f32_gemv_block128(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_INT8_F32_BLOCK128_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = zero_points
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks);
+        // SAFETY: dense tensors were validated for the one-byte-per-weight
+        // block-128 layout (blob_size == 128). The launch geometry (one CTA per
+        // column, BLOCK_THREADS lanes, no dynamic allocation, host sync, or
+        // architecture-specific instructions) matches the generic f32 GEMV, so it
+        // is CUDA-graph-capturable and portable across supported SM counts/CCs.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n as u32, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits int8 f32 block-128 GEMV", err))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_f32_gemv(
         &self,
@@ -5149,9 +5589,21 @@ impl MatMulNBitsKernel {
         let quantize_function =
             self.runtime
                 .nvrtc_function(GEMV_MODULE, GEMV_SRC, QUANTIZE_ACCURACY4_ENTRY)?;
-        let gemv_function =
-            self.runtime
-                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_ACCURACY4_ENTRY)?;
+        let capabilities = self.runtime.capabilities();
+        let stage64 = use_accuracy4_stage64(
+            self.n,
+            capabilities.multiprocessor_count(),
+            capabilities.compute_capability(),
+            capabilities.max_shared_memory_per_block_optin(),
+        );
+        let gemv_entry = if stage64 {
+            GEMV_ACCURACY4_STAGE64_ENTRY
+        } else {
+            GEMV_ACCURACY4_ENTRY
+        };
+        let gemv_function = self
+            .runtime
+            .nvrtc_function(GEMV_MODULE, GEMV_SRC, gemv_entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
         let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
@@ -5205,7 +5657,11 @@ impl MatMulNBitsKernel {
                     1,
                 ),
                 block_dim: (GEMV_ACCURACY4_THREADS, 1, 1),
-                shared_mem_bytes: GEMV_ACCURACY4_SHARED_BYTES,
+                shared_mem_bytes: if stage64 {
+                    GEMV_ACCURACY4_STAGE64_SHARED_BYTES
+                } else {
+                    GEMV_ACCURACY4_SHARED_BYTES
+                },
             })
         }
         .map(|_| ())
@@ -6594,6 +7050,15 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     }
 
     #[test]
+    fn accuracy4_stage64_is_limited_to_sub_wave_block32_grids() {
+        assert!(use_accuracy4_stage64(4608, 132, (9, 0), 64 * 1024));
+        assert!(!use_accuracy4_stage64(4608, 46, (8, 9), 48 * 1024));
+        assert!(!use_accuracy4_stage64(4608, 28, (8, 6), 48 * 1024));
+        assert!(!use_accuracy4_stage64(4608, 132, (9, 0), 1024));
+        assert!(!use_accuracy4_stage64(65_536, 132, (9, 0), 64 * 1024));
+    }
+
+    #[test]
     fn fp16_down_projection_loads_activation_directly_into_registers() {
         let start = GEMV_F16_SRC
             .find("void matmul_nbits_gemv_f16_scales_f16_down_tpl")
@@ -7219,6 +7684,303 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                  N={n}: max_rel={worst_rel:.3e}"
             );
         }
+    }
+
+    /// Runs a structurally-selected block-128 specialization and the generic
+    /// `matmul_nbits_gemv_f32` kernel on identical device buffers and
+    /// returns `(mismatching_columns, all_finite)`. The specialization only
+    /// rewrites address arithmetic (shift instead of divide/modulo, hoisted
+    /// per-column base, dropped bit-width branch) — the per-thread depth stride,
+    /// per-element fp32 expression, and block reduction are unchanged, so every
+    /// output column must be **bit-for-bit identical**. Includes partial final
+    /// K-blocks (`k` not a multiple of 128) to exercise the padded weight row.
+    fn run_f32_block128_byte_identity(
+        bits: usize,
+        k: usize,
+        n: usize,
+        with_bias: bool,
+        explicit_zp: bool,
+    ) -> (usize, bool) {
+        let Some(runtime) = runtime() else {
+            eprintln!(
+                "skipping MatMulNBits int{bits} f32 block-128 byte-identity test: CUDA runtime unavailable"
+            );
+            return (0, true);
+        };
+
+        let block_size = 128usize;
+        let k_blocks = k.div_ceil(block_size);
+        let blob_size = block_size * bits / 8;
+        let zp_row_bytes = (k_blocks * bits).div_ceil(8);
+
+        let mut state = 0x0bad_c0de_1234_5678u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation = vec![0.0f32; k];
+        for value in activation.iter_mut() {
+            *value = next();
+        }
+
+        // Packed weights are stored per padded K-block row (`k_blocks * blob_size`
+        // bytes per column); only depths `< k` are ever read.
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for value in packed.iter_mut() {
+            *value = ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+
+        let mut zero_points = vec![0u8; n * zp_row_bytes];
+        if explicit_zp {
+            for zp in zero_points.iter_mut() {
+                *zp = ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        let mut scale = vec![0.0f32; n * k_blocks];
+        for value in scale.iter_mut() {
+            *value = 0.015 + 0.01 * (next() * 0.5 + 0.5);
+        }
+
+        let mut bias = vec![0.0f32; n];
+        if with_bias {
+            for value in bias.iter_mut() {
+                *value = next();
+            }
+        }
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 4).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scale.len() * 4).unwrap();
+        let zp_dev = runtime.alloc_raw(zero_points.len().max(1)).unwrap();
+        let bias_dev = runtime.alloc_raw(n * 4).unwrap();
+        let spec_dev = runtime.alloc_raw(n * 4).unwrap();
+        let generic_dev = runtime.alloc_raw(n * 4).unwrap();
+
+        // SAFETY: device buffers were sized to hold each source slice.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scale), scales_dev).unwrap();
+            if explicit_zp {
+                runtime.htod(&zero_points, zp_dev).unwrap();
+            }
+            if with_bias {
+                runtime.htod(as_bytes(&bias), bias_dev).unwrap();
+            }
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let bias_shape = [n];
+        let bias_strides = [1i64];
+
+        let activation_view = TensorView::new(
+            device_ptr(activation_dev),
+            DataType::Float32,
+            &a_shape,
+            &a_strides,
+            device,
+        );
+        let packed_view = TensorView::new(
+            device_ptr(packed_dev),
+            DataType::Uint8,
+            &b_shape,
+            &b_strides,
+            device,
+        );
+        let scales_view = TensorView::new(
+            device_ptr(scales_dev),
+            DataType::Float32,
+            &scales_shape,
+            &scales_strides,
+            device,
+        );
+        let zp_view = explicit_zp.then(|| {
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            )
+        });
+        let bias_view = with_bias.then(|| {
+            TensorView::new(
+                device_ptr(bias_dev),
+                DataType::Float32,
+                &bias_shape,
+                &bias_strides,
+                device,
+            )
+        });
+
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let mut spec_out = TensorMut::new(
+            device_ptr_mut(spec_dev),
+            DataType::Float32,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+        let mut generic_out = TensorMut::new(
+            device_ptr_mut(generic_dev),
+            DataType::Float32,
+            &y_shape,
+            &y_strides,
+            device,
+        );
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+        };
+
+        match bits {
+            4 => kernel
+                .launch_int4_f32_gemv_block128(
+                    &activation_view,
+                    &packed_view,
+                    &scales_view,
+                    zp_view
+                        .as_ref()
+                        .expect("int4 block-128 specialization requires zero points"),
+                    bias_view.as_ref(),
+                    &mut spec_out,
+                    k_blocks,
+                )
+                .unwrap(),
+            8 => kernel
+                .launch_int8_f32_gemv_block128(
+                    &activation_view,
+                    &packed_view,
+                    &scales_view,
+                    zp_view.as_ref(),
+                    bias_view.as_ref(),
+                    &mut spec_out,
+                    k_blocks,
+                )
+                .unwrap(),
+            _ => unreachable!("byte-identity harness only supports int4/int8"),
+        }
+        kernel
+            .launch_f32_gemv(
+                &activation_view,
+                &packed_view,
+                &scales_view,
+                zp_view.as_ref(),
+                bias_view.as_ref(),
+                &mut generic_out,
+                k_blocks,
+                blob_size,
+                zp_row_bytes,
+            )
+            .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut spec = vec![0.0f32; n];
+        let mut generic = vec![0.0f32; n];
+        // SAFETY: both device buffers hold `n` fp32 values.
+        unsafe {
+            runtime.dtoh(as_bytes_mut(&mut spec), spec_dev).unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut generic), generic_dev)
+                .unwrap();
+        }
+
+        // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(bias_dev).unwrap();
+            runtime.free_raw(spec_dev).unwrap();
+            runtime.free_raw(generic_dev).unwrap();
+        }
+
+        let mut mismatches = 0usize;
+        let mut all_finite = true;
+        for (s, g) in spec.iter().zip(generic.iter()) {
+            if !s.is_finite() {
+                all_finite = false;
+            }
+            if s.to_bits() != g.to_bits() {
+                mismatches += 1;
+            }
+        }
+        (mismatches, all_finite)
+    }
+
+    /// The specialized int8/block-128 asymmetric decode GEMV must be
+    /// **bit-for-bit identical** to the generic `matmul_nbits_gemv_f32` it
+    /// replaces for Qwen3-0.6B's dominant projection — greedy decode tokens must
+    /// not shift. Covers square/tall/wide projections, ragged-N tails, and
+    /// partial final K-blocks, with and without an explicit asymmetric zero
+    /// point and bias.
+    #[test]
+    fn int8_f32_block128_specialization_is_bit_identical_to_generic() {
+        for (k, n) in [
+            (1024usize, 1024usize), // Qwen3-style square projection
+            (3072, 1024),           // tall-skinny down projection (K > N)
+            (1024, 3072),           // wide projection (N > K)
+            (1024, 1030),           // ragged N tail across CTAs
+            (1000, 1024),           // partial final K-block (k % 128 != 0)
+            (896, 1027),            // partial N and exact K-blocks
+        ] {
+            for (with_bias, explicit_zp) in [(true, true), (false, true), (true, false)] {
+                let (mismatches, all_finite) =
+                    run_f32_block128_byte_identity(8, k, n, with_bias, explicit_zp);
+                assert!(
+                    all_finite,
+                    "int8 block-128 specialization produced a non-finite output \
+                     (K={k} N={n} bias={with_bias} zp={explicit_zp})"
+                );
+                assert_eq!(
+                    mismatches, 0,
+                    "int8 block-128 specialization diverged from the generic GEMV in \
+                     {mismatches} column(s) (K={k} N={n} bias={with_bias} zp={explicit_zp}) — \
+                     output must be bit-for-bit identical"
+                );
+            }
+        }
+    }
+
+    /// The asymmetric int4/block-128 specialization must exactly match the
+    /// generic fp32 GEMV, including a partial final K-block.
+    #[test]
+    fn int4_f32_block128_specialization_is_bit_identical_to_generic() {
+        let (mismatches, all_finite) = run_f32_block128_byte_identity(4, 259, 37, true, true);
+        assert!(
+            all_finite,
+            "int4 block-128 specialization produced non-finite output"
+        );
+        assert_eq!(
+            mismatches, 0,
+            "int4 block-128 specialization diverged from generic GEMV in \
+             {mismatches} column(s)"
+        );
     }
 
     /// Folding a standalone `Add(MatMulNBits, bias)` into the GEMV epilogue must

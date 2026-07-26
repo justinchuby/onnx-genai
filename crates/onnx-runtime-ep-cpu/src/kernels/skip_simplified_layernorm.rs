@@ -66,7 +66,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 "{OP}: hidden (last) dimension must be non-empty"
             )));
         }
-        if gamma.len() != hidden || inputs[2].shape != [hidden] {
+        let gamma_is_exact_identity = crate::kernels::simd_normalize::scale_shape_is_exact_identity(
+            shape,
+            shape.len() - 1,
+            inputs[2].shape,
+        );
+        if gamma.len() != hidden || !gamma_is_exact_identity {
             return Err(EpError::KernelFailed(format!(
                 "{OP}: gamma must have shape [{hidden}], got {:?}",
                 inputs[2].shape
@@ -138,7 +143,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 if let Some(values) = inv_std_vars.as_mut() {
                     values[group] = inv_std_var;
                 }
-                normalize_and_scale(sum_row, normalized, inv_std_var, &gamma);
+                crate::kernels::simd_normalize::normalize_and_scale(
+                    sum_row,
+                    normalized,
+                    inv_std_var,
+                    &gamma,
+                );
             }
             if writes_mean {
                 write_dense_f32_narrow(OP, &mut stats_outputs[0], &vec![0.0f32; groups])?;
@@ -175,7 +185,12 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             if let Some(values) = inv_std_vars.as_mut() {
                 values[group] = inv_std_var;
             }
-            normalize_and_scale(row, &mut output[base..base + hidden], inv_std_var, &gamma);
+            crate::kernels::simd_normalize::normalize_and_scale(
+                row,
+                &mut output[base..base + hidden],
+                inv_std_var,
+                &gamma,
+            );
         }
 
         write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
@@ -193,26 +208,6 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
-    }
-}
-
-const SIMD_LANES: usize = 8;
-
-fn normalize_and_scale(sum: &[f32], output: &mut [f32], inv_std: f32, gamma: &[f32]) {
-    debug_assert_eq!(sum.len(), output.len());
-    debug_assert_eq!(sum.len(), gamma.len());
-
-    let bulk_len = sum.len() / SIMD_LANES * SIMD_LANES;
-    let mut base = 0;
-    while base < bulk_len {
-        for lane in 0..SIMD_LANES {
-            let index = base + lane;
-            output[index] = sum[index] * inv_std * gamma[index];
-        }
-        base += SIMD_LANES;
-    }
-    for index in bulk_len..sum.len() {
-        output[index] = sum[index] * inv_std * gamma[index];
     }
 }
 

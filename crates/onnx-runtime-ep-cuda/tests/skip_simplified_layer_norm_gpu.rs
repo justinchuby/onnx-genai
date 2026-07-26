@@ -262,6 +262,35 @@ fn assert_close(label: &str, got: &[f32], expected: &[f32]) {
     assert!(error <= 1e-5, "{label}: {got:?} vs {expected:?}");
 }
 
+fn ordered_f32_bits(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 == 0 {
+        bits | 0x8000_0000
+    } else {
+        !bits
+    }
+}
+
+fn assert_f64_reference(label: &str, got: f32, reference: f64, sequential_f32: f32, max_ulps: u32) {
+    let nearest = reference as f32;
+    let ulps = ordered_f32_bits(got).abs_diff(ordered_f32_bits(nearest));
+    let got_error = (f64::from(got) - reference).abs();
+    let sequential_error = (f64::from(sequential_f32) - reference).abs();
+    println!(
+        "{label}: got={got:.9e} reference={reference:.17e} \
+         error={got_error:.9e} sequential_error={sequential_error:.9e} ulps={ulps}"
+    );
+    assert!(
+        got_error <= sequential_error,
+        "{label}: parallel reduction error {got_error:.9e} exceeds sequential f32 error \
+         {sequential_error:.9e}"
+    );
+    assert!(
+        ulps <= max_ulps,
+        "{label}: {got:.9e} is {ulps} ULPs from the nearest f32 to {reference:.17e}"
+    );
+}
+
 #[test]
 fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
     let _guard = GPU_SERIAL.lock().unwrap();
@@ -310,7 +339,7 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
 }
 
 #[test]
-fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
+fn skip_simplified_layer_norm_matches_f64_reference_within_one_ulp() {
     let _guard = GPU_SERIAL.lock().unwrap();
     let Some(ep) = cuda_ep() else {
         return;
@@ -326,8 +355,37 @@ fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
     let (expected_y, expected_sum, expected_invstd) =
         reference(&[1, 4], &[1, 4], &input, &skip, &gamma, &bias, 1e-5);
 
-    assert_eq!(got[0], expected_y);
-    assert_eq!(got[2], expected_invstd);
+    // This fixture cannot prove that square accumulation is not contracted:
+    // an FMA-contracted sum and the deterministic block tree happen to have the
+    // same f32 bits here. Non-contraction is a source-level kernel guarantee
+    // (`__fadd_rn(..., __fmul_rn(...))`), with deterministic execution covered
+    // by the sibling replay test. This test instead locks the numeric contract:
+    // the tree sum (43.56543731689453) is closer to the f64 sum
+    // (43.565436791865004) than the sequential sum (43.565433502197266);
+    // inverse RMS must round exactly, and normalized outputs must be within one
+    // ULP of the f64 reference and no less accurate than the sequential oracle.
+    let sum_squares_f64 = expected_sum
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>();
+    let invstd_f64 = (sum_squares_f64 / expected_sum.len() as f64 + f64::from(1e-5f32))
+        .sqrt()
+        .recip();
+    assert_f64_reference("inverse RMS", got[2][0], invstd_f64, expected_invstd[0], 0);
+    for (index, ((&got, &sum), &sequential)) in got[0]
+        .iter()
+        .zip(&expected_sum)
+        .zip(&expected_y)
+        .enumerate()
+    {
+        assert_f64_reference(
+            &format!("normalized output[{index}]"),
+            got,
+            f64::from(sum) * invstd_f64 * f64::from(gamma[index]),
+            sequential,
+            1,
+        );
+    }
     assert_eq!(got[3], expected_sum);
 }
 

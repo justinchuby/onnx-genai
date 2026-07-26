@@ -266,6 +266,7 @@ fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorP
             kv_inputs: None,
             kv_outputs: None,
             encoder_hidden_states_input: None,
+            audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
             kv_update: None,

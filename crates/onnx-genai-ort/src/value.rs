@@ -875,6 +875,22 @@ impl Value {
         })
     }
 
+    /// If this value is a no-copy alias over a shared owner, produce another
+    /// alias over the same owner (O(1), no byte copy). Returns `None` for
+    /// owned-backing tensors, which must be deep-copied to be shared.
+    ///
+    /// This lets read-only, per-step-invariant inputs (e.g. an encoder-decoder's
+    /// static cross-attention KV) be re-bound every decode step without
+    /// reallocating or memcpy-ing the underlying buffer.
+    pub fn try_alias_clone(&self) -> Option<Result<Value>> {
+        match &self.backing {
+            TensorBacking::Alias(owner) => {
+                Some(Value::alias_with_shape(Arc::clone(owner), &self.shape))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) unsafe fn from_raw(ptr: *mut onnx_genai_ort_sys::OrtValue) -> Result<Self> {
         let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
         let (shape, dtype) = tensor_shape_and_type(ptr.as_ptr())?;

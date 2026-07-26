@@ -127,10 +127,17 @@ current setting, and `/ep` also lists what this build can select — provider
 support is compiled in, so a provider left out of the build cannot be chosen at
 runtime.
 
-`/profile on` turns the report on mid-session. The per-stage ORT breakdown is
-the exception: it is switched on from the environment before any thread starts,
-so it needs `--profile` at startup, and the command says so rather than printing
-a report that is quietly missing its most detailed section.
+`/profile on` turns the report on mid-session, and starts a Perfetto timeline
+with it at full detail — deciding you want a timeline usually happens after
+something looks wrong, which is the one moment a startup-only switch cannot
+serve. `/profile trace <path>` chooses where it goes (`trace off` stops it), and
+`/profile verbosity <decisions|ops|full>` changes how much it records between
+turns. Full adds a span per worker thread per operator and costs about 4%.
+
+The per-stage ORT breakdown is the exception: it is switched on from the
+environment before any thread starts, so it needs `--profile` at startup, and
+the command says so rather than printing a report that is quietly missing its
+most detailed section.
 
 `/stats` toggles per-turn numbers, for watching throughput and cache behavior
 without the full `--profile` report. While a reply streams, the numbers update
@@ -436,6 +443,13 @@ vocoder stage:
 The output sample rate is declared by the package as `pipeline.audio.sample_rate`
 rather than assumed; a package that omits it is rejected with an error rather
 than played back at a guessed pitch (pass `--sample-rate` to supply one).
+
+The native CPU decode path also enables a steady-state **decode-plan memo** by
+default: it caches the per-step shape/buffer plan and replays it token-to-token
+(token-exact by construction, with an in-flight verify net and a graceful fall
+back to rebuilding on any model where invariance can't be proven). Disable it
+with `ONNX_GENAI_DECODE_MEMO=0` (also `false`/`off`) on resource-constrained
+hosts or for debugging; any other value, including unset, keeps it on.
 
 ### Run the OpenAI-compatible server
 

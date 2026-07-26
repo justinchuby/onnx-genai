@@ -118,6 +118,25 @@ pub enum ScaleMode {
     SplitSqrt(f32),
 }
 
+/// Precision used to evaluate the exponential in the softmax epilogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftmaxExp {
+    /// Evaluate `exp(score - max)` in f32 (the existing SDPA behavior).
+    F32,
+    /// Evaluate in f64 and round once to f32 (the GQA decode contract).
+    F64Intermediate,
+}
+
+impl SoftmaxExp {
+    #[inline]
+    fn exp(self, value: f32) -> f32 {
+        match self {
+            Self::F32 => value.exp(),
+            Self::F64Intermediate => (value as f64).exp() as f32,
+        }
+    }
+}
+
 /// Fixed SDPA parameters (everything that isn't the Q/K/V data or the
 /// bias/mask hooks).
 pub struct SdpaConfig {
@@ -269,6 +288,329 @@ pub fn sdpa_f32(
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
 }
 
+/// Run one decode query row against the caller-selected KV window `[lo, hi)`.
+///
+/// The caller retains ownership of GQA-specific causal/sliding-window policy
+/// and passes the resulting bounds here. `k` and `v` contain one full KV head
+/// with `kv_seq` rows; `q` and `output` are one query/output row.
+pub fn sdpa_decode_row(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    lo: usize,
+    hi: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    exp: SoftmaxExp,
+    output: &mut [f32],
+) {
+    debug_assert!(lo <= hi && hi <= kv_seq);
+    debug_assert_eq!(k.len(), kv_seq * q.len());
+    debug_assert_eq!(v.len(), kv_seq * output.len());
+
+    let mut scores = vec![0.0f32; hi - lo];
+    for (i, ks) in (lo..hi).enumerate() {
+        let k_base = ks * q.len();
+        let mut score = dot_f32(q, &k[k_base..k_base + q.len()]);
+        score *= scale;
+        if let Some(softcap) = softcap {
+            score = softcap * (score / softcap).tanh();
+        }
+        scores[i] = score;
+    }
+
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for score in &mut scores {
+        *score = exp.exp(*score - max);
+        sum += *score;
+    }
+    if sum > 0.0 {
+        for score in &mut scores {
+            *score /= sum;
+        }
+    }
+
+    output.fill(0.0);
+    for (i, ks) in (lo..hi).enumerate() {
+        let probability = scores[i];
+        if probability == 0.0 {
+            continue;
+        }
+        let v_base = ks * output.len();
+        axpy_f32(output, probability, &v[v_base..v_base + output.len()]);
+    }
+}
+
+/// One chunk's contribution to a flash-decoding (split-KV) softmax reduction.
+///
+/// `max` is the running maximum score over the chunk's KV sub-window and `sum`
+/// is the unnormalized softmax denominator `Σ exp(score - max)` for that chunk;
+/// both are accumulated in f64. An empty or fully-masked chunk reports
+/// `max = f64::NEG_INFINITY` and `sum = 0.0`. The matching unnormalized
+/// weighted-value accumulator is written out-of-band by [`sdpa_decode_partial`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodePartial {
+    /// Running maximum score over the chunk (`f64::NEG_INFINITY` when empty).
+    pub max: f64,
+    /// Chunk-local softmax denominator `Σ exp(score - max)` in f64.
+    pub sum: f64,
+}
+
+/// Partial flash-decoding reduction over a single KV sub-window `[lo, hi)`.
+///
+/// Mirrors [`sdpa_decode_row`]'s scoring exactly (same [`dot_f32`], `scale`, and
+/// optional `softcap`) but stops **before** the final softmax normalization: it
+/// returns this chunk's [`DecodePartial`] (running max and denominator) and
+/// writes the unnormalized weighted-value accumulator
+/// `o = Σ exp(score - max) · v` into `partial_output` (length = `v` head size).
+///
+/// The exponential, the denominator, and the value accumulator are all evaluated
+/// in f64 so the two-level [`combine_decode_partials`] reduction stays as close
+/// to the sequential [`SoftmaxExp::F64Intermediate`] reference as the split
+/// reordering allows. Splitting reorders the additions and introduces the online
+/// rescale, so the combined result is *not* bit-identical to [`sdpa_decode_row`]
+/// — it is held to a tight max-abs-error bar instead (see the kernel tests).
+///
+/// An empty or fully-masked window (`hi <= lo`) yields
+/// `DecodePartial { max: f64::NEG_INFINITY, sum: 0.0 }` and a zeroed
+/// `partial_output`; [`combine_decode_partials`] skips such chunks.
+pub fn sdpa_decode_partial(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    lo: usize,
+    hi: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    partial_output: &mut [f64],
+) -> DecodePartial {
+    debug_assert!(lo <= hi && hi <= kv_seq);
+    debug_assert_eq!(k.len(), kv_seq * q.len());
+    debug_assert_eq!(v.len(), kv_seq * partial_output.len());
+
+    partial_output.fill(0.0);
+    if hi <= lo {
+        return DecodePartial {
+            max: f64::NEG_INFINITY,
+            sum: 0.0,
+        };
+    }
+
+    let mut scores = vec![0.0f32; hi - lo];
+    for (i, ks) in (lo..hi).enumerate() {
+        let k_base = ks * q.len();
+        let mut score = dot_f32(q, &k[k_base..k_base + q.len()]);
+        score *= scale;
+        if let Some(softcap) = softcap {
+            score = softcap * (score / softcap).tanh();
+        }
+        scores[i] = score;
+    }
+
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let max_f64 = max as f64;
+    let mut sum = 0.0f64;
+    for (i, ks) in (lo..hi).enumerate() {
+        // Match the reference's f64-intermediate exponential, but keep the
+        // weight, denominator, and value accumulation in f64 so the per-chunk
+        // partials carry full precision into the online-rescale combine.
+        let weight = ((scores[i] as f64) - max_f64).exp();
+        sum += weight;
+        let v_base = ks * partial_output.len();
+        let v_row = &v[v_base..v_base + partial_output.len()];
+        for (o, &value) in partial_output.iter_mut().zip(v_row) {
+            *o += weight * value as f64;
+        }
+    }
+    DecodePartial { max: max_f64, sum }
+}
+
+/// Combine per-chunk [`sdpa_decode_partial`] results into one normalized decode
+/// output row using the flash-decoding online-rescale reduction.
+///
+/// Given chunks with local max `m_j`, denominator `l_j`, and unnormalized value
+/// accumulator `o_j`, the global softmax is recovered (in exact arithmetic) as
+///
+/// ```text
+/// M = max_j m_j
+/// L = Σ_j exp(m_j - M) · l_j
+/// O = Σ_j exp(m_j - M) · o_j
+/// output = O / L
+/// ```
+///
+/// The rescale factor `exp(m_j - M) ∈ (0, 1]` re-bases every chunk onto the
+/// global maximum before summing — that invariant is what lets the KV windows be
+/// reduced independently. All arithmetic is f64; the result rounds to f32 once at
+/// the end. `partial_outputs` is chunk-major: chunk `j`'s accumulator occupies
+/// `[j * v_head_size, (j + 1) * v_head_size)`.
+pub fn combine_decode_partials(
+    partials: &[DecodePartial],
+    partial_outputs: &[f64],
+    v_head_size: usize,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(output.len(), v_head_size);
+    debug_assert_eq!(partial_outputs.len(), partials.len() * v_head_size);
+
+    let global_max = partials
+        .iter()
+        .map(|partial| partial.max)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if global_max == f64::NEG_INFINITY {
+        output.fill(0.0);
+        return;
+    }
+
+    let mut denominator = 0.0f64;
+    let mut accumulator = vec![0.0f64; v_head_size];
+    for (chunk, partial) in partials.iter().enumerate() {
+        if partial.max == f64::NEG_INFINITY {
+            continue;
+        }
+        let rescale = (partial.max - global_max).exp();
+        denominator += rescale * partial.sum;
+        let base = chunk * v_head_size;
+        let chunk_output = &partial_outputs[base..base + v_head_size];
+        for (acc, &value) in accumulator.iter_mut().zip(chunk_output) {
+            *acc += rescale * value;
+        }
+    }
+
+    if denominator > 0.0 {
+        let inverse = 1.0 / denominator;
+        for (out, &acc) in output.iter_mut().zip(&accumulator) {
+            *out = (acc * inverse) as f32;
+        }
+    } else {
+        output.fill(0.0);
+    }
+}
+
+#[inline]
+fn softmax_in_place(scores: &mut [f32], exp: SoftmaxExp) {
+    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max == f32::NEG_INFINITY {
+        scores.fill(0.0);
+        return;
+    }
+    let mut sum = 0.0f32;
+    for score in scores.iter_mut() {
+        let e = exp.exp(*score - max);
+        *score = e;
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for score in scores.iter_mut() {
+        *score *= inv;
+    }
+}
+
+/// Dot product using the decode path's AVX2+FMA accumulation order when
+/// available, with a scalar fallback on other targets.
+#[inline(always)]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if crate::backend::has_simd_x86() {
+        // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
+        return unsafe { dot_avx2_fma(a, b) };
+    }
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// AXPY using the decode path's AVX2+FMA accumulation order when available,
+/// with a scalar fallback on other targets.
+#[inline(always)]
+fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if crate::backend::has_simd_x86() {
+        // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
+        unsafe { axpy_avx2_fma(dst, scalar, src) };
+        return;
+    }
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d += scalar * s;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n = a.len();
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+
+    unsafe {
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let chunks16 = n / 16;
+        for i in 0..chunks16 {
+            let av0 = _mm256_loadu_ps(a_ptr.add(i * 16));
+            let bv0 = _mm256_loadu_ps(b_ptr.add(i * 16));
+            acc0 = _mm256_fmadd_ps(av0, bv0, acc0);
+            let av1 = _mm256_loadu_ps(a_ptr.add(i * 16 + 8));
+            let bv1 = _mm256_loadu_ps(b_ptr.add(i * 16 + 8));
+            acc1 = _mm256_fmadd_ps(av1, bv1, acc1);
+        }
+        let mut tail = chunks16 * 16;
+        if tail + 8 <= n {
+            let av = _mm256_loadu_ps(a_ptr.add(tail));
+            let bv = _mm256_loadu_ps(b_ptr.add(tail));
+            acc0 = _mm256_fmadd_ps(av, bv, acc0);
+            tail += 8;
+        }
+        let acc = _mm256_add_ps(acc0, acc1);
+        let lo = _mm256_extractf128_ps(acc, 0);
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let v4 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(v4);
+        let v2 = _mm_add_ps(v4, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, v2);
+        let v1 = _mm_add_ss(v2, shuf2);
+        let mut result = _mm_cvtss_f32(v1);
+        for i in tail..n {
+            result += *a_ptr.add(i) * *b_ptr.add(i);
+        }
+        result
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let n = dst.len();
+    let s = _mm256_set1_ps(scalar);
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+    unsafe {
+        let mut i = 0;
+        while i + 8 <= n {
+            let d = _mm256_loadu_ps(dst_ptr.add(i));
+            let x = _mm256_loadu_ps(src_ptr.add(i));
+            _mm256_storeu_ps(dst_ptr.add(i), _mm256_fmadd_ps(s, x, d));
+            i += 8;
+        }
+        while i < n {
+            *dst_ptr.add(i) += scalar * *src_ptr.add(i);
+            i += 1;
+        }
+    }
+}
+
 /// Byte-exact scalar SDPA reference — the oracle the parity goldens pin.
 ///
 /// See the module docs for the exact numerical sequence; it is a bit-for-bit
@@ -358,23 +700,7 @@ pub fn sdpa_f32_scalar(
                 // NaN — matching ORT's guarded softmax. Fills that stay finite
                 // (e.g. MHA's `f32::MIN`) never trigger this branch, so MHA's
                 // numerics are unchanged.
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                if max == f32::NEG_INFINITY {
-                    for sc in scores.iter_mut() {
-                        *sc = 0.0;
-                    }
-                } else {
-                    let mut sum = 0.0f32;
-                    for sc in scores.iter_mut() {
-                        let e = (*sc - max).exp();
-                        *sc = e;
-                        sum += e;
-                    }
-                    let inv = 1.0 / sum;
-                    for sc in scores.iter_mut() {
-                        *sc *= inv;
-                    }
-                }
+                softmax_in_place(&mut scores, SoftmaxExp::F32);
 
                 if let Some(cap) = qk.as_mut()
                     && cap.stage == QkCaptureStage::PostSoftmax
@@ -500,23 +826,7 @@ fn sdpa_f32_fast(
 
                 // Numerically-stable softmax with the fully-masked-row → zero
                 // guard (matching the scalar reference and ORT).
-                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                if max == f32::NEG_INFINITY {
-                    for s in row.iter_mut() {
-                        *s = 0.0;
-                    }
-                } else {
-                    let mut sum = 0.0f32;
-                    for s in row.iter_mut() {
-                        let e = (*s - max).exp();
-                        *s = e;
-                        sum += e;
-                    }
-                    let inv = 1.0 / sum;
-                    for s in row.iter_mut() {
-                        *s *= inv;
-                    }
-                }
+                softmax_in_place(row, SoftmaxExp::F32);
             }
 
             // context[q_seq, Dv] = probs · V.
@@ -541,6 +851,158 @@ fn sdpa_f32_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_row_f64_intermediate_is_bit_exact_with_gqa_reference() {
+        let (kv_seq, dh, dv) = (23usize, 133usize, 17usize);
+        let (lo, hi) = (5usize, 21usize);
+        let scale = 1.0 / (dh as f32).sqrt();
+        let softcap = 7.5f32;
+        let q: Vec<f32> = (0..dh)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+            .collect();
+        let k: Vec<f32> = (0..kv_seq * dh)
+            .map(|i| ((i * 29 % 211) as f32 - 105.0) / 61.0)
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * dv)
+            .map(|i| ((i * 43 % 157) as f32 - 78.0) / 53.0)
+            .collect();
+
+        // The pre-consolidation GQA decode loop, retained here as the bit oracle.
+        let mut scores = vec![0.0f32; hi - lo];
+        for (i, ks) in (lo..hi).enumerate() {
+            let k_base = ks * dh;
+            let mut score = dot_f32(&q, &k[k_base..k_base + dh]);
+            score *= scale;
+            score = softcap * (score / softcap).tanh();
+            scores[i] = score;
+        }
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for score in &mut scores {
+            *score = ((*score - max) as f64).exp() as f32;
+            sum += *score;
+        }
+        if sum > 0.0 {
+            for score in &mut scores {
+                *score /= sum;
+            }
+        }
+        let mut expected = vec![0.0f32; dv];
+        for (i, ks) in (lo..hi).enumerate() {
+            let probability = scores[i];
+            if probability == 0.0 {
+                continue;
+            }
+            axpy_f32(&mut expected, probability, &v[ks * dv..(ks + 1) * dv]);
+        }
+
+        let mut actual = vec![f32::NAN; dv];
+        sdpa_decode_row(
+            &q,
+            &k,
+            &v,
+            kv_seq,
+            lo,
+            hi,
+            scale,
+            Some(softcap),
+            SoftmaxExp::F64Intermediate,
+            &mut actual,
+        );
+        assert_eq!(
+            actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Split-KV (flash-decoding) parity: [`sdpa_decode_partial`] +
+    /// [`combine_decode_partials`] over many `(kv_len, split_count, head_size)`
+    /// combinations must reproduce the sequential [`sdpa_decode_row`] reference to
+    /// a tight max-abs-error bar. It is deliberately *not* bit-exact: the split
+    /// reorders the float additions and adds the online rescale multiplies, so a
+    /// small drift is expected. The bound is set to `1e-6`; the f64 intermediates
+    /// keep every observed case far under it. Edge cases covered: `P = 1`,
+    /// `P > kv_len` (empty chunks), sliding window `lo > 0`, `kv_len` not
+    /// divisible by `P`, and a fully-masked/empty window.
+    #[test]
+    fn split_decode_matches_sequential_reference_within_tolerance() {
+        const TOLERANCE: f32 = 1e-6;
+
+        fn run_case(kv_seq: usize, dh: usize, dv: usize, lo: usize, hi: usize, split_count: usize) {
+            let scale = 1.0 / (dh.max(1) as f32).sqrt();
+            let softcap = Some(6.25f32);
+            let q: Vec<f32> = (0..dh)
+                .map(|i| ((i * 13 % 97) as f32 - 48.0) / 29.0)
+                .collect();
+            let k: Vec<f32> = (0..kv_seq * dh)
+                .map(|i| ((i * 31 % 199) as f32 - 99.0) / 57.0)
+                .collect();
+            let v: Vec<f32> = (0..kv_seq * dv)
+                .map(|i| ((i * 37 % 173) as f32 - 86.0) / 47.0)
+                .collect();
+
+            let mut reference = vec![f32::NAN; dv];
+            sdpa_decode_row(
+                &q,
+                &k,
+                &v,
+                kv_seq,
+                lo,
+                hi,
+                scale,
+                softcap,
+                SoftmaxExp::F64Intermediate,
+                &mut reference,
+            );
+
+            // Split `[lo, hi)` into `split_count` contiguous chunks the same way
+            // the GQA scheduler does, compute each chunk's partial, then combine.
+            let length = hi - lo;
+            let base = length / split_count;
+            let remainder = length % split_count;
+            let mut partials = Vec::with_capacity(split_count);
+            let mut partial_outputs = vec![0.0f64; split_count * dv];
+            for chunk in 0..split_count {
+                let chunk_lo = lo + chunk * base + chunk.min(remainder);
+                let chunk_hi = chunk_lo + base + usize::from(chunk < remainder);
+                let slot = &mut partial_outputs[chunk * dv..(chunk + 1) * dv];
+                partials.push(sdpa_decode_partial(
+                    &q, &k, &v, kv_seq, chunk_lo, chunk_hi, scale, softcap, slot,
+                ));
+            }
+            let mut combined = vec![f32::NAN; dv];
+            combine_decode_partials(&partials, &partial_outputs, dv, &mut combined);
+
+            let mut max_abs_error = 0.0f32;
+            for (&reference_value, &combined_value) in reference.iter().zip(&combined) {
+                max_abs_error = max_abs_error.max((reference_value - combined_value).abs());
+            }
+            assert!(
+                max_abs_error <= TOLERANCE,
+                "kv_seq={kv_seq} dh={dh} dv={dv} lo={lo} hi={hi} split_count={split_count}: \
+                 max abs error {max_abs_error} exceeds {TOLERANCE}"
+            );
+        }
+
+        // Full window, exact and non-divisible splits, several head sizes.
+        for &(dh, dv) in &[(64usize, 64usize), (128, 128), (96, 40), (133, 17)] {
+            for &kv_seq in &[1usize, 2, 7, 64, 200, 1024] {
+                for &split_count in &[1usize, 2, 3, 4, 8, 16] {
+                    run_case(kv_seq, dh, dv, 0, kv_seq, split_count);
+                }
+            }
+        }
+        // Sliding window (lo > 0), including kv_len not divisible by P.
+        run_case(200, 128, 128, 37, 200, 4);
+        run_case(200, 128, 128, 37, 200, 7);
+        run_case(1024, 96, 40, 511, 1024, 5);
+        // P greater than the window length -> trailing chunks are empty.
+        run_case(5, 64, 64, 0, 5, 8);
+        run_case(5, 64, 64, 2, 5, 16);
+        // Fully-masked / empty window -> all chunks empty, output must be zero.
+        run_case(16, 64, 64, 8, 8, 4);
+    }
 
     /// Straightforward f32 SDPA reference for cross-checking the core on small
     /// shapes (single head, no bias/mask, PostDot scale).

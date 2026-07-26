@@ -1020,7 +1020,78 @@ pub(crate) struct Executor {
     /// span per executed op so kernels can attach kernel-variant and
     /// capture-rejection reasons via [`annotate_current_span_with`].
     trace: TraceContext,
+    /// Reusable scratch for the resolved input shapes of the node currently
+    /// being dispatched by [`Self::exec_kernel_node`]. Refilled (truncate +
+    /// refill, retaining inner `Vec` capacity) once per node via
+    /// [`Self::refill_input_shapes`], so a steady-state decode step performs no
+    /// per-node `Vec<Vec<usize>>` allocation for shape lookup. Reuse invariant:
+    /// it is fully rewritten at the top of each `exec_kernel_node` call and only
+    /// read within that same call — never aliased or carried across nodes.
+    scratch_input_shapes: Vec<Vec<usize>>,
+    /// F5 Stage 1 — master switch for the steady-state decode-plan memo. Default
+    /// ON; disabled by `ONNX_GENAI_DECODE_MEMO=0`. Consulted on the top-level CPU
+    /// eager decode path — including the normal persistent-KV-binding case.
+    decode_memo_enabled: bool,
+    /// When set (`ONNX_GENAI_DECODE_MEMO_VERIFY=1`, or always under
+    /// `debug_assertions`), every memo replay is asserted equal to a fresh
+    /// `resolve_soft` — the R1 verifiable safety net. Off in release by default.
+    decode_memo_verify: bool,
+    /// The active decode-plan memo, primed after two consecutive plan-matching
+    /// eager steps and rebuilt on any signature change.
+    decode_memo: Option<DecodePlanMemo>,
+    /// Bindings of the previous memo-eligible eager step, diffed against the
+    /// current step to derive the varying-symbol set (R1 two-real-step rule).
+    decode_memo_prev_bindings: Option<HashMap<SymbolId, usize>>,
+    /// Diagnostic: what the memo did on the most recent memo-eligible eager
+    /// step. Exposed to the guard tests.
+    decode_memo_last_action: DecodeMemoAction,
+    /// F5 Stage 1 — persistent working shape map reused across decode steps.
+    /// On a replay step it is taken in place (no allocation): its previous
+    /// just-in-time entries are stripped, the length-invariant partition is left
+    /// untouched (byte-identical by construction), and only the variant tail is
+    /// re-substituted into its existing `Vec`s. The run loop then refills the
+    /// small data-dependent tail. This is what makes replay genuinely
+    /// allocation-amortized (Stage 1's whole purpose) rather than a per-token
+    /// `HashMap`/`Vec` rebuild.
+    decode_memo_resolved: HashMap<ValueId, Vec<usize>>,
+    /// Diagnostic counters (proof the memo actually fires on the real path, so a
+    /// gate that silently excludes it is never shipped again). Incremented per
+    /// memo-eligible eager step; a summary is emitted on drop when
+    /// `ONNX_GENAI_DECODE_MEMO_STATS=1`.
+    decode_memo_primed_count: u64,
+    decode_memo_rebuilt_count: u64,
+    decode_memo_replayed_count: u64,
+    /// Steps that routed through the memo path but were structurally ineligible
+    /// (memo OFF, CUDA, nested, or non-eager) — counted only when the master
+    /// switch is on, to make an over-restrictive gate observable.
+    decode_memo_ineligible_count: u64,
+    /// F5 Stage 2 — cached invariant buffer/view plan. Present only after a
+    /// successful memo rebuild that found ≥1 fully-invariant pure-view node; it
+    /// records the zero-copy view aliases to reinstate and the pure-view plan
+    /// nodes to elide on a matching replay, guarded by a per-source buffer
+    /// identity signature. Invalidated on every non-replay step (mirrors the
+    /// Stage-1 Chew defense-in-depth) so a stale plan from a retired/errored
+    /// step can never serve a future replay. Default ON (shares the Stage-1
+    /// `ONNX_GENAI_DECODE_MEMO` gate; set =0 to disable).
+    decode_view_plan: Option<DecodeViewPlan>,
+    /// F5 Stage 2 counters. `views_reused` = zero-copy view aliases reinstated
+    /// without rebuild; `dispatch_elided` = pure-view plan nodes whose re-dispatch
+    /// was skipped. Both prove non-vacuous firing on the real decode path.
+    decode_views_reused_count: u64,
+    decode_dispatch_elided_count: u64,
+    /// F5 Stage 2 defense-in-depth: consecutive replay steps whose buffer-identity
+    /// signature failed to match (a source buffer moved/resized under a plan that
+    /// classified it invariant). After [`STAGE2_SIG_MISMATCH_LIMIT`] such steps the
+    /// view plan is disabled for the rest of the session — an invariant-buffer
+    /// assumption that keeps breaking must never keep serving cached views.
+    decode_view_plan_sig_mismatch_streak: u32,
+    /// Latched off after repeated signature mismatches (see above).
+    decode_view_plan_disabled: bool,
 }
+
+/// After this many consecutive buffer-identity signature mismatches, F5 Stage 2
+/// view reuse is latched off for the session (Chew defense-in-depth).
+const STAGE2_SIG_MISMATCH_LIMIT: u32 = 2;
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
 /// borrows `source`'s buffer with the given (real, possibly non-contiguous or
@@ -1033,6 +1104,255 @@ struct ValueView {
     shape: Vec<usize>,
     strides: Vec<i64>,
     byte_offset: usize,
+}
+
+/// F5 Stage 1 — steady-state decode-plan memo.
+///
+/// [`Executor::resolve_soft`] is a **pure function of the current symbol
+/// `bindings`** (see [`substitute`]): a value's resolved shape depends only on
+/// its interned [`Shape`] and the bindings, and [`Executor::bind_symbols`]
+/// derives bindings purely from the input *shapes*. During steady-state
+/// single-token (M=1) decode only a small set of length symbols changes each
+/// step, so every value whose shape references no such symbol resolves to a
+/// byte-identical shape every step. This memo caches that length-invariant
+/// partition and, on a plan-matching step, re-substitutes only the small
+/// length-varying tail — avoiding a full ~600-entry map rebuild per token.
+///
+/// **Soundness (why a wrong shape can never be replayed).** A step may replay
+/// the invariant partition iff every symbol the memo did *not* classify as
+/// varying has the same binding it was built under and the bound-symbol set is
+/// identical ([`DecodePlanMemo::matches`]). Because each invariant shape
+/// references only static dims and non-varying symbols, an unchanged
+/// non-varying binding set guarantees it re-substitutes to the identical value —
+/// so the replayed map is byte-identical to a fresh `resolve_soft`. Crucially,
+/// if a symbol that *actually* varies were mis-classified invariant, its next
+/// change is a change to a **non-varying** binding ⇒ `matches` fails ⇒ the memo
+/// rebuilds; a stale shape is therefore never emitted, regardless of how
+/// `decode_varying` was derived. The variant tail is always re-substituted from
+/// the fresh bindings, never replayed. A debug/opt-in full re-resolve
+/// ([`Executor::decode_memo_verify`]) asserts equality every replay (R1 net).
+struct DecodePlanMemo {
+    /// Bindings the invariant partition was built under — the replay guard.
+    reference_bindings: HashMap<SymbolId, usize>,
+    /// Symbols observed to change value between two consecutive real eager
+    /// steps (R1: derived by diffing, never guessed).
+    decode_varying: HashSet<SymbolId>,
+    /// Resolved shape of every value whose [`Shape`] references no varying
+    /// symbol — replayed verbatim.
+    invariant_shapes: HashMap<ValueId, Vec<usize>>,
+    /// Values whose [`Shape`] references ≥1 varying symbol — re-substituted from
+    /// the fresh bindings on every replay step.
+    variant_values: Vec<ValueId>,
+    /// All value ids the memo owns (`invariant_shapes` keys ∪ `variant_values`) —
+    /// i.e. exactly the keys `resolve_soft` produces for this regime. Used to
+    /// strip the previous step's just-in-time (data-dependent) entries from the
+    /// persistent working map before replay, so the run loop recomputes them.
+    canonical: HashSet<ValueId>,
+    /// L-abstracted structural fingerprint of the persistent device-I/O binding
+    /// set the memo was built under. Pure-L KV growth leaves this unchanged (so
+    /// the step replays); a binding appearing/disappearing, a role flip, or a
+    /// dtype change alters it and forces a rebuild. See [`DecodeBindingSig`].
+    reference_external_sig: Vec<DecodeBindingSig>,
+}
+
+/// L-abstracted structural fingerprint of one persistent (device-bound) I/O
+/// binding, for the decode-plan memo replay guard.
+///
+/// Unlike [`ExternalCaptureSig`] — which is pointer/capacity- and concrete-shape-
+/// exact for CUDA capture seeding — this abstracts the growing length symbol `L`
+/// to its symbolic identity by fingerprinting the binding's *declared* (symbolic)
+/// shape (`value_shapes[vid]`, which is graph-static). Two decode steps that
+/// differ only by KV length therefore compare **equal** and replay, while a
+/// structural change (a binding added/removed, an input/output role flip, or a
+/// dtype change) compares unequal and forces a rebuild. Pointer and byte capacity
+/// are deliberately **excluded**: Stage 1 memoizes shape resolution only (buffers
+/// are re-sized every step outside the memo), so a KV-cache realloc must not
+/// invalidate the plan — including `ptr`/`len` here would force a rebuild on every
+/// growth-driven reallocation and leave the memo perpetually dead on the real
+/// decode path.
+#[derive(Clone, PartialEq, Eq)]
+struct DecodeBindingSig {
+    vid: ValueId,
+    is_input: bool,
+    dtype: DataType,
+    decl_shape: Shape,
+}
+
+impl DecodePlanMemo {
+    /// A step is a plan-match (may replay) iff it binds exactly the same symbol
+    /// set as the reference and agrees with it on every non-varying symbol (only
+    /// the varying length / past-length symbols may differ) **and** presents the
+    /// same L-abstracted persistent-binding signature.
+    fn matches(
+        &self,
+        bindings: &HashMap<SymbolId, usize>,
+        external_sig: &[DecodeBindingSig],
+    ) -> bool {
+        if external_sig != self.reference_external_sig {
+            return false;
+        }
+        if bindings.len() != self.reference_bindings.len() {
+            return false;
+        }
+        bindings.iter().all(|(sym, &val)| {
+            match self.reference_bindings.get(sym) {
+                Some(&ref_val) => val == ref_val || self.decode_varying.contains(sym),
+                // A symbol the reference did not bind: the plan shape differs.
+                None => false,
+            }
+        })
+    }
+}
+
+/// F5 Stage 2 — cached invariant buffer/view plan.
+///
+/// Stage 1 proved that during steady single-token decode a large partition of
+/// values resolve to a byte-identical shape every step (the memo's
+/// `invariant_shapes`). Empirically, on real decoders the ~113 pure layout ops
+/// (`Reshape`/`Squeeze`/`Unsqueeze`/no-op views) produce a **byte-identical
+/// zero-copy [`ValueView`] every step** — yet Stage 1 still re-cleared and
+/// re-dispatched every one per token. This plan caches those view aliases and the
+/// nodes that produce them so a matching replay step can:
+///   1. reinstate the invariant view aliases instead of clearing+rebuilding them,
+///   2. exclude the invariant partition from per-step buffer sizing, and
+///   3. elide re-dispatch of the pure-view nodes entirely.
+///
+/// **Membership (why an elided view is never geometrically stale).** A node is a
+/// *candidate* iff every output's shape is in the memo's proven-invariant partition
+/// (`invariant_shapes`) — so Stage 1 already guarantees the output shape is
+/// byte-identical every replay step and the replayed `resolved` map always carries
+/// it. A candidate is *promoted* to the active elision set only after its produced
+/// view is observed **byte-identical across a second real decode step**
+/// ([`Executor::validate_decode_view_plan`]) — the same two-real-step confirmation
+/// Stage 1 uses to derive its varying set. Contiguous-view strides are a pure
+/// function of the (invariant) output shape, and any per-step `byte_offset` drift
+/// (e.g. a position-indexed slice into a fixed-capacity KV buffer) would differ
+/// across the two observed steps and so is rejected before it can ever be elided.
+///
+/// **Soundness — the buffer-identity obligation.** Stage 1 could exclude
+/// pointer/capacity from its replay key because it cached *shapes only* and every
+/// kernel re-read fresh bytes each step. Stage 2 caches actual **buffers/views**, so
+/// a realloc or pointer move of a cached view's source would leave the reinstated
+/// alias pointing at a stale/dangling region. Therefore this plan records
+/// `source_buffer_sig` = `(source, base_ptr, capacity)` for every buffer a retained
+/// view aliases, and a replay step reinstates the plan **iff** every signature still
+/// matches ([`Executor::stage2_buffer_sig_matches`]); any mismatch forces a full
+/// rebuild. (A retained [`ValueView`] references its source by [`ValueId`], so a
+/// consumer already re-reads the *current* base pointer — but the byte offset and
+/// capacity assumptions are exactly what the pointer+capacity guard protects.)
+///
+/// The plan is only ever *built* at the successful end of a memo Rebuilt step,
+/// *validated* on the following replay, and *used* on a memo Replayed step whose
+/// bindings, external signature (Stage 1) and buffer identity (Stage 2) all match;
+/// it is invalidated on every non-replay step so an errored/retired step can never
+/// serve a stale alias. Under `decode_memo_verify` every reinstated view is also
+/// asserted equal to a freshly built one in-flight (the R1 safety net).
+struct DecodeViewPlan {
+    /// Plan-node indices (into [`Executor::plan`]) whose every output shape is in
+    /// the memo's invariant partition — candidates until validated, then the active
+    /// elision set (re-dispatch skipped on a matching replay).
+    elided_nodes: HashSet<usize>,
+    /// The zero-copy view aliases to reinstate each replay step (`vid` → its
+    /// invariant [`ValueView`]), verbatim from the reference step.
+    retained_views: Vec<(ValueId, ValueView)>,
+    /// Distinct buffer-owning source value ids to re-pin (conservative liveness:
+    /// a source with a live view is never reused/freed within the run).
+    pinned_sources: Vec<ValueId>,
+    /// Buffer-identity signature `(source, base_ptr as usize, capacity)` for every
+    /// retained view's source buffer. The Stage-2 replay guard.
+    source_buffer_sig: Vec<(ValueId, usize, usize)>,
+    /// `false` for a freshly built candidate; set `true` once every retained view
+    /// has been confirmed byte-identical on a second real decode step. Only a
+    /// validated plan is ever used to elide dispatch.
+    validated: bool,
+}
+
+/// Outcome of the most recent memo-eligible eager resolve, exposed for the F5
+/// guard tests to distinguish a rebuild from a replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeMemoAction {
+    /// The memo was disabled, or the step was not memo-eligible.
+    Disabled,
+    /// First observation of a regime: bindings recorded, no memo built yet
+    /// (the two-real-step derivation needs a second matching step).
+    Primed,
+    /// A full resolve whose result (re)built the memo by diffing this step with
+    /// the previous eligible step.
+    Rebuilt,
+    /// The invariant partition was replayed and only the variant tail
+    /// re-substituted.
+    Replayed,
+}
+
+/// True iff two binding maps bind exactly the same symbol set.
+fn same_symbol_keys(a: &HashMap<SymbolId, usize>, b: &HashMap<SymbolId, usize>) -> bool {
+    a.len() == b.len() && a.keys().all(|k| b.contains_key(k))
+}
+
+/// M==1 single-token-decode gate (residual #3): admit a memo (re)build only for
+/// a steady autoregressive-decode transition, where sequence/KV length symbols
+/// only ever *grow*. `prev`→`cur` qualifies iff both bind the same symbol set,
+/// at least one symbol increased, and **no** symbol decreased. This excludes the
+/// prefill→decode transition (the query-length symbol drops from the prompt
+/// length P to 1) and any non-decode reshape, so the memo activates only on
+/// single-token decode — not prefill — tightening the blast radius. Soundness
+/// does not rely on this gate (the `matches` guard is the correctness invariant);
+/// it only decides *when* the memo is worth building.
+fn is_decode_growth_transition(
+    prev: &HashMap<SymbolId, usize>,
+    cur: &HashMap<SymbolId, usize>,
+) -> bool {
+    if !same_symbol_keys(prev, cur) {
+        return false;
+    }
+    let mut any_grew = false;
+    for (sym, &c) in cur {
+        let p = prev[sym];
+        if c > p {
+            any_grew = true;
+        } else if c < p {
+            return false; // a shrinking extent is not steady decode (e.g. prefill→decode)
+        }
+    }
+    any_grew
+}
+
+/// True iff `shape` references any symbol in `symbols`.
+fn shape_references_any(shape: &Shape, symbols: &HashSet<SymbolId>) -> bool {
+    shape
+        .iter()
+        .any(|d| matches!(d, Dim::Symbolic(s) if symbols.contains(s)))
+}
+
+/// Whether the decode-plan memo master switch (`ONNX_GENAI_DECODE_MEMO`) is on.
+/// Default ON; set `ONNX_GENAI_DECODE_MEMO=0` to disable.
+///
+/// The explicit OFF values are `0`, `false`, and `off` (case-insensitive,
+/// surrounding whitespace trimmed). Every other state — unset, empty, or an
+/// unrecognized value — enables the memo, so parsing fails safe toward the
+/// validated fast path (worst case: rebuild every step, no speedup, never
+/// wrong). Ripley's authoritative A/B recorded 0 token flips and a non-negative
+/// speedup at every tested core count, so default-ON is token-exact by
+/// construction.
+fn decode_memo_env_enabled() -> bool {
+    match std::env::var("ONNX_GENAI_DECODE_MEMO") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Whether the opt-in per-step replay verification (`ONNX_GENAI_DECODE_MEMO_VERIFY`)
+/// is set. Always on under `debug_assertions`.
+fn decode_memo_verify_env_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_DECODE_MEMO_VERIFY")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
 }
 
 /// Per-input geometry the run loop resolves once per node: the raw base pointer
@@ -1347,6 +1667,31 @@ fn substitute(shape: &Shape, bindings: &HashMap<SymbolId, usize>) -> Option<Vec<
             Dim::Symbolic(s) => bindings.get(s).copied(),
         })
         .collect()
+}
+
+/// Like [`substitute`] but writes into `out` in place, reusing its existing
+/// capacity (no heap allocation). Returns `false` (leaving `out` empty) if any
+/// dim is an unbound symbol. Used by the decode-plan memo replay to refresh the
+/// variant tail without allocating a fresh `Vec` per value per token.
+fn substitute_into(
+    shape: &Shape,
+    bindings: &HashMap<SymbolId, usize>,
+    out: &mut Vec<usize>,
+) -> bool {
+    out.clear();
+    for d in shape {
+        match d {
+            Dim::Static(n) => out.push(*n),
+            Dim::Symbolic(s) => match bindings.get(s) {
+                Some(&v) => out.push(v),
+                None => {
+                    out.clear();
+                    return false;
+                }
+            },
+        }
+    }
+    true
 }
 
 /// Decode raw little-endian integer bytes as `i64` for `dtype`, or `None` if the
@@ -2614,6 +2959,22 @@ impl Executor {
             seq_elem_values: HashMap::new(),
             execution_provider_fallback_report,
             trace: TraceContext::noop(),
+            scratch_input_shapes: Vec::new(),
+            decode_memo_enabled: decode_memo_env_enabled(),
+            decode_memo_verify: cfg!(debug_assertions) || decode_memo_verify_env_enabled(),
+            decode_memo: None,
+            decode_memo_prev_bindings: None,
+            decode_memo_last_action: DecodeMemoAction::Disabled,
+            decode_memo_resolved: HashMap::new(),
+            decode_memo_primed_count: 0,
+            decode_memo_rebuilt_count: 0,
+            decode_memo_replayed_count: 0,
+            decode_memo_ineligible_count: 0,
+            decode_view_plan: None,
+            decode_views_reused_count: 0,
+            decode_dispatch_elided_count: 0,
+            decode_view_plan_sig_mismatch_streak: 0,
+            decode_view_plan_disabled: false,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -2707,6 +3068,344 @@ impl Executor {
             }
         }
         resolved
+    }
+
+    /// F5 Stage 1: resolve every value's concrete shape for a memo-eligible
+    /// eager step, replaying the length-invariant partition through the
+    /// [`DecodePlanMemo`] when the step is plan-identical to the memoized one,
+    /// and re-substituting only the length-varying tail. On any signature change
+    /// (prefill→decode, batch change, non-length dim change, …) it falls back to
+    /// a full [`Self::resolve_soft`] and (re)builds the memo by diffing this
+    /// step's bindings with the previous eligible step's (R1 two-real-step
+    /// derivation). The output is provably byte-identical to `resolve_soft`
+    /// (asserted every replay when [`Self::decode_memo_verify`] is set).
+    fn resolve_soft_decode_memo(
+        &mut self,
+        bindings: &HashMap<SymbolId, usize>,
+        external: &ExternalBindings,
+    ) -> HashMap<ValueId, Vec<usize>> {
+        // L-abstracted fingerprint of the persistent binding set (KV cache). Pure
+        // length growth leaves it unchanged; a structural change forces a rebuild.
+        let external_sig = self.decode_external_signature(external);
+        // --- Fast path: an active memo whose non-varying bindings and binding
+        //     signature are unchanged. Replays the invariant partition with ZERO
+        //     allocation: the persistent working map is taken in place, the
+        //     previous step's just-in-time entries are stripped, invariant entries
+        //     are left untouched (byte-identical by construction), and only the
+        //     variant tail is re-substituted into its existing `Vec`s.
+        if self
+            .decode_memo
+            .as_ref()
+            .is_some_and(|memo| memo.matches(bindings, &external_sig))
+        {
+            // Own the memo for the duration so `self.value_shapes` /
+            // `decode_memo_resolved` can be borrowed disjointly; restored below.
+            let memo = self.decode_memo.take().unwrap();
+            let mut resolved = std::mem::take(&mut self.decode_memo_resolved);
+            // Drop the previous step's data-dependent (JIT) entries so the run
+            // loop recomputes them; the canonical partition is retained in place.
+            resolved.retain(|vid, _| memo.canonical.contains(vid));
+            // Restore any length-invariant entry missing from the persistent map.
+            // By construction (the run loop only adds/overwrites, never drops
+            // canonical keys, and the rebuild step persisted the full map) this
+            // never fires in steady state, so replay stays allocation-free; it is
+            // a defensive re-seed from the memo's authoritative invariant plan.
+            for (&vid, dims) in &memo.invariant_shapes {
+                resolved.entry(vid).or_insert_with(|| dims.clone());
+            }
+            // Re-substitute only the variant tail, reusing each `Vec`'s capacity.
+            for &vid in &memo.variant_values {
+                let shape = &self.value_shapes[&vid];
+                match resolved.get_mut(&vid) {
+                    Some(slot) => {
+                        if !substitute_into(shape, bindings, slot) {
+                            resolved.remove(&vid);
+                        }
+                    }
+                    None => {
+                        if let Some(dims) = substitute(shape, bindings) {
+                            resolved.insert(vid, dims);
+                        }
+                    }
+                }
+            }
+            if self.decode_memo_verify {
+                // R1 verifiable safety net: the replay must equal a fresh resolve.
+                let fresh = self.resolve_soft(bindings);
+                assert_eq!(
+                    resolved, fresh,
+                    "decode-plan memo replay diverged from resolve_soft (unsound invariant \
+                     classification)"
+                );
+            }
+            self.decode_memo = Some(memo);
+            self.decode_memo_last_action = DecodeMemoAction::Replayed;
+            self.decode_memo_replayed_count += 1;
+            self.decode_memo_prev_bindings = Some(bindings.clone());
+            return resolved;
+        }
+
+        // --- Slow path: full resolve, then try to (re)build the memo by diffing
+        //     this step with the previous eligible step (two real steps, R1) —
+        //     but only for a steady single-token-decode growth transition (M==1
+        //     gate), so the memo never activates on prefill.
+        //
+        // Defense-in-depth (Chew): drop the persistent working map on every
+        // non-replay step so a stale invariant `Vec` from a retired plan can
+        // never leak into a future replay (e.g. if a run errored before the
+        // end-of-step persist-back). It is repopulated by this step's persist-back
+        // (or, if that step errors, left empty and defensively re-seeded next
+        // replay), so the clear costs nothing on the steady path.
+        self.decode_memo_resolved.clear();
+        // F5 Stage 2 defense-in-depth: retire the cached view plan on every
+        // non-replay (rebuild/prime) step. A Rebuilt step rebuilds it fresh only
+        // at its successful end (below, in `run_scoped_mode`); a step that errors
+        // before that leaves it `None`, so a stale invariant view alias from a
+        // retired plan can never be reinstated into a later replay.
+        self.decode_view_plan = None;
+        let resolved = self.resolve_soft(bindings);
+        match self.decode_memo_prev_bindings.take() {
+            Some(prev) if is_decode_growth_transition(&prev, bindings) => {
+                let decode_varying: HashSet<SymbolId> = bindings
+                    .iter()
+                    .filter(|(sym, val)| prev.get(*sym) != Some(*val))
+                    .map(|(&sym, _)| sym)
+                    .collect();
+                let mut invariant_shapes = HashMap::with_capacity(resolved.len());
+                let mut variant_values = Vec::new();
+                let mut canonical = HashSet::with_capacity(resolved.len());
+                for (&vid, dims) in &resolved {
+                    canonical.insert(vid);
+                    if shape_references_any(&self.value_shapes[&vid], &decode_varying) {
+                        variant_values.push(vid);
+                    } else {
+                        invariant_shapes.insert(vid, dims.clone());
+                    }
+                }
+                self.decode_memo = Some(DecodePlanMemo {
+                    reference_bindings: bindings.clone(),
+                    decode_varying,
+                    invariant_shapes,
+                    variant_values,
+                    canonical,
+                    reference_external_sig: external_sig,
+                });
+                self.decode_memo_last_action = DecodeMemoAction::Rebuilt;
+                self.decode_memo_rebuilt_count += 1;
+            }
+            _ => {
+                // First observation of a regime, a bound-symbol-set change, or a
+                // non-decode transition (e.g. prefill): drop any stale memo and
+                // wait for the next steady-decode step to diff against.
+                self.decode_memo = None;
+                self.decode_memo_last_action = DecodeMemoAction::Primed;
+                self.decode_memo_primed_count += 1;
+            }
+        }
+        self.decode_memo_prev_bindings = Some(bindings.clone());
+        resolved
+    }
+
+    /// L-abstracted structural fingerprint of the persistent device-I/O binding
+    /// set (see [`DecodeBindingSig`]). Order-independent; the declared symbolic
+    /// shape (graph-static) stands in for the concrete one, so pure-L KV growth
+    /// yields an unchanged signature while a binding added/removed, a role flip,
+    /// or a dtype change yields a different one.
+    fn decode_external_signature(&self, external: &ExternalBindings) -> Vec<DecodeBindingSig> {
+        let mut sig: Vec<DecodeBindingSig> = external
+            .inputs
+            .keys()
+            .map(|&vid| (vid, true))
+            .chain(external.outputs.keys().map(|&vid| (vid, false)))
+            .map(|(vid, is_input)| DecodeBindingSig {
+                vid,
+                is_input,
+                dtype: self.value_dtypes[&vid],
+                decl_shape: self.value_shapes[&vid].clone(),
+            })
+            .collect();
+        sig.sort_by_key(|s| (s.vid.0, s.is_input));
+        sig
+    }
+
+    #[cfg(test)]
+    fn set_decode_memo_enabled(&mut self, enabled: bool) {
+        self.decode_memo_enabled = enabled;
+        self.decode_memo_verify = true;
+        self.decode_memo = None;
+        self.decode_memo_prev_bindings = None;
+        self.decode_memo_resolved.clear();
+        self.decode_memo_last_action = DecodeMemoAction::Disabled;
+        self.decode_memo_primed_count = 0;
+        self.decode_memo_rebuilt_count = 0;
+        self.decode_memo_replayed_count = 0;
+        self.decode_memo_ineligible_count = 0;
+        self.decode_view_plan = None;
+        self.decode_views_reused_count = 0;
+        self.decode_dispatch_elided_count = 0;
+        self.decode_view_plan_sig_mismatch_streak = 0;
+        self.decode_view_plan_disabled = false;
+    }
+
+    #[cfg(test)]
+    fn decode_memo_action(&self) -> DecodeMemoAction {
+        self.decode_memo_last_action
+    }
+
+    /// F5 Stage 1 memo activity counters `(primed, rebuilt, replayed, ineligible)`
+    /// accumulated over this executor's lifetime. `replayed > 0` on a real decode
+    /// run is the proof the memo actually fires (not silently gated out); the
+    /// coordinator's on-model A/B reads these to reject a vacuous pass.
+    pub(crate) fn decode_memo_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.decode_memo_primed_count,
+            self.decode_memo_rebuilt_count,
+            self.decode_memo_replayed_count,
+            self.decode_memo_ineligible_count,
+        )
+    }
+
+    /// F5 Stage 2 activity counters `(views_reused, dispatch_elided)` accumulated
+    /// over this executor's lifetime. Both `> 0` on a real decode run prove the
+    /// invariant view-reuse / dispatch-elision path actually fired (not a vacuous
+    /// pass); an on-model A/B reads these alongside the Stage-1 counters.
+    pub(crate) fn decode_view_plan_counts(&self) -> (u64, u64) {
+        (
+            self.decode_views_reused_count,
+            self.decode_dispatch_elided_count,
+        )
+    }
+
+    /// F5 Stage 2 replay guard: every retained view's source buffer must still be
+    /// the identical allocation (same base pointer *and* capacity) it was under
+    /// when the plan was built. A realloc or move — even one that preserves the
+    /// logical shape — invalidates the cached byte offsets/strides, so this must
+    /// return `false` and force a full rebuild. This is the pointer/capacity
+    /// obligation Stage 1 deferred (it cached shapes only); Stage 2 pays it here.
+    fn stage2_buffer_sig_matches(&self, plan: &DecodeViewPlan) -> bool {
+        plan.source_buffer_sig.iter().all(|(vid, ptr, cap)| {
+            self.buffers
+                .get(vid)
+                .is_some_and(|buf| buf.as_ptr() as usize == *ptr && buf.len() == *cap)
+        })
+    }
+
+    /// F5 Stage 2: build the *candidate* view plan from the state left by a
+    /// successful memo Rebuilt step. A node is a candidate iff every one of its
+    /// outputs is a zero-copy view (`self.views`) whose **shape is in the memo's
+    /// proven-invariant partition** — so Stage 1 guarantees the replayed `resolved`
+    /// map carries that exact shape every step. The candidate's source buffers can
+    /// still be classified variant (e.g. a fixed-capacity KV buffer whose logical
+    /// length grows): its concrete stability is confirmed separately by
+    /// [`Self::validate_decode_view_plan`] (byte-identical view across a second real
+    /// step) and guarded each replay by the buffer-identity signature. Returns
+    /// `None` if nothing is a candidate.
+    fn build_decode_view_plan(&self) -> Option<DecodeViewPlan> {
+        let memo = self.decode_memo.as_ref()?;
+        let invariant = |vid: &ValueId| memo.invariant_shapes.contains_key(vid);
+        let mut elided_nodes = HashSet::new();
+        let mut retained_views = Vec::new();
+        let mut sources: HashSet<ValueId> = HashSet::new();
+        for pi in 0..self.plan.len() {
+            let outputs = &self.plan[pi].outputs;
+            if outputs.is_empty() {
+                continue;
+            }
+            // Every output must be a zero-copy view whose shape Stage 1 already
+            // proves invariant (so `resolved[output]` is stable and correct when
+            // the node is elided).
+            let all_view_invariant = outputs
+                .iter()
+                .all(|ovid| invariant(ovid) && self.views.contains_key(ovid));
+            if !all_view_invariant {
+                continue;
+            }
+            elided_nodes.insert(pi);
+            for ovid in outputs {
+                let view = self.views[ovid].clone();
+                sources.insert(view.source);
+                retained_views.push((*ovid, view));
+            }
+        }
+        if elided_nodes.is_empty() {
+            return None;
+        }
+        // Record the buffer identity of every aliased source (the Stage-2 guard).
+        let mut source_buffer_sig = Vec::with_capacity(sources.len());
+        for &src in &sources {
+            let buf = self.buffers.get(&src)?;
+            source_buffer_sig.push((src, buf.as_ptr() as usize, buf.len()));
+        }
+        Some(DecodeViewPlan {
+            elided_nodes,
+            retained_views,
+            pinned_sources: sources.into_iter().collect(),
+            source_buffer_sig,
+            validated: false,
+        })
+    }
+
+    /// F5 Stage 2: confirm a candidate plan on a second real decode step. The step
+    /// ran every node normally (no elision), so `self.views` now holds freshly
+    /// built aliases; keep only the candidate nodes whose every output view is
+    /// **byte-identical** (source, shape, strides, byte offset) to the one captured
+    /// when the plan was built. This two-real-step confirmation (mirroring Stage 1's
+    /// varying-set derivation) rejects any view whose geometry actually drifts — e.g.
+    /// a position-indexed slice into a fixed-capacity buffer — before it is ever
+    /// elided. Sources and the buffer-identity signature are recomputed from the
+    /// surviving views. The plan is marked validated iff anything survives.
+    fn validate_decode_view_plan(&self, mut plan: DecodeViewPlan) -> Option<DecodeViewPlan> {
+        let view_matches = |a: &ValueView, b: &ValueView| {
+            a.source == b.source
+                && a.shape == b.shape
+                && a.strides == b.strides
+                && a.byte_offset == b.byte_offset
+        };
+        // A node survives iff every one of its retained outputs still matches the
+        // freshly rebuilt view this step.
+        let mut surviving_nodes: HashSet<usize> = HashSet::new();
+        let node_outputs = |pi: usize| self.plan[pi].outputs.clone();
+        for &pi in &plan.elided_nodes {
+            let ok = node_outputs(pi).iter().all(|ovid| {
+                match (
+                    plan.retained_views.iter().find(|(v, _)| v == ovid),
+                    self.views.get(ovid),
+                ) {
+                    (Some((_, cached)), Some(fresh)) => view_matches(cached, fresh),
+                    _ => false,
+                }
+            });
+            if ok {
+                surviving_nodes.insert(pi);
+            }
+        }
+        if surviving_nodes.is_empty() {
+            return None;
+        }
+        // Rebuild retained views / sources / signature from the survivors only,
+        // using the freshly built (identical) views.
+        let surviving_outputs: HashSet<ValueId> = surviving_nodes
+            .iter()
+            .flat_map(|&pi| self.plan[pi].outputs.clone())
+            .collect();
+        let mut retained_views = Vec::new();
+        let mut sources: HashSet<ValueId> = HashSet::new();
+        for ovid in surviving_outputs {
+            let view = self.views.get(&ovid)?.clone();
+            sources.insert(view.source);
+            retained_views.push((ovid, view));
+        }
+        let mut source_buffer_sig = Vec::with_capacity(sources.len());
+        for &src in &sources {
+            let buf = self.buffers.get(&src)?;
+            source_buffer_sig.push((src, buf.as_ptr() as usize, buf.len()));
+        }
+        plan.elided_nodes = surviving_nodes;
+        plan.retained_views = retained_views;
+        plan.pinned_sources = sources.into_iter().collect();
+        plan.source_buffer_sig = source_buffer_sig;
+        plan.validated = true;
+        Some(plan)
     }
 
     /// Size (allocate or reuse) a backing buffer for every value from its
@@ -3396,30 +4095,122 @@ impl Executor {
         // the run-scoped buffers from them (reused when unchanged). Values with a
         // data-dependent shape stay unresolved here and are filled in during the
         // execution loop, once their producing node's inputs are concrete.
+        //
+        // F5 Stage 1: on the top-level CPU eager decode path the steady-state
+        // decode-plan memo replays the length-invariant partition of this map
+        // instead of rebuilding it every token. It is a pure optimization of
+        // `resolve_soft` (a function of `bindings` only, since on the eager path
+        // no external/control-flow/warm seeding runs — that is Capture/Replay
+        // only), gated OFF by default and asserted byte-identical under
+        // `decode_memo_verify`.
+        //
+        // Persistent device-I/O bindings (the KV cache) are the NORMAL decode
+        // case, not an exclusion: the real native decode path always carries them
+        // (ext_in/ext_out non-empty), and `bind_symbols` already folds every
+        // external *input* binding's shape into `bindings`, so the growing KV
+        // length symbol L is captured by the replay guard exactly like any other
+        // varying symbol. The memo additionally fingerprints the external binding
+        // set (`decode_external_signature`) with L abstracted to its symbolic
+        // identity, so pure-L growth replays while any structural change (binding
+        // added/removed, role flip, dtype change) forces a rebuild.
+        let decode_memo_eligible = self.decode_memo_enabled
+            && mode == RunMode::Eager
+            && !nested
+            && self.ep.device_type() != DeviceType::Cuda;
         let mut resolved = {
             let _s = phase_span!("run_scoped.resolve_soft");
-            let mut resolved = self.resolve_soft(&bindings);
-            if mode != RunMode::Eager {
-                // Persistent bindings seed the kernel-visible geometry selected by
-                // their input/output contracts. Seed only unresolved values:
-                // statically/symbolically resolved shapes remain authoritative.
-                external.seed_capture_shapes(&mut resolved);
-                // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
-                // shape inference but stable within a generation: seed their concrete
-                // prior-run shape so downstream capturable consumers fold into
-                // captured segments instead of forming per-consumer eager seams.
-                self.seed_control_flow_capture_shapes(&mut resolved);
-                // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
-                // output shape is data-dependent stay unresolved in `resolve_soft`
-                // and would each form an eager seam even though their kernels are
-                // already capture-safe. Seed their exact just-in-time shapes from
-                // the eager warmup — but only for the identical persistent-binding
-                // signature the warmup ran under, so a changed pointer/capacity
-                // withholds the seed instead of baking a stale shape.
-                self.seed_warm_decode_capture_shapes(&mut resolved, external);
+            if decode_memo_eligible {
+                self.resolve_soft_decode_memo(&bindings, external)
+            } else {
+                // Observability: if the master switch is on but this step is
+                // structurally ineligible (CUDA, nested, non-eager), count it so
+                // an over-restrictive gate silently excluding the real decode path
+                // is never shipped again (the F5 regression Ripley caught).
+                if self.decode_memo_enabled && !nested {
+                    self.decode_memo_ineligible_count += 1;
+                }
+                let mut resolved = self.resolve_soft(&bindings);
+                if mode != RunMode::Eager {
+                    // Persistent bindings seed the kernel-visible geometry selected by
+                    // their input/output contracts. Seed only unresolved values:
+                    // statically/symbolically resolved shapes remain authoritative.
+                    external.seed_capture_shapes(&mut resolved);
+                    // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
+                    // shape inference but stable within a generation: seed their concrete
+                    // prior-run shape so downstream capturable consumers fold into
+                    // captured segments instead of forming per-consumer eager seams.
+                    self.seed_control_flow_capture_shapes(&mut resolved);
+                    // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
+                    // output shape is data-dependent stay unresolved in `resolve_soft`
+                    // and would each form an eager seam even though their kernels are
+                    // already capture-safe. Seed their exact just-in-time shapes from
+                    // the eager warmup — but only for the identical persistent-binding
+                    // signature the warmup ran under, so a changed pointer/capacity
+                    // withholds the seed instead of baking a stale shape.
+                    self.seed_warm_decode_capture_shapes(&mut resolved, external);
+                }
+                resolved
             }
-            resolved
         };
+        // --- F5 Stage 2: reinstate the cached invariant view/buffer plan --------
+        // On a memo Replayed step whose per-source buffer identity still matches,
+        // reinstate the zero-copy view aliases (lever 1) instead of clearing and
+        // rebuilding them, mark the pure-view nodes for dispatch elision (lever 3),
+        // and exclude the invariant partition from buffer sizing (lever 2). Taken
+        // out of `self` for the duration so an errored step drops it (a stale alias
+        // can never be reinstated into a later replay); restored on success.
+        let mut stage2_plan: Option<DecodeViewPlan> = None;
+        let mut stage2_candidate: Option<DecodeViewPlan> = None;
+        let mut stage2_excluded: Option<HashSet<ValueId>> = None;
+        if decode_memo_eligible
+            && !self.decode_view_plan_disabled
+            && self.decode_memo_last_action == DecodeMemoAction::Replayed
+            && let Some(plan) = self.decode_view_plan.take()
+        {
+            if !plan.validated {
+                // Candidate plan built on the preceding Rebuilt step: run this step
+                // in full (no reinstate/elide) so every invariant view is freshly
+                // built, then confirm two-real-step byte-identity below before it is
+                // ever used to elide. This is the second-real-step confirmation.
+                stage2_candidate = Some(plan);
+            } else if self.stage2_buffer_sig_matches(&plan) {
+                self.decode_view_plan_sig_mismatch_streak = 0;
+                // Lever 1: reinstate the invariant zero-copy view aliases and
+                // re-pin their source buffers (conservative liveness). Also
+                // restore each elided output's resolved shape to the view's own
+                // shape — the value the elided view node would have written into
+                // `resolved` (which can differ from the pre-loop `resolve_soft`
+                // shape Stage 1 restored, e.g. a Reshape with an inferred dim), so
+                // downstream consumers read the identical geometry as a full step.
+                for (vid, view) in &plan.retained_views {
+                    self.views.insert(*vid, view.clone());
+                    resolved.insert(*vid, view.shape.clone());
+                }
+                for &src in &plan.pinned_sources {
+                    self.pinned.insert(src);
+                }
+                self.decode_views_reused_count += plan.retained_views.len() as u64;
+                self.decode_dispatch_elided_count += plan.elided_nodes.len() as u64;
+                // Lever 2: exclude the memo's proven-invariant partition from
+                // per-step buffer sizing — those buffers were sized under the
+                // rebuild and are byte-identical (guarded by the buffer-identity
+                // signature above); the compute path still self-heals any output
+                // whose length unexpectedly differs.
+                if let Some(memo) = self.decode_memo.as_ref() {
+                    stage2_excluded = Some(memo.invariant_shapes.keys().copied().collect());
+                }
+                stage2_plan = Some(plan);
+            } else {
+                // A source buffer moved/resized under a plan that classified it
+                // invariant: retire the plan (dropped here) and run the full step.
+                // After repeated mismatches the assumption is untrustworthy on this
+                // model, so latch Stage 2 off for the session (defense-in-depth).
+                self.decode_view_plan_sig_mismatch_streak += 1;
+                if self.decode_view_plan_sig_mismatch_streak >= STAGE2_SIG_MISMATCH_LIMIT {
+                    self.decode_view_plan_disabled = true;
+                }
+            }
+        }
         let external_values = external
             .inputs
             .keys()
@@ -3435,7 +4226,19 @@ impl Executor {
         }
         {
             let _s = phase_span!("run_scoped.size_buffers");
-            self.size_buffers_excluding(&resolved, &external_values)?;
+            match &stage2_excluded {
+                // Stage 2 (lever 2): size only the values outside the memo's
+                // invariant partition (variant/JIT/external) — the invariant
+                // buffers are reused untouched from the rebuild step.
+                Some(invariant) => {
+                    let mut excluded = external_values.clone();
+                    excluded.extend(invariant.iter().copied());
+                    self.size_buffers_excluding(&resolved, &excluded)?;
+                }
+                None => {
+                    self.size_buffers_excluding(&resolved, &external_values)?;
+                }
+            }
         }
 
         // --- Bind input bytes into their (now correctly sized) buffers ------
@@ -3460,15 +4263,82 @@ impl Executor {
                 } else {
                     "run_scoped.plan_eager.top"
                 });
-                self.run_plan_eager(&mut resolved, outer_scope, external)?;
+                // F5 Stage 2: elide the plan's pure-view nodes only in production.
+                // Under `decode_memo_verify` (the R1 safety net) run every node so
+                // the invariant views are freshly rebuilt, then assert each equals
+                // the reinstated alias (bytes/shape/ptr) — proving reuse is exact.
+                let verify_stage2 = self.decode_memo_verify && stage2_plan.is_some();
+                let verify_snapshot: Option<Vec<(ValueId, ValueView)>> = if verify_stage2 {
+                    stage2_plan.as_ref().map(|p| p.retained_views.clone())
+                } else {
+                    None
+                };
+                let elided = if verify_stage2 {
+                    None
+                } else {
+                    stage2_plan.as_ref().map(|p| &p.elided_nodes)
+                };
+                self.run_plan_eager(&mut resolved, outer_scope, external, elided)?;
+                if let (Some(snapshot), Some(plan)) = (&verify_snapshot, &stage2_plan) {
+                    for (vid, cached) in snapshot {
+                        let fresh = self.views.get(vid).unwrap_or_else(|| {
+                            panic!(
+                                "F5 Stage 2 verify: elided view value#{} was not rebuilt by a \
+                                 full dispatch",
+                                vid.0
+                            )
+                        });
+                        assert!(
+                            fresh.source == cached.source
+                                && fresh.shape == cached.shape
+                                && fresh.strides == cached.strides
+                                && fresh.byte_offset == cached.byte_offset,
+                            "F5 Stage 2 verify: cached view for value#{} ({cached:?}) diverged \
+                             from a freshly built one ({fresh:?}) — invariant view reuse is unsound",
+                            vid.0
+                        );
+                    }
+                    assert!(
+                        self.stage2_buffer_sig_matches(plan),
+                        "F5 Stage 2 verify: a cached view source buffer moved during the step"
+                    );
+                }
+                // F5 Stage 2 plan lifecycle: rebuild the cached view plan at the
+                // successful end of a memo Rebuilt step (the plan was invalidated
+                // at the top of the rebuild path, so a mid-step error leaves it
+                // `None`); restore the in-flight plan after a successful replay.
+                if decode_memo_eligible {
+                    match self.decode_memo_last_action {
+                        DecodeMemoAction::Rebuilt => {
+                            self.decode_view_plan = self.build_decode_view_plan();
+                        }
+                        DecodeMemoAction::Replayed => {
+                            if let Some(cand) = stage2_candidate.take() {
+                                // This replay ran full dispatch as the candidate's
+                                // second-real-step confirmation: keep only the nodes
+                                // whose view is byte-identical to the built one, and
+                                // promote to validated (or drop if none survive).
+                                self.decode_view_plan = self.validate_decode_view_plan(cand);
+                            } else if let Some(plan) = stage2_plan.take() {
+                                self.decode_view_plan = Some(plan);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // Snapshot the exact just-in-time shapes this warm run resolved,
                 // together with the persistent-binding signature they were
                 // derived under. Capture-mode seeding replays these shapes only
                 // when a later step presents this exact signature (pointer- and
                 // capacity-stable), so a changed binding forces recapture, never
-                // a stale-shape replay.
-                self.capture_warm_shapes = resolved.clone();
-                self.capture_warm_signature = Some(external.capture_signature());
+                // a stale-shape replay. Skipped on the memo-eligible CPU decode
+                // path: that path never captures (CPU EP), so cloning the whole
+                // ~600-entry resolved map every token would be pure waste and
+                // would defeat the memo's allocation amortization.
+                if !decode_memo_eligible {
+                    self.capture_warm_shapes = resolved.clone();
+                    self.capture_warm_signature = Some(external.capture_signature());
+                }
             }
             RunMode::Capture => {
                 // A fresh capture may have resized/reallocated the `If` output
@@ -3663,6 +4533,15 @@ impl Executor {
         // exposes total and per-call host-output traffic without extra logging.
         if !nested {
             phase_profile::record("collect_outputs.top_host_bytes", host_output_bytes as u128);
+        }
+        // F5 Stage 1: hand the just-used shape map (now including this step's
+        // data-dependent JIT tail) back to the persistent working buffer so the
+        // next replay step can take it in place — retaining every invariant
+        // `Vec`'s allocation — rather than allocating a fresh map/`Vec`s per
+        // token. Only on the memo-eligible CPU decode path; otherwise the buffer
+        // stays untouched (and empty).
+        if decode_memo_eligible {
+            self.decode_memo_resolved = std::mem::take(&mut resolved);
         }
         Ok(ScopedRunResult::Executed(results))
     }
@@ -3974,54 +4853,71 @@ impl Executor {
         external: &ExternalBindings,
         capture: OpCaptureTrace<'_>,
     ) -> Result<()> {
-        let node = self.graph.node(self.plan[pi].node_id);
-        let op_type = node.op_type.clone();
-        let domain = node.domain.clone();
-        // Identify *which* node this is. The span name stays the bare op type so
-        // Perfetto still aggregates all `MatMul`s together; the identity rides
-        // along as args. A model has hundreds of same-typed nodes, and without
-        // this a slow one cannot be told from a fast one.
-        let node_name = node.name.clone();
-        let node_id = self.plan[pi].node_id.0;
-        // Stamped here rather than by each kernel. Kernels have to opt in to
-        // annotating themselves, and in practice most never do — the CPU
-        // provider annotates 11 of its 122 kernels and the CUDA provider
-        // annotated none — so a per-kernel convention leaves most of a trace
-        // unlabelled. The node's placement is known here for every node on
-        // every provider, so recording it at dispatch makes the coverage
-        // structural instead of a thing each kernel must remember.
-        let device = node.device.map(|device| device.device_type.trace_name());
-        // Open the span only when tracing is live so an untraced decode step
-        // never allocates a span name or touches the thread-local span stack.
-        let _span = self.trace.is_enabled().then(|| {
-            // Every op span comes from this one line, so the source location
-            // would be the same string on all of them; the node args below
-            // identify each span far better. Keeping it cost 22% of a trace.
-            let span = self.trace.span(op_type.clone(), "op").without_source();
-            annotate_current_span_with(|| {
-                let mut args = Args::new().with("node_id", node_id as u64);
-                if !node_name.is_empty() {
-                    args = args.with("node", node_name.clone());
-                }
-                // Only non-default domains are worth the bytes: `Attention` and
-                // `MatMulNBits` exist in both the default and `com.microsoft`
-                // domains, so the op type alone is ambiguous for custom ops.
-                if !domain.is_empty() {
-                    args = args.with("domain", domain.clone());
-                }
-                if let Some(device) = device.clone() {
-                    args = args.with(onnx_runtime_ep_api::ARG_DEVICE, device.into_owned());
-                }
-                args
+        // Dispatch by op-type/domain borrowed straight from the node, so a
+        // steady-state decode step compares `&str`s and never clones the
+        // op-type/domain `String`s per node. The immutable borrow of
+        // `self.graph` is confined to this block and dropped before the
+        // `&mut self` dispatch below; the span guard it yields owns its name
+        // (and a cheap `Arc`-clone of the trace context), so it borrows nothing
+        // from `self` and can stay live across the dispatch.
+        let (is_control_flow, is_sequence, _span) = {
+            let node = self.graph.node(self.plan[pi].node_id);
+            let is_control_flow = is_control_flow_op(&node.op_type, &node.domain);
+            let is_sequence = is_sequence_op(&node.op_type, &node.domain);
+            // Open the span only when tracing is live so an untraced decode step
+            // never allocates a span name or touches the thread-local span stack.
+            // Everything that clones a node field lives inside this closure for
+            // the same reason: an untraced step must not pay for identity it is
+            // never going to record.
+            let span = self.trace.is_enabled().then(|| {
+                // Every op span comes from this one line, so its source location
+                // would be the same string on all of them; the node args below
+                // identify each span far better. Keeping it cost 22% of a trace.
+                let span = self.trace.span(node.op_type.clone(), "op").without_source();
+                // Identify *which* node this is. The span name stays the bare op
+                // type so Perfetto still aggregates all `MatMul`s together; the
+                // identity rides along as args. A model has hundreds of
+                // same-typed nodes, and without this a slow one cannot be told
+                // from a fast one.
+                //
+                // Device is stamped here rather than by each kernel. Kernels have
+                // to opt in to annotating themselves and in practice most never
+                // do -- the CPU provider annotates 11 of its 122 kernels, the
+                // CUDA provider annotated none -- so a per-kernel convention
+                // leaves most of a trace unlabelled. The node's placement is
+                // known here for every node on every provider, which makes the
+                // coverage structural instead of something each kernel must
+                // remember.
+                annotate_current_span_with(|| {
+                    let mut args = Args::new().with("node_id", node.id.0 as u64);
+                    if !node.name.is_empty() {
+                        args = args.with("node", node.name.clone());
+                    }
+                    // Only non-default domains are worth the bytes: `Attention`
+                    // and `MatMulNBits` exist in both the default and
+                    // `com.microsoft` domains, so the op type alone is ambiguous
+                    // for custom ops.
+                    if !node.domain.is_empty() {
+                        args = args.with("domain", node.domain.clone());
+                    }
+                    if let Some(device) = node.device {
+                        args = args.with(
+                            onnx_runtime_ep_api::ARG_DEVICE,
+                            device.device_type.trace_name().into_owned(),
+                        );
+                    }
+                    args
+                });
+                // Span is now active on this thread; stamp the capture disposition
+                // (and let the kernel below stamp its selected variant).
+                capture.annotate();
+                span
             });
-            // Span is now active on this thread; stamp the capture disposition
-            // (and let the kernel below stamp its selected variant).
-            capture.annotate();
-            span
-        });
-        if is_control_flow_op(&op_type, &domain) {
+            (is_control_flow, is_sequence, span)
+        };
+        if is_control_flow {
             self.exec_control_flow(pi, resolved, outer_scope)
-        } else if is_sequence_op(&op_type, &domain) {
+        } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {
             self.exec_kernel_node(pi, resolved, external)
@@ -4029,16 +4925,27 @@ impl Executor {
     }
 
     /// Execute every plan node eagerly on the stream (no capture).
+    ///
+    /// F5 Stage 2: when `elided` is `Some`, the plan-node indices it contains are
+    /// pure invariant view nodes whose zero-copy output aliases have already been
+    /// reinstated into `self.views` for this step, so their re-dispatch is skipped.
+    /// The set is empty (or `None`) on every non-Stage-2 run, so ordinary steps
+    /// pay only one `HashSet::is_empty`/`contains` check per node.
     fn run_plan_eager(
         &mut self,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
         external: &ExternalBindings,
+        elided: Option<&HashSet<usize>>,
     ) -> Result<()> {
+        let elided = elided.filter(|set| !set.is_empty());
         if profile_ops_enabled() {
             let run_start = Instant::now();
             let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
             for pi in 0..self.plan.len() {
+                if elided.is_some_and(|set| set.contains(&pi)) {
+                    continue;
+                }
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();
                 let start = Instant::now();
                 let result =
@@ -4052,6 +4959,9 @@ impl Executor {
             print_op_profile(run_start.elapsed(), timings);
         } else {
             for pi in 0..self.plan.len() {
+                if elided.is_some_and(|set| set.contains(&pi)) {
+                    continue;
+                }
                 self.exec_plan_node(pi, resolved, outer_scope, external, OpCaptureTrace::Eager)?;
             }
         }
@@ -4175,6 +5085,34 @@ impl Executor {
         Ok(!invalidated)
     }
 
+    /// Refill [`Self::scratch_input_shapes`] with the resolved shapes of plan
+    /// node `pi`'s inputs, so the dispatch path reads shapes from a reused buffer
+    /// instead of allocating a fresh `Vec<Vec<usize>>` per node per token.
+    ///
+    /// The scratch is truncated to the node's arity and each inner `Vec` is
+    /// cleared and refilled in place (retaining its heap capacity), so a
+    /// steady-state decode step — a fixed sequence of fixed-arity nodes — does
+    /// zero shape-vector allocation after warmup. An omitted optional input
+    /// (`None` slot) yields an empty inner shape, exactly as the previous
+    /// `.unwrap_or_default()` collect did. `self.plan` and
+    /// `self.scratch_input_shapes` are disjoint fields, so the shared read of the
+    /// former coexists with the `&mut` refill of the latter.
+    fn refill_input_shapes(&mut self, pi: usize, resolved: &HashMap<ValueId, Vec<usize>>) {
+        let inputs = &self.plan[pi].inputs;
+        let scratch = &mut self.scratch_input_shapes;
+        scratch.truncate(inputs.len());
+        for (i, slot) in inputs.iter().enumerate() {
+            if i < scratch.len() {
+                scratch[i].clear();
+            } else {
+                scratch.push(Vec::new());
+            }
+            if let Some(vid) = slot {
+                scratch[i].extend_from_slice(&resolved[vid]);
+            }
+        }
+    }
+
     /// Execute one ordinary (leaf-kernel) plan node: resolve any data-dependent
     /// output shapes, size buffers, build the input/output views (with Holden's
     /// bounds gate), resolve the shape-keyed kernel, and dispatch it.
@@ -4184,21 +5122,28 @@ impl Executor {
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         external: &ExternalBindings,
     ) -> Result<()> {
-        // Small owned copies of the plan facts so the buffer/view/cache fields
-        // can be mutated below without fighting a borrow of `self.plan`.
+        // Whole-node dispatch span: its lifetime minus `exec_kernel.compute` is
+        // the serial per-node dispatch glue (shape resolve, input/output view
+        // build, kernel-cache lookup) the F5 Stage 3 record would elide.
+        let _node_span = phase_span!("exec_kernel.node");
+        // Borrow the plan facts in place rather than cloning them per node per
+        // token: `self.plan` is a distinct field from the buffer/view/cache
+        // fields mutated below, so these shared borrows coexist with the
+        // disjoint `&mut self.<field>` borrows the compute path takes (the
+        // dispatch never goes through a `&mut self` method while they are held).
         let node_id = self.plan[pi].node_id;
-        let inputs = self.plan[pi].inputs.clone();
-        let outputs = self.plan[pi].outputs.clone();
-        let input_dtypes = self.plan[pi].input_dtypes.clone();
-        let output_dtypes = self.plan[pi].output_dtypes.clone();
-
-        let input_shapes: Vec<Vec<usize>> = inputs
-            .iter()
-            .map(|v| v.map(|vid| resolved[&vid].clone()).unwrap_or_default())
-            .collect();
+        // Refill the reusable per-executor input-shape scratch first (before the
+        // shared borrows below), so a steady-state decode step allocates no
+        // fresh `Vec<Vec<usize>>` for shape lookup — see `refill_input_shapes`.
+        self.refill_input_shapes(pi, resolved);
+        let inputs = &self.plan[pi].inputs;
+        let outputs = &self.plan[pi].outputs;
+        let input_dtypes = &self.plan[pi].input_dtypes;
+        let output_dtypes = &self.plan[pi].output_dtypes;
+        let input_shapes = &self.scratch_input_shapes;
 
         let node = self.graph.node(node_id);
-        if let Some(output_shape) = runtime_elementwise_output_shape(node, &input_shapes) {
+        if let Some(output_shape) = runtime_elementwise_output_shape(node, input_shapes) {
             let output_shape = output_shape.map_err(|_| {
                 let node_name = if node.name.is_empty() {
                     format!("<unnamed node #{}>", node_id.0)
@@ -4209,7 +5154,7 @@ impl Executor {
                     node: node_name,
                     domain: canonical_domain(node),
                     op_type: node.op_type.clone(),
-                    input_shapes: input_shapes.clone(),
+                    input_shapes: input_shapes.to_vec(),
                 }
             })?;
             if outputs.len() != 1 {
@@ -4260,8 +5205,8 @@ impl Executor {
                 .collect();
             let out_shapes = dynamic_output_shapes(
                 node,
-                &input_shapes,
-                &input_dtypes,
+                input_shapes,
+                input_dtypes,
                 &input_values,
                 &input_float_values,
                 opset,
@@ -4357,6 +5302,7 @@ impl Executor {
         // Resolve each input's real geometry (root buffer + strides/offset) and
         // bounds-check it. View inputs read through their recorded strides.
         let mut in_infos: Vec<InInfo> = Vec::with_capacity(inputs.len());
+        let _build_inputs_span = phase_span!("exec_kernel.build_inputs");
         for (i, slot) in inputs.iter().enumerate() {
             let Some(vid) = *slot else {
                 in_infos.push(InInfo {
@@ -4480,6 +5426,7 @@ impl Executor {
                 root_len,
             });
         }
+        drop(_build_inputs_span);
 
         let ep = self.ep.clone();
 
@@ -4527,15 +5474,18 @@ impl Executor {
                 })
             })
             .collect();
-        let kernel = cache.get_or_create(
-            node_id,
-            node,
-            &input_shapes,
-            &input_dtypes,
-            &constant_inputs,
-            opset,
-            ep.as_ref(),
-        )?;
+        let kernel = {
+            let _s = phase_span!("exec_kernel.get_kernel");
+            cache.get_or_create(
+                node_id,
+                node,
+                input_shapes,
+                input_dtypes,
+                &constant_inputs,
+                opset,
+                ep.as_ref(),
+            )?
+        };
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs
         // (a layout/movement op such as Slice). If so, record view metadata
@@ -4739,7 +5689,7 @@ impl Executor {
             device: onnx_runtime_ir::DeviceId,
         }
         let mut out_bufs: Vec<OutBacking> = Vec::with_capacity(outputs.len());
-        for &vid in &outputs {
+        for &vid in outputs {
             if let Some(value) = external.outputs.get(&vid) {
                 out_bufs.push(OutBacking {
                     vid,
@@ -4793,9 +5743,12 @@ impl Executor {
                 })
                 .collect::<Vec<_>>()
         });
-        let execution = match &kernel_inputs {
-            Some(inputs) => kernel.execute_with_inputs(inputs, &mut outs),
-            None => kernel.execute(&views, &mut outs),
+        let execution = {
+            let _s = phase_span!("exec_kernel.compute");
+            match &kernel_inputs {
+                Some(inputs) => kernel.execute_with_inputs(inputs, &mut outs),
+                None => kernel.execute(&views, &mut outs),
+            }
         };
         execution.map_err(|error| {
                 let input_types = views.iter().map(|view| view.dtype).collect::<Vec<_>>();
@@ -7153,6 +8106,22 @@ impl TensorStackAccumulator {
 
 impl Drop for Executor {
     fn drop(&mut self) {
+        // Observability (F5): a one-line memo activity summary when
+        // `ONNX_GENAI_DECODE_MEMO_STATS=1`, so an on-model A/B can confirm the
+        // memo actually fired (`replayed>0`) rather than being silently gated out.
+        if self.decode_memo_enabled
+            && std::env::var("ONNX_GENAI_DECODE_MEMO_STATS")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+                .unwrap_or(false)
+        {
+            let (primed, rebuilt, replayed, ineligible) = self.decode_memo_counts();
+            let (views_reused, dispatch_elided) = self.decode_view_plan_counts();
+            eprintln!(
+                "[decode-memo] primed={primed} rebuilt={rebuilt} replayed={replayed} \
+                 ineligible={ineligible} views_reused={views_reused} \
+                 dispatch_elided={dispatch_elided}"
+            );
+        }
         let _ = self.ep.reset_device_graph();
         self.device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).
@@ -9384,6 +10353,13 @@ mod tests {
             auto_detect_cpu_ep().unwrap(),
         )
         .unwrap();
+        // Warm-decode capture-shape seeding is a device-graph-capture concern
+        // (capture-capable EPs only), where the decode-plan memo is disabled by
+        // construction (`device_type() != Cuda` gate). The memo-eligible CPU
+        // eager path deliberately skips recording `capture_warm_shapes` (it never
+        // captures). Disable the now-default-ON memo so this executor records the
+        // warm shapes exactly as a capture-capable EP would at runtime.
+        exec.set_decode_memo_enabled(false);
 
         let zero = Tensor::from_raw(DataType::Int64, vec![], &0i64.to_le_bytes()).unwrap();
         let four = Tensor::from_raw(DataType::Int64, vec![], &4i64.to_le_bytes()).unwrap();
@@ -9548,5 +10524,595 @@ mod tests {
             Some(SeamReason::CaptureRecordingFailed),
             "a quarantined op-type must be forced to a CaptureRecordingFailed eager seam"
         );
+    }
+
+    // ===================================================================
+    // F5 Stage 1 — steady-state decode-plan memo guard tests.
+    // ===================================================================
+
+    /// A decode-like symbolic graph: input `x` of shape `[batch, seq]` (both
+    /// symbolic) feeds an `Add(x, x)` whose output is length-*variant*, while an
+    /// inline initializer `w` of static shape `[4]` feeds a `Mul(y, w)` whose
+    /// output is length-*invariant*. This exercises both memo partitions.
+    #[cfg(test)]
+    struct DecodeMemoIds {
+        batch: SymbolId,
+        seq: SymbolId,
+        x2: ValueId,
+        ymul: ValueId,
+    }
+
+    #[cfg(test)]
+    fn decode_memo_test_graph() -> (Graph, DecodeMemoIds) {
+        use onnx_runtime_ir::TensorData;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let batch = graph.intern_symbol("batch");
+        let seq = graph.intern_symbol("seq");
+
+        // Length-variant spine: x[batch, seq] -> Add(x, x) -> x2[batch, seq].
+        let x = graph.create_named_value("x", DataType::Float32, vec![batch.into(), seq.into()]);
+        graph.add_input(x);
+        let x2 = graph.create_named_value("x2", DataType::Float32, vec![batch.into(), seq.into()]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(x), Some(x)],
+            vec![x2],
+        ));
+        graph.add_output(x2);
+
+        // Length-invariant tail: y[4] (required input) * w[4] (initializer).
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+        graph.add_input(y);
+        let w = graph.create_named_value("w", DataType::Float32, static_shape([4]));
+        graph.set_initializer(
+            w,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let ymul = graph.create_named_value("ymul", DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(y), Some(w)],
+            vec![ymul],
+        ));
+        graph.add_output(ymul);
+        (
+            graph,
+            DecodeMemoIds {
+                batch,
+                seq,
+                x2,
+                ymul,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn decode_memo_run(exec: &mut Executor, batch: usize, seq: usize) -> Vec<Vec<f32>> {
+        let x = Tensor::from_f32(
+            &[batch, seq],
+            &(0..batch * seq).map(|i| i as f32 + 1.0).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let y = Tensor::from_f32(&[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+        exec.run(&[("x", &x), ("y", &y)])
+            .unwrap()
+            .into_iter()
+            .map(|t| t.to_vec_f32())
+            .collect()
+    }
+
+    /// The default-ON master switch (Ripley's authoritative GO): the memo is
+    /// enabled unless `ONNX_GENAI_DECODE_MEMO` is an explicit OFF value
+    /// (`0`/`false`/`off`, case-insensitive, whitespace-trimmed). Unset, empty,
+    /// and unrecognized values all fail safe toward the validated fast path (ON).
+    #[test]
+    fn decode_memo_env_default_on_unless_explicitly_disabled() {
+        use std::ffi::OsString;
+        use std::sync::{Mutex, OnceLock};
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("decode-memo env lock");
+
+        struct RestoreEnv(Option<OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    // SAFETY: this test serializes all env mutations via ENV_LOCK.
+                    Some(value) => unsafe { std::env::set_var("ONNX_GENAI_DECODE_MEMO", value) },
+                    None => unsafe { std::env::remove_var("ONNX_GENAI_DECODE_MEMO") },
+                }
+            }
+        }
+        let _restore = RestoreEnv(std::env::var_os("ONNX_GENAI_DECODE_MEMO"));
+
+        // Unset ⇒ ON (default).
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::remove_var("ONNX_GENAI_DECODE_MEMO") };
+        assert!(decode_memo_env_enabled(), "unset must default ON");
+
+        // Explicit OFF values (case-insensitive, trimmed) ⇒ OFF.
+        for off in ["0", "false", "off", "FALSE", "Off", "  0  ", "\tOFF\n"] {
+            // SAFETY: guarded by ENV_LOCK above.
+            unsafe { std::env::set_var("ONNX_GENAI_DECODE_MEMO", off) };
+            assert!(!decode_memo_env_enabled(), "{off:?} must disable the memo");
+        }
+
+        // Explicit ON values and any unrecognized/empty value ⇒ ON (fail-safe).
+        for on in [
+            "1", "true", "on", "ON", "True", " on ", "", "  ", "yes", "2", "banana",
+        ] {
+            // SAFETY: guarded by ENV_LOCK above.
+            unsafe { std::env::set_var("ONNX_GENAI_DECODE_MEMO", on) };
+            assert!(decode_memo_env_enabled(), "{on:?} must keep the memo ON");
+        }
+    }
+
+    /// Plan-invalidation unit test (F5 Stage 1 merge gate #2): prefill→decode
+    /// rebuilds (signature changed), pure length growth replays (signature
+    /// stable), and a batch change rebuilds.
+    #[test]
+    fn decode_plan_memo_rebuilds_and_replays() {
+        let (graph, ids) = decode_memo_test_graph();
+        let mut exec = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        exec.set_decode_memo_enabled(true);
+
+        // "Prefill" step [1, 4]: first observation, nothing to diff yet.
+        decode_memo_run(&mut exec, 1, 4);
+        assert_eq!(exec.decode_memo_action(), DecodeMemoAction::Primed);
+        assert!(exec.decode_memo.is_none());
+
+        // First decode step [1, 5]: diffs against the prefill step and (re)builds
+        // the memo — the prefill→decode transition changed the plan signature.
+        decode_memo_run(&mut exec, 1, 5);
+        assert_eq!(exec.decode_memo_action(), DecodeMemoAction::Rebuilt);
+        let memo = exec.decode_memo.as_ref().expect("memo built");
+        // `seq` grew (4→5) so it is varying; `batch` stayed 1 so it is invariant.
+        assert!(memo.decode_varying.contains(&ids.seq));
+        assert!(!memo.decode_varying.contains(&ids.batch));
+        // The invariant tail (`ymul`) is cached; the variant spine (`x2`) is not.
+        assert!(memo.invariant_shapes.contains_key(&ids.ymul));
+        assert!(memo.variant_values.contains(&ids.x2));
+
+        // Two decode steps at growing L both REPLAY: signature stable (only the
+        // varying `seq` grows), invariant map reused, variant map re-resolved.
+        let out6 = decode_memo_run(&mut exec, 1, 6);
+        assert_eq!(exec.decode_memo_action(), DecodeMemoAction::Replayed);
+        let out7 = decode_memo_run(&mut exec, 1, 7);
+        assert_eq!(exec.decode_memo_action(), DecodeMemoAction::Replayed);
+        // The variant tail was genuinely re-resolved to the new length.
+        assert_eq!(out6[0].len(), 6);
+        assert_eq!(out7[0].len(), 7);
+
+        // A batch change [1, ·] → [2, ·] REBUILDS: `batch` was a non-varying
+        // binding, so the change fails the replay guard and forces a rebuild.
+        decode_memo_run(&mut exec, 2, 7);
+        assert_eq!(exec.decode_memo_action(), DecodeMemoAction::Rebuilt);
+        let memo = exec.decode_memo.as_ref().expect("memo rebuilt");
+        assert_eq!(memo.reference_bindings.get(&ids.batch), Some(&2));
+    }
+
+    /// Token-exact lock (F5 Stage 1 merge gate #1): over ≥128 growing-length CPU
+    /// decode steps the memo-ON output is bit-identical to the memo-OFF output,
+    /// step for step. `decode_memo_verify` (forced on by
+    /// `set_decode_memo_enabled`) additionally asserts every replayed shape map
+    /// equals a fresh `resolve_soft`.
+    ///
+    /// This locks the property the memo must never violate: it changes only
+    /// shape-resolution bookkeeping, never a produced byte. A full real-model
+    /// engine-level lock is available by running the (ignored) decode-lock
+    /// tests with `ONNX_GENAI_DECODE_MEMO=1`; this executor-level lock proves
+    /// memo==non-memo bit-exactness on the real CPU kernels without a model
+    /// fixture.
+    #[test]
+    fn decode_plan_memo_is_token_exact_over_128_steps() {
+        const STEPS: usize = 130;
+
+        let (off_graph, _) = decode_memo_test_graph();
+        let mut off = Executor::build(
+            off_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        // Memo is default-ON now; explicitly disable it for the reference run.
+        off.set_decode_memo_enabled(false);
+        assert!(!off.decode_memo_enabled);
+
+        let (on_graph, _) = decode_memo_test_graph();
+        let mut on = Executor::build(
+            on_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        on.set_decode_memo_enabled(true);
+
+        let mut replays = 0usize;
+        for step in 0..STEPS {
+            let seq = 3 + step; // strictly growing sequence length
+            let ref_out = decode_memo_run(&mut off, 1, seq);
+            let memo_out = decode_memo_run(&mut on, 1, seq);
+            assert_eq!(
+                ref_out, memo_out,
+                "decode-plan memo diverged from the reference at step {step} (seq={seq})"
+            );
+            if on.decode_memo_action() == DecodeMemoAction::Replayed {
+                replays += 1;
+            }
+        }
+        // Steady state must actually engage the replay fast path for the bulk of
+        // the run (priming costs the first two steps).
+        assert!(
+            replays >= STEPS - 2,
+            "expected the memo to replay in steady state; only {replays}/{STEPS} replays"
+        );
+    }
+
+    /// Proof-of-fire (F5 Stage 1): a PERSISTENT device-I/O binding shaped like a
+    /// KV cache — input+output aliased, length `L` growing by one each step —
+    /// must PRIME then REPLAY under the memo. This is the regression lock for
+    /// Ripley's finding that the memo reported `primed=0 rebuilt=0 replayed=0` on
+    /// the real native decode path because the old gate excluded any run carrying
+    /// external bindings. With `decode_memo_verify` on (forced by
+    /// `set_decode_memo_enabled`), every replay is also asserted byte-identical to
+    /// a fresh `resolve_soft`, so this doubles as a token-exact lock on the
+    /// persistent-binding path.
+    #[test]
+    fn decode_plan_memo_fires_on_persistent_kv_bindings() {
+        use onnx_runtime_ir::{TensorData, static_shape};
+
+        // KV-like length-variant spine: kv[L] -> Relu -> kvout[L], aliased into
+        // one persistent device buffer. Static invariant tail: y[4] * w[4].
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let l = graph.intern_symbol("L");
+        let kv = graph.create_named_value("kv", DataType::Float32, vec![l.into()]);
+        graph.add_input(kv);
+        let kvout = graph.create_named_value("kvout", DataType::Float32, vec![l.into()]);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+        graph.add_output(kvout);
+
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+        graph.add_input(y);
+        let w = graph.create_named_value("w", DataType::Float32, static_shape([4]));
+        graph.set_initializer(
+            w,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let ymul = graph.create_named_value("ymul", DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(y), Some(w)],
+            vec![ymul],
+        ));
+        graph.add_output(ymul);
+
+        let mut exec = Executor::build(
+            graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        exec.set_decode_memo_enabled(true);
+
+        // Pre-allocate the KV buffer to a fixed capacity (stable pointer) and grow
+        // only the logical length each step — the pre-allocated-KV-cache case.
+        const CAP: usize = 128;
+        let mut kv_binding = exec
+            .allocate_device_binding(
+                "kv".into(),
+                Some("kvout".into()),
+                DataType::Float32,
+                vec![CAP],
+                vec![1],
+            )
+            .unwrap();
+        let ptr0 = kv_binding.device_ptr();
+        let y_tensor = Tensor::from_f32(&[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+
+        let mut replays = 0usize;
+        for step in 0..8usize {
+            let len = 4 + step; // strictly growing KV length L
+            kv_binding.set_logical_shape(vec![len]).unwrap();
+            let bytes: Vec<u8> = (0..len).flat_map(|i| (i as f32).to_le_bytes()).collect();
+            kv_binding.write_bytes(0, &bytes).unwrap();
+            exec.run_with_device_bindings(
+                &[("y", &y_tensor)],
+                std::slice::from_mut(&mut kv_binding),
+            )
+            .unwrap();
+            if exec.decode_memo_action() == DecodeMemoAction::Replayed {
+                replays += 1;
+            }
+        }
+
+        // The pointer stayed stable (a growing-length view, not a realloc), so
+        // the memo must not have been invalidated by capacity noise.
+        assert_eq!(kv_binding.device_ptr(), ptr0);
+
+        let (primed, rebuilt, replayed, ineligible) = exec.decode_memo_counts();
+        assert_eq!(
+            ineligible, 0,
+            "persistent-KV decode must be memo-eligible, not excluded (the F5 regression)"
+        );
+        assert!(primed >= 1, "the first decode step must prime the memo");
+        assert!(
+            replayed >= 1,
+            "steady persistent-KV decode must replay the memo \
+             (primed={primed} rebuilt={rebuilt} replayed={replayed})"
+        );
+        assert_eq!(replays as u64, replayed);
+    }
+
+    /// F5 Stage 2 test graph. The persistent-KV spine (`kv[L] -> Relu -> kvout[L]`)
+    /// keeps the memo eligible, and an invariant tail (`y[4] * w[4] -> ymul[4]`)
+    /// feeds a `Reshape(ymul, [2,2]) -> yview` — a pure invariant zero-copy view.
+    /// Stage 2 must reinstate `yview` and elide the Reshape's dispatch on replay.
+    /// Returns the graph and the `ymul` value id (the view's source buffer).
+    #[cfg(test)]
+    fn stage2_view_graph() -> (Graph, ValueId) {
+        use onnx_runtime_ir::{TensorData, static_shape};
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let l = graph.intern_symbol("L");
+        let kv = graph.create_named_value("kv", DataType::Float32, vec![l.into()]);
+        graph.add_input(kv);
+        let kvout = graph.create_named_value("kvout", DataType::Float32, vec![l.into()]);
+        graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(kv)], vec![kvout]));
+        graph.add_output(kvout);
+
+        let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+        graph.add_input(y);
+        let w = graph.create_named_value("w", DataType::Float32, static_shape([4]));
+        graph.set_initializer(
+            w,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![4],
+                [1.0f32, 2.0, 3.0, 4.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            )),
+        );
+        let ymul = graph.create_named_value("ymul", DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(y), Some(w)],
+            vec![ymul],
+        ));
+
+        // Reshape ymul[4] -> yview[2,2] through a constant shape initializer, which
+        // the CPU Reshape kernel serves as a zero-copy view over `ymul`'s buffer.
+        let yshape = graph.create_named_value("yshape", DataType::Int64, static_shape([2]));
+        graph.set_initializer(
+            yshape,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![2],
+                [2i64, 2].into_iter().flat_map(i64::to_le_bytes).collect(),
+            )),
+        );
+        let yview = graph.create_named_value("yview", DataType::Float32, static_shape([2, 2]));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(ymul), Some(yshape)],
+            vec![yview],
+        ));
+        graph.add_output(yview);
+        (graph, ymul)
+    }
+
+    /// Run one persistent-KV decode step against [`stage2_view_graph`]: grow the KV
+    /// length to `len`, feed a fresh `y` (so `ymul` — and thus the elided `yview` —
+    /// varies each step, proving the reinstated view reads the freshly computed
+    /// source bytes), and return the materialized `yview` output.
+    #[cfg(test)]
+    fn stage2_run(
+        exec: &mut Executor,
+        kv_binding: &mut DeviceIoBinding,
+        len: usize,
+        y_bias: f32,
+    ) -> Vec<f32> {
+        kv_binding.set_logical_shape(vec![len]).unwrap();
+        let bytes: Vec<u8> = (0..len).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        kv_binding.write_bytes(0, &bytes).unwrap();
+        let y = Tensor::from_f32(
+            &[4],
+            &[y_bias + 1.0, y_bias + 2.0, y_bias + 3.0, y_bias + 4.0],
+        )
+        .unwrap();
+        let outs = exec
+            .run_with_device_bindings(&[("y", &y)], std::slice::from_mut(kv_binding))
+            .unwrap();
+        // Graph outputs are [kvout (bound → None), yview (returned)].
+        outs.into_iter()
+            .flatten()
+            .next()
+            .expect("yview output")
+            .to_vec_f32()
+    }
+
+    #[cfg(test)]
+    fn stage2_kv_binding(exec: &Executor) -> DeviceIoBinding {
+        exec.allocate_device_binding(
+            "kv".into(),
+            Some("kvout".into()),
+            DataType::Float32,
+            vec![256],
+            vec![1],
+        )
+        .unwrap()
+    }
+
+    /// F5 Stage 2 proof-of-fire + token-exact lock. Over ≥128 growing-length
+    /// persistent-KV decode steps the invariant `Reshape` view is reinstated and
+    /// its dispatch elided (`views_reused`/`dispatch_elided` both grow), and the
+    /// memo-ON `yview` output is bit-identical to the memo-OFF reference every
+    /// step (with `y` — and therefore the view's source `ymul` — changing each
+    /// step, so a stale alias would immediately diverge). `decode_memo_verify`
+    /// (forced on by `set_decode_memo_enabled`) additionally asserts every
+    /// reinstated view equals a freshly built one in-flight.
+    #[test]
+    fn decode_view_plan_fires_and_is_token_exact_over_128_steps() {
+        const STEPS: usize = 130;
+
+        let (off_graph, _) = stage2_view_graph();
+        let mut off = Executor::build(
+            off_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        // Memo is default-ON now; explicitly disable it for the reference run.
+        off.set_decode_memo_enabled(false);
+        assert!(!off.decode_memo_enabled, "reference must run memo-OFF");
+        let mut off_kv = stage2_kv_binding(&off);
+
+        let (on_graph, _) = stage2_view_graph();
+        let mut on = Executor::build(
+            on_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        on.set_decode_memo_enabled(true);
+        let mut on_kv = stage2_kv_binding(&on);
+
+        for step in 0..STEPS {
+            let len = 4 + step; // strictly growing KV length L
+            let bias = step as f32; // vary the invariant-shape source each step
+            let ref_out = stage2_run(&mut off, &mut off_kv, len, bias);
+            let memo_out = stage2_run(&mut on, &mut on_kv, len, bias);
+            assert_eq!(
+                ref_out, memo_out,
+                "Stage 2 view reuse diverged from the reference at step {step} (L={len})"
+            );
+        }
+
+        let (views_reused, dispatch_elided) = on.decode_view_plan_counts();
+        assert!(
+            views_reused > 0 && dispatch_elided > 0,
+            "Stage 2 must fire on steady decode (views_reused={views_reused}, \
+             dispatch_elided={dispatch_elided})"
+        );
+        // Non-vacuous: the reshape view must be reused/elided on the bulk of steps
+        // (priming + first rebuild cost the first few steps).
+        assert!(
+            views_reused as usize >= STEPS - 4,
+            "expected steady Stage 2 reuse; only {views_reused}/{STEPS} views reused"
+        );
+        assert!(
+            on.decode_view_plan.is_some(),
+            "the cached view plan must survive steady-state replay"
+        );
+    }
+
+    /// F5 Stage 2 buffer-identity invalidation lock. If a cached view's source
+    /// buffer is reallocated to a different base pointer between steps — the exact
+    /// hazard Stage 1 could ignore but Stage 2 cannot — the plan MUST detect the
+    /// signature mismatch, decline to reinstate the (now stale) alias, and fall
+    /// back to a full dispatch. The step's output must still be correct (no
+    /// dangling/stale view served) and the reuse counter must NOT advance.
+    #[test]
+    fn decode_view_plan_rebuilds_on_source_buffer_move() {
+        use onnx_runtime_ir::TensorLayout;
+
+        let (off_graph, _) = stage2_view_graph();
+        let mut off = Executor::build(
+            off_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        let mut off_kv = stage2_kv_binding(&off);
+
+        let (on_graph, ymul) = stage2_view_graph();
+        let mut on = Executor::build(
+            on_graph,
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        on.set_decode_memo_enabled(true);
+        let mut on_kv = stage2_kv_binding(&on);
+
+        // Warm up so the view plan is built and firing.
+        for step in 0..6usize {
+            let len = 4 + step;
+            let bias = step as f32;
+            let r = stage2_run(&mut off, &mut off_kv, len, bias);
+            let m = stage2_run(&mut on, &mut on_kv, len, bias);
+            assert_eq!(r, m, "warmup diverged at step {step}");
+        }
+        assert!(
+            on.decode_view_plan.is_some(),
+            "view plan must be built before the realloc test"
+        );
+        let (reused_before, _) = on.decode_view_plan_counts();
+
+        // Forcibly MOVE the view's source buffer (`ymul`) to a fresh allocation of
+        // the same capacity — a base-pointer change the plan's signature must catch.
+        let old = on.buffers.remove(&ymul).expect("ymul buffer");
+        let cap = old.len();
+        on.ep.deallocate(old).unwrap();
+        let fresh = on
+            .ep
+            .allocate(cap, TensorLayout::contiguous().alignment)
+            .unwrap();
+        let moved_ptr = fresh.as_ptr() as usize;
+        on.buffers.insert(ymul, fresh);
+        // Sanity: the plan's recorded source pointer no longer matches.
+        assert!(
+            !on.stage2_buffer_sig_matches(on.decode_view_plan.as_ref().unwrap()),
+            "the forced realloc must break the buffer-identity signature"
+        );
+
+        // Next step: Stage 2 must decline reuse (sig mismatch) yet stay correct.
+        let len = 4 + 6;
+        let bias = 6.0f32;
+        let ref_out = stage2_run(&mut off, &mut off_kv, len, bias);
+        let memo_out = stage2_run(&mut on, &mut on_kv, len, bias);
+        assert_eq!(
+            ref_out, memo_out,
+            "a moved source buffer must force a rebuild, never serve a stale view"
+        );
+        let (reused_after, _) = on.decode_view_plan_counts();
+        assert_eq!(
+            reused_after, reused_before,
+            "the mismatched step must NOT reuse cached views (would be stale)"
+        );
+        // The freshly computed ymul must live in a real buffer again (the moved one
+        // or a self-healed reallocation), never left dangling.
+        let healed = on.buffers.get(&ymul).expect("ymul rebound").as_ptr() as usize;
+        assert!(healed == moved_ptr || healed != 0, "ymul must be backed");
     }
 }

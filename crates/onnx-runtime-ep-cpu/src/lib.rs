@@ -70,5 +70,6 @@ pub use weight_offload::{
 pub use kernels::selection::non_max_suppression;
 pub use kernels::slice::{SliceAxisPlan, slice_axes_steps, slice_plan};
 
+pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
 pub use kernels::matmul_nbits::with_decode_pool_scope;
