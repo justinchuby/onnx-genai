@@ -23,7 +23,7 @@ chrome = []
 # ITT task annotations via the official `ittapi` crate (which links the static
 # `ittnotify` C library, compiled from vendored source — no system dependency).
 # Implemented in `src/itt.rs` with NO `unsafe` in this crate: all FFI is confined
-# to `ittapi`, so `forbid(unsafe_code)` stays active for this feature. When no
+# to `ittapi`, so `unsafe_code` stays denied for this feature. When no
 # ITT collector (VTune) is attached, every annotation is an inert stub.
 itt = ["dep:ittapi"]
 # OpenTelemetry export (stretch, §48.8.6). Declared as an empty capability flag

@@ -11,10 +11,10 @@
 //! the genai engine) can adopt it and share the exact same [`TraceContext`] type
 //! and one timeline (§48.2).
 //!
-//! `unsafe` is denied rather than forbidden, and appears in exactly two places,
-//! each a leaf FFI call with no ownership to reason about:
+//! `unsafe` is denied rather than forbidden, and confined to two places:
 //!
-//! * [`clock`], reading the operating system's monotonic clock. This is what
+//! * [`clock`], two leaf FFI calls reading the operating system's monotonic
+//!   clock, each exempt at function scope. This is what
 //!   lets a host trace and a trace from a plugin execution provider be read
 //!   together: they are readings of one clock, rather than two epochs that have
 //!   to be reconciled. A plugin dylib links its own copy of this crate with its
@@ -22,7 +22,9 @@
 //!   loaded by ONNX Runtime is reached through no interface of ours at all --
 //!   an offset cannot be handed over even in principle.
 //! * [`cupti`], whose GPU-kernel collector needs FFI and `dlopen` (optional
-//!   feature).
+//!   feature). This one is exempt at module scope rather than per call, so
+//!   `unsafe` added inside it in future is not linted -- a narrower exemption
+//!   would be better, and its 32 sites are why it has not been done yet.
 //!
 //! ## Architecture
 //!

@@ -37,6 +37,13 @@ use std::collections::BTreeMap;
 // ── Minimal hand-written subset of perfetto.protos ──
 // Field numbers match the upstream schema so Perfetto can parse the output.
 
+/// Perfetto's built-in id for `CLOCK_MONOTONIC`.
+///
+/// From `perfetto.protos.BuiltinClock`. Our timestamps are readings of that
+/// clock, so every packet says so rather than letting the viewer assume
+/// `BOOTTIME`.
+const CLOCK_MONOTONIC_ID: u32 = 3;
+
 /// `perfetto.protos.Trace` — the top-level trace container.
 #[derive(Clone, PartialEq, Message)]
 pub struct Trace {
@@ -48,9 +55,19 @@ pub struct Trace {
 /// `perfetto.protos.TracePacket` (subset).
 #[derive(Clone, PartialEq, Message)]
 pub struct TracePacket {
-    /// Absolute timestamp in nanoseconds (default clock).
+    /// Absolute timestamp in nanoseconds, on the clock named by
+    /// [`timestamp_clock_id`](TracePacket::timestamp_clock_id).
     #[prost(uint64, optional, tag = "8")]
     pub timestamp: Option<u64>,
+    /// Which clock [`timestamp`](TracePacket::timestamp) is measured on.
+    ///
+    /// Must be set. Perfetto's default for an unset value is `BOOTTIME`, which
+    /// counts time spent suspended; our timestamps come from `CLOCK_MONOTONIC`
+    /// (and `QueryPerformanceCounter` on Windows), which does not. Leaving it
+    /// unset told the viewer a different clock from the one we read, so a trace
+    /// taken across a suspend was skewed by however long the machine slept.
+    #[prost(uint32, optional, tag = "58")]
+    pub timestamp_clock_id: Option<u32>,
     /// Packet sequence this event belongs to (track events require one).
     #[prost(uint32, optional, tag = "10")]
     pub trusted_packet_sequence_id: Option<u32>,
@@ -196,6 +213,7 @@ pub fn to_perfetto_proto(events: &[TraceEvent], session: Option<TraceSessionId>)
     let process_track = process_track_uuid(pid);
     trace.packet.push(TracePacket {
         timestamp: None,
+        timestamp_clock_id: None,
         trusted_packet_sequence_id: Some(SEQUENCE_ID),
         track_event: None,
         track_descriptor: Some(TrackDescriptor {
@@ -218,6 +236,7 @@ pub fn to_perfetto_proto(events: &[TraceEvent], session: Option<TraceSessionId>)
         let name = thread_names.get(&tid).cloned();
         trace.packet.push(TracePacket {
             timestamp: None,
+            timestamp_clock_id: None,
             trusted_packet_sequence_id: Some(SEQUENCE_ID),
             track_event: None,
             track_descriptor: Some(TrackDescriptor {
@@ -278,6 +297,7 @@ fn slice(track: u64, e: &TraceEvent, kind: TrackEventType, ts_micros: u64) -> Tr
     };
     TracePacket {
         timestamp: Some(ns(ts_micros)),
+        timestamp_clock_id: Some(CLOCK_MONOTONIC_ID),
         trusted_packet_sequence_id: Some(SEQUENCE_ID),
         track_event: Some(TrackEvent {
             track_uuid: Some(track),
