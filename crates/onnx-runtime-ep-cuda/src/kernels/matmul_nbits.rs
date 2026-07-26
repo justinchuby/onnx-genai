@@ -20,6 +20,11 @@ const DEQUANT_ENTRY: &str = "matmul_nbits_dequant_f32";
 const GEMV_MODULE: &str = "matmul_nbits_gemv";
 const GEMV_F32_ENTRY: &str = "matmul_nbits_gemv_f32";
 const GEMV_INT8_F32_ENTRY: &str = "matmul_nbits_gemv_int8_f32";
+/// Structurally-selected int4 / `block_size == 128` / asymmetric fp32-activation
+/// decode GEMV. It preserves the generic f32 GEMV's per-thread accumulation and
+/// reduction order while folding block arithmetic and vectorizing packed-nibble
+/// loads.
+const GEMV_INT4_F32_BLOCK128_ENTRY: &str = "matmul_nbits_gemv_int4_f32_block128";
 /// Structurally-selected int8 / `block_size == 128` / asymmetric fp32-activation
 /// decode GEMV. Bit-for-bit identical to the generic [`GEMV_F32_ENTRY`] path
 /// (same per-thread depth stride, same per-element expression, same fp32
@@ -364,6 +369,55 @@ extern "C" __global__ void matmul_nbits_gemv_int8_f32_block128(
         const int block = depth >> 7;
         const int quantized = (int)packed[packed_row + depth];
         const int zero_point = col_zp ? (int)col_zp[block] : 128;
+        value += activation[depth] * ((float)quantized - (float)zero_point)
+            * col_scales[block];
+    }
+
+    value = block_sum(value);
+    if (threadIdx.x == 0) {
+        output[column] = value + (bias ? bias[column] : 0.0f);
+    }
+}
+
+// Int4 counterpart of the block-128 int8 specialization above. Each warp owns
+// 32 consecutive depths, hence 16 aligned packed bytes. Four lanes load one
+// aligned 32-bit word each and shuffle it to the eight lanes consuming its
+// nibbles. This removes duplicate scalar byte loads without changing any
+// thread's depth sequence or fp32 arithmetic.
+extern "C" __global__ void matmul_nbits_gemv_int4_f32_block128(
+    const float* activation,
+    const unsigned char* packed,
+    const float* scales,
+    const unsigned char* zero_points,
+    const float* bias,
+    float* output,
+    const int k,
+    const int n,
+    const int k_blocks)
+{
+    const int column = (int)blockIdx.x;
+    if (column >= n) {
+        return;
+    }
+
+    const int lane = (int)threadIdx.x & 31;
+    const long col_kb = (long)column * k_blocks;
+    const long packed_row = col_kb << 6;  // k_blocks * 64 bytes per weight row
+    const float* col_scales = scales + col_kb;
+    const unsigned char* col_zp =
+        zero_points + (long)column * ((k_blocks + 1) >> 1);
+
+    float value = 0.0f;
+    for (int depth = (int)threadIdx.x; depth < k; depth += (int)blockDim.x) {
+        const int block = depth >> 7;
+        const int warp_depth = depth - lane;
+        const unsigned int* packed_words =
+            (const unsigned int*)(packed + packed_row + (warp_depth >> 1));
+        unsigned int packed_word = lane < 4 ? packed_words[lane] : 0;
+        packed_word = __shfl_sync(__activemask(), packed_word, lane >> 3);
+        const int quantized = (int)((packed_word >> ((lane & 7) << 2)) & 15);
+        const unsigned char zp_byte = col_zp[block >> 1];
+        const int zero_point = (block & 1) ? (zp_byte >> 4) : (zp_byte & 15);
         value += activation[depth] * ((float)quantized - (float)zero_point)
             * col_scales[block];
     }
@@ -3478,6 +3532,30 @@ impl MatMulNBitsKernel {
         self.last_call_capture_safe
             .store(m == 1 && group_indices.is_none(), Ordering::Relaxed);
         if m == 1 && group_indices.is_none() {
+            if self.bits == 4
+                && self.block_size == 128
+                && let Some(zero_points) = zero_points
+            {
+                // The asymmetric int4/block-128 fp32 path is the dominant Qwen3
+                // decode kernel. Its specialized entry preserves the generic
+                // GEMV's arithmetic and reduction order while replacing block
+                // division/modulo with shifts, hoisting metadata row bases, and
+                // loading each warp's packed nibbles as four aligned u32 words.
+                onnx_runtime_ep_api::record_kernel_variant!(
+                    "gemv_int4_f32_block128",
+                    "M==1 decode: bits=4, block_size=128, asymmetric → specialized \
+                     shift-indexed int4 f32 GEMV (bit-identical to the generic path)"
+                );
+                return self.launch_int4_f32_gemv_block128(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    k_blocks,
+                );
+            }
             if self.bits == 8 && self.block_size == 128 && zero_points.is_some() {
                 // Qwen3-0.6B's dominant decode kernel: int8, block-128,
                 // asymmetric (per-block byte zero point), fp32 activations. The
@@ -5275,6 +5353,59 @@ impl MatMulNBitsKernel {
         }
         .map(|_| ())
         .map_err(|err| driver_err("launch MatMulNBits int8 f32 GEMV", err))
+    }
+
+    /// Specialized asymmetric int4 / `block_size == 128` fp32-activation decode
+    /// GEMV. The fixed layout makes `blob_size == 64` and
+    /// `zp_row_bytes == ceil(k_blocks / 2)`, so neither is passed at runtime.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_int4_f32_gemv_block128(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        zero_points: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        k_blocks: usize,
+    ) -> Result<()> {
+        let function =
+            self.runtime
+                .nvrtc_function(GEMV_MODULE, GEMV_SRC, GEMV_INT4_F32_BLOCK128_ENTRY)?;
+        let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
+        let zero_points_ptr = cuptr(zero_points.data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks = as_i32("K block count", k_blocks)?;
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&zero_points_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks);
+        // SAFETY: validation guarantees the asymmetric int4 block-128 layout.
+        // The fixed one-CTA-per-column launch has no allocation, synchronization,
+        // or architecture-specific launch geometry, so it is capture-safe.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n as u32, 1, 1),
+                block_dim: (BLOCK_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits int4 f32 block-128 GEMV", err))
     }
 
     /// Specialized int8 / `block_size == 128` / asymmetric fp32-activation decode
@@ -7514,15 +7645,16 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
     }
 
-    /// Runs the structurally-selected int8/block-128 specialization and the
-    /// generic `matmul_nbits_gemv_f32` kernel on identical device buffers and
+    /// Runs a structurally-selected block-128 specialization and the generic
+    /// `matmul_nbits_gemv_f32` kernel on identical device buffers and
     /// returns `(mismatching_columns, all_finite)`. The specialization only
     /// rewrites address arithmetic (shift instead of divide/modulo, hoisted
     /// per-column base, dropped bit-width branch) — the per-thread depth stride,
     /// per-element fp32 expression, and block reduction are unchanged, so every
     /// output column must be **bit-for-bit identical**. Includes partial final
     /// K-blocks (`k` not a multiple of 128) to exercise the padded weight row.
-    fn run_int8_f32_block128_byte_identity(
+    fn run_f32_block128_byte_identity(
+        bits: usize,
         k: usize,
         n: usize,
         with_bias: bool,
@@ -7530,15 +7662,15 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     ) -> (usize, bool) {
         let Some(runtime) = runtime() else {
             eprintln!(
-                "skipping MatMulNBits int8 f32 block-128 byte-identity test: CUDA runtime unavailable"
+                "skipping MatMulNBits int{bits} f32 block-128 byte-identity test: CUDA runtime unavailable"
             );
             return (0, true);
         };
 
         let block_size = 128usize;
         let k_blocks = k.div_ceil(block_size);
-        let blob_size = block_size; // one byte per weight for bits=8
-        let zp_row_bytes = k_blocks; // one byte per block for bits=8
+        let blob_size = block_size * bits / 8;
+        let zp_row_bytes = (k_blocks * bits).div_ceil(8);
 
         let mut state = 0x0bad_c0de_1234_5678u64;
         let mut next = || {
@@ -7560,7 +7692,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             *value = ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
         }
 
-        let mut zero_points = vec![0u8; n * k_blocks];
+        let mut zero_points = vec![0u8; n * zp_row_bytes];
         if explicit_zp {
             for zp in zero_points.iter_mut() {
                 *zp = ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
@@ -7607,8 +7739,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
         let scales_shape = [n, k_blocks];
         let scales_strides = [k_blocks as i64, 1];
-        let zp_shape = [n, k_blocks];
-        let zp_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
         let bias_shape = [n];
         let bias_strides = [1i64];
 
@@ -7673,7 +7805,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             runtime: runtime.clone(),
             k,
             n,
-            bits: 8,
+            bits,
             block_size,
             accuracy_level: 4,
             accuracy4_workspace: None,
@@ -7684,17 +7816,33 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             last_call_capture_safe: AtomicBool::new(false),
         };
 
-        kernel
-            .launch_int8_f32_gemv_block128(
-                &activation_view,
-                &packed_view,
-                &scales_view,
-                zp_view.as_ref(),
-                bias_view.as_ref(),
-                &mut spec_out,
-                k_blocks,
-            )
-            .unwrap();
+        match bits {
+            4 => kernel
+                .launch_int4_f32_gemv_block128(
+                    &activation_view,
+                    &packed_view,
+                    &scales_view,
+                    zp_view
+                        .as_ref()
+                        .expect("int4 block-128 specialization requires zero points"),
+                    bias_view.as_ref(),
+                    &mut spec_out,
+                    k_blocks,
+                )
+                .unwrap(),
+            8 => kernel
+                .launch_int8_f32_gemv_block128(
+                    &activation_view,
+                    &packed_view,
+                    &scales_view,
+                    zp_view.as_ref(),
+                    bias_view.as_ref(),
+                    &mut spec_out,
+                    k_blocks,
+                )
+                .unwrap(),
+            _ => unreachable!("byte-identity harness only supports int4/int8"),
+        }
         kernel
             .launch_f32_gemv(
                 &activation_view,
@@ -7762,7 +7910,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         ] {
             for (with_bias, explicit_zp) in [(true, true), (false, true), (true, false)] {
                 let (mismatches, all_finite) =
-                    run_int8_f32_block128_byte_identity(k, n, with_bias, explicit_zp);
+                    run_f32_block128_byte_identity(8, k, n, with_bias, explicit_zp);
                 assert!(
                     all_finite,
                     "int8 block-128 specialization produced a non-finite output \
@@ -7776,6 +7924,22 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 );
             }
         }
+    }
+
+    /// The asymmetric int4/block-128 specialization must exactly match the
+    /// generic fp32 GEMV, including a partial final K-block.
+    #[test]
+    fn int4_f32_block128_specialization_is_bit_identical_to_generic() {
+        let (mismatches, all_finite) = run_f32_block128_byte_identity(4, 259, 37, true, true);
+        assert!(
+            all_finite,
+            "int4 block-128 specialization produced non-finite output"
+        );
+        assert_eq!(
+            mismatches, 0,
+            "int4 block-128 specialization diverged from generic GEMV in \
+             {mismatches} column(s)"
+        );
     }
 
     /// Folding a standalone `Add(MatMulNBits, bias)` into the GEMV epilogue must
