@@ -31,6 +31,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # A release publishes crates one at a time against crates.io, so one
+      # listed before something it depends on fails partway through and leaves
+      # the registry half-updated. Cheap to check here; expensive to discover
+      # during a release.
+      - name: Check publish order
+        run: python3 scripts/check_publish_order.py
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.
