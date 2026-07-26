@@ -557,10 +557,10 @@ impl NativeProposerSession {
         let uses_decode_pool = self.uses_decode_pool;
         let outputs = if run_single_token {
             onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
-                self.session.run(&bindings)
+                self.session.run(&bindings).map_err(anyhow::Error::from)
             })
         } else {
-            self.session.run(&bindings)
+            self.session.run(&bindings).map_err(anyhow::Error::from)
         }
         .context("native proposer forward pass failed; verify metadata port names, sequence_source, kv_ownership, and tensor shapes")?;
         let names = self
@@ -3289,10 +3289,10 @@ fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
             return true;
         }
         for attr in node.attributes.values() {
-            if let onnx_runtime_ir::Attribute::Graph(subgraph) = attr {
-                if graph_uses_decode_pool(subgraph) {
-                    return true;
-                }
+            if let onnx_runtime_ir::Attribute::Graph(subgraph) = attr
+                && graph_uses_decode_pool(subgraph)
+            {
+                return true;
             }
         }
     }
