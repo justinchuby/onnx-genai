@@ -339,7 +339,7 @@ fn skip_simplified_layer_norm_matches_independent_residual_rms_reference() {
 }
 
 #[test]
-fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
+fn skip_simplified_layer_norm_matches_f64_reference_within_one_ulp() {
     let _guard = GPU_SERIAL.lock().unwrap();
     let Some(ep) = cuda_ep() else {
         return;
@@ -355,13 +355,15 @@ fn skip_simplified_layer_norm_does_not_contract_square_accumulation() {
     let (expected_y, expected_sum, expected_invstd) =
         reference(&[1, 4], &[1, 4], &input, &skip, &gamma, &bias, 1e-5);
 
-    // The kernel explicitly rounds every square and addition, so it does not
-    // contract to FMA. Its deterministic block tree is nevertheless reordered
-    // from the old left-to-right f32 oracle. For this sensitive fixture the tree
-    // sum (43.56543731689453) is closer to the f64 sum (43.565436791865004)
-    // than the sequential sum (43.565433502197266). Compare against the f64
-    // result: inverse RMS must round exactly, while the separately rounded f32
-    // inverse followed by the output multiply may differ by one ULP.
+    // This fixture cannot prove that square accumulation is not contracted:
+    // an FMA-contracted sum and the deterministic block tree happen to have the
+    // same f32 bits here. Non-contraction is a source-level kernel guarantee
+    // (`__fadd_rn(..., __fmul_rn(...))`), with deterministic execution covered
+    // by the sibling replay test. This test instead locks the numeric contract:
+    // the tree sum (43.56543731689453) is closer to the f64 sum
+    // (43.565436791865004) than the sequential sum (43.565433502197266);
+    // inverse RMS must round exactly, and normalized outputs must be within one
+    // ULP of the f64 reference and no less accurate than the sequential oracle.
     let sum_squares_f64 = expected_sum
         .iter()
         .map(|&value| f64::from(value) * f64::from(value))
