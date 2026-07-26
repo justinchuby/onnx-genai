@@ -3095,7 +3095,8 @@ impl PipelineDecodeLoopBackend<'_> {
     /// static encoder cross-attention KV (resolved once from the prologue) is
     /// appended verbatim so the decoder's `past_*_cross_%d` inputs are bound.
     fn decoder_extras(&self) -> anyhow::Result<Vec<(String, Value)>> {
-        let mut extras = Vec::with_capacity(self.decoder_in_edges.len() + self.static_cross_kv.len());
+        let mut extras =
+            Vec::with_capacity(self.decoder_in_edges.len() + self.static_cross_kv.len());
         for (from, port) in &self.decoder_in_edges {
             let value = self.pool.get(from).with_context(|| {
                 format!("missing routed pipeline tensor '{from}' for decoder input '{port}'")
@@ -4315,13 +4316,8 @@ impl DdimSchedule {
             .iter()
             .zip(model_out)
             .map(|(&x, &m)| {
-                let e = epsilon_from_model_output(
-                    m,
-                    x,
-                    sqrt_a_t,
-                    sqrt_one_minus_a_t,
-                    self.prediction,
-                );
+                let e =
+                    epsilon_from_model_output(m, x, sqrt_a_t, sqrt_one_minus_a_t, self.prediction);
                 let x0_hat = (x - sqrt_one_minus_a_t * e) / sqrt_a_t;
                 sqrt_a_prev * x0_hat + sqrt_one_minus_a_prev * e
             })
@@ -4485,7 +4481,8 @@ impl EulerSchedule {
             .iter()
             .zip(model_out)
             .map(|(&x, &m)| {
-                let e = epsilon_from_model_output(m, alpha_t * x, alpha_t, sigma_t, self.prediction);
+                let e =
+                    epsilon_from_model_output(m, alpha_t * x, alpha_t, sigma_t, self.prediction);
                 x + e * dt
             })
             .collect())
@@ -5941,17 +5938,28 @@ mod tests {
                 .abs()
                 < 1e-6
         );
-        let x0_eps = x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::Epsilon);
+        let x0_eps =
+            x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::Epsilon);
         assert!((x0_eps - (x_t - sigma_t * model_out) / alpha_t).abs() < 1e-6);
 
         // v_prediction: diffusers DDIMScheduler v_prediction branch.
         //   pred_epsilon = alpha_t * model_out + sigma_t * x_t
         //   pred_x0      = alpha_t * x_t - sigma_t * model_out
-        let eps_v =
-            epsilon_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction);
+        let eps_v = epsilon_from_model_output(
+            model_out,
+            x_t,
+            alpha_t,
+            sigma_t,
+            PredictionType::VPrediction,
+        );
         assert!((eps_v - (alpha_t * model_out + sigma_t * x_t)).abs() < 1e-6);
-        let x0_v =
-            x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction);
+        let x0_v = x0_from_model_output(
+            model_out,
+            x_t,
+            alpha_t,
+            sigma_t,
+            PredictionType::VPrediction,
+        );
         assert!((x0_v - (alpha_t * x_t - sigma_t * model_out)).abs() < 1e-6);
         // Internal consistency: eps and x0 satisfy x_t = alpha_t*x0 + sigma_t*eps.
         assert!((alpha_t * x0_v + sigma_t * eps_v - x_t).abs() < 1e-6);
@@ -5974,14 +5982,24 @@ mod tests {
         let x_t = 0.9f32;
         let model_out = -0.4f32;
         assert!(
-            (epsilon_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction)
-                - model_out)
+            (epsilon_from_model_output(
+                model_out,
+                x_t,
+                alpha_t,
+                sigma_t,
+                PredictionType::VPrediction
+            ) - model_out)
                 .abs()
                 < 1e-6
         );
         assert!(
-            (x0_from_model_output(model_out, x_t, alpha_t, sigma_t, PredictionType::VPrediction)
-                - x_t)
+            (x0_from_model_output(
+                model_out,
+                x_t,
+                alpha_t,
+                sigma_t,
+                PredictionType::VPrediction
+            ) - x_t)
                 .abs()
                 < 1e-6
         );

@@ -109,7 +109,10 @@ fn real_foundry_whisper_encoder_decoder_package_loads_as_pipeline() {
     assert_eq!(decoder_io.kv_inputs.as_deref().map(<[_]>::len), Some(8));
     assert_eq!(decoder_io.kv_outputs.as_deref().map(<[_]>::len), Some(8));
     assert_eq!(decoder_io.kv_update.as_deref(), Some("append"));
-    assert_eq!(decoder_io.cross_kv_inputs.as_deref().map(<[_]>::len), Some(8));
+    assert_eq!(
+        decoder_io.cross_kv_inputs.as_deref().map(<[_]>::len),
+        Some(8)
+    );
     assert_eq!(
         decoder_io.cross_kv_outputs.as_deref().map(<[_]>::len),
         Some(8)
@@ -119,7 +122,10 @@ fn real_foundry_whisper_encoder_decoder_package_loads_as_pipeline() {
     // the decoder's cross_kv_inputs (past_*_cross) and cross_kv_outputs (the
     // encoder-produced present_*_cross), computed once by the encoder. It is
     // stateful routing, not per-step dataflow, so no cross edges are emitted.
-    let cross_inputs = decoder_io.cross_kv_inputs.as_deref().expect("cross kv inputs");
+    let cross_inputs = decoder_io
+        .cross_kv_inputs
+        .as_deref()
+        .expect("cross kv inputs");
     let cross_outputs = decoder_io
         .cross_kv_outputs
         .as_deref()
@@ -137,7 +143,10 @@ fn real_foundry_whisper_encoder_decoder_package_loads_as_pipeline() {
         );
     }
     assert!(
-        !spec.dataflow.iter().any(|edge| edge.from.contains("_cross_")),
+        !spec
+            .dataflow
+            .iter()
+            .any(|edge| edge.from.contains("_cross_")),
         "cross-KV must be stateful routing, not per-step dataflow edges"
     );
 }

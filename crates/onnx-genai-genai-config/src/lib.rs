@@ -1584,27 +1584,28 @@ impl GenAiConfig {
         let encoder = required_ref(self.model.encoder.as_ref(), "model.encoder")?;
         let decoder = &self.model.decoder;
         let encoder_filename = required_str(encoder.filename.as_deref(), "model.encoder.filename")?;
-        let decoder_filename =
-            required_str(decoder.filename.as_deref(), "model.decoder.filename")?;
+        let decoder_filename = required_str(decoder.filename.as_deref(), "model.decoder.filename")?;
 
         // Encoder prompt input, keyed off the declared input SHAPE, not a model
         // name: audio front-ends declare `audio_features`, text encoders declare
         // `input_ids`. Exactly one must be present.
-        let (encoder_input_field, encoder_input) =
-            match (encoder.inputs.audio_features.as_deref(), encoder.inputs.input_ids.as_deref()) {
-                (Some(audio), None) => ("model.encoder.inputs.audio_features", audio),
-                (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids),
-                (Some(_), Some(_)) => {
-                    return Err(incomplete(
-                        "model.encoder declares both audio_features and input_ids; exactly one encoder prompt input is required",
-                    ));
-                }
-                (None, None) => {
-                    return Err(incomplete(
-                        "model.encoder.inputs.audio_features or model.encoder.inputs.input_ids",
-                    ));
-                }
-            };
+        let (encoder_input_field, encoder_input) = match (
+            encoder.inputs.audio_features.as_deref(),
+            encoder.inputs.input_ids.as_deref(),
+        ) {
+            (Some(audio), None) => ("model.encoder.inputs.audio_features", audio),
+            (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids),
+            (Some(_), Some(_)) => {
+                return Err(incomplete(
+                    "model.encoder declares both audio_features and input_ids; exactly one encoder prompt input is required",
+                ));
+            }
+            (None, None) => {
+                return Err(incomplete(
+                    "model.encoder.inputs.audio_features or model.encoder.inputs.input_ids",
+                ));
+            }
+        };
         let encoder_input = required_str(Some(encoder_input), encoder_input_field)?;
         require_graph_input(&graphs.encoder, encoder_input, "encoder")?;
 
@@ -1614,10 +1615,15 @@ impl GenAiConfig {
         )?;
         require_graph_output(&graphs.encoder, encoder_hidden, "encoder")?;
 
-        let token = required_str(decoder.inputs.input_ids.as_deref(), "model.decoder.inputs.input_ids")?;
+        let token = required_str(
+            decoder.inputs.input_ids.as_deref(),
+            "model.decoder.inputs.input_ids",
+        )?;
         require_graph_input(&graphs.decoder, token, "decoder")?;
-        let logits =
-            required_str(decoder.outputs.logits.as_deref(), "model.decoder.outputs.logits")?;
+        let logits = required_str(
+            decoder.outputs.logits.as_deref(),
+            "model.decoder.outputs.logits",
+        )?;
         require_graph_output(&graphs.decoder, logits, "decoder")?;
 
         // Self-attention KV: the growing per-step cache. Matched by pattern
@@ -3273,7 +3279,10 @@ mod tests {
 
         // Audio prompt input surfaced on the encoder.
         let encoder_io = pipeline.models["encoder"].io.as_ref().expect("encoder io");
-        assert_eq!(encoder_io.audio_features_input.as_deref(), Some("audio_features"));
+        assert_eq!(
+            encoder_io.audio_features_input.as_deref(),
+            Some("audio_features")
+        );
 
         // Decoder self-KV grows; cross-KV is present as static routing.
         let decoder_io = pipeline.models["decoder"].io.as_ref().expect("decoder io");
