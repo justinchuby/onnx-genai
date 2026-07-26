@@ -2380,6 +2380,7 @@ name = "onnx-runtime-ep-api"
 version = "0.1.0-dev.4"
 dependencies = [
  "libloading 0.8.9",
+ "memmap2",
  "onnx-genai-ort-sys",
  "onnx-runtime-ir",
  "onnx-runtime-loader",

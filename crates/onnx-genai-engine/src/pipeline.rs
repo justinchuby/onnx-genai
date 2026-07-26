@@ -279,13 +279,13 @@ fn build_native_pipeline_components(
     use onnx_genai_metadata::ComponentSession;
 
     let device = crate::engine::resolve_native_decode_device(
-        config.native_device,
+        config.native_device.clone(),
         &SessionOptions::default(),
     )?;
     let mut components: std::collections::BTreeMap<String, Box<dyn ComponentSession>> =
         std::collections::BTreeMap::new();
     for (name, path) in &directory.model_paths {
-        let session = NativeComponentSession::load(path, device).with_context(|| {
+        let session = NativeComponentSession::load(path, device.clone()).with_context(|| {
             format!("failed to construct pipeline component '{name}' on the native backend")
         })?;
         components.insert(name.clone(), Box::new(session));

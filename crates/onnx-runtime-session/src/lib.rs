@@ -38,11 +38,13 @@ pub use executor::{
 pub use onnx_runtime_loader::{
     EpContextDumpConfig, EpContextPartition, Model as EncoderModel, ModelMetadata,
 };
+pub use plugin_provider::PluginExecutionProvider;
 pub use tensor::{DeviceBindingTransferStats, DeviceIoBinding, Tensor, cpu_allocator};
 
 mod epcontext;
 mod executor;
 mod fp16_decode;
+mod plugin_provider;
 pub mod sequence;
 mod tensor;
 

@@ -195,6 +195,34 @@ pub mod ep_compat {
                 )
             }
         }
+
+        /// Native-runtime plugin bridge metadata, when this EP is backed by an
+        /// ORT plugin library. This keeps provider-name knowledge inside
+        /// `ep_compat` while allowing the native backend to load the same plugin.
+        #[must_use]
+        pub fn native_plugin_bridge(&self) -> Option<NativePluginBridge> {
+            match &self.strategy {
+                AppendStrategy::PluginLibrary {
+                    lib,
+                    registration_name,
+                    ..
+                } => Some(NativePluginBridge {
+                    lib: lib.clone(),
+                    registration_name: registration_name.clone(),
+                    provider_name: self.caps.name.clone(),
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    /// Metadata needed by the native runtime to load a plugin EP through the
+    /// ORT C ABI without duplicating provider-name logic outside `ep_compat`.
+    #[derive(Debug, Clone)]
+    pub struct NativePluginBridge {
+        pub lib: PathBuf,
+        pub registration_name: String,
+        pub provider_name: String,
     }
 
     /// Provider names this build can resolve to something real, in the order a
@@ -429,7 +457,7 @@ fn auto_default_execution_providers() -> Option<Vec<ResolvedEp>> {
             "Auto-selecting the MLX/Metal execution provider (macOS default) from {}",
             library.display()
         );
-        return Some(vec![resolve_execution_provider(&ep_selection("metal"))]);
+        Some(vec![resolve_execution_provider(&ep_selection("metal"))])
     }
     #[cfg(not(target_os = "macos"))]
     {
