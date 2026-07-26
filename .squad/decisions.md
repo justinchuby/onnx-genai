@@ -3959,3 +3959,158 @@ reserved (0% utilization but 129589 MiB allocated) and every other GPU was
 confirmation remains pending.
 
 <!-- scribe-merge-2026-07-26T19-45-52Z-cuda-perf-and-capture-regression-end -->
+
+
+<!-- scribe-merge-2026-07-26T20-00-00Z-cuda-perf-and-capture-regression-reconciliation -->
+## 2026-07-26 — CUDA capture regression and portable split-K reconciliation
+
+Decision archive gate checked at 2026-07-26T19:45:52Z: active ledger was 397763 bytes before this merge and exceeded 51200 bytes. Applied the 7-day policy with cutoff 2026-07-19; archived 0 eligible block(s).
+
+**Manifest:** PR #201 merged to main at `88e48eca`; PR #203 merged to main at `b80a8c83`; pre-existing main CI rustfmt break from PR #200 was fixed directly on main at `1bf119af`. Worktrees `wt-attn-regr` and `wt-perf-next` were cleaned.
+
+<!-- merged from .squad/decisions/inbox/chew-pr201-review.md -->
+# Chew review — PR #201 (test/attention-default-domain-capture)
+
+**Verdict: APPROVE** (independent Quality & Safety review; author Leon locked out, framing verified from scratch)
+
+Reviewed head `058bd273` vs `origin/main` (`b51ea239`). Diff = 3 files: decision note,
+`standard_attention.rs` (+50/-41), `standard_attention_capture_gpu.rs` (+349, new). No
+binaries, no unrelated files. `cargo fmt --check -p onnx-runtime-ep-cuda` clean.
+
+## Production change is real, not just a test seam — and it is justified
+`standard_attention.rs` does change runtime behavior: it extends CUDA-graph capture
+eligibility to the **staged (aliased dense KV growth) single-token decode path**
+(`staged_decode_eligible = (stage_key || stage_value) && batch==1 && q_seq==1`) and
+relocates the staging K/V buffers from per-op `alloc` into two new persistent workspace
+slots (`WS_STAGE_KEY`/`WS_STAGE_VALUE`, `WS_COUNT` 4→6). Assessed safe because:
+- **#193 fix intact.** Both aliased copy-backs still use `dtod_async` on `self.stream`
+  (2 occurrences), src=staging (`key_kv_ptr`/`value_kv_ptr`), dst=aliased present
+  (`present_*_ptr`). Disjointness preserved: staging comes from a dedicated WS slot, so
+  `key_kv_ptr != present_key_ptr` whenever `stage_key`.
+- **No path conflict.** `dev_length_eligible` (requires `capacity_*`) and
+  `staged_decode_eligible` (requires `!capacity_*`) are mutually exclusive.
+- **Growing-shape correctness handled.** The staged path passes a null `dev_len_ptr`
+  (host length, frozen at capture), and `key_cap==total_seq` grows each step. This is
+  safe because captured graphs are **shape-keyed** at the session layer
+  (`onnx-runtime-session/src/executor.rs` ~L356-360): each decode step's growing present
+  K/V shape is a distinct key → distinct captured graph → no stale graph replayed across
+  growth. `StdAttnWorkspace::reserve` grows eagerly (synchronize+free+alloc) and
+  hard-errors if a grow is needed mid-capture, enforcing the "warm the exact shape before
+  capture" contract.
+- Eager / dense-non-decode / causal / GQA paths unchanged; execute-exit synchronize still
+  drains the async copy for blocking eager callers.
+
+## Independent revert-check (reproduced, not trusted)
+Reverted both `dtod_async`→`dtod` in `standard_attention.rs`, rebuilt, reran:
+```
+KernelFailed("cuda_ep: stream synchronize: CUDA driver error:
+DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "operation not permitted when
+stream is capturing")")  ...  test result: FAILED
+```
+Restored file (`git checkout`, tree clean). The test genuinely guards the bug.
+
+## Test quality — good
+Routes through the real staged path (present aliases past, `!capacity`, batch=1, q_seq=1),
+3 decode steps with real KV growth (INITIAL_PAST=1 → 4), warms eager each step (required by
+the reserve contract), then captures+replays and asserts captured == eager for **output and
+both present K/V caches**, checks the latched capture-error word, and resets the graph. Gates
+cleanly on no-GPU via early `return` (skip, not fail) → CI without a GPU stays green.
+
+## Non-blocking notes
+- Test recaptures a fresh graph per step, so it validates single-step capture+replay, not
+  reuse of one graph across growing steps; that scenario is covered by the session's
+  shape-keyed cache (out of this test's scope). Fine as-is; a session-level multi-step test
+  would be a nice future add.
+- Staged workspace slots grow monotonically (never shrink); bounded by max seq, freed on
+  Drop. Acceptable.
+
+## Evidence
+- `cargo test -p onnx-runtime-ep-cuda --test standard_attention_capture_gpu` on head: PASS
+  (`CUDA_VISIBLE_DEVICES=6 taskset -c 1`).
+- Revert `dtod_async`→`dtod`: FAIL with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; restored.
+- `cargo fmt --check`: clean. Diff: 3 files, no binaries.
+
+Did not merge.
+
+
+<!-- merged from .squad/decisions/inbox/leon-capture-regression-test.md -->
+# Default Attention staged-KV capture regression
+
+The CUDA EP now warms persistent scratch for single-token default-domain
+Attention decode when dense present K/V outputs alias their growing past K/V
+inputs. This makes the staged disjoint KV copy-back recordable in a CUDA graph.
+
+`standard_attention_capture_gpu` compares three captured aliased decode steps
+against eager output and K/V cache state. Replacing the two stream-ordered
+`dtod_async` copy-backs with synchronous `dtod` fails during capture with
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.
+
+
+<!-- merged from .squad/decisions/inbox/luv-pr203-review.md -->
+# PR #203 Review — Luv (Quality & Safety)
+
+**PR:** justinchuby/onnx-genai #203 — "perf(cuda): split grid-starved symmetric int4 GEMV"
+**Branch:** perf/cuda-next-wave (+230/-36)
+**Reviewer:** Luv (independent; author Deckard locked out — all numbers reproduced, none trusted)
+**Date:** 2026-07-26
+**Verdict:** ⛔ REQUEST-CHANGES (one blocking test-coverage defect; kernel itself is correct, portable, and a real perf win)
+
+---
+
+## Summary of findings
+
+The kernel and routing changes are **numerically correct, genuinely portable, and a real (larger-than-claimed) performance win**. However, the *one* GPU test added to guard the new split-K kernels **does not exercise them** — it silently routes to a different kernel. For a change whose entire risk profile is split-K reduction accuracy, shipping with an ineffective regression guard (and a PR body that claims the opposite) is blocking.
+
+## 1. Correctness — VERIFIED GOOD (by me, not by the shipped test)
+
+- Read the full kernel diff. Split-K partitions the 256-wide K steps across `K_SPLIT=2` cooperating warps per output column and combines fp32 partials through shared memory (`partials[col_local][ks]`, `__syncthreads`, ks==0 folds). Reduction reachability of `__syncthreads` is uniform (outside the `column < n` guard) — no divergence/deadlock.
+- Hand-traced K coverage for K=896 (3.5 × 256-step): ks=0 covers [0,256)+[512,768); ks=1 covers [256,512)+[768,896). Union = full K, no overlap, no double-count. Correct.
+- Symmetric path uses `block_sub2<false>`=0x48004800 (fp16 8.0) and `block_zp<false>`=8 — consistent zp=8 offset, matching the non-split symmetric kernel.
+- The K%32==0 gate means the scalar "tail" branch (valid in 1..7) is provably dead (depth and k are both multiples of 8) — defensive, harmless.
+- **Measured vs f64 reference when the split-K kernel is actually exercised** (I forced shape k=896, **n=1152** so it routes to `matmul_nbits_gemv_f16_scales_f16_splitk`, confirmed via a temporary runtime probe: `entry=matmul_nbits_gemv_f16_scales_f16_splitk sym_splitk=true`):
+  - **max_abs_diff = 0.00195** vs the f64 accumulation reference (output magnitude ~2.6). That is fp16-rounding level — well inside tolerance and within the ~2e-3 you'd get vs the non-split kernel too.
+- Tolerances NOT weakened. The diff only *adds* a test (0.04 absolute vs f64); sibling f16 tests use 0.02–0.2. No existing tolerance touched.
+
+## 2. BLOCKING DEFECT — the split-K test does not exercise split-K
+
+`matmul_nbits_gpu_fp16_symmetric_splitk_matches_f64_reference` uses `(k, n) = (896, 97)`.
+
+- Variant selection (`select_f16_gemv_variant`) sets `down_eligible = !has_zp && scales_fp16 && block32 && k%32==0 && k > n`. With **896 > 97**, the shape is classified **DownProjection**, so it never reaches the `General` branch where symmetric split-K is chosen.
+- Confirmed at runtime with a temporary probe: `entry=matmul_nbits_gemv_f16_scales_f16_down_c2 sym_splitk=false k=896 n=97`. The test validates the **down-projection** kernel, not split-K.
+- I audited every symmetric f16 test shape in `matmul_nbits_gpu.rs`: (77,35),(77,37),(77,73)×2,(4096,73),(896,97),(64,151936). All have `k<512` or `k>n` (→DownProjection) or `n≥2112`. **No committed GPU test exercises the new symmetric split-K or its RMSNorm-prologue sibling.** The lib unit test only checks the gating boolean, not numerics.
+- The PR body states "The new GPU test compares the split-K output against an f64 accumulation reference" — **false as written**; the test routes to `down_c2`.
+
+**Required fix (trivial, verified):** change the test shape so `k ≤ n` and `n < SM*16`, e.g. `(k, n) = (896, 1152)`. I confirmed that shape routes to the split-K kernel and passes at max_abs_diff=0.00195. Ideally also add coverage for the RMSNorm-prologue split-K entry.
+
+## 3. Portability — VERIFIED GOOD
+
+- `use_f16_symmetric_splitk(k,n,mp,max_threads)` reads **live** device props: `k>=512 && k%32==0 && max_threads>=256 && n < mp.max(1)*16`. No hardcoded H200 SM/smem/N literals.
+- H200 (132 SM): threshold n<2112 → N=896/1152 split. 46-SM RTX 4070: threshold n<736 → same N fall back to the existing single-warp kernel. Verified by unit test `symmetric_fp16_splitk_is_device_driven_and_falls_back_on_small_gpus` (passes) and by reproducing on-device.
+- Split factor is a fixed K_SPLIT=2 (grid ×2), not a device-scaled factor — not pathological on mid-range GPUs (68-SM 3080, 84-SM 4090): it either splits by 2 or falls back; no over-splitting.
+
+## 4. A/B — REPRODUCED, real win, exceeds the claim
+
+Method: built `profile_native` (release, `bench-native,cuda`) at PR head, then rebuilt baseline by reverting **only** `matmul_nbits.rs` to origin/main (the sole perf-relevant file in the diff — identical everything else). Model `/home/justinchu/qwen2.5-0.5b-int4-onnx-native`, `--ep cuda --backend native --decode-precision fp16 --steady --warmups 2 --runs 3 --tokens 128`.
+
+Env note: briefing said pin GPU 6, but GPU 6 was **busy (97%)** at review time; idle GPUs were 0/4/5, so I pinned **CUDA_VISIBLE_DEVICES=5 taskset -c 1**. First A/B pass was ruined by idle→boost clock ramp (throughput jumped 500→1000 tok/s). After warming the GPU to its 1980 MHz boost state (clock-lock unavailable — no permission), 8 tightly interleaved paired rounds:
+
+- baseline median: **981.95 tok/s** (range 977.6–983.8)
+- head median: **997.10 tok/s** (range 986.9–1002.0)
+- delta: **+1.54%**, and **head > base in all 8 paired rounds with non-overlapping ranges**.
+
+Absolute tok/s is ~3× the author's 326/327 (idle H200 at boost clocks vs the author's GPU-6 numbers), but the **direction and relative win are confirmed and larger than the claimed +0.59%**. No e2e regression.
+
+## 5. Gates
+
+- `cargo fmt -p onnx-runtime-ep-cuda -- --check` — clean ✅
+- `cargo clippy --release -p onnx-runtime-ep-cuda --features cuda --lib -- -D warnings` — clean ✅
+- `cargo test -p onnx-runtime-ep-cuda --features cuda --lib` — **221 passed** ✅
+- `cargo test -p onnx-runtime-ep-cuda --test matmul_nbits_gpu` — **20 passed** ✅ (but see §2: the split-K one doesn't hit split-K)
+
+## Verdict
+
+**REQUEST-CHANGES.** The kernel is correct (0.00195 vs f64 when exercised), portable (device-driven gate, correct small-SM fallback), and a real +1.54% win. The single blocker: the added GPU test at (896,97) routes to `down_c2`, so the split-K path ships with **no** effective regression guard, and the PR body claims otherwise. Change the test shape to `k ≤ n` (e.g. 896×1152) so it actually exercises `matmul_nbits_gemv_f16_scales_f16_splitk`; add RMSNorm-prologue split-K coverage. Re-request review after.
+
+Do NOT merge.
+
+<!-- scribe-merge-2026-07-26T20-00-00Z-cuda-perf-and-capture-regression-reconciliation-end -->

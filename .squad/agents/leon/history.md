@@ -111,3 +111,7 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 ## 2026-07-26T19:45:52Z — Scribe update
 
 - Spawned as leon-10 on `test/attention-default-domain-capture` for PR #193 default-domain Attention capture-path regression and revert-check; outcome pending.
+
+## 2026-07-26T20:00:00Z — Scribe update
+
+- 2026-07-26T20:00:00Z — Delivered PR #201 capture regression coverage for default-domain Attention staged-KV copy-back under CUDA graph capture; merged to main at `88e48eca`.

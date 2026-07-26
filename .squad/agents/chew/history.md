@@ -111,3 +111,7 @@ Recorded the integration rejection and subsequent approval after dependency meta
 WP-B landed: Chew's rejection of loader-IR shape authority directly informed the final Sapper WP-B3 v3 fix.
 
 2026-07-22T22:15:00Z — Approved Zhora’s `f8848c9` MatMulNBits f16/bf16 and topology tuning with non-blocking parity/regression follow-ups.
+
+## 2026-07-26T20:00:00Z — Scribe update
+
+- 2026-07-26T20:00:01Z — Approved PR #201 after independently reproducing the `dtod` revert failure (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) and verifying persistent workspace staging preserved #193 copy-back safety.
