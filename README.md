@@ -111,8 +111,26 @@ current generation; two in a row exit. Slash commands control the session:
 >>> /audio ./speech.wav
 >>> /raw
 >>> /stats
+>>> /profile on
+>>> /model ./other-model
+>>> /ep cpu
+>>> /backend ort
 >>> /reset
 ```
+
+`/model`, `/ep`, and `/backend` reload the model, because an ONNX session is
+created against its execution provider and decode backend and cannot be moved
+between them; the conversation is cleared with it, since a reply belongs to the
+model that produced it. If the new selection fails to load, the message says so
+and the previous session keeps running. With no argument each reports the
+current setting, and `/ep` also lists what this build can select — provider
+support is compiled in, so a provider left out of the build cannot be chosen at
+runtime.
+
+`/profile on` turns the report on mid-session. The per-stage ORT breakdown is
+the exception: it is switched on from the environment before any thread starts,
+so it needs `--profile` at startup, and the command says so rather than printing
+a report that is quietly missing its most detailed section.
 
 `/stats` toggles per-turn numbers, for watching throughput and cache behavior
 without the full `--profile` report. While a reply streams, the numbers update

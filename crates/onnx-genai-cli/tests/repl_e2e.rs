@@ -455,3 +455,150 @@ fn stats_is_off_until_asked_for() {
         "an unasked-for stats line would be noise: {output}"
     );
 }
+
+#[test]
+fn model_reports_the_current_session_and_switches_to_another() {
+    // A second fixture with a different name proves the switch took effect.
+    let script = format!(
+        "/model\n/model {}\n/model\n\n",
+        fixture("tiny-llm-scatter").display()
+    );
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        &script,
+    ));
+
+    assert!(
+        output.contains("tiny-llm"),
+        "the starting model is reported: {output}"
+    );
+    assert!(
+        output.contains("tiny-llm-scatter"),
+        "the new model must be loaded and reported: {output}"
+    );
+    assert!(
+        output.contains("conversation cleared"),
+        "history belongs to the model that held it: {output}"
+    );
+}
+
+#[test]
+fn a_model_that_cannot_be_loaded_leaves_the_session_running() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/model /nonexistent-model-path\nhello\n\n",
+    ));
+
+    assert!(
+        output.contains("error:"),
+        "the failure must be reported: {output}"
+    );
+    assert!(
+        output.matches(">>>").count() >= 3,
+        "the REPL must keep prompting after a failed load: {output}"
+    );
+}
+
+#[test]
+fn an_execution_provider_this_build_lacks_is_rejected_before_reloading() {
+    // Reported as an unavailable provider, not as a failure to load the model.
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/ep nosuchprovider
+hello
+
+",
+    ));
+
+    assert!(
+        output.contains("is not an execution provider this build can select"),
+        "{output}"
+    );
+    assert!(
+        output.contains("auto, cpu"),
+        "the choices must be named: {output}"
+    );
+    assert!(
+        !output.contains("could not load"),
+        "it must not surface as a model-loading failure: {output}"
+    );
+}
+
+#[test]
+fn ep_lists_what_this_build_can_select() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/ep\n\n",
+    ));
+
+    assert!(output.contains("execution provider"), "{output}");
+    assert!(output.contains("cpu"), "cpu is always available: {output}");
+}
+
+#[test]
+fn ep_and_backend_switch_and_reload() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/ep cpu\n/backend ort\nhello\n\n",
+    ));
+
+    assert!(output.contains("execution provider cpu"), "{output}");
+    assert!(output.contains("decode backend ort"), "{output}");
+    assert!(
+        !output.contains("error:"),
+        "cpu and ort must both load this fixture: {output}"
+    );
+}
+
+#[test]
+fn an_unknown_backend_is_rejected_by_name() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/backend quantum\n\n",
+    ));
+
+    assert!(output.contains("not a decode backend"), "{output}");
+    assert!(
+        output.contains("auto, ort, or native"),
+        "the choices must be named: {output}"
+    );
+}
+
+#[test]
+fn profile_can_be_turned_on_for_a_session_that_did_not_start_with_it() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/profile\n/profile on\nhello\n\n",
+    ));
+
+    assert!(
+        output.contains("profile report off"),
+        "it starts off: {output}"
+    );
+    assert!(output.contains("profile report on"), "{output}");
+    assert!(
+        output.contains("generated tokens"),
+        "the report must actually be emitted: {output}"
+    );
+    assert!(
+        output.contains("per-stage timings need --profile at startup"),
+        "the one part that cannot be enabled later must be called out: {output}"
+    );
+}
+
+#[test]
+fn profile_rejects_a_setting_that_is_not_on_or_off() {
+    let output = text(&repl(
+        &fixture("tiny-llm"),
+        &["--max-new-tokens", "2"],
+        "/profile maybe\n\n",
+    ));
+    assert!(output.contains("is not a setting"), "{output}");
+}

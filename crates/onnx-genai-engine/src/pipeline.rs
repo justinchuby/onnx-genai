@@ -314,6 +314,26 @@ impl PipelineEngine {
         Self::from_dir_with_schedulers(pipeline_dir, config, &SchedulerRegistry::builtin())
     }
 
+    /// Load a pipeline with explicit session options, chiefly to pin the
+    /// execution provider.
+    ///
+    /// [`SessionOptions::default`] resolves the provider from the process
+    /// environment, which is read once and cached; a caller that wants to choose
+    /// a provider *after* startup — an interactive session switching devices —
+    /// has to pass one in instead.
+    pub fn from_dir_with_session_options(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            pipeline_dir,
+            config,
+            &SchedulerRegistry::builtin(),
+            session_options,
+        )
+    }
+
     /// Load a pipeline with a **custom [`SchedulerRegistry`]**, so a user can
     /// plug in their own [`Scheduler`] implementations (referenced by
     /// `scheduler_config.kind` in the pipeline metadata) alongside the built-in
@@ -322,6 +342,15 @@ impl PipelineEngine {
         pipeline_dir: &Path,
         config: EngineConfig,
         schedulers: &SchedulerRegistry,
+    ) -> anyhow::Result<Self> {
+        Self::build(pipeline_dir, config, schedulers, SessionOptions::default())
+    }
+
+    fn build(
+        pipeline_dir: &Path,
+        config: EngineConfig,
+        schedulers: &SchedulerRegistry,
+        session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
         let decode_backend = requested_decode_backend(config.decode_backend)?;
         // Select ONE backend for the whole pipeline (never a mix). Explicit
@@ -353,7 +382,7 @@ impl PipelineEngine {
                 return Err(build_native_pipeline_and_report_gap(&directory, &config));
             }
         }
-        let models = PipelineModels::load_with_options(pipeline_dir, SessionOptions::default())
+        let models = PipelineModels::load_with_options(pipeline_dir, session_options)
             .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
         let memoizable_components = deterministic_components(&models.directory);

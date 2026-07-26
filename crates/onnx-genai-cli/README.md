@@ -134,6 +134,23 @@ printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \
   run tests/fixtures/tiny-llm --max-new-tokens 5
 ```
 
+### Changing the session without restarting
+
+The REPL can reload the model under a different execution provider or decode
+backend, and switch models outright:
+
+```text
+>>> /ep                     # current provider, and what this build can select
+>>> /ep cpu
+>>> /backend ort            # auto | ort | native
+>>> /model ./another-model
+>>> /profile on             # report timings, memory, and cache reuse per turn
+```
+
+All but `/profile` reload the model and clear the conversation. A selection that
+fails to load is reported and the previous session keeps running, so an
+unavailable provider does not end the session.
+
 ### Tests
 
 Always name packages explicitly. A bare `--workspace` pulls in `mlas-sys`, whose

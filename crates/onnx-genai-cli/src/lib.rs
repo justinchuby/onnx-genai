@@ -39,9 +39,10 @@ use clap::{Args, Parser, Subcommand};
 mod live_turn;
 mod memory;
 mod profile;
-use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
+use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
 use onnx_genai::metadata::load_metadata;
 use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer};
+use onnx_genai::ort::{SessionOptions, ep_selection};
 use onnx_genai::preprocess::audio::{
     AudioSegment, SegmentConfig, StreamSegmenter, decode_wav_pcm16,
 };
@@ -215,8 +216,8 @@ const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_millis(100
 ///
 /// Suppressed while `--profile` is on, which already prints every one of these
 /// numbers and more; printing both would just repeat the turn twice.
-fn emit_stats_line(show_stats: bool, profiling: &ProfileArgs, profile: &mut RunProfile) {
-    if !show_stats || profiling.profile {
+fn emit_stats_line(show_stats: bool, show_profile: bool, profile: &mut RunProfile) {
+    if !show_stats || show_profile {
         return;
     }
     profile.memory.sample_peak();
@@ -268,9 +269,85 @@ struct PipelineBackend {
     multimodal: MultimodalSpecs,
 }
 
+/// Everything that decides how a model is loaded, so an interactive session can
+/// change one part and rebuild.
+///
+/// The execution provider and decode backend are properties of a *loaded*
+/// session, not of a request: an ONNX session is created against its providers
+/// and cannot be moved between them. Changing either therefore reloads the
+/// model, which is why they live here together with the directory.
+#[derive(Debug, Clone)]
+struct SessionSettings {
+    model_dir: PathBuf,
+    /// Execution provider name, or `None` to keep whatever the environment and
+    /// platform defaults select.
+    execution_provider: Option<String>,
+    decode_backend: EngineDecodeBackend,
+    limits: onnx_genai::engine::ResourceLimits,
+}
+
+impl SessionSettings {
+    fn new(model_dir: PathBuf, engine: &EngineArgs) -> Self {
+        Self {
+            model_dir,
+            execution_provider: None,
+            decode_backend: EngineDecodeBackend::Auto,
+            limits: engine.to_config().limits,
+        }
+    }
+
+    fn to_config(&self) -> EngineConfig {
+        EngineConfig {
+            decode_backend: self.decode_backend,
+            limits: self.limits.clone(),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Session options for the chosen provider, or the environment's default
+    /// when none was chosen.
+    fn to_session_options(&self) -> SessionOptions {
+        match &self.execution_provider {
+            Some(name) => SessionOptions::with_execution_provider(ep_selection(name.clone())),
+            None => SessionOptions::default(),
+        }
+    }
+
+    /// How the current selection reads back to a user.
+    fn describe(&self) -> String {
+        format!(
+            "model {} · ep {} · backend {}",
+            self.model_dir.display(),
+            self.execution_provider.as_deref().unwrap_or("auto"),
+            match self.decode_backend {
+                EngineDecodeBackend::Auto => "auto",
+                EngineDecodeBackend::Ort => "ort",
+                EngineDecodeBackend::Native => "native",
+            }
+        )
+    }
+}
+
 impl Backend {
+    /// Load the model described by `settings`.
+    fn open(settings: &SessionSettings) -> anyhow::Result<Self> {
+        Self::load_with_options(
+            &settings.model_dir,
+            settings.to_config(),
+            settings.to_session_options(),
+        )
+    }
+
     /// Load `model_dir`, preferring its declared pipeline when it has one.
     fn load(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
+        Self::load_with_options(model_dir, config, SessionOptions::default())
+    }
+
+    fn load_with_options(
+        model_dir: &Path,
+        config: EngineConfig,
+        session_options: SessionOptions,
+    ) -> anyhow::Result<Self> {
         match multimodal::load(model_dir)? {
             Some(setup) => {
                 let tokenizer = Tokenizer::from_file(&setup.tokenizer_path).map_err(|error| {
@@ -281,14 +358,22 @@ impl Backend {
                         setup.tokenizer_path.display()
                     )
                 })?;
-                let engine = Engine::from_pipeline_dir(model_dir, config)?;
+                let engine = PipelineEngine::from_dir_with_session_options(
+                    model_dir,
+                    config,
+                    session_options,
+                )?;
                 Ok(Self::Pipeline(Box::new(PipelineBackend {
                     engine,
                     tokenizer,
                     multimodal: setup.multimodal,
                 })))
             }
-            None => Ok(Self::Text(Box::new(Engine::from_dir(model_dir, config)?))),
+            None => Ok(Self::Text(Box::new(Engine::from_dir_with_session_options(
+                model_dir,
+                config,
+                session_options,
+            )?))),
         }
     }
 
@@ -613,6 +698,14 @@ enum ReplCommand {
     Reset,
     ToggleRaw,
     ToggleStats,
+    /// Turn the profile report on or off, or report its state.
+    Profile(Option<String>),
+    /// Load a different model, or report the current one.
+    Model(Option<String>),
+    /// Switch execution provider, or report the current one.
+    ExecutionProvider(Option<String>),
+    /// Switch decode backend, or report the current one.
+    DecodeBackend(Option<String>),
     System(Option<String>),
     Image {
         path: Option<String>,
@@ -630,6 +723,61 @@ enum ReplLine {
     Command(ReplCommand),
     Prompt(String),
     Empty,
+}
+
+/// Load a new session, leaving the caller's current one untouched on failure.
+///
+/// Building the replacement before swapping is what lets a rejected execution
+/// provider or backend be reported without ending the session: an interactive
+/// user should be able to try `cuda`, be told it is unavailable, and carry on.
+fn reload(settings: &SessionSettings) -> anyhow::Result<Backend> {
+    Backend::open(settings)
+}
+
+/// Execution providers this build can select.
+///
+/// Compiled-in rather than probed: a provider whose support was not built
+/// cannot be selected at runtime no matter what the machine has.
+fn available_execution_providers() -> Vec<&'static str> {
+    let mut providers = vec!["auto", "cpu"];
+    if cfg!(feature = "cuda") {
+        providers.push("cuda");
+    }
+    providers
+}
+
+fn parse_decode_backend(name: &str) -> Result<EngineDecodeBackend, String> {
+    match name {
+        "auto" => Ok(EngineDecodeBackend::Auto),
+        "ort" => Ok(EngineDecodeBackend::Ort),
+        "native" => Ok(EngineDecodeBackend::Native),
+        other => Err(format!(
+            "What: {other:?} is not a decode backend. \
+             Why: the choices are fixed by the engine, not by the model. \
+             How: use auto, ort, or native."
+        )),
+    }
+}
+
+/// `on` / `off` for a toggle command, or `None` to report the current state.
+fn parse_toggle(setting: Option<&str>) -> Result<Option<bool>, String> {
+    match setting {
+        None => Ok(None),
+        Some("on") => Ok(Some(true)),
+        Some("off") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "What: {other:?} is not a setting. \
+             Why: this command takes on or off, or nothing to report the current state. \
+             How: write /profile on or /profile off."
+        )),
+    }
+}
+
+/// A command's single optional argument, with blank treated as absent so
+/// `/ep` reports the current provider and `/ep cuda` sets one.
+fn argument_of(arguments: &str) -> Option<String> {
+    let trimmed = arguments.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn parse_repl_line(line: &str) -> ReplLine {
@@ -666,6 +814,10 @@ fn parse_repl_line(line: &str) -> ReplLine {
         "reset" => ReplCommand::Reset,
         "raw" => ReplCommand::ToggleRaw,
         "stats" => ReplCommand::ToggleStats,
+        "profile" => ReplCommand::Profile(argument_of(arguments)),
+        "model" => ReplCommand::Model(argument_of(arguments)),
+        "ep" => ReplCommand::ExecutionProvider(argument_of(arguments)),
+        "backend" => ReplCommand::DecodeBackend(argument_of(arguments)),
         "system" => ReplCommand::System((!arguments.is_empty()).then(|| arguments.to_string())),
         "image" => attachment_command(true),
         "audio" => attachment_command(false),
@@ -873,11 +1025,20 @@ impl ProfileArgs {
 
     /// Emit whatever the caller asked for.
     fn emit(&self, profile: &mut RunProfile) -> anyhow::Result<()> {
-        if !self.requested() {
+        self.emit_when(self.profile, profile)
+    }
+
+    /// Emit with the text report gated on `show_text` rather than on the
+    /// startup flag, so an interactive session can turn it on and off.
+    ///
+    /// The JSON and trace outputs stay tied to their flags: both name a file
+    /// chosen at startup.
+    fn emit_when(&self, show_text: bool, profile: &mut RunProfile) -> anyhow::Result<()> {
+        if !self.requested() && !show_text {
             return Ok(());
         }
         profile.memory.sample_peak();
-        if self.profile {
+        if show_text {
             eprint!("{}", profile.to_text());
         }
         if let Some(path) = &self.profile_json {
@@ -1420,11 +1581,13 @@ fn generate_audio(
 fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     args.cpu.apply()?;
-    let model_dir = resolve_model_dir(&args.model);
+    let mut settings = SessionSettings::new(resolve_model_dir(&args.model), &args.engine);
     let load_started = std::time::Instant::now();
-    let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
+    let mut backend = Backend::open(&settings)?;
     let load_elapsed = load_started.elapsed();
+    let mut model_dir = settings.model_dir.clone();
     let mut raw_mode = args.sampling.raw;
+    let mut show_profile = profiling.profile;
     // Per-turn numbers are opt-in: a line after every reply is noise until a
     // reader is actually watching throughput or cache behavior.
     let mut show_stats = false;
@@ -1465,7 +1628,7 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
             ReplLine::Prompt(prompt) => Some(prompt),
             ReplLine::Command(ReplCommand::Help) => {
                 println!(
-                    "/help\n/reset\n/raw\n/stats\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+                    "/help\n/reset\n/raw\n/stats\n/profile [on|off]\n/model [path]\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
                 );
                 None
             }
@@ -1474,6 +1637,120 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                 image_attachments.clear();
                 audio_attachments.clear();
                 println!("conversation history and pending attachments cleared");
+                None
+            }
+            ReplLine::Command(ReplCommand::Profile(setting)) => {
+                match parse_toggle(setting.as_deref()) {
+                    Ok(Some(on)) => {
+                        show_profile = on;
+                        println!("profile report {}", if on { "on" } else { "off" });
+                        // The engine's per-stage breakdown is switched on from
+                        // the environment before any thread starts, and cannot
+                        // be turned on later. Say so rather than print a report
+                        // that is quietly missing its most detailed section.
+                        if on && !profiling.profile {
+                            println!(
+                                "note: per-stage timings need --profile at startup; this report covers timings, memory, and cache reuse"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        println!("profile report {}", if show_profile { "on" } else { "off" })
+                    }
+                    Err(error) => eprintln!("error: {error}"),
+                }
+                None
+            }
+            ReplLine::Command(ReplCommand::Model(path)) => {
+                match path {
+                    Some(path) => {
+                        let mut next = settings.clone();
+                        next.model_dir = resolve_model_dir(Path::new(&path));
+                        match reload(&next) {
+                            Ok(loaded) => {
+                                backend = loaded;
+                                settings = next;
+                                model_dir = settings.model_dir.clone();
+                                template = load_chat_template(&model_dir, raw_mode);
+                                reasoning = detect_reasoning(template.as_ref());
+                                // A conversation is about the model that held
+                                // it; replaying it into a different model would
+                                // attribute words to something that never said
+                                // them.
+                                history.clear();
+                                image_attachments.clear();
+                                audio_attachments.clear();
+                                println!(
+                                    "loaded {} ({} input); conversation cleared",
+                                    model_dir.display(),
+                                    backend.accepted_modalities()
+                                );
+                            }
+                            Err(error) => eprintln!("error: {error:#}"),
+                        }
+                    }
+                    None => println!("{}", settings.describe()),
+                }
+                None
+            }
+            ReplLine::Command(ReplCommand::ExecutionProvider(name)) => {
+                match name {
+                    Some(name) if !available_execution_providers().contains(&name.as_str()) => {
+                        // Rejected here rather than by the loader, which would
+                        // report it as a failure to load the model.
+                        eprintln!(
+                            "error: What: {name:?} is not an execution provider this build can select. \
+                             Why: provider support is compiled in, so a provider left out of the build \
+                             cannot be chosen at runtime. \
+                             How: use one of {}.",
+                            available_execution_providers().join(", ")
+                        );
+                    }
+                    Some(name) => {
+                        let mut next = settings.clone();
+                        next.execution_provider = (name != "auto").then(|| name.clone());
+                        match reload(&next) {
+                            Ok(loaded) => {
+                                backend = loaded;
+                                settings = next;
+                                history.clear();
+                                println!("execution provider {name}; conversation cleared");
+                            }
+                            Err(error) => eprintln!(
+                                "error: {name} could not be selected: {error:#}\nthe previous session is still loaded"
+                            ),
+                        }
+                    }
+                    None => println!(
+                        "execution provider {} (available: {})",
+                        settings.execution_provider.as_deref().unwrap_or("auto"),
+                        available_execution_providers().join(", ")
+                    ),
+                }
+                None
+            }
+            ReplLine::Command(ReplCommand::DecodeBackend(name)) => {
+                match name {
+                    Some(name) => match parse_decode_backend(&name) {
+                        Ok(decode_backend) => {
+                            let mut next = settings.clone();
+                            next.decode_backend = decode_backend;
+                            match reload(&next) {
+                                Ok(loaded) => {
+                                    backend = loaded;
+                                    settings = next;
+                                    history.clear();
+                                    println!("decode backend {name}; conversation cleared");
+                                }
+                                Err(error) => eprintln!(
+                                    "error: the {name} backend could not load this model: {error:#}\nthe previous session is still loaded"
+                                ),
+                            }
+                        }
+                        Err(error) => eprintln!("error: {error}"),
+                    },
+                    None => println!("{}", settings.describe()),
+                }
                 None
             }
             ReplLine::Command(ReplCommand::ToggleStats) => {
@@ -1598,8 +1875,8 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                                 "note: generation stopped inside the model's reasoning, so this turn is not kept. Raise --max-new-tokens."
                             );
                             history.pop();
-                            profiling.emit(&mut profile)?;
-                            emit_stats_line(show_stats, profiling, &mut profile);
+                            profiling.emit_when(show_profile, &mut profile)?;
+                            emit_stats_line(show_stats, show_profile, &mut profile);
                             continue;
                         }
                         split.answer.to_string()
@@ -1612,8 +1889,8 @@ fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
                 }
                 // Report per turn: in a session the interesting comparison is
                 // between turns, not a single number at exit.
-                profiling.emit(&mut profile)?;
-                emit_stats_line(show_stats, profiling, &mut profile);
+                profiling.emit_when(show_profile, &mut profile)?;
+                emit_stats_line(show_stats, show_profile, &mut profile);
             }
             Err(error) if is_interrupt_error(&error) => {
                 // Drop the interrupted turn from history so a partial/aborted
@@ -2815,6 +3092,52 @@ mod tests {
             parse_repl_line("/unsupported extra"),
             ReplLine::Command(ReplCommand::Unknown("/unsupported".to_string()))
         );
+    }
+
+    #[test]
+    fn session_control_commands_parse_with_and_without_an_argument() {
+        assert_eq!(
+            parse_repl_line("/profile on"),
+            ReplLine::Command(ReplCommand::Profile(Some("on".to_string())))
+        );
+        assert_eq!(
+            parse_repl_line("/profile"),
+            ReplLine::Command(ReplCommand::Profile(None)),
+            "a bare command reports the current state"
+        );
+        assert_eq!(
+            parse_repl_line("/ep  cuda "),
+            ReplLine::Command(ReplCommand::ExecutionProvider(Some("cuda".to_string()))),
+            "surrounding whitespace is not part of the name"
+        );
+        assert_eq!(
+            parse_repl_line("/backend native"),
+            ReplLine::Command(ReplCommand::DecodeBackend(Some("native".to_string())))
+        );
+        assert_eq!(
+            parse_repl_line("/model ./m"),
+            ReplLine::Command(ReplCommand::Model(Some("./m".to_string())))
+        );
+    }
+
+    #[test]
+    fn a_toggle_reports_when_given_nothing_and_refuses_nonsense() {
+        assert_eq!(parse_toggle(None), Ok(None));
+        assert_eq!(parse_toggle(Some("on")), Ok(Some(true)));
+        assert_eq!(parse_toggle(Some("off")), Ok(Some(false)));
+        assert!(parse_toggle(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn decode_backends_are_named_by_the_engine_not_guessed() {
+        assert_eq!(parse_decode_backend("auto"), Ok(EngineDecodeBackend::Auto));
+        assert_eq!(parse_decode_backend("ort"), Ok(EngineDecodeBackend::Ort));
+        assert_eq!(
+            parse_decode_backend("native"),
+            Ok(EngineDecodeBackend::Native)
+        );
+        let error = parse_decode_backend("cuda").expect_err("not a backend");
+        assert!(error.contains("auto, ort, or native"), "{error}");
     }
 
     #[test]
