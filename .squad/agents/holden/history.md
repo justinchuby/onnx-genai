@@ -130,3 +130,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - Validation evidence: 6/6 unit tests and 18/18 `matmul_nbits_gpu` integration tests passed; Sapper's fix merged to main as `48de993`.
 
 2026-07-22T22:15:00Z — Delivered portable CPU GQA SIMD tests in `82e44be`; Roy approved scalar-fallback dispatch coverage on non-AVX2 x86 and ARM.
+## 2026-07-26T22:38:02+00:00 — Issue triage #45–#77
+
+- Closed #52 and #64 with merged-code and targeted-test evidence; left the remaining audited issues open/partial with posted gaps and no doable-now small item.

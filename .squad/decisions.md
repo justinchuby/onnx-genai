@@ -4114,3 +4114,212 @@ Absolute tok/s is ~3× the author's 326/327 (idle H200 at boost clocks vs the au
 Do NOT merge.
 
 <!-- scribe-merge-2026-07-26T20-00-00Z-cuda-perf-and-capture-regression-reconciliation-end -->
+
+
+<!-- scribe-archive-gate-2026-07-26T22-38-02+00-00 -->
+Decision archive gate checked at 2026-07-26T22:38:02+00:00: active ledger was 409707 bytes and exceeded 51200 bytes. Applied the 7-day policy with cutoff 2026-07-20; no active-ledger entries older than the retained 7-day window were present, so archived 0 eligible block(s) and no archive file was changed.
+
+
+<!-- scribe-merge-2026-07-26T22-38-02+00-00-mobius-issue-ort2-batch -->
+## 2026-07-26 — Mobius PR triage, issue audit, and ORT2 remaining-work reconciliation
+
+<!-- merged from .squad/decisions/inbox/sapper-mobius-pr-triage.md -->
+### 2026-07-26: Mobius PR 404, 423, and 430 triage
+**By:** Sapper
+**What:** Triaged all current review threads, linted all three branches, resolved PR 404 against current main on replacement branch `sapper/404-rebase`, and pushed safe review fixes to PRs 423 and 430 without merging.
+**Why:** Justin retains sole merge authority for Mobius PRs; the branches needed conflict resolution and concrete review follow-up before his review.
+
+## PR 404
+
+- Current actionable threads:
+  - `src/mobius/models/glm_moe_dsa_test.py:22`: add representative config-suite coverage — already implemented; thread left open because the original PR branch was not replaced.
+  - `src/mobius/components/_moe.py:295`: asymmetric QMoE zero points — already implemented.
+  - `docs/research/glm52-export.md:65`: onnx-genai MTP package support — already implemented.
+  - `src/mobius/models/deepseek.py:332`: QMoE routed-expert packing — already implemented.
+  - `export_glm_tiny_quant.py:3` and `export_glm_tiny_qmoe.py:3`: broken docstring backticks — fixed on replacement branch.
+  - `src/mobius/__main__.py:581`: missing `--glm-full-attention` CLI test — fixed on replacement branch.
+- Merged current `origin/main`, preserving GLM DSA/IndexShare, MTP, GGUF, and fused QMoE behavior.
+- Validation: Ruff check and format clean; 378 affected tests passed.
+- `lintrunner` could not run because its adapter uses forbidden `/tmp` response files; direct repository Ruff fallback was clean.
+- Pushed `fa30534` to `sapper/404-rebase`; original `glm5.2-moe-export` remains conflicting/draft. Justin must replace/update the PR branch.
+- Merge-ready for Justin: **No**, until the replacement branch is adopted and CI/review runs on the PR.
+
+## PR 423
+
+- Fixed grouped-routing validation and one-expert `noaux_tc` groups, relaxed brittle exact MatMul count, added shared-expert metadata aliases, defaulted unset activation metadata to SiLU, and validated grouped metadata invariants.
+- After GitHub reported a main conflict, merged current main and resolved the sole MoELayer documentation conflict.
+- Validation: Ruff check and format clean; 84 affected tests passed after the main merge, plus 23 focused routing/metadata tests after patch-coverage expansion.
+- Pushed `40846bb` to `squad/hythe-deepseek-moe-phase1`; branch is mergeable with no unresolved current review threads.
+- Merge-ready for Justin: **Pending CI and approval**; no current code-review blocker. Test jobs are still queued/running and Codecov currently reports failure before their coverage uploads complete.
+
+## PR 430
+
+- Fixed all code threads: removed stale `image_token_id`, validated numbered placeholders, cached projector weights, corrected NumPy/PyTorch documentation, kept projector GELU in float32, made legacy-cache conversion linear, and typed the CLIP config adapter boundary.
+- Confirmed the current PR description already documents the checked-in golden JSON, replied to the stale thread, and resolved it.
+- Validation: Ruff check and format clean; two focused golden-harness tests plus 24 Phi-3.5 model/projector tests passed.
+- Pushed `d1d235e` to `test/l4-l5-golden-new-models`; branch remains mergeable with no unresolved current review threads.
+- Merge-ready for Justin: **Pending CI and approval**. Test jobs are still queued/running and `codecov/patch` currently reports failure.
+
+No PR was merged.
+
+<!-- merged from .squad/decisions/inbox/holden-issue-triage-45-77.md -->
+### 2026-07-26: Backlog issue triage for #45–#77
+**By:** Holden
+**What:** Triaged all requested issues against current code, tests, progress/design docs, and merged PRs; closed only #52 and #64.
+**Why:** Both closed issues have merged implementation evidence and passing targeted tests. All uncertain or incomplete roadmap work remains open.
+
+| issue# | classification | evidence or gap |
+|---:|---|---|
+| 45 | OPEN | No Top-A, Mirostat, Typical-P, DRY, or XTC processors/tests exist in the engine. |
+| 46 | PARTIAL | Text completions map min-p and penalties, but chat completions still lack top-k, min-p, penalties, and seed. |
+| 47 | PARTIAL | PR #188 added v-prediction/x0 handling; DDPM and FlowMatching schedulers remain absent. |
+| 48 | PARTIAL | Declarative conditioning exists, but `run_comfyui` still lacks dual encoders and SDXL `time_ids`. |
+| 49 | PARTIAL | Typed rendering forwards `start_step`; `run_comfyui` still lacks source-image encode and inpainting masks. |
+| 50 | PARTIAL | Workflow parsing knows LoRA/ControlNet, but the runner does not load/feed their runtime inputs. |
+| 51 | PARTIAL | Renderers report non-finite output but neither fail closed nor upcast/retry. |
+| 52 | DONE-closed | PR #91 implements ordered pure composites; codec E2E test passed 2/2 locally. |
+| 53 | PARTIAL | PR #153 added typed text-to-image requests/results and E2E tests; latent-step streaming is absent. |
+| 54 | OPEN | No ORT model-package manifest parser, variant selector, validator, or package tooling exists. |
+| 55 | OPEN | ONNX metadata is preserved, but no `onnx_runtime.*` hint scanning/priority/type-validation runtime exists. |
+| 56 | PARTIAL | Int2 remains on the correctness/dequantization fallback; no direct packed 2-bit GEMV/GEMM. |
+| 57 | OPEN | CPU MatMulNBits still explicitly rejects nonzero `weight_prepacked`. |
+| 58 | PARTIAL | PR #105 includes native AVX-512 BF16 GEMM; f16 still widens to f32. |
+| 59 | PARTIAL | Stateless server batching is live, but persistent sessions use the per-request fallback and not scheduler-driven batching. |
+| 60 | PARTIAL | `DiskTierConfig` remains a placeholder; no disk payload spill/readback exists. |
+| 61 | PARTIAL | Priority pause/resume is implemented, but preempted KV stays in place rather than moving/evicting tiers. |
+| 62 | PARTIAL | Tier A in-place output exists; Tier B shared/paged append-only GQA KV remains deferred. |
+| 63 | PARTIAL | Host weight cache exists; live VRAM cache, H2D binding, and async prefetch remain unwired. |
+| 64 | DONE-closed | PRs #105/#113/#154/#200 plus `a414d615` implement automatic topology-aware pinned placement; 61 targeted tests passed. |
+| 65 | OPEN | No heterogeneous CPU/CUDA partition-and-execute path exists; sessions still do not provide mixed-EP fallback. |
+| 67 | PARTIAL | CUDA coverage grew to 88 listed ops, but CPU-registry parity and heterogeneous fallback remain incomplete. |
+| 68 | PARTIAL | Ratio-4 FP8 is device-resident/capturable; ratio-128 FP8 remains host-staged and non-capturable. |
+| 69 | PARTIAL | CUDA gets compile/clippy CI only; no GPU conformance profile, H200 execution lane, or automated report. |
+| 70 | PARTIAL | PR #92 improved MLX packaging/default selection; device sampling, quantized-KV switching, and Apple perf CI remain. |
+| 71 | OPEN | Python still advertises CUDA from a compile-time feature and does not apply requested providers to `RtSession`; no wheel-path discovery. |
+| 72 | PARTIAL | Windows/macOS CI and wheel matrices exist, but macOS wheel import smoke tests remain explicitly skipped. |
+| 73 | OPEN | Minimal-build operator manifests, generator, features, and `cargo xtask minimal-build` do not exist. |
+| 74 | PARTIAL | PR #105 includes CPU Conv and Resize; ScatterND and QLinearMatMul remain unregistered. |
+| 75 | PARTIAL | Catalog expanded to 71 standard ops/78 versions, but full standard/ONNX-ML schemas and inference remain incomplete. |
+| 76 | PARTIAL | PR #153 added direct ORT graph projection/capability queries; the immutable cached GraphView/lens design is absent. |
+| 77 | PARTIAL | PR #153 added plugin projection/execution plumbing; `EpRegistry::load_legacy` remains a Phase-2 `todo!()`. |
+
+## Issues closed
+
+- **#52 — Support generalized non-autoregressive composite pipelines**
+  - Evidence posted: PR #91, merge `c8bc70e8abda`; `PipelineEngine::run_pipeline` dispatches composite plans in `crates/onnx-genai-engine/src/pipeline.rs:1534-1549`; `crates/onnx-genai-engine/tests/codec_pipeline_e2e.rs:1-77` proves an ordered encoder→vocoder pure composite.
+  - Verification posted: `cargo test -p onnx-genai-engine --test codec_pipeline_e2e` — 2 passed, 0 failed.
+
+- **#64 — Implement automatic NUMA-aware decode placement**
+  - Evidence posted: PR #105 (`d0fdfa47d3ce`), #113 (`b9bb7143`), #154 (`a6848d4c`), #200 (`b51ea239`), and current-main follow-up `a414d615`; implementation spans `decode_affinity.rs`, `decode_spmd.rs`, `decode_numa.rs`, and `kernels/matmul_nbits.rs`.
+  - Verification posted: `decode_spmd::tests` 31 passed, `decode_affinity::tests` 25 passed, and `decode_numa::tests` 5 passed; 0 failed.
+
+## DOABLE-NOW
+
+None. Every not-started issue has medium/large cross-cutting scope; the small-looking non-finite VAE item is already partial and needs a product decision between fail-closed and retry/upcast semantics.
+
+Plain-text summary: 2 closed, 23 partial, 0 doable-now.
+
+<!-- merged from .squad/decisions/inbox/gaff-issue-triage-78-106.md -->
+### 2026-07-26: Justin backlog triage — issues 1–106
+**By:** Gaff
+**What:** Triaged issues #78–88, #106, #1, #9, #13, and #21 against `main` at `b33e7939785eb19e1c79d1545e73d0d3b795584a`, source/tests/docs, and merged/open PR state. Closed only #1; posted status evidence on every PARTIAL issue.
+**Why:** Keep the backlog aligned with landed behavior without closing roadmap work whose acceptance criteria remain incomplete.
+
+| issue# | classification | one-line evidence-or-gap |
+|---:|---|---|
+| #1 | DONE-closed | Issue screenshot says acceptance met; landed tool protocol SHAs `1699a6bd`/`385c25dc`, real Qwen HTTP E2E `d7896d26`, and `scripts/coding_agent.py` preserve the verified Hermes file-writing loop. |
+| #9 | PARTIAL | `9ab4fa91`/`b5934c6f`/`a5106f56` provide registry, lazy load/unload, admin routes, and LRU tests; §37 version policy, A/B hot-swap, health-check, and repository rescan remain absent. |
+| #13 | PARTIAL | Debug routes and Perfetto/Chrome exporters are tested, but `routes.rs::debug_kv` still literally reports engine KV-page statistics unavailable despite engine page-stat APIs. |
+| #21 | OPEN | No CLI/server session/model pretty-printer covering signature, FLOPs, size, and dtype; existing `/v1/models`/admin responses expose identity/lifecycle fields only. |
+| #78 | PARTIAL | PyO3 eager landed in `onnx-runtime-python/src/eager.rs` with Python tests, but `onnx-runtime-eager/src/dispatch.rs` still hard-codes one output and marks TopK/Split arity deferred. |
+| #79 | OPEN | CUDA registers `com.microsoft::QMoE` only; `kernels/mod.rs` has no `pkg.nxrt::BlockQuantizedMoE`, and `qmoe.rs` explicitly rejects IQ/MXFP4 layouts requiring that operator. |
+| #80 | PARTIAL | Runtime `IndexShare` v1 is frozen/implemented and QMoE runs E2E, but `onnxruntime/mobius#404` remains OPEN/DRAFT; its fused QMoE emitter is unmerged and private IndexShare exporter reconciliation is incomplete. |
+| #81 | PARTIAL | `e4d28832` + `2ffb4e45` implement the communicator oracle and seven in-process collectives; no NCCL/multi-process backend or EP/TP execution placement exists. |
+| #82 | PARTIAL | Host expert cache leases/governor landed (`f80ca09`), but CUDA QMoE still declares device paging, async prefetch, and expert sharding deferred; Phase 3b binding is unsupported. |
+| #83 | OPEN | Only Kimi readiness/design material exists; no KDA, gated-MLA latent-cache, AttnRes runtime contract, kernel, or artifact-backed test has landed. |
+| #84 | PARTIAL | Linear speculation is implemented and the proposal struct has placeholder tree fields, but every proposer emits `tree: None` and verification has no tree-aware path. |
+| #85 | OPEN | Executor supports view aliases and special KV aliases, not graph-planned compute-in-place; `Kernel` has no in-place capability and no dead-input liveness reuse. |
+| #86 | PARTIAL | Static-cache batching now binds per-row `nonpad_kv_seqlen` and CPU/CUDA Attention consume it; no packed `pkg.nxrt` varlen op, `cu_seqlens` kernel/oracle, or savings benchmark exists. |
+| #88 | PARTIAL | `b720a218` made warmed RoPE launches capture-compatible with device error latching/signature gates, but no standalone-RoPE graph record/replay or unfused-model zero-fallback token-parity DoD test exists; #193/#201 test Attention, not RoPE. |
+| #106 | OPEN | `docs/EXTENSIBLE_QUANT_TYPES.md` is explicitly a design draft; no `QuantTypeDeclProto`, `quant_type_uri`, codec registry, `CUSTOM_QUANT`, or `DequantizeExtensible` implementation exists. |
+
+1 closed, 9 partial, 0 doable-now.
+
+<!-- merged from .squad/decisions/inbox/pris-ort2-remaining-summary.md -->
+### 2026-07-26: ORT2 / DESIGN remaining-work audit
+**By:** Pris
+**What:** Ground-truth audit of the ORT2 runtime and the broader GenAI design against current code, tests, `docs/PROGRESS.md`, and Justin's open `release:backlog` issues.
+**Why:** `docs/ORT2-IMPL-PLAN.md` still describes the July 19 skeleton state, while current `main` has already completed Phase 1 and substantial Phase 2/3 work.
+
+# ORT2 / DESIGN：已完成多少、还剩多少
+
+## 审计口径
+
+- 审计代码：`main` at `b33e7939`（2026-07-26）。
+- 状态优先级：实际代码/测试 > `docs/PROGRESS.md` > 旧计划。`PROGRESS.md` 自称 living status，但文件头最后更新时间是 2026-07-25、记录 HEAD `5a8c3dc9`；因此又核对了其后代码。
+- 当前已发布：`onnx-runtime-*` 为 `v0.1.0-dev.1`，仓库行覆盖率约 **77%**（`docs/PROGRESS.md:3-9`）。
+- Justin 当前有 **42** 个 open `release:backlog` issues。
+- 七个目标 crate 一次性 `cargo build` 全部成功。
+- 用户指定的精确 grep：
+  `grep -rn "todo!()\|unimplemented!()" crates/onnx-runtime-*/src`
+  只命中 **1** 次，而且是 `onnx-runtime-session/src/lib.rs:10` 的过时文档注释；更宽松地搜实际宏调用后，只有 **1 个真实 TODO**：`onnx-runtime-ep-api/src/registry.rs:222` 的 legacy plugin EP `load_legacy()`。
+
+## 1. ORT2 crate 成熟度
+
+| crate | 状态 | 当前证据 | 关键剩余 |
+|---|---|---|---|
+| `onnx-runtime-ir` | **REAL** | 3,270 LOC；53/53 默认测试通过；0 实际 TODO。图 IR、符号 shape、layout、mutation、validation 已落地；Phase-1 BERT 真实模型首次运行无需跨 crate 修复（`PROGRESS.md:456-464`）。 | 完整 ORT 图 ABI 不属于 safe IR，本来就移到 `ep-api`。 |
+| `onnx-runtime-loader` | **REAL** | 4,509 LOC；默认 suite **109 passed / 1 ignored**；0 TODO。protobuf decode、IR builder、mmap external weights、shape inference、encoder、EPContext load/dump 均已实现（`loader/src/lib.rs:1-38,49-71`; `PROGRESS.md:460,465-488`）。 | 完整 schema/catalog breadth 仍受 #75 限制；model-package 解析不是 loader 现有 flat-model 路径的一部分（#54）。 |
+| `onnx-runtime-ep-api` | **partial（核心 REAL）** | 4,774 LOC；45/45 默认测试通过。EP/Kernel/registry/tensor/weight/EPContext contract 都是真实现；`OrtGraphView::query_plugin_capabilities()` 已能 `dlopen` plugin 并调用 `GetCapability`（`ep-api/src/abi.rs:20-175`）。 | 唯一真实 `todo!` 是 `EpRegistry::load_legacy()`（`registry.rs:219-223`）；native `query_capabilities()` 目前返回空；完整 GraphView/lens 与 plugin compile/run adapter 未完成（#76/#77）。 |
+| `onnx-runtime-ep-cpu` | **REAL** | 75,921 LOC；默认 suite **927 passed / 9 ignored**；0 TODO。当前源码可解析出 **164 个 unique op names / 169 domain-op pairs**，远超旧计划的 7 个 Phase-1 ops；含控制流、量化、MoE、SIMD/MLAS、decode 优化。 | `ScatterND`、`QLinearMatMul` 仍未注册；部分 dtype/layout/算子长尾与 conformance 仍在 #74/#75。 |
+| `onnx-runtime-ep-cuda` | **REAL，但覆盖 partial** | 52,292 LOC；0 TODO；`CUDA_COVERED_OPS` 当前锁定 **88** 个 op names（`kernels/mod.rs:109-...`, test at `:721`）；216 个 lib tests 曾整批通过。真实 Qwen/Phi/Llama/GLM/DeepSeek native CUDA 已运行并有 benchmark（`PROGRESS.md:11-160`）。 | 相对 CPU 164-op breadth 仍明显不足（#67）；runtime library discovery/Python provider 选择不完整（#71）；全图 all-or-nothing，缺异构 fallback（#65）；本机完整 GPU suite 有瞬时数值/并发不稳定，GQA 单测失败后 targeted rerun 通过。 |
+| `onnx-runtime-session` | **REAL** | 16,045 LOC；默认 suite **192 passed / 2 ignored**；0 TODO。`SessionBuilder::build()`、sequential executor、`run()`、dynamic shapes、optimizer、control flow、device binding、EPContext 都是真实现（`session/src/lib.rs:597,903-1058`; `executor.rs:2601,3741`）。 | session 仍是单 EP 选择/整图执行；异构 CPU/CUDA partition（#65）、GraphView placement（#76）、async DAG/cost placement 仍未完成。文件顶部“Phase 1 skeleton / todo”注释已严重过时（`lib.rs:8-10`）。 |
+| `onnx-runtime-capi` | **partial（Tier-1 REAL）** | 953 LOC；默认 suite **17/17** 通过；0 TODO。`nxrt_create_session`、options、tensor、run、status/release 等完整存在（`capi/src/lib.rs:232-720`）。 | 不是 upstream ORT drop-in：没有 `OrtGetApiBase`/`OrtApi` vtable，仍用 `nxrt_*` 名称；`crate-type` 还是 `["lib"]`，不是 cdylib/staticlib（`Cargo.toml:12`）。这是 #77 的核心剩余。 |
+
+**结论：现在没有 skeleton crate。** 七个 crate 都能 build；五个是完整可运行实现，`ep-api` 和 `capi` 是“核心真实、ORT 兼容层未收口”的 partial。
+
+## 2. July-19 Phase-1 计划 vs 现在
+
+`docs/ORT2-IMPL-PLAN.md:19-29` 当时把 loader/ep-api/ep-cpu/session/capi 全标成 🔨 skeleton。现在：
+
+| 旧计划项 | 现在 | 证据 |
+|---|---|---|
+| IR contract | ✅ | 34 tests 已增长到 53；仍是稳定底座。 |
+| Loader protobuf/graph/weights/shape inference | ✅ | 真实 loader + mmap + 独立 shape-inference crate + encoder/EPContext；109 tests。 |
+| EP API safety/tensor/registry | ✅（Phase 1） | DLPack、owned buffers、registry、EPContext/weight contracts 已落地；legacy loading 明确仍属 Phase 2。 |
+| CPU 7-op kernel slice | ✅ 且大幅超额 | 已从 7 ops 扩到约 164 unique op names，927 passing tests。 |
+| Sequential session executor | ✅ | `bert_toy_optimized.onnx` 384 nodes 端到端运行，输出对 ORT max_abs `1.19e-7`（`PROGRESS.md:464`）。 |
+| Tier-1 C API | ✅（项目自定义 `nxrt_*`） | create/run/tensor/status/options 已完成；但严格的 upstream `OrtGetApiBase` 仍未做。 |
+| Phase-1 BERT exit milestone | ✅ | commit `85f379b`，CPU 纯 Rust 对 ORT parity（`PROGRESS.md:464`）。 |
+
+因此，按仓库后来采用的 Phase-1 定义，**Phase 1 = 100% 完成**。唯一需要标注的规格偏差是：旧计划 `ORT2-IMPL-PLAN.md:148-159`/`ORT2.md:7838` 写了 `OrtGetApiBase`，实际 Phase 1 交付的是干净的 `nxrt_*` Tier-1 ABI，并把真正 ORT vtable/drop-in 放到 Phase 2（`capi/src/lib.rs:9-11`）。
+
+## 3. ORT2 剩余 workstreams
+
+百分比是按当前设计子项的工程完成度粗估，不是代码行比例。
+
+| workstream | 粗估完成 | 已完成 | 真正剩余 / blocker |
+|---|---:|---|---|
+| **C-ABI / plugin-EP transition** | **~65%** | Tier-1 `nxrt_*` C ABI；EPContext produce→dump→reload→consume 全链路；ORT plugin `GetCapability` Stage-1 graph projection 已实现（`PROGRESS.md:482-487`; `abi.rs:61-175`）。 | `OrtGetApiBase`/vtable、cdylib/staticlib、`load_legacy()`、plugin compile/run adapter、真正 drop-in conformance。**#77**。 |
+| **Operator / schema / shape coverage** | **~70%** | CPU 已约 164 op names；runtime shape registry 约 **81 domain-op pairs / 102 versioned registrations**；`onnx-std` 文档最新总结为 **71 standard ops / 78 versioned entries**（`ONNX_RS_SPEC_COVERAGE.md:406-410`）；CUDA 已 88 op names。 | #74 四个点中 Conv/Resize 已落地，**ScatterND/QLinearMatMul 仍缺**；完整 standard + ONNX-ML schema、sequence/optional/recurrent 长尾仍缺（**#74/#75**）；CUDA 与 CPU parity 仍缺（**#67**）；eager multi-output/PyO3（**#78**）。 |
+| **EP capability projection / heterogeneous placement** | **~35%** | ORT C graph host projection和 plugin `GetCapability` 已真实可调用；EP claim API 存在。 | GraphView immutable lens 尚未落地，native `query_capabilities()` 仍为空；session 仍选择单 EP，unsupported CUDA node 会整图失败，未做 CPU/CUDA partition。**#76**，并直接关联 **#65**。 |
+| **Model package + metadata hints** | **~10%** | flat model directory、ONNX metadata preservation、EPContext package-like compiled blobs 已有。 | package manifest、variant selection、package validation/tooling 全缺（**#54**）；`onnx_runtime.*` hint 扫描、优先级、类型校验、placement/warnings 全缺（**#55**）。这是最接近“未开始”的 ORT2 大块。 |
+| **CI / portability / packaging** | **~35%** | toolkit-free CUDA build、Linux 动态加载、Windows/macOS library-name logic、若干 Windows build fixes 已有；本次七 crate build 全绿。 | CUDA wheel 路径发现和 Python provider availability 不准确（**#71**）；主 CI 仍 Ubuntu-only、Windows/macOS wheels 未覆盖（**#72**）；CUDA GPU conformance CI 仍在 **#69**。 |
+
+另外，`ORT2.md:7847-7867` 的完整 Phase 2/3 愿景中，cost model placement、layout propagation、async DAG + transfers、arena/lifetime/in-place memory planner、ILP placement、多 EP 单图里程碑仍未整体完成；因此不能把“Phase 1 完成”误读成“整个 ORT2 设计完成”。
+
+## 4. `DESIGN.md` GenAI 层还剩什么
+
+| bucket | 当前完成度 | 已完成 | 剩余与 issues |
+|---|---:|---|---|
+| **Diffusion / non-AR pipelines** | **~75%** | iterative pipeline、DDIM/Euler/Euler-A/DPM++2M/Karras、CFG、SDXL、LoRA、ControlNet、inpaint、ComfyUI、masked language diffusion 大量路径已验证；`PROGRESS.md:527` 明确核心 correctness 很强。语言 diffusion roadmap 除 real-model 外已完成（`PROGRESS.md:978-990`）。 | FlowMatching/DDPM/modern DiT scheduler（**#47**）；native runner 的 SDXL/img2img/inpaint/ControlNet/LoRA 收口（**#48/#49/#50**）；fp16 VAE 非有限值（**#51**）；typed `generate_image` + latent streaming（**#53**）。`#52` 的旧描述已部分过时：single-pass composite 和 codec e2e 已在 `PROGRESS.md:1088-1097` 落地，但更深的 mixed iterative/AR composite 仍有余量。语言 diffusion 还缺真实 LLaDA/Dream/SMDM e2e。 |
+| **Scheduler / continuous batching** | **~60%** | scheduler 数据结构、FCFS/priority/FairShare、byte budget、preemption decisions、prefix/paged primitives 都有测试。 | 正常 engine serving loop 仍是单请求，continuous batching 未接入（**#59**）；scheduler 决定的 KV preemption/eviction 未由 engine 执行（**#61**）；真正 ragged/packed varlen attention（**#86**）。 |
+| **KV / weight offload** | **~50%** | GPU↔CPU tier bookkeeping、local connector、page table/LRU、shared ByteBudget、governor 配置和 snapshot 已有（`PROGRESS.md:519-525`）。 | 真 SSD/NVMe KV tier（**#60**）；GQA runtime-managed paged KV Tier-B（**#62**）；live VRAM weight pages/H2D binding/device execution（**#63**）；lowering live budget 后即时 eviction 仍缺。 |
+| **Multi-model / placement / distributed** | **~40%** | 多 component pipeline、VLM/audio/diffusion orchestration、单机多 session 基础已经存在。 | model-package/lifecycle/hot-swap 没有完整产品化（邻接 **#54**）；CPU/CUDA heterogeneous graph（**#65**）；multi-GPU communicator + expert/tensor parallel（**#81**）；routed-expert paging/leases/scheduler（**#82**）。`DESIGN.md` 的 cluster router、P/D disaggregation、remote KV、完整 multi-model resource broker 仍大多是设计。 |
+| **Sampling / speculation** | **~65%** | greedy/categorical、temperature、top-k/top-p/min-p、repetition/frequency/presence 等基础链路和 linear speculative decoding 已有。 | Top-A、Mirostat、Typical-P、DRY、XTC（**#45**）；OpenAI chat surface 尚未暴露完整 top-k/min-p/penalties/seed（**#46**）；tree speculative decoding（**#84**）。 |
+
+## 5. Bottom line：到底“还剩多少”
+
+按明确定义的 **ORT2 Phase-1 foundation**，已经 **100% 完成**：不再有 skeleton，BERT parity milestone 已通过，七个 crate 当前全部能 build。若看完整 `ORT2.md` runtime 愿景，粗估约 **65–70% 完成**；剩下的主要不是“把 skeleton 填完”，而是 ORT drop-in/plugin execution、全 schema/operator parity、异构 placement、model package 和跨平台发布。`DESIGN.md` 的核心单机 GenAI 产品能力约 **70% 左右**，但把 distributed KV/multi-model/multi-GPU/MoE、完整 continuous batching/offload、所有 diffusion/sampling 与生态绑定都算进“大愿景”，整体更接近 **55–60%**。换句话说：基础已经成型且能跑真实模型，余下约三到四成主要是广度、兼容性、调度/内存系统和产品化收口，而不是重写核心。
+
+<!-- scribe-merge-2026-07-26T22-38-02+00-00-mobius-issue-ort2-batch-end -->

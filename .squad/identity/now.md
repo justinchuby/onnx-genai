@@ -1,5 +1,5 @@
 # Team Focus — now
 
-**Current focus:** Merged #201 (capture regression test) + #203 (portable split-K perf). Main green. GLM/DeepSeek mobius export in Justin's PR queue (#404/#423/#430). Next: await user direction.
+**Current focus:** Mobius PRs #404/#423/#430 are ready for Justin review/merge; issue backlog triaged with #1, #52, and #64 closed; #88 RoPE capture DoD regression test is in progress on `test/rope-capture-dod`.
 
-**Updated:** 2026-07-26T19:45:52Z
+**Updated:** 2026-07-26T22:38:02+00:00

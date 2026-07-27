@@ -115,3 +115,6 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 ## 2026-07-26T20:00:00Z — Scribe update
 
 - 2026-07-26T20:00:00Z — Delivered PR #201 capture regression coverage for default-domain Attention staged-KV copy-back under CUDA graph capture; merged to main at `88e48eca`.
+## 2026-07-26T22:38:02+00:00 — #88 RoPE capture DoD dispatched
+
+- Dispatched on `test/rope-capture-dod` to add the standalone-RoPE graph record/replay or unfused-model zero-fallback token-parity DoD regression for issue #88. Status at Scribe handoff: in progress.
