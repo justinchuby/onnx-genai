@@ -314,6 +314,11 @@ pub(crate) fn resolved_host_ram_budget(
     Ok(governor.snapshot().resolved_limits.host_ram_bytes)
 }
 
+/// Error message used when the ORT decode backend is unexpectedly missing its
+/// decoder session. Shared by [`Engine::ort_session`] and the few call sites
+/// that must borrow the session field disjointly from other mutable fields.
+pub(crate) const MISSING_ORT_SESSION: &str = "ORT backend must own a decoder session";
+
 /// The generation engine.
 pub struct Engine {
     /// Resolved decoder execution backend.
@@ -1510,7 +1515,7 @@ impl Engine {
                 session: self
                     .session
                     .as_deref()
-                    .expect("ORT backend must own a decoder session"),
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                 kv_model: self.kv_model.as_ref(),
                 kv_cache: &mut self.kv_cache,
                 scheduler: &mut self.scheduler,
@@ -1917,9 +1922,7 @@ impl Engine {
                         .materialize_sequence(session_id)
                         .map_err(|e| anyhow::anyhow!("Failed to materialize prefix KV: {}", e))?;
                     load_materialized_past(
-                        self.session
-                            .as_deref()
-                            .expect("ORT backend must own a decoder session"),
+                        self.ort_session()?,
                         self.kv_model.as_ref().expect("checked above"),
                         &mut state.decode_state,
                         &materialized,
@@ -1989,15 +1992,12 @@ impl Engine {
         }
         // Scope the immutable `kv_model` borrow so it does not overlap the
         // `&mut self.connector` fetch below.
-        match self.kv_model.as_ref() {
-            Some(kv_model)
-                if kv_model_past_is_f32(
-                    self.session
-                        .as_deref()
-                        .expect("ORT backend must own a decoder session"),
-                    kv_model,
-                ) => {}
-            _ => return Ok(None),
+        let past_is_f32 = match self.kv_model.as_ref() {
+            Some(kv_model) => kv_model_past_is_f32(self.ort_session()?, kv_model),
+            None => false,
+        };
+        if !past_is_f32 {
+            return Ok(None);
         }
 
         let boundary = 0usize;
@@ -2033,14 +2033,7 @@ impl Engine {
             })
             .collect();
         let kv_model = self.kv_model.as_ref().expect("checked present above");
-        let kv = past_kv_from_payloads(
-            self.session
-                .as_deref()
-                .expect("ORT backend must own a decoder session"),
-            kv_model,
-            &placed,
-            total,
-        )?;
+        let kv = past_kv_from_payloads(self.ort_session()?, kv_model, &placed, total)?;
         state.decode_state.import_runner_kv(total, kv)?;
         state.kv_token_count = total;
         Ok(Some(total))
@@ -2118,7 +2111,7 @@ impl Engine {
                 session: self
                     .session
                     .as_deref()
-                    .expect("ORT backend must own a decoder session"),
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                 kv_model: self.kv_model.as_ref(),
                 kv_cache: &mut self.kv_cache,
                 scheduler: &mut self.scheduler,
@@ -2172,6 +2165,17 @@ impl Engine {
         Ok(())
     }
 
+    /// Borrow the ORT decoder session, returning an error instead of aborting
+    /// the host when the backend is in an invalid state without a session. The
+    /// ORT decode paths structurally guarantee a session is present, so this is
+    /// a defensive accessor: a future invalid backend state surfaces as a
+    /// recoverable error rather than a process abort.
+    fn ort_session(&self) -> anyhow::Result<&Session> {
+        self.session
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))
+    }
+
     fn ensure_session_kv_current(
         &mut self,
         session_id: SessionId,
@@ -2181,7 +2185,7 @@ impl Engine {
             let _ = next_session_token_logits(
                 self.session
                     .as_deref()
-                    .expect("ORT backend must own a decoder session"),
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                 self.kv_model.as_ref(),
                 &mut self.kv_cache,
                 session_id,
@@ -2199,15 +2203,8 @@ impl Engine {
         if !state.decode_state.runner_supports_kv_handoff() {
             return;
         }
-        let config = match self.kv_model.as_ref() {
-            Some(kv_model)
-                if kv_model_past_is_f32(
-                    self.session
-                        .as_deref()
-                        .expect("ORT backend must own a decoder session"),
-                    kv_model,
-                ) =>
-            {
+        let config = match (self.kv_model.as_ref(), self.session.as_deref()) {
+            (Some(kv_model), Some(session)) if kv_model_past_is_f32(session, kv_model) => {
                 kv_model.tensor_config
             }
             _ => return,

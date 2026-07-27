@@ -7,6 +7,9 @@ use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
+use onnx_genai_ort::decode_contract::{
+    KvNamingConvention, has_past_prefix, has_present_prefix, matching_past_input,
+};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -1269,6 +1272,94 @@ impl NativeDecodeSession {
             .map(|binding| binding.name.as_str())
     }
 
+    /// Run one eager (uncaptured) `[1, K]` device forward pass and return host
+    /// `[K, vocab]` logits.
+    ///
+    /// This is the shared body of `decode_cuda`'s multi-token branch and the
+    /// `decode_cuda_eager` verify path: invalidate any captured graph, rebuild
+    /// the host token/position input tensors, run against the device KV/mask
+    /// bindings, collect and validate the logits output, and advance the KV
+    /// logical length. `error_context` (`"decoder"` or `"verify"`) only selects
+    /// the wording of the two diagnostic messages so the extraction stays
+    /// byte-identical to the two original inlined bodies.
+    ///
+    /// The caller resolves the token/position input names and computes
+    /// `total_len`, and is responsible for the preceding `extend_mask` call
+    /// (whose exposed length differs between the two paths).
+    #[allow(clippy::too_many_arguments)]
+    fn run_cuda_eager_rows(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        total_len: usize,
+        token_input: &str,
+        position_input: Option<&str>,
+        error_context: &str,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.invalidate_graph(&mut self.session)?;
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
+        let mut owned = Vec::with_capacity(2);
+        owned.push((token_input.to_owned(), input_ids));
+        if let Some(position_ids_name) = position_input {
+            let positions = (past_len..total_len)
+                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            owned.push((
+                position_ids_name.to_owned(),
+                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
+            ));
+        }
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let outputs = match self
+            .session
+            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
+        {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native CUDA {error_context} forward pass failed{diagnosis}: {error}");
+            }
+        };
+        let names = self
+            .session
+            .outputs()
+            .iter()
+            .map(|meta| meta.name.clone())
+            .collect::<Vec<_>>();
+        let mut named = names
+            .into_iter()
+            .zip(outputs)
+            .filter_map(|(name, tensor)| tensor.map(|tensor| (name, tensor)))
+            .collect::<HashMap<_, _>>();
+        let logits = named
+            .remove(&self.logits)
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        if !named.is_empty() {
+            bail!(
+                "native CUDA {error_context} unexpectedly materialized bound outputs: {:?}",
+                named.keys().collect::<Vec<_>>()
+            );
+        }
+        let logits = extract_logits(&logits)?;
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(logits)
+    }
+
     fn decode_cuda(
         &mut self,
         token_ids: &[TokenId],
@@ -1333,64 +1424,14 @@ impl NativeDecodeSession {
             return Ok(logits);
         }
 
-        state.invalidate_graph(&mut self.session)?;
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
-        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
-        let mut owned = Vec::with_capacity(2);
-        owned.push((token_input, input_ids));
-        if let Some(position_ids_name) = position_input {
-            let positions = (past_len..total_len)
-                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            owned.push((
-                position_ids_name,
-                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
-            ));
-        }
-        let bindings = owned
-            .iter()
-            .map(|(name, tensor)| (name.as_str(), tensor))
-            .collect::<Vec<_>>();
-        let outputs = match self
-            .session
-            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
-        {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
-            }
-        };
-        let names = self
-            .session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.clone())
-            .collect::<Vec<_>>();
-        let mut named = names
-            .into_iter()
-            .zip(outputs)
-            .filter_map(|(name, tensor)| tensor.map(|tensor| (name, tensor)))
-            .collect::<HashMap<_, _>>();
-        let logits = named
-            .remove(&self.logits)
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        if !named.is_empty() {
-            bail!(
-                "native CUDA decoder unexpectedly materialized bound outputs: {:?}",
-                named.keys().collect::<Vec<_>>()
-            );
-        }
-        let logits = extract_logits(&logits)?;
-        if logits.iter().flatten().any(|value| !value.is_finite()) {
-            bail!("native decoder produced non-finite logits");
-        }
-        state.set_logical_len(total_len)?;
-        self.current_len = total_len;
-        Ok(logits)
+        self.run_cuda_eager_rows(
+            token_ids,
+            past_len,
+            total_len,
+            &token_input,
+            position_input.as_deref(),
+            "decoder",
+        )
     }
 
     /// Speculative **verify** primitive (option (b): the safe eager M=K path).
@@ -1470,64 +1511,14 @@ impl NativeDecodeSession {
             );
         }
         state.extend_mask(past_len, total_len, total_len)?;
-        state.invalidate_graph(&mut self.session)?;
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
-        let input_ids = Tensor::from_i64(&[1, token_ids.len()], &ids)?;
-        let mut owned = Vec::with_capacity(2);
-        owned.push((token_input, input_ids));
-        if let Some(position_ids_name) = position_input {
-            let positions = (past_len..total_len)
-                .map(|position| i64::try_from(position).context("position id exceeds i64 range"))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            owned.push((
-                position_ids_name,
-                Tensor::from_i64(&[1, token_ids.len()], &positions)?,
-            ));
-        }
-        let bindings = owned
-            .iter()
-            .map(|(name, tensor)| (name.as_str(), tensor))
-            .collect::<Vec<_>>();
-        let outputs = match self
-            .session
-            .run_with_device_bindings(&bindings, &mut state.bindings[..state.base_binding_count])
-        {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA verify forward pass failed{diagnosis}: {error}");
-            }
-        };
-        let names = self
-            .session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.clone())
-            .collect::<Vec<_>>();
-        let mut named = names
-            .into_iter()
-            .zip(outputs)
-            .filter_map(|(name, tensor)| tensor.map(|tensor| (name, tensor)))
-            .collect::<HashMap<_, _>>();
-        let logits = named
-            .remove(&self.logits)
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        if !named.is_empty() {
-            bail!(
-                "native CUDA verify unexpectedly materialized bound outputs: {:?}",
-                named.keys().collect::<Vec<_>>()
-            );
-        }
-        let logits = extract_logits(&logits)?;
-        if logits.iter().flatten().any(|value| !value.is_finite()) {
-            bail!("native decoder produced non-finite logits");
-        }
-        state.set_logical_len(total_len)?;
-        self.current_len = total_len;
-        Ok(logits)
+        self.run_cuda_eager_rows(
+            token_ids,
+            past_len,
+            total_len,
+            &token_input,
+            position_input.as_deref(),
+            "verify",
+        )
     }
 
     fn decode_cuda_greedy(
@@ -2333,17 +2324,18 @@ fn all_pasts_consumed_by_gqa(graph: &onnx_runtime_ir::Graph, past_names: &[Strin
 }
 
 impl NativeDecodeSession {
-    fn decode_cpu(
-        &mut self,
+    /// Build the non-KV step input tensors (token ids, attention mask, position
+    /// ids, and routed / inputs_embeds ports) shared by both CPU decode paths,
+    /// validating that every supplied routed tensor maps to a declared graph
+    /// port. KV inputs are appended by the caller: `decode_cpu` adds growable
+    /// host past tensors, while `decode_cpu_inplace` binds them on-device.
+    fn prepare_cpu_step_inputs(
+        &self,
         token_ids: &[TokenId],
         past_len: usize,
-        greedy: bool,
+        total_len: usize,
         supplied_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<NativeCpuDecodeResult> {
-        let total_len = past_len
-            .checked_add(token_ids.len())
-            .context("native decode context length overflow")?;
-        let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
+    ) -> anyhow::Result<Vec<(String, Tensor)>> {
         let ids = token_ids
             .iter()
             .map(|&id| i64::from(id))
@@ -2355,7 +2347,7 @@ impl NativeDecodeSession {
             }
         }
 
-        let mut owned = Vec::with_capacity(self.step_inputs.len() + self.kv_inputs.len());
+        let mut owned = Vec::with_capacity(self.step_inputs.len());
         for binding in &self.step_inputs {
             let tensor = match binding.source {
                 NativeStepInputSource::TokenIds => {
@@ -2400,6 +2392,58 @@ impl NativeDecodeSession {
                 "native decode received routed step inputs that are not declared graph ports: {unknown:?}"
             );
         }
+        Ok(owned)
+    }
+
+    /// Turn the raw logits / hidden outputs of a CPU forward pass into a decode
+    /// result: greedy argmax or full-logits extraction plus recording the
+    /// declared hidden state. Shared by both CPU decode paths; per-mode KV
+    /// output handling stays in each caller.
+    fn finalize_cpu_logits_and_hidden(
+        &mut self,
+        logits: Option<Tensor>,
+        hidden: Option<Tensor>,
+        greedy: bool,
+    ) -> anyhow::Result<NativeCpuDecodeResult> {
+        let logits = logits
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        let result = if greedy {
+            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
+            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
+        } else {
+            let logits = extract_logits(&logits)?;
+            if logits.iter().flatten().any(|value| !value.is_finite()) {
+                bail!("native decoder produced non-finite logits");
+            }
+            NativeCpuDecodeResult::Logits(logits)
+        };
+        self.last_hidden = match (&self.hidden_output, hidden) {
+            (Some(name), Some(tensor)) => Some(
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
+            ),
+            (Some(name), None) => {
+                bail!("native decoder omitted declared hidden output '{name}'")
+            }
+            (None, _) => None,
+        };
+        Ok(result)
+    }
+
+    fn decode_cpu(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        greedy: bool,
+        supplied_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<NativeCpuDecodeResult> {
+        let total_len = past_len
+            .checked_add(token_ids.len())
+            .context("native decode context length overflow")?;
+        let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
+        let mut owned =
+            self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
+        owned.reserve(self.kv_inputs.len());
         for name in &self.kv_inputs {
             let tensor = match self.past.remove(name) {
                 Some(tensor) => tensor,
@@ -2474,28 +2518,7 @@ impl NativeDecodeSession {
                 next_past.insert(past.clone(), tensor);
             }
         }
-        let logits = logits
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let result = if greedy {
-            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
-            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
-        } else {
-            let logits = extract_logits(&logits)?;
-            if logits.iter().flatten().any(|value| !value.is_finite()) {
-                bail!("native decoder produced non-finite logits");
-            }
-            NativeCpuDecodeResult::Logits(logits)
-        };
-        self.last_hidden = match (&self.hidden_output, hidden) {
-            (Some(name), Some(tensor)) => Some(
-                extract_last_row(&tensor)
-                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
-            ),
-            (Some(name), None) => {
-                bail!("native decoder omitted declared hidden output '{name}'")
-            }
-            (None, _) => None,
-        };
+        let result = self.finalize_cpu_logits_and_hidden(logits, hidden, greedy)?;
         for (present, past) in &self.present_to_past {
             if !next_past.contains_key(past) {
                 bail!("native decoder omitted present output '{present}'");
@@ -2539,63 +2562,10 @@ impl NativeDecodeSession {
         }
 
         let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
-        let mut supplied = HashMap::with_capacity(supplied_inputs.len());
-        for (name, tensor) in supplied_inputs {
-            if supplied.insert(name.as_str(), tensor).is_some() {
-                bail!("native decode received duplicate routed step input '{name}'");
-            }
-        }
         // The KV ports are device-bound (present==past), so only the generated
         // and routed non-KV step inputs are fed as fresh host tensors here.
-        let mut owned = Vec::with_capacity(self.step_inputs.len());
-        for binding in &self.step_inputs {
-            let tensor = match binding.source {
-                NativeStepInputSource::TokenIds => {
-                    Tensor::from_i64(&[1, token_ids.len()], &ids)?
-                }
-                NativeStepInputSource::AttentionMask => {
-                    Tensor::from_i64(&[1, total_len], &vec![1; total_len])?
-                }
-                NativeStepInputSource::PositionIds => {
-                    let positions = (past_len..total_len)
-                        .map(|position| {
-                            i64::try_from(position).context("position id exceeds i64 range")
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    Tensor::from_i64(&[1, token_ids.len()], &positions)?
-                }
-                NativeStepInputSource::InputsEmbeds => supplied
-                    .remove(binding.name.as_str())
-                    .cloned()
-                    .with_context(|| {
-                        format!(
-                            "declared inputs_embeds input '{}' was not supplied to the native decode step; route the current embedding component output to this exact decoder port",
-                            binding.name
-                        )
-                    })?,
-                NativeStepInputSource::Routed => supplied
-                    .remove(binding.name.as_str())
-                    .cloned()
-                    .with_context(|| {
-                        format!(
-                            "native decode graph input '{}' has no generated role and no routed step tensor; declare a pipeline dataflow edge to this exact decoder port",
-                            binding.name
-                        )
-                    })?,
-            };
-            owned.push((binding.name.clone(), tensor));
-        }
-        if !supplied.is_empty() {
-            let mut unknown = supplied.keys().copied().collect::<Vec<_>>();
-            unknown.sort_unstable();
-            bail!(
-                "native decode received routed step inputs that are not declared graph ports: {unknown:?}"
-            );
-        }
+        let owned =
+            self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
@@ -2664,28 +2634,7 @@ impl NativeDecodeSession {
                 );
             }
         }
-        let logits = logits
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let result = if greedy {
-            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
-            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
-        } else {
-            let logits = extract_logits(&logits)?;
-            if logits.iter().flatten().any(|value| !value.is_finite()) {
-                bail!("native decoder produced non-finite logits");
-            }
-            NativeCpuDecodeResult::Logits(logits)
-        };
-        self.last_hidden = match (&self.hidden_output, hidden) {
-            (Some(name), Some(tensor)) => Some(
-                extract_last_row(&tensor)
-                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
-            ),
-            (Some(name), None) => {
-                bail!("native decoder omitted declared hidden output '{name}'")
-            }
-            (None, _) => None,
-        };
+        let result = self.finalize_cpu_logits_and_hidden(logits, hidden, greedy)?;
         drop(fetch_span);
 
         self.current_len = total_len;
@@ -2958,26 +2907,15 @@ fn optional_declared_or_detected_output(
 }
 
 fn is_past_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("past_key_values.") || lower.starts_with("past.")
+    has_past_prefix(name, KvNamingConvention::Dotted)
 }
 
 fn is_present_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with("present_key_values.") || lower.starts_with("present.")
+    has_present_prefix(name, KvNamingConvention::Dotted)
 }
 
 fn matching_past_name(output: &str, inputs: &[String]) -> Option<String> {
-    let lower = output.to_ascii_lowercase();
-    let suffix = lower
-        .strip_prefix("present_key_values.")
-        .or_else(|| lower.strip_prefix("present."))?;
-    inputs.iter().find_map(|input| {
-        let input_lower = input.to_ascii_lowercase();
-        (input_lower.strip_prefix("past_key_values.") == Some(suffix)
-            || input_lower.strip_prefix("past.") == Some(suffix))
-        .then(|| input.clone())
-    })
+    matching_past_input(output, inputs, KvNamingConvention::Dotted).cloned()
 }
 
 fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {

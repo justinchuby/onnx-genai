@@ -17,6 +17,10 @@ use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
 use onnx_genai_metadata::{InferenceMetadata, LoopStatePair, PositionProgram};
+use onnx_genai_ort::decode_contract::{
+    KvNamingConvention, matching_past_input as decode_contract_matching_past_input,
+    name_contains_past_key_value, name_contains_present_key_value,
+};
 use onnx_genai_ort::{
     DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams, Session,
     StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
@@ -2899,46 +2903,18 @@ fn concat_value_axis(first: &Value, second: &Value, axis: usize) -> anyhow::Resu
 }
 
 pub(crate) fn is_kv_input(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("past") && (lower.contains("key") || lower.contains("value"))
+    name_contains_past_key_value(name)
 }
 
 pub(crate) fn is_present_output(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("present") && (lower.contains("key") || lower.contains("value"))
+    name_contains_present_key_value(name)
 }
 
 pub(crate) fn matching_past_input<'a>(
     present_name: &str,
     inputs: &'a [String],
 ) -> Option<&'a String> {
-    let present_suffix = kv_suffix(present_name)?;
-    inputs
-        .iter()
-        .find(|input| kv_suffix(input).as_deref() == Some(present_suffix.as_str()))
-}
-
-fn kv_suffix(name: &str) -> Option<String> {
-    let lower = name.to_ascii_lowercase();
-    for prefix in [
-        "past_key_values.",
-        "present_key_values.",
-        "past.",
-        "present.",
-        // Encoder-decoder self-attention KV (e.g. Whisper `past_key_self_%d` /
-        // `present_key_self_%d`). Generic `past_`/`present_` stripping pairs the
-        // self-KV past input with its present output while giving cross-attention
-        // ports (`past_key_cross_%d`) a distinct suffix so they are never matched
-        // as a growing self-KV layer. Checked last so the dotted conventions
-        // above keep their existing, more specific pairing.
-        "past_",
-        "present_",
-    ] {
-        if let Some(suffix) = lower.strip_prefix(prefix) {
-            return Some(suffix.to_string());
-        }
-    }
-    None
+    decode_contract_matching_past_input(present_name, inputs, KvNamingConvention::DottedAndGeneric)
 }
 
 pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {

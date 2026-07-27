@@ -14,7 +14,7 @@ use crate::decode::{
 use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
 };
-use crate::engine::Engine;
+use crate::engine::{Engine, MISSING_ORT_SESSION};
 use crate::kv_bridge::{
     common_prefix_len, mirror_present_kv_to_pages, rewind_draft_state_to_len,
     rewind_target_state_to_len, trim_overmaterialized_target_kv,
@@ -1227,7 +1227,7 @@ impl Engine {
                     let (logits, hidden) = next_session_token_logits_and_hidden(
                         self.session
                             .as_deref()
-                            .expect("ORT backend must own a decoder session"),
+                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
@@ -1245,7 +1245,7 @@ impl Engine {
                     let (logits, layers) = next_session_token_logits_and_hiddens(
                         self.session
                             .as_deref()
-                            .expect("ORT backend must own a decoder session"),
+                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
@@ -1270,7 +1270,7 @@ impl Engine {
                     let (logits, hidden) = next_session_token_logits_and_hidden(
                         self.session
                             .as_deref()
-                            .expect("ORT backend must own a decoder session"),
+                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
@@ -1283,7 +1283,7 @@ impl Engine {
                         next_session_token_logits(
                             self.session
                                 .as_deref()
-                                .expect("ORT backend must own a decoder session"),
+                                .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                             self.kv_model.as_ref(),
                             &mut self.kv_cache,
                             session_id,
@@ -1394,7 +1394,7 @@ impl Engine {
                 let outputs = run_decode_step(
                     self.session
                         .as_deref()
-                        .expect("ORT backend must own a decoder session"),
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                     &mut state.decode_state,
                     &draft_tokens,
                     base_len,
@@ -1404,7 +1404,7 @@ impl Engine {
                         mirror_present_kv_to_pages(
                             self.session
                                 .as_deref()
-                                .expect("ORT backend must own a decoder session"),
+                                .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                             kv_model,
                             &mut self.kv_cache,
                             session_id,
@@ -1430,7 +1430,7 @@ impl Engine {
                 extract_logits_sequence_with_io(
                     self.session
                         .as_deref()
-                        .expect("ORT backend must own a decoder session"),
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                     outputs,
                     state.decode_state.io.logits_output.as_deref(),
                 )?
@@ -1502,7 +1502,7 @@ impl Engine {
             rewind_target_state_to_len(
                 self.session
                     .as_deref()
-                    .expect("ORT backend must own a decoder session"),
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                 self.kv_model.as_ref(),
                 &mut self.kv_cache,
                 session_id,
@@ -1618,7 +1618,7 @@ impl Engine {
                     trim_overmaterialized_target_kv(
                         self.session
                             .as_deref()
-                            .expect("ORT backend must own a decoder session"),
+                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
                         self.kv_model.as_ref(),
                         &mut self.kv_cache,
                         session_id,
