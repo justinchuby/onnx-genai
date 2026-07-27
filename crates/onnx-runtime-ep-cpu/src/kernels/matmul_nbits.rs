@@ -1463,11 +1463,28 @@ fn configured_decode_threads() -> Option<usize> {
 pub fn configured_persistent_decode_threads() -> Option<usize> {
     let value = std::env::var(DECODE_THREADS_ENV).ok();
     let available = available_parallelism();
-    resolve_persistent_decode_threads_with_override(
+    let threads = resolve_persistent_decode_threads_with_override(
         decode_threads_override(),
         value.as_deref(),
         available,
-    )
+    );
+    // On Apple Silicon, when no explicit thread count was set, override the
+    // generic `available/2` default with `P_cores - 1`. The SPMD dispatcher
+    // thread spin-waits on completion counters, occupying one P-core; using
+    // P_cores - 1 workers fills the performance cluster exactly. This is
+    // derived at runtime from `hw.perflevel0.physicalcpu` and generalizes
+    // across all Apple Silicon tiers. Falls back silently on Intel Macs.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if decode_threads_override().is_none()
+        && value
+            .as_deref()
+            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err())
+        && let Some(perf_cores) = performance_core_count()
+    {
+        let override_threads = perf_cores.saturating_sub(1).max(1).min(available);
+        return Some(override_threads);
+    }
+    threads
 }
 
 /// Set or clear a process-local CPU decode worker budget.
@@ -1613,6 +1630,31 @@ pub fn bound_process_to_decode_budget() {
 fn default_persistent_threads(available: usize) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
     Some((available / 2).max(1))
+}
+
+/// Query the performance-core count on Apple Silicon via sysctl.
+/// Returns `None` on Intel Macs or if the query fails.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn performance_core_count() -> Option<usize> {
+    use std::ffi::CString;
+    let name = CString::new("hw.perflevel0.physicalcpu").ok()?;
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: sysctlbyname reads a kernel sysctl into a correctly-sized buffer.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &raw mut value as *mut std::ffi::c_void,
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
 }
 
 /// Resolve the persistent-pool worker count from the raw `ONNX_GENAI_CPU_DECODE_THREADS`
@@ -2201,11 +2243,16 @@ pub fn with_decode_pool_scope<R: Send>(
     model_uses_spmd_pool: bool,
     f: impl FnOnce() -> R + Send,
 ) -> R {
-    // Dense-f32 decode gains nothing from the spinning SPMD / numa-split worker
-    // sets and loses cores to them, so unless the persistent pool was explicitly
-    // forced on it skips them and runs on the bounded, non-spinning dense pool
-    // (which the multi-threaded MLAS GEMM tiles across). Keying off model op-mix
-    // (quantized vs dense), not model identity, keeps this general.
+    // The persistent SPMD pool benefits both quantized and dense-f32 models when
+    // the NEON GEMV kernel dispatches to it (aarch64 without MLAS). With MLAS the
+    // SPMD workers contend with the MLAS GEMM's own Rayon workers, so the pool
+    // is skipped. Without MLAS, let the auto-calibrator measure both paths and
+    // adopt the pool only when it is faster (no regression under load).
+    #[cfg(not(feature = "mlas"))]
+    let spmd_pool_eligible = model_uses_spmd_pool
+        || crate::decode_spmd::is_forced()
+        || crate::decode_spmd::pools().is_some(); // auto-calibration for dense FP32
+    #[cfg(feature = "mlas")]
     let spmd_pool_eligible = model_uses_spmd_pool || crate::decode_spmd::is_forced();
     if !spmd_pool_eligible {
         return with_dense_decode_pool_scope(f);

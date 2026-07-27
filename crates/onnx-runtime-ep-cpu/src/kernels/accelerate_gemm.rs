@@ -1,20 +1,15 @@
 //! Apple Accelerate + NEON GEMV for the M=1 decode hot path.
 //!
-//! Four routes, selected per-op by matrix size vs the L2 cache threshold:
+//! Three routes, selected per-op by matrix geometry:
 //!
 //! - `sgemm`: Accelerate `cblas_sgemm` for M>1 prefill (reaches AMX).
-//! - `sgemv_accelerate`: Accelerate `cblas_sgemv` for M=1 decode when the
-//!   weight matrix fits in L2 (measured 106-156 GB/s on Apple Silicon).
 //! - `neon_gemv_col_parallel`: Column-parallel NEON GEMV on pre-transposed B
-//!   for DRAM-bound M=1 decode (65-93 GB/s with Rayon on M1 Max).
+//!   for M=1 decode (65-93 GB/s with Rayon on M1 Max).
 //! - `neon_gemv_parallel`: Row-parallel NEON GEMV fallback for M=1 when
 //!   pre-transposed B is not available.
 
-use std::sync::OnceLock;
-
 const CBLAS_ROW_MAJOR: i32 = 101;
 const CBLAS_NO_TRANS: i32 = 111;
-const CBLAS_TRANS: i32 = 112;
 
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
@@ -33,21 +28,6 @@ unsafe extern "C" {
         beta: f32,
         c: *mut f32,
         ldc: i32,
-    );
-
-    fn cblas_sgemv(
-        order: i32,
-        trans: i32,
-        m: i32,
-        n: i32,
-        alpha: f32,
-        a: *const f32,
-        lda: i32,
-        x: *const f32,
-        incx: i32,
-        beta: f32,
-        y: *mut f32,
-        incy: i32,
     );
 }
 
@@ -72,87 +52,6 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) 
             0.0,
             c.as_mut_ptr(),
             n as i32,
-        );
-    }
-}
-
-// ─── L2-aware Accelerate sgemv for small matrices ───────────────────
-
-/// Runtime-queried L2 cache size for the performance core cluster.
-/// Used to decide whether a weight matrix is L2-resident (→ Accelerate sgemv)
-/// or DRAM-bound (→ NEON column-parallel GEMV).
-fn l2_cache_bytes() -> usize {
-    static L2: OnceLock<usize> = OnceLock::new();
-    *L2.get_or_init(|| {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            query_sysctl_usize("hw.perflevel0.l2cachesize")
-                .or_else(|| query_sysctl_usize("hw.l2cachesize"))
-                .unwrap_or(4 * 1024 * 1024) // conservative 4 MB default
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        {
-            4 * 1024 * 1024
-        }
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn query_sysctl_usize(name: &str) -> Option<usize> {
-    use std::ffi::CString;
-    let cname = CString::new(name).ok()?;
-    let mut value: u64 = 0;
-    let mut size = std::mem::size_of::<u64>();
-    // SAFETY: sysctlbyname reads a kernel sysctl value into the provided buffer.
-    // The buffer is correctly sized for a u64 value.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            cname.as_ptr(),
-            &raw mut value as *mut std::ffi::c_void,
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 { Some(value as usize) } else { None }
-}
-
-/// Whether a weight matrix of `weight_bytes` bytes is L2-resident and should
-/// use Accelerate's `cblas_sgemv` (which reaches 106-156 GB/s via AMX on Apple
-/// Silicon) rather than the NEON column-parallel GEMV (65-93 GB/s on DRAM).
-///
-/// The threshold is L2_cache_size / 2 — leaving room for the activation vector,
-/// output buffer, and Accelerate's internal workspace. Derived at runtime from
-/// `hw.perflevel0.l2cachesize` so it adapts across Apple Silicon tiers.
-pub fn is_l2_resident(weight_bytes: usize) -> bool {
-    weight_bytes <= l2_cache_bytes() / 2
-}
-
-/// y[n] = x[k] @ B[k,n] via Accelerate `cblas_sgemv` for L2-resident matrices.
-///
-/// Uses row-major CblasNoTrans: A is [K,N], x is length-K, y is length-N.
-/// Accelerate threads internally via GCD — do NOT call from inside a Rayon
-/// parallel region (measured 4× bandwidth drop from oversubscription).
-pub fn sgemv_accelerate(x: &[f32], b: &[f32], y: &mut [f32], k: usize, n: usize) {
-    debug_assert_eq!(x.len(), k);
-    debug_assert_eq!(b.len(), k * n);
-    debug_assert_eq!(y.len(), n);
-    // CblasRowMajor, CblasTrans: y = alpha * A^T * x + beta * y
-    // where A is [K,N] row-major, so A^T is [N,K] — exactly B^T @ x.
-    unsafe {
-        cblas_sgemv(
-            CBLAS_ROW_MAJOR,
-            CBLAS_TRANS,
-            k as i32,
-            n as i32,
-            1.0,
-            b.as_ptr(),
-            n as i32,
-            x.as_ptr(),
-            1,
-            0.0,
-            y.as_mut_ptr(),
-            1,
         );
     }
 }
@@ -612,55 +511,6 @@ mod tests {
         assert!(
             max_rel < 0.02,
             "col_parallel model-scale max relative error {max_rel} exceeds 2%"
-        );
-    }
-
-    #[test]
-    fn sgemv_accelerate_matches_reference() {
-        let (k, n) = (896, 896);
-        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.001).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 1000) as f32) * 0.0001).collect();
-        let mut y = vec![0.0f32; n];
-        sgemv_accelerate(&x, &b, &mut y, k, n);
-        let ref_y = reference_gemv(&x, &b, k, n);
-        let max_rel = y
-            .iter()
-            .zip(&ref_y)
-            .filter(|(_, r)| r.abs() > 1e-6)
-            .map(|(a, r)| ((a - r) / r).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_rel < 1e-5,
-            "sgemv_accelerate max relative error {max_rel} exceeds 1e-5"
-        );
-    }
-
-    #[test]
-    fn sgemv_accelerate_small_matches_reference() {
-        let (k, n) = (896, 128);
-        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 100) as f32) * 0.001).collect();
-        let mut y = vec![0.0f32; n];
-        sgemv_accelerate(&x, &b, &mut y, k, n);
-        let ref_y = reference_gemv(&x, &b, k, n);
-        let max_err = y
-            .iter()
-            .zip(&ref_y)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_err < 1e-3,
-            "sgemv_accelerate [896,128] max error {max_err} exceeds 1e-3"
-        );
-    }
-
-    #[test]
-    fn l2_threshold_query_returns_positive() {
-        let l2 = l2_cache_bytes();
-        assert!(l2 > 0, "L2 cache size should be positive, got {l2}");
-        assert!(
-            l2 >= 1024 * 1024,
-            "L2 cache size {l2} seems too small (< 1 MB)"
         );
     }
 }

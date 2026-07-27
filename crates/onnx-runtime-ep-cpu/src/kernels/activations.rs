@@ -350,9 +350,9 @@ pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
 
 /// NEON-vectorized SiLU: `x / (1 + exp(-x))`, processing 4 floats per iteration.
 ///
-/// Uses a Cephes-style exp polynomial with Cody-Waite range reduction for ~1 ULP
-/// f32 accuracy on the normal float range. Non-finite and extreme values are
-/// handled by clamping and the scalar fallback for the tail.
+/// Uses a Cephes-style exp polynomial with Cody-Waite range reduction. Measured
+/// worst-case error ~28 ULP on the normal f32 range ([-87, 88]). Non-finite and
+/// extreme values are handled by clamping and the scalar fallback for the tail.
 #[cfg(all(not(feature = "mlas"), target_arch = "aarch64"))]
 fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
     use std::arch::aarch64::*;
@@ -369,7 +369,6 @@ fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
         let log2ef = vdupq_n_f32(std::f32::consts::LOG2_E);
         let c1 = vdupq_n_f32(0.693359375_f32); // ln(2) high part (exact in f32)
         let c2 = vdupq_n_f32(-2.12194440e-4_f32); // ln(2) low part
-        let half = vdupq_n_f32(0.5_f32);
         let one = vdupq_n_f32(1.0_f32);
         // Polynomial coefficients for exp(r) on [-ln2/2, ln2/2]:
         // exp(r) ≈ 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
