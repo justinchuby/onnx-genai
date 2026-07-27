@@ -416,6 +416,130 @@ impl Executor {
         mut ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
     ) -> Result<Self> {
+        let execution_provider_fallback_report =
+            Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
+        // Topological order up front: also validates the selected graph is a DAG.
+        let order = graph.topological_order()?;
+        let weight_handles = {
+            let mut span = trace_span("session.lazy_weight_handles", "session");
+            let handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("handles", handles.len() as u64)
+                        .with("initializers", graph.initializers.len() as u64),
+                );
+            }
+            handles
+        };
+
+        let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
+            Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
+
+        // 2) Record the loader shape + dtype of every remaining value (graph
+        //    inputs and node outputs). No allocation yet — shapes may be
+        //    symbolic and are only sized once resolved.
+        let has_symbols =
+            Self::collect_value_metadata(&graph, &order, &mut value_shapes, &mut value_dtypes);
+
+        let (sequence_values, control_flow_output_values) =
+            Self::classify_special_values(&graph, &order);
+
+        // 3) Build the structural per-node plan.
+        let plan = Self::build_node_plan(&graph, &order, &value_dtypes, has_symbols);
+
+        // 4) name → value id and the set of caller-required inputs.
+        let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
+
+        let mut exec = Self {
+            graph,
+            weights,
+            ep,
+            weight_handles,
+            buffers,
+            buffer_shapes,
+            value_shapes,
+            value_dtypes,
+            plan,
+            input_index,
+            required_inputs,
+            has_symbols,
+            cache: KernelCache::default(),
+            name_index,
+            subgraph_execs: HashMap::new(),
+            control_flow_stats: ControlFlowStats::default(),
+            if_last_predicate: HashMap::new(),
+            device_graph_signature: None,
+            capture_schedule: None,
+            capture_segmentation: Vec::new(),
+            control_flow_output_values,
+            capture_cf_shapes: HashMap::new(),
+            capture_warm_signature: None,
+            capture_warm_shapes: HashMap::new(),
+            capture_warm_seeded: HashMap::new(),
+            capture_quarantine_ops: HashSet::new(),
+            last_capture_failed_node: None,
+            views: HashMap::new(),
+            pinned: HashSet::new(),
+            sequence_values,
+            shared_buffers: HashMap::new(),
+            sequences: HashMap::new(),
+            seq_elem_values: HashMap::new(),
+            execution_provider_fallback_report,
+            trace: TraceContext::noop(),
+            scratch_input_shapes: Vec::new(),
+            decode_memo_enabled: decode_memo_env_enabled(),
+            decode_memo_verify: cfg!(debug_assertions) || decode_memo_verify_env_enabled(),
+            decode_memo: None,
+            decode_memo_prev_bindings: None,
+            decode_memo_last_action: DecodeMemoAction::Disabled,
+            decode_memo_resolved: HashMap::new(),
+            decode_memo_primed_count: 0,
+            decode_memo_rebuilt_count: 0,
+            decode_memo_replayed_count: 0,
+            decode_memo_ineligible_count: 0,
+            decode_view_plan: None,
+            decode_views_reused_count: 0,
+            decode_dispatch_elided_count: 0,
+            decode_view_plan_sig_mismatch_streak: 0,
+            decode_view_plan_disabled: false,
+        };
+
+        // 5) Fully-static graphs are materialized eagerly (buffers + the whole
+        //    "compiled plan" of kernels), so the first `run` sees only cache
+        //    hits. Symbolic graphs cannot be sized until a `run` fixes their
+        //    shapes, so their buffers/kernels are created on first use.
+        if !exec.has_symbols {
+            let mut span = trace_span("session.static_materialize", "session");
+            let empty = HashMap::new();
+            let resolved = exec.resolve_all(&empty)?;
+            exec.size_buffers(&resolved)?;
+            exec.compile_all(&resolved)?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("resolved_values", resolved.len() as u64)
+                        .with("buffers", exec.buffers.len() as u64)
+                        .with("plan_len", exec.plan.len() as u64)
+                        .with("cache_entries", exec.cache.stats().entries as u64),
+                );
+            }
+        }
+        Ok(exec)
+    }
+
+    /// Place the graph on execution providers: reject incompatible graphs, run
+    /// the EP-scoped optimizer passes, and — when the requested CUDA EP cannot
+    /// cover the graph and CUDA is not required — fall back to the CPU EP.
+    /// Reassigns `graph` and `ep` in place and returns the fallback report (if
+    /// any) for the executor to retain. Preserves the `session.node_placement`
+    /// tracing span and every span argument.
+    fn place_graph(
+        graph: &mut Graph,
+        weights: &Arc<WeightStore>,
+        ep: &mut Arc<dyn ExecutionProvider>,
+        require_cuda: bool,
+    ) -> Result<Option<ExecutionProviderFallbackReport>> {
         let mut placement_span = trace_span("session.node_placement", "session");
         let requested_provider = placement_span.as_ref().map(|_| ep.name().to_string());
         let requested_device = placement_span
@@ -426,7 +550,7 @@ impl Executor {
         // optimizer postconditions recursively validate subgraphs and can
         // otherwise obscure the actionable If diagnostic with a structural
         // error from a malformed branch.
-        validate_control_flow_signatures(&graph)?;
+        validate_control_flow_signatures(graph)?;
         // Reject structurally invalid graphs (a non-DAG) and operators no EP can
         // run *before* EP optimizers run. An optimizer pass's postcondition
         // validation would otherwise obscure the actionable load-time diagnostic
@@ -434,12 +558,12 @@ impl Executor {
         // unsupported-operator error) with a structural error. Mirrors the
         // control-flow signature check above.
         graph.topological_order()?;
-        reject_unsupported_operators(&graph, ep.as_ref())?;
+        reject_unsupported_operators(graph, ep.as_ref())?;
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
-        run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
+        run_ep_scoped_passes(graph, weights, ep.as_ref())?;
         let ep_pass_nodes_after = graph.num_nodes();
-        let mut execution_provider_fallback_report = cuda_fallback_report(&graph, ep.as_ref());
+        let mut execution_provider_fallback_report = cuda_fallback_report(graph, ep.as_ref());
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
             .map_or(0, |report| report.declines.len());
@@ -449,11 +573,11 @@ impl Executor {
                     unsupported_nodes: report.to_string(),
                 });
             }
-            graph = graph_before_ep_passes;
-            ep = auto_detect_cpu_ep()?;
-            run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
+            *graph = graph_before_ep_passes;
+            *ep = auto_detect_cpu_ep()?;
+            run_ep_scoped_passes(graph, weights, ep.as_ref())?;
             let mut assigned_ops = BTreeSet::new();
-            report.assigned_node_count = collect_executable_ops(&graph, &mut assigned_ops);
+            report.assigned_node_count = collect_executable_ops(graph, &mut assigned_ops);
             report.assigned_ops = assigned_ops.into_iter().collect();
             eprintln!(
                 "[onnx-genai-warning] {report}. Set ONNX_GENAI_REQUIRE_CUDA=1 to reject this fallback"
@@ -461,7 +585,7 @@ impl Executor {
         }
         if let Some(span) = placement_span.as_mut() {
             let mut assigned_ops = BTreeSet::new();
-            let assigned_nodes = collect_executable_ops(&graph, &mut assigned_ops);
+            let assigned_nodes = collect_executable_ops(graph, &mut assigned_ops);
             span.set_args(
                 Args::new()
                     .with("requested_provider", requested_provider.unwrap_or_default())
@@ -481,33 +605,34 @@ impl Executor {
             );
         }
         drop(placement_span);
-        // Topological order up front: also validates the selected graph is a DAG.
-        let order = graph.topological_order()?;
-        let weight_handles = {
-            let mut span = trace_span("session.lazy_weight_handles", "session");
-            let handles = build_lazy_weight_handles(&graph, &weights, ep.as_ref())?;
-            if let Some(span) = span.as_mut() {
-                span.set_args(
-                    Args::new()
-                        .with("handles", handles.len() as u64)
-                        .with("initializers", graph.initializers.len() as u64),
-                );
-            }
-            handles
-        };
+        Ok(execution_provider_fallback_report)
+    }
 
+    /// Record initializer metadata and back resident consumers with a device
+    /// buffer. A non-host nxrt initializer used exclusively at the lazy
+    /// fused-MoE boundary deliberately has no eager buffer; the EP materializes
+    /// it through its WeightHandle on demand. If any resident consumer (or graph
+    /// output) coexists, no handle is built and the one eager buffer is shared by
+    /// every consumer. Host mmap bytes retain the existing zero-copy borrow path.
+    /// Preserves the `session.initializer_buffers` tracing span and its
+    /// arguments.
+    #[allow(clippy::type_complexity)]
+    fn materialize_initializers(
+        graph: &Graph,
+        weights: &Arc<WeightStore>,
+        ep: &dyn ExecutionProvider,
+        weight_handles: &HashMap<ValueId, WeightHandle>,
+    ) -> Result<(
+        HashMap<ValueId, Shape>,
+        HashMap<ValueId, DataType>,
+        HashMap<ValueId, DeviceBuffer>,
+        HashMap<ValueId, Vec<usize>>,
+    )> {
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
         let mut value_dtypes: HashMap<ValueId, DataType> = HashMap::new();
         let mut buffers: HashMap<ValueId, DeviceBuffer> = HashMap::new();
         let mut buffer_shapes: HashMap<ValueId, Vec<usize>> = HashMap::new();
 
-        // 1) Initializers: record metadata and back resident consumers with a
-        //    device buffer. A non-host nxrt initializer used exclusively at the
-        //    lazy fused-MoE boundary deliberately has no eager buffer; the EP
-        //    materializes it through its WeightHandle on demand. If any resident
-        //    consumer (or graph output) coexists, no handle is built and the one
-        //    eager buffer is shared by every consumer. Host mmap bytes retain the
-        //    existing zero-copy borrow path.
         let init_align = TensorLayout::contiguous().alignment;
         let mut initializer_span = trace_span("session.initializer_buffers", "session");
         let mut initializer_count = 0_u64;
@@ -592,17 +717,25 @@ impl Executor {
                     .with("buffers", buffers.len() as u64),
             );
         }
+        Ok((value_shapes, value_dtypes, buffers, buffer_shapes))
+    }
 
-        // 2) Record the loader shape + dtype of every remaining value (graph
-        //    inputs and node outputs). No allocation yet — shapes may be
-        //    symbolic and are only sized once resolved.
+    /// Record the loader shape + dtype of every remaining value (graph inputs
+    /// and node outputs). No allocation yet — shapes may be symbolic and are
+    /// only sized once resolved. Returns whether any recorded shape is symbolic.
+    fn collect_value_metadata(
+        graph: &Graph,
+        order: &[NodeId],
+        value_shapes: &mut HashMap<ValueId, Shape>,
+        value_dtypes: &mut HashMap<ValueId, DataType>,
+    ) -> bool {
         for &vid in &graph.inputs {
             value_shapes
                 .entry(vid)
                 .or_insert_with(|| graph.value(vid).shape.clone());
             value_dtypes.entry(vid).or_insert(graph.value(vid).dtype);
         }
-        for &nid in &order {
+        for &nid in order {
             for &out in &graph.node(nid).outputs {
                 value_shapes
                     .entry(out)
@@ -611,14 +744,21 @@ impl Executor {
             }
         }
 
-        let has_symbols = value_shapes.values().any(|s| as_static_shape(s).is_none());
+        value_shapes.values().any(|s| as_static_shape(s).is_none())
+    }
 
-        // Sequence-typed values own no tensor buffer: a Sequence op stores its
-        // list in `sequences` at run time. Mark every value produced by a
-        // sequence-producing op so buffer sizing skips it (and so a Sequence
-        // graph output is diagnosed cleanly rather than read as tensor bytes).
+    /// Classify values that need special buffer-sizing treatment: those produced
+    /// by a sequence-producing op (own no tensor buffer — a Sequence op stores
+    /// its list in `sequences` at run time) and the outputs of every
+    /// control-flow node (seeded into the capture plan so downstream capturable
+    /// consumers do not each form an eager seam). Returns
+    /// `(sequence_values, control_flow_output_values)`.
+    fn classify_special_values(
+        graph: &Graph,
+        order: &[NodeId],
+    ) -> (HashSet<ValueId>, HashSet<ValueId>) {
         let mut sequence_values: HashSet<ValueId> = HashSet::new();
-        for &nid in &order {
+        for &nid in order {
             let node = graph.node(nid);
             if produces_sequence_output(&node.op_type, &node.domain) {
                 for &out in &node.outputs {
@@ -627,11 +767,8 @@ impl Executor {
             }
         }
 
-        // Output value ids of every control-flow node, used to seed their
-        // concrete (branch-selected) shapes into the capture plan so downstream
-        // capturable consumers do not each form an eager seam.
         let mut control_flow_output_values: HashSet<ValueId> = HashSet::new();
-        for &nid in &order {
+        for &nid in order {
             let node = graph.node(nid);
             if is_control_flow_op(&node.op_type, &node.domain) {
                 for &out in &node.outputs {
@@ -640,11 +777,22 @@ impl Executor {
             }
         }
 
-        // 3) Build the structural per-node plan.
+        (sequence_values, control_flow_output_values)
+    }
+
+    /// Build the structural per-node plan in topological order, skipping
+    /// pre-compiled EPContext nodes. Preserves the `session.execution_plan`
+    /// tracing span and its arguments.
+    fn build_node_plan(
+        graph: &Graph,
+        order: &[NodeId],
+        value_dtypes: &HashMap<ValueId, DataType>,
+        has_symbols: bool,
+    ) -> Vec<NodePlan> {
         let mut plan_span = trace_span("session.execution_plan", "session");
         let mut plan = Vec::with_capacity(order.len());
         let mut skipped_epcontext = 0_u64;
-        for &nid in &order {
+        for &nid in order {
             let node = graph.node(nid);
             // EPContext nodes are pre-compiled: they bypass placement and were
             // already restored through their owning EP by the session's
@@ -695,8 +843,21 @@ impl Executor {
                     .with("has_symbols", has_symbols),
             );
         }
+        plan
+    }
 
-        // 4) name → value id and the set of caller-required inputs.
+    /// Build the name → value id indexes. Returns `(input_index,
+    /// required_inputs, name_index)`: the caller-input name map and the set of
+    /// caller-required inputs (graph inputs that are not pre-filled
+    /// initializers), plus the full name → value id map over every named value
+    /// (used to resolve a nested subgraph's outer-scope captures by name).
+    fn build_name_indexes(
+        graph: &Graph,
+    ) -> (
+        HashMap<String, ValueId>,
+        Vec<ValueId>,
+        HashMap<String, ValueId>,
+    ) {
         let mut input_index = HashMap::new();
         let mut required_inputs = Vec::new();
         for &vid in &graph.inputs {
@@ -709,8 +870,6 @@ impl Executor {
             }
         }
 
-        // Full name → value id map (every named value in the graph), used to
-        // resolve a nested subgraph's outer-scope captures by name.
         let mut name_index = HashMap::new();
         for (vid, value) in graph.values.iter() {
             if let Some(name) = &value.name {
@@ -718,81 +877,7 @@ impl Executor {
             }
         }
 
-        let mut exec = Self {
-            graph,
-            weights,
-            ep,
-            weight_handles,
-            buffers,
-            buffer_shapes,
-            value_shapes,
-            value_dtypes,
-            plan,
-            input_index,
-            required_inputs,
-            has_symbols,
-            cache: KernelCache::default(),
-            name_index,
-            subgraph_execs: HashMap::new(),
-            control_flow_stats: ControlFlowStats::default(),
-            if_last_predicate: HashMap::new(),
-            device_graph_signature: None,
-            capture_schedule: None,
-            capture_segmentation: Vec::new(),
-            control_flow_output_values,
-            capture_cf_shapes: HashMap::new(),
-            capture_warm_signature: None,
-            capture_warm_shapes: HashMap::new(),
-            capture_warm_seeded: HashMap::new(),
-            capture_quarantine_ops: HashSet::new(),
-            last_capture_failed_node: None,
-            views: HashMap::new(),
-            pinned: HashSet::new(),
-            sequence_values,
-            shared_buffers: HashMap::new(),
-            sequences: HashMap::new(),
-            seq_elem_values: HashMap::new(),
-            execution_provider_fallback_report,
-            trace: TraceContext::noop(),
-            scratch_input_shapes: Vec::new(),
-            decode_memo_enabled: decode_memo_env_enabled(),
-            decode_memo_verify: cfg!(debug_assertions) || decode_memo_verify_env_enabled(),
-            decode_memo: None,
-            decode_memo_prev_bindings: None,
-            decode_memo_last_action: DecodeMemoAction::Disabled,
-            decode_memo_resolved: HashMap::new(),
-            decode_memo_primed_count: 0,
-            decode_memo_rebuilt_count: 0,
-            decode_memo_replayed_count: 0,
-            decode_memo_ineligible_count: 0,
-            decode_view_plan: None,
-            decode_views_reused_count: 0,
-            decode_dispatch_elided_count: 0,
-            decode_view_plan_sig_mismatch_streak: 0,
-            decode_view_plan_disabled: false,
-        };
-
-        // 5) Fully-static graphs are materialized eagerly (buffers + the whole
-        //    "compiled plan" of kernels), so the first `run` sees only cache
-        //    hits. Symbolic graphs cannot be sized until a `run` fixes their
-        //    shapes, so their buffers/kernels are created on first use.
-        if !exec.has_symbols {
-            let mut span = trace_span("session.static_materialize", "session");
-            let empty = HashMap::new();
-            let resolved = exec.resolve_all(&empty)?;
-            exec.size_buffers(&resolved)?;
-            exec.compile_all(&resolved)?;
-            if let Some(span) = span.as_mut() {
-                span.set_args(
-                    Args::new()
-                        .with("resolved_values", resolved.len() as u64)
-                        .with("buffers", exec.buffers.len() as u64)
-                        .with("plan_len", exec.plan.len() as u64)
-                        .with("cache_entries", exec.cache.stats().entries as u64),
-                );
-            }
-        }
-        Ok(exec)
+        (input_index, required_inputs, name_index)
     }
 
     /// Allocate `vid`'s buffer for `dims`, or reuse the existing allocation when
