@@ -19,8 +19,9 @@ pub use split::{SplitSpec, split, split_tensor};
 pub use tensor::SeqTensor;
 pub use value::SequenceValue;
 
+pub(crate) use tensor::clone_shape;
 use tensor::{
-    addressable, checked_add, checked_mul, checked_product, clone_shape, normalize_axis, overflow,
+    addressable, checked_add, checked_mul, checked_product, normalize_axis, overflow,
     validate_view_bounds, zeroed_bytes,
 };
 
