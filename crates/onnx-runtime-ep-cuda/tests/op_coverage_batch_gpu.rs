@@ -137,6 +137,25 @@ fn run_cuda(
         .iter()
         .map(|tensor| tensor.shape.clone())
         .collect::<Vec<_>>();
+    // The claim gate (`supports_op`) must accept exactly the nodes we run so a
+    // graph partitioner keeps them on CUDA rather than falling back to the CPU EP.
+    let claim_shapes = inputs
+        .iter()
+        .map(|tensor| static_shape(tensor.shape.iter().copied()))
+        .collect::<Vec<_>>();
+    let claim_dtypes = inputs.iter().map(|tensor| tensor.dtype).collect::<Vec<_>>();
+    let claim = ep.supports_op(
+        model.graph.node(node_id),
+        opset,
+        &claim_shapes,
+        &claim_dtypes,
+        &[],
+    );
+    assert!(
+        claim.is_supported(),
+        "{op} (opset {opset}) must be claimed by the CUDA EP, got: {:?}",
+        claim.reason()
+    );
     let kernel = ep
         .get_kernel(model.graph.node(node_id), &concrete_shapes, opset)
         .unwrap();
@@ -444,4 +463,316 @@ fn trilu_matches_cpu() {
         }
     }
     eprintln!("Trilu: CUDA matches CPU EP across upper/lower, k offsets, f32/i64");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #67 coverage batch 2: extended reductions (`ReduceProd`,
+// `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, `ReduceLogSumExp`),
+// extended activations (`Swish`, `ThresholdedRelu`), the variadic elementwise
+// ops (`Sum`, `Mean`), and `Mod`. Every case compares the real CUDA kernel
+// against the CPU EP running the identical node.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Output shape for a reduction over `axes` (negative axes allowed) of an input
+/// with shape `in_shape`, honouring `keepdims`.
+fn reduce_out_shape(in_shape: &[usize], axes: &[i64], keepdims: bool) -> Vec<usize> {
+    let rank = in_shape.len() as i64;
+    let reduced: Vec<usize> = axes
+        .iter()
+        .map(|&a| {
+            if a < 0 {
+                (a + rank) as usize
+            } else {
+                a as usize
+            }
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (axis, &dim) in in_shape.iter().enumerate() {
+        if reduced.contains(&axis) {
+            if keepdims {
+                out.push(1);
+            }
+        } else {
+            out.push(dim);
+        }
+    }
+    out
+}
+
+/// Extended f32 reductions across several axes / keepdims combinations, compared
+/// against the CPU EP element-wise. Inputs are strictly positive so `ReduceLogSum`
+/// (`log(sum(x))`) stays well defined.
+#[test]
+fn extended_reductions_match_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    let in_shape = vec![2usize, 3, 4];
+    let count: usize = in_shape.iter().product();
+    // Positive, mildly varied magnitudes keep every reduction well conditioned.
+    let values: Vec<f32> = (0..count)
+        .map(|v| 0.5 + (v % 7) as f32 * 0.3 + (v % 3) as f32 * 0.1)
+        .collect();
+
+    let axes_cases: &[(&[i64], bool)] = &[
+        (&[1], true),
+        (&[1], false),
+        (&[0, 2], false),
+        (&[-1], false),
+        (&[0, 1, 2], true),
+    ];
+    for op in [
+        "ReduceProd",
+        "ReduceSumSquare",
+        "ReduceL1",
+        "ReduceL2",
+        "ReduceLogSum",
+        "ReduceLogSumExp",
+    ] {
+        for &(axes, keepdims) in axes_cases {
+            let out_shape = reduce_out_shape(&in_shape, axes, keepdims);
+            let inputs = [input(DataType::Float32, &in_shape, &values)];
+            let outputs = [(DataType::Float32, out_shape.clone())];
+            let attrs = [
+                ("axes", Attribute::Ints(axes.to_vec())),
+                ("keepdims", Attribute::Int(keepdims as i64)),
+            ];
+            let cuda = run_cuda(&ep, op, 13, &inputs, &outputs, &attrs);
+            let cpu = run_cpu(op, 13, &inputs, &outputs, &attrs);
+            let cuda_f = decode_floats(&cuda[0], DataType::Float32);
+            let cpu_f = decode_floats(&cpu[0], DataType::Float32);
+            // Reductions accumulate in f32; the surviving difference is a few ulp
+            // scaled by the reduced magnitude (products/log-sum-exp are largest).
+            assert_close(op, DataType::Float32, &cuda_f, &cpu_f, 2e-2);
+        }
+        eprintln!("{op}: CUDA matches CPU EP across axes/keepdims");
+    }
+}
+
+/// `ReduceLogSumExp` with the opset-18 axes-*input* form (rather than an
+/// attribute) exercises the kernel's device-side axes read.
+#[test]
+fn reduce_log_sum_exp_axes_input_matches_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    let in_shape = vec![2usize, 3, 4];
+    let count: usize = in_shape.iter().product();
+    let values: Vec<f32> = (0..count).map(|v| (v as f32 * 0.17) - 2.0).collect();
+    let axes: Vec<i64> = vec![2];
+    let out_shape = reduce_out_shape(&in_shape, &axes, false);
+    let inputs = [
+        input(DataType::Float32, &in_shape, &values),
+        input(DataType::Int64, &[axes.len()], &axes),
+    ];
+    let outputs = [(DataType::Float32, out_shape)];
+    let attrs = [("keepdims", Attribute::Int(0))];
+    let cuda = run_cuda(&ep, "ReduceLogSumExp", 18, &inputs, &outputs, &attrs);
+    let cpu = run_cpu("ReduceLogSumExp", 18, &inputs, &outputs, &attrs);
+    let cuda_f = decode_floats(&cuda[0], DataType::Float32);
+    let cpu_f = decode_floats(&cpu[0], DataType::Float32);
+    assert_close("ReduceLogSumExp", DataType::Float32, &cuda_f, &cpu_f, 2e-3);
+    eprintln!("ReduceLogSumExp (axes-input, opset 18): CUDA matches CPU EP");
+}
+
+/// Regression guard for the numerical-stability defect fixed in PR #266: a naive
+/// `log(sum(exp(x)))` overflows to `+inf` for large-magnitude inputs, while the
+/// CPU EP (and now the CUDA kernel) stabilizes as `m + log(sum(exp(x - m)))`.
+/// These inputs (≈90 and a wide negative-to-positive spread) return `+inf` under
+/// the old naive kernel, so this test fails on it and passes on the stable one.
+#[test]
+fn reduce_log_sum_exp_large_values_match_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    // Row 0: the classic overflow case `[90, 91, 92, 93]` (naive exp -> +inf).
+    // Row 1: a wide spread mixing large negatives and positives; exp(120) also
+    // overflows f32 (~3.4e38) without max-subtraction.
+    let in_shape = vec![2usize, 4];
+    let values: Vec<f32> = vec![90.0, 91.0, 92.0, 93.0, -100.0, 5.0, 120.0, -3.0];
+    let axes: Vec<i64> = vec![1];
+    let out_shape = reduce_out_shape(&in_shape, &axes, false);
+    let inputs = [input(DataType::Float32, &in_shape, &values)];
+    let outputs = [(DataType::Float32, out_shape)];
+    let attrs = [
+        ("axes", Attribute::Ints(axes.clone())),
+        ("keepdims", Attribute::Int(0)),
+    ];
+    let cuda = run_cuda(&ep, "ReduceLogSumExp", 13, &inputs, &outputs, &attrs);
+    let cpu = run_cpu("ReduceLogSumExp", 13, &inputs, &outputs, &attrs);
+    let cuda_f = decode_floats(&cuda[0], DataType::Float32);
+    let cpu_f = decode_floats(&cpu[0], DataType::Float32);
+    // The CPU reference must stay finite — proving the stabilization is the point
+    // of this test (a naive kernel would emit `+inf` here).
+    assert!(
+        cpu_f.iter().all(|v| v.is_finite()),
+        "CPU reference should be finite, got {cpu_f:?}"
+    );
+    assert!(
+        cuda_f.iter().all(|v| v.is_finite()),
+        "CUDA output overflowed (naive log(sum(exp))?): {cuda_f:?}"
+    );
+    assert_close("ReduceLogSumExp", DataType::Float32, &cuda_f, &cpu_f, 2e-3);
+    eprintln!("ReduceLogSumExp (large values): CUDA matches CPU EP, no overflow");
+}
+
+/// `Swish` and `ThresholdedRelu` across f32/f16/bf16 with default and explicit
+/// `alpha`, compared against the CPU EP.
+#[test]
+fn extended_activations_match_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    let values: &[f32] = &[-3.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0];
+    type ActivationCase = (&'static str, u64, Vec<(&'static str, Attribute)>);
+    let cases: Vec<ActivationCase> = vec![
+        ("Swish", 24, vec![]),
+        ("Swish", 24, vec![("alpha", Attribute::Float(0.5))]),
+        ("ThresholdedRelu", 10, vec![]),
+        (
+            "ThresholdedRelu",
+            10,
+            vec![("alpha", Attribute::Float(1.0))],
+        ),
+    ];
+    for (op, opset, attrs) in &cases {
+        let (op, opset) = (*op, *opset);
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let shape = vec![values.len()];
+            let inputs = [Tensor {
+                dtype,
+                shape: shape.clone(),
+                bytes: encode_floats(values, dtype),
+            }];
+            let outputs = [(dtype, shape.clone())];
+            let cuda = run_cuda(&ep, op, opset, &inputs, &outputs, attrs);
+            let cpu = run_cpu(op, opset, &inputs, &outputs, attrs);
+            let cuda_f = decode_floats(&cuda[0], dtype);
+            let cpu_f = decode_floats(&cpu[0], dtype);
+            let tolerance = match dtype {
+                DataType::Float32 => 1e-4,
+                DataType::Float16 => 3e-3,
+                DataType::BFloat16 => 3e-2,
+                _ => unreachable!(),
+            };
+            assert_close(op, dtype, &cuda_f, &cpu_f, tolerance);
+        }
+        eprintln!("{op} {attrs:?}: CUDA matches CPU EP across f32/f16/bf16");
+    }
+}
+
+/// `Sum` and `Mean` over a variadic, broadcasting input list across f32/f16/bf16,
+/// compared against the CPU EP.
+#[test]
+fn variadic_sum_mean_match_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    // Three operands with distinct broadcastable shapes -> output [2,3].
+    let a: &[f32] = &[1.0, -2.0, 3.0, -4.0, 5.0, -6.0];
+    let b: &[f32] = &[10.0, 20.0, 30.0];
+    let c: &[f32] = &[100.0, 200.0];
+    for op in ["Sum", "Mean"] {
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            let inputs = [
+                Tensor {
+                    dtype,
+                    shape: vec![2, 3],
+                    bytes: encode_floats(a, dtype),
+                },
+                Tensor {
+                    dtype,
+                    shape: vec![3],
+                    bytes: encode_floats(b, dtype),
+                },
+                Tensor {
+                    dtype,
+                    shape: vec![2, 1],
+                    bytes: encode_floats(c, dtype),
+                },
+            ];
+            let outputs = [(dtype, vec![2usize, 3])];
+            let cuda = run_cuda(&ep, op, 13, &inputs, &outputs, &[]);
+            let cpu = run_cpu(op, 13, &inputs, &outputs, &[]);
+            let cuda_f = decode_floats(&cuda[0], dtype);
+            let cpu_f = decode_floats(&cpu[0], dtype);
+            let tolerance = match dtype {
+                DataType::Float32 => 1e-4,
+                DataType::Float16 => 5e-1,
+                DataType::BFloat16 => 4.0,
+                _ => unreachable!(),
+            };
+            assert_close(op, dtype, &cuda_f, &cpu_f, tolerance);
+        }
+        eprintln!("{op}: CUDA matches CPU EP (variadic broadcasting)");
+    }
+}
+
+fn decode_i32(bytes: &[u8]) -> Vec<i32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+fn decode_i64(bytes: &[u8]) -> Vec<i64> {
+    bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// `Mod` parity against the CPU EP: f32 (`fmod=1`), plus i32/i64 in both the
+/// C-truncated (`fmod=1`) and Python floor (`fmod=0`) modes, including negative
+/// dividends and divisors and a divide-by-zero (defined to yield 0).
+#[test]
+fn mod_matches_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+
+    // Float Mod requires fmod=1 per ONNX.
+    let fa: &[f32] = &[5.3, -5.3, 7.5, -7.5, 2.0, -2.0];
+    let fb: &[f32] = &[2.0, 2.0, -2.5, -2.5, 3.0, 3.0];
+    let inputs = [
+        input(DataType::Float32, &[6], fa),
+        input(DataType::Float32, &[6], fb),
+    ];
+    let outputs = [(DataType::Float32, vec![6usize])];
+    let attrs = [("fmod", Attribute::Int(1))];
+    let cuda = run_cuda(&ep, "Mod", 13, &inputs, &outputs, &attrs);
+    let cpu = run_cpu("Mod", 13, &inputs, &outputs, &attrs);
+    assert_close(
+        "Mod",
+        DataType::Float32,
+        &decode_floats(&cuda[0], DataType::Float32),
+        &decode_floats(&cpu[0], DataType::Float32),
+        1e-5,
+    );
+
+    // Integer Mod: both modes, negative operands, and a zero divisor.
+    let ia: &[i64] = &[7, -7, 7, -7, 5, -5, 9];
+    let ib: &[i64] = &[3, 3, -3, -3, -2, 2, 0];
+    for fmod in [0_i64, 1] {
+        // i64
+        let inputs = [
+            input(DataType::Int64, &[7], ia),
+            input(DataType::Int64, &[7], ib),
+        ];
+        let outputs = [(DataType::Int64, vec![7usize])];
+        let attrs = [("fmod", Attribute::Int(fmod))];
+        let cuda = run_cuda(&ep, "Mod", 13, &inputs, &outputs, &attrs);
+        let cpu = run_cpu("Mod", 13, &inputs, &outputs, &attrs);
+        assert_eq!(
+            decode_i64(&cuda[0]),
+            decode_i64(&cpu[0]),
+            "Mod i64 fmod={fmod} mismatch"
+        );
+
+        // i32
+        let ia32: Vec<i32> = ia.iter().map(|&v| v as i32).collect();
+        let ib32: Vec<i32> = ib.iter().map(|&v| v as i32).collect();
+        let inputs = [
+            input(DataType::Int32, &[7], &ia32),
+            input(DataType::Int32, &[7], &ib32),
+        ];
+        let outputs = [(DataType::Int32, vec![7usize])];
+        let cuda = run_cuda(&ep, "Mod", 13, &inputs, &outputs, &attrs);
+        let cpu = run_cpu("Mod", 13, &inputs, &outputs, &attrs);
+        assert_eq!(
+            decode_i32(&cuda[0]),
+            decode_i32(&cpu[0]),
+            "Mod i32 fmod={fmod} mismatch"
+        );
+    }
+    eprintln!("Mod: CUDA matches CPU EP (f32 fmod=1; i32/i64 truncated + floor)");
 }
