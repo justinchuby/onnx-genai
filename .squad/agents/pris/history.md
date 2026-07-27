@@ -147,6 +147,14 @@ Revised the Phi decode lock after Holden's rejection: environment-gated real-mod
 - Without gating, these helpers compiled as dead code on x86_64 and x86, causing `-D warnings` CI failure.
 - Chose precise `cfg` gating over `#[allow(dead_code)]` to avoid silencing future genuine dead-code findings in this module.
 - Verified: `cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings` passes; native aarch64 clippy and 13 SDPA tests pass.
+
+## 2026-07-27T08:40:00-07:00 — Regression guard hardening: dispatch test + raised floors
+- Added `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` dispatch-reachability test with `GEMV_F16_TEST_HITS` atomic counter in `matmul.rs`. Uses f16×f16 M=1 tensors matching real model dtype.
+- Guard-break verified: test fails on current HEAD (before Iran's M=1 gate in `try_matmul_half`); passes with gate applied locally.
+- Raised FP32 absolute floor from 3.50 → 18.0 tok/s, roofline fraction from 0.30 → 0.35.
+- Added new FP16 floor test: absolute 28.0 tok/s, roofline fraction 0.25. Would have caught the 4.5× regression (13.37 < 28).
+- All machines check roofline fraction; measurement rig additionally checks absolute floor.
+- x86_64 cross-compile clean; aarch64 clippy clean; 132/133 matmul tests pass (1 expected failure: dispatch test correctly fails until Iran's fix lands).
 - Added aarch64-only `sdpa_f32_neon` parity coverage against scalar and f64 references on Qwen-style decode, odd/tail dimensions, masks/`-inf`, causal/softcap, and large-score softmax stability cases.
 - Added a dispatcher reach test proving `sdpa_f32(...)` executes the NEON path on Apple Silicon when MLAS is not selected.
 - Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.

@@ -56,6 +56,17 @@ mod accelerate_gemm;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) use accelerate_gemm::neon_gemv_f16_col_parallel;
 
+/// Test-only counter: incremented each time the FP16 GEMV decode path is reached
+/// inside [`MatMulKernel::execute_with_backend`]. Guards against dispatch
+/// regressions where a broader half-precision GEMM intercepts M=1 decode before
+/// the bandwidth-optimal GEMV.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "ios")
+))]
+static GEMV_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -502,6 +513,8 @@ impl MatMulKernel {
             && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
             && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n)
         {
+            #[cfg(all(test, target_arch = "aarch64"))]
+            GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let a_dense = self.prepack.dense(0, &inputs[0])?;
             let mut result = vec![0.0f32; geom.n];
             accelerate_gemm::neon_gemv_f16_col_parallel(
@@ -2200,5 +2213,49 @@ mod tests {
                 diff
             );
         }
+    }
+
+    /// Guard: an FP16 weight MatMul at M=1 (decode shape) must reach the NEON
+    /// GEMV path on Apple Silicon, not the half-precision blocked GEMM.  If the
+    /// dispatch order changes so `try_matmul_half` intercepts M=1 before the
+    /// GEMV, decode throughput drops ~4×.  This test would have caught the
+    /// `half_gemm.rs` regression that took native FP16 from 60→13 tok/s.
+    ///
+    /// Both A and B are Float16 to exercise the real fp16-model dispatch: the
+    /// regression occurs precisely when `try_matmul_half` matches (f16, f16) at
+    /// M=1 before the GEMV path can claim it.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn fp16_m1_decode_reaches_neon_gemv_not_half_gemm() {
+        use std::sync::atomic::Ordering;
+
+        let (k, n) = (64, 32);
+        let a_data: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = GEMV_F16_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = GEMV_F16_TEST_HITS.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "FP16 M=1 decode did not reach neon_gemv_f16_col_parallel — \
+             half_gemm.rs is likely intercepting M=1 before the GEMV path, \
+             which causes a ~4× decode throughput regression"
+        );
+        // Sanity: output should be finite
+        assert!(
+            out.to_f32().iter().all(|v| v.is_finite()),
+            "GEMV produced non-finite output"
+        );
     }
 }

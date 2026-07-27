@@ -647,7 +647,7 @@ fn run_direct_once(
         bail!("{} generated no tokens", backend.label());
     }
     let ttft = token_times[0];
-    let (decode_tokens, _decode_window, decode_tokens_per_second) =
+    let (_decode_tokens, _decode_window, decode_tokens_per_second) =
         decode_throughput(&token_times, generated_tokens, args.decode_skip).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} emitted too few timed tokens for decode throughput: tokens={} decode_skip={}",
