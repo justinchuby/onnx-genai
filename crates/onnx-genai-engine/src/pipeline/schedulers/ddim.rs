@@ -160,7 +160,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn ddim_new_rejects_invalid_step_counts() {
         assert!(DdimSchedule::with_schedule(1, 0.1, 0.2, "linear", 1).is_err()); // num_train < 2

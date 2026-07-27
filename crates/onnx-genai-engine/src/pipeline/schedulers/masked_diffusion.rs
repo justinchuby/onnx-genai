@@ -337,8 +337,8 @@ fn unmask_uniform(step: usize, position: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SchedulerRegistry;
+    use super::*;
     use onnx_genai_metadata::SchedulerSpec;
 
     #[test]
@@ -409,5 +409,4 @@ mod tests {
         };
         assert!(registry.build(&spec, 4).is_err());
     }
-
 }

@@ -12,11 +12,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 mod ddim;
+mod dpmpp;
 mod euler;
 mod masked_diffusion;
 
-use super::Dpmpp2m;
 use ddim::DdimSchedule;
+use dpmpp::Dpmpp2m;
 use euler::{EulerAncestral, EulerSchedule};
 use masked_diffusion::{MaskedDiffusion, Remasking};
 
@@ -237,7 +238,11 @@ impl SchedulerRegistry {
         self.factories.insert(kind.into(), factory);
     }
 
-    pub(crate) fn build(&self, spec: &SchedulerSpec, num_steps: usize) -> anyhow::Result<Arc<dyn Scheduler>> {
+    pub(crate) fn build(
+        &self,
+        spec: &SchedulerSpec,
+        num_steps: usize,
+    ) -> anyhow::Result<Arc<dyn Scheduler>> {
         let factory = self.factories.get(&spec.kind).with_context(|| {
             format!(
                 "unknown scheduler kind '{}' (registered: {:?})",
