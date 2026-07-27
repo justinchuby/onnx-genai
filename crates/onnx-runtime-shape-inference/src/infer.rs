@@ -70,7 +70,7 @@ impl InferenceRegistry {
         bind_captures(graph, &imported_scope, &mut types, &mut shape_data);
 
         // Snapshot graph outputs' declared shapes for the final merge.
-        let declared_out: HashMap<ValueId, Vec<Dim>> = graph
+        let declared_outputs: HashMap<ValueId, Vec<Dim>> = graph
             .outputs
             .iter()
             .filter_map(|&vid| graph.try_value(vid).map(|v| (vid, v.shape.clone())))
@@ -89,125 +89,50 @@ impl InferenceRegistry {
         // Propagate in topological order.
         for nid in order {
             let node = graph.node(nid).clone();
-            let mut child_keys: Vec<_> = graph
-                .subgraphs
-                .keys()
-                .filter(|(owner, _)| *owner == nid)
-                .cloned()
-                .collect();
-            child_keys.sort_by(|left, right| left.1.cmp(&right.1));
-            let mut subgraph_results = HashMap::new();
-            if !child_keys.is_empty() {
-                let scope = child_scope.get_or_insert_with(|| imported_scope.clone());
-                if !scope_sources_added {
-                    let formal_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
-                    let source_values: Vec<_> = graph
-                        .values
-                        .iter()
-                        .filter(|(vid, _)| {
-                            formal_inputs.contains(vid) || graph.initializers.contains_key(vid)
-                        })
-                        .map(|(vid, _)| vid)
-                        .collect();
-                    extend_visible_scope(
-                        graph,
-                        &types,
-                        &shape_data,
-                        scope,
-                        source_values,
-                        &mut interner,
-                    );
-                    scope_sources_added = true;
-                }
-                extend_visible_scope(
-                    graph,
-                    &types,
-                    &shape_data,
-                    scope,
-                    pending_scope_values.drain(..),
-                    &mut interner,
-                );
+            let subgraph_results = self.infer_child_subgraphs(
+                graph,
+                &node,
+                opset_imports,
+                policy,
+                &imported_scope,
+                &types,
+                &shape_data,
+                &mut child_scope,
+                &mut scope_sources_added,
+                &mut pending_scope_values,
+                &mut remaining_subgraph_nodes,
+                &mut interner,
+            )?;
 
-                for key in child_keys {
-                    let subgraph =
-                        graph
-                            .subgraphs
-                            .get_mut(&key)
-                            .ok_or_else(|| ShapeInferError::Invalid {
-                                op: node.op_type.clone(),
-                                detail: format!("subgraph attribute `{}` disappeared", key.1),
-                            })?;
-                    let result = self.infer_graph_scoped(subgraph, opset_imports, policy, scope)?;
-                    subgraph_results.insert(key.1, result);
-                }
-                remaining_subgraph_nodes -= 1;
-            }
-
-            if is_standard_if(&node) {
-                if let Some(outputs) =
-                    infer_if_outputs(graph, &node, &subgraph_results, &mut interner)?
-                {
-                    for (slot, output) in node.outputs.iter().zip(outputs) {
-                        match output {
-                            IfOutput::Typed(type_info) => {
-                                types.insert(*slot, type_info);
-                            }
-                            IfOutput::UnknownRank(element_type) => {
-                                types.remove(slot);
-                                shape_data.remove(slot);
-                                let value = graph.value_mut(*slot);
-                                value.dtype = element_type;
-                                graph.mark_value_type_known(*slot);
-                                graph.mark_value_shape_unknown(*slot);
-                            }
-                            IfOutput::Unresolved => {}
-                        }
-                    }
-                }
-                if remaining_subgraph_nodes > 0 {
-                    pending_scope_values.extend(node.outputs.iter().copied());
-                }
+            if infer_standard_if(
+                graph,
+                &node,
+                &subgraph_results,
+                &mut types,
+                &mut shape_data,
+                &mut interner,
+                remaining_subgraph_nodes,
+                &mut pending_scope_values,
+            )? {
                 continue;
             }
 
-            let inputs = gather_inputs(&node, &types, &shape_data);
-            let outputs = self.infer_node(&node, opset_imports, inputs, policy, &mut interner)?;
-            for (slot, io) in node.outputs.iter().zip(outputs) {
-                if let Some(ti) = io.type_info {
-                    types.insert(*slot, ti);
-                }
-                if let Some(sd) = io.shape_data
-                    && sd.within_bounds()
-                {
-                    shape_data.insert(*slot, sd);
-                }
-            }
+            self.infer_node_outputs(
+                &node,
+                opset_imports,
+                policy,
+                &mut types,
+                &mut shape_data,
+                &mut interner,
+            )?;
             if remaining_subgraph_nodes > 0 {
                 pending_scope_values.extend(node.outputs.iter().copied());
             }
         }
 
-        // Reconcile graph outputs with their declared shapes.
-        for (&vid, declared) in &declared_out {
-            if let Some(ti) = types.get(&vid) {
-                let merged = merge_shapes(vid, &ti.shape, declared, policy)?;
-                let dtype = ti.dtype;
-                types.insert(vid, TypeInfo::new(dtype, merged));
-            }
-        }
+        merge_declared_outputs(&mut types, &declared_outputs, policy)?;
 
-        // Write resolved types back into the graph (lowering DimExprs to Dims).
-        let mut resolved = Vec::new();
-        for (&vid, ti) in &types {
-            if graph.try_value(vid).is_none() {
-                continue;
-            }
-            let dims: Vec<Dim> = ti.shape.iter().map(|d| interner.lower(d)).collect();
-            let value = graph.value_mut(vid);
-            value.shape = dims;
-            value.dtype = ti.dtype;
-            resolved.push(vid);
-        }
+        let resolved = write_back_types(graph, &types, &mut interner);
 
         // Register any freshly-minted symbols on the graph.
         for &sym in interner.fresh_symbols() {
@@ -233,6 +158,176 @@ impl InferenceRegistry {
             parent_symbols,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_child_subgraphs(
+        &self,
+        graph: &mut Graph,
+        node: &Node,
+        opset_imports: &HashMap<String, u64>,
+        policy: MergePolicy,
+        imported_scope: &ScopeBindings,
+        types: &HashMap<ValueId, TypeInfo>,
+        shape_data: &HashMap<ValueId, ShapeData>,
+        child_scope: &mut Option<ScopeBindings>,
+        scope_sources_added: &mut bool,
+        pending_scope_values: &mut Vec<ValueId>,
+        remaining_subgraph_nodes: &mut usize,
+        interner: &mut SymbolInterner,
+    ) -> Result<HashMap<String, ScopedInference>, ShapeInferError> {
+        let mut child_keys: Vec<_> = graph
+            .subgraphs
+            .keys()
+            .filter(|(owner, _)| *owner == node.id)
+            .cloned()
+            .collect();
+        child_keys.sort_by(|left, right| left.1.cmp(&right.1));
+        let mut subgraph_results = HashMap::new();
+        if child_keys.is_empty() {
+            return Ok(subgraph_results);
+        }
+
+        let scope = child_scope.get_or_insert_with(|| imported_scope.clone());
+        if !*scope_sources_added {
+            let formal_inputs: HashSet<_> = graph.inputs.iter().copied().collect();
+            let source_values: Vec<_> = graph
+                .values
+                .iter()
+                .filter(|(vid, _)| {
+                    formal_inputs.contains(vid) || graph.initializers.contains_key(vid)
+                })
+                .map(|(vid, _)| vid)
+                .collect();
+            extend_visible_scope(graph, types, shape_data, scope, source_values, interner);
+            *scope_sources_added = true;
+        }
+        extend_visible_scope(
+            graph,
+            types,
+            shape_data,
+            scope,
+            pending_scope_values.drain(..),
+            interner,
+        );
+
+        for key in child_keys {
+            let subgraph =
+                graph
+                    .subgraphs
+                    .get_mut(&key)
+                    .ok_or_else(|| ShapeInferError::Invalid {
+                        op: node.op_type.clone(),
+                        detail: format!("subgraph attribute `{}` disappeared", key.1),
+                    })?;
+            let result = self.infer_graph_scoped(subgraph, opset_imports, policy, scope)?;
+            subgraph_results.insert(key.1, result);
+        }
+        *remaining_subgraph_nodes -= 1;
+
+        Ok(subgraph_results)
+    }
+
+    fn infer_node_outputs(
+        &self,
+        node: &Node,
+        opset_imports: &HashMap<String, u64>,
+        policy: MergePolicy,
+        types: &mut HashMap<ValueId, TypeInfo>,
+        shape_data: &mut HashMap<ValueId, ShapeData>,
+        interner: &mut SymbolInterner,
+    ) -> Result<(), ShapeInferError> {
+        let inputs = gather_inputs(node, types, shape_data);
+        let outputs = self.infer_node(node, opset_imports, inputs, policy, interner)?;
+        for (slot, io) in node.outputs.iter().zip(outputs) {
+            if let Some(type_info) = io.type_info {
+                types.insert(*slot, type_info);
+            }
+            if let Some(data) = io.shape_data
+                && data.within_bounds()
+            {
+                shape_data.insert(*slot, data);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_standard_if(
+    graph: &mut Graph,
+    node: &Node,
+    subgraph_results: &HashMap<String, ScopedInference>,
+    types: &mut HashMap<ValueId, TypeInfo>,
+    shape_data: &mut HashMap<ValueId, ShapeData>,
+    interner: &mut SymbolInterner,
+    remaining_subgraph_nodes: usize,
+    pending_scope_values: &mut Vec<ValueId>,
+) -> Result<bool, ShapeInferError> {
+    if !is_standard_if(node) {
+        return Ok(false);
+    }
+
+    if let Some(outputs) = infer_if_outputs(graph, node, subgraph_results, interner)? {
+        for (slot, output) in node.outputs.iter().zip(outputs) {
+            match output {
+                IfOutput::Typed(type_info) => {
+                    types.insert(*slot, type_info);
+                }
+                IfOutput::UnknownRank(element_type) => {
+                    types.remove(slot);
+                    shape_data.remove(slot);
+                    let value = graph.value_mut(*slot);
+                    value.dtype = element_type;
+                    graph.mark_value_type_known(*slot);
+                    graph.mark_value_shape_unknown(*slot);
+                }
+                IfOutput::Unresolved => {}
+            }
+        }
+    }
+    if remaining_subgraph_nodes > 0 {
+        pending_scope_values.extend(node.outputs.iter().copied());
+    }
+
+    Ok(true)
+}
+
+fn merge_declared_outputs(
+    types: &mut HashMap<ValueId, TypeInfo>,
+    declared_outputs: &HashMap<ValueId, Vec<Dim>>,
+    policy: MergePolicy,
+) -> Result<(), ShapeInferError> {
+    for (&vid, declared) in declared_outputs {
+        if let Some(type_info) = types.get(&vid) {
+            let merged = merge_shapes(vid, &type_info.shape, declared, policy)?;
+            let dtype = type_info.dtype;
+            types.insert(vid, TypeInfo::new(dtype, merged));
+        }
+    }
+    Ok(())
+}
+
+fn write_back_types(
+    graph: &mut Graph,
+    types: &HashMap<ValueId, TypeInfo>,
+    interner: &mut SymbolInterner,
+) -> Vec<ValueId> {
+    let mut resolved = Vec::new();
+    for (&vid, type_info) in types {
+        if graph.try_value(vid).is_none() {
+            continue;
+        }
+        let dims: Vec<Dim> = type_info
+            .shape
+            .iter()
+            .map(|dimension| interner.lower(dimension))
+            .collect();
+        let value = graph.value_mut(vid);
+        value.shape = dims;
+        value.dtype = type_info.dtype;
+        resolved.push(vid);
+    }
+    resolved
 }
 
 fn is_standard_if(node: &Node) -> bool {
