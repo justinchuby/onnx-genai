@@ -139,3 +139,25 @@ Key findings:
 - **⚠️ Dispatch bug found**: `try_matmul_half` (matmul.rs:488) fires for fully-fp16 models at ALL M values, including M=1. It intercepts the optimized `neon_gemv_f16_col_parallel` path. At M=1, half_gemm is single-threaded (1 row block) and packs f16→f32→f32 GEMM, whereas the GEMV reads f16 directly with multi-threaded column parallelism. Estimated 4–8× slower for M=1 decode. Flagged to Iran.
 - **Strategic impact**: Strengthens anti-vendoring argument (we now have portable f16 GEMM for non-Mac ARM). Q1 FP16 moat sharpened: even if ORT fixes routing, our prefill moat via AMX grows. Q5 unchanged except dispatch fix needed.
 - Updated decision brief with these findings.
+
+## 2026-07-27T16:28:00+00:00 — BNNS fp16 AMX discovery (game-changing)
+
+Justin asked: "Didn't you say GEMM can use Accelerate? If it's faster than NEON." Investigated BNNS (`BNNSMatMul`) as fp16 matmul path.
+
+Key findings:
+- **BNNS fp16 matmul reaches AMX.** Measured 2000–2450 GFLOPS at prefill shapes.
+- **BNNS f16→f32 mixed precision works** and is the fastest path: 2451 GFLOPS at M=128 Gate (vs sgemm 1972 GFLOPS, vs NEON ~52 GFLOPS single-threaded).
+- **Crossover is exactly M=2.** At M=1, BNNS has ~0.9 ms dispatch overhead (worse than GEMV). At M≥2, AMX throughput overwhelms. Binary threshold, chip-independent.
+- **Widen+sgemm is 1.6× slower than BNNS f16→f32** — widening doubles memory traffic for no gain.
+- **half_gemm.rs NEON path is 15–25× slower than BNNS on Mac.** Right kernel for non-Mac ARM; wrong approach for Mac prefill.
+- **BNNS deprecated in macOS 15** (replaced by BNNSGraph*). Still works, migration is future maintenance item.
+- TTFT at M=40: BNNS → ~37 ms, sgemm → ~45 ms, ORT → 107 ms. We beat ORT by 2.9×.
+- Corroborated all timings with mach_absolute_time + clock_gettime (agreement within 0.1%).
+
+Verdicts:
+1. f32 prefill → cblas_sgemm ✅ (already implemented)
+2. f16 prefill → **BNNS BNNSMatMul f16→f32** (new, must implement)
+3. half_gemm.rs NEON → keep for non-Mac ARM only; gate on `!cfg(target_os = "macos")` for prefill
+4. Threshold: M=1 → GEMV (ours), M≥2 → BNNS/sgemm (Accelerate). No per-chip calibration needed.
+
+Updated decision brief with BNNS section at top.
