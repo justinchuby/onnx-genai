@@ -1,0 +1,8 @@
+domain: ""
+name: PRelu
+since_version: 16
+doc: Parametric rectified linear unit with broadcast slope.
+inputs: [{ name: X, type_str: T }, { name: slope, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

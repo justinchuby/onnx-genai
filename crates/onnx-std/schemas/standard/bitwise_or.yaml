@@ -1,0 +1,8 @@
+domain: ""
+name: BitwiseOr
+since_version: 18
+doc: Element-wise bitwise OR with multidirectional broadcasting.
+inputs: [{ name: A, type_str: T }, { name: B, type_str: T }]
+outputs: [{ name: C, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64] }

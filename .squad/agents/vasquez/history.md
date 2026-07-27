@@ -11,3 +11,6 @@
 
 ## 2026-07-27T16:44:54Z — Wave 8 update
 - Approved Dallas PR #272 for #47 DDPM + flow-matching schedulers; merged as 229c1401.
+
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- PR #285 merged (`d889e85b`), closing #74 with CPU standard Conv without MLAS; fixed eager-dispatch cross-crate test breakage before merge.

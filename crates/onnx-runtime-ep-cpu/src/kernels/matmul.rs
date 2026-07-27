@@ -25,6 +25,8 @@
 //! marks graph-initializer inputs so this kernel can safely prepack constants.
 
 use std::borrow::Cow;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
@@ -67,10 +69,151 @@ pub(crate) use accelerate_gemm::neon_gemv_f16_col_parallel;
 ))]
 static GEMV_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter: incremented each time the column-major GEMV decode path
+/// is reached (M=1, constant column-major B, zero-copy from mmap'd data).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "ios")
+))]
+static GEMV_F16_COLMAJ_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only counter: incremented each time the non-contiguous f16 rescue block
+/// is reached (M≥2, non-contiguous constant B on macOS).
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+static NONCONTIG_RESCUE_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only counter: incremented each time the BNNS fp16→f32 prefill path is
+/// reached inside [`try_matmul_half`]. Guards against dispatch regressions where
+/// the portable half GEMM intercepts M≥2 fp16 on macOS before the AMX-backed
+/// BNNS path.
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+static BNNS_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Always-on counter: tracks total BNNS fp16 prefill calls for diagnostics.
+/// Queryable via [`bnns_prefill_stats`].
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static BNNS_PREFILL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Cumulative nanoseconds spent in BNNS fp16 prefill calls.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static BNNS_PREFILL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns (call_count, cumulative_nanos) for BNNS fp16 prefill calls.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn bnns_prefill_stats() -> (usize, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        BNNS_PREFILL_CALLS.load(Ordering::Relaxed),
+        BNNS_PREFILL_NANOS.load(Ordering::Relaxed),
+    )
+}
+
+/// Process-global cache for transposed f16 weight matrices, keyed by the
+/// source data pointer (stable for the lifetime of an mmap'd model file).
+/// Ensures the O(N×K) transpose is computed at most once per weight per
+/// process, surviving across shape-keyed kernel-cache evictions.
+///
+/// **Lifetime contract:** callers MUST call [`clear_weight_transpose_caches`]
+/// when an Executor drops to prevent serving a stale transpose if a
+/// subsequently loaded model's mmap reuses the same virtual address.
+/// This also prevents unbounded memory growth across model lifetimes.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static WEIGHT_TRANSPOSE_F16: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Arc<Vec<u16>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Process-global cache for transposed f32 weight matrices (Accelerate GEMV).
+/// See [`WEIGHT_TRANSPOSE_F16`] for lifetime contract.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static WEIGHT_TRANSPOSE_F32: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Arc<Vec<f32>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Evict all entries from the global weight-transpose caches.
+///
+/// **Must** be called when an Executor drops to prevent address-reuse staleness:
+/// if a subsequently loaded model's mmap places a weight at a recycled virtual
+/// address, the cache would otherwise serve the previous model's transposed
+/// data — producing silently wrong logits without any crash or error.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn clear_weight_transpose_caches() {
+    WEIGHT_TRANSPOSE_F16
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    WEIGHT_TRANSPOSE_F32
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Stub for non-Apple targets so callers don't need cfg gates.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn clear_weight_transpose_caches() {}
+
+/// Pre-compute and cache the f16 transpose of a weight matrix.
+///
+/// Called during model load to move the ~1 s first-decode-step transpose cost
+/// into the model-load budget (we have ~1.5 s of headroom vs ORT). The global
+/// cache ensures subsequent kernel-cache shape misses (prefill M=40 → decode
+/// M=1) find the transpose immediately.
+///
+/// # Safety
+/// `data_ptr` must point to a valid, aligned, contiguous array of `k * n`
+/// `u16` values that remains live for the duration of this call.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub unsafe fn precompute_f16_weight_transpose(data_ptr: *const u16, k: usize, n: usize) {
+    let ptr_key = data_ptr as usize;
+    if WEIGHT_TRANSPOSE_F16
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&ptr_key)
+    {
+        return;
+    }
+    let numel = k * n;
+    if numel == 0 {
+        return;
+    }
+    let src = unsafe { std::slice::from_raw_parts(data_ptr, numel) };
+    use rayon::prelude::*;
+    let mut bt = vec![0u16; n * k];
+    let threads = rayon::current_num_threads();
+    let rows_per_thread = n.div_ceil(threads).max(1);
+    bt.par_chunks_mut(rows_per_thread * k)
+        .enumerate()
+        .for_each(|(t, bt_chunk)| {
+            let j0 = t * rows_per_thread;
+            let j_end = (j0 + rows_per_thread).min(n);
+            let chunk_n = j_end - j0;
+            const TILE: usize = 64;
+            for i0 in (0..k).step_by(TILE) {
+                let ie = (i0 + TILE).min(k);
+                for jj in 0..chunk_n {
+                    let j = j0 + jj;
+                    for i in i0..ie {
+                        bt_chunk[jj * k + i] = src[i * n + j];
+                    }
+                }
+            }
+        });
+    WEIGHT_TRANSPOSE_F16
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ptr_key, Arc::new(bt));
+}
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
 /// zero-copy and need no owned cache entry.
+///
+/// Weight transpose caches (`transposed_b`, `transposed_b_f16`) use `Arc` so
+/// the data can be shared with the process-global `WEIGHT_TRANSPOSE_*` caches.
+/// This ensures that a kernel-cache shape miss (e.g. prefill M=40 → decode
+/// M=1) finds the transpose in the global cache rather than recomputing it.
 #[derive(Default)]
 pub(crate) struct MatMulPrepack {
     constant_inputs: [bool; 2],
@@ -81,13 +224,20 @@ pub(crate) struct MatMulPrepack {
     /// column-parallel GEMV path. Only populated for constant (model weight)
     /// inputs on macOS/iOS.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    transposed_b: OnceLock<Vec<f32>>,
+    transposed_b: OnceLock<Arc<Vec<f32>>>,
     /// Lazily-computed f16 transpose of the B weight matrix. Stores the raw
     /// u16 bit patterns of half::f16 in N×K layout, read directly from the
     /// mmap'd model file without widening to f32. Only populated when B is a
     /// constant Float16 input on macOS/iOS.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    transposed_b_f16: OnceLock<Vec<u16>>,
+    transposed_b_f16: OnceLock<Arc<Vec<u16>>>,
+    /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
+    /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
+    /// model). Stores raw u16 bit patterns in row-major K×N layout. Only
+    /// populated for constant Float16 inputs on macOS/iOS where the original
+    /// is non-contiguous.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
 }
 
 impl MatMulPrepack {
@@ -124,7 +274,8 @@ impl MatMulPrepack {
 
     /// Returns a cached transpose of B[K,N] -> B_T[N,K] row-major.
     /// Only transposes constant (model weight) inputs. Returns `None` for
-    /// activations. Uses Rayon + cache-blocking to hide the one-time cost.
+    /// activations. Uses a process-global cache so the transpose survives
+    /// kernel-cache shape evictions (e.g. prefill M=40 → decode M=1).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn transposed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&[f32]> {
         if !self.constant_inputs[1] {
@@ -133,11 +284,16 @@ impl MatMulPrepack {
         Some(
             self.transposed_b
                 .get_or_init(|| {
+                    let ptr_key = b.as_ptr() as usize;
+                    if let Some(cached) = WEIGHT_TRANSPOSE_F32
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&ptr_key)
+                    {
+                        return cached.clone();
+                    }
                     use rayon::prelude::*;
                     let mut bt = vec![0.0f32; n * k];
-                    // Parallel tiled transpose: each Rayon task handles a strip
-                    // of output rows (columns of B), using a tile size that keeps
-                    // both read and write working sets in L1 cache.
                     let threads = rayon::current_num_threads();
                     let rows_per_thread = n.div_ceil(threads).max(1);
                     bt.par_chunks_mut(rows_per_thread * k)
@@ -157,6 +313,11 @@ impl MatMulPrepack {
                                 }
                             }
                         });
+                    let bt = Arc::new(bt);
+                    WEIGHT_TRANSPOSE_F32
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(ptr_key, bt.clone());
                     bt
                 })
                 .as_slice(),
@@ -167,8 +328,8 @@ impl MatMulPrepack {
     ///
     /// Like [`transposed_b`] but preserves the original f16 storage format
     /// (as raw u16 bit patterns), reading directly from the mmap'd model
-    /// buffer. Only populated for constant Float16 inputs on macOS/iOS.
-    /// Returns `None` for non-constant inputs or non-Float16 dtypes.
+    /// buffer. Uses a process-global cache so the transpose survives
+    /// kernel-cache shape evictions.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn transposed_b_f16(
         &self,
@@ -185,11 +346,16 @@ impl MatMulPrepack {
             self.transposed_b_f16
                 .get_or_init(|| {
                     let numel = k * n;
-                    // SAFETY: validated contiguous Float16 view → exactly `numel`
-                    // 2-byte elements at `data_ptr`; `half::f16` is
-                    // `repr(transparent)` over `u16`.
                     let src =
                         unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), numel) };
+                    let ptr_key = src.as_ptr() as usize;
+                    if let Some(cached) = WEIGHT_TRANSPOSE_F16
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&ptr_key)
+                    {
+                        return cached.clone();
+                    }
                     use rayon::prelude::*;
                     let mut bt = vec![0u16; n * k];
                     let threads = rayon::current_num_threads();
@@ -211,7 +377,87 @@ impl MatMulPrepack {
                                 }
                             }
                         });
+                    let bt = Arc::new(bt);
+                    WEIGHT_TRANSPOSE_F16
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(ptr_key, bt.clone());
                     bt
+                })
+                .as_slice(),
+        )
+    }
+
+    /// Returns a cached contiguous f16 copy of a non-contiguous B weight.
+    ///
+    /// When a model stores a weight matrix with non-row-major strides (e.g.
+    /// the lm_head vocab projection stored column-major), `try_matmul_half`
+    /// skips it because BNNS requires contiguous input.  This method
+    /// materialises the contiguous K×N row-major copy once and caches it
+    /// for the session lifetime, so subsequent prefill calls avoid both:
+    ///   - the element-by-element `to_dense_f32_widen` (~1 s at 136 M elements)
+    ///   - the 2× memory of f16→f32 widening
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn contiguous_b_f16(&self, b_view: &TensorView) -> Option<&[u16]> {
+        use onnx_runtime_ir::DataType;
+        if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || b_view.is_contiguous() {
+            return None; // already contiguous or not cacheable
+        }
+        Some(
+            self.contiguous_b_f16
+                .get_or_init(|| {
+                    let numel = b_view.numel();
+                    let shape = b_view.shape;
+                    let strides = b_view.strides;
+                    let base = b_view.data_ptr::<u16>();
+                    let mut out = vec![0u16; numel];
+
+                    // Optimised 2-D path (covers all weight matrices).
+                    if shape.len() == 2 {
+                        let (rows, cols) = (shape[0], shape[1]);
+                        let (sr, sc) = (strides[0] as isize, strides[1] as isize);
+                        use rayon::prelude::*;
+                        let threads = rayon::current_num_threads();
+                        let rows_per_thread = rows.div_ceil(threads).max(1);
+                        // SAFETY: `base` points into the model's mmap'd weight
+                        // buffer which is immutable for the session lifetime.
+                        // Each Rayon task reads a disjoint set of source rows
+                        // and writes a disjoint output chunk.
+                        let base_usize = base as usize;
+                        out.par_chunks_mut(rows_per_thread * cols)
+                            .enumerate()
+                            .for_each(|(t, chunk)| {
+                                let base = base_usize as *const u16;
+                                let i0 = t * rows_per_thread;
+                                let i_end = (i0 + rows_per_thread).min(rows);
+                                for i in i0..i_end {
+                                    let row_base = unsafe { base.offset(i as isize * sr) };
+                                    let dst = &mut chunk[(i - i0) * cols..(i - i0 + 1) * cols];
+                                    for (j, d) in dst.iter_mut().enumerate() {
+                                        *d = unsafe { *row_base.offset(j as isize * sc) };
+                                    }
+                                }
+                            });
+                    } else {
+                        // General N-D fallback (rare).
+                        let mut idx = vec![0usize; shape.len()];
+                        for o in out.iter_mut() {
+                            let off: isize = idx
+                                .iter()
+                                .zip(strides.iter())
+                                .map(|(&i, &s)| i as isize * s as isize)
+                                .sum();
+                            *o = unsafe { *base.offset(off) };
+                            for d in (0..shape.len()).rev() {
+                                idx[d] += 1;
+                                if idx[d] < shape[d] {
+                                    break;
+                                }
+                                idx[d] = 0;
+                            }
+                        }
+                    }
+                    Arc::new(out)
                 })
                 .as_slice(),
         )
@@ -503,20 +749,52 @@ impl MatMulKernel {
             && numel(&geom.batch_shape) <= 1
             && geom.b_promoted_rank == 2
             && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
-            && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n)
         {
-            #[cfg(all(test, target_arch = "aarch64"))]
-            GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let a_dense = self.prepack.dense(0, &inputs[0])?;
-            let mut result = vec![0.0f32; geom.n];
-            accelerate_gemm::neon_gemv_f16_col_parallel(
-                &a_dense,
-                bt_f16,
-                &mut result,
-                geom.k,
-                geom.n,
-            );
-            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            // Try the transposed-B cache first (contiguous weights).
+            if let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n) {
+                #[cfg(all(test, target_arch = "aarch64"))]
+                GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let a_dense = self.prepack.dense(0, &inputs[0])?;
+                let mut result = vec![0.0f32; geom.n];
+                accelerate_gemm::neon_gemv_f16_col_parallel(
+                    &a_dense,
+                    bt_f16,
+                    &mut result,
+                    geom.k,
+                    geom.n,
+                );
+                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            }
+            // Column-major B[K,N] with strides [1, K]: memory is already
+            // B^T[N,K] row-major — exactly what the GEMV expects. Use the raw
+            // mmap'd data directly (zero-copy, no transpose needed). This
+            // avoids a ~960 ms f32 densification on the 896×151936 lm_head
+            // weight that would otherwise dominate the first decode step.
+            let b_view = &inputs[1];
+            if self.prepack.constant_inputs[1]
+                && b_view.shape.len() == 2
+                && b_view.strides.len() == 2
+                && b_view.strides[0] == 1
+                && b_view.strides[1] == b_view.shape[0] as i64
+            {
+                #[cfg(all(test, target_arch = "aarch64"))]
+                GEMV_F16_COLMAJ_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(all(test, target_arch = "aarch64"))]
+                GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let a_dense = self.prepack.dense(0, &inputs[0])?;
+                let bt_f16 = unsafe {
+                    std::slice::from_raw_parts(b_view.data_ptr::<u16>(), geom.k * geom.n)
+                };
+                let mut result = vec![0.0f32; geom.n];
+                accelerate_gemm::neon_gemv_f16_col_parallel(
+                    &a_dense,
+                    bt_f16,
+                    &mut result,
+                    geom.k,
+                    geom.n,
+                );
+                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            }
         }
 
         // Dedicated half-precision path: contiguous f16/bf16 operands stay in
@@ -525,6 +803,97 @@ impl MatMulKernel {
         // every other host uses the portable blocked implementation.
         if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom)? {
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
+        // Non-contiguous f16 weight rescue: when B is a constant Float16 weight
+        // stored column-major (e.g. lm_head vocab projection), route through
+        // BNNS with `trans_b: true` to avoid materialising a contiguous copy.
+        //
+        // Column-major B[K,N] in memory is equivalent to row-major B^T[N,K].
+        // BNNS `trans_b` handles the transpose internally via AMX, eliminating
+        // a 272 MB strided copy that previously cost ~280 ms.
+        //
+        // For non-column-major non-contiguous layouts, fall back to the
+        // contiguous copy path (cached via OnceLock).
+        //
+        // The `constant_inputs[1]` guard is essential: non-constant activations
+        // (e.g. a Transpose view of another op's output) must NOT enter this
+        // block because `contiguous_b_f16()` returns None for non-constants,
+        // which would leave `out` as all zeros — a silent correctness bug.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if inputs[0].dtype == onnx_runtime_ir::DataType::Float16
+            && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
+            && !inputs[1].is_contiguous()
+            && self.prepack.constant_inputs[1]
+            && geom.m >= 2
+            && inputs[0].is_contiguous()
+        {
+            #[cfg(test)]
+            NONCONTIG_RESCUE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let b_view = &inputs[1];
+            let b_shape = b_view.shape;
+            let b_strides = b_view.strides;
+
+            let a_len = inputs[0].numel();
+            let a_bits = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<u16>(), a_len) };
+            let b_len = b_view.numel();
+            let mut out = vec![0.0f32; geom.result_len];
+
+            // Check for column-major: 2-D with strides [1, K] (stride-0 = 1,
+            // stride-1 = rows). This is exactly B^T stored row-major.
+            let is_column_major = b_shape.len() == 2
+                && b_strides.len() == 2
+                && b_strides[0] == 1
+                && b_strides[1] == b_shape[0] as i64;
+
+            // A trivial batch (all dims are 1) behaves identically to no batch.
+            let trivial_batch =
+                geom.batch_shape.is_empty() || geom.batch_shape.iter().all(|&d| d == 1);
+
+            if !out.is_empty() && geom.k > 0 {
+                if is_column_major && trivial_batch {
+                    // B is column-major [K,N]: memory is row-major B^T[N,K].
+                    // Pass the raw data and let BNNS transpose internally.
+                    let bt_bits =
+                        unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), b_len) };
+                    if !accelerate_gemm::bnns_matmul_f16_trans_b(
+                        a_bits, bt_bits, &mut out, geom.m, geom.k, geom.n,
+                    ) {
+                        // Fallback: materialise contiguous copy
+                        if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                            half_gemm_tile(
+                                HalfFormat::F16,
+                                a_bits,
+                                b_contig,
+                                &mut out,
+                                geom.m,
+                                geom.k,
+                                geom.n,
+                            );
+                        }
+                    }
+                } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                    // Non-column-major or batched: use cached contiguous copy
+                    if trivial_batch {
+                        if !accelerate_gemm::bnns_matmul_f16(
+                            a_bits, b_contig, &mut out, geom.m, geom.k, geom.n,
+                        ) {
+                            half_gemm_tile(
+                                HalfFormat::F16,
+                                a_bits,
+                                b_contig,
+                                &mut out,
+                                geom.m,
+                                geom.k,
+                                geom.n,
+                            );
+                        }
+                    } else {
+                        bnns_half_dense_into(a_bits, b_contig, &geom, &mut out);
+                    }
+                }
+            }
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &out);
         }
 
         // Direct f32 output fast path: when the output is a contiguous Float32
@@ -671,6 +1040,32 @@ fn try_matmul_half(
     // `u16`, so reading their storage as raw bit patterns is sound.
     let a_bits = unsafe { std::slice::from_raw_parts(a.data_ptr::<u16>(), a_len) };
     let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), b_len) };
+
+    // BNNS fp16→f32 path for M≥2 on macOS: reaches AMX, ~15–25× faster than
+    // the portable NEON blocked GEMM at prefill shapes. Only for f16 (not bf16).
+    // Called from the dispatch level, NOT from inside a Rayon parallel region.
+    //
+    // The M≥2 threshold is categorical (GEMV at M=1 vs GEMM at M≥2), not a
+    // tuned crossover: there is no integer between 1 and 2, so this carries no
+    // machine-specific assumption and should not be "tuned" to a higher value.
+    // At M=1 the bandwidth-optimal NEON GEMV path (above) dominates; at M=2+
+    // the arithmetic intensity is high enough for AMX to outperform even at
+    // small M despite the ~50 µs GCD dispatch overhead per call.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if format == HalfFormat::F16 && geom.m >= 2 && accelerate_gemm::bnns_matmul_available() {
+        #[cfg(test)]
+        BNNS_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        bnns_half_dense_into(a_bits, b_bits, geom, &mut out);
+        let elapsed = t0.elapsed();
+        BNNS_PREFILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BNNS_PREFILL_NANOS.fetch_add(
+            elapsed.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return Ok(Some(out));
+    }
+
     half_dense_into(format, a_bits, b_bits, geom, &mut out);
     Ok(Some(out))
 }
@@ -704,6 +1099,38 @@ fn half_dense_into(
             k,
             n,
         );
+        b_out += 1;
+        if !next_index(&geom.batch_shape, &mut bidx) {
+            break;
+        }
+    }
+}
+
+/// Drive BNNS fp16→f32 matmul over a single, batched, or broadcast operand pair.
+/// Each per-tile call is made from the dispatch level (not inside a Rayon parallel
+/// region) to avoid oversubscribing GCD threads. Falls back to the portable
+/// half GEMM if BNNS fails for a particular tile.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn bnns_half_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut [f32]) {
+    let (m, k, n) = (geom.m, geom.k, geom.n);
+    let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
+    if geom.batch_shape.is_empty() {
+        if !accelerate_gemm::bnns_matmul_f16(a, b, out, m, k, n) {
+            half_gemm_tile(HalfFormat::F16, a, b, out, m, k, n);
+        }
+        return;
+    }
+    let mut bidx = vec![0usize; geom.batch_shape.len()];
+    let mut b_out = 0usize;
+    loop {
+        let a_off = broadcast_offset(&bidx, &geom.a_batch, &geom.a_batch_strides) * a_mat;
+        let b_off = broadcast_offset(&bidx, &geom.b_batch, &geom.b_batch_strides) * b_mat;
+        let a_tile = &a[a_off..a_off + a_mat];
+        let b_tile = &b[b_off..b_off + b_mat];
+        let c_tile = &mut out[b_out * c_mat..b_out * c_mat + c_mat];
+        if !accelerate_gemm::bnns_matmul_f16(a_tile, b_tile, c_tile, m, k, n) {
+            half_gemm_tile(HalfFormat::F16, a_tile, b_tile, c_tile, m, k, n);
+        }
         b_out += 1;
         if !next_index(&geom.batch_shape, &mut bidx) {
             break;
@@ -2256,6 +2683,583 @@ mod tests {
         assert!(
             out.to_f32().iter().all(|v| v.is_finite()),
             "GEMV produced non-finite output"
+        );
+    }
+
+    // ─── BNNS prefill dispatch reachability ─────────────────────────
+
+    /// Guard: FP16 M≥2 prefill on macOS must reach the BNNS path, not
+    /// the portable half_gemm. The BNNS path reaches AMX at ~2451 GFLOPS
+    /// vs 52 GFLOPS for the NEON blocked GEMM.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn fp16_m_ge2_prefill_reaches_bnns_not_half_gemm() {
+        use std::sync::atomic::Ordering;
+
+        if !accelerate_gemm::bnns_matmul_available() {
+            eprintln!("BNNS not available, skipping dispatch guard");
+            return;
+        }
+
+        let (m, k, n) = (4, 64, 32);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = BNNS_F16_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = BNNS_F16_TEST_HITS.load(Ordering::SeqCst);
+
+        assert!(
+            after > before,
+            "FP16 M≥2 prefill did not reach BNNS path — \
+             the portable half_gemm.rs is likely intercepting before BNNS, \
+             which would regress prefill by ~47×"
+        );
+        assert!(
+            out.to_f32().iter().all(|v| v.is_finite()),
+            "BNNS produced non-finite output"
+        );
+    }
+
+    /// Guard: BF16 M≥2 must NOT reach the BNNS path (BNNS only supports f16).
+    /// Verified by checking that bf16 output matches the portable half_gemm
+    /// reference — if BNNS were used, it would reinterpret bf16 bits as f16,
+    /// producing wildly incorrect results.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn bf16_m_ge2_does_not_reach_bnns() {
+        let (m, k, n) = (4, 64, 32);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::bf16(&[m, k], &a_data);
+        let b = Owned::bf16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        // Compute f64 reference from the actual bf16-rounded values
+        let a_bf16: Vec<half::bf16> = a_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let b_bf16: Vec<half::bf16> = b_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a_bf16[i * k + p].to_f64() * b_bf16[p * n + j].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+
+        let result = out.to_f32();
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.05,
+            "BF16 M≥2 max relative error {max_rel:.6} — if extremely large, \
+             BNNS may be reinterpreting bf16 bits as f16"
+        );
+    }
+
+    /// Numerics parity: end-to-end MatMulKernel with f16 at M≥2 must match
+    /// the f64 reference, exercising the BNNS dispatch path on macOS.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn bnns_f16_prefill_matches_f64_reference_via_matmul_kernel() {
+        let (m, k, n) = (8, 64, 32);
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 997) as f32) * 0.001 - 0.5)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 991) as f32) * 0.001 - 0.5)
+            .collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        let a_f16: Vec<half::f16> = a_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b_f16: Vec<half::f16> = b_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a_f16[i * k + p].to_f64() * b_f16[p * n + j].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+
+        let result = out.to_f32();
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.01,
+            "BNNS f16 prefill max relative error {max_rel:.6} exceeds 1%"
+        );
+    }
+
+    /// Guard: Non-constant non-contiguous f16 B at M≥2 must NOT enter the
+    /// rescue block (which would produce all zeros). Instead it must fall
+    /// through to the generic `matmul_dense_prepacked_with_backend` path and
+    /// produce correct results via f32 widening.
+    ///
+    /// This is the test that would have caught Blocking Bug #1 — the rescue
+    /// block originally lacked the `constant_inputs[1]` guard.
+    #[test]
+    fn f16_non_constant_non_contiguous_b_produces_correct_result() {
+        let (m, k, n) = (4, 32, 16);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+        // B stored as [N, K] (transposed layout), viewed as [K, N] with
+        // column-major strides [1, K] — this is non-contiguous for a [K,N]
+        // shape but valid memory.
+        let b_data_transposed: Vec<f32> =
+            (0..n * k).map(|i| ((i % 89) as f32) * 0.01 - 0.5).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        // Physical layout is [N, K] row-major; view as [K, N] column-major
+        let b_physical = Owned::f16(&[n, k], &b_data_transposed);
+        let b = b_physical.with_view(&[k, n], &[1, k as i64]);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        // Crucially: B is NOT constant — simulates an activation from another op
+        kernel.set_constant_inputs(&[false, false]);
+
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        // Compute f64 reference: C[i,j] = sum_p A[i,p] * B[p,j]
+        // B[p,j] in column-major with strides [1,K] means element [p,j] is at
+        // physical offset j*K + p, which is b_data_transposed[j*k + p].
+        let a_f16: Vec<half::f16> = a_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b_f16: Vec<half::f16> = b_data_transposed
+            .iter()
+            .map(|&v| half::f16::from_f32(v))
+            .collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a_f16[i * k + p].to_f64() * b_f16[j * k + p].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+
+        let result = out.to_f32();
+        // Must not be all zeros (that was the bug)
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "Non-constant non-contiguous B produced all-zero output — \
+             the rescue block is being entered without constant_inputs[1] guard"
+        );
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.02,
+            "Non-constant non-contiguous B: max relative error {max_rel:.6} exceeds 2%"
+        );
+    }
+
+    /// Constant non-contiguous f16 B at M≥2 correctly enters the rescue block
+    /// and uses the cached contiguous copy or BNNS trans_b path.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn f16_constant_non_contiguous_b_enters_rescue_block() {
+        use std::sync::atomic::Ordering;
+
+        let (m, k, n) = (4, 32, 16);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+        let b_data_transposed: Vec<f32> =
+            (0..n * k).map(|i| ((i % 89) as f32) * 0.01 - 0.5).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b_physical = Owned::f16(&[n, k], &b_data_transposed);
+        let b = b_physical.with_view(&[k, n], &[1, k as i64]);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        // B IS constant — should enter rescue block
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+
+        assert!(
+            after > before,
+            "Constant non-contiguous B did not enter the rescue block — \
+             dispatch may be falling through to the slow f32-widen path"
+        );
+
+        // Verify correctness regardless of path taken
+        let a_f16: Vec<half::f16> = a_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b_f16: Vec<half::f16> = b_data_transposed
+            .iter()
+            .map(|&v| half::f16::from_f32(v))
+            .collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a_f16[i * k + p].to_f64() * b_f16[j * k + p].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "Constant non-contiguous B produced all-zero output"
+        );
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.02,
+            "Constant non-contiguous B: max relative error {max_rel:.6} exceeds 2%"
+        );
+    }
+
+    // ─── Dispatch-reachability coverage: column-major GEMV (M=1) ────────
+
+    /// Guard: M=1 decode with a constant column-major f16 B must reach the
+    /// zero-copy column-major GEMV path (no transpose needed).
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn fp16_m1_column_major_b_reaches_colmaj_gemv() {
+        use std::sync::atomic::Ordering;
+
+        let (k, n) = (64, 32);
+        let a_data: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        // B stored as [N,K] row-major; viewed as [K,N] column-major strides [1,K]
+        let b_transposed: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b_phys = Owned::f16(&[n, k], &b_transposed);
+        let b = b_phys.with_view(&[k, n], &[1, k as i64]);
+        let mut out = Owned::zeros_f32(&[1, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = GEMV_F16_COLMAJ_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = GEMV_F16_COLMAJ_TEST_HITS.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "FP16 M=1 column-major B did not reach the zero-copy GEMV path"
+        );
+
+        // Verify correctness: C[j] = sum_p A[p] * B[p,j]
+        // B[p,j] with strides [1,K] ⇒ physical offset j*K + p
+        let a_f16: Vec<half::f16> = a_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b_f16: Vec<half::f16> = b_transposed
+            .iter()
+            .map(|&v| half::f16::from_f32(v))
+            .collect();
+        let mut ref_c = vec![0.0f64; n];
+        for j in 0..n {
+            for p in 0..k {
+                ref_c[j] += a_f16[p].to_f64() * b_f16[j * k + p].to_f64();
+            }
+        }
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "Column-major GEMV produced zeros"
+        );
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.01,
+            "Column-major GEMV: max relative error {max_rel:.6} exceeds 1%"
+        );
+    }
+
+    // ─── Dispatch-reachability: non-constant non-contiguous (the bug path) ──
+
+    /// Guard: non-constant non-contiguous f16 B at M=1 must NOT enter the
+    /// column-major GEMV (which requires constant_inputs[1]) — it must fall
+    /// through to the generic path and produce correct results.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn fp16_m1_non_constant_colmaj_b_does_not_reach_gemv() {
+        use std::sync::atomic::Ordering;
+
+        let (k, n) = (64, 32);
+        let a_data: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        let b_transposed: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b_phys = Owned::f16(&[n, k], &b_transposed);
+        let b = b_phys.with_view(&[k, n], &[1, k as i64]);
+        let mut out = Owned::zeros_f32(&[1, n]);
+
+        let mut kernel = MatMulKernel::default();
+        // Non-constant B — should NOT reach the GEMV path
+        kernel.set_constant_inputs(&[false, false]);
+
+        let before = GEMV_F16_COLMAJ_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = GEMV_F16_COLMAJ_TEST_HITS.load(Ordering::Relaxed);
+
+        assert_eq!(
+            before, after,
+            "Non-constant B incorrectly reached column-major GEMV"
+        );
+        // Still must produce correct output (via generic path)
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "Non-constant M=1 non-contiguous B produced all zeros"
+        );
+    }
+
+    // ─── Dispatch-reachability: non-contiguous rescue block variations ───
+
+    /// Guard: M≥2 with non-contiguous non-constant f16 B must NOT enter the
+    /// rescue block. This is the exact bug scenario from PR #275 review.
+    /// The test proves the `constant_inputs[1]` guard is effective.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn f16_m_ge2_non_constant_non_contiguous_b_does_not_enter_rescue() {
+        use std::sync::atomic::Ordering;
+
+        let (m, k, n) = (4, 32, 16);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+        let b_data_transposed: Vec<f32> =
+            (0..n * k).map(|i| ((i % 89) as f32) * 0.01 - 0.5).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b_physical = Owned::f16(&[n, k], &b_data_transposed);
+        let b = b_physical.with_view(&[k, n], &[1, k as i64]);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        // Non-constant — must NOT enter rescue block
+        kernel.set_constant_inputs(&[false, false]);
+
+        let before = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+
+        assert_eq!(
+            before, after,
+            "Non-constant non-contiguous B incorrectly entered rescue block — \
+             this would produce all-zero output (the exact PR #275 bug)"
+        );
+        // Must produce correct (non-zero) output via the generic path
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "Non-constant non-contiguous B produced all-zero output"
+        );
+    }
+
+    /// Guard: M≥2 with constant non-contiguous f16 B (non-column-major layout,
+    /// e.g. a permuted 3D weight) enters the rescue block and uses the
+    /// contiguous-copy fallback.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn f16_constant_non_contiguous_non_colmaj_b_enters_rescue() {
+        use std::sync::atomic::Ordering;
+
+        let (m, k, n) = (4, 16, 8);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+        // Non-column-major, non-contiguous: e.g. shape [K,N] with strides [2, 1]
+        // (stride-0 = 2 ≠ N=8, so not row-major; stride-0 ≠ 1, so not col-major)
+        // Physical buffer must be large enough: need (K-1)*2 + (N-1)*1 + 1 elements
+        // Keep `* 1` for symmetry with `* 2` — mirrors stride formula (dim-1)*stride.
+        #[allow(clippy::identity_op)]
+        let phys_len = (k - 1) * 2 + (n - 1) * 1 + 1;
+        let b_phys_data: Vec<f32> = (0..phys_len)
+            .map(|i| ((i % 89) as f32) * 0.01 - 0.5)
+            .collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        // Build a physically larger buffer viewed with stride [2, 1] for shape [K, N]
+        let b_physical = Owned::f16(&[phys_len], &b_phys_data);
+        let b = b_physical.with_view(&[k, n], &[2, 1]);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+
+        assert!(
+            after > before,
+            "Constant non-contiguous non-column-major B did not enter rescue block"
+        );
+
+        // Verify correctness: B[p,j] is at physical offset p*2 + j*1
+        let b_f16: Vec<half::f16> = b_phys_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v))
+            .collect();
+        let a_f16: Vec<half::f16> = a_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    let b_idx = p * 2 + j;
+                    sum += a_f16[i * k + p].to_f64() * b_f16[b_idx].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "Constant non-contiguous non-column-major B produced all zeros"
+        );
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.02,
+            "Non-column-major rescue: max relative error {max_rel:.6} exceeds 2%"
+        );
+    }
+
+    // ─── Dispatch-reachability: f32 fallback for non-f16 inputs ─────────
+
+    /// Guard: f32 inputs at M≥2 must NOT enter any half-precision path.
+    /// Verifies the dtype check at each dispatch branch.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn f32_m_ge2_does_not_enter_half_or_rescue_paths() {
+        use std::sync::atomic::Ordering;
+
+        let (m, k, n) = (4, 32, 16);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f32(&[m, k], &a_data);
+        let b = Owned::f32(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let rescue_before = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+        let bnns_before = BNNS_F16_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let rescue_after = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+        let bnns_after = BNNS_F16_TEST_HITS.load(Ordering::SeqCst);
+
+        assert_eq!(
+            rescue_before, rescue_after,
+            "f32 input entered rescue block"
+        );
+        assert_eq!(bnns_before, bnns_after, "f32 input entered BNNS f16 path");
+        // Correctness check
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "f32 matmul produced zeros"
+        );
+    }
+
+    /// Guard: bf16 M≥2 must NOT enter the non-contiguous rescue block
+    /// (which is f16-only).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn bf16_non_contiguous_does_not_enter_f16_rescue() {
+        use std::sync::atomic::Ordering;
+
+        let (m, k, n) = (4, 32, 16);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+        let b_data_transposed: Vec<f32> =
+            (0..n * k).map(|i| ((i % 89) as f32) * 0.01 - 0.5).collect();
+
+        let a = Owned::bf16(&[m, k], &a_data);
+        let b_physical = Owned::bf16(&[n, k], &b_data_transposed);
+        let b = b_physical.with_view(&[k, n], &[1, k as i64]);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = NONCONTIG_RESCUE_TEST_HITS.load(Ordering::SeqCst);
+
+        assert_eq!(
+            before, after,
+            "bf16 input incorrectly entered f16-only rescue block"
+        );
+        let result = out.to_f32();
+        assert!(
+            result.iter().any(|&v| v != 0.0),
+            "bf16 non-contiguous B produced all zeros"
         );
     }
 }
