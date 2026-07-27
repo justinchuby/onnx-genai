@@ -23,6 +23,7 @@ pub(crate) fn record_kernel_metrics(
 /// reason as the metrics wrapper: if a future host-side CUDA fallback shards one
 /// graph node across a CPU pool, it can opt into the shared worker-span contract
 /// without taking a direct dependency on the tracer crate.
+// Kept for a planned host-side CUDA fallback that shards work across CPU workers.
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn worker_span(label: &'static str) -> Option<impl Drop> {

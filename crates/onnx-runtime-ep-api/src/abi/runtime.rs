@@ -19,6 +19,7 @@ use crate::tensor::{TensorMut, TensorView};
 
 pub(super) struct PluginRuntime {
     pub(super) path: std::path::PathBuf,
+    // Kept as a lifetime anchor for every function pointer and plugin object released in Drop.
     #[allow(dead_code)]
     pub(super) lib: libloading::Library,
     pub(super) factory: *mut ort::OrtEpFactory,

@@ -77,14 +77,6 @@ pub(crate) enum ModelDecodePath {
 /// cursor. Callers decide which tokens to feed, when to stop, and how logical
 /// KV state participates in generation.
 pub(crate) trait DecodeBackend {
-    // Retained for the backend adapter contract while native runner integration is pending.
-    #[allow(dead_code)]
-    fn current_len(&self) -> usize;
-    // Retained for the backend adapter contract while native runner integration is pending.
-    #[allow(dead_code)]
-    fn max_context(&self) -> Option<usize> {
-        None
-    }
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>>;
     /// Greedy fast path: run the decode step and return only the argmax token
     /// id of the final position, or `None` when this backend cannot select the
@@ -115,21 +107,13 @@ pub(crate) trait DecodeBackend {
     fn supports_sampled(&self) -> bool {
         false
     }
-    // Retained for the backend adapter contract while native runner integration is pending.
-    #[allow(dead_code)]
-    fn rewind(&mut self, target_len: usize) -> anyhow::Result<()>;
-    // Retained for the backend adapter contract while native runner integration is pending.
-    #[allow(dead_code)]
-    fn reset(&mut self) -> anyhow::Result<()> {
-        self.rewind(0)
-    }
 }
 
 #[allow(clippy::large_enum_variant)]
 enum DecodeRunner {
     StaticCache(StaticCacheDecodeSession<'static>),
     PastPresent(DecodeSession<'static>),
-    // Retained for the native DecodeState integration while construction is pending.
+    // Kept for the planned native DecodeState runner construction path.
     #[cfg_attr(feature = "native-backend", allow(dead_code))]
     #[cfg(feature = "native-backend")]
     Native(crate::native_decode::NativeDecodeSession),
@@ -163,10 +147,6 @@ impl DecodeRunner {
 }
 
 impl DecodeBackend for DecodeSession<'static> {
-    fn current_len(&self) -> usize {
-        self.past_len()
-    }
-
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
         let total_len = past_len + token_ids.len();
         let input_ids = token_ids
@@ -232,22 +212,9 @@ impl DecodeBackend for DecodeSession<'static> {
     fn supports_sampled(&self) -> bool {
         self.will_sample_on_device()
     }
-
-    fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
-        DecodeSession::rewind(self, target_len)?;
-        Ok(())
-    }
 }
 
 impl DecodeBackend for StaticCacheDecodeSession<'static> {
-    fn current_len(&self) -> usize {
-        StaticCacheDecodeSession::current_len(self)
-    }
-
-    fn max_context(&self) -> Option<usize> {
-        Some(self.max_len())
-    }
-
     fn decode(&mut self, token_ids: &[TokenId], _past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
         let input_ids = token_ids
             .iter()
@@ -269,10 +236,5 @@ impl DecodeBackend for StaticCacheDecodeSession<'static> {
             }
             Ok(logits)
         }
-    }
-
-    fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
-        StaticCacheDecodeSession::rewind(self, target_len)?;
-        Ok(())
     }
 }

@@ -1,17 +1,6 @@
 use super::*;
 
 impl DecodeBackend for NativeDecodeSession {
-    fn current_len(&self) -> usize {
-        self.current_len
-    }
-
-    fn max_context(&self) -> Option<usize> {
-        self.cuda
-            .as_ref()
-            .map(|state| state.max_len)
-            .or_else(|| self.cpu_kv.as_ref().map(|state| state.max_len))
-    }
-
     fn decode(&mut self, token_ids: &[TokenId], past_len: usize) -> anyhow::Result<Vec<Vec<f32>>> {
         self.decode_with_step_inputs(token_ids, past_len, &[])
     }
@@ -56,8 +45,10 @@ impl DecodeBackend for NativeDecodeSession {
     fn supports_argmax(&self) -> bool {
         true
     }
+}
 
-    fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
+impl NativeDecodeSession {
+    pub(super) fn rewind_inner(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len > self.current_len {
             bail!(
                 "cannot rewind native KV from {} forward to {target_len}",

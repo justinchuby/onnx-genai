@@ -287,11 +287,11 @@ impl NativeDecodeSession {
 
     /// Rewind by prefix-slicing every carried host KV tensor.
     pub fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
-        <Self as DecodeBackend>::rewind(self, target_len)
+        self.rewind_inner(target_len)
     }
 
     pub fn reset(&mut self) -> anyhow::Result<()> {
-        <Self as DecodeBackend>::reset(self)
+        self.rewind(0)
     }
 
     /// Generate through the engine's shared token loop, not a backend-local loop.
