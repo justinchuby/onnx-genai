@@ -70,6 +70,7 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Added top-level concurrency cancellation to `ci.yml` using PR-number grouping for pull requests and SHA grouping for push/main runs, preserving post-merge `main` signal while cancelling stale PR coverage runs.
 - Added top-level concurrency cancellation to `audit.yml`, grouped by ref because audit has no pull request trigger.
 - Deliberately exempted release/state-mutating workflows: `publish.yml`, `wheels.yml`, and the squad issue/label workflows.
+- Verified by rapid pushes: run 30314651548 cancelled and run 30314662714 completed successfully.
 ## 2026-07-27T15:17:00-07:00 — Dispatch-reachability CI lint
 
 - Implemented `scripts/check_dispatch_reachability.py`: enforces that every `static ...TEST_HITS` counter has a corresponding `#[test]` reading it.

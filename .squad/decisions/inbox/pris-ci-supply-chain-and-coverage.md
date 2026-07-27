@@ -95,5 +95,9 @@ Justin directed CI to cancel superseded runs so rapid PR pushes do not keep burn
 
 ### Verification
 
-- First PR run after rapid pushes: pending in final report.
-- Second PR run after rapid pushes: pending in final report.
+After merging `origin/main` to restore a mergeable PR test merge, I pushed two commits in quick succession:
+
+- Superseded run (merge push `da7418b2`) was cancelled: https://github.com/justinchuby/onnx-genai/actions/runs/30314651548
+- Newer run (follow-up push `da81cb3b`) completed successfully: https://github.com/justinchuby/onnx-genai/actions/runs/30314662714
+
+An earlier run from `6edd2d1a` was also cancelled once the PR became mergeable again and the newer PR run entered the same PR-number group: https://github.com/justinchuby/onnx-genai/actions/runs/30314546751
