@@ -446,9 +446,28 @@ fn bitwise_not_cases() -> Vec<Case> {
     ]
 }
 
-/// `BitShift` parity: LEFT and RIGHT over unsigned dtypes, including a shift
-/// amount `>=` the element width (which must yield `0`, matching the CPU
-/// `checked_shl`/`checked_shr` contract) and a broadcast.
+/// `BitShift` parity: LEFT and RIGHT over unsigned dtypes, a broadcast, and a
+/// battery of width-guard overshift rows (amounts `==` and `>` the element
+/// width, both directions, every dtype) that lock the CPU
+/// `checked_shl`/`checked_shr` "overshift → 0" contract.
+///
+/// NOTE on the width guard's falsifiability (Bishop mutation probe #2): on GPU5
+/// (Ampere) these overshift rows do **not** by themselves fail when the kernel's
+/// `(amount >= bits) ? 0` guard is deleted — the hardware already yields `0` for
+/// an out-of-range shift, so the guard is *value-redundant on this target*. This
+/// was verified three ways (see `.squad/decisions/inbox/deckard-pr288-testfix-67`):
+/// (a) SASS shows a non-wrap `SHF.L.U32` funnel shift, which clamps counts `>=`
+/// the register width to `0`; (b) an exhaustive device brute force over every
+/// overshift `(dtype, value, amount)` found no non-zero raw result — native
+/// types clamp, and small types promote to `int` then narrow back to `0`; and
+/// (c) a real-kernel neuter (guard deleted) left this whole sweep green. The
+/// guard's removal *is* still caught by the source-contract lib unit test
+/// `shift_guard_matches_cpu_checked_shift_contract`. These rows remain valuable:
+/// they pin the overshift → 0 CPU contract against wrong-width / wrong-direction
+/// / narrowing regressions and against ports to any target whose shift does not
+/// clamp. The near-boundary in-range rows below additionally fail if the guard
+/// threshold is mutated too low (e.g. `>= bits - 1`), which the hardware does
+/// not mask.
 fn bitshift_cases() -> Vec<Case> {
     let dir = |d: &str| ("direction", Attribute::String(d.as_bytes().to_vec()));
     vec![
@@ -490,6 +509,146 @@ fn bitshift_cases() -> Vec<Case> {
                 input(DataType::Uint16, &[1, 3], &[0u16, 1, 2]),
             ],
             outputs: vec![(DataType::Uint16, vec![2, 3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        // ── Width-guard overshift cases (CPU checked-shift contract lock) ──
+        //
+        // Any amount `>=` the operand width must yield `0`, matching the CPU
+        // `checked_shl`/`checked_shr(amount as u32)` contract (`None -> 0`). The
+        // kernel enforces this with `(amount >= bits) ? 0`. On GPU5 the *raw* C
+        // shift ALSO yields 0 for these (SASS `SHF` clamps native-type overshift
+        // to 0; small types promote to `int` and narrow back to 0), so deleting
+        // the guard does not change these outputs on this target — see the
+        // function docstring. They are kept as a portable regression lock on the
+        // overshift → 0 contract (amount `==` width AND `>` width, LEFT & RIGHT,
+        // every dtype). The prior sole overshift case (`u8 >> 8`) already could
+        // not diverge: under int promotion `(int)0x10 >> 8 == 0`.
+        //
+        // `amount == width` AND `amount > width`, for both LEFT and RIGHT.
+        Case {
+            label: "BitShift[u32,LEFT,overshift>=width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint32, &[4], &[1u32, 3, 0x00FF_00FF, 7]),
+                input(DataType::Uint32, &[4], &[32u32, 40, 33, 64]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![4])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u32,RIGHT,overshift>=width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Uint32,
+                    &[4],
+                    &[0x8000_0000u32, 0xFFFF_FFFF, 0x00FF_00FF, 7],
+                ),
+                input(DataType::Uint32, &[4], &[32u32, 40, 33, 64]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![4])],
+            attrs: vec![dir("RIGHT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u64,LEFT,overshift>=width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Uint64,
+                    &[3],
+                    &[1u64, 0xFFFF_FFFF_FFFF_FFFF, 0x1234_5678],
+                ),
+                input(DataType::Uint64, &[3], &[64u64, 100, 64]),
+            ],
+            outputs: vec![(DataType::Uint64, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        // Small types promote to `int` before the shift and narrow back on
+        // store; an overshift therefore lands as 0 (guard or not) on GPU5. Kept
+        // to pin `u16`/`u8` overshift → 0 across LEFT and RIGHT.
+        Case {
+            label: "BitShift[u16,LEFT,overshift>width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint16, &[3], &[0xFFFFu16, 0xF0F0, 0x0F0F]),
+                input(DataType::Uint16, &[3], &[32u16, 40, 33]),
+            ],
+            outputs: vec![(DataType::Uint16, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u8,LEFT,overshift>width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint8, &[3], &[0xFFu8, 0x0F, 0x03]),
+                input(DataType::Uint8, &[3], &[32u8, 33, 34]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        // ── Near-boundary IN-RANGE rows (guard-threshold falsifiability) ──
+        //
+        // Max valid shift `amount == width - 1` produces a non-zero result. The
+        // hardware does NOT mask these (they are legal shifts), so they FAIL if
+        // the guard threshold is mutated one too low (e.g. `amount >= bits - 1`),
+        // which would wrongly zero a valid shift — the one guard-boundary bug
+        // that IS behaviorally observable on this target. Both directions.
+        Case {
+            label: "BitShift[u32,LEFT,max-valid=31]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint32, &[3], &[1u32, 3, 0x0000_00FF]),
+                input(DataType::Uint32, &[3], &[31u32, 31, 24]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u32,RIGHT,max-valid=31]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Uint32,
+                    &[3],
+                    &[0x8000_0000u32, 0xFFFF_FFFF, 0xFF00_0000],
+                ),
+                input(DataType::Uint32, &[3], &[31u32, 31, 24]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![3])],
+            attrs: vec![dir("RIGHT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u8,LEFT,max-valid=7]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint8, &[3], &[1u8, 3, 0x03]),
+                input(DataType::Uint8, &[3], &[7u8, 6, 5]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![3])],
             attrs: vec![dir("LEFT")],
             compare: Compare::ExactBytes,
         },
@@ -553,6 +712,37 @@ fn log_softmax_cases() -> Vec<Case> {
         attrs: vec![("axis", Attribute::Int(1))],
         compare: Compare::Float { tol: 1e-4 },
     });
+    // Overflow-stability proof (Bishop mutation probe / the #266 lesson).
+    //
+    // Logits reach 100, and the reduction widens every dtype to f32 before the
+    // `exp`. A *naive* `log(sum(exp(x)))` therefore evaluates `exp(100) ~ 2.7e43`,
+    // which overflows f32's ~3.4e38 range to `+inf` and drives the result to
+    // `-inf`/`nan` — diverging hard from the CPU oracle. Only the stable
+    // shifted-logsumexp (`x - max` before `exp`) stays finite here, so DELETING
+    // the kernel's max-subtraction makes this row FAIL. The earlier ~81 logit
+    // stayed inside f32 range (`exp(81) ~ 1.6e35 < 3.4e38`), which is exactly why
+    // it could not falsify the guard.
+    //
+    // The stable outputs are `[0, -100, -200]`, all exactly representable in
+    // f32/f16/bf16, so the CUDA-vs-CPU parity is byte-tight despite the large
+    // magnitudes. Every float dtype widens to f32 for the reduction, so a naive
+    // path overflows for all three and each row bites independently.
+    let overflow_logits: Vec<f32> = vec![100.0, 0.0, -100.0];
+    let overflow_shape = vec![1usize, 3];
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("LogSoftmax[{dtype:?},overflow-stability]"),
+            op: "LogSoftmax",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &overflow_shape, &overflow_logits)],
+            outputs: vec![(dtype, overflow_shape.clone())],
+            attrs: vec![("axis", Attribute::Int(-1))],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        });
+    }
     cases
 }
 
