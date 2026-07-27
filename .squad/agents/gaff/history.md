@@ -144,3 +144,7 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+
+## 2026-07-27T14:50:39-07:00 — PR #289 REPL phase 1 review
+
+- **Verdict:** 🔴 Reject. Non-TTY parser behavior is not byte-stable: `//` and `/help <arg>` now affect the plain piped path. Also found a TTY `--no-stats`/`/stats`-off newline seam where the next reedline prompt can attach to streamed output. Gates passed except targeted `repl_e2e` blocked by local ORT API mismatch (27 vs 17). Rachael locked out; named Zhora to revise.

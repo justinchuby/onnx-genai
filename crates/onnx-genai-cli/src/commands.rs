@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::ort::{SessionOptions, profile::TraceVerbosity};
 
-use super::interactive::{Backend, SessionSettings};
+use super::interactive::{Backend, ReplInputMode, SessionSettings};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ReplCommand {
@@ -413,11 +413,13 @@ fn parse_attachment(arguments: &str, is_image: bool) -> ReplCommand {
     }
 }
 
-pub(super) fn parse_repl_line(line: &str) -> ReplLine {
+pub(super) fn parse_repl_line(line: &str, mode: ReplInputMode) -> ReplLine {
     if line.trim().is_empty() {
         return ReplLine::Empty;
     }
-    if let Some(prompt) = line.strip_prefix("//") {
+    if matches!(mode, ReplInputMode::Tty)
+        && let Some(prompt) = line.strip_prefix("//")
+    {
         return ReplLine::Prompt(format!("/{prompt}"));
     }
     let Some(command_line) = line.strip_prefix('/') else {
@@ -431,7 +433,10 @@ pub(super) fn parse_repl_line(line: &str) -> ReplLine {
         return ReplLine::Command(ReplCommand::Unknown(format!("/{command}")));
     };
     let command = match spec.kind {
-        ReplCommandKind::Help => ReplCommand::Help(argument_of(arguments)),
+        ReplCommandKind::Help => ReplCommand::Help(match mode {
+            ReplInputMode::Tty => argument_of(arguments),
+            ReplInputMode::Plain => None,
+        }),
         ReplCommandKind::Reset => ReplCommand::Reset,
         ReplCommandKind::Raw => ReplCommand::ToggleRaw,
         ReplCommandKind::Stats => ReplCommand::ToggleStats,

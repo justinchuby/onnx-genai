@@ -151,6 +151,27 @@ fn unknown_commands_are_reported_without_ending_the_session() {
 }
 
 #[test]
+#[cfg(unix)]
+fn piped_double_slash_remains_an_unknown_command() {
+    let output = text(&repl(&text_model(), &[], "//foo\n/help\n\n"));
+
+    assert!(output.contains("unknown command: //foo"), "{output}");
+    assert!(
+        output.contains("/system <text>"),
+        "the session must continue after reporting the unknown command: {output}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn piped_help_with_an_argument_still_prints_full_help() {
+    let bare_help = text(&repl(&text_model(), &[], "/help\n\n"));
+    let help_with_argument = text(&repl(&text_model(), &[], "/help anything\n\n"));
+
+    assert_eq!(help_with_argument, bare_help);
+}
+
+#[test]
 fn system_and_raw_and_reset_acknowledge_their_effect() {
     let output = text(&repl(
         &text_model(),

@@ -47,8 +47,8 @@ use interactive::run_repl;
 use interactive::{
     InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
     context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
-    initial_repl_show_stats, interrupt_action, is_interrupt_error, repl_input_mode,
-    stage_attachment,
+    initial_repl_show_stats, interrupt_action, is_interrupt_error,
+    plain_stream_needs_trailing_newline, repl_input_mode, stage_attachment,
 };
 use model_inspection::{list, show, version};
 use onnx_genai::text_to_audio::TextToAudioRequest;
@@ -1029,6 +1029,18 @@ mod tests {
     }
 
     #[test]
+    fn plain_stream_newline_depends_on_this_turns_renderer_usage() {
+        let pending_live_renderer = live_turn::LiveTurn::Pending;
+        assert!(pending_live_renderer.is_active());
+        assert!(plain_stream_needs_trailing_newline(false));
+        assert!(!plain_stream_needs_trailing_newline(true));
+        assert!(
+            plain_stream_needs_trailing_newline(false),
+            "a pending reusable live renderer must not suppress the newline when this turn did not use it"
+        );
+    }
+
+    #[test]
     fn one_ctrl_c_stops_the_generation_and_two_exit() {
         // Idle prompt: the first press only warns, the second leaves.
         assert_eq!(
@@ -1257,15 +1269,15 @@ mod tests {
     #[test]
     fn parse_repl_line_recognizes_control_commands() {
         assert_eq!(
-            parse_repl_line("/help"),
+            parse_repl_line("/help", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Help(None))
         );
         assert_eq!(
-            parse_repl_line("/reset"),
+            parse_repl_line("/reset", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Reset)
         );
         assert_eq!(
-            parse_repl_line("/raw"),
+            parse_repl_line("/raw", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::ToggleRaw)
         );
     }
@@ -1273,11 +1285,11 @@ mod tests {
     #[test]
     fn parse_repl_line_recognizes_system_commands() {
         assert_eq!(
-            parse_repl_line("/system keep answers short"),
+            parse_repl_line("/system keep answers short", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::System(Some("keep answers short".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/system   "),
+            parse_repl_line("/system   ", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::System(None))
         );
     }
@@ -1285,28 +1297,28 @@ mod tests {
     #[test]
     fn parse_repl_line_recognizes_image_and_audio_attachments() {
         assert_eq!(
-            parse_repl_line("/image cat.png"),
+            parse_repl_line("/image cat.png", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Image {
                 path: Some("cat.png".to_string()),
                 prompt: None,
             })
         );
         assert_eq!(
-            parse_repl_line("/image cat.png describe this"),
+            parse_repl_line("/image cat.png describe this", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Image {
                 path: Some("cat.png".to_string()),
                 prompt: Some("describe this".to_string()),
             })
         );
         assert_eq!(
-            parse_repl_line("/audio speech.wav summarize it"),
+            parse_repl_line("/audio speech.wav summarize it", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Audio {
                 path: Some("speech.wav".to_string()),
                 prompt: Some("summarize it".to_string()),
             })
         );
         assert_eq!(
-            parse_repl_line("/audio"),
+            parse_repl_line("/audio", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Audio {
                 path: None,
                 prompt: None,
@@ -1317,16 +1329,32 @@ mod tests {
     #[test]
     fn parse_repl_line_preserves_prompts_and_rejects_unknown_commands() {
         assert_eq!(
-            parse_repl_line("  explain this"),
+            parse_repl_line("  explain this", ReplInputMode::Tty),
             ReplLine::Prompt("  explain this".to_string())
         );
         assert_eq!(
-            parse_repl_line("//literal slash"),
+            parse_repl_line("//literal slash", ReplInputMode::Tty),
             ReplLine::Prompt("/literal slash".to_string())
         );
         assert_eq!(
-            parse_repl_line("/unsupported extra"),
+            parse_repl_line("/unsupported extra", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Unknown("/unsupported".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_repl_line_keeps_plain_mode_compatible_with_piped_repl() {
+        assert_eq!(
+            parse_repl_line("//literal slash", ReplInputMode::Plain),
+            ReplLine::Command(ReplCommand::Unknown("//literal".to_string()))
+        );
+        assert_eq!(
+            parse_repl_line("/help anything", ReplInputMode::Plain),
+            ReplLine::Command(ReplCommand::Help(None))
+        );
+        assert_eq!(
+            parse_repl_line("/help anything", ReplInputMode::Tty),
+            ReplLine::Command(ReplCommand::Help(Some("anything".to_string())))
         );
     }
 
@@ -1341,7 +1369,7 @@ mod tests {
             );
             assert!(
                 !matches!(
-                    parse_repl_line(&format!("/{}", command.name)),
+                    parse_repl_line(&format!("/{}", command.name), ReplInputMode::Tty),
                     ReplLine::Command(ReplCommand::Unknown(_))
                 ),
                 "{} did not parse through registry",
@@ -1384,29 +1412,29 @@ mod tests {
     #[test]
     fn session_control_commands_parse_with_and_without_an_argument() {
         assert_eq!(
-            parse_repl_line("/profile on"),
+            parse_repl_line("/profile on", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Profile(Some("on".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/profile"),
+            parse_repl_line("/profile", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Profile(None)),
             "a bare command reports the current state"
         );
         assert_eq!(
-            parse_repl_line("/ep  cuda "),
+            parse_repl_line("/ep  cuda ", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::ExecutionProvider(Some("cuda".to_string()))),
             "surrounding whitespace is not part of the name"
         );
         assert_eq!(
-            parse_repl_line("/backend native"),
+            parse_repl_line("/backend native", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::DecodeBackend(Some("native".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/model ./m"),
+            parse_repl_line("/model ./m", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Model(Some("./m".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/session"),
+            parse_repl_line("/session", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Session)
         );
     }
@@ -1473,8 +1501,8 @@ mod tests {
 
     #[test]
     fn parse_repl_line_treats_empty_and_whitespace_lines_as_empty() {
-        assert_eq!(parse_repl_line(""), ReplLine::Empty);
-        assert_eq!(parse_repl_line(" \t "), ReplLine::Empty);
+        assert_eq!(parse_repl_line("", ReplInputMode::Tty), ReplLine::Empty);
+        assert_eq!(parse_repl_line(" \t ", ReplInputMode::Tty), ReplLine::Empty);
     }
 
     #[test]
