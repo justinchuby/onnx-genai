@@ -1198,20 +1198,27 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 }
 
 /// Log the first persistent-pool fallback/pinning problem once so a restricted
-/// or unsupported host surfaces the reason without spamming every worker. Gated
-/// behind `NXRT_CALIB_DEBUG` — a library must not print to stderr by default.
+/// or unsupported host surfaces the reason without spamming every worker.
+/// Emitted as `tracing::debug!` when the `tracing` feature is enabled, or
+/// gated behind `NXRT_CALIB_DEBUG` otherwise.
 fn report_spmd_fallback(message: &str) {
     DECODE_PATH_LABEL.get_or_init(|| "flat");
     static REPORTED: OnceLock<()> = OnceLock::new();
-    if REPORTED.set(()).is_ok() && std::env::var("NXRT_CALIB_DEBUG").is_ok() {
-        eprintln!("onnx-genai: persistent SPMD decode pool: {message}");
+    if REPORTED.set(()).is_ok() {
+        #[cfg(feature = "tracing")]
+        tracing_crate::debug!(path = "flat", reason = %message, "cpu decode pool fallback");
+        #[cfg(not(feature = "tracing"))]
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!("onnx-genai: persistent SPMD decode pool: {message}");
+        }
     }
 }
 
 /// Record the selected decode path in the queryable [`DECODE_PATH_LABEL`] static
-/// so callers can inspect it via [`decode_path_label`]. No unconditional stderr
-/// output — a library must not write to streams the caller owns. When
-/// `NXRT_CALIB_DEBUG` is set, a diagnostic line is emitted for debugging.
+/// so callers can inspect it via [`decode_path_label`]. Emitted as
+/// `tracing::debug!` when the `tracing` feature is enabled (visible to any
+/// subscriber at `debug` level or below), or gated behind `NXRT_CALIB_DEBUG`
+/// otherwise. See `docs/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
         PersistenceMode::On => "spmd-pool",
@@ -1219,6 +1226,17 @@ fn report_pool_built(mode: PersistenceMode) {
         PersistenceMode::Off => "flat",
     };
     DECODE_PATH_LABEL.get_or_init(|| label);
+
+    #[cfg(feature = "tracing")]
+    {
+        let workers = POOLS
+            .get()
+            .and_then(|p| p.as_ref())
+            .map(|p| p.total_workers())
+            .unwrap_or(0);
+        tracing_crate::debug!(path = label, workers, "cpu decode path selected");
+    }
+    #[cfg(not(feature = "tracing"))]
     if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
         static REPORTED: OnceLock<()> = OnceLock::new();
         if REPORTED.set(()).is_ok() {
