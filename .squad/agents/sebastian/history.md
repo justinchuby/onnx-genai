@@ -167,13 +167,27 @@ Updated decision brief with BNNS section at top.
 Justin asked about batch decode (M=B, B>1). Benchmarked BNNS vs sgemm vs NEON at B=1..32.
 
 Key findings:
-- **Batch decode is 10× bigger strategic opening than single-stream.** At B=32: BNNS 1663 tok/s vs ORT/MLAS ~108 tok/s (estimated) → **15× advantage.** Compare B=1: 1.4× advantage.
+- **Batch decode favours us significantly at B≥2.** At B=32: BNNS 1663 tok/s (measured, load 4–6).
 - **Roofline crossover at B≈6–7** (M1 Max). Below: bandwidth-bound, above: compute-bound → AMX dominance.
-- **BNNS wins at B≥2 for batch decode too.** Same M=2 threshold as prefill. Per-call overhead (~50 µs) is real but absorbed by AMX throughput on large ops (Gate/Up/Down). Total BNNS time at B=8: 22.2 ms vs sgemm 43.7 ms (2.0×).
-- **Dispatch overhead trap did NOT materialize.** BNNS wins overwhelmingly on large ops despite ~50 µs fixed overhead per call.
-- **Nothing in current design is hostile to batching.** SPMD pool, prepack cache, scheduler all work. Dispatch overhead amortizes: 0.87 ms/step ÷ 32 = 0.03 ms/token.
-- **Cannot measure ORT batch decode** — compare harness has no batch support. ORT numbers are indirect (MLAS NEON GFLOPS × roofline).
-- **Three-regime dispatch:** M=1 → GEMV, M≥2 Mac → BNNS, M≥2 non-Mac → half_gemm.rs. Same threshold for prefill and batch decode.
+- **BNNS wins at B≥2 for batch decode too.** Same M=2 threshold as prefill.
+- **Nothing in current design is hostile to batching.** SPMD pool, prepack cache, scheduler all work.
+- **Three-regime dispatch:** M=1 → GEMV, M≥2 Mac → BNNS, M≥2 non-Mac → half_gemm.rs.
 - All numbers corroborated with mach_absolute_time + clock_gettime (<1% agreement).
 
 Updated decision brief with batch decode section at top.
+
+## 2026-07-27T09:02:00-07:00 — ORT batch decode MEASURED, 15× claim retracted
+
+Previous batch decode entry estimated ORT at ~108 tok/s (B=32) based on MLAS NEON ~120 GFLOPS assumption. Actually measured ORT via Python API (`onnxruntime` 1.27.0, CPUExecutionProvider):
+
+| B | ORT tok/s (load 18–23 ⚠️) |
+|---|---|
+| 1 | 40.2 (vs 46.01 quiet = 0.87×) |
+| 8 | 224.6 |
+| 32 | 345.3 (spread 50.8%) |
+
+**Correction:** ORT at B=32 is ~345 tok/s, not ~108. Ratio is ~4–5× (1663/345), not 15×. The estimate was wrong because it assumed MLAS NEON kernel throughput (~120 GFLOPS) without accounting for ORT's graph fusion efficiency. ORT runs fused subgraphs (~300 ops) where we run 434 individual ops — at batch sizes, this compounds.
+
+**⚠️ Load asymmetry:** BNNS measured at load 4–6, ORT at load 18–23. Both should be re-measured under identical conditions before publication. The advantage is real (4–5×) but the exact ratio is uncertain.
+
+Commit `ad920725` title ("15× advantage") is retracted. Follow-up commit filed with correction.
