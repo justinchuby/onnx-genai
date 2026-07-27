@@ -3,10 +3,11 @@
 use crate::FimConfig;
 use crate::config::{FinishReason, GenerateConstraint, GenerateOptions};
 use crate::logits::{
-    ConstraintProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind, JsonConstraint,
-    LlguidanceConstraint, MinPProcessor, PresencePenaltyProcessor, ProcessorChain,
-    ProcessorContext, ProcessorSignal, RepetitionPenaltyProcessor, StopSequence,
-    StopSequenceProcessor, TemperatureProcessor, TokenId, TopKProcessor, TopPProcessor,
+    ConstraintProcessor, DryProcessor, FrequencyPenaltyProcessor, GrammarConstraintKind,
+    JsonConstraint, LlguidanceConstraint, MinPProcessor, MirostatProcessor,
+    PresencePenaltyProcessor, ProcessorChain, ProcessorContext, ProcessorSignal,
+    RepetitionPenaltyProcessor, StopSequence, StopSequenceProcessor, TemperatureProcessor, TokenId,
+    TopAProcessor, TopKProcessor, TopPProcessor, TypicalPProcessor, XtcProcessor,
 };
 use crate::sampling::{Sampler, default_sampler_for_options};
 use anyhow::Context;
@@ -35,6 +36,17 @@ pub(crate) fn build_processor_chain(
     if options.presence_penalty != 0.0 {
         chain.add(Box::new(PresencePenaltyProcessor {
             presence_penalty: options.presence_penalty,
+        }));
+    }
+
+    if let Some(dry) = &options.dry
+        && dry.multiplier > 0.0
+    {
+        chain.add(Box::new(DryProcessor {
+            multiplier: dry.multiplier,
+            base: dry.base,
+            allowed_length: dry.allowed_length,
+            sequence_breakers: dry.sequence_breakers.clone(),
         }));
     }
 
@@ -119,6 +131,36 @@ pub(crate) fn build_processor_chain(
         chain.add(Box::new(MinPProcessor {
             min_p: options.min_p,
         }));
+    }
+
+    if options.top_a > 0.0 {
+        chain.add(Box::new(TopAProcessor {
+            top_a: options.top_a,
+        }));
+    }
+
+    if options.typical_p < 1.0 {
+        chain.add(Box::new(TypicalPProcessor {
+            typical_p: options.typical_p,
+        }));
+    }
+
+    if let Some(mirostat) = options.mirostat {
+        chain.add(Box::new(MirostatProcessor::new(
+            mirostat.tau,
+            mirostat.eta,
+            mirostat.version,
+        )));
+    }
+
+    if let Some(xtc) = options.xtc
+        && xtc.probability > 0.0
+    {
+        chain.add(Box::new(XtcProcessor::new(
+            xtc.probability,
+            xtc.threshold,
+            options.seed,
+        )));
     }
 
     Ok(chain)

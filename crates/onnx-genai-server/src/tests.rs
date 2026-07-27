@@ -184,6 +184,79 @@ fn multimodal_message_parses_base64_wav_input_audio_part() {
 }
 
 #[test]
+fn chat_sampling_controls_round_trip_into_generate_options() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "top_k": 40,
+        "min_p": 0.1,
+        "top_a": 0.2,
+        "typical_p": 0.7,
+        "repetition_penalty": 1.15,
+        "frequency_penalty": 0.3,
+        "presence_penalty": 0.4,
+        "seed": 1234,
+        "dry_multiplier": 0.5,
+        "dry_base": 1.75,
+        "dry_allowed_length": 3,
+        "dry_sequence_breakers": [13, 42],
+        "mirostat": 2,
+        "mirostat_tau": 4.5,
+        "mirostat_eta": 0.2,
+        "xtc_probability": 0.6,
+        "xtc_threshold": 0.15
+    }))
+    .unwrap();
+
+    let options = build_generate_request(&request).options;
+    assert_eq!(options.temperature, 0.8);
+    assert_eq!(options.top_p, 0.9);
+    assert_eq!(options.top_k, 40);
+    assert_eq!(options.min_p, 0.1);
+    assert_eq!(options.top_a, 0.2);
+    assert_eq!(options.typical_p, 0.7);
+    assert_eq!(options.repetition_penalty, 1.15);
+    assert_eq!(options.frequency_penalty, 0.3);
+    assert_eq!(options.presence_penalty, 0.4);
+    assert!(!options.greedy);
+    assert_eq!(options.seed, Some(1234));
+
+    let dry = options.dry.expect("DRY enabled");
+    assert_eq!(dry.multiplier, 0.5);
+    assert_eq!(dry.base, 1.75);
+    assert_eq!(dry.allowed_length, 3);
+    assert_eq!(dry.sequence_breakers, vec![13, 42]);
+
+    let mirostat = options.mirostat.expect("Mirostat enabled");
+    assert_eq!(mirostat.tau, 4.5);
+    assert_eq!(mirostat.eta, 0.2);
+    assert_eq!(mirostat.version, onnx_genai_engine::MirostatVersion::V2);
+
+    let xtc = options.xtc.expect("XTC enabled");
+    assert_eq!(xtc.probability, 0.6);
+    assert_eq!(xtc.threshold, 0.15);
+}
+
+#[test]
+fn chat_sampling_defaults_stay_greedy_while_seed_enables_sampling() {
+    let request = |seed| {
+        serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "tiny-llm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "seed": seed
+        }))
+        .unwrap()
+    };
+
+    assert!(build_generate_request(&request(Value::Null)).options.greedy);
+    let seeded = build_generate_request(&request(json!(17))).options;
+    assert!(!seeded.greedy);
+    assert_eq!(seeded.seed, Some(17));
+}
+
+#[test]
 fn transcription_json_response_has_openai_shape() {
     let response = crate::types::AudioTranscriptionResponse {
         text: "hello".to_string(),
@@ -489,6 +562,43 @@ async fn logprobs_validation_enforces_openai_limits() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn chat_sampling_controls_reject_invalid_ranges() {
+    for (field, value) in [
+        ("min_p", json!(1.1)),
+        ("top_a", json!(-0.1)),
+        ("typical_p", json!(1.1)),
+        ("repetition_penalty", json!(0.0)),
+        ("dry_base", json!(0.5)),
+        ("mirostat", json!(3)),
+        ("xtc_probability", json!(1.1)),
+        ("xtc_threshold", json!(-0.1)),
+    ] {
+        let mut body = json!({
+            "model": "tiny-llm",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        });
+        body[field] = value;
+        let response = app(tiny_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{field} should be rejected"
+        );
+    }
 }
 
 #[test]

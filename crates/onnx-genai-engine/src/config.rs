@@ -717,6 +717,46 @@ impl From<Vec<TokenId>> for GeneratePrompt {
     }
 }
 
+/// DRY (Don't Repeat Yourself) n-gram repetition controls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DryConfig {
+    /// Penalty applied when a token would extend a repeated sequence.
+    pub multiplier: f32,
+    /// Exponential growth base for repetitions beyond `allowed_length`.
+    pub base: f32,
+    /// Repeated prefix length allowed before penalties begin.
+    pub allowed_length: usize,
+    /// Tokens that stop matching across semantic sequence boundaries.
+    pub sequence_breakers: Vec<TokenId>,
+}
+
+/// Mirostat feedback algorithm version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirostatVersion {
+    V1,
+    V2,
+}
+
+/// Adaptive Mirostat surprise controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MirostatConfig {
+    /// Target surprise, in bits.
+    pub tau: f32,
+    /// Feedback learning rate.
+    pub eta: f32,
+    /// Mirostat algorithm version.
+    pub version: MirostatVersion,
+}
+
+/// XTC (eXclude Top Choices) diversity controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XtcConfig {
+    /// Probability of applying XTC on each sampling step.
+    pub probability: f32,
+    /// Minimum token probability considered a top choice.
+    pub threshold: f32,
+}
+
 /// User-controllable decoding options for Phase 1 generation.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
@@ -730,6 +770,10 @@ pub struct GenerateOptions {
     pub top_k: usize,
     /// Min-p sampling threshold. Zero disables min-p filtering.
     pub min_p: f32,
+    /// Top-A sampling coefficient. Zero disables Top-A filtering.
+    pub top_a: f32,
+    /// Locally typical cumulative probability. One disables typical filtering.
+    pub typical_p: f32,
     /// Repetition penalty applied to prompt and generated tokens. Values <= 1 disable it.
     pub repetition_penalty: f32,
     /// When `Some(n)`, the repetition penalty only considers the most recent `n`
@@ -739,6 +783,12 @@ pub struct GenerateOptions {
     pub frequency_penalty: f32,
     /// OpenAI-style presence penalty: logit[t] -= presence_penalty once if seen.
     pub presence_penalty: f32,
+    /// Optional DRY n-gram repetition penalty.
+    pub dry: Option<DryConfig>,
+    /// Optional adaptive Mirostat sampler.
+    pub mirostat: Option<MirostatConfig>,
+    /// Optional XTC top-choice exclusion.
+    pub xtc: Option<XtcConfig>,
     /// If true, choose argmax after processors; otherwise sample categorically.
     pub greedy: bool,
     /// Optional seed for reproducible categorical sampling.
@@ -774,10 +824,15 @@ impl Default for GenerateOptions {
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
+            top_a: 0.0,
+            typical_p: 1.0,
             repetition_penalty: 1.0,
             repetition_window: None,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            dry: None,
+            mirostat: None,
+            xtc: None,
             greedy: true,
             seed: None,
             stop_sequences: Vec::new(),
@@ -819,6 +874,12 @@ impl GenerateOptions {
         if !self.min_p.is_finite() || !(0.0..=1.0).contains(&self.min_p) {
             anyhow::bail!("min_p must be finite and between 0 and 1");
         }
+        if !self.top_a.is_finite() || !(0.0..=1.0).contains(&self.top_a) {
+            anyhow::bail!("top_a must be finite and between 0 and 1");
+        }
+        if !self.typical_p.is_finite() || !(0.0..=1.0).contains(&self.typical_p) {
+            anyhow::bail!("typical_p must be finite and between 0 and 1");
+        }
         if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
             anyhow::bail!("repetition_penalty must be finite and greater than zero");
         }
@@ -827,6 +888,33 @@ impl GenerateOptions {
         }
         if !self.presence_penalty.is_finite() {
             anyhow::bail!("presence_penalty must be finite");
+        }
+        if let Some(dry) = &self.dry {
+            if !dry.multiplier.is_finite() || dry.multiplier < 0.0 {
+                anyhow::bail!("dry multiplier must be finite and non-negative");
+            }
+            if !dry.base.is_finite() || dry.base < 1.0 {
+                anyhow::bail!("dry base must be finite and at least 1");
+            }
+            if dry.allowed_length == 0 {
+                anyhow::bail!("dry allowed_length must be greater than zero");
+            }
+        }
+        if let Some(mirostat) = self.mirostat {
+            if !mirostat.tau.is_finite() || mirostat.tau <= 0.0 {
+                anyhow::bail!("mirostat tau must be finite and greater than zero");
+            }
+            if !mirostat.eta.is_finite() || mirostat.eta <= 0.0 {
+                anyhow::bail!("mirostat eta must be finite and greater than zero");
+            }
+        }
+        if let Some(xtc) = self.xtc {
+            if !xtc.probability.is_finite() || !(0.0..=1.0).contains(&xtc.probability) {
+                anyhow::bail!("xtc probability must be finite and between 0 and 1");
+            }
+            if !xtc.threshold.is_finite() || !(0.0..=1.0).contains(&xtc.threshold) {
+                anyhow::bail!("xtc threshold must be finite and between 0 and 1");
+            }
         }
         if self.max_context == Some(0) {
             anyhow::bail!("max_context must be greater than zero when provided");
