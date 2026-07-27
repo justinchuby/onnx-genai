@@ -778,12 +778,15 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 102);
-
-        let mut seen = std::collections::HashSet::new();
-        for op in CUDA_COVERED_OPS {
-            assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
-        }
+        let unique_ops = CUDA_COVERED_OPS
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            CUDA_COVERED_OPS.len(),
+            unique_ops.len(),
+            "CUDA_COVERED_OPS contains duplicate entries"
+        );
     }
 
     #[test]

@@ -150,6 +150,9 @@ fn wheel_library_directory(os: TargetOs) -> &'static str {
 }
 
 fn wheel_candidates_for(root: &Path, os: TargetOs, library: CudaLibrary) -> Vec<PathBuf> {
+    if !root.is_absolute() {
+        return Vec::new();
+    }
     let Some(component) = nvidia_component(library) else {
         return Vec::new();
     };
@@ -175,13 +178,14 @@ fn loaded_libraries() -> &'static Mutex<Vec<(CudaLibrary, Library)>> {
 
 /// Add roots such as Python's `site-packages` directory to the CUDA wheel search
 /// path. NVIDIA's pip wheels install component libraries beneath
-/// `nvidia/<component>/{lib,bin}` relative to these roots.
+/// `nvidia/<component>/{lib,bin}` relative to these roots. Relative roots are
+/// rejected so wheel libraries are never loaded relative to the process CWD.
 pub fn set_wheel_search_paths(paths: impl IntoIterator<Item = PathBuf>) {
     let mut configured = wheel_search_paths()
         .lock()
         .expect("CUDA wheel search-path lock poisoned");
     for path in paths {
-        if !configured.contains(&path) {
+        if path.is_absolute() && !configured.contains(&path) {
             configured.push(path);
         }
     }
@@ -212,6 +216,9 @@ fn load_library(library: CudaLibrary) -> Result<Library, Vec<String>> {
     let mut tried = Vec::new();
 
     for path in wheel_candidates {
+        if !path.is_absolute() {
+            continue;
+        }
         tried.push(path.display().to_string());
         // SAFETY: paths are supplied by nxrt's installed package layout and the
         // handle is retained for the lifetime of the process below.
@@ -302,38 +309,48 @@ mod tests {
     }
 
     #[test]
-    fn locates_wheel_libraries_relative_to_package_root() {
-        let root = Path::new("site-packages");
+    fn locates_wheel_libraries_beneath_absolute_package_root() {
+        let root = std::env::current_dir()
+            .expect("current directory should be available")
+            .join("site-packages");
         assert_eq!(
-            wheel_candidates_for(root, TargetOs::Linux, CudaLibrary::CublasLt),
+            wheel_candidates_for(&root, TargetOs::Linux, CudaLibrary::CublasLt),
             vec![
-                PathBuf::from("site-packages/nvidia/cublas/lib/libcublasLt.so.13"),
-                PathBuf::from("site-packages/nvidia/cublas/lib/libcublasLt.so.12"),
-                PathBuf::from("site-packages/nvidia/cublas/lib/libcublasLt.so"),
+                root.join("nvidia/cublas/lib/libcublasLt.so.13"),
+                root.join("nvidia/cublas/lib/libcublasLt.so.12"),
+                root.join("nvidia/cublas/lib/libcublasLt.so"),
             ]
         );
         assert_eq!(
-            wheel_candidates_for(root, TargetOs::Windows, CudaLibrary::Nvrtc),
+            wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Nvrtc),
             vec![
-                PathBuf::from("site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_130_0.dll"),
-                PathBuf::from("site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll"),
-                PathBuf::from("site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_13.dll"),
-                PathBuf::from("site-packages/nvidia/cuda_nvrtc/bin/nvrtc64_12.dll"),
-                PathBuf::from("site-packages/nvidia/cuda_nvrtc/bin/nvrtc.dll"),
+                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_130_0.dll"),
+                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll"),
+                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_13.dll"),
+                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_12.dll"),
+                root.join("nvidia/cuda_nvrtc/bin/nvrtc.dll"),
             ]
         );
     }
 
     #[test]
+    fn empty_python_search_path_produces_no_relative_candidates() {
+        for root in ["", "   ", "site-packages"] {
+            let candidates =
+                wheel_candidates_for(Path::new(root), TargetOs::Linux, CudaLibrary::CublasLt);
+            assert!(
+                candidates.is_empty(),
+                "relative sys.path entry {root:?} produced dlopen candidates: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
     fn driver_is_not_expected_in_a_python_wheel() {
-        assert!(
-            wheel_candidates_for(
-                Path::new("site-packages"),
-                TargetOs::Linux,
-                CudaLibrary::Driver
-            )
-            .is_empty()
-        );
+        let root = std::env::current_dir()
+            .expect("current directory should be available")
+            .join("site-packages");
+        assert!(wheel_candidates_for(&root, TargetOs::Linux, CudaLibrary::Driver).is_empty());
     }
 
     #[test]

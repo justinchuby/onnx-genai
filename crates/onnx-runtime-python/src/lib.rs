@@ -1466,6 +1466,8 @@ fn cupti_available() -> bool {
 /// directory and its parent, so pip-installed `nvidia-cuda-cupti-cu13` sitting
 /// beside nxrt is found with zero setup. The tracer probes each root for the
 /// pip layout `<root>/nvidia/cuda_cupti/lib/libcupti.so*`.
+/// Empty and relative entries are excluded so discovery cannot load a planted
+/// library relative to the process CWD.
 ///
 /// Best-effort: any lookup failure is ignored (env hints remain as fallback).
 #[cfg(feature = "cuda")]
@@ -1473,6 +1475,11 @@ fn python_package_search_paths(m: &Bound<'_, PyModule>) -> Vec<std::path::PathBu
     use std::path::PathBuf;
 
     let mut paths: Vec<PathBuf> = Vec::new();
+    let mut push_absolute = |path: PathBuf| {
+        if path.is_absolute() && !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
 
     // The loaded extension module's own directory (…/site-packages/nxrt/…) and
     // its parent (the site-packages root where `nvidia/` is a sibling).
@@ -1480,9 +1487,9 @@ fn python_package_search_paths(m: &Bound<'_, PyModule>) -> Vec<std::path::PathBu
         && let Ok(file) = file.extract::<PathBuf>()
         && let Some(dir) = file.parent()
     {
-        paths.push(dir.to_path_buf());
+        push_absolute(dir.to_path_buf());
         if let Some(parent) = dir.parent() {
-            paths.push(parent.to_path_buf());
+            push_absolute(parent.to_path_buf());
         }
     }
 
@@ -1492,7 +1499,7 @@ fn python_package_search_paths(m: &Bound<'_, PyModule>) -> Vec<std::path::PathBu
     {
         for entry in iter.flatten() {
             if let Ok(entry) = entry.extract::<PathBuf>() {
-                paths.push(entry);
+                push_absolute(entry);
             }
         }
     }
