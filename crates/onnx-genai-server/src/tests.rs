@@ -2190,6 +2190,53 @@ async fn admin_unload_unknown_model_returns_404() {
 }
 
 #[tokio::test]
+async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
+    let absent_model_state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    let absent_model_response = app(absent_model_state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/admin/models/model-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(absent_model_response.status(), StatusCode::NOT_FOUND);
+
+    let poisoned_registry_state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    poisoned_registry_state.registry.poison_for_test();
+    let poisoned_registry_response = app(poisoned_registry_state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/admin/models/model-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("poisoned registry must produce an HTTP response");
+    assert_eq!(
+        poisoned_registry_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: Value = serde_json::from_slice(
+        &to_bytes(poisoned_registry_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_well_formed_error_without_internal_path(&body);
+    assert_eq!(error_message(&body), "model registry failed");
+}
+
+#[tokio::test]
 async fn admin_load_unknown_model_returns_404() {
     let state = lazy_state(ServerConfig {
         enable_admin_endpoints: true,
@@ -2715,10 +2762,7 @@ async fn poisoned_model_registry_returns_http_500() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_well_formed_error_without_internal_path(&body);
-    assert_eq!(
-        error_message(&body),
-        "model registry failed: registry lock poisoned"
-    );
+    assert_eq!(error_message(&body), "model registry failed");
 }
 
 #[tokio::test]

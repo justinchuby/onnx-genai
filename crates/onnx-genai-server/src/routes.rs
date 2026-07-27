@@ -434,7 +434,8 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
 }
 
 fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
-    ApiError::internal(format!("model registry failed: {err}"))
+    tracing::error!(error = %err, "model registry operation failed");
+    ApiError::internal("model registry failed")
 }
 
 /// Route a request to the correct loaded model.
