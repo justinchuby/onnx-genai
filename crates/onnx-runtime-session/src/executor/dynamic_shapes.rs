@@ -49,6 +49,21 @@ pub(super) fn dynamic_output_shapes(
     input_float_values: &[Option<Vec<f64>>],
     opset: u64,
 ) -> Option<Vec<Vec<usize>>> {
+    // A plugin-fused node stands for a whole claimed subgraph, so no per-op
+    // rule can describe its outputs. It carries a subgraph the executor
+    // replays instead, which is exact rather than reconstructed -- a wrong KV
+    // shape here would corrupt the cache while still producing plausible text.
+    if node.domain == crate::plugin_provider::PLUGIN_FUSED_DOMAIN
+        && node.op_type == crate::plugin_provider::PLUGIN_FUSED_OP
+    {
+        return plugin_fused_output_shapes(
+            node,
+            input_shapes,
+            input_dtypes,
+            input_values,
+            input_float_values,
+        );
+    }
     match node.op_type.as_str() {
         "Resize" if node.is_default_domain() => {
             let input = input_shapes.first()?;
@@ -324,4 +339,229 @@ pub(super) fn dynamic_output_shapes(
                 .collect()
         }
     }
+}
+
+pub(super) fn plugin_fused_output_shapes(
+    node: &Node,
+    input_shapes: &[Vec<usize>],
+    input_dtypes: &[DataType],
+    input_values: &[Option<Vec<i64>>],
+    input_float_values: &[Option<Vec<f64>>],
+) -> Option<Vec<Vec<usize>>> {
+    let shape_graph = match node.attr(crate::plugin_provider::FUSION_SHAPE_GRAPH_ATTR)? {
+        Attribute::Graph(graph) => graph.as_ref(),
+        _ => return None,
+    };
+    if shape_graph.inputs.len() != input_shapes.len() {
+        return None;
+    }
+
+    let mut resolved: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    let mut shape_data: HashMap<ValueId, ShapeData> = HashMap::new();
+    let mut bindings: HashMap<SymbolId, usize> = HashMap::new();
+    for (index, &value) in shape_graph.inputs.iter().enumerate() {
+        let shape = input_shapes.get(index)?.clone();
+        bind_shape_symbols(
+            shape_graph.value(value).shape.as_slice(),
+            &shape,
+            &mut bindings,
+        )?;
+        resolved.insert(value, shape.clone());
+        if let Some(data) = shape_data_from_runtime_input(
+            input_dtypes[index],
+            &shape,
+            input_values.get(index).and_then(|v| v.as_ref()),
+            input_float_values.get(index).and_then(|v| v.as_ref()),
+        ) {
+            shape_data.insert(value, data);
+        }
+    }
+
+    for (&value, weight) in &shape_graph.initializers {
+        let dims = weight.dims().to_vec();
+        bind_shape_symbols(
+            shape_graph.value(value).shape.as_slice(),
+            &dims,
+            &mut bindings,
+        )?;
+        resolved.insert(value, dims);
+        if let WeightRef::Inline(tensor) = weight
+            && let Some(data) = ShapeData::from_tensor(tensor.dtype, &tensor.dims, &tensor.data)
+        {
+            shape_data.insert(value, data);
+        }
+    }
+
+    let registry = InferenceRegistry::default_registry();
+    let order = shape_graph.topological_order().ok()?;
+    for node_id in order {
+        let inner = shape_graph.node(node_id);
+        let mut node_input_shapes = Vec::with_capacity(inner.inputs.len());
+        let mut node_input_dtypes = Vec::with_capacity(inner.inputs.len());
+        let mut node_input_values = Vec::with_capacity(inner.inputs.len());
+        let mut node_input_float_values = Vec::with_capacity(inner.inputs.len());
+        let inputs = inner
+            .inputs
+            .iter()
+            .map(|slot| {
+                let Some(value) = slot else {
+                    node_input_shapes.push(Vec::new());
+                    node_input_dtypes.push(DataType::Float32);
+                    node_input_values.push(None);
+                    node_input_float_values.push(None);
+                    return Some(NodeIo::default());
+                };
+                let value_meta = shape_graph.value(*value);
+                let shape = resolved
+                    .get(value)
+                    .cloned()
+                    .or_else(|| substitute(&value_meta.shape, &bindings))?;
+                node_input_shapes.push(shape.clone());
+                node_input_dtypes.push(value_meta.dtype);
+                let data = shape_data.get(value).cloned();
+                node_input_values.push(data.as_ref().and_then(shape_data_as_i64));
+                node_input_float_values.push(data.as_ref().and_then(shape_data_as_f64));
+                Some(NodeIo {
+                    type_info: Some(TypeInfo::new(
+                        value_meta.dtype,
+                        shape
+                            .iter()
+                            .map(|&dim| i64::try_from(dim).ok().map(DimExpr::constant))
+                            .collect::<Option<Vec<_>>>()?,
+                    )),
+                    shape_data: data,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        let mut interner = SymbolInterner::new(0x8000_0000);
+        if let Ok(outputs) = registry.infer_node(
+            inner,
+            &shape_graph.opset_imports,
+            inputs,
+            MergePolicy::Strict,
+            &mut interner,
+        ) {
+            for (&output, io) in inner.outputs.iter().zip(outputs) {
+                if let Some(type_info) = io.type_info {
+                    let concrete = type_info
+                        .shape
+                        .iter()
+                        .map(|dim| usize::try_from(dim.as_const()?).ok())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(shape) = concrete {
+                        bind_shape_symbols(
+                            shape_graph.value(output).shape.as_slice(),
+                            &shape,
+                            &mut bindings,
+                        )?;
+                        resolved.insert(output, shape);
+                    }
+                }
+                if let Some(data) = io.shape_data
+                    && data.within_bounds()
+                {
+                    shape_data.insert(output, data);
+                }
+            }
+        }
+
+        if inner
+            .outputs
+            .iter()
+            .any(|output| !resolved.contains_key(output))
+        {
+            let inner_opset = effective_opset(shape_graph, inner);
+            let out_shapes = dynamic_output_shapes(
+                inner,
+                &node_input_shapes,
+                &node_input_dtypes,
+                &node_input_values,
+                &node_input_float_values,
+                inner_opset,
+            )?;
+            if out_shapes.len() != inner.outputs.len() {
+                return None;
+            }
+            for (&output, shape) in inner.outputs.iter().zip(out_shapes) {
+                bind_shape_symbols(
+                    shape_graph.value(output).shape.as_slice(),
+                    &shape,
+                    &mut bindings,
+                )?;
+                resolved.insert(output, shape);
+            }
+        }
+    }
+
+    shape_graph
+        .outputs
+        .iter()
+        .map(|output| {
+            resolved
+                .get(output)
+                .cloned()
+                .or_else(|| substitute(&shape_graph.value(*output).shape, &bindings))
+        })
+        .collect()
+}
+
+pub(super) fn bind_shape_symbols(
+    declared: &[Dim],
+    concrete: &[usize],
+    bindings: &mut HashMap<SymbolId, usize>,
+) -> Option<()> {
+    if declared.len() != concrete.len() {
+        return None;
+    }
+    for (dim, &actual) in declared.iter().zip(concrete) {
+        match dim {
+            Dim::Static(expected) if *expected != actual => return None,
+            Dim::Static(_) => {}
+            Dim::Symbolic(symbol) => match bindings.get(symbol) {
+                Some(&previous) if previous != actual => return None,
+                Some(_) => {}
+                None => {
+                    bindings.insert(*symbol, actual);
+                }
+            },
+        }
+    }
+    Some(())
+}
+
+fn shape_data_from_runtime_input(
+    dtype: DataType,
+    shape: &[usize],
+    ints: Option<&Vec<i64>>,
+    floats: Option<&Vec<f64>>,
+) -> Option<ShapeData> {
+    if let Some(values) = ints {
+        if shape.is_empty() && values.len() == 1 {
+            return Some(ShapeData::scalar(dtype, DimExpr::constant(values[0])));
+        }
+        if matches!(shape, [len] if *len == values.len()) {
+            return Some(ShapeData::vector(
+                dtype,
+                values.iter().copied().map(DimExpr::constant).collect(),
+            ));
+        }
+    }
+    if let Some(values) = floats {
+        if shape.is_empty() && values.len() == 1 {
+            return Some(ShapeData::float_scalar(dtype, values[0]));
+        }
+        if matches!(shape, [len] if *len == values.len()) {
+            return Some(ShapeData::float_vector(dtype, values.clone()));
+        }
+    }
+    None
+}
+
+fn shape_data_as_i64(data: &ShapeData) -> Option<Vec<i64>> {
+    data.elems.iter().map(DimExpr::as_const).collect()
+}
+
+fn shape_data_as_f64(data: &ShapeData) -> Option<Vec<f64>> {
+    data.float_elems.clone()
 }

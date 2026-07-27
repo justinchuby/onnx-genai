@@ -20,7 +20,7 @@ use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
 const OP: &str = "BlockQuantizedMatMul";
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 const LAYOUT_VERSION: i64 = 1;
 
 const MXFP4_QK: usize = 32;

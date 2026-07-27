@@ -153,6 +153,44 @@ impl<'a> Model<'a> {
 }
 
 /// Encode `model` into serialized ONNX protobuf bytes.
+/// Refuse to write a graph whose nodes disagree with its opset imports.
+///
+/// `Node::version` lets a rewrite emit a newer standard operator without
+/// claiming the rest of the graph was upgraded with it, which is what makes
+/// mixed-opset transformations possible. ONNX's protobuf has nowhere to put
+/// it, so writing such a graph out would silently produce a model asserting
+/// the wrong version for that operator.
+///
+/// Checked here rather than at each caller: this is the single funnel every
+/// serialisation path goes through, so no future writer can bypass it.
+fn reject_unrepresentable_node_versions(graph: &Graph) -> Result<(), LoaderError> {
+    for node in graph.nodes.values() {
+        let Some(node_version) = node.version else {
+            continue;
+        };
+        let graph_version = graph
+            .opset_imports
+            .get(node.domain.as_str())
+            .copied()
+            .unwrap_or(0);
+        if u64::try_from(node_version).is_ok_and(|version| version == graph_version) {
+            continue;
+        }
+        return Err(LoaderError::NodeVersionNotRepresentable {
+            node: if node.name.is_empty() {
+                format!("#{}", node.id.0)
+            } else {
+                node.name.clone()
+            },
+            op_type: node.op_type.clone(),
+            domain: node.domain.clone(),
+            node_version,
+            graph_version,
+        });
+    }
+    Ok(())
+}
+
 pub fn encode_model(model: &Model) -> Result<Vec<u8>, LoaderError> {
     Ok(encode_model_proto(model)?.encode_to_vec())
 }
@@ -171,6 +209,7 @@ pub fn write_model(model: &Model, path: impl AsRef<Path>) -> Result<(), LoaderEr
 /// caller wants to mutate the proto before encoding, e.g. the §55.4 writer
 /// splicing in `EPContext` nodes).
 pub fn encode_model_proto(model: &Model) -> Result<ModelProto, LoaderError> {
+    reject_unrepresentable_node_versions(model.graph)?;
     let meta = &model.metadata;
     let graph = encode_graph_proto(model.graph, model.weights, true, &meta.graph_name)?;
 
@@ -568,4 +607,54 @@ fn encode_type_proto(graph: &Graph, tp: &TypeProto) -> onnx::TypeProto {
 /// The name of a graph value, if it has one.
 fn value_name(graph: &Graph, vid: ValueId) -> Option<&str> {
     graph.try_value(vid).and_then(|v| v.name.as_deref())
+}
+
+#[cfg(test)]
+mod node_version_tests {
+    use super::*;
+    use onnx_runtime_ir::{DataType, Dim, Node, NodeId};
+
+    fn graph_with_node_version(version: Option<i64>) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 13);
+        let x = graph.create_named_value("x", DataType::Float32, vec![Dim::Static(2)]);
+        let y = graph.create_named_value("y", DataType::Float32, vec![Dim::Static(2)]);
+        graph.add_input(x);
+        graph.add_output(y);
+        let mut node = Node::new(NodeId(0), "Swish", vec![Some(x)], vec![y]);
+        node.version = version;
+        node.name = "swish".to_string();
+        graph.insert_node(node);
+        graph
+    }
+
+    /// Writing a node whose opset disagrees with the graph must fail loudly.
+    ///
+    /// ONNX's protobuf has nowhere to record a per-node version, so the value
+    /// would simply vanish and the file would assert this operator is at the
+    /// graph's version. Nothing downstream could tell — which is exactly why
+    /// this refuses rather than truncating.
+    #[test]
+    fn refuses_to_write_a_node_whose_version_the_format_cannot_hold() {
+        let graph = graph_with_node_version(Some(24));
+        let error = reject_unrepresentable_node_versions(&graph)
+            .expect_err("a mixed-version graph must not serialise");
+        let text = error.to_string();
+        assert!(text.contains("swish"), "must name the node: {text}");
+        assert!(text.contains("24"), "must give the node's version: {text}");
+        assert!(text.contains("13"), "must give the graph's version: {text}");
+        assert!(
+            text.contains("serialise before") || text.contains("fusion disabled"),
+            "must say how to proceed: {text}"
+        );
+    }
+
+    /// A node that agrees with the graph, or states nothing, writes normally.
+    #[test]
+    fn allows_versions_the_format_can_represent() {
+        reject_unrepresentable_node_versions(&graph_with_node_version(None))
+            .expect("an unversioned node is the ordinary case");
+        reject_unrepresentable_node_versions(&graph_with_node_version(Some(13)))
+            .expect("a node agreeing with the graph loses nothing when written");
+    }
 }

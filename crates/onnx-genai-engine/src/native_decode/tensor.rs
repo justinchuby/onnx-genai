@@ -1,6 +1,6 @@
 use super::*;
 
-fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
+pub(crate) fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     let values = tensor_to_f32(tensor)?;
     match tensor.shape.as_slice() {
         [vocab] if *vocab > 0 => Ok(vec![values]),
@@ -18,7 +18,7 @@ fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     }
 }
 
-fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
+pub(crate) fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
     let (value_count, vocab) = match tensor.shape.as_slice() {
         [vocab] if *vocab > 0 => (*vocab, *vocab),
         [seq, vocab] if *seq > 0 && *vocab > 0 => (seq * vocab, *vocab),
@@ -147,7 +147,7 @@ where
     Ok(best_index - row_start)
 }
 
-fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn extract_last_row(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     let width = *tensor
         .shape
         .last()
@@ -182,7 +182,11 @@ fn tensor_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     }
 }
 
-fn tensor_from_f32_as(dtype: DataType, shape: &[usize], values: &[f32]) -> anyhow::Result<Tensor> {
+pub(crate) fn tensor_from_f32_as(
+    dtype: DataType,
+    shape: &[usize],
+    values: &[f32],
+) -> anyhow::Result<Tensor> {
     match dtype {
         DataType::Float32 => Ok(Tensor::from_f32(shape, values)?),
         DataType::Float16 => {
@@ -212,11 +216,14 @@ fn tensor_from_f32_as(dtype: DataType, shape: &[usize], values: &[f32]) -> anyho
 /// `past_sequence_length` on that axis and are concatenated each step; recurrent
 /// states carry a concrete feature dimension there and are replaced wholesale.
 /// This is a purely structural signal (RULES.md §2) — never a model-name gate.
-fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
+pub(crate) fn is_recurrent_state_shape(shape: &[Dim]) -> bool {
     shape.len() >= 2 && shape[shape.len() - 2].is_static()
 }
 
-fn make_empty_input_tensor(session: &InferenceSession, name: &str) -> anyhow::Result<Tensor> {
+pub(crate) fn make_empty_input_tensor(
+    session: &InferenceSession,
+    name: &str,
+) -> anyhow::Result<Tensor> {
     let meta = session
         .inputs()
         .iter()
@@ -277,7 +284,7 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(value)
 }
 
-fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tensor> {
+pub(crate) fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tensor> {
     let axis_len = *tensor
         .shape
         .get(axis)
@@ -317,8 +324,11 @@ fn prefix_slice(tensor: &Tensor, axis: usize, len: usize) -> anyhow::Result<Tens
 /// structural graph property, never off a specific model, so it generalizes
 /// across every quantized and f32 model. Subgraphs (e.g. `If` branches) are
 /// scanned too so control-flow-wrapped decoders are classified correctly.
-fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
+pub(crate) fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
     for (_, node) in graph.nodes.iter() {
+        if onnx_runtime_session::is_plugin_fused_node(node) {
+            return false;
+        }
         if matches!(node.op_type.as_str(), "MatMulNBits" | "QMoE") {
             return true;
         }
@@ -333,7 +343,16 @@ fn graph_uses_decode_pool(graph: &onnx_runtime_ir::Graph) -> bool {
     false
 }
 
-fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
+pub(crate) fn graph_has_plugin_fused(graph: &onnx_runtime_ir::Graph) -> bool {
+    graph.nodes.iter().any(|(_, node)| {
+        onnx_runtime_session::is_plugin_fused_node(node)
+            || node.attributes.values().any(|attr| {
+                matches!(attr, onnx_runtime_ir::Attribute::Graph(subgraph) if graph_has_plugin_fused(subgraph))
+            })
+    })
+}
+
+pub(crate) fn diagnose_native_failure(session: &InferenceSession, error: &str) -> String {
     if error.contains("f32 kernel input requires Float32, got Int64") {
         for (_, node) in session.graph().nodes.iter() {
             if node.op_type == "Gather"

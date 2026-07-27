@@ -16,7 +16,7 @@ use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMatMul";
-const DOMAIN: &str = "pkg.nxrt";
+const DOMAIN: &str = onnx_runtime_ir::RUNTIME_DOMAIN;
 const LAYOUT_VERSION: i64 = 1;
 const SMALL_QK: usize = 32;
 const IQ_SUPER_QK: usize = 256;

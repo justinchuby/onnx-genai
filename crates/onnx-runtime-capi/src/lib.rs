@@ -131,7 +131,11 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,
-        E::DanglingEpContext { .. }
+        // The graph carries a per-node opset the ONNX format cannot represent,
+        // so it cannot be written out. That is a property of the graph, like
+        // the other members of this arm, rather than a runtime failure.
+        E::EpContextMixedNodeVersion { .. }
+        | E::DanglingEpContext { .. }
         | E::Ir(_)
         | E::Graph(_)
         | E::Optimize(_)

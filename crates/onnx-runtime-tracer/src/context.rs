@@ -490,6 +490,18 @@ impl SpanGuard {
         }
     }
 
+    /// Merge additional args into the span without discarding args already
+    /// attached by code running inside the span.
+    pub fn merge_args(&mut self, args: Args) {
+        if let Some(state) = self.state.as_mut() {
+            state
+                .args
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .merge(args);
+        }
+    }
+
     /// The clock epoch-relative start timestamp of this span in microseconds,
     /// or `None` for an inert guard.
     #[must_use]

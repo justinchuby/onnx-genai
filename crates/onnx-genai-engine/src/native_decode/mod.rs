@@ -31,18 +31,28 @@ mod tensor;
 #[cfg(test)]
 mod tests;
 
+use backend::*;
 use cpu::DecodeCpuKvState;
+use cpu::*;
 use cuda::DecodeCudaState;
+use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
-pub(crate) use proposer::{NativeProposerOutput, NativeProposerSession};
+use io::*;
+pub(crate) use proposer::NativeProposerSession;
+use tensor::*;
 
 /// Device requested for a native decode session.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum NativeDecodeDevice {
     #[default]
     Cpu,
     Cuda {
         index: Option<u32>,
+    },
+    Plugin {
+        library: std::path::PathBuf,
+        registration_name: Option<String>,
+        provider_name: String,
     },
 }
 
@@ -64,9 +74,10 @@ pub struct NativeDecodeSession {
     cuda: Option<DecodeCudaState>,
     cpu_kv: Option<DecodeCpuKvState>,
     trace: TraceContext,
-    current_len: usize,
+    pub(crate) current_len: usize,
     last_hidden: Option<Vec<f32>>,
     uses_decode_pool: bool,
+    has_plugin_fused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,7 +215,7 @@ impl NativeDecodeSession {
     /// on non-CUDA sessions. Not wired into any live decode path yet; exercised
     /// only by the option-(c) rewind-correctness tests.
     #[cfg(test)]
-    fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
+    pub(crate) fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
         if let Some(state) = self.cuda.as_mut() {
             state.configure_padded_verify_capture(max_query_rows);
         }
@@ -213,7 +224,7 @@ impl NativeDecodeSession {
     /// Toggle the option (c) "rewind retains the captured graph" guard directly.
     /// Dormant: bring-up / correctness tests only.
     #[cfg(test)]
-    fn set_retain_graph_on_rewind(&mut self, retain: bool) {
+    pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         if let Some(state) = self.cuda.as_mut() {
             state.set_retain_graph_on_rewind(retain);
         }
@@ -221,7 +232,7 @@ impl NativeDecodeSession {
 
     /// Fixed query-row capacity of the dormant padded verify capture, or `None`.
     #[cfg(test)]
-    fn padded_query_capacity(&self) -> Option<usize> {
+    pub(crate) fn padded_query_capacity(&self) -> Option<usize> {
         self.cuda
             .as_ref()
             .and_then(DecodeCudaState::padded_query_capacity)

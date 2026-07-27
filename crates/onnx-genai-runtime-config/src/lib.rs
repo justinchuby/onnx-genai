@@ -175,6 +175,11 @@ pub struct RuntimeConfig {
     /// ORT's generic `OrtHardwareDeviceType` (`CPU`, `GPU`, `NPU`) — a portable
     /// class, not a provider-specific device name, so nothing here is hardcoded.
     pub ep_device: Option<String>,
+    /// `ONNX_GENAI_PLUGIN_FUSION_MIN_NET_SCORE` (`i64`, default: 0): minimum
+    /// metadata-estimated net benefit required before accepting a plugin EP
+    /// subgraph claim. Higher values make plugin fusion more conservative; `0`
+    /// accepts any claim estimated to beat the fixed ABI/marshalling overhead.
+    pub plugin_fusion_min_net_score: i64,
     /// `ONNX_GENAI_PROFILE` (`bool`, default: false): enables aggregate per-stage profiling.
     pub profile: bool,
     /// `ONNX_GENAI_TRACE` (`PathBuf`, default: unset): writes a Perfetto timeline to this non-empty path.
@@ -290,6 +295,11 @@ impl RuntimeConfig {
             ep_device: env_string(&lookup, "ONNX_GENAI_EP_DEVICE")
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty()),
+            plugin_fusion_min_net_score: env_i64(
+                &lookup,
+                "ONNX_GENAI_PLUGIN_FUSION_MIN_NET_SCORE",
+                0,
+            ),
             profile: matches!(
                 env_string(&lookup, "ONNX_GENAI_PROFILE").as_deref(),
                 Some("1" | "true" | "yes")
@@ -340,6 +350,15 @@ where
 {
     env_string(lookup, name)
         .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64<F>(lookup: &F, name: &str, default: i64) -> i64
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env_string(lookup, name)
+        .and_then(|value| value.trim().parse().ok())
         .unwrap_or(default)
 }
 
@@ -721,6 +740,7 @@ mod tests {
         assert_eq!(actual.ep_registration_name, None);
         assert!(actual.ep_options.is_empty());
         assert_eq!(actual.ep_device, None);
+        assert_eq!(actual.plugin_fusion_min_net_score, 0);
     }
 
     #[test]
@@ -731,12 +751,14 @@ mod tests {
             ("ONNX_GENAI_SPEC_MAX_NEW_TOKENS", "48"),
             ("ONNX_GENAI_SPEC_K", "0"),
             ("ONNX_GENAI_MB_MAX", "96"),
+            ("ONNX_GENAI_PLUGIN_FUSION_MIN_NET_SCORE", "1250"),
         ]);
         assert_eq!(actual.cuda_device, CudaDevice::Id(3));
         assert_eq!(actual.intra_op_threads, IntraOpThreads::Count(8));
         assert_eq!(actual.spec_max_new_tokens, 48);
         assert_eq!(actual.spec_k, 1);
         assert_eq!(actual.mb_max, 96);
+        assert_eq!(actual.plugin_fusion_min_net_score, 1250);
 
         let invalid = config(&[
             ("ONNX_GENAI_CUDA_DEVICE", "-1"),
@@ -744,6 +766,7 @@ mod tests {
             ("ONNX_GENAI_SPEC_MAX_NEW_TOKENS", " 48 "),
             ("ONNX_GENAI_SPEC_K", "bad"),
             ("ONNX_GENAI_MB_MAX", "-1"),
+            ("ONNX_GENAI_PLUGIN_FUSION_MIN_NET_SCORE", "not-an-int"),
         ]);
         assert_eq!(invalid.cuda_device, CudaDevice::Invalid("-1".to_owned()));
         assert_eq!(
@@ -753,6 +776,7 @@ mod tests {
         assert_eq!(invalid.spec_max_new_tokens, 32);
         assert_eq!(invalid.spec_k, 4);
         assert_eq!(invalid.mb_max, 64);
+        assert_eq!(invalid.plugin_fusion_min_net_score, 0);
     }
 
     #[test]

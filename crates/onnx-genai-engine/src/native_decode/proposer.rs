@@ -24,8 +24,9 @@ pub(crate) struct NativeProposerSession {
     kv_inputs: Vec<String>,
     present_to_past: Vec<(String, String)>,
     past: HashMap<String, Tensor>,
-    current_len: usize,
+    pub(crate) current_len: usize,
     uses_decode_pool: bool,
+    has_plugin_fused: bool,
 }
 
 impl NativeProposerSession {
@@ -37,12 +38,25 @@ impl NativeProposerSession {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+            NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let session = InferenceSession::builder()
-            .model(path)
-            .device(preference)
-            .build()
-            .context("load native proposer model")?;
+        let mut builder = InferenceSession::builder().model(path).device(preference);
+        if let NativeDecodeDevice::Plugin {
+            library,
+            registration_name,
+            provider_name,
+        } = device
+        {
+            let ep = onnx_runtime_session::PluginExecutionProvider::new(
+                library,
+                registration_name,
+                provider_name.clone(),
+                provider_name,
+            )
+            .context("initialize native plugin execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
+        let session = builder.build().context("load native proposer model")?;
         Self::from_session(session, io)
     }
 
@@ -169,6 +183,7 @@ impl NativeProposerSession {
             }
         };
 
+        let has_plugin_fused = graph_has_plugin_fused(session.graph());
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
             session,
@@ -184,6 +199,7 @@ impl NativeProposerSession {
             past: HashMap::new(),
             current_len: 0,
             uses_decode_pool,
+            has_plugin_fused,
         })
     }
 
@@ -328,7 +344,7 @@ impl NativeProposerSession {
             .collect::<Vec<_>>();
         let run_single_token = sequence_len == 1;
         let uses_decode_pool = self.uses_decode_pool;
-        let outputs = if run_single_token {
+        let outputs = if run_single_token && !self.has_plugin_fused {
             onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                 self.session.run(&bindings).map_err(anyhow::Error::from)
             })

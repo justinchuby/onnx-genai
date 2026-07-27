@@ -1,69 +1,5 @@
 use super::*;
 
-/// Lower an exact `x * Sigmoid(x)` pair to the CPU EP's fused SiLU kernel.
-///
-/// The Sigmoid result must have exactly one consumer and must not be a graph
-/// output, so removing its materialized value cannot change observable behavior.
-pub(super) fn fuse_silu_patterns(graph: &mut Graph) -> usize {
-    let sigmoid_ids: Vec<NodeId> = graph
-        .nodes
-        .iter()
-        .filter_map(|(id, node)| {
-            (node.op_type == "Sigmoid"
-                && node.is_default_domain()
-                && node.inputs.len() == 1
-                && node.outputs.len() == 1)
-                .then_some(id)
-        })
-        .collect();
-    let mut fused = 0;
-
-    for sigmoid_id in sigmoid_ids {
-        let Some(sigmoid) = graph.try_node(sigmoid_id) else {
-            continue;
-        };
-        let Some(x) = sigmoid.inputs[0] else {
-            continue;
-        };
-        let sigmoid_output = sigmoid.outputs[0];
-        if graph.outputs.contains(&sigmoid_output) {
-            continue;
-        }
-        let consumers = graph.consumers(sigmoid_output);
-        if consumers.len() != 1 {
-            continue;
-        }
-        let mul_id = consumers[0];
-        let mul = graph.node(mul_id);
-        if mul.op_type != "Mul"
-            || !mul.is_default_domain()
-            || mul.inputs.len() != 2
-            || mul.outputs.len() != 1
-            || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
-                || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
-        {
-            continue;
-        }
-
-        let mut silu = mul.clone();
-        silu.op_type = "Silu".to_string();
-        silu.domain = "com.microsoft".to_string();
-        silu.inputs = vec![Some(x)];
-        silu.attributes.clear();
-        graph.replace_node(mul_id, silu);
-        graph.remove_node(sigmoid_id);
-        fused += 1;
-    }
-
-    if fused != 0 {
-        graph
-            .opset_imports
-            .entry("com.microsoft".to_string())
-            .or_insert(1);
-    }
-    fused
-}
-
 pub(super) struct WeightStoreInitializerResolver(Arc<WeightStore>);
 
 impl InitializerResolver for WeightStoreInitializerResolver {
@@ -499,7 +435,6 @@ impl Executor {
         // control-flow signature check above.
         graph.topological_order()?;
         reject_unsupported_operators(&graph, ep.as_ref())?;
-        let silu_fused = fuse_silu_patterns(&mut graph);
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
@@ -540,7 +475,6 @@ impl Executor {
                     .with("nodes_after", graph.num_nodes() as u64)
                     .with("ep_pass_nodes_before", ep_pass_nodes_before as u64)
                     .with("ep_pass_nodes_after", ep_pass_nodes_after as u64)
-                    .with("silu_fused", silu_fused as u64)
                     .with("assigned_nodes", assigned_nodes as u64)
                     .with("assigned_op_classes", assigned_ops.len() as u64)
                     .with("fallback_declines", fallback_declines as u64),

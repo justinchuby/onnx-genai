@@ -128,27 +128,30 @@ pub(super) fn checked_storage_bytes(
         })
 }
 
-/// The effective operator-set version governing `node` — the graph's imported
-/// opset for the node's domain. Loaded IR is canonical (the default domain is
-/// `""`, never `"ai.onnx"`; see [`onnx_runtime_ir::normalize_domain`]), so the
-/// node's domain keys directly into the opset-import map.
+/// The effective operator-set version governing `node`.
+///
+/// A node-local [`Node::version`] wins when set, which is how a rewrite emits a
+/// newer standard operator without claiming every other node in that domain was
+/// upgraded with it — the CPU provider's `Swish` fusion needs opset 24 in graphs
+/// exported against older ones. `None` falls back to the graph's import, which
+/// is ONNX's own behaviour and what every loaded node uses.
+///
+/// Loaded IR is canonical (the default domain is `""`, never `"ai.onnx"`; see
+/// [`onnx_runtime_ir::normalize_domain`]), so the domain keys directly into the
+/// opset-import map.
 pub(super) fn effective_opset(graph: &Graph, node: &Node) -> u64 {
-    graph
-        .opset_imports
-        .get(node.domain.as_str())
-        .copied()
-        .unwrap_or_else(|| {
-            unreachable!(
-                "internal invariant violated: node #{} ({}::{}) has no opset import",
-                node.id.0,
-                if node.domain.is_empty() {
-                    "ai.onnx"
-                } else {
-                    &node.domain
-                },
-                node.op_type
-            )
-        })
+    graph.effective_opset(node).unwrap_or_else(|| {
+        unreachable!(
+            "internal invariant violated: node #{} ({}::{}) has no opset import",
+            node.id.0,
+            if node.domain.is_empty() {
+                "ai.onnx"
+            } else {
+                &node.domain
+            },
+            node.op_type
+        )
+    })
 }
 
 /// Substitute concrete symbol bindings into a (possibly symbolic) shape.

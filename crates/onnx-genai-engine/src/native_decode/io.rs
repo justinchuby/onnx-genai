@@ -10,7 +10,7 @@ fn find_name(names: &[String], candidates: &[&str]) -> Option<String> {
     })
 }
 
-fn declared_or_detected_input(
+pub(crate) fn declared_or_detected_input(
     names: &[String],
     declared: Option<&str>,
     candidates: &[&str],
@@ -32,7 +32,7 @@ fn declared_or_detected_input(
     })
 }
 
-fn optional_declared_or_detected_input(
+pub(crate) fn optional_declared_or_detected_input(
     names: &[String],
     declared: Option<&str>,
     candidates: &[&str],
@@ -44,7 +44,7 @@ fn optional_declared_or_detected_input(
         .map(|declared| declared.or_else(|| find_name(names, candidates)))
 }
 
-fn declared_or_detected_output(
+pub(crate) fn declared_or_detected_output(
     names: &[String],
     declared: Option<&str>,
     candidates: &[&str],
@@ -66,7 +66,7 @@ fn declared_or_detected_output(
     })
 }
 
-fn optional_declared_or_detected_output(
+pub(crate) fn optional_declared_or_detected_output(
     names: &[String],
     declared: Option<&str>,
     candidates: &[&str],
@@ -78,14 +78,14 @@ fn optional_declared_or_detected_output(
         .map(|declared| declared.or_else(|| find_name(names, candidates)))
 }
 
-fn is_past_name(name: &str) -> bool {
+pub(crate) fn is_past_name(name: &str) -> bool {
     has_past_prefix(name, KvNamingConvention::Dotted)
 }
 
-fn is_present_name(name: &str) -> bool {
+pub(crate) fn is_present_name(name: &str) -> bool {
     has_present_prefix(name, KvNamingConvention::Dotted)
 }
 
-fn matching_past_name(output: &str, inputs: &[String]) -> Option<String> {
+pub(crate) fn matching_past_name(output: &str, inputs: &[String]) -> Option<String> {
     matching_past_input(output, inputs, KvNamingConvention::Dotted).cloned()
 }

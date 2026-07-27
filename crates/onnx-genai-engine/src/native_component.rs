@@ -119,6 +119,7 @@ impl NativeComponentSession {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+            NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
         let session = InferenceSession::builder()
             .model(path)

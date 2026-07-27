@@ -262,13 +262,23 @@ impl<'a> InferenceContext<'a> {
         self.policy
     }
 
-    /// The imported opset version for `domain` (the default `""`/`ai.onnx`
-    /// domain resolves to the canonical `""` key, else `1`).
+    /// The effective opset version for `domain`.
+    ///
+    /// When asking about the active node's own domain, a node-local
+    /// [`Node::version`](onnx_runtime_ir::Node::version) wins over the graph import. Other domains are resolved
+    /// from the graph-level imports because a node-local version describes only
+    /// that node's operator schema, not every domain a shape rule may consult.
     pub fn opset(&self, domain: &str) -> u64 {
-        self.opset_imports
-            .get(normalize_domain(domain))
-            .copied()
-            .unwrap_or(1)
+        let domain = normalize_domain(domain);
+        if domain == self.node.domain
+            && let Some(version) = self
+                .node
+                .version
+                .and_then(|version| u64::try_from(version).ok())
+        {
+            return version;
+        }
+        self.opset_imports.get(domain).copied().unwrap_or(1)
     }
 
     /// Mint a fresh opaque dimension.

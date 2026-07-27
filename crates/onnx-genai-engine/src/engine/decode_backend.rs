@@ -179,14 +179,14 @@ pub(crate) fn reject_native_request_speculation(options: &GenerateOptions) -> an
 
 /// Prompt-lookup speculation parameters resolved for a native request.
 #[cfg(feature = "native-backend")]
-struct NativeSpeculationPlan {
-    kind: NativeSpeculationKind,
-    width: usize,
+pub(crate) struct NativeSpeculationPlan {
+    pub(crate) kind: NativeSpeculationKind,
+    pub(crate) width: usize,
 }
 
 #[cfg(feature = "native-backend")]
 #[derive(Clone, Copy)]
-enum NativeSpeculationKind {
+pub(crate) enum NativeSpeculationKind {
     PromptLookup { ngram: usize, max_tokens: usize },
     SharedKv,
 }

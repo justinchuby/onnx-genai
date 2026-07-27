@@ -13,20 +13,27 @@ pub(crate) fn resolve_native_decode_device(
         return validate_native_decode_device(device);
     }
 
-    for provider in &session_options.execution_providers {
-        if !provider.caps.is_host() && !(provider.caps.is_gpu() && provider.caps.is_nvidia()) {
-            anyhow::bail!(
-                "native decoder backend does not support execution provider {provider:?}; supported devices are CPU and CUDA"
-            );
-        }
-    }
-
     match session_options
         .execution_providers
         .iter()
         .find(|provider| !provider.caps.is_host())
     {
         None => Ok(NativeDecodeDevice::Cpu),
+        Some(provider) if provider.native_plugin_bridge().is_some() => {
+            let bridge = provider.native_plugin_bridge().expect("checked above");
+            if bridge.lib.as_os_str().is_empty() || !bridge.lib.is_file() {
+                anyhow::bail!(
+                    "native decoder backend could not load execution provider {:?}: plugin library '{}' is missing; fix by setting the provider's plugin library environment variable or selecting CPU/CUDA",
+                    provider.caps.name,
+                    bridge.lib.display()
+                );
+            }
+            validate_native_decode_device(NativeDecodeDevice::Plugin {
+                library: bridge.lib,
+                registration_name: Some(bridge.registration_name),
+                provider_name: bridge.provider_name,
+            })
+        }
         Some(provider) if provider.caps.is_gpu() && provider.caps.is_nvidia() => {
             let device_id = provider.caps.device_id().unwrap_or(0);
             let index = u32::try_from(device_id).map_err(|_| {
@@ -37,7 +44,10 @@ pub(crate) fn resolve_native_decode_device(
             validate_native_decode_device(NativeDecodeDevice::Cuda { index: Some(index) })
         }
         Some(provider) => {
-            unreachable!("unsupported native provider already rejected: {provider:?}")
+            anyhow::bail!(
+                "native decoder backend does not support execution provider {:?}: it is neither host, CUDA, nor an ORT plugin with a loadable native bridge; fix by selecting CPU/CUDA or configuring a plugin provider library",
+                provider.caps.name
+            )
         }
     }
 }
@@ -48,6 +58,15 @@ pub(crate) fn validate_native_decode_device(
 ) -> anyhow::Result<crate::native_decode::NativeDecodeDevice> {
     match device {
         crate::native_decode::NativeDecodeDevice::Cpu => Ok(device),
+        crate::native_decode::NativeDecodeDevice::Plugin { ref library, .. } => {
+            if library.as_os_str().is_empty() || !library.is_file() {
+                anyhow::bail!(
+                    "native decoder backend plugin device cannot start because library '{}' is missing; fix by configuring the execution provider plugin library path",
+                    library.display()
+                );
+            }
+            Ok(device)
+        }
         crate::native_decode::NativeDecodeDevice::Cuda { .. } => {
             #[cfg(feature = "cuda")]
             {

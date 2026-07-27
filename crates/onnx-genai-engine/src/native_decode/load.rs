@@ -11,6 +11,7 @@ impl NativeDecodeSession {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+            NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
         let mut builder = InferenceSession::builder()
             .model(path)
@@ -28,6 +29,21 @@ impl NativeDecodeSession {
         if let NativeDecodeDevice::Cuda { index } = device {
             let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index.unwrap_or(0))
                 .context("initialize native CUDA execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
+        if let NativeDecodeDevice::Plugin {
+            library,
+            registration_name,
+            provider_name,
+        } = device
+        {
+            let ep = onnx_runtime_session::PluginExecutionProvider::new(
+                library,
+                registration_name,
+                provider_name.clone(),
+                provider_name,
+            )
+            .context("initialize native plugin execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
@@ -66,12 +82,25 @@ impl NativeDecodeSession {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
+            NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
-        let session = InferenceSession::builder()
-            .model(path)
-            .device(preference)
-            .build()
-            .context("load native decoder model")?;
+        let mut builder = InferenceSession::builder().model(path).device(preference);
+        if let NativeDecodeDevice::Plugin {
+            library,
+            registration_name,
+            provider_name,
+        } = device
+        {
+            let ep = onnx_runtime_session::PluginExecutionProvider::new(
+                library,
+                registration_name,
+                provider_name.clone(),
+                provider_name,
+            )
+            .context("initialize native plugin execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
+        let session = builder.build().context("load native decoder model")?;
         Self::from_session_with_cuda_options(session, options)
     }
 
@@ -80,7 +109,7 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
     }
 
-    fn from_session_with_cuda_kv_max_len_and_io(
+    pub(crate) fn from_session_with_cuda_kv_max_len_and_io(
         session: InferenceSession,
         cuda_kv_max_len: Option<usize>,
         io: Option<&ModelIoSpec>,
@@ -400,6 +429,7 @@ impl NativeDecodeSession {
                 None
             };
 
+        let has_plugin_fused = graph_has_plugin_fused(session.graph());
         let uses_decode_pool = graph_uses_decode_pool(session.graph());
         Ok(Self {
             session,
@@ -415,6 +445,7 @@ impl NativeDecodeSession {
             current_len: 0,
             last_hidden: None,
             uses_decode_pool,
+            has_plugin_fused,
         })
     }
 }

@@ -133,10 +133,10 @@ impl Drop for NativeDecodeSession {
     }
 }
 
-struct NativeLoopAdapter<'a> {
-    session: &'a mut NativeDecodeSession,
-    prompt_tokens: Vec<TokenId>,
-    pending_tokens: Vec<TokenId>,
+pub(crate) struct NativeLoopAdapter<'a> {
+    pub(crate) session: &'a mut NativeDecodeSession,
+    pub(crate) prompt_tokens: Vec<TokenId>,
+    pub(crate) pending_tokens: Vec<TokenId>,
 }
 
 impl DecodeLoopBackend for NativeLoopAdapter<'_> {

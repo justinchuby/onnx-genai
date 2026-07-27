@@ -1300,29 +1300,29 @@ fn symbolic_batch_matmul_chain_runs_for_multiple_shapes() {
         out[0].to_vec_f32()
     };
 
-    // batch = 2 → first shape: three nodes compiled (misses), no hits.
+    // batch = 2 → first shape: the CPU EP fuses MatMul+Add+Relu into one node.
     run_batch(&mut session, 2, 0.0);
     let s2 = session.cache_stats();
-    assert_eq!(s2.entries, 3, "three nodes compiled for batch=2");
-    assert_eq!(s2.misses, 3);
+    assert_eq!(s2.entries, 1, "one fused node compiled for batch=2");
+    assert_eq!(s2.misses, 1);
     assert_eq!(s2.hits, 0);
 
-    // batch = 3 → new resolved shape: re-resolves + re-plans (3 more entries).
+    // batch = 3 → new resolved shape: re-resolves + re-plans (1 more entry).
     run_batch(&mut session, 3, 10.0);
     let s3 = session.cache_stats();
     assert_eq!(
-        s3.entries, 6,
-        "batch=3 adds three distinct shape-keyed entries"
+        s3.entries, 2,
+        "batch=3 adds one distinct shape-keyed fused entry"
     );
-    assert_eq!(s3.misses, 6);
+    assert_eq!(s3.misses, 2);
     assert_eq!(s3.hits, 0);
 
     // batch = 2 again → the batch=2 plan is reused (cache hits, no new entries).
     run_batch(&mut session, 2, 100.0);
     let s2b = session.cache_stats();
-    assert_eq!(s2b.entries, 6, "no new entries: batch=2 plan reused");
-    assert_eq!(s2b.misses, 6);
-    assert_eq!(s2b.hits, 3, "each node served from the batch=2 cache");
+    assert_eq!(s2b.entries, 2, "no new entries: batch=2 plan reused");
+    assert_eq!(s2b.misses, 2);
+    assert_eq!(s2b.hits, 1, "the fused node served from the batch=2 cache");
 }
 
 /// Two inputs share a symbol (`batch`); supplying them with *conflicting*

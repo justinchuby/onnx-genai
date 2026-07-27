@@ -9,15 +9,13 @@
 //!
 //! Two levels are validated end-to-end:
 //!
-//! * `"basic"` — constant folding + dead-node elimination. These passes are
-//!   structure-preserving (no new op types), so the executor sees a subset of
-//!   the loaded graph and the numerics must stay identical. This is the clean
-//!   proof that the wiring — including the post-optimization shape re-inference
-//!   — does not perturb results.
+//! * `"basic"` — constant folding + dead-node elimination. These passes do not
+//!   introduce new op types; provider-scoped fusions still run later, so numerics
+//!   must remain within the same tight drift bound as the fused path.
 //!
-//! * `"all"` — the full device-independent pipeline, which additionally runs
-//!   operator **fusion**. On this model fusion collapses each LayerNorm
-//!   decomposition into a single schema-conformant
+//! * `"all"` — currently the same generic runtime pass list as `"basic"`. On
+//!   this model CPU provider-scoped fusion collapses each LayerNorm decomposition
+//!   into a single schema-conformant
 //!   `com.microsoft::LayerNormalization`, every MatMul+Add into
 //!   `com.microsoft::FusedMatMulBias`, each self-attention SDPA core into a
 //!   `com.microsoft::FusedAttention`, and each feed-forward exact-GELU `Erf`
@@ -109,6 +107,7 @@ fn basic_optimization_matches_reference_and_default() {
     // Same tolerance rationale as bert_toy_conformance.rs (numpy.allclose).
     const ATOL: f32 = 2e-3;
     const RTOL: f32 = 2e-3;
+    const DRIFT_ATOL: f32 = 1e-5;
 
     let opt_off = run_bert(None).expect("build+run with optimization off");
     let opt_basic = run_bert(Some("basic")).expect("build+run with optimization=basic");
@@ -154,21 +153,21 @@ fn basic_optimization_matches_reference_and_default() {
          vs opt-off max_abs = {overall_vs_off:.3e}"
     );
 
-    // `basic` (constant-fold + DCE) is structure-preserving, so it must be
-    // byte-identical to the optimization-off graph. Lock it in as an assertion.
-    assert_eq!(
-        overall_vs_off, 0.0,
-        "opt=basic must be byte-identical to opt-off (structure-preserving passes)"
+    // `basic` (constant-fold + DCE) preserves semantics but can materialize
+    // constants before the CPU EP's now-scoped fusions run, so lock it to a tight
+    // numeric drift bound rather than byte identity.
+    assert!(
+        overall_vs_off < DRIFT_ATOL,
+        "opt=basic must stay within drift atol={DRIFT_ATOL:.0e} of opt-off (got {overall_vs_off:.3e})"
     );
 }
 
-/// `"all"` optimization runs the full device-independent pipeline, including
-/// operator **fusion**. On this model fusion collapses each LayerNorm
+/// CPU provider-scoped optimization collapses each LayerNorm
 /// decomposition into a single schema-conformant `com.microsoft::LayerNormalization`
-/// (inputs `[X, Scale, B]` + `axis`/`epsilon` attributes) and every
-/// `MatMul + Add(bias)` into `com.microsoft::FusedMatMulBias`, both of which now
-/// have CPU kernels. The fused path therefore executes end-to-end and must match
-/// the reference to the same tolerance as the conformance / `"basic"` checks.
+/// (inputs `[X, Scale, B]` + `axis`/`epsilon` attributes) and every `MatMul +
+/// Add(bias)` into `com.microsoft::FusedMatMulBias`, both of which have CPU
+/// kernels. The fused path therefore executes end-to-end and must match the
+/// reference to the same tolerance as the conformance / `"basic"` checks.
 ///
 /// Unlike `MatMul + Add → FusedMatMulBias` (byte-identical to the original ops),
 /// the fused `LayerNormalization` kernel accumulates mean/variance in a single
@@ -257,8 +256,8 @@ fn full_optimization_fusion_path_matches_reference_and_default() {
 
 /// End-to-end proof the schema-aware fusions actually **fire on the real loaded
 /// `bert_toy` graph** — not just on synthetic unit fixtures. Loads the model
-/// through the production loader, runs the same `"all"` optimizer pipeline the
-/// session uses (constant-fold → DCE → fusion), and asserts the fused op counts.
+/// through the production loader, runs the generic passes plus the provider-owned
+/// fusion pass, and asserts the fused op counts.
 ///
 /// This is the coverage gap Deckard's advisory A1 flagged: the LayerNorm
 /// schema-aware path was previously exercised only by unit tests because

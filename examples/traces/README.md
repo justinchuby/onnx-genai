@@ -10,86 +10,81 @@ unset); add `ONNX_GENAI_PROFILE=1` to also print the aggregate per-stage table.
 document here is produced by `ONNX_GENAI_TRACE`. Warmup-run events are discarded,
 so a trace contains only the measured run.
 
-## Qwen2.5-0.5B on three backend/provider combinations
+## Qwen2.5-0.5B on four backend/provider combinations
 
-Captured on an Apple M1 Max with the same prompt and decoder settings, so the
-files differ only in what executes the model:
+Same prompt and decoder settings, so the files differ only in what executes the
+model:
 
 | File | Backend | Provider | Events | Per-op spans |
 | --- | --- | --- | --- | --- |
-| `qwen2.5-0.5b-ort-cpu.perfetto.json` | ONNX Runtime | CPU | 356 | no |
-| `qwen2.5-0.5b-ort-mlx.perfetto.json` | ONNX Runtime | MLX/Metal | 356 | no |
-| `qwen2.5-0.5b-native-cpu.perfetto.json` | native | CPU | 2304 | **yes** |
+| `qwen2.5-0.5b-ort-cpu.perfetto.json` | ONNX Runtime | CPU | 303 | no |
+| `qwen2.5-0.5b-ort-mlx.perfetto.json` | ONNX Runtime | MLX/Metal | 303 | no |
+| `qwen2.5-0.5b-native-cpu.perfetto.json` | native | CPU | 2339 | **yes** |
+| `qwen2.5-0.5b-native-mlx.perfetto.json` | native | MLX/Metal | 3366 | **yes** |
 
-### Why only the native trace has per-operator detail
+### Why only the native traces have per-operator detail
 
-This is the whole story of these three files, and it is a property of *who owns
-the executor*, not of the provider:
+This is a property of *who owns the executor*, not of the provider:
 
 * Under the **native** backend we execute the graph ourselves, so every kernel
-  goes through `onnx-runtime-tracer` and lands on the timeline as an `op` span
-  annotated with `device`, `bytes` and `flops`. 2264 of the 2304 events are
-  these. The trace shows three thread lanes because the CPU EP decodes across a
-  rayon pool.
+  lands on the timeline as an `op` span carrying the node's id and name, its
+  device, and where the span was opened. The CPU trace shows three thread lanes
+  because the CPU provider decodes across a rayon pool.
 * Under **ONNX Runtime** the model forward is a single `ort.session_run` call
-  into a foreign library. We can time it, but we cannot see inside it, so the
-  trace stays at 356 events no matter which provider ORT dispatches to. This is
-  why the ORT CPU and ORT MLX files have identical event *counts* while their
-  *durations* differ.
+  into a foreign library. We can time it but not see inside it, so both ORT
+  traces stay at 303 events regardless of which provider ORT dispatches to --
+  which is why their event *counts* are identical while their durations differ.
 
-Read those durations carefully: the raw `ort.session_run` mean is *higher* for
-MLX (35.8 ms against CPU's 25.3 ms), which looks like the GPU losing. It is not
-— the first call is the prefill, and MLX's prefill is much more expensive. Split
-it out and the ordering reverses:
+### The native + MLX trace
 
-```
-             prefill    decode mean
-ORT CPU      132.0 ms     22.01 ms   ->  45.4 tok/s
-ORT MLX      697.0 ms     15.10 ms   ->  66.2 tok/s
-```
+This combination could not run at all until the plugin-EP bridge landed, and it
+is the most informative file here: 1453 of its spans carry
+`device=mlx`, so the timeline shows directly which work the plugin took and
+which fell back to our own kernels. It is single-lane because the plugin is
+thread-affine, where the native CPU trace fans out across the rayon pool.
 
-An ORT plugin EP such as MLX does emit its own internal trace, but through its
-own mechanism (`ONNXRUNTIME_EP_MLX_TRACE`, writing a separate Chrome JSON with
-its own clock epoch). Merging that into this timeline needs a shared clock and
-is not done yet — it is the natural next step now that every EP is a plugin.
+Note the two traces are not the same length -- 4 tokens for CPU against 12 for
+MLX -- because at 3.5 tok/s the CPU file would otherwise be enormous. Compare
+the *shape* of a step, not the totals; the per-run numbers live in
+[`../profiles/`](../profiles/).
 
-**There is no native + MLX file** because that combination cannot run today: the
-native backend rejects it (`native decoder backend does not support execution
-provider metal; supported devices are CPU and CUDA`), and the ORT-ABI plugin
-bridge that would allow it is still a Phase 2 stub. Hence three files, not four.
+### What the spans carry
 
-### What the `op` spans show
+Every span records the source location that opened it, except the per-operator
+ones: those all come from a single line in the executor, where the location
+would be the same string on thousands of events and the node id and name
+identify them far better.
 
-| Operator | Count |
-| --- | --- |
-| `MatMul` | 1352 |
-| `Add` | 960 |
-| `Constant` | 768 |
-| `RMSNormalization` | 392 |
-| `RotaryEmbedding` | 384 |
-| `Attention` | 192 |
-
-(from the 18k-event capture the same command produces at 32 tokens; the
-committed file is trimmed to 4 tokens to keep it under 300 KiB.)
+Timestamps are microseconds on the operating system's monotonic clock, so a
+trace from the host and one from a plugin execution provider can be laid over
+each other with no offset to negotiate.
 
 ### Regenerate
 
 ```bash
-cargo build --release -p onnx-genai-cli
+cargo build --release -p onnx-genai-cli --features native-backend
 P='Write a short Rust function that reverses a string.'
+MLX=<path to libonnxruntime_mlx_ep.dylib>
 
 ONNX_GENAI_EP=cpu ./target/release/onnx-genai \
   --profile-trace examples/traces/qwen2.5-0.5b-ort-cpu.perfetto.json \
-  generate models/qwen2.5-0.5b --prompt "$P" --max-new-tokens 32 --temperature 0
+  generate models/qwen2.5-0.5b --prompt "$P" --max-new-tokens 24 --temperature 0
 
-ONNX_GENAI_METAL_EP_LIB=<path to libonnxruntime_mlx_ep.dylib> ./target/release/onnx-genai \
+ONNX_GENAI_METAL_EP_LIB=$MLX ./target/release/onnx-genai \
   --profile-trace examples/traces/qwen2.5-0.5b-ort-mlx.perfetto.json \
-  generate models/qwen2.5-0.5b --prompt "$P" --max-new-tokens 32 --temperature 0
+  generate models/qwen2.5-0.5b --prompt "$P" --max-new-tokens 24 --temperature 0
 
 ONNX_GENAI_BACKEND=native ./target/release/onnx-genai \
   --profile-trace examples/traces/qwen2.5-0.5b-native-cpu.perfetto.json \
   generate models/qwen2.5-0.5b --prompt "$P" --max-new-tokens 4 --temperature 0
+
+ONNX_GENAI_BACKEND=native ONNX_GENAI_METAL_EP_LIB=$MLX ./target/release/onnx-genai \
+  --profile-trace examples/traces/qwen2.5-0.5b-native-mlx.perfetto.json \
+  generate models/qwen2.5-0.5b --prompt "$P" --max-new-tokens 12 --temperature 0
 ```
+
+Add `ONNX_GENAI_TRACE_VERBOSITY=full` for a span per worker thread per
+operator; it costs about 4%.
 
 ## `onnx-genai-cuda-device-argmax.perfetto.json`
 

@@ -9,16 +9,16 @@ use super::*;
 /// remains the final safety net: if a would-be capture still carries a dynamic
 /// auxiliary seam it is transparently declined and decode continues eagerly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GraphCaptureStructuralSafety {
+pub(crate) struct GraphCaptureStructuralSafety {
     /// Decode runs on a CUDA device (device-resident, replayable bindings).
-    device_is_cuda: bool,
+    pub(crate) device_is_cuda: bool,
     /// KV cache is owned/device-resident (not a borrowed shared-KV proposer).
-    kv_ownership: KvOwnership,
+    pub(crate) kv_ownership: KvOwnership,
 }
 
 impl GraphCaptureStructuralSafety {
     /// True when structural conditions make whole-step capture safe to attempt.
-    fn is_capture_safe(self) -> bool {
+    pub(crate) fn is_capture_safe(self) -> bool {
         self.device_is_cuda && self.kv_ownership == KvOwnership::Owned
     }
 }
@@ -33,7 +33,7 @@ impl GraphCaptureStructuralSafety {
 ///    forces ON) is honored next.
 /// 3. When neither is set, auto-decide from `structural` safety: attempt capture
 ///    only when the decode topology is structurally graph-safe.
-fn resolve_graph_capture_enabled(
+pub(crate) fn resolve_graph_capture_enabled(
     programmatic: Option<bool>,
     env_explicit: bool,
     env_value: bool,
@@ -78,9 +78,9 @@ enum DecodeCudaGraphPhase {
     Unsupported,
 }
 
-struct DecodeCudaState {
+pub(crate) struct DecodeCudaState {
     logical_len: usize,
-    max_len: usize,
+    pub(crate) max_len: usize,
     bindings: Vec<DeviceIoBinding>,
     base_binding_count: usize,
     kv_binding_range: std::ops::Range<usize>,
@@ -104,15 +104,15 @@ struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
-    graph_fallback_reason: Option<String>,
-    graph_fallback_report: Option<CaptureDeclineReport>,
+    pub(crate) graph_fallback_reason: Option<String>,
+    pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
     /// graph outputs could not be persistently bound (an unresolved symbolic
     /// dimension that is not batch or query-seq). Non-empty here means CUDA
     /// graph capture was declined up front and the eager device path is in
     /// force for this generation. Empty when every auxiliary output was
     /// statically bindable.
-    auxiliary_bind_declines: Vec<String>,
+    pub(crate) auxiliary_bind_declines: Vec<String>,
     /// When `false` (today's default), `NativeDecodeSession::rewind` invalidates
     /// the captured decode graph before rolling the device KV back — correct for
     /// the eager M=K verify path (option (b)), which captures nothing.
@@ -124,23 +124,23 @@ struct DecodeCudaState {
     /// logical shapes change across steps — exactly the data-driven mutation the
     /// captured graph already tolerates on the M=1 replay path. Kept dormant
     /// (default `false`) until WP4 graduates verify to the captured path.
-    retain_graph_on_rewind: bool,
+    pub(crate) retain_graph_on_rewind: bool,
     /// Dormant option (c) scaffolding: the fixed query-row capacity (M=maxK) a
     /// padded single-capture verify graph would be captured at. `None` today —
     /// the eager verify path (option (b)) captures nothing. Set only by the
     /// dormant `configure_padded_verify_capture` switch (not on the hot path).
     #[allow(dead_code)]
-    padded_query_capacity: Option<usize>,
+    pub(crate) padded_query_capacity: Option<usize>,
 }
 
-struct DecodeCudaIo<'a> {
-    input_ids: &'a str,
-    attention_mask: &'a str,
-    position_ids: Option<&'a str>,
-    logits: &'a str,
+pub(crate) struct DecodeCudaIo<'a> {
+    pub(crate) input_ids: &'a str,
+    pub(crate) attention_mask: &'a str,
+    pub(crate) position_ids: Option<&'a str>,
+    pub(crate) logits: &'a str,
 }
 
-fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
+pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
     for decline in &report.entries {
         if let Some(node_id) = decline.node_id {
             capture_rejected(
@@ -243,7 +243,7 @@ impl NativeDecodeSession {
         Ok(logits)
     }
 
-    fn decode_cuda(
+    pub(crate) fn decode_cuda(
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
@@ -404,7 +404,7 @@ impl NativeDecodeSession {
         )
     }
 
-    fn decode_cuda_greedy(
+    pub(crate) fn decode_cuda_greedy(
         &mut self,
         token_id: TokenId,
         past_len: usize,
@@ -449,7 +449,11 @@ impl DecodeCudaState {
     /// safely collapse to `1`. `batch_only` restricts collection to axis 0 for
     /// inputs whose non-batch axes grow with the sequence (attention_mask and
     /// the past-KV tensors, whose total_seq axis is *not* a decode unit).
-    fn collect_unit_symbols(shape: &[Dim], batch_only: bool, out: &mut HashSet<SymbolId>) {
+    pub(crate) fn collect_unit_symbols(
+        shape: &[Dim],
+        batch_only: bool,
+        out: &mut HashSet<SymbolId>,
+    ) {
         for (axis, dim) in shape.iter().enumerate() {
             if batch_only && axis != 0 {
                 continue;
@@ -465,7 +469,7 @@ impl DecodeCudaState {
     /// symbols. Such a dimension is data-dependent (e.g. an accumulator indexed
     /// by total_seq / past+1), so collapsing it to `1` in a persistent device
     /// binding would under-allocate. Returns `(axis, symbol)` of the offender.
-    fn unresolved_symbolic_axis(
+    pub(crate) fn unresolved_symbolic_axis(
         shape: &[Dim],
         unit_symbols: &HashSet<SymbolId>,
     ) -> Option<(usize, SymbolId)> {
@@ -475,7 +479,7 @@ impl DecodeCudaState {
         })
     }
 
-    fn persistent_output_shape(
+    pub(crate) fn persistent_output_shape(
         name: &str,
         dtype: DataType,
         shape: &[Dim],
@@ -507,7 +511,7 @@ impl DecodeCudaState {
         Ok(shape)
     }
 
-    fn new(
+    pub(crate) fn new(
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
@@ -861,7 +865,7 @@ impl DecodeCudaState {
         Ok(())
     }
 
-    fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
+    pub(crate) fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
         for binding in &mut self.bindings[self.kv_binding_range.clone()] {
             let mut shape = binding.physical_shape().to_vec();
             shape[2] = len;
@@ -871,7 +875,7 @@ impl DecodeCudaState {
         Ok(())
     }
 
-    fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
+    pub(crate) fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len < self.logical_len {
             let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
             self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
@@ -952,7 +956,7 @@ impl DecodeCudaState {
         extract_logits(&logits)
     }
 
-    fn greedy_fastpath_supported(&self) -> bool {
+    pub(crate) fn greedy_fastpath_supported(&self) -> bool {
         self.bindings[self.logits_binding].device_argmax_supported()
     }
 
@@ -970,7 +974,10 @@ impl DecodeCudaState {
         ))
     }
 
-    fn invalidate_graph(&mut self, session: &mut InferenceSession) -> anyhow::Result<()> {
+    pub(crate) fn invalidate_graph(
+        &mut self,
+        session: &mut InferenceSession,
+    ) -> anyhow::Result<()> {
         session.reset_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         Ok(())
@@ -982,7 +989,7 @@ impl DecodeCudaState {
     /// instead of invalidating it. Not reachable from the plain M=1 hot path nor
     /// the eager (option (b)) verify path; only a future WP4 driver flips it on.
     #[allow(dead_code)]
-    fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
+    pub(crate) fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
         self.padded_query_capacity = Some(max_query_rows);
         self.retain_graph_on_rewind = true;
     }
@@ -991,18 +998,18 @@ impl DecodeCudaState {
     /// contents-only mutation) or invalidates it (option (b), the eager default).
     /// Dormant: only exercised by option-(c) correctness tests until WP4.
     #[allow(dead_code)]
-    fn set_retain_graph_on_rewind(&mut self, retain: bool) {
+    pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         self.retain_graph_on_rewind = retain;
     }
 
     /// Fixed query-row capacity (M=maxK) of the dormant padded verify capture, or
     /// `None` while the eager (option (b)) verify path is in force.
     #[allow(dead_code)]
-    fn padded_query_capacity(&self) -> Option<usize> {
+    pub(crate) fn padded_query_capacity(&self) -> Option<usize> {
         self.padded_query_capacity
     }
 
-    fn debug_stats(&self, session: &InferenceSession) -> CudaKvDebugStats {
+    pub(crate) fn debug_stats(&self, session: &InferenceSession) -> CudaKvDebugStats {
         let mut transfers = DeviceBindingTransferStats::default();
         let device_ptrs = self.bindings[self.kv_binding_range.clone()]
             .iter()
@@ -1032,7 +1039,7 @@ impl DecodeCudaState {
     }
 }
 
-fn cuda_kv_max_len_from_env() -> anyhow::Result<usize> {
+pub(crate) fn cuda_kv_max_len_from_env() -> anyhow::Result<usize> {
     match std::env::var("ONNX_GENAI_CUDA_KV_MAX_LEN") {
         Ok(value) => {
             let parsed = value.trim().parse::<usize>().with_context(|| {

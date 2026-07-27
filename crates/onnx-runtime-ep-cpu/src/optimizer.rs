@@ -2,7 +2,7 @@ use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
-    OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
+    OpFusion, OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
 };
 
 const PROJECTION_FUSION_ENV: &str = "ONNX_GENAI_PROJECTION_FUSION";
@@ -37,10 +37,15 @@ impl Default for ProjectionFusion {
 /// The ordered CPU EP optimization registry.
 pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     let mut passes: Vec<Box<dyn OptimizationPass>> = Vec::new();
+    passes.push(Box::new(CpuSiluFusion));
     let projection_fusion = ProjectionFusion::new();
     if projection_fusion.enabled() {
         passes.push(Box::new(projection_fusion));
     }
+    // The generic fusion machinery emits contrib/private fused ops that the CPU
+    // EP registers kernels for. Keeping it EP-scoped prevents those rewrites from
+    // shrinking another provider's chance to claim the original standard ops.
+    passes.push(Box::new(OpFusion::new()));
     // Always-on, byte-identical bias fold: `Add(MatMulNBits, [N]-bias)` becomes
     // the `MatMulNBits` optional bias input, which the kernel adds inside the
     // MLAS GEMV epilogue instead of paying for a standalone element-wise `Add`.
@@ -60,6 +65,72 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     passes
 }
 
+struct CpuSiluFusion;
+
+impl OptimizationPass for CpuSiluFusion {
+    fn name(&self) -> &str {
+        "CpuSiluFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        let sigmoid_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Sigmoid"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for sigmoid_id in sigmoid_ids {
+            let Some(sigmoid) = graph.try_node(sigmoid_id) else {
+                continue;
+            };
+            let Some(x) = sigmoid.inputs[0] else {
+                continue;
+            };
+            let sigmoid_output = sigmoid.outputs[0];
+            if graph.outputs.contains(&sigmoid_output) {
+                continue;
+            }
+            let consumers = graph.consumers(sigmoid_output);
+            if consumers.len() != 1 {
+                continue;
+            }
+            let mul_id = consumers[0];
+            let mul = graph.node(mul_id);
+            if mul.op_type != "Mul"
+                || !mul.is_default_domain()
+                || mul.inputs.len() != 2
+                || mul.outputs.len() != 1
+                || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
+                    || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
+            {
+                continue;
+            }
+
+            let mut fused = mul.clone();
+            fused.op_type = "Swish".to_string();
+            fused.domain.clear();
+            fused.version = Some(24);
+            fused.inputs = vec![Some(x)];
+            fused.attributes.clear();
+            graph.replace_node(mul_id, fused);
+            graph.remove_node(sigmoid_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
 impl OptimizationPass for ProjectionFusion {
     fn name(&self) -> &str {
         "CpuProjectionFusion"
@@ -70,21 +141,19 @@ impl OptimizationPass for ProjectionFusion {
             return Ok(());
         }
 
-        let silu_nodes: Vec<NodeId> = graph
+        let activation_nodes: Vec<NodeId> = graph
             .nodes
             .iter()
             .filter_map(|(id, node)| {
-                (node.op_type == "Silu"
-                    && node.domain == MICROSOFT_DOMAIN
-                    && node.inputs.len() == 1
-                    && node.outputs.len() == 1)
+                (is_silu_like_activation(node) && node.inputs.len() == 1 && node.outputs.len() == 1)
                     .then_some(id)
             })
             .collect();
 
         let mut changed = false;
-        for silu_id in silu_nodes {
-            let Some(candidate) = GateUpCandidate::match_from_silu(graph, silu_id, ctx) else {
+        for activation_id in activation_nodes {
+            let Some(candidate) = GateUpCandidate::match_from_activation(graph, activation_id, ctx)
+            else {
                 continue;
             };
             candidate.apply(graph);
@@ -95,6 +164,20 @@ impl OptimizationPass for ProjectionFusion {
             graph.validate().map_err(OptimizerError::from)?;
         }
         Ok(())
+    }
+}
+
+fn is_silu_like_activation(node: &Node) -> bool {
+    if node.op_type == "Silu" && node.domain == MICROSOFT_DOMAIN {
+        return true;
+    }
+    if node.op_type != "Swish" || !node.is_default_domain() {
+        return false;
+    }
+    match node.attr("alpha") {
+        None => true,
+        Some(Attribute::Float(alpha)) => *alpha == 1.0,
+        Some(_) => false,
     }
 }
 
@@ -390,22 +473,26 @@ struct GateUpCandidate {
 }
 
 impl GateUpCandidate {
-    fn match_from_silu(graph: &Graph, silu_id: NodeId, ctx: &PassContext) -> Option<Self> {
-        let silu = graph.try_node(silu_id)?;
-        let gate_output = silu.inputs[0]?;
-        let silu_output = silu.outputs[0];
+    fn match_from_activation(
+        graph: &Graph,
+        activation_id: NodeId,
+        ctx: &PassContext,
+    ) -> Option<Self> {
+        let activation = graph.try_node(activation_id)?;
+        let gate_output = activation.inputs[0]?;
+        let activation_output = activation.outputs[0];
         if graph.outputs.contains(&gate_output)
-            || graph.outputs.contains(&silu_output)
-            || graph.consumers(gate_output) != [silu_id]
+            || graph.outputs.contains(&activation_output)
+            || graph.consumers(gate_output) != [activation_id]
         {
             return None;
         }
 
-        let silu_consumers = graph.consumers(silu_output);
-        if silu_consumers.len() != 1 {
+        let activation_consumers = graph.consumers(activation_output);
+        if activation_consumers.len() != 1 {
             return None;
         }
-        let mul_id = silu_consumers[0];
+        let mul_id = activation_consumers[0];
         let mul = graph.try_node(mul_id)?;
         if mul.op_type != "Mul"
             || !matches!(mul.domain.as_str(), "" | "ai.onnx")
@@ -414,9 +501,9 @@ impl GateUpCandidate {
         {
             return None;
         }
-        let up_output = if mul.inputs[0] == Some(silu_output) {
+        let up_output = if mul.inputs[0] == Some(activation_output) {
             mul.inputs[1]?
-        } else if mul.inputs[1] == Some(silu_output) {
+        } else if mul.inputs[1] == Some(activation_output) {
             mul.inputs[0]?
         } else {
             return None;
@@ -887,7 +974,7 @@ fn remove_orphan_initializer(graph: &mut Graph, value: ValueId) {
 #[cfg(test)]
 mod tests {
     use super::checked_combined_initializer_len;
-    use super::{MICROSOFT_DOMAIN, MatMulNBitsBiasFusion};
+    use super::{CpuSiluFusion, MICROSOFT_DOMAIN, MatMulNBitsBiasFusion};
     use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, Node, NodeId, ValueId, static_shape};
     use onnx_runtime_optimizer::{OptimizationPass, PassContext};
 
@@ -906,6 +993,94 @@ mod tests {
 
     const K: usize = 8;
     const N: usize = 4;
+
+    fn silu_decomposition_graph(opset: u64, extra_sigmoid_consumer: bool) -> (Graph, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), opset);
+        let shape = static_shape([2]);
+        let x = graph.create_named_value("x", DataType::Float32, shape.clone());
+        let sigmoid_out = graph.create_named_value("sigmoid", DataType::Float32, shape.clone());
+        let silu_out = graph.create_named_value("silu", DataType::Float32, shape.clone());
+        graph.add_input(x);
+        graph.add_output(silu_out);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Sigmoid",
+            vec![Some(x)],
+            vec![sigmoid_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(sigmoid_out), Some(x)],
+            vec![silu_out],
+        ));
+        if extra_sigmoid_consumer {
+            let identity_out = graph.create_named_value("identity", DataType::Float32, shape);
+            graph.add_output(identity_out);
+            graph.insert_node(Node::new(
+                NodeId(0),
+                "Identity",
+                vec![Some(sigmoid_out)],
+                vec![identity_out],
+            ));
+        }
+        (graph, x)
+    }
+
+    #[test]
+    fn cpu_silu_fusion_prefers_standard_swish_when_opset_allows() {
+        let (mut graph, x) = silu_decomposition_graph(24, false);
+
+        CpuSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+
+        assert_eq!(graph.num_nodes(), 1);
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "Swish");
+        assert!(fused.domain.is_empty());
+        assert_eq!(fused.version, Some(24));
+        assert_eq!(fused.inputs, vec![Some(x)]);
+        assert!(!graph.opset_imports.contains_key(MICROSOFT_DOMAIN));
+    }
+
+    #[test]
+    fn cpu_silu_fusion_records_swish_opset_without_raising_graph_import() {
+        let (mut graph, x) = silu_decomposition_graph(21, false);
+
+        CpuSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+
+        assert_eq!(graph.num_nodes(), 1);
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "Swish");
+        assert!(fused.domain.is_empty());
+        assert_eq!(fused.version, Some(24));
+        assert_eq!(fused.inputs, vec![Some(x)]);
+        assert_eq!(graph.opset_imports[""], 21);
+    }
+
+    #[test]
+    fn cpu_silu_fusion_requires_private_sigmoid_output() {
+        let (mut graph, _) = silu_decomposition_graph(24, true);
+
+        CpuSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Sigmoid")
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Mul")
+                .count(),
+            1
+        );
+    }
 
     /// Builds `add = Add(MatMulNBits(a, w, s), bias)` and returns the graph plus
     /// the MatMulNBits node id and the bias value id. `bias_shape` lets tests

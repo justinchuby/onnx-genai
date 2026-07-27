@@ -74,6 +74,16 @@ jobs:
           -p onnx-std-python
           -- -D warnings
 
+      # onnx-genai-engine's native decode path only compiles when this feature
+      # is on. Without this step a refactor can leave it uncompilable while
+      # every other job still passes -- which is exactly what happened when
+      # native_decode.rs and engine.rs were split into module trees.
+      - name: Check the native backend compiles
+        run: >-
+          cargo clippy --locked --all-targets
+          -p onnx-genai-engine --features native-backend
+          -- -D warnings
+
   rust-portable:
     name: Rust (${{ matrix.name }})
     strategy:

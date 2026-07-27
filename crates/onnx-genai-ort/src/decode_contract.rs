@@ -196,7 +196,9 @@ mod tests {
 
     #[test]
     fn contains_classifiers_match_expected_names() {
-        assert!(name_contains_past_key_value("decoder.past_key_values.0.key"));
+        assert!(name_contains_past_key_value(
+            "decoder.past_key_values.0.key"
+        ));
         assert!(name_contains_present_key_value("present.0.value"));
         assert!(!name_contains_present_key_value("logits"));
         assert!(!name_contains_past_key_value("input_ids"));
@@ -204,10 +206,19 @@ mod tests {
 
     #[test]
     fn prefix_classifiers_are_dotted_only_by_default() {
-        assert!(has_past_prefix("past_key_values.0.key", KvNamingConvention::Dotted));
-        assert!(has_present_prefix("present.0.value", KvNamingConvention::Dotted));
+        assert!(has_past_prefix(
+            "past_key_values.0.key",
+            KvNamingConvention::Dotted
+        ));
+        assert!(has_present_prefix(
+            "present.0.value",
+            KvNamingConvention::Dotted
+        ));
         // Generic prefixes are not recognized under the dotted convention.
-        assert!(!has_past_prefix("past_key_self_0", KvNamingConvention::Dotted));
+        assert!(!has_past_prefix(
+            "past_key_self_0",
+            KvNamingConvention::Dotted
+        ));
         assert!(has_past_prefix(
             "past_key_self_0",
             KvNamingConvention::DottedAndGeneric

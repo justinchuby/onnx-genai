@@ -1144,6 +1144,9 @@ impl FusionPattern {
         {
             fused.domain = self.replacement_domain.clone();
         }
+        if !fused.domain.is_empty() {
+            graph.opset_imports.entry(fused.domain.clone()).or_insert(1);
+        }
         Ok(graph.insert_node(fused))
     }
 

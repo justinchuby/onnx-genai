@@ -39,6 +39,33 @@ impl DeviceType {
         }
     }
 
+    /// The device a canonical name refers to, or `None` if it names none.
+    ///
+    /// The inverse of [`trace_name`](DeviceType::trace_name), kept beside it so
+    /// the two cannot drift. A plugin execution provider is configured with a
+    /// device name from package metadata and has to report which device it
+    /// actually runs on; without this it could only guess, and guessing `Cpu`
+    /// makes a trace claim that Metal work happened on the host.
+    pub fn from_trace_name(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        Some(match name.as_str() {
+            "cpu" => DeviceType::Cpu,
+            "cuda" => DeviceType::Cuda,
+            "rocm" => DeviceType::Rocm,
+            "coreml" => DeviceType::CoreMl,
+            // The Metal plugin is named for the API it targets; the device
+            // class it runs on is MLX.
+            "mlx" | "metal" => DeviceType::Mlx,
+            "webgpu" => DeviceType::WebGpu,
+            "qnn" => DeviceType::Qnn,
+            "openvino" => DeviceType::OpenVino,
+            other => {
+                let id = other.strip_prefix("custom:")?.parse().ok()?;
+                DeviceType::Custom(id)
+            }
+        })
+    }
+
     /// Whether tensors on this device share the host address space and can be
     /// accessed by CPU code without an explicit copy.
     pub fn is_host_accessible(self) -> bool {

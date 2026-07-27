@@ -65,7 +65,7 @@ pub use graph::Graph;
 pub use layout::{
     MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides, is_contiguous,
 };
-pub use node::{Attribute, Node, NodeId};
+pub use node::{Attribute, Node, NodeId, RUNTIME_DOMAIN};
 pub use shape::{
     Dim, Shape, SymbolConstraints, SymbolId, as_static_shape, is_fully_static, static_shape,
 };

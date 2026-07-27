@@ -39,6 +39,14 @@ pub struct Graph {
     unknown_value_shapes: HashSet<ValueId>,
 }
 
+/// Upper bound on a plausible opset version.
+///
+/// ONNX is at 24 and gains roughly one per release, so anything past this is
+/// not a version but a corrupted or misinterpreted value. Bounding it here
+/// means every consumer agrees on which versions are usable, rather than each
+/// discovering its own limit when converting to a narrower integer.
+const MAX_PLAUSIBLE_OPSET: i64 = 1_000;
+
 impl Graph {
     /// An empty graph.
     pub fn new() -> Self {
@@ -46,6 +54,28 @@ impl Graph {
     }
 
     // === Query API ===
+
+    /// The opset version governing `node`, or `None` if neither the node nor
+    /// this graph names one.
+    ///
+    /// One owner for this decision, because three callers previously made it
+    /// separately and could disagree about the same node: shape inference,
+    /// native dispatch, and the plugin ABI, which converted to a narrower
+    /// integer and so rejected versions the others accepted.
+    ///
+    /// A node-local [`Node::version`] wins when it is a usable version. Values
+    /// that cannot be one — negative, zero, or beyond what any opset could
+    /// plausibly reach — are ignored rather than trusted, since a node claiming
+    /// them describes IR that is already wrong and the graph's own import is the
+    /// better answer.
+    pub fn effective_opset(&self, node: &Node) -> Option<u64> {
+        if let Some(version) = node.version
+            && (1..=MAX_PLAUSIBLE_OPSET).contains(&version)
+        {
+            return Some(version as u64);
+        }
+        self.opset_imports.get(node.domain.as_str()).copied()
+    }
 
     /// Borrow a node. Panics if `id` is not live; use
     /// [`Graph::try_node`] for a checked lookup.
@@ -1568,5 +1598,60 @@ mod tests {
         let s3 = g.intern_symbol("seq");
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
+    }
+}
+
+#[cfg(test)]
+mod effective_opset_tests {
+    use super::*;
+    use crate::node::Node;
+
+    fn node_with(version: Option<i64>) -> Node {
+        let mut node = Node::new(NodeId(0), "Swish", vec![], vec![]);
+        node.version = version;
+        node
+    }
+
+    /// A node's own version wins, which is the whole point of the field.
+    #[test]
+    fn a_node_version_overrides_the_graph_import() {
+        let mut graph = Graph::default();
+        graph.opset_imports.insert(String::new(), 13);
+        assert_eq!(graph.effective_opset(&node_with(Some(24))), Some(24));
+    }
+
+    /// Without one, the graph's import applies — ONNX's own behaviour.
+    #[test]
+    fn no_node_version_falls_back_to_the_graph() {
+        let mut graph = Graph::default();
+        graph.opset_imports.insert(String::new(), 13);
+        assert_eq!(graph.effective_opset(&node_with(None)), Some(13));
+    }
+
+    /// Values that cannot be a version are ignored, not honoured.
+    ///
+    /// Three callers resolve this — shape inference, native dispatch, and the
+    /// plugin ABI — and they used to convert independently, one to `u64` and
+    /// one to `i32`. A version between those ranges was therefore honoured by
+    /// one and dropped by another, so the same node meant different things
+    /// depending on who asked. Bounding it in one place is what stops that.
+    #[test]
+    fn implausible_versions_defer_to_the_graph() {
+        let mut graph = Graph::default();
+        graph.opset_imports.insert(String::new(), 13);
+        for version in [-1, 0, i64::MAX, i64::from(i32::MAX) + 1] {
+            assert_eq!(
+                graph.effective_opset(&node_with(Some(version))),
+                Some(13),
+                "version {version} is not usable and must not override the graph"
+            );
+        }
+    }
+
+    /// A domain the graph never imported has no version to offer.
+    #[test]
+    fn an_unimported_domain_resolves_to_nothing() {
+        let graph = Graph::default();
+        assert_eq!(graph.effective_opset(&node_with(None)), None);
     }
 }

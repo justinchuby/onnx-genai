@@ -1,19 +1,13 @@
-//! Integration test: run the optimizer pipeline over a real ONNX model
+//! Integration test: run the runtime default optimizer pipeline over a real ONNX model
 //! (`bert_toy`, loaded via `onnx-runtime-loader`) and assert the passes fire
 //! and preserve graph validity.
 //!
 //! This proves the device-independent passes work on a 384-node real model, not
 //! just hand-built fixtures.
 //!
-//! ## Note on LayerNorm fusion
-//!
-//! `bert_toy`'s LayerNorm decomposition shares the `mean` (first `ReduceMean`)
-//! across **two** `Sub` nodes (the variance branch and the numerator branch),
-//! so it is a DAG, not the idealized linear 9-op chain in `docs/ORT2.md` §18.2.
-//! The [`OpFusion`] safety rule correctly *declines* to fuse it, because the
-//! shared `mean` value escapes any linear match. A DAG-aware LayerNorm matcher
-//! is deferred (Phase 2b). The `MatMul+Add → FusedMatMulBias` fusion, whose
-//! intermediates are single-consumer, does fire on this model.
+//! Operator fusion is now provider-scoped, so this test only asserts the generic
+//! runtime passes. [`OpFusion`] has its own unit coverage and is scheduled by EPs
+//! that own the fused kernels.
 
 use std::path::Path;
 
@@ -30,7 +24,7 @@ fn count(g: &Graph, op: &str) -> usize {
 }
 
 #[test]
-fn pipeline_folds_constants_and_fuses_matmul_bias_on_bert_toy() {
+fn pipeline_folds_constants_without_provider_fusion_on_bert_toy() {
     let path = model_path();
     if !path.exists() {
         eprintln!("skipping: {} not present", path.display());
@@ -55,12 +49,15 @@ fn pipeline_folds_constants_and_fuses_matmul_bias_on_bert_toy() {
 
     // Constant folding materialized every Constant node into an initializer.
     assert_eq!(count(&g, "Constant"), 0, "all Constants should be folded");
-    // Op fusion collapsed MatMul+Add spines into FusedMatMulBias.
-    let fused = count(&g, "FusedMatMulBias");
-    assert!(fused > 0, "MatMul+Add fusion should fire on a real model");
-    assert!(
-        count(&g, "MatMul") < matmul_before,
-        "MatMul count should drop"
+    assert_eq!(
+        count(&g, "FusedMatMulBias"),
+        0,
+        "provider-scoped MatMul+Add fusion must not run in default_passes"
+    );
+    assert_eq!(
+        count(&g, "MatMul"),
+        matmul_before,
+        "default_passes must preserve the provider-claimable op surface"
     );
     // The pipeline is a net simplification.
     assert!(g.num_nodes() < nodes_before, "node count should decrease");

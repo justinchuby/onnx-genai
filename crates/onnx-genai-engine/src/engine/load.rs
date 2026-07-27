@@ -595,7 +595,8 @@ impl Engine {
         if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
             anyhow::bail!("native decoder backend does not yet support external KV connectors");
         }
-        let native_device = resolve_native_decode_device(config.native_device, session_options)?;
+        let native_device =
+            resolve_native_decode_device(config.native_device.clone(), session_options)?;
 
         let metadata = {
             let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
@@ -654,7 +655,7 @@ impl Engine {
             let _span = onnx_genai_ort::prof_span!("engine.native_session_load");
             crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
                 &model_directory.model_path,
-                native_device,
+                native_device.clone(),
                 governor.weight_offload_host_cache(),
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                 config.decode_precision,

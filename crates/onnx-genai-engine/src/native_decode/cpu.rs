@@ -1,13 +1,13 @@
 use super::*;
 
-enum NativeCpuDecodeResult {
+pub(crate) enum NativeCpuDecodeResult {
     Logits(Vec<Vec<f32>>),
     Token(TokenId),
 }
 
 /// Default persistent CPU KV cache capacity (sequence positions) when the
 /// `ONNX_GENAI_CPU_KV_MAX_LEN` override is unset. Matches the CUDA default.
-const DEFAULT_CPU_KV_MAX_LEN: usize = 4096;
+pub(crate) const DEFAULT_CPU_KV_MAX_LEN: usize = 4096;
 
 /// Persistent in-place CPU KV cache — the CPU analogue of [`DecodeCudaState`]'s
 /// present==past device bindings.
@@ -20,10 +20,10 @@ const DEFAULT_CPU_KV_MAX_LEN: usize = 4096;
 /// inputs nor round-trips the full present cache to host every step. `input_ids`,
 /// `attention_mask` and `position_ids` remain ordinary per-step host inputs, and
 /// `logits`/`hidden` still materialize normally, so only the KV traffic changes.
-struct DecodeCpuKvState {
+pub(crate) struct DecodeCpuKvState {
     /// One present==past binding per growable KV pair, sorted by past name.
     bindings: Vec<DeviceIoBinding>,
-    max_len: usize,
+    pub(crate) max_len: usize,
     logical_len: usize,
 }
 
@@ -33,7 +33,7 @@ impl DecodeCpuKvState {
     /// static head geometry, e.g. an f16 cache). `present_to_past` must contain
     /// only growable attention KV pairs — recurrent state pairs are handled by
     /// the host copy path and their presence disables this fast path upstream.
-    fn new(
+    pub(crate) fn new(
         session: &mut InferenceSession,
         present_to_past: &HashMap<String, String>,
         max_len: usize,
@@ -104,7 +104,7 @@ impl DecodeCpuKvState {
 
     /// Advance every KV binding's logical sequence length to `len`, exposing the
     /// freshly-appended rows to the next step's consumers.
-    fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
+    pub(crate) fn set_logical_len(&mut self, len: usize) -> anyhow::Result<()> {
         for binding in &mut self.bindings {
             let mut shape = binding.physical_shape().to_vec();
             shape[2] = len;
@@ -118,7 +118,7 @@ impl DecodeCpuKvState {
 /// Read the persistent CPU KV cache capacity override, falling back to
 /// [`DEFAULT_CPU_KV_MAX_LEN`]. Returns `Ok(None)` when the in-place path is
 /// disabled via `ONNX_GENAI_CPU_INPLACE_KV=0`.
-fn cpu_inplace_kv_max_len_from_env() -> anyhow::Result<Option<usize>> {
+pub(crate) fn cpu_inplace_kv_max_len_from_env() -> anyhow::Result<Option<usize>> {
     match std::env::var("ONNX_GENAI_CPU_INPLACE_KV") {
         Ok(value) if matches!(value.trim(), "0" | "off" | "false" | "no") => return Ok(None),
         _ => {}
@@ -142,7 +142,10 @@ fn cpu_inplace_kv_max_len_from_env() -> anyhow::Result<Option<usize>> {
 /// node — the only CPU kernel that implements the append-only in-place path. The
 /// persistent present==past binding is safe to apply only under this condition;
 /// any other producer (e.g. a plain `Concat`) requires the host copy path.
-fn all_pasts_consumed_by_gqa(graph: &onnx_runtime_ir::Graph, past_names: &[String]) -> bool {
+pub(crate) fn all_pasts_consumed_by_gqa(
+    graph: &onnx_runtime_ir::Graph,
+    past_names: &[String],
+) -> bool {
     if past_names.is_empty() {
         return false;
     }
@@ -265,7 +268,7 @@ impl NativeDecodeSession {
         Ok(result)
     }
 
-    fn decode_cpu(
+    pub(crate) fn decode_cpu(
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
@@ -294,7 +297,7 @@ impl NativeDecodeSession {
 
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
-            if token_ids.len() == 1 {
+            if token_ids.len() == 1 && !self.has_plugin_fused {
                 let uses_decode_pool = self.uses_decode_pool;
                 onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session.run(&bindings).map_err(anyhow::Error::from)
@@ -375,7 +378,7 @@ impl NativeDecodeSession {
     /// as fresh host inputs, but the KV caches persist in host buffers that the
     /// GroupQueryAttention kernel appends to in place. Only bound (present) KV
     /// outputs are suppressed; `logits`/`hidden` materialize as usual.
-    fn decode_cpu_inplace(
+    pub(crate) fn decode_cpu_inplace(
         &mut self,
         token_ids: &[TokenId],
         past_len: usize,
@@ -414,7 +417,7 @@ impl NativeDecodeSession {
             .expect("decode_cpu_inplace requires CPU KV state");
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
-            if token_ids.len() == 1 {
+            if token_ids.len() == 1 && !self.has_plugin_fused {
                 onnx_runtime_ep_cpu::with_decode_pool_scope(uses_decode_pool, || {
                     self.session
                         .run_with_device_bindings(&bindings, &mut state.bindings)

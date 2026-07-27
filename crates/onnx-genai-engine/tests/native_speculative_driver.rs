@@ -137,7 +137,7 @@ fn native_prompt_lookup_matches_plain_greedy_cuda() -> anyhow::Result<()> {
     }
 
     let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
-    let mut baseline = native_engine(&model_dir, device)?;
+    let mut baseline = native_engine(&model_dir, device.clone())?;
     let mut speculative = native_engine(&model_dir, device)?;
 
     // A deliberately repetitive prompt so prompt-lookup finds a matching n-gram,
