@@ -429,9 +429,7 @@ pub(super) struct DeviceBindingSignature {
     pub(super) device_ptr: usize,
 }
 
-
 impl Executor {
-
     /// Classify why one plan node cannot be recorded into a device graph, or
     /// `None` when it is capturable. Mirrors the per-node predicates the
     /// all-or-nothing audit used, but returns the reason instead of aborting so
@@ -452,7 +450,10 @@ impl Executor {
     ///
     /// Only genuinely-unresolved outputs are seeded: a statically/symbolically
     /// resolved shape stays authoritative, matching [`ExternalBindings::seed_capture_shapes`].
-    pub(super) fn seed_control_flow_capture_shapes(&self, resolved: &mut HashMap<ValueId, Vec<usize>>) {
+    pub(super) fn seed_control_flow_capture_shapes(
+        &self,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+    ) {
         for &vid in &self.control_flow_output_values {
             if resolved.contains_key(&vid) {
                 continue;

@@ -1,7 +1,6 @@
 use super::*;
 
 impl Executor {
-
     /// Execute the graph with `inputs` bound by name, plus an `outer_scope` of
     /// enclosing named values a nested control-flow subgraph body may capture.
     /// The top-level session `run` passes an empty scope; a control-flow body's

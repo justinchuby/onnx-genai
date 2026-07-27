@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// The `[shape, strides, byte_offset]` storage-bounds gate (Holden's
 /// precondition). Uses [`view_in_bounds`] for fixed-width dtypes and a
 /// `storage_bytes` check for sub-byte packed dtypes (which have no integral
@@ -298,4 +297,3 @@ pub(super) fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize)
         && input_index == 0
         && matches!(node.op_type.as_str(), "Shape" | "ReduceSum")
 }
-

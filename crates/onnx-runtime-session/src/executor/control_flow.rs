@@ -343,7 +343,12 @@ impl Executor {
     /// view (strided gather over its source buffer) or truncating an owned
     /// buffer to its logical size. This is the single materialization seam used
     /// by the graph-output boundary and control-flow scope capture.
-    pub(super) fn contiguous_bytes(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Result<Vec<u8>> {
+    pub(super) fn contiguous_bytes(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Result<Vec<u8>> {
         let value_name = || {
             self.graph
                 .try_value(vid)

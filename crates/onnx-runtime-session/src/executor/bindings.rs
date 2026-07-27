@@ -1,7 +1,6 @@
 use super::*;
 
 impl Executor {
-
     /// Bind the graph's symbols to concrete sizes from the actual bound-input
     /// shapes, validating rank and static dims and detecting symbol conflicts.
     pub(super) fn bind_symbols(

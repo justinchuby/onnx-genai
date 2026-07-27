@@ -149,13 +149,15 @@ const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
 /// (maximally polite, higher wake latency). Unset uses [`DEFAULT_BLOCKTIME`].
 fn decode_blocktime() -> Duration {
     static V: OnceLock<Duration> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("ONNX_GENAI_CPU_DECODE_BLOCKTIME_US") {
-        Ok(raw) => match raw.trim().parse::<u64>() {
-            Ok(us) => Duration::from_micros(us),
+    *V.get_or_init(
+        || match std::env::var("ONNX_GENAI_CPU_DECODE_BLOCKTIME_US") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(us) => Duration::from_micros(us),
+                Err(_) => DEFAULT_BLOCKTIME,
+            },
             Err(_) => DEFAULT_BLOCKTIME,
         },
-        Err(_) => DEFAULT_BLOCKTIME,
-    })
+    )
 }
 
 /// Spin iterations the (single, never-idle) dispatcher busy-waits on the

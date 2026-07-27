@@ -1,7 +1,6 @@
 use super::*;
 
 impl Executor {
-
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
     /// leaf kernel). Shared by the eager loop and the segmented runner.
     ///
@@ -262,7 +261,11 @@ impl Executor {
     /// `.unwrap_or_default()` collect did. `self.plan` and
     /// `self.scratch_input_shapes` are disjoint fields, so the shared read of the
     /// former coexists with the `&mut` refill of the latter.
-    pub(super) fn refill_input_shapes(&mut self, pi: usize, resolved: &HashMap<ValueId, Vec<usize>>) {
+    pub(super) fn refill_input_shapes(
+        &mut self,
+        pi: usize,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) {
         let inputs = &self.plan[pi].inputs;
         let scratch = &mut self.scratch_input_shapes;
         scratch.truncate(inputs.len());
@@ -963,7 +966,12 @@ impl Executor {
     /// first if needed. Used to resolve data-dependent output shapes (e.g. a
     /// `Slice` whose `ends` is produced at runtime). Returns `None` if the value
     /// has no readable buffer/view or its dtype is not an integer.
-    pub(super) fn input_i64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<i64>> {
+    pub(super) fn input_i64(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Option<Vec<i64>> {
         let bytes = self.contiguous_bytes(vid, shape, dtype).ok()?;
         bytes_as_i64(&bytes, dtype)
     }
@@ -971,7 +979,12 @@ impl Executor {
     /// Bounded integer reader for dynamic shape propagation. Views and sequence
     /// elements can have a tiny logical shape backed by a much larger root
     /// allocation, so cap that allocation before `contiguous_bytes` can copy it.
-    pub(super) fn shape_input_i64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<i64>> {
+    pub(super) fn shape_input_i64(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Option<Vec<i64>> {
         if !bounded_shape_input(dtype, shape) {
             return None;
         }
@@ -992,7 +1005,12 @@ impl Executor {
         self.input_i64(vid, shape, dtype)
     }
 
-    pub(super) fn shape_input_f64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<f64>> {
+    pub(super) fn shape_input_f64(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Option<Vec<f64>> {
         if !matches!(dtype, DataType::Float32 | DataType::Float64)
             || shape.len() > 1
             || shape
@@ -1024,7 +1042,12 @@ impl Executor {
     /// data-dependent output extent. Unlike ordinary shape tensors these inputs
     /// are rank 3 and may exceed `MAX_SHAPE_DATA_ELEMS`; materialize them only
     /// for this operator, immediately before its output allocation.
-    pub(super) fn nms_input_f64(&self, vid: ValueId, shape: &[usize], dtype: DataType) -> Option<Vec<f64>> {
+    pub(super) fn nms_input_f64(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Option<Vec<f64>> {
         if dtype != DataType::Float32 {
             return None;
         }

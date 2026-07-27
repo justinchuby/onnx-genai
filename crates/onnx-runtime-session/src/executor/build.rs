@@ -184,7 +184,10 @@ pub(super) fn validate_control_flow_signatures(graph: &Graph) -> Result<()> {
 /// declared input shapes are pre-validated: a symbolic/data-dependent shape is
 /// resolved and validated at run time, so pre-checking a contrib op whose
 /// support is shape-conditional would change behavior for valid graphs.
-pub(super) fn reject_unsupported_operators(graph: &Graph, ep: &dyn ExecutionProvider) -> Result<()> {
+pub(super) fn reject_unsupported_operators(
+    graph: &Graph,
+    ep: &dyn ExecutionProvider,
+) -> Result<()> {
     if ep.device_type() == DeviceType::Cuda {
         return Ok(());
     }
@@ -455,9 +458,6 @@ pub(super) fn build_lazy_weight_handles(
     }
     Ok(handles)
 }
-
-
-
 
 impl Executor {
     /// Compile a graph + weights into a runnable executor on the CPU EP.
@@ -863,7 +863,12 @@ impl Executor {
 
     /// Allocate `vid`'s buffer for `dims`, or reuse the existing allocation when
     /// it is already sized for `dims` (the run-scoped reuse path).
-    pub(super) fn ensure_buffer(&mut self, vid: ValueId, dtype: DataType, dims: &[usize]) -> Result<()> {
+    pub(super) fn ensure_buffer(
+        &mut self,
+        vid: ValueId,
+        dtype: DataType,
+        dims: &[usize],
+    ) -> Result<()> {
         if self.buffer_shapes.get(&vid).map(|s| s.as_slice()) == Some(dims) {
             return Ok(()); // identical shape → reuse allocation
         }
@@ -921,7 +926,10 @@ impl Executor {
     /// symbolic (a data-dependent extent the loader could not pin down) are
     /// simply omitted, to be resolved just-in-time during execution once their
     /// producing node's inputs are concrete.
-    pub(super) fn resolve_soft(&self, bindings: &HashMap<SymbolId, usize>) -> HashMap<ValueId, Vec<usize>> {
+    pub(super) fn resolve_soft(
+        &self,
+        bindings: &HashMap<SymbolId, usize>,
+    ) -> HashMap<ValueId, Vec<usize>> {
         let mut resolved = HashMap::with_capacity(self.value_shapes.len());
         for (&vid, shape) in &self.value_shapes {
             if let Some(dims) = substitute(shape, bindings) {
@@ -1072,7 +1080,10 @@ impl Executor {
     /// shape (graph-static) stands in for the concrete one, so pure-L KV growth
     /// yields an unchanged signature while a binding added/removed, a role flip,
     /// or a dtype change yields a different one.
-    pub(super) fn decode_external_signature(&self, external: &ExternalBindings) -> Vec<DecodeBindingSig> {
+    pub(super) fn decode_external_signature(
+        &self,
+        external: &ExternalBindings,
+    ) -> Vec<DecodeBindingSig> {
         let mut sig: Vec<DecodeBindingSig> = external
             .inputs
             .keys()
@@ -1215,7 +1226,10 @@ impl Executor {
     /// a position-indexed slice into a fixed-capacity buffer — before it is ever
     /// elided. Sources and the buffer-identity signature are recomputed from the
     /// surviving views. The plan is marked validated iff anything survives.
-    pub(super) fn validate_decode_view_plan(&self, mut plan: DecodeViewPlan) -> Option<DecodeViewPlan> {
+    pub(super) fn validate_decode_view_plan(
+        &self,
+        mut plan: DecodeViewPlan,
+    ) -> Option<DecodeViewPlan> {
         let view_matches = |a: &ValueView, b: &ValueView| {
             a.source == b.source
                 && a.shape == b.shape

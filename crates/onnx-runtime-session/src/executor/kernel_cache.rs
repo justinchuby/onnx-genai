@@ -111,5 +111,3 @@ impl KernelCache {
         Ok(self.entries.get(&key).expect("just inserted").as_ref())
     }
 }
-
-

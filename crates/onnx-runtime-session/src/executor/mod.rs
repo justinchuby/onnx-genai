@@ -472,7 +472,6 @@ fn required_outer_names(graph: &Graph) -> HashSet<String> {
     required
 }
 
-
 impl Drop for Executor {
     fn drop(&mut self) {
         // Observability (F5): a one-line memo activity summary when
@@ -501,32 +500,31 @@ impl Drop for Executor {
     }
 }
 
-
 mod state;
 use state::*;
 pub(crate) use state::{ChildExecutor, ChildExecutorStats, Executor};
 mod kernel_cache;
-use kernel_cache::*;
-use capture::*;
 use build::*;
-pub use kernel_cache::CacheStats;
-pub(crate) use kernel_cache::KernelCache;
+use capture::*;
 pub use capture::{
     CaptureDecline, CaptureDeclineReport, CapturePathKind, ControlFlowStats,
     DeviceAllocationCounts, DeviceGraphCaptureResult, ExecutionProviderDecline,
     ExecutionProviderFallbackReport, SeamReason,
 };
+pub use kernel_cache::CacheStats;
+pub(crate) use kernel_cache::KernelCache;
+use kernel_cache::*;
 mod dynamic_shapes;
 mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
-mod build;
 mod bindings;
-mod run;
+mod build;
 mod capture;
-mod dispatch;
 mod control_flow;
+mod dispatch;
 mod platform;
+mod run;
 mod sequence_ops;
 pub(crate) use platform::auto_detect_cpu_ep;
 
