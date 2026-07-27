@@ -172,6 +172,20 @@ pub struct SourceImage {
     pub mask: Option<Vec<f32>>,
 }
 
+/// One additional f32 input supplied directly to the declared denoiser.
+///
+/// This carries package-defined conditioning such as ControlNet images/scales
+/// and runtime LoRA gates without adding model-family logic to the engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenoiserInput {
+    /// Denoiser graph input port, without the component prefix.
+    pub name: String,
+    /// Tensor values in row-major order.
+    pub values: Vec<f32>,
+    /// Tensor shape; an empty shape denotes a scalar.
+    pub shape: Vec<i64>,
+}
+
 /// Sampling parameters for one text-to-image render.
 #[derive(Debug, Clone)]
 pub struct TextToImageRequest {
@@ -823,6 +837,16 @@ pub fn generate_image(
     engine: &mut PipelineEngine,
     request: &TextToImageRequest,
 ) -> Result<Vec<RenderedImage>> {
+    generate_image_with_denoiser_inputs(pipeline_dir, engine, request, &[])
+}
+
+/// Generate images while supplying package-defined denoiser inputs.
+pub fn generate_image_with_denoiser_inputs(
+    pipeline_dir: &Path,
+    engine: &mut PipelineEngine,
+    request: &TextToImageRequest,
+    denoiser_inputs: &[DenoiserInput],
+) -> Result<Vec<RenderedImage>> {
     if !request.height.is_multiple_of(VAE_DOWNSCALE) || !request.width.is_multiple_of(VAE_DOWNSCALE)
     {
         bail!(
@@ -1058,6 +1082,14 @@ pub fn generate_image(
                 engine.spec().strategy.denoiser.as_deref().unwrap()
             ),
             Value::from_slice_f32(&time_ids, &[batch_size as i64, 6])?,
+        );
+    }
+
+    let denoiser = engine.spec().strategy.denoiser.as_deref().unwrap();
+    for input in denoiser_inputs {
+        pipeline_request = pipeline_request.with_input(
+            format!("{denoiser}.{}", input.name),
+            Value::from_slice_f32(&input.values, &input.shape)?,
         );
     }
 

@@ -52,6 +52,11 @@ fn main() {
             "start_step": workflow.start_step,
             "loras": workflow.loras,
             "controlnet": workflow.controlnet,
+            "controlnets": workflow.controlnets.iter().map(|controlnet| json!({
+                "name": controlnet.name,
+                "strength": controlnet.strength,
+                "image": controlnet.image,
+            })).collect::<Vec<_>>(),
         },
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());

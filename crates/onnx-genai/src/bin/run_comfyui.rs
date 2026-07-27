@@ -25,11 +25,11 @@ use onnx_genai::engine::{
 };
 use onnx_genai::ort::Value;
 use onnx_genai::text_to_image::{
-    CLIP_CONTEXT_LENGTH, RenderedImage, TextToImageRequest, VaeEncoder, generate_image,
-    latent_channels, load_clip_tokenizer, load_source_image, save_png, tile_ids,
-    tokenize_clip as tokenize, validate_finite_decode_output,
+    CLIP_CONTEXT_LENGTH, DenoiserInput, RenderedImage, TextToImageRequest, VaeEncoder,
+    generate_image_with_denoiser_inputs, latent_channels, load_clip_tokenizer, load_source_image,
+    save_png, tile_ids, tokenize_clip as tokenize, validate_finite_decode_output,
 };
-use onnx_genai_comfyui_config::parse_workflow_file;
+use onnx_genai_comfyui_config::{ControlNet, parse_workflow_file};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -136,6 +136,92 @@ fn vae_scaling_factor(pipeline_dir: &Path) -> f32 {
         .unwrap_or(0.18215)
 }
 
+fn preprocess_control_image(
+    image: &image::DynamicImage,
+    width: usize,
+    height: usize,
+    batch_size: usize,
+) -> Vec<f32> {
+    let image = image
+        .resize_exact(
+            width as u32,
+            height as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .to_rgb8();
+    let plane = width * height;
+    let mut pixels = vec![0.0f32; batch_size * 3 * plane];
+    for batch in 0..batch_size {
+        let batch_offset = batch * 3 * plane;
+        for (index, pixel) in image.pixels().enumerate() {
+            for channel in 0..3 {
+                pixels[batch_offset + channel * plane + index] = pixel[channel] as f32 / 255.0;
+            }
+        }
+    }
+    pixels
+}
+
+fn adapter_id(name: &str) -> String {
+    Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name)
+        .to_owned()
+}
+
+fn workflow_denoiser_inputs(
+    workflow_path: &Path,
+    controlnets: &[ControlNet],
+    loras: &[(String, f64)],
+    width: usize,
+    height: usize,
+    batch_size: usize,
+) -> Result<Vec<DenoiserInput>> {
+    // Mobius exports a *single* fused ControlNet+UNet denoiser that declares one
+    // unsuffixed `controlnet_cond` image input (`mobius/tasks/_controlnet.py`,
+    // `_find_controlnet -> tuple | None`). There is no multi-ControlNet export
+    // and no per-adapter suffixed ports, so binding `controlnet_cond.{adapter}`
+    // would be silently dropped by the engine. Fail loudly instead of pretending
+    // multi-ControlNet works.
+    if controlnets.len() > 1 {
+        bail!(
+            "workflow declares {} ControlNets, but the exported denoiser supports a single \
+             fused ControlNet (`controlnet_cond`); multi-ControlNet export is unavailable. \
+             Refusing to bind unsupported per-adapter inputs that the model would silently drop.",
+            controlnets.len()
+        );
+    }
+    let mut inputs = Vec::with_capacity(controlnets.len() + loras.len());
+    for controlnet in controlnets {
+        let image_name = controlnet.image.as_deref().with_context(|| {
+            format!(
+                "ControlNet '{}' has no LoadImage-backed hint image",
+                controlnet.name
+            )
+        })?;
+        let path = workflow_asset(workflow_path, image_name);
+        let image = image::open(&path)
+            .with_context(|| format!("loading ControlNet hint image {}", path.display()))?;
+        // The only runtime ControlNet input the exported denoiser declares is the
+        // conditioning image `controlnet_cond`. ControlNet strength is fused at
+        // export time (`checkpoint_export(controlnet=...)`, DIFFUSION.md §9), not a
+        // runtime gate, so we deliberately do NOT feed a `conditioning_scale` input
+        // the model never declares (the engine would silently drop it).
+        inputs.push(DenoiserInput {
+            name: "controlnet_cond".to_owned(),
+            values: preprocess_control_image(&image, width, height, batch_size),
+            shape: vec![batch_size as i64, 3, height as i64, width as i64],
+        });
+    }
+    inputs.extend(loras.iter().map(|(name, strength)| DenoiserInput {
+        name: format!("lora_gate.{}", adapter_id(name)),
+        values: vec![*strength as f32],
+        shape: Vec::new(),
+    }));
+    Ok(inputs)
+}
+
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
 
@@ -168,6 +254,14 @@ fn main() -> Result<()> {
     let latent_width = width / 8;
     let batch_size = workflow.batch_size.max(1) as usize;
     let num_steps = workflow.steps as usize;
+    let denoiser_inputs = workflow_denoiser_inputs(
+        &arguments.workflow,
+        &workflow.controlnets,
+        &workflow.loras,
+        width,
+        height,
+        batch_size,
+    )?;
 
     eprintln!(
         "prompt={prompt:?} negative={negative_prompt:?} {num_steps} steps, cfg {}, {} ({})",
@@ -199,7 +293,7 @@ fn main() -> Result<()> {
                 scaling_factor: vae_scaling_factor(&arguments.pipeline_dir),
             }
         });
-        let images = generate_image(
+        let images = generate_image_with_denoiser_inputs(
             &arguments.pipeline_dir,
             &mut engine,
             &TextToImageRequest {
@@ -218,6 +312,7 @@ fn main() -> Result<()> {
                 source_image,
                 vae_encoder,
             },
+            &denoiser_inputs,
         )?;
         let pixels: Vec<f32> = images
             .iter()
@@ -335,4 +430,128 @@ fn main() -> Result<()> {
     }
     eprintln!("[verify A] PASS: native pipeline is bit-identical to the reference driver");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, Rgb, RgbImage};
+
+    fn controlnet(name: &str, strength: f64, image: &str) -> ControlNet {
+        ControlNet {
+            name: name.to_owned(),
+            strength,
+            image: Some(image.to_owned()),
+        }
+    }
+
+    #[test]
+    fn control_image_preprocessing_is_batched_chw_rgb_in_zero_to_one() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_fn(2, 1, |x, _| match x {
+            0 => Rgb([0, 127, 255]),
+            _ => Rgb([255, 64, 0]),
+        }));
+
+        let pixels = preprocess_control_image(&image, 2, 1, 2);
+        let expected_batch = vec![0.0, 1.0, 127.0 / 255.0, 64.0 / 255.0, 1.0, 0.0];
+        assert_eq!(pixels, [expected_batch.clone(), expected_batch].concat());
+        assert!(pixels.iter().all(|value| (0.0..=1.0).contains(value)));
+    }
+
+    #[test]
+    fn plain_workflow_routes_no_additional_denoiser_inputs() {
+        let inputs =
+            workflow_denoiser_inputs(Path::new("workflow.json"), &[], &[], 8, 8, 1).unwrap();
+        assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn lora_strengths_route_to_named_scalar_gates() {
+        let inputs = workflow_denoiser_inputs(
+            Path::new("workflow.json"),
+            &[],
+            &[
+                ("style.safetensors".to_owned(), 0.25),
+                ("detail.safetensors".to_owned(), -0.5),
+            ],
+            8,
+            8,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            inputs,
+            vec![
+                DenoiserInput {
+                    name: "lora_gate.style".to_owned(),
+                    values: vec![0.25],
+                    shape: vec![],
+                },
+                DenoiserInput {
+                    name: "lora_gate.detail".to_owned(),
+                    values: vec![-0.5],
+                    shape: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn single_controlnet_binds_the_declared_unsuffixed_cond_input() {
+        // The exported denoiser declares exactly one `controlnet_cond` input
+        // (mobius `tasks/_controlnet.py`). Pin that name so a regression to
+        // suffixed/renamed ports — which the engine would silently drop — fails
+        // here instead of producing a silent no-op.
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-fixtures/controlnet-single");
+        std::fs::create_dir_all(&directory).unwrap();
+        RgbImage::from_pixel(2, 1, Rgb([0, 127, 255]))
+            .save(directory.join("canny.png"))
+            .unwrap();
+        let controlnets = vec![controlnet("canny.safetensors", 0.75, "canny.png")];
+
+        let inputs =
+            workflow_denoiser_inputs(&directory.join("workflow.json"), &controlnets, &[], 2, 1, 2)
+                .unwrap();
+
+        // Exactly one input, bound to the real declared name; strength is fused at
+        // export, so NO `conditioning_scale` runtime input is emitted.
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "controlnet_cond");
+        assert_eq!(inputs[0].shape, vec![2, 3, 1, 2]);
+        assert_eq!(inputs[0].values.len(), 12);
+        assert!(
+            !inputs
+                .iter()
+                .any(|input| input.name.contains("conditioning_scale")),
+            "conditioning_scale is not a declared denoiser input and must never be fed"
+        );
+    }
+
+    #[test]
+    fn multiple_controlnets_fail_loudly_instead_of_silently_dropping() {
+        // Mobius exports a single fused ControlNet only. More than one declared
+        // ControlNet has no backing export, so we must error rather than emit
+        // per-adapter ports the engine would silently drop.
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-fixtures/controlnet-multi");
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["canny.png", "depth.png"] {
+            RgbImage::from_pixel(2, 1, Rgb([0, 127, 255]))
+                .save(directory.join(name))
+                .unwrap();
+        }
+        let controlnets = vec![
+            controlnet("canny.safetensors", 0.75, "canny.png"),
+            controlnet("depth.safetensors", 0.25, "depth.png"),
+        ];
+
+        let error =
+            workflow_denoiser_inputs(&directory.join("workflow.json"), &controlnets, &[], 2, 1, 2)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("single"),
+            "unsupported multi-ControlNet must fail loudly: {error}"
+        );
+    }
 }
