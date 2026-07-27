@@ -686,7 +686,7 @@ mod tests {
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
         let tokenizer = Tokenizer::from_file(&fixture)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
         let options = GenerateOptions {
             temperature: 0.7,
             top_p: 0.9,

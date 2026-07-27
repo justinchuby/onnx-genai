@@ -368,17 +368,16 @@ impl<'a> ContinuousBatchManager<'a> {
                     .last()
                     .context("continuous row has empty context")?;
                 input_ids[active_index] = i64::from(token);
-                position_ids[active_index] =
-                    self.decode.row_len(logical_row).map_err(|e| {
-                        anyhow::anyhow!("Failed to read continuous row length: {e}")
-                    })? as i64;
+                position_ids[active_index] = self
+                    .decode
+                    .row_len(logical_row)
+                    .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
+                    as i64;
             }
             let logits = self
                 .decode
                 .step_active(&input_ids, &position_ids)
-                .map_err(|e| {
-                    anyhow::anyhow!("Continuous active static-cache step failed: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("Continuous active static-cache step failed: {e}"))?;
             for (active_index, logical_row) in active_rows.into_iter().enumerate() {
                 let row = self.rows[logical_row]
                     .as_mut()
@@ -398,10 +397,11 @@ impl<'a> ContinuousBatchManager<'a> {
                     .last()
                     .context("continuous row has empty context")?;
                 input_ids[row.physical_row] = i64::from(token);
-                position_ids[row.physical_row] =
-                    self.decode.row_len(row.physical_row).map_err(|e| {
-                        anyhow::anyhow!("Failed to read continuous row length: {e}")
-                    })? as i64;
+                position_ids[row.physical_row] = self
+                    .decode
+                    .row_len(row.physical_row)
+                    .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
+                    as i64;
                 advance_rows[row.physical_row] = true;
             }
         }

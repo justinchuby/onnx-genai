@@ -126,9 +126,7 @@ fn find_ort_root() -> PathBuf {
         {
             return root_path;
         }
-        panic!(
-            "ORT_ROOT={root} does not contain include/onnxruntime_c_api.h"
-        );
+        panic!("ORT_ROOT={root} does not contain include/onnxruntime_c_api.h");
     }
 
     // 3. Try pkg-config

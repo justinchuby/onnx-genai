@@ -419,7 +419,7 @@ impl PipelineEngine {
             #[cfg(feature = "native-backend")]
             {
                 let directory = PipelineModelDirectory::load(pipeline_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
                 return Err(build_native_pipeline_and_report_gap(&directory, &config));
             }
         }
