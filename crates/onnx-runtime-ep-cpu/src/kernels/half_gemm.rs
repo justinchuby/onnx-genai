@@ -786,6 +786,7 @@ mod tests {
     /// FMA microkernel. Iterations are interleaved so shared-machine load drift
     /// cancels out; the reported speedup is load-independent. Run pinned:
     /// `taskset -c 1 cargo test -p onnx-runtime-ep-cpu --release half_gemm_prefill_gflops -- --ignored --nocapture`
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     #[ignore = "perf probe; run manually pinned to one core"]
     fn half_gemm_prefill_gflops() {
