@@ -2502,12 +2502,19 @@ Already implemented:
 - `TemperatureProcessor` — divide logits by T
 - `TopKProcessor` — keep top-K, -inf rest
 - `TopPProcessor` — nucleus sampling
+- `MinPProcessor` — probability threshold relative to the top token
+- `TopAProcessor` — threshold `top_a * p_max²`
+- `TypicalPProcessor` — locally typical entropy-distance truncation
 - `RepetitionPenaltyProcessor` — penalize repeated tokens
+- `FrequencyPenaltyProcessor` / `PresencePenaltyProcessor` — OpenAI-style penalties
+- `DryProcessor` — exponentially penalize repeated n-gram continuations
+- `MirostatProcessor` — v1/v2 adaptive target-surprise feedback
+- `XtcProcessor` — probabilistic top-choice exclusion
 - `StopSequenceProcessor` — detect stop strings
 - `ConstraintProcessor` — grammar/JSON masking
 - `sample_greedy` + `sample_categorical` — final token selection
 
-### 24.2 Missing Samplers
+### 24.2 Advanced Samplers
 
 ```rust
 /// Min-P sampling: only keep tokens with P >= min_p * P(top_token).
@@ -2528,13 +2535,14 @@ pub struct PresencePenaltyProcessor {
     pub penalty: f32,
 }
 
-/// Top-A sampling: adaptive threshold based on entropy.
+/// Top-A sampling: keep tokens where p >= top_a * p_max^2.
 pub struct TopAProcessor {
     pub top_a: f32,
 }
 
-/// Mirostat: target a specific perplexity (entropy) level.
-/// Self-tuning temperature that adapts during generation.
+/// Mirostat: target a specific per-token surprise level.
+/// V1 estimates the distribution's Zipf slope to choose K; V2 directly
+/// truncates tokens whose surprise exceeds mu. Both update mu after sampling.
 pub struct MirostatProcessor {
     pub tau: f32,        // target entropy
     pub eta: f32,        // learning rate
