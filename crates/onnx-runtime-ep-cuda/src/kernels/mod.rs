@@ -59,11 +59,13 @@ mod qmoe_grouping;
 pub mod reduce;
 pub mod rotary_embedding;
 pub mod shape;
+pub mod size;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
 pub mod topk;
+pub mod trilu;
 pub mod where_op;
 
 use activations::ActivationFactory;
@@ -96,14 +98,18 @@ use pointwise::{
 ///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`; arbitrary axes and keepdims.
 /// * **Pooling** — cuDNN `MaxPool`/`AveragePool` for 2-D NCHW f32/f16/bf16.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
-///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC
-///   f32/f16/bf16, formulas matched to the CPU EP `unary_math.rs`).
+///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus`, and the
+///   trigonometric/hyperbolic family `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
+///   `Atan`, `Asinh`, `Acosh`, `Atanh` (NVRTC f32/f16/bf16, formulas matched to
+///   the CPU EP `unary_math.rs`).
 /// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, broadcasting).
 /// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
 ///   `LessOrEqual` (f32/i32/i64 operands → bool, broadcasting; `Equal` also
 ///   accepts bool operands).
 /// * **Movement/construction** — `Concat`, `Expand`, `Reshape`, `Slice`, `Split`,
-///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, plus broadcasting `Where`.
+///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, `Identity`, `Flatten`, plus
+///   broadcasting `Where` and triangular-mask `Trilu`.
+/// * **Metadata** — `Shape`, `Size` (host-computed Int64, uploaded to device).
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -163,6 +169,15 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Sin",
     "Cos",
     "Softplus",
+    "Tan",
+    "Sinh",
+    "Cosh",
+    "Asin",
+    "Acos",
+    "Atan",
+    "Asinh",
+    "Acosh",
+    "Atanh",
     "Not",
     "And",
     "Or",
@@ -197,6 +212,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "GatherElements",
     "ScatterElements",
     "OneHot",
+    "Identity",
+    "Flatten",
+    "Size",
+    "Trilu",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -266,6 +285,18 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("Size", "", 1),
+        Box::new(size::SizeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Trilu", "", 14),
+        Box::new(trilu::TriluFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Constant", "", 1),
         Box::new(constant::ConstantFactory {
             runtime: runtime.clone(),
@@ -296,6 +327,18 @@ pub fn build_cuda_registry_with_metrics(
         (
             "Expand",
             Box::new(movement::ExpandFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Identity",
+            Box::new(movement::IdentityFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Flatten",
+            Box::new(movement::FlattenFactory {
                 runtime: runtime.clone(),
             }),
         ),
@@ -644,6 +687,15 @@ pub fn build_cuda_registry_with_metrics(
         ("Sin", UnaryMathOp::Sin),
         ("Cos", UnaryMathOp::Cos),
         ("Softplus", UnaryMathOp::Softplus),
+        ("Tan", UnaryMathOp::Tan),
+        ("Sinh", UnaryMathOp::Sinh),
+        ("Cosh", UnaryMathOp::Cosh),
+        ("Asin", UnaryMathOp::Asin),
+        ("Acos", UnaryMathOp::Acos),
+        ("Atan", UnaryMathOp::Atan),
+        ("Asinh", UnaryMathOp::Asinh),
+        ("Acosh", UnaryMathOp::Acosh),
+        ("Atanh", UnaryMathOp::Atanh),
     ] {
         reg.register(
             OpKey::new(op_type, "", 1),
@@ -726,7 +778,7 @@ mod tests {
 
     #[test]
     fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 88);
+        assert_eq!(CUDA_COVERED_OPS.len(), 102);
 
         let mut seen = std::collections::HashSet::new();
         for op in CUDA_COVERED_OPS {
@@ -845,6 +897,28 @@ mod tests {
     #[test]
     fn standard_attention_and_rope_are_listed_in_coverage() {
         for op in ["Attention", "RotaryEmbedding"] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn trig_hyperbolic_unary_ops_are_listed_in_coverage() {
+        for op in [
+            "Tan", "Sinh", "Cosh", "Asin", "Acos", "Atan", "Asinh", "Acosh", "Atanh",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn shape_movement_ops_are_listed_in_coverage() {
+        for op in ["Identity", "Flatten", "Size", "Trilu"] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"
