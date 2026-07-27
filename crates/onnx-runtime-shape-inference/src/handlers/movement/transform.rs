@@ -6,7 +6,8 @@ use crate::error::ShapeInferError;
 use crate::handlers::checked_axis;
 use crate::shape_data::ShapeData;
 
-use super::{const_ints, validate_vector_input, vector_length};
+use super::concat_slice::vector_length;
+use super::{const_ints, validate_vector_input};
 
 /// `Transpose`: permute dimensions by `perm` (default: reverse).
 pub fn transpose(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
