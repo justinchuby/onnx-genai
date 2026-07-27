@@ -396,10 +396,6 @@ impl PipelineEngine {
     /// keyed by port. `override_input`, when set as `(port, value)`, substitutes
     /// that input's value — used to supply the unconditional conditioning on the
     /// CFG unconditional pass.
-    /// Run one denoiser invocation for `step`. Returns `(outputs, sample_in)`
-    /// keyed by port. `override_input`, when set as `(port, value)`, substitutes
-    /// that input's value — used to supply the unconditional conditioning on the
-    /// CFG unconditional pass.
     fn run_denoiser_pass(
         &self,
         context: DenoiserPassContext<'_, '_>,
