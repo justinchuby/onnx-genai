@@ -149,3 +149,18 @@ Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Approved PR #282 after mutation-proven equivalence for tree speculative decoding core.
+
+## 2026-07-27T14:34:22-07:00 — Rules type-safety standard
+
+- Added a project rule requiring Rust types to enforce invariants: newtypes for transposable primitives, capability values over late hot-path checks, ownership/borrowing for aliasing, documented unsafe, property-based invariant tests, and restraint around heavier formal specs.
+
+## 2026-07-27T14:38:08-07:00 — Rules condensation pass
+
+- Tightened `RULES.md` from 10,167 bytes to 7,149 bytes after Justin's terseness directive.
+- Condensed the new Rust type-safety rule to the core invariants: invalid states, newtypes, capability values, and ownership/borrowing; dropped repeated unsafe/Miri, property-testing, and TLA+ detail.
+- Folded graph-fusion detail into the model/vendor/EP-agnostic rule without changing its force.
+
+## 2026-07-27T14:42:22-07:00 — Rule 2 force restored
+
+- Restored explicit no-hardcoded-architecture enumeration, fusion generalization, and review-blocking consequence in `RULES.md` rule 2 after Justin flagged the condensation as weakening the project identity rule.
+- Removed the stable-ABI wheel rule's stale inbox link; the corresponding abi3 details were found in archived decisions, not active `.squad/decisions.md`.
