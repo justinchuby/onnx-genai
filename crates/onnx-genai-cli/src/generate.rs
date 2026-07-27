@@ -11,7 +11,8 @@ use onnx_genai_server::multimodal;
 use super::commands::resolved_default_providers;
 use super::interactive::{
     Backend, EXIT_INTERRUPTED, TurnInput, apply_context_sized_max_new_tokens,
-    install_ctrlc_handler, is_interrupt_error, warn_missing_context_limit,
+    context_exhaustion_error, context_window_is_full, install_ctrlc_handler, is_interrupt_error,
+    warn_missing_context_limit,
 };
 use super::output::{build_turn_prompt, detect_reasoning, load_chat_template, run_generation_turn};
 use super::profile::{self, RunProfile};
@@ -55,6 +56,9 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
     profile.phase("model load", load_started.elapsed());
     let prompt_tokens = backend.prompt_tokens(&turn.prompt).unwrap_or_default();
     let effective_max_context = backend.effective_max_context(&turn.options);
+    if let Some(limit) = context_window_is_full(prompt_tokens, effective_max_context) {
+        return Err(context_exhaustion_error(prompt_tokens, limit));
+    }
     let used_fallback = apply_context_sized_max_new_tokens(
         &mut turn.options,
         args.sampling.max_new_tokens.is_some(),

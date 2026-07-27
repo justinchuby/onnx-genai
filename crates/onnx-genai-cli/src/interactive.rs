@@ -549,6 +549,58 @@ pub(super) fn warn_missing_context_limit(max_new_tokens: usize) {
     );
 }
 
+pub(super) fn context_exhaustion_error(prompt_tokens: usize, limit: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "What: the prompt already fills the context window ({prompt_tokens}/{limit} tokens). \
+         Why: there is no room to generate even one token, so returning an empty answer would be misleading. \
+         How: shorten the prompt or use a model/package with a larger context window."
+    )
+}
+
+pub(super) fn full_repl_context_message(prompt_tokens: usize, limit: usize) -> String {
+    format!(
+        "context window is full ({prompt_tokens}/{limit} tokens); no answer was generated and this turn was not kept. Use /reset to clear the conversation history, shorten your prompt, or use a model/package with a larger context window."
+    )
+}
+
+pub(super) fn context_window_is_full(
+    prompt_tokens: usize,
+    effective_max_context: Option<usize>,
+) -> Option<usize> {
+    effective_max_context.filter(|&limit| prompt_tokens >= limit)
+}
+
+pub(super) fn drop_exhausted_repl_turn(
+    history: &mut Vec<ChatMessage>,
+    prompt_tokens: usize,
+    effective_max_context: Option<usize>,
+) -> Option<String> {
+    context_window_is_full(prompt_tokens, effective_max_context).map(|limit| {
+        history.pop();
+        full_repl_context_message(prompt_tokens, limit)
+    })
+}
+
+fn reasoning_incomplete_note(
+    finish_reason: Option<&str>,
+    turn_max_new_tokens: usize,
+    max_new_tokens_was_explicit: bool,
+) -> String {
+    let finish_reason = finish_reason.unwrap_or("unknown");
+    let next_step = if max_new_tokens_was_explicit {
+        format!(
+            "If you want longer reasoning, try --max-new-tokens {}.",
+            turn_max_new_tokens.saturating_mul(2)
+        )
+    } else {
+        "If the context window is exhausted, use /reset to clear conversation history or shorten the prompt."
+            .to_string()
+    };
+    format!(
+        "note: generation stopped inside the model's reasoning (finish reason: {finish_reason}). No answer was produced, so this turn is not kept. {next_step}"
+    )
+}
+
 /// Turn a prompt plus its attachments into a pipeline generation request.///
 /// Audio replaces the prompt entirely: the transcription decoder is seeded with
 /// the model's own transcription token sequence because the spoken audio, not
@@ -997,6 +1049,14 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
         let mut turn_options = sampling_options.clone();
         let prompt_tokens = backend.prompt_tokens(&rendered).unwrap_or_default();
         let effective_max_context = backend.effective_max_context(&turn_options);
+        if let Some(message) =
+            drop_exhausted_repl_turn(&mut history, prompt_tokens, effective_max_context)
+        {
+            eprintln!("{message}");
+            image_attachments = staged_images;
+            audio_attachments = staged_audio;
+            continue;
+        }
         let used_fallback = apply_context_sized_max_new_tokens(
             &mut turn_options,
             args.sampling.max_new_tokens.is_some(),
@@ -1057,15 +1117,12 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             // record an empty assistant turn, which would teach
                             // the model that questions go unanswered.
                             eprintln!(
-                                "note: generation stopped inside the model's reasoning after hitting --max-new-tokens {turn_max_new_tokens}. No answer was produced, so this turn is not kept. Try {}.",
-                                if args.sampling.max_new_tokens.is_some() {
-                                    format!(
-                                        "--max-new-tokens {}",
-                                        turn_max_new_tokens.saturating_mul(2)
-                                    )
-                                } else {
-                                    "--max-context or model.max_sequence_length metadata if the automatic context limit was unavailable".to_string()
-                                }
+                                "{}",
+                                reasoning_incomplete_note(
+                                    profile.finish_reason.as_deref(),
+                                    turn_max_new_tokens,
+                                    args.sampling.max_new_tokens.is_some(),
+                                )
                             );
                             history.pop();
                             profiling.emit_when(show_profile, &mut profile)?;

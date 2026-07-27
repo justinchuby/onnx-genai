@@ -45,8 +45,9 @@ use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
 use interactive::{
-    InterruptAction, Interrupted, apply_context_sized_max_new_tokens, interrupt_action,
-    is_interrupt_error, stage_attachment,
+    InterruptAction, Interrupted, apply_context_sized_max_new_tokens, context_exhaustion_error,
+    context_window_is_full, drop_exhausted_repl_turn, interrupt_action, is_interrupt_error,
+    stage_attachment,
 };
 use model_inspection::{list, show, version};
 use onnx_genai::text_to_audio::TextToAudioRequest;
@@ -789,6 +790,75 @@ mod tests {
 
         assert!(used_fallback);
         assert_eq!(options.max_new_tokens, CLI_FALLBACK_MAX_NEW_TOKENS);
+    }
+
+    #[test]
+    fn context_exhaustion_at_equal_limit_drops_only_current_repl_turn() {
+        let mut history = vec![
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+
+        let message = drop_exhausted_repl_turn(&mut history, 2048, Some(2048))
+            .expect("equal limit should be exhausted");
+
+        assert!(message.contains("/reset"), "{message}");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "first question");
+        assert_eq!(history[1].content, "first answer");
+        assert!(
+            !history.iter().any(|message| {
+                message.role.as_str() == "assistant" && message.content.is_empty()
+            })
+        );
+    }
+
+    #[test]
+    fn context_exhaustion_above_limit_drops_only_current_repl_turn() {
+        let mut history = vec![
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+
+        let message = drop_exhausted_repl_turn(&mut history, 2050, Some(2048))
+            .expect("above limit should be exhausted");
+
+        assert!(message.contains("2050/2048"), "{message}");
+        assert_eq!(history.len(), 2);
+        assert!(
+            !history.iter().any(|message| {
+                message.role.as_str() == "assistant" && message.content.is_empty()
+            })
+        );
+    }
+
+    #[test]
+    fn context_exhaustion_one_shot_reports_actionable_error() {
+        let limit = context_window_is_full(2048, Some(2048))
+            .expect("equal limit should reject one-shot generation");
+        let error = context_exhaustion_error(2048, limit).to_string();
+
+        assert!(error.contains("2048/2048"), "{error}");
+        assert!(error.contains("shorten the prompt"), "{error}");
+        assert!(error.contains("larger context window"), "{error}");
+    }
+
+    #[test]
+    fn context_exhaustion_guard_leaves_healthy_turns_unchanged() {
+        let mut history = vec![ChatMessage::user("still has room")];
+        let mut options = GenerateOptions::default();
+
+        let message = drop_exhausted_repl_turn(&mut history, 2047, Some(2048));
+        let used_fallback =
+            apply_context_sized_max_new_tokens(&mut options, false, 2047, Some(2048));
+
+        assert!(message.is_none());
+        assert!(!used_fallback);
+        assert_eq!(options.max_new_tokens, 2);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "still has room");
     }
 
     #[test]
