@@ -640,6 +640,28 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         unsafe { f16c::narrow(data, dst) };
         return Ok(());
     }
+    // Contiguous f32→f32: memcpy directly, skipping both the identity Vec copy
+    // and the per-element strided write. This is the hot path for every dense
+    // f32 kernel on all architectures.
+    if out.dtype == DataType::Float32 && out.is_contiguous() {
+        out.validate()?;
+        let n = out.numel();
+        if data.len() != n {
+            return Err(EpError::KernelFailed(format!(
+                "{op}: output element count {n} does not match produced {}",
+                data.len()
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        // SAFETY: a validated contiguous Float32 output addresses exactly `n`
+        // f32 elements starting at `data_ptr_mut`. The caller's contract ensures
+        // `data` does not alias this output.
+        let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), n) };
+        dst.copy_from_slice(data);
+        return Ok(());
+    }
     dispatch_float!(out.dtype, op, T => {
         let narrowed: Vec<T> = data.iter().map(|&v| T::from_f32(v)).collect();
         write_dense_float::<T>(out, &narrowed)

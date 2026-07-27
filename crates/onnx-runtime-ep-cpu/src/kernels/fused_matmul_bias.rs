@@ -42,11 +42,26 @@ impl Kernel for FusedMatMulBiasKernel {
         check_arity("FusedMatMulBias", inputs, outputs, 3, 3, 1)?;
         // MatMul(A, B) into a dense buffer laid out over the output shape.
         let mut out = matmul_dense_prepacked(&inputs[0], &inputs[1], &self.prepack)?;
-        // Broadcast-add the bias in place, matching a standalone `Add`.
+        // Fast path: 1-D bias matching the last dimension of the output. This is
+        // the common case for linear projections (bias shape [N], output [..., N]).
+        // Avoids the generic broadcast_apply's per-element multi-dim index walk.
         let bias = to_dense_f32_widen("FusedMatMulBias", &inputs[2])?;
         let bias_shape = inputs[2].shape;
-        let out_shape = outputs[0].shape.to_vec();
-        broadcast_apply(&bias, bias_shape, &out_shape, |i, v| out[i] += v)?;
+        let out_shape = &outputs[0].shape;
+        if bias_shape.len() == 1
+            && !out_shape.is_empty()
+            && bias_shape[0] == out_shape[out_shape.len() - 1]
+        {
+            let n = bias_shape[0];
+            for chunk in out.chunks_exact_mut(n) {
+                for (o, &b) in chunk.iter_mut().zip(bias.iter()) {
+                    *o += b;
+                }
+            }
+        } else {
+            let out_shape_vec = out_shape.to_vec();
+            broadcast_apply(&bias, bias_shape, &out_shape_vec, |i, v| out[i] += v)?;
+        }
         write_dense_f32_narrow("FusedMatMulBias", &mut outputs[0], &out)
     }
 

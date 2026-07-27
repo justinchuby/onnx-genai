@@ -617,11 +617,10 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     if let Some(result) = try_matmul_bf16_native(a, b, &geom)? {
         return Ok(result);
     }
-    matmul_dense_impl_with_backend(
-        a,
-        b,
+    matmul_dense_impl_with_geom(
         to_dense_f32_widen("MatMul", a)?,
         to_dense_f32_widen("MatMul", b)?,
+        &geom,
         CpuBackend::auto_detect(),
         None,
     )
@@ -645,31 +644,26 @@ fn matmul_dense_prepacked_with_backend(
     if let Some(result) = try_matmul_bf16_native(a, b, &geom)? {
         return Ok(result);
     }
-    matmul_dense_impl_with_backend(
-        a,
-        b,
+    matmul_dense_impl_with_geom(
         prepack.dense(0, a)?,
         prepack.dense(1, b)?,
+        &geom,
         backend,
         Some(prepack),
     )
 }
 
-fn matmul_dense_impl_with_backend(
-    a: &TensorView,
-    b: &TensorView,
+/// Shared owned-vector GEMM: allocate the result buffer and GEMM into it.
+/// Geometry is pre-computed by the caller to avoid redundant derivation.
+fn matmul_dense_impl_with_geom(
     a_dense: Cow<'_, [f32]>,
     b_dense: Cow<'_, [f32]>,
+    geom: &MatMulGeometry,
     backend: CpuBackend,
     prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
-    // Owned-vector wrapper: compute geometry, allocate the result buffer, then
-    // GEMM into it via the shared `_into` helper. Used by callers that need an
-    // owned result (fused attention / fused MatMul+bias) and by the narrowing
-    // fallback in `MatMulKernel::execute`.
-    let geom = matmul_geometry(a, b)?;
     let mut out = vec![0.0f32; geom.result_len];
-    matmul_dense_into_with_backend(&a_dense, &b_dense, &geom, backend, prepack, &mut out)?;
+    matmul_dense_into_with_backend(&a_dense, &b_dense, geom, backend, prepack, &mut out)?;
     Ok(out)
 }
 
