@@ -3,6 +3,7 @@
 use std::{path::PathBuf, process::Command};
 
 const NATIVE_CPU_DECODE_FLOOR_TOK_PER_S: f64 = 3.50;
+const NATIVE_CPU_DECODE_FLOOR_ROOFLINE_FRACTION: f64 = 0.30;
 
 fn sysctl_value(name: &str) -> Option<String> {
     let output = Command::new("sysctl").args(["-n", name]).output().ok()?;
@@ -166,13 +167,7 @@ fn native_cpu_decode_throughput_regression_floor_on_apple_silicon() {
     }
     let p_cores = sysctl_value("hw.perflevel0.physicalcpu").and_then(|value| value.parse().ok());
     let memsize = sysctl_value("hw.memsize").and_then(|value| value.parse::<u64>().ok());
-    if p_cores != Some(8) || memsize != Some(32 * 1024 * 1024 * 1024) {
-        eprintln!(
-            "skip: absolute native CPU decode floor is scoped to the M1 Max 8P/32GiB rig \
-             (p_cores={p_cores:?}, memsize={memsize:?})"
-        );
-        return;
-    }
+    let is_measurement_rig = p_cores == Some(8) && memsize == Some(32 * 1024 * 1024 * 1024);
 
     let model = std::env::var("ONNX_GENAI_NATIVE_CPU_FLOOR_MODEL")
         .map(PathBuf::from)
@@ -238,18 +233,33 @@ fn native_cpu_decode_throughput_regression_floor_on_apple_silicon() {
 
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("compare --profile-json - must emit JSON");
-    let throughput = report["summaries"]
+    let native_summary = report["summaries"]
         .as_array()
         .and_then(|summaries| {
             summaries
                 .iter()
                 .find(|summary| summary["backend"] == "native")
         })
-        .and_then(|summary| summary["decode_tokens_per_second"]["median"].as_f64())
+        .expect("native summary in compare JSON");
+    let throughput = native_summary["decode_tokens_per_second"]["median"]
+        .as_f64()
         .expect("native decode throughput median in compare JSON");
-    assert!(
-        throughput >= NATIVE_CPU_DECODE_FLOOR_TOK_PER_S,
-        "native CPU decode throughput regressed: median {throughput:.2} tok/s < committed floor \
-         {NATIVE_CPU_DECODE_FLOOR_TOK_PER_S:.2} tok/s"
-    );
+    if is_measurement_rig {
+        assert!(
+            throughput >= NATIVE_CPU_DECODE_FLOOR_TOK_PER_S,
+            "native CPU decode throughput regressed: median {throughput:.2} tok/s < committed \
+             M1 Max floor {NATIVE_CPU_DECODE_FLOOR_TOK_PER_S:.2} tok/s"
+        );
+    } else {
+        let roofline_fraction = native_summary["decode_roofline_fraction"]["median"]
+            .as_f64()
+            .expect("native decode roofline fraction median in compare JSON");
+        assert!(
+            roofline_fraction >= NATIVE_CPU_DECODE_FLOOR_ROOFLINE_FRACTION,
+            "native CPU decode roofline utilization regressed: median {:.2}% < committed floor {:.2}% \
+             (p_cores={p_cores:?}, memsize={memsize:?})",
+            roofline_fraction * 100.0,
+            NATIVE_CPU_DECODE_FLOOR_ROOFLINE_FRACTION * 100.0
+        );
+    }
 }

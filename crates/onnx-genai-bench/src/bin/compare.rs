@@ -3,6 +3,8 @@ use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    sync::Arc,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -326,6 +328,16 @@ struct DirectSummary {
     generated_tokens: Distribution,
 }
 
+#[derive(Clone, Debug)]
+struct DirectRoofline {
+    measured_bandwidth_gbps: f64,
+    model_weight_bytes: u64,
+    ceiling_tokens_per_second: f64,
+    threads: usize,
+    bytes_per_thread: usize,
+    repetitions: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -468,6 +480,8 @@ fn run_direct_compare(args: &Args, model: &Path) -> Result<()> {
         .map_err(|err| anyhow!("failed to tokenize direct comparison prompt: {err}"))?
         .len();
 
+    let roofline = measure_direct_roofline(model_dir)?;
+
     for warmup in 1..=args.warmups {
         for &backend in &backends {
             eprintln!(
@@ -503,7 +517,14 @@ fn run_direct_compare(args: &Args, model: &Path) -> Result<()> {
         }
     }
     let summaries = summarize_direct_samples(&backends, &samples)?;
-    let report = render_direct_report(args, model_dir, &prompt_mode, prompt_tokens, &summaries);
+    let report = render_direct_report(
+        args,
+        model_dir,
+        &prompt_mode,
+        prompt_tokens,
+        &summaries,
+        roofline.as_ref(),
+    );
     let json_report = direct_json_report(
         args,
         model_dir,
@@ -511,6 +532,7 @@ fn run_direct_compare(args: &Args, model: &Path) -> Result<()> {
         prompt_tokens,
         &samples,
         &summaries,
+        roofline.as_ref(),
     );
 
     if args
@@ -669,6 +691,100 @@ fn configure_direct_backend(backend: DirectBackend) -> Result<()> {
     Ok(())
 }
 
+fn measure_direct_roofline(model_dir: &Path) -> Result<Option<DirectRoofline>> {
+    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+        return Ok(None);
+    }
+    let model_weight_bytes = model_weight_bytes(model_dir)?;
+    if model_weight_bytes == 0 {
+        bail!(
+            "cannot compute roofline fraction: no model weight bytes found under {}",
+            model_dir.display()
+        );
+    }
+    let available_threads = thread::available_parallelism().map_or(1, usize::from);
+    let threads = sysctl_usize("hw.perflevel0.physicalcpu")
+        .unwrap_or(available_threads)
+        .clamp(1, available_threads);
+    let bytes_per_thread = 256 * 1024 * 1024;
+    let repetitions = 3;
+    let measured_bandwidth_gbps =
+        measure_sequential_read_bandwidth_gbps(threads, bytes_per_thread, repetitions);
+    if !measured_bandwidth_gbps.is_finite() || measured_bandwidth_gbps <= 0.0 {
+        bail!("measured invalid Apple-Silicon memory bandwidth: {measured_bandwidth_gbps}");
+    }
+    Ok(Some(DirectRoofline {
+        measured_bandwidth_gbps,
+        model_weight_bytes,
+        ceiling_tokens_per_second: measured_bandwidth_gbps * 1_000_000_000.0
+            / model_weight_bytes as f64,
+        threads,
+        bytes_per_thread,
+        repetitions,
+    }))
+}
+
+fn model_weight_bytes(model_dir: &Path) -> Result<u64> {
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(model_dir).with_context(|| format!("read {}", model_dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "model.onnx" || name.starts_with("model.onnx.data") {
+            bytes += entry.metadata()?.len();
+        }
+    }
+    Ok(bytes)
+}
+
+fn sysctl_usize(name: &str) -> Option<usize> {
+    command_output("sysctl", &["-n", name])?.trim().parse().ok()
+}
+
+fn measure_sequential_read_bandwidth_gbps(
+    threads: usize,
+    bytes_per_thread: usize,
+    repetitions: usize,
+) -> f64 {
+    let len = bytes_per_thread / std::mem::size_of::<u64>();
+    let buffers = Arc::new(
+        (0..threads)
+            .map(|thread_index| {
+                (0..len)
+                    .map(|index| (index as u64).wrapping_mul(0x9E37_79B9) ^ thread_index as u64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut best = 0.0_f64;
+    for _ in 0..repetitions {
+        let started = Instant::now();
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for buffer in buffers.iter() {
+                handles.push(scope.spawn(move || {
+                    let mut sum = 0_u64;
+                    for value in buffer {
+                        sum = sum.wrapping_add(std::hint::black_box(*value));
+                    }
+                    std::hint::black_box(sum);
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("bandwidth worker panicked");
+            }
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            best = best.max((threads * bytes_per_thread) as f64 / elapsed / 1_000_000_000.0);
+        }
+    }
+    best
+}
+
 fn summarize_direct_samples(
     backends: &[DirectBackend],
     samples: &[DirectSample],
@@ -733,6 +849,7 @@ fn render_direct_report(
     prompt_mode: &str,
     prompt_tokens: usize,
     summaries: &[DirectSummary],
+    roofline: Option<&DirectRoofline>,
 ) -> String {
     let mut report = String::new();
     report.push_str("# Native CPU EP vs ORT CPU EP comparison\n\n");
@@ -767,16 +884,58 @@ fn render_direct_report(
         "git commit",
         command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into()),
     );
+    if let Some(roofline) = roofline {
+        metadata_row(
+            &mut report,
+            "measured CPU bandwidth",
+            format!(
+                "{:.1} GB/s ({} thread(s), {} MiB/thread, best of {})",
+                roofline.measured_bandwidth_gbps,
+                roofline.threads,
+                roofline.bytes_per_thread / (1024 * 1024),
+                roofline.repetitions
+            ),
+        );
+        metadata_row(
+            &mut report,
+            "model weight bytes",
+            roofline.model_weight_bytes.to_string(),
+        );
+        metadata_row(
+            &mut report,
+            "decode roofline ceiling",
+            format!("{:.2} tok/s", roofline.ceiling_tokens_per_second),
+        );
+    } else {
+        metadata_row(
+            &mut report,
+            "decode roofline ceiling",
+            "unavailable on non-Apple-Silicon host".to_string(),
+        );
+    }
     report.push('\n');
-    report.push_str("| backend | model load ms | TTFT ms | decode tok/s | end-to-end tok/s | total ms | output tokens |\n");
-    report.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+    report.push_str("| backend | model load ms | TTFT ms | decode tok/s | decode roofline % | end-to-end tok/s | total ms | output tokens |\n");
+    report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
     for summary in summaries {
+        let roofline_cell = roofline
+            .map(|roofline| {
+                percent_spread_cell(
+                    distribution_scale(
+                        summary.decode_tokens_per_second,
+                        roofline.model_weight_bytes as f64
+                            / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
+                    ),
+                    2,
+                )
+            })
+            .unwrap_or_else(|| "N/A".to_string());
         report.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             summary.backend.label(),
             spread_cell(summary.model_load_ms, 1),
             spread_cell(summary.ttft_ms, 1),
             spread_cell(summary.decode_tokens_per_second, 2),
+            roofline_cell,
             spread_cell(summary.end_to_end_tokens_per_second, 2),
             spread_cell(summary.total_ms, 1),
             spread_cell(summary.generated_tokens, 0),
@@ -834,6 +993,7 @@ fn direct_json_report(
     prompt_tokens: usize,
     samples: &[DirectSample],
     summaries: &[DirectSummary],
+    roofline: Option<&DirectRoofline>,
 ) -> Value {
     json!({
         "model": model_dir.display().to_string(),
@@ -850,7 +1010,8 @@ fn direct_json_report(
             "statistic": "median with p10/p95 spread",
             "sebastian_methodology": "defaults follow Sebastian's 1 warmup, 5 runs, 50 tokens, decode-skip 2 protocol"
         },
-        "summaries": summaries.iter().map(direct_summary_json).collect::<Vec<_>>(),
+        "roofline": roofline.map(direct_roofline_json),
+        "summaries": summaries.iter().map(|summary| direct_summary_json(summary, roofline)).collect::<Vec<_>>(),
         "ratios": direct_ratios(summaries).map(|ratios| json!({
             "native_over_ort_model_load_ms": ratios.model_load_ms,
             "native_over_ort_ttft_ms": ratios.ttft_ms,
@@ -861,12 +1022,27 @@ fn direct_json_report(
     })
 }
 
-fn direct_summary_json(summary: &DirectSummary) -> Value {
+fn direct_roofline_json(roofline: &DirectRoofline) -> Value {
+    json!({
+        "measured_bandwidth_gbps": roofline.measured_bandwidth_gbps,
+        "model_weight_bytes": roofline.model_weight_bytes,
+        "ceiling_tokens_per_second": roofline.ceiling_tokens_per_second,
+        "threads": roofline.threads,
+        "bytes_per_thread": roofline.bytes_per_thread,
+        "repetitions": roofline.repetitions,
+    })
+}
+
+fn direct_summary_json(summary: &DirectSummary, roofline: Option<&DirectRoofline>) -> Value {
     json!({
         "backend": summary.backend.as_str(),
         "model_load_ms": distribution_json(summary.model_load_ms),
         "ttft_ms": distribution_json(summary.ttft_ms),
         "decode_tokens_per_second": distribution_json(summary.decode_tokens_per_second),
+        "decode_roofline_fraction": roofline.map(|roofline| distribution_json(distribution_scale(
+            summary.decode_tokens_per_second,
+            roofline.model_weight_bytes as f64 / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
+        ))),
         "end_to_end_tokens_per_second": distribution_json(summary.end_to_end_tokens_per_second),
         "total_ms": distribution_json(summary.total_ms),
         "generated_tokens": distribution_json(summary.generated_tokens),
@@ -895,6 +1071,17 @@ fn distribution_json(distribution: Distribution) -> Value {
         "p95": distribution.p95,
         "max": distribution.max,
     })
+}
+
+fn distribution_scale(distribution: Distribution, scale: f64) -> Distribution {
+    Distribution {
+        min: distribution.min * scale,
+        p10: distribution.p10 * scale,
+        median: distribution.median * scale,
+        p90: distribution.p90 * scale,
+        p95: distribution.p95 * scale,
+        max: distribution.max * scale,
+    }
 }
 
 async fn probe_runtime(runtime: &RuntimeSpec) -> RuntimeState {
@@ -1483,6 +1670,10 @@ fn spread_cell(distribution: Distribution, precision: usize) -> String {
         "{:.*} [{:.*}, {:.*}]",
         precision, distribution.median, precision, distribution.p10, precision, distribution.p95
     )
+}
+
+fn percent_spread_cell(distribution: Distribution, precision: usize) -> String {
+    spread_cell(distribution_scale(distribution, 100.0), precision)
 }
 
 fn millis(duration: Duration) -> f64 {

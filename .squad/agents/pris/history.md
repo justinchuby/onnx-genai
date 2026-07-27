@@ -132,6 +132,6 @@ Revised the Phi decode lock after Holden's rejection: environment-gated real-mod
 - Recorded that ORT2 Phase 1 is complete, full ORT2 runtime vision is roughly 65–70% complete, and core GenAI functionality is roughly 70% complete; remaining work is breadth, compatibility, heterogeneous placement, packages, CI, and productization.
 
 ## 2026-07-26T21:06:24-07:00 — Mac CPU native-vs-ORT bench harness
-- Extended `crates/onnx-genai-bench/src/bin/compare.rs` with direct native CPU EP vs ORT CPU EP comparison, JSON output, warmups, repeated medians, and p10-p95 spread.
-- Measured Qwen2.5-0.5B on M1 Max: native decode median 3.74 tok/s vs ORT CPU 45.45 tok/s (0.082x); model-load median native 112.6 ms vs ORT 1244.6 ms.
-- Added Apple-Silicon release-harness regression floor `NATIVE_CPU_DECODE_FLOOR_TOK_PER_S = 3.50` in `crates/onnx-genai-bench/tests/profile_native.rs`.
+- Extended `crates/onnx-genai-bench/src/bin/compare.rs` with direct native CPU EP vs ORT CPU EP comparison, JSON output, warmups, repeated medians, p10-p95 spread, and measured-roofline fraction.
+- Measured Qwen2.5-0.5B on M1 Max: native decode median 3.83 tok/s (7.02% measured roofline) vs ORT CPU 45.45 tok/s (83.33% roofline), ratio 0.084x; model-load median native 108.5 ms vs ORT 1199.6 ms.
+- Added M1 Max absolute release-harness regression floor `NATIVE_CPU_DECODE_FLOOR_TOK_PER_S = 3.50` plus non-rig Apple-Silicon roofline-fraction floor in `crates/onnx-genai-bench/tests/profile_native.rs`.

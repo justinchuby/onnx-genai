@@ -46,8 +46,8 @@ aggregates; see [`../traces/`](../traces/).
 Use the bench crate's `compare` binary when optimizing the native CPU execution
 provider against ONNX Runtime's CPU EP. It loads the same model, renders the
 same prompt through the model chat template, alternates native and ORT CPU runs,
-discards warmups, then reports medians with p10-p95 spread plus JSON for
-plotting:
+measures the host's sequential CPU memory-bandwidth roofline, discards warmups,
+then reports medians with p10-p95 spread plus JSON for plotting:
 
 ```bash
 cargo run --release -p onnx-genai-bench --features bench-native --bin compare -- \
@@ -60,7 +60,10 @@ cargo run --release -p onnx-genai-bench --features bench-native --bin compare --
 This follows Sebastian's M1 Max methodology: one discarded full-generation
 warmup, at least five measured repetitions, a fixed 40-token prompt, 50 generated
 tokens, and the first two generated tokens excluded from the decode-throughput
-window. Keep the machine idle and cool between final runs.
+window. The output includes both absolute decode tok/s and decode roofline
+fraction, so a lower-bandwidth M1 Air result remains interpretable instead of
+being compared directly to this M1 Max. Keep the machine idle and cool between
+final runs.
 
 ## What the samples show
 
