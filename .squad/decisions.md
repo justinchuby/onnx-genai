@@ -8950,3 +8950,13 @@ All scrutiny points pass. Greedy-equivalence invariant is genuinely proven.
 No fix owner needed (APPROVE). A stale-mtime incremental-build gotcha was hit
 during the mutation revert (`mv` restored old mtime → cargo reused stale binary);
 `touch` + rebuild confirmed the clean tree passes.
+
+Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 747576 bytes; no dated entries older than 2026-07-20 remained, so no archive file was created or changed.
+
+<!-- merged/superseded from .squad/decisions/inbox/dallas-controlnet-lora-50.md -->
+<!-- merged from .squad/decisions/inbox/bishop-pr283-rereview.md -->
+### 2026-07-27: PR #283 / #50 landed with real mobius ControlNet contract
+**By:** Scribe, reconciling Dallas implementation note with Bishop re-review and Batty's fix.
+**What:** PR #283 closed #50 with native ComfyUI ControlNet and LoRA wiring, but the final landed ControlNet contract is Batty's corrected approach rather than Dallas's superseded suffix-port/`conditioning_scale` plan. Runtime binds exactly the real mobius denoiser input `controlnet_cond` for a single ControlNet hint as batched RGB CHW `[0,1]` at pixel resolution; ControlNet strength is export-fused, so no runtime `conditioning_scale` input is emitted. Multiple ControlNets fail loudly instead of inventing suffixed ports that mobius does not declare. LoRA remains routed through declared `lora_gate.{stem}` inputs.
+**Why:** Bishop's initial review found the prior `conditioning_scale` gate and multi-ControlNet suffix inputs had no mobius backing and would silently drop through declared-input routing. Batty removed those invented mechanisms, added contract-pinning tests (`single_controlnet_binds_the_declared_unsuffixed_cond_input`, `multiple_controlnets_fail_loudly_instead_of_silently_dropping`), and Bishop re-reviewed with APPROVE after mutation proof. The stale Dallas inbox note is retained here only as superseded history; future work should use the single `controlnet_cond`/export-fused-strength contract unless mobius changes.
+**Outcome:** Dallas authored the original PR, Batty owned the fix after Dallas lockout, Bishop approved the re-review, PR #283 merged as `687612f5`, and issue #50 is closed. The native image-pipeline trilogy is complete: #48 SDXL, #49 img2img/inpaint, and #50 ControlNet/LoRA are all closed.

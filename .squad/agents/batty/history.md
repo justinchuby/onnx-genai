@@ -72,3 +72,4 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_scale semantics and multi-ControlNet port backing before re-review.
+- 2026-07-27T16:44:54Z — Fixed PR #283 / #50 after Bishop REQUEST-CHANGES: removed invented `conditioning_scale`, bound real mobius `controlnet_cond`, made multi-ControlNet fail loudly, and added contract-pinning tests. Bishop approved; PR merged as 687612f5.
