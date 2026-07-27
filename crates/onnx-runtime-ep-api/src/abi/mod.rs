@@ -6,7 +6,7 @@
 //! Rust graph data.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 use std::ptr;
 use std::sync::{
@@ -18,7 +18,8 @@ use onnx_genai_ort_sys as ort;
 use onnx_runtime_ir::{Graph, NodeId, ValueId};
 
 use crate::error::{EpError, Result};
-use crate::provider::{EpId, ExecutionProvider};
+use crate::kernel::{Kernel, KernelMatch};
+use crate::provider::{DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence};
 mod ffi_helpers;
 mod host;
 mod runtime;
@@ -61,6 +62,142 @@ pub struct PluginExecutionPlan {
     kernels: Vec<Arc<PluginKernelShared>>,
 }
 
+/// An ORT plugin EP loaded through its stable C ABI.
+///
+/// Plugin EPs claim and compile *graphs*, rather than individual Rust
+/// [`Node`]s. Consequently, [`ExecutionProvider::supports_op`] intentionally
+/// declines individual-node dispatch; use [`PluginExecutionPlan::compile`] to
+/// query its graph-level capabilities and obtain runnable kernels.
+pub struct LegacyOrtEp {
+    inner: PluginRuntime,
+    name: String,
+}
+
+impl LegacyOrtEp {
+    /// Load and instantiate an ORT plugin EP from `path`.
+    ///
+    /// `legacy.registration_name`, when present in `config`, is passed to the
+    /// plugin's `CreateEpFactories` entry point. This is the only loader option
+    /// interpreted by the ABI bridge; all provider-specific options remain the
+    /// plugin's responsibility when it compiles a graph.
+    pub fn load(path: impl AsRef<Path>, config: &EpConfig) -> Result<Self> {
+        let path = path.as_ref();
+        let registration_name = config
+            .options
+            .get("legacy.registration_name")
+            .map(|name| {
+                CString::new(name.as_str()).map_err(|_| EpError::EpLoadFailed {
+                    path: path.to_path_buf(),
+                    reason: "legacy.registration_name contains an interior NUL byte".into(),
+                })
+            })
+            .transpose()?;
+        Self::load_with_registration_name(path, registration_name.as_deref())
+    }
+
+    fn load_with_registration_name(path: &Path, registration_name: Option<&CStr>) -> Result<Self> {
+        let inner = PluginRuntime::load(path, registration_name)?;
+        let name = unsafe {
+            (*inner.factory).GetName.and_then(|get_name| {
+                let name = get_name(inner.factory);
+                (!name.is_null()).then(|| CStr::from_ptr(name).to_string_lossy().into_owned())
+            })
+        }
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map_or_else(|| "legacy_ort_ep".into(), |stem| format!("legacy_{stem}"))
+        });
+        Ok(Self { inner, name })
+    }
+}
+
+impl ExecutionProvider for LegacyOrtEp {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn device_type(&self) -> onnx_runtime_ir::DeviceType {
+        // The plugin-EP ABI does not expose a portable device-type query.
+        onnx_runtime_ir::DeviceType::Custom(0)
+    }
+
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::new(self.device_type(), 0)
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn supports_op(
+        &self,
+        _op: &onnx_runtime_ir::Node,
+        _opset: u64,
+        _shapes: &[onnx_runtime_ir::Shape],
+        _input_dtypes: &[onnx_runtime_ir::DataType],
+        _layouts: &[onnx_runtime_ir::TensorLayout],
+    ) -> KernelMatch {
+        KernelMatch::unsupported(
+            "legacy ORT plugin EPs select graph subgraphs through PluginExecutionPlan, not individual nodes",
+        )
+    }
+
+    fn get_kernel(
+        &self,
+        _op: &onnx_runtime_ir::Node,
+        _shapes: &[Vec<usize>],
+        _opset: u64,
+    ) -> Result<Box<dyn Kernel>> {
+        Err(EpError::KernelFailed(format!(
+            "{} requires graph-level PluginExecutionPlan compilation before dispatch",
+            self.name
+        )))
+    }
+
+    fn allocate(&self, _size: usize, _alignment: usize) -> Result<DeviceBuffer> {
+        Err(EpError::KernelFailed(format!(
+            "{} does not expose allocation through the legacy plugin EP ABI",
+            self.name
+        )))
+    }
+
+    fn deallocate(&self, _buffer: DeviceBuffer) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{} does not expose deallocation through the legacy plugin EP ABI",
+            self.name
+        )))
+    }
+
+    fn copy(&self, _src: &DeviceBuffer, _dst: &mut DeviceBuffer, _size: usize) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{} does not expose copies through the legacy plugin EP ABI",
+            self.name
+        )))
+    }
+
+    fn copy_async(
+        &self,
+        _src: &DeviceBuffer,
+        _dst: &mut DeviceBuffer,
+        _size: usize,
+    ) -> Result<Fence> {
+        Err(EpError::KernelFailed(format!(
+            "{} does not expose asynchronous copies through the legacy plugin EP ABI",
+            self.name
+        )))
+    }
+
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl PluginExecutionPlan {
     /// Load `library_path`, run capability discovery, compile the selected fused
     /// groups, and return the claims plus runnable kernels in the same order.
@@ -82,7 +219,8 @@ impl PluginExecutionPlan {
         let library_path = library_path.as_ref();
         let device_label: Arc<str> = Arc::from(device_label.into());
         let mut support = HostSupportInfo::default();
-        let mut runtime = PluginRuntime::load(library_path, registration_name)?;
+        let legacy = LegacyOrtEp::load_with_registration_name(library_path, registration_name)?;
+        let mut runtime = legacy.inner;
         let host = HostGraph::new(graph).map_err(|reason| EpError::EpLoadFailed {
             path: library_path.to_path_buf(),
             reason,

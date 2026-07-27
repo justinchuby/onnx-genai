@@ -89,6 +89,22 @@ impl PluginRuntime {
             });
         }
         let factory = factories[0];
+        let supported_version = unsafe { (*factory).ort_version_supported };
+        if supported_version == 0 || supported_version > ort::ORT_API_VERSION {
+            if let Some(release_factory) = release_factory {
+                // SAFETY: The factory was returned by CreateEpFactories and the
+                // optional release callback was resolved from that same library.
+                let status = unsafe { release_factory(factory) };
+                release_status(status);
+            }
+            return Err(EpError::EpLoadFailed {
+                path: library_path.to_path_buf(),
+                reason: format!(
+                    "plugin factory requires ORT API version {supported_version}, but this host supports version {}; fix by using a plugin built for a compatible ORT plugin-EP ABI",
+                    ort::ORT_API_VERSION
+                ),
+            });
+        }
         let mut ep: *mut ort::OrtEp = ptr::null_mut();
         // SAFETY: The factory pointer came from the plugin and CreateEp writes
         // the out-pointer before returning a null status.
