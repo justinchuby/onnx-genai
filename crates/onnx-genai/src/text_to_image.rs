@@ -542,11 +542,11 @@ pub fn latent_channels(pipeline_dir: &Path) -> usize {
         .unwrap_or(DEFAULT_LATENT_CHANNELS)
 }
 
-/// Render `request` through the diffusion pipeline already loaded in `engine`.
+/// Generate images from a typed prompt-and-sampling request.
 ///
 /// `pipeline_dir` is the package root, used to resolve the tokenizer and the
 /// prompt encoder file when the request does not override them.
-pub fn render(
+pub fn generate_image(
     pipeline_dir: &Path,
     engine: &mut PipelineEngine,
     request: &TextToImageRequest,
@@ -724,6 +724,15 @@ pub fn render(
         &latent_shape,
     )?;
     Ok(split_batch(data, width, height, batch_size))
+}
+
+/// Backwards-compatible name for [`generate_image`].
+pub fn render(
+    pipeline_dir: &Path,
+    engine: &mut PipelineEngine,
+    request: &TextToImageRequest,
+) -> Result<Vec<RenderedImage>> {
+    generate_image(pipeline_dir, engine, request)
 }
 
 /// Resolve the prompt encoder's ONNX file from the package's declared components.

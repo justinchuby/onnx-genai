@@ -88,8 +88,9 @@ pub fn executor_phase_stats() -> Vec<(&'static str, u128, u64)> {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    IterativeOverrides, PipelineEngine, PipelineGenerateRequest, PipelineSynthesis,
-    PipelineTensors, Scheduler, SchedulerFactory, SchedulerRegistry,
+    ImageOutput, ImageRequest, ImageStep, ImageStepCallback, ImageStream, IterativeOverrides,
+    PipelineEngine, PipelineGenerateRequest, PipelineSynthesis, PipelineTensors, Scheduler,
+    SchedulerFactory, SchedulerRegistry,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
