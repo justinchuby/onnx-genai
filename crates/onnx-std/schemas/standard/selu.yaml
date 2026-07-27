@@ -1,0 +1,11 @@
+domain: ""
+name: Selu
+since_version: 6
+doc: Scaled exponential linear unit.
+attributes:
+  - { name: alpha, type: float, default: 1.6732631921768188 }
+  - { name: gamma, type: float, default: 1.0507010221481323 }
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

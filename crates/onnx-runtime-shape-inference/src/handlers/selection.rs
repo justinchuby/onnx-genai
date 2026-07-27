@@ -238,6 +238,36 @@ fn compress(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `Unique`: all occurrence-related outputs are vectors. With `axis`, the data
+/// output retains its rank and only the selected extent becomes data-dependent.
+fn unique(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(input) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    let unique_count = ctx.fresh_dim();
+    let inverse_count;
+    let output_shape;
+    if let Some(axis_attr) = ctx.node.attr("axis").and_then(Attribute::as_int) {
+        let axis =
+            checked_axis(axis_attr, input.rank()).ok_or_else(|| ShapeInferError::Invalid {
+                op: "Unique".into(),
+                detail: format!("axis {axis_attr} is out of range for rank {}", input.rank()),
+            })?;
+        inverse_count = input.shape[axis].clone();
+        let mut shape = input.shape;
+        shape[axis] = unique_count.clone();
+        output_shape = shape;
+    } else {
+        inverse_count = DimExpr::product(&input.shape);
+        output_shape = vec![unique_count.clone()];
+    }
+    ctx.set_output(0, input.dtype, output_shape);
+    ctx.set_output(1, DataType::Int64, vec![unique_count.clone()]);
+    ctx.set_output(2, DataType::Int64, vec![inverse_count]);
+    ctx.set_output(3, DataType::Int64, vec![unique_count]);
+    Ok(())
+}
+
 /// Register selection-family rules.
 pub fn register(reg: &mut InferenceRegistry) {
     for op in ["ArgMax", "ArgMin"] {
@@ -256,4 +286,5 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "OneHot", 11, one_hot);
     reg.register("", "Compress", 9, compress);
     reg.register("", "Compress", 11, compress);
+    reg.register("", "Unique", 11, unique);
 }
