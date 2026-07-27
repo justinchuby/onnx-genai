@@ -319,3 +319,65 @@ candidate.
   naming the missing library and how to fix it.
 
 `SkipSimplifiedLayerNormalization` raised the advertised CUDA set to **61** op names; `MatMulNBits` raised it to **62**. `Gather`, `Shape`, and `Constant` raise it to **65**; Gather uses an NVRTC device indexed-copy kernel, while Shape and Constant correctly use host metadata construction plus H2D upload.
+
+---
+
+## Conformance profile & GPU parity sweep
+
+The CUDA EP is validated against the **CPU EP as the reference oracle** through a
+declarative *conformance profile* rather than ad-hoc per-op tests. The profile
+lives in `crates/onnx-runtime-ep-cuda/tests/cuda_conformance_gpu.rs` and its
+shared parity harness in `crates/onnx-runtime-ep-cuda/tests/common/mod.rs`.
+
+### What the profile is
+
+A **conformance profile** is a table with exactly one entry per op in
+`CUDA_COVERED_OPS` (`kernels/mod.rs`). Each op is classified as either:
+
+- **`Sweep`** — inline `(op, dtype, shapes, attrs)` parity cases that a single
+  generic harness runs on the real GPU and compares to the CPU EP running the
+  identical node. New parity coverage is concentrated here on ops that
+  previously had *no* dedicated parity test at all (e.g. `Sqrt`, `Erf`, `Tanh`,
+  `Sigmoid`, `Abs`, `Neg`, `Reciprocal`, `Log`, `Sign`, `Floor`, `Ceil`,
+  `Round`, `Sin`, `Cos`, `Softplus`, `Pow`, `Min`, `Max`, `ReduceMean/Max/Min`,
+  `Cast`, `CastLike`, `Not`, `Gemm`, `SkipLayerNormalization`).
+- **`Dedicated`** — covered by a named dedicated GPU suite (another
+  `tests/*_gpu.rs` file). The profile records the suite file and a one-line note.
+
+### Coverage-of-coverage guards (no GPU required — run in CI)
+
+Three audits run on any host, including GPU-less CI runners, and are the
+highest-value deliverable:
+
+- `every_covered_op_has_a_conformance_entry` — **fails the moment an op is added
+  to `CUDA_COVERED_OPS` without a parity test entry** (the "claimed but
+  untested" defect class — exactly the miss that let `ReduceLogSumExp` and bf16
+  coverage gaps slip through). It also flags stale entries for ops no longer
+  covered.
+- `dedicated_suites_exist_and_name_their_op` — reads each referenced suite file
+  and asserts it actually names its op, so a deleted, renamed, or gutted suite
+  cannot silently leave an op unverified.
+- `profile_has_no_duplicate_entries`.
+
+### How to run
+
+The parity sweep is a normal `#[test]` that **graceful-skips when no CUDA device
+is present**, so it is safe on CPU-only CI. Run the whole conformance suite on a
+GPU box with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 cargo test -p onnx-runtime-ep-cuda --features cuda \
+    --test cuda_conformance_gpu -- --nocapture
+```
+
+The no-GPU audits alone (fast, deterministic, CI-friendly):
+
+```bash
+cargo test -p onnx-runtime-ep-cuda --features cuda --test cuda_conformance_gpu \
+    -- --skip conformance_sweep_matches_cpu
+```
+
+There is intentionally **no new GPU GitHub Actions workflow**: hosted CI runners
+have no GPU, so the sweep would only ever skip there. The no-GPU audits provide
+the enforcement in CI; the on-device parity sweep is run on a GPU host (e.g. an
+H100/H200 box) as documented above.
