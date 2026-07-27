@@ -168,6 +168,6 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-27T14:08:06-07:00 — CI supply-chain hardening and coverage
 - Replaced personally-owned Rust setup/cache/install actions in `ci.yml` and `audit.yml` with direct `rustup`, GitHub-owned `actions/cache@v4`, and direct pinned `cargo install cargo-llvm-cov 0.8.7`.
-- Converted coverage-capable test lanes to upload Codecov flags: `offline`, `mlas`, `cli-ort-linux`, and `cli-ort-windows`; verified final CI green at https://github.com/justinchuby/onnx-genai/actions/runs/30309111341.
+- Converted coverage-capable test lanes to upload Codecov flags: `offline`, `mlas`, `cli-ort-linux`, and `cli-ort-windows`; verified final CI green at https://github.com/justinchuby/onnx-genai/actions/runs/30309892830.
 - Confirmed CLI ORT Linux still executes `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`; Windows CLI ORT stages the DLL into cargo-llvm-cov target paths with `--no-clean`.
 - Documented Windows ARM64 coverage blocker (rust-lang/rust#150123) and release workflow debt in `.squad/decisions/inbox/pris-ci-supply-chain-and-coverage.md`.
