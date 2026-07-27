@@ -26,3 +26,20 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 - Key fix: `dot_f32` scalar fallback made always-reachable (matching `axpy_f32` pattern); imports and parameters scoped to their cfg contexts.
 - Enforced the "one implementation, no arch fork" mandate: SIMD paths are opt-in early-returns; the scalar baseline is always present and compilable on every target.
 - All 922 local tests green; NEON dispatch test confirms fast path still selected on Apple Silicon.
+
+## 2026-07-27T10:25:00-07:00 — Kernel layout reorganization plan
+
+- Produced planning document for reorganizing `kernels/` GEMM family into a `kernels/gemm/` subdirectory, requested by Justin Chu.
+- Key recommendation: group by role-in-dispatch, not per-platform. Disagreed with pure per-platform split — it encourages the architecture fork the crate has banned.
+- Proposed layout: `gemm/mod.rs` (dispatch), `gemm/half.rs` (cross-platform), `gemm/x86_sgemm.rs`, `gemm/x86_bf16.rs`, `gemm/accelerate.rs`, `gemm/portable.rs`.
+- Filed to `.squad/decisions/inbox/resch-kernel-layout-plan.md`.
+
+## 2026-07-27T10:40:00-07:00 — Platform-naming lint + x86 GEMM renames (PR #278)
+
+- Renamed `simd_gemm.rs` → `x86_sgemm.rs` and `bf16_gemm.rs` → `x86_bf16.rs`. Pure rename, zero behaviour change.
+- Created `scripts/check_platform_naming.py` — CI lint that catches files with single-arch cfg and no platform marker in the name.
+- Lint uses a portable-item check (top-level items not preceded by platform cfg) to avoid false positives on files like `simd_normalize.rs` that have portable entry points.
+- Known gap documented: doesn't catch within-file missing implementations (the sdpa dot_f32 case).
+- Guard-break proven: restoring old names triggers lint failure with actionable error.
+- All 945 tests pass; clippy green on both aarch64 and x86_64; dispatch-reachability tests unchanged.
+- Filed to `.squad/decisions/inbox/resch-platform-naming-lint.md`.
