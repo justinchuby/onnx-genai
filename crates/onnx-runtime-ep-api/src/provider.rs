@@ -271,9 +271,37 @@ unsafe impl Send for DeviceBuffer {}
 unsafe impl Sync for DeviceBuffer {}
 
 /// A synchronization fence returned by async operations.
-#[derive(Debug, Default)]
+///
+/// The `id` is an opaque, EP-private handle to a completion event recorded on a
+/// transfer stream by [`ExecutionProvider::copy_async`]. Await it by passing the
+/// fence back to [`ExecutionProvider::wait_fence`], which makes the EP's compute
+/// stream wait on the recorded event so a later kernel never reads bytes the
+/// asynchronous copy is still transferring.
+///
+/// The id `0` is reserved for an **already-signalled** fence: a fully
+/// synchronous copy (e.g. the CPU EP, or a zero-byte transfer) needs no wait, so
+/// [`Fence::default`] / [`Fence::signalled`] returns id `0` and
+/// [`ExecutionProvider::wait_fence`] treats it as a no-op.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Fence {
     pub id: u64,
+}
+
+impl Fence {
+    /// A fence that is already complete; awaiting it is a no-op.
+    pub fn signalled() -> Self {
+        Self { id: 0 }
+    }
+
+    /// Wrap an EP-private completion-event handle.
+    pub fn new(id: u64) -> Self {
+        Self { id }
+    }
+
+    /// Whether this fence is already complete (needs no wait).
+    pub fn is_signalled(&self) -> bool {
+        self.id == 0
+    }
 }
 
 /// Marker for an EP exported as an ORT-compatible C ABI plugin (Phase 2).
@@ -393,7 +421,29 @@ pub trait ExecutionProvider: Send + Sync {
     /// Synchronous copy (host↔device or device↔device).
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<()>;
     /// Asynchronous copy; returns a [`Fence`] to await.
+    ///
+    /// The copy is enqueued on a dedicated transfer stream (not the compute
+    /// stream) so it can overlap compute already queued on the compute stream —
+    /// this is the mechanism half of Phase-4 compute/transfer overlap for weight
+    /// paging. The returned [`Fence`] names a completion event on that transfer
+    /// stream; the caller must order any consumer of `dst` after the transfer by
+    /// passing the fence to [`ExecutionProvider::wait_fence`] before launching a
+    /// kernel that reads `dst`. A synchronous EP may perform the copy inline and
+    /// return an already-signalled [`Fence::signalled`].
     fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence>;
+
+    /// Order this EP's compute stream after the transfer named by `fence`.
+    ///
+    /// Makes the compute stream wait on the fence's completion event (a
+    /// stream-ordered, non-host-blocking cross-stream wait) so a subsequently
+    /// launched kernel observes the fully-transferred bytes produced by the
+    /// matching [`ExecutionProvider::copy_async`]. Awaiting an already-signalled
+    /// fence ([`Fence::is_signalled`]) is a no-op. The default implementation is
+    /// a no-op, correct for synchronous EPs whose `copy_async` already completed
+    /// the transfer before returning.
+    fn wait_fence(&self, _fence: &Fence) -> Result<()> {
+        Ok(())
+    }
 
     /// Whether this EP can select the first maximum f32 element on-device and
     /// return the token id together with its capture-error status.

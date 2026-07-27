@@ -160,6 +160,17 @@ signalled placeholder fence
 ([provider.rs lines 220-225](../crates/onnx-runtime-ep-cuda/src/provider.rs#L220-L225)).
 True prefetch requires stream-ordered host-to-device copies and awaitable completion.
 
+> **Update (issue #87, Phase-4 mechanism landed).** The placeholder fence is gone.
+> The CUDA EP now issues a real stream-ordered async H2D copy on a dedicated transfer
+> stream with pinned host staging and records a genuine CUDA completion event; the
+> generic trait gained `wait_fence`, which makes the compute stream wait on that event
+> (a non-host-blocking `cuStreamWaitEvent`). RAW ordering (compute waits for the
+> transfer) and WAR safety for double-buffer reuse (the copy stream waits on the prior
+> consumer's compute event) are both GPU-tested in `onnx-runtime-ep-cuda`. The
+> executor-side double-buffering *schedule* ships as a standalone, unit-tested strategy
+> (`onnx_runtime_session::plan_double_buffer` / `drive_double_buffer`); wiring it into
+> the live MoE decode loop depends on Phase-3b live device weight binding (follow-up).
+
 ### 3.3 Existing MoE representation is suitable for slicing, not yet paging
 
 The CPU `com.microsoft::MoE` kernel accepts ORT's expert-major canonical tensors and
@@ -486,8 +497,9 @@ VRAM. On a fitting model, fully resident performance must remain near baseline.
 
 **Ship independently:**
 
-- implement true stream-ordered H2D and awaitable fences;
-- double-buffer expert panels;
+- implement true stream-ordered H2D and awaitable fences; **[landed — issue #87]**
+- double-buffer expert panels; **[strategy landed as a standalone, unit-tested
+  scheduler; live MoE wiring pending Phase-3b device binding]**
 - add exact-next-wave, heat-based, then opt-in router-predicted prefetch;
 - budget reservations and cancel low-value work under pressure.
 
