@@ -18,7 +18,7 @@ use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
-use crate::dynamic_library::{CudaLibrary, require};
+use crate::dynamic_library::{CudaLibrary, require, wheel_cuda_include_paths};
 use crate::error::{driver_err, nvrtc_err};
 use crate::graph::CudaGraphLifecycle;
 
@@ -44,6 +44,7 @@ fn nvrtc_include_paths() -> Vec<String> {
         }
     }
     candidates.push(PathBuf::from("/usr/local/cuda/include"));
+    candidates.extend(wheel_cuda_include_paths());
 
     if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
         for path in std::env::split_paths(&paths) {
@@ -229,16 +230,22 @@ impl CudaRuntime {
     /// stream, and a cuBLASLt handle. Returns an error (never panics) when no
     /// such device exists or the CUDA driver / cuBLASLt cannot be loaded.
     pub fn new(ordinal: u32) -> Result<Self> {
-        require(CudaLibrary::Driver).map_err(|message| {
-            EpError::KernelFailed(format!(
-                "cuda_ep: {message}; CPU execution remains available"
-            ))
-        })?;
-        require(CudaLibrary::CublasLt).map_err(|message| {
-            EpError::KernelFailed(format!(
-                "cuda_ep: {message}; CPU execution remains available"
-            ))
-        })?;
+        // Preload the wheel-provided dependency chain by its absolute discovered
+        // paths. CUDA component wheels live in sibling directories, so relying on
+        // cuBLASLt's ambient dependency lookup would make `nxrt[cuda]` depend on
+        // a system CUDA installation.
+        for library in [
+            CudaLibrary::Driver,
+            CudaLibrary::Runtime,
+            CudaLibrary::Cublas,
+            CudaLibrary::CublasLt,
+        ] {
+            require(library).map_err(|message| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: {message}; CPU execution remains available"
+                ))
+            })?;
+        }
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let major = context
