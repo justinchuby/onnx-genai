@@ -776,3 +776,181 @@ fn mod_matches_cpu() {
     }
     eprintln!("Mod: CUDA matches CPU EP (f32 fmod=1; i32/i64 truncated + floor)");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #67 coverage batch 3: unary float predicates (`IsInf` with the
+// detect_positive/detect_negative attributes, `IsNaN`) and `PRelu` (parametric
+// ReLU with a NumPy-broadcastable slope). Every case runs the real CUDA kernel
+// and compares it byte-for-byte (bool) or element-wise (PRelu) against the CPU
+// EP running the identical node.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `IsInf` across f32/f16/bf16 with every detect_positive/detect_negative
+/// combination (plus the attribute defaults), fed +inf/-inf/NaN and finite
+/// values. Bool output is compared byte-for-byte with the CPU EP.
+#[test]
+fn is_inf_matches_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    // +inf, -inf, NaN, finite positive, finite negative, zero, -0.0.
+    let values: &[f32] = &[
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        3.5,
+        -2.25,
+        0.0,
+        -0.0,
+    ];
+    // `None` exercises the attribute defaults (both detections on).
+    let attr_cases: &[Option<(i64, i64)>] =
+        &[None, Some((1, 1)), Some((1, 0)), Some((0, 1)), Some((0, 0))];
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for &flags in attr_cases {
+            let shape = vec![values.len()];
+            let inputs = [Tensor {
+                dtype,
+                shape: shape.clone(),
+                bytes: encode_floats(values, dtype),
+            }];
+            let outputs = [(DataType::Bool, shape.clone())];
+            let attrs: Vec<(&str, Attribute)> = match flags {
+                None => vec![],
+                Some((dp, dn)) => vec![
+                    ("detect_positive", Attribute::Int(dp)),
+                    ("detect_negative", Attribute::Int(dn)),
+                ],
+            };
+            let cuda = run_cuda(&ep, "IsInf", 10, &inputs, &outputs, &attrs);
+            let cpu = run_cpu("IsInf", 10, &inputs, &outputs, &attrs);
+            assert_eq!(
+                cuda, cpu,
+                "IsInf {dtype:?} flags {flags:?} bool bytes mismatch"
+            );
+        }
+    }
+    eprintln!("IsInf: CUDA matches CPU EP across f32/f16/bf16 and every detect flag combo");
+}
+
+/// `IsNaN` across f32/f16/bf16, fed NaN/inf/finite values. Bool output compared
+/// byte-for-byte with the CPU EP. Also covers the empty-tensor edge case.
+#[test]
+fn is_nan_matches_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    let values: &[f32] = &[
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -4.5,
+        1.0,
+        f32::NAN,
+    ];
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        let shape = vec![values.len()];
+        let inputs = [Tensor {
+            dtype,
+            shape: shape.clone(),
+            bytes: encode_floats(values, dtype),
+        }];
+        let outputs = [(DataType::Bool, shape.clone())];
+        let cuda = run_cuda(&ep, "IsNaN", 13, &inputs, &outputs, &[]);
+        let cpu = run_cpu("IsNaN", 13, &inputs, &outputs, &[]);
+        assert_eq!(cuda, cpu, "IsNaN {dtype:?} bool bytes mismatch");
+
+        // Empty input: zero elements, empty bool output on both EPs.
+        let empty = [Tensor {
+            dtype,
+            shape: vec![0],
+            bytes: vec![],
+        }];
+        let empty_out = [(DataType::Bool, vec![0usize])];
+        let cuda_empty = run_cuda(&ep, "IsNaN", 13, &empty, &empty_out, &[]);
+        let cpu_empty = run_cpu("IsNaN", 13, &empty, &empty_out, &[]);
+        assert_eq!(cuda_empty, cpu_empty, "IsNaN {dtype:?} empty mismatch");
+    }
+    eprintln!("IsNaN: CUDA matches CPU EP across f32/f16/bf16 (incl. empty)");
+}
+
+/// `PRelu` across f32/f16/bf16 with several slope broadcast shapes (scalar,
+/// per-channel, full, rank-0 scalar), compared element-wise against the CPU EP.
+/// Negative-input lanes exercise the `x * slope` branch; the slope itself is
+/// negative to make the two branches unambiguous.
+#[test]
+fn prelu_matches_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+
+    // X shape [2,3,4] with a mix of negative, zero, and positive lanes.
+    let x_shape = vec![2usize, 3, 4];
+    let count: usize = x_shape.iter().product();
+    let x_values: Vec<f32> = (0..count)
+        .map(|v| (v as f32) - (count as f32) / 2.0)
+        .collect();
+
+    // (slope shape, slope values) — each unidirectionally broadcastable to X.
+    let per_channel: Vec<f32> = vec![-0.25, 0.10, -0.50]; // one per channel (dim 1)
+    let full: Vec<f32> = (0..count).map(|v| -0.05 * (v as f32 + 1.0)).collect();
+    let slope_cases: Vec<(Vec<usize>, Vec<f32>)> = vec![
+        (vec![1], vec![-0.30]),            // scalar broadcast
+        (vec![3, 1], per_channel.clone()), // per-channel over dims 1..
+        (x_shape.clone(), full.clone()),   // exact-shape slope
+    ];
+
+    for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+        for (slope_shape, slope_values) in &slope_cases {
+            let inputs = [
+                Tensor {
+                    dtype,
+                    shape: x_shape.clone(),
+                    bytes: encode_floats(&x_values, dtype),
+                },
+                Tensor {
+                    dtype,
+                    shape: slope_shape.clone(),
+                    bytes: encode_floats(slope_values, dtype),
+                },
+            ];
+            let outputs = [(dtype, x_shape.clone())];
+            let cuda = run_cuda(&ep, "PRelu", 16, &inputs, &outputs, &[]);
+            let cpu = run_cpu("PRelu", 16, &inputs, &outputs, &[]);
+            let cuda_f = decode_floats(&cuda[0], dtype);
+            let cpu_f = decode_floats(&cpu[0], dtype);
+            // Both EPs compute in f32 and round once on store, so results are
+            // bit-identical up to the storage rounding step; a tight tolerance
+            // guards against any accidental precision divergence.
+            let tolerance = match dtype {
+                DataType::Float32 => 0.0,
+                DataType::Float16 => 3e-3,
+                DataType::BFloat16 => 3e-2,
+                _ => unreachable!(),
+            };
+            assert_close("PRelu", dtype, &cuda_f, &cpu_f, tolerance);
+        }
+
+        // Rank-0 scalar X with a rank-0 scalar slope (negative lane).
+        let inputs = [
+            Tensor {
+                dtype,
+                shape: vec![],
+                bytes: encode_floats(&[-1.5], dtype),
+            },
+            Tensor {
+                dtype,
+                shape: vec![],
+                bytes: encode_floats(&[-0.20], dtype),
+            },
+        ];
+        let outputs = [(dtype, vec![])];
+        let cuda = run_cuda(&ep, "PRelu", 16, &inputs, &outputs, &[]);
+        let cpu = run_cpu("PRelu", 16, &inputs, &outputs, &[]);
+        let cuda_f = decode_floats(&cuda[0], dtype);
+        let cpu_f = decode_floats(&cpu[0], dtype);
+        let tolerance = match dtype {
+            DataType::Float32 => 0.0,
+            DataType::Float16 => 3e-3,
+            DataType::BFloat16 => 3e-2,
+            _ => unreachable!(),
+        };
+        assert_close("PRelu(scalar)", dtype, &cuda_f, &cpu_f, tolerance);
+    }
+    eprintln!("PRelu: CUDA matches CPU EP across f32/f16/bf16 and scalar/per-channel/full slopes");
+}

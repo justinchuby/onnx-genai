@@ -55,6 +55,7 @@ pub mod onehot;
 pub mod packed_varlen_attention;
 pub mod pointwise;
 pub mod pooling;
+pub mod prelu;
 pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
@@ -68,6 +69,7 @@ pub mod standard_attention;
 pub(crate) mod standard_claims;
 pub mod topk;
 pub mod trilu;
+pub mod unary_predicate;
 pub mod varlen_attention;
 pub mod where_op;
 
@@ -239,6 +241,9 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Sum",
     "Mean",
     "Mod",
+    "IsInf",
+    "IsNaN",
+    "PRelu",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -847,6 +852,35 @@ pub fn build_cuda_registry_with_metrics(
         );
     }
 
+    // ── CUDA op-coverage batch 3 (issue #67) ──
+
+    // Unary float predicates (f32/f16/bf16 → bool). `IsInf` honours the
+    // detect_positive/detect_negative attributes; formulas mirror the CPU EP
+    // (`is_inf.rs`/`is_nan.rs`).
+    reg.register(
+        OpKey::new("IsInf", "", 10),
+        Box::new(unary_predicate::PredicateFactory {
+            op: unary_predicate::PredicateOp::IsInf,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("IsNaN", "", 9),
+        Box::new(unary_predicate::PredicateFactory {
+            op: unary_predicate::PredicateOp::IsNaN,
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // PRelu (f32/f16/bf16, NumPy-broadcastable slope; matches the CPU EP
+    // `norm_ops.rs::prelu_typed`).
+    reg.register(
+        OpKey::new("PRelu", "", 16),
+        Box::new(prelu::PReluFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
     reg
 }
 
@@ -870,6 +904,16 @@ mod tests {
             "ReduceMax",
             "ReduceMin",
         ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_batch3_ops_are_listed_in_coverage() {
+        for op in ["IsInf", "IsNaN", "PRelu"] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"

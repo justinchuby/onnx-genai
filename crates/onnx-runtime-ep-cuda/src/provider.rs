@@ -250,6 +250,19 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if matches!(op.op_type.as_str(), "IsInf" | "IsNaN")
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::unary_predicate::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "PRelu"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) = crate::kernels::prelu::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
         let elems: u64 = shapes
             .iter()
