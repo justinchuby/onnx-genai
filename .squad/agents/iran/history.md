@@ -49,3 +49,110 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 ### 2026-07-27 — Tracing + half_gemm overlap analysis (post main merge)
 - **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
 - **half_gemm.rs overlap**: Complementary, not duplicated. GEMV (M=1 bandwidth-optimal, inline asm fcvtl ARMv8 base) vs GEMM (M>1 compute-optimal, vcvt_f32_f16 intrinsic requiring FEAT_FP16). Dispatch collision fixed in `ed7a65e3`. Consolidation deferred to separate PR.
+
+### 2026-07-27 — PR #275 Mac prefill campaign (BNNS/AMX + first-decode spike elimination)
+
+#### Phase 1: BNNS prefill (commits `f0cbd786`, `aa219b4b`)
+- Implemented three-regime dispatch: M=1→NEON GEMV, M≥2+macOS→BNNS `BNNSMatMul` f16→f32 (AMX), M≥2+other→`half_gemm.rs`
+- Initial null result (TTFT unchanged at 989ms) — diagnosed non-contiguous f16 weights bypassing BNNS. Fixed via `FilterCache` + `contiguous_b_f16` OnceLock.
+- Second null for lm_head (column-major B) — fixed via `bnns_matmul_f16_trans_b()` zero-copy column-major path and `trivial_batch` fix for engine's `[1,M,K]` A shape.
+- **TTFT: 989→348→167 ms** (5.9× prefill speedup). Production BNNS at 260–346 GFLOPS across 168 calls.
+
+#### Phase 2: First-decode spike elimination (commit `9f1e7684`)
+- Justin identified ~967ms unaccounted end-to-end gap: expected 1013ms (167+846), measured 1980ms.
+- Diagnosed root cause: shape-keyed kernel cache → prefill M=40 → decode M=1 creates new kernel instances with cold OnceLock caches → 169 kernels re-transpose ~776 MB.
+- Critically, lm_head (K=896, N=151936, column-major) fell through ALL fast paths to f32 densification (544 MB alloc) → ~960ms alone.
+- **Fix 1:** Global weight-transpose cache (`LazyLock<Mutex<HashMap<usize, Arc<Vec<u16>>>>>`). Key = data pointer, value = `Arc<Vec>` shared across kernel instances. Eager pre-transpose during model load (+7ms load, saves 30ms on first decode).
+- **Fix 2:** Column-major GEMV — recognized B[K,N] with strides [1,K] = B^T[N,K] in row-major memory. Route directly to `neon_gemv_f16_col_parallel` at M=1. Zero-copy, no transpose needed.
+- **End-to-end arithmetic reconciles:** TTFT(170) + 49×14.2 = 865ms ≈ 865ms measured. Spike gone.
+
+#### Final results (measured at load ~12, 5 runs with 1 warmup)
+| metric | before campaign | after | ORT | vs ORT |
+|---|---:|---:|---:|---:|
+| TTFT | 989 ms | 170 ms | 109 ms | 1.56× |
+| decode | 57.6 tok/s | 70.6 tok/s | 42.2 tok/s | **1.67×** |
+| end-to-end | 17.7 tok/s | 57.8 tok/s | 38.7 tok/s | **1.50×** |
+| model load | 105 ms | 114 ms | 1671 ms | 0.068× |
+
+Guard tests green: `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` ✓, `fp16_m_ge2_prefill_reaches_bnns_not_half_gemm` ✓. 959 CPU EP tests pass. Both aarch64 and x86_64 clippy clean.
+
+#### Remaining leads
+1. TTFT gap: 170ms vs ORT 109ms (1.56×). BNNS production at 260–346 GFLOPS vs 2451 microbenchmark — per-call M may be too small for AMX to reach steady state, plus ~200ms non-GEMM overhead.
+2. Further end-to-end: currently 1.50× ORT; decode dominates at 1.67× but TTFT holds it back.
+
+### 2026-07-27 — PR #275 BNNS fp16→f32 prefill via AMX
+- **Commit `a855f826`** on `squad/mac-prefill-bnns`: Implemented BNNS-based fp16→f32 MatMul for M≥2 prefill/batch-decode on Apple Silicon, reaching AMX at 2451 GFLOPS (vs 52 GFLOPS portable NEON).
+- **Three-regime dispatch**: M=1 → NEON GEMV (decode), M≥2 macOS → BNNS BNNSMatMul fp16→f32 (prefill/AMX), M≥2 non-Mac → half_gemm.rs (portable).
+- **BNNS FFI**: Raw binding to `BNNSFilterCreateLayerBroadcastMatMul`/`BNNSFilterApplyTwoInput`/`BNNSFilterDestroy` with correct 176-byte NDArrayDescriptor and 544-byte params struct layouts (verified against C). Critical: `b_is_weights=false` (both operands passed at apply time).
+- **Threading safety**: BNNS calls from dispatch level only, never inside Rayon parallel regions (avoids 4× GCD oversubscription).
+- **Tests**: dispatch reachability (atomic counter), bf16 exclusion (output parity), numerics vs f64 reference at model-scale 128×896×4864, edge values (fp16 max/denorm/NaN/zero), bitwise determinism, guard-break proof.
+- **Verification**: `cargo fmt` clean, clippy clean on aarch64 + x86_64 `--all-targets -D warnings`, all 140 matmul tests pass, full CPU EP suite green. Decode guard `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` passes (unregressed).
+- **Initial TTFT measurement: null result** — Justin measured 989 ms (unchanged from baseline). BNNS dispatch was reaching the unit test but two production bottlenecks masked the gain.
+
+### 2026-07-27 — Diagnosed and fixed null-result TTFT (filter cache + contiguous B rescue)
+- **Commit `58bafd0d`** on `squad/mac-prefill-bnns`: Two fixes that reduced TTFT from 989 ms to **347 ms** (2.8× improvement).
+- **Root cause 1 — BNNS filter cold-start**: `BNNSFilterCreateLayerBroadcastMatMul` costs 3–19 ms cold per unique (M,K,N) shape (GCD dispatch setup / AMX micro-code compilation). With ~20 unique shapes, first prefill paid ~60–380 ms. **Fix**: Thread-local `FilterCache` — `HashMap<(usize,usize,usize), BNNSFilter>` + Drop cleanup. Filter created once per shape, reused forever. Subsequent calls: ~0.3 ms → cached: 0 ms.
+- **Root cause 2 — Non-contiguous vocab weight**: lm_head weight (896×151936, 272 MB) stored column-major in ONNX model. `try_matmul_half` requires contiguous inputs, so vocab bypassed BNNS entirely and fell through to element-by-element `to_dense_f32_widen` (1066 ms for 136M elements). **Fix**: `MatMulPrepack::contiguous_b_f16` — parallel strided copy via Rayon, cached per session in `OnceLock`. Rescue dispatch in `execute_with_backend` routes non-contiguous f16 B to cached copy → BNNS.
+- **Measurements** (M1 Max, load 25–32, qwen2.5-0.5b-f16, 40-token prompt, 5 runs median):
+  - TTFT: **347.4 ms** [346.8, 351.1] vs ORT 108.5 ms — 3.2× ratio (down from 9.1×)
+  - decode: **58.36 tok/s** [57.32, 59.76] vs ORT 41.98 — 1.390× (unregressed)
+  - end-to-end: 22.94 [22.24, 23.34] vs ORT 38.50 — 0.596× (up from 0.464×)
+- **BNNS call profile**: 168 calls at M=40, 260–346 GFLOPS per call. Total BNNS GEMM time ~150 ms. Remaining ~200 ms is non-GEMM overhead (LayerNorm, SoftMax, RoPE, embedding, graph dispatch).
+- **All guards green**: `fp16_m1_decode_reaches_neon_gemv_not_half_gemm`, `fp16_m_ge2_prefill_reaches_bnns_not_half_gemm`, `bf16_m_ge2_does_not_reach_bnns`, `bnns_f16_prefill_matches_f64_reference_via_matmul_kernel`. Full suite: 936 passed, 0 failed.
+- **Verification**: cargo fmt clean, clippy clean aarch64 + x86_64 `--all-targets -D warnings`.
+
+#### Durable lessons
+- **BNNS filter creation is expensive cold** — always cache filters. Thread-local with Drop is the safe pattern (BNNSFilter is `*mut c_void`, not Send).
+- **Non-contiguous weights are invisible performance cliffs** — `is_contiguous()` gates throughout the codebase silently fall through to element-by-element conversion. Any new fast path must handle or explicitly diagnose non-contiguous weights.
+- **Microbenchmark ≠ production performance** — BNNS reached 2451 GFLOPS in microbenchmark but production TTFT includes filter creation, weight materialization, and non-GEMM ops. Always verify with the real model path.
+- **compare benchmark creates new Engine per run** — OnceLock caches (e.g. contiguous_b_f16) are NOT shared across measured runs. Thread-local BNNS filter cache IS shared. Production (persistent Engine) TTFT is ~30 ms better than compare reports.
+
+### Session 2026-07-27-c: trans_b zero-copy for column-major vocab weights
+
+**Commit:** `f0cbd786`
+**Branch:** `squad/mac-prefill-bnns`
+
+#### Key finding: trans_b eliminates the 180 ms contiguous copy
+
+Column-major B[K,N] in memory is row-major B^T[N,K]. BNNS supports `trans_b: true`, allowing C = A @ (B^T)^T = A @ B without any data copy. The lm_head vocab projection (896×151936, 272 MB column-major) now passes directly to BNNS — zero copy.
+
+Two bugs blocked the path initially:
+1. **FilterCache key**: needed `(M,K,N,trans_b)` not just `(M,K,N)` to avoid shape collisions
+2. **batch_shape check**: engine emits A as [1,M,K] producing trivial batch [1]. Changed from `batch_shape.is_empty()` to `trivial_batch` (all dims == 1).
+
+Probe technique: added diagnostic `eprintln!` behind env var `NXRT_BNNS_TRANS_B_PROBE`, discovered `batch_empty=false` was blocking the path. This is the 6th instance of "works in unit test, not in production" in this crate.
+
+#### Lead 1 results (BNNS GFLOPS gap)
+
+Production BNNS at 260–346 GFLOPS vs microbenchmark 966–2451 GFLOPS. The gap decomposes as:
+- ~2× from M=40 vs M=128 (AMX tile utilization)
+- ~3.7× from production environment (mmap'd weights, TLB pressure, GCD scheduling)
+- NOT explained by: cold cache, NEON interleaving, Rayon pool, or SPMD pool
+
+#### Lead 2 results (non-GEMM attribution)
+
+Profiled at M=11: non-GEMM ops are only **2.1% (8 ms)** of prefill time. The "~200 ms non-GEMM" hypothesis was wrong — the lm_head contiguous copy (287 ms at M=11 with cold mmap pages) was the real cost, and trans_b eliminates it.
+
+#### Measurements (load 24–27)
+
+| | native | ORT | ratio |
+|---|---:|---:|---|
+| TTFT | **167.4 ms** [166.8, 168.6] | 108.4 ms | 1.54× |
+| decode | 55.31 tok/s | 41.88 | 1.32× ✅ |
+| end-to-end | 24.54 | 38.42 | 0.639× |
+
+**Overall: 989 → 167 ms = 5.9× speedup.**
+**Decode unregressed**: guard test green, 1.32× ORT.
+
+#### Verification
+- `cargo fmt --all -- --check`: clean
+- clippy aarch64 `--all-targets -D warnings`: clean
+- clippy x86_64 `--all-targets -D warnings`: clean
+- Full CPU EP suite: 953 passed, 0 failed
+- All BNNS tests green including new `bnns_matmul_f16_trans_b_matches_normal`
+- Decode guard `fp16_m1_decode_reaches_neon_gemv_not_half_gemm`: green
+
+#### Durable lessons
+- **Column-major = row-major transpose** — this algebraic identity eliminates copies for any column-major weight; future non-contiguous weights should check for this pattern.
+- **Trivial batch dims block dispatch** — the engine promotes 2-D to 3-D with batch [1]. Any dispatch gate using `batch_shape.is_empty()` silently blocks the fast path. Use `trivial_batch` (all dims == 1) instead.
+- **Env-var probes are essential** — the `NXRT_BNNS_TRANS_B_PROBE` technique found the bug in seconds after the benchmark showed no improvement. Always probe the production path, never trust the unit test alone.
