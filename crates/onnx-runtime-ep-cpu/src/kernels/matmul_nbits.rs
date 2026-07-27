@@ -1899,7 +1899,7 @@ fn numa_decode_active() -> Option<&'static crate::decode_numa::NumaDecodePools> 
 
 /// The active persistent SPMD layout when the current thread is running a
 /// persistent-pool decode forward; `None` otherwise.
-fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDecodePools> {
+pub(crate) fn spmd_decode_active() -> Option<&'static crate::decode_spmd::SpmdDecodePools> {
     if IN_SPMD_SCOPE.with(Cell::get) {
         crate::decode_spmd::pools()
     } else {

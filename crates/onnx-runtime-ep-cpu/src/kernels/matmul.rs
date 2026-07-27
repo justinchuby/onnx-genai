@@ -798,16 +798,38 @@ fn matmul_dense_into_with_backend(
         None
     };
 
-    // Accelerate fast path: column-parallel GEMV on pre-transposed B.
-    // Yields 100–117 GB/s vs Accelerate sgemm's 35–40 GB/s at M=1.
+    // Accelerate hybrid M=1 fast path (macOS/iOS):
+    //
+    // 1. L2-resident matrices (≤ L2/2): Accelerate `cblas_sgemv`, which reaches
+    //    106-156 GB/s on Apple Silicon via AMX. Uses the original row-major B
+    //    directly — no pre-transposition needed.
+    //
+    // 2. DRAM-bound matrices (> L2/2): Column-parallel NEON GEMV on
+    //    pre-transposed B_T, parallelized via Rayon (65-93 GB/s measured).
+    //    Accelerate's sgemv drops to 35-59 GB/s on DRAM-bound shapes.
+    //
+    // The L2 threshold is queried at runtime from `hw.perflevel0.l2cachesize`
+    // so it adapts across M1/M2/M3/M4 base/Pro/Max/Ultra tiers.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     if backend == CpuBackend::Accelerate
         && m == 1
         && geom.batch_shape.is_empty()
         && geom.b_promoted_rank == 2
-        && let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n))
     {
-        accelerate_gemm::neon_gemv_col_parallel(a_dense, bt, out, k, n);
+        let weight_bytes = k * n * std::mem::size_of::<f32>();
+        if accelerate_gemm::is_l2_resident(weight_bytes) {
+            // Small matrix: Accelerate sgemv on row-major B (GCD-threaded
+            // internally, reaches AMX). No pre-transposition needed.
+            accelerate_gemm::sgemv_accelerate(a_dense, b_dense, out, k, n);
+        } else if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
+            // Large matrix: NEON column-parallel on pre-transposed B_T
+            // (each thread does independent dot products, no reduction).
+            accelerate_gemm::neon_gemv_col_parallel(a_dense, bt, out, k, n);
+        } else {
+            // Fallback: row-parallel NEON on original B (no pretranspose
+            // available, e.g. first call or non-constant weight).
+            accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n);
+        }
         return Ok(());
     }
 

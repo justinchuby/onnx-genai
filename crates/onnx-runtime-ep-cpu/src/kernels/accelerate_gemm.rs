@@ -1,14 +1,20 @@
 //! Apple Accelerate + NEON GEMV for the M=1 decode hot path.
 //!
-//! Three routes:
+//! Four routes, selected per-op by matrix size vs the L2 cache threshold:
+//!
 //! - `sgemm`: Accelerate `cblas_sgemm` for M>1 prefill (reaches AMX).
+//! - `sgemv_accelerate`: Accelerate `cblas_sgemv` for M=1 decode when the
+//!   weight matrix fits in L2 (measured 106-156 GB/s on Apple Silicon).
 //! - `neon_gemv_col_parallel`: Column-parallel NEON GEMV on pre-transposed B
-//!   (primary M=1 path, 100-117 GB/s on M1 Max).
+//!   for DRAM-bound M=1 decode (65-93 GB/s with Rayon on M1 Max).
 //! - `neon_gemv_parallel`: Row-parallel NEON GEMV fallback for M=1 when
 //!   pre-transposed B is not available.
 
+use std::sync::OnceLock;
+
 const CBLAS_ROW_MAJOR: i32 = 101;
 const CBLAS_NO_TRANS: i32 = 111;
+const CBLAS_TRANS: i32 = 112;
 
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
@@ -27,6 +33,21 @@ unsafe extern "C" {
         beta: f32,
         c: *mut f32,
         ldc: i32,
+    );
+
+    fn cblas_sgemv(
+        order: i32,
+        trans: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        x: *const f32,
+        incx: i32,
+        beta: f32,
+        y: *mut f32,
+        incy: i32,
     );
 }
 
@@ -55,43 +76,205 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) 
     }
 }
 
+// ─── L2-aware Accelerate sgemv for small matrices ───────────────────
+
+/// Runtime-queried L2 cache size for the performance core cluster.
+/// Used to decide whether a weight matrix is L2-resident (→ Accelerate sgemv)
+/// or DRAM-bound (→ NEON column-parallel GEMV).
+fn l2_cache_bytes() -> usize {
+    static L2: OnceLock<usize> = OnceLock::new();
+    *L2.get_or_init(|| {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            query_sysctl_usize("hw.perflevel0.l2cachesize")
+                .or_else(|| query_sysctl_usize("hw.l2cachesize"))
+                .unwrap_or(4 * 1024 * 1024) // conservative 4 MB default
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            4 * 1024 * 1024
+        }
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn query_sysctl_usize(name: &str) -> Option<usize> {
+    use std::ffi::CString;
+    let cname = CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: sysctlbyname reads a kernel sysctl value into the provided buffer.
+    // The buffer is correctly sized for a u64 value.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            &raw mut value as *mut std::ffi::c_void,
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 { Some(value as usize) } else { None }
+}
+
+/// Whether a weight matrix of `weight_bytes` bytes is L2-resident and should
+/// use Accelerate's `cblas_sgemv` (which reaches 106-156 GB/s via AMX on Apple
+/// Silicon) rather than the NEON column-parallel GEMV (65-93 GB/s on DRAM).
+///
+/// The threshold is L2_cache_size / 2 — leaving room for the activation vector,
+/// output buffer, and Accelerate's internal workspace. Derived at runtime from
+/// `hw.perflevel0.l2cachesize` so it adapts across Apple Silicon tiers.
+pub fn is_l2_resident(weight_bytes: usize) -> bool {
+    weight_bytes <= l2_cache_bytes() / 2
+}
+
+/// y[n] = x[k] @ B[k,n] via Accelerate `cblas_sgemv` for L2-resident matrices.
+///
+/// Uses row-major CblasNoTrans: A is [K,N], x is length-K, y is length-N.
+/// Accelerate threads internally via GCD — do NOT call from inside a Rayon
+/// parallel region (measured 4× bandwidth drop from oversubscription).
+pub fn sgemv_accelerate(x: &[f32], b: &[f32], y: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(b.len(), k * n);
+    debug_assert_eq!(y.len(), n);
+    // CblasRowMajor, CblasTrans: y = alpha * A^T * x + beta * y
+    // where A is [K,N] row-major, so A^T is [N,K] — exactly B^T @ x.
+    unsafe {
+        cblas_sgemv(
+            CBLAS_ROW_MAJOR,
+            CBLAS_TRANS,
+            k as i32,
+            n as i32,
+            1.0,
+            b.as_ptr(),
+            n as i32,
+            x.as_ptr(),
+            1,
+            0.0,
+            y.as_mut_ptr(),
+            1,
+        );
+    }
+}
+
 // ─── Column-parallel GEMV on pre-transposed B ───────────────────────
 
 /// Column-parallel NEON GEMV using pre-transposed B_T[N,K] row-major.
 ///
 /// Computes y[n] = x[k] @ B[k,n] where B_T[n,k] is the cached transpose
-/// of the weight matrix. Each Rayon thread processes a distinct slice of
-/// output columns via independent dot products — no partial sums, no
-/// reduction, no per-call allocation.
+/// of the weight matrix. Each thread processes a distinct slice of output
+/// columns via independent dot products — no partial sums, no reduction,
+/// no per-call allocation.
 ///
-/// For small matrices (k*n < 500K), runs single-threaded to avoid Rayon
-/// dispatch overhead.
+/// Dispatch priority:
+/// 1. Persistent SPMD pool (near-zero barrier latency, workers already hot).
+/// 2. Rayon `par_chunks_mut` (fork-join fallback).
+/// 3. Single-threaded for small matrices where dispatch > compute.
 pub fn neon_gemv_col_parallel(x: &[f32], bt: &[f32], y: &mut [f32], k: usize, n: usize) {
-    use rayon::prelude::*;
-
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(bt.len(), n * k);
     debug_assert_eq!(y.len(), n);
 
-    // Single-threaded for small matrices (Rayon dispatch > compute time).
+    // Single-threaded for small matrices (dispatch > compute time).
     if k * n < 500_000 || rayon::current_num_threads() <= 1 {
-        for i in 0..n {
-            y[i] = neon_dot(&bt[i * k..(i + 1) * k], x);
-        }
+        neon_gemv_batch(bt, x, y, n, k);
         return;
     }
 
+    // Prefer the persistent SPMD pool when active: workers are already hot
+    // (spin-then-park), and the sense-reversing barrier is ~50 ns vs Rayon's
+    // ~2-5 µs fork-join overhead per call.
+    if let Some(spmd) = crate::kernels::matmul_nbits::spmd_decode_active() {
+        spmd.dispatch_output_rows(y, k, &|start, outputs| {
+            neon_gemv_batch(&bt[start * k..], x, outputs, outputs.len(), k);
+        });
+        return;
+    }
+
+    // Rayon par_chunks_mut: fork-join over contiguous output slices.
+    use rayon::prelude::*;
     let threads = rayon::current_num_threads();
     let chunk = n.div_ceil(threads).max(1);
     y.par_chunks_mut(chunk)
         .enumerate()
         .for_each(|(t, y_chunk)| {
             let n0 = t * chunk;
-            for (li, yi) in y_chunk.iter_mut().enumerate() {
-                let i = n0 + li;
-                *yi = neon_dot(&bt[i * k..(i + 1) * k], x);
-            }
+            neon_gemv_batch(&bt[n0 * k..], x, y_chunk, y_chunk.len(), k);
         });
+}
+
+/// 4-row batched NEON GEMV: compute 4 dot products simultaneously, sharing
+/// x reads across rows to improve ILP and memory bandwidth utilization.
+/// Measured 24-35% faster than 1-row-at-a-time on DRAM-bound shapes.
+#[cfg(target_arch = "aarch64")]
+fn neon_gemv_batch(bt: &[f32], x: &[f32], y: &mut [f32], n: usize, k: usize) {
+    use std::arch::aarch64::*;
+    let mut i = 0;
+    // Process 4 output rows at a time: read x once, compute 4 dot products.
+    // Uses 8 independent accumulators (2 per row) to fill the FMA pipeline.
+    while i + 4 <= n {
+        let (r0, r1, r2, r3) = (
+            &bt[i * k..],
+            &bt[(i + 1) * k..],
+            &bt[(i + 2) * k..],
+            &bt[(i + 3) * k..],
+        );
+        let mut a0 = unsafe { vdupq_n_f32(0.0) };
+        let mut a1 = unsafe { vdupq_n_f32(0.0) };
+        let mut a2 = unsafe { vdupq_n_f32(0.0) };
+        let mut a3 = unsafe { vdupq_n_f32(0.0) };
+        let mut b0 = unsafe { vdupq_n_f32(0.0) };
+        let mut b1 = unsafe { vdupq_n_f32(0.0) };
+        let mut b2 = unsafe { vdupq_n_f32(0.0) };
+        let mut b3 = unsafe { vdupq_n_f32(0.0) };
+        let mut j = 0;
+        while j + 8 <= k {
+            unsafe {
+                let x0 = vld1q_f32(x.as_ptr().add(j));
+                let x1 = vld1q_f32(x.as_ptr().add(j + 4));
+                a0 = vfmaq_f32(a0, vld1q_f32(r0.as_ptr().add(j)), x0);
+                b0 = vfmaq_f32(b0, vld1q_f32(r0.as_ptr().add(j + 4)), x1);
+                a1 = vfmaq_f32(a1, vld1q_f32(r1.as_ptr().add(j)), x0);
+                b1 = vfmaq_f32(b1, vld1q_f32(r1.as_ptr().add(j + 4)), x1);
+                a2 = vfmaq_f32(a2, vld1q_f32(r2.as_ptr().add(j)), x0);
+                b2 = vfmaq_f32(b2, vld1q_f32(r2.as_ptr().add(j + 4)), x1);
+                a3 = vfmaq_f32(a3, vld1q_f32(r3.as_ptr().add(j)), x0);
+                b3 = vfmaq_f32(b3, vld1q_f32(r3.as_ptr().add(j + 4)), x1);
+            }
+            j += 8;
+        }
+        // Reduce NEON accumulators and add scalar tail for remainder elements.
+        let mut s0 = unsafe { vaddvq_f32(vaddq_f32(a0, b0)) };
+        let mut s1 = unsafe { vaddvq_f32(vaddq_f32(a1, b1)) };
+        let mut s2 = unsafe { vaddvq_f32(vaddq_f32(a2, b2)) };
+        let mut s3 = unsafe { vaddvq_f32(vaddq_f32(a3, b3)) };
+        while j < k {
+            let xv = x[j];
+            s0 += r0[j] * xv;
+            s1 += r1[j] * xv;
+            s2 += r2[j] * xv;
+            s3 += r3[j] * xv;
+            j += 1;
+        }
+        y[i] = s0;
+        y[i + 1] = s1;
+        y[i + 2] = s2;
+        y[i + 3] = s3;
+        i += 4;
+    }
+    // Remainder rows (fewer than 4)
+    while i < n {
+        y[i] = neon_dot(&bt[i * k..(i + 1) * k], x);
+        i += 1;
+    }
+}
+
+/// Scalar fallback for non-aarch64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+fn neon_gemv_batch(bt: &[f32], x: &[f32], y: &mut [f32], n: usize, k: usize) {
+    for i in 0..n {
+        y[i] = neon_dot(&bt[i * k..(i + 1) * k], x);
+    }
 }
 
 /// NEON 4×-unrolled dot product: `sum(a[i] * b[i])`.
@@ -429,6 +612,55 @@ mod tests {
         assert!(
             max_rel < 0.02,
             "col_parallel model-scale max relative error {max_rel} exceeds 2%"
+        );
+    }
+
+    #[test]
+    fn sgemv_accelerate_matches_reference() {
+        let (k, n) = (896, 896);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 1000) as f32) * 0.0001).collect();
+        let mut y = vec![0.0f32; n];
+        sgemv_accelerate(&x, &b, &mut y, k, n);
+        let ref_y = reference_gemv(&x, &b, k, n);
+        let max_rel = y
+            .iter()
+            .zip(&ref_y)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| ((a - r) / r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_rel < 1e-5,
+            "sgemv_accelerate max relative error {max_rel} exceeds 1e-5"
+        );
+    }
+
+    #[test]
+    fn sgemv_accelerate_small_matches_reference() {
+        let (k, n) = (896, 128);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 100) as f32) * 0.001).collect();
+        let mut y = vec![0.0f32; n];
+        sgemv_accelerate(&x, &b, &mut y, k, n);
+        let ref_y = reference_gemv(&x, &b, k, n);
+        let max_err = y
+            .iter()
+            .zip(&ref_y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-3,
+            "sgemv_accelerate [896,128] max error {max_err} exceeds 1e-3"
+        );
+    }
+
+    #[test]
+    fn l2_threshold_query_returns_positive() {
+        let l2 = l2_cache_bytes();
+        assert!(l2 > 0, "L2 cache size should be positive, got {l2}");
+        assert!(
+            l2 >= 1024 * 1024,
+            "L2 cache size {l2} seems too small (< 1 MB)"
         );
     }
 }

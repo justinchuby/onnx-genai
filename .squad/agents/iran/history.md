@@ -9,3 +9,58 @@
 
 ## 2026-07-26 — Joined the team
 Cast into the CPU & Edge pod. Standing directive: optimizations must be portable (consumer/edge hardware, not just H200); every perf claim backed by a benchmark; SIMD/NPU paths must match the scalar/f64 reference within a justified tolerance and be locked with regression tests.
+
+## 2026-07-27: Pre-transposed Column-Parallel NEON GEMV Implementation
+
+### Changes committed (squad/mac-cpu-ep-roofline, commit 487d1aff)
+1. **`accelerate_gemm.rs` (new)**: Apple Accelerate BLAS FFI + column-parallel NEON GEMV
+   - `sgemm()`: cblas_sgemm for M>1 prefill (reaches AMX coprocessor)
+   - `neon_gemv_col_parallel()`: Rayon-parallel NEON dot products on pre-transposed B_T[N,K]
+   - `neon_gemv_parallel()`: Row-parallel fallback when transposed B unavailable
+   - 4 internal tests (sgemm parity, col-parallel small/model-scale, row-parallel)
+
+2. **`matmul.rs` modifications**:
+   - `MatMulPrepack.transposed_b`: OnceLock cache for B[K,N]→B_T[N,K] transpose
+   - Accelerate arm in `gemm_with_backend`: sgemm for M>1, neon_gemv_parallel for M=1
+   - Pre-transposed GEMV dispatch in `matmul_dense_into_with_backend`
+   - `gemm_generic_col_parallel`: column-parallel generic GEMM for small M (arch-neutral)
+   - `prepack` parameter now unconditional (not behind cfg(mlas))
+   - 3 parity tests (accelerate_sgemm, accelerate_decode_gemv, col_parallel_gemm)
+
+## 2026-07-27 (session 2): Hybrid L2 dispatch + 4-row batched kernel
+
+### Changes (on top of 487d1aff, uncommitted)
+1. **Hybrid L2-aware dispatch** (`matmul.rs:810-834`):
+   - Runtime L2 cache query via `sysctl("hw.perflevel0.l2cachesize")`
+   - L2-resident matrices → `sgemv_accelerate()` (106-156 GB/s via AMX)
+   - DRAM-bound matrices → `neon_gemv_col_parallel()` (66 GB/s 8T NEON)
+   - Fallback when no pretranspose → `neon_gemv_parallel()`
+
+2. **`sgemv_accelerate()`** (`accelerate_gemm.rs`): cblas_sgemv FFI wrapper
+
+3. **4-row batched NEON inner kernel** (`neon_gemv_batch`):
+   - Processes 4 output rows simultaneously, sharing x reads across rows
+   - 8 independent FMA chains (2 per row) for better ILP
+   - 35% faster single-threaded, neutral at 8T (DRAM-limited)
+   - Correct scalar tail handling for arbitrary K
+
+4. **`spmd_decode_active()` made pub(crate)** for SPMD pool dispatch
+
+### Performance results (Qwen2.5-0.5B, M1 Max)
+- Steady-state p50: **35.8 ms (27.9 tok/s)** — 8.6× over 3.26 baseline
+- Overall decode: 18.9 tok/s (includes 830 ms first-token transpose)
+- ORT reference: 45.87 tok/s / 22.0 ms p50
+- All 126 matmul tests pass, fmt clean, clippy clean
+
+### Investigation results
+- **SPMD pool not effective for FP32**: 5 workers (avail/2) + no dispatcher compute → worse than Rayon 8T
+- **E-core scheduling**: no effect (tested with taskpolicy)
+- **Thread count saturation**: 6-8 threads optimal, more doesn't help
+- **Accelerate sgemv pathology**: 35-59 GB/s for DRAM-bound (91% of weights), 137-156 GB/s L2-resident only
+- **Standalone micro-benchmark**: 82-89 GB/s achievable with 4-row NEON 8T, but in-model only 66 GB/s (Rayon overhead + inter-op cache effects)
+
+### Remaining gap (27.9 vs 45.5 tok/s) — see attribution report
+- GEMV BW: 66 vs ORT's 88 GB/s (saves 7.3 ms if matched)
+- Non-GEMV ops: 6.5 ms (ORT ~0.1 ms due to op fusion)
+- **FP32 alone cannot reach 45.5 with kernel-only changes** — needs graph-level op fusion or FP16 weights
+- FP16 projected: ~62 tok/s (doubles ceiling, NEON FP16 universal on Apple Silicon)
