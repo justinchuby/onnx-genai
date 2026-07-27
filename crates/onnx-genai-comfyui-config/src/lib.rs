@@ -197,12 +197,25 @@ pub struct ComfyUiWorkflow {
     pub start_step: u32,
     /// LoRA `(name, strength)` pairs along the model chain, in application order.
     pub loras: Vec<(String, f64)>,
-    /// ControlNet `(name, strength)` if present.
+    /// First ControlNet `(name, strength)`, retained for compatibility.
     pub controlnet: Option<(String, f64)>,
+    /// ControlNets reachable from the sampler conditioning graph.
+    pub controlnets: Vec<ControlNet>,
     /// Source image referenced by the sampler's VAE-encode path.
     pub source_image: Option<String>,
     /// Inpainting mask referenced by the sampler's latent path.
     pub mask_image: Option<String>,
+}
+
+/// One ControlNet application recovered from the conditioning graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlNet {
+    /// ControlNet checkpoint name from the loader node.
+    pub name: String,
+    /// Runtime conditioning scale from the apply node.
+    pub strength: f64,
+    /// Hint image referenced by the apply node, when directly recoverable.
+    pub image: Option<String>,
 }
 
 /// Return the flat node map, tolerating a `{"prompt": {...}}` wrapper.
@@ -321,16 +334,27 @@ fn follow_prompt_text(
     if depth == 0 {
         return None;
     }
+    let slot = reference.and_then(link_slot).unwrap_or(0);
     let node = resolve(nodes, reference)?;
     if node_class(node).is_some_and(|c| TEXT_ENCODE_NODES.contains(&c)) {
         return input(node, "text")
             .and_then(Value::as_str)
             .map(str::to_owned);
     }
-    // Some graphs wrap conditioning (e.g. ConditioningCombine); follow one hop.
-    let inner = input(node, "conditioning")?;
-    if as_link(inner).is_some() {
-        return follow_prompt_text(nodes, Some(inner), depth - 1);
+    // Conditioning wrappers and ControlNetApply nodes preserve the prompt edge.
+    for key in if slot == 1 {
+        ["negative", "conditioning", "positive"]
+    } else {
+        ["positive", "conditioning", "negative"]
+    } {
+        let Some(inner) = input(node, key) else {
+            continue;
+        };
+        if as_link(inner).is_some()
+            && let Some(prompt) = follow_prompt_text(nodes, Some(inner), depth - 1)
+        {
+            return Some(prompt);
+        }
     }
     None
 }
@@ -393,26 +417,93 @@ fn trace_loras(nodes: &Map<String, Value>, reference: Option<&Value>) -> Vec<(St
     loras
 }
 
-/// Find a ControlNetApply node's `(control_net_name, strength)`, if any.
-fn find_controlnet(nodes: &Map<String, Value>) -> Option<(String, f64)> {
-    for node in nodes.values() {
-        if node_class(node)
-            .is_some_and(|c| matches!(c, "ControlNetApply" | "ControlNetApplyAdvanced"))
+fn trace_image_name(
+    nodes: &Map<String, Value>,
+    reference: Option<&Value>,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    let node = resolve(nodes, reference)?;
+    if let Some(name) = load_image_name(nodes, reference) {
+        return Some(name);
+    }
+    node_inputs(node)?
+        .values()
+        .find_map(|value| trace_image_name(nodes, Some(value), depth - 1))
+}
+
+fn trace_controlnets_from(
+    nodes: &Map<String, Value>,
+    reference: Option<&Value>,
+    depth: usize,
+    seen: &mut std::collections::HashSet<String>,
+    controlnets: &mut Vec<ControlNet>,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Some(node_id) = reference.and_then(as_link) else {
+        return;
+    };
+    if !seen.insert(node_id.to_owned()) {
+        return;
+    }
+    let Some(node) = nodes.get(node_id) else {
+        return;
+    };
+    let class = node_class(node).unwrap_or_default();
+    if matches!(class, "ControlNetApply" | "ControlNetApplyAdvanced") {
+        for key in ["conditioning", "positive", "negative"] {
+            trace_controlnets_from(nodes, input(node, key), depth - 1, seen, controlnets);
+        }
+        let strength = input(node, "strength")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        let loader = resolve(nodes, input(node, "control_net"));
+        if let Some(loader) = loader
+            && node_class(loader)
+                .is_some_and(|c| matches!(c, "ControlNetLoader" | "DiffControlNetLoader"))
+            && let Some(name) = input(loader, "control_net_name").and_then(Value::as_str)
         {
-            let strength = input(node, "strength")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            let loader = resolve(nodes, input(node, "control_net"));
-            if let Some(loader) = loader
-                && node_class(loader)
-                    .is_some_and(|c| matches!(c, "ControlNetLoader" | "DiffControlNetLoader"))
-                && let Some(name) = input(loader, "control_net_name").and_then(Value::as_str)
-            {
-                return Some((name.to_owned(), strength));
-            }
+            controlnets.push(ControlNet {
+                name: name.to_owned(),
+                strength,
+                image: trace_image_name(nodes, input(node, "image"), MAX_TRACE_DEPTH),
+            });
+        }
+        return;
+    }
+    if let Some(inputs) = node_inputs(node) {
+        for value in inputs.values().filter(|value| as_link(value).is_some()) {
+            trace_controlnets_from(nodes, Some(value), depth - 1, seen, controlnets);
         }
     }
-    None
+}
+
+fn trace_controlnets(
+    nodes: &Map<String, Value>,
+    positive: Option<&Value>,
+    negative: Option<&Value>,
+) -> Vec<ControlNet> {
+    let mut seen = std::collections::HashSet::new();
+    let mut controlnets = Vec::new();
+    trace_controlnets_from(
+        nodes,
+        positive,
+        MAX_TRACE_DEPTH,
+        &mut seen,
+        &mut controlnets,
+    );
+    trace_controlnets_from(
+        nodes,
+        negative,
+        MAX_TRACE_DEPTH,
+        &mut seen,
+        &mut controlnets,
+    );
+    controlnets
 }
 
 /// Build the native pipeline metadata document for a diffusion workflow.
@@ -549,7 +640,14 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
     let (width, height, batch_size) = follow_dims(nodes, input(sampler, "latent_image"));
     let checkpoint = trace_checkpoint(nodes, input(sampler, "model"));
     let loras = trace_loras(nodes, input(sampler, "model"));
-    let controlnet = find_controlnet(nodes);
+    let controlnets = trace_controlnets(
+        nodes,
+        input(sampler, "positive"),
+        input(sampler, "negative"),
+    );
+    let controlnet = controlnets
+        .first()
+        .map(|controlnet| (controlnet.name.clone(), controlnet.strength));
     let (source_image, mask_image) = follow_image_inputs(nodes, input(sampler, "latent_image"));
 
     let has_text_encoder = nodes
@@ -602,6 +700,7 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
         start_step,
         loras,
         controlnet,
+        controlnets,
         source_image,
         mask_image,
     })
@@ -847,18 +946,87 @@ mod tests {
     #[test]
     fn finds_controlnet() {
         let mut graph = txt2img_graph();
+        graph["3"]["inputs"]["positive"] = json!(["20", 0]);
         graph["20"] = json!({
             "class_type": "ControlNetApply",
-            "inputs": {"strength": 0.9, "control_net": ["21", 0], "conditioning": ["6", 0]}
+            "inputs": {
+                "strength": 0.9,
+                "control_net": ["21", 0],
+                "conditioning": ["6", 0],
+                "image": ["22", 0]
+            }
         });
         graph["21"] = json!({
             "class_type": "ControlNetLoader",
             "inputs": {"control_net_name": "canny.safetensors"}
         });
+        graph["22"] = json!({"class_type": "LoadImage", "inputs": {"image": "control.png"}});
         let workflow = parse_workflow(&graph).unwrap();
         assert_eq!(
             workflow.controlnet,
             Some(("canny.safetensors".to_owned(), 0.9))
+        );
+        assert_eq!(
+            workflow.controlnets,
+            vec![ControlNet {
+                name: "canny.safetensors".to_owned(),
+                strength: 0.9,
+                image: Some("control.png".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn traces_multiple_controlnets_in_conditioning_order_without_negative_duplicates() {
+        let mut graph = txt2img_graph();
+        graph["3"]["inputs"]["positive"] = json!(["20", 0]);
+        graph["3"]["inputs"]["negative"] = json!(["20", 1]);
+        graph["20"] = json!({
+            "class_type": "ControlNetApplyAdvanced",
+            "inputs": {
+                "strength": 0.25,
+                "control_net": ["21", 0],
+                "positive": ["23", 0],
+                "negative": ["23", 1],
+                "image": ["22", 0]
+            }
+        });
+        graph["21"] = json!({
+            "class_type": "ControlNetLoader",
+            "inputs": {"control_net_name": "depth.safetensors"}
+        });
+        graph["22"] = json!({"class_type": "LoadImage", "inputs": {"image": "depth.png"}});
+        graph["23"] = json!({
+            "class_type": "ControlNetApplyAdvanced",
+            "inputs": {
+                "strength": 0.75,
+                "control_net": ["24", 0],
+                "positive": ["6", 0],
+                "negative": ["7", 0],
+                "image": ["25", 0]
+            }
+        });
+        graph["24"] = json!({
+            "class_type": "ControlNetLoader",
+            "inputs": {"control_net_name": "canny.safetensors"}
+        });
+        graph["25"] = json!({"class_type": "LoadImage", "inputs": {"image": "canny.png"}});
+
+        let workflow = parse_workflow(&graph).unwrap();
+        assert_eq!(
+            workflow.controlnets,
+            vec![
+                ControlNet {
+                    name: "canny.safetensors".to_owned(),
+                    strength: 0.75,
+                    image: Some("canny.png".to_owned()),
+                },
+                ControlNet {
+                    name: "depth.safetensors".to_owned(),
+                    strength: 0.25,
+                    image: Some("depth.png".to_owned()),
+                },
+            ]
         );
     }
 
