@@ -49,3 +49,16 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 ### 2026-07-27 — Tracing + half_gemm overlap analysis (post main merge)
 - **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
 - **half_gemm.rs overlap**: Complementary, not duplicated. GEMV (M=1 bandwidth-optimal, inline asm fcvtl ARMv8 base) vs GEMM (M>1 compute-optimal, vcvt_f32_f16 intrinsic requiring FEAT_FP16). Dispatch collision fixed in `ed7a65e3`. Consolidation deferred to separate PR.
+
+### 2026-07-27 — BNNS prefill campaign (PR #275)
+- **Commits `f0cbd786`, `aa219b4b`**: BNNS fp16→f32 GEMM at M≥2 on macOS, FilterCache, contiguous_b_f16 cache. TTFT 989→348 ms.
+- **Commit `9f1e7684`**: Column-major zero-copy for both BNNS (trans_b) and GEMV. Eliminated ~1s first-decode spike (lm_head 544MB f32 densification). TTFT→167ms, end-to-end 1.50× ORT.
+- **Commit `3ab6999a`**: cfg-gated `Arc` import to fix CI on non-macOS targets.
+- **Commit `17be7087`**: Correctness fixes from rubber-duck review:
+  - Blocking #1: Added `constant_inputs[1]` guard to rescue block — non-constant non-contiguous B was producing all zeros.
+  - Blocking #2: Added `clear_weight_transpose_caches()` in `Executor::Drop` — pointer-keyed cache had no lifetime management; address reuse could serve stale data.
+  - Poison recovery on all cache lock sites.
+  - `debug_assert_eq` for buffer density in precompute.
+  - Documented M≥2 threshold rationale (categorical, not tuned).
+  - Two new tests: non-constant non-contiguous B (must NOT enter rescue), constant non-contiguous B (must enter rescue).
+- **Result:** TTFT 167ms (was 989), decode 1.10–1.67× ORT (load-dependent), end-to-end 1.50× ORT. All guard tests green. x86_64 + aarch64 clippy clean. Platform naming lint passes.
