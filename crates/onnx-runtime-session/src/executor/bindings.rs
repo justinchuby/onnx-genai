@@ -276,7 +276,7 @@ impl Executor {
                 )));
             }
             let physical_shape = binding.physical_shape();
-            let required = dtype.storage_bytes(physical_shape.iter().product());
+            let required = required_binding_bytes(dtype, physical_shape, &input_name)?;
             if required > len {
                 return Err(SessionError::Internal(format!(
                     "device binding '{input_name}' needs {required} bytes for {physical_shape:?}, allocation has {len}"
@@ -352,4 +352,17 @@ impl Executor {
         }
         Ok(external)
     }
+}
+
+pub(super) fn required_binding_bytes(
+    dtype: DataType,
+    physical_shape: &[usize],
+    input_name: &str,
+) -> Result<usize> {
+    onnx_runtime_ir::checked_expected_bytes(dtype, physical_shape).ok_or_else(|| {
+        SessionError::ShapeOverflow {
+            value: format!("device binding '{input_name}'"),
+            dims: physical_shape.to_vec(),
+        }
+    })
 }

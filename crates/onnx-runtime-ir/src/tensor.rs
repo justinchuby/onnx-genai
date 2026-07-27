@@ -37,14 +37,46 @@ impl TensorData {
 
     /// Number of elements (product of dims; `1` for a scalar).
     pub fn numel(&self) -> usize {
-        self.dims.iter().product()
+        self.checked_numel().expect("tensor element count overflow")
+    }
+
+    /// Number of elements, or `None` when the dimensions overflow `usize`.
+    pub fn checked_numel(&self) -> Option<usize> {
+        checked_numel(&self.dims)
     }
 
     /// Expected byte length for `numel` elements of `dtype`, accounting for
     /// sub-byte packing.
     pub fn expected_bytes(&self) -> usize {
-        self.dtype.storage_bytes(self.numel())
+        self.checked_expected_bytes()
+            .expect("tensor byte count overflow")
     }
+
+    /// Expected byte length, or `None` when the element or byte count overflows.
+    pub fn checked_expected_bytes(&self) -> Option<usize> {
+        checked_expected_bytes(self.dtype, &self.dims)
+    }
+}
+
+/// Number of elements in `dims`, or `None` when their product overflows.
+pub fn checked_numel(dims: &[usize]) -> Option<usize> {
+    dims.iter()
+        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+}
+
+/// Dense storage size for `dtype` and `dims`, or `None` on geometry overflow.
+pub fn checked_expected_bytes(dtype: DataType, dims: &[usize]) -> Option<usize> {
+    let element_count = checked_numel(dims)?;
+    if dtype == DataType::Undefined {
+        return None;
+    }
+    if dtype.is_sub_byte() {
+        let elements_per_byte = 8 / dtype.bit_size();
+        return (element_count / elements_per_byte).checked_add(usize::from(
+            !element_count.is_multiple_of(elements_per_byte),
+        ));
+    }
+    element_count.checked_mul(dtype.byte_size())
 }
 
 /// A sparse constant tensor in COO form.
@@ -131,6 +163,18 @@ mod tests {
         let t = TensorData::from_raw(DataType::Int4, vec![3], vec![0u8; 2]);
         assert_eq!(t.numel(), 3);
         assert_eq!(t.expected_bytes(), 2); // 3 packed nibbles -> 2 bytes
+    }
+
+    #[test]
+    fn checked_geometry_rejects_overflow() {
+        let tensor = TensorData::from_raw(DataType::Float32, vec![usize::MAX, 2], Vec::new());
+        assert_eq!(tensor.checked_numel(), None);
+        assert_eq!(tensor.checked_expected_bytes(), None);
+
+        let byte_overflow =
+            TensorData::from_raw(DataType::Float64, vec![usize::MAX / 4], Vec::new());
+        assert_eq!(byte_overflow.checked_numel(), Some(usize::MAX / 4));
+        assert_eq!(byte_overflow.checked_expected_bytes(), None);
     }
 
     #[test]

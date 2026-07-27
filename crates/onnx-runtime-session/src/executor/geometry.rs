@@ -14,8 +14,20 @@ pub(super) fn view_bounds(
     let esize = dtype.byte_size();
     if esize == 0 {
         // Sub-byte (int4/uint4) or variable-width: size via `storage_bytes`.
-        let numel: usize = shape.iter().product();
-        let need = byte_offset + dtype.storage_bytes(numel);
+        let storage_bytes =
+            onnx_runtime_ir::checked_expected_bytes(dtype, shape).ok_or_else(|| {
+                SessionError::ShapeOverflow {
+                    value: "sub-byte tensor view".to_string(),
+                    dims: shape.to_vec(),
+                }
+            })?;
+        let need =
+            byte_offset
+                .checked_add(storage_bytes)
+                .ok_or_else(|| SessionError::ShapeOverflow {
+                    value: "sub-byte tensor view byte offset".to_string(),
+                    dims: shape.to_vec(),
+                })?;
         if need > buffer_len {
             return Err(SessionError::from(
                 onnx_runtime_ep_api::EpError::InvalidTensorView {
