@@ -21,6 +21,7 @@
 //!
 //! [`docs/DIFFUSION.md`]: https://github.com/justinchuby/onnx-genai/blob/main/docs/DIFFUSION.md
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -215,16 +216,26 @@ pub struct RenderedImage {
 struct DiffusionEndpoints {
     /// `{denoiser}.{latent_port}` — the loop-carried sample input.
     latent: String,
-    /// `{denoiser}.{cfg_port}.uncond` — the CFG unconditional embedding, when guided.
-    uncond: Option<String>,
+    /// Prompt-encoder outputs routed into denoiser conditioning ports.
+    conditioning: Vec<ConditioningEdge>,
     /// `{denoiser}.{latent_port}.noise` — per-step noise for stochastic schedulers.
     noise: Option<String>,
-    /// `{text_encoder}.{input_port}` — prompt token ids.
-    prompt_ids: String,
     /// Prompt-phase encoder component name.
     text_encoder: String,
     /// Final-phase component emitting the image, when the pipeline declares one.
     final_component: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConditioningEdge {
+    encoder_output: String,
+    denoiser_input: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditioningKind {
+    Single,
+    DualWithPooled,
 }
 
 /// Split a `component.port` endpoint. Endpoints always carry both halves.
@@ -258,11 +269,6 @@ fn resolve_endpoints(spec: &PipelineSpec) -> Result<DiffusionEndpoints> {
         })?;
 
     let cfg_port = spec.strategy.cfg_conditioning_input.as_deref();
-    let uncond = cfg_port.map(|port| {
-        let port = split_endpoint(port).map_or(port, |(_, port)| port);
-        format!("{denoiser}.{port}.uncond")
-    });
-
     // The conditioning edge into the denoiser identifies the prompt encoder.
     let conditioning_target = cfg_port.map(|port| match split_endpoint(port) {
         Some((component, port)) if component == denoiser => format!("{denoiser}.{port}"),
@@ -297,6 +303,25 @@ fn resolve_endpoints(spec: &PipelineSpec) -> Result<DiffusionEndpoints> {
              Why: no dataflow edge feeds the denoiser's conditioning input and no single `run_on: prompt_only` component is declared. \
              How: declare `strategy.cfg_conditioning_input` plus the encoder→denoiser edge, or mark exactly one component `run_on: prompt_only`.",
         )?;
+    let conditioning: Vec<ConditioningEdge> = spec
+        .dataflow
+        .iter()
+        .filter_map(|edge| {
+            let (from_component, encoder_output) = split_endpoint(&edge.from)?;
+            let (to_component, denoiser_input) = split_endpoint(&edge.to)?;
+            (from_component == text_encoder && to_component == denoiser).then(|| ConditioningEdge {
+                encoder_output: encoder_output.to_string(),
+                denoiser_input: denoiser_input.to_string(),
+            })
+        })
+        .collect();
+    if conditioning.is_empty() {
+        bail!(
+            "What: the prompt encoder has no declared denoiser conditioning outputs. \
+             Why: no dataflow edge connects '{text_encoder}' to '{denoiser}'. \
+             How: declare each encoder output → denoiser input edge in pipeline.dataflow."
+        );
+    }
 
     let final_component = spec
         .phases
@@ -317,12 +342,68 @@ fn resolve_endpoints(spec: &PipelineSpec) -> Result<DiffusionEndpoints> {
 
     Ok(DiffusionEndpoints {
         latent: format!("{denoiser}.{latent_port}"),
-        uncond,
+        conditioning,
         noise,
-        prompt_ids: format!("{text_encoder}.input_ids"),
         text_encoder,
         final_component,
     })
+}
+
+fn conditioning_kind(edges: &[ConditioningEdge]) -> ConditioningKind {
+    if edges
+        .iter()
+        .any(|edge| edge.denoiser_input == "text_embeds")
+    {
+        ConditioningKind::DualWithPooled
+    } else {
+        ConditioningKind::Single
+    }
+}
+
+/// Build SDXL micro-conditioning values in diffusers order:
+/// `[original_height, original_width, crop_top, crop_left, target_height, target_width]`.
+pub fn build_time_ids(
+    batch_size: usize,
+    original_size: (usize, usize),
+    crop_top_left: (usize, usize),
+    target_size: (usize, usize),
+) -> Vec<f32> {
+    let row = [
+        original_size.0 as f32,
+        original_size.1 as f32,
+        crop_top_left.0 as f32,
+        crop_top_left.1 as f32,
+        target_size.0 as f32,
+        target_size.1 as f32,
+    ];
+    row.repeat(batch_size)
+}
+
+/// Concatenate two `[batch, sequence, hidden]` tensors along the hidden axis.
+pub fn concatenate_hidden_states(
+    left: &[f32],
+    right: &[f32],
+    batch_size: usize,
+    sequence_length: usize,
+) -> Result<Vec<f32>> {
+    let rows = batch_size
+        .checked_mul(sequence_length)
+        .context("hidden-state row count overflow")?;
+    if rows == 0 || !left.len().is_multiple_of(rows) || !right.len().is_multiple_of(rows) {
+        bail!(
+            "hidden states must both have shape [batch, sequence, hidden]; got {} and {} values for batch={batch_size}, sequence={sequence_length}",
+            left.len(),
+            right.len()
+        );
+    }
+    let left_hidden = left.len() / rows;
+    let right_hidden = right.len() / rows;
+    let mut concatenated = Vec::with_capacity(left.len() + right.len());
+    for row in 0..rows {
+        concatenated.extend_from_slice(&left[row * left_hidden..(row + 1) * left_hidden]);
+        concatenated.extend_from_slice(&right[row * right_hidden..(row + 1) * right_hidden]);
+    }
+    Ok(concatenated)
 }
 
 /// Load a CLIP tokenizer configured for fixed-length ([`CLIP_CONTEXT_LENGTH`])
@@ -424,6 +505,44 @@ pub fn text_encode(
         .next()
         .context("the prompt encoder produced no output")?;
     Ok(hidden.to_vec_f32_lossy()?)
+}
+
+fn tokenizer_for_encoder_input(
+    pipeline_dir: &Path,
+    requested: Option<&Path>,
+    declared: Option<&str>,
+    input_index: usize,
+) -> Result<tokenizers::Tokenizer> {
+    let primary = requested
+        .map(Path::to_path_buf)
+        .or_else(|| declared.map(|path| pipeline_dir.join(path)))
+        .unwrap_or_else(|| pipeline_dir.join("tokenizer.json"));
+    let path = if input_index == 0 {
+        primary
+    } else {
+        let indexed = pipeline_dir.join(format!("tokenizer_{}.json", input_index + 1));
+        if indexed.exists() { indexed } else { primary }
+    };
+    load_clip_tokenizer(&path)
+}
+
+fn encode_named(
+    environment: &Environment,
+    encoder_path: &Path,
+    inputs: &[(String, Value)],
+) -> Result<HashMap<String, Value>> {
+    let session = Session::new(environment, encoder_path, SessionOptions::default())
+        .with_context(|| format!("loading prompt encoder {}", encoder_path.display()))?;
+    let refs: Vec<(&str, &Value)> = inputs
+        .iter()
+        .map(|(name, value)| (name.as_str(), value))
+        .collect();
+    Ok(session
+        .output_names()
+        .iter()
+        .cloned()
+        .zip(session.run(&refs)?)
+        .collect())
 }
 
 /// Decode a `[batch, channels, h, w]` latent (already scaled by
@@ -576,12 +695,60 @@ pub fn generate_image(
         .unwrap_or(25);
     validate_steps(num_steps)?;
 
-    let tokenizer_path = request
-        .tokenizer_path
+    let encoder_component = engine
+        .spec()
+        .models
+        .get(&endpoints.text_encoder)
+        .with_context(|| format!("missing prompt encoder '{}'", endpoints.text_encoder))?;
+    let text_encoder_path = request
+        .text_encoder_path
         .clone()
-        .unwrap_or_else(|| pipeline_dir.join("tokenizer.json"));
-    let tokenizer = load_clip_tokenizer(&tokenizer_path)?;
-    let positive_ids = tile_ids(&tokenize_clip(&tokenizer, &request.prompt)?, batch_size);
+        .unwrap_or_else(|| pipeline_dir.join(&encoder_component.filename));
+    let environment = Environment::new("onnx-genai-text-to-image")?;
+    let encoder_session = Session::new(&environment, &text_encoder_path, SessionOptions::default())
+        .with_context(|| format!("loading prompt encoder {}", text_encoder_path.display()))?;
+    let mut encoder_inputs: Vec<String> = encoder_session
+        .inputs()
+        .iter()
+        .filter(|input| input.dtype == DataType::Int64 && input.name.contains("input_ids"))
+        .map(|input| input.name.clone())
+        .collect();
+    if encoder_inputs.is_empty() {
+        encoder_inputs = encoder_session
+            .inputs()
+            .iter()
+            .filter(|input| input.dtype == DataType::Int64)
+            .map(|input| input.name.clone())
+            .take(1)
+            .collect();
+    }
+    if encoder_inputs.is_empty() {
+        bail!("the prompt encoder graph declares no int64 token-id inputs");
+    }
+    let mut positive_encoder_inputs = Vec::with_capacity(encoder_inputs.len());
+    let mut negative_encoder_inputs = Vec::with_capacity(encoder_inputs.len());
+    for (index, input_name) in encoder_inputs.iter().enumerate() {
+        let tokenizer = tokenizer_for_encoder_input(
+            pipeline_dir,
+            request.tokenizer_path.as_deref(),
+            encoder_component.tokenizer.as_deref(),
+            index,
+        )?;
+        let positive_ids = tile_ids(&tokenize_clip(&tokenizer, &request.prompt)?, batch_size);
+        let negative_ids = tile_ids(
+            &tokenize_clip(&tokenizer, &request.negative_prompt)?,
+            batch_size,
+        );
+        let shape = [batch_size as i64, CLIP_CONTEXT_LENGTH as i64];
+        positive_encoder_inputs.push((
+            input_name.clone(),
+            Value::from_slice_i64(&positive_ids, &shape)?,
+        ));
+        negative_encoder_inputs.push((
+            input_name.clone(),
+            Value::from_slice_i64(&negative_ids, &shape)?,
+        ));
+    }
 
     let channels = latent_channels(pipeline_dir);
     let latent_height = request.height / VAE_DOWNSCALE;
@@ -607,13 +774,10 @@ pub fn generate_image(
 
     let mut pipeline_request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
-    pipeline_request = pipeline_request.with_input(
-        endpoints.prompt_ids.clone(),
-        Value::from_slice_i64(
-            &positive_ids,
-            &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64],
-        )?,
-    );
+    for (input_name, value) in positive_encoder_inputs {
+        pipeline_request = pipeline_request
+            .with_input(format!("{}.{}", endpoints.text_encoder, input_name), value);
+    }
     pipeline_request = pipeline_request.with_input(
         endpoints.latent.clone(),
         Value::from_slice_f32(&sample, &latent_shape)?,
@@ -621,27 +785,42 @@ pub fn generate_image(
 
     // Classifier-free guidance unconditional embedding: the encoding of the
     // negative prompt (empty by default), NOT zeros.
-    if uses_cfg && let Some(uncond_endpoint) = &endpoints.uncond {
-        let environment = Environment::new("onnx-genai-text-to-image")?;
-        let text_encoder_path = request
-            .text_encoder_path
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(|| {
-                encoder_path(pipeline_dir, engine.spec(), &endpoints.text_encoder)
-            })?;
-        let negative_ids = tile_ids(
-            &tokenize_clip(&tokenizer, &request.negative_prompt)?,
+    if uses_cfg {
+        let mut negative_outputs =
+            encode_named(&environment, &text_encoder_path, &negative_encoder_inputs)?;
+        for edge in &endpoints.conditioning {
+            let value = negative_outputs
+                .remove(&edge.encoder_output)
+                .with_context(|| {
+                    format!(
+                        "prompt encoder produced no declared conditioning output '{}'",
+                        edge.encoder_output
+                    )
+                })?;
+            pipeline_request = pipeline_request.with_input(
+                format!(
+                    "{}.{}.uncond",
+                    engine.spec().strategy.denoiser.as_deref().unwrap(),
+                    edge.denoiser_input
+                ),
+                value,
+            );
+        }
+    }
+
+    if conditioning_kind(&endpoints.conditioning) == ConditioningKind::DualWithPooled {
+        let time_ids = build_time_ids(
             batch_size,
+            (request.height, request.width),
+            (0, 0),
+            (request.height, request.width),
         );
-        let uncond = text_encode(&environment, &text_encoder_path, &negative_ids, batch_size)?;
-        let hidden_dim = (uncond.len() / (batch_size * CLIP_CONTEXT_LENGTH)) as i64;
         pipeline_request = pipeline_request.with_input(
-            uncond_endpoint.clone(),
-            Value::from_slice_f32(
-                &uncond,
-                &[batch_size as i64, CLIP_CONTEXT_LENGTH as i64, hidden_dim],
-            )?,
+            format!(
+                "{}.time_ids",
+                engine.spec().strategy.denoiser.as_deref().unwrap()
+            ),
+            Value::from_slice_f32(&time_ids, &[batch_size as i64, 6])?,
         );
     }
 
@@ -736,17 +915,6 @@ pub fn render(
 }
 
 /// Resolve the prompt encoder's ONNX file from the package's declared components.
-fn encoder_path(pipeline_dir: &Path, spec: &PipelineSpec, component: &str) -> Result<PathBuf> {
-    let declared = spec.models.get(component).with_context(|| {
-        format!(
-            "What: the prompt encoder file could not be resolved. \
-             Why: pipeline.models declares no component named '{component}'. \
-             How: pass --text-encoder pointing at the encoder's ONNX file."
-        )
-    })?;
-    Ok(pipeline_dir.join(&declared.filename))
-}
-
 /// Split a `[batch, 3, height, width]` buffer into per-image results.
 fn split_batch(
     data: Vec<f32>,
@@ -844,10 +1012,12 @@ mod tests {
 
         assert_eq!(endpoints.latent, "denoiser.sample");
         assert_eq!(
-            endpoints.uncond.as_deref(),
-            Some("denoiser.encoder_hidden_states.uncond")
+            endpoints.conditioning,
+            vec![ConditioningEdge {
+                encoder_output: "last_hidden_state".to_string(),
+                denoiser_input: "encoder_hidden_states".to_string(),
+            }]
         );
-        assert_eq!(endpoints.prompt_ids, "text_encoder.input_ids");
         assert_eq!(endpoints.text_encoder, "text_encoder");
         assert_eq!(endpoints.final_component.as_deref(), Some("vae"));
         assert!(endpoints.noise.is_none());
@@ -942,6 +1112,47 @@ mod tests {
         let endpoints = resolve_endpoints(&spec).unwrap();
 
         assert_eq!(endpoints.text_encoder, "text_encoder");
-        assert!(endpoints.uncond.is_none());
+        assert_eq!(
+            conditioning_kind(&endpoints.conditioning),
+            ConditioningKind::Single
+        );
+    }
+
+    #[test]
+    fn time_ids_follow_sdxl_micro_conditioning_order_and_batch_tiling() {
+        let ids = build_time_ids(2, (768, 1024), (12, 34), (640, 896));
+        assert_eq!(
+            ids,
+            vec![
+                768.0, 1024.0, 12.0, 34.0, 640.0, 896.0, 768.0, 1024.0, 12.0, 34.0, 640.0, 896.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn dual_encoder_hidden_states_concatenate_feature_rows() {
+        let left = vec![1.0, 2.0, 3.0, 4.0];
+        let right = vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0];
+        let combined = concatenate_hidden_states(&left, &right, 1, 2).unwrap();
+        assert_eq!(
+            combined,
+            vec![1.0, 2.0, 10.0, 11.0, 12.0, 3.0, 4.0, 20.0, 21.0, 22.0]
+        );
+    }
+
+    #[test]
+    fn pooled_conditioning_detects_sdxl_while_single_edge_stays_sd1() {
+        let single = vec![ConditioningEdge {
+            encoder_output: "last_hidden_state".to_string(),
+            denoiser_input: "encoder_hidden_states".to_string(),
+        }];
+        let mut dual = single.clone();
+        dual.push(ConditioningEdge {
+            encoder_output: "text_embeds".to_string(),
+            denoiser_input: "text_embeds".to_string(),
+        });
+
+        assert_eq!(conditioning_kind(&single), ConditioningKind::Single);
+        assert_eq!(conditioning_kind(&dual), ConditioningKind::DualWithPooled);
     }
 }
