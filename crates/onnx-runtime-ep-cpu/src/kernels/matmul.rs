@@ -3124,6 +3124,8 @@ mod tests {
         // Non-column-major, non-contiguous: e.g. shape [K,N] with strides [2, 1]
         // (stride-0 = 2 ≠ N=8, so not row-major; stride-0 ≠ 1, so not col-major)
         // Physical buffer must be large enough: need (K-1)*2 + (N-1)*1 + 1 elements
+        // Keep `* 1` for symmetry with `* 2` — mirrors stride formula (dim-1)*stride.
+        #[allow(clippy::identity_op)]
         let phys_len = (k - 1) * 2 + (n - 1) * 1 + 1;
         let b_phys_data: Vec<f32> = (0..phys_len)
             .map(|i| ((i % 89) as f32) * 0.01 - 0.5)
