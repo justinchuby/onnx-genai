@@ -5546,3 +5546,44 @@ Rust-quality gate all passed. The unrelated all-targets clippy
 
 Processed wave-6 inbox notes: `chico-fp16-vae-51`, `crowe-pr268-review`,
 `newt-cuda-coverage3`, and `ferro-pr269-review`.
+
+## 2026-07-27 — Roadmap wave-7
+
+Decision archive pre-check: the active ledger was 518,901 bytes. No dated section
+strictly older than 2026-07-20 was found, so
+`.squad/decisions/archive/2026-07.md` was not changed.
+
+<!-- inbox:deckard-cuda-conformance-69 -->
+### 2026-07-27: CUDA EP conformance profile and coverage-of-coverage — issue #69
+**By:** Deckard
+**PR:** https://github.com/justinchuby/onnx-genai/pull/270 (merged; advances #69)
+**What:** Added an additive declarative conformance profile for all 117
+`CUDA_COVERED_OPS`: a shared CUDA-vs-CPU single-node parity harness, 77 inline
+f32/f16/bf16 cases, and attributed dedicated suites. The no-GPU
+`every_covered_op_has_a_conformance_entry` guard enforces exact set equality
+with `CUDA_COVERED_OPS`; duplicate-profile and dedicated-suite existence/name
+guards prevent stale or dangling coverage claims.
+**Why:** An audit found 26 claimed CUDA ops without parity references. The
+profile closes those gaps (including Erf, SkipLayerNormalization, ReduceMean,
+Pow, CastLike, and Softplus) and makes future claimed-but-untested operations
+fail the guard rather than silently expanding coverage claims. No GPU Actions
+workflow was added because CI runners lack GPUs; local GPU execution is
+documented in `docs/CUDA_COVERAGE.md`.
+
+<!-- inbox:roy-pr270-review -->
+### 2026-07-27: Approve PR #270 CUDA EP conformance profile
+**By:** Roy
+**What:** Approved PR #270 after independent GPU and off-GPU validation. The
+coverage guard iterates the real 117-op set and mutation-removing Erf fails;
+the parity harness executes real CUDA and CPU paths, with a mutation of the
+f32 tolerance proving a genuine numerical comparison. All 77 inline cases
+passed on GPU7, and the three off-GPU guards passed without a GPU.
+**Why:** The profile is non-tautological, its dedicated-suite references are
+valid, and it adds no over-claiming workflow or kernel change. Formatting,
+targeted clippy, and PR checks were clean. All-targets test clippy reports only
+pre-existing untouched-suite lints and is non-blocking.
+
+Processed wave-7 inbox notes: `deckard-cuda-conformance-69`, `roy-pr270-review`.
+
+Archive pre-check correction: the active-ledger byte count at pre-check was
+518,843 bytes (the archival conclusion is unchanged).
