@@ -49,3 +49,12 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 ### 2026-07-27 — Tracing + half_gemm overlap analysis (post main merge)
 - **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
 - **half_gemm.rs overlap**: Complementary, not duplicated. GEMV (M=1 bandwidth-optimal, inline asm fcvtl ARMv8 base) vs GEMM (M>1 compute-optimal, vcvt_f32_f16 intrinsic requiring FEAT_FP16). Dispatch collision fixed in `ed7a65e3`. Consolidation deferred to separate PR.
+
+### 2026-07-27 — PR #275 BNNS fp16→f32 prefill via AMX
+- **Commit `a855f826`** on `squad/mac-prefill-bnns`: Implemented BNNS-based fp16→f32 MatMul for M≥2 prefill/batch-decode on Apple Silicon, reaching AMX at 2451 GFLOPS (vs 52 GFLOPS portable NEON).
+- **Three-regime dispatch**: M=1 → NEON GEMV (decode), M≥2 macOS → BNNS BNNSMatMul fp16→f32 (prefill/AMX), M≥2 non-Mac → half_gemm.rs (portable).
+- **BNNS FFI**: Raw binding to `BNNSFilterCreateLayerBroadcastMatMul`/`BNNSFilterApplyTwoInput`/`BNNSFilterDestroy` with correct 176-byte NDArrayDescriptor and 544-byte params struct layouts (verified against C). Critical: `b_is_weights=false` (both operands passed at apply time).
+- **Threading safety**: BNNS calls from dispatch level only, never inside Rayon parallel regions (avoids 4× GCD oversubscription).
+- **Tests**: dispatch reachability (atomic counter), bf16 exclusion (output parity), numerics vs f64 reference at model-scale 128×896×4864, edge values (fp16 max/denorm/NaN/zero), bitwise determinism, guard-break proof.
+- **Verification**: `cargo fmt` clean, clippy clean on aarch64 + x86_64 `--all-targets -D warnings`, all 140 matmul tests pass, full CPU EP suite green. Decode guard `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` passes (unregressed).
+- **TTFT measurement deferred**: System load 83 on 10-core M1 Max during implementation; measurement unreliable. Sebastian's microbenchmark (2451 GFLOPS) projects ~37 ms TTFT vs ORT's 107 ms.
