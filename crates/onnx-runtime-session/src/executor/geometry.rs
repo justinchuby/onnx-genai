@@ -140,25 +140,18 @@ pub(super) fn checked_storage_bytes(
 /// [`onnx_runtime_ir::normalize_domain`]), so the domain keys directly into the
 /// opset-import map.
 pub(super) fn effective_opset(graph: &Graph, node: &Node) -> u64 {
-    if let Some(version) = node.version.and_then(|version| u64::try_from(version).ok()) {
-        return version;
-    }
-    graph
-        .opset_imports
-        .get(node.domain.as_str())
-        .copied()
-        .unwrap_or_else(|| {
-            unreachable!(
-                "internal invariant violated: node #{} ({}::{}) has no opset import",
-                node.id.0,
-                if node.domain.is_empty() {
-                    "ai.onnx"
-                } else {
-                    &node.domain
-                },
-                node.op_type
-            )
-        })
+    graph.effective_opset(node).unwrap_or_else(|| {
+        unreachable!(
+            "internal invariant violated: node #{} ({}::{}) has no opset import",
+            node.id.0,
+            if node.domain.is_empty() {
+                "ai.onnx"
+            } else {
+                &node.domain
+            },
+            node.op_type
+        )
+    })
 }
 
 /// Substitute concrete symbol bindings into a (possibly symbolic) shape.

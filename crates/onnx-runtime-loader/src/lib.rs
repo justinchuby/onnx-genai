@@ -82,6 +82,23 @@ mod error {
     /// Errors produced while loading an ONNX model.
     #[derive(Debug, thiserror::Error)]
     pub enum LoaderError {
+        #[error(
+            "What: node {node} ({op_type}) carries opset version {node_version}, but the graph \
+             imports version {graph_version} for domain {domain:?}, and this model cannot be \
+             written out. \
+             Why: a per-node opset is an in-memory IR concept with no representation in ONNX's \
+             protobuf, so serialising would produce a model claiming the wrong operator version \
+             with nothing downstream able to detect it. \
+             How: serialise before the pass that introduced the node-local version, or run with \
+             that fusion disabled."
+        )]
+        NodeVersionNotRepresentable {
+            node: String,
+            op_type: String,
+            domain: String,
+            node_version: i64,
+            graph_version: u64,
+        },
         #[error("failed to read model file {path}: {source}")]
         Io {
             path: PathBuf,

@@ -1394,15 +1394,14 @@ fn dtype_to_ort(dtype: DataType) -> ort::ONNXTensorElementDataType {
 }
 
 fn since_version(graph: &Graph, node: &Node) -> i32 {
-    if let Some(version) = node.version.and_then(|version| i32::try_from(version).ok()) {
-        return version;
-    }
+    // Through the IR's resolver, so a plugin is told the same version shape
+    // inference and dispatch use. These previously disagreed: this function
+    // converted to `i32` and the executor to `u64`, so a version between the
+    // two ranges was honoured by one and ignored by the other.
     graph
-        .opset_imports
-        .get(&node.domain)
-        .or_else(|| graph.opset_imports.get(""))
-        .copied()
-        .unwrap_or(0) as i32
+        .effective_opset(node)
+        .and_then(|version| i32::try_from(version).ok())
+        .unwrap_or(0)
 }
 
 fn ort_api_base() -> *const ort::OrtApiBase {
