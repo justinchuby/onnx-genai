@@ -28,15 +28,17 @@
 //! on the metadata and preprocessing crates — never on `onnx-genai-ort`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use onnx_genai_metadata::{InferenceMetadata, SCHEMA_VERSION, capabilities};
 use onnx_genai_preprocess::image::ImagePreprocessor;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+mod loading;
 mod wire_types;
 
+pub use loading::*;
 pub use wire_types::*;
 
 /// Canonical file name onnxruntime-genai uses for its model config.
@@ -179,7 +181,7 @@ struct DecoderStateMetadata {
 
 /// Coarse structural family a `genai_config.json` describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelShape {
+pub(crate) enum ModelShape {
     /// A single, unsplit decoder graph.
     SingleDecoder,
     /// Embedding + vision/speech front-ends feeding a decoder (multimodal).
@@ -238,7 +240,7 @@ impl GenAiConfig {
             && self.max_sequence_length().is_some()
     }
 
-    fn shape(&self) -> ModelShape {
+    pub(crate) fn shape(&self) -> ModelShape {
         // Recognize the RNN-T transducer family BEFORE the encoder check: a
         // transducer also declares `model.encoder`, but its encoder is a
         // streaming Conformer with cache state (not a Whisper encoder emitting
@@ -793,109 +795,8 @@ impl GenAiConfig {
     }
 }
 
-/// Path to a `genai_config.json` inside `model_dir`, if one exists.
-pub fn find_in_dir(model_dir: &Path) -> Option<PathBuf> {
-    let path = model_dir.join(GENAI_CONFIG_FILE);
-    path.is_file().then_some(path)
-}
-
-/// Load and parse a `genai_config.json` from an explicit path.
-pub fn load(path: &Path) -> Result<GenAiConfig, GenAiConfigError> {
-    let content = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
-}
-
-/// Best-effort compatibility metadata for a model directory.
-///
-/// Returns `Ok(None)` when the directory has no `genai_config.json`.
-pub fn inference_metadata_from_dir(
-    model_dir: &Path,
-    kv_native_dtype: Option<&str>,
-) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
-    let Some(path) = find_in_dir(model_dir) else {
-        return Ok(None);
-    };
-    let config = load(&path)?;
-    Ok(Some(config.to_inference_metadata(kv_native_dtype)?))
-}
-
-/// Like [`inference_metadata_from_dir`], but derives the single-decoder KV/state
-/// topology from the decoder's actual ONNX graph inventory (`decoder_graph`)
-/// rather than expanding KV name patterns over a uniform per-layer count.
-///
-/// This is the entry point runtime loaders use once the decoder session is
-/// available: it lets hybrid SSM/attention decoders load by declaring only the
-/// graph's real ports (sparse dense KV plus fixed recurrent `state_pairs`).
-pub fn inference_metadata_from_dir_with_graph(
-    model_dir: &Path,
-    kv_native_dtype: Option<&str>,
-    decoder_graph: &ModelGraphInfo,
-) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
-    let Some(path) = find_in_dir(model_dir) else {
-        return Ok(None);
-    };
-    let config = load(&path)?;
-    Ok(Some(config.to_inference_metadata_with_graph(
-        kv_native_dtype,
-        decoder_graph,
-    )?))
-}
-
-/// Strict compatibility conversion for an existing multimodal ORT-GenAI package.
-///
-/// Unlike [`inference_metadata_from_dir`], this entry point never fills missing
-/// VLM semantics from conventions or layer counts. The JSON files provide the
-/// semantic contract while `graphs` provides the authoritative ONNX port list,
-/// rank, shape, and dtype facts.
-pub fn pipeline_inference_metadata_from_dir(
-    model_dir: &Path,
-    graphs: &PipelineGraphInfo,
-) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
-    let Some(path) = find_in_dir(model_dir) else {
-        return Ok(None);
-    };
-    let config = load(&path)?;
-    if config.shape() != ModelShape::Multimodal {
-        return Ok(None);
-    }
-    Ok(Some(config.to_strict_pipeline_metadata(model_dir, graphs)?))
-}
-
-/// Strict compatibility conversion for an existing encoder-decoder ORT-GenAI
-/// package (audio/text sequence-to-sequence, e.g. Whisper).
-///
-/// Like [`pipeline_inference_metadata_from_dir`], the JSON files provide the
-/// semantic contract while `graphs` provides the authoritative ONNX port list,
-/// rank, shape, and dtype facts. Nothing is inferred from `model.type` or a
-/// model name: the encoder-decoder shape is recognized only from the declared
-/// `model.encoder` section, and an RNN-T transducer (which also declares an
-/// encoder) is declined with [`GenAiConfigError::UnsupportedPipelineFamily`]
-/// rather than mis-bound. Returns `Ok(None)` when the directory has no
-/// `genai_config.json` or the config does not describe an encoder-decoder model.
-pub fn encoder_decoder_pipeline_inference_metadata_from_dir(
-    model_dir: &Path,
-    graphs: &EncoderDecoderGraphInfo,
-) -> Result<Option<InferenceMetadata>, GenAiConfigError> {
-    let Some(path) = find_in_dir(model_dir) else {
-        return Ok(None);
-    };
-    let config = load(&path)?;
-    // A transducer also declares `model.encoder`; decline it explicitly with the
-    // honest family error rather than returning `Ok(None)` (which would surface a
-    // misleading "not an encoder-decoder" fall-through) or fabricating a spec.
-    if config.is_transducer() {
-        return Err(transducer_unsupported());
-    }
-    if config.shape() != ModelShape::EncoderDecoder {
-        return Ok(None);
-    }
-    Ok(Some(
-        config.to_strict_encoder_decoder_pipeline_metadata(graphs)?,
-    ))
-}
-
 impl GenAiConfig {
-    fn to_strict_pipeline_metadata(
+    pub(crate) fn to_strict_pipeline_metadata(
         &self,
         model_dir: &Path,
         graphs: &PipelineGraphInfo,
@@ -1223,7 +1124,7 @@ impl GenAiConfig {
     /// name, so any encoder-decoder family (Whisper audio, and other
     /// sequence-to-sequence encoders) synthesizes the same way. Every port,
     /// rank, and dtype fact is validated against the authoritative ONNX graphs.
-    fn to_strict_encoder_decoder_pipeline_metadata(
+    pub(crate) fn to_strict_encoder_decoder_pipeline_metadata(
         &self,
         graphs: &EncoderDecoderGraphInfo,
     ) -> Result<InferenceMetadata, GenAiConfigError> {
@@ -1617,7 +1518,7 @@ fn incomplete(missing: impl Into<String>) -> GenAiConfigError {
 /// the loader declines with a descriptive reason instead of fabricating a
 /// Whisper-style cross-attention encoder-decoder spec that does not match the
 /// graphs.
-fn transducer_unsupported() -> GenAiConfigError {
+pub(crate) fn transducer_unsupported() -> GenAiConfigError {
     GenAiConfigError::UnsupportedPipelineFamily {
         family: "RNN-T transducer".into(),
         reason: "the package declares a joint (joiner) network and/or an LSTM prediction \
