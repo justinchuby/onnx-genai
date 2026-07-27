@@ -40,6 +40,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod live_turn;
 mod memory;
+mod model_inspection;
 mod pages;
 mod profile;
 use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
@@ -58,6 +59,7 @@ use onnx_genai::{
 };
 use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
 use onnx_genai_server::{ServeArgs, from_models_dir, run_serve};
+use model_inspection::{list, show, version};
 use profile::RunProfile;
 
 /// Process exit code for termination via SIGINT (Ctrl-C), matching the POSIX
@@ -2891,69 +2893,6 @@ fn read_wav_stream_header<R: BufRead>(reader: &mut R) -> anyhow::Result<StreamHe
     }
 }
 
-fn show(model: &Path) -> anyhow::Result<()> {
-    let model_dir = resolve_model_dir(model);
-    let directory = ModelDirectory::load(&model_dir)?;
-
-    println!("model directory: {}", directory.root.display());
-    println!("model file:      {}", directory.model_path.display());
-    println!("tokenizer:       {}", directory.tokenizer_path.display());
-    match &directory.metadata_path {
-        Some(path) => println!("metadata:        {}", path.display()),
-        None => println!("metadata:        (none)"),
-    }
-    let genai_config = model_dir.join("genai_config.json");
-    if genai_config.is_file() {
-        println!("genai config:    {}", genai_config.display());
-    }
-    if directory.speculator.is_some() {
-        println!("speculator:      detected");
-    }
-
-    if let Some(metadata_path) = &directory.metadata_path {
-        let metadata = load_metadata(metadata_path)?;
-        if !metadata.required_capabilities.is_empty() {
-            println!(
-                "capabilities:    {}",
-                metadata.required_capabilities.join(", ")
-            );
-        }
-        if let Some(model_caps) = &metadata.model {
-            if let Some(max_len) = model_caps.max_sequence_length {
-                println!("max sequence:    {max_len}");
-            }
-            if let Some(attention) = &model_caps.attention {
-                println!("attention:       {attention:?}");
-            }
-        }
-        if let Some(quantization) = &metadata.quantization {
-            println!("quantization:    {quantization:?}");
-        }
-    }
-    Ok(())
-}
-
-fn list(models_dir: &Path) -> anyhow::Result<()> {
-    let specs = from_models_dir(models_dir)?;
-    if specs.is_empty() {
-        println!("no models found under {}", models_dir.display());
-        return Ok(());
-    }
-    for spec in specs {
-        println!("{}\t{}", spec.id, spec.path.display());
-    }
-    Ok(())
-}
-
-fn version() {
-    println!("onnx-genai {}", env!("CARGO_PKG_VERSION"));
-    let mut providers = vec!["cpu"];
-    if cfg!(feature = "cuda") {
-        providers.push("cuda");
-    }
-    println!("execution providers: {}", providers.join(", "));
-    println!("select an execution provider at runtime with ONNX_GENAI_EP (e.g. cpu, cuda).");
-}
 
 #[cfg(test)]
 mod tests {
