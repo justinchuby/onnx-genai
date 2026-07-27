@@ -1,6 +1,0 @@
-### 2026-07-27: Split server routes by endpoint family
-**By:** Christie
-**What:** Replaced the 2,989-line `crates/onnx-genai-server/src/routes.rs` with a `routes/` module tree: `mod.rs` (530 LOC) retains `ApiError`, JSON rejection handling, model resolution, shared request preparation types/helpers, and facade re-exports; `admin.rs` (396 LOC) owns health, models, status, resources, debug, admin, and metrics endpoints; `sessions.rs` (60 LOC) owns session create/delete; `completions.rs` (1,719 LOC) owns completions, embeddings, chat, streaming, and generation helpers; `multimodal.rs` (312 LOC) owns transcription, speech, and image-generation endpoints.
-**Why:** This is a pure code-motion split of the HTTP god-file. Router registration remains untouched in `src/lib.rs`, preserving route paths and registration order exactly. The typed `ApiError` handling and server-side registry logging hardened in PR #213 were moved verbatim without behavior changes.
-
-**Gates:** `cargo build -p onnx-genai-server` passed. `cargo test -p onnx-genai-server` completed with 110 passed, 2 ignored, and only the accepted pre-existing `sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image` failure caused by missing `vlm-executable/vision.onnx`. `cargo clippy -p onnx-genai-server --all-targets -- -D warnings` passed. `cargo fmt -p onnx-genai-server` passed.

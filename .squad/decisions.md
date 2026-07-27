@@ -5,6 +5,22 @@
 > Scribe archive policy: when this file exceeds the hard gate, keep only the current active reconciliation here and move older active ledger content into `.squad/decisions/archive/`.
 
 <!-- scribe-merge-2026-07-23T02-50-00Z-persistent-default-shipped -->
+
+Decision archive gate rechecked after inbox merge at 2026-07-27T04:35:00-07:00: archived 25 newly merged dated entries older than 2026-07-20 to `.squad/decisions-archive/2026-07.md`.
+
+<!-- scribe-merge-2026-07-27T04-35-00-07-00-pr227-lessons -->
+## 2026-07-27 — PR #227 roofline and benchmark lessons
+
+**By:** Scribe, preserving overnight Mac CPU EP campaign learnings.
+
+**What:** Treat these as durable performance-process rules after PR #227 (`squad/mac-cpu-ep-roofline`):
+- Two independent measurements that agree beat one confident outlier; the single 197 GB/s microbenchmark target was physically unreachable and was retracted.
+- A roofline must use the achievable peak for the relevant access pattern. Streaming bandwidth is not GEMV bandwidth; the measured gap was about 2.2×.
+- Benchmark metric definitions must be explicit and identical on both sides (`1000/p50_ms`, `tokens/total_time`, and means including init spikes answer different questions).
+- A SIMD path without a test is equivalent to an unwired placeholder; this already bit `CpuBackend::Accelerate`, `--features native-backend`, and NEON SDPA.
+- Benchmarking on the same machine that runs agents corrupts results and can do so asymmetrically; here it flipped the native backend's auto-calibrator while leaving ORT untouched.
+
+**Why:** These mistakes cost multiple verification rounds and directly affected target-setting, claim wording, and confidence in the native Mac CPU EP win. Future performance campaigns must start with reproducible paired measurements, stated metrics, relevant roofline ceilings, and tested SIMD paths.
 ## 2026-07-23 — Persistent SPMD is the default CPU decode path
 
 **By:** Leon (implementation) + Deckard (affinity-defer revision); reviewed by Gaff (concurrency, APPROVE) and Chew (cross-platform, REJECT → APPROVE after revision)
@@ -16,7 +32,6 @@
 **Process learning:** Per-agent-worktree inbox notes are gitignored and must be merged into the ledger before `git worktree remove --force`; Leon's and Deckard's original inbox notes were lost when their worktree was removed.
 
 Decision archive gate checked at 2026-07-23T02:50:00Z: the active ledger was 257088 bytes before this entry. No entries older than 2026-06-23T02:50:00Z were present, so no archive was created or updated.
-
 <!-- scribe-merge-2026-07-23T01-55-00Z-persistent-default -->
 ## 2026-07-23 — CPU decode pool and f16 LayerNorm reviews
 
@@ -101,17 +116,14 @@ the global 96-thread Rayon pool and contended with the 32 pinned spinning SPMD w
   Not a correctness blocker — the logic is proven and the partition is separately tested.
 
 No data races, no deadlock/hang, no reentrancy, no regression. Approved.
-
 <!-- merged from .squad/decisions/inbox/roy-f16-layernorm-review.md -->
 ### 2026-07-22: Approve f16 SkipSimplifiedLayerNormalization widening
 **By:** Roy
 **What:** Reviewed f9f7572 against cee3c20 and approved the f16 widening/narrowing change with non-blocking test-coverage nits.
 **Why:** All float inputs are safely widened to f32, outputs are narrowed through the dtype helper, and non-float tensors receive the helper's structured unsupported-dtype error. The targeted unit tests and warnings-denied Clippy pass; adding bf16/bias/stat-output coverage would further protect the generalized path.
 <!-- scribe-merge-2026-07-23T01-55-00Z-persistent-default-end -->
-
 <!-- scribe-merge-2026-07-22T21-35-00Z-wp2-ort-reconciliation -->
 ## 2026-07-22 — VLM WP1/WP2/WP3 reconciliation and ORT CUDA attention review
-
 <!-- scribe-merge-2026-07-23T09-10-00Z-cuda-perf-wave2-3 -->
 ## 2026-07-23 — CUDA performance wave 2/3 reconciliation
 
@@ -125,8 +137,6 @@ No data races, no deadlock/hang, no reentrancy, no regression. Approved.
 - **Marsten — smoothness sweep:** This host has only Qwen2.5 and Phi CUDA-GPU models available; remaining benchmark gaps are Qwen2.5-0.5B batch-size-128 failure and Qwen2.5-1.5B repeated-text output.
 - **Open investigation — Qwen2.5-1.5B:** Native decode diverges from coherent ORT through degenerate repetition. SwiGLU-RMS fusion is proven not causal (fusion enabled/disabled is byte-identical); this is a pre-existing native numerical bug under root cause on `fix/qwen15b-native-divergence`.
 - **Review requirement — CUDA EP lib tests:** Reviewers must run `cargo test -p onnx-runtime-ep-cuda --features cuda --lib`; it contains hardcoded-expectation tests (including covered-op count and GQA error substrings) missed by targeted GPU tests.
-
-
 <!-- scribe-merge-2026-07-23T11-40-00Z-cpu-moe-h200-mobius-lmhead -->
 ## 2026-07-23 — CPU MoE review, H200 survey, Mobius #422, and lm_head fusion
 
@@ -183,13 +193,11 @@ Rebase of `71ab809` onto `origin/main` (`cd7dfcf`) was clean — no real code co
 
 ---
 **Plain-text summary:** 🟢 APPROVE. Independently reproduced Llama-3.2-1B **451 tok/s @128 / 439 @1024** (coherent, 4.6× over 97 baseline) and Qwen2.5-0.5B **313 tok/s @128 (no regression)**. Genericity grep clean (no model-name logic). Build + 5 new unit tests + GPU GEMV test + clippy + fmt all pass. Byte-wise Transpose fold is correct for any rank/perm and skips sub-byte/non-constant; fp16 M==1 GEMV is capture-safe and folds into the decode graph. No blocking defects. Branch rebased to `0a2422d` and pushed.
-
 <!-- source: .squad/decisions/inbox/coordinator-mobius-merge-policy.md -->
 ### 2026-07-22: Mobius PRs must be merged by Justin, not by Squad
 **By:** Squad (Coordinator), requested by Justin Chu
 **What:** Squad and its agents must NEVER self-merge mobius PRs. All mobius changes go into a single PR for Justin to review and merge himself. Already-merged mobius PRs are fine as-is.
 **Why:** User directive: "mobius的PR你不能自己merge，必须让我merge！你的所有更改可以放在同一个mobius pr里，我来审查。已经merge的就算了". Distinct from onnx-genai repo, where FF-merge-to-main by a non-author merge agent is permitted.
-
 <!-- source: .squad/decisions/inbox/dave-mobius-metadata-consolidation.md -->
 ### 2026-07-22: Mobius decoder metadata consolidation
 **By:** Dave
@@ -256,20 +264,17 @@ The merged `decoder_metadata_test.py` and `auto_export_test.py` suites passed:
 `44bbfe01d55b4d0559f6fd6d9e2550d3d78b6bdc`; all PR CI checks green. Hassan's
 branch was blocked and not merged because it can overwrite a correctly inferred
 `bfloat16` KV dtype with `float32`; that is the remaining blocker.
-
 <!-- source: .squad/decisions/inbox/iran-merge-roy-fusion.md -->
 ### 2026-07-23: Merge Roy's generic lm_head fusion
 **By:** Iran
 **What:** Fast-forward merged fusion commit `0a2422d` cleanly to `origin/main`, then added the required `docs/PROGRESS.md` entry in commit `a933ffe`.
 **Why:** The branch was independently approved, already rebased, and verified as exactly one commit ahead of `origin/main`.
-
 <!-- source: .squad/decisions/inbox/luba-joi-gemma4-review.md -->
 ### 2026-07-23: Review of joi-gemma4-e2b (Gemma4-E2B native bench)
 **By:** Luba
 **Verdict:** 🟡 APPROVE-WITH-NITS
 **What:** Rebased onto `origin/main`; resolved the `docs/PROGRESS.md` conflict by retaining main, which already contains Joi's Gemma4-E2B entry. The patch was already present upstream, so the rebased branch now equals main at `cd7dfcf`. CUDA release build and bench-native clippy passed; crate-scoped fmt was clean. RULES grep found only the existing synthetic tokenizer fixture name, with no model-family runtime branching. The report's timings are internally coherent and it clearly distinguishes an ORT CUDA pipeline from pure-Rust native execution.
 **Why:** The harness is generic, compiles, guards against falsely reported CUDA runs, and its 7.138 ms/token and 140.09 tok/s figures agree. Non-blocking documentation nits: the dated report does not provide an explicit HBM-roofline comparison, and its remaining-gap wording predates the landed backend-neutral component interface/Native GAP 2, though pure-Rust pipeline decode is still correctly described as incomplete.
-
 <!-- source: .squad/decisions/inbox/mercer-cpu-moe-phase2.md -->
 ### 2026-07-23: CPU grouped MoE Phase 2 acceptance
 **By:** Mercer
@@ -297,7 +302,6 @@ branch was blocked and not merged because it can overwrite a correctly inferred
 
 **Branch:** `squad/mercer-cpu-moe-phase2`
 **SHA:** `cc25ec741b0c891db5a7ddd1479d61b6eaf4932c`
-
 <!-- source: .squad/decisions/inbox/polokov-h200-survey.md -->
 ### 2026-07-23: H200 native decode model survey
 **By:** Polokov
@@ -333,7 +337,6 @@ MatMul(norm_out[1,2048], transposed[2048,128256]) -> logits[1,128256]   (fp16)
 The old rank-3 `audio_encoder.audio_features` → rank-2 `embedding.audio_features` edge
 is intentionally absent. The embedding port is explicitly declared as an external request
 input until WP-B supplies optional-modality/default or typed audio flattening semantics.
-
 <!-- source: .squad/decisions/inbox/roy-wp-a-contract-emission.md -->
 ### 2026-07-22: Emit graph-closed native VLM package contracts
 **By:** Roy
@@ -386,7 +389,6 @@ The incompatible audio edge is no longer guessed: `embedding.audio_features` is 
 
 Mobius delivery: branch `vlm-wp-a-executable-contract`, commit `6ae7017`, PR
 https://github.com/onnxruntime/mobius/pull/418.
-
 <!-- source: .squad/decisions/inbox/sapper-wp-c-revision.md -->
 ### 2026-07-22: WP-C admission gate revision
 **By:** Sapper
@@ -400,13 +402,11 @@ https://github.com/onnxruntime/mobius/pull/418.
 - `cargo test -p onnx-genai-ort --test pipeline_admission` — PASS (9/9)
 - `cargo clippy -p onnx-genai-ort --tests -- -D warnings` — PASS
 - `cargo fmt -p onnx-genai-ort --check` — PASS
-
 <!-- source: .squad/decisions/inbox/sapper-wp-c-schema-blocker.md -->
 ### 2026-07-22: WP-C metadata facts intentionally left fail-open
 **By:** Sapper
 **What:** The current metadata contract has no per-port temporal semantic (fixed prompt conditioning versus refreshed every step) and no explicit list of request-supplied external pipeline ports. The revision therefore removes temporal stale-input rejection and treats otherwise-unbound ports as request-external unless an autoregressive decoder has an explicit `ModelIoSpec`; only then can an undeclared required decoder port be rejected.
 **Why:** Shape symbols, port names, and component-level dataflow topology cannot prove temporal or external-binding semantics. Adding the missing fields requires metadata-schema and emitter work outside WP-C; failing open avoids false rejection while retaining sound closure checks where today's explicit decoder I/O contract proves a port has no source.
-
 <!-- source: .squad/decisions/inbox/sebastian-wp-a-review.md -->
 ### 2026-07-22: Review of mobius PR #418 "VLM WP-A executable-contract emission"
 
@@ -457,10 +457,8 @@ Approve for merge by an authorized non-author (coordinator or Justin). WP-B (opt
 **By:** Scribe
 **What:** Merged and cleared `bryant-wp-b1-review.md`, `deckard-wp-c-rereview.md`, `deckard-wp-c-review.md`, `deckard-wp-c-v3-review.md`, `deckard-wp-c-v4-review.md`, `gaff-wp-c-finding5-fix.md`, `holden-wp-c-v4-fix.md`, `keaton-phase1-seam.md`, `leon-keaton-phase1-review.md`, `leon-wp-c-admission-gate.md`, `pris-wp-b1-schema.md`, `roy-gemma4-e2b-reexport.md`, `roy-gemma4-e2b-topology.md`, `roy-wp-a-contract-emission.md`, `sapper-wp-c-revision.md`, `sapper-wp-c-schema-blocker.md`, `sebastian-wp-a-review.md`. Preserved active reference/in-flight files `keaton-native-specdecode-design.md`, `leon-vlm-scope.md`, `rachael-wp-b-optional-modality-design.md`, `zhora-deepseek-scope.md`.
 **Why:** Completed implementation, review, revision, benchmark, and schema notes belong in the current decision ledger; active scope/design files remain in the inbox until their work lands.
-
 <!-- scribe-merge-2026-07-22T12-00-00Z-phase0-7b-cudagraph -->
 ## 2026-07-22 — Partial CUDA-graph Phase 0 and Qwen2.5-7B CUDA-graph benchmark
-
 <!-- source: .squad/decisions/inbox/deckard-luv-phase0-review.md -->
 ### 2026-07-22: Review verdict — Luv Phase 0 partial-CUDA-graph capture-path-kind (🟢 GREEN)
 
@@ -478,7 +476,6 @@ Approve for merge by an authorized non-author (coordinator or Justin). WP-B (opt
 7. **Log output — PASS.** Seam-kind label uses `boundary.seam_reason.map(SeamReason::label).unwrap_or("unclassified-seam")`; behind the verbose diagnostic flag; no existing test asserts on the literal log string, so no format-assertion breakage.
 
 Conclusion: purely additive structural diagnostics, correct, model-agnostic, all gates green. Approved for merge.
-
 <!-- source: .squad/decisions/inbox/gaff-qwen7b-cudagraph.md -->
 ### 2026-07-22: Qwen2.5-7B int4 CUDA-graph auto-enable benchmark
 **By:** Gaff
@@ -499,7 +496,6 @@ Conclusion: purely additive structural diagnostics, correct, model-agnostic, all
 | Fraction of 4.8 TB/s ÷ 3.5 GB/token ceiling | **16.90%** | **13.16%** |
 
 The 128-token outputs were identical token-for-token across A and B. Auto-enable generalized cleanly to Qwen2.5-7B: CUDA plus owned device KV selected whole-step capture automatically, with one captured segment, no eager seams, and zero fallbacks. The **28.38%** gain is smaller than Qwen2.5-0.5B's 87.7% and Phi-4-mini's 41.0%, as expected for a larger decode that spends more time streaming/dequantizing int4 weights and less proportionally on launch overhead, but it remains substantial. The simple peak-bandwidth roofline is about 1,371 tok/s; measured auto throughput is 16.90% of that ceiling, and this ratio should not be interpreted as pure bandwidth efficiency because int4 dequantization and compute also constrain decode.
-
 <!-- source: .squad/decisions/inbox/luv-capture-pathkind.md -->
 ### 2026-07-22: Formalize partial CUDA-graph capture path kinds
 **By:** Luv
@@ -534,7 +530,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and cleared `deckard-luv-phase0-review.md`, `gaff-qwen7b-cudagraph.md`, `luv-capture-pathkind.md`. Preserved active scope/design files `zhora-deepseek-scope.md`, `leon-vlm-scope.md`, and `keaton-native-specdecode-design.md`.
 **Why:** Landed implementation, independent green review, benchmark results, and progress-log updates belong in the current decision ledger; active scope notes remain in the inbox.
-
 <!-- scribe-merge-2026-07-22T00-00-00Z-cudagraph-autoenable -->
 ## 2026-07-22 — CUDA graph auto-enable, GQA/VLM closure, and inbox reconciliation
 
@@ -568,7 +563,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and cleared `batty-cudagraph-autoenable.md`, `chew-gqa-batch1.md`, `chew-model-coverage-census.md`, `coordinator-gqa-merge.md`, `deckard-ds1-shapechain.md`, `deckard-dsnative.md`, `deckard-gqa-batch1-review.md`, `deckard-gqa-rereview.md`, `deckard-mla-conformance-review.md`, `deckard-wp1-packer-fix.md`, `factchecker-keaton-epclaim-review.md`, `gaff-decode-profile.md`, `gaff-native-rebench.md`, `gaff-native-rebench2.md`, `gaff-native-rebench3.md`, `gaff-phi4-bench.md`, `gaff-phi4-benchmark.md`, `holden-partial-rotary.md`, `keaton-epclaim-design.md`, `keaton-epclaim-v2.md`, `leon-batty-cudagraph-review.md`, `leon-wp1-rereview.md`, `leon-wp1-review.md`, `okonkwo-gqa-decode-bench.md`, `pris-ds1-testreview.md`, `pris-gqa-scalar-seqlens-plan.md`, `pris-holden-rotary-review.md`, `pris-mla-conformance.md`, `rachael-wp1-revision.md`, `roy-gqa-batch1-revision.md`, `roy-wp1-revision.md`, `sebastian-mobius416-ci.md`, `tyrell-progress-0722.md`, `zhora-glm-l4-fix.md`. Preserved active scope/design files `zhora-deepseek-scope.md`, `leon-vlm-scope.md`, and `keaton-native-specdecode-design.md`.
 **Why:** Completed implementation, review, benchmark, CI, and duplicate ledger artifacts belong in the current decision ledger; active scope notes remain in the inbox.
-
 <!-- scribe-merge-2026-07-22T00-00-00Z-int4-zp -->
 ## 2026-07-22 — Phi-4-mini int4 zero-point blocker closure
 
@@ -582,7 +576,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and cleared `sapper-int4-zp.md` and `holden-int4-zp-review.md`.
 **Why:** The implementation and independent green review are now represented in the ledger; unrelated active inbox artifacts remain untouched.
-
 <!-- scribe-merge-2026-07-22T06-17-16Z -->
 ## 2026-07-22 — Native proposer contract and Qwen0.5B H200 benchmark
 
@@ -600,7 +593,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and cleared `batty-proposer-contract.md`, `deckard-batty-proposer-review.md`, and `gaff-qwen05-bench.md` when present.
 **Why:** Landed implementation, review, and benchmark records belong in the ledger; active unrelated inbox artifacts remain in place.
-
 <!-- scribe-merge-2026-07-22T05-52-21Z -->
 ## 2026-07-22 — Fused CUDA SwiGLU M>1 prefill merge
 
@@ -613,7 +605,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and cleared `bryant-swiglu-prefill.md` and `deckard-bryant-swiglu-review.md`. Preserved unrelated active in-flight deliverables in `.squad/decisions/inbox/`.
 **Why:** Landed implementation and review decisions belong in the ledger; active scope/review/revision artifacts should remain in the inbox until their work lands.
-
 <!-- scribe-merge-2026-07-22T04:39Z -->
 ## 2026-07-22 — CPU SLN, stale-shape recompute, nbits prefill GEMM, and stale test merges
 
@@ -641,7 +632,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and deduplicated `deckard-sln-fp16.md`, `gaff-sln-fp16-review.md`, `pris-stale-shape.md`, `leon-stale-shape-review.md`, `sapper-nbits-prefill.md`, `batty-nbits-prefill-review.md`, and `hudson-stale-nbits-test.md`. Preserved active or not-yet-main GQA/VLM/specdecode/model-coverage scope and revision artifacts.
 **Why:** Landed implementation and review decisions belong in the ledger; active scope, review, and revision files should remain in the inbox until their work lands.
-
 <!-- scribe-merge-2026-07-22T03:37:44Z -->
 ## 2026-07-22 — GQA scalar seqlens_k and int8 fp16 default-zp test merges
 
@@ -664,7 +654,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Merged and deduplicated `deckard-int8-zp-test.md`, `roy-gqa-review.md`, `tyrell-int8-zp-review.md`, and `leon-wp1-review.md` into this ledger. Preserved active research/scope artifacts in the inbox, including `zhora-deepseek-scope.md`, `leon-vlm-scope.md`, `keaton-native-specdecode-design.md`, `pris-gqa-scalar-seqlens-plan.md`, and `chew-model-coverage-census.md` if present.
 **Why:** Review verdicts, lockouts, and landed implementation decisions belong in the current ledger; active research artifacts remain available for ongoing work.
-
 <!-- scribe-merge-2026-07-22T09:30Z -->
 ## 2026-07-22 — DeepSeek shape-chain, MLA conformance, and active inbox fold
 
@@ -733,7 +722,6 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 **By:** Scribe
 **What:** Left `zhora-deepseek-scope.md`, `leon-vlm-scope.md`, `pris-gqa-scalar-seqlens-plan.md`, and `keaton-native-specdecode-design.md` in `.squad/decisions/inbox/`.
 **Why:** These artifacts remain active references and should not be collapsed into the ledger yet.
-
 <!-- scribe-merge-2026-07-21T23:55Z -->
 <!-- scribe-merge-2026-07-22T21-00-00Z-cpu-ep-perf -->
 ## 2026-07-22 — CPU EP performance campaign reconciliation
@@ -852,7 +840,6 @@ of the naive version so the next iteration starts from evidence.
 
 Tests: `cargo test -p onnx-runtime-ep-cpu --features mlas` → 665 passed
 (4 new affinity unit tests). Non-author review pending (Chew/Gaff; rule 9).
-
 <!-- source: .squad/decisions/inbox/chew-perf-numerics-review.md -->
 ### 2026-07-22: Numerics review of CPU MatMulNBits and GQA decode optimizations
 **By:** Chew
@@ -878,7 +865,6 @@ Tests: `cargo test -p onnx-runtime-ep-cpu --features mlas` → 665 passed
 - Required revision by Deckard: correct the numerical bound/documentation; make the integrated long-context test use a realistic SIMD head width (at least 128), non-periodic realistic and cancellation-heavy data, and verify the AVX2 path on supported x86; add multi-key AXPY/output parity and retain scalar/non-x86 coverage. Any greedy-token claim must be backed by a checked-in end-to-end fixture with logit deltas/margins or softened to an empirical statement.
 
 Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas matmul_nbits` passed 32 tests (2 ignored); `cargo test -p onnx-runtime-ep-cpu --features mlas group_query` passed 16 tests.
-
 ### 2026-07-22: Re-review Leon's GQA numerics revision
 **By:** Chew
 **What:** `c9762b6` is **APPROVE-WITH-NONBLOCKING**. It resolves the blocking findings on `145549a`; Sapper remains locked out and Leon's revision is accepted.
@@ -891,7 +877,6 @@ Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas matmul_nbits` pas
 - Nonblocking portability note: the new assertions make the test suite fail on older x86 hosts without AVX2+FMA even though the runtime supports scalar fallback. Prefer an explicit capability skip plus dedicated AVX2 CI coverage. Also consider accumulating the test-only `Σ|a_i b_i|` in f64 so the theoretical tolerance oracle cannot be rounded downward in f32.
 
 Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas group_query` passed all 17 tests. The prior rejection is cleared.
-
 ### 2026-07-22: Review contiguous f32 kernel I/O bulk copies
 **By:** Chew
 **What:** `2e982c7` is **APPROVE-WITH-NONBLOCKING**.
@@ -901,7 +886,6 @@ Validation: `cargo test -p onnx-runtime-ep-cpu --features mlas group_query` pass
 - `extend_from_slice` and `copy_from_slice` copy the same consecutive f32 bit patterns that the prior logical element loads/stores produced. No arithmetic, reduction, dtype conversion, or ordering change occurs. The f16/bf16 widening and narrowing helpers are separate and unchanged, so no f32→f16→f32 rounding contract is affected.
 - Tests cover contiguous read/write and transposed strided read/write. The full CPU EP suite passed: 661 unit tests passed with 3 ignored, 10 numerical regression tests passed, and one doctest remained intentionally ignored.
 - Nonblocking coverage gap: no focused zero-stride broadcast or other overlapping-stride accessor test was added. The exact canonical-stride predicate makes the implementation safe by inspection, but add read-side broadcast and write-side overlapping-view regressions to lock that exclusion down.
-
 <!-- source: .squad/decisions/inbox/coordinator-cpu-perf-baseline.md -->
 ## 2026-07-22 — CPU EP performance baseline vs ORT/foundry
 
@@ -1124,7 +1108,6 @@ NUMA remote-weight latency, and the non-MatMulNBits ops. Closing to ORT's
   (`kernels/mod.rs`) — cover the new fast path and the retained strided path.
 - `matmulnbits_mlas_decode_step` extended to the 3-way hand / CompInt8 / CompFp32
   comparison.
-
 <!-- source: .squad/decisions/inbox/deckard-numa-affinity-fix.md -->
 ### 2026-07-22: NUMA decode-affinity — revised to clear Gaff's rejection
 **By:** Deckard (non-author reviser; Batty locked out per Rule 9)
@@ -1206,7 +1189,6 @@ tok/s) is unchanged; only correctness/quality was addressed.
 0 failed, 3 ignored. `cargo clippy -p onnx-runtime-ep-cpu --features mlas` →
 clean. Committed to `perf/cpu-ep-mlas` (NOT pushed). Non-author re-review by Gaff
 to follow.
-
 <!-- source: .squad/decisions/inbox/gaff-numa-affinity-review.md -->
 ### 2026-07-22: NUMA decode-affinity review — rejected pending revision
 **By:** Gaff
@@ -1218,14 +1200,12 @@ The diagnostics also do not meet Rule 1's requested combined contract. Malformed
 `compact` is also documented as selecting the smallest-index fitting node, but `min_by_key(|cpus| cpus.len())` selects the fitting node with the fewest CPUs (using index only as an equal-size tie-breaker). Make the selection match the documented smallest-index policy, or document the capacity-minimizing policy precisely.
 
 `cargo test -p onnx-runtime-ep-cpu --features mlas` passed: 665 passed, 0 failed, 3 ignored. `cargo clippy -p onnx-runtime-ep-cpu --features mlas` passed. The four unit tests cover parser modes, CPU-list parsing, compact selection, and unknown-node detection, but they do not cover the required diagnostic content or high CPU-index/fallback safety. Per Rule 9, Batty is locked out from revising this artifact; a different author must make the required fixes.
-
 ### 2026-07-22: NUMA decode-affinity revision review — approved
 **By:** Gaff
 **What:** Re-reviewed Deckard's independent revision, commit `046414b`, against the required fixes from the prior rejection.
 **Why:** `build_cpu_mask` correctly allocates `cpu / (8 * size_of::<c_ulong>()) + 1` words and sets bit `cpu % bits_per_word`, so IDs at and above the fixed `CPU_SETSIZE` cannot index a fixed-size `cpu_set_t` out of bounds. The syscall receives exactly `mask.len() * size_of::<c_ulong>()` bytes; the buffer is aligned as `c_ulong`, remains live for the call, and is read-only, making the sole FFI `unsafe` sound. Its checked index-size construction returns an error on arithmetic failure, and a kernel affinity failure is handled by the existing pool start handler's once-logged unpinned fallback.
 
 `DecodeAffinity::resolve` now unifies malformed, non-integer, unknown-node, and no-topology node-selector errors: each names the rejected selector, all three accepted modes, and either the ordered node list or an explicit topology-unavailable statement. `from_env` supplies detected topology to this validation. `compact` now uses `find` over ordered `BTreeMap` values, correctly choosing the smallest-index fitting node. The four new tests assert diagnostic content (including unavailable topology), masks beyond CPU_SETSIZE, and the differing-size smallest-index case. Validation passed: `cargo test -p onnx-runtime-ep-cpu --features mlas` and `cargo clippy -p onnx-runtime-ep-cpu --features mlas`.
-
 <!-- source: .squad/decisions/inbox/leon-gqa-revision.md -->
 ### 2026-07-22: Harden CPU GQA SIMD numerical validation
 **By:** Leon
@@ -1357,7 +1337,6 @@ All 16 GQA tests pass.
 - **AVX-512 dot-product**: the Xeon 8480C supports AVX-512, enabling 16-wide
   FMADD. The current 8-wide path leaves ~2× on the table for the QK scoring
   loop at long head_dim. Gating on `avx512f` is a follow-up.
-
 <!-- source: .squad/decisions/inbox/sebastian-cpu-profile.md -->
 ### 2026-07-22: Native 7B CPU decode profile
 **By:** Sebastian
@@ -1488,7 +1467,6 @@ The three measured M=8 node times were 1079.810, 583.353, and 582.688 ms, demons
 This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 model compute, not benchmark reset/allocation. The native M=8 prefill is roughly 0.58-1.08 seconds versus 63.5 ms for the 32-thread ORT wrapper first forward and about 102 ms for OGA prompt append/prefill. Lowering `NXRT_SQNBIT_PREFILL_MIN` to route M=8 through MLAS did not improve end-to-end throughput (8.43 versus 8.57 tok/s).
 
 **Decision:** assign dedicated CPU prefill optimization work if TTFT or short-request throughput matters. It will not improve steady M=1 decode, but the measured M=8 compute is a real product bottleneck and is overwhelmingly `MatMulNBits`, not harness overhead.
-
 ## 2026-07-21 — VLM WP2/WP3, opset-24 CUDA, ScatterElements, and DS-1
 
 ### Land VLM WP0 metadata contract and source-compatible hotfix
@@ -1557,7 +1535,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 - `wallace-ep-transparency-review.md` — 2026-07-21: EP transparency backbone review; By: Wallace; What: Deckard's per-op executor span backbone (`exec_plan_node`) is a genuine LIVE span, and the re-instrumented kernels attach kernel-variant + capture-status reasons to it in the real native decode path — my original dead-w….
 - `wallace-wp2-driver-review.md` — WP2 native speculative driver — review.  
 **Why:** The inbox should hold only living research artifacts; segment decisions belong in the active ledger.
-
 ## 2026-07-20 — CPU decode: resident pool and guarded GQA row parallelism
 
 ### Keep persistent M=1 decode-pool residency
@@ -1579,7 +1556,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Deckard  
 **What:** Revert the coarser 8/12-task MatMulNBits prototype and profiling probes; no commit landed.  
 **Why:** Long runs regressed 7.1–8.4%. Post-residency profiling showed serial GQA at about 20.58 ms/token exceeded MatMulNBits at about 15.51 ms/token, so reducing projection task count removed steal slack rather than solving the dominant bottleneck. Revisit only as graph-level projection fusion, after GQA.
-
 ## 2026-07-20 — CUDA fused flash attention
 
 ### Fuse standard Attention only on measured-winning shapes
@@ -1591,7 +1567,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Bryant, corrected by Rachael after Chew rejection; final review Chew 🟢  
 **What:** Reuse the shared flash kernel behind `com.microsoft::GroupQueryAttention` for measured-winning prefill. Cache append and implicit RoPE use `total_length - key_sequence_length`; attention causal masking uses the distinct query start `total_length - query_sequence_length`. The final parity matrix covers 40 scenarios across f32/f16/bf16, MHA/GQA/MQA, fresh/cached/ragged, RoPE, local window, softcap, generic non-WMMA routing, large scores, unequal Q/K lengths, and Auto fallback. Landed on main as `94fa2b6`.  
 **Why:** Bryant's first revision incorrectly reused the K append origin for queries when `Sq != Sk`; Chew rejected it and locked that artifact. Rachael's revision made the failing `Sq=2,Sk=4` case pass, tightened tolerances, and preserved exact present K/V. H200 fresh Q512 is about 1.31× faster with 48 MiB scratch saved; cached/large slower shapes fall back. The corrected artifact is approved and no active lockout remains.
-
 ## 2026-07-20 — Issue #40 Phase 1 distributed-runtime foundation
 
 ### Slice 1a: shared protocol trace + ticketed non-blocking host pressure
@@ -1613,14 +1588,12 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Scribe  
 **What:** Keep the TLC model gate CI-deferred. After 1c, Phase-1 slice 1d weight residency remains pending; issue #40 Phases 2–4 remain pending.  
 **Why:** The landed Rust conformance harnesses provide deterministic implementation-side evidence, but do not replace the configured CI model check or the remaining distributed-runtime roadmap.
-
 ## 2026-07-20 — Issue #40 collective ordering completion
 
 ### Land slice 1c with serialized abort wakes and broad equivalence coverage
 **By:** Tyrell; reviewed by Gaff 🟢  
 **What:** Land all seven in-process collectives behind one canonical per-group `CollectiveSequencer`, deterministic member-order reduction, additive independent replay checking, bounded allocation tombstones, and rank-local completion. Abort now holds each rendezvous mutex while notifying its paired condition variable, closing the review's notify-before-park race. Distributed-equals-single-device bitwise coverage spans all_reduce, reduce_scatter, all_gather, broadcast, all_to_all, and all_to_all_v. Landed as `2ffb4e4` with follow-up `128440d`.  
 **Why:** Gaff found the architecture and TLA refinement sound but blocked the original revision on a rare abort-path lost wakeup. Tyrell's deterministic waiter gate proved the fix, all comm/trace/scheduler suites passed, and the broadened equivalence matrix preserves fixed-rank-order determinism. TLC remains CI-deferred.
-
 ## 2026-07-20 — CUDA graph M4 capture-safety
 
 ### Own the CUDA graph lifecycle and exercise native decode replay
@@ -1647,15 +1620,12 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Sapper and Deckard; reviewed by Chew 🟢  
 **What:** Make supported unary and binary floating-point decode kernels capture-safe using persistent broadcast metadata and removed trailing synchronizations. Replace the initial boolean eligibility gate with mutex-protected exact dtype/entry and shape signatures; prefill, i64, errors, and signature changes remain ineligible. Landed final as `85b6f4e`.  
 **Why:** Chew rejected the boolean gate because a warmed kernel could later execute a different dtype or shape during capture. Exact signatures close that TOCTOU while preserving numerics and the approved persistent-metadata design.
-
 ## 2026-07-21 — CUDA graph M4 end-to-end validation
 
 ### Real Qwen2.5 int4 decode captures with zero fallbacks
 **By:** Rachael; reviewed by Chew; smoke correction by Pris 🟢  
 **What:** Seed unresolved persistent external input/output physical shapes only during capture, keeping eager shape resolution and binding-signature invalidation intact. Constant/Shape metadata reuse and capture-safe integer Sub, ReduceSum, and Gather complete the real Qwen graph while device-side GQA/Reduce/Gather guards still latch errors before token consumption. After Chew caught stale fallback assertions, Pris updated the H200 smoke to require one capture, 62 replays, zero fallbacks, and no fallback reason. Landed as `dda3b25`, `13c094a`, and `42b71f7`.  
 **Why:** Qwen2.5-0.5B int4 now captures end to end with token-exact graph ON/OFF parity and zero fallbacks: 70.33 versus 19.99 tok/s at 256 tokens (+251.8%), and 24.25 versus 11.73 tok/s at 1024 tokens (+106.7%). This validates the complete M4 capture-safety track on the real model.
-
-
 ## 2026-07-21 — Perf campaign reconciliation
 
 ### H200 native CUDA decode target and profiling baseline
@@ -1722,7 +1692,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Sebastian; reviewed by Bryant 🟢  
 **What:** Bryant approved `b6ada01`, a capture-safe warp-parallel Sq=1 GQA decode attention kernel for supported `head_dim <= 128` with zero CUDA-graph fallback.  
 **Why:** This was a correct f32 decode-attention stepping stone before the later fp16 flash-decode path.
-
 ## 2026-07-21 — fp16 decode, transparent fallback, cross-platform loading, and trace cost
 
 ### Land coherent end-to-end fp16 native CUDA decode
@@ -1744,9 +1713,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Rachael, Gaff, and Deckard; reviewed by Zhora 🟢  
 **What:** Annotate major CPU kernel spans with logical tensor bytes and documented FLOP estimates, lazily computing metrics only when a span is active. Keep tracing optional and propagate the `tracing` feature through `bench-native` and `native-backend`. Landed as `61f4d2c`.  
 **Why:** Profiles gain arithmetic-intensity and bandwidth inputs without imposing tensor scans, formula work, JSON allocation, or tracer dependencies on default non-tracing builds.
-
-
-
 ## 2026-07-21 — CI hardening and native CUDA decode wave 1–2
 
 ### Cover every offline crate and make warnings blocking on all portable targets
@@ -1778,7 +1744,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Coordinator directive; validated in wave-2 reviews by Holden, Wallace, and Pris  
 **What:** Every `onnx-runtime-ep-cuda` kernel must remain correct and performant across supported NVIDIA SM architectures, not merely `sm_90`. Dispatch must derive the live architecture dynamically, avoid unguarded SM90-only features, keep resource use within portable limits, and preserve capable fallbacks or variants where architecture-specific tuning is necessary.  
 **Why:** H200 wins are not acceptable if they break or materially strand devices such as RTX 4060 (`sm_89`). Wave-2 kernels use broadly available primitives and do not raise the minimum architecture.
-
 ## 2026-07-21 — Native CUDA decode wave 3 and CUDA CI
 
 ### Use 16-way split-K for long-context fp16 GQA decode
@@ -1800,8 +1765,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Gaff; reviewed by Wallace 🟢
 **What:** Clear all 21 existing `onnx-runtime-ep-cuda` Clippy warnings without adding allows, remove no-op explicit drops of non-owning `TensorMut` views, and add `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings` to the `cuda-compile` job. Landed as `22ec87e`.
 **Why:** CUDA EP warnings are now blocking in CI. Review verified the lint rewrites and drop removals preserve behavior and ownership, with builds, tests, Clippy, YAML parsing, and a zero-fallback performance sanity run passing.
-
-
 ## 2026-07-21 — Native CUDA decode wave 4
 
 ### Fold batch-1 GQA metadata into fused decode preparation
@@ -1823,10 +1786,8 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 **By:** Scribe  
 **What:** Preserve `.squad/decisions/inbox/ana-wave3-roofline-691.md` as the current roofline artifact: wave 4 achieved about **759 tok/s**, within its **750–790 tok/s** ceiling.  
 **Why:** The artifact remains the authoritative lever ranking and ceiling analysis after wave-4 validation.
-
 <!-- scribe-merge-2026-07-22T22-15-00Z-generality-batch -->
 ## 2026-07-22 — CPU EP generality and portability batch
-
 <!-- merged from .squad/decisions/inbox/coordinator-generality-directive.md -->
 ### 2026-07-22T21:25:00Z: Directive — cross-OS + cross-processor generality is mandatory
 **By:** justinchuby (via Copilot coordinator)
@@ -1836,7 +1797,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 - NUMA decode affinity (046414b) is currently Linux-only (`sched_setaffinity`, `/sys`); needs Windows (SetThreadAffinityMask / GetLogicalProcessorInformationEx) + macOS handling (or documented graceful no-op) to satisfy this.
 - ISA-gated kernels (GQA AVX2, hand int4/VNNI) must retain genuine scalar/aarch64 fallbacks.
 - Goal remains: beat ORT (26.9 tok/s) end-to-end while staying portable.
-
 <!-- merged from .squad/decisions/inbox/rachael-generality-audit.md -->
 ### 2026-07-22: CPU EP performance generality and production-readiness audit
 **By:** Rachael (Fact-Checker + Devil's Advocate)
@@ -2202,13 +2162,11 @@ A test-only `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1` override was added to `has
 - AVX2 host: `cargo test -p onnx-runtime-ep-cpu --features mlas group_query` passed (17 tests).
 - Forced scalar fallback: `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1 cargo test -p onnx-runtime-ep-cpu --features mlas group_query` passed (17 tests); SIMD-only helper regressions cleanly skip while the long-context GQA and generic AXPY coverage execute the scalar dispatch path.
 - `cargo clippy -p onnx-runtime-ep-cpu --features mlas --tests -- -D warnings` passed.
-
 <!-- merged from .squad/decisions/inbox/zhora-matmul-generality.md -->
 ### 2026-07-22: Generalize CPU MatMulNBits dtypes and topology tuning
 **By:** Zhora
 **What:** CPU `MatMulNBits` now accepts Float32, Float16, and BFloat16 activations, scales, bias, and output. Float16/BFloat16 reuse `to_dense_f32_widen` and `write_dense_f32_narrow`; Float32 continues through the original `to_dense_f32`/`write_dense_f32` path. The decode pool default is `min(1 + ceil(log2(available_parallelism)), 8, available_parallelism)`, and the MLAS crossover defaults to twice that worker count. Both existing environment overrides remain authoritative.
 **Why:** Shared widening/narrowing provides portable scalar fallbacks without duplicating conversion code, while preserving the existing Float32 accuracy-4 route and output. Logarithmic worker growth reflects the bandwidth-bound, per-projection fork/join cost; the eight-worker cap records the measured regression at 16+ workers rather than silently baking in the 96-core host. On this host the derived defaults remain 8 workers and M=16, so no tuning perf delta is expected. Float16/BFloat16 M=1 and M=3 parity tests exactly matched the corresponding widened-f32 computation after output narrowing. The full CPU EP MLAS suite (679 unit tests, 10 numeric regressions) and Clippy passed. A foundry Float16 int4 model advanced through MatMulNBits and then stopped at the separate Float16-unsupported `SkipSimplifiedLayerNormalization` kernel.
-
 <!-- merged from .squad/decisions/inbox/coordinator-generality-batch.md -->
 ### 2026-07-22: Generality/portability batch landed (cross-OS + cross-processor)
 **By:** Squad (Coordinator), for justinchuby
@@ -2219,7 +2177,6 @@ A test-only `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1` override was added to `has
 **Validation:** 694 ep-cpu tests pass, clippy clean (linux + windows-gnu + darwin type-check). Bench: auto-enable engages on 2-node host, bit-identical tokens auto-vs-off, +21% by default (14.58 vs 12.02 tok/s).
 **Why:** User directive — CPU EP must be cross-OS AND cross-processor, and the NUMA win must ship by default. Closes gaps #1 (auto-enable), #2 (hardcoded tuning), #3 (f16 rejected), #5 (GQA tests non-portable), #7 (cgroup cpuset) from Rachael's audit.
 **Owed follow-ups:** f16 for SkipSimplifiedLayerNormalization + other decode ops (full cuda-gpu f16 model); MLAS-routed f16 parity test; cross-target Windows/macOS CI runners; >64-CPU multigroup Windows validation.
-
 <!-- scribe-merge-2026-07-22T23-20-00Z-spmd-lever -->
 ## 2026-07-22 — Persistent SPMD CPU decode pool landed
 
@@ -2231,7 +2188,6 @@ A test-only `ONNX_RUNTIME_EP_CPU_FORCE_NO_SIMD_X86=1` override was added to `has
 **Safety and validation:** Sebastian's locked-out revision added a real subprocess ON/OFF parity regression using six sequential packed-int4 M=1 operations and 31 workers, asserts all ON operations dispatch through SPMD, documents precedence/fallback behavior, replaces the erased-job `transmute` with a pointer/trampoline, and makes worker panics poison the pool while releasing the pending barrier rather than hanging. CPU EP validation reported 698 unit tests plus 10 numeric regressions, clean MLAS clippy, 30/30 SPMD stress runs, and a 64-token native ON/OFF ID check. Chew approved the revised blocking requirements; Gaff approved with only non-blocking concurrency follow-up notes.
 
 **Sources reconciled:** `pris-decode-profile.md`, `pris-decode-barrier.md`, `sebastian-spmd-revision.md`, and `chew-spmd-rereview.md`. The earlier tracked Bryant NUMA, Holden portable-GQA, and Zhora dtype/topology notes were already present verbatim in this ledger and were deduplicated.
-
 <!-- scribe-merge-2026-07-23T04-10-00Z-f16-gqa-and-crossmodel -->
 ## 2026-07-23 — f16 GQA decode and cross-model CPU comparison
 
@@ -2297,7 +2253,6 @@ New 0.5B per-op steady: **MatMulNBits ~82%, GroupQueryAttention ~14%** (was 54%)
 - The `set_len` uninit optimization relies on the full-coverage invariant (no tail). Guarded by `has_tail`; the tail case keeps the safe zero-fill. Covered by existing prefill/padding tests.
 - Bottleneck has shifted to MatMulNBits (int4 GEMV) — that is the next highest-leverage target for further f16-model gains.
 - Kept `gqa_phase_profile` instrumentation behind an off-by-default feature (zero prod cost) for future profiling; strip if undesired.
-
 <!-- merged from .squad/decisions/inbox/sebastian-foundry-cpu-comparison.md -->
 ### 2026-07-23
 **By:** Sebastian
@@ -2305,7 +2260,6 @@ New 0.5B per-op steady: **MatMulNBits ~82%, GroupQueryAttention ~14%** (was 54%)
 **What:** Benchmarked foundry-local CPU decode with persistent SPMD left as the default. Qwen 2.5 Coder 7B generic-cpu ran at 28.62 tok/s native versus 21.00 tok/s ORT GenAI 0.14.1 CPU (1.36x native). Qwen 3.5 9B generic-cpu ran in ORT at 13.63 tok/s but cannot be loaded by this native checkout: direct loading sees multiple ONNX files and compatibility pipeline loading rejects unspecified smart-resize semantics.
 
 **Why:** The available evidence confirms the default native win on one fair generic-cpu model, but does not support a cross-two-model generality claim until the Qwen 3.5 multimodal package has complete native pipeline metadata/support. CUDA-export f16-GQA models were recorded separately as a native CPU follow-up; ORT CPU could not load them because its CUDA interface library was absent.
-
 <!-- scribe-merge-2026-07-23T05-00-00Z-f16-widen-parity-tests -->
 ## 2026-07-23 — f16 GQA lazy-widen parity closure
 
@@ -2316,7 +2270,6 @@ New 0.5B per-op steady: **MatMulNBits ~82%, GroupQueryAttention ~14%** (was 54%)
 **Sources reconciled:** `pris-f16-widen-parity-test.md` and `gaff-notail-widen-test.md`.
 
 Decision archive gate checked at 2026-07-23T05:00:00Z: the active ledger was 266888 bytes before this entry. No dated ledger entries older than 2026-06-23T05:00:00Z were present, so no archive was created or updated.
-
 <!-- scribe-merge-2026-07-23T06-31-00Z-f16-matmulnbits-shard -->
 ## 2026-07-23 — f16 MatMulNBits decode SPMD sharding
 
@@ -2329,7 +2282,6 @@ Decision archive gate checked at 2026-07-23T05:00:00Z: the active ledger was 266
 **Sources reconciled:** `bryant-f16-matmulnbits.md` and `pris-f16-matmulnbits-tests.md`.
 
 Decision archive gate checked at 2026-07-23T06:31:00Z: the active ledger was 268050 bytes before this entry. No dated ledger entries older than 2026-06-23T06:31:00Z were present, so no archive was created or updated.
-
 <!-- scribe-merge-2026-07-23T08-50-00Z-gqa-rotary-widen -->
 ## 2026-07-23 — GQA rotary-prefix bounded widen landed
 
@@ -2344,7 +2296,6 @@ Decision archive gate checked at 2026-07-23T06:31:00Z: the active ledger was 268
 **Sources reconciled:** `roy-f16-gqa-decode.md` and `pris-gqa-rotary-tests.md`.
 
 Decision archive gate checked at 2026-07-23T08:50:00Z: the active ledger exceeded 20480 bytes, but no dated entries were older than 2026-06-23T08:50:00Z; no archive was created or updated.
-
 <!-- scribe-merge-2026-07-23T10-30-00Z-perop-audit-silu-robustness -->
 ## 2026-07-23 — CPU per-op audit and SiLU MLAS robustness remediation
 
@@ -2606,7 +2557,6 @@ No behavioral change; only tests strengthened (below).
 
 Decision archive gate checked at 2026-07-23T10:30:00Z: the active ledger was 271720 bytes before this merge and exceeded 51200 bytes. No dated ledger entries older than 2026-07-16T10:30:00Z were present, so no archive was created or updated.
 <!-- scribe-merge-2026-07-23T10-30-00Z-perop-audit-silu-robustness-end -->
-
 <!-- scribe-merge-2026-07-23T10-35-00Z-deckard-skiplayernorm-simd -->
 <!-- merged from .squad/decisions/inbox/deckard-skiplayernorm-simd.md -->
 ### 2026-07-23: Make CPU SkipSimplifiedLayerNormalization allocation-free and vectorizable
@@ -2614,7 +2564,6 @@ Decision archive gate checked at 2026-07-23T10:30:00Z: the active ledger was 271
 **What:** The contiguous f32 `SkipSimplifiedLayerNormalization` path now also handles requested mean/inv-std outputs directly, fuses residual/bias assembly with an eight-lane f32 square reduction, and uses a fixed-lane normalize/scale loop with scalar remainders. The broadcast and widened f16/bf16 fallback remains dtype- and shape-generic.
 **Why:** The real 7B graph requested statistics, so the previous direct-output path was bypassed and every one of 56 decode calls allocated buffers and performed per-element broadcast index unraveling. On the mandated profile, average decode op time/share fell from 2.885 ms / 9.15% to 0.594 ms / 1.99%; this is about 3.3x faster than the audit's approximately 1.94 ms ORT result inferred from the reported 1.49x baseline gap. The rewrite contains no target-specific intrinsics or model constants, preserves the exact 16-token opener, and passed 719 unit tests plus 10 integration tests, warnings-denied Clippy, and formatting checks.
 <!-- scribe-merge-2026-07-23T10-35-00Z-deckard-skiplayernorm-simd-end -->
-
 <!-- scribe-merge-2026-07-23T11-00-00Z-roy-f16-silu -->
 <!-- merged from .squad/decisions/inbox/roy-f16-silu.md -->
 ### 2026-07-23: Route widened low-precision SiLU through the shared MLAS path
@@ -2624,7 +2573,6 @@ Decision archive gate checked at 2026-07-23T10:30:00Z: the active ledger was 271
 
 **Review:** Chew APPROVE. **Merged:** `d14cc83`.
 <!-- scribe-merge-2026-07-23T11-00-00Z-roy-f16-silu-end -->
-
 <!-- scribe-merge-2026-07-23T11-00-00Z-bryant-qkv-bias-add -->
 <!-- merged from .squad/decisions/inbox/bryant-qkv-bias-add.md -->
 ### 2026-07-23: Fold QKV-bias `Add` into `MatMulNBits` (CPU EP)
@@ -2675,7 +2623,6 @@ non-row-vector bias rejected, extra-consumer rejected, graph-output rejected).
 
 **Review:** Gaff APPROVE. **Merged:** `28adcd9`.
 <!-- scribe-merge-2026-07-23T11-00-00Z-bryant-qkv-bias-add-end -->
-
 <!-- scribe-merge-2026-07-23T11-10-00Z-coordinator-final-cpu-benchmark -->
 <!-- merged from .squad/decisions/inbox/coordinator-final-cpu-benchmark.md -->
 ### 2026-07-23: CPU EP whole-model decode beats onnxruntime-genai on all 3 models (matched-load A/B)
@@ -2687,7 +2634,6 @@ non-row-vector bias rejected, extra-consumer rejected, graph-output rejected).
 Openers byte-identical. ORT f16 baselines obtained via CPU-provider config variants (/tmp/ortcpu-{0.5b,1.5b}, provider_options emptied).
 **Why:** Confirms the user directive — every material CPU-EP decode op now beats/ties ORT AND whole-model decode beats ORT on all three. Landed this segment (all non-author reviewed, byte-identical/tight-tolerance, cross-OS/cross-arch, no hardcoded dims): f32 SiLU MLAS-logistic+robust-extreme (13x), f16/bf16 SiLU reuse (~3.9x), f16 Mul/Sub/Div binary_contiguous (~3.8x), SkipSimplifiedLayerNorm portable 8-lane SIMD + stats-output fast path (~3.3x vs ORT), QKV-bias Add folded into MatMulNBits epilogue (standalone Add eliminated). 730 CPU-EP tests green, clippy -D warnings clean. PR #105.
 <!-- scribe-merge-2026-07-23T11-10-00Z-coordinator-final-cpu-benchmark-end -->
-
 <!-- scribe-merge-2026-07-23T11-25-00Z-pris-parity-gate -->
 <!-- merged from .squad/decisions/inbox/pris-parity-gate.md -->
 ### 2026-07-23: Add CPU SIMD-versus-scalar parity regression gate
@@ -2697,7 +2643,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Validation:** 731 library tests passed; Clippy with warnings denied and rustfmt were clean.
 **Merged:** `1be1bd5`.
 <!-- scribe-merge-2026-07-23T11-25-00Z-pris-parity-gate-end -->
-
 <!-- scribe-merge-2026-07-23T14-45-00Z-bf16-coverage-start -->
 ## 2026-07-23 — CPU EP bfloat16 (bf16) coverage extended
 **By:** Zhora (impl), Gaff/opus (non-author review), requested by justinchuby.
@@ -2706,7 +2651,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Validation:** 757 ep-cpu lib tests + 10 numeric-regression golden tests green (752→771 total incl. new bf16 tests); clippy -D warnings clean. Non-author reviewed by Gaff (opus): attention KV round-trip verified single-narrow (no double-truncation), movement genuinely byte-generic, tests assert independent f32 reference / exact bit equality. Verdict ✅ ship.
 **Merged:** cherry-picked to perf/cpu-ep-mlas as `84b40d9` + `a68b076`, pushed (PR #105).
 <!-- scribe-merge-2026-07-23T14-45-00Z-bf16-coverage-end -->
-
 <!-- scribe-merge-2026-07-23T15-30-00Z-loop-and-divergence-start -->
 ## 2026-07-23 — Generation-loop overhead cut + same-loop backend A/B + token-divergence root-cause
 **By:** Bryant (loop), Deckard (A/B + divergence), requested by justinchuby.
@@ -2719,7 +2663,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Validation:** ep-cpu 759 tests green (incl. 2 new divergence tests); engine 164 passed / 17 pre-existing textproto-fixture failures (identical set on base — zero regression; separate fix PR opened via fix/textproto-fixture-loading). clippy clean.
 **Merged:** perf/cpu-ep-mlas 2fbc679 + 8f55928 + 557c3ed (cherry-picked; profile_native.rs --backend conflict resolved to Deckard's Auto-capable version, Bryant's native_decode engine opts retained). Pushed to PR #105.
 <!-- scribe-merge-2026-07-23T15-30-00Z-loop-and-divergence-end -->
-
 <!-- scribe-merge-2026-07-23T16-20-00Z-conv-fixture-start -->
 ## 2026-07-23 — Native CPU EP CNN support (MLAS Conv/Pool, ORT parity) + textproto fixture-loading fix (PR #107)
 **By:** Roy (Conv/Pool), Holden (fixture), reviewed by Gaff (opus). Requested by justinchuby.
@@ -2732,7 +2675,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Textproto fixture fix (Holden, SEPARATE PR #107 → main, aaecfef):** 17 engine tests failed because committed `.onnx.textproto` fixtures (no binary model.onnx) hit `model_requires_native_backend` + `scan_top_level_control_flow`, which raw-binary-decoded → "invalid wire type value: 6". Fix routes both scans through the loader's textproto-aware `read_model_binary`/`is_textproto_path`. 17 failing → 0 (263 passed). Regression test `backend_and_control_flow_scans_parse_textproto_fixture` (verified passing under --features native-backend). Isolated 44-line change; opened as its own PR to main per user request ("要是有test fixture error，可以开一个pr修理").
 **Still-open perf follow-ups (user: ALL parts must beat ORT):** (1) Conv NCHWc/prepack/fusion; (2) qwen3.5 native 0.07 tok/s — MatMulNBits (57-76%) + Reshape (24-42%) pathological on that hybrid model (Pris's new conv/linear-attn kernels are <1%); needs decode-path profiling.
 <!-- scribe-merge-2026-07-23T16-20-00Z-conv-fixture-end -->
-
 <!-- scribe-merge-2026-07-23T18-40-00Z-compint8-phi3-qwen35-start -->
 ## 2026-07-23 — CompInt8 accuracy fix + phi3 head_dim generality + Qwen3.5 native E2E (merged to PR #105)
 **By:** Deckard (CompInt8), Tyrell (phi3), Pris (qwen3.5). Reviews: Leon (CompInt8), Rachael (phi3), Deckardrev (qwen3.5) — all opus, all non-author. Requested by justinchuby.
@@ -2742,7 +2684,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Merge-resolution fixes (coordinator, folded into d91d776):** (a) native_decode.rs: merged Bryant's clean zip-loop output-fetch structure with Pris's recurrent-state guard inside the present→past branch. (b) rotary_embedding.rs: phi3's rank-2 cos-cache validation hardcoded inputs[1]/inputs[2]; under Pris's contrib remap inputs[1] is position_ids — rewrote validation to use resolved cos_i/sin_i indices so both standard and contrib orderings validate the correct tensors. (c) added contrib:false to tyrell's phi3 rotary test constructor.
 **Validation:** ep-cpu **786 tests green** (mlas, incl. registration-count 89+mlas confirmed), clippy clean, rustfmt clean. Engine: 164 passed / 17 pre-existing textproto-fixture failures (identical set, zero regression — fixed separately in PR #107 to main). Stack pushed 1932aee..d91d776 to perf/cpu-ep-mlas.
 <!-- scribe-merge-2026-07-23T18-40-00Z-compint8-phi3-qwen35-end -->
-
 <!-- scribe-merge-2026-07-23T17-30-00Z-qwen35-decode-start -->
 ## 2026-07-23 — Qwen3.5 native decode 180× (zero-copy Reshape/Transpose + constant provenance) — merged PR #105
 **By:** Warrick. Review: Nick (opus, non-author). Requested by justinchuby.
@@ -2751,7 +2692,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **🟡 Follow-up nits (non-blocking, queued):** (1) executor.rs:3251-3256 provenance predicate marks ANY view-of-initializer constant; the pre-existing Slice kernel uses runtime starts/ends — a runtime-sliced initializer feeding a prepacking weight could cache a stale pack. NOT reachable by real transformer graphs (weights never runtime-sliced; 789 tests + both models pass) but a latent hazard — narrow provenance to data-invariant view ops OR require the whole view chain (incl. Slice bounds) constant, + regression test. (2) Add a comment documenting the LinearAttention no-input/output-aliasing invariant.
 **Remaining perf gap (queued):** qwen3.5 native still 3.15× behind ORT — next: profile the residual MatMulNBits/attention path on this hybrid model.
 <!-- scribe-merge-2026-07-23T17-30-00Z-qwen35-decode-end -->
-
 <!-- scribe-merge-2026-07-23T17-55-00Z-nchwc-conv-start -->
 ## 2026-07-23 — CPU EP NCHWc Conv + weight pre-pack + Conv/BN/Relu fusion — merged PR #105
 **By:** Grissom. Review: Greg (opus, non-author). Requested by justinchuby.
@@ -2761,7 +2701,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Did NOT beat ORT yet** (7.7×/4.6× slower). Root cause of residual gap: every Conv reorders NCHW→NCHWc in and back out; ORT converts to NCHWc once at graph entry and stays blocked. **Next: graph-level NCHWc layout-propagation pass** (reorder only at layout boundaries, keep Conv/Pool/Add/Relu blocked) — the path to matching/beating ORT. bf16/f16 Conv = TODO (MLAS NCHWc is f32-centric).
 **Review (Greg/opus):** ✅ SAFE, no 🔴. FFI buffer sizing correct (round_up channels to block), per-node prepack cache no leakage, BN-fold inference/constant-only + Relu sole-consumer guarded. mlas-sys 18 + ep-cpu 792 tests green (3 new fusion tests), clippy clean, real-model parity re-verified. 🟡 nits (queued): add debug_assert! length checks in public nchwc_* wrappers; add a dilation>1 NCHWc unit test.
 <!-- scribe-merge-2026-07-23T17-55-00Z-nchwc-conv-end -->
-
 <!-- scribe-merge-2026-07-23T18-50-00Z-f16-rope-gemma-start -->
 ## 2026-07-23 — f16 RotaryEmbedding (enables Gemma-2) + foundry-model breadth + generality gaps — PR #105
 **By:** Sara. Review: Sofia (sol, non-author). Requested by justinchuby.
@@ -2829,7 +2768,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 **Also fixed latent UB in ALREADY-MERGED code:** Warrick's LinearAttention direct-state path did copy_from_slice(past_state)-then-mutate = copy_nonoverlapping UB if present aliases past_state. Now guarded.
 **Vartann verification:** byte_ranges_overlap correct on half-open ranges (exact/nested/partial detected, adjacent=non-overlap, saturating_add, no off-by-one); guard itself not UB (usize compare, no deref, &mut only after disjointness+exact-count proven); ALL direct-write sites gated; fallback byte-identical (copies past state before mutation, retrieved buffer fill(0.0) before use); length==1 CausalConv fast path algebraically identical. Vartann added an independent forced-alias test (output->q) that reproduces disjoint result exactly. Exact 32-token qwen3.5 ORT greedy parity.
 **Tests:** 815 ep-cpu lib green (+3 forced-alias regression tests: present<->past_state, y<->x, output<->v) + 10 integration; clippy clean. 🟡 nit (optional, not reachable today): CausalConv doesn't guard its two OUTPUTS (y vs present_state) against each other — LinearAttention already stricter. Per protocol Doc+Wendy both locked out; any hardening needs a third agent.
-
 ### 2026-07-23: Clean load-gated native-vs-ORT CPU EP scoreboard (Langston)
 **By:** Langston (benchmark) — recorded by Coordinator
 **What:** Load-gated (1-min load<5) A/B, same genai loop, only --backend swapped:
@@ -2839,7 +2777,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - qwen3-0.6b int4 (generic-cpu-4): native 5.41 vs ORT 111.8 → **0.048x (ORT 20.7x faster)** AND parity FAIL from token 0 → native slow/broken fallback path. HIGH-PRIORITY.
 - qwen3.5-2b-text hybrid SSM: LOAD FAIL in BOTH backends (conv_state/recurrent_state vs io.kv_inputs mismatch) — genai-loop generality gap, not perf.
 **Why:** Confirms we beat ORT on the Qwen2.5 int4 family (no regression) but exposes two native gaps to close per user mandate (all parts beat ORT, cross-model): qwen3-0.6b native bug (#1) and Phi-3.5 acc-level-4 perf gap (#2). Dispatched Ridley (qwen3-0.6b) and Palmer (Phi-3.5) to fix. qwen3.5-2b hybrid-KV loading is a separate generality track.
-
 ### 2026-07-23: qwen3-0.6b — native is CORRECT (ORT wrong), 8-bit MatMulNBits GEMV vectorized (Ridley, Speedle-reviewed 🟡)
 **By:** Ridley (author), Speedle (independent reviewer) — recorded by Coordinator
 **What:** The reported "qwen3-0.6b native parity FAIL + 20x slow" premise was INVERTED on the correctness axis:
@@ -2848,7 +2785,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - A/B (load-contaminated but relative valid): qwen3-0.6b native 5.41 → ~13 tok/s (8-bit decode ~145→~63 ms/tok), tokens unchanged (correct 1479...). coder-7b (100% 4-bit) native==ORT identical, no regression.
 - Tests: dot_u8_f32_matches_serial_reference, gemv_nk_u8_matches_dequant_f32_reference (asym zp + partial-K, rel-RMSE ≤1e-5), non-vacuous. cargo test -p onnx-runtime-ep-cpu --features mlas = 817 passed (815→817).
 **Why:** Closes the qwen3-0.6b escalation: we're MORE accurate than ORT (their int8-activation path flips the token) and 2.6x faster on the 8-bit path. Native stays slower than ORT's wrong-fast int8 by design; future accurate-speed direction = int16-activation fast path (do NOT route 8-bit through int8-activation MLAS/VNNI — reproduces ORT's wrong 3988). Merged to PR #105 as 0adb960. Reviewer nit (doc comment eight→sixteen) fixed in 2aedd0d.
-
 ### 2026-07-23: Phi-3.5 decode gap is executor control-flow/scheduling overhead, NOT a kernel fallback (Palmer diagnosis)
 **By:** Palmer — recorded by Coordinator
 **What:** Deep profile of Phi-3.5-mini int4 decode (clean, load~4). Native 14.66 tok/s vs ORT 21.93 (1.5x). Per-step 51.9ms: If 34.1ms/65.6%, MatMulNBits 13.1ms/25.2%, GQA 2.9ms/5.7%.
@@ -2858,7 +2794,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - The If 65% bucket is SUBSTANTIALLY scheduling/instrumentation time, not real compute: Palmer prototyped a constant-If output cache (Phi RoPE-cache If has two Constant-only outputs [4096,48]); NO throughput gain (14.47 vs 14.66) → reverted. So the gap lives in the executor's control-flow dispatch (exec_if/run_subgraph) + persistent-SPMD dispatcher wait, not in constant copying or kernels.
 - No production code changed (diagnosis only). CPU EP tests 815+10 green.
 **Why:** Rules out both a dequant-f32 fallback and a missing block-32 dot vectorization on Phi-3.5. Real bottleneck = per-decode-step control-flow/scheduling overhead (~34ms unaccounted when only ~16ms is kernel work). Qwen2.5 wins 2.5x because its decode body isn't wrapped in a per-step If, so this overhead is If/subgraph-dispatch-specific and general to Phi-family/Loop-wrapped graphs. Next: instrument exec_if/run_subgraph + SPMD dispatcher phase counters, compare persistent vs flat pool, eliminate per-subgraph-invocation overhead. Dispatched follow-up (Tripp) on this.
-
 ### 2026-07-23: Phi-3.5 decode bottleneck is CPU KV host round-trip (quadratic), NOT If dispatch — corrects Palmer (Tripp)
 **By:** Tripp — recorded by Coordinator
 **What:** Built a gated phase-profiler (NXRT_EXEC_PHASE_PROFILE, default-off) and re-attributed Phi-3.5 int4 decode per step:
@@ -2870,7 +2805,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - ROOT CAUSE: CPU decoder round-trips the full KV cache through HOST tensors every step. native_decode.rs:1901-1922 feeds growing past-KV host inputs + plain session.run with NO output bindings → executor.rs:2796-2818 materializes 65/65 outputs incl. full [1,32,total_len,96] KV present to host. The CUDA path avoids this via in-place present==past DEVICE bindings (native_decode.rs:1460-1466); the CPU path has NONE. Explains why we WIN Qwen (tiny KV) and LOSE Phi (huge KV): native is memory-bandwidth-bound while ORT stays compute-bound.
 - Instrumentation-only changes landed on branch perf/execif-dispatch (executor.rs gated profiler + test, lib.rs export, profile_native.rs dump table): default-off, zero hot-path cost, no numeric change. Phi native 14.76 vs ORT 21.64 (1.47x gap reproduced). No-regression: Qwen2.5-0.5B 166 tok/s, qwen3-0.6b 12.78 first-token 1479 (oracle-correct). 817 tests pass.
 **Why:** Identifies the REAL, GENERAL fix to beat ORT on Phi-3.5 and ANY large-KV model: in-place persistent CPU KV (mirror the CUDA run_with_device_bindings present==past path) to eliminate the per-step host KV round-trip. Expected -17-18ms/step → ~42ms ≈ ~24 tok/s (beats ORT 21.6). Large + parity-gated (needs CPU GQA in-place present==past, rewind/prefill, 4-model validation) — Tripp continuing on it. Instrumentation + fix to be reviewed together before merge to PR #105.
-
 ### 2026-07-23: Hybrid SSM (qwen3.5-2b) now loads+decodes on native — graph-derived per-layer KV/state metadata (Cooper, Natalia-reviewed 🟢)
 **By:** Cooper (author), Natalia (independent reviewer w/ ONNX oracle) — recorded by Coordinator
 **What:** qwen3.5-2b-text (hybrid SSM: conv + linear attention) previously FAILED to load in BOTH backends (native "missing native KV metadata for past_key_values.0.key"; ort "io.kv_inputs declares ... graph does not expose it"). Root cause: onnx-genai-genai-config to_inference_metadata/decoder_io_json expanded the uniform past_key_values.%d.key/value pattern over EVERY layer; a graph-driven deriver (strict_decoder_state) existed but was wired only to the multimodal path, not the text SingleDecoder path (error sites native_decode.rs:2513, decode.rs:609).
@@ -2880,7 +2814,6 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - NO-REGRESSION: qwen3-0.6b native first token 1479; uniform fallback unit-test byte-identical. Tests: genai-config 20 (+2 hybrid regression), ep-cpu(mlas) 817, engine builds; metadata/genai-config/engine/server all build (io.state_pairs added no downstream construction break). The 17 native-backend engine failures are PRE-EXISTING (invalid-protobuf fixtures, being fixed on fix/textproto-fixture-loading / PR #107) — Natalia confirmed identical failing set on a fresh base worktree.
 - Nits (deferred, cosmetic): kv_layer_count() over-counts for hybrids (profile display only); ORT-loop e2e qwen3.5 not smoke-tested (native goal met).
 **Why:** Closes a generality gap the user explicitly named (qwen3.5 conv + linear attention). Native now runs a hybrid SSM model correctly where BOTH backends failed before — and it's graph-driven so it generalizes to any dense/conv/recurrent per-layer topology. Merged to PR #105 as ca16c3b.
-
 ### 2026-07-23: Zero-copy output hand-off eliminates CPU KV OUTPUT round-trip (Tripp, Flack-reviewed 🟢) + phase profiler
 **By:** Tripp (author), Flack (independent reviewer) — recorded by Coordinator
 **What:** Two commits landed from perf/execif-dispatch:
@@ -2891,14 +2824,12 @@ Openers byte-identical. ORT f16 baselines obtained via CPU-provider config varia
 - PARITY (byte-identical feature vs base, run-1==run-2): qwen3-0.6b first token 1479 (oracle) ✓; Phi-3.5 [30751,31512,306,...] == fp32 oracle ✓; Qwen2.5-0.5B [271,40,1079,...] WIN preserved ~179 tok/s ✓. Tests: session lib 64 (+ non-vacuous zero_copy_output_move_reallocates_and_preserves_producer_less_output), ep-cpu(mlas) 817. Pre-existing (reviewer stash-verified on base, NOT from this change): 2 control_flow If integration tests (CpuMatMulNBitsBiasFusion MissingProducer) + 17 engine fixture-protobuf failures.
 - REMAINING (documented, not landed — the actual ORT-beating change): the INPUT side (re-feeding growing past_key_values host tensors, ~3ms/step) + full in-place persistent CPU KV. Blocker: a naive max-capacity buffer makes CPU GQA rewrite the ENTIRE capacity every call (~3.2GB/step @4096, worse than round-trip). The real fix needs a CPU GQA in-place APPEND-ONLY path gated on present==past aliasing + wiring DecodeCudaState for the CPU EP. Full plan w/ file:line in inbox tripp-execif-dispatch.md. Expected: ~42ms/step ≈ ~24 tok/s, beating ORT 21.6.
 **Why:** Safe, general, parity-clean partial (+6%) toward the memory-bandwidth root cause, plus a permanent measurement tool. Merged to PR #105 as ad0315d + 3dde516. Nits deferred: empty-tensor copy fallback; add explicit "device-binding must-not-move" regression test.
-
 ### 2026-07-23: Fix CpuMatMulNBitsBiasFusion masking control-flow rejection (Sidle, Grissom-reviewed 🟢)
 **By:** Sidle (author), Grissom (independent reviewer, opus) — recorded by Coordinator
 **What:** cherry-picked b7f1514 → b8cdcbc on PR #105. Two negative control-flow tests (if_rejects_mismatched_branch_output_counts_before_running_selected_branch, if_rejects_mismatched_branch_output_dtypes) were failing with Optimize(PostconditionFailed{pass:"CpuMatMulNBitsBiasFusion", errors:[MissingProducer(ValueId(3))]}) — confirmed PRE-EXISTING on base (Sidle stash-verified), not from this session's stack. Root cause: invalid If graphs (mismatched branch output counts/dtypes) reached the CPU EP graph optimizer, whose graph.validate() tripped MissingProducer on the malformed subgraph and masked the intended control-flow diagnostic. Fix (executor.rs): extracted validate_if_branch_outputs helper + added recursive validate_control_flow_signatures, called at Executor build BEFORE fuse_silu_patterns/EP passes, so invalid If graphs are rejected with the proper SessionError::ControlFlow message. Runtime If check now calls the same shared helper (message text identical → negative tests' asserted strings unchanged). Added POSITIVE regression test if_runs_fuseable_matmul_nbits_bias_branches (valid If with fuseable MatMulNBits+Add in BOTH branches still optimizes+runs; asserts fused-bias outputs + subgraph_builds/runs==2) — proves the pre-EP validation ordering does NOT disable fusion for legitimate control-flow graphs.
 - REVIEW (Grissom, opus, 🟢): count check is structurally always-known (Vec<ValueId>); dtype check correctly gated on value_type_is_known both sides + re-enforced at runtime via shared helper → no valid graph false-rejected; subgraphs HashMap recursion covers nested If/Loop/Scan, terminates, no cycles; domain gate ""|"ai.onnx" correct; error parity exact. Optional nit (non-blocking): positive test could add an explicit fusion-count assertion. No Sidle revision needed.
 - TESTS: control_flow 20/20 (was 18/20), session lib 64/64, ep-cpu(mlas) 823. Independently reproduced by Grissom.
 **Why:** Restores correct control-flow rejection semantics + adds fusion-under-control-flow coverage; clears 2 of the pre-existing session test failures. Merged to PR #105.
-
 ### 2026-07-24: In-place persistent CPU KV cache — eliminates input-side KV round-trip, Phi-3.5 +49.6% (Stokes, Messer-reviewed 🟢)
 **By:** Stokes (author, opus), Messer (independent reviewer, opus) — recorded by Coordinator
 **What:** cherry-picked d85c58d → 0281675 (kernel) + 15d0ff7 → a5ac872 (engine) onto PR #105. This closes the LAST big native-CPU-decode gap vs ORT on large-KV models (the input-side host KV round-trip; the output side was fixed earlier by Tripp's zero-copy hand-off). It is the CPU analogue of the CUDA in-place present==past device binding.
@@ -3021,7 +2952,6 @@ pre-transposed constant at claim time; (2) route dense fp16 M==1 MatMul to a
 portable, capture-safe, roofline-oriented GEMV. Detected by topology + dtype +
 shape, **no model names**. Qwen2.5-0.5B (quantized head) unchanged → **no
 regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
-
 <!-- source: .squad/decisions/inbox/voight-mercer-moe-review.md -->
 ### 2026-07-23: Review of mercer CPU grouped MoE Phase 2
 **By:** Voight
@@ -3029,7 +2959,6 @@ regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
 **What:** CPU grouped execution and route-first dequantization are implemented and performant, but the support document contains contradictory, false implementation-status claims.
 **Evidence:** `cargo test -p onnx-runtime-ep-cpu` passed; both named grouped differential tests and the all-experts residency test passed and genuinely exercise grouped/reference paths. Code inspection confirms an expert→token `BTreeMap`, one `run_expert_grouped` call per active expert, shared GEMM for M>1, and scalar GEMV for M=1. QMoE and BlockQuantizedMoE slice/dequantize routed experts inside the expert loop; the zero-cache residency test reports one expert, though its metric is explicitly recorded as `1` rather than lifetime-derived. Genericity grep found no architecture-dependent kernel control flow (only a Mixtral test name and llama.cpp compatibility/test references). Clippy and crate-scoped fmt passed. Release ignored test passed with 3.81x decode and 1.90x prefill speedups. `docs/MOE_SUPPORT.md` lines 3-6 and 161-163 still say fused/grouped CPU MoE/QMoE are unimplemented/unregistered, contradicting lines 479 and 518-555 and the code; CUDA is not claimed complete in the Phase 2 section.
 **If REJECT:** Deckard should revise the contradictory status/architecture sections and strengthen residency accounting so the test observes actual concurrent dequantized-expert lifetime rather than a hard-coded window value; Mercer is locked out.
-
 <!-- scribe-merge-2026-07-23T04-08-59Z-cuda-indexshare-f16attention (merged manually by coordinator; Scribe agent stuck in canary loop) -->
 ## 2026-07-23 — CUDA IndexShare + f16 Attention; plus prior-session backlog (Qwen split-K, CPU MoE docs, mobius #423)
 
@@ -3048,7 +2977,6 @@ regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
 - **Qwen2.5-0.5B O(seq) decode collapse fixed (`798d430`, Irmgard; landed by Sadik; reviewed 🟢 Borogrove/re-benched Marsten).** Root cause: f32 KV graph selected the single-warp-per-row f32 GQA decode kernel that serially walked full context. Fix: capture-safe 1/2/4/8/16-way split-K online-softmax kernel + merge, selected purely by dtype/shape. Qwen 313→460 tok/s @128, 84→448 @1024; Llama Q4KM flat; generic (no model-name), capture-safe, SM-portable. Marsten H200 re-bench: Qwen0.5B 459/446, 1.5B 486/460, 7B 230/223, Llama-1B Q4KM 450/439 tok/s.
 - **CPU MoE Phase 2 landed (`dc0cc18`, Sloat) + MOE_SUPPORT.md §6.2 honesty fix (Sapper; Voight 🔴→🟢).** Route-first int4 QMoE (peak-1-expert residency via RAII guard), grouped-expert GEMM (4.12x decode / 1.83x prefill), doc now correctly states CPU MoE/QMoE/BlockQuantizedMoE implemented + registered, CUDA incomplete. 648 CPU unit tests pass.
 - **Mobius PR #423 (DeepSeek MoE Phase 1 conformance) CI remediation (Abdul).** Ruff lint + codecov fixed; Integration/L4/L5 jobs fail on infra (`libcudart.so.13` missing on runner, identical on main). PR remains OPEN/UNMERGED for Justin.
-
 ### 2026-07-24: Merged origin/main into PR #105 — both teams' work integrated (Taylor, Duquesne-reviewed 🟢)
 **By:** Taylor (merge author, opus), Duquesne (independent reviewer, opus) — recorded by Coordinator
 **What:** Fast-forwarded perf/cpu-ep-mlas to merge commit b8f0bc4 (parents: ours 53ecf1b, theirs origin/main 621936f — no rewrite of our 96 commits). Resolves PR #105's CONFLICTING state so it is mergeable into main. The other team (main) owns the CUDA track (stream-ordered async copies, device-to-device copy ordering) + a native-vs-ORT decode parity harness (tests/parity/*, Q4 f32 oracle); our branch is the CPU-EP perf track. Both edited the same core files.
@@ -3056,42 +2984,35 @@ regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
 - NOVEL SEMANTIC FIX (Taylor): our zero-copy output move (try_move_host_output) freed a buffer that their memoized loop-invariant If (if_last_predicate; branch skipped on steady steps, output served from resident buffer) would re-serve → garbage. Guarded: if the output's producer node is a memoized If, fall back to the copy path (move→copy, bytes identical, no numeric change). Duquesne verified this is the ONLY skip-without-re-execution path (all others already guarded: external.outputs/in-place KV, sequence, views, seq_elem, shared_buffers, pinned, producer-less, dup-output; Loop/Scan re-execute every step) and that keying matches (connect_edges sets output.producer=node.id == if_last_predicate key).
 - REVIEW (Duquesne, opus, 🟢): guard complete+correct; native_decode unification loses no behavior either side; both parents ancestors, our 96 commits intact, both sides' features present. TESTS: ep-cpu 827, session lib 66, control_flow 22/22 (the invariant-If × move seam GREEN), engine 177 pass / 16 fail = PRE-EXISTING (missing generated model.onnx binary; fixtures byte-identical across all 3 commits — verified, being fixed by PR #107). PARITY byte-identical incl. INPLACE_KV=0: qwen3-0.6b first token 1479, Phi-3.5 [30751,31512,306,...]. Non-blocking nit: decisions.md lost 63 OLD base-history entries (0 new work — the other team pruned base history; effectively free archiving; Scribe-owned).
 **Why:** Makes PR #105 mergeable and keeps both teams' features working together with a proven correctness guard for the move×memoization interaction. Merged to PR #105 (b8f0bc4).
-
 ### 2026-07-24: bf16 op coverage extended across CPU EP (Grissom, Sanders 🟢)
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Merged Grissom's bf16 coverage onto perf/cpu-ep-mlas (cherry-pick 4b5afa2 -> 0312a9b). 6 ops moved f32-only -> bf16 with real code (Conv, FusedGemm, FusedMatMulBias, AffineGrid, GridSample, Col2Im — compute in f32 scratch, narrow on store via write_dense_f32_narrow; f32 fast path dtype-gated so bit-identical). 17 op families already bf16-capable now regression-guarded. 23 new bf16 parity tests (bf16 vs independent f32 ref ~3% rel tol; movement ops bit-exact). ep-cpu lib 827 -> 850, 0 failed. Deferred (hard f32-gated, documented): MoE/QMoE/BlockQuantizedMoE/GatherBlockQuantized/IndexShare/SparseKvGather.
 **Review:** Sanders (opus) 🟢 SAFE TO MERGE — all 6 review items PASS (widen/narrow correctness, generality/f32-bit-identical, real parity tests, no f32 hot-path regression, 850/0/4, deferrals genuinely hard). Non-blocking nit: add f32 contiguous copy_from_slice fast path to write_dense_f32_narrow (dtype.rs) mirroring the f16 branch — assigned to Stokes (Grissom locked out).
 **Why:** User mandate: CPU EP must support bf16 on every capable op (ORT's CPU EP lacks bf16 — a real usability gap we now close), general + well-tested.
-
 ### 2026-07-24: Phi-3.5 native-vs-ORT divergence — native is MORE accurate, KEPT (Brass, Warrick 🟢)
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Root-caused the Phi-3.5-mini int4 (block-32, acc-level-4) greedy divergence: native and ORT share 65 tokens then split at decode index 65 (native=263, ORT=6455). Brass built an independent ORT oracle (teacher-forced, same model.onnx) sweeping MatMulNBits acc-levels: acc-1 fp32→263, acc-2 fp16→263, acc-3 bf16→263, acc-4 int8→6455. Every higher-precision compute agrees with NATIVE (263); only ORT's default int8-activation quant (acc-level-4) flips to the wrong 6455. Native uses fp32 activations + fp32 GQA/LayerNorm so it lands on the fp32-correct token. VERDICT: keep native (a "fix" would make us LESS accurate). Same class as Ridley's qwen3-0.6b int8-activation-flip precedent. Merged 22fa3cd -> e0cfd66 onto perf/cpu-ep-mlas.
 **Tests (both green):** onnx-runtime-ep-cpu `int4_decode_preserves_f32_argmax_where_per_row_int8_activation_flips` (model-independent kernel guard: anti-correlated block geometry, near-tie filter, asserts native per-block int8 keeps fp32 argmax on ≥20 near-ties while a per-row int8 failure mode flips ≥3; scalar+SIMD); onnx-genai-engine tests/phi35_mini_divergence.rs `phi35_mini_int4_native_decode_keeps_high_precision_argmax` (#[ignore], gated PHI35_MINI_E2E_DIR, asserts token[65]==263 — verified passing on real model, 235s). ep-cpu 828/0/4; session 66/0.
 **Review:** Warrick (opus) 🟢 SAFE TO MERGE — all 5 items PASS (oracle sound, tests non-tautological, zero production-kernel change, E2E lock correct, counts confirmed). Nits: archive oracle script; add a comment tying kernel n=2 to the two contending logits.
 **Why:** User mandate: token divergences must be fixed UNLESS ours is more accurate — then keep ours with regression tests. This is the "keep ours" case, proven and locked.
-
 ### 2026-07-24: Gemma-2-2B f32 — native 6.1x SLOWER than ORT (Vega) -> f32 GEMM optimization launched (Hodges)
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Vega exported Gemma-2-2B-it to f32 ONNX via Mobius (/home/justinchu/gemma2-2b-it-mobius-cpu-f32) and A/B'd native vs ORT: native 1.83 tok/s (547.6 ms/token) vs ORT 11.19 tok/s (89.4 ms/token) — native 6.11x SLOWER. Parity IDENTICAL 128 token IDs (pure speed problem, not correctness). Root cause hypothesis: native's f32 MatMul/Gemm path is slow / not MLAS-backed / not multithreaded, whereas ORT uses multithreaded MLAS sgemm. This f32 path is shared by Whisper/Nemotron/vision CNNs, so it's likely THE central generality bottleneck. Dispatched Hodges (opus) on branch perf/cpu-f32-gemm to profile per-op, route f32 GEMM through multithreaded MLAS (keeping a portable fallback), preserve parity, and NOT regress the int4/int8 quantized wins (Phi-3.5/qwen already beat ORT).
 **Why:** User mandate: ALL parts beat ORT across models/OS/CPU. Quantized decode already wins; f32 decode is a major gap that must be closed generally.
-
 ### 2026-07-24: Vision CNN f32 native SLOWER than ORT + missing Resize kernel (Curtis)
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Curtis A/B'd native vs ORT on f32 vision CNNs via profile_vision (load 4.54): ResNet-50 v1-12 native 113.9ms vs ORT 6.5ms (17.57x SLOWER, Conv-dominated), MobileNetV2-10 13.4ms vs 4.8ms (2.78x slower), Tiny-YOLOv3-11 native FAILED — missing `Resize` opset-11 CPU kernel. Output parity PASS on both classifiers. Confirms native's f32 compute path (both f32 Conv AND f32 GEMM) is the central "beat ORT" bottleneck. Conv optimization to build on Hodges' GEMM/MLAS-threading foundation (Conv lowers to im2col+GEMM). Resize opset-11 missing = separate coverage gap (dispatched to Sanders).
 **Why:** User mandate: beat ORT on ALL models incl. traditional ML (resnet/yolo). f32 Conv/GEMM perf + op coverage gaps block this.
-
 ### 2026-07-24: ONNX Resize CPU kernel implemented (Hawkes, Bonasera 🟢)
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Merged Hawkes's native CPU-EP `Resize` kernel (cherry-pick f0a0bd4 -> cf96162). N-D nearest/linear/cubic; coordinate transforms half_pixel/pytorch_half_pixel/align_corners/asymmetric/tf_crop_and_resize/half_pixel_symmetric; nearest rounding modes; ROI, axes, sizes/scales, aspect policies; dtypes f32/f16/bf16/f64 (int rejected). antialias=1 and unknown modes ERROR clearly (no silent wrong output). Registered opset 10/11->13/18/25. Extracted YOLO-Resize + bilinear E2E models = EXACT ORT parity. ep-cpu 871 pass / 0 fail / 5 ignored. YOLO now runs PAST Resize but hits a separate unrelated dynamic-Squeeze sizing gap (follow-up).
 **Review:** Bonasera (opus) 🟢 SAFE TO MERGE — all 7 items PASS; hand-recomputed test vectors reproduce ONNX reference and distinguish modes; additive executor/shape-inference changes, no other kernel touched. Nits: f64 runs at f32 precision via widen (doc it); cubic test only asserts finiteness (add exact vector); non-nearest path single-threaded (perf).
 **Why:** User mandate: beat ORT on traditional ML (resnet/yolo) requires op coverage; Resize was a hard generality gap blocking YOLO.
-
 ### 2026-07-24: Native f32 GEMM now multithreaded-MLAS by default — 5.6x faster, ≈ORT parity (Hodges, Danville 🟢)
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Merged Hodges's f32 GEMM fix (cherry-pick 02ca566 -> 9cd1b1b). Root cause: CpuBackend::auto_detect() defaulted to the SINGLE-THREADED SimdX86 microkernel for f32 GEMM (MatMul = 95-98% of decode time) instead of multithreaded MLAS sgemm; also the pinned SPMD decode pool (~48 spinning workers, only serves quantized MatMulNBits/QMoE) CONTENDED with MLAS rayon on dense-f32 models. Fix (general, no model hacks): backend.rs defaults to MLAS on x86_64+mlas (portable SimdX86/Generic fallback for ARM/non-mlas); matmul_nbits.rs gates the SPMD pinned pool on presence of MatMulNBits/QMoE and routes dense-f32 through a bounded NON-SPINNING DENSE_DECODE_POOL = clamp(available/4,8,32); native_decode.rs computes uses_decode_pool at load by scanning graph+subgraphs. Gemma-2-2B f32 decode 1.83 -> ~10.3 tok/s (5.6x), now ≈ parity/ahead of ORT under matched load (native 10.22 vs ORT 8.42 matched; ~10.3 vs 11-14 fully idle). Parity byte-identical. Quantized no-regression CONFIRMED (qwen int4 still SPMD, 32.28 tok/s).
 **Review:** Danville (opus) 🟢 SAFE TO MERGE — all 7 PASS incl. high-risk threading (MLAS parallel-for runs on the CURRENT rayon pool so inside DENSE_DECODE_POOL.install it's bounded ≤24 — no second pool/oversubscription; lazy OnceLock, non-spinning) and quantized no-regression (int4 m=1 early-returns before backend_is_mlas). ep-cpu 865, session 66, clippy clean. Nits (non-blocking, -> Deckard): stale "MLAS opt-in" doc in backend.rs; stale comment matmul_nbits.rs:631-632 (default flip routes int4 acc-level-4 PREFILL to MLAS SQNBit CompInt8, not decode hot path).
 **Why:** User mandate: beat ORT on ALL models incl. f32 (Whisper/Nemotron/vision are f32). This closes the single biggest generality gap (was 6.1x slower). Conv (ResNet 17x) is next — may now benefit from MLAS-default backend; needs re-measurement.
-
 ### 2026-07-24: Definitive native-vs-ORT scoreboard (Robbins) — native wins 4/5, contended
 **By:** Squad (Coordinator), requested by justinchuby
 **What:** Robbins ran profile_native --backend native|ort (same genai loop, backend swapped) on merged HEAD b3f9430, 128 tok, decode-skip 8, median-of-3. RESULT native wins 4/5:
@@ -3105,82 +3026,68 @@ regression**. Branch `squad/roy-lmhead-fusion` @ `71ab809`.
 CAVEAT: box load 45-94 the whole time (never <5 after 15 min) — absolute tok/s NOT clean; directional only. The huge +1000% margins are partly ORT being hammered; a clean re-measure is still owed but the box won't quiet.
 **Qwen3-0.6B analysis:** NOT a bug. native=1479 is the fp32-oracle-correct token (Ridley+Speedle validated); ORT=3988 is WRONG (int8-activation acc-level-4 flip). Native is slower here BY DESIGN — it keeps 8-bit MatMulNBits activations in fp32 for correctness, while ORT uses fast-but-wrong int8-activation. Per user policy correctness>speed, so native's numerics stand. The documented path to ALSO be fast: an int16-activation VNNI fast path for 8-bit MatMulNBits (accurate + fast; must NOT route through int8-activation which reproduces ORT's wrong 3988). Dispatched Robbins... -> new agent (Sanders) on this.
 **Why:** User mandate: beat ORT on ALL models. We win 4/5 broadly; qwen3-0.6b 8-bit is the one gap, closable accurately via int16-activation.
-
 ### 2026-07-24: Filed upstream ORT correctness bug (microsoft/onnxruntime#29849)
 **By:** Squad (Coordinator), requested by justinchuby ("create an issue to ort if so")
 **What:** Filed https://github.com/microsoft/onnxruntime/issues/29849 — CPU MatMulNBits accuracy_level=4 (int8 ACTIVATION quant) selects the WRONG argmax token vs accuracy_level 0/1/2/3 on massive-activation LLMs. Two reproducible cases from our oracle work: Qwen3-0.6B first token 3988 (acc-4) vs 1479 (fp32/native correct); Phi-3.5-mini index-65 6455 (acc-4) vs 263 (fp32/fp16/bf16/native correct). Root cause: int8 activation scale too coarse for large-dynamic-range channels, flips near-tie logits. Suggested int16-activation path. ORT 1.27.0 CPU EP. This is the upstream counterpart of our two "native is more accurate" decisions (Ridley qwen3, Brass phi-3.5) — we keep native's correct numerics; ORT should fix acc-4.
 **Why:** The divergences we found are ORT bugs (native is correct), so reporting upstream is the right action per user request; also documents provenance for our keep-native regression tests.
-
 ### 2026-07-23: int16-activation fast path for 8-bit MatMulNBits (Ross, Vecchio review 🟢)
 **By:** Squad (Coordinator), authored by Ross, reviewed by Vecchio (non-author, opus)
 **What:** Added `gemv_nk_u8_i16` int16-activation decode path for 8-bit MatMulNBits (qwen3-0.6b class). Activation quantized symmetric int16 in groups of 32 (finer than 128-block weight granularity to confine massive-activation channels); u8×i16 via `_mm256_madd_epi16`, per-group scaled i32 folded into a single f32x8 block accumulator (single reduction/block — the restructure that made int16 faster not slower); exact f32 zero-point term; portable scalar fallback. Default on, opt-out `ONNX_GENAI_CPU_8BIT_ACT=fp32`. Merged cf04f7b→4b30a0e.
 **Why:** qwen3-0.6b 8-bit was accurate-but-slow BY DESIGN (native keeps activations fp32 → correct token 1479; ORT's int8-activation acc-4 is fast-but-wrong 3988, ORT bug #29849). Ross's int16 path is byte-identical to the fp32 oracle for all 128 tokens (1479 preserved, never 3988) AND ~10% faster (~13.7→~15.1 tok/s). We don't beat ORT's wrong-fast int8 path (fundamental — int8=3988); we stay correct and close the accurate-path gap. group=128 was faster but flipped token 1 → rejected; group=32 chosen.
 **Verification:** Vecchio verified all 6 areas 🟢 (diff math, non-vacuous argmax regression test asserting int8 flips while int16 preserves, i32 overflow bound safe at group≤block_size, 4-bit byte-identical, no-8bit models unaffected, opt-out works). `cargo test -p onnx-runtime-ep-cpu --features mlas`: 869 lib + 10 regression, 0 failed. 4 new tests incl. `gemv_nk_u8_i16_preserves_argmax_on_massive_activation_channel`. Optional low-pri hardening: clamp QGROUP override to a divisor of block_size.
-
 ### 2026-07-23: parallelize MLAS NCHWc conv/pool/reorder (Ecklie, Kujan review 🟢)
 **By:** Squad (Coordinator), authored by Ecklie, reviewed by Kujan (non-author, opus)
 **What:** Fixed a serial-execution bug in the standalone MLAS build: `MlasExecuteThreaded` ran all partitions serially in a for-loop (unlike GEMM's `MlasTrySimpleParallel`), so `NchwcConv` split work N ways then ran every tile on ONE thread — the entire post-GEMM vision bottleneck. Added `MlasStandaloneParallelFor` (race-free disjoint partitions via `MlasPartitionWork`, blocking rayon `into_par_iter` so the stack closure outlives workers), work-capped conv/pool fan-out (≥32M MACs/thread) and NCHWc→NCHW reorder (≥128K elems/thread) to avoid over-partitioning tiny/depthwise convs, plus `profile_vision --native-only`. Touches vendored MLAS C++ (threading.cpp, snchwc.cpp, reorder.cpp) + conv.rs tests. Merged a41b20a→ca885d7.
 **Why:** After Hodges routed dense f32 GEMM through multithreaded MLAS, vision Conv (NchwcConv = 86–94% of runtime) was the remaining generality bottleneck (ResNet-50 native ~17× slower than ORT). This fix: ResNet-50 ~1.4×, MobileNetV2 ~1.2× faster, parity byte-close (ResNet max_abs 9e-6, MobileNet top1 AGREE). Caps change thread COUNT only, never numeric results.
 **Verification:** Kujan verified all 6 areas — DATA-RACE gate 🟢 (partitions provably disjoint, per-tid output rebase, blocking closure lifetime, same bounded pool as shipped GEMM = no oversubscription; empirically forced 96-way partitioning + 10× parity + 5× nchwc stress = bit-stable). One follow-up landed: the original parity test's shapes all fell under the 32M cap → serial; Ecklie added non-ignored `conv_parallel_path_matches_f64_reference` (~127M MACs → tids≈3, bit-for-bit vs f64 oracle). Merged-branch `cargo test -p onnx-runtime-ep-cpu --features mlas`: 871 lib + 10 golden, 0 failed, 4 ignored; conv tests 3× bit-stable. Honest limit: full idle-box ORT parity (ResNet ~6.5ms) not verifiable on the chronically loaded shared host; structural bug is fixed, thresholds are safe coarse heuristics to re-tune on a quiet box.
-
 ### 2026-07-23: merge origin/main (CUDA + parity track) into PR #105 (Willows, Duquesne review 🟢)
 **By:** Squad (Coordinator), authored by Willows, reviewed by Duquesne (non-author, opus)
 **What:** Real merge commit cc4f3ab (parents ours fc8a72f + theirs origin/main 3dc0843) integrating the other squad team's 12 incoming commits (CUDA-EP capture/KV/MoE/Attention + one shared `perf(executor): seed warm JIT decode shapes`) into our CPU-EP perf branch. Only ONE file conflicted: executor.rs (union — kept our `phase_span!("run_scoped.resolve_soft")` profiler AND their new `seed_warm_decode_capture_shapes` call alongside seed_capture_shapes/seed_control_flow_capture_shapes). native_decode.rs auto-merged both sides (our decode_cpu_inplace/uses_decode_pool + their step_inputs/inputs_embeds). Taylor try_move_host_output × memoized-If guard intact (executor.rs:5543). Our 114 commits preserved as ancestors.
 **Why:** PR #105 went `dirty` because main advanced (other team, different repo/track). Merging keeps both tracks' work; our CPU kernels (gemv_nk_u8_i16 int16-activation, MLAS conv parallelization + conv_parallel_path test, MLAS-default backend, resize) all present post-merge.
 **Verification:** Duquesne verified all 6 areas 🟢 (merge integrity 2-parent + both-ancestor; executor.rs union correct single-occurrence; Taylor guard survived their invariant-If changes; native_decode both-sides; kernels intact). Tests: ep-cpu 871 lib + 10 golden 0 fail; session lib 69 (66→69, theirs +3) 0 fail; control_flow 22/22 incl. invariant-If×move seam. Pre-existing (merge-untouched): 5 executor integration (InvalidOpsetImport helpers) + 16 engine tiny_fixture (protobuf/missing model.onnx, PR #107). Pushed fc8a72f→cc4f3ab.
-
 ### 2026-07-23: resolve profile_native --backend bench conflict with new origin/main (coordinator)
 **By:** Squad (Coordinator)
 **What:** origin/main advanced again (3dc0843→d03261c) with 2 commits adding `--backend` decode-backend selection to profile_native.rs — the SAME feature our A/B harness already had. Merge commit 0478190 resolves the 7 bench-only conflicts by union: kept our sampling imports (MinP/RepetitionPenalty/profile) and informative bail/header prints AND their improvements (PartialEq/Eq + const fn as_str + arg doc comment + resolved_backend print). Deduped a doubled logits import. Conflict was confined to profile_native.rs + its test (bench tooling only — does NOT touch the runtime under benchmark).
 **Why:** Bench-only, small, and main is a fast-moving target (advanced twice in minutes), so a full agent+review cycle would go stale before landing; coordinator reconciled inline. profile_native bin compiles clean (`cargo build -p onnx-genai-bench --features mlas --bin profile_native` OK).
 **Result:** PR #105 mergeable:true again (was dirty). Pushed 6b59a9b→0478190. HEAD contains origin/main d03261c.
-
 ### 2026-07-23: native avx512_bf16 GEMM (Caine, Sorenson review 🟢)
 **By:** Squad (Coordinator), authored by Caine, reviewed by Sorenson (non-author, opus)
 **What:** Added `crates/onnx-runtime-ep-cpu/src/kernels/bf16_gemm.rs` — a native AVX-512 BF16 GEMM using `_mm512_dpbf16_ps` (bf16×bf16 pairwise → f32 accumulate), MR=NR=4 microkernel, B transposed to k-contiguous panels, K-tail via masked epi16 load, Rayon over disjoint C row blocks. `matmul.rs::try_matmul_bf16_native()` routes contiguous bf16×bf16 (single/batched/broadcast) to it when `avx512bf16`+`avx512bw`+`avx512f` are present, else falls back to the existing widen-to-f32 GEMM. Merged 4e73898 (base 83f14fc).
 **Why:** Our bf16 support is a differentiator (ORT's CPU EP has NO bf16 — user pain point). Previously bf16 compute was upcast-to-f32 only (correct but slow). Native path makes it fast. This box (SPR 8480C) has avx512_bf16 so it's natively benchmarked.
 **Verification:** Sorenson verified all 6 areas 🟢 — **f32 accumulator confirmed** (`_mm512_setzero_ps`→`_mm512_dpbf16_ps`→`_mm512_reduce_add_ps`, never bf16, per the hard no-bf16-accumulator rule); K-tail mask `(1<<chunk)-1` chunk∈[1,31] no UB/OOB; disjoint C-row Rayon partitions bit-stable 3×; runtime-gated with clean f32 fallback for non-bf16/non-contig/AVX2-only/aarch64. Tests: 873 lib + 10 golden 0 fail; **worst native-vs-f64 rel 1.870e-6, native/upcast ratio 1.000** (native as accurate as upcast — bf16 products exact in f32); Grissom's goldens unchanged.
 **Perf (SPR 8480C, load ~15-19, median-3; native-bf16 vs our-own-upcast-bf16 — ORT has no bf16 CPU baseline):** decode GEMV 1×4096×4096 **2.1-3.0×**, decode MLP 1×4096×11008 **3.1-3.7×**, prefill ~parity (follow-up: bf16 B-prepack at load).
-
 ### 2026-07-23: widen VNNI/int16 decode dots to true 512-bit on AVX-512 (Delko, Flack review 🟢 + coordinator live VNNI run)
 **By:** Squad (Coordinator), authored by Delko, reviewed by Flack (non-author, opus) + coordinator live-verified the VNNI tests
 **What:** Widened three int-quant decode dots in matmul_nbits.rs from 256-bit to true 512-bit, runtime-dispatched 512→256→scalar: (1) `int4_dot_row_avx512vnni` via `_mm512_dpbusd_epi32` — no `_mm512_sign_epi8`, so raw UNSIGNED nibbles + all-ones dpbusd zero-point correction `sum((n-8)a)=sum(na)-8·sum(a)`, single f32x16 accumulator; (2) `dot_u8_i8_avx512vnni` 64-byte `_mm512_dpbusd` + `_mm512_reduce_add_epi32` + 256/scalar tail; (3) NEW `block_dot_u8_i16_avx512bw` via `_mm512_madd_epi16`, same group=32 int16 quant + single-block accumulator preserving the fp32 argmax. Dispatch gated on avx512vnni/avx512bw. Merged 58d5d6e (base c60087c).
 **Why:** The existing avx512vnni-gated kernels were WASTING half the width (used 256-bit `_mm256_dpbusd_epi32` under a 512-bit feature gate). True 512-bit exploits this SPR box's full VNNI/BW width per the per-microarchitecture directive.
 **Verification:** Flack 🟢 all 6 areas (int4 zero-point algebra exact for all nibbles/signs; dpbusd operand roles correct unsigned×signed; overflow bounded; int16 argmax non-vacuous, ran live). Flack's sandbox lacked avx512vnni so the 2 VNNI tests self-skipped there — COORDINATOR re-ran them LIVE on the 8480C host (avx512vnni=true confirmed): `int4_dot_row_avx512vnni_matches_scalar` + `dot_u8_i8_avx512vnni_matches_scalar` = 2 passed live, 0 skipped. Merged-HEAD full suite (Caine bf16 + Delko VNNI together): 877 lib + 10 golden, 0 failed.
 **Perf (median-3, load-annotated):** int16 activation dot **+24%** (clean win); int4 **parity** — honestly root-caused as weight-UNPACK-bound not dpbusd-bound (future int4 opt: faster AVX-512 nibble unpack). e2e Qwen2.5-0.5B-int4 +1.8% (within noise). int4 results byte-identical (no-regression).
-
 ### 2026-07-24: int4 decode unpack ~1.45x (deinterleave-once + permutex2var) — MERGED to PR #105
 **By:** Bishop (author), Ferro (non-author review 🟢 APPROVE)
 **What:** Cherry-picked `7d74287` → `37ee582` onto perf/cpu-ep-mlas. `deinterleave_activation_int4` reorders activations (evens-then-odds per 32-block) once per matmul so SIMD int4 kernels drop per-block unpacklo/unpackhi; 512-bit unpack widened via `_mm512_permutex2var_epi64`. Gated on `use_simd` in `int4_matmul_m1` (scalar/non-x86 keep natural order). Single production caller.
 **Why:** int4 decode is unpack-bound (Delko finding). Beats prior kernel by 1.454x, parity preserved (few-ULP vs scalar oracle). Ferro adversarial review: all 7 areas PASS (pairing crux, permutex2var index, zero-point, K-tail, avxvnni parity, non-vacuous live tests, 32-byte load safety). Coordinator re-ran int4 tests LIVE on real host (avx512_vnni+avx_vnni present): 13/0 pass.
-
 ### 2026-07-24: Fix no-mlas ep-cpu build (gate NCHWc-via-MLAS) + workspace fmt — MERGED to PR #105
 **By:** Wierzbowski (author), Drake (non-author review 🟢 APPROVE)
 **What:** Cherry-picked `66f2d8d` → `9c29cc3` onto perf/cpu-ep-mlas (matmul_nbits.rs fmt-conflict resolved keeping int4 code, re-ran `cargo fmt --all`). Gated `pub mod nchwc;` + 6 NCHWc op registrations (mod.rs), `pub mod nchwc_layout;` (lib.rs), and the `NchwcLayoutPropagation` optimizer pass push (optimizer.rs) behind `#[cfg(feature="mlas")]`. Without mlas, no NCHWc ops emitted → plain Conv kernels run. Op-count constant updated (base→91, mlas term→7).
 **Why:** ep-cpu did NOT compile without the optional `mlas` feature (17× E0433 `mlas_sys` in nchwc.rs/nchwc_layout.rs). CI tests default features (no mlas) → this red-ed ALL Rust jobs AND the CUDA-compile job (ep-cuda pulls ep-cpu without mlas), and broke ARM/macOS which never use mlas. Coordinator independently verified LIVE: no-mlas ep-cpu compiles+tests, `cargo check -p onnx-runtime-ep-cuda --features cuda` now Finishes (was RED), mlas 879/0+10/0 green, fmt clean. Drake review: all 6 checks PASS incl. mlas behavior byte-unchanged + both-config builds exit 0.
-
 ### 2026-07-24: Contention-aware SPMD decode auto-enable (~34x faster default under load) — MERGED to PR #105
 **By:** Apone (author), Gorman (non-author review 🟢 APPROVE, 8/8 live)
 **What:** Cherry-picked `0a59532` → `16a0fae` onto perf/cpu-ep-mlas (+fmt fixup). decode_spmd.rs: new `loadavg_one()` (Linux /proc/loadavg; other-unix libc::getloadavg; Windows→None), `current_contention(allowed_cpus)=loadavg1/allowed_cpu_count`, `should_auto_enable(available,contention,max_load_per_cpu)` — declines auto pool when load_per_cpu>0.7 (loaded box), enables when idle OR contention unknown (preserves prior default-on for dedicated boxes/CI), <4-CPU floor unchanged. Env overrides intact: =1 Forced bypasses gate, =0 Off flat, explicit AFFINITY defers. Numerics identical (path-selection only). 2 new unit tests; suite 881+10 green.
 **Why:** The persistent SPMD pool's hard-spinning workers get OS-starved on loaded/shared boxes → ~700ms/token (1.40 tok/s vs 32-48 pool-off). Root-caused this session (Vasquez "100x" was entirely this). Fix keeps the dedicated-box win (auto-enables at low load) but steps aside under contention. Gorman live-verified on this loaded 96-CPU host: taskset -c 0-11 → contention 1.37>0.70 → flat → 34.86 tok/s (vs 1.4 disaster); full-budget idle → auto-enable 13.60 tok/s; Forced=1 still spins. Cross-platform clean (libc unconditional dep, macOS getloadavg builds, no unwrap on /proc, NaN filtered).
-
 ### 2026-07-24: Clear ep-cpu clippy -D warnings (unblocks CUDA-compile + Rust-quality CI jobs) — MERGED to PR #105
 **By:** Crowe (author), Spunkmeyer (non-author review 🟢 APPROVE)
 **What:** Cherry-picked `96de6be` → `adcfc5f`. Lint-only, behavior-preserving: cfg-gated MLAS-only profiler counters/fns (GEMV_NS/NARROW_NS/CALLS/time_gemv/time_narrow/tick) + `to_dense_f32_widen` import behind `#[cfg(feature="mlas")]` (dead without mlas); scoped `#[allow(clippy::needless_range_loop)]` on two gemv_nk_u8_i16 hot loops (NO body change, they index parallel arrays) + two test loops; behavior-identical test iterator rewrite; `.contains(&0)` for resize zero-extent check.
 **Why:** Our CPU perf work introduced clippy lints that failed CI. The CUDA-compile job runs `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings`, which transitively denies ep-cpu warnings — so ep-cpu lint hygiene gates BOTH the CUDA-compile job and Rust-quality. Coordinator + Spunkmeyer independently verified LIVE on integrated branch: ep-cuda clippy -D warnings Finished (exit 0), ep-cpu clippy mlas + no-mlas clean, fmt clean, 881+10 tests green.
-
 ### 2026-07-24: qwen3-0.6b native/ORT divergence — BENIGN-TIE, keep native (Hudson adjudication, Vasquez 🟢 review)
 **By:** Squad (Coordinator), integrating Hudson's investigation + Vasquez-1's adversarial review
 **What:** Native greedy decode diverges from ORT on qwen3-0.6b at the first split (native→518, ORT→264). Adjudicated BENIGN-TIE, keep native, no kernel change. Merged Hudson's teacher-forced regression test `qwen3_0_6b_divergence.rs` (`#[ignore]`+`QWEN3_0_6B_E2E_DIR`-gated) asserting native selects token 518.
 **Why:** fp32 oracle (ORT's own path, all 197 MatMulNBits nodes accuracy_level 4→1) picks 518; native (acc=4 int8) matches oracle, ORT (acc=4 int8) flips the razor-thin tie (gap ≤0.044 logits) to 264. Across 30 teacher-forced positions native matches oracle 29/30 vs ORT 28/30. Vasquez-1 independently rebuilt the oracle from scratch and reproduced every number to 4 decimals (oracle +0.04382, native +0.05162, ORT −0.05270); native tied-or-better across all 3 test prompts, never worse. Meets the user's bar ("ours not less accurate than ORT" — marginally more). Same class already locked for Phi-3.5. Non-blocking follow-up (Hudson locked out per reviewer protocol): optionally add a free-running end-to-end assertion; assign Gorman or another correctness agent.
-
 ### 2026-07-24: Restore executor early-rejection before EP passes / host copy (Dietrich, Hicks 🟢 review)
 **By:** Squad (Coordinator), integrating Dietrich's fix + Hicks's adversarial review
 **What:** Merged `executor.rs` fix (`643c4c6`) restoring the "reject-before-materialize" contract that the origin/main merge tightened and our CPU-EP perf commits regressed (5 executor tests + `slice_zero_step` failing on PR #105). Three fixes: (1) `reads_float_shape_input()` gates float shape-value host materialization to ONLY default-domain `Resize` scales (opset 10→idx1, else idx2), so an unrelated float input is no longer downloaded before an invalid integer shape input is rejected; (2) `reject_unsupported_operators()` + `graph.topological_order()?` run BEFORE EP optimizer passes (mirroring the control-flow signature pre-check), skipping CUDA EP (legit CPU fallback) and deferring non-static-shape nodes to the run-time kernel gate; (3) post-EP-pass `infer_graph` is now best-effort (infer on clone, adopt on success) so a data-dependent invalidity (Slice step 0) rejects at run time instead of aborting the build. Zero-copy decode fast path (`try_move_host_output`) unchanged.
 **Why:** origin/main requires invalid shapes/cyclic plans/unsupported ops be rejected before any `copy_to_host`. Our decode-perf float-shape reader + always-on CPU-EP passes violated the ordering. Hicks independently verified (adversarial): 32/0 executor, whole session crate green (`slice_view` 5/5), test files have EMPTY diff (not weakened), zero-copy perf test intact, `reads_float_shape_input` opset index matches ONNX Resize spec, no other op reads float shape data, no panic risk, collapsible-if rewrite logically identical, clippy `-D warnings` exit 0 + fmt clean. This greens the Rust test jobs + Rust quality on PR #105 without regressing decode perf.
 
 ---
-
 ### 2026-07-24: DETAILED REVIEW — Vasquez's adversarial adjudication of Hudson's qwen3-0.6b divergence
 
 **Reviewer:** Vasquez-1 (numerical-correctness, CPU EP); **Author:** Hudson; **Method:** Adversarial non-author review on worktree `/home/justinchu/onnx-genai-cpu-divergence`
@@ -3243,7 +3150,6 @@ test result: ok. 1 passed; 0 failed; 0 ignored; ... finished in 90.07s
 **VERDICT: 🟢 APPROVE** — keep native (benign int8-activation tie-break) and merge the regression test. Oracle is valid and independent of native; native/ORT/oracle numbers reproduced to 4 decimals; native matches the fp32 oracle at the one resolvable divergence where ORT flips; native is tied-or-better (never worse) across the extra prompts; commit adds only a well-gated, non-vacuous test with no kernel change; kernel guard + 879/0 confirmed on a clean run.
 
 ---
-
 ### 2026-07-24: DETAILED VERIFICATION — Hicks's adversarial review of Dietrich's executor fix
 
 **Reviewer:** Hicks (runtime/executor); **Author:** Dietrich; **Commit:** `862e471` on `fix/session-executor-early-reject`
@@ -3272,45 +3178,36 @@ test result: ok. 1 passed; 0 failed; 0 ignored; ... finished in 90.07s
 
 Worktree left pristine (no scratch files).
 
-**VERDICT: 🟢 APPROVE** — 32/0 executor, whole session crate green, tests unweakened, no correctness holes. 
-
-
+**VERDICT: 🟢 APPROVE** — 32/0 executor, whole session crate green, tests unweakened, no correctness holes.
 ### 2026-07-24: Cross-CPU mlas-sys test portability + guard MLAS AVX2 M=1 asym int8 bug (Ripley, Lambert 🟢 review)
 **By:** Squad (Coordinator), integrating Ripley's fix + Lambert's adversarial review
 **What:** Merged `9a1c550` (mlas-sys tests + ep-cpu production guard). Fixes the last 2 RED PR #105 CI jobs: CI runners are AVX2-class (no AVX-512), but two `crates/mlas-sys` tests hard-coded AVX-512 expectations. (1) `avx512_kernel_is_selected` → `best_available_float_kernel_is_selected`: portable per-ISA assertion (512/3/1/-1/0). (2) `sqnbit_int4_compint8_matches_reference`: M=1 **asymmetric** CompInt8 case gated to AVX-512 hosts (symmetric + all M>1 asym still run everywhere; tolerance unchanged). ROOT CAUSE (reproduced under Intel SDE: `-hsw` fails, `-skx` passes): MLAS's AVX2 M=1 CompInt8 SQNBit kernel with a zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`) is numerically broken for asymmetric int4 (~46% error, mlas=6.09 vs ref=11.29, all block sizes). Production guard: `try_mlas_sqnbit` refuses M=1 asym CompInt8 on hosts lacking the MLAS AVX-512 SQNBit dispatch (`host_has_mlas_sqnbit_avx512()` = avx512f+bw+dq+vl, mirroring MLAS platform.cpp:572) and falls back to the correct hand int8 kernel. New regression test `matmulnbits_accuracy4_m1_asymmetric_matches_fp32_reference`.
 **Why:** Default routing already kept M=1 decode on the hand int8 kernel via the `sqnbit_decode_min()>=2` crossover, so production default is correct on all CPUs; the guard closes a latent hole where `NXRT_SQNBIT_DECODE_MIN<=1` could reach the broken kernel on non-AVX512 hosts. Lambert independently verified (20/0 mlas-sys, 882/0+10 ep-cpu, clippy/fmt clean, fallback reaches hand int8 path, `zero_points.is_some()` = correct asym proxy, no over-fire/no AVX-512 perf regression) and caught that the guard must require F+BW+DQ+VL (not just F) to exactly mirror MLAS's dispatch gate — applied and re-verified. An upstream ORT/MLAS bug report is drafted (inbox `ripley-ort-issue-draft.md`) for filing. Cross-CPU correctness is a hard user requirement; this greens PR #105 CI on AVX2 runners while keeping production correct on every CPU.
-
 ### 2026-07-24: Batched MatMulNBits prefill fix (Nk dequant + MLAS sgemm trans_b)
 **By:** Burke (impl), Gorman2 (review 🟢)
 **What:** Fixed ~10× native prefill regression for 8-bit MatMulNBits. The m>1 batched dense-dequant path dequantized into transposed Kn layout (stride-N scatter, cache-thrash, 4773ms). Now dequants once into contiguous Nk (cached in weight_nk OnceLock) + MLAS sgemm(trans_b=true, ldb=k). Prefill 5335→~545ms; gap to ORT ~25×→~2.6× (clean host). Output byte-identical; new regression test matmulnbits_8bit_prefill_batched_matches_dequant_f32_oracle (m=16/32/100 × sym/asym vs independent f32 oracle, RMSE≤1e-5 + argmax parity).
 **Why:** User: native must beat ORT on prefill too. Gorman2 re-verified sgemm math by hand (A·Wᵀ identical to old Kn path/gemv_nk/oracle), confirmed weight_nk OnceLock has no cross-layout aliasing, tests non-vacuous. Cherry-picked 30f5837→a352686 onto perf/cpu-ep-mlas; ep-cpu 884/0, both clippy gates + fmt clean.
-
 ### 2026-07-24: Filed ORT issue microsoft/onnxruntime#29853 (MLAS AVX2 M=1 asym int8 bug)
 **By:** Ripley, with Lambert review
 **What:** Filed upstream issue `microsoft/onnxruntime#29853` documenting the MLAS AVX2 M=1 asymmetric CompInt8 SQNBit correctness defect.
 **Why:** The PR #105 production guard prevents affected non-AVX-512 hosts from using the broken route; the upstream report tracks the MLAS fix.
-
 ### 2026-07-24: ARM cross-platform dead-code fix (green CI on macOS/Windows arm64)
 **By:** Hasford (impl), Kano (review 🟢)
 **What:** PR #105 CI failed only on Rust (macOS arm64) + (Windows ARM64) "cross-platform offline crates" with `-D warnings` dead-code errors: `native_available` (bf16_gemm.rs) and `dot_u8_i16_scalar` (matmul_nbits.rs) unused on non-x86 in lib builds. Fix: `#[cfg_attr(not(target_arch="x86_64"), allow(dead_code))]` on the non-x86 bf16 native_available stub (used only by portable tests; lib callers are x86-gated); `#[cfg(target_arch="x86_64")]` on dot_u8_i16_scalar (only called from x86 SIMD-tail handling) and gated the single x86-specific assert in test dot_u8_i16_matches_serial_reference while keeping the portable block_dot_u8_i16 assertion on all arches.
 **Why:** User requires cross-OS/cross-CPU support. cfg-hygiene bugs, not functional gaps — ARM runtime paths already fall back to portable inline scalar. Verified by reproducing the aarch64 failure (both errors, exit 101) then confirming clean aarch64 lib+tests; x86 884/0, both clippy gates + fmt clean. Cherry-picked d3e7ed80→perf/cpu-ep-mlas.
-
 ### 2026-07-24: Persistent SPMD decode pool made opt-in (default flat) — landed on PR #105
 **By:** Voight (author), Chew 🟢 APPROVED (non-author, opus)
 **What:** Cherry-picked `176da282` onto perf/cpu-ep-mlas. The persistent SPMD decode pool is now opt-in via `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`; unset (`Auto`) and `=0` (`Off`) both take the flat Rayon path (same code path by construction). Removed 4 tests targeting now-deleted auto-enable heuristics (`auto_enable_suitable`, `should_auto_enable`, `current_contention`, `auto_defers_to_flat`); added `only_forced_mode_enables_the_persistent_pool`. Explicit-affinity property still covered by surviving integration tests.
 **Why:** The persistent pool was a structural 2.5–3× decode regression (per-op barrier-spin over ~197 tiny M=1 ops/token). Chew reproduced ~2.8–3× regression interleaved (flat 33–38 vs pool 12–13 tok/s, load 37–46), byte-identical tokens across default/=0/=1. Default decode is now competitive with ORT again (~33 tok/s). Q4 M=1 GEMV kernel work remains to actually beat ORT (~36–41) — deferred, correctness-gated.
 **Gates:** ep-cpu 881+10/0; clippy mlas + no-mlas exit 0; fmt clean; aarch64 `-D warnings` check clean; tokens byte-identical.
-
 ### 2026-07-22: Token-divergence regression locks landed on PR #105
 **By:** Squad (Coordinator) integrating Holden/Pris (author), Dietrich (🟢 reviewer)
 **What:** Cherry-picked ea31e26+7e70fcf (qwen3-0.6b + phi3.5-mini int4 divergence tests) onto perf/cpu-ep-mlas. qwen: token-0 lock (native 1479 vs ORT 3988) + decode-lock (native 518 vs ORT 264), both fp32-oracle-correct via accuracy_level 4→1 rewrite. phi: teacher-forced oracle (token-103=411) + real m=1 decode-loop lock (asserts native==411 && !=408).
 **Why:** Native int4 CPU decode diverges from ORT on sub-0.1-logit ties; fp32 activation oracle proves NATIVE is the higher-precision argmax, so we keep our implementation. Regression tests prevent silent drift. Tests are #[ignore]+env-gated (need foundry model dirs), compile under --features mlas.
-
 ### 2026-07-22: int4 M=1 GEMV multi-accumulator decode kernel landed on PR #105
 **By:** Squad (Coordinator) integrating Ripley (author, 59ea1ab), Gorman (opus 🟢 reviewer)
 **What:** Cherry-picked 59ea1ab onto perf/cpu-ep-mlas. int4_dot_row_avx512vnni now uses 4 independent f32 accumulators (unroll-by-4 via int4_pair_scaled_avx512 helper) + weight prefetch; int4_dot_row_avxvnni uses 2. Per-block integer VNNI dots stay bit-identical; only final f32 scale-accumulate order reassociates (few ULP, within 1e-4 tol). Added non-vacuous argmax-vs-scalar guard test + extended remainder/tail coverage.
 **Why:** Removes the loop-carried add_ps latency chain in the hot decode GEMV. Neutral (~1%) on bandwidth-bound qwen decode (the real gap is NUMA single-node bandwidth, tracked separately), POSITIVE on compute-bound cases, token-IDENTICAL on qwen3-0.6b + Phi-3.5-mini. Zero-regression, general (scalar/aarch64 unaffected), well-tested. Gorman verified non-vacuity by mutating the reduction → test FAILED.
-
 ### 2026-07-22: Generic native-vs-ORT benchmark tool (bench_generic) landed on PR #105
 **By:** Squad (Coordinator) integrating Vasquez (author, cdf1091), Drake (🟢 separable-part reviewer)
 **What:** Cherry-picked cdf1091 (bench_generic.rs + Cargo.toml bin) onto perf/cpu-ep-mlas. A generic single-inference native-vs-ORT bench (interleaved timing + output parity) for traditional-ML / non-genai ONNX models (resnet, yolo, etc.). Args: --model, --warmups, --runs.
@@ -3330,10 +3227,8 @@ Worktree left pristine (no scratch files).
 **Test non-vacuity PROVEN:** perturb borrow branch v[0]+=1.0 → "borrowed vs copied activation diverged" FAIL; revert → PASS (m=1 and m=4).
 **Residual warm prefill gap** (~2.9x qwen / ~1.4x phi) now dominated by MLAS over-sharding the small prefill GEMM → separate work-proportional thread-cap in mlas-sys (perf/mlas-sqnbit-threads, apone).
 **Gates:** 883 lib green; clippy w/ + w/o mlas -D warnings; fmt; aarch64 check.
-
 <!-- scribe-merge-2026-07-24T15-10-00Z-decode-locks-and-date-cleanup -->
 ## 2026-07-24 — Decision inbox reconciliation
-
 <!-- merged from deckard-phi-capture-seams.md -->
 ### 2026-07-23: Eliminate Phi decode CUDA-graph capture seams (Greater + invariant If)
 **By:** Deckard
@@ -3502,15 +3397,11 @@ negligible (~0.3% of ~5 ms/token) vs the seam removed.
   general without special-casing LongRoPE by name.
 - Reviewer focus: the zero-padding correctness argument (appended rows never
   indexed when predicate false) and the `Where` capture-signature gating.
-
-
 <!-- merged from marsten-glm4-static-split.md -->
 ### 2026-07-23: GLM-4 static Split capture result
 **By:** Marsten
 **What:** Generic EP-side static single-input Split capture reduces GLM-4-9B GPTQ from 41 captured segments and 40 eager seams to one captured segment and zero fallbacks. The seams are the fused-MLP gate/up activation Split (one per layer), `Split(axis=-1, num_outputs=2)` on `gate_up_proj`, named `model/layers.N/mlp/Split_node_*`; they are not RoPE splits. Throughput improves from 110.34 to 118.85 tok/s (+7.71%), or +38.99% over forced eager execution at 85.51 tok/s.
 **Why:** Capturing these static Split nodes removes host-reading, stream-synchronizing seams without requiring a model-specific graph rewrite. Separately, ORT GenAI 0.14.1 still cannot load GLM-4 because its GQA attention schema rejects the required partial-RoPE `rotary_embedding_dim` attribute; that schema issue is unrelated to the fused-MLP Split seams.
-
-
 <!-- merged from marsten-phi-postfix-nongpu-profile.md -->
 ### 2026-07-23: Target the remaining Phi LongRoPE host If
 **By:** Marsten
@@ -3526,15 +3417,11 @@ non-GEMV follow-up: its ~1.94 ms/token budget is about 88% of the ~2.20 ms
 non-GPU remainder, with a 5.15 to ~3.2 ms/token theoretical ceiling. Kernel
 launch batching is not first: the 236 kernels already arrive in two graph
 launches per decode forward.
-
-
 <!-- merged from marsten-phi-stacked-rebench.md -->
 ### 2026-07-23: Record cumulative Phi prefetch and standalone int8 split-K frontier
 **By:** Marsten
 **What:** At `4e774ee`, Phi-4-mini reaches 193.32 tok/s (median of 7, 121.21--194.67 spread under shared-host contention), 15.81% behind the canonical ORT 0.14.1 reference, with zero fallbacks and coherent output. Qwen2.5-1.5B and DeepSeek-R1-Distill-Qwen-1.5B remain within noise at 617.90 and 622.66 tok/s.
 **Why:** This is the honest cumulative frontier after stacking fused gate-up int4 software-prefetch and standalone int8-zp split-K; the median, full spread, and contention caveat prevent host variance from being misclassified as a regression.
-
-
 <!-- merged from marsten-scoreboard.md -->
 ### 2026-07-23: Native CUDA versus ORT real-weight baseline
 **By:** Marsten
@@ -3547,8 +3434,6 @@ was 186.19 versus 236.48 tok/s (-21.27%).
 `executor.rs` capture-seam work. GPU 5 was idle before/after testing, but the
 shared host produced a wide Phi range, so reserved-host confirmation is needed
 before treating the live shortfall versus the clean reference as a regression.
-
-
 <!-- merged from rachael-mask-island-closure.md -->
 ### 2026-07-24: Fixed-signature CUDA capture closes the DeepSeek mask island
 **By:** Rachael
@@ -3574,29 +3459,21 @@ The implementation necessarily changes generic CUDA movement/elementwise kernels
 - Softmax skips its trailing synchronization while the EP stream is being captured; the cuDNN handle is already created on that stream.
 - `indexing_gpu::warmed_moe_routing_ops_capture_without_allocations` verifies warmed TopK (K=6/64), GatherElements, and Softmax graph replay parity without allocation growth.
 - Bench/ORT-vs-native-CUDA: deferred to integration because Stage-0 executor shape seeding is required to engage all decode seams.
-
-
 <!-- merged from sebastian-qmoe-64expert.md -->
 ### 2026-07-23: Add 64-expert top-6 CUDA QMoE parity coverage
 **By:** Sebastian
 **What:** Added parameterized synthetic 64-expert/top-6 QMoE GPU parity tests for fp16 decode (M=1) and prefill (M=8), bf16 decode/prefill, hot-expert plus empty-expert routing, capture warm/replay with changed routes, and a 64-row worst-case route-scratch allocation. Each uses the existing CPU QMoE oracle, except replay additionally compares against an uncaptured CUDA reference.
 **Why:** DeepSeek-V2-Lite routing requires 64 experts and top-6, while the previous GPU tests only exercised 4 experts/top-2. GPU 5 results: qmoe_gpu 27 passed/0 failed; CUDA lib gate 192 passed/0 failed; clippy passed. No 64/top-6 kernel scale bug was found.
-
-
 <!-- merged from sebastian-qmoe-test-fix.md -->
 ### 2026-07-23: Serialize QMoE GPU capture tests and verify live replay routing
 **By:** Sebastian
 **What:** QMoE integration tests now hold a process-wide GPU mutex for each test body. The capture test also changes `router_probs` after capture and compares replay against an uncaptured eager run using the new expert routes.
 **Why:** Concurrent CUDA allocation can invalidate thread-local graph capture, while changed-routing parity proves expert selection is recomputed from live replay inputs rather than baked into the graph.
-
-
 <!-- merged from sebastian-static-split-test.md -->
 ### 2026-07-23: Static Split capture/replay test coverage
 **By:** Sebastian
 **What:** Reworked the static even `Split` byte-parity integration test to build with concrete input shapes, execute the static kernel, capture it, replay it with changed input, and compare replayed outputs with eager output bytes.
 **Why:** The generic `run()` helper supplies empty input shapes and therefore exercises only Split's dynamic path; successful CUDA graph capture is a regression guard for the static no-synchronize path.
-
-
 <!-- merged from tyrell-executor-shape-seeding.md -->
 ### 2026-07-24: Seed warm JIT decode shapes + capture-recording quarantine (Stage 0 of DeepSeek whole-step capture)
 
@@ -3661,14 +3538,12 @@ These now surface their true kernel decline (they were previously hidden as unre
 - `quarantined_op_type_is_forced_to_a_capture_recording_failed_seam`: a statically-shaped `Cast` is not a recording-failed seam until its `(domain, op_type)` is quarantined, after which `node_capture_reason` forces it to `CaptureRecordingFailed` regardless of resolved shapes/kernel capability.
 
 **Files changed:** `crates/onnx-runtime-session/src/executor.rs` (+ 2 tests in-module).
-
 <!-- scribe-merge-2026-07-24T16-04-31Z-bilecki-dlpack-arm64 -->
 <!-- merged from .squad/decisions/inbox/bilecki-dlpack-arm64.md -->
 ### 2026-07-24: Use per-test counters for DLPack import deleter tests
 **By:** Bilecki
 **What:** Store an `Arc<AtomicUsize>` in each fake producer context and have its foreign deleter increment that test-local counter; remove the shared import counters and serialization lock.
 **Why:** The shared static counter allowed unrelated deferred deleters to contaminate another test's assertion, observed as a Windows ARM64-only failure. Per-test ownership makes the deleter assertions hermetic while leaving production idempotency behavior unchanged.
-
 <!-- scribe-merge-2026-07-24T21-47-08Z-inbox-reconciliation -->
 ## 2026-07-24 — Decision inbox reconciliation (CPU coverage, ARM64 reliability, MHA/SDPA)
 
@@ -3695,7 +3570,6 @@ These now surface their true kernel decline (they were previously hidden as unre
 **By:** Dutch (review); upstream issue tracked at `microsoft/onnxruntime#29853`.
 
 - Reject the broad SQNBit skip until its comment and message identify the scoped AVX2 `CompInt8`, M=1, asymmetric/non-zero-point defect and link the upstream issue. The original author is locked out of the revision; a different agent must update the durable explanation.
-
 <!-- scribe-merge-2026-07-24T22-32-50Z-attention-bf16 -->
 ## 2026-07-24 — PRs #122, #124, and #125: BF16 SkipLayerNorm and shared CPU attention
 
@@ -3721,18 +3595,15 @@ These now surface their true kernel decline (they were previously hidden as unre
 **Impact:** This unblocks Whisper encoder attention. End-to-end Whisper wiring remains pending.
 
 **Review outcome:** PRs #122, #124, and #125 landed on main at `3f30f92`.
-
 <!-- scribe-merge-2026-07-26T19-45-52Z-cuda-perf-and-capture-regression -->
 ## 2026-07-26 — CUDA perf next-wave and #193 capture-regression reconciliation
 
 Decision archive gate checked at 2026-07-26T19:45:52Z: active ledger was 381527 bytes and exceeded 51200 bytes. No dated active-ledger entries older than 2026-07-19 were present, so no archive file was changed.
-
 <!-- merged from .squad/decisions/inbox/hicks-repl-commands.md -->
 ### 2026-07-24: REPL multimodal slash-command grammar
 **By:** hicks
 **What:** Added pure parsing for `/help`, `/reset`, `/raw`, `/system [text]`, `/image <path> [prompt text]`, and `/audio <path> [prompt text]`. Attachments stage for the next text turn, while single-line attachment commands immediately send their text. Missing paths warn without crashing; Phase 1 reports staged modalities and sends text only.
 **Why:** This makes multimodal REPL input testable and extensible while honestly deferring engine-side image and audio execution to Phase 2.
-
 <!-- merged from .squad/decisions/inbox/sapper-pr129-revision.md -->
 ### 2026-07-24: PR #129 Nemotron revision (transpose gap + README fix)
 **By:** sapper
@@ -3786,7 +3657,6 @@ policy only for proven-safe topology; preserve logical mask shape when
 non-Attention mask consumers reach prefix-sensitive indexer arithmetic. Add
 CUDA regressions for prompts `[123]` and `[1,2,3,4]` across at least two
 generated tokens.
-
 <!-- merged from .squad/decisions/inbox/hudson-deepseek-status.md -->
 ### 2026-07-25: DeepSeek native CUDA validation status
 **By:** Hudson
@@ -3805,19 +3675,16 @@ Coder. The QMoE ORT run was CPU-heavy (four Memcpy nodes, 0% observed GPU,
 invalid ORT performance baseline. Top remaining gaps are full-model QMoE
 language-coherence validation, a GPU-resident ORT QMoE reference, and continued
 explicit handling of DeepSeek-R1 MatMulNBits accuracy-level divergence.
-
 <!-- merged from .squad/decisions/inbox/pris-pr168-test-fix.md -->
 ### 2026-07-25: Cover the second AVX-512 vector's final lane
 **By:** Pris
 **What:** Corrected PR #168's two-vector NaN test to use a 32-element block and place the NaN at index 31.
 **Why:** The prior test wrote index 15, which only exercised the first vector's final lane and did not cover non-finite detection in the second vector.
-
 <!-- merged from .squad/decisions/inbox/ripley-core-budget.md -->
 ### 2026-07-25: Keep peak default and add an explicit CPU decode budget
 **By:** Ripley
 **What:** `onnx-genai generate` and `onnx-genai run` expose `--cpu-cores N`, mapped to the native decode worker-count mechanism with precedence CLI > `ONNX_GENAI_CPU_DECODE_THREADS` > AUTO. The uncapped automatic worker count is unchanged.
 **Why:** Shared-machine users need a first-class good-citizen control, while the measured 48-worker default remains the best dedicated-host peak. Persistent workers already pin one worker per selected allowed CPU, so the budget bounds their affinity footprint without requiring a hand-written `taskset`.
-
 <!-- merged from .squad/decisions/inbox/ripley-legit-cuda-sweep.md -->
 ### 2026-07-25: Require observed GPU execution for native-vs-ORT headlines
 **By:** Ripley
@@ -3828,7 +3695,6 @@ H200 utilization. Report the real native wins as 1.385×, 1.452×, and 1.100×.
 **Why:** Selecting the CUDA EP is insufficient proof by itself. A valid
 competitive claim requires a CUDA-targeted artifact, absence of fallback-copy
 thrash, and direct evidence that model compute exercised the selected GPU.
-
 <!-- merged from .squad/decisions/inbox/ripley-uncontended-sweep.md -->
 ### 2026-07-25: Treat CUDA-targeted rows as the clean native-vs-ORT comparison
 **By:** Ripley
@@ -3841,25 +3707,21 @@ ORT to insert 67/57 memcpy nodes and partially assign the CUDA EP.
 an idle GPU does not remove graph-export and execution-provider assignment
 confounds. The distinction preserves the credible 1.556× and 1.421× native
 wins without overstating the much larger generic-CPU-artifact ratios.
-
 <!-- merged from .squad/decisions/inbox/roy-pr167-guard-fix.md -->
 ### 2026-07-25: Gate RMSNorm SIMD scaling on exact-identity scale shape
 **By:** Roy
 **What:** The contiguous normalize-and-scale path now requires the right-aligned scale shape to exactly equal `x_shape[axis..]`. SkipSimplifiedLayerNormalization applies the same identity-shape check to gamma.
 **Why:** Equal element counts do not prove identity indexing: for `X=[2,2]`, `axis=1`, and `scale=[2,1]`, the scale varies by group while broadcasting along the normalized axis. Such broadcasts must use the scalar `scale_index` path.
-
 <!-- merged from .squad/decisions/inbox/deckard-down-gemv-validate.md -->
 ### 2026-07-26: Down-GEMV register-reuse validation stopped as duplicate
 **By:** Deckard
 **What:** Do not open a new PR for `1e2b02b9`. Its exact patch already exists on `origin/main` as `720fa032`; the requested validation worktree and branch were removed.
 **Why:** Both commits have stable patch ID `8950d3c0064da12e6edb023baef742552fa0e95b`, identical parent file content, and identical resulting `matmul_nbits.rs`. Cherry-picking onto current main conflicted because later work generalized the already-landed register-reuse kernel to adaptive 2/4/8-column CTAs and added subsequent specializations/tests. Keeping current main would make the cherry-pick empty, so candidate versus main has no performance delta and cannot pass the required positive-win gate. No build, CUDA test, golden-lock, benchmark, push, or PR was run because there is no candidate code difference to validate or merge.
-
 <!-- merged from .squad/decisions/inbox/sapper-glm52-land.md -->
 ### 2026-07-26: GLM-5.2 IndexShare landing is superseded
 **By:** Sapper
 **What:** Do not cherry-pick `528b0f28ebd39df8b27ff34f765190fcb3a26351` or open a PR. `origin/main` already contains the same shape-inference implementation and CUDA E2E under `6fdc8742`, with later fixture-backed eager-decode strengthening.
 **Why:** `6fdc8742` is an ancestor of `origin/main`; its IndexShare handler and shape tests match `528b0f28` exactly, while its only initial difference was rustfmt in the E2E test. Main subsequently added the committed tiny fixture and strengthened the test through `7c212bc7` and `ec4b62bf`, so landing the old commit would duplicate and regress the current coverage.
-
 <!-- merged from .squad/decisions/inbox/batty-dsmla-copyback.md -->
 ### 2026-07-26: Land DeepSeek MLA Attention KV copy-back stream ordering
 **By:** Batty
@@ -3959,8 +3821,6 @@ reserved (0% utilization but 129589 MiB allocated) and every other GPU was
 confirmation remains pending.
 
 <!-- scribe-merge-2026-07-26T19-45-52Z-cuda-perf-and-capture-regression-end -->
-
-
 <!-- scribe-merge-2026-07-26T20-00-00Z-cuda-perf-and-capture-regression-reconciliation -->
 ## 2026-07-26 — CUDA capture regression and portable split-K reconciliation
 
@@ -4118,11 +3978,8 @@ Do NOT merge.
 
 <!-- scribe-archive-gate-2026-07-26T22-38-02+00-00 -->
 Decision archive gate checked at 2026-07-26T22:38:02+00:00: active ledger was 409707 bytes and exceeded 51200 bytes. Applied the 7-day policy with cutoff 2026-07-20; no active-ledger entries older than the retained 7-day window were present, so archived 0 eligible block(s) and no archive file was changed.
-
-
 <!-- scribe-merge-2026-07-26T22-38-02+00-00-mobius-issue-ort2-batch -->
 ## 2026-07-26 — Mobius PR triage, issue audit, and ORT2 remaining-work reconciliation
-
 <!-- merged from .squad/decisions/inbox/sapper-mobius-pr-triage.md -->
 ### 2026-07-26: Mobius PR 404, 423, and 430 triage
 **By:** Sapper
@@ -4161,7 +4018,6 @@ Decision archive gate checked at 2026-07-26T22:38:02+00:00: active ledger was 40
 - Merge-ready for Justin: **Pending CI and approval**. Test jobs are still queued/running and `codecov/patch` currently reports failure.
 
 No PR was merged.
-
 <!-- merged from .squad/decisions/inbox/holden-issue-triage-45-77.md -->
 ### 2026-07-26: Backlog issue triage for #45–#77
 **By:** Holden
@@ -4218,7 +4074,6 @@ No PR was merged.
 None. Every not-started issue has medium/large cross-cutting scope; the small-looking non-finite VAE item is already partial and needs a product decision between fail-closed and retry/upcast semantics.
 
 Plain-text summary: 2 closed, 23 partial, 0 doable-now.
-
 <!-- merged from .squad/decisions/inbox/gaff-issue-triage-78-106.md -->
 ### 2026-07-26: Justin backlog triage — issues 1–106
 **By:** Gaff
@@ -4244,7 +4099,6 @@ Plain-text summary: 2 closed, 23 partial, 0 doable-now.
 | #106 | OPEN | `docs/EXTENSIBLE_QUANT_TYPES.md` is explicitly a design draft; no `QuantTypeDeclProto`, `quant_type_uri`, codec registry, `CUSTOM_QUANT`, or `DequantizeExtensible` implementation exists. |
 
 1 closed, 9 partial, 0 doable-now.
-
 <!-- merged from .squad/decisions/inbox/pris-ort2-remaining-summary.md -->
 ### 2026-07-26: ORT2 / DESIGN remaining-work audit
 **By:** Pris
@@ -4323,12 +4177,10 @@ Plain-text summary: 2 closed, 23 partial, 0 doable-now.
 按明确定义的 **ORT2 Phase-1 foundation**，已经 **100% 完成**：不再有 skeleton，BERT parity milestone 已通过，七个 crate 当前全部能 build。若看完整 `ORT2.md` runtime 愿景，粗估约 **65–70% 完成**；剩下的主要不是“把 skeleton 填完”，而是 ORT drop-in/plugin execution、全 schema/operator parity、异构 placement、model package 和跨平台发布。`DESIGN.md` 的核心单机 GenAI 产品能力约 **70% 左右**，但把 distributed KV/multi-model/multi-GPU/MoE、完整 continuous batching/offload、所有 diffusion/sampling 与生态绑定都算进“大愿景”，整体更接近 **55–60%**。换句话说：基础已经成型且能跑真实模型，余下约三到四成主要是广度、兼容性、调度/内存系统和产品化收口，而不是重写核心。
 
 <!-- scribe-merge-2026-07-26T22-38-02+00-00-mobius-issue-ort2-batch-end -->
-
 <!-- scribe-merge-2026-07-26T22-38-02Z-rope-capture-88 -->
 ## 2026-07-26 — RoPE capture DoD, PR #208 review, and fmt gate recovery
 
 Decision archive gate checked at 2026-07-26T22:38:02+00:00: active ledger was 435274 bytes before this merge. No dated ledger entries older than 2026-07-19T22:38:02+00:00 were present, so no archive file was created or updated.
-
 <!-- merged from .squad/decisions/inbox/leon-rope-capture-dod.md -->
 ### 2026-07-26: Standalone RoPE capture regression closes #88
 **By:** Leon
@@ -4375,12 +4227,1373 @@ Decision archive gate checked at 2026-07-26T22:38:02+00:00: active ledger was 43
 **APPROVE.** Merge-ready. The test exercises the true standalone RoPE decode kernel, asserts
 parity and real capture success (no fallback), gates cleanly on GPU availability, and is a
 proven guard (fails when capture-safety is broken).
-
 ### 2026-07-26: Resch restored the fmt gate and PR #208 closed #88
 **By:** Scribe, from coordinator manifest
 **What:** Resch landed pure rustfmt repair commit `63e0ef26` after PR #207 plus `decode_spmd.rs` regressed the BLOCKING fmt gate on main; `cargo fmt --all -- --check` returned exit 0. PR #208 then merged to main as `5eb0d8db` (`test(cuda): cover standalone RoPE graph capture`), closing issue #88.
 **Why:** The batch restored main's formatting health and permanently records that Leon's standalone RoPE capture DoD regression landed with Chew's independent approval and guard-break evidence.
+<!-- merged from .squad/decisions/inbox/andrews-split-movement-handlers.md -->
+### 2026-07-27: Split movement shape handlers by operator family
+**By:** Andrews
+**What:** Replaced the 1,809-line `handlers/movement.rs` with:
+- `movement/mod.rs` (114 lines): shared helpers and the unchanged registration facade.
+- `movement/transform.rs` (409 lines): Transpose, Reshape, Flatten, Squeeze, Unsqueeze, Expand.
+- `movement/resize.rs` (302 lines): Resize.
+- `movement/concat_slice.rs` (394 lines): Concat, Slice.
+- `movement/split_gather.rs` (380 lines): Split, Gather, GatherElements, GatherND.
+- `movement/scatter.rs` (137 lines): Scatter, ScatterElements, ScatterND, Trilu.
+- `movement/space_depth.rs` (132 lines): DepthToSpace, SpaceToDepth.
 
+The split totals 1,868 lines including module-local imports. Registration order, operator/opset mappings, handler bodies, shape rules, and diagnostic text are unchanged.
+
+**Why:** Cohesive operator-family modules reduce navigation and review cost while keeping this change mechanical and behavior-preserving. `cargo fmt -p onnx-runtime-shape-inference`, shape-inference build/tests (224 tests plus one doctest), clippy with `-D warnings`, and downstream `onnx-runtime-session` build all pass.
+<!-- merged from .squad/decisions/inbox/ash-split-genai-config.md -->
+### 2026-07-27: Split genai config compatibility crate into cohesive modules
+**By:** Ash
+**What:** Kept `lib.rs` as a 98-line facade retaining `GenAiConfigError`, `GENAI_CONFIG_FILE`, and the flat public re-exports. Moved config wire types to `wire_types.rs` (361 LOC), loading to `loading.rs` (109 LOC), graph I/O inspection to `graph_io.rs` (235 LOC), compatibility synthesis to `compatibility.rs` (1,427 LOC), JSON builders to `json_builders.rs` (341 LOC), and unit tests to `tests.rs` (1,212 LOC).
+**Why:** The former 3,743-line facade mixed serialization contracts, file loading, graph inspection, pipeline synthesis, JSON construction, and tests. The split is pure code motion; public names remain re-exported from the crate root. A source comparison confirmed config wire definitions, field/variant ordering, derives, every `#[serde(...)]` attribute, and all `GenAiConfigError` text are unchanged. `cargo build`, all 30 crate tests, clippy with `-D warnings`, and downstream engine/server/CLI builds passed.
+
+
+<!-- merged from .squad/decisions/inbox/batty-hybrid-prefill-decode.md -->
+# Hybrid execution (GPU prefill / CPU decode): premise FALSIFIED, KV-handoff prototype PROVEN
+
+**By:** Batty (Engine Dev)
+**Date:** 2026-07-13
+**Machine:** Apple M1 Max, macOS 25.x
+**Repo:** `onnx-genai` (engine + ort only). Model: `models/qwen2.5-0.5b-cpu-recipe`
+(fp32 GQA, 169 MatMulNBits, 24 GQA). Metal EP plugin:
+`../onnxruntime-mps/build/libonnxruntime_mps_ep.dylib` (`ONNX_GENAI_METAL_EP_LIB`).
+**No commit — coordinator commits.**
+
+## TL;DR
+
+The proposed hybrid — **prefill on the Metal EP (GPU), decode on the CPU EP** — has
+**no benefit on the current Metal EP** because the core premise is false: **Metal does
+NOT win prefill.** Metal prefill/TTFT is **~1.5–2× SLOWER than CPU at every prompt
+length, and the gap grows with prompt length** (the *opposite* of the premise).
+Root cause is structural: the Metal `MatMulNBits` kernel is a **decode GEMV replicated
+once per prompt token** (`grid.y = M`), with no `simdgroup_matrix` GEMM tiling and no
+weight reuse across the M prompt rows — so prefill re-streams the entire int4 weight set
+**M times** and is M×-weight-bandwidth-bound, the GPU's weakness, not a compute-bound
+GEMM.
+
+The **KV-handoff mechanism itself works and is essentially free** (0.2–2.8 ms on Apple
+unified memory), produces **coherent output**, and is now a reusable primitive. So the
+prototype is a *mechanism* success and a *premise* failure. **Recommendation: do NOT
+productionize the hybrid now.** The real lever is a **prefill GEMM kernel on the Metal
+EP** (Mariette: `simdgroup_matrix`, reuse weights across M). If/when Metal wins prefill,
+the hybrid path is ready and the handoff is proven.
+
+## 1. Premise validation (does Metal win prefill?) — NO
+
+Measured with the new `hybrid_prefill_decode` example (real ChatML prompt, padded by
+token-repeat to reach long context; both sessions run back-to-back so the **within-run**
+ratio is the reliable signal — absolute cross-run numbers drift with M1 thermals).
+
+| prompt tokens | CPU prefill/TTFT | Metal prefill/TTFT | Metal ÷ CPU |
+|---|---:|---:|:--:|
+| 26   | ~43 ms   | ~66 ms   | **1.5× slower** |
+| 256  | ~289 ms  | ~525 ms  | **1.8× slower** |
+| 512  | ~604–699 ms | ~1128–1225 ms | **1.9× slower** |
+| 1024 | ~1376 ms | ~2756 ms | **2.0× slower** |
+
+Metal prefill loses in **every** run, and the deficit **widens** with M. Decode (for
+reference, confirming prior notes): Metal ~30–68 tok/s vs CPU ~58–170 tok/s depending on
+context depth — Metal loses decode too. The hybrid end-to-end is therefore **always worse
+than pure-CPU** (e.g. 512-tok prompt + 48 decode: hybrid ~1536 ms vs pure-CPU ~1144 ms).
+
+**Contention note:** a peer agent's `profile_decode` (457% CPU) overlapped the first
+sweep. That only slows the **CPU** side, so solo CPU is *faster* → Metal's prefill deficit
+is if anything **larger** solo. Re-measured solo (contender gone); the relative conclusion
+is unchanged.
+
+### Root cause (confirmed in the kernel)
+
+`onnxruntime-mps/src/kernels/matmulnbits.metal` header, dispatch contract:
+`grid.x = N*32 (simdgroup per output column); grid.y = M (one row per y)`. Each of the M
+prompt rows is an independent GEMV that re-reads the full packed int4 weights; there is no
+`simdgroup_matrix` tile and no cross-row activation/weight reuse. `mariette-matmulnbits-
+bandwidth.md` already flagged "`simdgroup_matrix` tiling for large-M prefill" as
+**unimplemented future work**. So prefill traffic ≈ M × (whole weight set) ≈ M × ~350 MB;
+at ~46 GB/s effective that is seconds for M≈1024 — exactly what we measure. The premise's
+"prefill = compute-bound GEMM where GPU parallelism pays" does not apply to a GEMV-per-row
+kernel.
+
+## 2. Hybrid design + KV-handoff (built and proven)
+
+Two ORT sessions on the **same model**: a Metal-EP session for prefill and a CPU-EP
+session for decode, both driven by `DecodeSession` in `ZeroCopyRebind` KV mode. Handoff:
+
+1. Metal `DecodeSession::step(prompt, mask, positions)` runs the whole prompt in one
+   forward pass → `present.*` KV (`[1, 2, P, 64]` per layer) + last-position logits →
+   first token.
+2. **`DecodeSession::export_kv()`** (new) materializes each `present`/`past_key_values.*`
+   tensor onto host-owned Rust buffers (cheap `memcpy`; on Apple unified memory the Metal
+   output is already CPU-addressable). The returned `Value`s are session-independent.
+3. **`DecodeSession::import_kv(len, kv)`** (new) adopts them into the CPU decode session and
+   sets the logical KV cursor to `P`. Dtype and per-tensor sequence-axis length are
+   validated against the model.
+4. CPU decode continues: step `t` feeds one token at absolute position `P+t`, mask
+   `[1; P+t+1]` — identical to the engine's existing `DecodeBackend::decode` contract, so
+   position/seqlen continuity across the EP boundary is automatic.
+
+Both new methods are `ZeroCopyRebind`-only (shared-buffer mode owns fixed max-length
+device buffers that are not portable across sessions). This is the natural, minimal seam;
+no engine changes were required for the prototype.
+
+## 3. Prototype coherence + measurements
+
+- **Coherence (real 26-tok "capital of France" prompt, greedy):** pure-CPU, pure-Metal,
+  and hybrid all produce fluent, correct English — `"The capital of France is Paris.\n..."`
+  — token-identical for the first **14** tokens, then each diverges at token 14. That is
+  the **known pre-existing fp32 reduction-order drift** (Metal fp32-dequant vs CPU int8
+  `accuracy_level=4` MatMulNBits — `sebastian-accuracy-level-debug.md`,
+  `mariette-gqa-kernel.md`), **not** a handoff defect. The hybrid tracks the Metal-prefill
+  numerics through the boundary, then decodes on CPU; output stays coherent.
+- **KV handoff cost:** 0.19 ms (P=26) → 1.4 ms (P=512) → 2.8 ms (P=1024). Negligible; the
+  unified-memory copy is not a bottleneck.
+- **Decode recovery:** hybrid decode runs at **CPU speed** (e.g. 188 tok/s vs pure-Metal
+  123 tok/s at P=26; 123 vs 68 at P=512) — the one thing the hybrid does well is avoid
+  Metal's slower decode. But it cannot offset the slower Metal prefill.
+- **Regression test:** `exported_kv_handoff_continues_decode_identically` (CPU↔CPU handoff
+  via the same API) is **bit-identical** to a single-session run — proving the export/import
+  path is numerically exact.
+
+## 4. Is it a real win? Worth productionizing? — NO (not yet)
+
+No. Given the current Metal EP, the hybrid is **strictly worse** than pure-CPU on total
+latency at every prompt length, because it is forced to eat a prefill that is ~2× slower
+than CPU. The premise required Metal to win prefill; it loses prefill and the deficit grows
+with context — so the hybrid's intended win (better long-context TTFT) is exactly inverted.
+
+**What would make it worthwhile (the real lever):** a **prefill-specialized Metal
+`MatMulNBits` GEMM kernel** — `simdgroup_matrix` tiling that loads each weight block once
+and reuses it across a tile of M prompt rows (llama.cpp `mul_mm`-style), turning prefill
+from M× weight-bandwidth-bound back into the compute-bound GEMM the premise assumed. This
+is Mariette/Coco kernel work in `onnxruntime-mps`, not onnx-genai. **When Metal prefill
+beats CPU, revisit the hybrid — the KV-handoff seam (`export_kv`/`import_kv`) is already in
+place, coherent, and effectively free.** Until then, keep prefill and decode both on CPU.
+
+## Files changed (onnx-genai only; NOT committed)
+
+- `crates/onnx-genai-ort/src/decode.rs` — new `DecodeSession::export_kv()` /
+  `import_kv()` (ZeroCopyRebind cross-session KV handoff) + `clone_value_to_owned` helper.
+- `crates/onnx-genai-ort/tests/decode_session.rs` — new
+  `exported_kv_handoff_continues_decode_identically` (handoff is numerically exact).
+- `crates/onnx-genai-ort/examples/hybrid_prefill_decode.rs` — **new** prototype/harness:
+  CPU + Metal sessions, pure-CPU / pure-Metal / hybrid runs, TTFT + decode tok/s + total,
+  coherence diff vs pure-CPU. Supports `--prompt-tokens` (reproducible ChatML ids),
+  `--pad-to N`, `--chat`, `--mode cpu|metal|hybrid|all`.
+
+## Validation
+
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test -p onnx-genai-ort -p onnx-genai-engine` — green (a transient
+  `tiny-mtp-full` "Is a directory" failure was concurrent-fixture interference from a peer
+  agent's parallel run; passes in isolation and on rerun, and is untouched by this change).
+- Coherent output verified on the real prompt before any speed claim.
+
+## Reproduce
+
+```bash
+export ONNX_GENAI_METAL_EP_LIB="$PWD/../onnxruntime-mps/build/libonnxruntime_mps_ep.dylib"
+ORTLIB=$(dirname $(ls target/release/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib/libonnxruntime.dylib | head -1))
+export DYLD_LIBRARY_PATH="$ORTLIB"
+PT="151644 8948 198 2610 525 264 10950 17847 13 151645 198 151644 872 198 3838 374 279 6722 315 9625 30 151645 198 151644 77091 198"
+cargo run -p onnx-genai-ort --release --example hybrid_prefill_decode -- \
+  --model models/qwen2.5-0.5b-cpu-recipe --prompt-tokens "$PT" --pad-to 512 --max-tokens 48 --mode all
+```
+
+## Handoff / follow-ups
+
+- **Mariette/Coco (onnxruntime-mps):** prefill GEMM kernel for `MatMulNBits`
+  (`simdgroup_matrix`, weight reuse across M). This is the prerequisite for any GPU-prefill
+  win. Ping Batty to re-run the hybrid harness once it lands.
+- **Sebastian (perf):** if you want a clean solo TTFT sweep, `hybrid_prefill_decode
+  --mode metal|cpu` isolates prefill; my numbers overlapped your `profile_decode` run.
+- The `export_kv`/`import_kv` seam is generally useful (session migration, EP failover,
+  future speculative cross-EP draft/verify), independent of whether the hybrid ships.
+<!-- merged from .squad/decisions/inbox/call-split-onnx-std-rules.md -->
+### 2026-07-27: Split ONNX validation rules by model layer
+**By:** Call
+**What:** Split the former 5,316-line `crates/onnx-std/src/check/rules.rs` into a `rules/mod.rs` facade and five private rule-family modules:
+- `graph_topology.rs` — 368 lines; opset imports, duplicate names, graph input/output connectivity, and acyclicity.
+- `schema_types.rs` — 1,217 lines; schema conformance, type constraints, initializer declarations, metadata, attributes, and retained protobuf types.
+- `ir_version_functions.rs` — 1,147 lines; IR version/feature gates and local function validation. The two existing `#[allow(clippy::too_many_arguments)]` attributes remain on their original functions.
+- `tensor_sparse_payloads.rs` — 558 lines; dense tensor payload and sparse tensor validation.
+- `multi_device.rs` — 393 lines; device configuration and sharding validation.
+- `mod.rs` — 1,711 lines; public facade, shared diagnostic helpers, and unchanged tests.
+
+**Why:** Cohesive private modules reduce the validation implementation's file-level entropy while preserving the flat public API. Rule ORDER is unchanged because `check/mod.rs` and its 17 `checker.add_rule(...)` calls were not modified. Violation WORDING is unchanged: all 579 Rust string literals were compared as multisets before formatting and preserved exactly; the non-author reviewer independently approved the split and found rule implementations/helper logic unchanged.
+
+**Gates:** `cargo fmt -p onnx-std` passed; `cargo build -p onnx-std` passed; `cargo test -p onnx-std` passed (126 unit tests, 23 integration tests, 1 doc-test); `cargo clippy -p onnx-std --all-targets -- -D warnings` passed. Non-author review: approved with no blocking findings.
+
+
+<!-- merged from .squad/decisions/inbox/chew-pr227-fp16-review.md -->
+# Chew — PR #227 FP16 Path Numerics Review (Second Pass)
+
+**Branch:** `squad/mac-cpu-ep-roofline`
+**Date:** 2026-07-27T02:00:00-07:00
+**Commits under review:** `75311827` (FP16 storage GEMV + bulk conversion), `3a88ba8c` (SPMD pool for FP32 GEMV + cleanup)
+**Author under review:** Iran
+**Reviewer:** Chew (Numerics)
+
+---
+
+## Verdict: **APPROVE**
+
+The FP16 storage GEMV kernel and bulk f16↔f32 conversion are numerically sound. All 922 tests pass. `cargo fmt --check` clean (BLOCKING). `cargo clippy` produces only pre-existing cosmetic warnings in `activations.rs` (not new code). Two non-blocking concerns are noted below.
+
+---
+
+## Per-item findings
+
+### 1. Inline assembly for `fcvtl` — SOUND, NON-BLOCKING CONCERN
+
+**File:** `accelerate_gemm.rs:419-433` (`load_f16x4_to_f32x4`)
+
+The asm block:
+```asm
+"ldr {v:d}, [{ptr}]"       // load 8 bytes (4 × f16) into low 64 bits of Vn
+"fcvtl {v:v}.4s, {v:v}.4h" // widen low 4 × f16 → 4 × f32
+```
+
+**Correctness assessment:**
+- **Constraints correct.** `ptr = in(reg)` for the base address, `v = out(vreg)` for the NEON result. Using the same register for input/output of `fcvtl` is valid — the instruction reads from the low half and writes to the full register.
+- **Options correct.** `nostack` (no stack use), `readonly` (no memory writes), `pure` (no side effects). All accurate — the block only reads memory and produces a register value.
+- **Clobbers correct.** No additional clobbers needed; `v` is declared as `out(vreg)` which already tells the compiler it's modified.
+- **`volatile` correctly absent.** The `pure, readonly` combination allows the compiler to CSE/LICM the load, which is desirable for the GEMV inner loop.
+
+**Verified bit-exact against scalar `half::f16::to_f32()`** for: normal values (1.0–65504.0), denormals (0x0001, 0x03FF), ±inf (0x7C00, 0xFC00), NaN (0x7E00), ±zero (0x0000, 0x8000). All lanes match bit-for-bit.
+
+**Concern C1 (non-blocking):** The rationale for inline asm over intrinsics is that `vcvt_f32_f16` requires Rust's unstable `f16` type, which needs nightly. This is a valid practical reason today. However, Rust's `f16` type is on track for stabilization (RFC 3453). **Recommend: add a `// TODO: replace with vcvt_f32_f16 intrinsic when f16 stabilizes` comment.** Inline asm in a shared kernel that Resch (Intel) and Luba (ARM) also maintain is a maintenance hazard — the intrinsic should replace it as soon as feasible.
+
+**Assignee for C1:** Deckard or Sapper (not Iran).
+
+### 2. FP32 accumulation — VERIFIED SOUND
+
+**Files:** `accelerate_gemm.rs:474-554` (`neon_gemv_f16_batch`), `accelerate_gemm.rs:558-601` (`neon_dot_f16`)
+
+Accumulation is genuinely f32 throughout:
+- Accumulators `a0..a3`, `b0..b3` are `float32x4_t`, initialized via `vdupq_n_f32(0.0)`.
+- `vfmaq_f32` is f32 fused-multiply-add — operates entirely in f32.
+- Horizontal reduction via `vaddvq_f32` (f32).
+- Scalar tail accumulates into `s0..s3` (f32 locals) using `half::f16::from_bits(x).to_f32()` followed by f32 multiply.
+
+**This is NOT native FP16 accumulate.** It is the correct FP16-storage-f32-accumulate pattern.
+
+**Measured error vs f64 reference:**
+
+| Shape (name) | K | N | max abs | max rel | max ULP |
+|---|---:|---:|---:|---:|---:|
+| gate_proj | 896 | 4864 | 3.46e-6 | 1.52e-7 | 2 |
+| down_proj | 4864 | 896 | 2.95e-5 | 2.38e-7 | 4 |
+| q_proj | 896 | 896 | 3.37e-6 | 1.53e-7 | 2 |
+| kv_proj | 896 | 128 | 2.64e-6 | 1.15e-7 | 1 |
+| 1×1 | 1 | 1 | 4.49e-10 | 2.14e-8 | 0 |
+| 1×4 | 1 | 4 | 1.58e-9 | 4.86e-8 | 0 |
+| odd_tail | 67 | 9 | 2.28e-7 | 1.13e-7 | 1 |
+
+Max relative error across all shapes: **2.38e-7**. This is well within the FP32-accumulate envelope (~1e-7 relative from FMA ordering). The doc claim of "~2.3e-4 max relative error" is conservative — actual measured error is 1000× better than claimed, which is consistent with FP32 accumulation (the 2.3e-4 figure would be for FP16 accumulation).
+
+**FP16 GEMV vs F32 GEMV with identical f16-quantized weights:** max relative error **1.73e-6**. This confirms the accumulation is truly f32 — if it were FP16 accumulate, this would be ~1e-3 or worse.
+
+### 3. Tail handling — VERIFIED CORRECT
+
+**Main loop:** processes 8 elements per iteration (2 × 4 `fcvtl` loads per row) in `neon_gemv_f16_batch`, 16 elements per iteration in `neon_dot_f16`.
+
+**Tail:** scalar loop `while j < k` widens each f16 individually via `half::f16::from_bits().to_f32()`.
+
+**Verified at:** K=67 (not divisible by 8 or 16), N=9 (not divisible by 4). Both produce correct results with max abs error 2.28e-7 vs f64 reference. Also verified K=1, N=1 and K=1, N=4 — all correct.
+
+The `neon_gemv_f16_batch` outer loop processes 4 output rows at a time, with a `while i < n` scalar tail that calls `neon_dot_f16` per remaining row. This tail is also correct at N=9 (processes 2 groups of 4, then 1 remaining row).
+
+### 4. Transpose cache (`transposed_b_f16`) — THREAD-SAFE
+
+**File:** `matmul.rs:161-205`
+
+- Uses `OnceLock<Vec<u16>>`, which is Rust's standard thread-safe lazy initialization. Only one thread will execute `get_or_init`; all others block until initialization completes. No torn reads possible.
+- The transpose itself uses Rayon `par_chunks_mut` — each thread writes to a disjoint slice of `bt`, so no data races.
+- The `unsafe` for `from_raw_parts` is justified: the view is validated as contiguous Float16 with exactly `numel` elements; `half::f16` is `repr(transparent)` over `u16`.
+- Transpose logic verified correct: `bt_chunk[jj * k + i] = src[i * n + j]` where `j = j0 + jj`. This maps `src[K,N]` row-major → `bt[N,K]` row-major, which is the correct transposition.
+
+### 5. Bulk conversion (`neon_f16_to_f32_bulk` / `neon_f32_to_f16_bulk`) — SOUND
+
+**File:** `dtype.rs:774-828`
+
+**Widen (`fcvtl`, line 775-797):** Same asm block as `load_f16x4_to_f32x4`, correctly annotated `readonly, pure`. Scalar tail uses `half::f16::from_bits().to_f32()`. Verified bit-exact against scalar for all edge cases.
+
+**Narrow (`fcvtn`, line 803-828):**
+- Asm block correctly does NOT have `readonly` or `pure` — it writes to memory via `str`.
+- `options(nostack)` only — correct, since it has a memory side effect.
+- `src = in(vreg)` for the f32x4 input, `ptr = in(reg)` for the output address, `v = out(vreg) _` for the scratch register. Constraints are correct.
+
+**Rounding mode:** `fcvtn` uses IEEE round-to-nearest-even (the ARM default FPCR.RMode). Verified: `neon_f32_to_f16_bulk` produces bit-identical output to `half::f16::from_f32()` for all tested values including tie-breaking cases.
+
+**Overflow to inf:** Values > 65504 (e.g. 65520, 65536, 100000) correctly narrow to `±inf` (0x7C00/0xFC00). This matches `half::f16::from_f32()` behavior.
+
+**Denormal handling:** Values in the f16 denormal range (e.g. 6.0e-8) are correctly narrowed with gradual underflow, matching scalar.
+
+**NaN preservation:** NaN inputs produce NaN outputs (bit patterns may differ in payload, which is IEEE-compliant).
+
+**Non-multiple-of-4 tail:** Tested with n=21 (21 elements). Scalar tail correctly handles the remaining 1 element.
+
+### 6. SPMD pool correctness (`3a88ba8c`) — SOUND
+
+**File:** `matmul_nbits.rs:1463-1488`
+
+- `perf_cores.saturating_sub(1).max(1).min(available)` — correctly handles:
+  - 1 P-core → `max(0, 1) = 1` → 1 worker (safe minimum)
+  - 2 P-cores → `max(1, 1) = 1` → 1 worker (conservative)
+  - 8 P-cores (this M1 Max) → `min(7, 10) = 7` workers
+  - `.min(available)` prevents exceeding logical CPU count
+  - `saturating_sub` prevents underflow
+  - Cannot produce zero or negative — `.max(1)` is the floor
+
+- `performance_core_count()` (line 1632-1662) returns `None` on Intel Macs or VMs where `hw.perflevel0.physicalcpu` doesn't exist, causing the override block to be skipped entirely — falling back to the generic `available/2` default. Safe.
+
+- The existing `with_decode_pool_scope` change (line 2243-2258) correctly gates SPMD pool eligibility: without MLAS, the pool is eligible for both quantized and dense models; with MLAS, only quantized models use it (avoiding contention with MLAS's own Rayon pool).
+
+### 7. Silent-fallback audit — PASSED
+
+The `constant_weight_prepack_reuses_weight_and_keeps_activation_live` test (matmul.rs:1700-1745) asserts `kernel.prepack.transposed_b_f16.get().is_some()` on macOS, proving the FP16 GEMV path is compiled and executed. The test uses `Owned::f16` weights with M=1, which matches the dispatch condition. Result `[2., 6.]` and `[8., 15.]` are numerically exact (f16-representable values).
+
+### 8. Apple Silicon generality — CORRECT
+
+- `fcvtl` and `fcvtn` are ARMv8 base FP instructions, not FEAT_FP16. They are present on ALL aarch64 CPUs, not just Apple Silicon.
+- The entire `accelerate_gemm` module is gated by `#[cfg(any(target_os = "macos", target_os = "ios"))]` — Luba's ARM Linux code never enters this module.
+- Non-aarch64 scalar fallbacks exist at lines 551 and 606.
+- Thread count is derived at runtime from `hw.perflevel0.physicalcpu` with sane fallback — no hardcoded tile sizes or cache assumptions.
+
+### 9. Test coverage — ADEQUATE
+
+**New tests in `accelerate_gemm.rs`:**
+- `f16_col_parallel_gemv_matches_reference` (K=64, N=128, max abs < 1e-3)
+- `f16_col_parallel_matches_at_model_scale` (K=896, N=4864, max rel < 2%)
+- `f16_gemv_odd_k_tail` (K=67, N=9, exercises scalar tail)
+
+**Updated tests in `matmul.rs`:**
+- `constant_weight_prepack_reuses_weight_and_keeps_activation_live` — updated to assert f16 cache path on macOS
+
+**Concern C2 (non-blocking):** The model-scale test threshold of `max_rel < 0.02` (2%) is very loose for what should be FP32-accumulate accuracy. Measured actual error is ~2.4e-7 (1e5× below threshold). Recommend tightening to `max_rel < 1e-4` to catch genuine FP16-accumulate regressions. Similarly, the `f16_col_parallel_gemv_matches_reference` threshold of `max_abs < 1e-3` should be `< 1e-5`.
+
+**Assignee for C2:** Deckard or Sapper (not Iran).
+
+---
+
+## Summary
+
+| Item | Status |
+|---|---|
+| Inline asm `fcvtl` correctness | ✅ Sound (bit-exact vs scalar) |
+| FP32 accumulation preserved | ✅ Verified (max rel 2.38e-7) |
+| FP16 GEMV numerical parity | ✅ Within f32-accumulate envelope |
+| Tail handling (K, N non-aligned) | ✅ Correct at K=67/N=9/K=1/N=1 |
+| Transpose cache thread safety | ✅ OnceLock + disjoint par_chunks |
+| Bulk conversion rounding/overflow/NaN | ✅ Bit-exact with half::f16 |
+| SPMD pool edge cases | ✅ Cannot produce ≤0 workers |
+| Path reachability | ✅ Test proves f16 GEMV is hit |
+| Apple Silicon generality | ✅ ARMv8 base, correct gating |
+| Test coverage | ✅ Adequate (3 new + 1 updated) |
+
+**Non-blocking concerns:**
+- **C1:** Add TODO to replace inline asm with intrinsics when `f16` stabilizes.
+- **C2:** Tighten test error thresholds from 2%/1e-3 to 1e-4/1e-5 to guard against accumulation regressions.
+
+
+<!-- merged from .squad/decisions/inbox/chew-pr227-numerics-review.md -->
+# Chew — PR #227 Numerics Review
+
+**Branch:** `squad/mac-cpu-ep-roofline`
+**Date:** 2026-07-27T01:30:00-07:00
+**Author under review:** Iran
+**Reviewer:** Chew (Numerics)
+
+---
+
+## Verdict: **APPROVE with concerns**
+
+The four commits introduce NEON-vectorized SiLU, SDPA, and GEMV kernels plus an Accelerate sgemm integration for the native CPU EP on Apple Silicon. All 904 unit tests pass. `cargo fmt --check` passes (BLOCKING gate). `cargo clippy` passes (warnings only — dead code, cosmetic). End-to-end generation on Qwen 2.5-0.5B produces 30 tokens at ~30 tok/s without crashes or panics on M1 Max.
+
+The numerics are **sound for production inference** but several documentation claims are inaccurate, and the SDPA NEON path lacks direct test coverage. None of the concerns below are blocking for merge, but they should be tracked for follow-up.
+
+---
+
+## Per-item findings
+
+### 1. Vectorized SiLU (`activations.rs:357-436`) — NON-BLOCKING CONCERN
+
+**The "~1 ULP" claim (line 353) is incorrect.** Measured accuracy of the Cephes-style polynomial (simulated with hardware FMA to match NEON `vfmaq_f32`):
+
+| Range | Max ULP | Max relative error |
+|---|---:|---:|
+| Practical [-10, 10] | 28.0 | 3.31e-6 |
+| Wide [-20, 20] | 28.3 | 3.34e-6 |
+| Near zero [-0.01, 0.01] | 1.5 | 1.47e-7 |
+| Clamped region [-100, -87.3] | 12.5M | ~0 abs (subnormal) |
+| Positive > 88.7 | 0.0 | 0.0 |
+
+**Assessment:** ~28 ULP in the practical range is acceptable for f32 transformer inference (effective ~17 bits of precision). The extreme-negative clamped region produces subnormal-magnitude results where the absolute error is negligible (~1e-37). **But the docstring must be corrected from "1 ULP" to "~28 ULP" or "< 1e-5 relative error".**
+
+- `half` variable (line 372) is declared but never used — dead code from the original Cephes formulation where `floor(x+0.5)` was used for rounding; Iran replaced it with `vrndnq_f32` (NEON round-to-nearest) but didn't remove the constant.
+- Non-finite fix-up (lines 423-429) is correct: re-scans the NEON-computed region and delegates NaN/Inf to the scalar reference.
+- **Path verification PASSED:** inserted `panic!` at `silu_f32_neon` entry; `silu_contiguous_matches_reference` test hit it, confirming the NEON path is compiled and executed on this machine.
+
+**Assignee for correction:** Deckard or Sapper (not Iran — locked out).
+
+### 2. Swish→SiLU canonicalization (`activations.rs:234-246`) — SAFE
+
+```rust
+let activation = if alpha == 1.0 { Activation::Silu } else { Activation::Swish { alpha } };
+```
+
+- Uses **exact f32 equality** (`alpha == 1.0`), not epsilon. This is correct.
+- Default is `unwrap_or(1.0)` — exactly 1.0f32.
+- A near-1.0 alpha (e.g., 0.99999994) will NOT canonicalize to SiLU. No silent misrouting.
+- Mathematically, Swish(x, β=1) = x·σ(x) = SiLU(x). Identity confirmed.
+
+### 3. NEON SDPA (`sdpa.rs:744-820`) — NON-BLOCKING CONCERN
+
+**Numerics are sound:**
+- Softmax uses max-subtraction stability (line 502) — correct.
+- `sdpa_f32_neon` reuses the existing `softmax_in_place` scalar path, so softmax stability is inherited.
+- `dot_neon` and `axpy_neon` use 4×-unrolled FMA accumulators with correct tail handling (scalar fallback for remainder).
+- Masked/-inf entries handled correctly: `scores.fill(0.0)` in softmax when all scores are `-inf`, and `probability == 0.0` skip in V-weighted accumulation (line 815).
+- GQA grouping (`heads_per_kv`) is correct.
+
+**Test coverage gap:** All 11 SDPA tests call `sdpa_f32_scalar` directly — **no test exercises `sdpa_f32_neon`**. Inserted a `panic!` at `sdpa_f32_neon` entry; all SDPA tests passed without hitting it. This means a bug in the NEON SDPA path would go undetected.
+
+**Recommendation:** Add a parity test that calls `sdpa_f32(...)` (the dispatcher) and compares against `sdpa_f32_scalar(...)` for a representative set of shapes including non-power-of-2 head dims.
+
+**Assignee for follow-up:** Pris (test owner).
+
+### 4. GEMV correctness (`accelerate_gemm.rs`, `matmul.rs`) — SOUND
+
+**Transpose:** The pre-transpose in `MatMulPrepack::transposed_b` (matmul.rs:100-133) produces `B_T[N,K]` row-major from `B[K,N]` row-major via `bt[j*k + i] = b[i*n + j]`. Correct. The `neon_gemv_col_parallel` kernel then computes `y[j] = dot(B_T[j,:], x)` = `Σ_i B[i,j]*x[i]` — which is `y = B^T @ x`, i.e., the correct decode GEMV.
+
+**Tail handling:**
+- `neon_gemv_batch`: processes 4 output rows at a time with 8 accumulators (2 per row, 8-wide K loop). K-tail handled by scalar fallback. N-remainder via `neon_dot` for individual rows. Correct.
+- `neon_dot`: 16-element unrolled loop, 4-element secondary loop, scalar tail. Correct.
+- `neon_outer_product_unrolled`: 4-row K-unrolled outer product with NEON N-vectorized inner loop, scalar N-tail. Correct.
+
+**Accumulation:** All accumulations are f32 throughout (NEON `float32x4_t` → `vaddvq_f32` horizontal sum → f32 scalar tail).
+
+**Accelerate sgemv removed from dispatch:** Confirmed. The `matmul_dense_into_with_backend` function at matmul.rs:795-822 dispatches M=1 to `neon_gemv_col_parallel` or `neon_gemv_parallel`, never to `sgemv_accelerate`. The `gemm_with_backend` at matmul.rs:217-224 dispatches M=1 to `neon_gemv_parallel`. No dead branch in the dispatch chain.
+
+**Dead code in module:** `sgemv_accelerate`, `is_l2_resident`, `l2_cache_bytes`, `query_sysctl_usize`, `CBLAS_TRANS`, `cblas_sgemv` are declared but never called from production code. The compiler emits dead_code warnings. These are from the removed Accelerate sgemv path. Non-blocking: remove or mark `#[allow(dead_code)]` with a justification.
+
+**Test guard-break PASSED:** Zeroed `y[i]` in `neon_gemv_batch` → `col_parallel_gemv_matches_reference` test failed with error 0.997. Tests are sensitive to GEMV breakage.
+
+**Model-scale tolerance:** The `accelerate_decode_gemv_matches_generic_at_model_scale` test uses 2% relative tolerance. Measured actual max_rel: 0.018% for [1,896,896], 0.39% for [1,896,4864], 1.57% for [1,4864,896]. The 1.57% is a legitimate f32 accumulation-order difference (row-parallel outer-product reduction vs sequential tiled GEMM). The 2% tolerance accommodates this but is loose enough to mask real bugs. Non-blocking: consider tightening or comparing against a f64 reference.
+
+### 5. `dtype.rs` f32 memcpy fast path (dtype.rs:643-664) — SAFE
+
+Guard conditions:
+1. `out.dtype == DataType::Float32` — exact dtype match
+2. `out.is_contiguous()` — verified: calls `onnx_runtime_ir::is_contiguous(shape, strides)` which checks strides match computed contiguous strides exactly
+
+A strided-to-contiguous case cannot take this path — the strides check prevents it. The length check (`data.len() != n`) prevents buffer overrun. The `validate()` call checks the output tensor invariants. Safe.
+
+### 6. `matmul_nbits.rs` visibility change (line 1902) — SAFE
+
+`fn spmd_decode_active()` changed from private to `pub(crate)`. This allows `accelerate_gemm.rs` to call it (line ~186) to prefer the persistent SPMD pool when active. The function only reads thread-local state (`IN_SPMD_SCOPE`) — no side effects, no new computation. Safe.
+
+---
+
+## Structural checks
+
+### Silent-fallback bug class
+
+- **NEON SiLU path:** Verified reachable. `cfg(all(not(feature = "mlas"), target_arch = "aarch64"))` is active on this M1 Max. Panic-probe confirmed.
+- **NEON SDPA path:** `cfg(target_arch = "aarch64")` is active, and the dispatch at sdpa.rs:291-294 reaches it when `qk.is_none()`. However, **no unit test exercises this path** (all tests call `sdpa_f32_scalar` directly). The path IS reachable in production (the engine calls `sdpa_f32`), but it has no dedicated test coverage.
+- **Accelerate GEMM paths:** `cfg(any(target_os = "macos", target_os = "ios"))` is active. Tests exercise both sgemm and NEON GEMV paths.
+
+### Apple Silicon generality
+
+- **No hardcoded thread counts or cache sizes.** L2 threshold is queried at runtime via `hw.perflevel0.l2cachesize` sysctl with 4 MB fallback. Thread counts come from `rayon::current_num_threads()`.
+- **NEON intrinsics are ARMv8 baseline only.** All intrinsics used: `vfmaq_f32`, `vld1q_f32`, `vst1q_f32`, `vdupq_n_f32`, `vaddq_f32`, `vaddvq_f32`, `vmulq_f32`, `vnegq_f32`, `vrndnq_f32`, `vdivq_f32`, `vmaxq_f32`, `vminq_f32`, `vsubq_f32`, `vcvtq_s32_f32`, `vshlq_n_s32`, `vreinterpretq_f32_s32`. No dotprod, no FP16 arithmetic, no SME, no SVE, no BF16 intrinsics. Works on M1/M2/M3/M4 all trims.
+- **500,000 element threshold** for single-thread dispatch is a heuristic. Not chip-specific.
+- **TILE=64** in the transpose (matmul.rs:120) is a cache-blocking parameter, not tied to a specific L1 size.
+
+### One implementation, no arch fork
+
+The NEON kernels are guarded by `cfg(target_arch = "aarch64")` with scalar fallbacks on other architectures. The Accelerate integration is guarded by `cfg(any(target_os = "macos", target_os = "ios"))` with the generic GEMM fallback. This is **runtime branching behind cfg, not a fork of the kernel tree**. Intel (Resch) and ARM/QNN (Luba) share the same `gemm_with_backend` dispatcher and the same scalar reference. Acceptable.
+
+### Parity tests
+
+SiLU: `silu_contiguous_matches_reference` and `silu_in_range_region_is_bit_close` test the NEON path against f64 reference with ≤2e-6 / ≤1e-5 tolerances. Guard-break not directly tested on SiLU NEON (the test goes through `silu_f32_slice` which dispatches to NEON — confirmed reachable via panic probe).
+
+GEMV: `col_parallel_gemv_matches_reference`, `row_parallel_gemv_matches_reference`, `accelerate_sgemm_matches_generic_for_small_shapes`, `accelerate_decode_gemv_matches_generic_at_model_scale`, `col_parallel_matches_at_model_scale`. Guard-break test PASSED for GEMV.
+
+SDPA: **No parity test for the NEON path.** Gap.
+
+---
+
+## End-to-end coherence
+
+Generated 30 tokens with native CPU EP on Qwen 2.5-0.5B at ~30 tok/s with prompt "The capital of France is" (temperature implicitly greedy). No crash, no panic. The compare tool does not report generated text, so direct text comparison against ORT output could not be performed. Both backends generated exactly 30 tokens.
+
+---
+
+## Summary of concerns (non-blocking, for tracking)
+
+| # | Severity | Item | File:Line | Assignee |
+|---|---|---|---|---|
+| C1 | Low | SiLU docstring claims "1 ULP", measured ~28 ULP | activations.rs:353 | Deckard |
+| C2 | Medium | SDPA NEON path has zero test coverage | sdpa.rs:291-294, 744-820 | Pris |
+| C3 | Low | 7 dead code items from removed Accelerate sgemv | accelerate_gemm.rs:17,38,84,101,127,136 | Deckard |
+| C4 | Low | Unused `half` variable | activations.rs:372 | Deckard |
+| C5 | Low | GEMV model-scale tolerance is 2% (actual max 1.57%) | matmul.rs:1887 | Pris |
+| C6 | Info | Compare tool doesn't report generated text for coherence verification | bench compare.rs | Sebastian |
+<!-- merged from .squad/decisions/inbox/christie-split-server-routes.md -->
+### 2026-07-27: Split server routes by endpoint family
+**By:** Christie
+**What:** Replaced the 2,989-line `crates/onnx-genai-server/src/routes.rs` with a `routes/` module tree: `mod.rs` (530 LOC) retains `ApiError`, JSON rejection handling, model resolution, shared request preparation types/helpers, and facade re-exports; `admin.rs` (396 LOC) owns health, models, status, resources, debug, admin, and metrics endpoints; `sessions.rs` (60 LOC) owns session create/delete; `completions.rs` (1,719 LOC) owns completions, embeddings, chat, streaming, and generation helpers; `multimodal.rs` (312 LOC) owns transcription, speech, and image-generation endpoints.
+**Why:** This is a pure code-motion split of the HTTP god-file. Router registration remains untouched in `src/lib.rs`, preserving route paths and registration order exactly. The typed `ApiError` handling and server-side registry logging hardened in PR #213 were moved verbatim without behavior changes.
+
+**Gates:** `cargo build -p onnx-genai-server` passed. `cargo test -p onnx-genai-server` completed with 110 passed, 2 ignored, and only the accepted pre-existing `sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image` failure caused by missing `vlm-executable/vision.onnx`. `cargo clippy -p onnx-genai-server --all-targets -- -D warnings` passed. `cargo fmt -p onnx-genai-server` passed.
+<!-- merged from .squad/decisions/inbox/coordinator-apple-silicon-portability.md -->
+### 2026-07-26: CPU EP optimizations must be general across Apple Silicon
+**By:** Justin Chu (directive, via coordinator)
+**What:** Every optimization in the Mac CPU EP campaign (PR #227) must be correct and beneficial across the whole Apple Silicon family — M1/M2/M3/M4 and their base/Pro/Max/Ultra variants — not tuned to the M1 Max this work happens to be measured on. The M1 Max is the measurement rig, not the target.
+**Why:** Apple Silicon varies enormously along exactly the axes a roofline campaign is tempted to hardcode:
+- **Memory bandwidth** spans roughly 68 GB/s (M1 base) to ~800 GB/s (Ultra). A bandwidth-derived tuning constant baked in from a Max is wrong on most Macs developers own.
+- **Core topology** varies in both count and P:E ratio (e.g. 4P+4E on M1 base vs 8P+2E on M1 Max). Thread counts and work partitioning must be derived at runtime, not assumed.
+- **Cache/SLC sizes** differ per tier, so blocking and tile sizes must be computed from queried cache sizes.
+- **AMX generation differs, and it is undocumented and not architecturally stable.** Reaching the matrix coprocessor must go through Accelerate (BLAS/BNNS), never hand-rolled AMX encodings. M4 additionally exposes SME/SVE, which older chips lack.
+
+**Implications (binding on this campaign):**
+1. No compile-time constants derived from one machine's measurements. Query topology and cache sizes at runtime (`sysctl` / `sysconf`), derive tiling and thread counts from them.
+2. Feature-detect, never assume: any instruction path beyond the ARMv8.4 baseline that all Apple Silicon shares (incl. SME on M4, and dot-product/fp16 variations) requires a runtime check with a correct fallback.
+3. Gate the AMX/matrix path behind Accelerate, and keep a NEON path that is correct when Accelerate is unavailable or slower.
+4. Scaling must be validated as a *shape*, not a point: report performance as a fraction of the machine's own measured roofline, so the result is meaningful on a 68 GB/s M1 Air as well as on this Max.
+5. This does not fork the CPU EP. Per the standing portability rule, the CPU EP stays one general implementation shared with Intel (Resch) and ARM (Luba) — Apple Silicon specialization lives behind runtime detection, not behind a parallel kernel tree.
+<!-- merged from .squad/decisions/inbox/copilot-qwen3-tts-validated.md -->
+### 2026-07-20: Real Qwen3-TTS builds + validates at codec-token level; engine embeds-loop is the next contract
+
+**By:** Copilot (CLI)
+**What:** A real 1.7B `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` package now builds and
+runs end to end at the **codec-token** level via Mobius `examples/qwen3_tts.py`
+(3 models: `embedding`, `talker`, `code_predictor`; CustomVoice has no
+`speaker_encoder`). Fixed two Mobius build bugs to get there, both pushed on
+`mobius@feat/any-to-any-pipeline`:
+1. `codec_embeddings` table is exposed via `op.Identity(stacked_codec_embedding)`;
+   onnx-ir folds the Identity so the sole initializer takes the unprefixed output
+   name `codec_embeddings`. `finalize_stacked_weights` now keys the stacked weight to
+   that exact name (verified `maxdiff 0.0` vs HF `codec_embedding.{i}.weight` stack).
+2. The talker's interleaved-MRoPE `rope_scaling`
+   (`{"interleaved": true, "mrope_section": [24,20,20], "type": "default"}`) was
+   silently dropped by HF PretrainedConfig standardization → talker fell back to 1D
+   RoPE → ORT `cos_cache expected 3 dims, got 4`. `_dict_to_pretrained_config` now
+   preserves raw nested `rope_scaling`/`rope_parameters`, and `_extract_mrope_fields`
+   accepts the bare `interleaved` alias. Greedy generation: 27 frames × 16 codes for
+   "Hello world.", all codes in [0,2047], natural EOS.
+
+**Remaining (ordered), the hard coupled phase:** the onnx-genai engine's
+`nested_autoregressive` (pipeline.rs `run_nested_autoregressive`) is a **simplified
+token-ID** loop (outer feeds input_ids = prev outer argmax; inner threads a per-code
+embed output). The real talker instead consumes **`inputs_embeds`** built *inside* the
+loop each step: `codec_sum + trailing_text`, where `codec_sum = talker.embed(code_0) +
+Σ_i CP.embed[i](code_{i+1})` (from the `embedding` model + `cp_codec_weights`), with 3D
+MRoPE `position_ids`, a `step_index` input, a **2-token** CP prefill
+(`[talker_hidden, talker.codec_embed(code_0)]`), and code_0 suppress tokens. The exact
+reference is `mobius/examples/qwen3_tts.py::generate_codes`. Closing it needs EITHER an
+engine outer-step embedding builder OR a Mobius pre-embedding component that materializes
+the talker `inputs_embeds` sequence — then the `build_tts_pipeline_metadata` emitter
+(`mobius .../onnx_genai/auto_export.py`, replacing the `_looks_like_multi_decoder_tts`
+NotImplementedError). Both sides share an undefined metadata contract, so define the
+contract first rather than implementing the two sides independently.
+
+**Why:** Records that build+validation (DESIGN §20.3 step 1) is DONE and pins the precise
+engine I/O contract so the next session/agent can go straight to the design without
+re-deriving the generation loop. Test package cached at `mobius/output/` (gitignored).
+
+---
+### 2026-07-20 (update): pre_embedder contract COMPLETE end-to-end
+
+**By:** Copilot (CLI)
+**What:** The extensible `pre_embedder` extension to `nested_autoregressive` is fully
+wired across both repos and pushed:
+- **onnx-genai** (`474bac6`): optional `PipelineStrategy.pre_embedder` field (canonical
+  schema `crates/onnx-genai-metadata/src/schema.rs` + regenerated
+  `schema/inference_metadata.schema.json`); engine `run_nested_autoregressive` drives the
+  outer talker via the pre-embedder (frame_codes = prev frame's codes → inputs_embeds);
+  fixture `tests/fixtures/tiny-tts-nested-preembed/` + test
+  `tts_nested_preembed_pipeline_e2e.rs`. Backward compatible (absent ⇒ legacy input_ids
+  loop; `tiny-tts-nested` unregressed). Full engine suite green.
+- **mobius**: `talker_step_embedder` component (`a5e4ab7`, maxdiff 0.0, exact code match)
+  + `build_tts_pipeline_metadata` emitter wired into `write_onnx_genai_config`
+  (emits when the package carries `talker_step_embedder`, else precise raise). Real 1.7B
+  package emits metadata that validates against the committed JSON schema. 43 emitter
+  tests pass.
+- **DESIGN §20.3** documents the finalized contract (required
+  `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds` edge, runtime-resolved
+  frame_codes/text_embed inputs, on_demand phase).
+
+**Remaining (single documented follow-up):** thread the real trailing-text `text_embed`
+and the talker PREFILL embeds (role/codec-tag/speaker/first-text interleaving) — the
+engine currently feeds `text_embed` zeros + a zero frame-0 seed. That is the only piece
+left before bit-accurate real-package audio playback; the codec-token contract + wiring
+are done and schema-validated.
+
+---
+### 2026-07-20 (update 2): prefill + trailing-text follow-up in progress
+
+**By:** Copilot (CLI)
+**What:** PRs opened — onnx-genai #91, mobius #415 (both base `main`). Follow-up (real
+text_embed + prefill) underway:
+- **Mobius `talker_prefill_embedder` DONE** (`1dfb784`): `text_ids -> prefill_embeds
+  [B,8,H] + trailing_text_embeds [B,text_len-8,H]`, reuses embedding weights, validated
+  vs generate_codes (maxdiff ~1e-7, Auto/no-speaker/no-instruct path). prefill_len=8
+  (constant), trailing_len=text_len-8.
+- **Engine wiring IN PROGRESS** (delegated): optional `prefill_embedder` field on
+  nested_autoregressive; frame 0 feeds `prefill_embeds` to the talker (past_len += P),
+  frames>=1 feed `trailing_text_embeds[:,k-1,:]` as the pre_embedder `text_embed` (zeros
+  when exhausted). Backward compatible.
+
+**Next after engine lands:** extend the Mobius `build_tts_pipeline_metadata` emitter to
+emit `prefill_embedder` + `talker_prefill_embedder` (prompt_only); update DESIGN §20.3;
+real-audio parity check vs generate_codes. Remaining follow-ups: speaker/language/instruct
+prefill branches; exact tts_pad embedding for exhausted trailing text.
+
+---
+### 2026-07-20 (update 3): prefill + trailing-text COMPLETE; PR #415 comments resolved
+
+**By:** Copilot (CLI)
+**What:**
+- **Engine `prefill_embedder` DONE** (onnx-genai `94d0d6e`): optional field on
+  nested_autoregressive; frame 0 feeds `prefill_embeds` to the talker (past_len += P),
+  frames>=1 thread `trailing_text_embeds[:,k-1,:]` as the pre_embedder `text_embed`
+  (zeros when exhausted). Schema regenerated; fixtures `tiny-tts-nested-prefill` + tests
+  green; backward compatible.
+- **Mobius emitter DONE** (`build_tts_pipeline_metadata` emits `prefill_embedder` +
+  `talker_prefill_embedder` prompt_only when present). Real 5-model 1.7B package emits
+  the full `pre_embedder` + `prefill_embedder` contract + passes schema validation.
+- **DESIGN §20.3 updated**: prefill/trailing-text now DONE (was "follow-up TODO").
+- **PR #415 review comments resolved**: ort-genai runtime choice, unified
+  `build_from_gguf(mmproj=...)`, ASR/TTS exports, codec dtype fp16/bf16 mapping, docstrings,
+  onnx_ir.save. Replied to both @justinchuby threads.
+
+**Remaining refinements (small):** speaker/language/instruct prefill branches in
+`talker_prefill_embedder` (currently Auto/no-speaker/no-instruct); exact tts_pad
+embedding for exhausted trailing text. Full engine-side real-audio E2E parity check
+(vs generate_codes) needs a runner harness — the codec-token contract + all wiring are
+done + schema-validated.
+<!-- merged from .squad/decisions/inbox/deckard-fp16-review-followups.md -->
+### 2026-07-27: FP16 GEMV review follow-ups
+**By:** Deckard
+**What:** Documented each NEON f16 inline-asm conversion site with the stabilization condition for replacing it with f16 intrinsics, and tightened FP16 GEMV guards to `1e-4` relative / `1e-5` absolute. The model-scale guard now runs under 1, 3, 7, and 11 Rayon workers to cover Apple Silicon worker-count differences.
+**Why:** Chew verified the asm is bit-exact but noted the maintainability hazard; the comments preserve that context until Rust `f16` and aarch64 f16 conversion intrinsics stabilize. Chew measured 2.38e-7 max relative f64-reference drift, 1.73e-6 FP16-vs-F32 parity, and 2.28e-7 odd-tail absolute error, so the new thresholds keep cross-chip headroom while catching real FP16 accumulate, lane, or tail regressions.
+<!-- merged from .squad/decisions/inbox/dillon-split-ort-decode.md -->
+### 2026-07-27: Split ORT decode by cache and session family
+**By:** Dillon
+**What:** Replaced `crates/onnx-genai-ort/src/decode.rs` with a facade and six focused submodules:
+
+- `decode/mod.rs` — 201 lines; public option/signature types, batched trait, and re-exports.
+- `decode/dynamic.rs` — 1,550 lines; dynamic past/present decode and captured-step tests.
+- `decode/kv_growth.rs` — 465 lines; shared KV bucket growth, host/CUDA prefix copying, and tests.
+- `decode/static_cache.rs` — 1,210 lines; scalar and batched static-cache sessions.
+- `decode/shared_batch.rs` — 476 lines; continuous-batch shared-buffer session.
+- `decode/io.rs` — 196 lines; KV-name pairing and static-cache signature detection.
+- `decode/tensor.rs` — 149 lines; logits, cloning, empty tensor, and allocation helpers.
+
+All existing public types remain available from `onnx_genai_ort::decode` through facade re-exports. The `decode_contract`-based `KvNamingConvention`, `kv_suffix`, and `name_contains_present_key_value` call sites were moved unchanged into `decode/io.rs`; no local classifier copies were introduced.
+
+`cargo fmt -p onnx-genai-ort` was run. Gates passed:
+
+- `cargo build -p onnx-genai-ort`
+- `cargo test -p onnx-genai-ort` (all unit, integration, and doc tests)
+- `cargo clippy -p onnx-genai-ort --all-targets -- -D warnings`
+- `cargo build -p onnx-genai-engine`
+
+**Why:** The original 4,239-line file mixed materially different cache ownership and batching models. The split is pure code motion and clarifies ownership without changing algorithms, allocation, CUDA annotations, or the public facade.
+
+
+<!-- merged from .squad/decisions/inbox/fact-checker-roofline-adjudication.md -->
+# Fact Checker: Roofline Adjudication — M1 Max CPU EP Campaign
+
+**By:** Fact Checker
+**Date:** 2026-07-27T05:04Z
+**Branch:** `squad/mac-cpu-ep-roofline` (PR #227)
+**Machine:** Apple M1 Max (MacBookPro18,2), 8 P-cores + 2 E-cores, 32 GiB LPDDR5
+
+---
+
+## TL;DR — The Authoritative Number
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| **Achievable 8-P-core DRAM read bandwidth** | **~112 GB/s** (range 108–120) | Independently reproduced |
+| **Roofline ceiling, Qwen 0.5B FP32 batch-1 decode** | **~56–57 tok/s** | 112 GB/s ÷ 1.976 GB |
+| **ORT's position** | **45.45 tok/s = 80% of roof** | Not 44.6% |
+| **~59 tok/s target** | **Physically at the ragged edge; realistic target is 52–56 tok/s** | Exceeds GEMV-achievable BW |
+
+**Sebastian's 197 GB/s headline ceiling is wrong. It is not reproducible.** His own "achievable MT GEMV = 112 GB/s" is the correct number, and it agrees with Pris's probe (108.3 GB/s) and my independent measurements (108–120 GB/s). The campaign should use **~112 GB/s** as the bandwidth ceiling for FP32 GEMV decode.
+
+---
+
+## 1. Reproduction of Both Measurements
+
+### My Independent Bandwidth Measurement
+
+I compiled and ran three standalone C programs from scratch (`_scratch_fc/bw_test.c`, `bw_neon.c`, `bw_sweep.c`) testing:
+- Scalar 8-byte reads (mimicking both approaches)
+- NEON 16/64/128-byte vectorized reads
+- With and without QoS thread affinity (`QOS_CLASS_USER_INTERACTIVE`)
+- Buffer sizes from 1 MiB to 256 MiB per thread
+
+**Key results (8 P-cores, 256 MiB/thread, QoS, best of 5):**
+
+| Approach | 1 thread | 2 threads | 4 threads | 8 threads |
+|----------|----------|-----------|-----------|-----------|
+| Scalar read, no QoS | 52.9 | 99.3 | 76.3 | 115.4 |
+| Scalar read, QoS | 55.5 | 62.9 | 88.3 | **119.7** |
+| Volatile read (≈ black_box), no QoS | 22.1 | 42.0 | 76.8 | 122.9 |
+| NEON 128B unrolled, QoS | 59.9 | 56.2 | 98.9 | 109.2 |
+
+**Buffer-size sweep (8 threads, QoS):**
+
+| Total buffer | GB/s |
+|-------------|------|
+| 32 MiB (near SLC) | 102.0 |
+| 48 MiB (SLC boundary) | 99.1 |
+| 256 MiB (DRAM) | 110.5 |
+| 2 GiB (DRAM, matches both probes) | 119.1 |
+
+**Conclusion: the 8-P-core DRAM streaming-read bandwidth on this M1 Max is 108–120 GB/s.** It is NOT 197 GB/s. My single-core results (55–60 GB/s) match Sebastian's single-core claim (60.2 GB/s), so the hardware is the same — the discrepancy is purely in the multi-threaded scaling.
+
+### Pris's Probe Reproduction
+
+Pris's code (`compare.rs:747–786`) uses:
+- `thread::scope` with 8 threads (from `hw.perflevel0.physicalcpu`)
+- 256 MiB/thread (line 709)
+- `wrapping_add` with `std::hint::black_box` (sequential dependency chain)
+- Best of 3 repetitions
+- **No thread affinity (no QoS class)**
+
+Her reported 108.3 GB/s falls squarely in my measured range. The slight underperformance vs my best (119 GB/s) is explained by:
+1. `black_box` adds a compiler barrier per load (prevents instruction reordering)
+2. No QoS → some threads may run on E-cores at 2–4 thread counts
+3. Rust's iterator overhead vs C pointer arithmetic (minor)
+
+**Pris's 108.3 GB/s: ✅ Consistent with independent measurement.**
+
+### Sebastian's Measurement: NOT Reproducible
+
+Sebastian claims 196.8 GB/s for "sequential read, 256 MiB/thread, from DRAM" on 8 P-cores. My maximum is 122.9 GB/s under any access pattern, thread configuration, or QoS setting. His number is **1.64× what I can reproduce**.
+
+The most likely error source: Sebastian's 197 GB/s streaming measurement has a bug in the benchmark code — possibly a timing error (e.g., dividing total bytes by per-rep time instead of total time), double-counting bytes across repetitions, or a buffer that was partially SLC-resident despite being nominally 256 MiB.
+
+**However, Sebastian's own GEMV measurement (112 GB/s, 8 threads, gate_proj 4864×896) is correct.** It is consistent with both my streaming bandwidth and Pris's probe. He has two contradictory numbers in his own report — a streaming-read "ceiling" (197 GB/s) and an "achievable GEMV" (112 GB/s) — and the achievable GEMV is the correct one.
+
+---
+
+## 2. Mechanistic Explanation of the 197 vs 108 Gap
+
+**They are NOT measuring "different things" where both are right. Sebastian's 197 GB/s is an erroneous measurement.**
+
+Evidence:
+1. My independent streaming read (identical methodology: scalar sequential, 256 MiB/thread, 8 P-cores, QoS) peaks at 119.7 GB/s — nowhere near 197.
+2. The M1 Max has 400 GB/s total LPDDR5 bandwidth shared across CPU, GPU, and Neural Engine. The CPU accessing 197 GB/s = 49% of total is inconsistent with published measurements (~30% CPU share = ~120 GB/s in Anandtech, Chips and Cheese, and other independent reviews).
+3. Sebastian's own data is self-contradictory: his single-core BW (60.2 GB/s) would require 60.2 × 8^0.58 = 197 GB/s scaling, but this exponent was derived FROM the 197 GB/s number, making it circular. Independent measurement shows 8-thread scaling of ~2.0× single-core (60 → 120), not 3.3×.
+
+**Candidate hypotheses tested:**
+
+| Hypothesis | Result |
+|-----------|--------|
+| QoS/affinity difference | Tested both. QoS affects 2–4 threads, not 8. Max 8T: 119.7 vs 122.9 GB/s |
+| NEON-wide loads vs scalar | Tested 8B/16B/64B/128B loads. All converge to 109–120 GB/s at 8 threads |
+| Buffer too small → SLC | Tested 1–256 MiB/thread. SLC boundary (~48 MiB total) shows no 197 GB/s cliff |
+| E-core contamination | E-cores only in no-QoS mode; all-10-core test = 126.1 GB/s (still <197) |
+| Thermal/power state | 5 repetitions in each test; best-of-5 consistent across tests |
+
+**Bottom line: Sebastian's streaming-read benchmark has a bug.** His GEMV number (112 GB/s) was measured with a different, more realistic benchmark (actual matrix multiply, not a synthetic loop) and is correct. The campaign should discard the 197 GB/s figure entirely.
+
+---
+
+## 3. Authoritative Roofline Number
+
+**For batch-1 FP32 decode of Qwen 2.5-0.5B on Apple M1 Max:**
+
+```
+Achievable GEMV bandwidth:     ~112 GB/s  (110–120 range)
+Weight bytes per token:         1.976 GB   (from model shapes)
+Roofline ceiling:              ~56.7 tok/s
+ORT baseline:                   45.45 tok/s (80.2% of roof)
+Realistic target (persistent pool): 52–56 tok/s (92–99% of roof)
+```
+
+**Convention applied:** The achievable peak for the relevant access pattern (multi-threaded GEMV, not pure streaming read) is the correct roofline denominator, per standard roofline methodology. A pure streaming read (119 GB/s) is not achievable under actual GEMV because of FMA compute, write-back, and thread synchronization. The 112 GB/s GEMV-achievable number from Sebastian's own measurements is the correct ceiling.
+
+### Blended analysis (cache effects on small matrices)
+
+Not all matrices hit DRAM. Small qkvo projections (≤3.2 MB) fit in L2 and achieve ~145 GB/s (Sebastian's data, plausible):
+
+| Matrix class | Weight bytes | Effective BW | Time |
+|-------------|-------------|-------------|------|
+| qkvo (L2-resident) | 176 MB | 145 GB/s | 1.21 ms |
+| FFN + LM head (DRAM) | 1800 MB | 112 GB/s | 16.07 ms |
+| **Total GEMV** | **1976 MB** | | **17.28 ms** |
+| Non-GEMV overhead | — | — | ~1–2 ms |
+| **Realistic total** | | | **18.3–19.3 ms** |
+| **Achievable tok/s** | | | **51.8–54.6** |
+
+**Authoritative verdict: the achievable FP32 ceiling on this machine is ~52–57 tok/s**, depending on cache effects and non-GEMV overhead. ORT at 45.45 is beatable by 15–25%, not 30%+.
+
+### Apple Silicon Generality
+
+This roofline scales with each chip's measured CPU bandwidth. The 112 GB/s is specific to M1 Max; other chips will differ:
+
+| Chip | Estimated CPU BW | FP32 Ceiling | ORT % of roof (est.) |
+|------|-----------------|-------------|---------------------|
+| M1 Air (4P) | ~30 GB/s | ~15 tok/s | ~80% (similar) |
+| M1 Max (8P) | ~112 GB/s | ~57 tok/s | ~80% (measured) |
+| M4 Pro (10P) | ~120–150 GB/s | ~61–76 tok/s | ~80% (estimated) |
+
+The **relative** conclusion (ORT ≈ 80% of achievable roof; custom GEMV can reach 92–99%) is expected to hold across the Apple Silicon family because the physics are the same. The **absolute** numbers must be measured per chip.
+
+---
+
+## 4. Devil's Advocate — Campaign Central Claim
+
+**Claim:** *"A multithreaded NEON GEMV on a persistent pool will reach ~59 tok/s and beat ORT's 45.45."*
+
+### 4.1 Is 59 tok/s physically achievable?
+
+**No. 59 tok/s requires ~116.6 GB/s effective bandwidth, which exceeds the GEMV-achievable ceiling (~112 GB/s) by 4%.** Even the pure streaming-read ceiling (119 GB/s) barely supports it.
+
+With cache effects on small matrices, the absolute theoretical maximum (zero overhead, perfect cache, perfect pool) is **~57.9 tok/s**. Adding any non-GEMV overhead (attention, layer norm, sampling: ~1–2 ms) drops this to **~52–55 tok/s**.
+
+**The ~59 tok/s target is 4–13% above what the hardware can deliver.** It was derived from Sebastian's erroneous 197 GB/s ceiling, which inflated the perceived headroom.
+
+### 4.2 What is ORT actually doing?
+
+ORT's CPU EP uses MLAS — Microsoft's internal BLAS library with:
+- Persistent thread pool (no per-call thread creation)
+- Optimized NEON GEMV with cache-aware tiling
+- Multi-threaded N-dimension parallelism for M=1
+- Static thread scheduling (no work-stealing overhead)
+
+At 88 GB/s effective, ORT achieves **79% of the GEMV ceiling (112 GB/s)**. This is excellent. We're proposing to build exactly what ORT already has (persistent-pool NEON GEMV), so the question is: why would ours be faster rather than merely equal?
+
+Possible advantages of our approach:
+- Shape-aware dispatch (Accelerate for small matrices, custom NEON for large ones)
+- Tighter integration (no ONNX Runtime overhead)
+
+Possible disadvantages:
+- MLAS has been production-tuned for years; our kernel is new
+- We lack MLAS's sophisticated cache-tiling strategies
+- Our Rayon pool uses work-stealing (overhead) vs MLAS's static dispatch
+
+**Realistic FP32 outcome: parity with ORT (45 tok/s) to modest superiority (50–55 tok/s).** The 30% advantage (59 tok/s) is not achievable.
+
+### 4.3 The "persistent pool recovers 33%" assumption
+
+Sebastian's measured pthread GEMV: 39.8 tok/s (25.1 ms). His persistent-pool estimate: ~59 tok/s (~17 ms). The gap (8.1 ms) was attributed to thread creation/join overhead.
+
+**This assumption is load-bearing and numerically wrong:**
+- 168 GEMV calls × 8 threads × 2 ops (create+join) = 2,688 thread operations
+- At ~3 µs each = ~8.1 ms — arithmetic checks out
+- But a persistent pool doesn't achieve zero overhead. Rayon task dispatch costs ~0.5–1.5 µs per task.
+- Realistic savings: 8.1 ms → 0.5 ms, for net time of 17.5 ms → **57 tok/s**
+- But this STILL exceeds the bandwidth limit (56.7 tok/s from GEMV ceiling)
+
+**The estimate assumed thread overhead was the ONLY bottleneck.** It isn't — memory bandwidth is the binding constraint. Removing thread overhead gets you TO the bandwidth ceiling; it doesn't get you ABOVE it.
+
+Corrected estimate with persistent pool: **52–56 tok/s** (not 59).
+
+### 4.4 Strongest argument that FP32 parity is the realistic best case
+
+1. ORT's MLAS is a mature, well-tuned BLAS with persistent pools and optimized cache tiling. We are proposing to replicate what MLAS already does.
+2. At 80% of achievable bandwidth, ORT is already in the regime of diminishing returns. Each additional percentage point of BW utilization is exponentially harder.
+3. Our Rayon work-stealing pool has inherent overhead that MLAS's static scheduling avoids.
+4. The 20% gap between ORT (80%) and ceiling (100%) includes non-GEMV overhead that we cannot eliminate (attention, layer norms, sampling, token embedding lookup).
+5. **FP16/quantization changes the game entirely**: halving bytes per token doubles the ceiling to ~114 tok/s. The absolute gain from FP16 (45 → ~95 tok/s) dwarfs the gain from better FP32 GEMV (45 → ~52 tok/s).
+
+### 4.5 Pre-Mortem: 30 Days From Now, FP32 NEON GEMV Did Not Beat ORT
+
+**Date:** 2026-08-26. The PR ships an FP32 multithreaded NEON GEMV on Rayon. Results: 47.2 tok/s. Improvement: 4% over ORT. Not worth the engineering cost. What happened?
+
+1. **Rayon work-stealing overhead.** MLAS uses static thread scheduling with pre-computed tile assignments. Rayon's work-stealing dequeue/steal pattern adds 0.3–0.8 µs per task. Over 168 GEMV dispatches, this adds 0.5–1.3 ms — eating half the theoretical advantage.
+
+2. **Cache thrashing from work-stealing.** Rayon's threads migrate between cores when stealing work. This invalidates L1/L2 hot data, reducing effective bandwidth on the next GEMV call. MLAS pins work to threads, preserving cache residency.
+
+3. **Small-matrix regression.** The hybrid dispatch (Accelerate for small matrices, NEON for large) required calling Accelerate's `cblas_sgemv` from outside the Rayon pool. But the engine's decode loop already runs ON the Rayon pool (from Rayon's global scope), causing oversubscription when Accelerate's GCD spawns additional threads. The team fell back to NEON for all sizes, losing the cache-resident advantage on small matrices.
+
+4. **Non-GEMV overhead was underestimated.** Attention computation (softmax over KV cache), layer norms, and RoPE embeddings add 2.5 ms per token — more than the 1–2 ms assumed. This pushes the floor from 52 to 48 tok/s even with perfect GEMV.
+
+5. **The team targeted 59 tok/s and felt they failed at 52 tok/s**, so they spent the remaining time on kernel micro-optimization instead of shipping the 15% improvement they already had and pivoting to FP16.
+
+---
+
+## 5. Verification of Load-Bearing Claims
+
+| # | Claim | Verdict | Evidence |
+|---|-------|---------|----------|
+| 1 | Model weights are 1932 MB FP32 | ⚠️ **Approximately correct, unit confusion** | model.onnx.data = 1,984,561,152 bytes (1984.6 MB). Shape-based: 1975.8 MB. Sebastian writes "1.932 GB" in summary — this appears to be GiB (1975.8/1024 = 1.929 GiB). The number is correct within 3%; the unit label is wrong. |
+| 2 | ORT baseline 45.45 tok/s | ⚠️ **Unverified today** | Would require a full `cargo build --release` + benchmark run. Pris's harness (committed `e5ff5bf1`, `d8857cf0`) reports this number, and Sebastian's independent profile agrees. Plausible but not independently reproduced in this session due to build time constraints. |
+| 3 | `CpuBackend::Accelerate` falls through to `gemm_generic` | ✅ **Verified (committed code)** | `backend.rs:48–50`: "Design placeholder — currently routes to Generic arithmetic." `matmul.rs:167–172` (committed HEAD): `_ => { gemm_generic(...) }`. The Accelerate arm has NO dedicated match — it's caught by the wildcard. **Note:** Iran's uncommitted local changes (`matmul.rs` diff) wire `CpuBackend::Accelerate` to `neon_gemv_parallel` + `cblas_sgemm`. |
+| 4 | `gemm_generic` is single-threaded at M=1 | ✅ **Verified (committed code)** | `matmul.rs:196–221` (committed HEAD): `mc = 1` when M=1 → `par_chunks_mut(1 * n)` = one chunk → zero parallelism. No `gemm_generic_col_parallel` exists in committed code. **Note:** Iran's uncommitted changes add a col-parallel path at lines 207–209. |
+| 5 | Accelerate `cblas_sgemv` collapses to 33 GB/s on LM head | ⚠️ **Plausible, not independently verified** | Sebastian's measurements show 33–35 GB/s sustained for the 544 MB LM head matrix. This is consistent with Accelerate's known poor multi-threading for large DRAM-bound GEMV (well-documented in Apple developer forums). I did not independently run `cblas_sgemv` microbenchmarks, but the number is physically reasonable (below single-core BW of 60 GB/s, suggesting effectively single-threaded execution). |
+| 6 | FFN + LM head = 91% of weight bytes | ✅ **Verified** | gate+up+down (3×418.4 MB) + lm_head (544.5 MB) = 1799.7 MB / 1975.8 MB = **91.1%**. Computed from model shapes. |
+| 7 | Sebastian's streaming-read BW = 197 GB/s | ❌ **Contradicted** | Independent measurement with three distinct benchmark programs, multiple access widths, with and without QoS affinity: maximum 8-P-core bandwidth = 119.7 GB/s (best of 5). Sebastian's 197 GB/s is 1.64× higher than reproducible. |
+| 8 | Pris's probe = 108.3 GB/s | ✅ **Consistent** | Falls within measured range of 108–120 GB/s for 8-P-core sequential reads at 256 MiB/thread. |
+| 9 | Sebastian's achievable MT GEMV = 112 GB/s | ✅ **Plausible and consistent** | 112 GB/s is within the measured streaming bandwidth range (108–120 GB/s) and slightly below the raw streaming ceiling as expected for GEMV (which has FMA compute and write-back overhead). |
+
+---
+
+## 6. Recommendation
+
+### Use this roofline going forward
+
+```
+BW_achievable = ~112 GB/s  (measure at startup; do NOT use 197)
+W_bytes       = 1.976 GB   (from model shapes)
+Ceiling       = 56.7 tok/s
+ORT           = 80.2% of ceiling
+Target        = 52–56 tok/s (92–99% of ceiling)
+```
+
+### Revise the ~59 tok/s target downward
+
+The team should target **52–56 tok/s** for FP32, which is a 15–23% improvement over ORT. This is still a meaningful win and is physically achievable.
+
+### Accelerate the pivot to FP16
+
+The real user-facing win is FP16:
+- FP16 halves bytes per token → ceiling doubles to ~114 tok/s
+- Sebastian measured FP16 NEON at 94 GB/s on the LM head (188 GB/s FP32-equivalent, near the streaming ceiling)
+- Estimated FP16 ceiling: ~95–100 tok/s (2.1× ORT)
+- ORT has no CPU FP16 path on Apple Silicon → clear competitive differentiation
+- The marginal engineering effort (custom NEON kernel) is the same
+
+### This analysis transfers across Apple Silicon
+
+The absolute numbers change by chip, but the conclusions are universal:
+- ORT ≈ 80% of achievable BW everywhere (MLAS scales with cores)
+- FP32 headroom above ORT ≈ 15–25% everywhere
+- FP16/quantization is the multiplier, not FP32 kernel quality
+
+
+<!-- merged from .squad/decisions/inbox/fact-checker-win-verification.md -->
+# Fact Checker: Win Verification — "Native CPU EP beats ORT by 1.27×"
+
+**Verdict: ❌ OVERSTATED — Cannot reproduce. Native FP16 does not beat ORT.**
+
+**By:** Fact Checker
+**Date:** 2026-07-27T09:17Z
+**Branch:** `squad/mac-cpu-ep-roofline` (PR #227)
+**Machine:** Apple M1 Max (MacBookPro18,2), 8 P-cores, 32 GiB LPDDR5
+**Commit:** `a1859113d1c90c572ef837edcd713507eb230387`
+**Instrument:** Pris's committed `compare.rs` harness, same flags as Iran's run
+
+---
+
+## Executive Summary
+
+Iran claims native FP16 decode at **57.5 tok/s = 1.27× ORT's best** (45.0 tok/s FP32).
+
+On independent reproduction using the same harness, model, prompt, and flags:
+- **Native FP16 decode: 36.1 tok/s** (median, 5 runs) — not 57.5
+- **ORT FP32 decode: 45.7 tok/s** — consistent with Iran's 45.0
+- **Native/ORT ratio: 0.79×** — native *loses*, not wins
+
+The 57.5 tok/s figure is **not reproducible**. Even my best single run (42.7 tok/s) is 26% below Iran's claim. The headline should not be published.
+
+---
+
+## 1. Benchmark Reproduction
+
+### Exact command (FP32)
+```
+cargo run --release -p onnx-genai-bench --features bench-native --bin compare -- \
+  --model models/qwen2.5-0.5b --prompt "Write a short Rust function that reverses a string." \
+  --tokens 50 --decode-skip 2 --warmups 1 --runs 5 --profile-json target/fc-fp32.json
+```
+
+### Exact command (FP16)
+```
+cargo run --release -p onnx-genai-bench --features bench-native --bin compare -- \
+  --model models/qwen2.5-0.5b-f16 --prompt "Write a short Rust function that reverses a string." \
+  --tokens 50 --decode-skip 2 --warmups 1 --runs 5 --profile-json target/fc-fp16.json
+```
+
+### Results
+
+| Backend | Model | Iran claimed tok/s | FC reproduced tok/s (median) | FC spread [p10–p95] | Status |
+|---------|-------|--------------------|------------------------------|---------------------|--------|
+| ORT FP32 | qwen2.5-0.5b | 45.0 | **45.70** | [34.35, 45.76] | ✅ Matches |
+| ORT FP16 | qwen2.5-0.5b-f16 | 40.8 | **39.87** | [23.02, 42.41] | ✅ Roughly matches |
+| Native FP32 | qwen2.5-0.5b | 41.3 | **40.92** | [38.34, 41.72] | ✅ Matches |
+| **Native FP16** | **qwen2.5-0.5b-f16** | **57.5** | **36.09** | **[29.79, 41.49]** | **❌ NOT reproduced** |
+
+**Three of four cells reproduce; the headline cell does not.** The FP32 and ORT numbers are within noise of Iran's. The native FP16 number is 37% below the claim.
+
+### End-to-end (including TTFT)
+
+| Backend | TTFT ms (median) | End-to-end tok/s (median) | Total ms (median) |
+|---------|------------------|---------------------------|-------------------|
+| Native FP32 | 1022.3 | 15.59 | 3206.9 |
+| Native FP16 | 1246.5 | 12.96 | 3857.3 |
+| ORT FP32 | 107.0 | 41.64 | 1200.7 |
+| ORT FP16 | 112.8 | 35.96 | 1390.4 |
+
+**Native TTFT is 9.6–11.0× worse than ORT.** End-to-end, native is 0.36× ORT. The decode-only metric (which drops TTFT) is the most charitable framing.
+
+### Run-to-run variance
+
+The system was not idle (overnight autonomous squad operation). Native FP16 per-run decode tok/s over 7 runs (3 warmups):
+
+```
+Run 1: 39.87    Run 5: 33.35
+Run 2: 42.68    Run 6: 35.41
+Run 3: 30.99    Run 7: 29.04
+Run 4: 34.48
+```
+
+Coefficient of variation: ~14%. Even accounting for maximum noise, the best single run (42.68) is still:
+- 26% below Iran's 57.5
+- Below ORT FP32's median (45.70)
+- Below ORT FP16's median (39.87) by only 7%
+
+**The 1.27× margin does not survive any reasonable variance budget.**
+
+---
+
+## 2. Steady-State Framing
+
+The `--decode-skip 2` parameter is implemented in `compare.rs` lines 641–660. The decode window calculation:
+
+```rust
+let decode_tokens = generated_tokens.saturating_sub(args.decode_skip);
+let decode_window = token_times[token_times.len() - 1]
+    .saturating_sub(token_times[args.decode_skip.saturating_sub(1)]);
+```
+
+**This is applied identically to both backends** via the same `run_direct_once()` function (line 584). No skew. The TTFT is excluded from both backends' decode throughput equally.
+
+However, the "steady tok/s" framing flatters native disproportionately because native's TTFT is 10× worse. The honest comparison is:
+
+| Metric | Native FP16 | ORT FP32 | Ratio |
+|--------|-------------|----------|-------|
+| Decode tok/s | 36.1 | 45.7 | 0.79× |
+| End-to-end tok/s | 13.0 | 41.6 | 0.31× |
+
+**The defensible headline is decode-only, and even there native loses.**
+
+---
+
+## 3. GB/s Internal Consistency
+
+The `model_weight_bytes()` function (line 727) sums `model.onnx` + `model.onnx.data*` files — identical for both backends. GB/s is computed as:
+
+```
+tok/s × model_weight_bytes / 1e9
+```
+
+Using my reproduced numbers:
+- Native FP16: 36.1 × 994,146,547 / 1e9 ≈ 35.9 GB/s
+- ORT FP32: 45.7 × 1,984,877,724 / 1e9 ≈ 90.7 GB/s
+
+Iran's computation method is consistent but applied to an unreproduced tok/s for native FP16.
+
+---
+
+## 4. FP16 Path Verification
+
+### 4a. Kernel reachability — ✅ CONFIRMED
+
+Added atomic counter probe to `matmul.rs` line 505 (then reverted):
+
+```
+[FC-PROBE] neon_gemv_f16_col_parallel ACTIVE (call #0), k=896, n=4864
+[FC-PROBE] neon_gemv_f16_col_parallel ACTIVE (call #10), k=896, n=4864
+[FC-PROBE] neon_gemv_f16_col_parallel ACTIVE (call #50), k=896, n=4864
+```
+
+The FP16 GEMV path is genuinely executing during native FP16 inference. `git status` confirms probe was reverted.
+
+### 4b. `to_dense_f32_widen` bypass — ✅ CONFIRMED (for B weights, not for all inputs)
+
+In `matmul.rs` line 495–512, when the FP16 GEMV path is taken:
+- **B (weights):** Read via `transposed_b_f16()` as raw `u16` — no widening to f32. ✅
+- **A (activations):** Still widened via `self.prepack.dense(0, &inputs[0])` → `to_dense_f32_widen`. But A is already f32 (activations), so no widen occurs.
+
+The architectural claim "reads FP16 directly from the mmap" requires clarification: the kernel reads from a **heap-allocated transposed u16 copy** (`transposed_b_f16`, line 181: `vec![0u16; n * k]`), not directly from the mmap. The mmap data is read once to populate the transpose cache. The GEMV then reads 2 bytes/weight from this cache, which is the bandwidth win.
+
+### 4c. Resident memory — INCONCLUSIVE
+
+macOS `vmmap --summary` during native FP16 decode:
+```
+TOTAL: 803.6M virtual, 184.4M resident
+Physical footprint: 960K
+```
+
+The 960K physical footprint is likely measured at a moment when mmap pages were not yet faulted in. The 803.6M virtual is consistent with ~948 MB mmap + overhead. The transposed u16 cache should add another ~948 MB heap, but MALLOC regions showed only 8 MB — suggesting the large allocations may have been released or not yet populated at measurement time. **This check is inconclusive; more controlled measurement needed.**
+
+The expected memory model:
+- FP16 path: ~948 MB mmap + ~948 MB transposed u16 cache = ~1.9 GB total
+- FP32 path: ~1932 MB mmap + ~1932 MB transposed f32 cache = ~3.9 GB total
+
+---
+
+## 5. Output Coherence — ✅ PASS (100 tokens), ⚠️ NON-DETERMINISM at 500 tokens
+
+### 100-token greedy generation (temperature=0, seed=0)
+
+Native FP16 and Native FP32 produce **byte-identical token IDs** and text on the same prompt:
+
+```
+generated_token_ids: [220, 16, 13, 33789, 374, 264, 91174, 31969, 4128, ...]
+```
+
+Both produce: *"1. Rust is a statically typed language, which means that the type of a variable is known at compile time..."*
+
+**The FP16 GEMV produces numerically correct output.**
+
+### ⚠️ Non-determinism at 500 tokens
+
+When generating 500 tokens with `--runs 3`, `profile_native` reported:
+```
+Error: native greedy decode was not deterministic
+```
+
+Token divergence begins at token ~175 between runs. This is likely caused by the SPMD pool auto-calibration switching between flat and threaded execution paths, which introduces floating-point non-associativity. The auto-calibration message confirms:
+
+```
+onnx-genai: persistent SPMD decode pool built for auto-calibration
+```
+
+This is a correctness concern for production use but does not invalidate the benchmark claim.
+
+---
+
+## 6. Supporting Claims Verification
+
+| Claim | Verdict | Evidence |
+|-------|---------|----------|
+| ORT is slower on FP16 than FP32 | ✅ Verified | ORT FP16: 39.87 tok/s vs ORT FP32: 45.70 tok/s. Iran's narrative that ORT widens f16→f32 (doubling bandwidth) is architecturally sound. |
+| 3.26 tok/s pre-campaign baseline | ⚠️ Unverified | Not directly testable; would require reverting to pre-campaign code. Plausible given the known FMB path issues. |
+| 906 tests pass | ✅ Verified | `cargo test -p onnx-runtime-ep-cpu`: 906 passed, 0 failed, 5 ignored. Full workspace fails on mlas-sys (pre-existing x86 cross-compile) and cpuinfo (missing CMakeLists). |
+| `cargo fmt --all -- --check` clean | ✅ Verified | Exit code 0, no output. |
+| NEON bulk conversion was load-bearing (FP16 slower without it) | ⚠️ Unverified | Would require reverting commit `75311827` and re-benchmarking. The architectural argument is sound: without NEON `fcvtl`, scalar f16→f32 conversion would dominate. |
+
+---
+
+## 7. Devil's Advocate
+
+### Are we comparing ORT at its best?
+
+**Most likely source of future embarrassment.** The harness uses `EngineConfig::default()` for ORT, which means:
+- Default thread count (likely `std::thread::available_parallelism()` = 10 on this M1 Max)
+- Default graph optimization level (ORT's default = Level 1 = basic)
+- Default arena allocation
+
+ORT supports `ORT_SESSION_OPTIONS_GRAPH_OPTIMIZATION_LEVEL = ORT_ENABLE_ALL` (Level 99) and `ORT_SESSION_OPTIONS_INTRA_OP_NUM_THREADS` tuning. **We did not verify ORT is at its best configuration.** However, since our FP32 ORT numbers match Iran's, this is a concern for both our and Iran's measurements equally.
+
+### Is the win model/prompt/token-count specific?
+
+Tested only on Qwen 2.5 0.5B with one prompt at 50 tokens. The model has K=896, N=4864 for the main GEMV — small enough that cache effects may differ from larger models. **No generalization beyond this model is warranted.**
+
+### Apple Silicon generality
+
+The M1 Max has 400 GB/s unified memory bandwidth (theoretical). At 8 P-cores, the achievable DRAM bandwidth is ~112 GB/s (per roofline adjudication). Lower-bandwidth parts (M1 base = 68.25 GB/s theoretical, ~34 GB/s achievable on 4 P-cores) would see:
+- Proportionally lower tok/s on both backends
+- The FP16 bandwidth advantage (2×) would remain, but absolute numbers would halve
+- The TTFT gap would widen because prefill is also memory-bound on native
+
+**The relative ratios should transfer across the Apple Silicon family, but the absolute numbers are M1 Max-specific.**
+
+### What breaks first in production?
+
+1. **TTFT** — Native TTFT is 1022–1246 ms vs ORT 107–113 ms. For interactive use, this is disqualifying.
+2. **Non-determinism** — The SPMD auto-calibration causes non-deterministic output at ≥175 tokens. This would fail any reproducibility requirement.
+3. **Memory** — The transposed u16 cache doubles the model's memory footprint. On memory-constrained devices, this may force swapping.
+
+---
+
+## Conclusion
+
+### What is TRUE:
+- The FP16 GEMV path is architecturally sound and genuinely active
+- It reads 2 bytes/weight instead of 4, halving bandwidth per element
+- It produces numerically correct output (identical to FP32 at 100 tokens)
+- ORT is genuinely slower on FP16 than FP32 (architectural advantage exists)
+- The pre-campaign improvement from 3.26 tok/s is massive and real
+
+### What is FALSE:
+- "57.5 tok/s" — not reproducible; measured 36.1 tok/s median (best single: 42.7)
+- "1.27× ORT" — native FP16 is 0.79× ORT FP32 and 0.90× ORT FP16 on decode
+- "Beats ORT" — native loses on every metric (decode, end-to-end, TTFT)
+
+### Defensible Claim
+
+> "The native CPU EP on Apple M1 Max now delivers **~41 tok/s decode on FP32** (0.90× ORT) and **~36 tok/s on FP16** (0.90× ORT FP16), up from 3.26 tok/s pre-campaign. The FP16 GEMV path correctly reads half-precision weights without widening, and ORT's paradoxical FP16 slowdown (40 vs 46 tok/s) suggests a durable architectural advantage exists — but it has not yet been realized as a throughput win. End-to-end throughput is dominated by native's 10× TTFT regression."
+
+That is what the evidence supports. Anything stronger will not survive independent reproduction.
+
+---
+
+# Re-Verification — Calibrator Hypothesis (2026-07-27T10:55Z)
+
+**Updated Verdict: ✅ TRUE-WITH-CAVEATS — Win is real, decode-only, and SPMD-pool-dependent.**
+
+**Trigger:** Iran identified the SPMD auto-calibrator as the root cause of the original 36.1 tok/s non-reproduction. The machine was loaded (overnight autonomous squad operation), causing the calibrator to commit to the flat Rayon path — which specifically devastates native FP16. Machine is now quiet; all agents idle.
+
+**Commit:** `8ccc2e04` (includes Deckard's tightened FP16 test thresholds)
+
+---
+
+## 1. Re-run: All Four Cells on Quiet Machine
+
+Exact same harness and flags, 2 warmups, 7 measured runs.
+
+### FP16 model (qwen2.5-0.5b-f16)
+
+| Backend | Decode tok/s (median) | Spread [p10–p95] | TTFT ms | End-to-end tok/s |
+|---------|----------------------|-------------------|---------|------------------|
+| **Native** | **58.69** | **[58.15, 60.54]** | 1073.0 | 17.44 |
+| ORT | 42.40 | [42.10, 42.52] | 107.7 | 38.81 |
+
+### FP32 model (qwen2.5-0.5b)
+
+| Backend | Decode tok/s (median) | Spread [p10–p95] | TTFT ms | End-to-end tok/s |
+|---------|----------------------|-------------------|---------|------------------|
+| Native | 42.23 | [41.96, 42.71] | 1003.9 | 15.96 |
+| ORT | 45.76 | [45.67, 46.07] | 101.2 | 41.88 |
+
+**Spreads are tight** — coefficient of variation <2% on all cells. Night-time contention was the sole cause of the prior variance.
+
+### Per-run detail (native FP16, 7 runs)
+
+```
+Run 1: 58.35    Run 5: 60.46
+Run 2: 58.69    Run 6: 57.83
+Run 3: 58.69    Run 7: 60.58
+Run 4: 60.09
+```
+
+**No run below 57.83 tok/s.** Compare to prior round where runs swung 29–43 tok/s.
+
+---
+
+## 2. Calibrator Hypothesis — ✅ CONFIRMED by Direct Experiment
+
+### The test
+
+Three conditions, same prompt/model/flags, quiet machine:
+
+| Condition | Env var | Native FP16 decode tok/s | Notes |
+|-----------|---------|--------------------------|-------|
+| **Forced pool** | `=1` | **60.20** [58.34, 60.51] | SPMD workers always active |
+| **Auto-calibrate** (quiet) | *unset* | **58.69** [58.15, 60.54] | Calibrator correctly picks pool |
+| **Forced flat** | `=0` | **43.78** [43.50, 43.94] | Rayon fallback only |
+
+**Pool → flat regression: 60.20 → 43.78 = −27%.** The auto-calibrator on a quiet machine correctly selects the pool path (58.69 ≈ 60.20).
+
+### Reproducing the original 36.1 under deliberate load
+
+Started 6 `yes > /dev/null` processes to simulate overnight contention, then ran with auto-calibrate:
+
+| Condition | Native FP16 decode tok/s |
+|-----------|--------------------------|
+| Loaded, auto-calibrate | **24.56** [23.84, 25.38] |
+
+**Even worse than my original 36.1** — confirmed that load causes the calibrator to commit to the flat path, devastating FP16 throughput. The measured bandwidth probe also dropped: 62.6 GB/s under load vs 121.8 GB/s quiet. ORT is unaffected because it uses its own MLAS thread pool, not the SPMD calibrator.
+
+### Mechanism (code-verified)
+
+1. `neon_gemv_f16_col_parallel` (accelerate_gemm.rs:460) checks `spmd_decode_active()` as its **first dispatch priority**. If active, uses the persistent SPMD pool. Otherwise falls back to Rayon `par_chunks_mut`.
+
+2. The calibrator (`decode_spmd.rs:1325`) defaults to the flat path (`committed: AutoPath::Flat`, line 1346). It probes both paths during warmup and commits the pool **only when pool is ≥8% faster** (`CALIB_SWITCH_MARGIN_PCT = 8`).
+
+3. Under load, the SPMD pool's busy-wait barrier contends with co-tenants, making it slower than flat. The calibrator correctly avoids it. But this leaves native FP16 on the Rayon path, which delivers 44 tok/s instead of 60.
+
+4. **Iran's explanation is correct.** The asymmetry — contention hurts only native FP16 — is because only native uses the SPMD pool. ORT uses MLAS's own parallelism.
+
+---
+
+## 3. Metric Verification — ✅ CORRECT AND IDENTICAL
+
+The harness (`compare.rs` line 668) computes:
+```
+decode_tokens_per_second = (generated_tokens - decode_skip) / decode_window_seconds
+```
+where `decode_window = token_times[last] - token_times[decode_skip - 1]`.
+
+This is **true throughput** (tokens / elapsed time), not `1000 / p50_ms` (which is the reciprocal of median per-token latency — a related but different metric). Both are applied through the **same code path** (`run_direct_once`, line 584) to both backends. No metric flatters one side.
+
+Iran's original 57.5 tok/s was computed as `1000 / 17.4ms = 57.47`. The harness-computed true throughput is 58.69–60.20 tok/s (depending on pool vs auto). The difference arises because `1000/median_per_token_ms` is the harmonic mean of rates, which is slightly lower than the arithmetic throughput. **Iran's original 57.5 was the conservative metric; the true throughput is ~59 tok/s.**
+
+---
+
+## 4. Non-Determinism — Confirmed, Root-Caused, Recommendation
+
+### Findings
+
+| Condition | 500-token determinism (3 runs) |
+|-----------|-------------------------------|
+| Auto-calibrate, quiet machine | ❌ Non-deterministic (diverges mid-generation) |
+| Forced pool (`=1`) | ✅ Deterministic |
+| Forced flat (`=0`) | ✅ Deterministic |
+
+**Root cause:** The auto-calibrator re-probes every `CALIB_RECAL_PERIOD = 600` decode steps (decode_spmd.rs:1246). During a re-probe, some tokens use the pool path and others use the flat path. Pool and flat produce **bitwise-identical tokens at 50 and 200 tokens**, but **diverge at token 459** due to accumulated floating-point non-associativity from different Rayon vs SPMD parallelization. The code comment (matmul_nbits.rs:2354) claims "both paths are token-exact" — **this is incorrect at high token counts** (verified: forced-pool and forced-flat diverge at token 459 of 500).
+
+### Recommendation: Known-issue, document before merge
+
+This is **not a merge blocker** for these reasons:
+- At the benchmark length (50 tokens) and typical interactive use (<200 tokens), pool and flat are bitwise identical.
+- Divergence begins around token 459 — well beyond typical single-turn generations.
+- Both paths produce coherent, correct text; only low-order FP bits differ.
+- The code comment's "token-exact" claim should be corrected to "token-exact for short generations; may diverge at ~400+ tokens due to floating-point non-associativity."
+
+However, it **should be documented** because:
+- Temperature-0 users expect deterministic output.
+- The auto-calibrator can switch paths based on momentary load, causing non-reproducible output in production.
+- For production deployments, recommend `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` (forced pool) for deterministic output at any length.
+
+---
+
+## 5. The Honest Headline
+
+### Defensible ratios
+
+| Comparison | Ratio | Source |
+|------------|-------|--------|
+| Native FP16 vs ORT FP16 (like-for-like) | **1.38×** | 58.69 / 42.40 |
+| Native FP16 vs ORT FP32 (ORT's best) | **1.28×** | 58.69 / 45.76 |
+| Iran's claimed 1.27× | **was conservative** | Her 57.5 / 45.0 ≈ 1.28 |
+
+Both "1.38× like-for-like on FP16" and "1.28× vs ORT's best" are **defensible on decode throughput** with the quiet-machine, auto-calibrated numbers. Iran's original 1.27× was actually conservative because her 57.5 was computed with the less favorable `1000/p50_ms` metric.
+
+### Required caveats
+
+1. **Decode-only.** End-to-end at 50 tokens: native FP16 = 17.44 tok/s vs ORT FP32 = 41.88 tok/s = **0.42×**. TTFT is 1073 ms vs 101 ms = **10.6× worse**.
+
+2. **Quiet-machine measurement.** Under co-tenant load, the auto-calibrator may commit to the flat path, reducing native FP16 to ~44 tok/s (0.96× ORT). The win requires either a quiet host or `PERSISTENT_POOL=1`.
+
+3. **TTFT remains 10× worse.** For interactive use, end-to-end is the user-visible metric.
+
+4. **Model-specific.** Verified on Qwen 2.5 0.5B only (K=896, N=4864).
+
+### Exact publishable wording
+
+> **Native FP16 decode throughput: 1.28× ORT's best (decode-only, quiet host)**
+>
+> On Apple M1 Max with Qwen 2.5 0.5B, the native CPU EP's FP16 GEMV path delivers 58.7 tok/s steady-state decode — 1.38× ORT on the same FP16 model, and 1.28× ORT's best FP32 configuration (45.8 tok/s). The win comes from reading half-precision weights directly via NEON fcvtl, halving memory bandwidth vs ORT's widened FP32 path.
+>
+> **Caveats:** (1) Decode throughput only; end-to-end at 50 tokens is 0.42× ORT due to 10× higher TTFT (1073 ms vs 101 ms). (2) Requires a quiet host or `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`; under co-tenant load the SPMD auto-calibrator falls back to Rayon, reducing the win to near-parity. (3) Verified on Qwen 2.5 0.5B; wider models with larger K×N GEMVs may differ.
+
+### Apple Silicon generality
+
+The FP16 bandwidth advantage (2 bytes vs 4 bytes per weight) is architectural and applies to all Apple Silicon parts. The absolute tok/s scales linearly with achievable DRAM bandwidth. On an M1 base (~34 GB/s achievable at 4 P-cores vs M1 Max ~112 GB/s at 8 P-cores), expect proportionally lower absolute numbers but similar ratios. **The relative win transfers across the family.**
+
+---
+
+## Correction of Prior Verdict
+
+My original "OVERSTATED" verdict was caused by measuring on a loaded machine during overnight autonomous squad operation. The auto-calibrator correctly detected the load and committed to the flat path — which is its designed behavior to avoid regression. However, this made the FP16 path run at 36 tok/s instead of 59 tok/s, making it appear that native FP16 did not beat ORT.
+
+**Iran's calibrator explanation is correct and verified by direct experiment.** The 59 tok/s number reproduces on a quiet machine with tight spreads (±2%). The original 36.1 reproduces under deliberate load. The mechanism is fully understood and code-verified.
 ## 2026-07-27 — Roadmap parallel wave (samplers, GEMM, CUDA attention/coverage, EP loader, discovery)
 
 ### apone-varlen-attn
@@ -4949,6 +6162,825 @@ and both regimes. Validation passed: `cargo test -p onnx-runtime-ep-cpu`,
 
 **Why:** An unloaded default model and a poisoned registry lock are operational failures, not process-abort invariants. Registry poisoning deliberately fails only the affected request with a 500 `ApiError` rather than recovering with `into_inner()`: recovery could expose state interrupted during a write, while an explicit error preserves the lock's safety signal and keeps the server process available for unrelated work.
 
+
+<!-- merged from .squad/decisions/inbox/iran-fp16-discrepancy-resolution.md -->
+# Iran: Native FP16 Discrepancy Resolution
+
+**By:** Iran (Mac CPU Optimization Engineer)
+**Date:** 2026-07-27T03:42Z
+**Requested by:** Coordinator, in response to Fact Checker's win-verification report
+
+---
+
+## Executive Summary
+
+**The 57.5 tok/s number was real but reported with the wrong metric.**
+My original "57.5 tok/s" was `1000 / p50_latency_ms` (reciprocal of median
+per-token latency), not the throughput computed by the `compare` harness
+(total tokens / total time). On a quiet machine, Fact Checker's exact
+protocol produces **59.78 tok/s** [58.77, 59.81] with <2% CoV — the number
+actually *exceeds* my claim. Fact Checker's 36.1 was measured on a heavily
+loaded machine where the auto-calibrator fell back to single-threaded decode.
+
+| Cell | Iran original | Fact Checker (loaded) | Iran re-measurement (quiet) | Status |
+|---|---|---|---|---|
+| ORT FP32 | 45.0 | 45.7 | 45.91 [45.84, 46.06] | ✅ |
+| ORT FP16 | 40.8 | 39.9 | 42.33 [42.06, 42.41] | ✅ |
+| Native FP32 | 41.3 | 40.9 | 42.07 [41.96, 42.24] | ✅ |
+| **Native FP16** | **57.5** | **36.1** | **59.78 [58.77, 59.81]** | **✅ reproduces on quiet machine** |
+
+**Native FP16 / ORT FP32 ratio: 1.30×. Native FP16 / ORT FP16 ratio: 1.41×.**
+
+---
+
+## 1. Root Cause: Auto-Calibrator Under Load
+
+The SPMD pool auto-calibrator (`decode_spmd.rs`) measures both the flat
+(single-threaded) and pool (multi-threaded) paths on initial tokens and commits
+to whichever is faster. Under system load:
+
+1. Pool workers compete with other processes for P-cores
+2. The flat path wins the calibration probe (it avoids contention overhead)
+3. The calibrator commits to flat for the remainder of the run
+4. Native FP16 loses its key advantage: multi-threaded streaming of half the data
+
+This explains why the discrepancy is **isolated to native FP16**:
+
+- **ORT** is unaffected because MLAS always uses its thread pool (no auto-calibrator)
+- **Native FP32** is barely affected because at 1932 MB, single-threaded
+  streaming is bandwidth-limited regardless of thread count
+- **Native FP16** is specifically devastated because its entire advantage
+  (halving bandwidth to 994 MB via multi-threaded streaming) requires the pool
+
+Evidence: with `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` (forced pool), native
+FP16 delivers **60.17 tok/s** [59.84, 60.71] — identical to auto-cal on a quiet
+machine (59.78) where the auto-calibrator correctly selects pool.
+
+---
+
+## 2. Metric Clarification
+
+My original "57.5 tok/s steady-state" was computed as `1000 / p50_ms` where
+p50 = 17.4 ms from the `--profile` output's `inter-token latency` line.
+
+The `compare` harness computes throughput as:
+```
+decode_tok_s = (generated_tokens - decode_skip) / (time[last] - time[decode_skip - 1])
+```
+
+These differ when the per-token latency distribution is skewed:
+- `1/p50` gives the reciprocal of the median single-token time (ignores slow tail)
+- `tokens/total_time` is the reciprocal of the mean (includes all tokens)
+
+On a quiet machine with no outliers, both converge. The `compare` harness
+(tokens/total_time) is the correct throughput metric. On a quiet machine it
+gives **59.78 tok/s** — above my `1/p50` estimate of 57.5.
+
+---
+
+## 3. Non-Determinism at 500+ Tokens
+
+**Cannot reproduce on a quiet machine.** Tested with both auto-calibration and
+forced pool:
+
+| Config | Tokens | Runs | Determinism | Throughput |
+|---|---|---|---|---|
+| auto-cal | 500 | 3 | ✅ Pass | 48.76 tok/s |
+| pool=1 | 500 | 3 | ✅ Pass | 48.74 tok/s |
+| auto-cal vs pool=1 | 100 | 1 each | ✅ Identical token IDs | — |
+
+Auto-cal and forced pool produce **byte-identical token sequences** on a quiet
+machine. The non-determinism Fact Checker observed was caused by the
+auto-calibrator switching between flat and pool paths mid-run under load.
+Floating-point summation order differs between single-threaded (flat) and
+multi-threaded (pool) reduction, so path-switching causes different logits →
+different argmax under greedy decode.
+
+**This is a real correctness concern for production use under variable load.**
+The fix is one of:
+1. Force the pool once calibrated (do not re-probe after commitment)
+2. Use `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` in latency-sensitive deployments
+3. Make the multi-threaded reduction order deterministic (Kahan summation or
+   fixed-partition reduction)
+
+---
+
+## 4. Why 48 tok/s at 500 Tokens vs 60 at 50
+
+The 20% throughput drop at 500 tokens (48.76 vs 59.78) is expected: the SDPA
+attention kernel's cost grows linearly with sequence length. At 500 tokens,
+attention's 2.23 ms/token (at 50 tokens) grows to approximately 5+ ms/token,
+which is now a significant fraction of the ~20.5 ms total.
+
+---
+
+## 5. TTFT Remains ~10× Worse
+
+| Backend | TTFT ms (quiet) |
+|---|---|
+| Native FP16 | 1065.9 [1063.0, 1143.0] |
+| ORT FP16 | 108.4 [107.4, 111.6] |
+
+**9.8× gap.** Prefill is compute-bound and was not optimised in this campaign.
+This is a documented, known weakness. End-to-end throughput is 17.51 vs 38.55
+(0.45× ORT) because the 1-second TTFT dominates a 50-token run.
+
+**The headline must be decode-only.** End-to-end is not the right framing for a
+50-token run where TTFT is 37% of total time for native but only 8% for ORT.
+
+---
+
+## 6. Complete Quiet-Machine Numbers
+
+All on commit `6449ecd9`, Apple M1 Max, load avg <6, `compare` harness with
+`--tokens 50 --decode-skip 2 --warmups 1 --runs 5`:
+
+### FP16 (models/qwen2.5-0.5b-f16, 994 MB)
+| Backend | Decode tok/s | Roofline % | E2E tok/s | TTFT ms |
+|---|---|---|---|---|
+| Native | **59.78** [58.77, 59.81] | 48.70% | 17.41 | 1069.6 |
+| ORT | 42.33 [42.06, 42.41] | 34.48% | 38.77 | 107.4 |
+| **Ratio** | **1.41×** | — | 0.45× | 9.96× worse |
+
+### FP32 (models/qwen2.5-0.5b, 1985 MB)
+| Backend | Decode tok/s | Roofline % | E2E tok/s | TTFT ms |
+|---|---|---|---|---|
+| Native | 42.07 [41.96, 42.24] | 68.24% | 15.93 | 1009.9 |
+| ORT | 45.91 [45.84, 46.06] | 74.48% | 41.95 | 104.4 |
+| **Ratio** | 0.92× | — | 0.38× | 9.68× worse |
+
+### GB/s
+| Path | Decode GB/s | Achievable roof (~112 GB/s) |
+|---|---|---|
+| Native FP16 | 59.78 × 0.994 = **59.4 GB/s** | 53% |
+| Native FP32 | 42.07 × 1.985 = **83.5 GB/s** | 75% |
+| ORT FP16 | 42.33 × 0.994 = 42.1 GB/s | 38% |
+| ORT FP32 | 45.91 × 1.985 = 91.1 GB/s | 81% |
+
+---
+
+## 7. Defensible Claim
+
+> "Native CPU EP FP16 decode at **59.8 tok/s** beats ORT FP16 at 42.3 tok/s
+> (**1.41×**, like-for-like) and ORT FP32 at 45.9 tok/s (**1.30×**) on Apple
+> M1 Max. The win is architectural: native reads FP16 weights directly from
+> mmap via NEON, while ORT widens to FP32 before every GEMM. Prefill/TTFT
+> remains ~10× worse than ORT (1070 ms vs 107 ms) and end-to-end throughput
+> at 50 tokens is 0.45× ORT. The result is reproducible with <2% run-to-run
+> variance on a quiet machine; under system load, the auto-calibrator may
+> fall back to single-threaded decode, reducing throughput to ~36 tok/s."
+
+
+<!-- merged from .squad/decisions/inbox/iran-native-cpu-decode-attribution.md -->
+# Native CPU Decode Attribution — Iran
+
+**Date:** 2026-07-27 (updated)
+**Model:** Qwen2.5-0.5B-Instruct (100% fp32 dense, 1.93 GB, 496M params)
+**Hardware:** Apple M1 Max, 8P+2E cores, 32 GiB unified memory
+
+## Baseline (before changes)
+| Configuration | Load | TTFT | Decode | Effective BW |
+|---|---|---|---|---|
+| ORT + CPU | 1343 ms | 118 ms | **45.87 tok/s** | ~88 GB/s |
+| Native + CPU | 125 ms | 1253 ms | **3.26 tok/s** | ~6 GB/s |
+
+## Root Cause (two bugs, both universal)
+
+### Bug 1: Accelerate is an unwired placeholder
+`CpuBackend::auto_detect()` returns `Accelerate` on macOS (`backend.rs:83`).
+`gemm_with_backend()` had only `Mlas` and `SimdX86` arms — `Accelerate`
+fell to `_ => gemm_generic()` (`matmul.rs:169`). Every Mac was running the
+pure-Rust correctness baseline (scalar 4×4 tiled GEMM).
+
+### Bug 2: gemm_generic has zero M=1 parallelism
+`gemm_generic()` parallelizes over `M` rows via `par_chunks_mut(mc * n)`.
+At M=1 (decode), mc=1 → 1 chunk → single-threaded on a 10-core machine.
+
+### Combined effect
+Single-threaded scalar GEMV at ~6 GB/s on a 197 GB/s machine = **2.9% of roofline**.
+
+## Per-Op Decode Attribution (169 ops/token, steady-state)
+
+| Op Type | Count | ms/token | % of decode |
+|---|---|---|---|
+| MatMul | 49 | 16.9 | 47% |
+| FusedMatMulBias | 120 | 12.4 | 35% |
+| Attention | 24 | 2.9 | 8% |
+| Swish | 24 | 1.1 | 3% |
+| Other (RMSNorm, RotaryEmb, etc.) | ~200 | ~1.2 | 3% |
+| Session overhead | — | ~0.8 | 2% |
+| **Total** | **~417** | **~35.8** | **= p50 decode latency** |
+
+Key weight shapes: [896,4864]×48, [4864,896]×24, [896,896]×48, [896,128]×48, [896,151936]×1
+
+## Per-Shape GEMV Bandwidth (current)
+
+| Shape | Weight MB | Route | p50 µs | GB/s |
+|---|---|---|---|---|
+| [896,4864] gate/up | 17.5 | NEON-MT 8T | ~260 | 66 |
+| [4864,896] down | 17.4 | NEON-MT 8T | ~260 | 66 |
+| [896,896] q/o | 3.2 | Accelerate sgemv | ~30 | 107 |
+| [896,128] k/v | 0.46 | Accelerate sgemv | ~4 | 129 |
+| [896,151936] lm_head | 545 | NEON-MT 8T | ~5500 | 99 |
+
+## Fixes Applied
+
+### Fix A: Column-parallel gemm_generic (arch-neutral)
+When M < threads, partition over N instead of M. Helps all backends.
+
+### Fix B: Wire Accelerate arm
+- M>1 prefill: `cblas_sgemm` via Accelerate (reaches AMX, 2449 GFLOPS)
+- M=1 decode: hybrid dispatch based on L2 residency
+
+### Fix C: NEON GEMV with 4-row batched inner kernel
+- Cache B_T[N,K] (transpose of weight B[K,N]) in MatMulPrepack OnceLock
+- Each Rayon thread: 4-row-batched NEON dot products on contiguous B_T rows
+- 4-row batching improves ILP (8 independent FMA chains vs 4)
+- Hybrid L2-aware dispatch: `sgemv_accelerate` for L2-resident, NEON for DRAM-bound
+
+### Fix D: Hybrid L2-aware dispatch (Accelerate for small, NEON for large)
+- Runtime L2 cache query via `sysctl("hw.perflevel0.l2cachesize")`
+- `is_l2_resident()` threshold = L2_bytes / 2
+- Accelerate sgemv for L2-resident (106-156 GB/s)
+- NEON col-parallel for DRAM-bound (66 GB/s)
+
+## After Changes
+| Configuration | Load | TTFT | p50 ms | Steady-state tok/s | Overall tok/s |
+|---|---|---|---|---|---|
+| ORT + CPU | 1343 ms | 118 ms | 22.0 | 45.5 | 45.87 |
+| Native + CPU | 125 ms | 1120 ms | 35.8 | **27.9** | 18.9* |
+
+*Overall includes one-time ~830 ms transpose on first decode token.
+
+Improvement from baseline: **3.26 → 27.96 tok/s** steady-state (**8.6× speedup**).
+
+## Revised Roofline (Pris's harness, authoritative)
+
+| Metric | Value |
+|---|---|
+| Measured achievable BW (8T, 256 MiB/thread) | **121.9 GB/s** |
+| FP32 decode ceiling | **61.41 tok/s** |
+| ORT decode | 45.83 tok/s = **74.6% of roof** |
+| Native decode | 27.96 tok/s = **45.5% of roof** |
+
+Note: Sebastian's 197 GB/s was a pure sequential-stream measurement; the achievable
+GEMV bandwidth is 121.9 GB/s (Pris's probe), consistent with Sebastian's own
+"achievable MT GEMV" figure of 112 GB/s. The FP32 opportunity is much thinner
+than earlier estimates suggested.
+
+## The FP32 Wall — Cannot Beat ORT with Kernel Changes Alone
+
+| Scenario | GEMV ms | + Non-GEMV | Total | tok/s | Roof % |
+|---|---|---|---|---|---|
+| **Current** | 35.8 | 6.5 | 42.3 | **27.96** | 45.5% |
+| Match ORT GEMV BW (91 GB/s) | 21.8 | 6.5 | 28.3 | 35.3 | 57.5% |
+| **100% GEMV roof (121.9 GB/s)** | 16.3 | 6.5 | 22.8 | **43.9** | **71.5%** |
+| ORT (for reference) | ~21.8 | ~0.1 | 21.9 | 45.83 | 74.6% |
+
+**Even at theoretical maximum GEMV bandwidth, non-GEMV overhead (6.5 ms)
+caps the native EP at 43.9 tok/s — below ORT's 45.83.**
+
+ORT achieves near-zero non-GEMV overhead through op fusion (MatMul+Bias, fused
+attention, fused activation). Our native EP executes 417 ops/token individually,
+each with dispatch overhead and intermediate buffer allocation.
+
+## FP16 is the Lever
+
+| Scenario | GEMV ms | + Non-GEMV | Total | tok/s |
+|---|---|---|---|---|
+| FP16 @ current BW (55.5 GB/s) | 17.9 | 6.5 | 24.4 | **41.0** |
+| FP16 @ ORT BW (91 GB/s) | 10.9 | 6.5 | 17.4 | **57.4** |
+
+FP16 halves the bytes moved per token. At ORT-level GEMV bandwidth, FP16 clears
+ORT by 25%. NEON FP16 arithmetic (FMLA/half) is ARMv8.2 baseline — universal
+across all Apple Silicon. Accelerate has no FP16 GEMV, so this path is ours
+regardless.
+
+## Remaining Gap Analysis (27.96 vs 45.83 tok/s)
+
+### GEMV bandwidth: 55.5 vs ~91 GB/s effective
+- Pure GEMV at ~66 GB/s; total effective 55.5 GB/s (diluted by non-GEMV)
+- 45.5% of achievable roof vs ORT's 74.6%
+- Root causes investigated:
+  - E-core scheduling: tested with `taskpolicy -c utility`, no effect
+  - Thread count: saturates at 6-8 threads, more doesn't help
+  - 4-row batched kernel: 35% faster single-threaded, neutral at 8T (DRAM-limited)
+  - Rayon per-call overhead: ~5 µs × 169 = 0.85 ms (3% of GEMV time)
+  - ORT uses MLAS packed weight format + persistent pool, achieving higher BW
+
+### Non-GEMV op time: 6.5 ms (the hard wall)
+- ORT has near-zero non-GEMV overhead (~0.1 ms) due to op fusion
+- Our Attention (2.9 ms), Swish (1.1 ms), RMSNorm/RotaryEmb/etc. (2.5 ms) = 6.5 ms
+- Not reducible by kernel optimization alone
+- Op fusion (graph-level) would amortize dispatch and eliminate intermediate buffers
+
+### Ranked fixes
+
+| # | Fix | Tok/s gain | Classification |
+|---|---|---|---|
+| 1 | **FP16 weight GEMV** | +13-30 tok/s | Universal, THE lever |
+| 2 | **Op fusion** (gate+up, QKV, MatMul+bias+act) | +5-8 tok/s | Universal, graph-level |
+| 3 | **MLAS-like packed weights** (higher GEMV BW) | +4-7 tok/s | Universal |
+| 4 | **Background weight transpose** | -830 ms TTFT | Universal, one-time |
+| 5 | **Prefill opt** (TTFT 1105→102 ms) | 10× TTFT | Universal |
+
+### Path to beating ORT (45.83 tok/s)
+
+**FP32 alone cannot reach ORT with kernel-only changes.** Even at 100% GEMV roof
+(121.9 GB/s) + current 6.5 ms non-GEMV = 22.8 ms → 43.9 tok/s < ORT 45.83.
+This is a hard wall: the non-GEMV overhead is 6.5 ms that ORT doesn't pay
+because it fuses those ops into the GEMM dispatch.
+
+**FP16 weights clears ORT.** At current 55.5 GB/s effective BW, FP16 gives
+41.0 tok/s. At ORT-level BW (91 GB/s), FP16 gives 57.4 tok/s. NEON FP16
+(FMLA half-precision) is ARMv8.2 baseline — universal on Apple Silicon.
+Accelerate has no FP16 GEMV, so this would be our custom kernel path.
+
+## Answers to Five Questions
+
+1. **Dtype**: 100% fp32 dense. Zero MatMulNBits ops. No quantization engaged.
+2. **Multithreading**: Was single-threaded (M=1 → 1 Rayon chunk). Now 8-thread parallel via Rayon dense decode pool.
+3. **NEON**: `simd_gemm.rs` is `cfg(x86)`-gated only. New `accelerate_gemm.rs` has NEON intrinsics (4-row batched).
+4. **Accelerate/AMX**: Was unwired placeholder. Now wired: sgemm for M>1, sgemv for L2-resident M=1, NEON for DRAM-bound M=1.
+5. **TTFT/prefill**: Was 38× slower because prefill also ran scalar single-threaded GEMM. Now uses Accelerate sgemm. TTFT ~1120 ms vs ORT's 118 ms — still 10× slower, attributed to non-MLAS GEMM path.
+
+## Session 3: SDPA NEON + Dispatch Simplification
+
+### Changes
+1. **NEON SDPA fast path** (sdpa.rs):
+   - Added `dot_neon()` and `axpy_neon()` — 4×-unrolled NEON intrinsics for aarch64
+   - New `sdpa_f32_neon()` function using NEON dot/AXPY for QK and AttnV inner loops
+   - Attention: 111 µs/call → 75 µs/call (32% faster), saving **0.86 ms per token**
+   - Same bug class as the original GEMV scalar fallback: `dot_f32` and `axpy_f32` 
+     had AVX2 paths for x86 but fell through to scalar on aarch64
+
+2. **Unified GEMV dispatch** (matmul.rs):
+   - Removed Accelerate sgemv L2-resident path
+   - Measured: Accelerate sgemv has ~30-50 µs GCD thread wake-up overhead, making it
+     equivalent to Rayon NEON for L2-resident matrices
+   - All M=1 decode now routes to NEON col-parallel (neutral on performance, simpler)
+
+### Updated Per-Op Attribution (post-session 3)
+
+| Op Type | Count | ms/token | µs/call | % of decode | Change |
+|---|---|---|---|---|---|
+| MatMul | 49 | 16.9 | 345 | 49% | — |
+| FusedMatMulBias | 120 | 12.6 | 105 | 37% | — |
+| **Attention** | **24** | **1.8** | **75** | **5%** | **-0.86 ms** |
+| Swish | 24 | 1.0 | 43 | 3% | — |
+| Other | ~200 | ~1.2 | — | 3% | — |
+| Session overhead | — | ~0.8 | — | 2% | — |
+| **Total** | **~417** | **~34.5** | — | **100%** | **-1.2 ms** |
+
+### Updated Measurements (Pris compare harness, 5 runs, median)
+
+| Configuration | p50 ms | tok/s | Roof % | Effective GB/s |
+|---|---|---|---|---|
+| Native + CPU (session 3) | 34.3 | **29.17** | 47.6% | ~58 |
+| Native + CPU (session 2) | 35.7 | 27.96 | 45.5% | ~55.5 |
+| ORT + CPU | 22.0 | **45.82** | 74.7% | ~91 |
+
+### Updated FP32 Wall (with session 3 non-GEMV reduction)
+
+| Scenario | GEMV ms | + Non-GEMV | Total | tok/s | Roof % |
+|---|---|---|---|---|---|
+| **Current** | 29.5 | 5.0 | 34.5 | **29.0** | 47.3% |
+| Match ORT GEMV BW (91 GB/s) | 21.8 | 5.0 | 26.8 | 37.3 | 60.8% |
+| **100% GEMV roof (121.9 GB/s)** | 16.3 | 5.0 | 21.3 | **46.9** | **76.5%** |
+| ORT (for reference) | ~21.8 | ~0.1 | 21.9 | 45.83 | 74.6% |
+
+Progress: reduced non-GEMV from 6.5 → 5.0 ms. At 100% GEMV roof, native EP 
+would now reach **46.9 tok/s — just barely above ORT's 45.83**. But achieving 
+100% GEMV roof requires closing a 30% gap (66 → 95+ GB/s), which is limited by
+Rayon fork-join overhead vs ORT's MLAS persistent pool.
+
+### What Didn't Work This Session
+
+1. **Accelerate sgemv for L2-resident**: 30-50 µs GCD overhead per call makes it 
+   equivalent to NEON multi-threaded for small matrices. Not a win.
+2. **L2-aware single-threaded threshold**: Routing q/o [896,896] to single-threaded 
+   NEON was slightly WORSE than multi-threaded. L2-resident matrices are still 
+   large enough that 8T parallelism helps.
+3. **Persistent barrier pool (GCD/pthread)**: Deadlocked in standalone test, but the 
+   concept is sound — Rayon's ~5 µs per fork-join × 169 calls = 0.85 ms overhead.
+
+
+## Session 4 Update — Dispatch Overhead Reduction
+
+**Authoritative harness result: 31.30 tok/s (50.7% of roof) — up from 29.17 tok/s (+7.3%)**
+
+### Optimizations Applied
+
+| Change | Savings | Scope |
+|---|---|---|
+| f32 memcpy fast path in `write_dense_f32_narrow` | ~1.5 ms/token | Universal (all architectures) |
+| NEON SiLU vectorization (Cephes exp, ~1 ULP) | ~0.8 ms/token | aarch64 (scalar fallback elsewhere) |
+| Swish(1.0) → Silu canonicalization | ~0.2 ms/token | Universal |
+| Redundant `matmul_geometry` elimination | ~0.1 ms/token | Universal |
+| FMB fast 1-D bias add | ~0.1 ms/token | Universal |
+| **Total** | **~2.7 ms/token** | |
+
+### Updated Per-Op Breakdown (31.5 ms/token steady-state)
+
+| Op Type | Count | ms/token | % of decode | vs Session 3 |
+|---|---|---|---|---|
+| MatMul | 49 | 16.5 | 54.2% | -0.4 ms |
+| FusedMatMulBias | 120 | 11.3 | 37.2% | -1.3 ms |
+| Attention | 24 | 1.26 | 4.2% | -0.55 ms |
+| RMSNormalization | 49 | 0.36 | 1.2% | -0.10 ms |
+| Swish | 24 | 0.25 | 0.8% | -0.78 ms |
+| Other | 151 | 0.87 | 2.9% | ~same |
+| **Total** | **417** | **30.5** | **100%** | **-3.1 ms** |
+
+### FP32 Wall Analysis (revised)
+
+| Scenario | GEMV ms | Non-GEMV ms | Total ms | tok/s | Roofline % |
+|---|---|---|---|---|---|
+| **Current** | 27.8 | 3.5 | 31.3 | **31.9** | **51.7%** |
+| Non-GEMV → 1 ms | 27.8 | 1.0 | 28.8 | 34.7 | 56.2% |
+| GEMV at ORT's 91 GB/s | 21.8 | 3.5 | 25.3 | 39.5 | 64.0% |
+| GEMV at 91 GB/s + non-GEMV → 1 ms | 21.8 | 1.0 | 22.8 | 43.9 | 71.1% |
+| GEMV at 100% roof (122.5 GB/s) + 1 ms | 16.2 | 1.0 | 17.2 | 58.1 | 94.1% |
+| ORT (for reference) | ~21.8 | ~0.1 | ~21.9 | 45.96 | 74.5% |
+
+### Gap to ORT — Two Independent Bottlenecks
+
+1. **GEMV BW: 62 GB/s vs 91 GB/s (68% of ORT)**
+   - MLAS uses hand-tuned ARM assembly GEMV kernels
+   - ORT's intra-op thread pool has lower fork-join overhead than Rayon (~2 µs vs ~5 µs per dispatch)
+   - ORT fuses gate+up projections into single GEMV, halving dispatches
+
+2. **Non-GEMV overhead: 3.5 ms vs ~0.1 ms (35× worse)**
+   - ORT fuses entire subgraphs (attention, norm, activation) into mega-ops
+   - Our EP dispatches 417 individual ops with per-op executor overhead
+   - Not fixable at the kernel level — requires graph-level fusion
+
+### Conclusion
+
+**FP32 native decode is unlikely to beat ORT (45.96 tok/s) without graph-level op fusion.**
+
+Even at 100% GEMV roof AND non-GEMV reduced to 1 ms, we reach 58 tok/s. But our GEMV realistically caps at ~80-85 GB/s (without MLAS-quality kernels), giving ~40 tok/s even with perfect non-GEMV.
+
+**The honest FP32 ceiling with current architecture: ~35-40 tok/s.** This requires GEMV at 80+ GB/s (via better prefetching, reduced Rayon overhead, or graph-level GEMV batching) + non-GEMV reduced to ~1 ms (via op fusion).
+
+### Next Lever: FP16
+
+FP16 model exists at `models/qwen2.5-0.5b-f16` (959 MB — half the bytes).
+Sebastian measured FP16 NEON at 46.3 tok/s with pthread spawn, ~97 tok/s projected with persistent pool.
+Must compare native-FP16 vs ORT-FP16 per Justin's fairness rule.
+
+---
+
+## Session 6 — batch_shape dispatch bug fix + FMB direct output
+
+**Date:** 2026-07-27T09:25Z
+
+### Critical Discovery: batch_shape dispatch bug
+
+The Accelerate M=1 GEMV fast path in `matmul_dense_into_with_backend` checked
+`geom.batch_shape.is_empty()`, but during decode with input shape [1,1,K],
+`batch_shape = [1]` (not empty). This caused ALL GEMV calls to fall through
+to `gemm_with_backend` → `neon_gemv_parallel` (outer product approach) instead
+of the optimized `neon_gemv_col_parallel` (dot product with pre-transposed B_T).
+
+**Evidence:** CPU sampling confirmed 672/672 GEMV samples in `neon_gemv_parallel`,
+0 in `neon_gemv_col_parallel`. After fix: 247/247 samples in `neon_gemv_col_parallel`.
+
+**Fix:** `numel(&geom.batch_shape) <= 1` treats single-element batch shapes as
+non-batched. Also applied to the general non-batched path (line 826).
+
+### Performance results (commit d65e5c38)
+
+| | p50 ms/tok | tok/s | Eff. GB/s | Roof % |
+|---|---|---|---|---|
+| Before (session 5) | 32.5 | 30.8 | 61 | 55% |
+| **After (session 6)** | **29.7** | **33.7** | **65** | **60%** |
+| ORT | 22.2 | 45.0 | 87 | 78% |
+| Ceiling | 17.3 | 56.7 | 112 | 100% |
+
+### Also: FMB direct output path
+
+FusedMatMulBias now writes directly into the output tensor when eligible
+(contiguous f32, no alias), skipping Vec<f32> allocation + write_dense_f32_narrow
+copy for 120 calls/token. Measured at parity — the allocation overhead was
+already small (~200 µs), but eliminates unnecessary allocation traffic.
+
+### Accelerate sgemv experiment — NEGATIVE result
+
+Tested Accelerate cblas_sgemv for L2-resident attention projections. Result:
+GCD wake-up overhead (~30-50 µs per call) dominates compute saving. For [896,896]
+at 3.2 MB: Accelerate 58 µs (18 µs compute + 40 µs wake-up) vs single-thread
+NEON 49 µs. Net negative — reverted.
+
+### Remaining gap analysis (29.7 ms vs ORT 22.2 ms = 7.5 ms gap)
+
+1. **GEMV bandwidth:** ~75 GB/s (col-parallel NEON) vs ~91 GB/s (MLAS) = 4.5 ms gap
+   - MLAS uses hand-written aarch64 assembly with explicit prefetch
+   - Our NEON intrinsics generate good code (5 ldp + 8 fmla) but ~20% lower BW
+2. **Non-GEMV overhead:** ~3.5 ms vs ~1 ms = 2.5 ms gap
+   - Graph executor dispatches 168 individual ops per token
+   - ORT fuses subgraphs into fewer mega-ops
+3. **Both must improve to beat ORT in FP32**
+
+### Updated fix ranking
+
+| Priority | Fix | Est. gain | Status |
+|---|---|---|---|
+| 1 | MLAS-quality GEMV kernel (prefetch, tile) | 3-5 ms/tok | Not started |
+| 2 | Graph-level op fusion (reduce 168→~50 ops) | 2-3 ms/tok | Architecture change |
+| 3 | FP16 NEON GEMV (halve bytes moved) | 2× ceiling | Next lever |
+
+---
+
+## Session 7: Final FP32 attribution — GEMV sequence benchmark
+
+**Date:** 2026-07-26
+
+### Pure GEMV sequence benchmark (isolating kernel from framework)
+
+Ran a standalone benchmark simulating the full Qwen2.5 decode pattern:
+169 GEMV calls (24 layers × 7 projections + LM head) through a Rayon pool,
+no graph executor, no tensor binding, no shape resolution.
+
+| Measurement | Time | GB/s | Roof % |
+|---|---|---|---|
+| **Full 169-call GEMV sequence** | **24.35 ms** | **81.1** | **72%** |
+| 48× gate/up [896,4864] isolated | 7.58 ms | 110.4 | 99% |
+| 1× gate [896,4864] isolated | 0.175 ms | 99.8 | 89% |
+
+**Key finding: the NEON GEMV kernel achieves 81 GB/s when measured
+without framework overhead — within 10% of ORT's ~89 GB/s.**
+
+The drop from 99 GB/s (single call) to 81 GB/s (full sequence) is due to:
+- Small matrices ([896,128] K/V projections) that don't parallelise well
+- The massive LM head ([896,151936]) that dominates with less bandwidth efficiency
+- Inter-call Rayon dispatch overhead across 169 calls
+
+### Per-op decode breakdown (ONNX_GENAI_PROFILE_OPS=1, steady-state token)
+
+| Op | Calls/token | Total ms | % of decode |
+|---|---|---|---|
+| MatMul | 49 | 14.80 | 52.3% |
+| FusedMatMulBias | 120 | 11.16 | 39.4% |
+| Attention | 24 | 1.21 | 4.3% |
+| RMSNormalization | 49 | 0.28 | 1.0% |
+| Swish | 24 | 0.23 | 0.8% |
+| RotaryEmbedding | 48 | 0.19 | 0.7% |
+| Mul | 24 | 0.18 | 0.6% |
+| Constant | 96 | 0.10 | 0.4% |
+| **Total (executor)** | **434** | **28.32** | **100%** |
+
+### Gap decomposition (native 30 ms vs ORT 22 ms = 8 ms gap)
+
+| Source | Our cost | ORT cost | Gap | % of gap |
+|---|---|---|---|---|
+| GEMV pure bandwidth | 24.4 ms | ~21.7 ms | 2.7 ms | 34% |
+| Per-op framework overhead | 1.6 ms | ~0 ms | 1.6 ms | 20% |
+| Non-GEMV computation | 2.3 ms | ~0.5 ms | 1.8 ms | 23% |
+| Non-graph overhead | 1.7 ms | ~0 ms | 1.7 ms | 21% |
+
+ORT's near-zero non-GEMV cost comes from fused kernels (MatMul+Bias+Activation
+in MLAS handles bias/activation while data is still in cache) and significantly
+fewer graph nodes (~50 fused ops vs our 434 individual ops).
+
+### Experiments attempted and abandoned (session 7)
+
+1. **Accelerate cblas_sgemv for L2-resident attention projections** — NEGATIVE
+   - GCD wake-up overhead (~30-50 µs/call) exceeds compute savings
+   - [896,896]: Accelerate 58 µs vs NEON 49 µs
+2. **L2-based single-thread threshold** — NEGATIVE
+   - Col-parallel with 8 threads beats single-thread even for L2-resident shapes
+3. **Software prefetch (prfm pldl1strm)** — NEGATIVE
+   - M1's hardware prefetcher handles sequential access better; SW prefetch 40% slower
+4. **Persistent spin-wait pool (session 5, re-confirmed session 7)** — NEGATIVE (~3% improvement)
+   - Rayon IS a persistent pool with ~3 µs per-call cost (not 30-50 µs as initially projected)
+   - Custom sense-reversing barrier pool only 3% better
+
+### Conclusions
+
+**FP32 native cannot beat ORT without two structural changes:**
+1. MLAS-quality GEMV assembly (~10% bandwidth gap, 2.7 ms)
+2. Graph-level op fusion (~3.4 ms from framework + non-GEMV overhead)
+
+**The GEMV kernel is NOT the bottleneck.** At 81 GB/s pure, it's at 72% of roof.
+The bottleneck is the graph executor dispatching 434 individual ops per token
+vs ORT's ~50 fused ops.
+
+**Recommended next step: FP16 NEON GEMV.**
+- Model at 959 MB → GEMV ceiling at 81 GB/s would give ~85 tok/s
+- ORT on FP16: ~42 tok/s (widens to FP32)
+- Path to 2× over ORT is clear
+- FP16 storage + FP32 accumulate for numerics safety
+
+## Final Results — Calibrator Freeze + Verified Numbers (session 9)
+
+### Calibrator Mid-Generation Freeze (commit 177e8a73)
+
+The auto-calibrator could switch between flat (single-threaded) and pool
+(multi-threaded SPMD) decode paths every 600 steps. Because these paths use
+different floating-point reduction orders, switching mid-generation produced
+different logits under greedy decode — Fact Checker observed non-deterministic
+output at 500+ tokens.
+
+**Fix:** Removed re-probing entirely. The calibrator decides once during the
+initial ~14 calibration steps and stays committed permanently. The trade-off
+is that a host becoming loaded after commitment will run a suboptimal pool
+path for the rest of the session, but deterministic output is more important
+than adapting to load changes.
+
+**Load behaviour (measured under 4 `yes` processes, ~25% idle):**
+| Config | Decode tok/s |
+|---|---|
+| forced flat (=0) | 32.55 (best under load) |
+| auto-cal (unset) | 31.00 |
+| forced pool (=1) | 19.43 (worst — spin-wait workers consume CPU) |
+
+**Conclusion:** The auto-calibrator IS correct — pool genuinely loses under
+load due to spin-wait contention. Cannot make pool the unconditional default.
+The fix is freezing the path (not changing which path is selected).
+
+### Verified Profile Numbers (commit d8793f33)
+
+Regenerated on a quiet Apple M1 Max after the calibrator freeze:
+
+| Backend | Model | Load | TTFT | Decode | End-to-end |
+|---|---|---|---|---|---|
+| **ORT FP32** | qwen2.5-0.5b | 2710 ms | 114 ms | **45.5 tok/s** | 44.4 tok/s |
+| **ORT FP16** | qwen2.5-0.5b-f16 | 1988 ms | 119 ms | **40.5 tok/s** | 39.5 tok/s |
+| **Native FP32** | qwen2.5-0.5b | 134 ms | 1023 ms | **33.6 tok/s** | 28.8 tok/s |
+| **Native FP16** | qwen2.5-0.5b-f16 | 138 ms | 1366 ms | **43.6 tok/s** | 33.7 tok/s |
+
+Native FP16 steady-state (p50): 17.3 ms = 57.8 tok/s.
+
+### Further Work (not pursued in this campaign)
+
+1. **FP16 at ~49% of GEMV roof.** At ORT-level 80% efficiency: ~90 tok/s.
+2. **Gate+up GEMV fusion** — ~228 µs savings + one fewer activation read/layer.
+3. **Graph-level op fusion** — 434 individual op dispatches vs ORT's ~50.
+4. **Prefill/TTFT** — compute-bound regime, ~10× worse than ORT, untouched.
+5. **Q4** — ~450 tok/s ceiling, needs int4 aarch64 kernel + compatible export.
+<!-- merged from .squad/decisions/inbox/pris-cpu-bench-harness.md -->
+### 2026-07-26: Native CPU vs ORT CPU bench harness
+**By:** Pris
+**What:** Extended `onnx-genai-bench --bin compare` with direct native CPU EP vs ORT CPU EP measurement on the same model and chat-templated prompt. The harness alternates backend pairs, discards warmups, reports median with p10-p95 spread for model load, TTFT, absolute decode tok/s, decode roofline fraction, end-to-end tok/s, total latency, and emits `--profile-json` machine-readable output. It follows Sebastian's M1 Max protocol defaults: 1 warmup, 5 measured repetitions, 50 generated tokens, and first 2 generated tokens excluded from decode throughput. Added an Apple-Silicon native CPU decode floor test at 3.50 tok/s for this M1 Max measurement rig.
+**Why:** The Mac CPU roofline campaign needs a reproducible instrument instead of a hand-run README paste. The absolute tok/s floor is scoped to this M1 Max rig per Sebastian; other Apple-Silicon hosts assert a measured-roofline utilization floor instead of a global tok/s constant.
+
+
+<!-- merged from .squad/decisions/inbox/pris-sdpa-neon-coverage.md -->
+# Pris — SDPA NEON coverage follow-up
+
+Date: 2026-07-27
+Campaign: PR #227 (`squad/mac-cpu-ep-roofline`)
+Owner: Pris (Tester)
+
+## Decision
+
+`sdpa_f32_neon` now has direct aarch64 coverage instead of relying on scalar-only SDPA tests.
+
+The new coverage in `crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs` compares NEON against both `sdpa_f32_scalar` and an f64 reference on decode-relevant shapes:
+
+- Qwen-style GQA decode: batch 1, 14 query heads, 2 KV heads, q_seq 1, kv_seq 257, dh/dv 64.
+- Odd/tail dimensions: dh 133, dv 65, q_seq 3, kv_seq 129, causal, softcap, bias, mask, and a fully masked query.
+- Large-score stability: magnitude 48 inputs to exercise softmax max-subtraction, with masked entries and odd dimensions.
+
+Tolerance is intentionally not exact: NEON uses 4x-unrolled/tree accumulation while the scalar path is sequential. The guard accepts NEON-vs-scalar max abs <= 5e-4, relative <= 2e-3 with a 1e-4 denominator floor, and NEON-vs-f64 max abs <= 1e-3.
+
+A dispatcher reach test increments a test-only hit counter in `sdpa_f32_neon` and asserts `sdpa_f32(...)` reaches that path on aarch64 when the MLAS feature is not selected.
+
+## Guard-break proof
+
+Probe applied: deliberately skipped `dot_neon` scalar tail handling by setting `j = n` before the final `while j < n` tail loop.
+
+Expected failure observed:
+
+```text
+test kernels::sdpa::tests::sdpa_neon_matches_scalar_and_f64_reference_on_decode_shapes ... FAILED
+odd-dh-dv-tail-masked: NEON vs scalar max_abs=9.221658e-4 max_rel=2.034264e0
+```
+
+After restoring the tail loop, the focused test passed:
+
+```text
+running 1 test
+test kernels::sdpa::tests::sdpa_neon_matches_scalar_and_f64_reference_on_decode_shapes ... ok
+```
+
+The aarch64 dispatcher reach check also passed:
+
+```text
+test kernels::sdpa::tests::sdpa_dispatcher_reaches_neon_on_aarch64 ... ok
+```
+
+## GEMV tolerance follow-up
+
+Chew measured the model-scale GEMV max relative drift at 1.57% for `[1,4864,896]`, with smaller cases below that. The `accelerate_decode_gemv_matches_generic_at_model_scale` threshold was tightened from 2.0% to 1.8%, leaving modest cross-machine headroom for legitimate f32 accumulation-order drift while catching larger regressions.
+<!-- merged from .squad/decisions/inbox/rains-split-sequence.md -->
+### 2026-07-27: Split sequence storage and algorithms into focused modules
+**By:** Rains
+**What:** Replaced the 1,761-line `crates/onnx-runtime-session/src/sequence.rs` with a `sequence/` module tree: `mod.rs` (238 lines; root, re-exports, tests), `error.rs` (errors/result), `tensor.rs` (shared tensor storage, allocation, byte/view validation), `value.rs` (homogeneous sequence storage and indexing), `split.rs` (split specifications and planning), and `concat.rs` (concat planning, copying, and new-axis stacking).
+**Why:** This is behavior-preserving code motion for Dallas entropy audit item #11. `sequence::SequenceError`, `SequenceResult`, `SeqTensor`, `SequenceValue`, `SplitSpec`, `split`, `split_tensor`, `concat`, and the existing crate-visible concat helpers remain re-exported at their prior paths; `executor.rs` and root `Cargo.toml` are unchanged. Allocation order, view-bound checks, signatures, error text, cfg/allow attributes, and tests are unchanged. Gates passed: `cargo build -p onnx-runtime-session`; `cargo test -p onnx-runtime-session` (82 unit tests, integration tests, and doc tests passed); `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings`; and `cargo fmt -p onnx-runtime-session`. The known pre-existing `tests/decode_session.rs` missing `tests/fixtures/tiny-llm/model.onnx` failure did not reproduce in this checkout's gate run; no fixture or decode-session files were changed.
+
+
+<!-- merged from .squad/decisions/inbox/rem-controlflow.md -->
+# Decision: Control-flow ops (If / Scan / Loop) in the MLX plugin EP
+
+**Author:** rem (Metal/MLX EP)
+**Branch/worktree:** `rem/controlflow` @ `/Users/justinc/Documents/GitHub/onnxruntime-mlx-cf`
+**Date:** 2026-07-14
+**Status:** Implemented (static/foldable forms) + feasibility documented. No commit.
+
+## Feasibility verdict — plugin EPs CAN access subgraph bodies
+
+**YES.** The ORT 1.27 plugin-EP C ABI exposes a control-flow node's body subgraphs to a compiling
+plugin EP. Concretely:
+
+- `OrtEpApi`/`OrtApi`: `Node_GetNumSubgraphs` + `Node_GetSubgraphs` (since 1.23) return each body as
+  an `OrtGraph` together with its attribute name (`then_branch` / `else_branch` / `body`).
+- C++ wrappers used here: `Ort::ConstNode::GetSubgraphs()` →
+  `std::vector<Ort::AttrNameSubgraph{attr_name, ConstGraph sub_graph}>`, plus
+  `ConstGraph::GetNodes/GetInputs/GetOutputs/GetInitializers`, `ConstNode::GetImplicitInputs()`,
+  and `Graph_GetParentNode` to detect that a graph is a CF body.
+
+**Empirical proof (Model A).** ORT partitions control flow **bottom-up**: `GetCapability` is called
+on the body subgraphs FIRST (with a non-null parent node), then on the parent graph. By default ORT
+offloads translatable body ops independently and runs the If/Scan/Loop node itself on ORT CPU
+("Model B"). To own the whole construct ("Model A") the EP must, in `GetCapability`, **decline all
+body nodes** when the enclosing CF node is itself claimable, and **claim the CF node** in the parent
+graph. At `Compile` time the EP then receives the CF node with `Node_GetSubgraphs` returning the
+bodies with their original ops intact (verified: `then_branch[Add] else_branch[Sub]`,
+`Scan body[Add Identity]`, `Loop body[Add Identity]`). So If/Scan/Loop are **feasible** in the
+plugin-EP compiling model. (There is also a separate 1.24 kernel-EP path — `CreateIf/Loop/ScanKernel`
+— which this compiling EP does not use.)
+
+## What was implemented
+
+`src/ep/ops/controlflow.cc` → `RegisterControlFlowOps` registers `If`, `Scan`, `Loop` with
+conservative claim predicates; a claimed node is translated by unrolling its body inline via the new
+`TranslationContext::RunSubgraph`. Claim predicates recursively require every body op to be
+MLX-translatable, so a claimed CF node can never contain an untranslatable op.
+
+- **If (runtime/foldable cond):** both branches must be translatable at claim time. Each forward the
+  eager path reads `cond` host-side (`RawHost`) and translates ONLY the taken branch — no `mlx_where`
+  needed because the graph is rebuilt per forward. Compiled-decode fast-path is disabled for CF plans
+  (`has_control_flow`) since branch structure is data-dependent.
+- **Scan (static trip):** trip count = scan-input axis-0 length (must be statically known, ≥1).
+  Forward direction, axis 0 only (non-zero `scan_*_directions`/`scan_*_axes` → unclaimed). Unrolls the
+  body, threads carried state, stacks scan outputs along axis 0.
+- **Loop (constant M + pass-through cond):** requires explicit int64 `M` and bool `cond` inputs
+  (host-read) and a body whose cond output is a pass-through of the cond input (direct alias or an
+  `Identity` copy) — the provable `for i in range(M)` idiom. Unrolls exactly `M` iterations
+  (`cond0 ? M : 0`). MVP: carried-state-only (no per-iteration scan outputs).
+
+### Plumbing (kept minimal, existing flat-graph path untouched)
+- `ep.cc` `GetCapability`: decline body nodes when inside a translatable CF body; force CF nodes into
+  singleton clusters so cond/M and implicit inputs resolve host-readably from the fused boundary.
+- `ep.cc` recursive `BuildSubgraphs`: captures each body as a `NodeDesc::SubgraphDesc`
+  (topo-ordered body `NodeDesc`s, implicit-input resolution, nested-CF recursion).
+- `mlx_backend.h`: `SubgraphDesc` + `NodeDesc::subgraphs`; `TensorRef` gained an owning
+  `init_owned` buffer.
+- `mlx_engine.h` / `mlx_backend.cc`: `RunSubgraph` (scoped env save/restore); `BuildPlan`
+  recursively validates body ops and disables the compiled fast-path for CF plans.
+
+### Bug found + fixed during bring-up
+Body initializers are reached through the subgraph handle that ORT **releases once the body walk
+returns**, so a borrowed `GetTensorRawData()` pointer dangled (manifested as an `If` else-branch
+subtracting ≈1.000002 instead of 1.0 — nondeterministic). Fix: **copy** body-initializer bytes into a
+`shared_ptr<vector<uint8_t>>` owned by the `TensorRef` (fused-graph initializers still borrow
+session-owned memory). Correctness now deterministic.
+
+## What was deferred to ORT CPU (unclaimed — runs correctly on fallback)
+- **Loop** with dynamic / data-dependent (non-pass-through) cond → trip count not statically known.
+- **Loop** scan outputs (per-iteration accumulation) — carried-state-only in this MVP.
+- **Scan** with non-forward directions or non-zero axes; scalar (rank-0) scan inputs.
+- Any body containing an op the flat path can't translate (recursive claim guard).
+
+Declined CF nodes still let their translatable body ops offload to MLX via the ordinary flat path;
+only the CF node runs on CPU. Verified with a data-dependent `Loop` case (`Loop` on CPU, body `Add`
+fused to MLX, output correct).
+
+## Tests + build status
+- New `tests/ops/test_rem_controlflow.py`: If (runtime cond true/false), Scan (static trip), Loop
+  (M∈{0,1,3,5}, cond-false→0 iters), and a data-dependent Loop asserted left-on-CPU. Each claimed case
+  asserts (via per-node profiling) the CF node is actually claimed by MLX (non-vacuous) AND matches
+  ORT CPU. **9 passed.**
+- Full pytest ops suite: **746 passed, 56 skipped** (no flat-path regression).
+- `ctest` (mlx_op_tests, mlx_leak_test, mlx_e2e) with prebuilt ORT DYLD: **3/3 passed** (leak-clean,
+  e2e unchanged).
+- Build clean. No commit (per task constraints). Scratch (`cf_probe.py`) deleted.
+<!-- merged from .squad/decisions/inbox/spunkmeyer-split-image.md -->
+### 2026-07-27: Split image preprocessing into cohesive submodules
+**By:** Spunkmeyer
+**What:** Split `crates/onnx-genai-preprocess/src/image.rs` into a 29-line facade plus `image/config.rs` (293 LOC), `image/program.rs` (1,742 LOC), `image/tiling.rs` (323 LOC), `image/transform.rs` (233 LOC), and `image/tests.rs` (1,408 LOC). `image/packed.rs` remains unchanged at 1,330 LOC. The facade preserves every existing public re-export and import path.
+**Why:** Separate image-program metadata compilation/dataflow validation from pixel transforms and tiling without changing behavior. All serde attributes, resize/normalization arithmetic, tiling boundary math, serialization behavior, and error text are unchanged; the unknown-output-source regression now asserts the complete byte-identical error string. Gates passed: preprocess build, 54 preprocess tests, preprocess clippy with `-D warnings`, and downstream engine/CLI build. A non-author code-review agent approved the diff with no findings.
+<!-- merged from .squad/decisions/inbox/wierzbowski-split-cli-lib.md -->
+### 2026-07-27: Split CLI orchestration from presentation and REPL parsing
+**By:** Wierzbowski
+**What:** Split `crates/onnx-genai-cli/src/lib.rs` (3,559 lines before; 1,233 after) into `generate.rs` (219 LOC), `interactive.rs` (953), `commands.rs` (234), `output.rs` (232), `model_inspection.rs` (71), and `transcribe.rs` (709), retaining the existing `profile.rs`. `lib.rs` remains the CLI argument/type and dispatch facade.
+**Why:** Cohesive private modules make generation, interactive orchestration, command parsing, presentation, model inspection, and transcription independently navigable without changing the crate's public surface, CLI shapes, or output text.
+
+Ctrl-C wiring was moved intact into `interactive.rs`: the `Once`-guarded `ctrlc::set_handler` body retains its registration sites and order, the same `GENERATING`, `INTERRUPT_REQUESTED`, and `EXIT_ARMED` atomics with `SeqCst`, and the REPL still clears `EXIT_ARMED` immediately after a submitted line before parsing it. One-shot generation and transcription install the same handler at their original points.
+
+Gates: `cargo build -p onnx-genai-cli` passed; `cargo test -p onnx-genai-cli` passed (127 tests total across targets); strict `cargo clippy -p onnx-genai-cli --all-targets -- -D warnings` is blocked by pre-existing unchanged `crates/onnx-genai-cli/src/pages.rs:129` (`clippy::manual_checked_ops`); clippy passes with only that lint allowed. `cargo fmt -p onnx-genai-cli -- --check` and `git diff --check` passed. Non-author code review found no significant issues.
 ### newt-ops-coverage
 
 <!-- merged from .squad/decisions/inbox/newt-ops-coverage.md -->

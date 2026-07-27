@@ -2417,6 +2417,7 @@ dependencies = [
  "onnx-runtime-tracer",
  "rayon",
  "thiserror 2.0.19",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 

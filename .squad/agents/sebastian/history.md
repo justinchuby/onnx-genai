@@ -90,6 +90,104 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 - 2026-07-26T20:00:04Z — Repaired PR #203 coverage under lockout by changing the split-K numeric test to `n=1152`, exercising `matmul_nbits_gemv_f16_scales_f16_splitk`.
 
+## 2026-07-27T07:55:00-07:00 — MLAS vs Native CPU EP Strategy Analysis
+
+Delivered decision-grade brief (`sebastian-mlas-vs-native-strategy.md`) answering Justin's question: **can the native CPU EP stand alone on Apple Silicon?**
+
+**Key findings (all measured on M1 Max, dual-corroborated):**
+
+1. **Q5 (strategy): YES, stand alone.** Decode → our NEON f16 GEMV (88–100 GB/s, 1.42× over ORT). Prefill → Accelerate/AMX (900–2100 GFLOPS, 50–100× over NEON-only). ORT cannot reach AMX (no Accelerate linkage). Under this split we never need MLAS on Mac.
+
+2. **Q1 (fp16 fragility): FRAGILE.** Our 1.42× fp16 decode lead rests on ORT's `FuseFp16InitializerToFp32NodeTransformer` widening fp16→fp32 before MLAS hgemm sees it. MLAS has a fully-wired hgemm path (`MlasHGemmDispatchNeon`, `MLAS_HGEMM_DATA_PARAMS`). Upstream fix is one graph-optimizer config change. If fixed, our residual advantage shrinks to ~10–20%. **Real moat is AMX for prefill, not fp16 for decode.**
+
+3. **Q2 (AMX threshold): No lower threshold.** AMX pays off at M=10 (170+ GFLOPS vs NEON's 21 GFLOPS). Crossover is exactly M=1 (decode) vs M≥2 (prefill). No hybrid needed. Predicted TTFT with Accelerate: ~47 ms at M=40 vs ORT's 107 ms.
+
+4. **Q3 (MLAS porting): Skip.** Accelerate makes MLAS's NEON GEMM/packing/tiling moot for compute-bound work. Our NEON GEMV suffices for bandwidth-bound decode. KleidiAI GEMV offers ~5–15% marginal improvement at high FFI maintenance cost. Only potential future interest: quantized GEMM for int4 models.
+
+5. **Q4 (8% f32 gap): Concede.** Gap is dispatch overhead (435 vs ~300 ops/token) + kernel micro-optimization. Irrelevant when Mac ships fp16 as default (we lead 42% there).
+
+**No code changes made** (per rules — Iran, Deckard, and Pris are pushing to the active branch).
+
+## 2026-07-27T08:09:00-07:00 — Q6: Vendoring ARM MLAS verdict (NOT WORTH IT)
+
+Added Q6 to the strategy brief responding to Justin's proposal to vendor MLAS's ARM kernels and default-enable the `mlas` feature.
+
+**Decisive finding: MLAS's ARM GEMV kernel is tied with ours.** Head-to-head microbenchmark (isolated kernel, no graph fusion confound) at Qwen2.5-0.5B decode shapes:
+- Run 1 (load 24.9): MLAS/ours = 1.05×
+- Run 2 (load 7.0): MLAS/ours = 1.00×
+
+The 8% ORT gap is ~60% graph-fusion (dispatch overhead) and ~40% kernel quality. Vendoring MLAS addresses only the smaller half. Accelerate makes MLAS's GEMM irrelevant for prefill (8–15× faster).
+
+**KleidiAI is load-bearing** — ORT's ARM perf comes from KleidiAI microkernels, not just MLAS assembly. Vendoring MLAS without KleidiAI would not reproduce ORT's speed. KleidiAI headers are NOT in our vendor snapshot — would need separate vendor drop. Both MIT-licensed.
+
+**Strategy ranking:**
+1. Ours + Accelerate (already implemented) — best
+2. Option 1 + graph-level op fusion — second best, addresses actual gap source
+3. Vendor ARM MLAS (Justin's proposal) — not worth it; 0–5% gain vs high cost
+
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - PR #265 for #58 merged after Hicks approved runtime-dispatched AVX2/F16C and NEON f16/bf16 GEMM SIMD, including scalar/tail fallbacks and parity coverage.
+
+## 2026-07-27T15:55:00+00:00 — half_gemm.rs analysis (Q6/Q1 update)
+
+After main merge (e104664b), analyzed the new `half_gemm.rs` kernel (898 lines).
+
+Key findings:
+- **Architecture**: Blocked GEBP GEMM with MR=4, NR=8, KC=128, NC=64. Packs f16→f32 during panel creation. NEON microkernel uses separate vmulq+vaddq (not fmla — 45% headroom left). Rayon-parallelized over row blocks.
+- **Estimated GFLOPS**: ~18–20/core single-threaded, ~100–160 multi-threaded (8 P-cores). Accelerate/AMX is 6–15× faster at all prefill shapes. MLAS hgemm would be ~1.3–1.7× faster on NEON (native fp16 = 2× element width), but both are irrelevant vs Accelerate.
+- **⚠️ Dispatch bug found**: `try_matmul_half` (matmul.rs:488) fires for fully-fp16 models at ALL M values, including M=1. It intercepts the optimized `neon_gemv_f16_col_parallel` path. At M=1, half_gemm is single-threaded (1 row block) and packs f16→f32→f32 GEMM, whereas the GEMV reads f16 directly with multi-threaded column parallelism. Estimated 4–8× slower for M=1 decode. Flagged to Iran.
+- **Strategic impact**: Strengthens anti-vendoring argument (we now have portable f16 GEMM for non-Mac ARM). Q1 FP16 moat sharpened: even if ORT fixes routing, our prefill moat via AMX grows. Q5 unchanged except dispatch fix needed.
+- Updated decision brief with these findings.
+
+## 2026-07-27T16:28:00+00:00 — BNNS fp16 AMX discovery (game-changing)
+
+Justin asked: "Didn't you say GEMM can use Accelerate? If it's faster than NEON." Investigated BNNS (`BNNSMatMul`) as fp16 matmul path.
+
+Key findings:
+- **BNNS fp16 matmul reaches AMX.** Measured 2000–2450 GFLOPS at prefill shapes.
+- **BNNS f16→f32 mixed precision works** and is the fastest path: 2451 GFLOPS at M=128 Gate (vs sgemm 1972 GFLOPS, vs NEON ~52 GFLOPS single-threaded).
+- **Crossover is exactly M=2.** At M=1, BNNS has ~0.9 ms dispatch overhead (worse than GEMV). At M≥2, AMX throughput overwhelms. Binary threshold, chip-independent.
+- **Widen+sgemm is 1.6× slower than BNNS f16→f32** — widening doubles memory traffic for no gain.
+- **half_gemm.rs NEON path is 15–25× slower than BNNS on Mac.** Right kernel for non-Mac ARM; wrong approach for Mac prefill.
+- **BNNS deprecated in macOS 15** (replaced by BNNSGraph*). Still works, migration is future maintenance item.
+- TTFT at M=40: BNNS → ~37 ms, sgemm → ~45 ms, ORT → 107 ms. We beat ORT by 2.9×.
+- Corroborated all timings with mach_absolute_time + clock_gettime (agreement within 0.1%).
+
+Verdicts:
+1. f32 prefill → cblas_sgemm ✅ (already implemented)
+2. f16 prefill → **BNNS BNNSMatMul f16→f32** (new, must implement)
+3. half_gemm.rs NEON → keep for non-Mac ARM only; gate on `!cfg(target_os = "macos")` for prefill
+4. Threshold: M=1 → GEMV (ours), M≥2 → BNNS/sgemm (Accelerate). No per-chip calibration needed.
+
+Updated decision brief with BNNS section at top.
+
+## 2026-07-27T16:48:00+00:00 — Batch decode analysis (bigger strategic opening)
+
+Justin asked about batch decode (M=B, B>1). Benchmarked BNNS vs sgemm vs NEON at B=1..32.
+
+Key findings:
+- **Batch decode favours us significantly at B≥2.** At B=32: BNNS 1663 tok/s (measured, load 4–6).
+- **Roofline crossover at B≈6–7** (M1 Max). Below: bandwidth-bound, above: compute-bound → AMX dominance.
+- **BNNS wins at B≥2 for batch decode too.** Same M=2 threshold as prefill.
+- **Nothing in current design is hostile to batching.** SPMD pool, prepack cache, scheduler all work.
+- **Three-regime dispatch:** M=1 → GEMV, M≥2 Mac → BNNS, M≥2 non-Mac → half_gemm.rs.
+- All numbers corroborated with mach_absolute_time + clock_gettime (<1% agreement).
+
+Updated decision brief with batch decode section at top.
+
+## 2026-07-27T09:02:00-07:00 — ORT batch decode MEASURED, 15× claim retracted
+
+Previous batch decode entry estimated ORT at ~108 tok/s (B=32) based on MLAS NEON ~120 GFLOPS assumption. Actually measured ORT via Python API (`onnxruntime` 1.27.0, CPUExecutionProvider):
+
+| B | ORT tok/s (load 18–23 ⚠️) |
+|---|---|
+| 1 | 40.2 (vs 46.01 quiet = 0.87×) |
+| 8 | 224.6 |
+| 32 | 345.3 (spread 50.8%) |
+
+**Correction:** ORT at B=32 is ~345 tok/s, not ~108. Ratio is ~4–5× (1663/345), not 15×. The estimate was wrong because it assumed MLAS NEON kernel throughput (~120 GFLOPS) without accounting for ORT's graph fusion efficiency. ORT runs fused subgraphs (~300 ops) where we run 434 individual ops — at batch sizes, this compounds.
+
+**⚠️ Load asymmetry:** BNNS measured at load 4–6, ORT at load 18–23. Both should be re-measured under identical conditions before publication. The advantage is real (4–5×) but the exact ratio is uncertain.
+
+Commit `ad920725` title ("15× advantage") is retracted. Follow-up commit filed with correction.

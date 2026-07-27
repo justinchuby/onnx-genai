@@ -245,6 +245,9 @@ pub struct QkCapture<'a> {
     pub stage: QkCaptureStage,
 }
 
+#[cfg(all(test, target_arch = "aarch64"))]
+static SDPA_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Run scaled-dot-product attention over `t`, writing the context into `y`
 /// (`[batch, num_heads, q_seq, v_head_size]`, `BNSH`).
 ///
@@ -284,6 +287,14 @@ pub fn sdpa_f32(
             sdpa_f32_fast(t, cfg, bias, mask, y);
             return;
         }
+    }
+    // NEON-vectorized path for aarch64: uses dot_f32 and axpy_f32 which
+    // dispatch to 4×-unrolled NEON intrinsics. Same semantics as the scalar
+    // reference, just faster inner loops.
+    #[cfg(target_arch = "aarch64")]
+    if qk.is_none() {
+        sdpa_f32_neon(t, cfg, bias, mask, y);
+        return;
     }
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
 }
@@ -509,7 +520,7 @@ fn softmax_in_place(scores: &mut [f32], exp: SoftmaxExp) {
 }
 
 /// Dot product using the decode path's AVX2+FMA accumulation order when
-/// available, with a scalar fallback on other targets.
+/// available, NEON on aarch64, with a scalar fallback on other targets.
 #[inline(always)]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -518,11 +529,16 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
         return unsafe { dot_avx2_fma(a, b) };
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return dot_neon(a, b);
+    }
+    #[allow(unreachable_code)]
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// AXPY using the decode path's AVX2+FMA accumulation order when available,
-/// with a scalar fallback on other targets.
+/// NEON on aarch64, with a scalar fallback on other targets.
 #[inline(always)]
 fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -532,8 +548,117 @@ fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
         unsafe { axpy_avx2_fma(dst, scalar, src) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        axpy_neon(dst, scalar, src);
+        return;
+    }
+    #[allow(unreachable_code)]
     for (d, s) in dst.iter_mut().zip(src) {
         *d += scalar * s;
+    }
+}
+
+/// NEON 4×-unrolled dot product for aarch64 (ARMv8 baseline).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let mut acc0 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc1 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc2 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc3 = unsafe { vdupq_n_f32(0.0) };
+    let mut j = 0;
+    while j + 16 <= n {
+        unsafe {
+            acc0 = vfmaq_f32(
+                acc0,
+                vld1q_f32(a.as_ptr().add(j)),
+                vld1q_f32(b.as_ptr().add(j)),
+            );
+            acc1 = vfmaq_f32(
+                acc1,
+                vld1q_f32(a.as_ptr().add(j + 4)),
+                vld1q_f32(b.as_ptr().add(j + 4)),
+            );
+            acc2 = vfmaq_f32(
+                acc2,
+                vld1q_f32(a.as_ptr().add(j + 8)),
+                vld1q_f32(b.as_ptr().add(j + 8)),
+            );
+            acc3 = vfmaq_f32(
+                acc3,
+                vld1q_f32(a.as_ptr().add(j + 12)),
+                vld1q_f32(b.as_ptr().add(j + 12)),
+            );
+        }
+        j += 16;
+    }
+    while j + 4 <= n {
+        unsafe {
+            acc0 = vfmaq_f32(
+                acc0,
+                vld1q_f32(a.as_ptr().add(j)),
+                vld1q_f32(b.as_ptr().add(j)),
+            );
+        }
+        j += 4;
+    }
+    let mut sum = unsafe { vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3))) };
+    while j < n {
+        sum += a[j] * b[j];
+        j += 1;
+    }
+    sum
+}
+
+/// NEON 4×-unrolled AXPY for aarch64: dst[i] += scalar * src[i].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn axpy_neon(dst: &mut [f32], scalar: f32, src: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = dst.len();
+    let vs = unsafe { vdupq_n_f32(scalar) };
+    let mut j = 0;
+    while j + 16 <= n {
+        unsafe {
+            let d0 = vld1q_f32(dst.as_ptr().add(j));
+            let d1 = vld1q_f32(dst.as_ptr().add(j + 4));
+            let d2 = vld1q_f32(dst.as_ptr().add(j + 8));
+            let d3 = vld1q_f32(dst.as_ptr().add(j + 12));
+            vst1q_f32(
+                dst.as_mut_ptr().add(j),
+                vfmaq_f32(d0, vs, vld1q_f32(src.as_ptr().add(j))),
+            );
+            vst1q_f32(
+                dst.as_mut_ptr().add(j + 4),
+                vfmaq_f32(d1, vs, vld1q_f32(src.as_ptr().add(j + 4))),
+            );
+            vst1q_f32(
+                dst.as_mut_ptr().add(j + 8),
+                vfmaq_f32(d2, vs, vld1q_f32(src.as_ptr().add(j + 8))),
+            );
+            vst1q_f32(
+                dst.as_mut_ptr().add(j + 12),
+                vfmaq_f32(d3, vs, vld1q_f32(src.as_ptr().add(j + 12))),
+            );
+        }
+        j += 16;
+    }
+    while j + 4 <= n {
+        unsafe {
+            let d = vld1q_f32(dst.as_ptr().add(j));
+            vst1q_f32(
+                dst.as_mut_ptr().add(j),
+                vfmaq_f32(d, vs, vld1q_f32(src.as_ptr().add(j))),
+            );
+        }
+        j += 4;
+    }
+    while j < n {
+        dst[j] += scalar * src[j];
+        j += 1;
     }
 }
 
@@ -607,6 +732,90 @@ unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
         while i < n {
             *dst_ptr.add(i) += scalar * *src_ptr.add(i);
             i += 1;
+        }
+    }
+}
+
+/// NEON-vectorized SDPA for aarch64 — same semantics as the scalar reference
+/// but uses 4×-unrolled NEON dot product and AXPY for the inner loops.
+///
+/// Handles all features (GQA, causal, softcap, bias, mask) with identical
+/// control flow to the scalar reference, just faster inner math.
+#[cfg(target_arch = "aarch64")]
+fn sdpa_f32_neon(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    y: &mut [f32],
+) {
+    #[cfg(test)]
+    SDPA_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let SdpaTensors {
+        q,
+        k,
+        v,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_seq,
+        kv_seq,
+        head_size,
+        v_head_size,
+    } = *t;
+
+    debug_assert_eq!(q.len(), batch * num_heads * q_seq * head_size);
+    debug_assert_eq!(k.len(), batch * num_kv_heads * kv_seq * head_size);
+    debug_assert_eq!(v.len(), batch * num_kv_heads * kv_seq * v_head_size);
+    debug_assert_eq!(y.len(), batch * num_heads * q_seq * v_head_size);
+    debug_assert!(num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads));
+
+    let heads_per_kv = num_heads / num_kv_heads;
+
+    let (post_scale, operand_scale) = match cfg.scale {
+        ScaleMode::PostDot(s) => (s, 1.0f32),
+        ScaleMode::SplitSqrt(s) => (1.0f32, s.sqrt()),
+    };
+    let combined_scale = post_scale * operand_scale * operand_scale;
+
+    let mut scores = vec![0.0f32; kv_seq];
+    for b in 0..batch {
+        for n in 0..num_heads {
+            let kv_n = n / heads_per_kv;
+            for i in 0..q_seq {
+                let q_base = ((b * num_heads + n) * q_seq + i) * head_size;
+                let q_slice = &q[q_base..q_base + head_size];
+
+                // scores[j] = combined_scale * dot(Q, K_j) [+softcap] + bias + mask
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
+                    let mut s = dot_f32(q_slice, &k[k_base..k_base + head_size]) * combined_scale;
+                    if let Some(softcap) = cfg.softcap {
+                        s = softcap * (s / softcap).tanh();
+                    }
+                    s += bias.at(b, n, i, j);
+                    s += mask.at(b, i, j);
+                    if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+                        s = cfg.causal_fill;
+                    }
+                    *sc = s;
+                }
+
+                softmax_in_place(&mut scores, SoftmaxExp::F32);
+
+                // context: Y[i] = sum_j(probs[j] * V[j, :]) via NEON AXPY
+                let y_base = ((b * num_heads + n) * q_seq + i) * v_head_size;
+                let y_slice = &mut y[y_base..y_base + v_head_size];
+                y_slice.fill(0.0);
+                for (j, &probability) in scores.iter().enumerate() {
+                    if probability == 0.0 {
+                        continue;
+                    }
+                    let v_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * v_head_size;
+                    axpy_f32(y_slice, probability, &v[v_base..v_base + v_head_size]);
+                }
+            }
         }
     }
 }
@@ -1191,6 +1400,335 @@ mod tests {
         for (a, b) in y_post.iter().zip(y_split.iter()) {
             assert!((a - b).abs() < 1e-5, "post {y_post:?} split {y_split:?}");
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn deterministic_values(n: usize, seed: u64, magnitude: f32) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..n)
+            .map(|_| {
+                s ^= s >> 30;
+                s = s.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                s ^= s >> 27;
+                let unit = ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0;
+                unit * magnitude
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    struct PatternBias {
+        q_seq: usize,
+        kv_seq: usize,
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    impl AttnBias for PatternBias {
+        fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32 {
+            let idx = (((b * 17 + head * 13 + i) * self.kv_seq + j) % 19) as f32;
+            debug_assert!(i < self.q_seq);
+            (idx - 9.0) * 0.03125
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    struct PatternMask {
+        q_seq: usize,
+        kv_seq: usize,
+        fully_masked_query: Option<usize>,
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    impl KeyMask for PatternMask {
+        fn at(&self, b: usize, i: usize, j: usize) -> f32 {
+            debug_assert!(i < self.q_seq && j < self.kv_seq);
+            if self
+                .fully_masked_query
+                .is_some_and(|query| query == b * self.q_seq + i)
+            {
+                return f32::NEG_INFINITY;
+            }
+            if (b * 31 + i * 7 + j * 3).is_multiple_of(11) {
+                f32::NEG_INFINITY
+            } else if (i + j).is_multiple_of(13) {
+                -37.0
+            } else {
+                0.0
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn sdpa_f64_reference(
+        t: &SdpaTensors,
+        cfg: &SdpaConfig,
+        bias: &dyn AttnBias,
+        mask: &dyn KeyMask,
+    ) -> Vec<f32> {
+        let SdpaTensors {
+            q,
+            k,
+            v,
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_seq,
+            kv_seq,
+            head_size,
+            v_head_size,
+        } = *t;
+        let heads_per_kv = num_heads / num_kv_heads;
+        let (post_scale, operand_scale) = match cfg.scale {
+            ScaleMode::PostDot(s) => (s as f64, 1.0f64),
+            ScaleMode::SplitSqrt(s) => (1.0f64, (s as f64).sqrt()),
+        };
+        let mut y = vec![0.0f32; batch * num_heads * q_seq * v_head_size];
+        let mut scores = vec![0.0f64; kv_seq];
+        for b in 0..batch {
+            for n in 0..num_heads {
+                let kv_n = n / heads_per_kv;
+                for i in 0..q_seq {
+                    let q_base = ((b * num_heads + n) * q_seq + i) * head_size;
+                    for (j, score) in scores.iter_mut().enumerate() {
+                        let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
+                        let mut acc = 0.0f64;
+                        for p in 0..head_size {
+                            acc += (q[q_base + p] as f64 * operand_scale)
+                                * (k[k_base + p] as f64 * operand_scale);
+                        }
+                        let mut s = acc * post_scale;
+                        if let Some(softcap) = cfg.softcap {
+                            let softcap = softcap as f64;
+                            s = softcap * (s / softcap).tanh();
+                        }
+                        s += bias.at(b, n, i, j) as f64;
+                        s += mask.at(b, i, j) as f64;
+                        if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+                            s = cfg.causal_fill as f64;
+                        }
+                        *score = s;
+                    }
+                    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let y_base = ((b * num_heads + n) * q_seq + i) * v_head_size;
+                    if max == f64::NEG_INFINITY {
+                        y[y_base..y_base + v_head_size].fill(0.0);
+                        continue;
+                    }
+                    let mut denominator = 0.0f64;
+                    for score in &mut scores {
+                        *score = (*score - max).exp();
+                        denominator += *score;
+                    }
+                    let mut acc = vec![0.0f64; v_head_size];
+                    if denominator > 0.0 {
+                        for (j, &weight) in scores.iter().enumerate() {
+                            let probability = weight / denominator;
+                            if probability == 0.0 {
+                                continue;
+                            }
+                            let v_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * v_head_size;
+                            for c in 0..v_head_size {
+                                acc[c] += probability * v[v_base + c] as f64;
+                            }
+                        }
+                    }
+                    for c in 0..v_head_size {
+                        y[y_base + c] = acc[c] as f32;
+                    }
+                }
+            }
+        }
+        y
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sdpa_neon_matches_scalar_and_f64_reference_on_decode_shapes() {
+        struct Case {
+            name: &'static str,
+            batch: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            q_seq: usize,
+            kv_seq: usize,
+            head_size: usize,
+            v_head_size: usize,
+            magnitude: f32,
+            cfg: SdpaConfig,
+            use_bias: bool,
+            use_mask: bool,
+            fully_masked_query: Option<usize>,
+        }
+
+        let cases = [
+            Case {
+                name: "qwen-style-decode-gqa",
+                batch: 1,
+                num_heads: 14,
+                num_kv_heads: 2,
+                q_seq: 1,
+                kv_seq: 257,
+                head_size: 64,
+                v_head_size: 64,
+                magnitude: 0.75,
+                cfg: SdpaConfig {
+                    scale: ScaleMode::PostDot(1.0 / 8.0),
+                    softcap: None,
+                    causal: false,
+                    past_seq: 256,
+                    causal_fill: f32::MIN,
+                },
+                use_bias: false,
+                use_mask: false,
+                fully_masked_query: None,
+            },
+            Case {
+                name: "odd-dh-dv-tail-masked",
+                batch: 1,
+                num_heads: 8,
+                num_kv_heads: 2,
+                q_seq: 3,
+                kv_seq: 129,
+                head_size: 133,
+                v_head_size: 65,
+                magnitude: 0.5,
+                cfg: SdpaConfig {
+                    scale: ScaleMode::SplitSqrt(1.0 / 133.0_f32.sqrt()),
+                    softcap: Some(7.5),
+                    causal: true,
+                    past_seq: 126,
+                    causal_fill: f32::NEG_INFINITY,
+                },
+                use_bias: true,
+                use_mask: true,
+                fully_masked_query: Some(2),
+            },
+            Case {
+                name: "large-score-softmax-stability",
+                batch: 1,
+                num_heads: 4,
+                num_kv_heads: 1,
+                q_seq: 2,
+                kv_seq: 33,
+                head_size: 65,
+                v_head_size: 17,
+                magnitude: 48.0,
+                cfg: SdpaConfig {
+                    scale: ScaleMode::PostDot(1.0),
+                    softcap: None,
+                    causal: false,
+                    past_seq: 0,
+                    causal_fill: f32::NEG_INFINITY,
+                },
+                use_bias: true,
+                use_mask: true,
+                fully_masked_query: None,
+            },
+        ];
+
+        for case in cases {
+            let q_len = case.batch * case.num_heads * case.q_seq * case.head_size;
+            let k_len = case.batch * case.num_kv_heads * case.kv_seq * case.head_size;
+            let v_len = case.batch * case.num_kv_heads * case.kv_seq * case.v_head_size;
+            let y_len = case.batch * case.num_heads * case.q_seq * case.v_head_size;
+            let q = deterministic_values(q_len, 0x1000 + q_len as u64, case.magnitude);
+            let k = deterministic_values(k_len, 0x2000 + k_len as u64, case.magnitude);
+            let v = deterministic_values(v_len, 0x3000 + v_len as u64, 0.75);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch: case.batch,
+                num_heads: case.num_heads,
+                num_kv_heads: case.num_kv_heads,
+                q_seq: case.q_seq,
+                kv_seq: case.kv_seq,
+                head_size: case.head_size,
+                v_head_size: case.v_head_size,
+            };
+            let bias = PatternBias {
+                q_seq: case.q_seq,
+                kv_seq: case.kv_seq,
+            };
+            let mask = PatternMask {
+                q_seq: case.q_seq,
+                kv_seq: case.kv_seq,
+                fully_masked_query: case.fully_masked_query,
+            };
+            let bias_ref: &dyn AttnBias = if case.use_bias { &bias } else { &NoBias };
+            let mask_ref: &dyn KeyMask = if case.use_mask { &mask } else { &NoMask };
+            let mut scalar = vec![f32::NAN; y_len];
+            let mut neon = vec![f32::NAN; y_len];
+            sdpa_f32_scalar(&tensors, &case.cfg, bias_ref, mask_ref, &mut scalar, None);
+            sdpa_f32_neon(&tensors, &case.cfg, bias_ref, mask_ref, &mut neon);
+            let f64_ref = sdpa_f64_reference(&tensors, &case.cfg, bias_ref, mask_ref);
+
+            let mut max_scalar_abs = 0.0f32;
+            let mut max_f64_abs = 0.0f32;
+            let mut max_scalar_rel = 0.0f32;
+            for ((&got, &scalar), &f64_value) in neon.iter().zip(&scalar).zip(&f64_ref) {
+                assert!(got.is_finite(), "{} produced non-finite output", case.name);
+                let scalar_abs = (got - scalar).abs();
+                let f64_abs = (got - f64_value).abs();
+                max_scalar_abs = max_scalar_abs.max(scalar_abs);
+                max_f64_abs = max_f64_abs.max(f64_abs);
+                max_scalar_rel = max_scalar_rel.max(scalar_abs / scalar.abs().max(1e-4));
+            }
+            // NEON uses a 4x-unrolled tree reduction while the scalar reference
+            // is sequential, so exact parity is not expected. The bound is still
+            // tight enough to catch dropped tail lanes, missing max subtraction,
+            // and accumulator corruption; guard-break probes for those fail.
+            assert!(
+                max_scalar_abs <= 5e-4 && max_scalar_rel <= 2e-3,
+                "{}: NEON vs scalar max_abs={max_scalar_abs:e} max_rel={max_scalar_rel:e}",
+                case.name
+            );
+            assert!(
+                max_f64_abs <= 1e-3,
+                "{}: NEON vs f64 max_abs={max_f64_abs:e}",
+                case.name
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "mlas")))]
+    #[test]
+    fn sdpa_dispatcher_reaches_neon_on_aarch64() {
+        use std::sync::atomic::Ordering;
+
+        let (batch, num_heads, num_kv_heads, q_seq, kv_seq, dh, dv) =
+            (1usize, 4usize, 2usize, 1usize, 11usize, 17usize, 9usize);
+        let q = deterministic_values(batch * num_heads * q_seq * dh, 0xA11CE, 0.5);
+        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0xB0B, 0.5);
+        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0xCAFE, 0.5);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dv,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let before = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+        let mut y = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut y, None);
+        let after = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "sdpa_f32 dispatcher did not execute sdpa_f32_neon on aarch64"
+        );
+        assert!(y.iter().all(|value| value.is_finite()));
     }
 
     /// Deterministic pseudo-random f32 fill in `[-1, 1)` for parity fixtures.
