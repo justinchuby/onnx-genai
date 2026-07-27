@@ -486,16 +486,26 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "device")]
     fn deallocate_rejects_cross_device_buffer() {
         let ep = CpuExecutionProvider::new();
         // Fabricate a buffer tagged with a CUDA device to trip invariant #3.
         let boxed = vec![0u8; 8].into_boxed_slice();
         let ptr = Box::into_raw(boxed) as *mut c_void;
         // SAFETY: valid 8-byte host allocation; we only use it to exercise the
-        // device assert. It leaks on the panic path, which is fine in a test.
+        // device assert. The allocation is reclaimed after catching the panic.
         let foreign = unsafe { DeviceBuffer::from_raw_parts(ptr, DeviceId::cuda(0), 8, 8) };
-        let _ = ep.deallocate(foreign); // must panic before freeing
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ep.deallocate(foreign); // must panic before freeing
+        }));
+        assert!(result.is_err());
+        // SAFETY: `deallocate` panicked before freeing, so `ptr` still names the
+        // original boxed slice allocation.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                ptr as *mut u8,
+                8,
+            )));
+        }
     }
 
     #[test]
