@@ -196,36 +196,20 @@ pub(super) fn substitute_into(
 /// and materialized-view integer-input readers.
 pub(super) fn bytes_as_i64(bytes: &[u8], dtype: DataType) -> Option<Vec<i64>> {
     match dtype {
-        DataType::Int64 => Some(
-            bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect(),
-        ),
-        DataType::Int32 => Some(
-            bytes
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64)
-                .collect(),
-        ),
+        DataType::Int64 => onnx_runtime_ir::read_vec_le(bytes).ok(),
+        DataType::Int32 => onnx_runtime_ir::read_vec_le::<i32>(bytes)
+            .ok()
+            .map(|values| values.into_iter().map(i64::from).collect()),
         _ => None,
     }
 }
 
 pub(super) fn bytes_as_f64(bytes: &[u8], dtype: DataType) -> Option<Vec<f64>> {
     match dtype {
-        DataType::Float32 => Some(
-            bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64)
-                .collect(),
-        ),
-        DataType::Float64 => Some(
-            bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-                .collect(),
-        ),
+        DataType::Float32 => onnx_runtime_ir::read_vec_le::<f32>(bytes)
+            .ok()
+            .map(|values| values.into_iter().map(f64::from).collect()),
+        DataType::Float64 => onnx_runtime_ir::read_vec_le(bytes).ok(),
         _ => None,
     }
 }

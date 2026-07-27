@@ -70,6 +70,7 @@ pub use shape::{
     Dim, Shape, SymbolConstraints, SymbolId, as_static_shape, is_fully_static, static_shape,
 };
 pub use tensor::{
-    SparseTensorData, TensorData, TypeProto, WeightRef, checked_expected_bytes, checked_numel,
+    FromLeBytes, RawBytesError, SparseTensorData, TensorData, TypeProto, WeightRef,
+    checked_expected_bytes, checked_numel, read_scalar_le, read_vec_le,
 };
 pub use value::{Consumers, Usage, Value, ValueId};
