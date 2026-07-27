@@ -141,6 +141,12 @@ Revised the Phi decode lock after Holden's rejection: environment-gated real-mod
 - Fixed `--profile-json -` in non-direct mode emitting invalid JSON (markdown + JSON mixed on stdout); mirrored direct-mode stderr routing.
 - Added `decode_throughput_skip_0_1_2` test with guard-break proof; all 9 `compare` tests pass.
 - Published figures unaffected: profile README used `--decode-skip 2`.
+
+## 2026-07-27T08:11:00-07:00 — SDPA test helpers cfg-gated for x86_64 CI
+- Gated `deterministic_values`, `PatternBias`, `PatternMask`, `sdpa_f64_reference` with `#[cfg(target_arch = "aarch64")]` to match their consuming tests.
+- Without gating, these helpers compiled as dead code on x86_64 and x86, causing `-D warnings` CI failure.
+- Chose precise `cfg` gating over `#[allow(dead_code)]` to avoid silencing future genuine dead-code findings in this module.
+- Verified: `cargo clippy --all-targets --target x86_64-apple-darwin -- -D warnings` passes; native aarch64 clippy and 13 SDPA tests pass.
 - Added aarch64-only `sdpa_f32_neon` parity coverage against scalar and f64 references on Qwen-style decode, odd/tail dimensions, masks/`-inf`, causal/softcap, and large-score softmax stability cases.
 - Added a dispatcher reach test proving `sdpa_f32(...)` executes the NEON path on Apple Silicon when MLAS is not selected.
 - Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.

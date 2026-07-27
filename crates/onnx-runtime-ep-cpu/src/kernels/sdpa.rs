@@ -1402,6 +1402,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn deterministic_values(n: usize, seed: u64, magnitude: f32) -> Vec<f32> {
         let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         (0..n)
@@ -1415,11 +1416,13 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_arch = "aarch64")]
     struct PatternBias {
         q_seq: usize,
         kv_seq: usize,
     }
 
+    #[cfg(target_arch = "aarch64")]
     impl AttnBias for PatternBias {
         fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32 {
             let idx = (((b * 17 + head * 13 + i) * self.kv_seq + j) % 19) as f32;
@@ -1428,12 +1431,14 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     struct PatternMask {
         q_seq: usize,
         kv_seq: usize,
         fully_masked_query: Option<usize>,
     }
 
+    #[cfg(target_arch = "aarch64")]
     impl KeyMask for PatternMask {
         fn at(&self, b: usize, i: usize, j: usize) -> f32 {
             debug_assert!(i < self.q_seq && j < self.kv_seq);
@@ -1453,6 +1458,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn sdpa_f64_reference(
         t: &SdpaTensors,
         cfg: &SdpaConfig,
