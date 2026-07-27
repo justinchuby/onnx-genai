@@ -152,11 +152,11 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 
 ## 2026-07-27T14:34:22-07:00 — Rules type-safety standard
 
-- Added a project rule requiring Rust types to enforce invariants: newtypes for transposable primitives, capability values over late hot-path checks, ownership/borrowing for aliasing, documented unsafe, property-based invariant tests, and restraint around heavier formal specs.
+- Added a project rule requiring Rust types to enforce invariants: newtypes for transposable primitives, capability values over late hot-path checks, and ownership/borrowing for aliasing.
 
 ## 2026-07-27T14:38:08-07:00 — Rules condensation pass
 
-- Tightened `RULES.md` from 10,167 bytes to 7,149 bytes after Justin's terseness directive.
+- `RULES.md` was 8,923 bytes on `main`; the new rule initially pushed it to 10,167 bytes, and the condensation pass brought it to 7,149 bytes, smaller than the starting file despite adding a rule.
 - Condensed the new Rust type-safety rule to the core invariants: invalid states, newtypes, capability values, and ownership/borrowing; dropped repeated unsafe/Miri, property-testing, and TLA+ detail.
 - Folded graph-fusion detail into the model/vendor/EP-agnostic rule without changing its force.
 
