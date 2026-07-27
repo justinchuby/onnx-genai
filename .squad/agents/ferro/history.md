@@ -10,3 +10,6 @@
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Reviewed PR #266: rejected the naive ReduceLogSumExp overflow path, then approved Deckard's stable two-pass CUDA reduction and large-value parity regression.
+# 2026-07-27 — Roadmap wave-6
+
+Approved PR #269 after confirming IsInf, IsNaN, PRelu, CPU IsNaN parity, claim gates, and targeted CPU/GPU validation.

@@ -5488,3 +5488,61 @@ etc. were previously listed as cuDNN candidates but are now NVRTC-covered.
 **By:** Sebastian
 **What:** The shared f16/bf16 blocked GEMM now runtime-selects AVX2 on x86-64 or NEON on aarch64, vectorizes f32 accumulation, and vectorizes contiguous widening (bf16 on both architectures; f16 through F16C or ARM FP16 when detected). Scalar widening and accumulation remain available for every host and all tails.
 **Why:** PR #246 established correct f32-accumulated half GEMM but left scalar inner loops. Runtime dispatch avoids AVX-512 assumptions, preserves CI portability, and scalar-versus-SIMD regression tests cover f16/bf16 square, skinny, and non-vector-aligned shapes within 1e-6.
+
+## 2026-07-27 — Roadmap wave-6 reconciliation
+
+Decision archive pre-check: the active ledger was 515835 bytes. No dated
+section strictly older than 2026-07-20 was found, so
+`.squad/decisions/archive/2026-07.md` was not changed.
+
+<!-- inbox:chico-fp16-vae-51 -->
+### Fail closed on non-finite image decode output
+**By:** Chico
+**What:** Validate widened image decode outputs at VAE, pipeline, and RGB
+encoding boundaries; reject NaN and infinities with an actionable fp32-decoder
+error.
+**Why:** Widening fp16 output cannot recover values that already overflowed
+inside a typed ONNX graph, and transparently rerunning that graph as fp32 is
+not generally possible. Failing closed prevents corrupt images and
+false-positive verification while remaining model-independent. PR #268 merged;
+issue #51 is closed.
+
+<!-- inbox:crowe-pr268-review -->
+### Approve PR #268 non-finite VAE output handling
+**By:** Crowe
+**What:** Approved the shared `validate_finite_decode_output` guard applied at
+standalone VAE, declared pipeline image, ComfyUI, and RGB encoding boundaries.
+**Why:** It rejects NaN and both infinities before images are returned or
+encoded, provides fp32 remediation, and its in-crate fp16-bit tests cover all
+non-finite classes plus finite passthrough without model artifacts.
+
+<!-- inbox:newt-cuda-coverage3 -->
+### CUDA EP op-coverage batch 3 (#67) — IsInf, IsNaN, PRelu
+**By:** Newt
+**What:** Added IsInf (opset 10), IsNaN (opset 9), and PRelu (opset 16) to the
+CUDA EP, raising `CUDA_COVERED_OPS` from 114 to 117. IsInf and IsNaN are
+NVRTC unary float-to-bool predicates for f32/f16/bf16, with IsInf's
+`detect_positive` and `detect_negative` flags validated. PRelu uses a
+unidirectionally broadcastable slope and f32 widen-compute-narrow semantics.
+Added CPU EP IsNaN as the parity reference and raised its registration count
+from 95 to 96.
+**Why:** The claim gates accept only the dtypes and attributes each kernel
+implements, preventing over-broad CUDA claims. GPU-vs-CPU parity covers
+IsInf's flag combinations, IsNaN including empty tensors, and scalar,
+per-channel, full, and rank-0 PRelu slopes. PR #269 merged and advances #67.
+
+<!-- inbox:ferro-pr269-review -->
+### Approve PR #269 CUDA EP op-coverage batch 3
+**By:** Ferro
+**What:** Reviewed CUDA IsInf, IsNaN, and PRelu plus the CPU IsNaN parity
+kernel. Confirmed exact claim gates, opset registration, f32 accumulation for
+half PRelu, unidirectional slope broadcasting, portable NVRTC guards, and
+non-default-stream/capture behavior.
+**Why:** CPU IsNaN registration correctly moves the count from 95 to 96; the
+CUDA covered-op test reports 117 unique entries. CPU IsNaN tests, the 13-test
+GPU parity target, CUDA library tests, formatting, targeted clippy, and CI's
+Rust-quality gate all passed. The unrelated all-targets clippy
+`too_many_arguments` finding in `tests/fused_epilogue_gpu.rs` is non-blocking.
+
+Processed wave-6 inbox notes: `chico-fp16-vae-51`, `crowe-pr268-review`,
+`newt-cuda-coverage3`, and `ferro-pr269-review`.

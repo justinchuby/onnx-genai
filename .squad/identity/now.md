@@ -1,11 +1,11 @@
 # Team Focus — now
 
-**Current focus:** Roadmap CUDA/CPU parity and performance. Wave-5 landed PRs #265/#266/#267: portable half-GEMM SIMD, CUDA coverage batch 2 with stable ReduceLogSumExp, and `pkg.nxrt::VarlenAttention` with bf16 parity coverage.
+**Current focus:** Roadmap CUDA/CPU parity and performance. Overnight landed 13 PRs total; this segment landed #265 (#58 SIMD), #266 (#67→113), #267 (#86 varlen), #268 (#51 CLOSED), and #269 (#67→117).
 
-**Remaining unblocked:** #67 more CUDA ops, #69 conformance, #13 tracing, #51 VAE.
+**Remaining unblocked:** #69 conformance (in-flight), #13 tracing, #58 macOS Accelerate.
 
-**Blocked:** GLM/DeepSeek E2E awaits Justin merging Mobius #404/#423/#430.
+**Blocked:** GLM/DeepSeek E2E awaits Justin merging Mobius #404/#423/#430, including #79/#80/#82/#83.
 
-Concurrent other-squad refactoring remains active; preserve its split-* decision-inbox records.
+**Deferred:** Other-squad refactor turf #55/#75/#78/#85/#206/#207/#228/#230.
 
-**Updated:** 2026-07-27T13:12:20+00:00
+**Updated:** 2026-07-27T14:25:39+0000
