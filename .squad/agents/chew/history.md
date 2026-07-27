@@ -132,3 +132,20 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 - 7 dead code items from removed Accelerate sgemv path.
 - Filed to `.squad/decisions/inbox/chew-pr227-numerics-review.md`.
 
+## 2026-07-27T02:00:00-07:00 — PR #227 FP16 Path Review (Second Pass)
+
+**Scope:** Commits `75311827` (FP16 storage GEMV + NEON bulk f16↔f32) and `3a88ba8c` (SPMD pool for FP32 GEMV + cleanup).
+
+**Verdict: APPROVE** — numerics are sound.
+
+### Key findings
+- **Inline asm `fcvtl`:** Constraints, clobbers, and options are correct. Bit-exact against scalar `half::f16::to_f32()` across all edge cases (denorm, inf, NaN, ±0). Using asm to avoid nightly `f16` type is justified today. Recommend TODO for intrinsic replacement.
+- **FP32 accumulation verified:** Measured max relative error 2.38e-7 vs f64 reference across model-scale shapes (gate/down/q/kv projections). FP16 vs F32 GEMV same-weight discrepancy: 1.73e-6 — confirms accumulation is genuinely f32.
+- **Bulk conversion:** `fcvtn` narrow matches `half::f16::from_f32()` bit-for-bit. Round-to-nearest-even confirmed. Overflow → inf. Denormal/NaN preserved. Asm annotations correct (`nostack` only for write path, `readonly,pure` for read path).
+- **Tail handling:** K=67, N=9 correct. K=1/N=1 correct.
+- **Transpose cache:** `OnceLock` provides thread-safe lazy init. Rayon `par_chunks_mut` writes to disjoint slices.
+- **SPMD pool:** `perf_cores.saturating_sub(1).max(1).min(available)` guarantees ≥1 worker. `None` fallback on Intel/VM is correct.
+- **Tests:** 922 passing (906 lib + extras). 3 new FP16 GEMV tests + 1 updated cache test.
+- **Non-blocking concerns:** C1 = add TODO for intrinsic migration; C2 = tighten test error thresholds (2% → 1e-4).
+- Filed to `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
+
