@@ -11,8 +11,8 @@ use super::{
     CHANNELS, ImageLayout, ImagePreprocessConfig, ImageTensorBundle, ImageTensorDType,
     ImageTilingConfig, Interpolation, MAX_ASPECT_RATIOS, MAX_IMAGE_COUNT, MAX_IMAGE_OUTPUTS,
     MAX_IMAGE_PIXELS, MAX_IMAGE_TRANSFORMS, MAX_TENSOR_ELEMENTS, MAX_TILES_PER_IMAGE,
-    Normalization, ResizeMode, ThumbnailPosition, TileGrid, TilingMode, normalize_tile, packed,
-    tile_image,
+    Normalization, ResizeMode, ThumbnailPosition, TileGrid, TilingMode, packed, tiling::tile_image,
+    transform::normalize_tile,
 };
 use packed::{PackSpec, PreparedImage};
 
@@ -1709,6 +1709,7 @@ pub(super) fn checked_image_elements(
             "{description} requires {elements} elements, exceeding the safety limit of {MAX_TENSOR_ELEMENTS}; reduce image dimensions"
         );
     }
+
     Ok(elements)
 }
 
@@ -1716,6 +1717,7 @@ fn resolve_dimension(name: &str, model: i64, configured: Option<u32>) -> anyhow:
     if model == 0 || model < -1 {
         anyhow::bail!("vision input has invalid {name} dimension {model}");
     }
+
     let model_dimension = (model > 0)
         .then(|| {
             u32::try_from(model)
@@ -1734,3 +1736,7 @@ fn resolve_dimension(name: &str, model: i64, configured: Option<u32>) -> anyhow:
         ),
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

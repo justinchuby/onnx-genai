@@ -68,7 +68,7 @@ fn pixel_area_size(
     Ok((resized_width, resized_height))
 }
 
-fn round_to_multiple_ties_even(value: u32, multiple: u32) -> u32 {
+pub(super) fn round_to_multiple_ties_even(value: u32, multiple: u32) -> u32 {
     let quotient = value / multiple;
     let remainder = value % multiple;
     let rounded = match remainder.cmp(&(multiple - remainder)) {
