@@ -249,6 +249,8 @@ pub(crate) async fn image_generations(
         tokenizer_path: None,
         text_encoder_path: None,
         vae_decoder: None,
+        source_image: None,
+        vae_encoder: None,
     };
     let images = handle
         .engine

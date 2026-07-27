@@ -25,6 +25,30 @@ use euler::{EulerAncestral, EulerSchedule};
 use flow_matching::FlowMatching;
 use masked_diffusion::{MaskedDiffusion, Remasking};
 
+fn mix_noise(
+    original: &Value,
+    noise: &Value,
+    original_scale: f32,
+    noise_scale: f32,
+) -> anyhow::Result<Value> {
+    if original.shape() != noise.shape() {
+        anyhow::bail!(
+            "original/noise shape mismatch: {:?} vs {:?}",
+            original.shape(),
+            noise.shape()
+        );
+    }
+    let shape = original.shape().to_vec();
+    let original = original.to_vec_f32_lossy()?;
+    let noise = noise.to_vec_f32_lossy()?;
+    let mixed: Vec<f32> = original
+        .iter()
+        .zip(noise)
+        .map(|(&sample, noise)| original_scale * sample + noise_scale * noise)
+        .collect();
+    Value::from_slice_f32(&mixed, &shape).map_err(Into::into)
+}
+
 /// A loop-carried transform applied to a denoiser's output at each iterative
 /// step. **Implement this trait to plug in a custom scheduler** and register it
 /// with a [`SchedulerRegistry`]; the built-in `ddim` (continuous latents) and
@@ -84,6 +108,17 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
     /// DPM-Solver++ leave the seed unscaled and return `1.0` (the default).
     fn init_noise_sigma(&self) -> f32 {
         1.0
+    }
+
+    /// Noise an encoded sample to the scheduler state used at `step`.
+    fn add_noise(
+        &self,
+        _step: usize,
+        _num_steps: usize,
+        _original: &Value,
+        _noise: &Value,
+    ) -> anyhow::Result<Value> {
+        anyhow::bail!("this scheduler does not support continuous-latent noise initialization")
     }
 
     /// The per-step denoiser timesteps this scheduler feeds to the model, matching

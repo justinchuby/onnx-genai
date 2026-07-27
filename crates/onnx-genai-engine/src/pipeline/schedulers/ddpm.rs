@@ -137,6 +137,21 @@ impl Scheduler for DdpmSchedule {
     fn timesteps(&self) -> Option<Vec<f32>> {
         Some(self.timesteps.clone())
     }
+
+    fn add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        if step == num_steps {
+            return Value::from_slice_f32(&original.to_vec_f32_lossy()?, original.shape())
+                .map_err(Into::into);
+        }
+        let (alpha, _) = self.steps[step];
+        super::mix_noise(original, noise, alpha.sqrt(), (1.0 - alpha).sqrt())
+    }
 }
 
 #[cfg(test)]
