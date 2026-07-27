@@ -4,7 +4,7 @@ use std::ptr;
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ir::NodeId;
 
-use super::{
+use super::host::{
     HostGraph, HostNode, HostOpAttr, HostOrtValue, HostSupportInfo, HostTensorTypeAndShapeInfo,
     HostTypeInfo, HostValueInfo, ort_api,
 };

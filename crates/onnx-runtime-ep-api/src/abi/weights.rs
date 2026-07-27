@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use memmap2::Mmap;
 use onnx_runtime_ir::WeightRef;
 
-use super::{HostOrtValue, HostOrtValueStorage, HostTensorTypeAndShapeInfo, dtype_to_ort};
+use super::host::{HostOrtValue, HostOrtValueStorage, HostTensorTypeAndShapeInfo, dtype_to_ort};
 
 /// External weight files, mapped once and shared by every tensor in them.
 ///
