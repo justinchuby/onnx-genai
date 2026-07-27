@@ -1,0 +1,555 @@
+use super::*;
+
+// === Sequence-of-tensors ops: SequenceEmpty / SequenceConstruct /
+// SequenceInsert / SequenceErase / SequenceAt / SequenceLength /
+// SplitToSequence / ConcatFromSequence ===
+//
+// These are handled at the executor level (like control-flow ops) rather than as
+// leaf kernels, because they operate on a *sequence-of-tensors* runtime value
+// that a `Kernel` — which sees only individual tensor views — cannot represent.
+//
+// ## No-copy design
+//
+// A sequence stores its elements as `Arc`-shared **immutable** [`SeqTensor`]s
+// (see [`crate::sequence`]). Insert/Erase/Construct build a NEW list that SHARES
+// the surviving element `Arc`s — only handles (a refcount bump), never element
+// bytes, are cloned. `SequenceAt` yields the shared element `Arc` and backs its
+// output tensor value with that same allocation (`seq_elem_values`), so a
+// downstream kernel reads it through a zero-copy [`TensorView`] and no bytes are
+// copied out of the sequence until the graph-output boundary. Tensor→sequence
+// entry promotes the existing `DeviceBuffer` into an Arc owner and leaves a
+// non-owning dispatch alias in the executor. `SplitToSequence` creates
+// shape/stride/offset views over that same owner. `ConcatFromSequence` is the
+// only sequence data op that materializes a new contiguous tensor.
+//
+// ## No-race design
+//
+// Elements are immutable after construction and only ever shared read-only
+// through `Arc`; there is no interior mutability, so concurrent readers cannot
+// race (the only cross-thread state is `Arc`'s atomic refcount).
+impl Executor {
+    /// Execute one Sequence-op plan node.
+    pub(super) fn exec_sequence_node(
+        &mut self,
+        pi: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        let node_id = self.plan[pi].node_id;
+        let inputs = self.plan[pi].inputs.clone();
+        let outputs = self.plan[pi].outputs.clone();
+        let op = self.graph.node(node_id).op_type.clone();
+
+        match op.as_str() {
+            "SequenceEmpty" => {
+                let dtype_attr = self
+                    .graph
+                    .node(node_id)
+                    .attr("dtype")
+                    .and_then(|a| a.as_int());
+                let dtype = match dtype_attr {
+                    None => DataType::Float32, // ONNX default element type.
+                    Some(raw) => i32::try_from(raw)
+                        .ok()
+                        .and_then(DataType::from_onnx)
+                        .ok_or_else(|| SessionError::SequenceOp {
+                            op: op.clone(),
+                            reason: format!(
+                                "attribute 'dtype' = {raw} is not a known ONNX \
+                                 TensorProto.DataType. To fix: use a valid element \
+                                 dtype id (e.g. 1=float32, 7=int64)"
+                            ),
+                        })?,
+                };
+                self.sequences
+                    .insert(outputs[0], SequenceValue::empty(dtype));
+                Ok(())
+            }
+            "SequenceConstruct" => {
+                let mut items = Vec::with_capacity(inputs.len());
+                for slot in &inputs {
+                    let vid = slot.ok_or_else(|| self.seq_missing_input(&op))?;
+                    items.push(self.read_seq_element(vid, resolved)?);
+                }
+                let seq = SequenceValue::construct(items).map_err(seq_err)?;
+                self.sequences.insert(outputs[0], seq);
+                Ok(())
+            }
+            "SequenceInsert" => {
+                let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
+                let tvid = inputs
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.seq_missing_input(&op))?;
+                let tensor = self.read_seq_element(tvid, resolved)?;
+                let position = match inputs.get(2).copied().flatten() {
+                    Some(pvid) => Some(self.read_scalar_i64(pvid, resolved, &op)?),
+                    None => None,
+                };
+                let out = seq.insert(tensor, position).map_err(seq_err)?;
+                self.sequences.insert(outputs[0], out);
+                Ok(())
+            }
+            "SequenceErase" => {
+                let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
+                let position = match inputs.get(1).copied().flatten() {
+                    Some(pvid) => Some(self.read_scalar_i64(pvid, resolved, &op)?),
+                    None => None,
+                };
+                let out = seq.erase(position).map_err(seq_err)?;
+                self.sequences.insert(outputs[0], out);
+                Ok(())
+            }
+            "SequenceAt" => {
+                let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
+                let pvid =
+                    inputs
+                        .get(1)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| SessionError::SequenceOp {
+                            op: op.clone(),
+                            reason: "requires a 'position' input. To fix: supply the \
+                                 index tensor of the element to read"
+                                .to_string(),
+                        })?;
+                let pos = self.read_scalar_i64(pvid, resolved, &op)?;
+                let elem = seq.at(pos).map_err(seq_err)?;
+                self.store_seq_element_output(outputs[0], elem, resolved, external)
+            }
+            "SequenceLength" => {
+                let seq = self.get_sequence(inputs.first().copied().flatten(), &op)?;
+                let len = i64::try_from(seq.length()).map_err(|_| {
+                    seq_err(SequenceError::LengthOverflow {
+                        op: "SequenceLength",
+                        len: seq.length(),
+                    })
+                })?;
+                self.store_raw_tensor_output(
+                    outputs[0],
+                    DataType::Int64,
+                    Vec::new(),
+                    &len.to_le_bytes(),
+                    resolved,
+                    external,
+                )
+            }
+            "SplitToSequence" => {
+                self.exec_split_to_sequence(node_id, &op, &inputs, &outputs, resolved)
+            }
+            "ConcatFromSequence" => {
+                self.exec_concat_from_sequence(node_id, &op, &inputs, &outputs, resolved, external)
+            }
+            other => Err(SessionError::SequenceOp {
+                op: other.to_string(),
+                reason: "unrecognized Sequence op (executor routing bug)".to_string(),
+            }),
+        }
+    }
+
+    /// `SplitToSequence`: split a tensor into a sequence along `axis`.
+    pub(super) fn exec_split_to_sequence(
+        &mut self,
+        node_id: NodeId,
+        op: &str,
+        inputs: &[Option<ValueId>],
+        outputs: &[ValueId],
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+    ) -> Result<()> {
+        let (axis_attr, keepdims) = {
+            let node = self.graph.node(node_id);
+            (
+                node.attr("axis").and_then(|a| a.as_int()).unwrap_or(0),
+                node.attr("keepdims").and_then(|a| a.as_int()).unwrap_or(1) != 0,
+            )
+        };
+
+        let ivid = inputs
+            .first()
+            .copied()
+            .flatten()
+            .ok_or_else(|| self.seq_missing_input(op))?;
+        let input = self.read_seq_element(ivid, resolved)?;
+
+        let split_input = match inputs.get(1).copied().flatten() {
+            None => None,
+            Some(svid) => {
+                let split_shape = resolved
+                    .get(&svid)
+                    .cloned()
+                    .ok_or_else(|| self.seq_unresolved(op, svid))?;
+                let values = self.read_i64_vec(svid, &split_shape, op)?;
+                Some((split_shape, values))
+            }
+        };
+        let split_spec = match split_input.as_ref() {
+            None => SplitSpec::Each,
+            Some((split_shape, values)) if split_shape.is_empty() => {
+                let [chunk] = values.as_slice() else {
+                    return Err(SessionError::SequenceOp {
+                        op: op.to_string(),
+                        reason: format!(
+                            "scalar 'split' input contains {} values, expected exactly one",
+                            values.len()
+                        ),
+                    });
+                };
+                SplitSpec::Chunk(*chunk)
+            }
+            Some((split_shape, values)) if split_shape.len() == 1 => SplitSpec::Sizes(values),
+            Some((split_shape, _)) => {
+                return Err(SessionError::SequenceOp {
+                    op: op.to_string(),
+                    reason: format!(
+                        "'split' input must be rank 0 (chunk size) or rank 1 (explicit sizes), \
+                         got rank {} with shape {split_shape:?}",
+                        split_shape.len()
+                    ),
+                });
+            }
+        };
+        let sequence = split_tensor(&input, axis_attr, split_spec, keepdims).map_err(seq_err)?;
+        self.sequences.insert(outputs[0], sequence);
+        Ok(())
+    }
+
+    /// `ConcatFromSequence`: concatenate (or stack, when `new_axis=1`) a
+    /// sequence's tensors into one freshly-allocated output.
+    pub(super) fn exec_concat_from_sequence(
+        &mut self,
+        node_id: NodeId,
+        op: &str,
+        inputs: &[Option<ValueId>],
+        outputs: &[ValueId],
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        let node = self.graph.node(node_id);
+        let axis_attr =
+            node.attr("axis")
+                .and_then(|a| a.as_int())
+                .ok_or_else(|| SessionError::SequenceOp {
+                    op: op.to_string(),
+                    reason: "requires the mandatory 'axis' attribute. To fix: set 'axis'"
+                        .to_string(),
+                })?;
+        let new_axis = node.attr("new_axis").and_then(|a| a.as_int()).unwrap_or(0) != 0;
+
+        let seq = self.get_sequence(inputs.first().copied().flatten(), op)?;
+        let plan = ConcatPlan::new(&seq, axis_attr, new_axis).map_err(seq_err)?;
+        self.prepare_tensor_output(
+            outputs[0],
+            plan.dtype,
+            plan.shape.clone(),
+            plan.bytes,
+            resolved,
+            external,
+        )?;
+        let ep = Arc::clone(&self.ep);
+        if let Some(value) = external.outputs.get(&outputs[0]) {
+            let mut buffer = value.writable_buffer()?;
+            plan.write(&seq, |offset, bytes| {
+                ep.copy_from_host_at(bytes, &mut buffer, offset)?;
+                Ok(())
+            })?;
+        } else {
+            let buffer = self.buffers.get_mut(&outputs[0]).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "missing ConcatFromSequence output buffer for value#{}",
+                    outputs[0].0
+                ))
+            })?;
+            plan.write(&seq, |offset, bytes| {
+                ep.copy_from_host_at(bytes, buffer, offset)?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Build (or share) a `SeqTensor` for a tensor value entering a sequence.
+    /// Existing sequence elements clone their Arc. Ordinary tensors promote the
+    /// existing allocation into a shared owner and keep a non-owning executor
+    /// alias, so no element bytes move.
+    pub(super) fn read_seq_element(
+        &mut self,
+        vid: ValueId,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+    ) -> Result<SeqTensor> {
+        if self.sequence_values.contains(&vid) {
+            return Err(SessionError::SequenceOp {
+                op: "Sequence".to_string(),
+                reason: format!(
+                    "input value#{} is a Sequence value, expected a tensor element",
+                    vid.0
+                ),
+            });
+        }
+        if let Some(elem) = self.seq_elem_values.get(&vid) {
+            return Ok(elem.clone()); // zero-copy Arc share
+        }
+        let dtype = self.value_dtypes[&vid];
+        let shape = resolved
+            .get(&vid)
+            .cloned()
+            .ok_or_else(|| self.seq_unresolved("Sequence", vid))?;
+        let (root, layout, byte_offset) = match self.views.get(&vid) {
+            Some(view) => (
+                view.source,
+                TensorLayout::strided(view.strides.clone()),
+                view.byte_offset,
+            ),
+            None => (vid, TensorLayout::contiguous(), 0),
+        };
+        if !self.shared_buffers.contains_key(&root) {
+            let buffer = self
+                .buffers
+                .remove(&root)
+                .ok_or_else(|| SessionError::SequenceOp {
+                    op: "Sequence".to_string(),
+                    reason: format!("tensor value#{} has no live backing buffer", vid.0),
+                })?;
+            let storage = SharedTensorBuffer::new(Arc::clone(&self.ep), buffer);
+            self.buffers.insert(root, storage.alias());
+            self.shared_buffers.insert(root, storage);
+        }
+        self.pinned.insert(root);
+        SeqTensor::from_shared(
+            Arc::clone(&self.shared_buffers[&root]),
+            dtype,
+            shape,
+            layout,
+            byte_offset,
+        )
+        .map_err(SessionError::from)
+    }
+
+    pub(super) fn restore_shared_buffers(&mut self) -> Result<()> {
+        let mut retained = Vec::new();
+        for (vid, storage) in self.shared_buffers.drain() {
+            if let Some(alias) = self.buffers.remove(&vid) {
+                self.ep.deallocate(alias)?;
+            }
+            match Arc::try_unwrap(storage) {
+                Ok(storage) => {
+                    self.buffers.insert(vid, storage.into_buffer());
+                }
+                Err(storage) if self.graph.initializers.contains_key(&vid) => {
+                    self.buffers.insert(vid, storage.alias());
+                    retained.push((vid, storage));
+                }
+                Err(storage) => {
+                    let replacement = self
+                        .ep
+                        .allocate(storage.buffer().len(), storage.buffer().alignment())?;
+                    self.buffers.insert(vid, replacement);
+                }
+            }
+        }
+        for (vid, storage) in retained {
+            self.shared_buffers.insert(vid, storage);
+        }
+        Ok(())
+    }
+
+    /// Fetch (clone) the sequence value bound to `vid` (cheap — `Arc` handle
+    /// clones), or an actionable error if the input is missing / not a sequence.
+    pub(super) fn get_sequence(&self, vid: Option<ValueId>, op: &str) -> Result<SequenceValue> {
+        let vid = vid.ok_or_else(|| self.seq_missing_input(op))?;
+        self.sequences
+            .get(&vid)
+            .cloned()
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "input value#{} is not a live sequence. To fix: ensure it is produced \
+                 by a Sequence-producing op (SequenceEmpty/Construct/Insert/Erase/\
+                 SplitToSequence)",
+                    vid.0
+                ),
+            })
+    }
+
+    /// Read a scalar `i64`/`i32` position input.
+    pub(super) fn read_scalar_i64(
+        &self,
+        vid: ValueId,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        op: &str,
+    ) -> Result<i64> {
+        let shape = resolved.get(&vid).cloned().unwrap_or_default();
+        if !shape.is_empty() {
+            return Err(SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "position input must be a rank-0 scalar, got rank {} with shape {shape:?}",
+                    shape.len()
+                ),
+            });
+        }
+        let dtype = self.value_dtypes[&vid];
+        let vals = self
+            .input_i64(vid, &shape, dtype)
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "position input has dtype {dtype:?}, expected an integer (int32/int64). \
+                 To fix: provide an int64 scalar index"
+                ),
+            })?;
+        let [value] = vals.as_slice() else {
+            return Err(SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "position input contains {} values; expected exactly one scalar index",
+                    vals.len()
+                ),
+            });
+        };
+        Ok(*value)
+    }
+
+    /// Read an `i64` vector from an integer tensor input (SplitToSequence's
+    /// `split`).
+    pub(super) fn read_i64_vec(&self, vid: ValueId, shape: &[usize], op: &str) -> Result<Vec<i64>> {
+        let dtype = self.value_dtypes[&vid];
+        self.input_i64(vid, shape, dtype)
+            .ok_or_else(|| SessionError::SequenceOp {
+                op: op.to_string(),
+                reason: format!(
+                    "'split' input has dtype {dtype:?}, expected int32/int64. To fix: \
+                 provide integer split sizes"
+                ),
+            })
+    }
+
+    /// Back a tensor *output* value with a shared sequence element (SequenceAt).
+    /// The element retains its original device allocation and view metadata.
+    pub(super) fn store_seq_element_output(
+        &mut self,
+        vid: ValueId,
+        elem: SeqTensor,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        if elem.device() != self.ep.device_id() {
+            return Err(SessionError::SequenceOp {
+                op: "SequenceAt".to_string(),
+                reason: format!(
+                    "sequence element is on {:?}, but the active execution provider is on {:?}",
+                    elem.device(),
+                    self.ep.device_id()
+                ),
+            });
+        }
+        if external.outputs.contains_key(&vid) {
+            let dtype = elem.dtype;
+            let shape = elem.shape.clone();
+            let bytes = elem.contiguous_bytes().map_err(seq_err)?;
+            return self.store_raw_tensor_output(vid, dtype, shape, &bytes, resolved, external);
+        }
+        if let Some(old) = self.buffers.remove(&vid) {
+            self.ep.deallocate(old)?;
+        }
+        self.shared_buffers.remove(&vid);
+        self.buffer_shapes.remove(&vid);
+        self.views.remove(&vid);
+        resolved.insert(vid, elem.shape.clone());
+        self.value_dtypes.insert(vid, elem.dtype);
+        self.seq_elem_values.insert(vid, elem);
+        Ok(())
+    }
+
+    /// Store freshly-computed contiguous bytes into a tensor output value
+    /// (SequenceLength / ConcatFromSequence): (re)allocate its buffer, copy the
+    /// bytes once, and record its dtype/shape.
+    pub(super) fn store_raw_tensor_output(
+        &mut self,
+        vid: ValueId,
+        dtype: DataType,
+        dims: Vec<usize>,
+        bytes: &[u8],
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        self.prepare_tensor_output(vid, dtype, dims, bytes.len(), resolved, external)?;
+        if let Some(value) = external.outputs.get(&vid) {
+            let mut buffer = value.writable_buffer()?;
+            self.ep.copy_from_host(bytes, &mut buffer)?;
+        } else {
+            let buffer = self.buffers.get_mut(&vid).ok_or_else(|| {
+                SessionError::Internal(format!("missing tensor output buffer for value#{}", vid.0))
+            })?;
+            self.ep.copy_from_host(bytes, buffer)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_tensor_output(
+        &mut self,
+        vid: ValueId,
+        dtype: DataType,
+        dims: Vec<usize>,
+        bytes: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        self.seq_elem_values.remove(&vid);
+        self.views.remove(&vid);
+        let need = bytes.max(1);
+        if let Some(value) = external.outputs.get(&vid) {
+            if !value.accepts_output(dtype, &dims, need) {
+                let name = self.graph.value(vid).name.as_deref().unwrap_or("<unnamed>");
+                return Err(SessionError::Internal(format!(
+                    "external output '{name}' has {:?} {:?} ({} bytes), sequence op requires {:?} {:?} ({need} bytes)",
+                    value.dtype, value.shape, value.len, dtype, dims
+                )));
+            }
+        } else {
+            let fits = self
+                .buffers
+                .get(&vid)
+                .map(|buffer| buffer.len() == need)
+                .unwrap_or(false);
+            if !fits {
+                if let Some(old) = self.buffers.remove(&vid) {
+                    self.ep.deallocate(old)?;
+                }
+                self.shared_buffers.remove(&vid);
+                let buffer = self
+                    .ep
+                    .allocate(need, TensorLayout::contiguous().alignment)?;
+                self.buffers.insert(vid, buffer);
+            }
+            self.buffer_shapes.insert(vid, dims.clone());
+        }
+        self.value_dtypes.insert(vid, dtype);
+        resolved.insert(vid, dims);
+        Ok(())
+    }
+
+    pub(super) fn seq_missing_input(&self, op: &str) -> SessionError {
+        SessionError::SequenceOp {
+            op: op.to_string(),
+            reason: "a required input is missing (omitted None slot). To fix: connect \
+                     all required inputs of this Sequence op"
+                .to_string(),
+        }
+    }
+
+    pub(super) fn seq_unresolved(&self, op: &str, vid: ValueId) -> SessionError {
+        let name = self
+            .graph
+            .try_value(vid)
+            .and_then(|v| v.name.clone())
+            .unwrap_or_else(|| format!("value#{}", vid.0));
+        SessionError::SequenceOp {
+            op: op.to_string(),
+            reason: format!(
+                "input {name} has no resolved shape yet. To fix: ensure its producer \
+                 runs before this Sequence op"
+            ),
+        }
+    }
+}

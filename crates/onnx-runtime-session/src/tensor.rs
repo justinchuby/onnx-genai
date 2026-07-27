@@ -224,6 +224,19 @@ pub struct DeviceBindingTransferStats {
     pub host_download_bytes: u64,
 }
 
+/// The parameters for [`DeviceIoBinding::allocate`], grouped so the constructor
+/// takes a single spec rather than a long positional argument list.
+pub(crate) struct DeviceBindingSpec {
+    pub(crate) input_name: String,
+    pub(crate) bind_input: bool,
+    pub(crate) output_name: Option<String>,
+    pub(crate) dtype: DataType,
+    pub(crate) physical_shape: Vec<usize>,
+    pub(crate) logical_shape: Vec<usize>,
+    /// Whether graph inputs see the valid prefix rather than allocation capacity.
+    pub(crate) expose_logical_input_shape: bool,
+}
+
 /// An externally owned persistent device allocation bound to a graph input and
 /// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
@@ -243,14 +256,17 @@ pub struct DeviceIoBinding {
 impl DeviceIoBinding {
     pub(crate) fn allocate(
         allocator: Arc<dyn ExecutionProvider>,
-        input_name: String,
-        bind_input: bool,
-        output_name: Option<String>,
-        dtype: DataType,
-        physical_shape: Vec<usize>,
-        logical_shape: Vec<usize>,
-        expose_logical_input_shape: bool,
+        spec: DeviceBindingSpec,
     ) -> Result<Self> {
+        let DeviceBindingSpec {
+            input_name,
+            bind_input,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            expose_logical_input_shape,
+        } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
         let numel = physical_shape.iter().try_fold(1usize, |product, &dim| {
             product.checked_mul(dim).ok_or_else(|| {
@@ -905,13 +921,15 @@ mod tests {
         // logical == physical (the state at decode construction time).
         let mut logical_mask = DeviceIoBinding::allocate(
             shared_cpu_ep(),
-            "attention_mask".into(),
-            true,
-            None,
-            DataType::Int64,
-            vec![1, 4096],
-            vec![1, 4096],
-            true,
+            DeviceBindingSpec {
+                input_name: "attention_mask".into(),
+                bind_input: true,
+                output_name: None,
+                dtype: DataType::Int64,
+                physical_shape: vec![1, 4096],
+                logical_shape: vec![1, 4096],
+                expose_logical_input_shape: true,
+            },
         )
         .unwrap();
         assert!(logical_mask.exposes_logical_input_shape());
@@ -929,13 +947,15 @@ mod tests {
         // the current logical shape, so kernels always see the padded width.
         let mut physical_mask = DeviceIoBinding::allocate(
             shared_cpu_ep(),
-            "attention_mask".into(),
-            true,
-            None,
-            DataType::Int64,
-            vec![1, 4096],
-            vec![1, 5],
-            false,
+            DeviceBindingSpec {
+                input_name: "attention_mask".into(),
+                bind_input: true,
+                output_name: None,
+                dtype: DataType::Int64,
+                physical_shape: vec![1, 4096],
+                logical_shape: vec![1, 5],
+                expose_logical_input_shape: false,
+            },
         )
         .unwrap();
         assert!(!physical_mask.exposes_logical_input_shape());
