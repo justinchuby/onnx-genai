@@ -324,8 +324,9 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
   weights (the exact multi-input CFG path is unit-tested to 1e-5). The Mobius **export side is
   done** — `checkpoint_export` auto-detects SDXL and emits the dual-encoder + 5-input-UNet pipeline,
   and `mobius convert-comfyui` routes both conditioning edges automatically. The native `run_comfyui`
-  binary currently drives the plain **SD txt2img** path (+ batched generation); rendering the SDXL /
-  ControlNet / inpaint variants through the one-command runner is not yet ported to native Rust.
+  binary drives both plain **SD txt2img** and **SDXL** (+ batched generation): it discovers every
+  token-id input on the declared prompt encoder, guides every routed conditioning output, and supplies
+  SDXL `time_ids`. ControlNet / inpaint variants remain to be ported to the one-command runner.
 - **ControlNet** ✅ handled by a **combined ControlNet+UNet export** (like SDXL, no runtime change):
   the denoiser is a fused ControlNet+UNet taking an extra constant `controlnet_cond` image input
   (the ControlNet produces down/mid residuals injected into the UNet). The translator collects
