@@ -279,11 +279,14 @@ impl AppState {
 
     /// Returns the id of the first loaded model, for use in log messages and the CLI.
     pub fn model_id(&self) -> String {
-        self.registry
-            .default_id()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "onnx-genai-model".to_string())
+        match self.registry.default_id() {
+            Ok(Some(model_id)) => model_id,
+            Ok(None) => "onnx-genai-model".to_string(),
+            Err(error) => {
+                tracing::error!(error = %error, "model registry operation failed");
+                "onnx-genai-model".to_string()
+            }
+        }
     }
 }
 

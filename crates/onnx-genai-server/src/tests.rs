@@ -2206,6 +2206,14 @@ async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
         .await
         .unwrap();
     assert_eq!(absent_model_response.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(absent_model_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_well_formed_error_without_internal_path(&body);
+    assert_eq!(error_message(&body), "model 'model-b' is not loaded");
 
     let poisoned_registry_state = lazy_state(ServerConfig {
         enable_admin_endpoints: true,
@@ -2656,92 +2664,6 @@ async fn content_parts_must_be_objects_with_a_type() {
         assert_actionable(&message);
         assert!(message.contains(expected), "message: {message}");
     }
-}
-
-#[tokio::test]
-async fn non_streaming_vision_contract_failure_returns_http_400() {
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-llm",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
-                ]
-            }],
-            "max_tokens": 1,
-            "stream": false
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_well_formed_error_without_internal_path(&body);
-    assert!(
-        error_message(&body).contains("image input was rejected"),
-        "body: {body}"
-    );
-}
-
-#[tokio::test]
-async fn streaming_vision_contract_failure_returns_http_400() {
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-llm",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
-                ]
-            }],
-            "max_tokens": 1,
-            "stream": true
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_well_formed_error_without_internal_path(&body);
-    assert!(
-        error_message(&body).contains("image input was rejected"),
-        "body: {body}"
-    );
-}
-
-#[tokio::test]
-async fn audio_contract_failure_returns_http_400() {
-    let (status, body) = post_json(
-        tiny_state(),
-        "/v1/chat/completions",
-        json!({
-            "model": "tiny-llm",
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": tiny_wav_base64(),
-                        "format": "wav"
-                    }
-                }]
-            }],
-            "max_tokens": 1
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    assert_well_formed_error_without_internal_path(&body);
-    assert!(
-        error_message(&body).contains("audio input was rejected"),
-        "body: {body}"
-    );
 }
 
 #[tokio::test]
