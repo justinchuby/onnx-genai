@@ -1,6 +1,6 @@
-[2m2026-07-27T10:37:28.692313Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
-[2m2026-07-27T10:37:30.504794Z[0m [32m INFO[0m [2monnx_genai_ort::session[0m[2m:[0m Loading model: models/qwen2.5-0.5b-f16/model.onnx
-[2m2026-07-27T10:37:30.505055Z[0m [32m INFO[0m [2monnx_genai_engine::engine::load[0m[2m:[0m No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)
+[2m2026-07-27T11:21:59.059349Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
+[2m2026-07-27T11:22:00.937991Z[0m [32m INFO[0m [2monnx_genai_ort::session[0m[2m:[0m Loading model: models/qwen2.5-0.5b-f16/model.onnx
+[2m2026-07-27T11:22:00.938202Z[0m [32m INFO[0m [2monnx_genai_engine::engine::load[0m[2m:[0m No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)
 Certainly! Below is a simple Rust function that reverses a string:
 
 ```rust
@@ -33,14 +33,14 @@ This function works by first converting the string into an
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b-f16
 execution provider       cpu
-model load                   1923.8 ms
+model load                   1987.9 ms
 prompt tokens                    40
 generated tokens                200
-time to first token           108.6 ms
-generation wall time         5040.3 ms
-decode throughput             40.56 tok/s
-end-to-end throughput         39.68 tok/s
-inter-token latency      mean 24.7 / p50 24.5 / p90 26.6 / p99 32.2 / max 33.0 ms
+time to first token           119.0 ms
+generation wall time         5061.3 ms
+decode throughput             40.47 tok/s
+end-to-end throughput         39.52 tok/s
+inter-token latency      mean 24.7 / p50 24.4 / p90 26.5 / p99 31.8 / max 44.3 ms
 finish reason            MaxTokens
 kv page activity:
   allocated                      15
@@ -56,28 +56,28 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-loop.next_logits               5013.295        200       25066.48     25066.48
-ort.session_run                5011.157        201       24931.13     25055.79
-loop.step                      4906.510        199       24655.83     24532.55
-engine.ort_session_load        1812.456          1     1812455.83      9062.28
-loop.prefill                    108.449          1      108448.67       542.24
-engine.tokenizer_load            99.125          1       99124.96       495.62
-ort.sampling                     10.483        200          52.41        52.41
-engine.ort_environment            9.521          1        9520.79        47.60
-ort.bind_inputs                   7.733        201          38.47        38.66
-ort.extract_outputs               6.488        201          32.28        32.44
-loop.commit_selected              1.514        200           7.57         7.57
-loop.commit_selected_token        1.458        200           7.29         7.29
-loop.detokenize                   1.293        200           6.46         6.46
-engine.resolve_decode_backend        1.027          1        1026.58         5.13
-engine.kv_cache_alloc             1.015          1        1015.08         5.08
-engine.kv_bookkeeping             1.005        200           5.03         5.03
-engine.metadata_load              0.212          1         211.79         1.06
-engine.logits_to_vec              0.141          1         141.12         0.71
-engine.kv_model_info              0.095          1          95.38         0.48
-engine.resolve_model_directory        0.092          1          91.54         0.46
-engine.ort_prepare_inputs         0.076        200           0.38         0.38
-engine.resource_governor          0.075          1          75.25         0.38
-loop.commit_token                 0.067        200           0.34         0.34
-engine.detect_decode_path         0.007          1           7.25         0.04
-engine.connector_bridge           0.000          1           0.21         0.00
+loop.next_logits               5034.794        200       25173.97     25173.97
+ort.session_run                5031.895        201       25034.30     25159.48
+loop.step                      4917.713        199       24712.12     24588.56
+engine.ort_session_load        1878.616          1     1878616.00      9393.08
+loop.prefill                    118.793          1      118792.92       593.96
+engine.tokenizer_load            97.474          1       97474.33       487.37
+ort.sampling                     10.593        200          52.96        52.96
+engine.ort_environment            9.698          1        9698.08        48.49
+ort.bind_inputs                   7.966        201          39.63        39.83
+ort.extract_outputs               6.434        201          32.01        32.17
+loop.commit_selected              1.547        200           7.74         7.74
+loop.commit_selected_token        1.475        200           7.37         7.37
+engine.kv_cache_alloc             1.439          1        1439.38         7.20
+loop.detokenize                   1.310        200           6.55         6.55
+engine.kv_bookkeeping             0.963        200           4.82         4.82
+engine.metadata_load              0.199          1         199.08         1.00
+engine.logits_to_vec              0.134          1         133.83         0.67
+engine.ort_prepare_inputs         0.117        200           0.59         0.59
+engine.resolve_model_directory        0.101          1         100.67         0.50
+engine.kv_model_info              0.096          1          96.25         0.48
+loop.commit_token                 0.071        200           0.35         0.35
+engine.resource_governor          0.068          1          67.62         0.34
+engine.detect_decode_path         0.007          1           7.29         0.04
+engine.resolve_decode_backend        0.002          1           1.71         0.01
+engine.connector_bridge           0.000          1           0.17         0.00

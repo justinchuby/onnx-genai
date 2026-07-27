@@ -96,43 +96,46 @@ final runs.
 
 ```
                       ORT+CPU  ORT+CPU f16    native  native f16  ORT+Metal  native+MLX
-model load           1388 ms     1924 ms      131 ms     137 ms     492 ms      216 ms
-time to first token   124 ms      109 ms     1174 ms    1291 ms     504 ms      342 ms
-decode throughput   44.6 tok/s  40.6 tok/s  33.6 tok/s  43.9 tok/s  69.3 tok/s  62.8 tok/s
-end-to-end          43.4 tok/s  39.7 tok/s  28.2 tok/s  34.3 tok/s  40.1 tok/s  44.0 tok/s
+model load           2710 ms     1988 ms      134 ms     138 ms     492 ms      216 ms
+time to first token   114 ms      119 ms     1023 ms    1366 ms     504 ms      342 ms
+decode throughput   45.5 tok/s  40.5 tok/s  33.6 tok/s  43.6 tok/s  69.3 tok/s  62.8 tok/s
+end-to-end          44.4 tok/s  39.5 tok/s  28.8 tok/s  33.7 tok/s  40.1 tok/s  44.0 tok/s
 ```
 
 The CPU FP16 pair is the headline result. The native CPU EP reads FP16 weights
 directly from the memory-mapped model file via NEON `fcvtl`, streaming half the
 bytes of FP32. ONNX Runtime's CPU EP cannot do this -- it widens FP16 to FP32
 before every GEMM, so it pays a conversion cost and gets none of the bandwidth
-benefit. The result is that **native FP16 (43.9 tok/s) beats ORT FP16
-(40.6 tok/s)** on the same model and dtype, an architectural advantage rather
-than a tuning difference.
+benefit. The result is that **native FP16 (43.6 tok/s) beats ORT FP16
+(40.5 tok/s)** on the same model and dtype, an architectural advantage rather
+than a tuning difference. On a quiet host the native FP16 steady-state (p50
+17.3 ms = 57.8 tok/s) exceeds ORT's FP32 rate; the profile's mean includes a
+~1 s pool-initialisation spike that pulls the average down.
 
-On FP32, ORT still leads: 44.6 vs 33.6 tok/s. The native EP reaches ~75% of
+On FP32, ORT still leads: 45.5 vs 33.6 tok/s. The native EP reaches ~74% of
 ORT's FP32 decode throughput using multi-threaded NEON GEMV on a persistent
 SPMD worker pool. The remaining gap is structural: ORT's MLAS fuses subgraph
 operations and has a mature thread pool, while the native EP dispatches 434
-individual ops per token. Under lighter load the native FP16 steady-state (p50
-17.1 ms = 58.5 tok/s) exceeds ORT's FP32 rate.
+individual ops per token.
 
 **Prefill/TTFT remains a weakness.** The native backend's time to first token
-is ~10x worse than ORT (1174--1291 ms vs 109--124 ms). Prefill is compute-bound
+is ~10x worse than ORT (1023--1366 ms vs 114--119 ms). Prefill is compute-bound
 rather than bandwidth-bound and has not been optimised in this campaign; it is a
 separate regime from the decode path that these changes target. This pulls
 native's end-to-end throughput well below its decode rate.
 
 The native CPU profiles were captured with `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`
-(forced SPMD pool). Under heavy system load the auto-calibrator may fall back to
-a single-threaded flat path, which is correct behaviour for a contended machine
-but does not reflect the kernel's capability. The decode throughput shown above
-is the mean across all generated tokens including a ~1 s pool-initialisation
-spike on the first decode step; the p50 inter-token latency in the `.txt` files
-is the better measure of steady-state performance.
+(forced SPMD pool). The auto-calibrator decides once at the start of each
+session and freezes the path permanently (it does not re-probe mid-generation);
+under heavy system load it selects the single-threaded flat path, which is
+correct behaviour for a contended machine but does not reflect the kernel's
+capability. The decode throughput shown above is the mean across all generated
+tokens including a ~1 s pool-initialisation spike on the first decode step; the
+p50 inter-token latency in the `.txt` files is the better measure of
+steady-state performance.
 
-The native backend loads an order of magnitude faster than ONNX Runtime (131 ms
-vs 1388 ms) because it memory-maps weights instead of building a session graph.
+The native backend loads an order of magnitude faster than ONNX Runtime (134 ms
+vs 2710 ms) because it memory-maps weights instead of building a session graph.
 
 Running the native backend through the MLX plugin (`native+MLX`) recovers full
 GPU-accelerated decode while keeping the fast load, which is why it leads on
