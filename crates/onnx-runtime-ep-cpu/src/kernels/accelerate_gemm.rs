@@ -409,6 +409,209 @@ fn scalar_outer_product(
     }
 }
 
+// ─── FP16 storage GEMV (f16 weights, f32 activations, f32 accumulate) ─
+
+/// Load 4 × f16 (8 bytes) from `ptr` and widen to `float32x4_t`.
+///
+/// Uses `fcvtl` which is ARMv8 base FP — no FEAT_FP16 required.
+/// `vld1_f16`/`vcvt_f32_f16` intrinsics need unstable `f16` type;
+/// this inline-asm wrapper avoids the nightly dependency.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_f16x4_to_f32x4(ptr: *const u16) -> std::arch::aarch64::float32x4_t {
+    let result: std::arch::aarch64::float32x4_t;
+    unsafe {
+        std::arch::asm!(
+            "ldr {v:d}, [{ptr}]",
+            "fcvtl {v:v}.4s, {v:v}.4h",
+            ptr = in(reg) ptr,
+            v = out(vreg) result,
+            options(nostack, readonly, pure),
+        );
+    }
+    result
+}
+
+/// Column-parallel NEON GEMV with f16 weight storage and f32 accumulate.
+///
+/// Same dispatch priority as [`neon_gemv_col_parallel`] (SPMD pool → Rayon →
+/// single-threaded) but reads pre-transposed B_T in f16 directly from the
+/// mmap'd model file, halving memory bandwidth. Weights are widened to f32
+/// in NEON registers via `fcvtl` (ARMv8 base, safe M1–M4) and accumulated
+/// in f32, giving ~2.3e-4 max relative error (same as FP16 storage + FP32
+/// accumulate reference).
+///
+/// `bt_f16` is `N×K` row-major with each element stored as a raw `u16`
+/// (`half::f16` bit pattern). `x` is the f32 activation vector of length K.
+pub fn neon_gemv_f16_col_parallel(x: &[f32], bt_f16: &[u16], y: &mut [f32], k: usize, n: usize) {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(bt_f16.len(), n * k);
+    debug_assert_eq!(y.len(), n);
+
+    if k * n < 500_000 || rayon::current_num_threads() <= 1 {
+        neon_gemv_f16_batch(bt_f16, x, y, n, k);
+        return;
+    }
+
+    if let Some(spmd) = crate::kernels::matmul_nbits::spmd_decode_active() {
+        spmd.dispatch_output_rows(y, k, &|start, outputs| {
+            neon_gemv_f16_batch(&bt_f16[start * k..], x, outputs, outputs.len(), k);
+        });
+        return;
+    }
+
+    use rayon::prelude::*;
+    let threads = rayon::current_num_threads();
+    let chunk = n.div_ceil(threads).max(1);
+    y.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(t, y_chunk)| {
+            let n0 = t * chunk;
+            neon_gemv_f16_batch(&bt_f16[n0 * k..], x, y_chunk, y_chunk.len(), k);
+        });
+}
+
+/// 4-row batched NEON GEMV with f16 weights: compute 4 dot products
+/// simultaneously, loading f16 weights via `fcvtl` → f32 and sharing
+/// f32 activation reads across rows. F32 accumulation throughout.
+#[cfg(target_arch = "aarch64")]
+fn neon_gemv_f16_batch(bt_f16: &[u16], x: &[f32], y: &mut [f32], n: usize, k: usize) {
+    use std::arch::aarch64::*;
+    let mut i = 0;
+    while i + 4 <= n {
+        let (r0, r1, r2, r3) = (
+            &bt_f16[i * k..],
+            &bt_f16[(i + 1) * k..],
+            &bt_f16[(i + 2) * k..],
+            &bt_f16[(i + 3) * k..],
+        );
+        let mut a0 = unsafe { vdupq_n_f32(0.0) };
+        let mut a1 = unsafe { vdupq_n_f32(0.0) };
+        let mut a2 = unsafe { vdupq_n_f32(0.0) };
+        let mut a3 = unsafe { vdupq_n_f32(0.0) };
+        let mut b0 = unsafe { vdupq_n_f32(0.0) };
+        let mut b1 = unsafe { vdupq_n_f32(0.0) };
+        let mut b2 = unsafe { vdupq_n_f32(0.0) };
+        let mut b3 = unsafe { vdupq_n_f32(0.0) };
+        let mut j = 0;
+        // Main loop: 8 elements per iteration (2 × 4 f16 loads per row).
+        while j + 8 <= k {
+            unsafe {
+                let x0 = vld1q_f32(x.as_ptr().add(j));
+                let x1 = vld1q_f32(x.as_ptr().add(j + 4));
+                // Row 0: load 8 f16 → 2×4 f32, FMA with activations.
+                let w0a = load_f16x4_to_f32x4(r0.as_ptr().add(j));
+                let w0b = load_f16x4_to_f32x4(r0.as_ptr().add(j + 4));
+                a0 = vfmaq_f32(a0, w0a, x0);
+                b0 = vfmaq_f32(b0, w0b, x1);
+                // Row 1
+                let w1a = load_f16x4_to_f32x4(r1.as_ptr().add(j));
+                let w1b = load_f16x4_to_f32x4(r1.as_ptr().add(j + 4));
+                a1 = vfmaq_f32(a1, w1a, x0);
+                b1 = vfmaq_f32(b1, w1b, x1);
+                // Row 2
+                let w2a = load_f16x4_to_f32x4(r2.as_ptr().add(j));
+                let w2b = load_f16x4_to_f32x4(r2.as_ptr().add(j + 4));
+                a2 = vfmaq_f32(a2, w2a, x0);
+                b2 = vfmaq_f32(b2, w2b, x1);
+                // Row 3
+                let w3a = load_f16x4_to_f32x4(r3.as_ptr().add(j));
+                let w3b = load_f16x4_to_f32x4(r3.as_ptr().add(j + 4));
+                a3 = vfmaq_f32(a3, w3a, x0);
+                b3 = vfmaq_f32(b3, w3b, x1);
+            }
+            j += 8;
+        }
+        let mut s0 = unsafe { vaddvq_f32(vaddq_f32(a0, b0)) };
+        let mut s1 = unsafe { vaddvq_f32(vaddq_f32(a1, b1)) };
+        let mut s2 = unsafe { vaddvq_f32(vaddq_f32(a2, b2)) };
+        let mut s3 = unsafe { vaddvq_f32(vaddq_f32(a3, b3)) };
+        // Scalar tail: widen remaining f16 elements individually.
+        while j < k {
+            let xv = x[j];
+            s0 += half::f16::from_bits(r0[j]).to_f32() * xv;
+            s1 += half::f16::from_bits(r1[j]).to_f32() * xv;
+            s2 += half::f16::from_bits(r2[j]).to_f32() * xv;
+            s3 += half::f16::from_bits(r3[j]).to_f32() * xv;
+            j += 1;
+        }
+        y[i] = s0;
+        y[i + 1] = s1;
+        y[i + 2] = s2;
+        y[i + 3] = s3;
+        i += 4;
+    }
+    while i < n {
+        y[i] = neon_dot_f16(&bt_f16[i * k..(i + 1) * k], x);
+        i += 1;
+    }
+}
+
+/// Scalar fallback for non-aarch64.
+#[cfg(not(target_arch = "aarch64"))]
+fn neon_gemv_f16_batch(bt_f16: &[u16], x: &[f32], y: &mut [f32], n: usize, k: usize) {
+    for i in 0..n {
+        y[i] = neon_dot_f16(&bt_f16[i * k..(i + 1) * k], x);
+    }
+}
+
+/// NEON dot product: f16 weights × f32 activations → f32 scalar.
+#[cfg(target_arch = "aarch64")]
+fn neon_dot_f16(a_f16: &[u16], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(a_f16.len(), b.len());
+    let k = a_f16.len();
+    let mut acc0 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc1 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc2 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc3 = unsafe { vdupq_n_f32(0.0) };
+    let mut j = 0;
+    while j + 16 <= k {
+        unsafe {
+            acc0 = vfmaq_f32(
+                acc0,
+                load_f16x4_to_f32x4(a_f16.as_ptr().add(j)),
+                vld1q_f32(b.as_ptr().add(j)),
+            );
+            acc1 = vfmaq_f32(
+                acc1,
+                load_f16x4_to_f32x4(a_f16.as_ptr().add(j + 4)),
+                vld1q_f32(b.as_ptr().add(j + 4)),
+            );
+            acc2 = vfmaq_f32(
+                acc2,
+                load_f16x4_to_f32x4(a_f16.as_ptr().add(j + 8)),
+                vld1q_f32(b.as_ptr().add(j + 8)),
+            );
+            acc3 = vfmaq_f32(
+                acc3,
+                load_f16x4_to_f32x4(a_f16.as_ptr().add(j + 12)),
+                vld1q_f32(b.as_ptr().add(j + 12)),
+            );
+        }
+        j += 16;
+    }
+    let mut sum = unsafe {
+        let s = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        vaddvq_f32(s)
+    };
+    while j < k {
+        sum += half::f16::from_bits(a_f16[j]).to_f32() * b[j];
+        j += 1;
+    }
+    sum
+}
+
+/// Scalar dot fallback for non-aarch64.
+#[cfg(not(target_arch = "aarch64"))]
+fn neon_dot_f16(a_f16: &[u16], b: &[f32]) -> f32 {
+    a_f16
+        .iter()
+        .zip(b)
+        .map(|(&a, &b)| half::f16::from_bits(a).to_f32() * b)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +714,109 @@ mod tests {
         assert!(
             max_rel < 0.02,
             "col_parallel model-scale max relative error {max_rel} exceeds 2%"
+        );
+    }
+
+    // ─── FP16 GEMV tests ────────────────────────────────────────────
+
+    /// Convert f32 values to f16 bit patterns (u16).
+    fn f32_to_f16_bits(vals: &[f32]) -> Vec<u16> {
+        vals.iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect()
+    }
+
+    /// Reference GEMV using f64 accumulation for the gold standard,
+    /// with weights rounded through f16 to match the kernel's input.
+    fn reference_gemv_f16(x: &[f32], b_f16: &[u16], k: usize, n: usize) -> Vec<f32> {
+        let mut y = vec![0.0f64; n];
+        for j in 0..n {
+            for i in 0..k {
+                let w = half::f16::from_bits(b_f16[i * n + j]).to_f32() as f64;
+                y[j] += (x[i] as f64) * w;
+            }
+        }
+        y.iter().map(|&v| v as f32).collect()
+    }
+
+    #[test]
+    fn f16_col_parallel_gemv_matches_reference() {
+        let (k, n) = (64, 128);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 100) as f32) * 0.001).collect();
+        let b_f16 = f32_to_f16_bits(&b);
+        // Transpose b_f16[K,N] → bt_f16[N,K]
+        let mut bt_f16 = vec![0u16; n * k];
+        for i in 0..k {
+            for j in 0..n {
+                bt_f16[j * k + i] = b_f16[i * n + j];
+            }
+        }
+        let mut y = vec![0.0f32; n];
+        neon_gemv_f16_col_parallel(&x, &bt_f16, &mut y, k, n);
+        let ref_y = reference_gemv_f16(&x, &b_f16, k, n);
+        let max_err = y
+            .iter()
+            .zip(&ref_y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-3,
+            "f16 col_parallel_gemv max error {max_err} exceeds 1e-3"
+        );
+    }
+
+    #[test]
+    fn f16_col_parallel_matches_at_model_scale() {
+        let (k, n) = (896, 4864);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 1000) as f32) * 0.0001).collect();
+        let b_f16 = f32_to_f16_bits(&b);
+        let mut bt_f16 = vec![0u16; n * k];
+        for i in 0..k {
+            for j in 0..n {
+                bt_f16[j * k + i] = b_f16[i * n + j];
+            }
+        }
+        let mut y = vec![0.0f32; n];
+        neon_gemv_f16_col_parallel(&x, &bt_f16, &mut y, k, n);
+        let ref_y = reference_gemv_f16(&x, &b_f16, k, n);
+        let max_rel = y
+            .iter()
+            .zip(&ref_y)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| ((a - r) / r).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_rel < 0.02,
+            "f16 col_parallel model-scale max relative error {max_rel} exceeds 2%"
+        );
+    }
+
+    #[test]
+    fn f16_gemv_odd_k_tail() {
+        // Test with K not divisible by 8 or 16 to exercise scalar tail.
+        let (k, n) = (67, 9);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 50) as f32) * 0.01).collect();
+        let b_f16 = f32_to_f16_bits(&b);
+        let mut bt_f16 = vec![0u16; n * k];
+        for i in 0..k {
+            for j in 0..n {
+                bt_f16[j * k + i] = b_f16[i * n + j];
+            }
+        }
+        let mut y = vec![0.0f32; n];
+        neon_gemv_f16_col_parallel(&x, &bt_f16, &mut y, k, n);
+        let ref_y = reference_gemv_f16(&x, &b_f16, k, n);
+        let max_err = y
+            .iter()
+            .zip(&ref_y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-2,
+            "f16 gemv odd tail max error {max_err} exceeds 1e-2"
         );
     }
 }

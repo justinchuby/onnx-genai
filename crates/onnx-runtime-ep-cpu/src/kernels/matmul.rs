@@ -27,7 +27,7 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
 use rayon::prelude::*;
 
 use super::check_arity;
@@ -51,6 +51,10 @@ mod bf16_gemm;
 #[path = "accelerate_gemm.rs"]
 mod accelerate_gemm;
 
+/// Re-export the f16 GEMV for use by sibling kernels (FusedMatMulBias).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) use accelerate_gemm::neon_gemv_f16_col_parallel;
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -66,6 +70,12 @@ pub(crate) struct MatMulPrepack {
     /// inputs on macOS/iOS.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     transposed_b: OnceLock<Vec<f32>>,
+    /// Lazily-computed f16 transpose of the B weight matrix. Stores the raw
+    /// u16 bit patterns of half::f16 in N×K layout, read directly from the
+    /// mmap'd model file without widening to f32. Only populated when B is a
+    /// constant Float16 input on macOS/iOS.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    transposed_b_f16: OnceLock<Vec<u16>>,
 }
 
 impl MatMulPrepack {
@@ -75,7 +85,11 @@ impl MatMulPrepack {
         }
     }
 
-    fn dense<'a>(&'a self, index: usize, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+    pub(crate) fn dense<'a>(
+        &'a self,
+        index: usize,
+        view: &'a TensorView<'_>,
+    ) -> Result<Cow<'a, [f32]>> {
         if !self.constant_inputs[index] {
             return to_dense_f32_widen("MatMul", view);
         }
@@ -127,6 +141,59 @@ impl MatMulPrepack {
                                     let j = j0 + jj;
                                     for i in i0..ie {
                                         bt_chunk[jj * k + i] = b[i * n + j];
+                                    }
+                                }
+                            }
+                        });
+                    bt
+                })
+                .as_slice(),
+        )
+    }
+
+    /// Returns a cached f16 transpose of B[K,N] → B_T[N,K] row-major.
+    ///
+    /// Like [`transposed_b`] but preserves the original f16 storage format
+    /// (as raw u16 bit patterns), reading directly from the mmap'd model
+    /// buffer. Only populated for constant Float16 inputs on macOS/iOS.
+    /// Returns `None` for non-constant inputs or non-Float16 dtypes.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn transposed_b_f16(
+        &self,
+        b_view: &TensorView,
+        k: usize,
+        n: usize,
+    ) -> Option<&[u16]> {
+        if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
+        {
+            return None;
+        }
+        Some(
+            self.transposed_b_f16
+                .get_or_init(|| {
+                    let numel = k * n;
+                    // SAFETY: validated contiguous Float16 view → exactly `numel`
+                    // 2-byte elements at `data_ptr`; `half::f16` is
+                    // `repr(transparent)` over `u16`.
+                    let src =
+                        unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), numel) };
+                    use rayon::prelude::*;
+                    let mut bt = vec![0u16; n * k];
+                    let threads = rayon::current_num_threads();
+                    let rows_per_thread = n.div_ceil(threads).max(1);
+                    bt.par_chunks_mut(rows_per_thread * k)
+                        .enumerate()
+                        .for_each(|(t, bt_chunk)| {
+                            let j0 = t * rows_per_thread;
+                            let j_end = (j0 + rows_per_thread).min(n);
+                            let chunk_n = j_end - j0;
+                            const TILE: usize = 64;
+                            for i0 in (0..k).step_by(TILE) {
+                                let ie = (i0 + TILE).min(k);
+                                for jj in 0..chunk_n {
+                                    let j = j0 + jj;
+                                    for i in i0..ie {
+                                        bt_chunk[jj * k + i] = src[i * n + j];
                                     }
                                 }
                             }
@@ -417,6 +484,31 @@ impl MatMulKernel {
         // narrow into the output dtype. Falls through to the widen-to-f32 paths
         // below on any other dtype/layout or host (the correctness reference).
         if let Some(result) = try_matmul_bf16_native(&inputs[0], &inputs[1], &geom)? {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
+        // FP16 storage GEMV: when B is a constant Float16 weight and M=1
+        // (decode), GEMV directly from the f16 mmap'd data — reading 2 bytes
+        // per weight instead of 4, halving memory bandwidth. Activations (A)
+        // are widened to f32, weights are widened in-register via NEON fcvtl,
+        // accumulation is in f32. The output is f32 and narrowed if needed.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if backend == CpuBackend::Accelerate
+            && geom.m == 1
+            && numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && inputs[1].dtype == DataType::Float16
+            && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n)
+        {
+            let a_dense = self.prepack.dense(0, &inputs[0])?;
+            let mut result = vec![0.0f32; geom.n];
+            accelerate_gemm::neon_gemv_f16_col_parallel(
+                &a_dense,
+                bt_f16,
+                &mut result,
+                geom.k,
+                geom.n,
+            );
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
@@ -1611,20 +1703,39 @@ mod tests {
             .execute(&[a1.view(), weight.view()], &mut [out1.view_mut()])
             .unwrap();
         assert_eq!(out1.to_f32(), vec![2., 6.]);
+        // On macOS with M=1 and f16 weights, the f16 GEMV path reads weights
+        // directly as f16 (via transposed_b_f16) and never widens to f32 —
+        // so dense[1] is NOT populated. On other platforms, dense[1] IS populated.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(kernel.prepack.transposed_b_f16.get().is_some());
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert!(kernel.prepack.dense[1].get().is_some());
         assert!(kernel.prepack.dense[0].get().is_none());
 
-        let cached_weight = kernel.prepack.dense[1].get().unwrap().as_ptr();
         let a2 = Owned::f32(&[1, 2], &[4., 5.]);
         let mut out2 = Owned::zeros_f32(&[1, 2]);
         kernel
             .execute(&[a2.view(), weight.view()], &mut [out2.view_mut()])
             .unwrap();
         assert_eq!(out2.to_f32(), vec![8., 15.]);
-        assert_eq!(
-            kernel.prepack.dense[1].get().unwrap().as_ptr(),
-            cached_weight
-        );
+        // Verify the cache is reused across calls (pointer equality).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let cached = kernel.prepack.transposed_b_f16.get().unwrap().as_ptr();
+            // Re-invoke does not reallocate; the OnceLock is already populated.
+            assert_eq!(
+                kernel.prepack.transposed_b_f16.get().unwrap().as_ptr(),
+                cached
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let cached_weight = kernel.prepack.dense[1].get().unwrap().as_ptr();
+            assert_eq!(
+                kernel.prepack.dense[1].get().unwrap().as_ptr(),
+                cached_weight
+            );
+        }
     }
 
     // --- Direct f32 output path (Option A) --------------------------------

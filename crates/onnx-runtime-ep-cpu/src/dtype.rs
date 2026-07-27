@@ -607,6 +607,23 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
         unsafe { f16c::widen(src, &mut dst) };
         return Ok(Cow::Owned(dst));
     }
+    // NEON bulk widen for contiguous f16 tensors on aarch64.
+    // Uses `fcvtl` (ARMv8 base FP, no FEAT_FP16 required) to widen 4 f16→f32
+    // per instruction, matching the x86 F16C path's role for non-GEMV ops
+    // (RMSNorm, Swish, Attention, RotaryEmbedding) that go through
+    // `to_dense_f32_widen` rather than the direct-read GEMV kernel.
+    #[cfg(target_arch = "aarch64")]
+    if view.dtype == DataType::Float16 && view.is_contiguous() {
+        view.validate()?;
+        let len = view.numel();
+        if len == 0 {
+            return Ok(Cow::Borrowed(&[]));
+        }
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) };
+        let mut dst = vec![0.0f32; len];
+        neon_f16_to_f32_bulk(src, &mut dst);
+        return Ok(Cow::Owned(dst));
+    }
     dispatch_float!(view.dtype, op, T => {
         let raw = to_dense_float::<T>(view)?;
         Ok(Cow::Owned(
@@ -638,6 +655,25 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
         // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
         unsafe { f16c::narrow(data, dst) };
+        return Ok(());
+    }
+    // NEON bulk narrow for contiguous f16 output on aarch64.
+    // Counterpart to the NEON widen path in `to_dense_f32_widen`.
+    #[cfg(target_arch = "aarch64")]
+    if out.dtype == DataType::Float16 && out.is_contiguous() {
+        out.validate()?;
+        let n = out.numel();
+        if data.len() != n {
+            return Err(EpError::KernelFailed(format!(
+                "output element count {n} does not match produced {}",
+                data.len()
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
+        neon_f32_to_f16_bulk(data, dst);
         return Ok(());
     }
     // Contiguous f32→f32: memcpy directly, skipping both the identity Vec copy
@@ -728,6 +764,67 @@ pub fn output_direct_write_eligible(
     read_ranges
         .iter()
         .all(|r| !byte_ranges_overlap(&out_range, r))
+}
+
+// ─── NEON bulk f16↔f32 conversion (aarch64) ─────────────────────────────
+
+/// Bulk-widen contiguous f16 (as u16 bit patterns) → f32 using NEON `fcvtl`.
+/// ARMv8 base FP — no FEAT_FP16 required. Processes 4 elements per `fcvtl`
+/// instruction with a scalar tail for the remainder.
+#[cfg(target_arch = "aarch64")]
+fn neon_f16_to_f32_bulk(src: &[u16], dst: &mut [f32]) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    let mut i = 0;
+    while i + 4 <= n {
+        unsafe {
+            let f32x4: float32x4_t;
+            std::arch::asm!(
+                "ldr {v:d}, [{ptr}]",
+                "fcvtl {v:v}.4s, {v:v}.4h",
+                ptr = in(reg) src.as_ptr().add(i),
+                v = out(vreg) f32x4,
+                options(nostack, readonly, pure),
+            );
+            vst1q_f32(dst.as_mut_ptr().add(i), f32x4);
+        }
+        i += 4;
+    }
+    while i < n {
+        dst[i] = half::f16::from_bits(src[i]).to_f32();
+        i += 1;
+    }
+}
+
+/// Bulk-narrow contiguous f32 → f16 (as u16 bit patterns) using NEON `fcvtn`.
+/// ARMv8 base FP — no FEAT_FP16 required.
+#[cfg(target_arch = "aarch64")]
+fn neon_f32_to_f16_bulk(src: &[f32], dst: &mut [u16]) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    let mut i = 0;
+    while i + 4 <= n {
+        unsafe {
+            let f32x4 = vld1q_f32(src.as_ptr().add(i));
+            // fcvtn narrows 4 × f32 → 4 × f16, stored in the low 64 bits of a
+            // NEON register. We store those 8 bytes (4 × u16) to dst.
+            std::arch::asm!(
+                "fcvtn {v:v}.4h, {src:v}.4s",
+                "str {v:d}, [{ptr}]",
+                src = in(vreg) f32x4,
+                ptr = in(reg) dst.as_mut_ptr().add(i),
+                v = out(vreg) _,
+                options(nostack),
+            );
+        }
+        i += 4;
+    }
+    while i < n {
+        dst[i] = half::f16::from_f32(src[i]).to_bits();
+        i += 1;
+    }
 }
 
 #[cfg(test)]
