@@ -130,3 +130,6 @@ Revised the Phi decode lock after Holden's rejection: environment-gated real-mod
 ## 2026-07-26T22:38:02+00:00 — ORT2 remaining-work audit
 
 - Recorded that ORT2 Phase 1 is complete, full ORT2 runtime vision is roughly 65–70% complete, and core GenAI functionality is roughly 70% complete; remaining work is breadth, compatibility, heterogeneous placement, packages, CI, and productization.
+
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.

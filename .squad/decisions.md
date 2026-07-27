@@ -5587,3 +5587,293 @@ Processed wave-7 inbox notes: `deckard-cuda-conformance-69`, `roy-pr270-review`.
 
 Archive pre-check correction: the active-ledger byte count at pre-check was
 518,843 bytes (the archival conclusion is unchanged).
+
+<!-- scribe-merge-2026-07-27T09-26-45-0700-cli-improvements -->
+## 2026-07-27 — CLI dev-tool charter and split backlog reconciliation
+
+Decision archive gate checked at 2026-07-27T09:26:45-07:00 after inbox merge: active ledger was 526691 bytes before merge and exceeds 51200 bytes; applying 7-day policy with cutoff 2026-07-20.
+
+### andrews-split-movement-handlers
+
+<!-- merged from .squad/decisions/inbox/andrews-split-movement-handlers.md -->
+### 2026-07-27: Split movement shape handlers by operator family
+**By:** Andrews
+**What:** Replaced the 1,809-line `handlers/movement.rs` with:
+- `movement/mod.rs` (114 lines): shared helpers and the unchanged registration facade.
+- `movement/transform.rs` (409 lines): Transpose, Reshape, Flatten, Squeeze, Unsqueeze, Expand.
+- `movement/resize.rs` (302 lines): Resize.
+- `movement/concat_slice.rs` (394 lines): Concat, Slice.
+- `movement/split_gather.rs` (380 lines): Split, Gather, GatherElements, GatherND.
+- `movement/scatter.rs` (137 lines): Scatter, ScatterElements, ScatterND, Trilu.
+- `movement/space_depth.rs` (132 lines): DepthToSpace, SpaceToDepth.
+
+The split totals 1,868 lines including module-local imports. Registration order, operator/opset mappings, handler bodies, shape rules, and diagnostic text are unchanged.
+
+**Why:** Cohesive operator-family modules reduce navigation and review cost while keeping this change mechanical and behavior-preserving. `cargo fmt -p onnx-runtime-shape-inference`, shape-inference build/tests (224 tests plus one doctest), clippy with `-D warnings`, and downstream `onnx-runtime-session` build all pass.
+
+### ash-split-genai-config
+
+<!-- merged from .squad/decisions/inbox/ash-split-genai-config.md -->
+### 2026-07-27: Split genai config compatibility crate into cohesive modules
+**By:** Ash
+**What:** Kept `lib.rs` as a 98-line facade retaining `GenAiConfigError`, `GENAI_CONFIG_FILE`, and the flat public re-exports. Moved config wire types to `wire_types.rs` (361 LOC), loading to `loading.rs` (109 LOC), graph I/O inspection to `graph_io.rs` (235 LOC), compatibility synthesis to `compatibility.rs` (1,427 LOC), JSON builders to `json_builders.rs` (341 LOC), and unit tests to `tests.rs` (1,212 LOC).
+**Why:** The former 3,743-line facade mixed serialization contracts, file loading, graph inspection, pipeline synthesis, JSON construction, and tests. The split is pure code motion; public names remain re-exported from the crate root. A source comparison confirmed config wire definitions, field/variant ordering, derives, every `#[serde(...)]` attribute, and all `GenAiConfigError` text are unchanged. `cargo build`, all 30 crate tests, clippy with `-D warnings`, and downstream engine/server/CLI builds passed.
+
+### call-split-onnx-std-rules
+
+<!-- merged from .squad/decisions/inbox/call-split-onnx-std-rules.md -->
+### 2026-07-27: Split ONNX validation rules by model layer
+**By:** Call
+**What:** Split the former 5,316-line `crates/onnx-std/src/check/rules.rs` into a `rules/mod.rs` facade and five private rule-family modules:
+- `graph_topology.rs` — 368 lines; opset imports, duplicate names, graph input/output connectivity, and acyclicity.
+- `schema_types.rs` — 1,217 lines; schema conformance, type constraints, initializer declarations, metadata, attributes, and retained protobuf types.
+- `ir_version_functions.rs` — 1,147 lines; IR version/feature gates and local function validation. The two existing `#[allow(clippy::too_many_arguments)]` attributes remain on their original functions.
+- `tensor_sparse_payloads.rs` — 558 lines; dense tensor payload and sparse tensor validation.
+- `multi_device.rs` — 393 lines; device configuration and sharding validation.
+- `mod.rs` — 1,711 lines; public facade, shared diagnostic helpers, and unchanged tests.
+
+**Why:** Cohesive private modules reduce the validation implementation's file-level entropy while preserving the flat public API. Rule ORDER is unchanged because `check/mod.rs` and its 17 `checker.add_rule(...)` calls were not modified. Violation WORDING is unchanged: all 579 Rust string literals were compared as multisets before formatting and preserved exactly; the non-author reviewer independently approved the split and found rule implementations/helper logic unchanged.
+
+**Gates:** `cargo fmt -p onnx-std` passed; `cargo build -p onnx-std` passed; `cargo test -p onnx-std` passed (126 unit tests, 23 integration tests, 1 doc-test); `cargo clippy -p onnx-std --all-targets -- -D warnings` passed. Non-author review: approved with no blocking findings.
+
+### christie-split-server-routes
+
+<!-- merged from .squad/decisions/inbox/christie-split-server-routes.md -->
+### 2026-07-27: Split server routes by endpoint family
+**By:** Christie
+**What:** Replaced the 2,989-line `crates/onnx-genai-server/src/routes.rs` with a `routes/` module tree: `mod.rs` (530 LOC) retains `ApiError`, JSON rejection handling, model resolution, shared request preparation types/helpers, and facade re-exports; `admin.rs` (396 LOC) owns health, models, status, resources, debug, admin, and metrics endpoints; `sessions.rs` (60 LOC) owns session create/delete; `completions.rs` (1,719 LOC) owns completions, embeddings, chat, streaming, and generation helpers; `multimodal.rs` (312 LOC) owns transcription, speech, and image-generation endpoints.
+**Why:** This is a pure code-motion split of the HTTP god-file. Router registration remains untouched in `src/lib.rs`, preserving route paths and registration order exactly. The typed `ApiError` handling and server-side registry logging hardened in PR #213 were moved verbatim without behavior changes.
+
+**Gates:** `cargo build -p onnx-genai-server` passed. `cargo test -p onnx-genai-server` completed with 110 passed, 2 ignored, and only the accepted pre-existing `sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image` failure caused by missing `vlm-executable/vision.onnx`. `cargo clippy -p onnx-genai-server --all-targets -- -D warnings` passed. `cargo fmt -p onnx-genai-server` passed.
+
+### coordinator-cli-is-a-dev-tool
+
+<!-- merged from .squad/decisions/inbox/coordinator-cli-is-a-dev-tool.md -->
+# CLI is a developer/maintainer tool, not an end-user product surface
+
+**By:** Squad (Coordinator), capturing a directive from Justin Chu
+**Date:** 2026-07-27T09:26:45-07:00
+
+**What:** The `onnx-genai` CLI (`crates/onnx-genai-cli`) is scoped as a
+**development and maintainer tool**. It is not trying to be a consumer-facing
+local-inference product like `ollama`.
+
+Two direct consequences:
+
+1. **Remote-client mode is out of scope.** The CLI does not need to act as a
+   client against a remote OpenAI-compatible server. Existing third-party CLIs
+   already do that well, and the user will use those. (Explicitly overrides
+   Rachael's finding #1 in `docs/research/cli/02-ux-and-server-surface.md`,
+   which ranked remote-client mode as a top gap.)
+2. **Competitive parity with consumer CLIs is not a goal.** Model
+   pull/registry workflows, conversion/quantization/fine-tuning loops, and
+   general product polish are only worth doing where they make *development*
+   faster. This aligns with the Fact Checker's devil's-advocate conclusion in
+   `docs/research/cli/03-competitive-and-devils-advocate.md`.
+
+**Why:** The repo's primary fronts are CUDA/perf, model enablement, and the
+server/Python integration path. Investing in CLI features that duplicate
+existing tooling would spend effort where it does not compound. What *does*
+compound is the CLI's value as an inner-loop instrument: fast iteration on a
+model, visibility into what the engine is actually doing (EP selection, decode
+backend, KV reuse, timings), and reachability of runtime capabilities that are
+otherwise only testable through code.
+
+**Prioritization lens going forward:** rank CLI work by *"does this shorten a
+maintainer's debug/iterate loop or expose engine behavior we currently cannot
+observe?"* — not by *"does ollama have it?"*
+
+**Concretely reprioritized upward:** discoverability and defaults of
+diagnostics (e.g. the live-stats view is gated behind an undocumented `/stats`
+toggle with no CLI flag), machine-readable output for scripted experiments,
+reachability of engine features (speculative decoding, batching, fork/rewind,
+KV controls) from the command line, and benchmark/eval commands.
+
+**Concretely reprioritized downward / dropped:** remote-client mode, model
+registry & pull workflows, consumer-grade onboarding polish.
+
+### coordinator-repl-is-the-product
+
+<!-- merged from .squad/decisions/inbox/coordinator-repl-is-the-product.md -->
+# REPL is the primary CLI investment — Copilot-CLI-class interactive shell
+
+**By:** Squad (Coordinator), capturing a directive from Justin Chu
+**Date:** 2026-07-27T09:30:56-07:00
+
+**What:** The interactive REPL (`onnx-genai run`) is now the *primary* CLI
+investment, not a side feature. Target quality bar: **GitHub Copilot CLI's
+interactive layout**. Required capabilities:
+
+1. **Copilot-CLI-style layout** — a persistent input area with streaming
+   output above it, rather than today's plain line-by-line `>>>` loop.
+2. **Real line editing** — cursor movement, multiline input/paste, kill/yank,
+   persistent history. Today the REPL is a bare line reader.
+3. **Session fork** and the other agent-first runtime primitives, driven from
+   the REPL.
+4. **Expose as much of the runtime as possible** — the engine has prefix
+   caching, multi-session, CoW fork, KV rewind, speculative decoding, and
+   continuous batching, and almost none of it is reachable interactively.
+   Reachability is the point of the tool.
+5. **Stats shown by default.** This is a developer tool; per-turn numbers are
+   signal, not noise. Inverts the current default (`interactive.rs:614`
+   `show_stats = false`, toggled only by an undocumented `/stats`).
+6. **Slash-command autocompletion.**
+
+**Why:** This follows directly from the dev-tool charter
+(`coordinator-cli-is-a-dev-tool.md`). If the CLI's job is to shorten the
+maintainer debug/iterate loop and make engine behavior observable, then the
+interactive shell *is* the product — it is where a maintainer actually spends
+time, and it is currently the weakest surface relative to what the runtime can
+do. Note the contrast with the rejected remote-client work: this invests in
+capability *reachability*, not in duplicating tooling that already exists
+elsewhere.
+
+**Backlog impact:** Supersedes the ranking in `docs/research/cli/00-backlog.md`.
+Promoted to P0: P0.1 (stats reachable — now *stats by default*), P0.4 (expose
+engine behavior), P1.3 (session/KV debug controls: fork, rewind), P1.4 (REPL
+ergonomics: multiline, history). The rejected items are unchanged and remain
+rejected.
+
+**Open design question for the user:** whether the REPL becomes a full-screen
+ratatui application or keeps an inline viewport with a rich line editor. The
+team is to present the tradeoff with a recommendation rather than choose
+silently.
+
+### dietrich-split-ep-api-abi
+
+<!-- merged from .squad/decisions/inbox/dietrich-split-ep-api-abi.md -->
+### 2026-07-27: Split the plugin EP ABI bridge by responsibility
+**By:** Dietrich
+**What:** Moved `crates/onnx-runtime-ep-api/src/abi.rs` to `abi/mod.rs` and split implementation details into `runtime.rs`, `host.rs`, `ffi_helpers.rs`, and `weights.rs`. The facade retains `OrtGraphView`, `SubgraphClaim`, and `PluginExecutionPlan`; it re-exports `PluginCompiledKernel` at the unchanged `abi::PluginCompiledKernel` path. The host projection test is colocated in `host.rs`.
+**Why:** The 2,512-line plugin-EP ORT C-ABI boundary was difficult to review safely. This is pure code motion with only minimally scoped `pub(super)` visibility needed between sibling modules.
+
+Module breakdown:
+- `abi/mod.rs`: facade, stable public surface, graph view, claims, execution plan — 429 LOC.
+- `abi/runtime.rs`: plugin runtime ownership, shared kernel state, compiled kernel — 304 LOC.
+- `abi/host.rs`: ORT host projections, C-ABI vtables/callbacks, and host projection test — 1,618 LOC.
+- `abi/ffi_helpers.rs`: raw-pointer conversions and plugin-device accessors — 127 LOC.
+- `abi/weights.rs`: mapped external-weight cache and initializer projection — 103 LOC.
+
+Invariant counts across the ABI module tree:
+- ABI root LOC: 2,512 before; 429 after.
+- `unsafe {` blocks: 82 before; 82 after.
+- `#[cfg(...)]` attributes: 1 before; 1 after.
+- `extern "C"` occurrences: 59 before; 59 after.
+- `#[no_mangle]` attributes: 0 before; 0 after.
+
+Public API is unchanged: all prior bare-`pub` items and methods retain their paths and signatures; `PluginCompiledKernel` is re-exported from the facade.
+
+Validation:
+- `cargo build -p onnx-runtime-ep-api`: passed.
+- `cargo test -p onnx-runtime-ep-api`: passed (38 unit tests, 7 integration tests, 0 failures).
+- `cargo clippy -p onnx-runtime-ep-api --all-targets -- -D warnings`: passed.
+- `cargo build -p onnx-runtime-session`: passed.
+- `cargo fmt -p onnx-runtime-ep-api`: passed.
+
+### dillon-split-ort-decode
+
+<!-- merged from .squad/decisions/inbox/dillon-split-ort-decode.md -->
+### 2026-07-27: Split ORT decode by cache and session family
+**By:** Dillon
+**What:** Replaced `crates/onnx-genai-ort/src/decode.rs` with a facade and six focused submodules:
+
+- `decode/mod.rs` — 201 lines; public option/signature types, batched trait, and re-exports.
+- `decode/dynamic.rs` — 1,550 lines; dynamic past/present decode and captured-step tests.
+- `decode/kv_growth.rs` — 465 lines; shared KV bucket growth, host/CUDA prefix copying, and tests.
+- `decode/static_cache.rs` — 1,210 lines; scalar and batched static-cache sessions.
+- `decode/shared_batch.rs` — 476 lines; continuous-batch shared-buffer session.
+- `decode/io.rs` — 196 lines; KV-name pairing and static-cache signature detection.
+- `decode/tensor.rs` — 149 lines; logits, cloning, empty tensor, and allocation helpers.
+
+All existing public types remain available from `onnx_genai_ort::decode` through facade re-exports. The `decode_contract`-based `KvNamingConvention`, `kv_suffix`, and `name_contains_present_key_value` call sites were moved unchanged into `decode/io.rs`; no local classifier copies were introduced.
+
+`cargo fmt -p onnx-genai-ort` was run. Gates passed:
+
+- `cargo build -p onnx-genai-ort`
+- `cargo test -p onnx-genai-ort` (all unit, integration, and doc tests)
+- `cargo clippy -p onnx-genai-ort --all-targets -- -D warnings`
+- `cargo build -p onnx-genai-engine`
+
+**Why:** The original 4,239-line file mixed materially different cache ownership and batching models. The split is pure code motion and clarifies ownership without changing algorithms, allocation, CUDA annotations, or the public facade.
+
+### frost-split-ort-session
+
+<!-- merged from .squad/decisions/inbox/frost-split-ort-session.md -->
+### 2026-07-27: Split ORT session god-file into focused modules
+**By:** Frost
+**What:** Moved `crates/onnx-genai-ort/src/session.rs` to `session/mod.rs` and split options, environment configuration, EP compatibility, provider dispatch, CUDA wiring, plugin wiring, and tests into sibling modules. The facade re-exports the existing public API.
+**Why:** Reduce the 2,504-line session god-file while preserving behavior, provider resolution order, environment handling, error text, cfg gates, and downstream import paths.
+
+#### Module breakdown
+- `session/mod.rs` — `Session`, `TensorInfo`, `RunPhaseError`, `RawSessionOptions`, I/O metadata helpers, facade exports
+- `session/options.rs` — `SessionOptions`, defaults/builders, `ep_selection`, provider availability
+- `session/env_config.rs` — runtime/environment configuration readers and provider/fallback predicates
+- `session/ep_compat.rs` — EP capability model and provider-name compatibility resolution
+- `session/providers.rs` — generic provider append/dispatch and WebGPU session options
+- `session/cuda.rs` — cfg-gated CUDA provider setup and diagnostics
+- `session/plugin.rs` — plugin resolution, registration, discovery, and append flow
+- `session/tests.rs` — all existing session unit tests
+
+#### Size
+- Session root before: 2,504 LOC (`session.rs`)
+- Session root after: 839 LOC (`session/mod.rs`)
+- Session module tree after: 2,571 LOC (module declarations/imports and minimal `pub(super)` visibility account for the increase)
+
+#### cfg count
+| Measurement | Before | After |
+|---|---:|---:|
+| Original cfg attributes preserved | 29 | 29 |
+| Module/import wiring cfg attributes | 0 | 7 |
+| Total cfg attributes | 29 | 36 |
+
+All original cfg expressions, including the platform-specific duplicate CUDA library/search-path functions, remain verbatim. The seven additions only gate new module/import wiring.
+
+#### API and gates
+Public paths remain unchanged, including `Session`, `SessionOptions`, `TensorInfo`, `ep_selection`, `available_execution_providers`, and `session::ep_compat`. No private item was widened to unrestricted `pub`; cross-module helpers use `pub(super)`.
+
+- `cargo build -p onnx-genai-ort` — PASS
+- `cargo test -p onnx-genai-ort --lib` — PASS (56 tests)
+- `cargo clippy -p onnx-genai-ort --all-targets -- -D warnings` — PASS
+- `cargo check -p onnx-genai-ort --features cuda` — PASS
+- `cargo build -p onnx-genai-engine` — PASS
+- `cargo fmt -p onnx-genai-ort` — PASS
+
+### rains-split-sequence
+
+<!-- merged from .squad/decisions/inbox/rains-split-sequence.md -->
+### 2026-07-27: Split sequence storage and algorithms into focused modules
+**By:** Rains
+**What:** Replaced the 1,761-line `crates/onnx-runtime-session/src/sequence.rs` with a `sequence/` module tree: `mod.rs` (238 lines; root, re-exports, tests), `error.rs` (errors/result), `tensor.rs` (shared tensor storage, allocation, byte/view validation), `value.rs` (homogeneous sequence storage and indexing), `split.rs` (split specifications and planning), and `concat.rs` (concat planning, copying, and new-axis stacking).
+**Why:** This is behavior-preserving code motion for Dallas entropy audit item #11. `sequence::SequenceError`, `SequenceResult`, `SeqTensor`, `SequenceValue`, `SplitSpec`, `split`, `split_tensor`, `concat`, and the existing crate-visible concat helpers remain re-exported at their prior paths; `executor.rs` and root `Cargo.toml` are unchanged. Allocation order, view-bound checks, signatures, error text, cfg/allow attributes, and tests are unchanged. Gates passed: `cargo build -p onnx-runtime-session`; `cargo test -p onnx-runtime-session` (82 unit tests, integration tests, and doc tests passed); `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings`; and `cargo fmt -p onnx-runtime-session`. The known pre-existing `tests/decode_session.rs` missing `tests/fixtures/tiny-llm/model.onnx` failure did not reproduce in this checkout's gate run; no fixture or decode-session files were changed.
+
+### roy-cli-improvements
+
+<!-- merged from .squad/decisions/inbox/roy-cli-improvements.md -->
+### 2026-07-27: CLI improvements should start with interface contracts
+**By:** Roy
+**What:** Treat the next `onnx-genai` CLI wave as an interface-contract project: split clap args out of `lib.rs`, add typed output/rendering seams, define JSON schemas and exit codes, and snapshot help before adding model-store/config subcommands.
+**Why:** The current CLI already has useful commands, but its 1,134-line `lib.rs` owns parsing, dispatch, profiling side effects, and tests. Adding model management, profiles, completions, and machine-readable output on top of that shape would lock in inconsistent flags and ad hoc rendering.
+
+### spunkmeyer-split-image
+
+<!-- merged from .squad/decisions/inbox/spunkmeyer-split-image.md -->
+### 2026-07-27: Split image preprocessing into cohesive submodules
+**By:** Spunkmeyer
+**What:** Split `crates/onnx-genai-preprocess/src/image.rs` into a 29-line facade plus `image/config.rs` (293 LOC), `image/program.rs` (1,742 LOC), `image/tiling.rs` (323 LOC), `image/transform.rs` (233 LOC), and `image/tests.rs` (1,408 LOC). `image/packed.rs` remains unchanged at 1,330 LOC. The facade preserves every existing public re-export and import path.
+**Why:** Separate image-program metadata compilation/dataflow validation from pixel transforms and tiling without changing behavior. All serde attributes, resize/normalization arithmetic, tiling boundary math, serialization behavior, and error text are unchanged; the unknown-output-source regression now asserts the complete byte-identical error string. Gates passed: preprocess build, 54 preprocess tests, preprocess clippy with `-D warnings`, and downstream engine/CLI build. A non-author code-review agent approved the diff with no findings.
+
+### wierzbowski-split-cli-lib
+
+<!-- merged from .squad/decisions/inbox/wierzbowski-split-cli-lib.md -->
+### 2026-07-27: Split CLI orchestration from presentation and REPL parsing
+**By:** Wierzbowski
+**What:** Split `crates/onnx-genai-cli/src/lib.rs` (3,559 lines before; 1,233 after) into `generate.rs` (219 LOC), `interactive.rs` (953), `commands.rs` (234), `output.rs` (232), `model_inspection.rs` (71), and `transcribe.rs` (709), retaining the existing `profile.rs`. `lib.rs` remains the CLI argument/type and dispatch facade.
+**Why:** Cohesive private modules make generation, interactive orchestration, command parsing, presentation, model inspection, and transcription independently navigable without changing the crate's public surface, CLI shapes, or output text.
+
+Ctrl-C wiring was moved intact into `interactive.rs`: the `Once`-guarded `ctrlc::set_handler` body retains its registration sites and order, the same `GENERATING`, `INTERRUPT_REQUESTED`, and `EXIT_ARMED` atomics with `SeqCst`, and the REPL still clears `EXIT_ARMED` immediately after a submitted line before parsing it. One-shot generation and transcription install the same handler at their original points.
+
+Gates: `cargo build -p onnx-genai-cli` passed; `cargo test -p onnx-genai-cli` passed (127 tests total across targets); strict `cargo clippy -p onnx-genai-cli --all-targets -- -D warnings` is blocked by pre-existing unchanged `crates/onnx-genai-cli/src/pages.rs:129` (`clippy::manual_checked_ops`); clippy passes with only that lint allowed. `cargo fmt -p onnx-genai-cli -- --check` and `git diff --check` passed. Non-author code review found no significant issues.
+<!-- scribe-merge-2026-07-27T09-26-45-0700-cli-improvements-end -->
+
+Archive action at 2026-07-27T09:26:45-07:00: active ledger exceeded 51200 bytes; no dated active-ledger entries older than 2026-07-20 were present, so archived 0 block(s).
+

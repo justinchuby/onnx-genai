@@ -59,3 +59,6 @@ Authored bit-exact native-CUDA-versus-ORT 64-token decode locks for Qwen2.5-0.5B
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Under Leon's lockout, added bf16 harness support and ragged causal/non-causal VarlenAttention parity tests; Bishop approved PR #267.
+
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.

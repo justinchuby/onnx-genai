@@ -93,3 +93,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - PR #265 for #58 merged after Hicks approved runtime-dispatched AVX2/F16C and NEON f16/bf16 GEMM SIMD, including scalar/tail fallbacks and parity coverage.
+
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
