@@ -61,152 +61,6 @@ fn retry_pre_run_captured_failure<T>(
     }
 }
 
-#[cfg(test)]
-mod captured_step_retry_tests {
-    use super::*;
-    use std::cell::Cell;
-
-    /// A fake model+sampler that counts how many times the model is invoked.
-    ///
-    /// Its [`Self::captured_step`] mirrors the phase ordering of the real
-    /// [`DecodeSession::step_captured`]: a pre-run setup phase (input binding /
-    /// run-option setup) that has *not* touched the model, then the single model
-    /// invocation, then the post-run device-argmax readback / sampler. Failures
-    /// are injected at a chosen phase so a test can prove exactly how many times
-    /// the model runs across the fast path and any standard-step fallback.
-    struct FakeRunner {
-        model_invocations: Cell<usize>,
-    }
-
-    impl FakeRunner {
-        fn new() -> Self {
-            Self {
-                model_invocations: Cell::new(0),
-            }
-        }
-
-        fn invoke_model(&self) {
-            self.model_invocations.set(self.model_invocations.get() + 1);
-        }
-
-        /// One captured decode step, failing at `fail_phase` if set.
-        fn captured_step(
-            &self,
-            fail_phase: Option<StepPhase>,
-        ) -> std::result::Result<i64, CapturedStepError> {
-            // PRE-run: input/mask/KV binding and run-option setup. The model has
-            // not executed, so a failure here is retryable.
-            if fail_phase == Some(StepPhase::Setup) {
-                return Err(classify_run_phase(RunPhaseError::Setup(
-                    OrtError::InvalidArgument("injected binding failure".into()),
-                )));
-            }
-            // The model invocation itself (advances KV state exactly once).
-            self.invoke_model();
-            if fail_phase == Some(StepPhase::Run) {
-                return Err(classify_run_phase(RunPhaseError::Invoked(
-                    OrtError::InvalidArgument("injected run failure".into()),
-                )));
-            }
-            // POST-run: device-argmax readback / device sampler. The model has
-            // already advanced, so a failure here must propagate, never retry.
-            if fail_phase == Some(StepPhase::Sample) {
-                return Err(CapturedStepError::RunInvoked(OrtError::InvalidArgument(
-                    "injected sampler failure".into(),
-                )));
-            }
-            Ok(7)
-        }
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum StepPhase {
-        Setup,
-        Run,
-        Sample,
-    }
-
-    #[test]
-    fn post_run_sampling_failure_runs_model_once_and_does_not_fall_back() {
-        let runner = FakeRunner::new();
-        let result =
-            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Sample)), |_| {
-                // step_standard fallback would re-invoke the model — forbidden
-                // once the sampler failed post-invocation.
-                runner.invoke_model();
-                Ok(0)
-            });
-
-        assert!(result.is_err(), "post-run sampler failure must propagate");
-        assert_eq!(
-            runner.model_invocations.get(),
-            1,
-            "post-run failure must not replay the model via the standard step"
-        );
-    }
-
-    #[test]
-    fn post_run_invocation_failure_runs_model_once_and_does_not_fall_back() {
-        let runner = FakeRunner::new();
-        let result =
-            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Run)), |_| {
-                runner.invoke_model();
-                Ok(0)
-            });
-
-        assert!(result.is_err(), "run-call failure must propagate");
-        assert_eq!(
-            runner.model_invocations.get(),
-            1,
-            "a failure at the model invocation must not be replayed"
-        );
-    }
-
-    #[test]
-    fn pre_run_setup_failure_falls_back_and_runs_model_once() {
-        let runner = FakeRunner::new();
-        let result =
-            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Setup)), |_| {
-                // Setup failed before the model ran, so the standard step safely
-                // performs the one and only model invocation.
-                runner.invoke_model();
-                Ok(99)
-            });
-
-        assert_eq!(result.expect("pre-run failure should retry"), 99);
-        assert_eq!(
-            runner.model_invocations.get(),
-            1,
-            "pre-run failure must retry through the standard step exactly once"
-        );
-    }
-
-    #[test]
-    fn classify_run_phase_maps_setup_to_retryable_and_invoked_to_propagate() {
-        // Setup failures are retryable (PreRun); invocation failures propagate.
-        let runner = FakeRunner::new();
-        let retried = retry_pre_run_captured_failure(
-            Err(classify_run_phase(RunPhaseError::Setup(
-                OrtError::InvalidArgument("setup".into()),
-            ))),
-            |_| {
-                runner.invoke_model();
-                Ok(1)
-            },
-        );
-        assert_eq!(retried.expect("setup must retry"), 1);
-        assert_eq!(runner.model_invocations.get(), 1);
-
-        let propagated: Result<i64> = retry_pre_run_captured_failure(
-            Err(classify_run_phase(RunPhaseError::Invoked(
-                OrtError::InvalidArgument("invoked".into()),
-            ))),
-            |_| panic!("invoked failure must not retry"),
-        );
-        assert!(propagated.is_err());
-    }
-}
-
 /// A stateful IoBinding decode runner that keeps KV OrtValues inside ORT.
 pub struct DecodeSession<'a> {
     session: &'a Session,
@@ -1546,5 +1400,151 @@ impl<'a> DecodeSession<'a> {
              path"
                 .into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod captured_step_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A fake model+sampler that counts how many times the model is invoked.
+    ///
+    /// Its [`Self::captured_step`] mirrors the phase ordering of the real
+    /// [`DecodeSession::step_captured`]: a pre-run setup phase (input binding /
+    /// run-option setup) that has *not* touched the model, then the single model
+    /// invocation, then the post-run device-argmax readback / sampler. Failures
+    /// are injected at a chosen phase so a test can prove exactly how many times
+    /// the model runs across the fast path and any standard-step fallback.
+    struct FakeRunner {
+        model_invocations: Cell<usize>,
+    }
+
+    impl FakeRunner {
+        fn new() -> Self {
+            Self {
+                model_invocations: Cell::new(0),
+            }
+        }
+
+        fn invoke_model(&self) {
+            self.model_invocations.set(self.model_invocations.get() + 1);
+        }
+
+        /// One captured decode step, failing at `fail_phase` if set.
+        fn captured_step(
+            &self,
+            fail_phase: Option<StepPhase>,
+        ) -> std::result::Result<i64, CapturedStepError> {
+            // PRE-run: input/mask/KV binding and run-option setup. The model has
+            // not executed, so a failure here is retryable.
+            if fail_phase == Some(StepPhase::Setup) {
+                return Err(classify_run_phase(RunPhaseError::Setup(
+                    OrtError::InvalidArgument("injected binding failure".into()),
+                )));
+            }
+            // The model invocation itself (advances KV state exactly once).
+            self.invoke_model();
+            if fail_phase == Some(StepPhase::Run) {
+                return Err(classify_run_phase(RunPhaseError::Invoked(
+                    OrtError::InvalidArgument("injected run failure".into()),
+                )));
+            }
+            // POST-run: device-argmax readback / device sampler. The model has
+            // already advanced, so a failure here must propagate, never retry.
+            if fail_phase == Some(StepPhase::Sample) {
+                return Err(CapturedStepError::RunInvoked(OrtError::InvalidArgument(
+                    "injected sampler failure".into(),
+                )));
+            }
+            Ok(7)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StepPhase {
+        Setup,
+        Run,
+        Sample,
+    }
+
+    #[test]
+    fn post_run_sampling_failure_runs_model_once_and_does_not_fall_back() {
+        let runner = FakeRunner::new();
+        let result =
+            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Sample)), |_| {
+                // step_standard fallback would re-invoke the model — forbidden
+                // once the sampler failed post-invocation.
+                runner.invoke_model();
+                Ok(0)
+            });
+
+        assert!(result.is_err(), "post-run sampler failure must propagate");
+        assert_eq!(
+            runner.model_invocations.get(),
+            1,
+            "post-run failure must not replay the model via the standard step"
+        );
+    }
+
+    #[test]
+    fn post_run_invocation_failure_runs_model_once_and_does_not_fall_back() {
+        let runner = FakeRunner::new();
+        let result =
+            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Run)), |_| {
+                runner.invoke_model();
+                Ok(0)
+            });
+
+        assert!(result.is_err(), "run-call failure must propagate");
+        assert_eq!(
+            runner.model_invocations.get(),
+            1,
+            "a failure at the model invocation must not be replayed"
+        );
+    }
+
+    #[test]
+    fn pre_run_setup_failure_falls_back_and_runs_model_once() {
+        let runner = FakeRunner::new();
+        let result =
+            retry_pre_run_captured_failure(runner.captured_step(Some(StepPhase::Setup)), |_| {
+                // Setup failed before the model ran, so the standard step safely
+                // performs the one and only model invocation.
+                runner.invoke_model();
+                Ok(99)
+            });
+
+        assert_eq!(result.expect("pre-run failure should retry"), 99);
+        assert_eq!(
+            runner.model_invocations.get(),
+            1,
+            "pre-run failure must retry through the standard step exactly once"
+        );
+    }
+
+    #[test]
+    fn classify_run_phase_maps_setup_to_retryable_and_invoked_to_propagate() {
+        // Setup failures are retryable (PreRun); invocation failures propagate.
+        let runner = FakeRunner::new();
+        let retried = retry_pre_run_captured_failure(
+            Err(classify_run_phase(RunPhaseError::Setup(
+                OrtError::InvalidArgument("setup".into()),
+            ))),
+            |_| {
+                runner.invoke_model();
+                Ok(1)
+            },
+        );
+        assert_eq!(retried.expect("setup must retry"), 1);
+        assert_eq!(runner.model_invocations.get(), 1);
+
+        let propagated: Result<i64> = retry_pre_run_captured_failure(
+            Err(classify_run_phase(RunPhaseError::Invoked(
+                OrtError::InvalidArgument("invoked".into()),
+            ))),
+            |_| panic!("invoked failure must not retry"),
+        );
+        assert!(propagated.is_err());
     }
 }
