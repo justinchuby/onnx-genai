@@ -25,7 +25,7 @@
 //! marks graph-initializer inputs so this kernel can safely prepack constants.
 
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
@@ -92,10 +92,78 @@ pub fn bnns_prefill_stats() -> (usize, u64) {
     )
 }
 
+/// Process-global cache for transposed f16 weight matrices, keyed by the
+/// source data pointer (stable for the lifetime of an mmap'd model file).
+/// Ensures the O(N×K) transpose is computed at most once per weight per
+/// process, surviving across shape-keyed kernel-cache evictions.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static WEIGHT_TRANSPOSE_F16: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Arc<Vec<u16>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Process-global cache for transposed f32 weight matrices (Accelerate GEMV).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static WEIGHT_TRANSPOSE_F32: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Arc<Vec<f32>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Pre-compute and cache the f16 transpose of a weight matrix.
+///
+/// Called during model load to move the ~1 s first-decode-step transpose cost
+/// into the model-load budget (we have ~1.5 s of headroom vs ORT). The global
+/// cache ensures subsequent kernel-cache shape misses (prefill M=40 → decode
+/// M=1) find the transpose immediately.
+///
+/// # Safety
+/// `data_ptr` must point to a valid, aligned, contiguous array of `k * n`
+/// `u16` values that remains live for the duration of this call.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub unsafe fn precompute_f16_weight_transpose(data_ptr: *const u16, k: usize, n: usize) {
+    let ptr_key = data_ptr as usize;
+    if WEIGHT_TRANSPOSE_F16.lock().unwrap().contains_key(&ptr_key) {
+        return;
+    }
+    let numel = k * n;
+    if numel == 0 {
+        return;
+    }
+    let src = unsafe { std::slice::from_raw_parts(data_ptr, numel) };
+    use rayon::prelude::*;
+    let mut bt = vec![0u16; n * k];
+    let threads = rayon::current_num_threads();
+    let rows_per_thread = n.div_ceil(threads).max(1);
+    bt.par_chunks_mut(rows_per_thread * k)
+        .enumerate()
+        .for_each(|(t, bt_chunk)| {
+            let j0 = t * rows_per_thread;
+            let j_end = (j0 + rows_per_thread).min(n);
+            let chunk_n = j_end - j0;
+            const TILE: usize = 64;
+            for i0 in (0..k).step_by(TILE) {
+                let ie = (i0 + TILE).min(k);
+                for jj in 0..chunk_n {
+                    let j = j0 + jj;
+                    for i in i0..ie {
+                        bt_chunk[jj * k + i] = src[i * n + j];
+                    }
+                }
+            }
+        });
+    WEIGHT_TRANSPOSE_F16
+        .lock()
+        .unwrap()
+        .insert(ptr_key, Arc::new(bt));
+}
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
 /// zero-copy and need no owned cache entry.
+///
+/// Weight transpose caches (`transposed_b`, `transposed_b_f16`) use `Arc` so
+/// the data can be shared with the process-global `WEIGHT_TRANSPOSE_*` caches.
+/// This ensures that a kernel-cache shape miss (e.g. prefill M=40 → decode
+/// M=1) finds the transpose in the global cache rather than recomputing it.
 #[derive(Default)]
 pub(crate) struct MatMulPrepack {
     constant_inputs: [bool; 2],
@@ -106,20 +174,20 @@ pub(crate) struct MatMulPrepack {
     /// column-parallel GEMV path. Only populated for constant (model weight)
     /// inputs on macOS/iOS.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    transposed_b: OnceLock<Vec<f32>>,
+    transposed_b: OnceLock<Arc<Vec<f32>>>,
     /// Lazily-computed f16 transpose of the B weight matrix. Stores the raw
     /// u16 bit patterns of half::f16 in N×K layout, read directly from the
     /// mmap'd model file without widening to f32. Only populated when B is a
     /// constant Float16 input on macOS/iOS.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    transposed_b_f16: OnceLock<Vec<u16>>,
+    transposed_b_f16: OnceLock<Arc<Vec<u16>>>,
     /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
     /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
     /// model). Stores raw u16 bit patterns in row-major K×N layout. Only
     /// populated for constant Float16 inputs on macOS/iOS where the original
     /// is non-contiguous.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    contiguous_b_f16: OnceLock<Vec<u16>>,
+    contiguous_b_f16: OnceLock<Arc<Vec<u16>>>,
 }
 
 impl MatMulPrepack {
@@ -156,7 +224,8 @@ impl MatMulPrepack {
 
     /// Returns a cached transpose of B[K,N] -> B_T[N,K] row-major.
     /// Only transposes constant (model weight) inputs. Returns `None` for
-    /// activations. Uses Rayon + cache-blocking to hide the one-time cost.
+    /// activations. Uses a process-global cache so the transpose survives
+    /// kernel-cache shape evictions (e.g. prefill M=40 → decode M=1).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn transposed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&[f32]> {
         if !self.constant_inputs[1] {
@@ -165,11 +234,12 @@ impl MatMulPrepack {
         Some(
             self.transposed_b
                 .get_or_init(|| {
+                    let ptr_key = b.as_ptr() as usize;
+                    if let Some(cached) = WEIGHT_TRANSPOSE_F32.lock().unwrap().get(&ptr_key) {
+                        return cached.clone();
+                    }
                     use rayon::prelude::*;
                     let mut bt = vec![0.0f32; n * k];
-                    // Parallel tiled transpose: each Rayon task handles a strip
-                    // of output rows (columns of B), using a tile size that keeps
-                    // both read and write working sets in L1 cache.
                     let threads = rayon::current_num_threads();
                     let rows_per_thread = n.div_ceil(threads).max(1);
                     bt.par_chunks_mut(rows_per_thread * k)
@@ -189,6 +259,11 @@ impl MatMulPrepack {
                                 }
                             }
                         });
+                    let bt = Arc::new(bt);
+                    WEIGHT_TRANSPOSE_F32
+                        .lock()
+                        .unwrap()
+                        .insert(ptr_key, bt.clone());
                     bt
                 })
                 .as_slice(),
@@ -199,8 +274,8 @@ impl MatMulPrepack {
     ///
     /// Like [`transposed_b`] but preserves the original f16 storage format
     /// (as raw u16 bit patterns), reading directly from the mmap'd model
-    /// buffer. Only populated for constant Float16 inputs on macOS/iOS.
-    /// Returns `None` for non-constant inputs or non-Float16 dtypes.
+    /// buffer. Uses a process-global cache so the transpose survives
+    /// kernel-cache shape evictions.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn transposed_b_f16(
         &self,
@@ -217,11 +292,12 @@ impl MatMulPrepack {
             self.transposed_b_f16
                 .get_or_init(|| {
                     let numel = k * n;
-                    // SAFETY: validated contiguous Float16 view → exactly `numel`
-                    // 2-byte elements at `data_ptr`; `half::f16` is
-                    // `repr(transparent)` over `u16`.
                     let src =
                         unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), numel) };
+                    let ptr_key = src.as_ptr() as usize;
+                    if let Some(cached) = WEIGHT_TRANSPOSE_F16.lock().unwrap().get(&ptr_key) {
+                        return cached.clone();
+                    }
                     use rayon::prelude::*;
                     let mut bt = vec![0u16; n * k];
                     let threads = rayon::current_num_threads();
@@ -243,6 +319,11 @@ impl MatMulPrepack {
                                 }
                             }
                         });
+                    let bt = Arc::new(bt);
+                    WEIGHT_TRANSPOSE_F16
+                        .lock()
+                        .unwrap()
+                        .insert(ptr_key, bt.clone());
                     bt
                 })
                 .as_slice(),
@@ -277,8 +358,6 @@ impl MatMulPrepack {
                     if shape.len() == 2 {
                         let (rows, cols) = (shape[0], shape[1]);
                         let (sr, sc) = (strides[0] as isize, strides[1] as isize);
-                        // Parallel + tiled for cache-friendly access on large
-                        // matrices (e.g. 896×151936 = 136 M elements).
                         use rayon::prelude::*;
                         let threads = rayon::current_num_threads();
                         let rows_per_thread = rows.div_ceil(threads).max(1);
@@ -320,7 +399,7 @@ impl MatMulPrepack {
                             }
                         }
                     }
-                    out
+                    Arc::new(out)
                 })
                 .as_slice(),
         )
@@ -612,20 +691,50 @@ impl MatMulKernel {
             && numel(&geom.batch_shape) <= 1
             && geom.b_promoted_rank == 2
             && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
-            && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n)
         {
-            #[cfg(all(test, target_arch = "aarch64"))]
-            GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let a_dense = self.prepack.dense(0, &inputs[0])?;
-            let mut result = vec![0.0f32; geom.n];
-            accelerate_gemm::neon_gemv_f16_col_parallel(
-                &a_dense,
-                bt_f16,
-                &mut result,
-                geom.k,
-                geom.n,
-            );
-            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            // Try the transposed-B cache first (contiguous weights).
+            if let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n) {
+                #[cfg(all(test, target_arch = "aarch64"))]
+                GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let a_dense = self.prepack.dense(0, &inputs[0])?;
+                let mut result = vec![0.0f32; geom.n];
+                accelerate_gemm::neon_gemv_f16_col_parallel(
+                    &a_dense,
+                    bt_f16,
+                    &mut result,
+                    geom.k,
+                    geom.n,
+                );
+                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            }
+            // Column-major B[K,N] with strides [1, K]: memory is already
+            // B^T[N,K] row-major — exactly what the GEMV expects. Use the raw
+            // mmap'd data directly (zero-copy, no transpose needed). This
+            // avoids a ~960 ms f32 densification on the 896×151936 lm_head
+            // weight that would otherwise dominate the first decode step.
+            let b_view = &inputs[1];
+            if self.prepack.constant_inputs[1]
+                && b_view.shape.len() == 2
+                && b_view.strides.len() == 2
+                && b_view.strides[0] == 1
+                && b_view.strides[1] == b_view.shape[0] as i64
+            {
+                #[cfg(all(test, target_arch = "aarch64"))]
+                GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let a_dense = self.prepack.dense(0, &inputs[0])?;
+                let bt_f16 = unsafe {
+                    std::slice::from_raw_parts(b_view.data_ptr::<u16>(), geom.k * geom.n)
+                };
+                let mut result = vec![0.0f32; geom.n];
+                accelerate_gemm::neon_gemv_f16_col_parallel(
+                    &a_dense,
+                    bt_f16,
+                    &mut result,
+                    geom.k,
+                    geom.n,
+                );
+                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            }
         }
 
         // Dedicated half-precision path: contiguous f16/bf16 operands stay in
@@ -879,19 +988,6 @@ fn try_matmul_half(
             elapsed.as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        if std::env::var("NXRT_BNNS_DEBUG").is_ok() {
-            let flops = 2.0 * geom.m as f64 * geom.k as f64 * geom.n as f64;
-            let gflops = flops / elapsed.as_secs_f64() / 1e9;
-            eprintln!(
-                "[bnns] M={} K={} N={} {:.3}ms {:.0} GFLOPS (call #{})",
-                geom.m,
-                geom.k,
-                geom.n,
-                elapsed.as_secs_f64() * 1e3,
-                gflops,
-                BNNS_PREFILL_CALLS.load(std::sync::atomic::Ordering::Relaxed),
-            );
-        }
         return Ok(Some(out));
     }
 
