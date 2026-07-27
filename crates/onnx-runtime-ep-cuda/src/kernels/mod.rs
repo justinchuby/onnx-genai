@@ -50,6 +50,7 @@ pub mod matmul_nbits;
 pub mod movement;
 pub mod normalization;
 pub mod onehot;
+pub mod packed_varlen_attention;
 pub mod pointwise;
 pub mod pooling;
 pub mod qmoe;
@@ -114,6 +115,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
+    "PackedVarlenAttention",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -390,6 +392,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        Box::new(packed_varlen_attention::PackedVarlenAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
