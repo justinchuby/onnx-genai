@@ -265,6 +265,126 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
     outs[0].type_info.as_ref().unwrap().dtype
 }
 
+#[test]
+fn expanded_registry_catalog_count_is_pinned() {
+    let registry = InferenceRegistry::default_registry();
+    assert_eq!(registry.operator_count(), 164);
+    assert_eq!(registry.entry_count(), 203);
+}
+
+#[test]
+fn kernel_gap_unary_rules_preserve_symbolic_shapes_and_versions() {
+    for (op, since_version) in [
+        ("Selu", 6),
+        ("ThresholdedRelu", 10),
+        ("Hardmax", 13),
+        ("LpNormalization", 1),
+        ("GroupNormalization", 18),
+        ("BitwiseNot", 18),
+    ] {
+        let input = tin(DataType::Float32, vec![sym(1), c(4)]);
+        let unresolved = run(&node(op, 1, 1), vec![input.clone()], since_version - 1);
+        assert!(unresolved[0].type_info.is_none(), "{op}");
+        let output = run(&node(op, 1, 1), vec![input], since_version);
+        assert_eq!(out_shape(&output), vec![sym(1), c(4)], "{op}");
+    }
+}
+
+#[test]
+fn bitwise_and_prelu_broadcast_symbolic_dims() {
+    for (op, opset, dtype) in [
+        ("BitShift", 11, DataType::Uint32),
+        ("BitwiseAnd", 18, DataType::Int32),
+        ("BitwiseOr", 18, DataType::Int32),
+        ("BitwiseXor", 18, DataType::Int32),
+        ("PRelu", 16, DataType::Float32),
+    ] {
+        let output = run(
+            &node(op, 2, 1),
+            vec![
+                tin(dtype, vec![sym(7), c(1), c(8)]),
+                tin(dtype, vec![c(3), c(8)]),
+            ],
+            opset,
+        );
+        assert_eq!(out_shape(&output), vec![sym(7), c(3), c(8)], "{op}");
+        assert!(
+            run(
+                &node(op, 2, 1),
+                vec![tin(dtype, vec![c(2)]), tin(dtype, vec![c(2)])],
+                opset - 1,
+            )[0]
+            .type_info
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn predicates_dropout_and_eye_like_resolve_all_outputs() {
+    for (op, opset) in [("IsNaN", 9), ("IsInf", 10)] {
+        let output = run(&node(op, 1, 1), vec![f32in(vec![sym(3), c(5)])], opset);
+        assert_eq!(out_dtype(&output), DataType::Bool);
+        assert_eq!(out_shape(&output), vec![sym(3), c(5)]);
+    }
+
+    for opset in [13, 22] {
+        let output = run(
+            &node("Dropout", 1, 2),
+            vec![f32in(vec![sym(4), c(7)])],
+            opset,
+        );
+        assert_eq!(out_shape(&output), vec![sym(4), c(7)]);
+        assert_eq!(output[1].type_info.as_ref().unwrap().dtype, DataType::Bool);
+        assert_eq!(
+            output[1].type_info.as_ref().unwrap().shape,
+            vec![sym(4), c(7)]
+        );
+    }
+    assert!(
+        run(&node("Dropout", 1, 2), vec![f32in(vec![c(2)])], 12)[0]
+            .type_info
+            .is_none()
+    );
+
+    let eye = with_attr(
+        node("EyeLike", 1, 1),
+        "dtype",
+        Attribute::Int(DataType::Float16.to_onnx() as i64),
+    );
+    let output = run(&eye, vec![f32in(vec![sym(5), c(9)])], 9);
+    assert_eq!(out_dtype(&output), DataType::Float16);
+    assert_eq!(out_shape(&output), vec![sym(5), c(9)]);
+    assert!(try_run(&eye, vec![f32in(vec![c(2), c(3), c(4)])], 9).is_err());
+}
+
+#[test]
+fn unique_tracks_axis_and_flattened_inverse_lengths() {
+    let flat = run(&node("Unique", 1, 4), vec![f32in(vec![sym(2), c(4)])], 11);
+    assert_eq!(flat[0].type_info.as_ref().unwrap().shape.len(), 1);
+    assert_eq!(
+        flat[2].type_info.as_ref().unwrap().shape,
+        vec![sym(2).mul(&c(4))]
+    );
+    for output in [&flat[0], &flat[1], &flat[3]] {
+        assert_eq!(output.type_info.as_ref().unwrap().shape.len(), 1);
+    }
+
+    let axis = with_attr(node("Unique", 1, 4), "axis", Attribute::Int(-1));
+    let output = run(&axis, vec![f32in(vec![sym(8), c(6)])], 11);
+    assert_eq!(output[0].type_info.as_ref().unwrap().shape[0], sym(8));
+    assert_eq!(output[0].type_info.as_ref().unwrap().shape.len(), 2);
+    assert_eq!(output[2].type_info.as_ref().unwrap().shape, vec![c(6)]);
+    assert!(
+        try_run(
+            &with_attr(node("Unique", 1, 4), "axis", Attribute::Int(2)),
+            vec![f32in(vec![c(2), c(3)])],
+            11,
+        )
+        .is_err()
+    );
+}
+
 // --- MatMul ---------------------------------------------------------------
 
 #[test]

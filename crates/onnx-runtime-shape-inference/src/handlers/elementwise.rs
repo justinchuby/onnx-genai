@@ -42,6 +42,14 @@ pub fn logical_not(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// Shape-preserving unary predicate (`IsInf`, `IsNaN`): output is boolean.
+pub fn unary_predicate(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(shape) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) {
+        ctx.set_output(0, onnx_runtime_ir::DataType::Bool, shape);
+    }
+    Ok(())
+}
+
 /// Broadcasting comparison or binary logical op: output is always boolean.
 pub fn boolean_binary(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
@@ -193,6 +201,12 @@ pub fn register(reg: &mut InferenceRegistry) {
     for op in ["Clip", "Elu", "HardSigmoid", "LeakyRelu"] {
         reg.register("", op, 1, unary);
     }
+    reg.register("", "Selu", 6, unary);
+    reg.register("", "ThresholdedRelu", 10, unary);
+    reg.register("", "Hardmax", 13, unary);
+    reg.register("", "LpNormalization", 1, unary);
+    reg.register("", "GroupNormalization", 18, unary);
+    reg.register("", "GroupNormalization", 21, unary);
     // `ai.onnx::Gelu` (opset 20): same-shape elementwise activation. Registered
     // at its since_version so shape-inference membership agrees with the CPU
     // kernel (also opset 20); the contrib `com.microsoft::Gelu` is separate.
@@ -203,6 +217,11 @@ pub fn register(reg: &mut InferenceRegistry) {
         reg.register("", op, 1, binary);
     }
     reg.register("", "Mod", 10, binary);
+    reg.register("", "BitShift", 11, binary);
+    for op in ["BitwiseAnd", "BitwiseOr", "BitwiseXor"] {
+        reg.register("", op, 18, binary);
+    }
+    reg.register("", "PRelu", 16, binary);
     for op in ["Less", "Greater", "Equal", "And", "Or", "Xor"] {
         reg.register("", op, 1, boolean_binary);
     }
@@ -210,6 +229,9 @@ pub fn register(reg: &mut InferenceRegistry) {
         reg.register("", op, 12, boolean_binary);
     }
     reg.register("", "Not", 1, logical_not);
+    reg.register("", "BitwiseNot", 18, unary);
+    reg.register("", "IsNaN", 9, unary_predicate);
+    reg.register("", "IsInf", 10, unary_predicate);
     for op in ["Min", "Max", "Sum", "Mean"] {
         reg.register("", op, 1, variadic);
     }

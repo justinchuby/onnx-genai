@@ -229,6 +229,30 @@ pub fn dropout(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `EyeLike`: preserve the matrix shape and optionally override its dtype.
+fn eye_like(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(input) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    if input.rank() != 2 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "EyeLike".into(),
+            index: 0,
+            rank: input.rank(),
+            detail: "input must be a rank-2 tensor".into(),
+        });
+    }
+    let dtype = match ctx.node.attr("dtype").and_then(Attribute::as_int) {
+        Some(raw) => DataType::from_onnx(raw as i32).ok_or_else(|| ShapeInferError::Invalid {
+            op: "EyeLike".into(),
+            detail: format!("unknown output dtype {raw}"),
+        })?,
+        None => input.dtype,
+    };
+    ctx.set_output(0, dtype, input.shape);
+    Ok(())
+}
+
 /// Read the `value` attribute of a `ConstantOfShape` as `(dtype, fill_scalar)`.
 fn value_attr_scalar(node: &onnx_runtime_ir::Node) -> (DataType, Option<DimExpr>) {
     if let Some(Attribute::Tensor(t)) = node.attr("value") {
@@ -249,6 +273,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "CastLike", 1, cast_like);
     reg.register("", "Identity", 1, identity);
     reg.register("", "Dropout", 1, dropout);
+    reg.register("", "EyeLike", 9, eye_like);
     for version in [10, 13, 19, 21, 23, 25] {
         reg.register("", "QuantizeLinear", version, quantize_linear);
         reg.register("", "DequantizeLinear", version, dequantize_linear);
