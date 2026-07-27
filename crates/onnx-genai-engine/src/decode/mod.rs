@@ -71,14 +71,17 @@ pub(crate) enum ModelDecodePath {
     Legacy,
 }
 
-#[allow(dead_code)]
 /// Engine-facing boundary over low-level ORT forward-pass/KV-buffer sessions.
 ///
 /// Implementations produce logits and maintain or rewind their local KV buffer
 /// cursor. Callers decide which tokens to feed, when to stop, and how logical
 /// KV state participates in generation.
 pub(crate) trait DecodeBackend {
+    // Retained for the backend adapter contract while native runner integration is pending.
+    #[allow(dead_code)]
     fn current_len(&self) -> usize;
+    // Retained for the backend adapter contract while native runner integration is pending.
+    #[allow(dead_code)]
     fn max_context(&self) -> Option<usize> {
         None
     }
@@ -112,17 +115,22 @@ pub(crate) trait DecodeBackend {
     fn supports_sampled(&self) -> bool {
         false
     }
+    // Retained for the backend adapter contract while native runner integration is pending.
+    #[allow(dead_code)]
     fn rewind(&mut self, target_len: usize) -> anyhow::Result<()>;
+    // Retained for the backend adapter contract while native runner integration is pending.
+    #[allow(dead_code)]
     fn reset(&mut self) -> anyhow::Result<()> {
         self.rewind(0)
     }
 }
 
 #[allow(clippy::large_enum_variant)]
-#[allow(dead_code)]
 enum DecodeRunner {
     StaticCache(StaticCacheDecodeSession<'static>),
     PastPresent(DecodeSession<'static>),
+    // Retained for the native DecodeState integration while construction is pending.
+    #[cfg_attr(feature = "native-backend", allow(dead_code))]
     #[cfg(feature = "native-backend")]
     Native(crate::native_decode::NativeDecodeSession),
 }
