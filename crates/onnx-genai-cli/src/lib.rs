@@ -57,8 +57,6 @@ use profile::RunProfile;
 use transcribe::transcribe;
 
 #[cfg(test)]
-use anyhow::Context as _;
-#[cfg(test)]
 use commands::{
     ProfileSetting, ReplCommand, ReplLine, parse_decode_backend, parse_profile_setting,
     parse_repl_line,
