@@ -1,0 +1,530 @@
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::Context;
+use axum::{
+    Json,
+    extract::{FromRequest, Multipart, Path as AxumPath, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response, Sse, sse::Event},
+};
+use base64::Engine as _;
+use onnx_genai::text_to_audio::TextToAudioRequest;
+use onnx_genai::text_to_image::TextToImageRequest;
+use onnx_genai::{
+    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
+    StopSequence,
+};
+use onnx_genai_engine::{
+    EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot, ResourceLimit,
+    TokenLogprob, parse_resource_limit,
+};
+use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::{
+    driver::{DriverEvent, EngineDriver, GenerateSubmitError},
+    multimodal::MultimodalInput,
+    registry::ModelHandle,
+    session::SessionRegistry,
+    sse::{
+        StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
+        role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_calls_chunk,
+    },
+    state::{AppState, ServerConfig},
+    types::{
+        AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest, ChatCompletionResponse,
+        ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
+        ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
+        CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
+        ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
+        SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
+    },
+};
+
+mod admin;
+mod completions;
+mod multimodal;
+mod sessions;
+
+#[cfg(feature = "metrics")]
+pub(crate) use admin::prometheus_metrics;
+pub(crate) use admin::{
+    admin_list_models, admin_load_model, admin_set_vram_limit, admin_unload_model, debug_config,
+    debug_kv, debug_profile, debug_sessions, debug_trace, debug_trace_perfetto, health, models,
+    resources, status,
+};
+pub use completions::{
+    ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
+    parse_tool_calls,
+};
+pub(crate) use completions::{
+    chat_completions, collect_generation_result, completions, embeddings,
+};
+#[cfg(test)]
+pub(crate) use completions::{image_placeholder_text, prepare_completion};
+pub(crate) use multimodal::{audio_speech, audio_transcriptions, image_generations};
+pub(crate) use sessions::{create_session, delete_session};
+
+const SESSION_ID_HEADER: &str = "x-session-id";
+const MAX_SESSION_ID_LEN: usize = 128;
+const OVERLOAD_RETRY_AFTER_SECS: u64 = 1;
+const MAX_CHAT_TOP_LOGPROBS: usize = 20;
+const MAX_COMPLETION_LOGPROBS: usize = 5;
+/// Path of the downloadable Perfetto trace endpoint, reported by the trace
+/// status endpoint so clients can discover the export without guessing.
+const PERFETTO_EXPORT_PATH: &str = "/v1/debug/trace/perfetto";
+/// OTLP span export is intentionally deferred (see issue #13); the status
+/// endpoint reports this honestly rather than pretending it works.
+const OTLP_EXPORT_STATUS: &str = "deferred: OTLP span export is not implemented (Perfetto export is available at /v1/debug/trace/perfetto)";
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ModelsResponse {
+    object: &'static str,
+    data: Vec<ModelObject>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelObject {
+    id: String,
+    object: &'static str,
+    created: u64,
+    owned_by: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct HealthResponse {
+    status: &'static str,
+    model: String,
+}
+
+/// Node-status contract polled by the cluster router (§34.8) every 1-2s.
+///
+/// Field honesty: values are populated from generic runtime state where a getter
+/// exists (`queue_depth`, `active_sessions`, `healthy`, `node_id`). Metrics the
+/// server cannot yet measure are reported as documented zeros/empties rather than
+/// fabricated — see the per-field comments in [`status`]. All values are
+/// model-agnostic; `node_id` names this node, never a model.
+#[derive(Debug, Serialize)]
+pub(crate) struct NodeStatus {
+    node_id: String,
+    healthy: bool,
+    kv_usage: f32,
+    kv_pages_used: u32,
+    kv_pages_total: u32,
+    kv_pages_shared: u32,
+    queue_depth: u32,
+    active_sessions: u32,
+    paused_sessions: u32,
+    tokens_per_second: f64,
+    batch_utilization: f32,
+    sessions: Vec<SessionStatus>,
+    prefix_hashes: Vec<String>,
+}
+
+/// Per-session detail entry in [`NodeStatus::sessions`] (§34.8).
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionStatus {
+    id: String,
+    priority: String,
+    kv_pages: u32,
+    state: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugConfigResponse {
+    model_id: String,
+    pipeline: bool,
+    max_output_tokens: usize,
+    max_sessions: usize,
+    max_queue_depth: usize,
+    model_max_context: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugSessionsResponse {
+    active_sessions: u64,
+    max_sessions: usize,
+    sessions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugKvResponse {
+    prefix_cache_hits: u64,
+    prefix_cache_lookups: u64,
+    prefix_cache_hit_rate: f64,
+    active_batch_size: u64,
+    pending_queue_depth: u64,
+    available_admission_slots: usize,
+    rejected_requests: u64,
+    engine_kv_introspection: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResourcesResponse {
+    configured_limits: ConfiguredResourceLimits,
+    resolved_limits: ResolvedResourceLimits,
+    derived_kv_budget: DerivedKvBudget,
+    vram: ResourceTier,
+    host_ram: ResourceTier,
+    disk_spill: Option<ResourceTier>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfiguredResourceLimits {
+    vram: String,
+    host_ram: String,
+    disk_spill: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolvedResourceLimits {
+    vram_bytes: u64,
+    host_ram_bytes: u64,
+    disk_spill_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DerivedKvBudget {
+    bytes: u64,
+    total_pages: u64,
+    max_total_tokens: u64,
+    reserved_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceTier {
+    used: u64,
+    limit: u64,
+    headroom: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetVramLimitRequest {
+    limit: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugTraceResponse {
+    tracing_span: &'static str,
+    latest_trace_id: String,
+    /// Discovery info for the Perfetto (Chrome Trace Event Format) export.
+    perfetto_export: PerfettoExportInfo,
+    otlp_export: &'static str,
+    /// Where to get stage totals instead of a full timeline.
+    aggregate_profile: &'static str,
+}
+
+/// Aggregate decode-stage costs for this process.
+#[derive(Debug, Serialize)]
+pub(crate) struct DebugProfileResponse {
+    /// Whether stages are being accumulated at all.
+    collecting: bool,
+    note: &'static str,
+    stages: Vec<ProfileStage>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ProfileStage {
+    stage: &'static str,
+    total_ms: f64,
+    calls: u64,
+    us_per_call: f64,
+}
+
+/// Discovery payload describing the downloadable Perfetto trace export.
+#[derive(Debug, Serialize)]
+pub(crate) struct PerfettoExportInfo {
+    /// Endpoint that serves the Perfetto/Chrome-trace JSON document.
+    endpoint: &'static str,
+    /// Number of timeline events currently retained in the in-memory sink.
+    recorded_events: usize,
+    /// Whether the profiler is actively collecting spans into the sink. Spans
+    /// are only recorded while `ONNX_GENAI_TRACE` is set; when unset the export
+    /// is a well-formed but empty trace.
+    collecting: bool,
+    /// Human-readable note describing how to populate the trace.
+    note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminModelObject {
+    id: String,
+    loaded: bool,
+    is_default: bool,
+    /// Epoch-millisecond timestamp of the last request routed to this model,
+    /// present only while the model is loaded.
+    last_request_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminModelsResponse {
+    object: &'static str,
+    data: Vec<AdminModelObject>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminLoadResponse {
+    id: String,
+    loaded: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionResponse {
+    id: String,
+    object: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: ErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    message: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Debug)]
+pub(crate) struct ApiError {
+    status: StatusCode,
+    message: String,
+    retry_after_secs: Option<u64>,
+}
+
+struct PreparedGenerateRequest {
+    request: GenerateRequest,
+    prompt_tokens: usize,
+}
+
+pub(crate) struct PreparedCompletion {
+    pub(crate) generation: CompletionGeneration,
+    prompt_tokens: usize,
+}
+
+pub(crate) enum CompletionGeneration {
+    Plain(GenerateRequest),
+    Fim {
+        prefix: String,
+        suffix: String,
+        options: GenerateOptions,
+    },
+}
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            retry_after_secs: Some(OVERLOAD_RETRY_AFTER_SECS),
+        }
+    }
+}
+
+/// JSON body extractor that reports rejections as OpenAI-shaped [`ApiError`]s.
+///
+/// Axum's stock `Json` rejection returns a 422 whose body is a bare
+/// "Failed to deserialize the JSON body into the target type: ..." string. That
+/// loses the what/why/how contract every user-facing failure owes the caller,
+/// so this wrapper re-frames the rejection — and passes through the detailed
+/// messages the multimodal content-part parser already produces.
+pub(crate) struct ApiJson<T>(pub(crate) T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ApiError::bad_request(describe_json_rejection(&rejection))),
+        }
+    }
+}
+
+/// Drop serde's trailing " at line N column M", which points into a body the
+/// caller cannot see and only dilutes the actionable message.
+pub(crate) fn strip_serde_position(message: &str) -> &str {
+    match message.rfind(" at line ") {
+        Some(index) if message[index..].ends_with(char::is_numeric) => message[..index].trim_end(),
+        _ => message,
+    }
+}
+
+/// Turn an axum JSON rejection into an actionable message.
+fn describe_json_rejection(rejection: &JsonRejection) -> String {
+    let text = rejection.body_text();
+    // Content-part rejections are already what/why/how; surface them verbatim
+    // rather than burying them behind axum's generic prefix.
+    if let Some(start) = text.find("What: ") {
+        return strip_serde_position(&text[start..]).to_string();
+    }
+    match rejection {
+        JsonRejection::MissingJsonContentType(_) => {
+            "What: the request was rejected before parsing. \
+             Why: it did not declare `Content-Type: application/json`. \
+             How: send the header `Content-Type: application/json` with a JSON body."
+                .to_string()
+        }
+        JsonRejection::JsonSyntaxError(_) => format!(
+            "What: the request body could not be parsed as JSON. \
+             Why: {text}. \
+             How: send a well-formed JSON object."
+        ),
+        _ => format!(
+            "What: the request body did not match this endpoint's schema. \
+             Why: {text}. \
+             How: check the field names and types against the OpenAI API reference for this endpoint."
+        ),
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = Json(ErrorResponse {
+            error: ErrorBody {
+                message: self.message,
+                kind: "server_error",
+            },
+        });
+        let mut response = (self.status, body).into_response();
+        if let Some(seconds) = self.retry_after_secs {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string()).expect("valid retry-after"),
+            );
+        }
+        response
+    }
+}
+
+fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
+    match err {
+        GenerateSubmitError::Overloaded => ApiError::too_many_requests(
+            "generation capacity exceeded; retry after the server finishes queued work",
+        ),
+        GenerateSubmitError::DriverStopped => ApiError::internal("engine driver stopped"),
+    }
+}
+
+fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
+    tracing::error!(error = %err, "model registry operation failed");
+    ApiError::internal("model registry failed")
+}
+
+/// Route a request to the correct loaded model.
+///
+/// - **Non-empty `requested`** — resolves the exact id.  If the model is
+///   configured but not currently loaded, it is lazily loaded (blocking the
+///   request until ready).  Returns a 404 only if the id is not configured at
+///   all; never falls back to the default model for a named request.
+/// - **Empty `requested`** — falls back to the default model, lazily loading it
+///   if necessary, preserving the single-model UX where clients omit `model`.
+async fn resolve_model(
+    registry: &crate::registry::ModelRegistry,
+    requested: &str,
+) -> Result<Arc<ModelHandle>, ApiError> {
+    // Fast path: already loaded (handles empty -> default).
+    if let Some(handle) = registry.resolve(requested).map_err(map_registry_error)? {
+        return Ok(handle);
+    }
+    // Determine the concrete id to lazily load.
+    let id = if requested.trim().is_empty() {
+        registry
+            .default_id()
+            .map_err(map_registry_error)?
+            .ok_or_else(|| ApiError::internal("no model loaded"))?
+    } else {
+        requested.to_string()
+    };
+    if !registry
+        .contains_available(&id)
+        .map_err(map_registry_error)?
+    {
+        return Err(ApiError::not_found(format!(
+            "model '{requested}' not found"
+        )));
+    }
+    registry
+        .load(&id)
+        .await
+        .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))
+}
+
+fn audio_decoder_prompt(
+    tokenizer: &Tokenizer,
+    language: Option<&str>,
+) -> Result<Vec<u32>, ApiError> {
+    crate::multimodal::audio_decoder_prompt(tokenizer, language)
+        .map_err(|error| ApiError::bad_request(format!("{error:#}")))
+}
+
+async fn close_evicted_session(
+    engine: &EngineDriver,
+    evicted: Option<SessionId>,
+) -> Result<(), ApiError> {
+    if let Some(evicted) = evicted {
+        engine
+            .close_session(evicted)
+            .await
+            .map_err(|err| ApiError::internal(format!("evicted session close failed: {err}")))?;
+    }
+    Ok(())
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
