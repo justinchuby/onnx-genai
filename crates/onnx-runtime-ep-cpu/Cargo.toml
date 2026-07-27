@@ -58,3 +58,6 @@ criterion = "0.5"
 [[bench]]
 name = "kernels"
 harness = false
+
+[lints]
+workspace = true

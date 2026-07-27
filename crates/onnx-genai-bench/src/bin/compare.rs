@@ -824,7 +824,7 @@ fn render_report(
     if !run_notes.is_empty() {
         report.push_str("\n## Skips and run failures\n\n");
         for note in run_notes {
-            report.push_str(&format!("- {}\n", note));
+            report.push_str(&format!("- {note}\n"));
         }
     }
     report.push_str("\n## Fairness caveats\n\n");

@@ -137,9 +137,7 @@ impl DecodeState {
             || present_to_past.len() != present_outputs.len()
         {
             anyhow::bail!(
-                "model exposes incomplete KV I/O; past inputs: {:?}, present outputs: {:?}",
-                kv_inputs,
-                present_outputs
+                "model exposes incomplete KV I/O; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
             );
         }
 

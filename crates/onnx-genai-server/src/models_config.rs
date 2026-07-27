@@ -77,8 +77,7 @@ impl ModelsConfig {
             "json" => serde_json::from_str(&content)
                 .map_err(|e| anyhow::anyhow!("invalid JSON in '{}': {}", path.display(), e))?,
             other => anyhow::bail!(
-                "unsupported config file format '.{}': expected '.toml' or '.json'",
-                other
+                "unsupported config file format '.{other}': expected '.toml' or '.json'"
             ),
         };
         config.validate()
@@ -90,7 +89,7 @@ impl ModelsConfig {
         }
         for (i, spec) in self.models.iter().enumerate() {
             if spec.id.trim().is_empty() {
-                anyhow::bail!("models[{}]: id must not be empty or whitespace-only", i);
+                anyhow::bail!("models[{i}]: id must not be empty or whitespace-only");
             }
             if spec.path.as_os_str().is_empty() {
                 anyhow::bail!("models[{}] (id='{}'): path must not be empty", i, spec.id);

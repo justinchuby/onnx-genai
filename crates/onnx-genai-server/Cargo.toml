@@ -58,3 +58,6 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 tower = { workspace = true }
 image = { workspace = true, features = ["png"] }
 tempfile = "3"
+
+[lints]
+workspace = true

@@ -112,7 +112,7 @@ fn find_ort_root() -> PathBuf {
             return lib_path;
         }
         // Use as-is, trust the user
-        println!("cargo:rustc-link-search=native={}", lib_dir);
+        println!("cargo:rustc-link-search=native={lib_dir}");
         return lib_path.parent().unwrap_or(&lib_path).to_path_buf();
     }
 
@@ -127,8 +127,7 @@ fn find_ort_root() -> PathBuf {
             return root_path;
         }
         panic!(
-            "ORT_ROOT={} does not contain include/onnxruntime_c_api.h",
-            root
+            "ORT_ROOT={root} does not contain include/onnxruntime_c_api.h"
         );
     }
 
@@ -208,10 +207,10 @@ fn metal_plugin_ort_root() -> Option<PathBuf> {
 fn download_prebuilt(target_dir: &Path) {
     let (os, ext) = prebuilt_target();
 
-    let filename = format!("onnxruntime-{}-{}.{}", os, ORT_VERSION, ext);
-    let url = format!("{}/v{}/{}", ORT_RELEASE_BASE, ORT_VERSION, filename);
+    let filename = format!("onnxruntime-{os}-{ORT_VERSION}.{ext}");
+    let url = format!("{ORT_RELEASE_BASE}/v{ORT_VERSION}/{filename}");
 
-    eprintln!("Downloading ONNX Runtime {} from {}", ORT_VERSION, url);
+    eprintln!("Downloading ONNX Runtime {ORT_VERSION} from {url}");
 
     // Use curl for download (available on all CI platforms)
     let download_path = target_dir.parent().unwrap().join(&filename);
@@ -223,7 +222,7 @@ fn download_prebuilt(target_dir: &Path) {
         .expect("Failed to run curl. Install curl or set ORT_ROOT manually.");
 
     if !status.success() {
-        panic!("Failed to download ORT from {}", url);
+        panic!("Failed to download ORT from {url}");
     }
 
     verify_archive_checksum(&download_path, &filename);
@@ -244,7 +243,7 @@ fn download_prebuilt(target_dir: &Path) {
             panic!("Failed to extract ORT archive");
         }
         // Rename extracted directory
-        let extracted = parent_dir.join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
+        let extracted = parent_dir.join(format!("onnxruntime-{os}-{ORT_VERSION}"));
         if extracted.exists() {
             if target_dir.exists() {
                 std::fs::remove_dir_all(target_dir).unwrap();
@@ -258,7 +257,7 @@ fn download_prebuilt(target_dir: &Path) {
         // (docs/CROSS_PLATFORM.md, "ORT Windows bootstrap"). This path is
         // identical on Linux/macOS/Windows and needs no external tool.
         extract_zip(&download_path, parent_dir);
-        let extracted = parent_dir.join(format!("onnxruntime-{}-{}", os, ORT_VERSION));
+        let extracted = parent_dir.join(format!("onnxruntime-{os}-{ORT_VERSION}"));
         if extracted.exists() {
             if target_dir.exists() {
                 std::fs::remove_dir_all(target_dir).unwrap();

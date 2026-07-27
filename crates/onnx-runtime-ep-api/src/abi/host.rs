@@ -311,7 +311,7 @@ impl HostGraph {
                 Box::new(HostValueInfo {
                     id: value_id,
                     name: CString::new(value.name.clone().unwrap_or_default()).map_err(|_| {
-                        format!("value {:?} name contains an interior NUL byte", value_id)
+                        format!("value {value_id:?} name contains an interior NUL byte")
                     })?,
                     type_info: HostTypeInfo {
                         tensor: HostTensorTypeAndShapeInfo {
@@ -361,8 +361,7 @@ impl HostGraph {
                         Ok(HostOpAttr {
                             name: CString::new(name.as_str()).map_err(|_| {
                                 format!(
-                                    "attribute {name:?} on node {:?} contains an interior NUL byte",
-                                    node_id
+                                    "attribute {name:?} on node {node_id:?} contains an interior NUL byte"
                                 )
                             })?,
                             attr: attr.clone(),
@@ -423,7 +422,7 @@ impl HostNode {
             .map(|value| {
                 graph
                     .try_value(*value)
-                    .ok_or_else(|| format!("fused plugin input value {:?} is not live", value))
+                    .ok_or_else(|| format!("fused plugin input value {value:?} is not live"))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let output_value_ptrs = claim
@@ -432,7 +431,7 @@ impl HostNode {
             .map(|value| {
                 graph
                     .try_value(*value)
-                    .ok_or_else(|| format!("fused plugin output value {:?} is not live", value))
+                    .ok_or_else(|| format!("fused plugin output value {value:?} is not live"))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut inputs = Vec::with_capacity(value_ptrs.len());

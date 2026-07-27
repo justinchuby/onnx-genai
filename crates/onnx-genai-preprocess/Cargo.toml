@@ -16,3 +16,6 @@ onnx-genai-metadata = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

@@ -179,7 +179,7 @@ pub fn plan_placement(
             });
         }
         let reason = match &fallback_reason {
-            None => format!("device ({bytes} bytes; {} bytes remain)", remaining),
+            None => format!("device ({bytes} bytes; {remaining} bytes remain)"),
             Some(HostFallbackReason::NonPageableRegion {
                 region_index,
                 reason,

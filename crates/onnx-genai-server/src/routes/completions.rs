@@ -1251,7 +1251,7 @@ fn prepare_generate_request(
     };
     let token_ids = tokenizer
         .encode(&prompt)
-        .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {

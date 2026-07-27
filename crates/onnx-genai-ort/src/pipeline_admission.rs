@@ -517,8 +517,7 @@ fn validate_image_program(
                         "the declared image modality endpoint cannot be constructed: pipeline.vision is present, but preprocessing.image does not bind this required ONNX input"
                             .to_string(),
                         format!(
-                            "regenerate the native sidecar with preprocessing.image output '{}' and a matching vision expansion program",
-                            endpoint
+                            "regenerate the native sidecar with preprocessing.image output '{endpoint}' and a matching vision expansion program"
                         ),
                     ));
                 }

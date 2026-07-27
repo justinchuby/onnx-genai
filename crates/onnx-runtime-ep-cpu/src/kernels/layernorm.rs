@@ -104,8 +104,7 @@ pub(crate) fn layer_norm_dense(
     let axis = if axis < 0 { axis + rank as i64 } else { axis };
     if axis < 0 || axis as usize > rank {
         return Err(EpError::KernelFailed(format!(
-            "LayerNormalization: axis {} out of range for rank {rank}",
-            axis
+            "LayerNormalization: axis {axis} out of range for rank {rank}"
         )));
     }
     let axis = axis as usize;
