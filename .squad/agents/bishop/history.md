@@ -10,3 +10,7 @@
 
 ## 2026-07-27T16:44:54Z — Wave 8 update
 - Approved Moss PR #273 for #79 CUDA BlockQuantizedMoE kernel; merged as 4e4dd25d.
+
+## 2026-07-27T16:44:54Z — Wave 9 update
+Requested changes on PR #283 and assigned Batty as fix owner; Dallas is locked out from revising.
+- 2026-07-27T16:44:54Z — Re-reviewed PR #283 after Batty fix and APPROVED. Mutation-proven tests pin single unsuffixed `controlnet_cond`, no runtime `conditioning_scale`, and loud multi-ControlNet failure. PR merged as 687612f5; #50 closed.

@@ -9,6 +9,9 @@
 Decision archive gate rechecked after inbox merge at 2026-07-27T04:35:00-07:00: archived 25 newly merged dated entries older than 2026-07-20 to `.squad/decisions-archive/2026-07.md`.
 
 <!-- scribe-merge-2026-07-27T04-35-00-07-00-pr227-lessons -->
+
+Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 734629 bytes; archived 0 dated entries older than 2026-07-20 to `.squad/decisions/archive/2026-07-27T16-44-54Z-wave9-older-than-7-days.md`.
+
 ## 2026-07-27 — PR #227 roofline and benchmark lessons
 
 **By:** Scribe, preserving overnight Mac CPU EP campaign learnings.
@@ -1535,91 +1538,6 @@ This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 m
 - `wallace-ep-transparency-review.md` — 2026-07-21: EP transparency backbone review; By: Wallace; What: Deckard's per-op executor span backbone (`exec_plan_node`) is a genuine LIVE span, and the re-instrumented kernels attach kernel-variant + capture-status reasons to it in the real native decode path — my original dead-w….
 - `wallace-wp2-driver-review.md` — WP2 native speculative driver — review.  
 **Why:** The inbox should hold only living research artifacts; segment decisions belong in the active ledger.
-## 2026-07-20 — CPU decode: resident pool and guarded GQA row parallelism
-
-### Keep persistent M=1 decode-pool residency
-**By:** Sapper; reviewed by Luv 🟢  
-**What:** Run the whole native CPU M=1 forward inside one bounded decode-pool `install`, using a worker-local, nested, panic-safe RAII residency guard so each MatMulNBits call executes inline rather than reinstalling the same pool. `ONNX_GENAI_CPU_DECODE_THREADS=0`, prefill, default-feature-off, and CUDA behavior remain unchanged. Landed on main as `cbacb75`.  
-**Why:** Qwen2.5-0.5B int4 decode improved about 3–6% with bit-identical tokens. This proves install crossings were avoidable but not the dominant remaining cost. Luv verified TLS isolation, Rayon semantics, deadlock safety, feature gates, and the CPU/build test matrix.
-
-### Parallelize sufficiently large CPU GQA attention rows
-**By:** Roy; reviewed by Luv 🟢  
-**What:** Parallelize independent `(batch, query_head, query_sequence)` rows with one Rayon fork-join only above a 163,840 `row × key × head-dimension` work guard; retain serial execution below it. Each task owns a disjoint output row and private score buffer while preserving each row's reduction order. Landed on main as `c391327`.  
-**Why:** Short decode regressed when parallelism was unconditional. Guarded parallelism improved 512-token decode throughput by 8.6%, reduced profiled GQA time by 13.9%, and cut 225-token prefill GQA time by 88.3%, with bit-identical 1-thread/8-thread greedy output. A future coverage follow-up may force exact serial/parallel comparison for a large ragged batch.
-
-### Retain Tier-A GQA KV copy cleanup, defer shared append-only KV
-**By:** Roy; regression coverage by Pris  
-**What:** Borrow contiguous f32 past caches, remove a redundant owned clone, and replace scalar cache materialization loops with contiguous slice copies. Keep attention math and the SSA output contract unchanged. Pris added f16-widening and ragged-per-batch cache-materialization regressions.  
-**Why:** The cleanup is bit-identical and removes avoidable work, but measured end-to-end decode was neutral within noise. True O(1)-append shared KV requires runtime aliasing/lifecycle changes and remains deferred.
-
-### Do not land the decode fork-join granularity prototype
-**By:** Deckard  
-**What:** Revert the coarser 8/12-task MatMulNBits prototype and profiling probes; no commit landed.  
-**Why:** Long runs regressed 7.1–8.4%. Post-residency profiling showed serial GQA at about 20.58 ms/token exceeded MatMulNBits at about 15.51 ms/token, so reducing projection task count removed steal slack rather than solving the dominant bottleneck. Revisit only as graph-level projection fusion, after GQA.
-## 2026-07-20 — CUDA fused flash attention
-
-### Fuse standard Attention only on measured-winning shapes
-**By:** Rachael; reviewed by Chew 🟡  
-**What:** Add an NVRTC tiled online-softmax backend behind `AttentionKernel`, including f16 WMMA with f32 accumulation and scalar f32/f16/bf16 support for MHA/GQA/MQA, causal/non-causal attention, and additive mask planes. Auto dispatch retains Phase-2a for decode, `D>128`, unsupported layouts/features, and measured-slower long spans. Landed on main as `a67b7a5`.  
-**Why:** H200 f16 S512 improved about 1.53–1.60× and removed 48 MiB score scratch; S2048 regressed heavily when forced, so fallback is part of the design. Chew found the online-softmax merge, WMMA masking/synchronization, numerics, and dispatch sound. Non-blocking coverage remains for explicit Auto fallback gates, non-multiple-of-16 f16 head dimensions, and per-batch/per-head masks.
-
-### Fuse GroupQueryAttention prefill with distinct physical and causal origins
-**By:** Bryant, corrected by Rachael after Chew rejection; final review Chew 🟢  
-**What:** Reuse the shared flash kernel behind `com.microsoft::GroupQueryAttention` for measured-winning prefill. Cache append and implicit RoPE use `total_length - key_sequence_length`; attention causal masking uses the distinct query start `total_length - query_sequence_length`. The final parity matrix covers 40 scenarios across f32/f16/bf16, MHA/GQA/MQA, fresh/cached/ragged, RoPE, local window, softcap, generic non-WMMA routing, large scores, unequal Q/K lengths, and Auto fallback. Landed on main as `94fa2b6`.  
-**Why:** Bryant's first revision incorrectly reused the K append origin for queries when `Sq != Sk`; Chew rejected it and locked that artifact. Rachael's revision made the failing `Sq=2,Sk=4` case pass, tightened tolerances, and preserved exact present K/V. H200 fresh Q512 is about 1.31× faster with 48 MiB scratch saved; cached/large slower shapes fall back. The corrected artifact is approved and no active lockout remains.
-## 2026-07-20 — Issue #40 Phase 1 distributed-runtime foundation
-
-### Slice 1a: shared protocol trace + ticketed non-blocking host pressure
-**By:** Tyrell; reviewed by Gaff 🟡  
-**What:** Add the unpublished `onnx-runtime-protocol-trace` crate with public protocol envelopes/identities and a conformance-only independent `ReplayChecker`; add `HostGovernor` ticketed pressure accounting to `onnx-genai-scheduler`. All state transitions and trace linearization points commit under one short ledger lock; waits occur only on ticket-local condition variables after capacity is atomically charged. Landed on main as `0d1d265`.  
-**Why:** The implementation conforms to `PressureProtocol.tla` invariants through an independent deterministic replay campaign and snapshot invariant checks. Gaff approved with two non-blocking issues—terminal-entry reaping and cancel-granted wake-after-unlock—which were folded into slice 1b. The TLC model gate is CI-deferred because Java/TLA tooling is unavailable locally.
-
-### Slice 1b: Communicator + in-process backend + BufferOwnership registry
-**By:** Tyrell; reviewed by Gaff 🟢  
-**What:** Add unpublished `onnx-runtime-comm` with the async `Communicator` trait, synchronous reference `InProcessCommunicator`, and one-lock `OwnershipRegistry` over read/write lease sets. Dropping an operation handle detaches but does not release storage; terminal completion/abort releases leases, and freed allocation IDs remain tombstoned to prevent reuse/ABA. Reuse the slice-1a trace framework and independently replay `BufferOwnership` events. Landed on main as `e4d2883`.  
-**Why:** Gaff verified exactly-one-owner, conflict, release, transfer, generation/ABA, non-blocking-lock, linearization, barrier, mailbox, and deterministic-conformance obligations. Slice 1b also reaps terminal pressure entries and moves all pressure wakeups after unlock. Non-blocking follow-ups for 1c include abort waking barrier waiters, barrier-map cleanup, and documenting tombstone growth.
-
-### Slice 1c: one topology-wide collective ordering authority — IN PROGRESS
-**By:** Tyrell  
-**What:** Implement direct host rendezvous collectives behind a shared `CollectiveSequencer`; keep canonical submit order independent per communicator group, use one slot for count exchange plus all-to-all-v data, freeze reduction member order with checked arithmetic and per-contribution f16/bf16 rounding, and bound free tombstones with an exact window plus allocator-proven epoch floors.  
-**Why:** This maps to `CollectiveOrdering.tla`: ranks may progress asynchronously without divergent order, groups do not acquire a false global enqueue order, completion stays rank-local, and abort freezes submissions before backend wakeup. This slice is not yet landed.
-
-### Phase-1 deferred gates and remaining phases
-**By:** Scribe  
-**What:** Keep the TLC model gate CI-deferred. After 1c, Phase-1 slice 1d weight residency remains pending; issue #40 Phases 2–4 remain pending.  
-**Why:** The landed Rust conformance harnesses provide deterministic implementation-side evidence, but do not replace the configured CI model check or the remaining distributed-runtime roadmap.
-## 2026-07-20 — Issue #40 collective ordering completion
-
-### Land slice 1c with serialized abort wakes and broad equivalence coverage
-**By:** Tyrell; reviewed by Gaff 🟢  
-**What:** Land all seven in-process collectives behind one canonical per-group `CollectiveSequencer`, deterministic member-order reduction, additive independent replay checking, bounded allocation tombstones, and rank-local completion. Abort now holds each rendezvous mutex while notifying its paired condition variable, closing the review's notify-before-park race. Distributed-equals-single-device bitwise coverage spans all_reduce, reduce_scatter, all_gather, broadcast, all_to_all, and all_to_all_v. Landed as `2ffb4e4` with follow-up `128440d`.  
-**Why:** Gaff found the architecture and TLA refinement sound but blocked the original revision on a rare abort-path lost wakeup. Tyrell's deterministic waiter gate proved the fix, all comm/trace/scheduler suites passed, and the broadened equivalence matrix preserves fixed-rank-order determinism. TLC remains CI-deferred.
-## 2026-07-20 — CUDA graph M4 capture-safety
-
-### Own the CUDA graph lifecycle and exercise native decode replay
-**By:** Rachael and Deckard; replay coverage by Pris; reviewed by Chew 🟢  
-**What:** Serialize one CUDA graph lifecycle inside `CudaRuntime`, capture/replay only on its dedicated stream, invalidate on generation/binding lifecycle changes, and split capture-end from instantiate so failed instantiation cannot leak the intermediate `CUgraph`. Native decode remains flag-gated and strict-audit: unsupported graphs fall back eagerly. A capture-safe synthetic decoder proves token-exact eager/replay parity across reset, stable addresses, O(1) scalar uploads, two captures, sixteen replays, and zero fallbacks. Landed as `637e247`, `5470c01`, `dd2d807`, and `4755575`.  
-**Why:** The first Qwen test exercised only fallback and was rejected as replay evidence. The final synthetic integration test executes the real `NativeDecodeSession::decode_cuda` state machine and resolved the M4 decode-loop review blocker without weakening the all-kernel capture audit.
-
-### Gate MatMulNBits M=1 capture safety to the proven decode path
-**By:** Bryant  
-**What:** Remove trailing GEMV synchronizations and advertise MatMulNBits capture compatibility only after a successful no-`g_idx`, M=1 decode warmup; prefill, grouped-index, unwarmed, and configuration-changing paths remain ineligible. Runtime D2H helpers explicitly order after the EP stream. Landed as `a210703`.  
-**Why:** The proven GEMV path is allocation-free, D2H-free, and synchronization-free, while the excluded paths dequantize, allocate, or validate on the host.
-
-### Make fixed-shape GQA decode capture-safe with detect-before-consume metadata guards
-**By:** Deckard, Rachael, and Bryant; reviewed by Chew 🟢  
-**What:** Persist GQA scratch and remove the trailing stream sync (`dcb4f1b`); move advancing decode metadata reads and derived lengths on-device (`77829b9`); preserve warmup rejection and add on-device replay bounds checks with sentinel no-write behavior (`82c249d`). The final shared sticky error latch poisons subsequent replay steps after any violation and is polled immediately after logits D2H, before token consumption; explicit graph reset clears it. Landed final as `ca50bae`.  
-**Why:** Earlier revisions were rejected for silent clamping and then for allowing a later valid replay to resume over a skipped KV row. The final detect-before-consume latch makes invalid metadata a hard, deterministic failure while valid fixed-capacity f32 one-token replay remains byte-identical and allocation-free.
-
-### Make four normalization variants capture-safe
-**By:** Roy; reviewed by Chew 🟢  
-**What:** Remove trailing synchronizations from LayerNormalization, RMS/SimplifiedLayerNormalization, SkipSimplifiedLayerNormalization, and SkipLayerNormalization. Keep SkipSimplified broadcast metadata in a mutex-protected, shape-keyed persistent cache and permit capture only after successful single-group warmup. Landed as `6184d82`.  
-**Why:** The warmed decode paths now have stable metadata and no per-step allocation, free, upload, host read, or stream synchronization; the full CUDA suite and direct capture/replay byte-parity test passed.
-
-### Bind elementwise capture eligibility to exact warmed signatures
-**By:** Sapper and Deckard; reviewed by Chew 🟢  
-**What:** Make supported unary and binary floating-point decode kernels capture-safe using persistent broadcast metadata and removed trailing synchronizations. Replace the initial boolean eligibility gate with mutex-protected exact dtype/entry and shape signatures; prefill, i64, errors, and signature changes remain ineligible. Landed final as `85b6f4e`.  
-**Why:** Chew rejected the boolean gate because a warmed kernel could later execute a different dtype or shape during capture. Exact signatures close that TOCTOU while preserving numerics and the approved persistent-metadata design.
 ## 2026-07-21 — CUDA graph M4 end-to-end validation
 
 ### Real Qwen2.5 int4 decode captures with zero fallbacks
@@ -4609,117 +4527,6 @@ Generated 30 tokens with native CPU EP on Qwen 2.5-0.5B at ~30 tok/s with prompt
 4. Scaling must be validated as a *shape*, not a point: report performance as a fraction of the machine's own measured roofline, so the result is meaningful on a 68 GB/s M1 Air as well as on this Max.
 5. This does not fork the CPU EP. Per the standing portability rule, the CPU EP stays one general implementation shared with Intel (Resch) and ARM (Luba) — Apple Silicon specialization lives behind runtime detection, not behind a parallel kernel tree.
 <!-- merged from .squad/decisions/inbox/copilot-qwen3-tts-validated.md -->
-### 2026-07-20: Real Qwen3-TTS builds + validates at codec-token level; engine embeds-loop is the next contract
-
-**By:** Copilot (CLI)
-**What:** A real 1.7B `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` package now builds and
-runs end to end at the **codec-token** level via Mobius `examples/qwen3_tts.py`
-(3 models: `embedding`, `talker`, `code_predictor`; CustomVoice has no
-`speaker_encoder`). Fixed two Mobius build bugs to get there, both pushed on
-`mobius@feat/any-to-any-pipeline`:
-1. `codec_embeddings` table is exposed via `op.Identity(stacked_codec_embedding)`;
-   onnx-ir folds the Identity so the sole initializer takes the unprefixed output
-   name `codec_embeddings`. `finalize_stacked_weights` now keys the stacked weight to
-   that exact name (verified `maxdiff 0.0` vs HF `codec_embedding.{i}.weight` stack).
-2. The talker's interleaved-MRoPE `rope_scaling`
-   (`{"interleaved": true, "mrope_section": [24,20,20], "type": "default"}`) was
-   silently dropped by HF PretrainedConfig standardization → talker fell back to 1D
-   RoPE → ORT `cos_cache expected 3 dims, got 4`. `_dict_to_pretrained_config` now
-   preserves raw nested `rope_scaling`/`rope_parameters`, and `_extract_mrope_fields`
-   accepts the bare `interleaved` alias. Greedy generation: 27 frames × 16 codes for
-   "Hello world.", all codes in [0,2047], natural EOS.
-
-**Remaining (ordered), the hard coupled phase:** the onnx-genai engine's
-`nested_autoregressive` (pipeline.rs `run_nested_autoregressive`) is a **simplified
-token-ID** loop (outer feeds input_ids = prev outer argmax; inner threads a per-code
-embed output). The real talker instead consumes **`inputs_embeds`** built *inside* the
-loop each step: `codec_sum + trailing_text`, where `codec_sum = talker.embed(code_0) +
-Σ_i CP.embed[i](code_{i+1})` (from the `embedding` model + `cp_codec_weights`), with 3D
-MRoPE `position_ids`, a `step_index` input, a **2-token** CP prefill
-(`[talker_hidden, talker.codec_embed(code_0)]`), and code_0 suppress tokens. The exact
-reference is `mobius/examples/qwen3_tts.py::generate_codes`. Closing it needs EITHER an
-engine outer-step embedding builder OR a Mobius pre-embedding component that materializes
-the talker `inputs_embeds` sequence — then the `build_tts_pipeline_metadata` emitter
-(`mobius .../onnx_genai/auto_export.py`, replacing the `_looks_like_multi_decoder_tts`
-NotImplementedError). Both sides share an undefined metadata contract, so define the
-contract first rather than implementing the two sides independently.
-
-**Why:** Records that build+validation (DESIGN §20.3 step 1) is DONE and pins the precise
-engine I/O contract so the next session/agent can go straight to the design without
-re-deriving the generation loop. Test package cached at `mobius/output/` (gitignored).
-
----
-### 2026-07-20 (update): pre_embedder contract COMPLETE end-to-end
-
-**By:** Copilot (CLI)
-**What:** The extensible `pre_embedder` extension to `nested_autoregressive` is fully
-wired across both repos and pushed:
-- **onnx-genai** (`474bac6`): optional `PipelineStrategy.pre_embedder` field (canonical
-  schema `crates/onnx-genai-metadata/src/schema.rs` + regenerated
-  `schema/inference_metadata.schema.json`); engine `run_nested_autoregressive` drives the
-  outer talker via the pre-embedder (frame_codes = prev frame's codes → inputs_embeds);
-  fixture `tests/fixtures/tiny-tts-nested-preembed/` + test
-  `tts_nested_preembed_pipeline_e2e.rs`. Backward compatible (absent ⇒ legacy input_ids
-  loop; `tiny-tts-nested` unregressed). Full engine suite green.
-- **mobius**: `talker_step_embedder` component (`a5e4ab7`, maxdiff 0.0, exact code match)
-  + `build_tts_pipeline_metadata` emitter wired into `write_onnx_genai_config`
-  (emits when the package carries `talker_step_embedder`, else precise raise). Real 1.7B
-  package emits metadata that validates against the committed JSON schema. 43 emitter
-  tests pass.
-- **DESIGN §20.3** documents the finalized contract (required
-  `{pre_embedder}.inputs_embeds -> {outer}.inputs_embeds` edge, runtime-resolved
-  frame_codes/text_embed inputs, on_demand phase).
-
-**Remaining (single documented follow-up):** thread the real trailing-text `text_embed`
-and the talker PREFILL embeds (role/codec-tag/speaker/first-text interleaving) — the
-engine currently feeds `text_embed` zeros + a zero frame-0 seed. That is the only piece
-left before bit-accurate real-package audio playback; the codec-token contract + wiring
-are done and schema-validated.
-
----
-### 2026-07-20 (update 2): prefill + trailing-text follow-up in progress
-
-**By:** Copilot (CLI)
-**What:** PRs opened — onnx-genai #91, mobius #415 (both base `main`). Follow-up (real
-text_embed + prefill) underway:
-- **Mobius `talker_prefill_embedder` DONE** (`1dfb784`): `text_ids -> prefill_embeds
-  [B,8,H] + trailing_text_embeds [B,text_len-8,H]`, reuses embedding weights, validated
-  vs generate_codes (maxdiff ~1e-7, Auto/no-speaker/no-instruct path). prefill_len=8
-  (constant), trailing_len=text_len-8.
-- **Engine wiring IN PROGRESS** (delegated): optional `prefill_embedder` field on
-  nested_autoregressive; frame 0 feeds `prefill_embeds` to the talker (past_len += P),
-  frames>=1 feed `trailing_text_embeds[:,k-1,:]` as the pre_embedder `text_embed` (zeros
-  when exhausted). Backward compatible.
-
-**Next after engine lands:** extend the Mobius `build_tts_pipeline_metadata` emitter to
-emit `prefill_embedder` + `talker_prefill_embedder` (prompt_only); update DESIGN §20.3;
-real-audio parity check vs generate_codes. Remaining follow-ups: speaker/language/instruct
-prefill branches; exact tts_pad embedding for exhausted trailing text.
-
----
-### 2026-07-20 (update 3): prefill + trailing-text COMPLETE; PR #415 comments resolved
-
-**By:** Copilot (CLI)
-**What:**
-- **Engine `prefill_embedder` DONE** (onnx-genai `94d0d6e`): optional field on
-  nested_autoregressive; frame 0 feeds `prefill_embeds` to the talker (past_len += P),
-  frames>=1 thread `trailing_text_embeds[:,k-1,:]` as the pre_embedder `text_embed`
-  (zeros when exhausted). Schema regenerated; fixtures `tiny-tts-nested-prefill` + tests
-  green; backward compatible.
-- **Mobius emitter DONE** (`build_tts_pipeline_metadata` emits `prefill_embedder` +
-  `talker_prefill_embedder` prompt_only when present). Real 5-model 1.7B package emits
-  the full `pre_embedder` + `prefill_embedder` contract + passes schema validation.
-- **DESIGN §20.3 updated**: prefill/trailing-text now DONE (was "follow-up TODO").
-- **PR #415 review comments resolved**: ort-genai runtime choice, unified
-  `build_from_gguf(mmproj=...)`, ASR/TTS exports, codec dtype fp16/bf16 mapping, docstrings,
-  onnx_ir.save. Replied to both @justinchuby threads.
-
-**Remaining refinements (small):** speaker/language/instruct prefill branches in
-`talker_prefill_embedder` (currently Auto/no-speaker/no-instruct); exact tts_pad
-embedding for exhausted trailing text. Full engine-side real-audio E2E parity check
-(vs generate_codes) needs a runner harness — the codec-token contract + all wiring are
-done + schema-validated.
-<!-- merged from .squad/decisions/inbox/deckard-fp16-review-followups.md -->
 ### 2026-07-27: FP16 GEMV review follow-ups
 **By:** Deckard
 **What:** Documented each NEON f16 inline-asm conversion site with the stabilization condition for replacing it with f16 intrinsics, and tightened FP16 GEMV guards to `1e-4` relative / `1e-5` absolute. The model-scale guard now runs under 1, 3, 7, and 11 Rayon workers to cover Apple Silicon worker-count differences.
@@ -7375,6 +7182,295 @@ Processed wave-7 inbox notes: `deckard-cuda-conformance-69`, `roy-pr270-review`.
 Archive pre-check correction: the active-ledger byte count at pre-check was
 518,843 bytes (the archival conclusion is unchanged).
 
+<!-- scribe-merge-2026-07-27T09-26-45-0700-cli-improvements -->
+## 2026-07-27 — CLI dev-tool charter and split backlog reconciliation
+
+Decision archive gate checked at 2026-07-27T09:26:45-07:00 after inbox merge: active ledger was 526691 bytes before merge and exceeds 51200 bytes; applying 7-day policy with cutoff 2026-07-20.
+
+### andrews-split-movement-handlers
+
+<!-- merged from .squad/decisions/inbox/andrews-split-movement-handlers.md -->
+### 2026-07-27: Split movement shape handlers by operator family
+**By:** Andrews
+**What:** Replaced the 1,809-line `handlers/movement.rs` with:
+- `movement/mod.rs` (114 lines): shared helpers and the unchanged registration facade.
+- `movement/transform.rs` (409 lines): Transpose, Reshape, Flatten, Squeeze, Unsqueeze, Expand.
+- `movement/resize.rs` (302 lines): Resize.
+- `movement/concat_slice.rs` (394 lines): Concat, Slice.
+- `movement/split_gather.rs` (380 lines): Split, Gather, GatherElements, GatherND.
+- `movement/scatter.rs` (137 lines): Scatter, ScatterElements, ScatterND, Trilu.
+- `movement/space_depth.rs` (132 lines): DepthToSpace, SpaceToDepth.
+
+The split totals 1,868 lines including module-local imports. Registration order, operator/opset mappings, handler bodies, shape rules, and diagnostic text are unchanged.
+
+**Why:** Cohesive operator-family modules reduce navigation and review cost while keeping this change mechanical and behavior-preserving. `cargo fmt -p onnx-runtime-shape-inference`, shape-inference build/tests (224 tests plus one doctest), clippy with `-D warnings`, and downstream `onnx-runtime-session` build all pass.
+
+### ash-split-genai-config
+
+<!-- merged from .squad/decisions/inbox/ash-split-genai-config.md -->
+### 2026-07-27: Split genai config compatibility crate into cohesive modules
+**By:** Ash
+**What:** Kept `lib.rs` as a 98-line facade retaining `GenAiConfigError`, `GENAI_CONFIG_FILE`, and the flat public re-exports. Moved config wire types to `wire_types.rs` (361 LOC), loading to `loading.rs` (109 LOC), graph I/O inspection to `graph_io.rs` (235 LOC), compatibility synthesis to `compatibility.rs` (1,427 LOC), JSON builders to `json_builders.rs` (341 LOC), and unit tests to `tests.rs` (1,212 LOC).
+**Why:** The former 3,743-line facade mixed serialization contracts, file loading, graph inspection, pipeline synthesis, JSON construction, and tests. The split is pure code motion; public names remain re-exported from the crate root. A source comparison confirmed config wire definitions, field/variant ordering, derives, every `#[serde(...)]` attribute, and all `GenAiConfigError` text are unchanged. `cargo build`, all 30 crate tests, clippy with `-D warnings`, and downstream engine/server/CLI builds passed.
+
+### call-split-onnx-std-rules
+
+<!-- merged from .squad/decisions/inbox/call-split-onnx-std-rules.md -->
+### 2026-07-27: Split ONNX validation rules by model layer
+**By:** Call
+**What:** Split the former 5,316-line `crates/onnx-std/src/check/rules.rs` into a `rules/mod.rs` facade and five private rule-family modules:
+- `graph_topology.rs` — 368 lines; opset imports, duplicate names, graph input/output connectivity, and acyclicity.
+- `schema_types.rs` — 1,217 lines; schema conformance, type constraints, initializer declarations, metadata, attributes, and retained protobuf types.
+- `ir_version_functions.rs` — 1,147 lines; IR version/feature gates and local function validation. The two existing `#[allow(clippy::too_many_arguments)]` attributes remain on their original functions.
+- `tensor_sparse_payloads.rs` — 558 lines; dense tensor payload and sparse tensor validation.
+- `multi_device.rs` — 393 lines; device configuration and sharding validation.
+- `mod.rs` — 1,711 lines; public facade, shared diagnostic helpers, and unchanged tests.
+
+**Why:** Cohesive private modules reduce the validation implementation's file-level entropy while preserving the flat public API. Rule ORDER is unchanged because `check/mod.rs` and its 17 `checker.add_rule(...)` calls were not modified. Violation WORDING is unchanged: all 579 Rust string literals were compared as multisets before formatting and preserved exactly; the non-author reviewer independently approved the split and found rule implementations/helper logic unchanged.
+
+**Gates:** `cargo fmt -p onnx-std` passed; `cargo build -p onnx-std` passed; `cargo test -p onnx-std` passed (126 unit tests, 23 integration tests, 1 doc-test); `cargo clippy -p onnx-std --all-targets -- -D warnings` passed. Non-author review: approved with no blocking findings.
+
+### christie-split-server-routes
+
+<!-- merged from .squad/decisions/inbox/christie-split-server-routes.md -->
+### 2026-07-27: Split server routes by endpoint family
+**By:** Christie
+**What:** Replaced the 2,989-line `crates/onnx-genai-server/src/routes.rs` with a `routes/` module tree: `mod.rs` (530 LOC) retains `ApiError`, JSON rejection handling, model resolution, shared request preparation types/helpers, and facade re-exports; `admin.rs` (396 LOC) owns health, models, status, resources, debug, admin, and metrics endpoints; `sessions.rs` (60 LOC) owns session create/delete; `completions.rs` (1,719 LOC) owns completions, embeddings, chat, streaming, and generation helpers; `multimodal.rs` (312 LOC) owns transcription, speech, and image-generation endpoints.
+**Why:** This is a pure code-motion split of the HTTP god-file. Router registration remains untouched in `src/lib.rs`, preserving route paths and registration order exactly. The typed `ApiError` handling and server-side registry logging hardened in PR #213 were moved verbatim without behavior changes.
+
+**Gates:** `cargo build -p onnx-genai-server` passed. `cargo test -p onnx-genai-server` completed with 110 passed, 2 ignored, and only the accepted pre-existing `sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image` failure caused by missing `vlm-executable/vision.onnx`. `cargo clippy -p onnx-genai-server --all-targets -- -D warnings` passed. `cargo fmt -p onnx-genai-server` passed.
+
+### coordinator-cli-is-a-dev-tool
+
+<!-- merged from .squad/decisions/inbox/coordinator-cli-is-a-dev-tool.md -->
+# CLI is a developer/maintainer tool, not an end-user product surface
+
+**By:** Squad (Coordinator), capturing a directive from Justin Chu
+**Date:** 2026-07-27T09:26:45-07:00
+
+**What:** The `onnx-genai` CLI (`crates/onnx-genai-cli`) is scoped as a
+**development and maintainer tool**. It is not trying to be a consumer-facing
+local-inference product like `ollama`.
+
+Two direct consequences:
+
+1. **Remote-client mode is out of scope.** The CLI does not need to act as a
+   client against a remote OpenAI-compatible server. Existing third-party CLIs
+   already do that well, and the user will use those. (Explicitly overrides
+   Rachael's finding #1 in `docs/research/cli/02-ux-and-server-surface.md`,
+   which ranked remote-client mode as a top gap.)
+2. **Competitive parity with consumer CLIs is not a goal.** Model
+   pull/registry workflows, conversion/quantization/fine-tuning loops, and
+   general product polish are only worth doing where they make *development*
+   faster. This aligns with the Fact Checker's devil's-advocate conclusion in
+   `docs/research/cli/03-competitive-and-devils-advocate.md`.
+
+**Why:** The repo's primary fronts are CUDA/perf, model enablement, and the
+server/Python integration path. Investing in CLI features that duplicate
+existing tooling would spend effort where it does not compound. What *does*
+compound is the CLI's value as an inner-loop instrument: fast iteration on a
+model, visibility into what the engine is actually doing (EP selection, decode
+backend, KV reuse, timings), and reachability of runtime capabilities that are
+otherwise only testable through code.
+
+**Prioritization lens going forward:** rank CLI work by *"does this shorten a
+maintainer's debug/iterate loop or expose engine behavior we currently cannot
+observe?"* — not by *"does ollama have it?"*
+
+**Concretely reprioritized upward:** discoverability and defaults of
+diagnostics (e.g. the live-stats view is gated behind an undocumented `/stats`
+toggle with no CLI flag), machine-readable output for scripted experiments,
+reachability of engine features (speculative decoding, batching, fork/rewind,
+KV controls) from the command line, and benchmark/eval commands.
+
+**Concretely reprioritized downward / dropped:** remote-client mode, model
+registry & pull workflows, consumer-grade onboarding polish.
+
+### coordinator-repl-is-the-product
+
+<!-- merged from .squad/decisions/inbox/coordinator-repl-is-the-product.md -->
+# REPL is the primary CLI investment — Copilot-CLI-class interactive shell
+
+**By:** Squad (Coordinator), capturing a directive from Justin Chu
+**Date:** 2026-07-27T09:30:56-07:00
+
+**What:** The interactive REPL (`onnx-genai run`) is now the *primary* CLI
+investment, not a side feature. Target quality bar: **GitHub Copilot CLI's
+interactive layout**. Required capabilities:
+
+1. **Copilot-CLI-style layout** — a persistent input area with streaming
+   output above it, rather than today's plain line-by-line `>>>` loop.
+2. **Real line editing** — cursor movement, multiline input/paste, kill/yank,
+   persistent history. Today the REPL is a bare line reader.
+3. **Session fork** and the other agent-first runtime primitives, driven from
+   the REPL.
+4. **Expose as much of the runtime as possible** — the engine has prefix
+   caching, multi-session, CoW fork, KV rewind, speculative decoding, and
+   continuous batching, and almost none of it is reachable interactively.
+   Reachability is the point of the tool.
+5. **Stats shown by default.** This is a developer tool; per-turn numbers are
+   signal, not noise. Inverts the current default (`interactive.rs:614`
+   `show_stats = false`, toggled only by an undocumented `/stats`).
+6. **Slash-command autocompletion.**
+
+**Why:** This follows directly from the dev-tool charter
+(`coordinator-cli-is-a-dev-tool.md`). If the CLI's job is to shorten the
+maintainer debug/iterate loop and make engine behavior observable, then the
+interactive shell *is* the product — it is where a maintainer actually spends
+time, and it is currently the weakest surface relative to what the runtime can
+do. Note the contrast with the rejected remote-client work: this invests in
+capability *reachability*, not in duplicating tooling that already exists
+elsewhere.
+
+**Backlog impact:** Supersedes the ranking in `docs/research/cli/00-backlog.md`.
+Promoted to P0: P0.1 (stats reachable — now *stats by default*), P0.4 (expose
+engine behavior), P1.3 (session/KV debug controls: fork, rewind), P1.4 (REPL
+ergonomics: multiline, history). The rejected items are unchanged and remain
+rejected.
+
+**Open design question for the user:** whether the REPL becomes a full-screen
+ratatui application or keeps an inline viewport with a rich line editor. The
+team is to present the tradeoff with a recommendation rather than choose
+silently.
+
+### dietrich-split-ep-api-abi
+
+<!-- merged from .squad/decisions/inbox/dietrich-split-ep-api-abi.md -->
+### 2026-07-27: Split the plugin EP ABI bridge by responsibility
+**By:** Dietrich
+**What:** Moved `crates/onnx-runtime-ep-api/src/abi.rs` to `abi/mod.rs` and split implementation details into `runtime.rs`, `host.rs`, `ffi_helpers.rs`, and `weights.rs`. The facade retains `OrtGraphView`, `SubgraphClaim`, and `PluginExecutionPlan`; it re-exports `PluginCompiledKernel` at the unchanged `abi::PluginCompiledKernel` path. The host projection test is colocated in `host.rs`.
+**Why:** The 2,512-line plugin-EP ORT C-ABI boundary was difficult to review safely. This is pure code motion with only minimally scoped `pub(super)` visibility needed between sibling modules.
+
+Module breakdown:
+- `abi/mod.rs`: facade, stable public surface, graph view, claims, execution plan — 429 LOC.
+- `abi/runtime.rs`: plugin runtime ownership, shared kernel state, compiled kernel — 304 LOC.
+- `abi/host.rs`: ORT host projections, C-ABI vtables/callbacks, and host projection test — 1,618 LOC.
+- `abi/ffi_helpers.rs`: raw-pointer conversions and plugin-device accessors — 127 LOC.
+- `abi/weights.rs`: mapped external-weight cache and initializer projection — 103 LOC.
+
+Invariant counts across the ABI module tree:
+- ABI root LOC: 2,512 before; 429 after.
+- `unsafe {` blocks: 82 before; 82 after.
+- `#[cfg(...)]` attributes: 1 before; 1 after.
+- `extern "C"` occurrences: 59 before; 59 after.
+- `#[no_mangle]` attributes: 0 before; 0 after.
+
+Public API is unchanged: all prior bare-`pub` items and methods retain their paths and signatures; `PluginCompiledKernel` is re-exported from the facade.
+
+Validation:
+- `cargo build -p onnx-runtime-ep-api`: passed.
+- `cargo test -p onnx-runtime-ep-api`: passed (38 unit tests, 7 integration tests, 0 failures).
+- `cargo clippy -p onnx-runtime-ep-api --all-targets -- -D warnings`: passed.
+- `cargo build -p onnx-runtime-session`: passed.
+- `cargo fmt -p onnx-runtime-ep-api`: passed.
+
+### dillon-split-ort-decode
+
+<!-- merged from .squad/decisions/inbox/dillon-split-ort-decode.md -->
+### 2026-07-27: Split ORT decode by cache and session family
+**By:** Dillon
+**What:** Replaced `crates/onnx-genai-ort/src/decode.rs` with a facade and six focused submodules:
+
+- `decode/mod.rs` — 201 lines; public option/signature types, batched trait, and re-exports.
+- `decode/dynamic.rs` — 1,550 lines; dynamic past/present decode and captured-step tests.
+- `decode/kv_growth.rs` — 465 lines; shared KV bucket growth, host/CUDA prefix copying, and tests.
+- `decode/static_cache.rs` — 1,210 lines; scalar and batched static-cache sessions.
+- `decode/shared_batch.rs` — 476 lines; continuous-batch shared-buffer session.
+- `decode/io.rs` — 196 lines; KV-name pairing and static-cache signature detection.
+- `decode/tensor.rs` — 149 lines; logits, cloning, empty tensor, and allocation helpers.
+
+All existing public types remain available from `onnx_genai_ort::decode` through facade re-exports. The `decode_contract`-based `KvNamingConvention`, `kv_suffix`, and `name_contains_present_key_value` call sites were moved unchanged into `decode/io.rs`; no local classifier copies were introduced.
+
+`cargo fmt -p onnx-genai-ort` was run. Gates passed:
+
+- `cargo build -p onnx-genai-ort`
+- `cargo test -p onnx-genai-ort` (all unit, integration, and doc tests)
+- `cargo clippy -p onnx-genai-ort --all-targets -- -D warnings`
+- `cargo build -p onnx-genai-engine`
+
+**Why:** The original 4,239-line file mixed materially different cache ownership and batching models. The split is pure code motion and clarifies ownership without changing algorithms, allocation, CUDA annotations, or the public facade.
+
+### frost-split-ort-session
+
+<!-- merged from .squad/decisions/inbox/frost-split-ort-session.md -->
+### 2026-07-27: Split ORT session god-file into focused modules
+**By:** Frost
+**What:** Moved `crates/onnx-genai-ort/src/session.rs` to `session/mod.rs` and split options, environment configuration, EP compatibility, provider dispatch, CUDA wiring, plugin wiring, and tests into sibling modules. The facade re-exports the existing public API.
+**Why:** Reduce the 2,504-line session god-file while preserving behavior, provider resolution order, environment handling, error text, cfg gates, and downstream import paths.
+
+#### Module breakdown
+- `session/mod.rs` — `Session`, `TensorInfo`, `RunPhaseError`, `RawSessionOptions`, I/O metadata helpers, facade exports
+- `session/options.rs` — `SessionOptions`, defaults/builders, `ep_selection`, provider availability
+- `session/env_config.rs` — runtime/environment configuration readers and provider/fallback predicates
+- `session/ep_compat.rs` — EP capability model and provider-name compatibility resolution
+- `session/providers.rs` — generic provider append/dispatch and WebGPU session options
+- `session/cuda.rs` — cfg-gated CUDA provider setup and diagnostics
+- `session/plugin.rs` — plugin resolution, registration, discovery, and append flow
+- `session/tests.rs` — all existing session unit tests
+
+#### Size
+- Session root before: 2,504 LOC (`session.rs`)
+- Session root after: 839 LOC (`session/mod.rs`)
+- Session module tree after: 2,571 LOC (module declarations/imports and minimal `pub(super)` visibility account for the increase)
+
+#### cfg count
+| Measurement | Before | After |
+|---|---:|---:|
+| Original cfg attributes preserved | 29 | 29 |
+| Module/import wiring cfg attributes | 0 | 7 |
+| Total cfg attributes | 29 | 36 |
+
+All original cfg expressions, including the platform-specific duplicate CUDA library/search-path functions, remain verbatim. The seven additions only gate new module/import wiring.
+
+#### API and gates
+Public paths remain unchanged, including `Session`, `SessionOptions`, `TensorInfo`, `ep_selection`, `available_execution_providers`, and `session::ep_compat`. No private item was widened to unrestricted `pub`; cross-module helpers use `pub(super)`.
+
+- `cargo build -p onnx-genai-ort` — PASS
+- `cargo test -p onnx-genai-ort --lib` — PASS (56 tests)
+- `cargo clippy -p onnx-genai-ort --all-targets -- -D warnings` — PASS
+- `cargo check -p onnx-genai-ort --features cuda` — PASS
+- `cargo build -p onnx-genai-engine` — PASS
+- `cargo fmt -p onnx-genai-ort` — PASS
+
+### rains-split-sequence
+
+<!-- merged from .squad/decisions/inbox/rains-split-sequence.md -->
+### 2026-07-27: Split sequence storage and algorithms into focused modules
+**By:** Rains
+**What:** Replaced the 1,761-line `crates/onnx-runtime-session/src/sequence.rs` with a `sequence/` module tree: `mod.rs` (238 lines; root, re-exports, tests), `error.rs` (errors/result), `tensor.rs` (shared tensor storage, allocation, byte/view validation), `value.rs` (homogeneous sequence storage and indexing), `split.rs` (split specifications and planning), and `concat.rs` (concat planning, copying, and new-axis stacking).
+**Why:** This is behavior-preserving code motion for Dallas entropy audit item #11. `sequence::SequenceError`, `SequenceResult`, `SeqTensor`, `SequenceValue`, `SplitSpec`, `split`, `split_tensor`, `concat`, and the existing crate-visible concat helpers remain re-exported at their prior paths; `executor.rs` and root `Cargo.toml` are unchanged. Allocation order, view-bound checks, signatures, error text, cfg/allow attributes, and tests are unchanged. Gates passed: `cargo build -p onnx-runtime-session`; `cargo test -p onnx-runtime-session` (82 unit tests, integration tests, and doc tests passed); `cargo clippy -p onnx-runtime-session --all-targets -- -D warnings`; and `cargo fmt -p onnx-runtime-session`. The known pre-existing `tests/decode_session.rs` missing `tests/fixtures/tiny-llm/model.onnx` failure did not reproduce in this checkout's gate run; no fixture or decode-session files were changed.
+
+### roy-cli-improvements
+
+<!-- merged from .squad/decisions/inbox/roy-cli-improvements.md -->
+### 2026-07-27: CLI improvements should start with interface contracts
+**By:** Roy
+**What:** Treat the next `onnx-genai` CLI wave as an interface-contract project: split clap args out of `lib.rs`, add typed output/rendering seams, define JSON schemas and exit codes, and snapshot help before adding model-store/config subcommands.
+**Why:** The current CLI already has useful commands, but its 1,134-line `lib.rs` owns parsing, dispatch, profiling side effects, and tests. Adding model management, profiles, completions, and machine-readable output on top of that shape would lock in inconsistent flags and ad hoc rendering.
+
+### spunkmeyer-split-image
+
+<!-- merged from .squad/decisions/inbox/spunkmeyer-split-image.md -->
+### 2026-07-27: Split image preprocessing into cohesive submodules
+**By:** Spunkmeyer
+**What:** Split `crates/onnx-genai-preprocess/src/image.rs` into a 29-line facade plus `image/config.rs` (293 LOC), `image/program.rs` (1,742 LOC), `image/tiling.rs` (323 LOC), `image/transform.rs` (233 LOC), and `image/tests.rs` (1,408 LOC). `image/packed.rs` remains unchanged at 1,330 LOC. The facade preserves every existing public re-export and import path.
+**Why:** Separate image-program metadata compilation/dataflow validation from pixel transforms and tiling without changing behavior. All serde attributes, resize/normalization arithmetic, tiling boundary math, serialization behavior, and error text are unchanged; the unknown-output-source regression now asserts the complete byte-identical error string. Gates passed: preprocess build, 54 preprocess tests, preprocess clippy with `-D warnings`, and downstream engine/CLI build. A non-author code-review agent approved the diff with no findings.
+
+### wierzbowski-split-cli-lib
+
+<!-- merged from .squad/decisions/inbox/wierzbowski-split-cli-lib.md -->
+### 2026-07-27: Split CLI orchestration from presentation and REPL parsing
+**By:** Wierzbowski
+**What:** Split `crates/onnx-genai-cli/src/lib.rs` (3,559 lines before; 1,233 after) into `generate.rs` (219 LOC), `interactive.rs` (953), `commands.rs` (234), `output.rs` (232), `model_inspection.rs` (71), and `transcribe.rs` (709), retaining the existing `profile.rs`. `lib.rs` remains the CLI argument/type and dispatch facade.
+**Why:** Cohesive private modules make generation, interactive orchestration, command parsing, presentation, model inspection, and transcription independently navigable without changing the crate's public surface, CLI shapes, or output text.
+
+Ctrl-C wiring was moved intact into `interactive.rs`: the `Once`-guarded `ctrlc::set_handler` body retains its registration sites and order, the same `GENERATING`, `INTERRUPT_REQUESTED`, and `EXIT_ARMED` atomics with `SeqCst`, and the REPL still clears `EXIT_ARMED` immediately after a submitted line before parsing it. One-shot generation and transcription install the same handler at their original points.
+
+Gates: `cargo build -p onnx-genai-cli` passed; `cargo test -p onnx-genai-cli` passed (127 tests total across targets); strict `cargo clippy -p onnx-genai-cli --all-targets -- -D warnings` is blocked by pre-existing unchanged `crates/onnx-genai-cli/src/pages.rs:129` (`clippy::manual_checked_ops`); clippy passes with only that lint allowed. `cargo fmt -p onnx-genai-cli -- --check` and `git diff --check` passed. Non-author code review found no significant issues.
+<!-- scribe-merge-2026-07-27T09-26-45-0700-cli-improvements-end -->
+
+Archive action at 2026-07-27T09:26:45-07:00: active ledger exceeded 51200 bytes; no dated active-ledger entries older than 2026-07-20 were present, so archived 0 block(s).
+
 Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 654224 bytes before wave-8 merge; archived 2 entries older than 2026-07-20 into `.squad/decisions/archive/`.
 <!-- scribe-merge-2026-07-27T16-44-54Z-wave8-bishop-pr273-review -->
 <!-- merged from .squad/decisions/inbox/bishop-pr273-review.md -->
@@ -8438,3 +8534,429 @@ Files: `pipeline/schedulers/{ddim.rs, ddpm.rs (new), flow_matching.rs (new), mod
 ## Owner of any follow-up
 None required — APPROVE. No revision needed.
 <!-- scribe-merge-2026-07-27T16-44-54Z-wave8-vasquez-pr272-review-end -->
+
+<!-- scribe-merge-2026-07-27T13-10-00-07-00-cli-improvement-session -->
+
+<!-- merged from .squad/decisions/inbox/batty-cli-sampling-fixes.md -->
+# Batty decision — CLI sampling and context defaults
+
+Date: 2026-07-27
+
+## Decision
+
+- Keep `GenerateOptions::default().max_new_tokens` at 128 for engine/server compatibility.
+- When CLI `generate` or `run` omits `--max-new-tokens`, derive the per-turn budget from the model's effective context limit: `min(model.max_sequence_length, decode_path_max_len)` plus any `--max-context` override, minus the current prompt/context tokens.
+- In the REPL, recompute that ceiling every turn after rendering the live multi-turn prompt, so it reflects the current context length as history grows. One-shot `generate` uses the same helper once because it has only one prompt.
+- Report context usage in the compact stats path as `ctx used / max`.
+- Apply the same model-following budget to reasoning and non-reasoning models; reasoning no longer gets a separate hardcoded default.
+- If no effective context limit is discoverable, warn once and use a finite 512-token fallback rather than allowing an unbounded decode to hit ORT out-of-bounds behavior. The warning points to `--max-context` and `model.max_sequence_length` metadata.
+- If `--max-new-tokens` is explicit, honor it exactly.
+- Treat `--temperature` above 0, `--top-p`, and `--top-k` as requests for stochastic sampling by setting `greedy = false`; keep `--temperature 0` as greedy.
+- Expose `--max-context` through the shared CLI sampling args so users can cap prompt plus generated tokens when model metadata lacks a context limit.
+
+## Why
+
+The CLI is a developer/maintainer tool and should follow the loaded model instead of imposing an arbitrary per-turn cap. `max_new_tokens` is a safety ceiling, not a target or a context-allocation policy; the model decides when to stop by emitting EOS, with the context window as the hard stop. The REPL recomputes the ceiling against the current rendered prompt every turn for correctness, but does not reserve headroom or refuse turns preemptively. Context-fill is also appropriate for one-shot `generate`: it is the same developer-facing generation surface as `run`, and users who want a shorter completion can pass `--max-new-tokens` exactly. The finite 512 fallback exists only for packages with no discoverable context window, where unbounded generation can otherwise walk into an ORT Gather out-of-bounds crash; `--max-context` is the CLI escape hatch until metadata is fixed.
+
+<!-- merged from .squad/decisions/inbox/isidore-cli-native-cuda-feature.md -->
+### 2026-07-27: CLI native CUDA feature uses two-axis selection
+**By:** Isidore
+**What:** Added a first-class CLI `native-cuda` feature for the native backend plus hand-written CUDA EP, while leaving the existing CLI `cuda` feature on the wheel-compatible ONNX Runtime CUDAExecutionProvider path.
+**Why:** Build-time features decide which CUDA kernels are compiled in, but runtime selection remains separate: `ONNX_GENAI_EP=cuda` selects the ORT session EP, and `/backend native` selects the native decoder in the REPL.
+
+### 2026-07-27: One-shot native decode needs CLI backend flag
+**By:** Isidore
+**What:** Backlog item: add a command-line `--backend` selector for `generate` and `run`.
+**Why:** Today the decode backend is only switchable through the REPL `/backend` command, so one-shot `generate` cannot request the native decoder even when the native CUDA feature is compiled in.
+
+<!-- merged from .squad/decisions/inbox/leon-cli-context-exhaustion-guard.md -->
+### 2026-07-27: CLI context exhaustion guard
+**By:** Leon
+**What:** The CLI now treats `prompt_tokens >= effective_max_context` as a pre-decode context-exhaustion condition. In the REPL it drops the just-added user turn, does not append an assistant message, tells the user to use `/reset` or shorten/change context, and continues. In one-shot `generate` it returns an actionable error instead of silent empty success.
+**Why:** At equality or above the engine has provably zero room to emit even one token, so decoding can only produce an empty `Length` result that poisons conversation history. This is a correctness guard for the degenerate zero-room boundary, not a heuristic budget policy: when `prompt_tokens < effective_max_context`, even by one token, the existing automatic `max_new_tokens` sizing remains unchanged and the model still decides when to stop within the safety ceiling.
+<!-- merged from .squad/decisions/inbox/apone-pr281-review.md -->
+# Decision: PR #281 (issue #49) — native img2img & inpainting in run_comfyui
+
+- **Reviewer:** Apone (independent/adversarial). Author: Newt.
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE (non-blocking notes)
+
+## Verification of the classic img2img/inpainting failure points
+- **strength→start_step:** `strength_to_start_step = num_steps − round_ties_even(num_steps·strength)`,
+  clamped to `0..=num_steps` (comfyui-config/src/lib.rs). Matches diffusers `get_timesteps` and
+  DIFFUSION.md §4. Unit test `strength_mapping_matches_hand_computed_diffusers_steps` pins the exact
+  endpoints: `strength=0.0 → start_step=num_steps` (zero denoise) and `strength=1.0 → 0` (full denoise
+  from noise), plus the banker's-rounding tie (`0.5, 21 → 11`). Would catch an inversion or off-by-one. ✓
+- **Noise init (not pure random):** img2img VAE-encodes the source, then calls
+  `engine.diffusion_add_noise(start_step, num_steps, encoded, noise)`; only txt2img keeps the
+  `noise · init_noise_sigma` seed. Each scheduler's `add_noise` uses correct diffusers semantics —
+  DDIM/DDPM `√ᾱ·x + √(1−ᾱ)·noise` (ᾱ = alpha_cumprod at the step's timestep), Euler/EulerA
+  `x + σ·noise`, DPM++ `α_t·x + σ_t·noise`, FlowMatch `(1−σ)·x + σ·noise`. `step==num_steps → 0` sigma /
+  returns original. `ddim_add_noise_matches_hand_computed_alpha_mix` pins the mix + zero-step identity. ✓
+- **9-channel inpaint layout:** UNet input is `[4 noisy latent | 1 downsampled mask | 4 masked-image
+  latent]` = 9. `build_inpaint_conditioning` emits the 5-ch conditioning `[mask | masked latent]`;
+  `append_loop_conditioning` (iterative.rs) concatenates it AFTER the (already scale_model_input-scaled)
+  4-ch latent — matching diffusers (scale then cat). Test `inpaint_loop_input_is_nine_channels_in_declared_order`
+  asserts exact shape `[1,9,1,2]` and exact element order. Scheduler state stays 4-ch. Would catch a
+  swapped/short channel layout. ✓
+- **Masked-image latent:** `VAE-encode(source · (1−mask))`; mask=1 means repaint (ComfyUI semantics),
+  so repaint region is zeroed before encode. Mask downsampled to latent res via `VAE_DOWNSCALE=8`. ✓
+- **VAE-encode generality:** driven off the workflow graph — detects `VAEEncode`/`VAEEncodeTiled` and
+  `VAEEncodeForInpaint`/`InpaintModelConditioning` on the sampler's `latent_image` link; encoder chosen
+  by component `role == "vae_encoder"` (filename fallback), NOT hard-coded model names. ✓
+- **txt2img non-regression:** `start_step` passed only when `source_image` is Some; else `None` →
+  pure-noise `init_noise_sigma` seed path is byte-for-byte unchanged. Detection is presence-of-node
+  driven. `iterative_override_allows_zero_step_tail` confirms the zero-step boundary publishes the seed
+  unchanged; the `< num_steps` → `<= num_steps` guard relaxations are consistent across mod.rs/iterative.rs. ✓
+- **DRY:** shared `mix_noise` helper, one `add_noise` trait method, one `strength_to_start_step`, one
+  `build_inpaint_conditioning`, one `append_loop_conditioning`. No per-checkpoint/per-benchmark casing. ✓
+- **Docs:** DIFFUSION.md §4/§4.1 additions (zero-strength edge, VAE-encoder discovery, 9-ch order) are
+  genuine additions describing new behavior — not doc-moved-to-match-code; the pre-existing
+  `start_step = num_steps − round(num_steps·denoise)` formula already matched the impl.
+
+## Validation evidence (worktree @ 6358c963, origin/squad/49-img2img-inpaint)
+- `cargo fmt --all -- --check` → exit 0
+- `cargo clippy -p onnx-genai-engine -p onnx-genai --all-targets -- -D warnings` → `Finished` exit 0
+- `cargo test -p onnx-genai-engine` → 233 unit (0 failed) + all integration suites incl. 32/32 iterative e2e
+- `cargo test -p onnx-genai` → 28 unit + 6 audio + 5 image e2e, 0 failed
+- `cargo test -p onnx-genai-comfyui-config` → 14 pass (strength mapping + detection routing)
+
+## Non-blocking notes (owner: Newt is LOCKED OUT — assign **Hudson**)
+1. **VAE encode uses the distribution mode (mean), not `latent_dist.sample()`.** `vae_encode` slices the
+   first `latent_channels` from moment output and drops logvar. Deterministic and reasonable, and guarded
+   by `scripts/img2img_e2e.py` (~1e-2). Consider a one-line comment noting the intentional mode choice.
+2. **`downsample_mask` uses nearest top-left pixel per 8×8 block.** Fine approximation of ComfyUI's
+   nearest downsample; a doc/comment noting it isn't area-averaged would help future readers.
+
+Neither note affects correctness of the reviewed paths; both are guarded by the e2e parity script.
+
+<!-- merged from .squad/decisions/inbox/bishop-pr283-review.md -->
+### 2026-07-27: PR #283 (issue #50) ControlNet/LoRA wiring — REQUEST-CHANGES
+**By:** Bishop (independent review; author Dallas locked out)
+**Verdict:** REQUEST-CHANGES. Fix owner: **Batty** (Engine Dev), with **Roy** (Lead) to arbitrate the cross-repo run_comfyui↔mobius input contract.
+
+**What is correct (keep):**
+- Control-image preprocessing (`preprocess_control_image`): batched RGB CHW in `[0,1]`, resize-to-output-resolution. Matches diffusers ControlNet `prepare_image` and mobius `controlnet_cond` shape `[batch, conditioning_channels, height*8, width*8]` (pixel resolution). Unit-tested with real oracle values.
+- LoRA gate: `lora_gate.{stem}` matches the documented + real mobius runtime convention (`models/unet.py` `_lora_gates`, `_diffusers_builder.py` bakes scale=1.0, runtime gate supplies strength). DIFFUSION.md §8b.
+- Additive / non-regression: plain txt2img/img2img/inpaint/SDXL take the empty-`denoiser_inputs` wrapper path; verify-A bit-identical check retained. Graph-driven routing (not hard-coded node names).
+- All validations pass (fmt, clippy -D warnings, engine/genai/comfyui-config tests).
+
+**Blocking concerns:**
+1. **`conditioning_scale` is an invented runtime gate with no exporter contract.** It appears NOWHERE in `../mobius`. DIFFUSION.md §9 says ControlNet strength is collected at translate time and **fused at export** (`checkpoint_export(controlnet=...)`), i.e. bake-at-export, NOT a runtime gate. Engine `routing.rs::component_inputs` iterates the model's *declared* inputs and looks up matching endpoints, so an undeclared `denoiser.conditioning_scale` is **silently dropped** → strength silently not applied (or dead code if baked). This is exactly the invented-mechanism / wrong export-fuse-vs-runtime convention pattern to avoid.
+2. **Multi-ControlNet `.{adapter}` suffix ports have zero backing.** mobius supports a *single* ControlNet only (`integrations/onnx_genai/comfyui.py::_find_controlnet` → `tuple|None`; `models/controlnet.py`/`tasks/_controlnet.py` declare unsuffixed `controlnet_cond`). No fused multi-CN export exists. Suffixed `controlnet_cond.{adapter}` / `conditioning_scale.{adapter}` would all silently drop → multi-CN non-functional against any real model.
+3. **Tests give false confidence.** They validate only the driver's internal math/routing; none asserts against a real denoiser's declared input set. They stay green even though ControlNet feeding silently no-ops. A swapped scale or missing port is not caught.
+
+**Requested fix (owner Batty + Roy):** Reconcile the runtime↔exporter contract before merge: either (a) mobius grows a real `conditioning_scale` denoiser input (+ multi-CN port scheme) and DIFFUSION.md is updated to document runtime scaling, or (b) run_comfyui drops `conditioning_scale`/multi-CN suffixes and relies on export-baked strength per current doc. Add a contract-level test (or gate the CN path as experimental) so silent input-drop cannot pass as success. LoRA + preprocessing work can land as-is.
+
+<!-- merged from .squad/decisions/inbox/deckard-fix-pr276-87.md -->
+# Decision: PR #276 (issue #87) async prefetch overlap — Deckard revision
+
+**Fix owner:** Deckard (Systems Dev, CUDA & Perf pod)
+**Author (locked out):** Keaton
+**Date:** 2026-07-27
+**Branch:** feat/async-prefetch-overlap-87 (pushed, force-with-lease after rebase onto origin/main)
+**Status:** Both of Ferro's REQUEST-CHANGES blockers fixed; awaiting Ferro re-review (do NOT self-merge).
+
+## Blocker 1 — GPU test suite build break (fixed)
+Adding `async_host_to_device` to `CudaTransferCounts` left the pre-existing
+struct literal in `crates/onnx-runtime-ep-cuda/tests/compressed_sparse_attention_gpu.rs`
+missing the new field, so `cargo test -p onnx-runtime-ep-cuda --features cuda`
+failed to compile. Fixed by populating the field with the observed
+before/after delta (consistent with the other two counters), so the existing
+"ratio-128 FP8 must not stage through host memory" assertion now also covers
+async H2D copies. Verified all `CudaTransferCounts` construction sites compile
+(runtime.rs:500 already had the field; the `::default()` site is unaffected).
+
+## Blocker 2 — WAR race in shipped driver + doc overclaim (fixed)
+The public `drive_double_buffer` reused a double-buffer slot without ordering the
+reuse copy after the prior consumer, so on the CUDA EP a copy stream could
+overwrite a buffer while the previous wave's compute was still reading it
+(write-after-read hazard). The WAR fence existed only in a hand-rolled ep-cuda
+test loop, not the driven path.
+
+Fix (generic over any `&dyn ExecutionProvider`, no per-EP / per-buffer-count
+special-casing):
+- New `ExecutionProvider` trait methods: `record_compute_fence` (default
+  `Fence::signalled()`) and `copy_wait_fence` (default no-op). Implemented on the
+  CUDA EP over the compute/transfer streams (`record_compute_fence` /
+  `copy_wait_fence` runtime primitives). Non-CUDA EPs stay safe no-ops.
+- `drive_double_buffer` records a compute fence over each consumer and makes the
+  transfer stream wait on the prior consumer of a slot before issuing the reuse
+  copy. The WAR fence is now enforced by the shipped driver itself.
+- New GPU regression test `drive_double_buffer_war_safe_across_waves`
+  (`crates/onnx-runtime-session/tests/cuda_prefetch_war.rs`, session `cuda`
+  feature) drives the PUBLIC path across 6 waves (both slots reused) with a slow
+  compute-stream consumer; corrupts if the driver WAR fence is removed. Added
+  `cudarc` as a session dev-dependency (test-only, dynamic-loading, no toolkit).
+- Rewrote the `prefetch.rs` module + driver docs and `docs/WEIGHT_OFFLOAD.md` to
+  state plainly that the driver enforces WAR (removed the hand-rolled-loop
+  overclaim).
+
+Kept intact: RAW ordering, `copy_wait_fence`/`compute_wait_fence` primitives,
+pinned-staging lifetime, dtoh/dtod synchronize-first discipline, honest deferral
+of live-MoE-loop wiring.
+
+## WAR-fence neutering experiment (load-bearing proof) — on the NEW driver-path test
+Neutered the driver's `ep.copy_wait_fence(&last_compute_fence[next_slot])?` call
+in `drive_double_buffer`, then restored it. Pinned GPU7.
+- Neutered: `drive_double_buffer_war_safe_across_waves` FAILED —
+  "wave 0 output corrupted — the driver WAR fence was violated: a reuse prefetch
+  clobbered a staging buffer while this wave's consumer was reading it"
+  (wave 0 read wave 4's payload: got [53,54,55,...]).
+- Restored: PASS (1 passed; 0 failed).
+Not theater — the driver's own WAR fence is load-bearing.
+
+## Validation (pinned GPU7: `CUDA_VISIBLE_DEVICES=7 taskset -c 1`)
+- `cargo test -p onnx-runtime-ep-cuda --features cuda` (lib): 244 passed, 0 failed
+  (incl. the 3 overlap tests). `--test compressed_sparse_attention_gpu`: 26
+  passed, 1 ignored. Provider `copy_async_fence_orders_h2d_prefetch_through_ep_api`:
+  pass.
+- `cargo test -p onnx-runtime-session` (lib): 90 passed, 0 failed (incl. prefetch
+  strategy tests).
+- `cargo test -p onnx-runtime-session --features cuda --test cuda_prefetch_war`:
+  1 passed (the new driver-path WAR test).
+- Clippy PR's own code (`-p onnx-runtime-ep-api -p onnx-runtime-ep-cuda --features
+  cuda -p onnx-runtime-session --lib -- -D warnings`): clean. `--all-targets`
+  fails only in unrelated pre-existing test/kernel files (matmul_nbits.rs,
+  normalization.rs, standard_attention.rs, several *_gpu.rs test files) — all
+  byte-identical to origin/main (verified via `git diff origin/main`).
+- `cargo fmt --all -- --check`: clean.
+
+## Ignorable environmental failures (NOT this PR — confirmed on parent 6654a168)
+- `conv_gpu` / `pooling_gpu` (cuDNN libcudnn.so.9 absent) — as Ferro noted.
+- `matmul_gpu::matmul_f32_on_gpu_matches_cpu_reference` — 4-D batched mismatch;
+  reproduces BYTE-IDENTICALLY on parent commit 6654a168 (matmul_gpu.rs is
+  unchanged by the PR). Pre-existing GPU7 environmental failure, not a
+  regression. (Ferro tested on GPU6 and did not flag this; documented here for
+  transparency.)
+- A `fused_attention`/standard-attention bf16 tolerance case is the `1 ignored`
+  in the CSA test binary.
+
+## Follow-ups
+- Live MoE decode-loop wiring still depends on Phase-3b live device weight
+  binding (unchanged, honestly deferred).
+
+<!-- merged from .squad/decisions/inbox/ferro-pr276-rereview.md -->
+# Decision: PR #276 (issue #87) re-review — APPROVE
+
+- **Reviewer:** Ferro (concurrency) — independent, not the author
+- **Date:** 2026-07-27
+- **Artifact:** feat/async-prefetch-overlap-87 @ f47916e7 (rebased onto origin/main, force-with-lease)
+- **Prior verdict:** REQUEST-CHANGES (2 blockers). Fixer: Deckard (Keaton locked out as author).
+
+## Verdict: APPROVE — both blockers genuinely fixed, WAR fence proven load-bearing.
+
+### Blocker 1 (build break) — RESOLVED
+`compressed_sparse_attention_gpu.rs:706` now populates `async_host_to_device`
+with the observed delta (`after - before`). `cargo test -p onnx-runtime-ep-cuda
+--features cuda` compiles; CSA 26 pass / 1 ignored. The value is CORRECT, not a
+placeholder: the assertion is `observation.transfers == CudaTransferCounts::default()`
+(all-zero), so populating the field actually STRENGTHENS the "no host staging"
+check (async H2D copies must also be 0) rather than making it vacuous.
+
+### Blocker 2 (WAR race + doc overclaim) — RESOLVED
+- New generic `ExecutionProvider::record_compute_fence` (default already-signalled)
+  + `copy_wait_fence` (default no-op); CUDA EP records over compute stream / waits
+  on copy stream via non-host-blocking cuStreamWaitEvent.
+- `drive_double_buffer` now, over any `&dyn ExecutionProvider`: waits the transfer
+  stream on the prior consumer's fence of a slot (`copy_wait_fence`) BEFORE the
+  reuse `copy_async`, and records the consumer fence AFTER `compute(n)`. Ordering
+  is correct; enforced in the shared driver, no hand-rolled test loop, no-op-safe
+  on sync EPs.
+- Docs (prefetch.rs + WEIGHT_OFFLOAD.md) rewritten to state the driver enforces
+  WAR and the public-path test proves it — no residual overclaim.
+
+## Load-bearing neutering experiment (driver-path test)
+`drive_double_buffer_war_safe_across_waves` (session `cuda` feature, public path,
+6 waves both slots reused):
+- Fence intact -> PASS.
+- Neutered CUDA EP `copy_wait_fence` to a no-op (dropped cuStreamWaitEvent) ->
+  FAIL: `wave 0 output corrupted ... reuse prefetch clobbered a staging buffer`
+  (wave 0 read wave 4's payload, 53.0). Not theater.
+- Restored -> PASS.
+RAW guards (prior 3 ep-cuda tests) still present/pass in the 244-lib run.
+
+## Validation (pinned GPU6: CUDA_VISIBLE_DEVICES=6 taskset -c 1)
+- ep-cuda `--features cuda`: 244 lib pass; CSA 26/1-ign; only conv_gpu/pooling_gpu
+  fail (cuDNN absent — ignorable env, reproduces on parent).
+- session host: 90 lib pass. session `--features cuda` WAR test: 1 pass.
+- clippy PR-owned targets (ep-cuda lib, ep-api lib, session lib+tests) clean under
+  `-D warnings`. `--all-targets` fails only in pre-existing untouched
+  `fused_epilogue_gpu.rs` (too_many_arguments, fails on base).
+- `cargo fmt --all -- --check`: clean.
+
+No follow-up owner needed — merge-ready.
+
+<!-- merged from .squad/decisions/inbox/newt-img2img-inpaint-49.md -->
+### 2026-07-27: Keep inpainting conditioning outside scheduler state
+**By:** Newt
+**What:** Image diffusion carries only the 4-channel latent through the scheduler. The runner supplies a separate `{loop_endpoint}.conditioning` tensor containing `[mask | masked-image latent]`, and the engine appends it to form the 9-channel denoiser input each step.
+**Why:** Schedulers must update only the noisy latent, while inpainting UNets require static 1+4 conditioning channels. This preserves the existing loop and final VAE decode contracts without checkpoint-specific dispatch.
+
+### 2026-07-27: Zero strength means a zero-iteration tail
+**By:** Newt
+**What:** `start_step == num_steps` is valid and publishes the encoded seed directly to final pipeline phases.
+**Why:** The documented `num_steps - round(num_steps * strength)` mapping produces exactly `num_steps` at strength 0.0; accepting it avoids an edge-case special case in front ends.
+
+<!-- merged from .squad/decisions/inbox/pris-cli-ci-coverage.md -->
+# Pris decision — CLI ORT CI coverage
+
+Date: 2026-07-27
+
+## Constraint found
+
+`onnx-genai-ort-sys` resolves ONNX Runtime in this order: `ORT_LIB_DIR`, `ORT_ROOT`, `pkg-config`, then an automatic GitHub release download. The automatic path downloads ONNX Runtime 1.27.0 with `curl`, verifies a pinned SHA-256 for Linux x64, macOS arm64, Windows x64, and Windows arm64, extracts it under Cargo `OUT_DIR`, and reuses it only when the cached header and runtime match API version 27. Bindgen needs libclang; Linux CI should install `clang libclang-dev`, while Windows can use the hosted LLVM install. Windows test processes must also load the downloaded DLL, not the runner's older ambient `onnxruntime.dll` (observed as API 17 / ORT 1.17.1), so the lane copies the pinned DLL beside the Cargo-built binaries before testing.
+
+`publish.yml` already pays the ORT-linked build cost for `onnx-genai` and `onnx-genai-server` wheels. Those wheels deliberately do not bundle libonnxruntime; runtime loading comes from the Python `onnxruntime` package. Their build-time headers/import library still come from the same `ort-sys` auto-download. `wheels.yml` builds `nxrt` wheels and leaves `onnx-genai-server` wheels to `publish.yml`.
+
+## Design chosen
+
+Add an isolated `cli-ort` CI job, separate from the offline allowlist, with Linux x86_64 and Windows x86_64 matrix entries. It intentionally permits the pinned native ORT download only for `onnx-genai-cli`, then runs:
+
+- `cargo build --locked -p onnx-genai-cli`
+- `cargo test --locked -p onnx-genai-cli`
+- `cargo clippy --locked -p onnx-genai-cli --all-targets -- -D warnings`
+
+Linux is mandatory because `repl_e2e.rs` contains Unix-only REPL/interrupt/contract tests, including `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`. Windows is included because the auto-download path supports `win-x64` and it catches platform drift on Justin's main development OS.
+
+## CI cost
+
+Observed green run: https://github.com/justinchuby/onnx-genai/actions/runs/30298789423
+
+- `CLI ORT coverage (Linux x86_64)`: 1m13s.
+- `CLI ORT coverage (Windows x86_64)`: 6m48s.
+- Marginal wall-clock in that run: about 48s beyond the next slowest existing job, because the matrix runs in parallel.
+
+## Residual coverage gap
+
+The lane covers CLI build, unit tests, and integration tests that can run against checked-in fixtures. It still does not cover paths requiring a real external model, GPU execution, or an actual interactive TTY. The ratatui live view is inert when `stdout` is not a terminal, so piped CI cannot exercise the live terminal rendering path.
+
+<!-- scribe-merge-2026-07-27T13-10-00-07-00-cli-improvement-durable-lessons -->
+### 2026-07-27: CLI coverage must include an ORT-linked lane
+**By:** Scribe, preserving the CLI improvement track outcome.
+**What:** The CLI previously had zero CI coverage, which plausibly allowed the token-budget, ignored-sampling-flags, and missing-context-cap regressions to survive. The merged `cli-ort` lane now builds, tests, and lints `onnx-genai-cli` with the ORT backend on Linux and Windows.
+**Why:** This lane is a baseline, not complete product coverage: it does not exercise real external models, GPU execution, or the ratatui live TTY view because `live_turn.rs:91` gates that path on `stdout().is_terminal()`.
+
+### 2026-07-27: CUDA EP fallback claims must distinguish the three runtime cases
+**By:** Scribe, preserving the native-CUDA feature review outcome.
+**What:** Documentation and comments must not claim that requesting `cuda` silently falls back to CPU. The distinct cases are: CUDA support not compiled, CUDA requested but no device/provider is available, and node-level fallback inside an otherwise CUDA-capable ORT session; only the third is a fallback.
+**Why:** A stale `onnx-genai-engine/Cargo.toml` comment propagated the wrong claim into new documentation before automated review caught it. Runtime capability claims need source-of-truth verification before reuse.
+
+### 2026-07-27: Independent second-opinion review is required after nontrivial CLI correctness changes
+**By:** Scribe, preserving the reviewer rejection protocol outcome.
+**What:** A second-opinion reviewer caught the context-exhaustion bug after a human-style reviewer approved the CLI changes. For nontrivial CLI correctness changes, keep the independent pass in the review plan.
+**Why:** The missed defect would have recorded an empty assistant turn in the non-reasoning path and permanently poisoned the conversation. The independent pass materially changed the outcome.
+
+Decision archive gate fired at 2026-07-27T13:10:00-07:00: active ledger was 753542 bytes; archived 9 dated entries on or before 2026-07-20 to `.squad/decisions/archive/2026-07.md`.
+<!-- merged from .squad/decisions/inbox/parker-pr280-review.md -->
+# Decision: PR #280 (issue #48) — SDXL dual-encoder conditioning in run_comfyui
+
+- **Reviewer:** Parker (independent/adversarial). Author: Ripley.
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE (non-blocking notes)
+
+## Verification of the classic SDXL failure points
+- **time_ids order:** `build_time_ids` emits `[original_h, original_w, crop_top, crop_left, target_h, target_w]`,
+  matching diffusers `list(original_size + crops_coords_top_left + target_size)`. Unit test pins the exact
+  12-value vector incl. batch tiling — would catch a swapped order or an h/w flip. ✓
+- **time_ids fed as a single `[batch, 6]` denoiser input (no `.uncond`)** — correct: SDXL shares time_ids
+  across both CFG passes; DIFFUSION.md §9 documents "sharing time_ids". ✓
+- **Dual-encoder concat:** performed inside the exported ONNX text_encoder (per DIFFUSION.md §9), not at
+  runtime. Runner routes conditioning declaratively via dataflow edges. ✓
+- **Detection is filename-free:** `conditioning_kind` = DualWithPooled iff a `text_embeds` denoiser
+  conditioning edge exists — driven off declared edges, not checkpoint names. DRY, general. ✓
+- **Pooled text_embeds + per-edge uncond:** each encoder→denoiser edge routed individually, uncond fed
+  as `{denoiser}.{port}.uncond`. ✓
+- **SD1.x non-regression:** single-edge path → ConditioningKind::Single, no time_ids; replay/verify contract
+  preserved. Existing endpoint tests updated and pass. ✓
+
+## Validation evidence (worktree @ a78a5834)
+- `cargo fmt --all -- --check` → exit 0
+- `cargo clippy -p onnx-genai-engine -p onnx-genai --all-targets -- -D warnings` → exit 0
+- `cargo test -p onnx-genai-engine` → ok (0 failed; env-gated ignored)
+- `cargo test -p onnx-genai` → 27 + 6 + 5 pass; 0 failed
+
+## Non-blocking notes (owner: Ripley is LOCKED OUT — assign Hicks)
+1. `concatenate_hidden_states` is **dead code** — only referenced by its own unit test; the real concat is
+   export-side. The test gives false confidence it guards the runtime concat axis. Either drop it (add a
+   comment that concat is export-owned) or wire it. Low priority.
+2. Encoder-input→tokenizer mapping relies on graph input declaration order (index 0→primary,
+   1→tokenizer_2.json). Safe in practice (SDXL's two tokenizers share vocab) but add a clarifying comment.
+3. Repeated `spec().strategy.denoiser.as_deref().unwrap()` — safe (guarded by `resolve_endpoints`) but
+   reuse the already-resolved denoiser name for clarity.
+
+None of these corrupt conditioning; approving.
+
+<!-- merged from .squad/decisions/inbox/ripley-sdxl-dual-encoders-48.md -->
+### 2026-07-27: Reuse typed image generation for native ComfyUI SDXL
+**By:** Ripley
+**What:** `run_comfyui` delegates normal renders to the metadata-driven typed image generator. SDXL is detected from a pooled `text_embeds` conditioning edge; all encoder token inputs and CFG outputs are wired, and `[original H/W, crop top/left, target H/W]` time IDs are supplied.
+**Why:** The engine already executes multi-output prompt conditioning and multi-input CFG. Keeping conditioning construction in one shared renderer avoids a second checkpoint-specific path while preserving the hidden SD1.x replay verifier.
+
+<!-- merged from .squad/decisions/inbox/roy-pr282-review.md -->
+# Decision: PR #282 (issue #84) — Tree-structured speculative decoding review
+
+- **Reviewer:** Roy (independent, adversarial)
+- **Author:** Hicks (locked out of fixes)
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE
+
+## Summary
+Adversarial correctness review of tree-structured speculative decoding core.
+All scrutiny points pass. Greedy-equivalence invariant is genuinely proven.
+
+## Key findings
+1. **Greedy-equivalence test is GENUINE.** `tests/tree_speculative.rs` drives a
+   full tree-speculative loop against the real `tiny-llm` fixture and compares
+   byte-for-byte to an *independent* plain-greedy reference engine. It asserts
+   `saw_branching` (tree wider than its roots) and `saw_multi_accept`
+   (accepted path >= 2) so it is NOT a degenerate 1-node/single-chain pass.
+   Two prompts covered. Per-node scorer uses full independent forwards on each
+   ancestor path — the exact context a correct 2D tree mask would supply — which
+   is consistent with the deferral (mask itself guarded separately).
+2. **Ancestor-only mask correct.** `ancestor_attention_mask`: `mask[q][k]` iff k
+   is ancestor of q or k==q. Unit test hand-builds a real multi-branch tree
+   (root→{a,b}; a→{c,d}; b→{e,f}), asserts the exact edge set + explicit
+   no-sibling-leak asserts. **Mutation-verified:** injecting a sibling edge made
+   the mask unit test FAIL; reverted → pass. Test genuinely guards correctness.
+3. **Position ids == depth**, siblings share a slot ([0,1,1,2,2,2,2]). Correct.
+4. **Acceptance walk** generic over rule; full/partial/root-reject/typical all
+   tested. Greedy follows target argmax → reproduces greedy exactly, bonus token
+   = target argmax, length 1..=path_len+1. RejectionSampling coincides with
+   Greedy at T=0 (sound: spec decode runs at temp 0). Typical gates on softmax
+   mass ≥ threshold.
+5. **KV retention** keeps exactly the accepted path in order,
+   `final_len == base_len + accepted_len`; asserted in both unit and real-model
+   integration tests (`retained_nodes == outcome.nodes`).
+6. **Linear non-regression.** mod.rs diff is a pure file move + additive
+   (module decl, re-exports, enum extension). `Eq` dropped from `AcceptanceRule`
+   (required by `Typical{f32}`); nothing in the linear path relied on it. All
+   pre-existing engine tests pass unchanged.
+7. **Deferral is HONEST.** `decode/step.rs:138` (and decode/mod.rs) build
+   `vec![1_i64; total_len]` — a 1D key mask, no per-query 2D input; a real
+   batched tree forward needs graph/session changes. The tree core is NOT wired
+   into the live decode path (no refs in src outside `speculative/`), sits behind
+   the `TreeScorer` seam, and is fully tested (not dead scaffolding). PR body
+   states the deferral plainly. No false "live tree overlap" claim.
+
+## Validation evidence
+- `cargo test -p onnx-genai-engine` → all pass; 8 tree unit tests + 2 real-model
+  greedy-equivalence integration tests all `ok`.
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `cargo clippy -p onnx-genai-engine --all-targets -- -D warnings` → clean.
+- Mutation check on the mask → test FAILED as expected, then reverted.
+
+## Note
+No fix owner needed (APPROVE). A stale-mtime incremental-build gotcha was hit
+during the mutation revert (`mv` restored old mtime → cargo reused stale binary);
+`touch` + rebuild confirmed the clean tree passes.
+
+Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 747576 bytes; no dated entries older than 2026-07-20 remained, so no archive file was created or changed.
+
+<!-- merged/superseded from .squad/decisions/inbox/dallas-controlnet-lora-50.md -->
+<!-- merged from .squad/decisions/inbox/bishop-pr283-rereview.md -->
+### 2026-07-27: PR #283 / #50 landed with real mobius ControlNet contract
+**By:** Scribe, reconciling Dallas implementation note with Bishop re-review and Batty's fix.
+**What:** PR #283 closed #50 with native ComfyUI ControlNet and LoRA wiring, but the final landed ControlNet contract is Batty's corrected approach rather than Dallas's superseded suffix-port/`conditioning_scale` plan. Runtime binds exactly the real mobius denoiser input `controlnet_cond` for a single ControlNet hint as batched RGB CHW `[0,1]` at pixel resolution; ControlNet strength is export-fused, so no runtime `conditioning_scale` input is emitted. Multiple ControlNets fail loudly instead of inventing suffixed ports that mobius does not declare. LoRA remains routed through declared `lora_gate.{stem}` inputs.
+**Why:** Bishop's initial review found the prior `conditioning_scale` gate and multi-ControlNet suffix inputs had no mobius backing and would silently drop through declared-input routing. Batty removed those invented mechanisms, added contract-pinning tests (`single_controlnet_binds_the_declared_unsuffixed_cond_input`, `multiple_controlnets_fail_loudly_instead_of_silently_dropping`), and Bishop re-reviewed with APPROVE after mutation proof. The stale Dallas inbox note is retained here only as superseded history; future work should use the single `controlnet_cond`/export-fused-strength contract unless mobius changes.
+**Outcome:** Dallas authored the original PR, Batty owned the fix after Dallas lockout, Bishop approved the re-review, PR #283 merged as `687612f5`, and issue #50 is closed. The native image-pipeline trilogy is complete: #48 SDXL, #49 img2img/inpaint, and #50 ControlNet/LoRA are all closed.

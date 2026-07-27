@@ -16,3 +16,6 @@ Approved PR #269 after confirming IsInf, IsNaN, PRelu, CPU IsNaN parity, claim g
 
 ## 2026-07-27T16:44:54Z — Wave 8 update
 - Reviewed Keaton PR #276 for #87 and requested changes: GPU test literal build break plus WAR-racy `drive_double_buffer` path; Deckard owns fixes.
+
+## 2026-07-27T16:44:54Z — Wave 9 update
+Requested changes on PR #276, then approved Deckard's fix cycle for #87 async prefetch overlap.

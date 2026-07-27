@@ -51,6 +51,8 @@ const MAX_TRACE_DEPTH: usize = 16;
 /// ComfyUI node `class_type`s the translator recognizes.
 const SAMPLER_NODES: &[&str] = &["KSampler", "KSamplerAdvanced"];
 const VAE_DECODE_NODES: &[&str] = &["VAEDecode", "VAEDecodeTiled"];
+const VAE_ENCODE_NODES: &[&str] = &["VAEEncode", "VAEEncodeTiled"];
+const INPAINT_NODES: &[&str] = &["VAEEncodeForInpaint", "InpaintModelConditioning"];
 const TEXT_ENCODE_NODES: &[&str] = &["CLIPTextEncode"];
 const LATENT_NODES: &[&str] = &["EmptyLatentImage", "EmptySD3LatentImage"];
 
@@ -195,8 +197,27 @@ pub struct ComfyUiWorkflow {
     pub start_step: u32,
     /// LoRA `(name, strength)` pairs along the model chain, in application order.
     pub loras: Vec<(String, f64)>,
-    /// ControlNet `(name, strength)` if present.
+    /// First ControlNet `(name, strength)`, retained for compatibility.
     pub controlnet: Option<(String, f64)>,
+    /// ControlNets reachable from the sampler conditioning graph.
+    pub controlnets: Vec<ControlNet>,
+    /// Source image referenced by the sampler's VAE-encode path.
+    pub source_image: Option<String>,
+    /// Inpainting mask referenced by the sampler's latent path.
+    pub mask_image: Option<String>,
+}
+
+/// One ControlNet application recovered from the conditioning graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlNet {
+    /// ControlNet checkpoint name from the loader node.
+    pub name: String,
+    /// Conditioning strength from the apply node. This is metadata only: mobius
+    /// fuses ControlNet strength at export (`checkpoint_export(controlnet=...)`),
+    /// so it is not fed as a runtime denoiser input.
+    pub strength: f64,
+    /// Hint image referenced by the apply node, when directly recoverable.
+    pub image: Option<String>,
 }
 
 /// Return the flat node map, tolerating a `{"prompt": {...}}` wrapper.
@@ -236,6 +257,52 @@ fn input<'a>(node: &'a Value, key: &str) -> Option<&'a Value> {
     node_inputs(node)?.get(key)
 }
 
+fn link_slot(value: &Value) -> Option<usize> {
+    value
+        .as_array()
+        .filter(|link| link.len() == 2)?
+        .get(1)?
+        .as_u64()
+        .map(|slot| slot as usize)
+}
+
+fn load_image_name(nodes: &Map<String, Value>, reference: Option<&Value>) -> Option<String> {
+    let node = resolve(nodes, reference)?;
+    match node_class(node)? {
+        "LoadImage" | "LoadImageMask" => input(node, "image")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn follow_image_inputs(
+    nodes: &Map<String, Value>,
+    reference: Option<&Value>,
+) -> (Option<String>, Option<String>) {
+    let Some(node) = resolve(nodes, reference) else {
+        return (None, None);
+    };
+    let class = node_class(node).unwrap_or_default();
+    if VAE_ENCODE_NODES.contains(&class) {
+        return (load_image_name(nodes, input(node, "pixels")), None);
+    }
+    if INPAINT_NODES.contains(&class) {
+        let pixels = input(node, "pixels").or_else(|| input(node, "image"));
+        let mask = input(node, "mask");
+        return (
+            load_image_name(nodes, pixels),
+            load_image_name(nodes, mask).or_else(|| {
+                let source = pixels?;
+                (link_slot(mask?) == Some(1))
+                    .then(|| load_image_name(nodes, Some(source)))
+                    .flatten()
+            }),
+        );
+    }
+    (None, None)
+}
+
 /// Find the single node of one of `class_types`; error if absent or ambiguous.
 fn find_single<'a>(
     nodes: &'a Map<String, Value>,
@@ -269,16 +336,27 @@ fn follow_prompt_text(
     if depth == 0 {
         return None;
     }
+    let slot = reference.and_then(link_slot).unwrap_or(0);
     let node = resolve(nodes, reference)?;
     if node_class(node).is_some_and(|c| TEXT_ENCODE_NODES.contains(&c)) {
         return input(node, "text")
             .and_then(Value::as_str)
             .map(str::to_owned);
     }
-    // Some graphs wrap conditioning (e.g. ConditioningCombine); follow one hop.
-    let inner = input(node, "conditioning")?;
-    if as_link(inner).is_some() {
-        return follow_prompt_text(nodes, Some(inner), depth - 1);
+    // Conditioning wrappers and ControlNetApply nodes preserve the prompt edge.
+    for key in if slot == 1 {
+        ["negative", "conditioning", "positive"]
+    } else {
+        ["positive", "conditioning", "negative"]
+    } {
+        let Some(inner) = input(node, key) else {
+            continue;
+        };
+        if as_link(inner).is_some()
+            && let Some(prompt) = follow_prompt_text(nodes, Some(inner), depth - 1)
+        {
+            return Some(prompt);
+        }
     }
     None
 }
@@ -341,26 +419,93 @@ fn trace_loras(nodes: &Map<String, Value>, reference: Option<&Value>) -> Vec<(St
     loras
 }
 
-/// Find a ControlNetApply node's `(control_net_name, strength)`, if any.
-fn find_controlnet(nodes: &Map<String, Value>) -> Option<(String, f64)> {
-    for node in nodes.values() {
-        if node_class(node)
-            .is_some_and(|c| matches!(c, "ControlNetApply" | "ControlNetApplyAdvanced"))
+fn trace_image_name(
+    nodes: &Map<String, Value>,
+    reference: Option<&Value>,
+    depth: usize,
+) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    let node = resolve(nodes, reference)?;
+    if let Some(name) = load_image_name(nodes, reference) {
+        return Some(name);
+    }
+    node_inputs(node)?
+        .values()
+        .find_map(|value| trace_image_name(nodes, Some(value), depth - 1))
+}
+
+fn trace_controlnets_from(
+    nodes: &Map<String, Value>,
+    reference: Option<&Value>,
+    depth: usize,
+    seen: &mut std::collections::HashSet<String>,
+    controlnets: &mut Vec<ControlNet>,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Some(node_id) = reference.and_then(as_link) else {
+        return;
+    };
+    if !seen.insert(node_id.to_owned()) {
+        return;
+    }
+    let Some(node) = nodes.get(node_id) else {
+        return;
+    };
+    let class = node_class(node).unwrap_or_default();
+    if matches!(class, "ControlNetApply" | "ControlNetApplyAdvanced") {
+        for key in ["conditioning", "positive", "negative"] {
+            trace_controlnets_from(nodes, input(node, key), depth - 1, seen, controlnets);
+        }
+        let strength = input(node, "strength")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        let loader = resolve(nodes, input(node, "control_net"));
+        if let Some(loader) = loader
+            && node_class(loader)
+                .is_some_and(|c| matches!(c, "ControlNetLoader" | "DiffControlNetLoader"))
+            && let Some(name) = input(loader, "control_net_name").and_then(Value::as_str)
         {
-            let strength = input(node, "strength")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
-            let loader = resolve(nodes, input(node, "control_net"));
-            if let Some(loader) = loader
-                && node_class(loader)
-                    .is_some_and(|c| matches!(c, "ControlNetLoader" | "DiffControlNetLoader"))
-                && let Some(name) = input(loader, "control_net_name").and_then(Value::as_str)
-            {
-                return Some((name.to_owned(), strength));
-            }
+            controlnets.push(ControlNet {
+                name: name.to_owned(),
+                strength,
+                image: trace_image_name(nodes, input(node, "image"), MAX_TRACE_DEPTH),
+            });
+        }
+        return;
+    }
+    if let Some(inputs) = node_inputs(node) {
+        for value in inputs.values().filter(|value| as_link(value).is_some()) {
+            trace_controlnets_from(nodes, Some(value), depth - 1, seen, controlnets);
         }
     }
-    None
+}
+
+fn trace_controlnets(
+    nodes: &Map<String, Value>,
+    positive: Option<&Value>,
+    negative: Option<&Value>,
+) -> Vec<ControlNet> {
+    let mut seen = std::collections::HashSet::new();
+    let mut controlnets = Vec::new();
+    trace_controlnets_from(
+        nodes,
+        positive,
+        MAX_TRACE_DEPTH,
+        &mut seen,
+        &mut controlnets,
+    );
+    trace_controlnets_from(
+        nodes,
+        negative,
+        MAX_TRACE_DEPTH,
+        &mut seen,
+        &mut controlnets,
+    );
+    controlnets
 }
 
 /// Build the native pipeline metadata document for a diffusion workflow.
@@ -436,10 +581,9 @@ fn build_pipeline_metadata(
         }
     }
     if let Some(start) = start_step {
-        if start == 0 || start >= num_steps {
+        if start == 0 || start > num_steps {
             return Err(ComfyUiConfigError::Unsupported(format!(
-                "start_step ({start}) must be in 1..{}",
-                num_steps - 1
+                "start_step ({start}) must be in 1..={num_steps}"
             )));
         }
         strategy.insert("start_step".into(), json!(start));
@@ -491,23 +635,22 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
     let kind = sampler_kind(&sampler_name)?;
     let known_spacing = SUPPORTED_SPACINGS.contains(&spacing.as_str());
 
-    // img2img: a KSampler `denoise` < 1.0 skips the earliest (noisiest) steps.
-    // start_step = num_steps - round(num_steps * denoise). Uses banker's rounding
-    // to match numpy/diffusers get_timesteps.
-    let mut start_step = 0u32;
-    if denoise > 0.0 && denoise < 1.0 {
-        let raw = (steps as f64) * denoise;
-        let rounded = round_ties_even(raw) as i64;
-        let candidate = steps as i64 - rounded;
-        start_step = candidate.clamp(0, (steps as i64 - 1).max(0)) as u32;
-    }
+    let start_step = strength_to_start_step(denoise, steps);
 
     let prompt = follow_prompt_text(nodes, input(sampler, "positive"), MAX_TRACE_DEPTH);
     let negative_prompt = follow_prompt_text(nodes, input(sampler, "negative"), MAX_TRACE_DEPTH);
     let (width, height, batch_size) = follow_dims(nodes, input(sampler, "latent_image"));
     let checkpoint = trace_checkpoint(nodes, input(sampler, "model"));
     let loras = trace_loras(nodes, input(sampler, "model"));
-    let controlnet = find_controlnet(nodes);
+    let controlnets = trace_controlnets(
+        nodes,
+        input(sampler, "positive"),
+        input(sampler, "negative"),
+    );
+    let controlnet = controlnets
+        .first()
+        .map(|controlnet| (controlnet.name.clone(), controlnet.strength));
+    let (source_image, mask_image) = follow_image_inputs(nodes, input(sampler, "latent_image"));
 
     let has_text_encoder = nodes
         .values()
@@ -559,7 +702,23 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
         start_step,
         loras,
         controlnet,
+        controlnets,
+        source_image,
+        mask_image,
     })
+}
+
+/// Convert ComfyUI denoise strength to the first executed diffusion step.
+///
+/// This is `num_steps - round_ties_even(num_steps * strength)`, matching
+/// diffusers `get_timesteps`. Strength zero therefore executes no denoise steps.
+pub fn strength_to_start_step(strength: f64, num_steps: u32) -> u32 {
+    if num_steps == 0 {
+        return 0;
+    }
+    let strength = strength.clamp(0.0, 1.0);
+    let rounded = round_ties_even(num_steps as f64 * strength) as i64;
+    (num_steps as i64 - rounded).clamp(0, num_steps as i64) as u32
 }
 
 /// Parse a ComfyUI API-format workflow from a JSON string.
@@ -712,6 +871,57 @@ mod tests {
     }
 
     #[test]
+    fn strength_mapping_matches_hand_computed_diffusers_steps() {
+        for (strength, steps, expected) in [
+            (0.0, 20, 20),
+            (0.1, 20, 18),
+            (0.5, 21, 11), // 10.5 ties to even -> 10
+            (0.6, 20, 8),
+            (1.0, 20, 0),
+        ] {
+            assert_eq!(
+                strength_to_start_step(strength, steps),
+                expected,
+                "strength={strength}, steps={steps}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_txt2img_img2img_and_inpainting_from_latent_graph() {
+        let txt2img = parse_workflow(&txt2img_graph()).unwrap();
+        assert_eq!((txt2img.source_image, txt2img.mask_image), (None, None));
+
+        let mut img2img_graph = txt2img_graph();
+        img2img_graph["3"]["inputs"]["latent_image"] = json!(["10", 0]);
+        img2img_graph["10"] = json!({
+            "class_type": "VAEEncode",
+            "inputs": {"pixels": ["11", 0], "vae": ["4", 2]}
+        });
+        img2img_graph["11"] = json!({"class_type": "LoadImage", "inputs": {"image": "source.png"}});
+        let img2img = parse_workflow(&img2img_graph).unwrap();
+        assert_eq!(img2img.source_image.as_deref(), Some("source.png"));
+        assert_eq!(img2img.mask_image, None);
+
+        let mut inpaint_graph = txt2img_graph();
+        inpaint_graph["3"]["inputs"]["latent_image"] = json!(["10", 0]);
+        inpaint_graph["10"] = json!({
+            "class_type": "VAEEncodeForInpaint",
+            "inputs": {
+                "pixels": ["11", 0],
+                "mask": ["12", 0],
+                "vae": ["4", 2]
+            }
+        });
+        inpaint_graph["11"] = json!({"class_type": "LoadImage", "inputs": {"image": "source.png"}});
+        inpaint_graph["12"] =
+            json!({"class_type": "LoadImageMask", "inputs": {"image": "mask.png"}});
+        let inpaint = parse_workflow(&inpaint_graph).unwrap();
+        assert_eq!(inpaint.source_image.as_deref(), Some("source.png"));
+        assert_eq!(inpaint.mask_image.as_deref(), Some("mask.png"));
+    }
+
+    #[test]
     fn traces_loras_in_application_order() {
         let mut graph = txt2img_graph();
         // KSampler.model -> LoraLoader(b) -> LoraLoader(a) -> checkpoint.
@@ -738,18 +948,87 @@ mod tests {
     #[test]
     fn finds_controlnet() {
         let mut graph = txt2img_graph();
+        graph["3"]["inputs"]["positive"] = json!(["20", 0]);
         graph["20"] = json!({
             "class_type": "ControlNetApply",
-            "inputs": {"strength": 0.9, "control_net": ["21", 0], "conditioning": ["6", 0]}
+            "inputs": {
+                "strength": 0.9,
+                "control_net": ["21", 0],
+                "conditioning": ["6", 0],
+                "image": ["22", 0]
+            }
         });
         graph["21"] = json!({
             "class_type": "ControlNetLoader",
             "inputs": {"control_net_name": "canny.safetensors"}
         });
+        graph["22"] = json!({"class_type": "LoadImage", "inputs": {"image": "control.png"}});
         let workflow = parse_workflow(&graph).unwrap();
         assert_eq!(
             workflow.controlnet,
             Some(("canny.safetensors".to_owned(), 0.9))
+        );
+        assert_eq!(
+            workflow.controlnets,
+            vec![ControlNet {
+                name: "canny.safetensors".to_owned(),
+                strength: 0.9,
+                image: Some("control.png".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn traces_multiple_controlnets_in_conditioning_order_without_negative_duplicates() {
+        let mut graph = txt2img_graph();
+        graph["3"]["inputs"]["positive"] = json!(["20", 0]);
+        graph["3"]["inputs"]["negative"] = json!(["20", 1]);
+        graph["20"] = json!({
+            "class_type": "ControlNetApplyAdvanced",
+            "inputs": {
+                "strength": 0.25,
+                "control_net": ["21", 0],
+                "positive": ["23", 0],
+                "negative": ["23", 1],
+                "image": ["22", 0]
+            }
+        });
+        graph["21"] = json!({
+            "class_type": "ControlNetLoader",
+            "inputs": {"control_net_name": "depth.safetensors"}
+        });
+        graph["22"] = json!({"class_type": "LoadImage", "inputs": {"image": "depth.png"}});
+        graph["23"] = json!({
+            "class_type": "ControlNetApplyAdvanced",
+            "inputs": {
+                "strength": 0.75,
+                "control_net": ["24", 0],
+                "positive": ["6", 0],
+                "negative": ["7", 0],
+                "image": ["25", 0]
+            }
+        });
+        graph["24"] = json!({
+            "class_type": "ControlNetLoader",
+            "inputs": {"control_net_name": "canny.safetensors"}
+        });
+        graph["25"] = json!({"class_type": "LoadImage", "inputs": {"image": "canny.png"}});
+
+        let workflow = parse_workflow(&graph).unwrap();
+        assert_eq!(
+            workflow.controlnets,
+            vec![
+                ControlNet {
+                    name: "canny.safetensors".to_owned(),
+                    strength: 0.75,
+                    image: Some("canny.png".to_owned()),
+                },
+                ControlNet {
+                    name: "depth.safetensors".to_owned(),
+                    strength: 0.25,
+                    image: Some("depth.png".to_owned()),
+                },
+            ]
         );
     }
 

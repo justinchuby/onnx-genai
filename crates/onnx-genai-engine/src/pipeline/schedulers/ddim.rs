@@ -115,6 +115,21 @@ impl Scheduler for DdimSchedule {
     fn timesteps(&self) -> Option<Vec<f32>> {
         Some(self.timesteps.clone())
     }
+
+    fn add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        if step == num_steps {
+            return Value::from_slice_f32(&original.to_vec_f32_lossy()?, original.shape())
+                .map_err(Into::into);
+        }
+        let (alpha, _) = self.steps[step];
+        super::mix_noise(original, noise, alpha.sqrt(), (1.0 - alpha).sqrt())
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +153,23 @@ mod tests {
             (n1[0] - (std::f32::consts::SQRT_2 - 1.0)).abs() < 1e-5,
             "{}",
             n1[0]
+        );
+    }
+
+    #[test]
+    fn ddim_add_noise_matches_hand_computed_alpha_mix() {
+        let scheduler = DdimSchedule::with_schedule(2, 0.5, 0.5, "linear", 1).unwrap();
+        let original = Value::from_slice_f32(&[2.0], &[1]).unwrap();
+        let noise = Value::from_slice_f32(&[3.0], &[1]).unwrap();
+        let noised = Scheduler::add_noise(&scheduler, 0, 1, &original, &noise).unwrap();
+        let expected = 2.0 * 0.5f32.sqrt() + 3.0 * 0.5f32.sqrt();
+        assert!((noised.to_vec_f32_lossy().unwrap()[0] - expected).abs() < 1e-6);
+        assert_eq!(
+            Scheduler::add_noise(&scheduler, 1, 1, &original, &noise)
+                .unwrap()
+                .to_vec_f32_lossy()
+                .unwrap(),
+            vec![2.0]
         );
     }
 

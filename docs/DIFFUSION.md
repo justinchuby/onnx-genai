@@ -207,7 +207,21 @@ A `KSampler.denoise` < 1.0 is img2img: encode a source image to a latent, noise 
 intermediate step, and run only the tail of the loop. The `start_step` field on the iterative
 strategy runs `start_step..num_steps` from the noised encoded-image seed, with
 `start_step = num_steps − round(num_steps·denoise)` (matching diffusers `get_timesteps`).
+`denoise = 0` maps to `start_step = num_steps`, so the loop executes zero steps.
 `scripts/img2img_e2e.py` validates it against diffusers img2img (max|Δ| ~1.0e-2).
+
+The native `run_comfyui` runner detects `VAEEncode`/`VAEEncodeTiled` on the sampler's latent
+input, loads the linked `LoadImage`, and uses the package component whose type is `vae_encoder`
+(`vae_encoder.onnx` is the compatibility fallback). Relative image paths are resolved beside the
+workflow JSON.
+
+### 4.1 Inpainting
+
+`VAEEncodeForInpaint` and `InpaintModelConditioning` additionally route the linked mask and masked
+source image through the VAE encoder. The UNet input is exactly 9 channels, in this order:
+`[4-channel noisy latent | 1-channel downsampled repaint mask | 4-channel masked-image latent]`.
+The scheduler continues to carry and update only the first four channels; the five conditioning
+channels are appended immediately before each denoiser invocation.
 
 ---
 
@@ -334,8 +348,14 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
   `mobius convert-comfyui --controlnet NAME=PATH` resolves it; `controlnet_cond` is an external
   denoiser input (like SDXL `time_ids`) shared across the CFG cond/uncond passes. Validated
   (`scripts/controlnet_e2e.py`): a fused export matches diffusers to 5.8e-6 and differs from base by
-  0.45 (ControlNet takes effect). *Remaining:* native `run_comfyui` rendering of ControlNet / LoRA /
-  SDXL ControlNet / inpaint workflows (conversion via `mobius convert-comfyui` already supports them).
+  0.45 (ControlNet takes effect). Native `run_comfyui` renders **single-ControlNet** workflows by
+  feeding the one declared `denoiser.controlnet_cond` image input (batched RGB CHW in `[0,1]`,
+  shape `[batch, conditioning_channels, height*8, width*8]`). ControlNet **strength is fused at
+  export** (`checkpoint_export(controlnet=...)`), so it is *not* a runtime input — the runner never
+  feeds a `conditioning_scale` gate the denoiser does not declare. Mobius exports a **single** fused
+  ControlNet only; a workflow declaring more than one ControlNet is **rejected loudly** rather than
+  silently dropping unbacked per-adapter ports. *Remaining:* SDXL ControlNet / inpaint workflows in
+  the native runner (conversion via `mobius convert-comfyui` already supports them).
 - **img2img** is supported. **Inpainting** (9-channel UNet) runs through the declarative pipeline
   engine, but native `run_comfyui` rendering of inpaint (mask) workflows is not yet wired up
   (conversion via `mobius convert-comfyui` already supports them).

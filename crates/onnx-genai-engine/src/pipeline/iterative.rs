@@ -22,6 +22,56 @@ struct DenoiserPassContext<'a, 'o> {
     overrides: &'a [(&'o str, &'o Value)],
 }
 
+fn append_loop_conditioning(
+    constants: &PipelineTensors,
+    endpoint: &str,
+    latent: &Value,
+    is_loop: bool,
+) -> anyhow::Result<Value> {
+    let Some(conditioning) = is_loop
+        .then(|| constants.get(&format!("{endpoint}.conditioning")))
+        .flatten()
+    else {
+        return clone_value(latent);
+    };
+    let latent_shape = latent.shape();
+    let conditioning_shape = conditioning.shape();
+    if latent_shape.len() != 4
+        || conditioning_shape.len() != 4
+        || latent_shape[0] != conditioning_shape[0]
+        || latent_shape[2..] != conditioning_shape[2..]
+    {
+        anyhow::bail!(
+            "loop conditioning requires matching [batch, channels, height, width] tensors, got {latent_shape:?} and {conditioning_shape:?}"
+        );
+    }
+    let batch = latent_shape[0] as usize;
+    let latent_channels = latent_shape[1] as usize;
+    let conditioning_channels = conditioning_shape[1] as usize;
+    let plane = latent_shape[2] as usize * latent_shape[3] as usize;
+    let latent = latent.to_vec_f32_lossy()?;
+    let conditioning = conditioning.to_vec_f32_lossy()?;
+    let mut combined = Vec::with_capacity(latent.len() + conditioning.len());
+    for batch_index in 0..batch {
+        let latent_start = batch_index * latent_channels * plane;
+        let conditioning_start = batch_index * conditioning_channels * plane;
+        combined.extend_from_slice(&latent[latent_start..latent_start + latent_channels * plane]);
+        combined.extend_from_slice(
+            &conditioning[conditioning_start..conditioning_start + conditioning_channels * plane],
+        );
+    }
+    Value::from_slice_f32(
+        &combined,
+        &[
+            latent_shape[0],
+            latent_shape[1] + conditioning_shape[1],
+            latent_shape[2],
+            latent_shape[3],
+        ],
+    )
+    .map_err(Into::into)
+}
+
 impl PipelineEngine {
     /// Run a bounded iterative (diffusion) denoise loop.
     ///
@@ -58,9 +108,9 @@ impl PipelineEngine {
         if num_steps == 0 {
             anyhow::bail!("iterative override num_steps must be >= 1");
         }
-        if start_step >= num_steps {
+        if start_step > num_steps {
             anyhow::bail!(
-                "iterative override start_step ({start_step}) must be < num_steps ({num_steps})"
+                "iterative override start_step ({start_step}) must be <= num_steps ({num_steps})"
             );
         }
         // Rebuild the scheduler when the step count changes (its schedule may be
@@ -174,6 +224,15 @@ impl PipelineEngine {
         // separate from the immutable `constants` pool prevents an output whose
         // name collides with a conditioning input from clobbering it.
         let mut carried: HashMap<String, Value> = HashMap::new();
+        if start_step == num_steps {
+            for (_, in_port) in &plan.loop_edges {
+                let endpoint = format!("{}.{}", plan.denoiser, in_port);
+                let seed = constants.get(&endpoint).with_context(|| {
+                    format!("missing iterative pipeline seed '{endpoint}' at start step")
+                })?;
+                carried.insert(in_port.clone(), clone_value(seed)?);
+            }
+        }
         let mut last_outputs: HashMap<String, Value> = HashMap::new();
         // Reset any multistep scheduler state before the loop (img2img reuses a
         // plan whose scheduler may hold state from a previous run).
@@ -436,14 +495,13 @@ impl PipelineEngine {
         for info in denoiser.inputs() {
             let port = info.name.as_str();
             let endpoint = format!("{}.{}", plan.denoiser, port);
+            let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
             // An override wins for its port. Two producers use overrides: the
             // scheduler's per-step input scaling (Euler) and CFG's unconditional
             // conditioning embedding.
             if let Some((_, over_value)) = overrides.iter().find(|(p, _)| *p == port) {
-                inputs.push((
-                    port.to_string(),
-                    coerce_value_to_dtype(over_value, info.dtype)?,
-                ));
+                let value = append_loop_conditioning(constants, &endpoint, over_value, is_loop)?;
+                inputs.push((port.to_string(), coerce_value_to_dtype(&value, info.dtype)?));
                 continue;
             }
             // Per-step timestep injection takes precedence for its port. Honor
@@ -457,7 +515,6 @@ impl PipelineEngine {
                 inputs.push((port.to_string(), ts));
                 continue;
             }
-            let is_loop = plan.loop_edges.iter().any(|(_, in_port)| in_port == port);
             let value = if is_loop {
                 if step == start_step {
                     constants.get(&endpoint).with_context(|| {
@@ -479,8 +536,10 @@ impl PipelineEngine {
                     .or(routed)
                     .with_context(|| format!("missing pipeline input '{endpoint}'"))?
             };
-            inputs.push((port.to_string(), coerce_value_to_dtype(value, info.dtype)?));
+            let value = append_loop_conditioning(constants, &endpoint, value, is_loop)?;
+            inputs.push((port.to_string(), coerce_value_to_dtype(&value, info.dtype)?));
         }
+
         let refs = inputs
             .iter()
             .map(|(name, value)| (name.as_str(), value))
@@ -642,4 +701,39 @@ fn dump_stage_timings(stages: &[serde_json::Value]) {
     };
     let path = std::path::Path::new(&dir).join("stages.json");
     let _ = std::fs::write(path, serde_json::json!({ "stages": stages }).to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inpaint_loop_input_is_nine_channels_in_declared_order() {
+        let latent =
+            Value::from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 4, 1, 2])
+                .unwrap();
+        let conditioning = Value::from_slice_f32(
+            &[
+                10.0, 11.0, // mask
+                20.0, 21.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0, // masked latent
+            ],
+            &[1, 5, 1, 2],
+        )
+        .unwrap();
+        let mut constants = PipelineTensors::new();
+        constants.insert("denoiser.sample.conditioning".to_string(), conditioning);
+
+        let combined =
+            append_loop_conditioning(&constants, "denoiser.sample", &latent, true).unwrap();
+
+        assert_eq!(combined.shape(), &[1, 9, 1, 2]);
+        assert_eq!(
+            combined.to_vec_f32_lossy().unwrap(),
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, // noisy latent
+                10.0, 11.0, // mask
+                20.0, 21.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0, // masked latent
+            ]
+        );
+    }
 }

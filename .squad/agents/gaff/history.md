@@ -138,3 +138,9 @@ Rejected Howie's ORT CUDA attention branch `7ff33496bda2` because `ONNX_GENAI_CU
 ## 2026-07-26T22:38:02+00:00 — Issue triage #78–#106 plus legacy items
 
 - Closed #1 with evidence and posted status/gap comments for #9, #13, #21, #78–#88, and #106; #88 remains partial pending Leon's RoPE capture DoD regression work.
+
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.

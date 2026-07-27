@@ -119,6 +119,10 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 🟢 Approved Rachael’s QKV-bias and paired gate/up+SwiGLU fusion after bit-exactness, misfire guards, portability, capture safety, and H200 performance checks; stacked throughput reached ~759 tok/s at 256 and ~789 at 1024.
 - 2026-07-21T23:55Z — Approved WP2 revised native image processor, DS-1 bounded shape propagation, and related dtype/opset reviews for the segment.
 
+## 2026-07-27T12:11:15-07:00 — CLI CI coverage lane
+- Added a dedicated `onnx-genai-cli` CI lane so ORT-linked CLI build/test/clippy coverage is no longer hidden behind the offline crate allowlist. The lane is isolated because `onnx-genai-ort-sys` downloads pinned ONNX Runtime 1.27.0 prebuilt archives when no local ORT is configured.
+- Verified the Linux lane ran `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`; observed green run 30298789423 cost 1m13s on Linux and 6m48s on Windows.
+
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
@@ -131,6 +135,8 @@ Revised the Phi decode lock after Holden's rejection: environment-gated real-mod
 
 - Recorded that ORT2 Phase 1 is complete, full ORT2 runtime vision is roughly 65–70% complete, and core GenAI functionality is roughly 70% complete; remaining work is breadth, compatibility, heterogeneous placement, packages, CI, and productization.
 
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
 ## 2026-07-26T21:06:24-07:00 — Mac CPU native-vs-ORT bench harness
 - Extended `crates/onnx-genai-bench/src/bin/compare.rs` with direct native CPU EP vs ORT CPU EP comparison, JSON output, warmups, repeated medians, p10-p95 spread, and measured-roofline fraction.
 - Measured Qwen2.5-0.5B on M1 Max: native decode median 3.83 tok/s (7.02% measured roofline) vs ORT CPU 45.45 tok/s (83.33% roofline), ratio 0.084x; model-load median native 108.5 ms vs ORT 1199.6 ms.

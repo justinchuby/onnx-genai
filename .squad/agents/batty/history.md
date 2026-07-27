@@ -59,3 +59,17 @@ Authored bit-exact native-CUDA-versus-ORT 64-token decode locks for Qwen2.5-0.5B
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Under Leon's lockout, added bf16 harness support and ragged causal/non-causal VarlenAttention parity tests; Bishop approved PR #267.
+
+## 2026-07-27T09:42:11-07:00 — CLI sampling/default-budget fixes
+
+- Changed CLI `generate`/`run` absent `--max-new-tokens` semantics to fill the model's remaining effective context instead of imposing a fixed cap; engine/server default remains 128.
+- REPL recomputes remaining-context ceiling per rendered turn and `/stats` shows context usage; no headroom reservation or pre-decode refusal policy.
+- Added a 512-token warning fallback only when no metadata/decode-path/`--max-context` limit is discoverable, avoiding unbounded ORT decode.
+- Fixed sampling flags so temperature/top-p/top-k disable greedy sampling unless `--temperature 0` or explicit `--greedy` applies; added `--no-greedy`.
+- Added shared `--max-context` plumbing for `generate` and `run`.
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
+
+## 2026-07-27T16:44:54Z — Wave 9 update
+Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_scale semantics and multi-ControlNet port backing before re-review.
+- 2026-07-27T16:44:54Z — Fixed PR #283 / #50 after Bishop REQUEST-CHANGES: removed invented `conditioning_scale`, bound real mobius `controlnet_cond`, made multi-ControlNet fail loudly, and added contract-pinning tests. Bishop approved; PR merged as 687612f5.

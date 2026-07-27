@@ -33,6 +33,23 @@ that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
 **Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
 run is also cancelled by **Ctrl-C** mid-generation.
 
+### Generation budget and sampling
+
+When `--max-new-tokens` is omitted, `generate` and `run` follow the model's
+effective context window: the CLI uses the remaining context after the prompt, so
+generation stops on EOS, a stop sequence, or the full context. Pass
+`--max-new-tokens` to override exactly. If neither metadata nor the decode path
+reveals a context limit, the CLI warns and uses a finite fallback instead of
+risking an ORT out-of-bounds decode; fix that with `--max-context TOKENS` or by
+declaring `model.max_sequence_length` in inference metadata.
+
+The REPL recomputes that remaining-context ceiling every turn as conversation
+history grows. `/stats` includes a terse context meter (`ctx used / max`).
+
+Sampling flags (`--temperature` above 0, `--top-p`, or `--top-k`) switch from
+greedy argmax to stochastic sampling. `--temperature 0` remains greedy. Use
+`--greedy` or `--no-greedy` to make the mode explicit.
+
 ### Polite CPU decode
 
 Use `--cpu-cores N` with `generate` or `run` to cap native CPU decode to N
@@ -64,10 +81,40 @@ unset, keeps it on.
 
 ## Runtime selection
 
-Choose an execution provider at runtime with `ONNX_GENAI_EP` (e.g. `cpu`,
-`cuda`). CUDA requires the `[cuda]` extra (or a separately installed
-`onnxruntime-gpu`). On Apple Silicon, the `onnxruntime-ep-mlx` plugin is
-installed by default.
+CUDA has two independent switches:
+
+1. Build-time features select which CUDA code is compiled in. `--features cuda`
+   enables ONNX Runtime's built-in `CUDAExecutionProvider` path only. `--features
+   native-cuda` enables the native backend plus the project's hand-written CUDA
+   EP (`onnx-runtime-ep-cuda`).
+2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
+   session to use CUDA, while the decode backend selects the decoder. In the REPL
+   (`run`), use `/backend native` to use the native decoder.
+
+CUDA failure modes are intentionally distinct:
+
+- If CUDA support was not compiled into the ORT layer, `ONNX_GENAI_EP=cuda`
+  fails session creation with a "CUDA support not compiled in" error; request
+  `cpu` (or rebuild with `--features cuda` / `--features native-cuda`) instead.
+- If CUDA support was compiled in but the provider is unavailable at runtime
+  (for example, no loadable CUDA provider library, driver, or GPU),
+  `ONNX_GENAI_EP=cuda` also fails session creation and tells you to request
+  `ONNX_GENAI_EP=cpu` when CPU execution is intentional.
+- When CUDA is compiled in and available for the ORT/native session but the
+  native CUDA EP cannot claim every executable node, the native runtime falls
+  back to its CPU EP. Set `ONNX_GENAI_REQUIRE_CUDA=1` to reject that node-level
+  CPU fallback. On Apple Silicon, the `onnxruntime-ep-mlx` plugin is installed
+  by default.
+
+Windows PowerShell example for the native CUDA path:
+
+```powershell
+$env:ONNX_GENAI_EP = "cuda"
+$env:ONNX_GENAI_REQUIRE_CUDA = "1"
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- run .\path\to\model
+# In the REPL:
+# /backend native
+```
 
 Python 3.11+ is required (the `onnxruntime` dependency ships no earlier wheels).
 
