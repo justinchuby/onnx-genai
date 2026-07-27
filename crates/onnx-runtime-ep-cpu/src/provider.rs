@@ -188,6 +188,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "QLinearMatMul"
+            && op.domain.is_empty()
+            && let Some(reason) =
+                crate::kernels::qlinear_matmul::unsupported_reason(input_dtypes, shapes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
@@ -535,6 +542,33 @@ mod tests {
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
         assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn qlinear_matmul_claim_gate_checks_quantized_dtypes() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
+        let valid = [
+            DataType::Uint8,
+            DataType::Float32,
+            DataType::Uint8,
+            DataType::Int8,
+            DataType::Float32,
+            DataType::Int8,
+            DataType::Float32,
+            DataType::Uint8,
+        ];
+        assert!(
+            ep.supports_op(&node, 10, &[], &valid, &[]).is_supported(),
+            "valid QLinearMatMul types should be claimed"
+        );
+
+        let mut invalid = valid;
+        invalid[0] = DataType::Float32;
+        let rejected = ep.supports_op(&node, 10, &[], &invalid, &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected.reason().unwrap();
+        assert!(reason.contains("A must have Int8 or Uint8"), "{reason}");
     }
 
     #[test]

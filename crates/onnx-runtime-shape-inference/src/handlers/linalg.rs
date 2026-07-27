@@ -19,6 +19,19 @@ pub fn matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `QLinearMatMul` has MatMul's NumPy shape semantics; its output type is the
+/// type of `y_zero_point` (input 7).
+pub fn qlinear_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let a = ctx.input_shape(0).map(<[DimExpr]>::to_vec);
+    let b = ctx.input_shape(3).map(<[DimExpr]>::to_vec);
+    let dtype = ctx.input_dtype(7);
+    if let (Some(a), Some(b), Some(dtype)) = (a, b, dtype) {
+        let shape = matmul_shape(ctx, &a, &b, "QLinearMatMul")?;
+        ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
 /// Quantized matmul with packed weights and output width supplied by `N`.
 pub fn quantized_matmul(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(mut shape) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
@@ -689,6 +702,7 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 /// Register the linear-algebra family.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MatMul", 1, matmul);
+    reg.register("", "QLinearMatMul", 10, qlinear_matmul);
     reg.register("", "Gemm", 1, gemm);
     reg.register("pkg.nxrt", "BlockQuantizedMatMul", 1, quantized_matmul);
     reg.register("com.microsoft", "MatMulNBits", 1, quantized_matmul);

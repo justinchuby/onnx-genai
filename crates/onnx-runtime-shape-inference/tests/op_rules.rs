@@ -333,6 +333,27 @@ fn matmul_contraction_mismatch_errors() {
 }
 
 #[test]
+fn qlinear_matmul_uses_matmul_shape_and_output_zero_point_dtype() {
+    let n = node("QLinearMatMul", 8, 1);
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Uint8, vec![c(2), c(3)]),
+            f32in(vec![]),
+            tin(DataType::Uint8, vec![]),
+            tin(DataType::Int8, vec![c(3), c(4)]),
+            f32in(vec![c(4)]),
+            tin(DataType::Int8, vec![c(4)]),
+            f32in(vec![]),
+            tin(DataType::Int8, vec![]),
+        ],
+        10,
+    );
+    assert_eq!(out_shape(&outs), vec![c(2), c(4)]);
+    assert_eq!(out_dtype(&outs), DataType::Int8);
+}
+
+#[test]
 fn mod_broadcasts_and_preserves_dtype() {
     let n = node("Mod", 2, 1);
     let outs = run(
