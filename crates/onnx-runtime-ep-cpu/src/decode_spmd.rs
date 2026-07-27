@@ -933,6 +933,24 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
 /// without forcing a build.
 static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
 
+/// The label describing the active decode path, set once at pool build time.
+/// Queryable via [`decode_path_label`] so callers can inspect which strategy is
+/// active without parsing stderr or comparing throughput numbers.
+static DECODE_PATH_LABEL: OnceLock<&'static str> = OnceLock::new();
+
+/// Human-readable label for the decode path that was selected. Returns the
+/// path name once the pool initialization has run, or `"unresolved"` if it
+/// has not been queried yet.
+///
+/// Examples:
+/// - `"spmd-pool"` — the persistent SPMD pool (default or `=1`)
+/// - `"adaptive"` — load-adaptive calibration (`=auto`)
+/// - `"flat"` — the flat legacy path (`=0` or fallback)
+/// - `"unresolved"` — pool initialization has not run yet
+pub fn decode_path_label() -> &'static str {
+    DECODE_PATH_LABEL.get().copied().unwrap_or("unresolved")
+}
+
 /// The lazily built persistent SPMD layout, or `None` when the mode is opted out
 /// or the safe auto-enable gate declines. Built once and reused for the whole
 /// process.
@@ -1180,32 +1198,44 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 }
 
 /// Log the first persistent-pool fallback/pinning problem once so a restricted
-/// or unsupported host surfaces the reason without spamming every worker.
+/// or unsupported host surfaces the reason without spamming every worker. Gated
+/// behind `NXRT_CALIB_DEBUG` — a library must not print to stderr by default.
 fn report_spmd_fallback(message: &str) {
+    DECODE_PATH_LABEL.get_or_init(|| "flat");
     static REPORTED: OnceLock<()> = OnceLock::new();
-    if REPORTED.set(()).is_ok() {
+    if REPORTED.set(()).is_ok() && std::env::var("NXRT_CALIB_DEBUG").is_ok() {
         eprintln!("onnx-genai: persistent SPMD decode pool: {message}");
     }
 }
 
-/// Announce once how the persistent SPMD pool was built so the selected decode
-/// path is inspectable: `On` (the default or `=1`) always dispatches to it, while
-/// `Adaptive` (`=auto`) builds it for calibration and commits once.
+/// Record the selected decode path in the queryable [`DECODE_PATH_LABEL`] static
+/// so callers can inspect it via [`decode_path_label`]. No unconditional stderr
+/// output — a library must not write to streams the caller owns. When
+/// `NXRT_CALIB_DEBUG` is set, a diagnostic line is emitted for debugging.
 fn report_pool_built(mode: PersistenceMode) {
-    static REPORTED: OnceLock<()> = OnceLock::new();
-    if REPORTED.set(()).is_ok() {
-        match mode {
-            PersistenceMode::On => eprintln!(
-                "onnx-genai: decode path = persistent SPMD pool (default). \
-                 Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto for load-adaptive \
-                 selection, =0 for the flat legacy path"
-            ),
-            PersistenceMode::Adaptive => eprintln!(
-                "onnx-genai: decode path = adaptive (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto); \
-                 the initial decode steps are timed both ways and the faster path is kept \
-                 permanently. Set =1 or unset for the deterministic pool, =0 for flat"
-            ),
-            PersistenceMode::Off => {} // pool not built; nothing to report
+    let label = match mode {
+        PersistenceMode::On => "spmd-pool",
+        PersistenceMode::Adaptive => "adaptive",
+        PersistenceMode::Off => "flat",
+    };
+    DECODE_PATH_LABEL.get_or_init(|| label);
+    if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+        static REPORTED: OnceLock<()> = OnceLock::new();
+        if REPORTED.set(()).is_ok() {
+            match mode {
+                PersistenceMode::On => eprintln!(
+                    "NXRT_CALIB: decode path = persistent SPMD pool (default). \
+                     Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto for load-adaptive \
+                     selection, =0 for the flat legacy path"
+                ),
+                PersistenceMode::Adaptive => eprintln!(
+                    "NXRT_CALIB: decode path = adaptive \
+                     (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto); \
+                     the initial decode steps are timed both ways and the faster path is \
+                     kept permanently. Set =1 or unset for the deterministic pool, =0 for flat"
+                ),
+                PersistenceMode::Off => {}
+            }
         }
     }
 }
