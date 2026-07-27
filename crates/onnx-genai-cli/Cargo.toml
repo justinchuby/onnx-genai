@@ -66,7 +66,7 @@ libc = "0.2"
 
 [dev-dependencies]
 # The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 onnx-genai = { workspace = true }
 serde_json = { workspace = true }
 

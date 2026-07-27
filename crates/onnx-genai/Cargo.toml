@@ -35,7 +35,7 @@ clap = { workspace = true }
 tokenizers = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 rand = "0.9"
 rand_distr = "0.5"
 

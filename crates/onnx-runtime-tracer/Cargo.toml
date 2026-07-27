@@ -42,10 +42,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Perfetto protobuf serialization. Pure Rust, no `protoc` required — the trace
 # schema subset is hand-written with `#[derive(prost::Message)]`.
-prost = { version = "0.13", optional = true }
+prost = { workspace = true, optional = true }
 # Runtime dlopen/dlsym of libcupti for the `cupti` feature. Pure Rust, no
 # link-time CUDA dependency; only pulled in when `cupti` is enabled.
-libloading = { version = "0.8", optional = true }
+libloading = { workspace = true, optional = true }
 # Intel ITT (VTune/Inspector) task annotations for the `itt` feature. Links the
 # static `ittnotify` C library (built from vendored source by `ittapi-sys` via
 # `cc`, no system/`protoc` dependency); only pulled in when `itt` is enabled. The
@@ -64,4 +64,4 @@ windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
 [dev-dependencies]
 # Used only by the `perfetto` feature's export test to decode and validate the
 # emitted `Trace` protobuf. Not part of the library's dependency surface.
-prost = "0.13"
+prost = { workspace = true }
