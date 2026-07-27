@@ -139,6 +139,8 @@ pub(super) struct TurnInput {
     pub(super) images: Vec<PathBuf>,
     pub(super) audio: Vec<PathBuf>,
     pub(super) options: GenerateOptions,
+    pub(super) prompt_tokens: Option<usize>,
+    pub(super) context_limit: Option<usize>,
 }
 
 /// The loaded model, which is either a single decoder graph or a declared
@@ -289,8 +291,12 @@ impl fmt::Display for SessionSummary<'_> {
         )?;
         writeln!(
             formatter,
-            "  sampling: max_new_tokens={} temperature={} top_p={} top_k={} greedy={}",
+            "  sampling: max_new_tokens={} max_context={} temperature={} top_p={} top_k={} greedy={}",
             self.options.max_new_tokens,
+            self.options
+                .max_context
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
             self.options.temperature,
             self.options.top_p,
             self.options.top_k,
@@ -466,6 +472,13 @@ impl Backend {
         }
     }
 
+    pub(super) fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        match self {
+            Self::Text(engine) => engine.effective_max_context(options),
+            Self::Pipeline(_) => options.max_context,
+        }
+    }
+
     pub(super) fn generate(
         &mut self,
         turn: TurnInput,
@@ -507,6 +520,87 @@ impl Backend {
     }
 }
 
+pub(super) fn apply_context_sized_max_new_tokens(
+    options: &mut GenerateOptions,
+    max_new_tokens_was_explicit: bool,
+    prompt_tokens: usize,
+    effective_max_context: Option<usize>,
+) -> bool {
+    if max_new_tokens_was_explicit {
+        return false;
+    }
+    match effective_max_context {
+        Some(limit) => {
+            // Leave the context-window check, not max_new_tokens, as the natural
+            // stop so the engine reports FinishReason::Length at the boundary.
+            options.max_new_tokens = limit.saturating_sub(prompt_tokens).saturating_add(1);
+            false
+        }
+        None => {
+            options.max_new_tokens = super::CLI_FALLBACK_MAX_NEW_TOKENS;
+            true
+        }
+    }
+}
+
+pub(super) fn warn_missing_context_limit(max_new_tokens: usize) {
+    eprintln!(
+        "warning: model context length could not be inferred from inference metadata or the decode path; using finite fallback --max-new-tokens {max_new_tokens}. Configure --max-context, or declare model.max_sequence_length in inference metadata, to generate until the context window is full without risking an ORT out-of-bounds decode."
+    );
+}
+
+pub(super) fn context_exhaustion_error(prompt_tokens: usize, limit: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "What: the prompt already fills the context window ({prompt_tokens}/{limit} tokens). \
+         Why: there is no room to generate even one token, so returning an empty answer would be misleading. \
+         How: shorten the prompt or use a model/package with a larger context window."
+    )
+}
+
+pub(super) fn full_repl_context_message(prompt_tokens: usize, limit: usize) -> String {
+    format!(
+        "context window is full ({prompt_tokens}/{limit} tokens); no answer was generated and this turn was not kept. Use /reset to clear the conversation history, shorten your prompt, or use a model/package with a larger context window."
+    )
+}
+
+pub(super) fn context_window_is_full(
+    prompt_tokens: usize,
+    effective_max_context: Option<usize>,
+) -> Option<usize> {
+    effective_max_context.filter(|&limit| prompt_tokens >= limit)
+}
+
+pub(super) fn drop_exhausted_repl_turn(
+    history: &mut Vec<ChatMessage>,
+    prompt_tokens: usize,
+    effective_max_context: Option<usize>,
+) -> Option<String> {
+    context_window_is_full(prompt_tokens, effective_max_context).map(|limit| {
+        history.pop();
+        full_repl_context_message(prompt_tokens, limit)
+    })
+}
+
+fn reasoning_incomplete_note(
+    finish_reason: Option<&str>,
+    turn_max_new_tokens: usize,
+    max_new_tokens_was_explicit: bool,
+) -> String {
+    let finish_reason = finish_reason.unwrap_or("unknown");
+    let next_step = if max_new_tokens_was_explicit {
+        format!(
+            "If you want longer reasoning, try --max-new-tokens {}.",
+            turn_max_new_tokens.saturating_mul(2)
+        )
+    } else {
+        "If the context window is exhausted, use /reset to clear conversation history or shorten the prompt."
+            .to_string()
+    };
+    format!(
+        "note: generation stopped inside the model's reasoning (finish reason: {finish_reason}). No answer was produced, so this turn is not kept. {next_step}"
+    )
+}
+
 /// Turn a prompt plus its attachments into a pipeline generation request.///
 /// Audio replaces the prompt entirely: the transcription decoder is seeded with
 /// the model's own transcription token sequence because the spoken audio, not
@@ -522,6 +616,8 @@ pub(super) fn build_pipeline_request(
         images,
         audio,
         options,
+        prompt_tokens: _,
+        context_limit: _,
     } = turn;
 
     if let Some(path) = audio.first() {
@@ -619,6 +715,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut live = live_turn::LiveTurn::new();
     let mut template = load_chat_template(&model_dir, raw_mode);
     let mut reasoning = detect_reasoning(template.as_ref());
+    let mut warned_missing_context_limit = false;
 
     eprintln!(
         "onnx-genai interactive session ({} input). Enter a prompt, or an empty line / Ctrl-D to exit.\n\
@@ -749,6 +846,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                 model_dir = settings.model_dir.clone();
                                 template = load_chat_template(&model_dir, raw_mode);
                                 reasoning = detect_reasoning(template.as_ref());
+                                warned_missing_context_limit = false;
                                 // A conversation is about the model that held
                                 // it; replaying it into a different model would
                                 // attribute words to something that never said
@@ -948,18 +1046,46 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             println!("(sending {})", display_paths(&staged_images));
         }
         let rendered = build_turn_prompt(template.as_ref(), &history)?;
+        let mut turn_options = sampling_options.clone();
+        let prompt_tokens = backend.prompt_tokens(&rendered).unwrap_or_default();
+        let effective_max_context = backend.effective_max_context(&turn_options);
+        if let Some(message) =
+            drop_exhausted_repl_turn(&mut history, prompt_tokens, effective_max_context)
+        {
+            eprintln!("{message}");
+            image_attachments = staged_images;
+            audio_attachments = staged_audio;
+            continue;
+        }
+        let used_fallback = apply_context_sized_max_new_tokens(
+            &mut turn_options,
+            args.sampling.max_new_tokens.is_some(),
+            prompt_tokens,
+            effective_max_context,
+        );
+        if used_fallback && !warned_missing_context_limit {
+            warn_missing_context_limit(turn_options.max_new_tokens);
+            warned_missing_context_limit = true;
+        }
+        let turn_max_new_tokens = turn_options.max_new_tokens;
         let turn = TurnInput {
             prompt: rendered,
             images: staged_images,
             audio: staged_audio,
-            options: sampling_options.clone(),
+            options: turn_options,
+            prompt_tokens: Some(prompt_tokens),
+            context_limit: effective_max_context,
         };
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
         profile.execution_provider = settings.resolved_providers();
         profile.decode_backend = Some(settings.backend_name().to_string());
         profile.phase("model load", load_elapsed);
-        profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
+        profile.prompt_tokens = Some(prompt_tokens);
+        profile.context = effective_max_context.map(|max_tokens| profile::ContextUsage {
+            used_tokens: prompt_tokens,
+            max_tokens,
+        });
         if let Some(memory) = backend.kv_usage() {
             profile.memory = memory;
         }
@@ -991,7 +1117,12 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             // record an empty assistant turn, which would teach
                             // the model that questions go unanswered.
                             eprintln!(
-                                "note: generation stopped inside the model's reasoning, so this turn is not kept. Raise --max-new-tokens."
+                                "{}",
+                                reasoning_incomplete_note(
+                                    profile.finish_reason.as_deref(),
+                                    turn_max_new_tokens,
+                                    args.sampling.max_new_tokens.is_some(),
+                                )
                             );
                             history.pop();
                             profiling.emit_when(show_profile, &mut profile)?;

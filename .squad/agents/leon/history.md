@@ -126,3 +126,8 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - PR #267 for #86 merged: pkg.nxrt::VarlenAttention consumes Attention-24 nonpad_kv_seqlen. Bishop required bf16 coverage; Batty supplied the lockout revision.
+
+## 2026-07-27T12:20:00-07:00 — CLI context exhaustion guard
+
+- Repaired PR #277 lockout defect in `fix/cli-sampling-and-context`: CLI now rejects `prompt_tokens >= effective_max_context` before decode, so exhausted turns do not append empty assistant history.
+- Added equality/greater-than boundary unit coverage and preserved the one-token-room healthy path; clippy is clean with the known `pages.rs:129` lint allowed.

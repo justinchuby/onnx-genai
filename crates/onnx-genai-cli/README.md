@@ -33,6 +33,23 @@ that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
 **Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
 run is also cancelled by **Ctrl-C** mid-generation.
 
+### Generation budget and sampling
+
+When `--max-new-tokens` is omitted, `generate` and `run` follow the model's
+effective context window: the CLI uses the remaining context after the prompt, so
+generation stops on EOS, a stop sequence, or the full context. Pass
+`--max-new-tokens` to override exactly. If neither metadata nor the decode path
+reveals a context limit, the CLI warns and uses a finite fallback instead of
+risking an ORT out-of-bounds decode; fix that with `--max-context TOKENS` or by
+declaring `model.max_sequence_length` in inference metadata.
+
+The REPL recomputes that remaining-context ceiling every turn as conversation
+history grows. `/stats` includes a terse context meter (`ctx used / max`).
+
+Sampling flags (`--temperature` above 0, `--top-p`, or `--top-k`) switch from
+greedy argmax to stochastic sampling. `--temperature 0` remains greedy. Use
+`--greedy` or `--no-greedy` to make the mode explicit.
+
 ### Polite CPU decode
 
 Use `--cpu-cores N` with `generate` or `run` to cap native CPU decode to N
