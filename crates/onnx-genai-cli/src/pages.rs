@@ -126,7 +126,7 @@ fn tier_name(device: onnx_genai::kv::Device) -> String {
 }
 
 fn percent(part: usize, whole: usize) -> usize {
-    if whole == 0 { 0 } else { part * 100 / whole }
+    part.saturating_mul(100).checked_div(whole).unwrap_or(0)
 }
 
 #[cfg(test)]

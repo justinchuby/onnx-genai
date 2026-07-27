@@ -119,6 +119,9 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 🟢 Approved Rachael’s QKV-bias and paired gate/up+SwiGLU fusion after bit-exactness, misfire guards, portability, capture safety, and H200 performance checks; stacked throughput reached ~759 tok/s at 256 and ~789 at 1024.
 - 2026-07-21T23:55Z — Approved WP2 revised native image processor, DS-1 bounded shape propagation, and related dtype/opset reviews for the segment.
 
+## 2026-07-27T12:11:15-07:00 — CLI CI coverage lane
+- Added a dedicated `onnx-genai-cli` CI lane so ORT-linked CLI build/test/clippy coverage is no longer hidden behind the offline crate allowlist. The lane is isolated because `onnx-genai-ort-sys` downloads pinned ONNX Runtime 1.27.0 prebuilt archives when no local ORT is configured.
+
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
