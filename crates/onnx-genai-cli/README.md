@@ -64,10 +64,29 @@ unset, keeps it on.
 
 ## Runtime selection
 
-Choose an execution provider at runtime with `ONNX_GENAI_EP` (e.g. `cpu`,
-`cuda`). CUDA requires the `[cuda]` extra (or a separately installed
-`onnxruntime-gpu`). On Apple Silicon, the `onnxruntime-ep-mlx` plugin is
-installed by default.
+CUDA has two independent switches:
+
+1. Build-time features select which CUDA code is compiled in. `--features cuda`
+   enables ONNX Runtime's built-in `CUDAExecutionProvider` path only. `--features
+   native-cuda` enables the native backend plus the project's hand-written CUDA
+   EP (`onnx-runtime-ep-cuda`).
+2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
+   session to use CUDA, while the decode backend selects the decoder. In the REPL
+   (`run`), use `/backend native` to use the native decoder.
+
+If CUDA was not compiled in, a `cuda` request silently falls back to CPU. Set
+`ONNX_GENAI_REQUIRE_CUDA=1` to make that failure loud instead. On Apple Silicon,
+the `onnxruntime-ep-mlx` plugin is installed by default.
+
+Windows PowerShell example for the native CUDA path:
+
+```powershell
+$env:ONNX_GENAI_EP = "cuda"
+$env:ONNX_GENAI_REQUIRE_CUDA = "1"
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- run .\path\to\model
+# In the REPL:
+# /backend native
+```
 
 Python 3.11+ is required (the `onnxruntime` dependency ships no earlier wheels).
 

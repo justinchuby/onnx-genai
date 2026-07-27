@@ -15,7 +15,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
 default = []
-# Forward the engine CUDA execution provider + on-device argmax through the C ABI.
+# Forward the engine's native CUDA EP + on-device argmax through the C ABI.
 cuda = ["onnx-genai-engine/cuda"]
 
 [dependencies]
