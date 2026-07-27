@@ -256,3 +256,36 @@ Machine was under heavy load from concurrent agents. Used
 falls back to flat under load). Used 200 tokens to dilute the ~1s pool init spike.
 
 `check_profile_table.py` passes (6 samples × 4 rows). `cargo fmt --check` clean.
+
+### Session 8 — FP16 Discrepancy Resolution
+
+Coordinator stopped docs work: Fact Checker measured native FP16 at 36.1 tok/s
+vs my 57.5 claim. Three of four cells reproduced; only native FP16 diverged.
+
+**Root cause: auto-calibrator under load.** Under system contention, the SPMD
+pool auto-calibrator selects the flat (single-threaded) path. This specifically
+devastates native FP16 (loses multi-threaded bandwidth advantage) while ORT
+(MLAS, no auto-calibrator) and native FP32 are barely affected.
+
+**Re-measurement on quiet machine (load avg <6), FC's exact protocol:**
+
+| Backend | Decode tok/s | Spread |
+|---|---|---|
+| Native FP16 | **59.78** | [58.77, 59.81] |
+| ORT FP16 | 42.33 | [42.06, 42.41] |
+| Native FP32 | 42.07 | [41.96, 42.24] |
+| ORT FP32 | 45.91 | [45.84, 46.06] |
+
+Native FP16/ORT FP16 = **1.41×**. Native FP16/ORT FP32 = **1.30×**.
+<2% CoV across 5 runs. Number exceeds original 57.5 claim.
+
+**Metric clarification:** Original 57.5 was 1000/p50_ms. Correct throughput
+(tokens/total_time from compare harness) is 59.78. The p50 metric underestimated
+because it ignores the distribution shape.
+
+**500-token non-determinism: cannot reproduce on quiet machine.** Both auto-cal
+and forced pool produce byte-identical tokens at 500 tokens. FC's non-determinism
+was from auto-calibrator path-switching under load (flat vs pool → different
+floating-point reduction order → different logits → different argmax).
+
+**TTFT still ~10× worse** (1070 ms vs 107 ms). Known, documented weakness.
