@@ -195,6 +195,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "PackedVarlenAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::packed_varlen_attention::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "QMoE"
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::qmoe::unsupported_reason(op)
