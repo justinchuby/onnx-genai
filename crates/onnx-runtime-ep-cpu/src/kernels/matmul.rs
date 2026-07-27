@@ -11,7 +11,7 @@
 //!   register-tiled, rayon-parallelized pure-Rust f32 GEMM ([`gemm_generic`]).
 //!   It is the correctness baseline and contains no `unsafe`.
 //! * **`SimdX86`** (default on AVX2/FMA x86-64, runtime-detected): an
-//!   MLAS-style packed SIMD f32 SGEMM ([`simd_gemm`]) — panel packing + a
+//!   MLAS-style packed SIMD f32 SGEMM ([`x86_sgemm`]) — panel packing + a
 //!   `6×16` AVX2/FMA register microkernel + K/N cache blocking, parallelized
 //!   over column strips. Selected automatically with no cargo feature; falls
 //!   back to Generic when AVX2/FMA is absent.
@@ -40,13 +40,13 @@ use crate::strided::{next_index, numel};
 // MLAS-style packed SIMD f32 GEMM (the `SimdX86` backend). Kept in a sibling
 // file but included here so `kernels/mod.rs` needs no edit; it is an internal
 // perf detail of the MatMul hot path, not a new op.
-#[path = "simd_gemm.rs"]
-mod simd_gemm;
+#[path = "x86_sgemm.rs"]
+mod x86_sgemm;
 
 // Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. It is
 // runtime-detected and otherwise falls back to the portable blocked half GEMM.
-#[path = "bf16_gemm.rs"]
-mod bf16_gemm;
+#[path = "x86_bf16.rs"]
+mod x86_bf16;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[path = "accelerate_gemm.rs"]
@@ -291,7 +291,7 @@ fn gemm_with_backend(
         // Built-in MLAS-style packed SIMD backend for AVX2/FMA x86-64 hosts.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         CpuBackend::SimdX86 => {
-            simd_gemm::sgemm_simd(a, b, c, m, k, n);
+            x86_sgemm::sgemm_simd(a, b, c, m, k, n);
             Ok(())
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -723,8 +723,8 @@ fn half_gemm_tile(
     n: usize,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if format == HalfFormat::Bf16 && bf16_gemm::native_available() {
-        bf16_gemm::gemm(a, b, c, m, k, n);
+    if format == HalfFormat::Bf16 && x86_bf16::native_available() {
+        x86_bf16::gemm(a, b, c, m, k, n);
         return;
     }
 
@@ -1312,7 +1312,7 @@ mod tests {
         // SAME bf16-rounded operands within bf16 tolerance, and (b) be no worse
         // than the widen-to-f32 upcast path — bf16-input products are exact in
         // f32, so both paths differ from f64 only by f32 summation rounding.
-        if !bf16_gemm::native_available() {
+        if !x86_bf16::native_available() {
             eprintln!("skipping: host lacks avx512_bf16");
             return;
         }
@@ -1365,7 +1365,7 @@ mod tests {
 
             // Native bf16 path.
             let mut native = vec![0.0f32; m * n];
-            bf16_gemm::gemm(&a_bits, &b_bits, &mut native, m, k, n);
+            x86_bf16::gemm(&a_bits, &b_bits, &mut native, m, k, n);
 
             let rel = |got: f32, want: f64| -> f64 {
                 let denom = want.abs().max(1.0);
@@ -1403,7 +1403,7 @@ mod tests {
         // The public MatMul kernel (which auto-routes to the native path on this
         // host) must produce a bf16 result matching a direct f64 reference for a
         // K that is not a multiple of the 32-lane bf16 width.
-        if !bf16_gemm::native_available() {
+        if !x86_bf16::native_available() {
             eprintln!("skipping: host lacks avx512_bf16");
             return;
         }
@@ -1451,7 +1451,7 @@ mod tests {
     #[ignore = "microbench: run explicitly with --ignored --nocapture"]
     fn bench_bf16_native_vs_upcast() {
         use std::time::Instant;
-        if !bf16_gemm::native_available() {
+        if !x86_bf16::native_available() {
             eprintln!("skipping bench: host lacks avx512_bf16");
             return;
         }
@@ -1489,7 +1489,7 @@ mod tests {
                 median3(Box::new(move || {
                     let mut c = vec![0.0f32; m * n];
                     let t = Instant::now();
-                    bf16_gemm::gemm(&a, &b, &mut c, m, k, n);
+                    x86_bf16::gemm(&a, &b, &mut c, m, k, n);
                     std::hint::black_box(&c);
                     t.elapsed().as_secs_f64() * 1e3
                 }))
