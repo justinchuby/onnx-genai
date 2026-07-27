@@ -165,3 +165,22 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Added a dispatcher reach test proving `sdpa_f32(...)` executes the NEON path on Apple Silicon when MLAS is not selected.
 - Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.
 - Tightened model-scale GEMV max-relative tolerance from 2.0% to 1.8%, based on Chew's 1.57% measured worst legitimate f32 accumulation-order drift.
+
+## 2026-07-27T14:35:00-07:00 — Dispatch-branch coverage audit (PR #275 blocking bugs)
+
+- **Finding: 12 of 13 reachable dispatch combinations in `matmul.rs` had zero test coverage** while codecov reported PASS. Line coverage (78%) masked the gap.
+- Added 8 new dispatch-reachability tests with atomic hit counters:
+  - `fp16_m1_column_major_b_reaches_colmaj_gemv`
+  - `fp16_m1_non_constant_colmaj_b_does_not_reach_gemv`
+  - `f16_m_ge2_non_constant_non_contiguous_b_does_not_enter_rescue` ← **THE BUG GUARD**
+  - `f16_constant_non_contiguous_b_enters_rescue_block`
+  - `f16_constant_non_contiguous_non_colmaj_b_enters_rescue`
+  - `f16_non_constant_non_contiguous_b_produces_correct_result`
+  - `f32_m_ge2_does_not_enter_half_or_rescue_paths`
+  - `bf16_non_contiguous_does_not_enter_f16_rescue`
+- Added two new static counters: `GEMV_F16_COLMAJ_TEST_HITS`, `NONCONTIG_RESCUE_TEST_HITS`.
+- **Guard-break evidence:** removing `constant_inputs[1]` guard → test fails with exact message proving wrong dispatch.
+- Region coverage improved: 79.6% → 88.8% (+9.2pp).
+- Recommended enforcement: every new dispatch branch ships with a `_TEST_HITS` reachability test.
+- Decision filed: `.squad/decisions/inbox/pris-dispatch-coverage-audit.md`.
+- Commit: `17be7087` (coordinated with Iran's fix in same commit).
