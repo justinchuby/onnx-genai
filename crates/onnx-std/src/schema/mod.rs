@@ -435,6 +435,25 @@ const BUILTIN_YAML: &[&str] = &[
     include_str!("../../schemas/standard/unsqueeze_v11.yaml"),
     include_str!("../../schemas/standard/unsqueeze_v13.yaml"),
     include_str!("../../schemas/standard/unsqueeze.yaml"),
+    include_str!("../../schemas/standard/bit_shift.yaml"),
+    include_str!("../../schemas/standard/bitwise_and.yaml"),
+    include_str!("../../schemas/standard/bitwise_or.yaml"),
+    include_str!("../../schemas/standard/bitwise_xor.yaml"),
+    include_str!("../../schemas/standard/bitwise_not.yaml"),
+    include_str!("../../schemas/standard/dropout.yaml"),
+    include_str!("../../schemas/standard/dropout_v22.yaml"),
+    include_str!("../../schemas/standard/eye_like.yaml"),
+    include_str!("../../schemas/standard/eye_like_v22.yaml"),
+    include_str!("../../schemas/standard/group_normalization.yaml"),
+    include_str!("../../schemas/standard/group_normalization_v21.yaml"),
+    include_str!("../../schemas/standard/hardmax.yaml"),
+    include_str!("../../schemas/standard/is_inf.yaml"),
+    include_str!("../../schemas/standard/is_nan.yaml"),
+    include_str!("../../schemas/standard/lp_normalization.yaml"),
+    include_str!("../../schemas/standard/prelu.yaml"),
+    include_str!("../../schemas/standard/selu.yaml"),
+    include_str!("../../schemas/standard/thresholded_relu.yaml"),
+    include_str!("../../schemas/standard/unique.yaml"),
 ];
 
 // FOLLOW-UP §7.4: complete the standard and ONNX-ML YAML catalogues.
@@ -700,6 +719,69 @@ type_constraints:
         ] {
             assert!(registry.lookup(name, "", 25).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn kernel_gap_schemas_match_opset_boundaries_and_catalog_count() {
+        let registry = SchemaRegistry::builtins();
+        assert_eq!(registry.schemas.len(), 99);
+        assert_eq!(registry.iter().count(), 111);
+
+        for (name, since_version) in [
+            ("BitShift", 11),
+            ("BitwiseAnd", 18),
+            ("BitwiseOr", 18),
+            ("BitwiseXor", 18),
+            ("BitwiseNot", 18),
+            ("Hardmax", 13),
+            ("IsInf", 10),
+            ("IsNaN", 9),
+            ("LpNormalization", 1),
+            ("PRelu", 16),
+            ("Selu", 6),
+            ("ThresholdedRelu", 10),
+            ("Unique", 11),
+        ] {
+            assert!(
+                registry.lookup(name, "", since_version - 1).is_none(),
+                "{name}"
+            );
+            assert_eq!(
+                registry
+                    .lookup(name, "", since_version)
+                    .unwrap()
+                    .since_version,
+                since_version,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            registry.lookup("Dropout", "", 21).unwrap().since_version,
+            13
+        );
+        assert_eq!(
+            registry.lookup("Dropout", "", 22).unwrap().since_version,
+            22
+        );
+        assert_eq!(registry.lookup("EyeLike", "", 21).unwrap().since_version, 9);
+        assert_eq!(
+            registry.lookup("EyeLike", "", 22).unwrap().since_version,
+            22
+        );
+        assert_eq!(
+            registry
+                .lookup("GroupNormalization", "", 20)
+                .unwrap()
+                .since_version,
+            18
+        );
+        assert_eq!(
+            registry
+                .lookup("GroupNormalization", "", 21)
+                .unwrap()
+                .since_version,
+            21
+        );
     }
 
     #[test]

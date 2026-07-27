@@ -270,6 +270,15 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if matches!(
+            op.op_type.as_str(),
+            "BitwiseAnd" | "BitwiseOr" | "BitwiseXor" | "BitwiseNot" | "BitShift"
+        ) && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::bitwise::unsupported_reason(&op.op_type, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
         let elems: u64 = shapes
             .iter()

@@ -131,3 +131,5 @@ Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/
 - Fixed Batty's rejected CLI backend flag revision: profile output, REPL /session, bare /backend, and /stats now use the loaded engine's resolved backend; auto is only shown as a requested backend when it differs.
 - Kept --backend on transcribe deliberately because speech transcription drives the same autoregressive pipeline decoder; added parser and invalid-backend coverage plus README documentation.
 - Verified cargo build -p onnx-genai-cli, cargo test -p onnx-genai-cli --lib, cargo fmt -p onnx-genai-cli -- --check, cargo clippy -p onnx-genai-cli --all-targets -- -D warnings, and cargo build -p onnx-genai-server.
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- Fixed PR #288 tests after Moss lockout: LogSoftmax overflow-stability is value-falsifiable; BitShift width guard is locked by source-contract test.

@@ -16,3 +16,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-27T16:44:54Z — Wave 8 update
 - Approved Gorman PR #274 for #53 typed `generate_image` + latent streaming; merged as 270fade1.
+
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- Approved PR #292 after mutation-proving eager multi-output dispatch behavior.

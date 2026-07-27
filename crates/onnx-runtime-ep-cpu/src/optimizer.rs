@@ -46,6 +46,24 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     // EP registers kernels for. Keeping it EP-scoped prevents those rewrites from
     // shrinking another provider's chance to claim the original standard ops.
     passes.push(Box::new(OpFusion::new()));
+    // Q/K/V sibling-projection merge: when 3 (or 2) FusedMatMulBias nodes share
+    // the same activation input, merge them into a single wider GEMM + Split.
+    //
+    // Gated behind ONNX_RT_SIBLING_MERGE=1 — measurement on Apple M1 Max shows
+    // BNNS prefers individual smaller GEMMs over one wide merged GEMM:
+    //   TTFT +68% regression (91→153 ms at load 6-8, both arms same conditions).
+    // Root cause: BNNS internal AMX tiling handles [40,896]×[896,896] more
+    // efficiently than [40,896]×[896,1152]. The 24 fewer dispatches do not
+    // compensate for the kernel-level efficiency loss.
+    //
+    // Expected to HELP on the `half_gemm.rs` path (x86_64, non-Apple aarch64)
+    // where rayon thread-pool dispatch overhead per call is significant and
+    // 1 call with more N-tiles load-balances better than 3 separate calls.
+    // Re-evaluate when targeting those platforms.
+    let sibling_merge = SiblingProjectionMerge::new();
+    if sibling_merge.enabled() {
+        passes.push(Box::new(sibling_merge));
+    }
     // Always-on, byte-identical bias fold: `Add(MatMulNBits, [N]-bias)` becomes
     // the `MatMulNBits` optional bias input, which the kernel adds inside the
     // MLAS GEMV epilogue instead of paying for a standalone element-wise `Add`.
@@ -968,6 +986,404 @@ fn concatenate_initializer_bytes(
 fn remove_orphan_initializer(graph: &mut Graph, value: ValueId) {
     if !graph.has_uses(value) && !graph.inputs.contains(&value) && !graph.outputs.contains(&value) {
         graph.initializers.remove(&value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SiblingProjectionMerge: merge sibling FusedMatMulBias (or plain MatMul)
+// nodes that share the same activation input into a single wider GEMM + Split.
+// ---------------------------------------------------------------------------
+
+/// Merges 2 or 3 sibling `FusedMatMulBias` (or plain `MatMul`) nodes sharing the
+/// same first input into a single wider GEMM + `Split`, cutting dispatch overhead.
+///
+/// The merge is only attempted when:
+/// - All siblings have identical K dimension (same activation width)
+/// - All siblings have static N dimension (known at optimization time)
+/// - Weight and bias data are accessible as initializers
+/// - No intermediate value escapes the merged region (consumed only by the Split outputs)
+///
+/// The rewrite physically concatenates weight matrices along the N axis and
+/// concatenates biases, producing a single `FusedMatMulBias` (or `MatMul`) whose
+/// output is then split. Since GEMM columns are independent, the output is
+/// bit-for-bit identical to running the projections separately.
+pub struct SiblingProjectionMerge;
+
+impl SiblingProjectionMerge {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Enabled when `ONNX_RT_SIBLING_MERGE=1`. Disabled by default because
+    /// measurement shows BNNS prefers smaller individual GEMMs on Apple Silicon
+    /// (TTFT +68% regression). May help on `half_gemm.rs` path (x86_64,
+    /// non-Apple aarch64) where per-call rayon overhead is more significant.
+    pub fn enabled(&self) -> bool {
+        std::env::var("ONNX_RT_SIBLING_MERGE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    }
+}
+
+impl Default for SiblingProjectionMerge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OptimizationPass for SiblingProjectionMerge {
+    fn name(&self) -> &str {
+        "CpuSiblingProjectionMerge"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        let mut changed = false;
+
+        // Find groups of 2+ sibling FusedMatMulBias or plain MatMul sharing the
+        // same activation input.
+        loop {
+            let group = find_mergeable_sibling_group(graph, ctx);
+            if group.is_none() {
+                break;
+            }
+            let group = group.unwrap();
+            apply_sibling_merge(graph, &group, ctx);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// A group of sibling projection nodes eligible for merging.
+struct SiblingGroup {
+    /// Node IDs of the siblings, sorted by their output N dimension (largest first
+    /// by convention — Q is typically widest).
+    node_ids: Vec<NodeId>,
+    /// The shared activation input.
+    activation: ValueId,
+    /// Whether these are FusedMatMulBias (true) or plain MatMul (false).
+    has_bias: bool,
+    /// Per-sibling: (weight_value_id, bias_value_id_or_none, N_dim)
+    projections: Vec<SiblingProjection>,
+}
+
+struct SiblingProjection {
+    node_id: NodeId,
+    weight: ValueId,
+    bias: Option<ValueId>,
+    output: ValueId,
+    n: usize,
+    k: usize,
+}
+
+fn find_mergeable_sibling_group(graph: &Graph, ctx: &PassContext) -> Option<SiblingGroup> {
+    // Build a map: activation value → list of FusedMatMulBias/MatMul consuming it.
+    let mut activation_to_projs: std::collections::HashMap<ValueId, Vec<NodeId>> =
+        std::collections::HashMap::new();
+
+    for (id, node) in graph.nodes.iter() {
+        let is_fused = node.op_type == "FusedMatMulBias" && node.domain == MICROSOFT_DOMAIN;
+        let is_plain = node.op_type == "MatMul" && node.is_default_domain();
+        if !is_fused && !is_plain {
+            continue;
+        }
+        if node.outputs.len() != 1 {
+            continue;
+        }
+        if let Some(Some(activation)) = node.inputs.first() {
+            activation_to_projs.entry(*activation).or_default().push(id);
+        }
+    }
+
+    // Look for groups of 2+ siblings of the SAME op type.
+    for (activation, mut candidates) in activation_to_projs {
+        if candidates.len() < 2 {
+            continue;
+        }
+
+        // Group by op type (don't mix FusedMatMulBias with plain MatMul).
+        let first_op = graph.node(candidates[0]).op_type.clone();
+        candidates.retain(|&id| graph.node(id).op_type == first_op);
+        if candidates.len() < 2 {
+            continue;
+        }
+
+        let has_bias = first_op == "FusedMatMulBias";
+
+        // Validate each candidate: weight must be an initializer with known shape.
+        let mut projections = Vec::new();
+        let mut valid = true;
+        for &nid in &candidates {
+            let node = graph.node(nid);
+            let output = node.outputs[0];
+
+            // The output must not be a graph output.
+            if graph.outputs.contains(&output) {
+                valid = false;
+                break;
+            }
+
+            // Extract weight and bias.
+            let weight = if has_bias {
+                // FusedMatMulBias inputs: [A, B, bias]
+                if node.inputs.len() != 3 {
+                    valid = false;
+                    break;
+                }
+                node.inputs[1]?
+            } else {
+                // MatMul inputs: [A, B]
+                if node.inputs.len() != 2 {
+                    valid = false;
+                    break;
+                }
+                node.inputs[1]?
+            };
+
+            let bias = if has_bias {
+                Some(node.inputs[2]?)
+            } else {
+                None
+            };
+
+            // Weight must be an initializer with rank 2 and known static dims.
+            if !graph.initializers.contains_key(&weight) {
+                valid = false;
+                break;
+            }
+            let weight_shape = &graph.value(weight).shape;
+            if weight_shape.len() != 2 {
+                valid = false;
+                break;
+            }
+            let k = match weight_shape[0] {
+                Dim::Static(k) => k,
+                _ => {
+                    valid = false;
+                    break;
+                }
+            };
+            let n = match weight_shape[1] {
+                Dim::Static(n) => n,
+                _ => {
+                    valid = false;
+                    break;
+                }
+            };
+
+            // If bias exists, it must be an initializer with shape [N].
+            if let Some(b) = bias {
+                if !graph.initializers.contains_key(&b) {
+                    valid = false;
+                    break;
+                }
+                let bias_shape = &graph.value(b).shape;
+                if bias_shape.len() != 1 || bias_shape[0] != Dim::Static(n) {
+                    valid = false;
+                    break;
+                }
+            }
+
+            // Verify weight bytes are accessible.
+            let weight_ref = graph.initializers.get(&weight)?;
+            if ctx.initializer_bytes(weight_ref).is_none() {
+                valid = false;
+                break;
+            }
+            if let Some(b) = bias {
+                let bias_ref = graph.initializers.get(&b)?;
+                if ctx.initializer_bytes(bias_ref).is_none() {
+                    valid = false;
+                    break;
+                }
+            }
+
+            projections.push(SiblingProjection {
+                node_id: nid,
+                weight,
+                bias,
+                output,
+                n,
+                k,
+            });
+        }
+
+        if !valid || projections.len() < 2 {
+            continue;
+        }
+
+        // All siblings must share the same K dimension.
+        let k0 = projections[0].k;
+        if projections.iter().any(|p| p.k != k0) {
+            continue;
+        }
+
+        // All siblings must share the same weight dtype.
+        let dtype0 = graph.value(projections[0].weight).dtype;
+        if projections
+            .iter()
+            .any(|p| graph.value(p.weight).dtype != dtype0)
+        {
+            continue;
+        }
+
+        // Sort by N (largest first) for deterministic output order.
+        projections.sort_by(|a, b| b.n.cmp(&a.n).then(a.node_id.0.cmp(&b.node_id.0)));
+        let node_ids: Vec<NodeId> = projections.iter().map(|p| p.node_id).collect();
+
+        return Some(SiblingGroup {
+            node_ids,
+            activation,
+            has_bias,
+            projections,
+        });
+    }
+    None
+}
+
+fn apply_sibling_merge(graph: &mut Graph, group: &SiblingGroup, ctx: &PassContext) {
+    let k = group.projections[0].k;
+    let weight_dtype = graph.value(group.projections[0].weight).dtype;
+    let total_n: usize = group.projections.iter().map(|p| p.n).sum();
+    let byte_size = weight_dtype.byte_size();
+
+    // Concatenate weights along N axis: each weight is [K, N_i], concatenated to [K, total_N].
+    let mut merged_weight_bytes = Vec::with_capacity(k * total_n * byte_size);
+    for row in 0..k {
+        for proj in &group.projections {
+            let weight_ref = graph.initializers.get(&proj.weight).unwrap();
+            let bytes = ctx.initializer_bytes(weight_ref).unwrap();
+            let row_start = row * proj.n * byte_size;
+            let row_end = row_start + proj.n * byte_size;
+            merged_weight_bytes.extend_from_slice(&bytes[row_start..row_end]);
+        }
+    }
+
+    // Create merged weight initializer.
+    let merged_weight_name = format!("__nxrt_sibling_merged_{}_weight", group.node_ids[0].0);
+    let merged_weight_vid = graph.create_named_value(
+        &merged_weight_name,
+        weight_dtype,
+        static_shape([k, total_n]),
+    );
+    graph.set_initializer(
+        merged_weight_vid,
+        WeightRef::Inline(TensorData::from_raw(
+            weight_dtype,
+            vec![k, total_n],
+            merged_weight_bytes,
+        )),
+    );
+
+    // Concatenate biases if present: each bias is [N_i], merged to [total_N].
+    let merged_bias_vid = if group.has_bias {
+        let bias_dtype = graph.value(group.projections[0].bias.unwrap()).dtype;
+        let bias_byte_size = bias_dtype.byte_size();
+        let mut merged_bias_bytes = Vec::with_capacity(total_n * bias_byte_size);
+        for proj in &group.projections {
+            let bias_ref = graph.initializers.get(&proj.bias.unwrap()).unwrap();
+            let bytes = ctx.initializer_bytes(bias_ref).unwrap();
+            merged_bias_bytes.extend_from_slice(bytes);
+        }
+
+        let merged_bias_name = format!("__nxrt_sibling_merged_{}_bias", group.node_ids[0].0);
+        let vid = graph.create_named_value(&merged_bias_name, bias_dtype, static_shape([total_n]));
+        graph.set_initializer(
+            vid,
+            WeightRef::Inline(TensorData::from_raw(
+                bias_dtype,
+                vec![total_n],
+                merged_bias_bytes,
+            )),
+        );
+        Some(vid)
+    } else {
+        None
+    };
+
+    // Create the merged GEMM output value. Copy the shape of the first projection's
+    // output but replace the last dimension with total_N.
+    let first_output_shape = graph.value(group.projections[0].output).shape.clone();
+    let output_dtype = graph.value(group.projections[0].output).dtype;
+    let mut merged_shape: Vec<Dim> = first_output_shape;
+    if let Some(last) = merged_shape.last_mut() {
+        *last = Dim::Static(total_n);
+    }
+    let merged_output_vid = graph.create_value(output_dtype, merged_shape.clone());
+
+    // Create the merged GEMM node (FusedMatMulBias or MatMul).
+    let merged_inputs = if group.has_bias {
+        vec![
+            Some(group.activation),
+            Some(merged_weight_vid),
+            Some(merged_bias_vid.unwrap()),
+        ]
+    } else {
+        vec![Some(group.activation), Some(merged_weight_vid)]
+    };
+
+    let merged_node = Node::new(
+        NodeId(0),
+        if group.has_bias {
+            "FusedMatMulBias".to_string()
+        } else {
+            "MatMul".to_string()
+        },
+        merged_inputs,
+        vec![merged_output_vid],
+    );
+    let mut merged_node = merged_node;
+    if group.has_bias {
+        merged_node.domain = MICROSOFT_DOMAIN.to_string();
+    }
+    graph.insert_node(merged_node);
+
+    // Create Split node: splits the merged output along the last axis.
+    let split_sizes: Vec<i64> = group.projections.iter().map(|p| p.n as i64).collect();
+    let split_sizes_name = format!("__nxrt_sibling_merged_{}_split_sizes", group.node_ids[0].0);
+    let split_sizes_vid = graph.create_named_value(
+        &split_sizes_name,
+        DataType::Int64,
+        static_shape([split_sizes.len()]),
+    );
+    let split_sizes_bytes: Vec<u8> = split_sizes.iter().flat_map(|v| v.to_le_bytes()).collect();
+    graph.set_initializer(
+        split_sizes_vid,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![split_sizes.len()],
+            split_sizes_bytes,
+        )),
+    );
+
+    // The Split outputs reuse the ORIGINAL output ValueIds so downstream wiring
+    // is preserved automatically (same technique as OpFusion's apply_fusion).
+    let split_outputs: Vec<ValueId> = group.projections.iter().map(|p| p.output).collect();
+
+    let mut split_node = Node::new(
+        NodeId(0),
+        "Split".to_string(),
+        vec![Some(merged_output_vid), Some(split_sizes_vid)],
+        split_outputs,
+    );
+    // axis = -1 (last dimension) — encode as the resolved positive index.
+    let rank = graph.value(group.projections[0].output).shape.len();
+    split_node
+        .attributes
+        .insert("axis".to_string(), Attribute::Int(rank as i64 - 1));
+    graph.insert_node(split_node);
+
+    // Remove the original projection nodes and clean up orphaned initializers.
+    for proj in &group.projections {
+        graph.remove_node(proj.node_id);
+        remove_orphan_initializer(graph, proj.weight);
+        if let Some(b) = proj.bias {
+            remove_orphan_initializer(graph, b);
+        }
     }
 }
 

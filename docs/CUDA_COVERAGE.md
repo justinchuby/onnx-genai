@@ -206,6 +206,11 @@ The **42 CPU `ai.onnx` gaps** are: `AffineGrid`, `ArgMax`, `ArgMin`,
 `NonZero`, `PRelu`, `Pad`, `QuantizeLinear`, `Range`, `Resize`,
 `SpaceToDepth`, and `Unique`.
 
+> **Note (batch 4, below):** `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`,
+> `BitwiseNot`, `BitShift`, `LogSoftmax`, and `Hardmax` have since moved from the
+> gap list into the shared `ai.onnx` set; the counts above are the pre-batch-4
+> snapshot.
+
 For `com.microsoft`, CUDA matches the CPU pairs `FusedGemm`, `FusedMatMulBias`,
 `Gelu`, `LayerNormalization`, `MatMulNBits`, `SimplifiedLayerNormalization`,
 `SkipLayerNormalization`, and `SkipSimplifiedLayerNormalization`; CPU-only gaps
@@ -266,6 +271,24 @@ several axes/keepdims combinations, including the opset-18 axes-input form for
 `ReduceLogSumExp`; `Mod` with negative operands and a zero divisor). This raises
 `CUDA_COVERED_OPS` to **113** advertised op names and CPU standard-domain op-type
 coverage to **99 / 141**.
+
+The issue #67 operator-coverage batch 4 adds seven more advertised op names — the
+integer **bitwise** family (`BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
+over all integer dtypes, broadcasting) plus unsigned `BitShift` (LEFT/RIGHT), and
+the softmax-family axis reductions `LogSoftmax` (f32/f16/bf16, opset-13 per-axis
+and legacy opset-≤12 coerce-to-2D) and `Hardmax` (f32/f16/bf16, first-argmax
+one-hot). All are **NVRTC-custom** kernels matched to the CPU EP: `LogSoftmax`
+uses the stable shifted-`logsumexp` formulation (`max + log(sum(exp(x - max)))`,
+the #266 overflow lesson), and `BitShift` mirrors the CPU `checked_shl`/
+`checked_shr` contract (an amount `>=` the operand width yields `0`). Each is
+GPU-validated against the CPU oracle on the local CUDA host across the
+dtypes/attributes it claims (signed + unsigned bitwise with broadcasting,
+over-shift, `LogSoftmax` large-magnitude rows and interior axes, `Hardmax` ties
+and negative interior axes). This brings the machine-verified
+`CUDA_COVERED_OPS` list length from **118** to **125** op names. (The narrative
+"113" figure above is a stale pre-batch-3 snapshot; the authoritative count is the
+`CUDA_COVERED_OPS` slice length, which the `covered_ops_have_no_duplicates` test
+guards.)
 
 ---
 
