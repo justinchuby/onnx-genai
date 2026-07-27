@@ -59,3 +59,11 @@ Authored bit-exact native-CUDA-versus-ORT 64-token decode locks for Qwen2.5-0.5B
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Under Leon's lockout, added bf16 harness support and ragged causal/non-causal VarlenAttention parity tests; Bishop approved PR #267.
+
+## 2026-07-27T09:42:11-07:00 — CLI sampling/default-budget fixes
+
+- Changed CLI `generate`/`run` absent `--max-new-tokens` semantics to fill the model's remaining effective context instead of imposing a fixed cap; engine/server default remains 128.
+- REPL recomputes remaining-context ceiling per rendered turn and `/stats` shows context usage; no headroom reservation or pre-decode refusal policy.
+- Added a 512-token warning fallback only when no metadata/decode-path/`--max-context` limit is discoverable, avoiding unbounded ORT decode.
+- Fixed sampling flags so temperature/top-p/top-k disable greedy sampling unless `--temperature 0` or explicit `--greedy` applies; added `--no-greedy`.
+- Added shared `--max-context` plumbing for `generate` and `run`.

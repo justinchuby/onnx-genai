@@ -160,12 +160,19 @@ pub(crate) struct RunProfile {
     pub(crate) counters: Vec<Counter>,
     pub(crate) timings: TokenTimings,
     pub(crate) prompt_tokens: Option<usize>,
+    pub(crate) context: Option<ContextUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) prefix_cache_hit: Option<usize>,
     pub(crate) memory: MemoryUsage,
     pub(crate) pages: Option<PageActivity>,
     /// Reuse across a multi-component (multimodal) pipeline's generations.
     pub(crate) multimodal_reuse: Option<MultimodalReuse>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ContextUsage {
+    pub(crate) used_tokens: usize,
+    pub(crate) max_tokens: usize,
 }
 
 /// What a multimodal pipeline avoided recomputing for this generation.
@@ -219,9 +226,13 @@ impl RunProfile {
         if self.timings.tokens() > 0 {
             parts.push(format!("{} out", self.timings.tokens()));
         }
+        if let Some(context) = self.context {
+            parts.push(format!("ctx {context}"));
+        }
         if let Some(rate) = self.timings.decode_tokens_per_second() {
             parts.push(format!("{rate:.1} tok/s"));
         }
+
         if let Some(ttft) = self.timings.time_to_first_token() {
             parts.push(format!("ttft {:.0} ms", ttft.as_secs_f64() * 1000.0));
         }
@@ -253,6 +264,25 @@ impl RunProfile {
         } else {
             format!("[ {} ]", parts.join(" · "))
         }
+    }
+}
+
+impl std::fmt::Display for ContextUsage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} / {}",
+            format_token_count(self.used_tokens),
+            format_token_count(self.max_tokens)
+        )
+    }
+}
+
+fn format_token_count(tokens: usize) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -1096,5 +1126,19 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected} in:\n{text}");
         }
+    }
+
+    #[test]
+    fn stats_line_reports_context_usage() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.prompt_tokens = Some(3100);
+        profile.context = Some(ContextUsage {
+            used_tokens: 3128,
+            max_tokens: 8192,
+        });
+
+        let line = profile.to_stats_line();
+
+        assert!(line.contains("ctx 3.1k / 8.2k"), "{line}");
     }
 }

@@ -29,7 +29,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 
 mod commands;
 mod generate;
@@ -45,7 +45,8 @@ use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
 use interactive::{
-    InterruptAction, Interrupted, interrupt_action, is_interrupt_error, stage_attachment,
+    InterruptAction, Interrupted, apply_context_sized_max_new_tokens, interrupt_action,
+    is_interrupt_error, stage_attachment,
 };
 use model_inspection::{list, show, version};
 use onnx_genai::text_to_audio::TextToAudioRequest;
@@ -55,6 +56,8 @@ use onnx_genai_server::{ServeArgs, run_serve};
 use output::write_merged_trace;
 use profile::RunProfile;
 use transcribe::transcribe;
+
+const CLI_FALLBACK_MAX_NEW_TOKENS: usize = 512;
 
 #[cfg(test)]
 use commands::{
@@ -110,6 +113,10 @@ struct SamplingArgs {
     #[arg(long)]
     max_new_tokens: Option<usize>,
 
+    /// Maximum total context length (prompt + generated tokens).
+    #[arg(long, value_name = "TOKENS")]
+    max_context: Option<NonZeroUsize>,
+
     /// Temperature applied before token selection.
     #[arg(long)]
     temperature: Option<f32>,
@@ -121,6 +128,14 @@ struct SamplingArgs {
     /// Keep only the top-k logits before token selection. Zero disables top-k filtering.
     #[arg(long)]
     top_k: Option<usize>,
+
+    /// Force deterministic argmax token selection.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_greedy")]
+    greedy: bool,
+
+    /// Use stochastic sampling. Sampling flags also imply this unless temperature is 0.
+    #[arg(long = "no-greedy", action = ArgAction::SetTrue)]
+    no_greedy: bool,
 
     /// Text stop sequence. May be provided multiple times.
     #[arg(long)]
@@ -164,9 +179,18 @@ impl CpuArgs {
 
 impl SamplingArgs {
     fn to_options(&self) -> GenerateOptions {
-        let mut options = GenerateOptions::default();
-        if let Some(max_new_tokens) = self.max_new_tokens {
-            options.max_new_tokens = max_new_tokens;
+        let mut options = GenerateOptions {
+            max_new_tokens: self.max_new_tokens.unwrap_or(CLI_FALLBACK_MAX_NEW_TOKENS),
+            max_context: self.max_context.map(NonZeroUsize::get),
+            ..GenerateOptions::default()
+        };
+        if self
+            .temperature
+            .is_some_and(|temperature| temperature > 0.0)
+            || self.top_p.is_some()
+            || self.top_k.is_some_and(|top_k| top_k > 0)
+        {
+            options.greedy = false;
         }
         if let Some(temperature) = self.temperature {
             options.temperature = temperature;
@@ -176,6 +200,15 @@ impl SamplingArgs {
         }
         if let Some(top_k) = self.top_k {
             options.top_k = top_k;
+        }
+        if self.no_greedy {
+            options.greedy = false;
+        }
+        if self.greedy {
+            options.greedy = true;
+        }
+        if self.temperature == Some(0.0) {
+            options.greedy = true;
         }
         options.stop_sequences = self.stop.iter().cloned().map(StopSequence::Text).collect();
         options
@@ -707,6 +740,168 @@ mod tests {
     }
 
     #[test]
+    fn cli_uses_finite_fallback_until_a_model_context_is_known() {
+        let parsed =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                assert_eq!(
+                    args.sampling.to_options().max_new_tokens,
+                    CLI_FALLBACK_MAX_NEW_TOKENS
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn absent_max_new_tokens_fills_remaining_context_when_known() {
+        let mut options = GenerateOptions::default();
+
+        let used_fallback =
+            apply_context_sized_max_new_tokens(&mut options, false, 128, Some(2048));
+
+        assert!(!used_fallback);
+        assert_eq!(options.max_new_tokens, 1921);
+    }
+
+    #[test]
+    fn explicit_max_new_tokens_is_honored_exactly() {
+        let mut options = GenerateOptions {
+            max_new_tokens: 2,
+            ..GenerateOptions::default()
+        };
+
+        let used_fallback = apply_context_sized_max_new_tokens(&mut options, true, 128, Some(2048));
+
+        assert!(!used_fallback);
+        assert_eq!(options.max_new_tokens, 2);
+    }
+
+    #[test]
+    fn absent_max_new_tokens_uses_finite_fallback_when_context_is_unknown() {
+        let mut options = GenerateOptions::default();
+
+        let used_fallback = apply_context_sized_max_new_tokens(&mut options, false, 128, None);
+
+        assert!(used_fallback);
+        assert_eq!(options.max_new_tokens, CLI_FALLBACK_MAX_NEW_TOKENS);
+    }
+
+    #[test]
+    fn max_context_is_shared_by_generate_and_run() {
+        let generate = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--max-context",
+            "1024",
+        ])
+        .unwrap();
+        let run =
+            Cli::try_parse_from(["onnx-genai", "run", "./m", "--max-context", "2048"]).unwrap();
+
+        match generate.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.sampling.to_options().max_context, Some(1024));
+            }
+            _ => panic!("expected generate command"),
+        }
+        match run.command {
+            Commands::Run(args) => {
+                assert_eq!(args.sampling.to_options().max_context, Some(2048));
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn max_context_rejects_zero() {
+        assert!(
+            Cli::try_parse_from([
+                "onnx-genai",
+                "generate",
+                "./m",
+                "--prompt",
+                "hi",
+                "--max-context",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sampling_flags_disable_greedy_unless_temperature_is_zero_or_greedy_is_forced() {
+        let stochastic = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--temperature",
+            "0.7",
+        ])
+        .unwrap();
+        let top_p = Cli::try_parse_from(["onnx-genai", "run", "./m", "--top-p", "0.9"]).unwrap();
+        let top_k = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--top-k",
+            "40",
+        ])
+        .unwrap();
+        let temperature_zero = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--temperature",
+            "0",
+        ])
+        .unwrap();
+        let forced_greedy = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--temperature",
+            "0.7",
+            "--greedy",
+        ])
+        .unwrap();
+
+        match stochastic.command {
+            Commands::Generate(args) => assert!(!args.sampling.to_options().greedy),
+            _ => panic!("expected generate command"),
+        }
+        match top_p.command {
+            Commands::Run(args) => assert!(!args.sampling.to_options().greedy),
+            _ => panic!("expected run command"),
+        }
+        match top_k.command {
+            Commands::Generate(args) => assert!(!args.sampling.to_options().greedy),
+            _ => panic!("expected generate command"),
+        }
+        match temperature_zero.command {
+            Commands::Generate(args) => assert!(args.sampling.to_options().greedy),
+            _ => panic!("expected generate command"),
+        }
+        match forced_greedy.command {
+            Commands::Generate(args) => assert!(args.sampling.to_options().greedy),
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
     fn generate_requires_prompt_flag() {
         assert!(Cli::try_parse_from(["onnx-genai", "generate", "./m"]).is_err());
     }
@@ -1099,7 +1294,7 @@ mod tests {
              \x20\x20model: models/tiny\n\
              \x20\x20execution provider: cpu\n\
              \x20\x20decode backend: auto\n\
-             \x20\x20sampling: max_new_tokens=32 temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
+             \x20\x20sampling: max_new_tokens=32 max_context=auto temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
              \x20\x20messages: 3 (system: 1, user: 1, assistant: 1)\n\
              \x20\x20completed turns: 1\n\
              \x20\x20tokens: prompt=14 generated=5"

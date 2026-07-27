@@ -92,6 +92,16 @@ cargo build --release -p onnx-genai-cli
   --prompt "Write a short Rust hello-world program."
 ```
 
+When `--max-new-tokens` is omitted, `generate` and `run` use whatever budget
+remains in the model's effective context window, stopping on EOS, a stop
+sequence, or context length. Sampling flags such as `--temperature 0.7`,
+`--top-p`, or `--top-k` enable stochastic sampling, while `--temperature 0` and
+`--greedy` force argmax. If a package has no discoverable context limit, the CLI
+warns and uses a finite fallback; pass `--max-context TOKENS` or declare
+`model.max_sequence_length` in inference metadata to make context-fill automatic.
+In the REPL this budget is recomputed for each turn as history grows; `/stats`
+shows `ctx used / max`.
+
 On a shared machine, add `--cpu-cores N` to `generate`, `run`, or `transcribe` to
 cap native CPU decode to N workers (for example, `--cpu-cores 8`); where
 supported, those workers are pinned to at most N allowed CPUs. The equivalent
@@ -382,13 +392,16 @@ These models are trained with earlier turns' thinking removed: replaying it
 degrades quality and inflates the context, since the reasoning of a long session
 can dwarf the conversation itself.
 
-If the decode budget runs out inside the reasoning, the turn genuinely has no
-answer. The exchange is dropped rather than stored as an empty reply, which
-would otherwise teach the model that questions go unanswered:
+When `--max-new-tokens` is omitted, the CLI gives reasoning models the same
+model-following budget as any other model: the remaining context window. If an
+explicit or fallback decode budget still runs out inside the reasoning, the turn
+genuinely has no answer. The exchange is dropped rather than stored as an empty
+reply, which would otherwise teach the model that questions go unanswered:
 
 ```text
-note: generation stopped inside the model's reasoning, so this turn is not
-kept. Raise --max-new-tokens.
+note: generation stopped inside the model's reasoning after hitting
+--max-new-tokens 2. No answer was produced, so this turn is not kept.
+Try --max-new-tokens 4.
 ```
 
 Because the thinking is stripped before history is replayed, a follow-up prompt

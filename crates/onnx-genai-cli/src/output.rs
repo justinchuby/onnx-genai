@@ -149,6 +149,8 @@ pub(super) fn run_generation_turn(
     GENERATING.store(true, Ordering::SeqCst);
     backend.reset_reuse_stats();
 
+    let prompt_tokens = turn.prompt_tokens;
+    let context_limit = turn.context_limit;
     let mut output = String::new();
     let mut timings = profile::TokenTimings::default();
     timings.start();
@@ -186,7 +188,21 @@ pub(super) fn run_generation_turn(
                 // throttled, since they move faster than they can be read and
                 // every update costs a frame.
                 if first || last_status.elapsed() >= STATUS_REFRESH {
-                    live.set_status(timings.live_summary())?;
+                    let mut status = timings.live_summary();
+                    if let (Some(prompt_tokens), Some(context_limit)) =
+                        (prompt_tokens, context_limit)
+                    {
+                        let context = profile::ContextUsage {
+                            used_tokens: prompt_tokens + timings.tokens(),
+                            max_tokens: context_limit,
+                        };
+                        if status.is_empty() {
+                            status = format!("ctx {context}");
+                        } else {
+                            status.push_str(&format!(" · ctx {context}"));
+                        }
+                    }
+                    live.set_status(status)?;
                     last_status = Instant::now();
                 }
             } else {
@@ -217,6 +233,12 @@ pub(super) fn run_generation_turn(
         if let Ok(result) = &result {
             profile.finish_reason = Some(format!("{:?}", result.finish_reason));
             profile.prefix_cache_hit = Some(result.prefix_cache_hit_len);
+            if let (Some(prompt_tokens), Some(context_limit)) = (prompt_tokens, context_limit) {
+                profile.context = Some(profile::ContextUsage {
+                    used_tokens: prompt_tokens + result.token_ids.len(),
+                    max_tokens: context_limit,
+                });
+            }
         }
     }
     result?;

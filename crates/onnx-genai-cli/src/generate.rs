@@ -10,7 +10,8 @@ use onnx_genai_server::multimodal;
 
 use super::commands::resolved_default_providers;
 use super::interactive::{
-    Backend, EXIT_INTERRUPTED, TurnInput, install_ctrlc_handler, is_interrupt_error,
+    Backend, EXIT_INTERRUPTED, TurnInput, apply_context_sized_max_new_tokens,
+    install_ctrlc_handler, is_interrupt_error, warn_missing_context_limit,
 };
 use super::output::{build_turn_prompt, detect_reasoning, load_chat_template, run_generation_turn};
 use super::profile::{self, RunProfile};
@@ -40,17 +41,36 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
     let template = load_chat_template(&model_dir, args.sampling.raw);
     let history = vec![ChatMessage::user(args.prompt)];
     let prompt = build_turn_prompt(template.as_ref(), &history)?;
-    let turn = TurnInput {
+    let mut turn = TurnInput {
         prompt,
         images: args.attachments.images.clone(),
         audio: args.attachments.audio.clone(),
         options,
+        prompt_tokens: None,
+        context_limit: None,
     };
 
     let load_started = std::time::Instant::now();
     let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
     profile.phase("model load", load_started.elapsed());
-    profile.prompt_tokens = backend.prompt_tokens(&turn.prompt);
+    let prompt_tokens = backend.prompt_tokens(&turn.prompt).unwrap_or_default();
+    let effective_max_context = backend.effective_max_context(&turn.options);
+    let used_fallback = apply_context_sized_max_new_tokens(
+        &mut turn.options,
+        args.sampling.max_new_tokens.is_some(),
+        prompt_tokens,
+        effective_max_context,
+    );
+    if used_fallback {
+        warn_missing_context_limit(turn.options.max_new_tokens);
+    }
+    turn.prompt_tokens = Some(prompt_tokens);
+    turn.context_limit = effective_max_context;
+    profile.prompt_tokens = Some(prompt_tokens);
+    profile.context = effective_max_context.map(|max_tokens| profile::ContextUsage {
+        used_tokens: prompt_tokens,
+        max_tokens,
+    });
     if let Some(memory) = backend.kv_usage() {
         profile.memory = memory;
     }

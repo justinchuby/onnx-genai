@@ -3,6 +3,12 @@
 use super::*;
 
 impl Engine {
+    /// Effective context limit for a request, combining model metadata,
+    /// per-request override, and decode-path capacity.
+    pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        self.max_context_for_request(options)
+    }
+
     #[cfg(feature = "native-backend")]
     fn generate_native_with_callback(
         &mut self,
