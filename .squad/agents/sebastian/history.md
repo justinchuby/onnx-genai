@@ -161,3 +161,19 @@ Verdicts:
 4. Threshold: M=1 → GEMV (ours), M≥2 → BNNS/sgemm (Accelerate). No per-chip calibration needed.
 
 Updated decision brief with BNNS section at top.
+
+## 2026-07-27T16:48:00+00:00 — Batch decode analysis (bigger strategic opening)
+
+Justin asked about batch decode (M=B, B>1). Benchmarked BNNS vs sgemm vs NEON at B=1..32.
+
+Key findings:
+- **Batch decode is 10× bigger strategic opening than single-stream.** At B=32: BNNS 1663 tok/s vs ORT/MLAS ~108 tok/s (estimated) → **15× advantage.** Compare B=1: 1.4× advantage.
+- **Roofline crossover at B≈6–7** (M1 Max). Below: bandwidth-bound, above: compute-bound → AMX dominance.
+- **BNNS wins at B≥2 for batch decode too.** Same M=2 threshold as prefill. Per-call overhead (~50 µs) is real but absorbed by AMX throughput on large ops (Gate/Up/Down). Total BNNS time at B=8: 22.2 ms vs sgemm 43.7 ms (2.0×).
+- **Dispatch overhead trap did NOT materialize.** BNNS wins overwhelmingly on large ops despite ~50 µs fixed overhead per call.
+- **Nothing in current design is hostile to batching.** SPMD pool, prepack cache, scheduler all work. Dispatch overhead amortizes: 0.87 ms/step ÷ 32 = 0.03 ms/token.
+- **Cannot measure ORT batch decode** — compare harness has no batch support. ORT numbers are indirect (MLAS NEON GFLOPS × roofline).
+- **Three-regime dispatch:** M=1 → GEMV, M≥2 Mac → BNNS, M≥2 non-Mac → half_gemm.rs. Same threshold for prefill and batch decode.
+- All numbers corroborated with mach_absolute_time + clock_gettime (<1% agreement).
+
+Updated decision brief with batch decode section at top.
