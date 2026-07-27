@@ -11,4 +11,4 @@
 
 The split totals 1,868 lines including module-local imports. Registration order, operator/opset mappings, handler bodies, shape rules, and diagnostic text are unchanged.
 
-**Why:** Cohesive operator-family modules reduce navigation and review cost while keeping this change mechanical and behavior-preserving. `cargo fmt -p onnx-runtime-shape-inference`, shape-inference build/tests (225 tests plus one doctest), clippy with `-D warnings`, and downstream `onnx-runtime-session` build all pass.
+**Why:** Cohesive operator-family modules reduce navigation and review cost while keeping this change mechanical and behavior-preserving. `cargo fmt -p onnx-runtime-shape-inference`, shape-inference build/tests (224 tests plus one doctest), clippy with `-D warnings`, and downstream `onnx-runtime-session` build all pass.
