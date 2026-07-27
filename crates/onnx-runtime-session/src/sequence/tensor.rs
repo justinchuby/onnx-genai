@@ -481,7 +481,7 @@ pub(super) fn zeroed_bytes(
     Ok(output)
 }
 
-pub(super) fn clone_shape(op: &'static str, shape: &[usize]) -> SequenceResult<Vec<usize>> {
+pub(crate) fn clone_shape(op: &'static str, shape: &[usize]) -> SequenceResult<Vec<usize>> {
     let bytes = shape
         .len()
         .checked_mul(std::mem::size_of::<usize>())

@@ -1,23 +1,11 @@
-//! `pkg.nxrt::CompressedSparseAttention` v1: correctness-first, **host-staged**
-//! CUDA execution of the DeepSeek-V4-Flash / GLM-5.2 compressed sparse-attention
-//! (CSA) operator.
+//! `pkg.nxrt::CompressedSparseAttention` v1 CUDA execution for the
+//! DeepSeek-V4-Flash / GLM-5.2 compressed sparse-attention (CSA) operator.
 //!
 //! The fully-implemented CPU kernel in
 //! `crates/onnx-runtime-ep-cpu/src/kernels/compressed_sparse_attention.rs` is the
-//! authoritative numerical oracle for this op. Re-deriving its ~4.6k lines of
-//! frozen-contract math (learned FP8/FP4 compression, the ratio-4 index-key
-//! stream, sparse sink-softmax, and the stateful compressed KV cache/carry
-//! lifecycle) on the device would be error-prone and is explicitly a later,
-//! separately-tracked phase. This kernel therefore guarantees bit-parity by
-//! **delegating to the CPU kernel itself**:
-//!
-//! 1. every device input tensor is copied host-side (D2H),
-//! 2. the CPU `CompressedSparseAttention` kernel — built by the CPU factory from
-//!    the same node, so it carries the identical attribute configuration — runs
-//!    over host-resident views, producing every output (`Y`, the present
-//!    compressed KV cache, the present compression carry, and, for ratio-4, the
-//!    present index key / index carry / selected indices),
-//! 3. each host output is uploaded back to its device buffer (H2D).
+//! authoritative numerical oracle. The production ratio-4 and ratio-128 hybrid
+//! FP8 paths execute entirely on the EP stream; unsupported non-resident
+//! configurations retain the diagnostic CPU-oracle staging path.
 //!
 //! ## Statefulness
 //!
@@ -25,17 +13,14 @@
 //! `past_* → present_*` input/output tensors (the standard ONNX KV-cache
 //! pattern), not held inside the kernel. A `prefill → decode → decode` sequence
 //! feeds each step's `present_*` outputs back in as the next step's `past_*`
-//! inputs. Because this kernel reuses the CPU kernel verbatim, the entire
-//! compressed-cache / carry / index-carry lifecycle is reproduced exactly, and
-//! the host-resident staging keeps state correct across steps (device-resident
-//! state is the Phase-B optimization).
+//! inputs. Device paths write graph-threaded `present_*` outputs directly and
+//! consume those device buffers as the next step's `past_*` inputs.
 //!
 //! ## Capture support
 //!
-//! Like the correctness-first `standard_attention` / `sparse_kv_gather`
-//! kernels, execution round-trips through host memory and synchronizes the
-//! stream on every D2H/H2D copy, neither of which is legal during CUDA-graph
-//! capture.
+//! Both fully device-resident FP8 paths reserve stable scratch at construction,
+//! read logical cursors on device, and are CUDA-graph capture compatible after
+//! eager NVRTC warmup.
 //!
 //! ## Claim-time gating
 //!
@@ -46,11 +31,6 @@
 //! contract: "`supports_op` must reject unsupported ratio/layout/dtype/shape
 //! combinations instead of claiming the node and falling back inside the kernel."
 //!
-// TODO(csa-cuda phase B): replace this host-staged path with a device-resident
-// fused CSA kernel (device-resident compressed cache/carry, fused
-// selection/score/sink-softmax/value-reduction, CUDA-graph capture, no host
-// round trip). See docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8.
-
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -73,16 +53,16 @@ const WS_TRANSFORMED: usize = 0;
 const WS_SCORES: usize = 1;
 const WS_SELECTED: usize = 2;
 const WS_ATTN: usize = 3;
+const WS_RATIO128_ATTN: usize = 0;
 /// The fused ratio-4 dense window is capped at 128 candidates (the sliding
 /// window), so `dense_candidates + topk_width <= 128 + topk_width` bounds the
 /// per-row attention score scratch stride.
 const RATIO4_DENSE_WINDOW: usize = 128;
 
-/// Fixed-capacity (D3) byte sizes for the ratio-4 pooled workspaces, computed
+/// Fixed-capacity (D3) byte sizes for pooled workspaces, computed
 /// from the reserved [`CsaBufferLayout`] so the device-only capture path never
-/// allocates per call. Returns an empty set for non-ratio-4 configs (they use
-/// no pooled scratch).
-fn ratio4_workspace_bytes(
+/// allocates per call.
+fn csa_workspace_bytes(
     node: &Node,
     input_shapes: &[Vec<usize>],
     layout: &CsaBufferLayout,
@@ -91,9 +71,6 @@ fn ratio4_workspace_bytes(
         .attr("compression_ratio")
         .and_then(|attribute| attribute.as_int())
         .unwrap_or(0);
-    if ratio != 4 {
-        return Vec::new();
-    }
     let query = match input_shapes.first() {
         Some(shape) if shape.len() >= 4 => shape,
         _ => return Vec::new(),
@@ -107,13 +84,24 @@ fn ratio4_workspace_bytes(
     let batch = query[0];
     let sequence = query[1];
     let heads = query[2];
+    let rows = batch.saturating_mul(sequence);
+    let f32 = std::mem::size_of::<f32>();
+    if ratio == 128 {
+        let max_records = layout.max_seq_len.div_ceil(128);
+        return vec![
+            rows.saturating_mul(heads)
+                .saturating_mul(RATIO4_DENSE_WINDOW.saturating_add(max_records))
+                .saturating_mul(f32),
+        ];
+    }
+    if ratio != 4 {
+        return Vec::new();
+    }
     let index_heads = attr_usize("index_num_heads");
     let index_dim = attr_usize("index_head_dim");
     let max_records = layout.max_seq_len.div_ceil(4);
     let max_topk = max_records.min(512);
-    let rows = batch.saturating_mul(sequence);
     let rows_attn = rows.saturating_mul(heads);
-    let f32 = std::mem::size_of::<f32>();
     let i32 = std::mem::size_of::<i32>();
     vec![
         rows.saturating_mul(index_heads)
@@ -187,10 +175,11 @@ extern "C" __global__ void csa_ratio128_compress(
     const float* past_carry, const unsigned char* past_cache,
     float* carry, unsigned char* cache,
     int batch, int sequence, int dim, int past_records, int cache_records, int cache_fp8,
-    long long start)
+    const long long* total_ptr)
 {
     const int b = blockIdx.x;
     if (b >= batch || threadIdx.x != 0) return;
+    const long long start = *total_ptr - (long long)sequence;
     const int carry_stride = 2 * 128 * dim;
     const int cache_width = cache_fp8 ? 583 : dim * 4;
     // The graph outputs are the next state.  Copy only the old records/carry;
@@ -680,17 +669,18 @@ const ATTENTION_SOURCE: &str = r#"
 extern "C" __global__ void csa_ratio128_sink_attention(
     const float* query,        // [batch, sequence, heads, dim]
     const float* current_kv,   // [batch, current_kv_len, dim]
-    const float* compressed,   // [batch, compressed_records, dim]
+    const unsigned char* compressed,
     const float* sink,         // [heads]
+    const float* bias,
     float* output,             // [batch, sequence, heads, dim]
-    float* scores,             // [rows * candidate_count] scratch
+    float* scores,             // [rows * scratch_stride] scratch
     int batch, int sequence, int heads, int dim,
     int current_kv_len,
-    long long current_kv_base,
-    long long query_start,
+    const long long* total_ptr,
     int compressed_records,
-    int dense_candidates,
-    int candidate_count,
+    int scratch_stride,
+    int cache_fp8,
+    int bias_present, int bias_b, int bias_h, int bias_s, int bias_k,
     float scale)
 {
     const int row = blockIdx.x;
@@ -702,6 +692,12 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     const int b = tmp / sequence;
 
     const float NEG = __int_as_float(0xff800000);
+    const long long total = *total_ptr;
+    const long long query_start = total - (long long)sequence;
+    const long long current_kv_base = total - (long long)current_kv_len;
+    int dense_candidates = 128;
+    if (query_start == 0) dense_candidates = current_kv_len < 128 ? current_kv_len : 128;
+    const int candidate_count = dense_candidates + compressed_records;
     const long long position = query_start + (long long)s;
     long long window = position + 1 - 128;
     if (window < 0) window = 0;
@@ -710,7 +706,7 @@ extern "C" __global__ void csa_ratio128_sink_attention(
     int comp_limit = compressed_records < (int)valid_compressed
         ? compressed_records : (int)valid_compressed;
 
-    float* row_scores = scores + (long long)row * candidate_count;
+    float* row_scores = scores + (long long)row * scratch_stride;
     const long long q_base = ((long long)(b * sequence + s) * heads + h) * dim;
 
     __shared__ float s_max;
@@ -730,18 +726,52 @@ extern "C" __global__ void csa_ratio128_sink_attention(
             float acc = 0.0f;
             for (int d = 0; d < dim; ++d)
                 acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
-            const float score = __fmul_rn(acc, scale);
+            float score = __fmul_rn(acc, scale);
+            if (bias_present) {
+                const int bb = bias_b == 1 ? 0 : b;
+                const int bh = bias_h == 1 ? 0 : h;
+                const int bq = bias_s == 1 ? 0 : s;
+                const int bk = bias_k == 1 ? 0 : c;
+                score = __fadd_rn(score, bias[(((bb * bias_h + bh) * bias_s + bq) * bias_k + bk)]);
+            }
             row_scores[c] = score;
             maximum = fmaxf(maximum, score);
         }
         // Completed compressed records, ascending.
         for (int rec = 0; rec < comp_limit; ++rec) {
-            const float* kv = compressed + ((long long)b * compressed_records + rec) * dim;
             float acc = 0.0f;
-            for (int d = 0; d < dim; ++d)
-                acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
-            const float score = __fmul_rn(acc, scale);
-            row_scores[dense_candidates + rec] = score;
+            if (cache_fp8) {
+                const unsigned char* packed = compressed
+                    + ((long long)b * compressed_records + rec) * 583;
+                for (int block = 0; block < 7; ++block) {
+                    const float block_scale = e8m0_scale(packed[65 * block]);
+                    for (int d = 0; d < 64; ++d)
+                        acc = __fadd_rn(acc, __fmul_rn(query[q_base + 64 * block + d],
+                            decode_e4m3fn(packed[65 * block + 1 + d]) * block_scale));
+                }
+                for (int d = 448; d < dim; ++d) {
+                    const int tail = d - 448;
+                    const unsigned short bits = (unsigned short)packed[455 + 2 * tail]
+                        | ((unsigned short)packed[455 + 2 * tail + 1] << 8);
+                    acc = __fadd_rn(acc, __fmul_rn(query[q_base + d],
+                        __uint_as_float((unsigned int)bits << 16)));
+                }
+            } else {
+                const float* kv = (const float*)compressed
+                    + ((long long)b * compressed_records + rec) * dim;
+                for (int d = 0; d < dim; ++d)
+                    acc = __fadd_rn(acc, __fmul_rn(query[q_base + d], kv[d]));
+            }
+            const int candidate = dense_candidates + rec;
+            float score = __fmul_rn(acc, scale);
+            if (bias_present) {
+                const int bb = bias_b == 1 ? 0 : b;
+                const int bh = bias_h == 1 ? 0 : h;
+                const int bq = bias_s == 1 ? 0 : s;
+                const int bk = bias_k == 1 ? 0 : candidate;
+                score = __fadd_rn(score, bias[(((bb * bias_h + bh) * bias_s + bq) * bias_k + bk)]);
+            }
+            row_scores[candidate] = score;
             maximum = fmaxf(maximum, score);
         }
         if (maximum == NEG) {
@@ -782,7 +812,23 @@ extern "C" __global__ void csa_ratio128_sink_attention(
                 val = current_kv[(((long long)b * current_kv_len + relative) * dim) + d];
             } else {
                 const int rec = c - dense_candidates;
-                val = compressed[(((long long)b * compressed_records + rec) * dim) + d];
+                if (cache_fp8) {
+                    const unsigned char* packed = compressed
+                        + ((long long)b * compressed_records + rec) * 583;
+                    if (d < 448) {
+                        const int block = d / 64, in_block = d % 64;
+                        val = decode_e4m3fn(packed[65 * block + 1 + in_block])
+                            * e8m0_scale(packed[65 * block]);
+                    } else {
+                        const int tail = d - 448;
+                        const unsigned short bits = (unsigned short)packed[455 + 2 * tail]
+                            | ((unsigned short)packed[455 + 2 * tail + 1] << 8);
+                        val = __uint_as_float((unsigned int)bits << 16);
+                    }
+                } else {
+                    val = ((const float*)compressed)
+                        [(((long long)b * compressed_records + rec) * dim) + d];
+                }
             }
             result = __fadd_rn(result, __fmul_rn(prob, val));
         }
@@ -921,9 +967,8 @@ extern "C" __global__ void csa_ratio4_sink_attention(
 }
 "#;
 
-/// Factory for the host-staged CUDA CSA kernel. It builds the CPU CSA kernel
-/// from the same node (reusing the CPU oracle's attribute validation and compute
-/// core) and wraps it so execution stages tensors through the host.
+/// Factory for CUDA CSA device paths plus the diagnostic host-staged oracle.
+/// The CPU factory remains the single source of schema and attribute validation.
 pub struct CompressedSparseAttentionFactory {
     pub runtime: Arc<CudaRuntime>,
     /// Shared §8 telemetry surface owned by the EP; cloned into every CSA kernel.
@@ -957,30 +1002,26 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         let layout = CsaBufferLayout::from_runner(node, input_shapes, ratio)?;
         // B6 pooled scratch: the device-only capture path never allocates per
         // call, so size every workspace to the fixed-capacity (D3) bound now and
-        // reserve stable addresses. Only the ratio-4 index/attention path uses
-        // them; other configs reserve nothing.
-        let workspace_bytes = ratio4_workspace_bytes(node, input_shapes, &layout);
+        // reserve stable addresses.
+        let workspace_bytes = csa_workspace_bytes(node, input_shapes, &layout);
         let device_state =
             CsaDeviceBufferManager::reserve(self.runtime.clone(), layout, &workspace_bytes)?;
 
-        // B1: flip stage-6 (candidate read) + stage-7 (sparse sink-softmax
-        // attention) to Device for ratio-128 with the f32 record cache, where
-        // the host-staged compression already produces the dequantized candidate
-        // records (`present_compressed_kv` == the f32 logical records). FP8
-        // ratio-128 FP8 records remain host-staged this slice; ratio-4 B5
-        // dequantizes packed candidate records directly on device, including
-        // optional attention bias. Compression/writeback and B4's index readback
-        // keep capture support declined.
+        // Ratio-128 compression and attention both consume graph-threaded device
+        // state. Hybrid FP8 is fully resident/capturable; f32 retains the
+        // host-oracle writeback path while recomputing attention on device.
         let cache_format = node
             .attr("cache_format")
             .and_then(|attribute| attribute.as_str())
             .unwrap_or("f32")
             .to_string();
-        let has_attention_bias = node.inputs.get(19).is_some_and(Option::is_some);
-        let device_compression = ratio == 128 && !has_attention_bias;
+        let device_compression = ratio == 128;
         let device_index_compression = ratio == 4;
         let device_index_scoring = ratio == 4;
-        let device_attention = ratio == 128 && cache_format == "f32" && !has_attention_bias;
+        let device_attention =
+            ratio == 128 && matches!(cache_format.as_str(), "f32" | "fp8_e4m3_block64");
+        let device_resident_ratio128 =
+            ratio == 128 && cache_format == "fp8_e4m3_block64" && node.outputs.len() == 3;
         // B6: ratio-4 main KV compression (outputs 1/2) on device — the last
         // host-staged ratio-4 stage. With it the whole ratio-4 decode is
         // device-resident.
@@ -991,16 +1032,14 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // record stream to dereference, so `Y` must stay on the host oracle. This
         // flag keys strictly on ratio; the output-count gate lives at dispatch.
         let device_ratio4_attention = ratio == 4;
-        // B6 capture eligibility: the fully device-resident ratio-4 fp8 config
-        // with the optional `selected_indices` present (6 outputs). Every output
-        // is produced by a device kernel reading device-resident cursors — no
-        // host round trip, no per-call alloc/free/sync — so the decode is
-        // capture-clean. All other configs return an actionable capture decline.
-        let capturable = device_main_compression
-            && device_index_compression
-            && device_index_scoring
-            && device_ratio4_attention
-            && node.outputs.len() == 6;
+        // Capture eligibility requires every output to be produced by kernels
+        // reading device-resident cursors with stable pooled scratch.
+        let capturable = device_resident_ratio128
+            || (device_main_compression
+                && device_index_compression
+                && device_index_scoring
+                && device_ratio4_attention
+                && node.outputs.len() == 6);
         let configured_scale = node
             .attr("scale")
             .and_then(|attribute| attribute.as_float())
@@ -1034,6 +1073,7 @@ impl KernelFactory for CompressedSparseAttentionFactory {
             device_state,
             dispatch,
             device_compression,
+            device_resident_ratio128,
             device_index_compression,
             device_main_compression,
             device_index_scoring,
@@ -1071,17 +1111,18 @@ impl KernelFactory for CompressedSparseAttentionFactory {
     }
 }
 
-/// Host-staged CUDA CSA kernel: wraps the CPU oracle kernel and moves data
-/// device↔host around each `execute`.
+/// CUDA CSA kernel with device-resident FP8 paths and a host-staged oracle
+/// fallback for unsupported/diagnostic configurations.
 struct CompressedSparseAttentionKernel {
     runtime: Arc<CudaRuntime>,
     inner: Box<dyn Kernel>,
     // Kept alive for stable device addresses; B0 still uses graph-threaded state.
     device_state: CsaDeviceBufferManager,
     dispatch: CsaStageDispatch,
-    /// B2: ratio-128 stage-1 is a device kernel for both f32 and hybrid-FP8
-    /// caches.  Ratio-4 remains entirely host-staged.
+    /// Ratio-128 stage-1 device kernel.
     device_compression: bool,
+    /// Ratio-128 hybrid FP8 cache/carry + attention run without host staging.
+    device_resident_ratio128: bool,
     /// B3: ratio-4 stage-2 index-key compression is independently finalized on
     /// the device; scoring and attention deliberately remain host-staged.
     device_index_compression: bool,
@@ -1091,17 +1132,14 @@ struct CompressedSparseAttentionKernel {
     /// B4/B5: ratio-4 selection writes device `selected_indices`; fused
     /// candidate assembly and sparse attention consume it directly.
     device_index_scoring: bool,
-    /// B1: ratio-128 f32-cache path runs stage-7 attention on device.
+    /// Ratio-128 f32 or hybrid-FP8 stage-7 attention kernel.
     device_attention: bool,
     /// B5: ratio-4 fused selection→attention runs stage-6/7 on device, but only
     /// when the node emits `selected_indices` (6 outputs). A 5-output ratio-4
     /// node keeps `Y` from the host oracle — the device ratio-128 attention
     /// kernel must never run for a ratio-4 node.
     device_ratio4_attention: bool,
-    /// B6: the whole ratio-4 fp8 6-output decode is device-resident and
-    /// capture-clean. When set, `execute` takes the device-only path (no host
-    /// staging, no per-call alloc/free, cursor-driven launch) and
-    /// `capture_support()` returns `Supported`.
+    /// The selected FP8 configuration is fully device-resident and capture-clean.
     capturable: bool,
     /// D7 diagnostic override: when set, `execute` takes the host-staged oracle
     /// path even for the capturable config, and `capture_support()` reports
@@ -1184,11 +1222,16 @@ impl CsaStageDispatch {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct CsaGoldenBoundary {
+    // Kept for the planned CSA golden-boundary diff consumer.
+    #[allow(dead_code)]
     stage: CsaPipelineStage,
+    // Kept for the planned CSA golden-boundary diff consumer.
+    #[allow(dead_code)]
     mode: CsaStageMode,
+    // Kept for the planned CSA golden-boundary diff consumer.
+    #[allow(dead_code)]
     payload: Vec<u8>,
 }
 #[derive(Debug)]
@@ -1242,130 +1285,125 @@ impl CompressedSparseAttentionKernel {
         self.inner.execute(inputs, outputs)
     }
 
-    /// B1 device stage-6/7 for ratio-128 (f32 cache). Launches the CUDA
-    /// sink-softmax attention kernel over the device query / `current_kv` /
-    /// candidate-record buffers, writing `Y` (output 0) directly and matching
-    /// the CPU oracle's `ratio128_attention` numerics bit-for-bit.
+    /// Device stage-6/7 for ratio-128. Reads f32 or packed hybrid-FP8 records
+    /// directly, writes `Y`, and derives every logical cursor on device.
     fn run_device_attention(
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        staged: &[Vec<u8>],
+        sync: bool,
     ) -> Result<()> {
-        // Reproduce the oracle's derived attention geometry from the staged
-        // inputs and inferred output shapes (see the CPU
-        // `execute_stateful_ratio128` / `ratio128_attention`).
-        let query_shape = inputs[0].shape;
-        let batch = query_shape[0];
-        let sequence = query_shape[1];
-        let heads = query_shape[2];
-        let dim = query_shape[3];
-        let current_kv_len = inputs[1].shape[1];
-        let compressed_records = outputs[1].shape[1];
-
-        let total_bytes = &staged[9];
-        if total_bytes.len() != 8 {
-            return Err(not_implemented(format!(
-                "{OP}: device attention expects a scalar total_sequence_length"
-            )));
-        }
-
-        let total = i64::from_ne_bytes(total_bytes[..8].try_into().expect("8 bytes")) as usize;
-        let start = total.checked_sub(sequence).ok_or_else(|| {
-            not_implemented(format!("{OP}: total < sequence in device attention"))
-        })?;
-        let current_kv_base = total.checked_sub(current_kv_len).ok_or_else(|| {
+        let [batch, sequence, heads, dim] = inputs[0].shape.try_into().map_err(|_| {
             not_implemented(format!(
-                "{OP}: current_kv longer than total in device attention"
+                "{OP}: ratio-128 device attention requires rank-4 query"
             ))
         })?;
-        let dense_candidates = if start == 0 {
-            current_kv_len.min(128)
-        } else {
-            128
-        };
-        let candidate_count = dense_candidates + compressed_records;
-        let rows = batch * sequence * heads;
-        if rows == 0 || candidate_count == 0 {
+        let current_kv_len = inputs[1].shape[1];
+        let compressed_records = outputs[1].shape[1];
+        let scratch_stride = RATIO4_DENSE_WINDOW
+            .checked_add(compressed_records)
+            .ok_or_else(|| not_implemented(format!("{OP}: ratio-128 scratch stride overflow")))?;
+        let rows = batch
+            .checked_mul(sequence)
+            .and_then(|count| count.checked_mul(heads))
+            .ok_or_else(|| not_implemented(format!("{OP}: ratio-128 row count overflow")))?;
+        if rows == 0 || scratch_stride == 0 {
             return Ok(());
         }
-
         let scale = if self.configured_scale == 0.0 {
             1.0f32 / (dim as f32).sqrt()
         } else {
             self.configured_scale
         };
-
+        let mut bias_shape = [1i32; 4];
+        let bias_present = inputs.get(19).is_some_and(|input| !input.is_absent());
+        if bias_present {
+            let shape = inputs[19].shape;
+            bias_shape[4 - shape.len()..].copy_from_slice(
+                &shape
+                    .iter()
+                    .copied()
+                    .map(|extent| {
+                        i32::try_from(extent)
+                            .map_err(|_| not_implemented("CSA bias dimension exceeds i32"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
         let query_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let current_kv_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
-        // Compressed candidate records are the freshly uploaded f32
-        // `present_compressed_kv` (output 1). When there are no completed
-        // records the pointer is unused by the kernel.
         let compressed_ptr = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
         let sink_ptr = cuptr(inputs[10].data_ptr::<u8>() as *const c_void);
-        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-
-        let score_bytes = rows
-            .checked_mul(candidate_count)
-            .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| not_implemented(format!("{OP}: score scratch size overflow")))?;
-        let scratch = self.runtime.alloc_raw(score_bytes.max(1))?;
-
-        let launch = || -> Result<()> {
-            let func =
-                self.runtime
-                    .nvrtc_function(ATTENTION_MODULE, ATTENTION_SOURCE, ATTENTION_ENTRY)?;
-            let batch_i = batch as i32;
-            let sequence_i = sequence as i32;
-            let heads_i = heads as i32;
-            let dim_i = dim as i32;
-            let current_kv_len_i = current_kv_len as i32;
-            let current_kv_base_i = current_kv_base as i64;
-            let query_start_i = start as i64;
-            let compressed_records_i = compressed_records as i32;
-            let dense_candidates_i = dense_candidates as i32;
-            let candidate_count_i = candidate_count as i32;
-            let grid = u32::try_from(rows)
-                .map_err(|_| not_implemented(format!("{OP}: attention row count exceeds u32")))?;
-
-            let stream = self.runtime.stream();
-            let mut builder = stream.launch_builder(&func);
-            builder
-                .arg(&query_ptr)
-                .arg(&current_kv_ptr)
-                .arg(&compressed_ptr)
-                .arg(&sink_ptr)
-                .arg(&output_ptr)
-                .arg(&scratch)
-                .arg(&batch_i)
-                .arg(&sequence_i)
-                .arg(&heads_i)
-                .arg(&dim_i)
-                .arg(&current_kv_len_i)
-                .arg(&current_kv_base_i)
-                .arg(&query_start_i)
-                .arg(&compressed_records_i)
-                .arg(&dense_candidates_i)
-                .arg(&candidate_count_i)
-                .arg(&scale);
-            // SAFETY: argument types and order match `csa_ratio128_sink_attention`;
-            // all pointers refer to live contiguous device allocations sized by
-            // the shapes above, and the scratch covers `rows * candidate_count`.
-            unsafe {
-                builder.launch(LaunchConfig {
-                    grid_dim: (grid, 1, 1),
-                    block_dim: (ATTENTION_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }
-            .map_err(|error| driver_err("launch csa_ratio128_sink_attention", error))?;
-            self.runtime.synchronize()
+        let bias_ptr = if bias_present {
+            cuptr(inputs[19].data_ptr::<u8>() as *const c_void)
+        } else {
+            cuptr(std::ptr::null::<c_void>())
         };
-
-        let result = launch();
-        // SAFETY: `scratch` came from this runtime's `alloc_raw` and is freed once.
-        let free = unsafe { self.runtime.free_raw(scratch) };
-        result.and(free)
+        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let total_ptr = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
+        let scratch = self.device_state.workspace(WS_RATIO128_ATTN);
+        let source = format!("{}\n{}", block_quant::source(), ATTENTION_SOURCE);
+        let func = self
+            .runtime
+            .nvrtc_function(ATTENTION_MODULE, &source, ATTENTION_ENTRY)?;
+        let ints = [
+            batch,
+            sequence,
+            heads,
+            dim,
+            current_kv_len,
+            compressed_records,
+            scratch_stride,
+        ]
+        .map(|extent| {
+            i32::try_from(extent).map_err(|_| not_implemented("CSA ratio-128 geometry exceeds i32"))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        let cache_fp8 = i32::from(outputs[1].dtype == DataType::Uint8);
+        let bias_present_i = i32::from(bias_present);
+        let grid = u32::try_from(rows)
+            .map_err(|_| not_implemented(format!("{OP}: attention row count exceeds u32")))?;
+        let mut builder = self.runtime.stream().launch_builder(&func);
+        builder
+            .arg(&query_ptr)
+            .arg(&current_kv_ptr)
+            .arg(&compressed_ptr)
+            .arg(&sink_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&scratch)
+            .arg(&ints[0])
+            .arg(&ints[1])
+            .arg(&ints[2])
+            .arg(&ints[3])
+            .arg(&ints[4])
+            .arg(&total_ptr)
+            .arg(&ints[5])
+            .arg(&ints[6])
+            .arg(&cache_fp8)
+            .arg(&bias_present_i)
+            .arg(&bias_shape[0])
+            .arg(&bias_shape[1])
+            .arg(&bias_shape[2])
+            .arg(&bias_shape[3])
+            .arg(&scale);
+        // SAFETY: argument types and order match `csa_ratio128_sink_attention`;
+        // all pointers refer to live contiguous device allocations sized by the
+        // validated tensor shapes and fixed-capacity pooled scratch.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (ATTENTION_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch csa_ratio128_sink_attention", error))?;
+        if sync {
+            self.runtime.synchronize()
+        } else {
+            Ok(())
+        }
     }
 
     /// B5 stages 6–7 for ratio-4. The selected record IDs remain in the
@@ -1506,7 +1544,7 @@ impl CompressedSparseAttentionKernel {
         &self,
         inputs: &[TensorView],
         outputs: &mut [TensorMut],
-        staged: &[Vec<u8>],
+        sync: bool,
     ) -> Result<()> {
         let shape = inputs[0].shape;
         let (batch, sequence, dim) = (shape[0], shape[1], shape[3]);
@@ -1515,16 +1553,6 @@ impl CompressedSparseAttentionKernel {
         if batch == 0 || sequence == 0 {
             return Ok(());
         }
-        let start_total = staged[9].as_slice();
-        if start_total.len() != 8 {
-            return Err(not_implemented(format!(
-                "{OP}: device compression expects scalar total_sequence_length"
-            )));
-        }
-        let total = i64::from_ne_bytes(start_total.try_into().expect("8 bytes"));
-        let start = total.checked_sub(sequence as i64).ok_or_else(|| {
-            not_implemented(format!("{OP}: total < sequence in device compression"))
-        })?;
         let cache_fp8 = i32::from(outputs[1].dtype == DataType::Uint8);
         let source = format!("{}\n{}", block_quant::source(), COMPRESSION_SOURCE);
         let func = self
@@ -1538,6 +1566,7 @@ impl CompressedSparseAttentionKernel {
         let past_cache = cuptr(inputs[6].data_ptr::<u8>() as *const c_void);
         let carry = cuptr(outputs[2].data_ptr_mut::<u8>() as *const c_void);
         let cache = cuptr(outputs[1].data_ptr_mut::<u8>() as *const c_void);
+        let total = cuptr(inputs[9].data_ptr::<u8>() as *const c_void);
         let mut builder = self.runtime.stream().launch_builder(&func);
         let batch_i = i32::try_from(batch).map_err(|_| not_implemented("CSA batch exceeds i32"))?;
         let sequence_i =
@@ -1562,7 +1591,7 @@ impl CompressedSparseAttentionKernel {
             .arg(&past_i)
             .arg(&records_i)
             .arg(&cache_fp8)
-            .arg(&start);
+            .arg(&total);
         // SAFETY: all arguments are contiguous device buffers whose shape was
         // validated by the CPU factory; one serial thread owns each batch row.
         unsafe {
@@ -1573,7 +1602,10 @@ impl CompressedSparseAttentionKernel {
             })
         }
         .map_err(|error| driver_err("launch csa_ratio128_compress", error))?;
-        self.runtime.synchronize()
+        if sync {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
 
     /// Record §8 observability for one device-path decode into the shared
@@ -1632,6 +1664,18 @@ impl CompressedSparseAttentionKernel {
             }
         }
         sequence
+    }
+
+    /// Device-only ratio-128 hybrid-FP8 pipeline. Compression writes packed
+    /// cache/carry outputs, then attention consumes the packed cache on the same
+    /// non-default stream. The logical cursor stays device-resident throughout.
+    fn run_device_ratio128(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.run_device_compression(inputs, outputs, false)?;
+        self.run_device_attention(inputs, outputs, false)?;
+        if !self.runtime.is_capturing()? {
+            self.runtime.synchronize()?;
+        }
+        Ok(())
     }
 
     /// B6 device-only, capture-clean pipeline for the ratio-4 fp8 6-output
@@ -1959,6 +2003,9 @@ impl CompressedSparseAttentionKernel {
 
 impl Kernel for CompressedSparseAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        if self.device_resident_ratio128 && !self.force_host {
+            return self.run_device_ratio128(inputs, outputs);
+        }
         // B6/B7: the fully device-resident ratio-4 fp8 6-output config runs a
         // device-only pipeline — every stage reads the `total_sequence_length`
         // cursor on device, uses pre-reserved stable-address scratch, and skips
@@ -2070,17 +2117,19 @@ impl Kernel for CompressedSparseAttentionKernel {
         // B2 device stage-1: overwrite the host-oracle cache/carry with the
         // independently computed device result.  The host invocation remains
         // the compatibility path for all other stages and output shapes.
-        if self.device_compression
+        if !self.force_host
+            && self.device_compression
             && self.dispatch.mode(CsaPipelineStage::CompressionUpdate) == CsaStageMode::Device
             // The f32 cache remains B1's strict-Y reference path.  Its device
             // attention consumes the exact f32 oracle record, while B2 owns the
             // hybrid FP8 record format (including its BF16 RoPE tail).
             && outputs[1].dtype == DataType::Uint8
         {
-            self.run_device_compression(inputs, outputs, &staged)?;
+            self.run_device_compression(inputs, outputs, true)?;
         }
 
-        if self.device_index_compression
+        if !self.force_host
+            && self.device_index_compression
             && self.dispatch.mode(CsaPipelineStage::IndexKeyUpdate) == CsaStageMode::Device
         {
             self.run_device_index_compression(inputs, outputs, true)?;
@@ -2088,7 +2137,8 @@ impl Kernel for CompressedSparseAttentionKernel {
 
         // B6 device stage-1 for ratio-4: overwrite the host-oracle main
         // compressed KV cache/carry with the device result (byte-exact FP8).
-        if self.device_main_compression
+        if !self.force_host
+            && self.device_main_compression
             && self.dispatch.mode(CsaPipelineStage::CompressionUpdate) == CsaStageMode::Device
         {
             self.run_device_main_compression(inputs, outputs, true)?;
@@ -2096,7 +2146,8 @@ impl Kernel for CompressedSparseAttentionKernel {
 
         // B4 device stages 3–5: recompute `selected_indices` (output 5) on device
         // from the freshly written device `present_index_key` (output 3).
-        if self.device_index_scoring
+        if !self.force_host
+            && self.device_index_scoring
             && outputs.len() == 6
             && self.dispatch.mode(CsaPipelineStage::Selection) == CsaStageMode::Device
         {
@@ -2106,13 +2157,14 @@ impl Kernel for CompressedSparseAttentionKernel {
         // B1 device stage-7: ratio-128 f32-cache consumes the f32 candidate
         // records and recomputes `Y` on device. This path is never taken for
         // ratio-4 (its cache is the packed FP8/BF16 583-byte record, not f32).
-        if self.device_attention
+        if !self.force_host
+            && self.device_attention
             && self
                 .dispatch
                 .mode(CsaPipelineStage::SparseSinkSoftmaxAttention)
                 == CsaStageMode::Device
         {
-            self.run_device_attention(inputs, outputs, &staged)?;
+            self.run_device_attention(inputs, outputs, true)?;
         }
 
         // B5 device stage-6/7: ratio-4 fused selection→attention. Gated on the
@@ -2123,7 +2175,8 @@ impl Kernel for CompressedSparseAttentionKernel {
         // above, and we must NOT fall through to `run_device_attention` (the
         // ratio-128 kernel), which would read the 583-byte packed record as
         // `f32×512` out of bounds and clobber the correct `Y`.
-        if self.device_ratio4_attention
+        if !self.force_host
+            && self.device_ratio4_attention
             && outputs.len() == 6
             && self
                 .dispatch
@@ -2169,16 +2222,16 @@ impl Kernel for CompressedSparseAttentionKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // B6/B7: the ratio-4 fp8 6-output config runs a fully device-resident,
-        // cursor-driven pipeline with pre-reserved stable-address scratch and no
-        // per-call alloc/free/sync, so it is capture-clean and the default path.
+        // Ratio-4 fp8 six-output and ratio-128 fp8 three-output configurations
+        // run cursor-driven pipelines with pre-reserved stable-address scratch
+        // and no per-call alloc/free/sync while capture is active.
         // `ONNX_GENAI_CSA_FORCE_HOST` (D7) forces the host-staged oracle, which
         // host-stages (D2H inputs, H2D outputs, per-copy syncs) — illegal during
         // capture — so it must report non-capturable. Every other config also
         // stays non-capturable.
         if !self.capturable {
             return onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires the ratio-4 fp8 six-output device-resident compressed-attention path",
+                "requires a fully device-resident ratio-4 or ratio-128 fp8 compressed-attention path",
             );
         }
         if self.force_host {

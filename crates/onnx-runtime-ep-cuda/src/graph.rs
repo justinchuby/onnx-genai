@@ -316,6 +316,7 @@ impl CudaGraphLifecycle {
     /// eager seam nodes whose per-step effects a bare replay would not reproduce.
     /// A retained-graph verify path must gate on this invariant before reusing
     /// the capture instead of re-warming.
+    // Kept for the planned WP4 retained-graph verification path.
     #[allow(dead_code)]
     pub(crate) fn holds_single_capture(&self) -> Result<bool> {
         Ok(self.lock()?.segments.len() == 1)

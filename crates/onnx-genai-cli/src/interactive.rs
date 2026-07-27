@@ -228,14 +228,88 @@ impl SessionSettings {
             EngineDecodeBackend::Native => "native",
         }
     }
+}
 
-    /// How the current selection reads back to a user.
-    pub(super) fn describe(&self) -> String {
-        format!(
-            "model {} · ep {} · backend {}",
-            self.model_dir.display(),
-            self.resolved_providers(),
-            self.backend_name()
+/// Cumulative, privacy-preserving usage for the conversation currently in the REPL.
+#[derive(Debug, Default)]
+pub(super) struct SessionUsage {
+    pub(super) prompt_tokens: usize,
+    pub(super) generated_tokens: usize,
+    pub(super) completed_turns: usize,
+}
+
+impl SessionUsage {
+    fn record(&mut self, prompt_tokens: Option<usize>, generated_tokens: usize) {
+        self.prompt_tokens += prompt_tokens.unwrap_or_default();
+        self.generated_tokens += generated_tokens;
+        self.completed_turns += 1;
+    }
+}
+
+/// Human-readable state for an interactive session.
+///
+/// Message text is deliberately not included: `/session` is useful for sharing
+/// diagnostics without echoing conversation content.
+pub(super) struct SessionSummary<'a> {
+    pub(super) settings: &'a SessionSettings,
+    pub(super) options: &'a GenerateOptions,
+    pub(super) history: &'a [ChatMessage],
+    pub(super) usage: &'a SessionUsage,
+}
+
+impl fmt::Display for SessionSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let system_messages = self
+            .history
+            .iter()
+            .filter(|message| matches!(message.role, ChatRole::System))
+            .count();
+        let user_messages = self
+            .history
+            .iter()
+            .filter(|message| matches!(message.role, ChatRole::User))
+            .count();
+        let assistant_messages = self
+            .history
+            .iter()
+            .filter(|message| matches!(message.role, ChatRole::Assistant))
+            .count();
+
+        writeln!(formatter, "session")?;
+        writeln!(formatter, "  model: {}", self.settings.model_dir.display())?;
+        writeln!(
+            formatter,
+            "  execution provider: {}",
+            self.settings.resolved_providers()
+        )?;
+        writeln!(
+            formatter,
+            "  decode backend: {}",
+            self.settings.backend_name()
+        )?;
+        writeln!(
+            formatter,
+            "  sampling: max_new_tokens={} temperature={} top_p={} top_k={} greedy={}",
+            self.options.max_new_tokens,
+            self.options.temperature,
+            self.options.top_p,
+            self.options.top_k,
+            self.options.greedy
+        )?;
+        writeln!(
+            formatter,
+            "  messages: {} (system: {system_messages}, user: {user_messages}, assistant: {assistant_messages})",
+            self.history.len()
+        )?;
+        writeln!(
+            formatter,
+            "  completed turns: {}",
+            self.usage.completed_turns
+        )?;
+        write!(
+            formatter,
+            "  tokens: prompt={} generated={}",
+            self.usage.prompt_tokens, self.usage.generated_tokens
         )
     }
 }
@@ -538,6 +612,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     // Per-turn numbers are opt-in: a line after every reply is noise until a
     // reader is actually watching throughput or cache behavior.
     let mut show_stats = false;
+    let sampling_options = args.sampling.to_options();
+    let mut session_usage = SessionUsage::default();
     // Inert unless stdout is a terminal, so a piped session is byte-for-byte
     // what it was before.
     let mut live = live_turn::LiveTurn::new();
@@ -575,7 +651,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             ReplLine::Prompt(prompt) => Some(prompt),
             ReplLine::Command(ReplCommand::Help) => {
                 println!(
-                    "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+                    "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/session\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
                 );
                 None
             }
@@ -583,6 +659,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 history.clear();
                 image_attachments.clear();
                 audio_attachments.clear();
+                session_usage = SessionUsage::default();
                 println!("conversation history and pending attachments cleared");
                 None
             }
@@ -679,6 +756,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                 history.clear();
                                 image_attachments.clear();
                                 audio_attachments.clear();
+                                session_usage = SessionUsage::default();
                                 println!(
                                     "loaded {} ({} input); conversation cleared",
                                     model_dir.display(),
@@ -688,8 +766,28 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             Err(error) => eprintln!("error: {error:#}"),
                         }
                     }
-                    None => println!("{}", settings.describe()),
+                    None => println!(
+                        "{}",
+                        SessionSummary {
+                            settings: &settings,
+                            options: &sampling_options,
+                            history: &history,
+                            usage: &session_usage,
+                        }
+                    ),
                 }
+                None
+            }
+            ReplLine::Command(ReplCommand::Session) => {
+                println!(
+                    "{}",
+                    SessionSummary {
+                        settings: &settings,
+                        options: &sampling_options,
+                        history: &history,
+                        usage: &session_usage,
+                    }
+                );
                 None
             }
             ReplLine::Command(ReplCommand::ExecutionProvider(name)) => {
@@ -713,6 +811,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                 backend = loaded;
                                 settings = next;
                                 history.clear();
+                                session_usage = SessionUsage::default();
                                 println!("execution provider {name}; conversation cleared");
                             }
                             Err(error) => eprintln!(
@@ -739,6 +838,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                                     backend = loaded;
                                     settings = next;
                                     history.clear();
+                                    session_usage = SessionUsage::default();
                                     println!("decode backend {name}; conversation cleared");
                                 }
                                 Err(error) => eprintln!(
@@ -748,7 +848,15 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         }
                         Err(error) => eprintln!("error: {error}"),
                     },
-                    None => println!("{}", settings.describe()),
+                    None => println!(
+                        "{}",
+                        SessionSummary {
+                            settings: &settings,
+                            options: &sampling_options,
+                            history: &history,
+                            usage: &session_usage,
+                        }
+                    ),
                 }
                 None
             }
@@ -844,7 +952,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             prompt: rendered,
             images: staged_images,
             audio: staged_audio,
-            options: args.sampling.to_options(),
+            options: sampling_options.clone(),
         };
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
@@ -895,6 +1003,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     None => output,
                 };
                 history.push(ChatMessage::assistant(reply));
+                session_usage.record(profile.prompt_tokens, profile.timings.tokens());
                 if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
                     profile.pages = Some(profile::PageActivity::since(before, after));
                 }

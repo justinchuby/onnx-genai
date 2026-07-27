@@ -27,9 +27,10 @@ use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes};
+use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes, read_vec_le};
 
 use crate::error::{Result, SessionError};
+use crate::sequence::{SequenceError, SequenceResult, clone_shape};
 
 /// A process-wide, already-initialized CPU execution provider used to back
 /// user-constructed [`Tensor`]s (host `malloc`/`free` is global, so any
@@ -697,6 +698,29 @@ impl Tensor {
         Ok(())
     }
 
+    /// Deep-copy this tensor while reporting allocation and shape failures.
+    ///
+    /// Prefer this over [`Clone`] in fallible runtime control-flow paths where an
+    /// allocator failure must be propagated instead of panicking.
+    pub fn try_clone(&self) -> SequenceResult<Tensor> {
+        const OP: &str = "Tensor::try_clone";
+        let shape = clone_shape(OP, &self.shape)?;
+        if checked_expected_bytes(self.dtype, &shape).is_none() {
+            return Err(SequenceError::ShapeOverflow {
+                op: OP,
+                context: "tensor byte count",
+                shape,
+            });
+        }
+        Self::from_raw_in(
+            Arc::clone(&self.allocator),
+            self.dtype,
+            shape,
+            self.as_bytes(),
+        )
+        .map_err(|source| SequenceError::TensorCreation { op: OP, source })
+    }
+
     fn buffer(&self) -> &DeviceBuffer {
         self.buffer
             .as_ref()
@@ -779,10 +803,8 @@ impl Tensor {
         );
         self.try_as_slice_f32().map_or_else(
             || {
-                self.as_bytes()
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect()
+                read_vec_le::<f32>(self.as_bytes())
+                    .expect("Float32 tensor storage length must be a multiple of 4 bytes")
             },
             <[f32]>::to_vec,
         )
@@ -791,25 +813,15 @@ impl Tensor {
     /// Copy out the elements as `i64`. Panics if the dtype is not `Int64`.
     pub fn to_vec_i64(&self) -> Vec<i64> {
         assert_eq!(self.dtype, DataType::Int64, "to_vec_i64 on non-i64 tensor");
-        self.as_bytes()
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-            .collect()
+        read_vec_le(self.as_bytes())
+            .expect("Int64 tensor storage length must be a multiple of 8 bytes")
     }
 }
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
-        // Deep copy: a fresh allocation with identical bytes. Cannot fail for
-        // host allocations of the same size; propagate as a panic-free fallback
-        // by re-using `from_raw_in` and unwrapping the size-checked path.
-        Self::from_raw_in(
-            self.allocator.clone(),
-            self.dtype,
-            self.shape.clone(),
-            self.as_bytes(),
-        )
-        .expect("Tensor::clone: re-allocation of identical bytes")
+        self.try_clone()
+            .expect("Tensor::clone: re-allocation of identical bytes")
     }
 }
 
@@ -862,6 +874,18 @@ mod tests {
         let error = Tensor::from_raw(DataType::Float32, vec![usize::MAX, 2], &[])
             .expect_err("overflowing tensor geometry must be rejected");
         assert!(matches!(error, SessionError::ShapeOverflow { .. }));
+    }
+
+    #[test]
+    fn try_clone_deep_copies_shape_and_data() {
+        let tensor = Tensor::from_f32(&[2, 2], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+        let cloned = tensor.try_clone().unwrap();
+
+        assert_eq!(cloned.dtype, tensor.dtype);
+        assert_eq!(cloned.shape, tensor.shape);
+        assert_eq!(cloned.layout, tensor.layout);
+        assert_eq!(cloned.as_bytes(), tensor.as_bytes());
+        assert_ne!(cloned.device_ptr(), tensor.device_ptr());
     }
 
     #[test]

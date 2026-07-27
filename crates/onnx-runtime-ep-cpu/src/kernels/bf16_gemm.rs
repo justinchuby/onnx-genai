@@ -1,12 +1,10 @@
 //! Native BF16×BF16→FP32 GEMM for x86-64 hosts with `avx512_bf16`.
 //!
-//! ONNX Runtime's CPU EP has no bf16 compute; our MatMul supports bf16 by
-//! widening every element to f32 and running the f32 SGEMM (correct, but it
-//! doubles the operand bandwidth and does no native bf16 work). On a
+//! The portable half GEMM is the correctness baseline on every CPU. On a
 //! Sapphire-Rapids-class core with `avx512_bf16`, `_mm512_dpbf16_ps` multiplies
 //! 32 bf16 pairs and horizontally accumulates them into 16 f32 lanes in a single
-//! instruction. This module routes bf16×bf16 MatMul through that instruction,
-//! keeping the operands in bf16 (half the bytes) and accumulating in **f32**.
+//! instruction. This module provides that runtime-gated optimization while
+//! keeping operands in bf16 and accumulating in **f32**.
 //!
 //! ## Numerics
 //!

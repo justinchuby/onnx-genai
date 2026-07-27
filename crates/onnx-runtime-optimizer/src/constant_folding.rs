@@ -24,7 +24,7 @@ use std::collections::{BinaryHeap, HashMap};
 
 use onnx_runtime_ir::{
     Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, as_static_shape,
-    is_fully_static, static_shape,
+    is_fully_static, read_vec_le, static_shape,
 };
 
 use crate::error::Result;
@@ -289,24 +289,14 @@ fn read_i64(t: &TensorData) -> Option<Vec<i64>> {
     if t.data.len() != t.numel() * 8 {
         return None;
     }
-    Some(
-        t.data
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-            .collect(),
-    )
+    read_vec_le(&t.data).ok()
 }
 
 fn read_i32(t: &TensorData) -> Option<Vec<i32>> {
     if t.data.len() != t.numel() * 4 {
         return None;
     }
-    Some(
-        t.data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-            .collect(),
-    )
+    read_vec_le(&t.data).ok()
 }
 
 #[cfg(test)]

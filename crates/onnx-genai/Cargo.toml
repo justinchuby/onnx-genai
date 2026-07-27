@@ -35,7 +35,7 @@ clap = { workspace = true }
 tokenizers = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 rand = "0.9"
 rand_distr = "0.5"
 
@@ -46,3 +46,6 @@ path = "src/bin/run_comfyui.rs"
 [[bin]]
 name = "render_sd"
 path = "src/bin/render_sd.rs"
+
+[lints]
+workspace = true

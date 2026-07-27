@@ -181,12 +181,14 @@ This increment adds the standard **linear** `bits=2` layout:
 - four 2-bit codes occupy each byte, low bits first;
 - absent zero point means `zp=2`;
 - dequantization is `(q-2)*scale`; and
-- computation is correctness-first f32 GEMV/GEMM after dequantization.
+- CPU GEMV/GEMM decode the packed codes inline and accumulate in f32 without
+  materializing an f32 weight matrix.
 
 The int4 VNNI/int8 paths are deliberately gated to `bits=4`. A 2-bit model can
-therefore never be misread by the nibble kernel. Unit tests cover a partial
-final K block, batched matmul parity against an independently dequantized f32
-reference, and explicit low-bit-first unpacking.
+therefore never be misread by the nibble kernel. Unit tests cover direct GEMV
+and GEMM, symmetric and asymmetric zero points, block sizes 16 and 32, f32 and
+f16 scales, a partial final K block, parity against an independently
+dequantized f32 reference, and explicit low-bit-first unpacking.
 
 ### 3.2 What fits and what does not
 
@@ -211,9 +213,9 @@ schema revision with an agreed default zero point and packing; a private
 interpretation would not be portable.
 
 For performance, use ORT/MLAS packing and kernels as the reference. In our CPU
-EP, the current f32 dequant path is the oracle. Prefill can feed the existing
-the built-in f32 GEMM after dequantization; decode ultimately needs a direct packed
-2-bit GEMV because materializing f32 weights is memory-bandwidth hostile.
+EP, the f32 dequant path remains the correctness oracle and fallback for
+unsupported configurations. Standard linear int2 now uses direct packed GEMV
+and GEMM kernels because materializing f32 weights is memory-bandwidth hostile.
 
 ### 4.2 Native path: `BlockQuantizedMatMul`
 

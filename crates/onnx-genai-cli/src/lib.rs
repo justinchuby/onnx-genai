@@ -1056,6 +1056,55 @@ mod tests {
             parse_repl_line("/model ./m"),
             ReplLine::Command(ReplCommand::Model(Some("./m".to_string())))
         );
+        assert_eq!(
+            parse_repl_line("/session"),
+            ReplLine::Command(ReplCommand::Session)
+        );
+    }
+
+    #[test]
+    fn session_summary_is_structured_and_redacts_message_content() {
+        let settings =
+            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
+        let options = GenerateOptions {
+            max_new_tokens: 32,
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            greedy: false,
+            ..GenerateOptions::default()
+        };
+        let history = vec![
+            ChatMessage::system("private instruction"),
+            ChatMessage::user("private question"),
+            ChatMessage::assistant("private answer"),
+        ];
+        let usage = interactive::SessionUsage {
+            prompt_tokens: 14,
+            generated_tokens: 5,
+            completed_turns: 1,
+        };
+
+        let summary = interactive::SessionSummary {
+            settings: &settings,
+            options: &options,
+            history: &history,
+            usage: &usage,
+        }
+        .to_string();
+
+        assert_eq!(
+            summary,
+            "session\n\
+             \x20\x20model: models/tiny\n\
+             \x20\x20execution provider: cpu\n\
+             \x20\x20decode backend: auto\n\
+             \x20\x20sampling: max_new_tokens=32 temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
+             \x20\x20messages: 3 (system: 1, user: 1, assistant: 1)\n\
+             \x20\x20completed turns: 1\n\
+             \x20\x20tokens: prompt=14 generated=5"
+        );
+        assert!(!summary.contains("private"), "{summary}");
     }
 
     #[test]

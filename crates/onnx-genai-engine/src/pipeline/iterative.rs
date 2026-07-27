@@ -6,6 +6,22 @@
 
 use super::*;
 
+/// Bundled inputs for [`PipelineEngine::run_denoiser_pass`]: the denoiser
+/// session, the iterative plan and its start step, the constant conditioning
+/// tensors and loop-carried values, the current step index and timestep, and
+/// any per-port input overrides (input scaling or CFG unconditional
+/// conditioning).
+struct DenoiserPassContext<'a, 'o> {
+    denoiser: &'a Session,
+    plan: &'a IterativePlan,
+    start_step: usize,
+    constants: &'a PipelineTensors,
+    carried: &'a HashMap<String, Value>,
+    step: usize,
+    timestep: f32,
+    overrides: &'a [(&'o str, &'o Value)],
+}
+
 impl PipelineEngine {
     /// Run a bounded iterative (diffusion) denoise loop.
     ///
@@ -224,16 +240,16 @@ impl PipelineEngine {
                     .collect();
 
                 // Conditional pass (all inputs as declared, plus any input scaling).
-                let cond_out = self.run_denoiser_pass(
+                let cond_out = self.run_denoiser_pass(DenoiserPassContext {
                     denoiser,
                     plan,
                     start_step,
-                    &constants,
-                    &carried,
+                    constants: &constants,
+                    carried: &carried,
                     step,
                     timestep,
-                    &scale_overrides,
-                )?;
+                    overrides: &scale_overrides,
+                })?;
 
                 // Classifier-free guidance: run an unconditional pass with the
                 // conditioning replaced by the unconditional embedding, then combine
@@ -261,16 +277,16 @@ impl PipelineEngine {
                         cfg_overrides.retain(|(p, _)| *p != port.as_str());
                         cfg_overrides.push((port.as_str(), value));
                     }
-                    let uncond_out = self.run_denoiser_pass(
+                    let uncond_out = self.run_denoiser_pass(DenoiserPassContext {
                         denoiser,
                         plan,
                         start_step,
-                        &constants,
-                        &carried,
+                        constants: &constants,
+                        carried: &carried,
                         step,
                         timestep,
-                        &cfg_overrides,
-                    )?;
+                        overrides: &cfg_overrides,
+                    })?;
                     let mut combined: HashMap<String, Value> = HashMap::new();
                     for (port, cond_value) in &cond_out {
                         let uncond_value = uncond_out.get(port).with_context(|| {
@@ -380,18 +396,20 @@ impl PipelineEngine {
     /// keyed by port. `override_input`, when set as `(port, value)`, substitutes
     /// that input's value — used to supply the unconditional conditioning on the
     /// CFG unconditional pass.
-    #[allow(clippy::too_many_arguments)]
     fn run_denoiser_pass(
         &self,
-        denoiser: &Session,
-        plan: &IterativePlan,
-        start_step: usize,
-        constants: &PipelineTensors,
-        carried: &HashMap<String, Value>,
-        step: usize,
-        timestep: f32,
-        overrides: &[(&str, &Value)],
+        context: DenoiserPassContext<'_, '_>,
     ) -> anyhow::Result<HashMap<String, Value>> {
+        let DenoiserPassContext {
+            denoiser,
+            plan,
+            start_step,
+            constants,
+            carried,
+            step,
+            timestep,
+            overrides,
+        } = context;
         let mut inputs: Vec<(String, Value)> = Vec::new();
         for info in denoiser.inputs() {
             let port = info.name.as_str();

@@ -353,7 +353,7 @@ pub(crate) fn load_materialized_past(
 
 pub(crate) fn past_shape(shape: &[i64], sequence_len: usize) -> anyhow::Result<Vec<i64>> {
     if shape.len() < 3 {
-        anyhow::bail!("KV past shape rank must be >= 3, got {:?}", shape);
+        anyhow::bail!("KV past shape rank must be >= 3, got {shape:?}");
     }
     let seq_axis = shape.len() - 2;
     Ok(shape
@@ -468,7 +468,7 @@ pub(crate) fn rewind_decode_state_to_len(
     if decode_state.has_runner() {
         kv_cache
             .rewind_to(seq, len)
-            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
         decode_state.rewind_runner(len)?;
         *kv_token_count = len;
         return Ok(());
@@ -477,7 +477,7 @@ pub(crate) fn rewind_decode_state_to_len(
         decode_state.rewind_windowed(*kv_token_count, len)?;
         kv_cache
             .rewind_to(seq, len)
-            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
         *kv_token_count = len;
         return Ok(());
     }
@@ -486,7 +486,7 @@ pub(crate) fn rewind_decode_state_to_len(
     }
     kv_cache
         .rewind_to(seq, len)
-        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
     *kv_token_count = len;
     if len == 0 {
         decode_state.past.clear();
@@ -495,7 +495,7 @@ pub(crate) fn rewind_decode_state_to_len(
     let kv_model = kv_model.context("missing KV model after rewind check")?;
     let materialized = kv_cache
         .materialize_sequence(seq)
-        .map_err(|e| anyhow::anyhow!("Failed to materialize rewound KV sequence {seq}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to materialize rewound KV sequence {seq}: {e}"))?;
     load_materialized_past(session, kv_model, decode_state, &materialized)
 }
 

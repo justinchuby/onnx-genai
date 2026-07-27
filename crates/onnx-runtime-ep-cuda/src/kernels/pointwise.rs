@@ -155,6 +155,15 @@ __device__ float op_round(float x) { return rintf(x); }
 __device__ float op_sin(float x) { return sinf(x); }
 __device__ float op_cos(float x) { return cosf(x); }
 __device__ float op_softplus(float x) { return fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x))); }
+__device__ float op_tan(float x) { return tanf(x); }
+__device__ float op_sinh(float x) { return sinhf(x); }
+__device__ float op_cosh(float x) { return coshf(x); }
+__device__ float op_asin(float x) { return asinf(x); }
+__device__ float op_acos(float x) { return acosf(x); }
+__device__ float op_atan(float x) { return atanf(x); }
+__device__ float op_asinh(float x) { return asinhf(x); }
+__device__ float op_acosh(float x) { return acoshf(x); }
+__device__ float op_atanh(float x) { return atanhf(x); }
 
 #define DEFINE_UNARY(NAME, TYPE, SUFFIX) \
 extern "C" __global__ void NAME##_##SUFFIX(const TYPE* x, TYPE* y, const unsigned long long n) { \
@@ -174,7 +183,16 @@ DEFINE_UNARY(ceil, TYPE, SUFFIX) \
 DEFINE_UNARY(round, TYPE, SUFFIX) \
 DEFINE_UNARY(sin, TYPE, SUFFIX) \
 DEFINE_UNARY(cos, TYPE, SUFFIX) \
-DEFINE_UNARY(softplus, TYPE, SUFFIX)
+DEFINE_UNARY(softplus, TYPE, SUFFIX) \
+DEFINE_UNARY(tan, TYPE, SUFFIX) \
+DEFINE_UNARY(sinh, TYPE, SUFFIX) \
+DEFINE_UNARY(cosh, TYPE, SUFFIX) \
+DEFINE_UNARY(asin, TYPE, SUFFIX) \
+DEFINE_UNARY(acos, TYPE, SUFFIX) \
+DEFINE_UNARY(atan, TYPE, SUFFIX) \
+DEFINE_UNARY(asinh, TYPE, SUFFIX) \
+DEFINE_UNARY(acosh, TYPE, SUFFIX) \
+DEFINE_UNARY(atanh, TYPE, SUFFIX)
 DEFINE_FOR_TYPE(float, f32)
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
@@ -182,7 +200,7 @@ DEFINE_FOR_TYPE(__nv_bfloat16, bf16)
 #endif
 "#;
 
-const UNARY_MATH_MODULE: &str = "pointwise_unary_math_float_v2";
+const UNARY_MATH_MODULE: &str = "pointwise_unary_math_float_v3";
 
 /// A supported unary math op and its NVRTC entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +217,15 @@ pub enum UnaryMathOp {
     Sin,
     Cos,
     Softplus,
+    Tan,
+    Sinh,
+    Cosh,
+    Asin,
+    Acos,
+    Atan,
+    Asinh,
+    Acosh,
+    Atanh,
 }
 
 impl UnaryMathOp {
@@ -216,6 +243,15 @@ impl UnaryMathOp {
             UnaryMathOp::Sin => "sin",
             UnaryMathOp::Cos => "cos",
             UnaryMathOp::Softplus => "softplus",
+            UnaryMathOp::Tan => "tan",
+            UnaryMathOp::Sinh => "sinh",
+            UnaryMathOp::Cosh => "cosh",
+            UnaryMathOp::Asin => "asin",
+            UnaryMathOp::Acos => "acos",
+            UnaryMathOp::Atan => "atan",
+            UnaryMathOp::Asinh => "asinh",
+            UnaryMathOp::Acosh => "acosh",
+            UnaryMathOp::Atanh => "atanh",
         }
     }
 
@@ -237,6 +273,15 @@ impl UnaryMathOp {
             UnaryMathOp::Sin => "Sin",
             UnaryMathOp::Cos => "Cos",
             UnaryMathOp::Softplus => "Softplus",
+            UnaryMathOp::Tan => "Tan",
+            UnaryMathOp::Sinh => "Sinh",
+            UnaryMathOp::Cosh => "Cosh",
+            UnaryMathOp::Asin => "Asin",
+            UnaryMathOp::Acos => "Acos",
+            UnaryMathOp::Atan => "Atan",
+            UnaryMathOp::Asinh => "Asinh",
+            UnaryMathOp::Acosh => "Acosh",
+            UnaryMathOp::Atanh => "Atanh",
         }
     }
 }

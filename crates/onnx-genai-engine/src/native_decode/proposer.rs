@@ -208,7 +208,7 @@ impl NativeProposerSession {
         self.current_len = 0;
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn step_token_ids(
         &mut self,
         token_ids: &[TokenId],

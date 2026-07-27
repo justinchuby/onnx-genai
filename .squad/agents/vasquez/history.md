@@ -6,3 +6,5 @@
 
 ## 2026-07-18T01:20:34Z — PR #25 lifecycle regression approved
 - Approved `dbff29c`: real Environment lifecycle, last-drop cache clearing, and fresh registration attempt are covered; PR #25 merged.
+
+- 2026-07-27T10:09:19Z: Roadmap wave landed: #239/#246/#249/#248/#256/#263/#259 plus fmt gate #264; reviewer-lockout protocol enforced where required.

@@ -192,24 +192,98 @@ pub struct ScatterElementsKernel {
     axis: i64,
     reduction: ScatterReduction,
 }
+
+/// `ScatterND`: update slices selected by the trailing index tuples.
+pub struct ScatterNDKernel {
+    reduction: ScatterReduction,
+}
+
+pub struct ScatterNDFactory;
+
+impl KernelFactory for ScatterNDFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ScatterNDKernel {
+            reduction: parse_scatter_reduction("ScatterND", node)?,
+        }))
+    }
+}
+
+pub(crate) fn scatter_nd_unsupported_reason(input_dtypes: &[DataType]) -> Option<String> {
+    if input_dtypes.is_empty() {
+        return None;
+    }
+    if input_dtypes.len() != 3 {
+        return Some(format!(
+            "ScatterND requires 3 inputs, got {}",
+            input_dtypes.len()
+        ));
+    }
+    let data_dtype = input_dtypes[0];
+    if !matches!(
+        data_dtype,
+        DataType::Float32
+            | DataType::Float16
+            | DataType::BFloat16
+            | DataType::Float64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Uint8
+            | DataType::Uint16
+            | DataType::Uint32
+            | DataType::Uint64
+    ) {
+        return Some(format!(
+            "ScatterND: data dtype {data_dtype:?} is not implemented by the CPU kernel"
+        ));
+    }
+    if input_dtypes[1] != DataType::Int64 {
+        return Some(format!(
+            "ScatterND: indices must have Int64 dtype, got {:?}",
+            input_dtypes[1]
+        ));
+    }
+    if input_dtypes[2] != data_dtype {
+        return Some(format!(
+            "ScatterND: updates dtype {:?} must match data dtype {data_dtype:?}",
+            input_dtypes[2]
+        ));
+    }
+    None
+}
+
+fn parse_scatter_reduction(op: &str, node: &Node) -> Result<ScatterReduction> {
+    match node.attr("reduction").and_then(Attribute::as_str) {
+        None | Some("none") => Ok(ScatterReduction::None),
+        Some("add") => Ok(ScatterReduction::Add),
+        Some("mul") => Ok(ScatterReduction::Mul),
+        Some("max") => Ok(ScatterReduction::Max),
+        Some("min") => Ok(ScatterReduction::Min),
+        Some(value) => Err(EpError::KernelFailed(format!(
+            "{op}: unsupported reduction {value:?}"
+        ))),
+    }
+}
+
+impl Kernel for ScatterNDKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("ScatterND", inputs, outputs, 3, 3, 1)?;
+        dispatch_arith!(inputs[0].dtype, "ScatterND", T => {
+            scatter_nd_typed::<T>(self, inputs, outputs)
+        })
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
 pub struct ScatterElementsFactory;
 impl KernelFactory for ScatterElementsFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let reduction = match node.attr("reduction").and_then(Attribute::as_str) {
-            None | Some("none") => ScatterReduction::None,
-            Some("add") => ScatterReduction::Add,
-            Some("mul") => ScatterReduction::Mul,
-            Some("max") => ScatterReduction::Max,
-            Some("min") => ScatterReduction::Min,
-            Some(value) => {
-                return Err(EpError::KernelFailed(format!(
-                    "ScatterElements: unsupported reduction {value:?}"
-                )));
-            }
-        };
         Ok(Box::new(ScatterElementsKernel {
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
-            reduction,
+            reduction: parse_scatter_reduction("ScatterElements", node)?,
         }))
     }
 }
@@ -304,6 +378,96 @@ where
             ScatterReduction::Max => T::from_acc(out[data_offset].to_acc().c_max(update.to_acc())),
             ScatterReduction::Min => T::from_acc(out[data_offset].to_acc().c_min(update.to_acc())),
         };
+    }
+    write_dense::<T>(&mut outputs[0], &out)
+}
+
+fn scatter_nd_typed<T: NumericElem>(
+    kernel: &ScatterNDKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+) -> Result<()>
+where
+    T::Acc: PartialOrd,
+{
+    let data = &inputs[0];
+    let indices = &inputs[1];
+    let updates = &inputs[2];
+    if indices.dtype != DataType::Int64 {
+        return Err(EpError::KernelFailed(
+            "ScatterND: indices must be Int64".into(),
+        ));
+    }
+    if updates.dtype != T::DTYPE || outputs[0].dtype != T::DTYPE {
+        return Err(EpError::KernelFailed(
+            "ScatterND: data, updates, and output must share a dtype".into(),
+        ));
+    }
+    if indices.shape.is_empty() {
+        return Err(EpError::KernelFailed(
+            "ScatterND: indices must have rank at least 1".into(),
+        ));
+    }
+    if outputs[0].shape != data.shape {
+        return Err(EpError::KernelFailed(
+            "ScatterND: output shape must match data".into(),
+        ));
+    }
+
+    let index_depth = *indices.shape.last().expect("rank checked above");
+    if index_depth > data.shape.len() {
+        return Err(EpError::KernelFailed(format!(
+            "ScatterND: index tuple length {index_depth} exceeds data rank {}",
+            data.shape.len()
+        )));
+    }
+    let mut expected_updates_shape = indices.shape[..indices.shape.len() - 1].to_vec();
+    expected_updates_shape.extend_from_slice(&data.shape[index_depth..]);
+    if updates.shape != expected_updates_shape {
+        return Err(EpError::KernelFailed(format!(
+            "ScatterND: updates shape {:?} must be {:?}",
+            updates.shape, expected_updates_shape
+        )));
+    }
+
+    let tuple_count = numel(&indices.shape[..indices.shape.len() - 1]);
+    let slice_len = numel(&data.shape[index_depth..]);
+    let mut out = to_dense::<T>(data)?;
+    let indices = to_dense_i64(indices)?;
+    let updates = to_dense::<T>(updates)?;
+    let data_strides = contiguous(data.shape);
+    for tuple in 0..tuple_count {
+        let mut destination = 0usize;
+        for dimension in 0..index_depth {
+            let raw = indices[tuple * index_depth + dimension];
+            let dim = data.shape[dimension];
+            let coordinate = if raw < 0 { raw + dim as i64 } else { raw };
+            if coordinate < 0 || coordinate as usize >= dim {
+                return Err(EpError::KernelFailed(format!(
+                    "ScatterND: index {raw} out of range at tuple dimension {dimension}"
+                )));
+            }
+            destination += coordinate as usize * data_strides[dimension];
+        }
+        for element in 0..slice_len {
+            let destination = destination + element;
+            let update = updates[tuple * slice_len + element];
+            out[destination] = match kernel.reduction {
+                ScatterReduction::None => update,
+                ScatterReduction::Add => {
+                    T::from_acc(out[destination].to_acc().c_add(update.to_acc()))
+                }
+                ScatterReduction::Mul => {
+                    T::from_acc(out[destination].to_acc().c_mul(update.to_acc()))
+                }
+                ScatterReduction::Max => {
+                    T::from_acc(out[destination].to_acc().c_max(update.to_acc()))
+                }
+                ScatterReduction::Min => {
+                    T::from_acc(out[destination].to_acc().c_min(update.to_acc()))
+                }
+            };
+        }
     }
     write_dense::<T>(&mut outputs[0], &out)
 }
@@ -468,6 +632,66 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.to_i32(), vec![9, 8, 3]);
+    }
+
+    #[test]
+    fn scatter_nd_replaces_slices_at_multidimensional_tuples() {
+        // ONNX ScatterND: indices [2,2] address the first two dimensions of
+        // data [2,3,2], so each update is a trailing slice of length two.
+        let data = Owned::f32(
+            &[2, 3, 2],
+            &[0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.],
+        );
+        let indices = Owned::i64(&[2, 2], &[1, 0, 0, 1]);
+        let updates = Owned::f32(&[2, 2], &[10., 11., 20., 21.]);
+        let mut out = Owned::zeros_f32(&[2, 3, 2]);
+        ScatterNDKernel {
+            reduction: ScatterReduction::None,
+        }
+        .execute(
+            &[data.view(), indices.view(), updates.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(
+            out.to_f32(),
+            vec![0., 1., 20., 21., 4., 5., 10., 11., 8., 9., 10., 11.]
+        );
+    }
+
+    #[test]
+    fn scatter_nd_add_reduces_duplicate_indices() {
+        // Duplicate coordinates are well-defined with reduction=add.
+        let data = Owned::i32(&[2, 2], &[1, 2, 3, 4]);
+        let indices = Owned::i64(&[3, 1], &[0, 1, 1]);
+        let updates = Owned::i32(&[3, 2], &[10, 20, 30, 40, 50, 60]);
+        let mut out = Owned::zeros(DataType::Int32, &[2, 2]);
+        ScatterNDKernel {
+            reduction: ScatterReduction::Add,
+        }
+        .execute(
+            &[data.view(), indices.view(), updates.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_i32(), vec![11, 22, 83, 104]);
+    }
+
+    #[test]
+    fn scatter_nd_mul_reduces_duplicate_indices() {
+        let data = Owned::i32(&[2, 2], &[2, 3, 4, 5]);
+        let indices = Owned::i64(&[3, 1], &[0, 1, 1]);
+        let updates = Owned::i32(&[3, 2], &[7, 11, 2, 3, 5, 7]);
+        let mut out = Owned::zeros(DataType::Int32, &[2, 2]);
+        ScatterNDKernel {
+            reduction: ScatterReduction::Mul,
+        }
+        .execute(
+            &[data.view(), indices.view(), updates.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_i32(), vec![14, 33, 40, 105]);
     }
 
     #[test]

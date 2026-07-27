@@ -16,3 +16,6 @@ doctest = false
 bindgen = "0.72"
 sha2 = "0.10"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

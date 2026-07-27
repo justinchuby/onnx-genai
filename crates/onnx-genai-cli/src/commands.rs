@@ -17,6 +17,8 @@ pub(super) enum ReplCommand {
     Profile(Option<String>),
     /// Load a different model, or report the current one.
     Model(Option<String>),
+    /// Print a structured summary of the current interactive session.
+    Session,
     /// Switch execution provider, or report the current one.
     ExecutionProvider(Option<String>),
     /// Switch decode backend, or report the current one.
@@ -223,6 +225,7 @@ pub(super) fn parse_repl_line(line: &str) -> ReplLine {
         "pages" => ReplCommand::Pages,
         "profile" => ReplCommand::Profile((!arguments.is_empty()).then(|| arguments.to_string())),
         "model" => ReplCommand::Model(argument_of(arguments)),
+        "session" => ReplCommand::Session,
         "ep" => ReplCommand::ExecutionProvider(argument_of(arguments)),
         "backend" => ReplCommand::DecodeBackend(argument_of(arguments)),
         "system" => ReplCommand::System((!arguments.is_empty()).then(|| arguments.to_string())),

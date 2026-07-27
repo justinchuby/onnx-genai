@@ -64,7 +64,7 @@ pub fn to_text_with(model: &Model, opts: &PrintOptions) -> String {
     imports.sort_by(|a, b| a.0.cmp(b.0));
     let imports_str = imports
         .iter()
-        .map(|(domain, version)| format!("{:?} : {}", domain, version))
+        .map(|(domain, version)| format!("{domain:?} : {version}"))
         .collect::<Vec<_>>()
         .join(", ");
     let _ = writeln!(out, "{}opset_import: [{}]", opts.indent, imports_str);
@@ -100,11 +100,11 @@ fn print_graph(out: &mut String, graph: &Graph, name: &str, depth: usize, opts: 
         .collect::<Vec<_>>()
         .join(", ");
 
-    let _ = writeln!(out, "{}{} ({}) => ({}) {{", pad, name, inputs, outputs);
+    let _ = writeln!(out, "{pad}{name} ({inputs}) => ({outputs}) {{");
 
     // Initializers as references (never inlined data) — §5.3.
     if opts.weight_shapes_only && !graph.initializers.is_empty() {
-        let _ = writeln!(out, "{}// initializers", inner);
+        let _ = writeln!(out, "{inner}// initializers");
         let mut inits: Vec<(&ValueId, &WeightRef)> = graph.initializers.iter().collect();
         inits.sort_by_key(|(v, _)| v.0);
         for (vid, weight) in inits {
@@ -128,7 +128,7 @@ fn print_graph(out: &mut String, graph: &Graph, name: &str, depth: usize, opts: 
         print_node(out, graph, nid, depth + 1, opts);
     }
 
-    let _ = writeln!(out, "{}}}", pad);
+    let _ = writeln!(out, "{pad}}}");
 }
 
 /// Print one node, including any nested subgraph attributes.
@@ -166,7 +166,7 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
             .map(|(k, v)| format!("{} = {}", k, attr_value(v)))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(" <{}>", body)
+        format!(" <{body}>")
     };
 
     let inputs = node
@@ -181,7 +181,7 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
 
     let doc = if opts.doc_strings {
         match &node.doc_string {
-            Some(d) if !d.is_empty() => format!("  // {}", d),
+            Some(d) if !d.is_empty() => format!("  // {d}"),
             _ => String::new(),
         }
     } else {
@@ -191,9 +191,9 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
     let lhs = if outputs.is_empty() {
         String::new()
     } else {
-        format!("{} = ", outputs)
+        format!("{outputs} = ")
     };
-    let _ = writeln!(out, "{}{}{}{}({}){}", pad, lhs, op, attr_str, inputs, doc);
+    let _ = writeln!(out, "{pad}{lhs}{op}{attr_str}({inputs}){doc}");
 
     // Nested subgraph bodies (If/Loop/Scan) — §5.3.
     let mut subgraph_attrs: Vec<&String> = node
@@ -210,7 +210,7 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
                     .subgraphs
                     .get(&(nid, attr_name.clone()))
                     .unwrap_or(inline);
-                let _ = writeln!(out, "{}{} = graph", pad, attr_name);
+                let _ = writeln!(out, "{pad}{attr_name} = graph");
                 print_graph(out, sub, "", depth, opts);
             }
             Attribute::Graphs(inline) => {
@@ -220,7 +220,7 @@ fn print_node(out: &mut String, graph: &Graph, nid: NodeId, depth: usize, opts: 
                         .subgraphs
                         .get(&(nid, indexed_name.clone()))
                         .unwrap_or(fallback);
-                    let _ = writeln!(out, "{}{} = graph", pad, indexed_name);
+                    let _ = writeln!(out, "{pad}{indexed_name} = graph");
                     print_graph(out, sub, "", depth, opts);
                 }
             }
@@ -304,9 +304,9 @@ fn weight_kind(weight: &WeightRef) -> &'static str {
 fn attr_value(attr: &Attribute) -> String {
     match attr {
         Attribute::Int(v) => v.to_string(),
-        Attribute::Float(v) => format!("{:?}", v),
+        Attribute::Float(v) => format!("{v:?}"),
         Attribute::String(bytes) => match std::str::from_utf8(bytes) {
-            Ok(s) => format!("{:?}", s),
+            Ok(s) => format!("{s:?}"),
             Err(_) => format!("<{} bytes>", bytes.len()),
         },
         Attribute::Ints(v) if v.is_empty() => "[]:ints".to_string(),
@@ -321,7 +321,7 @@ fn attr_value(attr: &Attribute) -> String {
         Attribute::Floats(v) => format!(
             "[{}]",
             v.iter()
-                .map(|f| format!("{:?}", f))
+                .map(|f| format!("{f:?}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

@@ -9,6 +9,7 @@ description = "FFI bindings to a vendored subset of ONNX Runtime's MLAS SGEMM ke
 # Kept out of `default-members` (see root Cargo.toml) so the opt-in vendored
 # C++/asm build cannot affect the default `cargo build`/`cargo test`.
 [lints]
+workspace = true
 
 [dependencies]
 rayon = "1"

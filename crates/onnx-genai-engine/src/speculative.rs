@@ -7,9 +7,10 @@
 use crate::TokenId;
 use crate::config::{MtpCacheScope, MtpHiddenLayout};
 use crate::decode::{
-    apply_paged_sliding_window, extract_logits_sequence_with_io, next_session_token_logits,
-    next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
-    propose_draft_tokens, run_decode_session_logits, run_decode_step,
+    DraftProposalRequest, apply_paged_sliding_window, extract_logits_sequence_with_io,
+    next_session_token_logits, next_session_token_logits_and_hidden,
+    next_session_token_logits_and_hiddens, propose_draft_tokens, run_decode_session_logits,
+    run_decode_step,
 };
 use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
@@ -343,8 +344,7 @@ pub(crate) fn load_target_initializer_adapters(
     let embedding_dims = embedding_weight.dims();
     if embedding_dims.len() != 2 || embedding_dims[1] != hidden_size {
         anyhow::bail!(
-            "target embedding initializer '{embedding_name}' shape {:?} must be [vocab, {hidden_size}]",
-            embedding_dims
+            "target embedding initializer '{embedding_name}' shape {embedding_dims:?} must be [vocab, {hidden_size}]"
         );
     }
     let vocab_size = embedding_dims[0];
@@ -363,8 +363,7 @@ pub(crate) fn load_target_initializer_adapters(
         )
     } else {
         anyhow::bail!(
-            "target LM-head initializer '{lm_head_name}' shape {:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]",
-            lm_head_dims
+            "target LM-head initializer '{lm_head_name}' shape {lm_head_dims:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]"
         );
     };
     let embedder = TargetInitializerEmbedder {
@@ -1041,17 +1040,17 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
     ) -> anyhow::Result<SpeculativeProposal> {
         let mut fallback_rng = SamplingRng::new(context.options.seed);
         let rng = self.rng.as_deref_mut().unwrap_or(&mut fallback_rng);
-        let tokens = propose_draft_tokens(
-            self.draft_model,
-            self.draft_state,
-            context.width,
-            context.generated_tokens,
-            context.generated_text,
-            context.first_step,
-            context.options,
-            context.chain,
+        let tokens = propose_draft_tokens(DraftProposalRequest {
+            draft_model: self.draft_model,
+            draft_state: self.draft_state,
+            width: context.width,
+            generated_tokens: context.generated_tokens,
+            generated_text: context.generated_text,
+            first_step: context.first_step,
+            options: context.options,
+            chain: context.chain,
             rng,
-        )?;
+        })?;
         Ok(SpeculativeProposal::linear(tokens))
     }
 
@@ -1067,6 +1066,57 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
     fn name(&self) -> &str {
         "draft_model"
     }
+}
+
+/// Bundled inputs for [`Engine::generate_speculative_loop`]: the session
+/// identifier and its mutable engine state, the generation options and
+/// processor chain, the context limit and prefix-cache hit length, the mutable
+/// output accumulators (generated tokens, text, and log-probabilities), the
+/// sampling RNG, and the optional per-token callback.
+pub(crate) struct SpeculativeLoopState<'state, 'callback> {
+    pub(crate) session_id: SessionId,
+    pub(crate) state: &'state mut EngineSession,
+    pub(crate) options: &'state GenerateOptions,
+    pub(crate) chain: &'state ProcessorChain,
+    pub(crate) max_context: Option<usize>,
+    pub(crate) prefix_cache_hit_len: usize,
+    pub(crate) generated_tokens: &'state mut Vec<TokenId>,
+    pub(crate) generated_text: &'state mut String,
+    pub(crate) generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
+    pub(crate) rng: &'state mut SamplingRng,
+    pub(crate) callback: Option<&'state mut GenerateTokenCallback<'callback>>,
+}
+
+/// Target-model forward result for one speculative step: the base next-token
+/// logits, any hidden state(s) the active proposer consumes, and the target's
+/// unprocessed greedy next token (used by hidden-state proposers).
+struct TargetPrediction {
+    base_logits: Vec<f32>,
+    target_hidden: Option<Vec<f32>>,
+    target_hidden_layers: Option<Vec<Vec<f32>>>,
+    guaranteed_token: Option<TokenId>,
+}
+
+/// Immutable per-step inputs threaded into [`Engine::propose_candidates`].
+struct CandidateProposalInputs<'a> {
+    width: usize,
+    step: usize,
+    base_len: usize,
+    prediction: &'a TargetPrediction,
+    shared_kv_slices: Option<&'a [SharedKvInput]>,
+    generated_tokens: &'a [TokenId],
+    generated_text: &'a str,
+    options: &'a GenerateOptions,
+    chain: &'a ProcessorChain,
+}
+
+/// Longest-accepted-prefix decision for one verification pass: the number of
+/// accepted draft tokens, the correction token when the first mismatch occurred,
+/// and the per-candidate log-probabilities captured during selection.
+struct AcceptedPrefix {
+    accepted: usize,
+    replacement: Option<TokenId>,
+    candidate_logprobs: Option<Vec<crate::config::TokenLogprob>>,
 }
 
 impl Engine {
@@ -1102,23 +1152,190 @@ impl Engine {
             && self.kv_model.is_some()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_speculative_loop(
         &mut self,
-        session_id: SessionId,
-        state: &mut EngineSession,
-        options: &GenerateOptions,
-        chain: &ProcessorChain,
-        max_context: Option<usize>,
-        prefix_cache_hit_len: usize,
-        generated_tokens: &mut Vec<TokenId>,
-        generated_text: &mut String,
-        generated_logprobs: &mut Option<Vec<crate::config::TokenLogprob>>,
-        rng: &mut SamplingRng,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        loop_state: SpeculativeLoopState<'_, '_>,
     ) -> anyhow::Result<GenerateResult> {
+        let SpeculativeLoopState {
+            session_id,
+            state,
+            options,
+            chain,
+            max_context,
+            prefix_cache_hit_len,
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            rng,
+            mut callback,
+        } = loop_state;
         let speculative_mode = self.speculative_mode(options);
-        let draft_width = match &speculative_mode {
+        let draft_width = self.resolve_draft_width(options, &speculative_mode)?;
+        let mut mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
+            let mtp = self
+                .mtp
+                .as_ref()
+                .context("MTP speculation requested without a loaded MTP head")?;
+            Some(MtpProposer::new_owned(
+                Arc::clone(&mtp.session),
+                MtpDecodeOptions {
+                    kv_mode: mtp.kv_mode,
+                    batch_size: 1,
+                    hc_mult: mtp.runtime_config.hc_mult,
+                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
+                        == MtpHiddenLayout::Bshc,
+                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
+                    state_output: mtp.runtime_config.mtp_state_output.clone(),
+                },
+                mtp.embedder.clone(),
+                mtp.lm_head.clone(),
+                mtp.runtime_config.cache_scope,
+            )?)
+        } else {
+            None
+        };
+        let mut step = 0;
+
+        loop {
+            if let Some(result) = self.check_speculative_termination(
+                generated_tokens,
+                generated_text,
+                generated_logprobs,
+                state.tokens.len(),
+                options,
+                max_context,
+                prefix_cache_hit_len,
+            )? {
+                return Ok(result);
+            }
+
+            let remaining_tokens = options.max_new_tokens - generated_tokens.len();
+            let remaining_context = max_context
+                .map(|limit| limit.saturating_sub(state.tokens.len()))
+                .unwrap_or(remaining_tokens);
+            let width = draft_width
+                .min(remaining_tokens)
+                .min(remaining_context)
+                .max(1);
+
+            let base_len = state.tokens.len();
+            let base_generated_len = generated_tokens.len();
+
+            let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
+
+            // Slice the target's paged KV for the assistant's shared_kv.* inputs.
+            let shared_kv_slices = if let SpeculativeMode::SharedKv(_) = &speculative_mode {
+                Some(self.shared_kv_proposer_slices(session_id)?)
+            } else {
+                None
+            };
+
+            let draft_tokens = self.propose_candidates(
+                &speculative_mode,
+                state,
+                &mut mtp_proposer,
+                rng,
+                CandidateProposalInputs {
+                    width,
+                    step,
+                    base_len,
+                    prediction: &prediction,
+                    shared_kv_slices: shared_kv_slices.as_deref(),
+                    generated_tokens,
+                    generated_text,
+                    options,
+                    chain,
+                },
+            )?;
+
+            let verified_logits =
+                self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
+
+            let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
+            target_logits.push(prediction.base_logits);
+            target_logits.extend(verified_logits);
+
+            let accepted_prefix = self.choose_accepted_prefix(
+                &mut target_logits,
+                &draft_tokens,
+                base_len,
+                state,
+                generated_tokens,
+                options,
+                chain,
+                rng,
+                step,
+            )?;
+            let accepted = accepted_prefix.accepted;
+
+            // Rewind the target KV to the accepted prefix and pick any correction
+            // or bonus token. The rewind happens inside assemble_commit_tokens
+            // BEFORE the token push in commit_speculative_tokens, so the commit
+            // starts from exactly the accepted boundary (base_len + accepted).
+            let (commit_tokens, commit_logprobs) = self.assemble_commit_tokens(
+                &accepted_prefix,
+                &draft_tokens,
+                base_len,
+                state,
+                &mut target_logits,
+                generated_tokens,
+                options,
+                chain,
+                rng,
+                step,
+                max_context,
+                session_id,
+            )?;
+
+            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
+                self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+            } else if let Some(proposer) = mtp_proposer.as_mut() {
+                proposer.accept(&SpeculativeAcceptContext {
+                    accepted_prefix_len: accepted,
+                    committed_tokens: &commit_tokens,
+                    target_tokens: &state.tokens,
+                })?;
+            }
+
+            if let Some(result) = self.commit_speculative_tokens(
+                session_id,
+                state,
+                generated_tokens,
+                generated_text,
+                generated_logprobs,
+                commit_tokens,
+                commit_logprobs,
+                accepted,
+                base_len,
+                prefix_cache_hit_len,
+                options,
+                chain,
+                &speculative_mode,
+                &mut step,
+                &mut callback,
+                max_context,
+            )? {
+                return Ok(result);
+            }
+
+            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
+                self.sync_draft_to_target(state)?;
+            }
+
+            if generated_tokens.len() == base_generated_len {
+                anyhow::bail!("speculative decoding made no progress");
+            }
+        }
+    }
+
+    /// Resolve the configured maximum draft width for the active speculative
+    /// mode, clamped to at least one token per step.
+    fn resolve_draft_width(
+        &self,
+        options: &GenerateOptions,
+        speculative_mode: &SpeculativeMode,
+    ) -> anyhow::Result<usize> {
+        let draft_width = match speculative_mode {
             SpeculativeMode::PromptLookup { max_tokens, .. } => *max_tokens,
             SpeculativeMode::Mtp(_) => {
                 self.mtp
@@ -1160,490 +1377,540 @@ impl Engine {
                 .unwrap_or(self.num_speculative_tokens),
         }
         .max(1);
-        let mut mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
-            let mtp = self
-                .mtp
-                .as_ref()
-                .context("MTP speculation requested without a loaded MTP head")?;
-            Some(MtpProposer::new_owned(
-                Arc::clone(&mtp.session),
-                MtpDecodeOptions {
-                    kv_mode: mtp.kv_mode,
-                    batch_size: 1,
-                    hc_mult: mtp.runtime_config.hc_mult,
-                    hidden_state_rank4: mtp.runtime_config.target_hidden_layout
-                        == MtpHiddenLayout::Bshc,
-                    hidden_output: mtp.runtime_config.mtp_hidden_output.clone(),
-                    state_output: mtp.runtime_config.mtp_state_output.clone(),
-                },
-                mtp.embedder.clone(),
-                mtp.lm_head.clone(),
-                mtp.runtime_config.cache_scope,
-            )?)
-        } else {
-            None
-        };
-        let mut step = 0;
+        Ok(draft_width)
+    }
 
-        loop {
-            if generated_tokens.len() >= options.max_new_tokens {
-                ensure_constrained_finish(options, generated_text, FinishReason::MaxTokens)?;
-                return self.finish_result(
-                    generated_tokens,
-                    FinishReason::MaxTokens,
-                    prefix_cache_hit_len,
-                    generated_logprobs.as_deref(),
-                );
-            }
-            if reached_context_limit(state.tokens.len(), max_context) {
-                ensure_constrained_finish(options, generated_text, FinishReason::Length)?;
-                return self.finish_result(
-                    generated_tokens,
-                    FinishReason::Length,
-                    prefix_cache_hit_len,
-                    generated_logprobs.as_deref(),
-                );
-            }
-
-            let remaining_tokens = options.max_new_tokens - generated_tokens.len();
-            let remaining_context = max_context
-                .map(|limit| limit.saturating_sub(state.tokens.len()))
-                .unwrap_or(remaining_tokens);
-            let width = draft_width
-                .min(remaining_tokens)
-                .min(remaining_context)
-                .max(1);
-
-            let base_len = state.tokens.len();
-            let base_generated_len = generated_tokens.len();
-            let (mut base_logits, target_hidden, target_hidden_layers) =
-                if let SpeculativeMode::Mtp(_) = &speculative_mode {
-                    let hidden_output = self
-                        .mtp
-                        .as_ref()
-                        .context("MTP speculation requested without a loaded MTP head")?
-                        .hidden_output
-                        .clone();
-                    let (logits, hidden) = next_session_token_logits_and_hidden(
-                        self.session
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                        self.kv_model.as_ref(),
-                        &mut self.kv_cache,
-                        session_id,
-                        state,
-                        &hidden_output,
-                    )?;
-                    (logits, Some(hidden), None)
-                } else if let SpeculativeMode::Eagle3(_) = &speculative_mode {
-                    let hidden_outputs = self
-                        .eagle3
-                        .as_ref()
-                        .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
-                        .hidden_outputs
-                        .clone();
-                    let (logits, layers) = next_session_token_logits_and_hiddens(
-                        self.session
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                        self.kv_model.as_ref(),
-                        &mut self.kv_cache,
-                        session_id,
-                        state,
-                        &hidden_outputs,
-                    )?;
-                    let last_hidden = layers
-                        .last()
-                        .cloned()
-                        .context("EAGLE-3 target hidden-state list was empty")?;
-                    (logits, Some(last_hidden), Some(layers))
-                } else if let SpeculativeMode::SharedKv(_) = &speculative_mode {
-                    let hidden_output = self
-                        .shared_kv_proposer
-                        .as_ref()
-                        .context(
-                            "shared-KV proposer speculation requested without a loaded proposer model",
-                        )?
-                        .config
-                        .target_hidden_output
-                        .clone();
-                    let (logits, hidden) = next_session_token_logits_and_hidden(
-                        self.session
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                        self.kv_model.as_ref(),
-                        &mut self.kv_cache,
-                        session_id,
-                        state,
-                        &hidden_output,
-                    )?;
-                    (logits, Some(hidden), None)
-                } else {
-                    (
-                        next_session_token_logits(
-                            self.session
-                                .as_deref()
-                                .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                            self.kv_model.as_ref(),
-                            &mut self.kv_cache,
-                            session_id,
-                            state,
-                        )?,
-                        None,
-                        None,
-                    )
-                };
-            let guaranteed_token = target_hidden
-                .as_ref()
-                .map(|_| argmax(&base_logits).context("target logits were empty"))
-                .transpose()?
-                .map(TokenId::try_from)
-                .transpose()
-                .context("target token id exceeds u32 range")?;
-
-            // Slice the target's paged KV for the assistant's shared_kv.* inputs.
-            let shared_kv_slices = if let SpeculativeMode::SharedKv(_) = &speculative_mode {
-                Some(self.shared_kv_proposer_slices(session_id)?)
-            } else {
-                None
-            };
-
-            let proposer_context = SpeculativeProposerContext {
-                width,
-                context_tokens: &state.tokens,
+    /// Emit an early [`GenerateResult`] when the max-token or context limit is
+    /// reached before proposing this step, mirroring the greedy loop's stops.
+    #[allow(clippy::too_many_arguments)]
+    fn check_speculative_termination(
+        &self,
+        generated_tokens: &[TokenId],
+        generated_text: &str,
+        generated_logprobs: &Option<Vec<crate::config::TokenLogprob>>,
+        token_count: usize,
+        options: &GenerateOptions,
+        max_context: Option<usize>,
+        prefix_cache_hit_len: usize,
+    ) -> anyhow::Result<Option<GenerateResult>> {
+        if generated_tokens.len() >= options.max_new_tokens {
+            ensure_constrained_finish(options, generated_text, FinishReason::MaxTokens)?;
+            return Ok(Some(self.finish_result(
                 generated_tokens,
-                generated_text,
-                first_step: step,
-                options,
-                chain,
-                target_hidden: target_hidden.as_deref(),
-                target_hidden_layers: target_hidden_layers.as_deref(),
-                guaranteed_token,
-                shared_kv_slices: shared_kv_slices.as_deref(),
-            };
-            let draft_tokens = match &speculative_mode {
-                SpeculativeMode::None => Vec::new(),
-                SpeculativeMode::DraftModel => {
-                    let draft_model = self
-                        .draft
-                        .as_mut()
-                        .context("speculative decoding requested without a draft model")?;
-                    let draft_state = state
-                        .draft
-                        .as_mut()
-                        .context("speculative session missing draft state")?;
-                    let mut proposer = DraftModelProposer::with_rng(draft_model, draft_state, rng);
-                    proposer.align_to_target_prefix(&state.tokens, base_len)?;
-                    proposer.propose(&proposer_context)?.tokens
-                }
-                SpeculativeMode::PromptLookup { ngram, max_tokens } => {
-                    NgramProposer::new(*ngram, *max_tokens)?
-                        .propose(&proposer_context)?
-                        .tokens
-                }
-                SpeculativeMode::Mtp(_) => {
-                    mtp_proposer
-                        .as_mut()
-                        .context("MTP proposer state was not initialized")?
-                        .propose(&proposer_context)?
-                        .tokens
-                }
-                SpeculativeMode::Eagle3(_) => {
-                    let eagle3 = self
-                        .eagle3
-                        .as_ref()
-                        .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?;
-                    Eagle3Proposer::new(
-                        &eagle3.session,
-                        Eagle3DecodeOptions {
-                            kv_mode: eagle3.kv_mode,
-                            batch_size: 1,
-                        },
-                        eagle3.embedder.clone(),
+                FinishReason::MaxTokens,
+                prefix_cache_hit_len,
+                generated_logprobs.as_deref(),
+            )?));
+        }
+        if reached_context_limit(token_count, max_context) {
+            ensure_constrained_finish(options, generated_text, FinishReason::Length)?;
+            return Ok(Some(self.finish_result(
+                generated_tokens,
+                FinishReason::Length,
+                prefix_cache_hit_len,
+                generated_logprobs.as_deref(),
+            )?));
+        }
+        Ok(None)
+    }
+
+    /// Run the target model forward for the current base position, returning its
+    /// next-token logits, any proposer hidden state(s), and greedy next token.
+    fn load_target_prediction(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        speculative_mode: &SpeculativeMode,
+    ) -> anyhow::Result<TargetPrediction> {
+        let (base_logits, target_hidden, target_hidden_layers) =
+            if let SpeculativeMode::Mtp(_) = speculative_mode {
+                let hidden_output = self
+                    .mtp
+                    .as_ref()
+                    .context("MTP speculation requested without a loaded MTP head")?
+                    .hidden_output
+                    .clone();
+                let (logits, hidden) = next_session_token_logits_and_hidden(
+                    self.session
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                    self.kv_model.as_ref(),
+                    &mut self.kv_cache,
+                    session_id,
+                    state,
+                    &hidden_output,
+                )?;
+                (logits, Some(hidden), None)
+            } else if let SpeculativeMode::Eagle3(_) = speculative_mode {
+                let hidden_outputs = self
+                    .eagle3
+                    .as_ref()
+                    .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?
+                    .hidden_outputs
+                    .clone();
+                let (logits, layers) = next_session_token_logits_and_hiddens(
+                    self.session
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                    self.kv_model.as_ref(),
+                    &mut self.kv_cache,
+                    session_id,
+                    state,
+                    &hidden_outputs,
+                )?;
+                let last_hidden = layers
+                    .last()
+                    .cloned()
+                    .context("EAGLE-3 target hidden-state list was empty")?;
+                (logits, Some(last_hidden), Some(layers))
+            } else if let SpeculativeMode::SharedKv(_) = speculative_mode {
+                let hidden_output = self
+                    .shared_kv_proposer
+                    .as_ref()
+                    .context(
+                        "shared-KV proposer speculation requested without a loaded proposer model",
                     )?
+                    .config
+                    .target_hidden_output
+                    .clone();
+                let (logits, hidden) = next_session_token_logits_and_hidden(
+                    self.session
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                    self.kv_model.as_ref(),
+                    &mut self.kv_cache,
+                    session_id,
+                    state,
+                    &hidden_output,
+                )?;
+                (logits, Some(hidden), None)
+            } else {
+                (
+                    next_session_token_logits(
+                        self.session
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                        self.kv_model.as_ref(),
+                        &mut self.kv_cache,
+                        session_id,
+                        state,
+                    )?,
+                    None,
+                    None,
+                )
+            };
+        let guaranteed_token = target_hidden
+            .as_ref()
+            .map(|_| argmax(&base_logits).context("target logits were empty"))
+            .transpose()?
+            .map(TokenId::try_from)
+            .transpose()
+            .context("target token id exceeds u32 range")?;
+        Ok(TargetPrediction {
+            base_logits,
+            target_hidden,
+            target_hidden_layers,
+            guaranteed_token,
+        })
+    }
+
+    /// Invoke the active proposer to produce this step's draft tokens.
+    fn propose_candidates(
+        &mut self,
+        speculative_mode: &SpeculativeMode,
+        state: &mut EngineSession,
+        mtp_proposer: &mut Option<MtpProposer<'_, MtpEmbedder, MtpLmHead>>,
+        rng: &mut SamplingRng,
+        inputs: CandidateProposalInputs<'_>,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        let proposer_context = SpeculativeProposerContext {
+            width: inputs.width,
+            context_tokens: &state.tokens,
+            generated_tokens: inputs.generated_tokens,
+            generated_text: inputs.generated_text,
+            first_step: inputs.step,
+            options: inputs.options,
+            chain: inputs.chain,
+            target_hidden: inputs.prediction.target_hidden.as_deref(),
+            target_hidden_layers: inputs.prediction.target_hidden_layers.as_deref(),
+            guaranteed_token: inputs.prediction.guaranteed_token,
+            shared_kv_slices: inputs.shared_kv_slices,
+        };
+        let draft_tokens = match speculative_mode {
+            SpeculativeMode::None => Vec::new(),
+            SpeculativeMode::DraftModel => {
+                let draft_model = self
+                    .draft
+                    .as_mut()
+                    .context("speculative decoding requested without a draft model")?;
+                let draft_state = state
+                    .draft
+                    .as_mut()
+                    .context("speculative session missing draft state")?;
+                let mut proposer = DraftModelProposer::with_rng(draft_model, draft_state, rng);
+                proposer.align_to_target_prefix(&state.tokens, inputs.base_len)?;
+                proposer.propose(&proposer_context)?.tokens
+            }
+            SpeculativeMode::PromptLookup { ngram, max_tokens } => {
+                NgramProposer::new(*ngram, *max_tokens)?
                     .propose(&proposer_context)?
                     .tokens
-                }
-                SpeculativeMode::SharedKv(_) => {
-                    let assistant = self.shared_kv_proposer.as_ref().context(
-                        "shared-KV proposer speculation requested without a loaded proposer model",
-                    )?;
-                    SharedKvProposer::new(&assistant.session, &assistant.embedder)?
-                        .propose(&proposer_context)?
-                        .tokens
-                }
-            };
-            self.last_speculative_stats.verification_steps += 1;
-            self.last_speculative_stats.proposed_tokens += draft_tokens.len();
-
-            state.tokens.extend_from_slice(&draft_tokens);
-            let verified_logits = if draft_tokens.is_empty() {
-                Vec::new()
-            } else if state.decode_state.has_runner() {
-                let logits =
-                    run_decode_session_logits(&mut state.decode_state, &draft_tokens, base_len)?;
-                self.kv_cache
-                    .append(session_id, draft_tokens.len())
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
-                    })?;
-                state.kv_token_count += draft_tokens.len();
-                logits
-            } else {
-                let retained_base_len = state.decode_state.retained_kv_len(base_len);
-                let outputs = run_decode_step(
-                    self.session
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                    &mut state.decode_state,
-                    &draft_tokens,
-                    base_len,
-                )?;
-                if state.decode_state.use_kv {
-                    if let Some(kv_model) = &self.kv_model {
-                        mirror_present_kv_to_pages(
-                            self.session
-                                .as_deref()
-                                .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                            kv_model,
-                            &mut self.kv_cache,
-                            session_id,
-                            &outputs,
-                            retained_base_len,
-                            draft_tokens.len(),
-                        )?;
-                    } else {
-                        self.kv_cache
-                            .append(session_id, draft_tokens.len())
-                            .map_err(|e| {
-                                anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
-                            })?;
-                    }
-                    state.kv_token_count += draft_tokens.len();
-                    apply_paged_sliding_window(
-                        &mut self.kv_cache,
-                        session_id,
-                        state.decode_state.sliding_window(),
-                        state.decode_state.sink_tokens(),
-                    )?;
-                }
-                extract_logits_sequence_with_io(
-                    self.session
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                    outputs,
-                    state.decode_state.io.logits_output.as_deref(),
+            }
+            SpeculativeMode::Mtp(_) => {
+                mtp_proposer
+                    .as_mut()
+                    .context("MTP proposer state was not initialized")?
+                    .propose(&proposer_context)?
+                    .tokens
+            }
+            SpeculativeMode::Eagle3(_) => {
+                let eagle3 = self
+                    .eagle3
+                    .as_ref()
+                    .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?;
+                Eagle3Proposer::new(
+                    &eagle3.session,
+                    Eagle3DecodeOptions {
+                        kv_mode: eagle3.kv_mode,
+                        batch_size: 1,
+                    },
+                    eagle3.embedder.clone(),
                 )?
-            };
-
-            let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
-            target_logits.push(std::mem::take(&mut base_logits));
-            target_logits.extend(verified_logits);
-
-            let mut accepted = 0;
-            let mut replacement = None;
-            let mut candidate_logprobs = options.top_logprobs.map(|_| Vec::new());
-            for idx in 0..draft_tokens.len() {
-                let mut context = ProcessorContext {
-                    prompt_tokens: state.tokens[..base_len].to_vec(),
-                    generated_tokens: generated_tokens
-                        .iter()
-                        .copied()
-                        .chain(draft_tokens[..idx].iter().copied())
-                        .collect(),
-                    generated_text: self
-                        .tokenizer
-                        .decode(
-                            &generated_tokens
-                                .iter()
-                                .copied()
-                                .chain(draft_tokens[..idx].iter().copied())
-                                .collect::<Vec<_>>(),
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
-                        })?,
-                    step: step + idx,
-                };
-                let target_token = select_next_token_with_rng(
-                    &mut target_logits[idx],
-                    &context,
-                    options,
-                    chain,
-                    rng,
-                );
-                if let (Some(top_logprobs), Some(logprobs)) =
-                    (options.top_logprobs, candidate_logprobs.as_mut())
-                {
-                    logprobs.push(logprob_for_token(
-                        &target_logits[idx],
-                        target_token,
-                        top_logprobs,
-                    ));
-                }
-                if target_token == draft_tokens[idx] {
-                    accepted += 1;
-                } else {
-                    replacement = Some(target_token);
-                    context.generated_tokens.push(target_token);
-                    break;
-                }
+                .propose(&proposer_context)?
+                .tokens
             }
-            self.last_speculative_stats.accepted_tokens += accepted;
-            if accepted >= 2 {
-                self.last_speculative_stats.multi_token_accepts += 1;
+            SpeculativeMode::SharedKv(_) => {
+                let assistant = self.shared_kv_proposer.as_ref().context(
+                    "shared-KV proposer speculation requested without a loaded proposer model",
+                )?;
+                SharedKvProposer::new(&assistant.session, &assistant.embedder)?
+                    .propose(&proposer_context)?
+                    .tokens
             }
+        };
+        Ok(draft_tokens)
+    }
 
-            let mut commit_tokens = draft_tokens[..accepted].to_vec();
-            let mut commit_logprobs = candidate_logprobs
-                .as_ref()
-                .map(|logprobs| logprobs[..accepted].to_vec());
-            let rewind_len = base_len + accepted;
-            rewind_target_state_to_len(
+    /// Append the draft tokens to the target sequence and run the target
+    /// verification forward, returning one logits row per proposed token.
+    fn run_target_verification(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        draft_tokens: &[TokenId],
+        base_len: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.last_speculative_stats.verification_steps += 1;
+        self.last_speculative_stats.proposed_tokens += draft_tokens.len();
+
+        state.tokens.extend_from_slice(draft_tokens);
+        let verified_logits = if draft_tokens.is_empty() {
+            Vec::new()
+        } else if state.decode_state.has_runner() {
+            let logits =
+                run_decode_session_logits(&mut state.decode_state, draft_tokens, base_len)?;
+            self.kv_cache
+                .append(session_id, draft_tokens.len())
+                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {session_id}: {e}"))?;
+            state.kv_token_count += draft_tokens.len();
+            logits
+        } else {
+            let retained_base_len = state.decode_state.retained_kv_len(base_len);
+            let outputs = run_decode_step(
                 self.session
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                self.kv_model.as_ref(),
-                &mut self.kv_cache,
-                session_id,
-                state,
-                rewind_len,
+                &mut state.decode_state,
+                draft_tokens,
+                base_len,
             )?;
-
-            if let Some(token) = replacement {
-                commit_tokens.push(token);
-                if let (Some(source), Some(commit)) =
-                    (candidate_logprobs.as_ref(), commit_logprobs.as_mut())
-                {
-                    commit.push(source[accepted].clone());
-                }
-            } else if generated_tokens.len() + commit_tokens.len() < options.max_new_tokens
-                && !reached_context_limit(base_len + commit_tokens.len(), max_context)
-            {
-                let mut context = ProcessorContext {
-                    prompt_tokens: state.tokens[..base_len].to_vec(),
-                    generated_tokens: generated_tokens
-                        .iter()
-                        .copied()
-                        .chain(draft_tokens.iter().copied())
-                        .collect(),
-                    generated_text: self
-                        .tokenizer
-                        .decode(
-                            &generated_tokens
-                                .iter()
-                                .copied()
-                                .chain(draft_tokens.iter().copied())
-                                .collect::<Vec<_>>(),
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
-                        })?,
-                    step: step + draft_tokens.len(),
-                };
-                let token = select_next_token_with_rng(
-                    target_logits
-                        .last_mut()
-                        .context("target verification did not produce next-token logits")?,
-                    &context,
-                    options,
-                    chain,
-                    rng,
-                );
-                if let (Some(top_logprobs), Some(logprobs)) =
-                    (options.top_logprobs, commit_logprobs.as_mut())
-                {
-                    logprobs.push(logprob_for_token(
-                        target_logits
-                            .last()
-                            .context("target verification did not produce next-token logits")?,
-                        token,
-                        top_logprobs,
-                    ));
-                }
-                context.generated_tokens.push(token);
-                commit_tokens.push(token);
-            }
-
-            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
-            } else if let Some(proposer) = mtp_proposer.as_mut() {
-                proposer.accept(&SpeculativeAcceptContext {
-                    accepted_prefix_len: accepted,
-                    committed_tokens: &commit_tokens,
-                    target_tokens: &state.tokens,
-                })?;
-            }
-
-            for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
-                if generated_tokens.len() >= options.max_new_tokens
-                    || (commit_idx >= accepted
-                        && reached_context_limit(state.tokens.len(), max_context))
-                {
-                    break;
-                }
-                if commit_idx >= accepted {
-                    state.tokens.push(token_id);
-                }
-                self.scheduler.advance(session_id);
-                let prompt_tokens = state.tokens[..base_len.min(state.tokens.len())].to_vec();
-                let mut commit_state = DecodeLoopState {
-                    generated_tokens: std::mem::take(generated_tokens),
-                    generated_text: std::mem::take(generated_text),
-                    step,
-                    prefix_cache_hit_len,
-                    logprobs: generated_logprobs.take(),
-                    rng: SamplingRng::new(options.seed),
-                    custom_sampler: None,
-                };
-                if let (Some(all_logprobs), Some(step_logprobs)) =
-                    (commit_state.logprobs.as_mut(), commit_logprobs.as_ref())
-                {
-                    all_logprobs.push(step_logprobs[commit_idx].clone());
-                }
-                let finish_reason = commit_selected_token(
-                    &mut commit_state,
-                    &prompt_tokens,
-                    token_id,
-                    options,
-                    chain,
-                    &self.tokenizer,
-                    callback.as_deref_mut(),
-                )?;
-                *generated_tokens = commit_state.generated_tokens;
-                *generated_text = commit_state.generated_text;
-                *generated_logprobs = commit_state.logprobs;
-                step = commit_state.step;
-                if let Some(finish_reason) = finish_reason {
-                    trim_overmaterialized_target_kv(
+            if state.decode_state.use_kv {
+                if let Some(kv_model) = &self.kv_model {
+                    mirror_present_kv_to_pages(
                         self.session
                             .as_deref()
                             .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
-                        self.kv_model.as_ref(),
+                        kv_model,
                         &mut self.kv_cache,
                         session_id,
-                        state,
+                        &outputs,
+                        retained_base_len,
+                        draft_tokens.len(),
                     )?;
-                    if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                        self.sync_draft_to_target(state)?;
-                    }
-                    return self.finish_result(
-                        generated_tokens,
-                        finish_reason,
-                        prefix_cache_hit_len,
-                        generated_logprobs.as_deref(),
-                    );
+                } else {
+                    self.kv_cache
+                        .append(session_id, draft_tokens.len())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to advance KV sequence {session_id}: {e}")
+                        })?;
                 }
+                state.kv_token_count += draft_tokens.len();
+                apply_paged_sliding_window(
+                    &mut self.kv_cache,
+                    session_id,
+                    state.decode_state.sliding_window(),
+                    state.decode_state.sink_tokens(),
+                )?;
             }
+            extract_logits_sequence_with_io(
+                self.session
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                outputs,
+                state.decode_state.io.logits_output.as_deref(),
+            )?
+        };
+        Ok(verified_logits)
+    }
 
-            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                self.sync_draft_to_target(state)?;
+    /// Select the target token for each proposed position and count the longest
+    /// accepted prefix, recording the correction token at the first mismatch.
+    #[allow(clippy::too_many_arguments)]
+    fn choose_accepted_prefix(
+        &mut self,
+        target_logits: &mut [Vec<f32>],
+        draft_tokens: &[TokenId],
+        base_len: usize,
+        state: &EngineSession,
+        generated_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        rng: &mut SamplingRng,
+        step: usize,
+    ) -> anyhow::Result<AcceptedPrefix> {
+        let mut accepted = 0;
+        let mut replacement = None;
+        let mut candidate_logprobs = options.top_logprobs.map(|_| Vec::new());
+        for idx in 0..draft_tokens.len() {
+            let mut context = ProcessorContext {
+                prompt_tokens: state.tokens[..base_len].to_vec(),
+                generated_tokens: generated_tokens
+                    .iter()
+                    .copied()
+                    .chain(draft_tokens[..idx].iter().copied())
+                    .collect(),
+                generated_text: self
+                    .tokenizer
+                    .decode(
+                        &generated_tokens
+                            .iter()
+                            .copied()
+                            .chain(draft_tokens[..idx].iter().copied())
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
+                    })?,
+                step: step + idx,
+            };
+            let target_token =
+                select_next_token_with_rng(&mut target_logits[idx], &context, options, chain, rng);
+            if let (Some(top_logprobs), Some(logprobs)) =
+                (options.top_logprobs, candidate_logprobs.as_mut())
+            {
+                logprobs.push(logprob_for_token(
+                    &target_logits[idx],
+                    target_token,
+                    top_logprobs,
+                ));
             }
-
-            if generated_tokens.len() == base_generated_len {
-                anyhow::bail!("speculative decoding made no progress");
+            if target_token == draft_tokens[idx] {
+                accepted += 1;
+            } else {
+                replacement = Some(target_token);
+                context.generated_tokens.push(target_token);
+                break;
             }
         }
+        self.last_speculative_stats.accepted_tokens += accepted;
+        if accepted >= 2 {
+            self.last_speculative_stats.multi_token_accepts += 1;
+        }
+        Ok(AcceptedPrefix {
+            accepted,
+            replacement,
+            candidate_logprobs,
+        })
+    }
+
+    /// Build the committed token list for this step. This rewinds the target KV
+    /// to the accepted prefix (base_len + accepted) BEFORE selecting any
+    /// correction or bonus token, so downstream commit pushes resume from
+    /// exactly the accepted boundary. Do not reorder the rewind relative to the
+    /// correction-token selection below.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_commit_tokens(
+        &mut self,
+        accepted_prefix: &AcceptedPrefix,
+        draft_tokens: &[TokenId],
+        base_len: usize,
+        state: &mut EngineSession,
+        target_logits: &mut [Vec<f32>],
+        generated_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        rng: &mut SamplingRng,
+        step: usize,
+        max_context: Option<usize>,
+        session_id: SessionId,
+    ) -> anyhow::Result<(Vec<TokenId>, Option<Vec<crate::config::TokenLogprob>>)> {
+        let accepted = accepted_prefix.accepted;
+        let candidate_logprobs = accepted_prefix.candidate_logprobs.as_ref();
+
+        let mut commit_tokens = draft_tokens[..accepted].to_vec();
+        let mut commit_logprobs = candidate_logprobs.map(|logprobs| logprobs[..accepted].to_vec());
+        let rewind_len = base_len + accepted;
+        rewind_target_state_to_len(
+            self.session
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+            self.kv_model.as_ref(),
+            &mut self.kv_cache,
+            session_id,
+            state,
+            rewind_len,
+        )?;
+
+        if let Some(token) = accepted_prefix.replacement {
+            commit_tokens.push(token);
+            if let (Some(source), Some(commit)) = (candidate_logprobs, commit_logprobs.as_mut()) {
+                commit.push(source[accepted].clone());
+            }
+        } else if generated_tokens.len() + commit_tokens.len() < options.max_new_tokens
+            && !reached_context_limit(base_len + commit_tokens.len(), max_context)
+        {
+            let mut context = ProcessorContext {
+                prompt_tokens: state.tokens[..base_len].to_vec(),
+                generated_tokens: generated_tokens
+                    .iter()
+                    .copied()
+                    .chain(draft_tokens.iter().copied())
+                    .collect(),
+                generated_text: self
+                    .tokenizer
+                    .decode(
+                        &generated_tokens
+                            .iter()
+                            .copied()
+                            .chain(draft_tokens.iter().copied())
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
+                    })?,
+                step: step + draft_tokens.len(),
+            };
+            let token = select_next_token_with_rng(
+                target_logits
+                    .last_mut()
+                    .context("target verification did not produce next-token logits")?,
+                &context,
+                options,
+                chain,
+                rng,
+            );
+            if let (Some(top_logprobs), Some(logprobs)) =
+                (options.top_logprobs, commit_logprobs.as_mut())
+            {
+                logprobs.push(logprob_for_token(
+                    target_logits
+                        .last()
+                        .context("target verification did not produce next-token logits")?,
+                    token,
+                    top_logprobs,
+                ));
+            }
+            context.generated_tokens.push(token);
+            commit_tokens.push(token);
+        }
+        Ok((commit_tokens, commit_logprobs))
+    }
+
+    /// Commit the accepted (and any correction/bonus) tokens: push not-yet-seen
+    /// tokens onto the target sequence, emit the per-token callback, and advance
+    /// counters. On a finish signal, trim the over-materialized target KV, sync
+    /// the draft state, and return the terminal [`GenerateResult`].
+    #[allow(clippy::too_many_arguments)]
+    fn commit_speculative_tokens(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        generated_tokens: &mut Vec<TokenId>,
+        generated_text: &mut String,
+        generated_logprobs: &mut Option<Vec<crate::config::TokenLogprob>>,
+        commit_tokens: Vec<TokenId>,
+        commit_logprobs: Option<Vec<crate::config::TokenLogprob>>,
+        accepted: usize,
+        base_len: usize,
+        prefix_cache_hit_len: usize,
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        speculative_mode: &SpeculativeMode,
+        step: &mut usize,
+        callback: &mut Option<&mut GenerateTokenCallback<'_>>,
+        max_context: Option<usize>,
+    ) -> anyhow::Result<Option<GenerateResult>> {
+        for (commit_idx, token_id) in commit_tokens.into_iter().enumerate() {
+            if generated_tokens.len() >= options.max_new_tokens
+                || (commit_idx >= accepted
+                    && reached_context_limit(state.tokens.len(), max_context))
+            {
+                break;
+            }
+            if commit_idx >= accepted {
+                state.tokens.push(token_id);
+            }
+            self.scheduler.advance(session_id);
+            let prompt_tokens = state.tokens[..base_len.min(state.tokens.len())].to_vec();
+            let mut commit_state = DecodeLoopState {
+                generated_tokens: std::mem::take(generated_tokens),
+                generated_text: std::mem::take(generated_text),
+                step: *step,
+                prefix_cache_hit_len,
+                logprobs: generated_logprobs.take(),
+                rng: SamplingRng::new(options.seed),
+                custom_sampler: None,
+            };
+            if let (Some(all_logprobs), Some(step_logprobs)) =
+                (commit_state.logprobs.as_mut(), commit_logprobs.as_ref())
+            {
+                all_logprobs.push(step_logprobs[commit_idx].clone());
+            }
+            let finish_reason = commit_selected_token(
+                &mut commit_state,
+                &prompt_tokens,
+                token_id,
+                options,
+                chain,
+                &self.tokenizer,
+                callback.as_deref_mut(),
+            )?;
+            *generated_tokens = commit_state.generated_tokens;
+            *generated_text = commit_state.generated_text;
+            *generated_logprobs = commit_state.logprobs;
+            *step = commit_state.step;
+            if let Some(finish_reason) = finish_reason {
+                trim_overmaterialized_target_kv(
+                    self.session
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                    self.kv_model.as_ref(),
+                    &mut self.kv_cache,
+                    session_id,
+                    state,
+                )?;
+                if matches!(speculative_mode, SpeculativeMode::DraftModel) {
+                    self.sync_draft_to_target(state)?;
+                }
+                return Ok(Some(self.finish_result(
+                    generated_tokens,
+                    finish_reason,
+                    prefix_cache_hit_len,
+                    generated_logprobs.as_deref(),
+                )?));
+            }
+        }
+        Ok(None)
     }
 
     /// Slice the target model's paged KV cache into per-group `shared_kv.*`
@@ -1662,7 +1929,7 @@ impl Engine {
         let materialized = self
             .kv_cache
             .materialize_sequence(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {e}"))?;
         shared_kv_slices_from_materialized(&assistant.config.shared_kv, &materialized)
     }
 

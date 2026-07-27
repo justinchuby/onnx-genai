@@ -66,8 +66,8 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
 onnx-runtime-tracer = { workspace = true, optional = true }
-prost = { version = "0.13" }
-memmap2 = "0.9"
+prost = { workspace = true }
+memmap2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -77,7 +77,7 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 tokenizers = { workspace = true }
 rand = "0.9.5"
-half = { version = "2", features = ["use-intrinsics"] }
+half = { workspace = true, features = ["use-intrinsics"] }
 llguidance = "1.7.6"
 toktrie_hf_tokenizers = "1.7.6"
 
@@ -85,3 +85,6 @@ toktrie_hf_tokenizers = "1.7.6"
 onnx-genai-preprocess = { workspace = true }
 onnx-std = { workspace = true }
 async-trait = { workspace = true }
+
+[lints]
+workspace = true

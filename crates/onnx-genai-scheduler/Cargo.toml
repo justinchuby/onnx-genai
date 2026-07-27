@@ -19,3 +19,6 @@ tracing = { workspace = true }
 # protocol conformance campaigns.
 onnx-runtime-protocol-trace = { workspace = true, features = ["conformance"] }
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

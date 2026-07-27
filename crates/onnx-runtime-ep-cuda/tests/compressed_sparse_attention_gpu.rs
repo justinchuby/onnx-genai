@@ -17,9 +17,11 @@
 //! Tests skip cleanly when no CUDA device is present.
 
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    CaptureSupport, DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch,
+    TensorMut, TensorView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
+use onnx_runtime_ep_cuda::runtime::CudaTransferCounts;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
     CsaAttentionMode, CsaCheckpointJournal, CsaCursors, CudaExecutionProvider,
@@ -619,15 +621,20 @@ fn run_cpu(
     Ok(out_bufs)
 }
 
-/// Run the node on the CUDA EP: upload inputs, execute host-staged, download
-/// each output's raw bytes.
-fn run_gpu(
+struct GpuExecutionObservation {
+    transfers: CudaTransferCounts,
+    capture_supported: bool,
+}
+
+/// Run the node on the CUDA EP and observe transfers made strictly during
+/// `Kernel::execute` (input upload/output download are outside the snapshot).
+fn run_gpu_observed(
     ep: &CudaExecutionProvider,
     graph: &Graph,
     node: NodeId,
     inputs: &[HostTensor],
     output_specs: &[OutputSpec],
-) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
+) -> onnx_runtime_ep_api::Result<(Vec<Vec<u8>>, GpuExecutionObservation)> {
     let model = Model::new(graph);
     let concrete: Vec<Vec<usize>> = inputs.iter().map(|input| input.shape.clone()).collect();
     let kernel = ep.get_kernel(model.graph.node(node), &concrete, 1)?;
@@ -685,7 +692,18 @@ fn run_gpu(
             )
         })
         .collect();
+    let capture_supported = matches!(kernel.capture_support(), CaptureSupport::Supported);
+    let before_transfers = runtime.transfer_counts();
     let result = kernel.execute(&input_views, &mut out_views);
+    let after_transfers = runtime.transfer_counts();
+    let transfers = CudaTransferCounts {
+        host_to_device: after_transfers
+            .host_to_device
+            .saturating_sub(before_transfers.host_to_device),
+        device_to_host: after_transfers
+            .device_to_host
+            .saturating_sub(before_transfers.device_to_host),
+    };
     drop(out_views);
     drop(input_views);
 
@@ -706,7 +724,25 @@ fn run_gpu(
     for buffer in out_buffers.drain(..) {
         ep.deallocate(buffer)?;
     }
-    result.map(|()| outputs)
+    result.map(|()| {
+        (
+            outputs,
+            GpuExecutionObservation {
+                transfers,
+                capture_supported,
+            },
+        )
+    })
+}
+
+fn run_gpu(
+    ep: &CudaExecutionProvider,
+    graph: &Graph,
+    node: NodeId,
+    inputs: &[HostTensor],
+    output_specs: &[OutputSpec],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
+    run_gpu_observed(ep, graph, node, inputs, output_specs).map(|(outputs, _)| outputs)
 }
 
 fn as_f32(bytes: &[u8]) -> Vec<f32> {
@@ -755,7 +791,8 @@ fn run_step(ep: &CudaExecutionProvider, inputs: &[HostTensor], next_records: usi
     ];
     let (graph, node) = ratio128_node(inputs, next_records);
     let cpu = run_cpu(&graph, node, inputs, &output_specs).expect("CPU CSA kernel");
-    let gpu = run_gpu(ep, &graph, node, inputs, &output_specs).expect("CUDA CSA kernel");
+    let (gpu, observation) =
+        run_gpu_observed(ep, &graph, node, inputs, &output_specs).expect("CUDA CSA kernel");
 
     assert_f32_close(&gpu[0], &cpu[0], 1e-4, "Y");
     assert_eq!(
@@ -763,6 +800,15 @@ fn run_step(ep: &CudaExecutionProvider, inputs: &[HostTensor], next_records: usi
         "present_compressed_kv bytes must match exactly"
     );
     assert_f32_close(&gpu[2], &cpu[2], 1e-4, "present_compression_carry");
+    assert_eq!(
+        observation.transfers,
+        CudaTransferCounts::default(),
+        "ratio-128 FP8 execute must not stage tensors through host memory"
+    );
+    assert!(
+        observation.capture_supported,
+        "ratio-128 FP8 must advertise capture support after becoming device-resident"
+    );
 
     CsaState {
         cache: HostTensor::u8(&output_specs[1].shape, &cpu[1]),
@@ -831,6 +877,75 @@ fn ratio128_device_compression_crosses_two_blocks_matches_cpu() {
     let decode = ratio128_inputs(1, 255, 0, 256, 256, &ape, &norm, &sink, &after_prefill);
     let after_decode = run_step(&ep, &decode, 2);
     assert_eq!(after_decode.cache.shape, vec![1, 2, STORED_WIDTH]);
+}
+
+#[test]
+fn ratio128_fp8_decode_capture_replay_matches_cpu() {
+    let Some(ep) = gpu() else { return };
+    let ape = HostTensor::f32(&[RATIO, DIM], &rows(0, RATIO, ape_value));
+    let norm = HostTensor::f32(
+        &[DIM],
+        &(0..DIM)
+            .map(|d| 0.75 + (d % 17) as f32 * 0.03125)
+            .collect::<Vec<_>>(),
+    );
+    let sink = HostTensor::f32(&[1], &[-0.375]);
+    let initial = CsaState {
+        cache: HostTensor::zeros(DataType::Uint8, &[1, 0, STORED_WIDTH]),
+        carry: HostTensor::zeros(DataType::Float32, &[1, RATIO, 2, DIM]),
+    };
+    let prefill = ratio128_inputs(127, 0, 0, 127, 127, &ape, &norm, &sink, &initial);
+    let prefill_specs = vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 127, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 0, STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, RATIO, 2, DIM],
+        },
+    ];
+    let (prefill_graph, prefill_node) = ratio128_node(&prefill, 0);
+    let prefill_outputs = run_gpu(&ep, &prefill_graph, prefill_node, &prefill, &prefill_specs)
+        .expect("ratio-128 prefill");
+    let state = CsaState {
+        cache: HostTensor::u8(&[1, 0, STORED_WIDTH], &prefill_outputs[1]),
+        carry: HostTensor::f32(&[1, RATIO, 2, DIM], &as_f32(&prefill_outputs[2])),
+    };
+    let decode = ratio128_inputs(1, 127, 0, 128, 128, &ape, &norm, &sink, &state);
+    let specs = vec![
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, 1, 1, DIM],
+        },
+        OutputSpec {
+            dtype: DataType::Uint8,
+            shape: vec![1, 1, STORED_WIDTH],
+        },
+        OutputSpec {
+            dtype: DataType::Float32,
+            shape: vec![1, RATIO, 2, DIM],
+        },
+    ];
+    let (graph, node) = ratio128_node(&decode, 1);
+    let cpu = run_cpu(&graph, node, &decode, &specs).expect("CPU ratio-128 decode");
+    let replay = run_gpu_capture_replay(&ep, &graph, node, &decode, &specs)
+        .expect("captured ratio-128 decode");
+    assert_f32_close(&replay[0], &cpu[0], 1e-4, "captured Y");
+    assert_eq!(
+        replay[1], cpu[1],
+        "captured present_compressed_kv must be byte-identical"
+    );
+    assert_f32_close(
+        &replay[2],
+        &cpu[2],
+        1e-4,
+        "captured present_compression_carry",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,7 +2056,7 @@ fn run_gpu_capture_replay(
     let kernel = ep.get_kernel(model.graph.node(node), &concrete, 1)?;
     assert!(
         kernel.cuda_graph_compatible(),
-        "ratio-4 fp8 6-output decode must advertise CUDA-graph capture eligibility"
+        "device-resident FP8 decode must advertise CUDA-graph capture eligibility"
     );
     let runtime = ep.runtime();
 

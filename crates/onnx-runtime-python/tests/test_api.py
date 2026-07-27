@@ -37,6 +37,8 @@ def test_module_surface():
     assert isinstance(nxrt.__version__, str) and nxrt.__version__
     providers = nxrt.get_available_providers()
     assert "CPUExecutionProvider" in providers
+    if "CUDAExecutionProvider" not in providers:
+        assert providers == ["CPUExecutionProvider"]
 
 
 def test_session_metadata():
@@ -183,13 +185,23 @@ def test_unknown_provider_lists_available():
     assert "TotallyFakeEP" in msg and "CPUExecutionProvider" in msg
 
 
-def test_cuda_provider_without_feature_is_actionable():
+def test_cuda_provider_availability_and_application_are_runtime_accurate():
     model = _single_op_model("Relu", TensorProto.FLOAT, [1])
-    with pytest.raises(ValueError) as ei:
-        nxrt.InferenceSession(model, providers=["CUDAExecutionProvider"])
-    # Only asserted when this wheel lacks CUDA (the default build).
-    if "CUDAExecutionProvider" not in nxrt.get_available_providers():
+    if "CUDAExecutionProvider" in nxrt.get_available_providers():
+        session = nxrt.InferenceSession(
+            model, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
+        assert session.get_providers() == ["CUDAExecutionProvider"]
+    else:
+        with pytest.raises((RuntimeError, ValueError)) as ei:
+            nxrt.InferenceSession(model, providers=["CUDAExecutionProvider"])
         assert "CUDA" in str(ei.value)
+
+
+def test_provider_selection_reports_the_provider_actually_applied():
+    model = _single_op_model("Relu", TensorProto.FLOAT, [1])
+    session = nxrt.InferenceSession(model, providers=["CPUExecutionProvider"])
+    assert session.get_providers() == ["CPUExecutionProvider"]
 
 
 def test_missing_model_file():

@@ -22,6 +22,12 @@
 //! only on [`onnx_runtime_ir`], contains no `unsafe`, and is free of PyO3 / EP /
 //! session dependencies so it is trivially testable in isolation.
 //!
+//! Because the executor integration lands later, this crate currently has
+//! **zero inbound Cargo edges** inside the workspace — by design. It is kept in
+//! the workspace so its planner is versioned, built, and exercised by its
+//! deterministic test suite (`tests/planner.rs`) ahead of the executor rework;
+//! do not remove it as "dead weight".
+//!
 //! ## What it computes
 //!
 //! Given a [`Graph`](onnx_runtime_ir::Graph), a [`ViewMap`] of zero-copy view

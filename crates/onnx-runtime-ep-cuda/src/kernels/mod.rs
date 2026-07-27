@@ -47,22 +47,30 @@ pub mod index_share;
 pub mod indexing;
 pub mod matmul;
 pub mod matmul_nbits;
+pub mod mod_op;
 pub mod movement;
+pub mod nary;
 pub mod normalization;
 pub mod onehot;
+pub mod packed_varlen_attention;
 pub mod pointwise;
 pub mod pooling;
+pub mod prelu;
 pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
 pub mod reduce;
 pub mod rotary_embedding;
 pub mod shape;
+pub mod size;
 pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
 pub mod topk;
+pub mod trilu;
+pub mod unary_predicate;
+pub mod varlen_attention;
 pub mod where_op;
 
 use activations::ActivationFactory;
@@ -92,17 +100,29 @@ use pointwise::{
 /// * **Cast / CastLike** — NVRTC element-wise dtype conversion (f32/f64/f16/bf16/
 ///   int8-64/uint8-64/bool).
 /// * **Reductions** — cuDNN `ReduceSum`/`ReduceMean` (f32/f16/bf16, f32 NVRTC
-///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`; arbitrary axes and keepdims.
+///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`, and the f32 NVRTC family
+///   `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`,
+///   `ReduceLogSumExp`; arbitrary axes and keepdims.
 /// * **Pooling** — cuDNN `MaxPool`/`AveragePool` for 2-D NCHW f32/f16/bf16.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
-///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` (NVRTC
-///   f32/f16/bf16, formulas matched to the CPU EP `unary_math.rs`).
+///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus`, and the
+///   trigonometric/hyperbolic family `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
+///   `Atan`, `Asinh`, `Acosh`, `Atanh` (NVRTC f32/f16/bf16, formulas matched to
+///   the CPU EP `unary_math.rs`).
 /// * **Logical** — `Not` (bool), `And`, `Or`, `Xor` (bool, broadcasting).
 /// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
 ///   `LessOrEqual` (f32/i32/i64 operands → bool, broadcasting; `Equal` also
 ///   accepts bool operands).
 /// * **Movement/construction** — `Concat`, `Expand`, `Reshape`, `Slice`, `Split`,
-///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, plus broadcasting `Where`.
+///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, `Identity`, `Flatten`, plus
+///   broadcasting `Where` and triangular-mask `Trilu`.
+/// * **Metadata** — `Shape`, `Size` (host-computed Int64, uploaded to device).
+/// * **Activations (extended)** — `Swish` (opset 24) and `ThresholdedRelu`
+///   (opset 10), attribute-driven f32/f16/bf16.
+/// * **Variadic elementwise** — `Sum` and `Mean` (f32/f16/bf16, NumPy
+///   broadcasting across a variadic input list).
+/// * **Modulo** — `Mod` (f32 with `fmod=1`, plus i32/i64 truncated and
+///   floor modulo).
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -114,6 +134,8 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
+    "PackedVarlenAttention",
+    "VarlenAttention",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -149,6 +171,12 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ReduceMean",
     "ReduceMax",
     "ReduceMin",
+    "ReduceProd",
+    "ReduceSumSquare",
+    "ReduceL1",
+    "ReduceL2",
+    "ReduceLogSum",
+    "ReduceLogSumExp",
     "Abs",
     "Neg",
     "Reciprocal",
@@ -161,6 +189,15 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Sin",
     "Cos",
     "Softplus",
+    "Tan",
+    "Sinh",
+    "Cosh",
+    "Asin",
+    "Acos",
+    "Atan",
+    "Asinh",
+    "Acosh",
+    "Atanh",
     "Not",
     "And",
     "Or",
@@ -195,6 +232,18 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "GatherElements",
     "ScatterElements",
     "OneHot",
+    "Identity",
+    "Flatten",
+    "Size",
+    "Trilu",
+    "Swish",
+    "ThresholdedRelu",
+    "Sum",
+    "Mean",
+    "Mod",
+    "IsInf",
+    "IsNaN",
+    "PRelu",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -264,6 +313,18 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("Size", "", 1),
+        Box::new(size::SizeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Trilu", "", 14),
+        Box::new(trilu::TriluFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Constant", "", 1),
         Box::new(constant::ConstantFactory {
             runtime: runtime.clone(),
@@ -294,6 +355,18 @@ pub fn build_cuda_registry_with_metrics(
         (
             "Expand",
             Box::new(movement::ExpandFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Identity",
+            Box::new(movement::IdentityFactory {
+                runtime: runtime.clone(),
+            }),
+        ),
+        (
+            "Flatten",
+            Box::new(movement::FlattenFactory {
                 runtime: runtime.clone(),
             }),
         ),
@@ -394,6 +467,18 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        Box::new(packed_varlen_attention::PackedVarlenAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        Box::new(varlen_attention::VarlenAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Gemm", "", 1),
         Box::new(gemm::GemmFactory {
             runtime: runtime.clone(),
@@ -474,8 +559,20 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
-
-    // Elementwise binary (NVRTC f32/f16/bf16, NumPy broadcasting).
+    reg.register(
+        OpKey::new("ThresholdedRelu", "", 10),
+        Box::new(ActivationFactory {
+            name: "ThresholdedRelu",
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Swish", "", 24),
+        Box::new(ActivationFactory {
+            name: "Swish",
+            runtime: runtime.clone(),
+        }),
+    );
     for (op_type, op) in [
         ("Add", BinaryOp::Add),
         ("Sub", BinaryOp::Sub),
@@ -618,6 +715,66 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("ReduceProd", "", 1),
+        Box::new(reduce::ReduceProdFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceSumSquare", "", 1),
+        Box::new(reduce::ReduceSumSquareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceL1", "", 1),
+        Box::new(reduce::ReduceL1Factory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceL2", "", 1),
+        Box::new(reduce::ReduceL2Factory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceLogSum", "", 1),
+        Box::new(reduce::ReduceLogSumFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceLogSumExp", "", 1),
+        Box::new(reduce::ReduceLogSumExpFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Variadic elementwise (nary.rs) — Sum/Mean, f32/f16/bf16 broadcasting.
+    reg.register(
+        OpKey::new("Sum", "", 1),
+        Box::new(nary::NaryFactory {
+            is_mean: false,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Mean", "", 1),
+        Box::new(nary::NaryFactory {
+            is_mean: true,
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Mod (mod_op.rs) — f32 (fmod=1) plus i32/i64 truncated and floor modulo.
+    reg.register(
+        OpKey::new("Mod", "", 10),
+        Box::new(mod_op::ModFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
 
@@ -636,6 +793,15 @@ pub fn build_cuda_registry_with_metrics(
         ("Sin", UnaryMathOp::Sin),
         ("Cos", UnaryMathOp::Cos),
         ("Softplus", UnaryMathOp::Softplus),
+        ("Tan", UnaryMathOp::Tan),
+        ("Sinh", UnaryMathOp::Sinh),
+        ("Cosh", UnaryMathOp::Cosh),
+        ("Asin", UnaryMathOp::Asin),
+        ("Acos", UnaryMathOp::Acos),
+        ("Atan", UnaryMathOp::Atan),
+        ("Asinh", UnaryMathOp::Asinh),
+        ("Acosh", UnaryMathOp::Acosh),
+        ("Atanh", UnaryMathOp::Atanh),
     ] {
         reg.register(
             OpKey::new(op_type, "", 1),
@@ -686,6 +852,35 @@ pub fn build_cuda_registry_with_metrics(
         );
     }
 
+    // ── CUDA op-coverage batch 3 (issue #67) ──
+
+    // Unary float predicates (f32/f16/bf16 → bool). `IsInf` honours the
+    // detect_positive/detect_negative attributes; formulas mirror the CPU EP
+    // (`is_inf.rs`/`is_nan.rs`).
+    reg.register(
+        OpKey::new("IsInf", "", 10),
+        Box::new(unary_predicate::PredicateFactory {
+            op: unary_predicate::PredicateOp::IsInf,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("IsNaN", "", 9),
+        Box::new(unary_predicate::PredicateFactory {
+            op: unary_predicate::PredicateOp::IsNaN,
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // PRelu (f32/f16/bf16, NumPy-broadcastable slope; matches the CPU EP
+    // `norm_ops.rs::prelu_typed`).
+    reg.register(
+        OpKey::new("PRelu", "", 16),
+        Box::new(prelu::PReluFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
     reg
 }
 
@@ -717,13 +912,26 @@ mod tests {
     }
 
     #[test]
-    fn covered_ops_have_no_duplicates() {
-        assert_eq!(CUDA_COVERED_OPS.len(), 88);
-
-        let mut seen = std::collections::HashSet::new();
-        for op in CUDA_COVERED_OPS {
-            assert!(seen.insert(*op), "duplicate op {op} in CUDA_COVERED_OPS");
+    fn coverage_batch3_ops_are_listed_in_coverage() {
+        for op in ["IsInf", "IsNaN", "PRelu"] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
         }
+    }
+
+    #[test]
+    fn covered_ops_have_no_duplicates() {
+        let unique_ops = CUDA_COVERED_OPS
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            CUDA_COVERED_OPS.len(),
+            unique_ops.len(),
+            "CUDA_COVERED_OPS contains duplicate entries"
+        );
     }
 
     #[test]
@@ -742,6 +950,28 @@ mod tests {
     #[test]
     fn group_query_attention_is_listed_in_coverage() {
         assert!(CUDA_COVERED_OPS.contains(&"GroupQueryAttention"));
+    }
+
+    #[test]
+    fn coverage_batch2_ops_are_listed_in_coverage() {
+        for op in [
+            "ReduceProd",
+            "ReduceSumSquare",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "Swish",
+            "ThresholdedRelu",
+            "Sum",
+            "Mean",
+            "Mod",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
     }
 
     #[test]
@@ -837,6 +1067,28 @@ mod tests {
     #[test]
     fn standard_attention_and_rope_are_listed_in_coverage() {
         for op in ["Attention", "RotaryEmbedding"] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn trig_hyperbolic_unary_ops_are_listed_in_coverage() {
+        for op in [
+            "Tan", "Sinh", "Cosh", "Asin", "Acos", "Atan", "Asinh", "Acosh", "Atanh",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn shape_movement_ops_are_listed_in_coverage() {
+        for op in ["Identity", "Flatten", "Size", "Trilu"] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"

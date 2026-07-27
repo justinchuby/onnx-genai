@@ -40,7 +40,7 @@ pub mod registry;
 pub mod tensor;
 pub mod weight;
 
-pub use abi::{PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
+pub use abi::{LegacyOrtEp, PluginCompiledKernel, PluginExecutionPlan, SubgraphClaim};
 pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
 pub use kernel::{

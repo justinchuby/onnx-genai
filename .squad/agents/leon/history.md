@@ -122,3 +122,7 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 
 - PR #208 (`test(cuda): cover standalone RoPE graph capture`) merged to main as `5eb0d8db`, closing #88. Chew independently approved with guard-break evidence; Resch's `63e0ef26` fmt-gate repair kept main green for the merge.
 
+
+## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
+
+- PR #267 for #86 merged: pkg.nxrt::VarlenAttention consumes Attention-24 nonpad_kv_seqlen. Bishop required bf16 coverage; Batty supplied the lockout revision.

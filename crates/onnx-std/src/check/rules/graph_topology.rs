@@ -318,7 +318,7 @@ fn check_graph_duplicate_names(graph: &Graph, rule_id: &str) -> Vec<Violation> {
         .map(|(name, count)| Violation {
             rule_id: rule_id.to_string(),
             severity: Severity::Error,
-            message: format!("value name '{}' is used by {} distinct values", name, count),
+            message: format!("value name '{name}' is used by {count} distinct values"),
             location: ViolationLocation::Value {
                 value_name: name.to_string(),
             },

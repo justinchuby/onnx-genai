@@ -17,4 +17,7 @@ onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 
 [dev-dependencies]
-prost = "0.13"
+prost = { workspace = true }
+
+[lints]
+workspace = true

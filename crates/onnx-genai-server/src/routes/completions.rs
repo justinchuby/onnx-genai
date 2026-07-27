@@ -863,6 +863,70 @@ fn validate_request(
             "top_p must be finite and non-negative",
         ));
     }
+    if !request.min_p.is_finite() || !(0.0..=1.0).contains(&request.min_p) {
+        return Err(ApiError::bad_request(
+            "min_p must be finite and between 0 and 1",
+        ));
+    }
+    if !request.top_a.is_finite() || !(0.0..=1.0).contains(&request.top_a) {
+        return Err(ApiError::bad_request(
+            "top_a must be finite and between 0 and 1",
+        ));
+    }
+    if !request.typical_p.is_finite() || !(0.0..=1.0).contains(&request.typical_p) {
+        return Err(ApiError::bad_request(
+            "typical_p must be finite and between 0 and 1",
+        ));
+    }
+    if !request.repetition_penalty.is_finite() || request.repetition_penalty <= 0.0 {
+        return Err(ApiError::bad_request(
+            "repetition_penalty must be finite and greater than zero",
+        ));
+    }
+    if !request.frequency_penalty.is_finite() {
+        return Err(ApiError::bad_request("frequency_penalty must be finite"));
+    }
+    if !request.presence_penalty.is_finite() {
+        return Err(ApiError::bad_request("presence_penalty must be finite"));
+    }
+    if !request.dry_multiplier.is_finite() || request.dry_multiplier < 0.0 {
+        return Err(ApiError::bad_request(
+            "dry_multiplier must be finite and non-negative",
+        ));
+    }
+    if !request.dry_base.is_finite() || request.dry_base < 1.0 {
+        return Err(ApiError::bad_request(
+            "dry_base must be finite and at least 1",
+        ));
+    }
+    if request.dry_allowed_length == 0 {
+        return Err(ApiError::bad_request(
+            "dry_allowed_length must be greater than zero",
+        ));
+    }
+    if request.mirostat > 2 {
+        return Err(ApiError::bad_request("mirostat must be 0, 1, or 2"));
+    }
+    if !request.mirostat_tau.is_finite() || request.mirostat_tau <= 0.0 {
+        return Err(ApiError::bad_request(
+            "mirostat_tau must be finite and greater than zero",
+        ));
+    }
+    if !request.mirostat_eta.is_finite() || request.mirostat_eta <= 0.0 {
+        return Err(ApiError::bad_request(
+            "mirostat_eta must be finite and greater than zero",
+        ));
+    }
+    if !request.xtc_probability.is_finite() || !(0.0..=1.0).contains(&request.xtc_probability) {
+        return Err(ApiError::bad_request(
+            "xtc_probability must be finite and between 0 and 1",
+        ));
+    }
+    if !request.xtc_threshold.is_finite() || !(0.0..=1.0).contains(&request.xtc_threshold) {
+        return Err(ApiError::bad_request(
+            "xtc_threshold must be finite and between 0 and 1",
+        ));
+    }
     if request
         .top_logprobs
         .is_some_and(|count| count > MAX_CHAT_TOP_LOGPROBS)
@@ -1187,7 +1251,7 @@ fn prepare_generate_request(
     };
     let token_ids = tokenizer
         .encode(&prompt)
-        .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
@@ -1199,10 +1263,52 @@ fn prepare_generate_request(
 }
 
 fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
+    // Chat historically used greedy decoding even with its default temperature
+    // and top-p fields. Preserve that default while treating the newly exposed
+    // stochastic controls as an explicit request to sample.
+    let stochastic_sampling_requested = request.seed.is_some()
+        || request.top_k > 0
+        || request.min_p > 0.0
+        || request.top_a > 0.0
+        || request.typical_p < 1.0
+        || request.mirostat > 0
+        || request.xtc_probability > 0.0;
     let mut options = GenerateOptions {
         max_new_tokens: request.max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        top_a: request.top_a,
+        typical_p: request.typical_p,
+        repetition_penalty: request.repetition_penalty,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        greedy: request.temperature == 0.0 || !stochastic_sampling_requested,
+        seed: request.seed,
+        dry: (request.dry_multiplier > 0.0).then(|| DryConfig {
+            multiplier: request.dry_multiplier,
+            base: request.dry_base,
+            allowed_length: request.dry_allowed_length,
+            sequence_breakers: request.dry_sequence_breakers.clone(),
+        }),
+        mirostat: match request.mirostat {
+            1 => Some(MirostatConfig {
+                tau: request.mirostat_tau,
+                eta: request.mirostat_eta,
+                version: MirostatVersion::V1,
+            }),
+            2 => Some(MirostatConfig {
+                tau: request.mirostat_tau,
+                eta: request.mirostat_eta,
+                version: MirostatVersion::V2,
+            }),
+            _ => None,
+        },
+        xtc: (request.xtc_probability > 0.0).then_some(XtcConfig {
+            probability: request.xtc_probability,
+            threshold: request.xtc_threshold,
+        }),
         top_logprobs: request
             .logprobs
             .then_some(request.top_logprobs.unwrap_or(0)),

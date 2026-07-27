@@ -5,6 +5,7 @@ use std::path::Path;
 
 use onnx_runtime_ir::{DataType, Node, Shape, TensorLayout};
 
+use crate::abi::LegacyOrtEp;
 use crate::error::Result;
 use crate::kernel::{Kernel, KernelMatch};
 use crate::provider::{EpConfig, EpId, ExecutionProvider};
@@ -216,10 +217,13 @@ impl EpRegistry {
         id
     }
 
-    /// Load a legacy ORT plugin EP from a shared library (Phase 2).
+    /// Load a legacy ORT plugin EP from a shared library.
+    ///
+    /// The loaded provider remains in this registry (and keeps its dynamic
+    /// library handle alive). Legacy EPs negotiate graph-level subgraphs through
+    /// [`crate::PluginExecutionPlan`], rather than claiming individual nodes.
     pub fn load_legacy(&mut self, path: &Path, config: &EpConfig) -> Result<EpId> {
-        let _ = (path, config);
-        todo!("ort2-ep-api Phase 2: dlopen legacy ORT plugin EP and adapt its vtable")
+        Ok(self.register(Box::new(LegacyOrtEp::load(path, config)?)))
     }
 
     /// Override the priority order.
@@ -256,5 +260,77 @@ impl EpRegistry {
             }
         }
         out
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod legacy_loader_tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::*;
+
+    fn build_fixture(name: &str) -> PathBuf {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = manifest.join("tests/fixtures").join(format!("{name}.c"));
+        let output_dir = manifest.join("target/legacy-plugin-fixtures");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output directory");
+        let output = output_dir.join(format!("lib{name}.so"));
+        let status = Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .args(["-o"])
+            .arg(&output)
+            .status()
+            .expect("invoke C compiler for legacy plugin fixture");
+        assert!(status.success(), "compile legacy plugin fixture");
+        output
+    }
+
+    #[test]
+    fn load_legacy_resolves_and_invokes_plugin_factory() {
+        let path = build_fixture("legacy_plugin_stub");
+        let mut registry = EpRegistry::new();
+        let mut config = EpConfig::default();
+        config.options.insert(
+            "legacy.registration_name".into(),
+            "synthetic-registration".into(),
+        );
+
+        let id = registry.load_legacy(&path, &config).expect("load plugin");
+
+        assert_eq!(id, EpId(0));
+        assert_eq!(
+            registry.get(id).map(ExecutionProvider::name),
+            Some("synthetic_legacy_ep")
+        );
+    }
+
+    #[test]
+    fn load_legacy_reports_missing_factory_symbol() {
+        let path = build_fixture("missing_create_ep_factories");
+        let error = EpRegistry::new()
+            .load_legacy(&path, &EpConfig::default())
+            .expect_err("missing CreateEpFactories must fail cleanly");
+
+        assert!(matches!(
+            error,
+            crate::EpError::EpLoadFailed { ref reason, .. }
+                if reason.contains("CreateEpFactories symbol was not found")
+        ));
+    }
+
+    #[test]
+    fn load_legacy_rejects_an_incompatible_plugin_abi() {
+        let path = build_fixture("incompatible_api_plugin");
+        let error = EpRegistry::new()
+            .load_legacy(&path, &EpConfig::default())
+            .expect_err("newer plugin ABI must fail cleanly");
+
+        assert!(matches!(
+            error,
+            crate::EpError::EpLoadFailed { ref reason, .. }
+                if reason.contains("requires ORT API version")
+        ));
     }
 }

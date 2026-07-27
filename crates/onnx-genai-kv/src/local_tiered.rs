@@ -109,7 +109,6 @@ impl Default for LocalTieredConfig {
 struct ChunkEntry {
     page_ids: Vec<PageId>,
     priority: CachePriority,
-    #[allow(dead_code)]
     ttl: Option<Duration>,
     stored_at: Instant,
     size_bytes: usize,
@@ -120,6 +119,19 @@ struct ChunkEntry {
     /// both tiers are host RAM, so the page-table bookkeeping above tracks
     /// tiering/eviction while these bytes are the authoritative KV.
     payload: KvPayload,
+}
+
+impl ChunkEntry {
+    /// Whether this entry's time-to-live has elapsed as of `now`.
+    ///
+    /// A `None` ttl never expires; otherwise the entry is expired once at least
+    /// `ttl` has passed since it was stored (or last refreshed).
+    fn is_expired(&self, now: Instant) -> bool {
+        match self.ttl {
+            Some(duration) => now.duration_since(self.stored_at) >= duration,
+            None => false,
+        }
+    }
 }
 
 /// Interior state guarded by the connector's mutex.
@@ -341,10 +353,24 @@ fn evict_rank(priority: CachePriority) -> u8 {
     }
 }
 
+/// Map a poisoned connector-mutex lock to a recoverable backend error so
+/// fallible connector methods degrade gracefully instead of panicking.
+fn poisoned_lock_error<T>(_: std::sync::PoisonError<T>) -> ConnectorError {
+    ConnectorError::Backend("connector mutex poisoned".into())
+}
+
 #[async_trait::async_trait]
 impl KvCacheConnector for LocalTieredConnector {
     async fn lookup(&self, key: &KvCacheKey) -> ConnectorResult<KvCacheLocation> {
-        let inner = self.inner.lock().expect("connector mutex poisoned");
+        let now = Instant::now();
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
+        if inner
+            .chunks
+            .get(key)
+            .is_some_and(|entry| entry.is_expired(now))
+        {
+            inner.drop_chunk(key);
+        }
         Ok(match inner.chunks.get(key) {
             Some(entry) => inner.locate(entry, self.config.cpu_load_ms_per_page),
             None => KvCacheLocation::NotFound,
@@ -352,8 +378,23 @@ impl KvCacheConnector for LocalTieredConnector {
     }
 
     async fn lookup_batch(&self, keys: &[KvCacheKey]) -> ConnectorResult<Vec<KvCacheLocation>> {
-        let inner = self.inner.lock().expect("connector mutex poisoned");
+        let now = Instant::now();
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
         let rate = self.config.cpu_load_ms_per_page;
+        // Lazy expiry: drop entries whose ttl has elapsed before resolving.
+        let expired: Vec<KvCacheKey> = keys
+            .iter()
+            .filter(|key| {
+                inner
+                    .chunks
+                    .get(key)
+                    .is_some_and(|entry| entry.is_expired(now))
+            })
+            .cloned()
+            .collect();
+        for key in &expired {
+            inner.drop_chunk(key);
+        }
         Ok(keys
             .iter()
             .map(|key| match inner.chunks.get(key) {
@@ -388,7 +429,7 @@ impl KvCacheConnector for LocalTieredConnector {
         let path = Self::key_path(&entry.key);
         let scale = self.fp8_format;
 
-        let mut inner = self.inner.lock().expect("connector mutex poisoned");
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
 
         if let Some(existing) = inner.chunks.get_mut(&entry.key) {
             // Idempotent re-store of identical content: refresh hints only. The
@@ -450,7 +491,14 @@ impl KvCacheConnector for LocalTieredConnector {
 
     async fn fetch(&self, key: &KvCacheKey, target: Device) -> ConnectorResult<FetchedKv> {
         let start = Instant::now();
-        let mut inner = self.inner.lock().expect("connector mutex poisoned");
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
+        if inner
+            .chunks
+            .get(key)
+            .is_some_and(|entry| entry.is_expired(start))
+        {
+            inner.drop_chunk(key);
+        }
         let Some(entry) = inner.chunks.get(key).cloned() else {
             return Err(ConnectorError::NotFound);
         };
@@ -487,8 +535,9 @@ impl KvCacheConnector for LocalTieredConnector {
 
     fn prefetch(&self, key: &KvCacheKey, target: Device) {
         // Non-blocking, best-effort: only act if we can grab the lock instantly.
-        // If busy, silently drop the hint (no background thread — keeps the crate
-        // runtime-free; a future revision may queue hints for an offload task).
+        // If busy or poisoned, silently drop the hint (no background thread —
+        // keeps the crate runtime-free; a future revision may queue hints for an
+        // offload task).
         let Ok(mut inner) = self.inner.try_lock() else {
             return;
         };
@@ -518,7 +567,7 @@ impl KvCacheConnector for LocalTieredConnector {
     }
 
     async fn pin(&self, key: &KvCacheKey) -> ConnectorResult<()> {
-        let mut inner = self.inner.lock().expect("connector mutex poisoned");
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
         if !inner.chunks.contains_key(key) {
             return Err(ConnectorError::NotFound);
         }
@@ -527,7 +576,7 @@ impl KvCacheConnector for LocalTieredConnector {
     }
 
     async fn unpin(&self, key: &KvCacheKey) -> ConnectorResult<()> {
-        let mut inner = self.inner.lock().expect("connector mutex poisoned");
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
         if !inner.chunks.contains_key(key) {
             return Err(ConnectorError::NotFound);
         }
@@ -536,7 +585,7 @@ impl KvCacheConnector for LocalTieredConnector {
     }
 
     async fn evict(&self, key: &KvCacheKey) -> ConnectorResult<()> {
-        let mut inner = self.inner.lock().expect("connector mutex poisoned");
+        let mut inner = self.inner.lock().map_err(poisoned_lock_error)?;
         if inner.drop_chunk(key) {
             Ok(())
         } else {
@@ -1101,5 +1150,115 @@ mod tests {
                 "layer {l} value bytes differ after LocalTieredConnector round-trip"
             );
         }
+    }
+
+    /// Helper: backdate a resident chunk so its ttl is guaranteed elapsed,
+    /// making expiry deterministic without sleeping.
+    fn force_expired(conn: &LocalTieredConnector, key: &KvCacheKey) {
+        let mut inner = conn.inner.lock().unwrap();
+        let chunk = inner.chunks.get_mut(key).expect("chunk must be resident");
+        chunk.stored_at = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("clock supports backdating in tests");
+    }
+
+    #[tokio::test]
+    async fn expired_entry_is_treated_as_miss_and_removed() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let k = key("m", 0, 0x1234, 4);
+        let mut entry = store_entry(k.clone(), CachePriority::Session);
+        entry.ttl = Some(Duration::from_millis(50));
+        conn.store(entry).await.unwrap();
+
+        force_expired(&conn, &k);
+
+        // lookup: expired entry reads as a miss.
+        assert_eq!(conn.lookup(&k).await.unwrap(), KvCacheLocation::NotFound);
+        // ...and was removed from the map under the same lock (lazy expiry).
+        {
+            let inner = conn.inner.lock().unwrap();
+            assert!(
+                !inner.chunks.contains_key(&k),
+                "expired entry must be dropped, not merely hidden"
+            );
+        }
+
+        // fetch on an already-removed expired entry also reports NotFound.
+        let err = conn.fetch(&k, Device::Cpu).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn fetch_expires_entry_lazily() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let k = key("m", 1, 0x5678, 4);
+        let mut entry = store_entry(k.clone(), CachePriority::Session);
+        entry.ttl = Some(Duration::from_millis(50));
+        conn.store(entry).await.unwrap();
+
+        force_expired(&conn, &k);
+
+        let err = conn.fetch(&k, Device::Gpu(0)).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::NotFound));
+        let inner = conn.inner.lock().unwrap();
+        assert!(!inner.chunks.contains_key(&k));
+    }
+
+    #[tokio::test]
+    async fn none_ttl_never_expires() {
+        let conn = LocalTieredConnector::new(small_config()).unwrap();
+        let k = key("m", 2, 0x9ABC, 4);
+        // Default store_entry uses ttl = None.
+        conn.store(store_entry(k.clone(), CachePriority::Session))
+            .await
+            .unwrap();
+
+        // Even after backdating stored_at far into the past, a None ttl persists.
+        force_expired(&conn, &k);
+        assert!(matches!(
+            conn.lookup(&k).await.unwrap(),
+            KvCacheLocation::LocalGpu { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn poisoned_lock_yields_backend_error_not_panic() {
+        let conn = std::sync::Arc::new(LocalTieredConnector::new(small_config()).unwrap());
+        let poisoner = std::sync::Arc::clone(&conn);
+        // Poison the mutex by panicking while holding the guard.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoner.inner.lock().unwrap();
+            panic!("intentionally poison the connector mutex");
+        }));
+        assert!(result.is_err());
+        assert!(conn.inner.is_poisoned());
+
+        let k = key("m", 0, 1, 4);
+        // Every fallible method surfaces a backend error instead of panicking.
+        assert!(matches!(
+            conn.lookup(&k).await.unwrap_err(),
+            ConnectorError::Backend(_)
+        ));
+        assert!(matches!(
+            conn.lookup_batch(std::slice::from_ref(&k))
+                .await
+                .unwrap_err(),
+            ConnectorError::Backend(_)
+        ));
+        assert!(matches!(
+            conn.fetch(&k, Device::Cpu).await.unwrap_err(),
+            ConnectorError::Backend(_)
+        ));
+        assert!(matches!(
+            conn.pin(&k).await.unwrap_err(),
+            ConnectorError::Backend(_)
+        ));
+        assert!(matches!(
+            conn.evict(&k).await.unwrap_err(),
+            ConnectorError::Backend(_)
+        ));
+
+        // Best-effort prefetch must also refuse to panic on a poisoned lock.
+        conn.prefetch(&k, Device::Gpu(0));
     }
 }

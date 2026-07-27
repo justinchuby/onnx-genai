@@ -359,19 +359,19 @@ impl Engine {
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             if self.should_use_speculative(&options) && !has_custom_sampler {
-                return self.generate_speculative_loop(
+                return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
                     session_id,
-                    &mut state,
-                    &options,
-                    &chain,
+                    state: &mut state,
+                    options: &options,
+                    chain: &chain,
                     max_context,
                     prefix_cache_hit_len,
-                    &mut loop_state.generated_tokens,
-                    &mut loop_state.generated_text,
-                    &mut loop_state.logprobs,
-                    &mut loop_state.rng,
-                    callback.as_deref_mut(),
-                );
+                    generated_tokens: &mut loop_state.generated_tokens,
+                    generated_text: &mut loop_state.generated_text,
+                    generated_logprobs: &mut loop_state.logprobs,
+                    rng: &mut loop_state.rng,
+                    callback: callback.as_deref_mut(),
+                });
             }
 
             let mut backend = SessionDecodeLoopBackend {
@@ -534,7 +534,7 @@ impl Engine {
         self.scheduler.complete(session_id);
         self.kv_cache
             .remove(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {session_id}: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {session_id}: {e}"))?;
         self.kv_cache.page_table.create_sequence(session_id);
         let decode_state = self.new_target_decode_state()?;
         let state = self
@@ -548,7 +548,7 @@ impl Engine {
             draft_model
                 .kv_cache
                 .remove(draft.seq)
-                .map_err(|e| anyhow::anyhow!("Failed to reset draft KV sequence: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to reset draft KV sequence: {e}"))?;
             draft.seq = draft_model.kv_cache.create_sequence();
             draft.tokens.clear();
             draft.kv_token_count = 0;
@@ -602,12 +602,12 @@ impl Engine {
             .with_context(|| format!("session {session_id} not found"))?;
         self.kv_cache
             .remove(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {session_id}: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {session_id}: {e}"))?;
         if let (Some(draft_model), Some(draft)) = (&mut self.draft, state.draft) {
             draft_model
                 .kv_cache
                 .remove(draft.seq)
-                .map_err(|e| anyhow::anyhow!("Failed to remove draft KV sequence: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to remove draft KV sequence: {e}"))?;
         }
         Ok(())
     }
@@ -712,7 +712,7 @@ impl Engine {
             GeneratePrompt::Text(text) => self
                 .tokenizer
                 .encode(text)
-                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e)),
+                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}")),
         }
     }
 
@@ -783,7 +783,7 @@ impl Engine {
                     let materialized = self
                         .kv_cache
                         .materialize_sequence(session_id)
-                        .map_err(|e| anyhow::anyhow!("Failed to materialize prefix KV: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to materialize prefix KV: {e}"))?;
                     load_materialized_past(
                         self.ort_session()?,
                         self.kv_model.as_ref().expect("checked above"),
@@ -1168,7 +1168,7 @@ impl Engine {
             text: self
                 .tokenizer
                 .decode(generated_tokens)
-                .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
             token_ids: generated_tokens.to_vec(),
             finish_reason,
             prefix_cache_hit_len,

@@ -76,215 +76,7 @@ fn trace_span(name: &'static str, cat: &'static str) -> Option<SpanGuard> {
         .map(|trace| trace.span(name, cat))
 }
 
-mod error {
-    use std::path::PathBuf;
-
-    /// Errors produced while loading an ONNX model.
-    #[derive(Debug, thiserror::Error)]
-    pub enum LoaderError {
-        #[error(
-            "What: node {node} ({op_type}) carries opset version {node_version}, but the graph \
-             imports version {graph_version} for domain {domain:?}, and this model cannot be \
-             written out. \
-             Why: a per-node opset is an in-memory IR concept with no representation in ONNX's \
-             protobuf, so serialising would produce a model claiming the wrong operator version \
-             with nothing downstream able to detect it. \
-             How: serialise before the pass that introduced the node-local version, or run with \
-             that fusion disabled."
-        )]
-        NodeVersionNotRepresentable {
-            node: String,
-            op_type: String,
-            domain: String,
-            node_version: i64,
-            graph_version: u64,
-        },
-        #[error("failed to read model file {path}: {source}")]
-        Io {
-            path: PathBuf,
-            #[source]
-            source: std::io::Error,
-        },
-
-        #[error("failed to parse ONNX protobuf: {0}")]
-        ProtobufParse(String),
-
-        #[error("failed to parse ONNX protobuf TextFormat: {0}")]
-        TextProtoParse(String),
-
-        #[error("unsupported opset: domain={domain}, version={version}")]
-        UnsupportedOpset { domain: String, version: u64 },
-
-        #[error(
-            "illegal ONNX model: operator {domain}::{op_type} at node {node} uses domain \
-             '{domain}' but no corresponding opset_import is declared. RULES #1: the model must \
-             declare an opset_import for domain '{domain}'; if you built this graph \
-             programmatically, add it before loading; if this is a file, the model is \
-             malformed/invalid per the ONNX spec"
-        )]
-        MissingOpsetImport {
-            op_type: String,
-            node: String,
-            domain: String,
-        },
-
-        #[error(
-            "unsupported ONNX model: operator {domain}::{op_type} at node {node} carries a \
-             subgraph attribute '{attr}' (control-flow / nested-graph op) that this runtime cannot \
-             execute. RULES #1: ep-cpu recursively executes the standard control-flow ops \
-             If/Loop/Scan (ai.onnx), but not {op_type}, so the model cannot be run as-is. \
-             Expected: express control flow with If/Loop/Scan, lower/unroll {op_type} into \
-             supported ops, or register a kernel able to execute its subgraph body"
-        )]
-        UnsupportedControlFlow {
-            op_type: String,
-            node: String,
-            domain: String,
-            attr: String,
-        },
-
-        #[error(
-            "illegal ONNX model: operator {domain}::{op_type} at node {node} consumes tensor \
-             '{tensor}', but no producer exists — it is not a graph input, not an initializer, and \
-             not produced by any upstream node. RULES #1: every consumed tensor must be sourced; \
-             the graph is structurally malformed. Expected: add '{tensor}' as a graph input or \
-             initializer, or add a node that produces it; if this is a file, the model is invalid \
-             per the ONNX spec"
-        )]
-        DanglingTensorRef {
-            op_type: String,
-            node: String,
-            domain: String,
-            tensor: String,
-        },
-
-        #[error(
-            "illegal ONNX model: tensor '{tensor}' is declared as an initializer but is also \
-             produced as an output of node {node} — an initializer must be a constant source with \
-             no producer. RULES #1: initializer names must be unique and must not collide with any \
-             node output name; a producer-backed initializer would let a kernel write through \
-             read-only weight storage. Expected: rename the node output or the initializer so they \
-             no longer share a name; if this is a file, the model is malformed per the ONNX spec"
-        )]
-        InitializerHasProducer { tensor: String, node: String },
-
-        #[error(
-            "illegal ONNX model: value '{tensor}' has multiple producers ({first} and {second}). \
-             RULES #1: ONNX graphs are in SSA form, so a value name may be assigned only once. \
-             Expected: give each graph input and node output a unique name"
-        )]
-        DuplicateValueProducer {
-            tensor: String,
-            first: String,
-            second: String,
-        },
-
-        #[error(
-            "illegal ONNX model: operator {domain}::{op_type} at node {node} has attribute \
-             '{attr}' referring to function attribute '{ref_attr_name}' outside a FunctionProto. \
-             RULES #1: ref_attr_name is only bound while inlining a FunctionProto; it has no \
-             executable value in a main graph or control-flow subgraph. Expected: replace it with \
-             a concrete attribute value or move the node into a FunctionProto"
-        )]
-        RefAttributeOutsideFunction {
-            op_type: String,
-            node: String,
-            domain: String,
-            attr: String,
-            ref_attr_name: String,
-        },
-
-        #[error(
-            "illegal ONNX model: ir_version {ir_version} is invalid. RULES #1: ir_version is \
-             required and ONNX IR versions start at 1. Expected: emit a model with ir_version >= 1"
-        )]
-        InvalidIrVersion { ir_version: i64 },
-
-        #[error(
-            "illegal ONNX model: ir_version {ir_version} requires at least one opset_import \
-             (ONNX IR>=3). Expected: add an opset_import for every operator domain used by the \
-             model"
-        )]
-        MissingModelOpsetImport { ir_version: i64 },
-
-        #[error(
-            "illegal ONNX model: initializer '{tensor}' in an outer graph is shadowed by a \
-             subgraph input of the same name. RULES #1: this runtime does not permit ambiguous \
-             initializer/subgraph binding. Expected: rename the subgraph formal input or the \
-             outer initializer"
-        )]
-        SubgraphInputShadowsInitializer { tensor: String },
-
-        #[error(
-            "illegal ONNX model: graph output '{tensor}' has no producer in its graph. RULES #1: \
-             every output must be a graph input, initializer, or node output in the same scope. \
-             Expected: produce '{tensor}' locally or declare it as an input/initializer"
-        )]
-        GraphOutputMissingProducer { tensor: String },
-
-        #[error("external data file not found: {path}")]
-        ExternalDataNotFound { path: PathBuf },
-
-        #[error("external data path rejected ({reason}): {path}")]
-        ExternalDataPath { path: String, reason: &'static str },
-
-        #[error("weight mmap failed: {0}")]
-        Mmap(String),
-
-        #[error("EPContext node error: {0}")]
-        EpContext(String),
-
-        #[error("EPContext external path rejected ({reason}): {path}")]
-        EpContextPath { path: String, reason: &'static str },
-
-        #[error("graph construction failed: {0}")]
-        GraphBuild(String),
-
-        #[error(
-            "illegal ONNX model: model-local function {function} is recursive (call chain: \
-             {chain}). RULES #1: ONNX function bodies may reference other model-local functions \
-             but MUST NOT be recursive — inlining cannot terminate. Expected: break the cycle so \
-             no function transitively calls itself"
-        )]
-        RecursiveFunction { function: String, chain: String },
-
-        #[error(
-            "illegal ONNX model: call to model-local function {function} at node {node} passes \
-             {actual} {kind}(s) but the function declares only {formal}. RULES #1: a function \
-             call may omit trailing optional {kind}s but must not supply more than are declared. \
-             Expected: remove the extra {kind}(s) or fix the function signature"
-        )]
-        FunctionArityMismatch {
-            function: String,
-            node: String,
-            kind: &'static str,
-            formal: usize,
-            actual: usize,
-        },
-
-        #[error(
-            "illegal ONNX model: call to model-local function {function} at node {node} is missing \
-             required attribute '{attribute}', and the function declares no default for it. \
-             RULES #1: an attribute listed in FunctionProto.attribute has no default and must be \
-             supplied at every call site. Expected: set '{attribute}' on the call node, or give \
-             the function a default via attribute_proto"
-        )]
-        MissingRequiredFunctionAttribute {
-            function: String,
-            node: String,
-            attribute: String,
-        },
-
-        #[error("unsupported ONNX data_type {raw} at {context}")]
-        UnsupportedDataType { raw: i32, context: String },
-
-        #[error("shape inference failed: {0}")]
-        ShapeInference(#[from] onnx_runtime_shape_inference::ShapeInferError),
-
-        #[error(transparent)]
-        Ir(#[from] onnx_runtime_ir::IrError),
-    }
-}
+mod error;
 
 /// Load a model from a filesystem path, producing a fully-built [`Graph`].
 ///
@@ -408,85 +200,110 @@ fn build_from_bytes_with_weights(
     bytes: &[u8],
     model_dir: &Path,
 ) -> Result<(Graph, Arc<WeightStore>), LoaderError> {
-    let model = {
-        let mut span = trace_span("load.parse_model", "load");
-        let model = proto::decode_model(bytes)?;
-        if let Some(span) = span.as_mut() {
-            span.set_args(Args::new().bytes(bytes.len() as u64));
-        }
-        model
-    };
-    {
-        let mut span = trace_span("load.validate_model_proto", "load");
-        validate_model_proto(&model)?;
-        if let Some(span) = span.as_mut() {
-            span.set_args(
-                Args::new()
-                    .with("graph_count", if model.graph.is_some() { 1_u64 } else { 0 })
-                    .with("metadata_props", model.metadata_props.len() as u64),
-            );
-        }
-    }
+    let model = parse_model(bytes)?;
+    validate_proto(&model)?;
     let BuiltGraph {
         mut graph,
         name_map,
-    } = {
-        let mut span = trace_span("load.build_graph", "load");
-        let built = graph_builder::build_graph(&model)?;
-        if let Some(span) = span.as_mut() {
-            span.set_args(
-                Args::new()
-                    .with("nodes", built.graph.num_nodes() as u64)
-                    .with("values", built.graph.values.len() as u64)
-                    .with("inputs", built.graph.inputs.len() as u64)
-                    .with("outputs", built.graph.outputs.len() as u64)
-                    .with("initializers", built.graph.initializers.len() as u64),
-            );
-        }
-        built
-    };
+    } = build_graph(&model)?;
 
     // Fail-fast legality check that needs no weights: reject illegal opset
     // imports before we touch the (potentially large) weight files.
     validate_opset_imports(&graph)?;
 
-    let store = {
-        let mut span = trace_span("load.external_weights", "load");
-        let store = weights::load_weights(&model, model_dir, &name_map)?;
-        if let Some(span) = span.as_mut() {
-            let mut inline_count = 0_u64;
-            let mut inline_bytes = 0_u64;
-            let mut external_count = 0_u64;
-            let mut external_bytes = 0_u64;
-            for weight in store.weights.values() {
-                match weight {
-                    WeightRef::Inline(tensor) => {
-                        inline_count += 1;
-                        inline_bytes += tensor.data.len() as u64;
-                    }
-                    WeightRef::External { length, .. } => {
-                        external_count += 1;
-                        external_bytes += *length as u64;
-                    }
+    let store = load_weights(&model, model_dir, &name_map)?;
+    attach_weights(&mut graph, &store);
+
+    validate_ir(&graph)?;
+    validate_loaded_model(&graph)?;
+    infer_shapes(&mut graph)?;
+
+    Ok((graph, Arc::new(store)))
+}
+
+fn parse_model(bytes: &[u8]) -> Result<proto::onnx::ModelProto, LoaderError> {
+    let mut span = trace_span("load.parse_model", "load");
+    let model = proto::decode_model(bytes)?;
+    if let Some(span) = span.as_mut() {
+        span.set_args(Args::new().bytes(bytes.len() as u64));
+    }
+    Ok(model)
+}
+
+fn validate_proto(model: &proto::onnx::ModelProto) -> Result<(), LoaderError> {
+    let mut span = trace_span("load.validate_model_proto", "load");
+    validate_model_proto(model)?;
+    if let Some(span) = span.as_mut() {
+        span.set_args(
+            Args::new()
+                .with("graph_count", if model.graph.is_some() { 1_u64 } else { 0 })
+                .with("metadata_props", model.metadata_props.len() as u64),
+        );
+    }
+    Ok(())
+}
+
+fn build_graph(model: &proto::onnx::ModelProto) -> Result<BuiltGraph, LoaderError> {
+    let mut span = trace_span("load.build_graph", "load");
+    let built = graph_builder::build_graph(model)?;
+    if let Some(span) = span.as_mut() {
+        span.set_args(
+            Args::new()
+                .with("nodes", built.graph.num_nodes() as u64)
+                .with("values", built.graph.values.len() as u64)
+                .with("inputs", built.graph.inputs.len() as u64)
+                .with("outputs", built.graph.outputs.len() as u64)
+                .with("initializers", built.graph.initializers.len() as u64),
+        );
+    }
+    Ok(built)
+}
+
+fn load_weights(
+    model: &proto::onnx::ModelProto,
+    model_dir: &Path,
+    name_map: &std::collections::HashMap<String, onnx_runtime_ir::ValueId>,
+) -> Result<WeightStore, LoaderError> {
+    let mut span = trace_span("load.external_weights", "load");
+    let store = weights::load_weights(model, model_dir, name_map)?;
+    if let Some(span) = span.as_mut() {
+        let mut inline_count = 0_u64;
+        let mut inline_bytes = 0_u64;
+        let mut external_count = 0_u64;
+        let mut external_bytes = 0_u64;
+        for weight in store.weights.values() {
+            match weight {
+                WeightRef::Inline(tensor) => {
+                    inline_count += 1;
+                    inline_bytes += tensor.data.len() as u64;
+                }
+                WeightRef::External { length, .. } => {
+                    external_count += 1;
+                    external_bytes += *length as u64;
                 }
             }
-            span.set_args(
-                Args::new()
-                    .with("initializers", store.weights.len() as u64)
-                    .with("inline_initializers", inline_count)
-                    .with("inline_bytes", inline_bytes)
-                    .with("external_initializers", external_count)
-                    .with("external_bytes", external_bytes)
-                    .with("model_dir", model_dir.display().to_string()),
-            );
         }
-        store
-    };
-    // Copy descriptors into the graph; the store's mmaps stay alive via Arc.
-    for (&vid, weight) in &store.weights {
-        graph.set_initializer(vid, weight.clone());
+        span.set_args(
+            Args::new()
+                .with("initializers", store.weights.len() as u64)
+                .with("inline_initializers", inline_count)
+                .with("inline_bytes", inline_bytes)
+                .with("external_initializers", external_count)
+                .with("external_bytes", external_bytes)
+                .with("model_dir", model_dir.display().to_string()),
+        );
     }
+    Ok(store)
+}
 
+fn attach_weights(graph: &mut Graph, store: &WeightStore) {
+    // Copy descriptors into the graph; the store's mmaps stay alive via Arc.
+    for (&value_id, weight) in &store.weights {
+        graph.set_initializer(value_id, weight.clone());
+    }
+}
+
+fn validate_ir(graph: &Graph) -> Result<(), LoaderError> {
     // Structural IR validation runs here — *after* initializers are attached —
     // rather than inside `graph_builder::build_graph`. A top-level initializer
     // is only recorded in `graph.initializers` by the weight-loading path above,
@@ -494,33 +311,35 @@ fn build_from_bytes_with_weights(
     // graph output (constant pass-through) or a pre-IR-4 graph input that is
     // also an initializer as a producer-less `MissingProducer`. Validating the
     // fully-assembled graph recognizes those values as initializer sources.
-    {
-        let mut span = trace_span("load.validate_graph", "load");
-        graph
-            .validate()
-            .map_err(|errs| LoaderError::GraphBuild(format!("{errs:?}")))?;
-        if let Some(span) = span.as_mut() {
-            span.set_args(
-                Args::new()
-                    .with("nodes", graph.num_nodes() as u64)
-                    .with("values", graph.values.len() as u64)
-                    .with("initializers", graph.initializers.len() as u64),
-            );
-        }
+    let mut span = trace_span("load.validate_graph", "load");
+    graph
+        .validate()
+        .map_err(|errors| LoaderError::GraphBuild(format!("{errors:?}")))?;
+    if let Some(span) = span.as_mut() {
+        span.set_args(
+            Args::new()
+                .with("nodes", graph.num_nodes() as u64)
+                .with("values", graph.values.len() as u64)
+                .with("initializers", graph.initializers.len() as u64),
+        );
     }
+    Ok(())
+}
 
+fn validate_loaded_model(graph: &Graph) -> Result<(), LoaderError> {
     // Full fail-fast validation once initializers are attached (so
     // initializer-backed values are recognized as sourced). Rejects
     // statically-knowable unsupported/illegal constructs before shape
     // inference or execution — see [`validate_model`].
-    {
-        let mut span = trace_span("load.validate_model", "load");
-        validate_model(&graph)?;
-        if let Some(span) = span.as_mut() {
-            span.set_args(Args::new().with("nodes", graph.num_nodes() as u64));
-        }
+    let mut span = trace_span("load.validate_model", "load");
+    validate_model(graph)?;
+    if let Some(span) = span.as_mut() {
+        span.set_args(Args::new().with("nodes", graph.num_nodes() as u64));
     }
+    Ok(())
+}
 
+fn infer_shapes(graph: &mut Graph) -> Result<(), LoaderError> {
     // Static/symbolic shape inference (the loader owns this seam). Run the
     // extensible per-op registry over the fully-built graph — inputs,
     // initializers, and node outputs — to populate every value's shape and
@@ -531,20 +350,17 @@ fn build_from_bytes_with_weights(
     // fallback to resolve at run time.
     let registry = InferenceRegistry::default_registry();
     let opset_imports = graph.opset_imports.clone();
-    {
-        let mut span = trace_span("load.shape_inference", "load");
-        registry.infer_graph(&mut graph, &opset_imports, MergePolicy::Permissive)?;
-        if let Some(span) = span.as_mut() {
-            span.set_args(
-                Args::new()
-                    .with("nodes", graph.num_nodes() as u64)
-                    .with("values", graph.values.len() as u64)
-                    .with("opset_domains", graph.opset_imports.len() as u64),
-            );
-        }
+    let mut span = trace_span("load.shape_inference", "load");
+    registry.infer_graph(graph, &opset_imports, MergePolicy::Permissive)?;
+    if let Some(span) = span.as_mut() {
+        span.set_args(
+            Args::new()
+                .with("nodes", graph.num_nodes() as u64)
+                .with("values", graph.values.len() as u64)
+                .with("opset_domains", graph.opset_imports.len() as u64),
+        );
     }
-
-    Ok((graph, Arc::new(store)))
+    Ok(())
 }
 
 /// Fail-fast, load-time validation of everything statically knowable to be

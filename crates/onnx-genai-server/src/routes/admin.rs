@@ -214,7 +214,7 @@ pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
 
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
     let latest_trace_id = crate::metrics::latest_trace_id();
-    let recorded_events = onnx_genai_ort::profile::trace_event_count();
+    let recorded_events = perfetto_event_count();
     let collecting = onnx_genai_ort::profile::tracing_enabled();
     Json(DebugTraceResponse {
         tracing_span: "http.request",
@@ -233,14 +233,14 @@ pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
 /// `GET /v1/debug/trace/perfetto` — download the accumulated decode-timeline as
 /// a Chrome Trace Event Format (Perfetto) JSON document.
 ///
-/// The document is built from the process-global profiler sink in
-/// `onnx-genai-ort`, which records real ORT `session.run` timings and engine
-/// step spans while `ONNX_GENAI_TRACE` is set. When no spans have been
-/// recorded the response is a well-formed but empty trace (`traceEvents: []`) —
-/// never fabricated events. The recorded events carry only stage names and
-/// timings (no session IDs or user data), so no redaction is required.
+/// The document combines the process-global engine profiler with native-runtime
+/// and execution-provider spans, so a native `session_run` is no longer an
+/// opaque block. When no spans have been recorded the response is a well-formed
+/// but empty trace (`traceEvents: []`) — never fabricated events. The recorded
+/// events carry only static stage names and timings (no session IDs, paths, or
+/// user data), so no redaction is required.
 pub(crate) async fn debug_trace_perfetto() -> Response {
-    let document = onnx_genai_ort::profile::trace_document();
+    let document = perfetto_trace_document();
     let body = match serde_json::to_vec(&document) {
         Ok(body) => body,
         Err(err) => {
@@ -262,6 +262,39 @@ pub(crate) async fn debug_trace_perfetto() -> Response {
         body,
     )
         .into_response()
+}
+
+fn perfetto_trace_document() -> serde_json::Value {
+    let mut document = onnx_genai_ort::profile::trace_document();
+    let runtime_events = runtime_trace_events();
+    if !runtime_events.is_empty()
+        && let Some(events) = document
+            .get_mut("traceEvents")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        events.extend(runtime_events);
+    }
+    document
+}
+
+fn perfetto_event_count() -> usize {
+    onnx_genai_ort::profile::trace_event_count() + runtime_trace_events().len()
+}
+
+/// Native runtime and execution-provider spans share the engine timeline when
+/// the native backend is present. The server remains usable without it.
+fn runtime_trace_events() -> Vec<serde_json::Value> {
+    #[cfg(feature = "native-backend")]
+    {
+        onnx_genai::engine::runtime_trace::collected_events()
+            .into_iter()
+            .filter_map(|event| serde_json::to_value(event).ok())
+            .collect()
+    }
+    #[cfg(not(feature = "native-backend"))]
+    {
+        Vec::new()
+    }
 }
 
 /// `GET /v1/admin/models` — list every configured model with loaded/available

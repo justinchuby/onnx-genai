@@ -5,6 +5,85 @@ use std::path::PathBuf;
 use crate::dtype::DataType;
 use crate::shape::Shape;
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A primitive numeric type that can be decoded from little-endian bytes.
+pub trait FromLeBytes: sealed::Sealed + Sized {
+    const BYTE_SIZE: usize;
+
+    fn from_le_bytes(bytes: &[u8]) -> Self;
+}
+
+macro_rules! impl_from_le_bytes {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl sealed::Sealed for $type {}
+
+            impl FromLeBytes for $type {
+                const BYTE_SIZE: usize = size_of::<Self>();
+
+                fn from_le_bytes(bytes: &[u8]) -> Self {
+                    let mut array = [0_u8; size_of::<Self>()];
+                    array.copy_from_slice(bytes);
+                    Self::from_le_bytes(array)
+                }
+            }
+        )+
+    };
+}
+
+impl_from_le_bytes!(i32, i64, f32, f64);
+
+/// An invalid byte length for little-endian numeric decoding.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RawBytesError {
+    #[error(
+        "invalid byte length for little-endian {type_name} scalar: expected {expected}, got {actual}"
+    )]
+    ScalarLength {
+        type_name: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "invalid byte length for little-endian {type_name} vector: {actual} is not a multiple of {element_size}"
+    )]
+    VectorLength {
+        type_name: &'static str,
+        element_size: usize,
+        actual: usize,
+    },
+}
+
+/// Decode one primitive numeric value from an exact-length little-endian byte slice.
+pub fn read_scalar_le<T: FromLeBytes>(bytes: &[u8]) -> Result<T, RawBytesError> {
+    if bytes.len() != T::BYTE_SIZE {
+        return Err(RawBytesError::ScalarLength {
+            type_name: std::any::type_name::<T>(),
+            expected: T::BYTE_SIZE,
+            actual: bytes.len(),
+        });
+    }
+    Ok(T::from_le_bytes(bytes))
+}
+
+/// Decode primitive numeric values from a little-endian byte slice.
+pub fn read_vec_le<T: FromLeBytes>(bytes: &[u8]) -> Result<Vec<T>, RawBytesError> {
+    if !bytes.len().is_multiple_of(T::BYTE_SIZE) {
+        return Err(RawBytesError::VectorLength {
+            type_name: std::any::type_name::<T>(),
+            element_size: T::BYTE_SIZE,
+            actual: bytes.len(),
+        });
+    }
+    Ok(bytes
+        .chunks_exact(T::BYTE_SIZE)
+        .map(T::from_le_bytes)
+        .collect())
+}
+
 /// A concrete constant tensor held inline (e.g. an attribute value or a small
 /// initializer). Element bytes are stored little-endian and densely packed.
 ///
@@ -188,5 +267,34 @@ mod tests {
         };
         assert_eq!(w.dtype(), DataType::Float16);
         assert_eq!(w.dims(), &[64, 32]);
+    }
+
+    #[test]
+    fn read_little_endian_values() {
+        assert_eq!(read_scalar_le::<i32>(&42_i32.to_le_bytes()), Ok(42));
+
+        let bytes = [1.5_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat();
+        assert_eq!(read_vec_le::<f32>(&bytes), Ok(vec![1.5, -2.0]));
+        assert_eq!(read_vec_le::<i64>(&[]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn read_little_endian_values_rejects_wrong_lengths() {
+        assert!(matches!(
+            read_scalar_le::<i64>(&[0; 7]),
+            Err(RawBytesError::ScalarLength {
+                expected: 8,
+                actual: 7,
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_vec_le::<i32>(&[0; 5]),
+            Err(RawBytesError::VectorLength {
+                element_size: 4,
+                actual: 5,
+                ..
+            })
+        ));
     }
 }

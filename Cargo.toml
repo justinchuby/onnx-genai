@@ -104,6 +104,17 @@ license = "MIT"
 authors = ["Justin Chu"]
 repository = "https://github.com/justinchuby/onnx-genai"
 
+# Central workspace lint policy (rico audit #11). Keep this SMALL, WARN-only,
+# and defensible: it is a shared, extensible anchor, not a cleanup crusade.
+# Member crates opt in via `[lints] workspace = true`. Do NOT add `deny`/`forbid`
+# or noisy pedantic/nursery groups here without team sign-off.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+# Widely-satisfied hygiene lints only.
+uninlined_format_args = "warn"
+
 [workspace.dependencies]
 # Internal crates
 onnx-genai = { path = "crates/onnx-genai", version = "=0.1.0-dev.5" }
@@ -166,3 +177,9 @@ ctrlc = { version = "3.4", features = ["termination"] }
 tower = { version = "0.5", features = ["util"] }
 hound = "3.5"
 rustfft = "6.4"
+half = "2"
+prost = "0.13"
+image = { version = "0.25", default-features = false }
+libloading = "0.8"
+memmap2 = "0.9"
+prost-reflect = { version = "0.14" }

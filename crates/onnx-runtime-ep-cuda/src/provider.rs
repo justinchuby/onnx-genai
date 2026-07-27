@@ -85,6 +85,13 @@ impl CudaExecutionProvider {
         Self::new(0)
     }
 
+    /// Return whether a fully initialized CUDA EP can be constructed for this
+    /// device right now. This checks the driver, wheel/system libraries, device,
+    /// and thread binding rather than reporting a compile-time feature.
+    pub fn is_available(ordinal: u32) -> bool {
+        Self::initialized(ordinal).is_ok()
+    }
+
     /// Borrow the CUDA op registry (shared with the session layer).
     pub fn registry(&self) -> &OpRegistry {
         &self.registry
@@ -195,6 +202,20 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "PackedVarlenAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::packed_varlen_attention::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "VarlenAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::varlen_attention::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "QMoE"
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::qmoe::unsupported_reason(op)
@@ -226,6 +247,19 @@ impl ExecutionProvider for CudaExecutionProvider {
         ) && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
                 crate::kernels::pointwise::comparison_unsupported_reason(&op.op_type, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if matches!(op.op_type.as_str(), "IsInf" | "IsNaN")
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::unary_predicate::unsupported_reason(op, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "PRelu"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) = crate::kernels::prelu::unsupported_reason(op, input_dtypes)
         {
             return KernelMatch::unsupported(reason);
         }
@@ -470,5 +504,17 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn sync(&self) -> Result<()> {
         self.runtime.synchronize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_availability_matches_constructability() {
+        let available = CudaExecutionProvider::is_available(0);
+        let constructible = CudaExecutionProvider::initialized(0).is_ok();
+        assert_eq!(available, constructible);
     }
 }

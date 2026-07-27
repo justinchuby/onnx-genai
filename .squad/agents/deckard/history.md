@@ -108,3 +108,6 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 - Fixed tautological cache-reuse assertion in `matmul.rs`: moved pointer capture before the second `execute()` so the comparison actually spans the call. Guard-break proof: fresh-kernel substitution made the assertion fail with distinct pointers (0x1030b68d0 ≠ 0x1030b6860).
 - Fixed conflicting SiLU accuracy claim in `activations.rs`: slice-level doc now reads "~28 ULP worst-case" matching the implementation comment. Grep-confirmed no other "1 ULP" exp-accuracy claim survives in the crate.
 - Full verification: fmt ✅, clippy aarch64 ✅, clippy x86_64 ✅, 906 tests passed ✅, NEON SDPA dispatch confirmed ✅.
+## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
+
+- Under Moss's lockout, repaired PR #266 ReduceLogSumExp numerical stability with a dedicated two-pass reduction; Ferro approved and the PR merged.

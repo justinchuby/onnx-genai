@@ -791,8 +791,7 @@ impl HostExpertCache {
         }
         if projected > budget_bytes {
             return Err(error(format!(
-                "cannot lower owned host-cache budget to {budget_bytes} bytes while {} bytes are leased",
-                projected
+                "cannot lower owned host-cache budget to {budget_bytes} bytes while {projected} bytes are leased"
             )));
         }
         for victim in &victims {

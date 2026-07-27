@@ -86,6 +86,41 @@ pub struct ChatCompletionRequest {
     #[serde(default = "default_top_p")]
     pub top_p: f32,
     #[serde(default)]
+    pub top_k: usize,
+    #[serde(default)]
+    pub min_p: f32,
+    #[serde(default)]
+    pub top_a: f32,
+    #[serde(default = "default_typical_p")]
+    pub typical_p: f32,
+    #[serde(default = "default_repetition_penalty")]
+    pub repetition_penalty: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub dry_multiplier: f32,
+    #[serde(default = "default_dry_base")]
+    pub dry_base: f32,
+    #[serde(default = "default_dry_allowed_length")]
+    pub dry_allowed_length: usize,
+    #[serde(default)]
+    pub dry_sequence_breakers: Vec<u32>,
+    /// `0` disables Mirostat; `1` and `2` select the corresponding algorithm.
+    #[serde(default)]
+    pub mirostat: u8,
+    #[serde(default = "default_mirostat_tau")]
+    pub mirostat_tau: f32,
+    #[serde(default = "default_mirostat_eta")]
+    pub mirostat_eta: f32,
+    #[serde(default)]
+    pub xtc_probability: f32,
+    #[serde(default = "default_xtc_threshold")]
+    pub xtc_threshold: f32,
+    #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub stop: Option<StopInput>,
@@ -664,4 +699,25 @@ fn default_temperature() -> f32 {
 }
 fn default_top_p() -> f32 {
     1.0
+}
+fn default_typical_p() -> f32 {
+    1.0
+}
+fn default_repetition_penalty() -> f32 {
+    1.0
+}
+fn default_dry_base() -> f32 {
+    1.75
+}
+fn default_dry_allowed_length() -> usize {
+    2
+}
+fn default_mirostat_tau() -> f32 {
+    5.0
+}
+fn default_mirostat_eta() -> f32 {
+    0.1
+}
+fn default_xtc_threshold() -> f32 {
+    0.1
 }

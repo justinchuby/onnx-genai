@@ -298,7 +298,7 @@ pub(crate) fn commit_selected_token(
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         tokenizer
             .decode(&[token_id])
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {e}"))?
     } else {
         String::new()
     };
@@ -341,7 +341,7 @@ pub(crate) fn finish_result(
     Ok(GenerateResult {
         text: tokenizer
             .decode(generated_tokens)
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
+            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         prefix_cache_hit_len,
@@ -438,12 +438,24 @@ mod tests {
         }
 
         fn with_outcome(sampled_supported: bool, sampled_outcome: SampledOutcome) -> Self {
-            Self {
-                logits: vec![
+            Self::with_logits(
+                sampled_supported,
+                sampled_outcome,
+                vec![
                     vec![0.0, 0.4, 1.0],
                     vec![0.5, 1.0, 0.0],
                     vec![1.0, 0.0, 0.5],
                 ],
+            )
+        }
+
+        fn with_logits(
+            sampled_supported: bool,
+            sampled_outcome: SampledOutcome,
+            logits: Vec<Vec<f32>>,
+        ) -> Self {
+            Self {
+                logits,
                 next_logits: 0,
                 sampled_attempts: 0,
                 sampled_supported,
@@ -544,6 +556,43 @@ mod tests {
         assert_eq!(fallback.token_ids, host.token_ids);
         assert_eq!(fallback_backend.committed, host_backend.committed);
         assert_eq!(fallback_backend.sampled_attempts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_generation_reproduces_the_full_multi_token_stream() -> anyhow::Result<()> {
+        let tokenizer = tokenizer()?;
+        let generate = |seed| -> anyhow::Result<Vec<TokenId>> {
+            let options = GenerateOptions {
+                max_new_tokens: 24,
+                greedy: false,
+                stop_on_eos: false,
+                seed: Some(seed),
+                ..Default::default()
+            };
+            let chain = build_processor_chain(&options, None)?;
+            let mut backend = MockBackend::with_logits(
+                false,
+                SampledOutcome::HardError,
+                vec![vec![0.0; 8]; options.max_new_tokens],
+            );
+            let mut state = DecodeLoopState::new(0, options.seed, None);
+            Ok(run_decode_loop(
+                &mut backend,
+                &mut state,
+                &options,
+                &chain,
+                &tokenizer,
+                None,
+                None,
+            )?
+            .token_ids)
+        };
+
+        let first = generate(42)?;
+        assert_eq!(first.len(), 24);
+        assert_eq!(first, generate(42)?);
+        assert_ne!(first, generate(43)?);
         Ok(())
     }
 

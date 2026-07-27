@@ -73,7 +73,9 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Relu`, `Sqrt`, `Erf`, `Tanh`, `Sigmoid`, `Gelu` | standard / `com.microsoft` | ✅ | **NVRTC-custom** | f32/f16/bf16; half storage widens to f32 compute and narrows once on store (`elementwise.rs`). |
 | `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`, `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with CPU-matched formulas (`pointwise.rs`); `Round` uses ties-to-even and `Sign` preserves NaN. |
+| `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh` | `` | ✅ | **NVRTC-custom** | Trigonometric/hyperbolic family (`pointwise.rs`); f32/f16/bf16 with half storage widened to f32 compute, matching the CPU EP's f32-widened reference. |
 | `LeakyRelu`, `Elu`, `HardSigmoid`, `Clip`, `Softsign`, `Selu` | `` | ✅ | **NVRTC-custom** | Attribute/input-driven f32/f16/bf16 activations (`activations.rs`), computed in f32 for half storage. |
+| `Swish` (v24), `ThresholdedRelu` (v10) | `` | ✅ | **NVRTC-custom** | Attribute-driven f32/f16/bf16 activations (`activations.rs`); `Swish` is `x·sigmoid(alpha·x)` and `ThresholdedRelu` is `x>alpha ? x : 0` (both `alpha` default `1.0`), computed in f32 for half storage. |
 
 ### Elementwise — logical / comparison
 
@@ -88,6 +90,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | Op | Domain | Status | Backend | Notes |
 |----|--------|--------|---------|-------|
 | `Add`, `Sub`, `Mul`, `Div`, `Pow`, `Min`, `Max` | `` | ✅ | **NVRTC-custom** | f32/f16/bf16 with NumPy right-aligned broadcasting. Host-computed output shape plus zero-stride metadata drives one generic device index walk; half arithmetic computes in f32. |
+| `Sum`, `Mean` | `` | ✅ | **NVRTC-custom** | Variadic f32/f16/bf16 with NumPy right-aligned broadcasting (`nary.rs`); accumulates each input into an f32 scratch buffer, then `Mean` divides by the input count before narrowing once on store. |
+| `Mod` (v10) | `` | ✅ | **NVRTC-custom** | Broadcasting modulo (`mod_op.rs`); f32 requires `fmod=1` (`fmodf`), i32/i64 support both C-truncated (`fmod=1`) and Python floor (`fmod=0`) modes; a zero divisor yields `0`, matching the CPU EP. |
 
 ### Normalization & softmax
 
@@ -108,6 +112,12 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` (AVG) | Same shape/axis handling and fallback as `ReduceSum`. |
 | `ReduceMax` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating (numpy / CPU-EP semantics). |
 | `ReduceMin` | `` | ✅ | **NVRTC block reduction** (cub-class) | As above; NaN-propagating. |
+| `ReduceProd` | `` | ✅ | **NVRTC block reduction** (f32) | Product over the reduced group; shares the offset-table plumbing (`reduce.rs`). |
+| `ReduceSumSquare` | `` | ✅ | **NVRTC block reduction** (f32) | Sum of squares (`x²`) over the group. |
+| `ReduceL1` | `` | ✅ | **NVRTC block reduction** (f32) | Sum of `abs(x)` over the group. |
+| `ReduceL2` | `` | ✅ | **NVRTC block reduction** (f32) | `sqrt` of the sum of squares over the group. |
+| `ReduceLogSum` | `` | ✅ | **NVRTC block reduction** (f32) | `log` of the sum over the group. |
+| `ReduceLogSumExp` | `` | ✅ | **NVRTC block reduction** (f32) | `log(sum(exp(x)))` over the group, matching the CPU EP's naive (no max-shift) accumulation; opset-1 attribute and opset-18 axes-input forms. |
 
 > **Why NVRTC block reduction, not cub?** cub's `DeviceSegmentedReduce` is the
 > vendor primitive, and our kernel matches its shape (one block per output
@@ -130,7 +140,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-------|
 | `Cast` | `` | ✅ | **NVRTC-custom** | Element-wise dtype conversion; f32/f64/f16/bf16/int8-64/uint8-64/bool, ONNX saturating float→int. Two NVRTC modules keep f16/bf16 (which need NVRTC's built-in `cuda_fp16.h`/`cuda_bf16.h`) out of the common integer/f32 path (`cast.rs`). |
 | `CastLike` | `` | ✅ | **NVRTC-custom** | Same kernel as `Cast`; target dtype taken from the output tensor. |
-| `Identity` | `` | ⏳ | **memcpy** (D2D) | Straight device copy; dtype-agnostic. |
+| `Identity` | `` | ✅ | **memcpy** (D2D) | Straight dtype-agnostic device copy into the pre-shaped output (`movement.rs`). |
+| `Flatten` | `` | ✅ | **memcpy** (D2D) | Dtype-agnostic D2D copy; the 2-D output shape is metadata-only, so the bytes are copied unchanged (`movement.rs`). |
 | `Concat` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy, arbitrary/negative axis, multiple inputs. |
 | `Reshape`, `Squeeze`, `Unsqueeze` | `` | ✅ | **memcpy** | Dtype-agnostic D2D copy into the executor's pre-shaped output; modern axes inputs and legacy attributes are accepted. |
 | `Transpose` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed byte copy; explicit permutation or default axis reversal. |
@@ -140,6 +151,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `TopK` (v10) | `` | ✅ | **NVRTC-custom** | Deterministic f32 per-slice selection with input `K`, arbitrary/negative axis, largest/smallest modes, and CPU tie-breaking by lower source index. |
 | `CumSum` (v11) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane f32/Int64 scan with scalar axis input, negative axes, and all exclusive/reverse combinations. |
 | `Shape` | `` | ✅ | **host + H2D** | Computes the metadata-only Int64 shape vector on host, including opset-15 `start`/`end`, then uploads it. |
+| `Size` | `` | ✅ | **host + H2D** | Computes the metadata-only Int64 element count on host and uploads the scalar (`size.rs`). |
+| `Trilu` (v14) | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy that zeroes the elements outside the retained triangle over the trailing two dimensions (`trilu.rs`); `upper` attribute plus optional Int64 `k` diagonal input, matching the CPU EP. |
 | `Expand` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic broadcast copy sharing the binary-elementwise zero-stride indexing infrastructure. |
 | `Slice` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic strided/stepped copy with opset-10 input-driven ranges, negative axes, and negative steps. |
 | `Split` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic byte copy; split input, legacy attribute, even split, negative axis, and opset-18 `num_outputs`. |
@@ -147,56 +160,70 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Where` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic branch selection with right-aligned broadcasting across condition, x, and y. |
 | `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors and numeric `value_*` attribute forms to the device. |
 
-## Source-derived coverage audit (2026-07-15)
+## Source-derived coverage audit (2026-07-27)
 
 This snapshot is derived directly from `build_cpu_registry`,
 `build_cuda_registry`, and `CUDA_COVERED_OPS`, rather than the historical wave
-counts:
+counts. The denominators have grown substantially since the 2026-07-15 snapshot
+(103 → 168 CPU pairs) because the CPU EP registry has continued to expand; the
+numbers below reflect the current registries after the issue #67 trig/hyperbolic
++ shape-movement batch (`Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`, `Atan`, `Asinh`,
+`Acosh`, `Atanh`, `Identity`, `Flatten`, `Size`, `Trilu`):
 
 | Measure | Count |
 |---------|------:|
-| CPU registry `(domain, op_type)` pairs | **103** |
-| CPU standard-domain (`ai.onnx`) op types | **93** |
-| CUDA registry `(domain, op_type)` pairs | **66** |
-| CUDA advertised op names | **65** |
-| CPU pairs implemented by CUDA in the same domain | **54 / 103** |
-| CPU standard-domain op types implemented by CUDA | **46 / 93** |
+| CPU registry `(domain, op_type)` pairs | **168** |
+| CPU standard-domain (`ai.onnx`) op types | **141** |
+| CUDA registry `(domain, op_type)` pairs | **118** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **113** |
+| CPU pairs implemented by CUDA in the same domain | **116 / 168** |
+| CPU standard-domain op types implemented by CUDA | **99 / 141** |
 
-The **46 shared `ai.onnx` ops** are: `Abs`, `Add`, `AveragePool`, `Cast`, `CastLike`,
-`Ceil`, `Clip`, `Constant`, `Cos`, `Div`, `Elu`, `Equal`, `Erf`, `Exp`, `Floor`,
-`Gather`, `Gemm`, `HardSigmoid`, `LayerNormalization`, `LeakyRelu`, `Log`, `MatMul`,
-`Max`, `Min`, `MaxPool`, `Mul`, `Neg`, `Not`, `Pow`, `RMSNormalization`, `Reciprocal`,
-`ReduceMax`, `ReduceMean`, `ReduceMin`, `ReduceSum`, `Relu`, `Round`, `Shape`,
-`Sigmoid`, `Sign`, `Sin`, `Softmax`, `Softplus`, `Sqrt`, `Sub`, and `Tanh`.
+The **99 shared `ai.onnx` ops** are: `Abs`, `Acos`, `Acosh`, `Add`, `And`, `Asin`,
+`Asinh`, `Atan`, `Atanh`, `Attention`, `AveragePool`, `Cast`, `CastLike`, `Ceil`,
+`Clip`, `Concat`, `Constant`, `ConstantOfShape`, `Cos`, `Cosh`, `CumSum`, `Div`,
+`Elu`, `Equal`, `Erf`, `Exp`, `Expand`, `Flatten`, `Floor`, `Gather`,
+`GatherElements`, `Gelu`, `Gemm`, `Greater`, `GreaterOrEqual`, `HardSigmoid`,
+`Identity`, `LayerNormalization`, `LeakyRelu`, `Less`, `LessOrEqual`, `Log`,
+`MatMul`, `Max`, `MaxPool`, `Mean`, `Min`, `Mod`, `Mul`, `Neg`, `Not`, `OneHot`,
+`Or`, `Pow`, `RMSNormalization`, `Reciprocal`, `ReduceL1`, `ReduceL2`,
+`ReduceLogSum`, `ReduceLogSumExp`, `ReduceMax`, `ReduceMean`, `ReduceMin`,
+`ReduceProd`, `ReduceSum`, `ReduceSumSquare`, `Relu`, `Reshape`, `RotaryEmbedding`,
+`Round`, `ScatterElements`, `Selu`, `Shape`, `Sigmoid`, `Sign`,
+`SimplifiedLayerNormalization`, `Sin`, `Sinh`, `Size`, `Slice`, `Softmax`,
+`Softplus`, `Softsign`, `Split`, `Sqrt`, `Squeeze`, `Sub`, `Sum`, `Swish`, `Tan`,
+`Tanh`, `ThresholdedRelu`, `Tile`, `TopK`, `Transpose`, `Trilu`, `Unsqueeze`,
+`Where`, and `Xor`.
 
-The **47 CPU `ai.onnx` gaps** are: `Acos`, `Acosh`, `ArgMax`, `ArgMin`, `Asin`,
-`Asinh`, `Atan`, `Atanh`, `Attention`, `Concat`, `ConstantOfShape`, `Cosh`, `CumSum`,
-`DequantizeLinear`, `DynamicQuantizeLinear`, `Expand`, `Flatten`, `GatherElements`,
-`GatherND`, `Gelu`, `GlobalAveragePool`, `GlobalMaxPool`, `Identity`,
-`LogSoftmax`, `Mean`, `NonZero`, `Pad`, `QuantizeLinear`, `Range`,
-`ReduceL2`, `ReduceProd`, `ReduceSumSquare`, `Reshape`, `RotaryEmbedding`,
-`Sinh`, `Size`, `Slice`, `Split`, `Squeeze`, `Sum`, `Swish`, `Tan`, `Tile`, `TopK`,
-`Transpose`, `Unsqueeze`, and `Where`.
+The **42 CPU `ai.onnx` gaps** are: `AffineGrid`, `ArgMax`, `ArgMin`,
+`BatchNormalization`, `BitShift`, `BitwiseAnd`, `BitwiseNot`, `BitwiseOr`,
+`BitwiseXor`, `BlackmanWindow`, `CenterCropPad`, `Col2Im`, `Compress`,
+`ConvTranspose`, `CumProd`, `DequantizeLinear`, `Dropout`,
+`DynamicQuantizeLinear`, `EyeLike`, `GatherND`, `GlobalAveragePool`,
+`GlobalLpPool`, `GlobalMaxPool`, `GridSample`, `GroupNormalization`,
+`HammingWindow`, `HannWindow`, `Hardmax`, `InstanceNormalization`, `IsInf`,
+`LogSoftmax`, `LpNormalization`, `LpPool`, `NonMaxSuppression`,
+`NonZero`, `PRelu`, `Pad`, `QuantizeLinear`, `Range`, `Resize`,
+`SpaceToDepth`, and `Unique`.
 
-For `com.microsoft`, CUDA matches eight CPU pairs (`FusedGemm`,
-`FusedMatMulBias`, `Gelu`, `LayerNormalization`, `MatMulNBits`,
-`SimplifiedLayerNormalization`, `SkipLayerNormalization`,
-`SkipSimplifiedLayerNormalization`); CPU-only gaps are `BiasGelu`, `FastGelu`,
-`FusedAttention`, and `QuickGelu`. CUDA additionally exposes
-`com.microsoft::Attention`. CUDA standard-domain extras not currently registered
-by the CPU EP are `And`, `Conv`, `Greater`, `GreaterOrEqual`, `Less`,
-`LessOrEqual`, `Or`, `Selu`, `Softsign`, and `Xor`.
+For `com.microsoft`, CUDA matches the CPU pairs `FusedGemm`, `FusedMatMulBias`,
+`Gelu`, `LayerNormalization`, `MatMulNBits`, `SimplifiedLayerNormalization`,
+`SkipLayerNormalization`, and `SkipSimplifiedLayerNormalization`; CPU-only gaps
+are `BiasGelu`, `FastGelu`, `FusedAttention`, and `QuickGelu`. CUDA additionally
+exposes `com.microsoft::Attention`. CUDA standard-domain extras not currently
+registered by the CPU EP are `Conv` (cuDNN).
+
 
 ### Library mapping for the remaining CPU gaps
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
 | **cuBLASLt** | `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
-| **cuDNN** | `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax`, `ReduceL2`, `ReduceProd`, `ReduceSumSquare` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
+| **cuDNN** | `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
 | **CUTLASS / cuDNN SDPA** | standard `Attention`, `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `NonZero` | Select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
-| **NVRTC-custom** | remaining unary math (`Acos`…`Tan`, `Swish`), quantize/dequantize, `Where`, `RotaryEmbedding`, indexed/strided movement (`Gather*`, `Slice`, `Tile`, `Expand`, `Transpose`, `Concat`, `Pad`, `Split`, `Range`) | Pointwise or index-transform work with no suitable runtime library; RoPE is a justified fusion kernel. |
-| **view / memcpy / host** | `Identity`, `Reshape`, `Flatten`, `Squeeze`, `Unsqueeze`, `Shape`, `Size`, `Constant`, `ConstantOfShape` | Metadata-only views, raw D2D copies, or small host-generated tensors. |
+| **NVRTC-custom** | quantize/dequantize, `Pad`, `Range`, `GatherND` | Pointwise or index-transform work with no suitable runtime library. |
+| **view / memcpy / host** | `Constant`, `ConstantOfShape` | Metadata-only views, raw D2D copies, or small host-generated tensors. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
@@ -219,6 +246,26 @@ The pointwise dtype/broadcast pass is GPU-validated on H200 for f16 and bf16
 `Add`/`Sub`/`Mul`/`Div`, `[4,1,3]` with `[1,5,3]` NumPy broadcasting, and
 representative unary/activation kernels. Half storage is widened to f32 for
 compute and rounded once on output, matching the CPU EP convention.
+
+The issue #67 operator-coverage batch adds thirteen advertised op names — the
+trigonometric/hyperbolic unary family (`Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`,
+`Atan`, `Asinh`, `Acosh`, `Atanh`) plus `Identity`, `Flatten`, `Size`, and
+`Trilu`. Each is GPU-validated against the CPU EP on the local CUDA host across
+the dtypes/attributes it claims (trig ops in f32/f16/bf16; `Trilu` upper/lower
+with positive/negative `k` in f32/Int64), raising CPU standard-domain op-type
+coverage to **88 / 141**.
+
+The issue #67 operator-coverage batch 2 adds eleven more advertised op names —
+the extended f32 reductions (`ReduceProd`, `ReduceSumSquare`, `ReduceL1`,
+`ReduceL2`, `ReduceLogSum`, `ReduceLogSumExp`), the attribute-driven activations
+`Swish` (opset 24) and `ThresholdedRelu` (opset 10) in f32/f16/bf16, the variadic
+broadcasting ops `Sum` and `Mean` in f32/f16/bf16, and `Mod` (f32 with `fmod=1`
+plus i32/i64 truncated and floor modulo). Each is GPU-validated against the CPU
+EP on the local CUDA host across the dtypes/attributes it claims (reductions over
+several axes/keepdims combinations, including the opset-18 axes-input form for
+`ReduceLogSumExp`; `Mod` with negative operands and a zero divisor). This raises
+`CUDA_COVERED_OPS` to **113** advertised op names and CPU standard-domain op-type
+coverage to **99 / 141**.
 
 ---
 

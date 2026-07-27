@@ -41,12 +41,13 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
+    DryConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
     GenerateToken, GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, LimitParseError,
-    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId, SharedKvBinding,
-    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, parse_resource_limit,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig,
+    parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -635,9 +636,26 @@ mod tests {
             top_p: 0.9,
             top_k: 10,
             min_p: 0.05,
+            top_a: 0.4,
+            typical_p: 0.8,
             repetition_penalty: 1.1,
             frequency_penalty: 0.2,
             presence_penalty: 0.3,
+            dry: Some(crate::config::DryConfig {
+                multiplier: 0.5,
+                base: 1.75,
+                allowed_length: 2,
+                sequence_breakers: vec![13],
+            }),
+            mirostat: Some(crate::config::MirostatConfig {
+                tau: 5.0,
+                eta: 0.1,
+                version: crate::config::MirostatVersion::V2,
+            }),
+            xtc: Some(crate::config::XtcConfig {
+                probability: 0.5,
+                threshold: 0.1,
+            }),
             stop_sequences: vec![StopSequence::Tokens(vec![42])],
             ..Default::default()
         };
@@ -648,11 +666,16 @@ mod tests {
                 "repetition_penalty",
                 "frequency_penalty",
                 "presence_penalty",
+                "dry",
                 "stop_sequence",
                 "temperature",
                 "top_k",
                 "top_p",
-                "min_p"
+                "min_p",
+                "top_a",
+                "typical_p",
+                "mirostat_v2",
+                "xtc"
             ]
         );
     }
@@ -663,12 +686,14 @@ mod tests {
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
         let tokenizer = Tokenizer::from_file(&fixture)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
         let options = GenerateOptions {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 10,
             min_p: 0.05,
+            top_a: 0.4,
+            typical_p: 0.8,
             repetition_penalty: 1.1,
             frequency_penalty: 0.2,
             presence_penalty: 0.3,
@@ -688,7 +713,9 @@ mod tests {
                 "temperature",
                 "top_k",
                 "top_p",
-                "min_p"
+                "min_p",
+                "top_a",
+                "typical_p"
             ]
         );
         Ok(())

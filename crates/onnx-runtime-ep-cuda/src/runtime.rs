@@ -18,7 +18,7 @@ use onnx_runtime_ep_api::Result;
 
 use crate::blas::CublasLt;
 use crate::cudnn::CudnnBackend;
-use crate::dynamic_library::{CudaLibrary, require};
+use crate::dynamic_library::{CudaLibrary, require, wheel_cuda_include_paths};
 use crate::error::{driver_err, nvrtc_err};
 use crate::graph::CudaGraphLifecycle;
 
@@ -29,6 +29,13 @@ pub struct CudaAllocationCounts {
     pub frees: u64,
 }
 
+/// Counts explicit host/device transfers made through a runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaTransferCounts {
+    pub host_to_device: u64,
+    pub device_to_host: u64,
+}
+
 fn nvrtc_include_paths() -> Vec<String> {
     let mut candidates = Vec::<PathBuf>::new();
     for variable in ["CUDA_HOME", "CUDA_PATH"] {
@@ -37,6 +44,7 @@ fn nvrtc_include_paths() -> Vec<String> {
         }
     }
     candidates.push(PathBuf::from("/usr/local/cuda/include"));
+    candidates.extend(wheel_cuda_include_paths());
 
     if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
         for path in std::env::split_paths(&paths) {
@@ -196,6 +204,8 @@ pub struct CudaRuntime {
     nvrtc_cubin_fallback: AtomicBool,
     allocations: AtomicU64,
     frees: AtomicU64,
+    host_to_device_copies: AtomicU64,
+    device_to_host_copies: AtomicU64,
     /// Persistent four-byte device word into which capture-safe kernels latch an
     /// out-of-range bounds violation detected during CUDA-graph replay. It is set
     /// (via `atomicOr`) by device kernels and never auto-cleared on the device;
@@ -220,16 +230,22 @@ impl CudaRuntime {
     /// stream, and a cuBLASLt handle. Returns an error (never panics) when no
     /// such device exists or the CUDA driver / cuBLASLt cannot be loaded.
     pub fn new(ordinal: u32) -> Result<Self> {
-        require(CudaLibrary::Driver).map_err(|message| {
-            EpError::KernelFailed(format!(
-                "cuda_ep: {message}; CPU execution remains available"
-            ))
-        })?;
-        require(CudaLibrary::CublasLt).map_err(|message| {
-            EpError::KernelFailed(format!(
-                "cuda_ep: {message}; CPU execution remains available"
-            ))
-        })?;
+        // Preload the wheel-provided dependency chain by its absolute discovered
+        // paths. CUDA component wheels live in sibling directories, so relying on
+        // cuBLASLt's ambient dependency lookup would make `nxrt[cuda]` depend on
+        // a system CUDA installation.
+        for library in [
+            CudaLibrary::Driver,
+            CudaLibrary::Runtime,
+            CudaLibrary::Cublas,
+            CudaLibrary::CublasLt,
+        ] {
+            require(library).map_err(|message| {
+                EpError::KernelFailed(format!(
+                    "cuda_ep: {message}; CPU execution remains available"
+                ))
+            })?;
+        }
         let context =
             CudaContext::new(ordinal as usize).map_err(|e| driver_err("CudaContext::new", e))?;
         let major = context
@@ -300,6 +316,8 @@ impl CudaRuntime {
             nvrtc_cubin_fallback: AtomicBool::new(false),
             allocations: AtomicU64::new(0),
             frees: AtomicU64::new(0),
+            host_to_device_copies: AtomicU64::new(0),
+            device_to_host_copies: AtomicU64::new(0),
             capture_error: 0,
         }
         .with_capture_error_word()
@@ -436,6 +454,14 @@ impl CudaRuntime {
         CudaAllocationCounts {
             allocations: self.allocations.load(Ordering::Relaxed),
             frees: self.frees.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshot explicit host/device transfer calls made through this runtime.
+    pub fn transfer_counts(&self) -> CudaTransferCounts {
+        CudaTransferCounts {
+            host_to_device: self.host_to_device_copies.load(Ordering::Relaxed),
+            device_to_host: self.device_to_host_copies.load(Ordering::Relaxed),
         }
     }
 
@@ -794,7 +820,9 @@ impl CudaRuntime {
         self.bind()?;
         // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_htod_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyHtoD", e))
+            .map_err(|e| driver_err("cuMemcpyHtoD", e))?;
+        self.host_to_device_copies.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Copy `dst.len()` bytes device → host (D2H). `src` must be large enough.
@@ -809,7 +837,9 @@ impl CudaRuntime {
         self.synchronize()?;
         // SAFETY: bound context; `src` covers `dst.len()` bytes per the contract.
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(dst, src) }
-            .map_err(|e| driver_err("cuMemcpyDtoH", e))
+            .map_err(|e| driver_err("cuMemcpyDtoH", e))?;
+        self.device_to_host_copies.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Copy `bytes` device → device (D2D).

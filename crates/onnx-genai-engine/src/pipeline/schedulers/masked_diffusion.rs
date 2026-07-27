@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 use onnx_genai_ort::Value;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::Scheduler;
 
@@ -66,12 +66,18 @@ pub(super) struct MaskedDiffusion {
 }
 
 impl MaskedDiffusion {
+    fn lock_generation_start(&self) -> MutexGuard<'_, Option<Vec<usize>>> {
+        self.generation_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Capture each sequence's generation-region start (prompt length) on the
     /// first use of a loop — the index of its first mask token. Cleared by
     /// [`Scheduler::reset`]. Called from both `step` and `cfg_uncond_sample`, so
     /// whichever runs first in a loop iteration records it from the seed.
     fn ensure_generation_start(&self, tokens: &[i64], batch: usize, sequence_length: usize) {
-        let mut guard = self.generation_start.lock().unwrap();
+        let mut guard = self.lock_generation_start();
         if guard.is_some() {
             return;
         }
@@ -151,7 +157,7 @@ impl MaskedDiffusion {
 
 impl Scheduler for MaskedDiffusion {
     fn reset(&self) {
-        *self.generation_start.lock().unwrap() = None;
+        *self.lock_generation_start() = None;
     }
 
     /// LLaDA unconditional pass: re-mask the prompt tokens of the current
@@ -166,7 +172,10 @@ impl Scheduler for MaskedDiffusion {
         }
         let batch = count.checked_div(sequence_length).unwrap_or(0).max(1);
         self.ensure_generation_start(&tokens, batch, sequence_length);
-        let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
+        let generation_start = self
+            .lock_generation_start()
+            .clone()
+            .context("masked-diffusion generation start was not initialized")?;
 
         let mut output = tokens;
         for (row_index, &prompt_length) in generation_start.iter().enumerate() {
@@ -210,7 +219,10 @@ impl Scheduler for MaskedDiffusion {
 
         // Capture each sequence's generation-region start on the first step.
         self.ensure_generation_start(&tokens, batch, sequence_length);
-        let generation_start = self.generation_start.lock().unwrap().clone().unwrap();
+        let generation_start = self
+            .lock_generation_start()
+            .clone()
+            .context("masked-diffusion generation start was not initialized")?;
 
         let all_logits = logits.to_vec_f32()?;
         let mut output = tokens.clone();
@@ -340,6 +352,30 @@ mod tests {
     use super::super::SchedulerRegistry;
     use super::*;
     use onnx_genai_metadata::SchedulerSpec;
+
+    #[test]
+    fn masked_diffusion_recovers_poisoned_generation_start_lock() {
+        let scheduler = MaskedDiffusion {
+            mask_token_id: 4,
+            temperature: 0.0,
+            block_length: None,
+            remasking: Remasking::LowConfidence,
+            generation_start: Mutex::new(None),
+        };
+
+        std::thread::scope(|scope| {
+            let result = scope
+                .spawn(|| {
+                    let mut guard = scheduler.lock_generation_start();
+                    *guard = Some(vec![2]);
+                    panic!("poison generation-start lock");
+                })
+                .join();
+            assert!(result.is_err());
+        });
+
+        assert_eq!(*scheduler.lock_generation_start(), Some(vec![2]));
+    }
 
     #[test]
     fn masked_diffusion_random_unmasks_all_and_never_emits_mask() {

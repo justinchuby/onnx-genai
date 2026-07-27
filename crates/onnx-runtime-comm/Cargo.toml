@@ -13,9 +13,12 @@ publish = false
 onnx-runtime-protocol-trace = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-half = "2"
+half = { workspace = true }
 
 [dev-dependencies]
 # Enables the test-only independent replay-checker harness for the
 # buffer-ownership conformance campaigns.
 onnx-runtime-protocol-trace = { workspace = true, features = ["conformance"] }
+
+[lints]
+workspace = true

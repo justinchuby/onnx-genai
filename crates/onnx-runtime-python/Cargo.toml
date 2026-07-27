@@ -52,3 +52,6 @@ cuda = [
     "dep:onnx-runtime-tracer",
     "onnx-runtime-tracer/cupti",
 ]
+
+[lints]
+workspace = true
