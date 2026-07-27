@@ -129,7 +129,7 @@ pub(crate) struct DecodeCudaState {
     /// padded single-capture verify graph would be captured at. `None` today —
     /// the eager verify path (option (b)) captures nothing. Set only by the
     /// dormant `configure_padded_verify_capture` switch (not on the hot path).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) padded_query_capacity: Option<usize>,
 }
 
@@ -822,6 +822,7 @@ impl DecodeCudaState {
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
             retain_graph_on_rewind: false,
+            #[cfg(test)]
             padded_query_capacity: None,
         })
     }
@@ -988,7 +989,7 @@ impl DecodeCudaState {
     /// and retain the captured graph across `rewind` (contents-only mutation)
     /// instead of invalidating it. Not reachable from the plain M=1 hot path nor
     /// the eager (option (b)) verify path; only a future WP4 driver flips it on.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn configure_padded_verify_capture(&mut self, max_query_rows: usize) {
         self.padded_query_capacity = Some(max_query_rows);
         self.retain_graph_on_rewind = true;
@@ -997,14 +998,14 @@ impl DecodeCudaState {
     /// Toggle whether `rewind` retains the captured decode graph (option (c),
     /// contents-only mutation) or invalidates it (option (b), the eager default).
     /// Dormant: only exercised by option-(c) correctness tests until WP4.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         self.retain_graph_on_rewind = retain;
     }
 
     /// Fixed query-row capacity (M=maxK) of the dormant padded verify capture, or
     /// `None` while the eager (option (b)) verify path is in force.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn padded_query_capacity(&self) -> Option<usize> {
         self.padded_query_capacity
     }
