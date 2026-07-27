@@ -110,7 +110,7 @@ The EP contract. Signatures already frozen on this branch.
 |--------|----------------|--------|
 | `provider` | Finalize `DeviceBuffer` ownership/`Send+Sync` story (currently a documented placeholder `unsafe impl`) | §4.1 |
 | `kernel` | Confirm `Cost` shape vs. `onnx-runtime-cost-model` (Phase 2) | §4.2, §6 |
-| `registry` | `OpRegistry`/`EpRegistry` ✅ done; `load_legacy` is Phase 2 | §4.3, §4.6 |
+| `registry` | `OpRegistry`/`EpRegistry` ✅ done; `load_legacy` resolves and validates ORT plugin-EP factories | §4.3, §4.6 |
 | `tensor` | `TensorView`/`TensorMut` ✅ shape; validate against DLPack import path (§5.3) | §5.4 |
 | `abi` | `OrtGraphView` C projection — **Phase 2**, `unsafe` FFI | §3.4, §4.5 |
 
