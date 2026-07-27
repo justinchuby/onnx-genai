@@ -107,3 +107,13 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
 Pris authored WP-B1 optional-modality metadata schema support and Bryant approved it; the work landed on origin/main as `a71c6f3`. Rachael's WP-B design note remains active for WP-B2/WP-B3 follow-up reference.
+
+## 2026-07-27T09:15:14-07:00 — CLI UX/server-surface research
+
+- Audited `onnx-genai` interactive REPL, streaming output, `serve` ergonomics, and CLI reachability of server/runtime features.
+- Wrote findings to `docs\research\cli\02-ux-and-server-surface.md`; top gaps are remote OpenAI-compatible client mode, structured/quiet output, stronger REPL input/history, explicit session/fork/rewind UX, and advanced runtime controls.
+
+## 2026-07-27T09:30:56-07:00 — REPL redesign research
+
+- Wrote `docs\research\cli\05-repl-redesign.md` after Justin clarified the CLI is a maintainer tool and the REPL is the primary CLI investment.
+- Recommended preserving ratatui inline viewport/native scrollback, adding a TTY-only `reedline` editor, generating slash help/completions from a declarative registry, and keeping non-TTY e2e output byte-stable.
