@@ -7,9 +7,10 @@
 use crate::TokenId;
 use crate::config::{MtpCacheScope, MtpHiddenLayout};
 use crate::decode::{
-    apply_paged_sliding_window, extract_logits_sequence_with_io, next_session_token_logits,
-    next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
-    propose_draft_tokens, run_decode_session_logits, run_decode_step,
+    DraftProposalRequest, apply_paged_sliding_window, extract_logits_sequence_with_io,
+    next_session_token_logits, next_session_token_logits_and_hidden,
+    next_session_token_logits_and_hiddens, propose_draft_tokens, run_decode_session_logits,
+    run_decode_step,
 };
 use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
@@ -1041,17 +1042,17 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
     ) -> anyhow::Result<SpeculativeProposal> {
         let mut fallback_rng = SamplingRng::new(context.options.seed);
         let rng = self.rng.as_deref_mut().unwrap_or(&mut fallback_rng);
-        let tokens = propose_draft_tokens(
-            self.draft_model,
-            self.draft_state,
-            context.width,
-            context.generated_tokens,
-            context.generated_text,
-            context.first_step,
-            context.options,
-            context.chain,
+        let tokens = propose_draft_tokens(DraftProposalRequest {
+            draft_model: self.draft_model,
+            draft_state: self.draft_state,
+            width: context.width,
+            generated_tokens: context.generated_tokens,
+            generated_text: context.generated_text,
+            first_step: context.first_step,
+            options: context.options,
+            chain: context.chain,
             rng,
-        )?;
+        })?;
         Ok(SpeculativeProposal::linear(tokens))
     }
 
@@ -1067,6 +1068,25 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
     fn name(&self) -> &str {
         "draft_model"
     }
+}
+
+/// Bundled inputs for [`Engine::generate_speculative_loop`]: the session
+/// identifier and its mutable engine state, the generation options and
+/// processor chain, the context limit and prefix-cache hit length, the mutable
+/// output accumulators (generated tokens, text, and log-probabilities), the
+/// sampling RNG, and the optional per-token callback.
+pub(crate) struct SpeculativeLoopState<'state, 'callback> {
+    pub(crate) session_id: SessionId,
+    pub(crate) state: &'state mut EngineSession,
+    pub(crate) options: &'state GenerateOptions,
+    pub(crate) chain: &'state ProcessorChain,
+    pub(crate) max_context: Option<usize>,
+    pub(crate) prefix_cache_hit_len: usize,
+    pub(crate) generated_tokens: &'state mut Vec<TokenId>,
+    pub(crate) generated_text: &'state mut String,
+    pub(crate) generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
+    pub(crate) rng: &'state mut SamplingRng,
+    pub(crate) callback: Option<&'state mut GenerateTokenCallback<'callback>>,
 }
 
 impl Engine {
@@ -1102,21 +1122,23 @@ impl Engine {
             && self.kv_model.is_some()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_speculative_loop(
         &mut self,
-        session_id: SessionId,
-        state: &mut EngineSession,
-        options: &GenerateOptions,
-        chain: &ProcessorChain,
-        max_context: Option<usize>,
-        prefix_cache_hit_len: usize,
-        generated_tokens: &mut Vec<TokenId>,
-        generated_text: &mut String,
-        generated_logprobs: &mut Option<Vec<crate::config::TokenLogprob>>,
-        rng: &mut SamplingRng,
-        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+        loop_state: SpeculativeLoopState<'_, '_>,
     ) -> anyhow::Result<GenerateResult> {
+        let SpeculativeLoopState {
+            session_id,
+            state,
+            options,
+            chain,
+            max_context,
+            prefix_cache_hit_len,
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            rng,
+            mut callback,
+        } = loop_state;
         let speculative_mode = self.speculative_mode(options);
         let draft_width = match &speculative_mode {
             SpeculativeMode::PromptLookup { max_tokens, .. } => *max_tokens,

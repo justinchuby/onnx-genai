@@ -359,19 +359,19 @@ impl Engine {
 
         let result = (|| -> anyhow::Result<GenerateResult> {
             if self.should_use_speculative(&options) && !has_custom_sampler {
-                return self.generate_speculative_loop(
+                return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
                     session_id,
-                    &mut state,
-                    &options,
-                    &chain,
+                    state: &mut state,
+                    options: &options,
+                    chain: &chain,
                     max_context,
                     prefix_cache_hit_len,
-                    &mut loop_state.generated_tokens,
-                    &mut loop_state.generated_text,
-                    &mut loop_state.logprobs,
-                    &mut loop_state.rng,
-                    callback.as_deref_mut(),
-                );
+                    generated_tokens: &mut loop_state.generated_tokens,
+                    generated_text: &mut loop_state.generated_text,
+                    generated_logprobs: &mut loop_state.logprobs,
+                    rng: &mut loop_state.rng,
+                    callback: callback.as_deref_mut(),
+                });
             }
 
             let mut backend = SessionDecodeLoopBackend {

@@ -46,9 +46,9 @@ pub(crate) use metadata::{
 pub(crate) use state::DecodeState;
 pub(crate) use step::{run_decode_session_logits, run_decode_step, run_decode_step_with_extra};
 pub(crate) use token_sampling::{
-    apply_paged_sliding_window, next_session_token_argmax, next_session_token_logits,
-    next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
-    next_session_token_sampled, propose_draft_tokens,
+    DraftProposalRequest, apply_paged_sliding_window, next_session_token_argmax,
+    next_session_token_logits, next_session_token_logits_and_hidden,
+    next_session_token_logits_and_hiddens, next_session_token_sampled, propose_draft_tokens,
 };
 pub(crate) use values::{clone_value, is_kv_input, is_present_output, matching_past_input};
 
