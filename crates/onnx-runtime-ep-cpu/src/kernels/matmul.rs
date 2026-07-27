@@ -637,40 +637,83 @@ impl MatMulKernel {
         }
 
         // Non-contiguous f16 weight rescue: when B is a constant Float16 weight
-        // stored with non-standard strides (e.g. lm_head stored column-major),
-        // `try_matmul_half` above skips it.  Rather than falling through to
-        // `to_dense_f32_widen` (which converts 136 M elements one-by-one,
-        // measured at ~1 s for the vocab projection), materialise a contiguous
-        // f16 copy once and route through BNNS / half GEMM.  The copy is cached
-        // for the session lifetime, amortising the one-time cost.
+        // stored column-major (e.g. lm_head vocab projection), route through
+        // BNNS with `trans_b: true` to avoid materialising a contiguous copy.
+        //
+        // Column-major B[K,N] in memory is equivalent to row-major B^T[N,K].
+        // BNNS `trans_b` handles the transpose internally via AMX, eliminating
+        // a 272 MB strided copy that previously cost ~280 ms.
+        //
+        // For non-column-major non-contiguous layouts, fall back to the
+        // contiguous copy path (cached via OnceLock).
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if inputs[0].dtype == onnx_runtime_ir::DataType::Float16
             && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
             && !inputs[1].is_contiguous()
             && geom.m >= 2
             && inputs[0].is_contiguous()
-            && let Some(b_contig) = self.prepack.contiguous_b_f16(&inputs[1])
         {
+            let b_view = &inputs[1];
+            let b_shape = b_view.shape;
+            let b_strides = b_view.strides;
+
             let a_len = inputs[0].numel();
             let a_bits = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<u16>(), a_len) };
+            let b_len = b_view.numel();
             let mut out = vec![0.0f32; geom.result_len];
+
+            // Check for column-major: 2-D with strides [1, K] (stride-0 = 1,
+            // stride-1 = rows). This is exactly B^T stored row-major.
+            let is_column_major = b_shape.len() == 2
+                && b_strides.len() == 2
+                && b_strides[0] == 1
+                && b_strides[1] == b_shape[0] as i64;
+
+            // A trivial batch (all dims are 1) behaves identically to no batch.
+            let trivial_batch =
+                geom.batch_shape.is_empty() || geom.batch_shape.iter().all(|&d| d == 1);
+
             if !out.is_empty() && geom.k > 0 {
-                if geom.batch_shape.is_empty() {
-                    if !accelerate_gemm::bnns_matmul_f16(
-                        a_bits, b_contig, &mut out, geom.m, geom.k, geom.n,
+                if is_column_major && trivial_batch {
+                    // B is column-major [K,N]: memory is row-major B^T[N,K].
+                    // Pass the raw data and let BNNS transpose internally.
+                    let bt_bits =
+                        unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), b_len) };
+                    if !accelerate_gemm::bnns_matmul_f16_trans_b(
+                        a_bits, bt_bits, &mut out, geom.m, geom.k, geom.n,
                     ) {
-                        half_gemm_tile(
-                            HalfFormat::F16,
-                            a_bits,
-                            b_contig,
-                            &mut out,
-                            geom.m,
-                            geom.k,
-                            geom.n,
-                        );
+                        // Fallback: materialise contiguous copy
+                        if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                            half_gemm_tile(
+                                HalfFormat::F16,
+                                a_bits,
+                                b_contig,
+                                &mut out,
+                                geom.m,
+                                geom.k,
+                                geom.n,
+                            );
+                        }
                     }
-                } else {
-                    bnns_half_dense_into(a_bits, b_contig, &geom, &mut out);
+                } else if let Some(b_contig) = self.prepack.contiguous_b_f16(b_view) {
+                    // Non-column-major or batched: use cached contiguous copy
+                    if trivial_batch {
+                        if !accelerate_gemm::bnns_matmul_f16(
+                            a_bits, b_contig, &mut out, geom.m, geom.k, geom.n,
+                        ) {
+                            half_gemm_tile(
+                                HalfFormat::F16,
+                                a_bits,
+                                b_contig,
+                                &mut out,
+                                geom.m,
+                                geom.k,
+                                geom.n,
+                            );
+                        }
+                    } else {
+                        bnns_half_dense_into(a_bits, b_contig, &geom, &mut out);
+                    }
                 }
             }
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &out);

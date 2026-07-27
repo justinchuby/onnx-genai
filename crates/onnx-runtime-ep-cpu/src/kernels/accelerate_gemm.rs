@@ -181,7 +181,7 @@ pub fn bnns_matmul_available() -> bool {
 /// Filters are destroyed when the thread exits via the `Drop` impl on
 /// `FilterCache`.
 struct FilterCache {
-    map: std::collections::HashMap<(usize, usize, usize), BNNSFilter>,
+    map: std::collections::HashMap<(usize, usize, usize, bool), BNNSFilter>,
 }
 
 impl FilterCache {
@@ -191,19 +191,25 @@ impl FilterCache {
         }
     }
 
-    fn get_or_create(&mut self, m: usize, k: usize, n: usize) -> BNNSFilter {
-        *self.map.entry((m, k, n)).or_insert_with(|| {
+    fn get_or_create(&mut self, m: usize, k: usize, n: usize, trans_b: bool) -> BNNSFilter {
+        *self.map.entry((m, k, n, trans_b)).or_insert_with(|| {
+            // When trans_b, B input is [N,K] row-major (B^T), BNNS transposes it.
+            let b_desc = if trans_b {
+                make_nd_desc(n, k, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut())
+            } else {
+                make_nd_desc(k, n, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut())
+            };
             let params = BNNSLayerParametersBroadcastMatMul {
                 alpha: 1.0,
                 beta: 0.0,
                 trans_a: false,
-                trans_b: false,
+                trans_b,
                 quadratic: false,
                 a_is_weights: false,
                 b_is_weights: false,
                 _pad: [0; 3],
                 i_a_desc: make_nd_desc(m, k, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
-                i_b_desc: make_nd_desc(k, n, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
+                i_b_desc: b_desc,
                 o_desc: make_nd_desc(m, n, BNNS_DATA_TYPE_FLOAT32, std::ptr::null_mut()),
             };
             unsafe { BNNSFilterCreateLayerBroadcastMatMul(&params, std::ptr::null()) }
@@ -234,19 +240,55 @@ pub fn bnns_matmul_f16(a: &[u16], b: &[u16], c: &mut [f32], m: usize, k: usize, 
     debug_assert_eq!(c.len(), m * n);
 
     BNNS_FILTER_CACHE.with(|cache| {
-        let filter = cache.borrow_mut().get_or_create(m, k, n);
+        let filter = cache.borrow_mut().get_or_create(m, k, n, false);
         if filter.is_null() {
             return false;
         }
-        unsafe {
-            let rc = BNNSFilterApplyTwoInput(
+        let rc = unsafe {
+            BNNSFilterApplyTwoInput(
                 filter,
                 a.as_ptr() as *const std::ffi::c_void,
                 b.as_ptr() as *const std::ffi::c_void,
                 c.as_mut_ptr() as *mut std::ffi::c_void,
-            );
-            rc == 0
+            )
+        };
+        rc == 0
+    })
+}
+
+/// C[m,n] = A[m,k] @ B^T[n,k]^T via BNNS with transposed B.
+///
+/// B is passed as a row-major [N,K] matrix (i.e. B^T stored row-major).
+/// BNNS applies the transpose internally, so the caller does NOT need to
+/// materialise a contiguous row-major [K,N] copy.  This is critical for
+/// column-major weights (e.g. lm_head vocab) where the column-major
+/// [K,N] storage IS a row-major [N,K] B^T — eliminating a 272 MB copy.
+pub fn bnns_matmul_f16_trans_b(
+    a: &[u16],
+    bt: &[u16],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(bt.len(), n * k); // B^T is [N, K]
+    debug_assert_eq!(c.len(), m * n);
+
+    BNNS_FILTER_CACHE.with(|cache| {
+        let filter = cache.borrow_mut().get_or_create(m, k, n, true);
+        if filter.is_null() {
+            return false;
         }
+        let rc = unsafe {
+            BNNSFilterApplyTwoInput(
+                filter,
+                a.as_ptr() as *const std::ffi::c_void,
+                bt.as_ptr() as *const std::ffi::c_void,
+                c.as_mut_ptr() as *mut std::ffi::c_void,
+            )
+        };
+        rc == 0
     })
 }
 
@@ -1105,6 +1147,62 @@ mod tests {
                 max_rel < tol,
                 "BNNS f16 matmul ({m},{k},{n}) max relative error {max_rel:.6} \
                  exceeds tolerance {tol:.4}"
+            );
+        }
+    }
+
+    /// BNNS trans_b correctness: C = A[m,k] @ B[k,n] using B^T[n,k] with trans_b.
+    /// Verifies that `bnns_matmul_f16_trans_b` produces the same result as the
+    /// non-transposed path, which is critical for the column-major weight rescue.
+    #[test]
+    fn bnns_matmul_f16_trans_b_matches_normal() {
+        if !bnns_matmul_available() {
+            eprintln!("BNNS not available, skipping");
+            return;
+        }
+        let shapes: &[(usize, usize, usize)] = &[(2, 3, 4), (11, 64, 32), (40, 896, 4864)];
+        for &(m, k, n) in shapes {
+            let a_f32: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 997) as f32) * 0.001 - 0.5)
+                .collect();
+            let b_f32: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 991) as f32) * 0.001 - 0.5)
+                .collect();
+            let a_f16 = f32_to_f16_bits(&a_f32);
+            let b_f16 = f32_to_f16_bits(&b_f32);
+
+            // Normal path: A[m,k] @ B[k,n] row-major
+            let mut c_normal = vec![0.0f32; m * n];
+            assert!(bnns_matmul_f16(&a_f16, &b_f16, &mut c_normal, m, k, n));
+
+            // Trans_b path: A[m,k] @ B^T[n,k]^T — create B^T as row-major [n,k]
+            let mut bt_f16 = vec![0u16; n * k];
+            for i in 0..k {
+                for j in 0..n {
+                    bt_f16[j * k + i] = b_f16[i * n + j];
+                }
+            }
+            let mut c_trans = vec![0.0f32; m * n];
+            assert!(
+                bnns_matmul_f16_trans_b(&a_f16, &bt_f16, &mut c_trans, m, k, n),
+                "bnns_matmul_f16_trans_b failed at ({m},{k},{n})"
+            );
+
+            // Compare: should be bitwise identical (same BNNS accumulation)
+            // or at least within f32 epsilon
+            let max_diff = c_normal
+                .iter()
+                .zip(&c_trans)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let scale = c_normal
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-6);
+            assert!(
+                max_diff / scale < 1e-5,
+                "trans_b vs normal mismatch at ({m},{k},{n}): max_diff={max_diff}, scale={scale}"
             );
         }
     }
