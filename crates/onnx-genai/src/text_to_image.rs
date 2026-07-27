@@ -152,6 +152,26 @@ pub struct VaeDecoder {
     pub scaling_factor: f32,
 }
 
+/// Standalone VAE encoder used by img2img and inpainting workflows.
+#[derive(Debug, Clone)]
+pub struct VaeEncoder {
+    /// ONNX model file implementing `image -> latent` (or latent moments).
+    pub model_path: PathBuf,
+    /// Scale applied to the encoded latent before diffusion.
+    pub scaling_factor: f32,
+}
+
+/// Source pixels and optional repaint mask for image-conditioned diffusion.
+#[derive(Debug, Clone)]
+pub struct SourceImage {
+    pub width: usize,
+    pub height: usize,
+    /// RGB pixels in channel-major `[-1, 1]` form.
+    pub pixels_chw: Vec<f32>,
+    /// Optional single-channel mask in `[0, 1]`; one means repaint.
+    pub mask: Option<Vec<f32>>,
+}
+
 /// Sampling parameters for one text-to-image render.
 #[derive(Debug, Clone)]
 pub struct TextToImageRequest {
@@ -182,6 +202,10 @@ pub struct TextToImageRequest {
     pub text_encoder_path: Option<PathBuf>,
     /// Standalone VAE decode for packages without a final image phase.
     pub vae_decoder: Option<VaeDecoder>,
+    /// Source image for img2img/inpainting. `None` selects txt2img.
+    pub source_image: Option<SourceImage>,
+    /// VAE encoder required when `source_image` is present.
+    pub vae_encoder: Option<VaeEncoder>,
 }
 
 impl Default for TextToImageRequest {
@@ -199,8 +223,49 @@ impl Default for TextToImageRequest {
             tokenizer_path: None,
             text_encoder_path: None,
             vae_decoder: None,
+            source_image: None,
+            vae_encoder: None,
         }
     }
+}
+
+/// Load an RGB source image and optional grayscale repaint mask.
+pub fn load_source_image(path: &Path, mask_path: Option<&Path>) -> Result<SourceImage> {
+    let image = image::open(path)
+        .with_context(|| format!("loading source image {}", path.display()))?
+        .to_rgb8();
+    let (width, height) = image.dimensions();
+    let plane = width as usize * height as usize;
+    let mut pixels_chw = vec![0.0f32; 3 * plane];
+    for (index, pixel) in image.pixels().enumerate() {
+        for channel in 0..3 {
+            pixels_chw[channel * plane + index] = pixel[channel] as f32 / 127.5 - 1.0;
+        }
+    }
+    let mask = mask_path
+        .map(|mask_path| -> Result<Vec<f32>> {
+            if mask_path == path {
+                let rgba = image::open(path)
+                    .with_context(|| format!("loading source alpha mask {}", path.display()))?
+                    .to_rgba8();
+                return Ok(rgba
+                    .pixels()
+                    .map(|pixel| 1.0 - pixel[3] as f32 / 255.0)
+                    .collect());
+            }
+            let mask = image::open(mask_path)
+                .with_context(|| format!("loading inpainting mask {}", mask_path.display()))?
+                .resize_exact(width, height, image::imageops::FilterType::Nearest)
+                .to_luma8();
+            Ok(mask.pixels().map(|pixel| pixel[0] as f32 / 255.0).collect())
+        })
+        .transpose()?;
+    Ok(SourceImage {
+        width: width as usize,
+        height: height as usize,
+        pixels_chw,
+        mask,
+    })
 }
 
 /// One rendered image as `[3, height, width]` f32 channel-major data in `[-1, 1]`.
@@ -545,6 +610,94 @@ fn encode_named(
         .collect())
 }
 
+fn vae_encode(
+    environment: &Environment,
+    encoder: &VaeEncoder,
+    pixels: &[f32],
+    batch_size: usize,
+    height: usize,
+    width: usize,
+    latent_channels: usize,
+) -> Result<Vec<f32>> {
+    let session = Session::new(environment, &encoder.model_path, SessionOptions::default())
+        .with_context(|| format!("loading VAE encoder {}", encoder.model_path.display()))?;
+    let input = session
+        .inputs()
+        .first()
+        .context("the VAE encoder graph declares no inputs")?;
+    let value = float_input(
+        pixels,
+        &[batch_size as i64, 3, height as i64, width as i64],
+        input.dtype,
+    )?;
+    let outputs = session.run(&[(input.name.as_str(), &value)])?;
+    let encoded = outputs
+        .into_iter()
+        .next()
+        .context("the VAE encoder produced no output")?;
+    let shape = encoded.shape();
+    if shape.len() != 4 {
+        bail!("VAE encoder output must be rank 4, got {shape:?}");
+    }
+    let output_channels = shape[1] as usize;
+    if output_channels != latent_channels && output_channels != latent_channels * 2 {
+        bail!(
+            "VAE encoder produced {output_channels} channels; expected {latent_channels} latents or {} moments",
+            latent_channels * 2
+        );
+    }
+    let encoded = encoded.to_vec_f32_lossy()?;
+    let output_plane = shape[2] as usize * shape[3] as usize;
+    let mut latents = Vec::with_capacity(batch_size * latent_channels * output_plane);
+    for batch in 0..batch_size {
+        let start = batch * output_channels * output_plane;
+        latents.extend(
+            encoded[start..start + latent_channels * output_plane]
+                .iter()
+                .map(|value| value * encoder.scaling_factor),
+        );
+    }
+    Ok(latents)
+}
+
+fn downsample_mask(mask: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let latent_width = width / VAE_DOWNSCALE;
+    let latent_height = height / VAE_DOWNSCALE;
+    let mut downsampled = Vec::with_capacity(latent_width * latent_height);
+    for y in 0..latent_height {
+        for x in 0..latent_width {
+            downsampled.push(mask[y * VAE_DOWNSCALE * width + x * VAE_DOWNSCALE]);
+        }
+    }
+    downsampled
+}
+
+/// Build inpainting conditioning in UNet channel order:
+/// `[1-channel mask | 4-channel masked-image latent]`.
+pub fn build_inpaint_conditioning(
+    mask: &[f32],
+    masked_latent: &[f32],
+    batch_size: usize,
+    latent_channels: usize,
+    latent_height: usize,
+    latent_width: usize,
+) -> Result<Vec<f32>> {
+    let plane = latent_height * latent_width;
+    if mask.len() != batch_size * plane
+        || masked_latent.len() != batch_size * latent_channels * plane
+    {
+        bail!("inpainting mask/latent shapes do not match");
+    }
+    let mut conditioning = Vec::with_capacity(batch_size * (latent_channels + 1) * plane);
+    for batch in 0..batch_size {
+        conditioning.extend_from_slice(&mask[batch * plane..(batch + 1) * plane]);
+        conditioning.extend_from_slice(
+            &masked_latent[batch * latent_channels * plane..(batch + 1) * latent_channels * plane],
+        );
+    }
+    Ok(conditioning)
+}
+
 /// Decode a `[batch, channels, h, w]` latent (already scaled by
 /// `1 / scaling_factor`) through a standalone VAE decoder session.
 pub fn vae_decode(
@@ -694,6 +847,24 @@ pub fn generate_image(
         .or(engine.spec().strategy.num_steps)
         .unwrap_or(25);
     validate_steps(num_steps)?;
+    let start_step = request
+        .start_step
+        .or(engine.spec().strategy.start_step)
+        .unwrap_or(0);
+    if start_step > num_steps {
+        bail!("start_step ({start_step}) must be <= num_steps ({num_steps})");
+    }
+    if let Some(source) = &request.source_image
+        && (source.width != request.width || source.height != request.height)
+    {
+        bail!(
+            "source image is {}x{} but the request is {}x{}",
+            source.width,
+            source.height,
+            request.width,
+            request.height
+        );
+    }
 
     let encoder_component = engine
         .spec()
@@ -760,17 +931,69 @@ pub fn generate_image(
         latent_width as i64,
     ];
 
-    // Seed latent: standard normal noise pre-scaled into the scheduler's sigma
-    // space, queried from the engine so the renderer never duplicates sigma math.
+    // Draw one deterministic noise tensor. Txt2img scales it by the scheduler's
+    // initial sigma; img2img asks the scheduler to noise the encoded source at
+    // the selected start step.
     let init_noise_sigma = engine.diffusion_init_noise_sigma().unwrap_or(1.0);
     let mut rng = StdRng::seed_from_u64(request.seed);
     let sample_len = batch_size * channels * latent_height * latent_width;
-    let sample: Vec<f32> = (0..sample_len)
-        .map(|_| {
-            let normal: f32 = StandardNormal.sample(&mut rng);
-            normal * init_noise_sigma
-        })
+    let noise: Vec<f32> = (0..sample_len)
+        .map(|_| StandardNormal.sample(&mut rng))
         .collect();
+    let mut inpaint_conditioning = None;
+    let sample = if let Some(source) = &request.source_image {
+        let encoder = request
+            .vae_encoder
+            .as_ref()
+            .context("img2img/inpainting requires a VAE encoder")?;
+        let pixels = source.pixels_chw.repeat(batch_size);
+        let encoded = vae_encode(
+            &environment,
+            encoder,
+            &pixels,
+            batch_size,
+            request.height,
+            request.width,
+            channels,
+        )?;
+        let encoded_value = Value::from_slice_f32(&encoded, &latent_shape)?;
+        let noise_value = Value::from_slice_f32(&noise, &latent_shape)?;
+        let noised =
+            engine.diffusion_add_noise(start_step, num_steps, &encoded_value, &noise_value)?;
+        if let Some(mask) = &source.mask {
+            let mut masked_pixels = source.pixels_chw.clone();
+            let plane = request.height * request.width;
+            for channel in 0..3 {
+                for index in 0..plane {
+                    masked_pixels[channel * plane + index] *= 1.0 - mask[index];
+                }
+            }
+            let masked_latent = vae_encode(
+                &environment,
+                encoder,
+                &masked_pixels.repeat(batch_size),
+                batch_size,
+                request.height,
+                request.width,
+                channels,
+            )?;
+            let mask = downsample_mask(mask, request.width, request.height).repeat(batch_size);
+            inpaint_conditioning = Some(build_inpaint_conditioning(
+                &mask,
+                &masked_latent,
+                batch_size,
+                channels,
+                latent_height,
+                latent_width,
+            )?);
+        }
+        noised.to_vec_f32_lossy()?
+    } else {
+        noise
+            .iter()
+            .map(|normal| normal * init_noise_sigma)
+            .collect()
+    };
 
     let mut pipeline_request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
@@ -782,6 +1005,20 @@ pub fn generate_image(
         endpoints.latent.clone(),
         Value::from_slice_f32(&sample, &latent_shape)?,
     );
+    if let Some(conditioning) = inpaint_conditioning {
+        pipeline_request = pipeline_request.with_input(
+            format!("{}.conditioning", endpoints.latent),
+            Value::from_slice_f32(
+                &conditioning,
+                &[
+                    batch_size as i64,
+                    (channels + 1) as i64,
+                    latent_height as i64,
+                    latent_width as i64,
+                ],
+            )?,
+        );
+    }
 
     // Classifier-free guidance unconditional embedding: the encoding of the
     // negative prompt (empty by default), NOT zeros.
@@ -895,7 +1132,6 @@ pub fn generate_image(
         .iter()
         .map(|&value| value / vae_decoder.scaling_factor)
         .collect();
-    let environment = Environment::new("onnx-genai-text-to-image")?;
     let (data, height, width) = vae_decode(
         &environment,
         &vae_decoder.model_path,
@@ -1154,5 +1390,22 @@ mod tests {
 
         assert_eq!(conditioning_kind(&single), ConditioningKind::Single);
         assert_eq!(conditioning_kind(&dual), ConditioningKind::DualWithPooled);
+    }
+
+    #[test]
+    fn inpaint_conditioning_orders_mask_before_masked_image_latent() {
+        let conditioning = build_inpaint_conditioning(
+            &[10.0, 11.0],
+            &[20.0, 21.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0],
+            1,
+            4,
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            conditioning,
+            vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0, 40.0, 41.0, 50.0, 51.0,]
+        );
     }
 }

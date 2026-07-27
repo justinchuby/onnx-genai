@@ -1240,17 +1240,41 @@ fn iterative_override_rejects_invalid_start_step() -> anyhow::Result<()> {
         .join("../../tests/fixtures/tiny-masked-diffusion")
         .canonicalize()?;
     let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
-    // start_step must be < the (overridden) num_steps.
+    // start_step may equal num_steps (zero-strength img2img), but not exceed it.
     let request = empty_request()
         .with_input(
             "denoiser.input_ids",
             Value::from_slice_i64(&[1, 1, 1, 1], &[1, 4])?,
         )
         .with_iterative_overrides(IterativeOverrides {
-            start_step: Some(4),
+            start_step: Some(5),
             ..Default::default()
         });
     assert!(engine.run_pipeline(request).is_err());
+    Ok(())
+}
+
+#[test]
+fn iterative_override_allows_zero_step_tail() -> anyhow::Result<()> {
+    use onnx_genai_engine::IterativeOverrides;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-masked-diffusion")
+        .canonicalize()?;
+    let mut engine = Engine::from_pipeline_dir(&dir, EngineConfig::default())?;
+    let seed = [1, 2, 3, 4];
+    let outputs = engine.run_pipeline(
+        empty_request()
+            .with_input("denoiser.input_ids", Value::from_slice_i64(&seed, &[1, 4])?)
+            .with_iterative_overrides(IterativeOverrides {
+                start_step: Some(4),
+                ..Default::default()
+            }),
+    )?;
+    assert_eq!(
+        outputs["denoiser.input_ids"].to_vec_i64()?,
+        seed,
+        "zero-strength img2img must publish the encoded seed unchanged"
+    );
     Ok(())
 }
 

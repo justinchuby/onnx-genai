@@ -680,6 +680,35 @@ impl PipelineEngine {
         }
     }
 
+    /// Add noise to an encoded diffusion latent at the scheduler state for `step`.
+    pub fn diffusion_add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        let PipelinePlan::Iterative(iterative) = &self.plan else {
+            anyhow::bail!("pipeline is not iterative");
+        };
+        if step > num_steps {
+            anyhow::bail!("start step ({step}) must be <= num_steps ({num_steps})");
+        }
+        let rebuilt;
+        let scheduler = if num_steps == iterative.num_steps {
+            iterative.scheduler.as_ref()
+        } else {
+            rebuilt = iterative
+                .scheduler_spec
+                .as_ref()
+                .map(|spec| iterative.scheduler_registry.build(spec, num_steps))
+                .transpose()?;
+            rebuilt.as_ref()
+        }
+        .context("iterative pipeline declares no diffusion scheduler")?;
+        scheduler.add_noise(step, num_steps, original, noise)
+    }
+
     /// Generate an image and retain the post-scheduler latent for every step.
     pub fn generate_image(&mut self, request: ImageRequest) -> anyhow::Result<ImageStream> {
         let mut steps = Vec::new();
@@ -1651,9 +1680,9 @@ impl PipelinePlan {
             anyhow::bail!("iterative strategy 'num_steps' must be greater than zero");
         }
         let start_step = spec.strategy.start_step.unwrap_or(0);
-        if start_step >= num_steps {
+        if start_step > num_steps {
             anyhow::bail!(
-                "iterative strategy 'start_step' ({start_step}) must be less than 'num_steps' ({num_steps})"
+                "iterative strategy 'start_step' ({start_step}) must be <= 'num_steps' ({num_steps})"
             );
         }
 

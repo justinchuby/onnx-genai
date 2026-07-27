@@ -207,7 +207,21 @@ A `KSampler.denoise` < 1.0 is img2img: encode a source image to a latent, noise 
 intermediate step, and run only the tail of the loop. The `start_step` field on the iterative
 strategy runs `start_step..num_steps` from the noised encoded-image seed, with
 `start_step = num_steps − round(num_steps·denoise)` (matching diffusers `get_timesteps`).
+`denoise = 0` maps to `start_step = num_steps`, so the loop executes zero steps.
 `scripts/img2img_e2e.py` validates it against diffusers img2img (max|Δ| ~1.0e-2).
+
+The native `run_comfyui` runner detects `VAEEncode`/`VAEEncodeTiled` on the sampler's latent
+input, loads the linked `LoadImage`, and uses the package component whose type is `vae_encoder`
+(`vae_encoder.onnx` is the compatibility fallback). Relative image paths are resolved beside the
+workflow JSON.
+
+### 4.1 Inpainting
+
+`VAEEncodeForInpaint` and `InpaintModelConditioning` additionally route the linked mask and masked
+source image through the VAE encoder. The UNet input is exactly 9 channels, in this order:
+`[4-channel noisy latent | 1-channel downsampled repaint mask | 4-channel masked-image latent]`.
+The scheduler continues to carry and update only the first four channels; the five conditioning
+channels are appended immediately before each denoiser invocation.
 
 ---
 

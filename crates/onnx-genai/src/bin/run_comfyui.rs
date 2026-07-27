@@ -25,9 +25,9 @@ use onnx_genai::engine::{
 };
 use onnx_genai::ort::Value;
 use onnx_genai::text_to_image::{
-    CLIP_CONTEXT_LENGTH, RenderedImage, TextToImageRequest, generate_image, latent_channels,
-    load_clip_tokenizer, save_png, tile_ids, tokenize_clip as tokenize,
-    validate_finite_decode_output,
+    CLIP_CONTEXT_LENGTH, RenderedImage, TextToImageRequest, VaeEncoder, generate_image,
+    latent_channels, load_clip_tokenizer, load_source_image, save_png, tile_ids,
+    tokenize_clip as tokenize, validate_finite_decode_output,
 };
 use onnx_genai_comfyui_config::parse_workflow_file;
 use std::path::{Path, PathBuf};
@@ -95,6 +95,7 @@ fn save_images(images: &[RenderedImage], output: &Path) -> Result<()> {
         eprintln!("saved: {}", output.display());
         return Ok(());
     }
+
     let stem = output
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -111,6 +112,30 @@ fn save_images(images: &[RenderedImage], output: &Path) -> Result<()> {
     Ok(())
 }
 
+fn workflow_asset(workflow_path: &Path, asset: &str) -> PathBuf {
+    let path = PathBuf::from(asset);
+    if path.is_absolute() {
+        path
+    } else {
+        workflow_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    }
+}
+
+fn vae_scaling_factor(pipeline_dir: &Path) -> f32 {
+    std::fs::read_to_string(pipeline_dir.join("run.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|run| {
+            run.get("vae_scaling_factor")
+                .and_then(|value| value.as_f64())
+        })
+        .map(|value| value as f32)
+        .unwrap_or(0.18215)
+}
+
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
 
@@ -118,9 +143,29 @@ fn main() -> Result<()> {
         .with_context(|| format!("parsing workflow {}", arguments.workflow.display()))?;
     let prompt = workflow.prompt.clone().unwrap_or_default();
     let negative_prompt = workflow.negative_prompt.clone().unwrap_or_default();
+    let source_image = workflow
+        .source_image
+        .as_deref()
+        .map(|source| {
+            let source = workflow_asset(&arguments.workflow, source);
+            let mask = workflow
+                .mask_image
+                .as_deref()
+                .map(|mask| workflow_asset(&arguments.workflow, mask));
+            load_source_image(&source, mask.as_deref())
+        })
+        .transpose()?;
+    let width = source_image
+        .as_ref()
+        .map(|image| image.width)
+        .unwrap_or(workflow.width as usize);
+    let height = source_image
+        .as_ref()
+        .map(|image| image.height)
+        .unwrap_or(workflow.height as usize);
     let latent_channels = latent_channels(&arguments.pipeline_dir);
-    let latent_height = (workflow.height / 8) as usize;
-    let latent_width = (workflow.width / 8) as usize;
+    let latent_height = height / 8;
+    let latent_width = width / 8;
     let batch_size = workflow.batch_size.max(1) as usize;
     let num_steps = workflow.steps as usize;
 
@@ -141,6 +186,19 @@ fn main() -> Result<()> {
     eprintln!("init_noise_sigma = {init_noise_sigma}");
 
     if arguments.replay_inputs.is_none() {
+        let vae_encoder = source_image.as_ref().map(|_| {
+            let filename = engine
+                .spec()
+                .models
+                .values()
+                .find(|component| component.role == "vae_encoder")
+                .map(|component| component.filename.as_str())
+                .unwrap_or("vae_encoder.onnx");
+            VaeEncoder {
+                model_path: arguments.pipeline_dir.join(filename),
+                scaling_factor: vae_scaling_factor(&arguments.pipeline_dir),
+            }
+        });
         let images = generate_image(
             &arguments.pipeline_dir,
             &mut engine,
@@ -149,14 +207,16 @@ fn main() -> Result<()> {
                 negative_prompt,
                 steps: Some(num_steps),
                 guidance_scale: Some(workflow.cfg as f32),
-                start_step: None,
+                start_step: source_image.as_ref().map(|_| workflow.start_step as usize),
                 seed: workflow.seed as u64,
-                height: workflow.height as usize,
-                width: workflow.width as usize,
+                height,
+                width,
                 batch_size,
                 tokenizer_path: arguments.tokenizer.clone(),
                 text_encoder_path: None,
                 vae_decoder: None,
+                source_image,
+                vae_encoder,
             },
         )?;
         let pixels: Vec<f32> = images
