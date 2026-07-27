@@ -59,3 +59,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-26T20:00:00Z — Scribe update
 
 - 2026-07-26T20:00:03Z — Reviewed PR #203: reproduced +1.54% A/B and split-K numeric parity, requested changes for the `(896,97)` test routing to DownProjection instead of split-K.
+
+## 2026-07-27T10:05:00-07:00 — PR #277 CLI sampling/context review
+- 🟢 Approved Batty's CLI sampling/context fix after checking explicit `--max-new-tokens` preservation, per-turn REPL budget recomputation, finite unknown-context fallback, context arithmetic, sampling/greedy flag semantics, non-TTY stability, and the engine accessor-only API addition.
+- Validation: `cargo build -q -p onnx-genai-cli`, `cargo test -q -p onnx-genai-cli --lib` (72 passed), and `cargo fmt -p onnx-genai-cli -- --check` passed; `cargo clippy -q -p onnx-genai-cli --all-targets -- -D warnings` hit only the known pre-existing `pages.rs:129` manual_checked_ops lint.
