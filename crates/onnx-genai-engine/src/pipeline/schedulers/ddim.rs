@@ -5,7 +5,7 @@
 
 use onnx_genai_ort::Value;
 
-use super::{PredictionType, Scheduler, epsilon_from_model_output};
+use super::{PredictionType, Scheduler, epsilon_from_model_output, training_alpha_cumprod};
 
 /// DDIM (η = 0) noise schedule, precomputed per inference
 /// step as `(alpha_cumprod_t, alpha_cumprod_prev)`.
@@ -34,27 +34,8 @@ impl DdimSchedule {
         if num_steps == 0 || num_steps > num_train_timesteps {
             anyhow::bail!("scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}");
         }
-        // Beta schedule -> cumulative product of alphas.
-        //   linear:        beta_i = lerp(beta_start, beta_end)
-        //   scaled_linear: beta_i = lerp(sqrt(beta_start), sqrt(beta_end))^2  (Stable Diffusion)
-        let denom = (num_train_timesteps - 1) as f32;
-        let (lo, hi, square) = match beta_schedule {
-            "linear" => (beta_start, beta_end, false),
-            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
-            other => anyhow::bail!(
-                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
-            ),
-        };
-        let mut alpha_cumprod = Vec::with_capacity(num_train_timesteps);
-        let mut prod = 1.0f32;
-        for i in 0..num_train_timesteps {
-            let mut beta = lo + (hi - lo) * (i as f32) / denom;
-            if square {
-                beta *= beta;
-            }
-            prod *= 1.0 - beta;
-            alpha_cumprod.push(prod);
-        }
+        let alpha_cumprod =
+            training_alpha_cumprod(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
         // Evenly spaced inference timesteps, descending (diffusers convention).
         let step_ratio = num_train_timesteps / num_steps;
         let ascending: Vec<usize> = (0..num_steps).map(|i| i * step_ratio).collect();

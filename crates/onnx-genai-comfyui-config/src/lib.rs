@@ -97,7 +97,8 @@ fn sampler_kind(sampler_name: &str) -> Result<&'static str, ComfyUiConfigError> 
 /// the Stable Diffusion values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulerConfig {
-    /// Scheduler algorithm (`ddim`, `euler`, `euler_ancestral`, `dpmpp_2m`).
+    /// Scheduler algorithm (`ddpm`, `ddim`, `euler`, `euler_ancestral`,
+    /// `dpmpp_2m`, or `flow_matching`).
     pub kind: String,
     /// Training timesteps the schedule was defined over.
     pub num_train_timesteps: usize,

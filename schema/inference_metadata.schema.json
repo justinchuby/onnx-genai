@@ -3010,7 +3010,7 @@
       "type": "object"
     },
     "SchedulerSpec": {
-      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\n(or, for `masked_diffusion`, as token logits) and applies one scheduler step\nper iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image\ndiffusion, with optional Karras/exponential sigmas) and `masked_diffusion`\n(discrete language diffusion).",
+      "description": "Diffusion scheduler configuration for an iterative strategy.\n\nThe runtime treats the denoiser's loop-carried output as a noise prediction\n(or, for `flow_matching`, as a vector field and, for `masked_diffusion`, as\ntoken logits) and applies one scheduler step per iteration. Supported\n`kind`s: `ddpm`, `ddim`, `euler`, `euler_ancestral`, `dpmpp_2m`,\n`flow_matching`, and `masked_diffusion`.",
       "properties": {
         "beta_end": {
           "description": "Linear beta-schedule end (default 0.012).",
@@ -3047,7 +3047,7 @@
           ]
         },
         "kind": {
-          "description": "Scheduler algorithm: `\"ddim\"`, `\"euler\"`, `\"dpmpp_2m\"`, or\n`\"masked_diffusion\"`.",
+          "description": "Scheduler algorithm: `\"ddpm\"`, `\"ddim\"`, `\"euler\"`,\n`\"euler_ancestral\"`, `\"dpmpp_2m\"`, `\"flow_matching\"`, or\n`\"masked_diffusion\"`.",
           "type": "string"
         },
         "mask_token_id": {
@@ -3068,7 +3068,7 @@
           ]
         },
         "prediction_type": {
-          "description": "Model output parameterization: `\"epsilon\"` (default, noise prediction),\n`\"v_prediction\"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or\n`\"sample\"`/`\"x0\"` (the model predicts the clean sample directly). All\nbuilt-in continuous schedulers (`ddim`, `euler`, `euler_ancestral`,\n`dpmpp_2m`) support every parameterization.",
+          "description": "Model output parameterization: `\"epsilon\"` (default, noise prediction),\n`\"v_prediction\"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or\n`\"sample\"`/`\"x0\"` (the model predicts the clean sample directly). All\nbuilt-in diffusion schedulers (`ddpm`, `ddim`, `euler`,\n`euler_ancestral`, `dpmpp_2m`) support every parameterization.\n`flow_matching` instead consumes the model's velocity/vector-field output\ndirectly and accepts an omitted value or `\"flow\"`/`\"velocity\"`.",
           "type": [
             "string",
             "null"
@@ -3078,6 +3078,15 @@
           "description": "Unmasking strategy for a `masked_diffusion` scheduler:\n  * `\"low_confidence\"` (default) — LLaDA: each step commits the\n    highest-confidence still-masked positions (confidence-ranked). Best\n    for LLaDA checkpoints, but greedy/confidence-ranked decoding of other\n    masked-diffusion LMs (e.g. MDLM) collapses into repetitive text.\n  * `\"random\"` — MDLM-style ancestral: each still-masked position unmasks\n    independently with the schedule probability `1/(steps_remaining)`,\n    sampling its token from the model's categorical distribution (use\n    `temperature: 1.0` for a true categorical sample). This per-position\n    stochastic unmasking avoids the degenerate loops that confidence\n    ranking produces. The mask token is never emitted.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "shift": {
+          "description": "Static timestep shift for `flow_matching` (default `1.0`). The base\nrectified-flow sigma `s` is transformed to\n`shift * s / (1 + (shift - 1) * s)`.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
             "null"
           ]
         },

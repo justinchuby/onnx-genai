@@ -47,11 +47,13 @@ on `OFA-Sys/small-stable-diffusion-v0` unless noted.
 
 | onnx-genai `kind`   | diffusers scheduler                | ComfyUI `sampler_name` | validation (max\|Δ\| / mean) | script |
 |---------------------|------------------------------------|------------------------|------------------------------|--------|
+| `ddpm`              | `DDPMScheduler`                    | `ddpm`                 | unit reference (fixed noise) | Rust scheduler tests |
 | `ddim`              | `DDIMScheduler`                    | `ddim`                 | 6.9e-4 latent / img ~1.8e-3  | `diffusion_image.py`, `diffusion_e2e.py` |
 | `euler`             | `EulerDiscreteScheduler`           | `euler`                | 7.9e-3 / 2.5e-5              | `comfyui_e2e.py`, `euler_parity.py` |
 | `dpmpp_2m`          | `DPMSolverMultistepScheduler`      | `dpmpp_2m`             | 1.8e-3 / 1.7e-5             | `dpmpp_e2e.py`, `dpmpp_parity.py` |
 | `dpmpp_2m` + Karras | `…(use_karras_sigmas=True)`        | `dpmpp_2m` / `karras`  | 5.9e-3 / 7.4e-5             | `dpmpp_e2e.py` (`ONNX_GENAI_KARRAS=1`), `karras_parity.py` |
 | `euler_ancestral`   | `EulerAncestralDiscreteScheduler`  | `euler_ancestral`      | 4.7e-2 / 1.3e-3 (stochastic) | `euler_a_e2e.py` |
+| `flow_matching`     | `FlowMatchEulerDiscreteScheduler`  | —                      | unit reference               | Rust scheduler tests |
 | `masked_diffusion`  | — (discrete language diffusion)    | —                      | synthetic fixture           | §7 |
 
 **Sigma spacing.** `use_karras_sigmas` (Karras rho=7) or `use_exponential_sigmas` on `SchedulerSpec` replace the default linspace schedule for `euler`/`dpmpp_2m`; `DPM++ 2M Karras` is the most popular real-world combo. Both match diffusers (`scripts/karras_parity.py`).
@@ -68,6 +70,9 @@ DDIM and linspace DPM++ timesteps are integers (int64). The converter selects th
 - **DPM++ 2M** — no input scaling; `init_noise_sigma = 1.0`; multistep (keeps the previous data
   prediction, reset each loop); integer timesteps.
 - **Euler Ancestral** — like Euler but injects `noise·σ_up` each step (stochastic, §5).
+- **DDPM** — ancestral posterior sampling with fixed-small variance; consumes per-step noise.
+- **Flow matching** — Euler integration of the predicted velocity/vector field on a shifted
+  sigma schedule (`shift`, default `1.0`); intended for modern DiT/rectified-flow models.
 
 ### 2.1 Extensible schedulers
 
@@ -307,8 +312,8 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
 
 ## 9. Limitations & roadmap
 
-- **Samplers:** euler, euler_ancestral, ddim, dpmpp_2m (+Karras). Not yet: other DPM++ variants,
-  exponential/beta sigma spacings, other SDE/ancestral samplers.
+- **Samplers:** ddpm, ddim, euler, euler_ancestral, dpmpp_2m (+Karras), and flow_matching.
+  Not yet: other DPM++ variants, beta sigma spacing, or other SDE/ancestral samplers.
 - **Models:** SD 1.x-style **and SDXL** run through the same declarative pipeline. **SDXL is
   validated end-to-end** (`scripts/sdxl_e2e.py`) — the two text encoders' penultimate hidden states
   are concatenated into `encoder_hidden_states`, the pooled `text_embeds` and the `time_ids` vector
