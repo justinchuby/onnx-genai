@@ -31,15 +31,23 @@
 //!   3. `wait_fence(n)` is awaited *before* `compute(n)` (RAW: compute never
 //!      reads bytes the copy is still transferring).
 //!
-//! ## What this module does **not** own
+//! ## WAR safety on buffer reuse
 //!
-//! *WAR* safety for reusing a double-buffer (the copy of `n+1` must not
-//! overwrite a buffer while expert `n-1`'s compute is still reading it) is a
-//! *mechanism* concern handled EP-side: on the CUDA EP the copy stream waits on
-//! the previous consumer's compute event before overwriting a reused buffer
-//! (proven by `double_buffered_prefetch_is_race_free_across_waves` in the
-//! ep-cuda runtime tests). The generic strategy only sequences *when* copies and
-//! computes are issued; it does not expose the CUDA-concrete WAR primitive.
+//! With only two device buffers, slot `s` is reused every second expert, so the
+//! copy that refills `s` for expert `n+1` must not overwrite it while expert
+//! `n-1`'s compute (which shares slot `s`) is still reading it — a
+//! write-after-read hazard. [`drive_double_buffer`] enforces this itself: it
+//! records a compute fence over each consumer ([`ExecutionProvider::record_compute_fence`])
+//! and makes the transfer stream wait on the prior consumer's fence
+//! ([`ExecutionProvider::copy_wait_fence`]) *before* issuing the reuse copy.
+//! This is done generically over any `&dyn ExecutionProvider`; on the CUDA EP it
+//! becomes a real cross-stream `cuStreamWaitEvent`, and on a synchronous EP the
+//! fences are already-signalled and the waits are no-ops. The GPU regression
+//! test `drive_double_buffer_war_safe_across_waves` (session `cuda` feature)
+//! drives this public path across enough waves that both slots are reused and
+//! fails if the driver's WAR fence is removed.
+//!
+//! ## What this module does **not** own
 //!
 //! Wiring this scheduler into the live MoE decode loop depends on Phase-3b
 //! (live device weight binding), which is not yet landed; until then this is a
@@ -118,9 +126,13 @@ pub fn plan_double_buffer(num_experts: usize) -> Vec<PrefetchStep> {
 ///   now holds its fully-transferred weights.
 ///
 /// The next expert's prefetch is always issued before the current expert's
-/// `wait_fence`/`compute`, which is what produces the overlap. On a synchronous
-/// EP this still runs correctly — `copy_async` completes inline and `wait_fence`
-/// is a no-op — it simply does not overlap.
+/// `wait_fence`/`compute`, which is what produces the overlap. Before a reuse
+/// copy overwrites a double-buffer slot, the driver makes the transfer stream
+/// wait on the prior consumer of that slot ([`ExecutionProvider::copy_wait_fence`]
+/// on the fence recorded by [`ExecutionProvider::record_compute_fence`]), so
+/// buffer reuse is write-after-read safe on async EPs. On a synchronous EP this
+/// still runs correctly — `copy_async` completes inline, and `wait_fence` /
+/// `copy_wait_fence` are no-ops — it simply does not overlap.
 pub fn drive_double_buffer<F>(
     ep: &dyn ExecutionProvider,
     buffers: &mut [DeviceBuffer; 2],
@@ -141,6 +153,12 @@ where
         return Ok(());
     }
 
+    // WAR guard: the last compute that read each double-buffer slot. Before a
+    // reuse copy overwrites a slot, the transfer stream must wait on the prior
+    // consumer's completion (`copy_wait_fence`), or a still-running kernel's read
+    // races the overwrite. Slots start already-signalled (no prior consumer).
+    let mut last_compute_fence: [Fence; 2] = [Fence::signalled(), Fence::signalled()];
+
     // Prime expert 0's transfer into buffer 0.
     let mut current_fence: Fence = ep.copy_async(&sources[0], &mut buffers[0], sizes[0])?;
 
@@ -151,6 +169,12 @@ where
         // before we wait on / consume expert n.
         let next_fence = if n + 1 < num_experts {
             let next_slot = (n + 1) % 2;
+            // WAR: the alternate slot may still be under read by the consumer of
+            // expert n-1 (which shares this slot). Hold the reuse copy on the
+            // transfer stream until that prior consumer completes. This is
+            // enforced by the driver over any `&dyn ExecutionProvider`; on a
+            // synchronous EP the fence is already-signalled and this is a no-op.
+            ep.copy_wait_fence(&last_compute_fence[next_slot])?;
             Some(ep.copy_async(&sources[n + 1], &mut buffers[next_slot], sizes[n + 1])?)
         } else {
             None
@@ -160,6 +184,10 @@ where
         // bytes before the kernel reads them.
         ep.wait_fence(&current_fence)?;
         compute(n, &buffers[current_slot])?;
+
+        // Mark this slot busy until the just-issued consumer finishes, so a
+        // future reuse prefetch into it waits (WAR).
+        last_compute_fence[current_slot] = ep.record_compute_fence()?;
 
         if let Some(next) = next_fence {
             current_fence = next;

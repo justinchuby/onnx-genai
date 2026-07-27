@@ -445,6 +445,35 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(())
     }
 
+    /// Record a completion event for all compute enqueued on this EP's compute
+    /// stream so far, returning a [`Fence`] that later transfers can wait on.
+    ///
+    /// This is the write-after-read (WAR) half of double-buffered prefetch: once
+    /// a kernel that *reads* a staging buffer has been launched on the compute
+    /// stream, record a fence over it and pass that fence to
+    /// [`ExecutionProvider::copy_wait_fence`] before enqueueing the async copy
+    /// that *overwrites* the same buffer, so the transfer stream never clobbers
+    /// bytes a still-running consumer is reading. The default implementation
+    /// returns an already-signalled [`Fence::signalled`] — correct for
+    /// synchronous EPs whose compute completes inline, making the paired
+    /// [`ExecutionProvider::copy_wait_fence`] a no-op.
+    fn record_compute_fence(&self) -> Result<Fence> {
+        Ok(Fence::signalled())
+    }
+
+    /// Order this EP's transfer stream after the compute named by `fence`.
+    ///
+    /// Makes the transfer (copy) stream wait on the fence's completion event (a
+    /// stream-ordered, non-host-blocking cross-stream wait) so an async copy
+    /// enqueued afterwards does not overwrite a buffer while the prior consumer
+    /// recorded by [`ExecutionProvider::record_compute_fence`] is still reading
+    /// it (WAR hazard on double-buffer reuse). Awaiting an already-signalled
+    /// fence ([`Fence::is_signalled`]) is a no-op, as is the default
+    /// implementation — correct for synchronous EPs.
+    fn copy_wait_fence(&self, _fence: &Fence) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether this EP can select the first maximum f32 element on-device and
     /// return the token id together with its capture-error status.
     fn device_argmax_supported(&self) -> bool {

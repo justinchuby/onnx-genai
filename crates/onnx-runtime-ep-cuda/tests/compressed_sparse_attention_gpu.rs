@@ -703,6 +703,9 @@ fn run_gpu_observed(
         device_to_host: after_transfers
             .device_to_host
             .saturating_sub(before_transfers.device_to_host),
+        async_host_to_device: after_transfers
+            .async_host_to_device
+            .saturating_sub(before_transfers.async_host_to_device),
     };
     drop(out_views);
     drop(input_views);

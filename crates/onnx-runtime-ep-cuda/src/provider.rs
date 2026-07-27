@@ -424,6 +424,21 @@ impl ExecutionProvider for CudaExecutionProvider {
         self.runtime.compute_wait_fence(fence.id)
     }
 
+    fn record_compute_fence(&self) -> Result<Fence> {
+        // Record a completion event over the compute stream so a later reuse
+        // prefetch (via `copy_wait_fence`) waits for this consumer to finish
+        // reading a double-buffer slot before overwriting it (WAR ordering).
+        let fence_id = self.runtime.record_compute_fence()?;
+        Ok(Fence::new(fence_id))
+    }
+
+    fn copy_wait_fence(&self, fence: &Fence) -> Result<()> {
+        // Order the transfer stream after the prior consumer's compute: a
+        // stream-ordered, non host-blocking cross-stream wait so a reuse prefetch
+        // never clobbers a staging buffer mid-read. Already-signalled is a no-op.
+        self.runtime.copy_wait_fence(fence.id)
+    }
+
     fn device_argmax_supported(&self) -> bool {
         true
     }
