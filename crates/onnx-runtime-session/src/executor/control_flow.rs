@@ -488,14 +488,14 @@ impl Executor {
                 } else {
                     outer_scope
                         .get(&name)
-                        .cloned()
                         .ok_or_else(|| missing_capture_error(attr_key, &name))?
+                        .try_clone()?
                 }
             } else {
                 outer_scope
                     .get(&name)
-                    .cloned()
                     .ok_or_else(|| missing_capture_error(attr_key, &name))?
+                    .try_clone()?
             };
             captures.insert(name, tensor);
         }
