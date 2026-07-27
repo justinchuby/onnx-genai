@@ -59,7 +59,7 @@ use onnx_runtime_ep_cpu::strided::view_in_bounds;
 use onnx_runtime_ir::Attribute;
 use onnx_runtime_ir::{
     DataType, DeviceType, Dim, Graph, Node, NodeId, Shape, SymbolId, TensorLayout, ValueId,
-    WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides,
+    WeightRef, as_static_shape, broadcast_shapes, compute_contiguous_strides, read_scalar_le,
 };
 use onnx_runtime_loader::WeightStore;
 use onnx_runtime_optimizer::InitializerResolver;
@@ -409,9 +409,7 @@ fn tensor_scalar_i64(t: &Tensor) -> Option<i64> {
     if t.dtype != DataType::Int64 || t.numel() != 1 {
         return None;
     }
-    t.as_bytes()
-        .get(..8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+    read_scalar_le(t.as_bytes()).ok()
 }
 
 /// Read a single scalar bool from a length-1 `BOOL` tensor (a `BOOL` is one

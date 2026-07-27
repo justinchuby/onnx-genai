@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes};
+use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes, read_vec_le};
 
 use crate::error::{Result, SessionError};
 
@@ -779,10 +779,8 @@ impl Tensor {
         );
         self.try_as_slice_f32().map_or_else(
             || {
-                self.as_bytes()
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect()
+                read_vec_le::<f32>(self.as_bytes())
+                    .expect("Float32 tensor storage length must be a multiple of 4 bytes")
             },
             <[f32]>::to_vec,
         )
@@ -791,10 +789,8 @@ impl Tensor {
     /// Copy out the elements as `i64`. Panics if the dtype is not `Int64`.
     pub fn to_vec_i64(&self) -> Vec<i64> {
         assert_eq!(self.dtype, DataType::Int64, "to_vec_i64 on non-i64 tensor");
-        self.as_bytes()
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-            .collect()
+        read_vec_le(self.as_bytes())
+            .expect("Int64 tensor storage length must be a multiple of 8 bytes")
     }
 }
 
