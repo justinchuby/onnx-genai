@@ -391,7 +391,7 @@ impl NativeDecodeSession {
         let max_len = self
             .cpu_kv
             .as_ref()
-            .expect("decode_cpu_inplace requires CPU KV state")
+            .ok_or_else(|| anyhow::anyhow!("decode_cpu_inplace requires CPU KV state"))?
             .max_len;
         if total_len > max_len {
             bail!(
@@ -414,7 +414,7 @@ impl NativeDecodeSession {
         let state = self
             .cpu_kv
             .as_mut()
-            .expect("decode_cpu_inplace requires CPU KV state");
+            .ok_or_else(|| anyhow::anyhow!("decode_cpu_inplace requires CPU KV state"))?;
         let run_result: anyhow::Result<_> = {
             let _run_span = onnx_genai_ort::prof_span!("native.session_run");
             if token_ids.len() == 1 && !self.has_plugin_fused {

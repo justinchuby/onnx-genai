@@ -621,7 +621,11 @@ impl<'a> DecodeSession<'a> {
         // Move the capture buffers out of `self` for the duration of the step so
         // the `&mut self` bind helpers don't alias the borrow; restore on the
         // success path (an error aborts generation and drops the state).
-        let mut cap = self.capture.take().expect("capture state initialized");
+        let mut cap = self.capture.take().ok_or_else(|| {
+            CapturedStepError::PreRun(OrtError::InvalidArgument(
+                "capture state initialized".into(),
+            ))
+        })?;
         let valid_len = attention_mask.len();
         if valid_len > cap.mask_len {
             return Err(CapturedStepError::PreRun(OrtError::InvalidArgument(
@@ -713,9 +717,11 @@ impl<'a> DecodeSession<'a> {
 
         {
             let _run_span = crate::prof_span!("ort.session_run");
-            let graph_id = self
-                .capture_graph_id
-                .expect("capture graph id assigned in ensure_capture_state");
+            let graph_id = self.capture_graph_id.ok_or_else(|| {
+                CapturedStepError::PreRun(OrtError::InvalidArgument(
+                    "capture graph id assigned in ensure_capture_state".into(),
+                ))
+            })?;
             self.session
                 .run_with_binding_graph_phased(&self.binding, graph_id)
                 .map_err(classify_run_phase)?;
