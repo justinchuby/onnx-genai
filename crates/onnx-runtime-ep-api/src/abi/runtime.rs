@@ -9,10 +9,8 @@ use std::sync::{
 
 use onnx_genai_ort_sys as ort;
 
-use super::{
-    HostKernelContext, MAX_PLUGIN_THREAD_STATES, check_compute_status, check_status, ort_api_base,
-    release_status,
-};
+use super::ffi_helpers::MAX_PLUGIN_THREAD_STATES;
+use super::{HostKernelContext, check_compute_status, check_status, ort_api_base, release_status};
 use crate::error::{EpError, Result};
 use crate::kernel::{ARG_BYTES, ARG_DEVICE, ARG_FLOPS, CAT_KERNEL_WORKER, Kernel};
 use crate::tensor::{TensorMut, TensorView};
