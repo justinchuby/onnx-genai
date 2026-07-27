@@ -188,6 +188,20 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "ScatterND"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::indexing::scatter_nd_unsupported_reason(input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "QLinearMatMul"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::qlinear_matmul::unsupported_reason(input_dtypes, shapes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // The reference kernels produce contiguous row-major outputs and accept
         // strided inputs, so no input layout is required.
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
@@ -535,6 +549,126 @@ mod tests {
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
         assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn qlinear_matmul_claim_gate_checks_quantized_dtypes() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "QLinearMatMul", vec![], vec![]);
+        let valid = [
+            DataType::Uint8,
+            DataType::Float32,
+            DataType::Uint8,
+            DataType::Int8,
+            DataType::Float32,
+            DataType::Int8,
+            DataType::Float32,
+            DataType::Uint8,
+        ];
+        assert!(
+            ep.supports_op(&node, 10, &[], &valid, &[]).is_supported(),
+            "valid QLinearMatMul types should be claimed"
+        );
+
+        let mut invalid = valid;
+        invalid[0] = DataType::Float32;
+        let rejected = ep.supports_op(&node, 10, &[], &invalid, &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected.reason().unwrap();
+        assert!(reason.contains("A must have Int8 or Uint8"), "{reason}");
+
+        let valid_shapes = [
+            static_shape([2, 3, 4]),
+            static_shape([2, 3, 1]),
+            static_shape([2, 3, 1]),
+            static_shape([1, 4, 5]),
+            static_shape([1, 1, 5]),
+            static_shape([1, 1, 5]),
+            static_shape([]),
+            static_shape([]),
+        ];
+        assert!(
+            ep.supports_op(&node, 10, &valid_shapes, &valid, &[])
+                .is_supported(),
+            "valid N-D per-row/per-column quantization should be claimed"
+        );
+        let valid_2d_shapes = [
+            static_shape([3, 4]),
+            static_shape([3]),
+            static_shape([3]),
+            static_shape([4, 5]),
+            static_shape([5]),
+            static_shape([5]),
+            static_shape([1]),
+            static_shape([1]),
+        ];
+        assert!(
+            ep.supports_op(&node, 10, &valid_2d_shapes, &valid, &[])
+                .is_supported(),
+            "valid 2-D per-row/per-column quantization should be claimed"
+        );
+
+        let mut mismatched_pair = valid_shapes.clone();
+        mismatched_pair[2] = static_shape([]);
+        let rejected = ep.supports_op(&node, 10, &mismatched_pair, &valid, &[]);
+        assert!(!rejected.is_supported());
+        assert!(
+            rejected.reason().unwrap().contains("shapes must match"),
+            "{:?}",
+            rejected.reason()
+        );
+
+        let mut invalid_nd_vector = valid_shapes;
+        invalid_nd_vector[1] = static_shape([3]);
+        invalid_nd_vector[2] = static_shape([3]);
+        let rejected = ep.supports_op(&node, 10, &invalid_nd_vector, &valid, &[]);
+        assert!(!rejected.is_supported());
+        assert!(
+            rejected.reason().unwrap().contains("invalid a"),
+            "{:?}",
+            rejected.reason()
+        );
+    }
+
+    #[test]
+    fn scatter_nd_claim_gate_only_accepts_executable_dtypes() {
+        let ep = CpuExecutionProvider::new();
+        let node = Node::new(onnx_runtime_ir::NodeId(0), "ScatterND", vec![], vec![]);
+
+        for dtype in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Float64,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Uint8,
+            DataType::Uint16,
+            DataType::Uint32,
+            DataType::Uint64,
+        ] {
+            assert!(
+                ep.supports_op(&node, 18, &[], &[dtype, DataType::Int64, dtype], &[])
+                    .is_supported(),
+                "{dtype:?} should be claimed"
+            );
+        }
+
+        for dtype in [
+            DataType::String,
+            DataType::Bool,
+            DataType::Complex64,
+            DataType::Complex128,
+        ] {
+            let rejected = ep.supports_op(&node, 18, &[], &[dtype, DataType::Int64, dtype], &[]);
+            assert!(!rejected.is_supported(), "{dtype:?} must not be claimed");
+            assert!(
+                rejected.reason().unwrap().contains("not implemented"),
+                "{dtype:?}"
+            );
+        }
     }
 
     #[test]

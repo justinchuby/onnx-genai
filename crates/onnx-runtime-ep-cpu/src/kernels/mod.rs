@@ -84,6 +84,7 @@ pub mod norm_ops;
 pub mod onehot;
 pub mod pad;
 pub mod pooling;
+pub mod qlinear_matmul;
 pub mod qmoe;
 pub mod quantization;
 pub mod reduce;
@@ -209,6 +210,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "GatherElements",
     "GatherND",
     "ScatterElements",
+    "ScatterND",
     "OneHot",
     "Compress",
     "Tile",
@@ -225,6 +227,7 @@ pub const PHASE1_OPS: &[&str] = &[
     "QuantizeLinear",
     "DequantizeLinear",
     "DynamicQuantizeLinear",
+    "QLinearMatMul",
     "Dropout",
 ];
 
@@ -656,6 +659,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         Box::new(quantization::DynamicQuantizeLinearFactory),
     );
+    reg.register(
+        OpKey::new("QLinearMatMul", "", 10),
+        Box::new(qlinear_matmul::QLinearMatMulFactory),
+    );
     // Spatial pooling. Newer registrations preserve version-specific attributes.
     reg.register(
         OpKey::new("AveragePool", "", 1),
@@ -883,6 +890,13 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("ScatterElements", "", 16),
         Box::new(indexing::ScatterElementsFactory),
     );
+    // ScatterND gained reduction at opset 16 and max/min reductions at opset 18.
+    for version in [11, 16, 18] {
+        reg.register(
+            OpKey::new("ScatterND", "", version),
+            Box::new(indexing::ScatterNDFactory),
+        );
+    }
     reg.register(
         OpKey::new("OneHot", "", 9),
         Box::new(indexing::OneHotFactory),
@@ -1612,16 +1626,17 @@ mod tests {
         // QuickGelu, Silu, SkipLayerNormalization, SimplifiedLayerNormalization,
         // SkipSimplifiedLayerNormalization) add seven more; `MoE`, `QMoE`, and
         // `GroupQueryAttention` add one contrib entry each.
-        // QuantizeLinear and
-        // DequantizeLinear each add six versioned entries, while
-        // DynamicQuantizeLinear adds one (twenty-eight over the
+        // QuantizeLinear and DequantizeLinear each add six versioned entries,
+        // while DynamicQuantizeLinear and QLinearMatMul add one each
+        // (twenty-nine over the
         // op-name count). Pooling adds twelve more versioned entries: five each
         // for AveragePool and MaxPool, plus the two global pool operators, for
         // forty over the op-name count. ScatterElements also has distinct
         // opset-11 and opset-16 registrations. BatchNormalization,
         // InstanceNormalization and PRelu add one registration each, while
         // GroupNormalization adds opset-18 and opset-21 entries, for forty-seven
-        // registrations over the Phase-1 op-name count in total.
+        // registrations over the Phase-1 op-name count in total. ScatterND has
+        // opset-11, -16, and -18 entries, adding two more.
         // ReduceLogSumExp adds a separate opset-18 axes-input registration.
         // BitwiseAnd,
         // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
@@ -1642,7 +1657,7 @@ mod tests {
         // NCHWc layout-propagation pass add six more entries, but only when the
         // `mlas` feature is enabled (the NCHWc kernels are MLAS-backed).
         let mlas_registrations = if cfg!(feature = "mlas") { 7 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 93 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 95 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1672,6 +1687,8 @@ mod tests {
         assert!(reg.lookup("Resize", "", 10).is_some());
         assert!(reg.lookup("Resize", "", 25).is_some());
         assert!(reg.lookup("ConvTranspose", "", 22).is_some());
+        assert!(reg.lookup("ScatterND", "", 18).is_some());
+        assert!(reg.lookup("QLinearMatMul", "", 10).is_some());
         assert!(reg.lookup("MatMulNBits", "com.microsoft", 1).is_some());
         assert!(reg.lookup("QMoE", "com.microsoft", 1).is_some());
         assert!(reg.lookup("BlockQuantizedMatMul", "pkg.nxrt", 1).is_some());
