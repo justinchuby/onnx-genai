@@ -47,8 +47,9 @@ default = []
 # GPU sampler. This does NOT bundle any CUDA libraries: the GPU ONNX Runtime is
 # provided at runtime by the `onnxruntime-gpu` wheel, installed via the
 # `onnx-genai[cuda]` pip extra. Runtime EP selection still goes through
-# `ONNX_GENAI_EP`; without this feature a `cuda` request falls back to CPU. The
-# Windows/Linux x86_64 wheels build with this feature; macOS does not.
+# `ONNX_GENAI_EP`; without this feature a `cuda` request is rejected at session
+# creation rather than falling back to CPU. The Windows/Linux x86_64 wheels build
+# with this feature; macOS does not.
 cuda = ["onnx-genai-engine/ort-cuda"]
 
 [lints]

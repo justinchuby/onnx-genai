@@ -31,7 +31,8 @@ mlas = [
 ]
 # The native CUDA EP is pinned to CUDA 13.0, so select the same cudarc bindings
 # in `onnx-genai-ort`. Runtime EP selection still goes through `ONNX_GENAI_EP`;
-# without this feature a `cuda` request silently falls back to CPU.
+# without `onnx-genai-ort/cuda`, a `cuda` request is rejected at session
+# creation rather than silently falling back to CPU.
 cuda = [
     "onnx-genai-ort/cuda",
     "onnx-genai-ort/cuda-13000",
