@@ -45,6 +45,15 @@ pub struct Node {
     pub op_type: String,
     /// Operator domain (`""` == the default ONNX domain).
     pub domain: String,
+    /// Opset version of the operator called.
+    ///
+    /// If `None`, the version is unspecified and follows the owning graph's
+    /// `opset_imports`. This property is special to ONNX IR to allow mixed opset
+    /// usage in a graph for more flexible graph transformations; it does not
+    /// exist in the ONNX protobuf spec. For example, a fusion may emit an
+    /// opset-24 `Swish` into a graph whose other default-domain nodes still use
+    /// the graph's older exported opset, avoiding a false graph-wide upgrade.
+    pub version: Option<i64>,
     pub inputs: Vec<Option<ValueId>>,
     pub outputs: Vec<ValueId>,
     pub attributes: HashMap<String, Attribute>,
@@ -68,6 +77,7 @@ impl Node {
             name: String::new(),
             op_type: op_type.into(),
             domain: String::new(),
+            version: None,
             inputs,
             outputs,
             attributes: HashMap::new(),

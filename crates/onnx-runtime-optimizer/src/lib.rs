@@ -12,13 +12,16 @@
 //! | Pass contract | [`OptimizationPass`], [`PassContext`], [`run_passes`] |
 //! | Dead-code removal | [`DeadNodeElimination`] |
 //! | Bounded constant folding | [`ConstantFolding`] |
-//! | Operator fusion | [`OpFusion`], [`FusionPattern`], [`PatternMatch`] |
+//! | Reusable provider-scoped fusion machinery | [`OpFusion`], [`FusionPattern`], [`PatternMatch`] |
 //! | Errors | [`OptimizerError`], [`Result`] |
 //!
 //! ## Pipeline
 //!
 //! [`default_passes`] returns only the device-independent passes implemented
-//! here, in pipeline order: `ConstantFolding → DeadNodeElimination → OpFusion`.
+//! here, in pipeline order: `ConstantFolding → DeadNodeElimination`.
+//! [`OpFusion`] remains in this crate as reusable machinery, but providers must
+//! schedule it themselves so private fused ops are introduced only when the
+//! selected provider can run them.
 //!
 //! ### Deferred (Phase 2b / Phase 3)
 //!
@@ -47,16 +50,17 @@ pub use pass::{InitializerResolver, OptimizationPass, PassContext, run_passes};
 /// The device-independent Phase-1 pass pipeline, in run order.
 ///
 /// ```text
-/// ConstantFolding  →  DeadNodeElimination  →  OpFusion
+/// ConstantFolding  →  DeadNodeElimination
 /// ```
 ///
 /// Constant folding runs first so it can materialize shape-computation
 /// constants, then dead-node elimination prunes any node left unreachable, and
-/// finally op fusion collapses recognized op sequences.
+/// then dead-node elimination prunes any node left unreachable. Operator fusion
+/// is provider-scoped because its replacements change the operator set.
 ///
 /// **Deferred passes** (each in its eventual pipeline slot; see the crate-level
 /// docs for why): after `ConstantFolding` would come `ShapeInference`; after
-/// `OpFusion` would come `AttentionFusionPass`, then `LayoutPropagation`,
+/// provider-scoped fusion would come `AttentionFusionPass`, then `LayoutPropagation`,
 /// `PlacementOptimizer`, `TransferInsertion`, `InPlaceDetection`,
 /// `MemoryPlanning`, `CudaGraphRegionDetection`, and `OverlapScheduling`.
 pub fn default_passes() -> Vec<Box<dyn OptimizationPass>> {
@@ -64,7 +68,6 @@ pub fn default_passes() -> Vec<Box<dyn OptimizationPass>> {
         Box::new(ConstantFolding),
         // ShapeInference — deferred (Phase 2b): the loader owns inference.
         Box::new(DeadNodeElimination),
-        Box::new(OpFusion::new()),
         // AttentionFusionPass, LayoutPropagation, PlacementOptimizer,
         // TransferInsertion, InPlaceDetection, MemoryPlanning,
         // CudaGraphRegionDetection, OverlapScheduling — deferred (Phase 2b/3).
@@ -77,12 +80,11 @@ mod tests {
     use onnx_runtime_ir::{DataType, Graph, Node, NodeId, static_shape};
 
     #[test]
-    fn default_passes_lists_three() {
+    fn default_passes_lists_two() {
         let passes = default_passes();
-        assert_eq!(passes.len(), 3);
+        assert_eq!(passes.len(), 2);
         assert_eq!(passes[0].name(), "ConstantFolding");
         assert_eq!(passes[1].name(), "DeadNodeElimination");
-        assert_eq!(passes[2].name(), "OpFusion");
     }
 
     #[test]
@@ -119,9 +121,16 @@ mod tests {
 
         run_passes(&mut g, &default_passes(), &PassContext::new()).unwrap();
 
-        // Dead Neg removed by DCE; MatMul+Add fused by OpFusion.
-        assert_eq!(g.num_nodes(), 1);
-        assert_eq!(g.nodes.values().next().unwrap().op_type, "FusedMatMulBias");
+        // Dead Neg removed by DCE; provider-scoped fusion is not part of the
+        // runtime default pipeline, so the standard MatMul/Add pair remains.
+        assert_eq!(g.num_nodes(), 2);
+        assert_eq!(
+            g.nodes
+                .values()
+                .filter(|node| matches!(node.op_type.as_str(), "MatMul" | "Add"))
+                .count(),
+            2
+        );
         assert!(g.validate().is_ok());
     }
 

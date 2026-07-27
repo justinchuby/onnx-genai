@@ -234,6 +234,11 @@ fn with_domain(mut n: Node, domain: &str) -> Node {
     n
 }
 
+fn with_version(mut n: Node, version: i64) -> Node {
+    n.version = Some(version);
+    n
+}
+
 fn run(n: &Node, inputs: Vec<NodeIo>, opset: u64) -> Vec<NodeIo> {
     try_run(n, inputs, opset).unwrap()
 }
@@ -2995,6 +3000,14 @@ fn swish_passthrough() {
     // Elementwise, same shape/dtype (opset 24).
     let n = with_attr(node("Swish", 1, 1), "alpha", Attribute::Float(1.0));
     let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 24);
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn swish_uses_node_local_opset_when_graph_import_is_older() {
+    let n = with_version(node("Swish", 1, 1), 24);
+    let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 21);
     assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
     assert_eq!(out_dtype(&outs), DataType::Float32);
 }

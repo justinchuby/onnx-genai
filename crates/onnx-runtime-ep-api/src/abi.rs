@@ -889,6 +889,7 @@ struct HostNode {
     /// when the node does, which is when the compiled plan is dropped. Leaking
     /// them was also correct in the narrow sense and grew without bound in a
     /// process that builds sessions repeatedly.
+    #[allow(clippy::vec_box)]
     owned_values: Vec<Box<HostValueInfo>>,
 }
 
@@ -1393,6 +1394,9 @@ fn dtype_to_ort(dtype: DataType) -> ort::ONNXTensorElementDataType {
 }
 
 fn since_version(graph: &Graph, node: &Node) -> i32 {
+    if let Some(version) = node.version.and_then(|version| i32::try_from(version).ok()) {
+        return version;
+    }
     graph
         .opset_imports
         .get(&node.domain)

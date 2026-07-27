@@ -164,7 +164,7 @@ fn projection_fusion_runs_after_silu_rewrite() {
     let bytes = model_bytes("decomposed");
     let session = build(&bytes, true);
     assert_eq!(count(session.graph(), "Sigmoid"), 0);
-    assert_eq!(count(session.graph(), "Silu"), 1);
+    assert_eq!(count(session.graph(), "Swish"), 1);
     assert_eq!(count(session.graph(), "MatMulNBits"), 1);
     assert_eq!(count(session.graph(), "Split"), 1);
 }

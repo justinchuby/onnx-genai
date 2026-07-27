@@ -1634,11 +1634,16 @@ fn checked_storage_bytes(
         })
 }
 
-/// The effective operator-set version governing `node` — the graph's imported
-/// opset for the node's domain. Loaded IR is canonical (the default domain is
-/// `""`, never `"ai.onnx"`; see [`onnx_runtime_ir::normalize_domain`]), so the
-/// node's domain keys directly into the opset-import map.
+/// The effective operator-set version governing `node`.
+///
+/// A node-local version wins when a rewrite intentionally emits a newer
+/// standard operator without upgrading every other node in that domain. `None`
+/// preserves ONNX's graph-import behavior. Loaded IR is canonical (the default
+/// domain is `""`, never `"ai.onnx"`; see [`onnx_runtime_ir::normalize_domain`]).
 fn effective_opset(graph: &Graph, node: &Node) -> u64 {
+    if let Some(version) = node.version.and_then(|version| u64::try_from(version).ok()) {
+        return version;
+    }
     graph
         .opset_imports
         .get(node.domain.as_str())
@@ -2378,70 +2383,6 @@ fn shape_data_as_f64(data: &ShapeData) -> Option<Vec<f64>> {
     data.float_elems.clone()
 }
 
-/// Lower an exact `x * Sigmoid(x)` pair to the CPU EP's fused SiLU kernel.
-///
-/// The Sigmoid result must have exactly one consumer and must not be a graph
-/// output, so removing its materialized value cannot change observable behavior.
-fn fuse_silu_patterns(graph: &mut Graph) -> usize {
-    let sigmoid_ids: Vec<NodeId> = graph
-        .nodes
-        .iter()
-        .filter_map(|(id, node)| {
-            (node.op_type == "Sigmoid"
-                && node.is_default_domain()
-                && node.inputs.len() == 1
-                && node.outputs.len() == 1)
-                .then_some(id)
-        })
-        .collect();
-    let mut fused = 0;
-
-    for sigmoid_id in sigmoid_ids {
-        let Some(sigmoid) = graph.try_node(sigmoid_id) else {
-            continue;
-        };
-        let Some(x) = sigmoid.inputs[0] else {
-            continue;
-        };
-        let sigmoid_output = sigmoid.outputs[0];
-        if graph.outputs.contains(&sigmoid_output) {
-            continue;
-        }
-        let consumers = graph.consumers(sigmoid_output);
-        if consumers.len() != 1 {
-            continue;
-        }
-        let mul_id = consumers[0];
-        let mul = graph.node(mul_id);
-        if mul.op_type != "Mul"
-            || !mul.is_default_domain()
-            || mul.inputs.len() != 2
-            || mul.outputs.len() != 1
-            || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
-                || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
-        {
-            continue;
-        }
-
-        let mut silu = mul.clone();
-        silu.op_type = "Silu".to_string();
-        silu.domain = "com.microsoft".to_string();
-        silu.inputs = vec![Some(x)];
-        silu.attributes.clear();
-        graph.replace_node(mul_id, silu);
-        graph.remove_node(sigmoid_id);
-        fused += 1;
-    }
-
-    if fused != 0 {
-        graph
-            .opset_imports
-            .entry("com.microsoft".to_string())
-            .or_insert(1);
-    }
-    fused
-}
-
 struct WeightStoreInitializerResolver(Arc<WeightStore>);
 
 impl InitializerResolver for WeightStoreInitializerResolver {
@@ -2874,7 +2815,6 @@ impl Executor {
         // control-flow signature check above.
         graph.topological_order()?;
         reject_unsupported_operators(&graph, ep.as_ref())?;
-        let silu_fused = fuse_silu_patterns(&mut graph);
         let graph_before_ep_passes = graph.clone();
         let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(&mut graph, &weights, ep.as_ref())?;
@@ -2915,7 +2855,6 @@ impl Executor {
                     .with("nodes_after", graph.num_nodes() as u64)
                     .with("ep_pass_nodes_before", ep_pass_nodes_before as u64)
                     .with("ep_pass_nodes_after", ep_pass_nodes_after as u64)
-                    .with("silu_fused", silu_fused as u64)
                     .with("assigned_nodes", assigned_nodes as u64)
                     .with("assigned_op_classes", assigned_ops.len() as u64)
                     .with("fallback_declines", fallback_declines as u64),
@@ -9651,89 +9590,6 @@ mod tests {
         assert_eq!(original.as_ptr(), executor.buffers[&input].as_ptr());
     }
 
-    #[test]
-    fn fuses_only_single_consumer_silu_pattern() {
-        let mut graph = Graph::new();
-        let shape = vec![Dim::Static(2)];
-        let x = graph.create_named_value("x", DataType::Float32, shape.clone());
-        let sigmoid_out = graph.create_named_value("sigmoid", DataType::Float32, shape.clone());
-        let silu_out = graph.create_named_value("silu", DataType::Float32, shape);
-        graph.add_input(x);
-        graph.add_output(silu_out);
-        graph.insert_node(Node::new(
-            NodeId(0),
-            "Sigmoid",
-            vec![Some(x)],
-            vec![sigmoid_out],
-        ));
-        graph.insert_node(Node::new(
-            NodeId(0),
-            "Mul",
-            vec![Some(sigmoid_out), Some(x)],
-            vec![silu_out],
-        ));
-
-        assert_eq!(fuse_silu_patterns(&mut graph), 1);
-        assert_eq!(graph.num_nodes(), 1);
-        let fused = graph.nodes.values().next().unwrap();
-        assert_eq!(fused.op_type, "Silu");
-        assert_eq!(fused.domain, "com.microsoft");
-        assert_eq!(fused.inputs, vec![Some(x)]);
-        assert_eq!(fused.outputs, vec![silu_out]);
-        assert_eq!(graph.opset_imports["com.microsoft"], 1);
-    }
-
-    #[test]
-    fn does_not_fuse_silu_when_sigmoid_has_second_consumer() {
-        let mut graph = Graph::new();
-        let shape = vec![Dim::Static(2)];
-        let x = graph.create_named_value("x", DataType::Float32, shape.clone());
-        let sigmoid_out = graph.create_named_value("sigmoid", DataType::Float32, shape.clone());
-        let mul_out = graph.create_named_value("mul", DataType::Float32, shape.clone());
-        let identity_out = graph.create_named_value("identity", DataType::Float32, shape);
-        graph.add_input(x);
-        graph.add_output(mul_out);
-        graph.add_output(identity_out);
-        graph.insert_node(Node::new(
-            NodeId(0),
-            "Sigmoid",
-            vec![Some(x)],
-            vec![sigmoid_out],
-        ));
-        graph.insert_node(Node::new(
-            NodeId(0),
-            "Mul",
-            vec![Some(x), Some(sigmoid_out)],
-            vec![mul_out],
-        ));
-        graph.insert_node(Node::new(
-            NodeId(0),
-            "Identity",
-            vec![Some(sigmoid_out)],
-            vec![identity_out],
-        ));
-
-        assert_eq!(fuse_silu_patterns(&mut graph), 0);
-        assert_eq!(graph.num_nodes(), 3);
-        assert_eq!(
-            graph
-                .nodes
-                .values()
-                .filter(|node| node.op_type == "Sigmoid")
-                .count(),
-            1
-        );
-        assert_eq!(
-            graph
-                .nodes
-                .values()
-                .filter(|node| node.op_type == "Mul")
-                .count(),
-            1
-        );
-        assert!(graph.validate().is_ok());
-    }
-
     /// Holden's precondition: the dispatch-boundary gate must reject a view that
     /// addresses bytes past its backing allocation, rather than letting a kernel
     /// dereference out of bounds (UB).
@@ -10016,8 +9872,8 @@ mod tests {
         );
     }
 
-    /// The effective opset is read from the graph's import for the op's domain,
-    /// with the default and `ai.onnx` spellings treated as one.
+    /// The effective opset is read from the graph's import for the op's domain
+    /// unless the node records a more precise per-node version.
     #[test]
     fn effective_opset_reads_graph_import() {
         let mut graph = Graph::default();
@@ -10027,6 +9883,15 @@ mod tests {
 
         graph.opset_imports.insert(String::new(), 0);
         assert_eq!(effective_opset(&graph, &node), 0);
+    }
+
+    #[test]
+    fn effective_opset_prefers_node_version() {
+        let mut graph = Graph::default();
+        graph.opset_imports.insert(String::new(), 13);
+        let mut node = Node::new(NodeId(0), "Swish", vec![], vec![]);
+        node.version = Some(24);
+        assert_eq!(effective_opset(&graph, &node), 24);
     }
 
     #[test]

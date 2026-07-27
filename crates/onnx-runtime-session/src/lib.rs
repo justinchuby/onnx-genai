@@ -265,6 +265,22 @@ mod error {
             partition_name: Option<String>,
         },
 
+        #[error(
+            "EPContext export failed: operator {domain}::{op_type} at node {node} has \
+             in-memory IR version {node_version}, but the graph-level opset_import for \
+             domain '{domain}' is {graph_version}. Why: Node.version supports mixed-opset \
+             graph rewrites in memory, but ONNX protobuf has no per-node version field, so \
+             writing this graph would silently claim the wrong operator version. How to fix: \
+             export before EP fusion, or disable the fusion for an export run"
+        )]
+        EpContextMixedNodeVersion {
+            op_type: String,
+            node: String,
+            domain: String,
+            node_version: i64,
+            graph_version: String,
+        },
+
         #[error(transparent)]
         Load(#[from] onnx_runtime_loader::LoaderError),
 
@@ -387,7 +403,9 @@ pub enum DecodePrecision {
 ///
 /// This is a generic, model-agnostic knob — no level ever special-cases a model
 /// name or op. Higher levels simply enable more of the device-independent pass
-/// pipeline from [`onnx_runtime_optimizer`].
+/// pipeline from [`onnx_runtime_optimizer`]. Operator fusion is deliberately
+/// excluded here because provider-specific fused operators must be introduced
+/// only by the execution provider that can run them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OptimizationLevel {
     /// No passes — the `optimize` stage is a no-op (default).
@@ -397,9 +415,9 @@ pub enum OptimizationLevel {
     /// elimination. No operator fusion, so the op set the executor sees is a
     /// subset of the loaded graph's.
     Basic,
-    /// The full device-independent pipeline: constant folding, dead-node
-    /// elimination, and operator fusion (which can introduce fused
-    /// `com.microsoft` contrib ops such as `LayerNormalization`).
+    /// The full device-independent pipeline. This currently matches
+    /// [`OptimizationLevel::Basic`]; provider-scoped fusion runs later through
+    /// [`onnx_runtime_ep_api::ExecutionProvider::custom_passes`].
     All,
 }
 
@@ -418,15 +436,11 @@ impl OptimizationLevel {
     /// The optimizer passes this level enables, in pipeline order. Empty for
     /// [`OptimizationLevel::None`].
     fn passes(self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {
-        use onnx_runtime_optimizer::{ConstantFolding, DeadNodeElimination, OpFusion};
+        use onnx_runtime_optimizer::{ConstantFolding, DeadNodeElimination};
         match self {
             Self::None => Vec::new(),
             Self::Basic => vec![Box::new(ConstantFolding), Box::new(DeadNodeElimination)],
-            Self::All => vec![
-                Box::new(ConstantFolding),
-                Box::new(DeadNodeElimination),
-                Box::new(OpFusion::new()),
-            ],
+            Self::All => vec![Box::new(ConstantFolding), Box::new(DeadNodeElimination)],
         }
     }
 }
@@ -815,8 +829,7 @@ fn parse_embed_mode(key: &str, value: &str) -> Result<u8> {
 }
 
 /// Run the optimizer passes selected by `level`, then re-run shape inference so
-/// any node fusion introduced (whose outputs the loader never saw) gets a fully
-/// inferred shape/dtype before compile.
+/// any rewritten values get a fully inferred shape/dtype before compile.
 ///
 /// A no-op when `level` is [`OptimizationLevel::None`] — the graph is returned
 /// untouched and no re-inference runs, keeping the default path byte-identical.
@@ -843,15 +856,6 @@ fn optimize_graph(graph: &mut onnx_runtime_ir::Graph, level: OptimizationLevel) 
             );
         }
     }
-
-    // Fusion emits fused ops in the `com.microsoft` contrib domain; make sure
-    // that domain is imported so shape-inference and kernel dispatch pick the
-    // contrib-registered rules (they register from opset 1, but recording the
-    // import keeps the graph self-consistent and future-proofs versioned rules).
-    graph
-        .opset_imports
-        .entry(onnx_runtime_optimizer::CONTRIB_DOMAIN.to_string())
-        .or_insert(1);
 
     // Re-infer shapes over the rewritten graph: fused nodes' outputs (and any
     // value whose producer changed) must be re-resolved before compile.
@@ -1254,9 +1258,40 @@ impl InferenceSession {
         orig_path: &Path,
         partitions: &[CompiledPartition],
     ) -> Result<PathBuf> {
+        if self.ep_context_config.enable {
+            reject_mixed_versions_for_ep_context_export(self.exec.graph())?;
+        }
         let model = EncoderModel::new(self.exec.graph()).with_weights(self.exec.weights().as_ref());
         dump_session_ep_context(&model, orig_path, partitions, &self.ep_context_config)
     }
+}
+
+fn reject_mixed_versions_for_ep_context_export(graph: &onnx_runtime_ir::Graph) -> Result<()> {
+    for node in graph.nodes.values() {
+        let Some(node_version) = node.version else {
+            continue;
+        };
+        let graph_version = graph.opset_imports.get(node.domain.as_str()).copied();
+        if graph_version == u64::try_from(node_version).ok() {
+            continue;
+        }
+        return Err(SessionError::EpContextMixedNodeVersion {
+            op_type: node.op_type.clone(),
+            node: if node.name.is_empty() {
+                format!("#{}", node.id.0)
+            } else {
+                node.name.clone()
+            },
+            domain: if node.domain.is_empty() {
+                "ai.onnx".to_string()
+            } else {
+                node.domain.clone()
+            },
+            node_version,
+            graph_version: graph_version.map_or_else(|| "missing".to_string(), |v| v.to_string()),
+        });
+    }
+    Ok(())
 }
 
 /// Load a model. Auto-detects the best available hardware (§20.2).
@@ -1573,6 +1608,39 @@ mod option_tests {
     }
 
     #[test]
+    fn ep_context_export_rejects_mixed_node_version() {
+        let mut graph = onnx_runtime_ir::Graph::new();
+        graph.opset_imports.insert(String::new(), 21);
+        let x = graph.create_named_value(
+            "x",
+            onnx_runtime_ir::DataType::Float32,
+            onnx_runtime_ir::static_shape([2]),
+        );
+        let y = graph.create_named_value(
+            "y",
+            onnx_runtime_ir::DataType::Float32,
+            onnx_runtime_ir::static_shape([2]),
+        );
+        graph.add_input(x);
+        graph.add_output(y);
+        let mut node =
+            onnx_runtime_ir::Node::new(onnx_runtime_ir::NodeId(0), "Swish", vec![Some(x)], vec![y]);
+        node.version = Some(24);
+        graph.insert_node(node);
+
+        let err = reject_mixed_versions_for_ep_context_export(&graph).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionError::EpContextMixedNodeVersion {
+                op_type,
+                node_version: 24,
+                graph_version,
+                ..
+            } if op_type == "Swish" && graph_version == "21"
+        ));
+    }
+
+    #[test]
     fn optimization_defaults_to_none_when_unset() {
         assert_eq!(level_of(&[]).unwrap(), OptimizationLevel::None);
     }
@@ -1619,7 +1687,7 @@ mod option_tests {
     fn none_level_selects_no_passes() {
         assert!(OptimizationLevel::None.passes().is_empty());
         assert_eq!(OptimizationLevel::Basic.passes().len(), 2);
-        assert_eq!(OptimizationLevel::All.passes().len(), 3);
+        assert_eq!(OptimizationLevel::All.passes().len(), 2);
     }
 
     // ── EPContext dump options (§21.4 / §55.5) ────────────────────────────────
