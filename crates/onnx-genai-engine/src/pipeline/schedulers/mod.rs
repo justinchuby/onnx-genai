@@ -12,14 +12,42 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 mod ddim;
+mod ddpm;
 mod dpmpp;
 mod euler;
+mod flow_matching;
 mod masked_diffusion;
 
 use ddim::DdimSchedule;
+use ddpm::DdpmSchedule;
 use dpmpp::Dpmpp2m;
 use euler::{EulerAncestral, EulerSchedule};
+use flow_matching::FlowMatching;
 use masked_diffusion::{MaskedDiffusion, Remasking};
+
+fn mix_noise(
+    original: &Value,
+    noise: &Value,
+    original_scale: f32,
+    noise_scale: f32,
+) -> anyhow::Result<Value> {
+    if original.shape() != noise.shape() {
+        anyhow::bail!(
+            "original/noise shape mismatch: {:?} vs {:?}",
+            original.shape(),
+            noise.shape()
+        );
+    }
+    let shape = original.shape().to_vec();
+    let original = original.to_vec_f32_lossy()?;
+    let noise = noise.to_vec_f32_lossy()?;
+    let mixed: Vec<f32> = original
+        .iter()
+        .zip(noise)
+        .map(|(&sample, noise)| original_scale * sample + noise_scale * noise)
+        .collect();
+    Value::from_slice_f32(&mixed, &shape).map_err(Into::into)
+}
 
 /// A loop-carried transform applied to a denoiser's output at each iterative
 /// step. **Implement this trait to plug in a custom scheduler** and register it
@@ -82,6 +110,17 @@ pub trait Scheduler: Send + Sync + std::fmt::Debug {
         1.0
     }
 
+    /// Noise an encoded sample to the scheduler state used at `step`.
+    fn add_noise(
+        &self,
+        _step: usize,
+        _num_steps: usize,
+        _original: &Value,
+        _noise: &Value,
+    ) -> anyhow::Result<Value> {
+        anyhow::bail!("this scheduler does not support continuous-latent noise initialization")
+    }
+
     /// The per-step denoiser timesteps this scheduler feeds to the model, matching
     /// the diffusers scheduler it emulates (e.g. `[999.0, 966.0, ..., 33.0]` for a
     /// 30-step DPM-Solver++ linspace schedule). Length equals the loop step count.
@@ -132,9 +171,24 @@ impl std::fmt::Debug for SchedulerRegistry {
 }
 
 impl SchedulerRegistry {
-    /// Registry with the built-in `ddim`, `euler`, `dpmpp_2m` and `masked_diffusion` schedulers.
+    /// Registry with the built-in diffusion, flow-matching, and masked-token schedulers.
     pub fn builtin() -> Self {
         let mut factories: HashMap<String, SchedulerFactory> = HashMap::new();
+        factories.insert(
+            "ddpm".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                let prediction = PredictionType::parse(cfg.prediction_type.as_deref())?;
+                let sched = DdpmSchedule::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    cfg.beta_start.unwrap_or(0.0001),
+                    cfg.beta_end.unwrap_or(0.02),
+                    cfg.beta_schedule.as_deref().unwrap_or("linear"),
+                    num_steps,
+                )?
+                .with_prediction(prediction);
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
         factories.insert(
             "ddim".to_string(),
             Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
@@ -195,6 +249,26 @@ impl SchedulerRegistry {
                     sigma_spacing(cfg)?,
                 )?
                 .with_prediction(prediction);
+                Ok(Arc::new(sched) as Arc<dyn Scheduler>)
+            }),
+        );
+        factories.insert(
+            "flow_matching".to_string(),
+            Arc::new(|cfg: &SchedulerSpec, num_steps: usize| {
+                if let Some(prediction) = cfg.prediction_type.as_deref()
+                    && !prediction.is_empty()
+                    && prediction != "flow"
+                    && prediction != "velocity"
+                {
+                    anyhow::bail!(
+                        "flow_matching prediction_type must be omitted or 'flow'/'velocity', got '{prediction}'"
+                    );
+                }
+                let sched = FlowMatching::with_schedule(
+                    cfg.num_train_timesteps.unwrap_or(1000),
+                    num_steps,
+                    cfg.shift.unwrap_or(1.0),
+                )?;
                 Ok(Arc::new(sched) as Arc<dyn Scheduler>)
             }),
         );
@@ -354,6 +428,24 @@ pub(crate) fn training_sigmas(
     beta_end: f32,
     beta_schedule: &str,
 ) -> anyhow::Result<Vec<f32>> {
+    Ok(
+        training_alpha_cumprod(num_train_timesteps, beta_start, beta_end, beta_schedule)?
+            .into_iter()
+            .map(|alpha| ((1.0 - alpha) / alpha).sqrt())
+            .collect(),
+    )
+}
+
+/// Cumulative alpha products for the configured beta schedule.
+pub(crate) fn training_alpha_cumprod(
+    num_train_timesteps: usize,
+    beta_start: f32,
+    beta_end: f32,
+    beta_schedule: &str,
+) -> anyhow::Result<Vec<f32>> {
+    if num_train_timesteps < 2 {
+        anyhow::bail!("scheduler num_train_timesteps must be >= 2");
+    }
     let denom = (num_train_timesteps - 1) as f32;
     let (lo, hi, square) = match beta_schedule {
         "linear" => (beta_start, beta_end, false),
@@ -370,7 +462,7 @@ pub(crate) fn training_sigmas(
             beta *= beta;
         }
         prod *= 1.0 - beta;
-        out.push(((1.0 - prod) / prod).sqrt());
+        out.push(prod);
     }
     Ok(out)
 }
@@ -652,7 +744,7 @@ mod tests {
         let num_steps = 4usize;
         let shape = [1i64, 2, 2, 2];
         let elems = 8usize;
-        for kind in ["ddim", "euler", "euler_ancestral", "dpmpp_2m"] {
+        for kind in ["ddpm", "ddim", "euler", "euler_ancestral", "dpmpp_2m"] {
             for prediction in ["v_prediction", "x0", "sample"] {
                 let spec = SchedulerSpec {
                     kind: kind.to_string(),
@@ -695,5 +787,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn registry_accepts_modern_prediction_contracts() {
+        let registry = SchedulerRegistry::builtin();
+        for prediction in ["epsilon", "v_prediction", "sample", "x0"] {
+            let spec = SchedulerSpec {
+                kind: "ddpm".to_string(),
+                prediction_type: Some(prediction.to_string()),
+                num_train_timesteps: Some(8),
+                ..SchedulerSpec::default()
+            };
+            registry
+                .build(&spec, 4)
+                .unwrap_or_else(|error| panic!("ddpm/{prediction} must build: {error}"));
+        }
+        for prediction in [None, Some("flow"), Some("velocity")] {
+            let spec = SchedulerSpec {
+                kind: "flow_matching".to_string(),
+                prediction_type: prediction.map(str::to_string),
+                shift: Some(3.0),
+                ..SchedulerSpec::default()
+            };
+            registry
+                .build(&spec, 4)
+                .unwrap_or_else(|error| panic!("flow_matching/{prediction:?} must build: {error}"));
+        }
+        let invalid = SchedulerSpec {
+            kind: "flow_matching".to_string(),
+            prediction_type: Some("epsilon".to_string()),
+            ..SchedulerSpec::default()
+        };
+        assert!(registry.build(&invalid, 4).is_err());
     }
 }

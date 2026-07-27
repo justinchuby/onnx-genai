@@ -187,6 +187,21 @@ impl Scheduler for EulerSchedule {
     fn timesteps(&self) -> Option<Vec<f32>> {
         Some(self.timesteps.clone())
     }
+
+    fn add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        let sigma = if step == num_steps {
+            0.0
+        } else {
+            self.sigmas[step]
+        };
+        super::mix_noise(original, noise, 1.0, sigma)
+    }
 }
 
 /// Euler Ancestral (`EulerAncestralDiscreteScheduler`, epsilon) — a *stochastic*
@@ -319,5 +334,20 @@ impl Scheduler for EulerAncestral {
 
     fn timesteps(&self) -> Option<Vec<f32>> {
         Some(self.timesteps.clone())
+    }
+
+    fn add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        let sigma = if step == num_steps {
+            0.0
+        } else {
+            self.sigmas[step]
+        };
+        super::mix_noise(original, noise, 1.0, sigma)
     }
 }

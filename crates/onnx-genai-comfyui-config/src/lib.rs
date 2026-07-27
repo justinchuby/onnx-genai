@@ -51,6 +51,8 @@ const MAX_TRACE_DEPTH: usize = 16;
 /// ComfyUI node `class_type`s the translator recognizes.
 const SAMPLER_NODES: &[&str] = &["KSampler", "KSamplerAdvanced"];
 const VAE_DECODE_NODES: &[&str] = &["VAEDecode", "VAEDecodeTiled"];
+const VAE_ENCODE_NODES: &[&str] = &["VAEEncode", "VAEEncodeTiled"];
+const INPAINT_NODES: &[&str] = &["VAEEncodeForInpaint", "InpaintModelConditioning"];
 const TEXT_ENCODE_NODES: &[&str] = &["CLIPTextEncode"];
 const LATENT_NODES: &[&str] = &["EmptyLatentImage", "EmptySD3LatentImage"];
 
@@ -97,7 +99,8 @@ fn sampler_kind(sampler_name: &str) -> Result<&'static str, ComfyUiConfigError> 
 /// the Stable Diffusion values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchedulerConfig {
-    /// Scheduler algorithm (`ddim`, `euler`, `euler_ancestral`, `dpmpp_2m`).
+    /// Scheduler algorithm (`ddpm`, `ddim`, `euler`, `euler_ancestral`,
+    /// `dpmpp_2m`, or `flow_matching`).
     pub kind: String,
     /// Training timesteps the schedule was defined over.
     pub num_train_timesteps: usize,
@@ -196,6 +199,10 @@ pub struct ComfyUiWorkflow {
     pub loras: Vec<(String, f64)>,
     /// ControlNet `(name, strength)` if present.
     pub controlnet: Option<(String, f64)>,
+    /// Source image referenced by the sampler's VAE-encode path.
+    pub source_image: Option<String>,
+    /// Inpainting mask referenced by the sampler's latent path.
+    pub mask_image: Option<String>,
 }
 
 /// Return the flat node map, tolerating a `{"prompt": {...}}` wrapper.
@@ -233,6 +240,52 @@ fn node_inputs(node: &Value) -> Option<&Map<String, Value>> {
 
 fn input<'a>(node: &'a Value, key: &str) -> Option<&'a Value> {
     node_inputs(node)?.get(key)
+}
+
+fn link_slot(value: &Value) -> Option<usize> {
+    value
+        .as_array()
+        .filter(|link| link.len() == 2)?
+        .get(1)?
+        .as_u64()
+        .map(|slot| slot as usize)
+}
+
+fn load_image_name(nodes: &Map<String, Value>, reference: Option<&Value>) -> Option<String> {
+    let node = resolve(nodes, reference)?;
+    match node_class(node)? {
+        "LoadImage" | "LoadImageMask" => input(node, "image")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn follow_image_inputs(
+    nodes: &Map<String, Value>,
+    reference: Option<&Value>,
+) -> (Option<String>, Option<String>) {
+    let Some(node) = resolve(nodes, reference) else {
+        return (None, None);
+    };
+    let class = node_class(node).unwrap_or_default();
+    if VAE_ENCODE_NODES.contains(&class) {
+        return (load_image_name(nodes, input(node, "pixels")), None);
+    }
+    if INPAINT_NODES.contains(&class) {
+        let pixels = input(node, "pixels").or_else(|| input(node, "image"));
+        let mask = input(node, "mask");
+        return (
+            load_image_name(nodes, pixels),
+            load_image_name(nodes, mask).or_else(|| {
+                let source = pixels?;
+                (link_slot(mask?) == Some(1))
+                    .then(|| load_image_name(nodes, Some(source)))
+                    .flatten()
+            }),
+        );
+    }
+    (None, None)
 }
 
 /// Find the single node of one of `class_types`; error if absent or ambiguous.
@@ -435,10 +488,9 @@ fn build_pipeline_metadata(
         }
     }
     if let Some(start) = start_step {
-        if start == 0 || start >= num_steps {
+        if start == 0 || start > num_steps {
             return Err(ComfyUiConfigError::Unsupported(format!(
-                "start_step ({start}) must be in 1..{}",
-                num_steps - 1
+                "start_step ({start}) must be in 1..={num_steps}"
             )));
         }
         strategy.insert("start_step".into(), json!(start));
@@ -490,16 +542,7 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
     let kind = sampler_kind(&sampler_name)?;
     let known_spacing = SUPPORTED_SPACINGS.contains(&spacing.as_str());
 
-    // img2img: a KSampler `denoise` < 1.0 skips the earliest (noisiest) steps.
-    // start_step = num_steps - round(num_steps * denoise). Uses banker's rounding
-    // to match numpy/diffusers get_timesteps.
-    let mut start_step = 0u32;
-    if denoise > 0.0 && denoise < 1.0 {
-        let raw = (steps as f64) * denoise;
-        let rounded = round_ties_even(raw) as i64;
-        let candidate = steps as i64 - rounded;
-        start_step = candidate.clamp(0, (steps as i64 - 1).max(0)) as u32;
-    }
+    let start_step = strength_to_start_step(denoise, steps);
 
     let prompt = follow_prompt_text(nodes, input(sampler, "positive"), MAX_TRACE_DEPTH);
     let negative_prompt = follow_prompt_text(nodes, input(sampler, "negative"), MAX_TRACE_DEPTH);
@@ -507,6 +550,7 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
     let checkpoint = trace_checkpoint(nodes, input(sampler, "model"));
     let loras = trace_loras(nodes, input(sampler, "model"));
     let controlnet = find_controlnet(nodes);
+    let (source_image, mask_image) = follow_image_inputs(nodes, input(sampler, "latent_image"));
 
     let has_text_encoder = nodes
         .values()
@@ -558,7 +602,22 @@ pub fn parse_workflow(workflow: &Value) -> Result<ComfyUiWorkflow, ComfyUiConfig
         start_step,
         loras,
         controlnet,
+        source_image,
+        mask_image,
     })
+}
+
+/// Convert ComfyUI denoise strength to the first executed diffusion step.
+///
+/// This is `num_steps - round_ties_even(num_steps * strength)`, matching
+/// diffusers `get_timesteps`. Strength zero therefore executes no denoise steps.
+pub fn strength_to_start_step(strength: f64, num_steps: u32) -> u32 {
+    if num_steps == 0 {
+        return 0;
+    }
+    let strength = strength.clamp(0.0, 1.0);
+    let rounded = round_ties_even(num_steps as f64 * strength) as i64;
+    (num_steps as i64 - rounded).clamp(0, num_steps as i64) as u32
 }
 
 /// Parse a ComfyUI API-format workflow from a JSON string.
@@ -708,6 +767,57 @@ mod tests {
             workflow.metadata.pipeline.unwrap().strategy.start_step,
             Some(8)
         );
+    }
+
+    #[test]
+    fn strength_mapping_matches_hand_computed_diffusers_steps() {
+        for (strength, steps, expected) in [
+            (0.0, 20, 20),
+            (0.1, 20, 18),
+            (0.5, 21, 11), // 10.5 ties to even -> 10
+            (0.6, 20, 8),
+            (1.0, 20, 0),
+        ] {
+            assert_eq!(
+                strength_to_start_step(strength, steps),
+                expected,
+                "strength={strength}, steps={steps}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_txt2img_img2img_and_inpainting_from_latent_graph() {
+        let txt2img = parse_workflow(&txt2img_graph()).unwrap();
+        assert_eq!((txt2img.source_image, txt2img.mask_image), (None, None));
+
+        let mut img2img_graph = txt2img_graph();
+        img2img_graph["3"]["inputs"]["latent_image"] = json!(["10", 0]);
+        img2img_graph["10"] = json!({
+            "class_type": "VAEEncode",
+            "inputs": {"pixels": ["11", 0], "vae": ["4", 2]}
+        });
+        img2img_graph["11"] = json!({"class_type": "LoadImage", "inputs": {"image": "source.png"}});
+        let img2img = parse_workflow(&img2img_graph).unwrap();
+        assert_eq!(img2img.source_image.as_deref(), Some("source.png"));
+        assert_eq!(img2img.mask_image, None);
+
+        let mut inpaint_graph = txt2img_graph();
+        inpaint_graph["3"]["inputs"]["latent_image"] = json!(["10", 0]);
+        inpaint_graph["10"] = json!({
+            "class_type": "VAEEncodeForInpaint",
+            "inputs": {
+                "pixels": ["11", 0],
+                "mask": ["12", 0],
+                "vae": ["4", 2]
+            }
+        });
+        inpaint_graph["11"] = json!({"class_type": "LoadImage", "inputs": {"image": "source.png"}});
+        inpaint_graph["12"] =
+            json!({"class_type": "LoadImageMask", "inputs": {"image": "mask.png"}});
+        let inpaint = parse_workflow(&inpaint_graph).unwrap();
+        assert_eq!(inpaint.source_image.as_deref(), Some("source.png"));
+        assert_eq!(inpaint.mask_image.as_deref(), Some("mask.png"));
     }
 
     #[test]

@@ -47,11 +47,13 @@ on `OFA-Sys/small-stable-diffusion-v0` unless noted.
 
 | onnx-genai `kind`   | diffusers scheduler                | ComfyUI `sampler_name` | validation (max\|Δ\| / mean) | script |
 |---------------------|------------------------------------|------------------------|------------------------------|--------|
+| `ddpm`              | `DDPMScheduler`                    | `ddpm`                 | unit reference (fixed noise) | Rust scheduler tests |
 | `ddim`              | `DDIMScheduler`                    | `ddim`                 | 6.9e-4 latent / img ~1.8e-3  | `diffusion_image.py`, `diffusion_e2e.py` |
 | `euler`             | `EulerDiscreteScheduler`           | `euler`                | 7.9e-3 / 2.5e-5              | `comfyui_e2e.py`, `euler_parity.py` |
 | `dpmpp_2m`          | `DPMSolverMultistepScheduler`      | `dpmpp_2m`             | 1.8e-3 / 1.7e-5             | `dpmpp_e2e.py`, `dpmpp_parity.py` |
 | `dpmpp_2m` + Karras | `…(use_karras_sigmas=True)`        | `dpmpp_2m` / `karras`  | 5.9e-3 / 7.4e-5             | `dpmpp_e2e.py` (`ONNX_GENAI_KARRAS=1`), `karras_parity.py` |
 | `euler_ancestral`   | `EulerAncestralDiscreteScheduler`  | `euler_ancestral`      | 4.7e-2 / 1.3e-3 (stochastic) | `euler_a_e2e.py` |
+| `flow_matching`     | `FlowMatchEulerDiscreteScheduler`  | —                      | unit reference               | Rust scheduler tests |
 | `masked_diffusion`  | — (discrete language diffusion)    | —                      | synthetic fixture           | §7 |
 
 **Sigma spacing.** `use_karras_sigmas` (Karras rho=7) or `use_exponential_sigmas` on `SchedulerSpec` replace the default linspace schedule for `euler`/`dpmpp_2m`; `DPM++ 2M Karras` is the most popular real-world combo. Both match diffusers (`scripts/karras_parity.py`).
@@ -68,6 +70,9 @@ DDIM and linspace DPM++ timesteps are integers (int64). The converter selects th
 - **DPM++ 2M** — no input scaling; `init_noise_sigma = 1.0`; multistep (keeps the previous data
   prediction, reset each loop); integer timesteps.
 - **Euler Ancestral** — like Euler but injects `noise·σ_up` each step (stochastic, §5).
+- **DDPM** — ancestral posterior sampling with fixed-small variance; consumes per-step noise.
+- **Flow matching** — Euler integration of the predicted velocity/vector field on a shifted
+  sigma schedule (`shift`, default `1.0`); intended for modern DiT/rectified-flow models.
 
 ### 2.1 Extensible schedulers
 
@@ -202,7 +207,21 @@ A `KSampler.denoise` < 1.0 is img2img: encode a source image to a latent, noise 
 intermediate step, and run only the tail of the loop. The `start_step` field on the iterative
 strategy runs `start_step..num_steps` from the noised encoded-image seed, with
 `start_step = num_steps − round(num_steps·denoise)` (matching diffusers `get_timesteps`).
+`denoise = 0` maps to `start_step = num_steps`, so the loop executes zero steps.
 `scripts/img2img_e2e.py` validates it against diffusers img2img (max|Δ| ~1.0e-2).
+
+The native `run_comfyui` runner detects `VAEEncode`/`VAEEncodeTiled` on the sampler's latent
+input, loads the linked `LoadImage`, and uses the package component whose type is `vae_encoder`
+(`vae_encoder.onnx` is the compatibility fallback). Relative image paths are resolved beside the
+workflow JSON.
+
+### 4.1 Inpainting
+
+`VAEEncodeForInpaint` and `InpaintModelConditioning` additionally route the linked mask and masked
+source image through the VAE encoder. The UNet input is exactly 9 channels, in this order:
+`[4-channel noisy latent | 1-channel downsampled repaint mask | 4-channel masked-image latent]`.
+The scheduler continues to carry and update only the first four channels; the five conditioning
+channels are appended immediately before each denoiser invocation.
 
 ---
 
@@ -307,8 +326,8 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
 
 ## 9. Limitations & roadmap
 
-- **Samplers:** euler, euler_ancestral, ddim, dpmpp_2m (+Karras). Not yet: other DPM++ variants,
-  exponential/beta sigma spacings, other SDE/ancestral samplers.
+- **Samplers:** ddpm, ddim, euler, euler_ancestral, dpmpp_2m (+Karras), and flow_matching.
+  Not yet: other DPM++ variants, beta sigma spacing, or other SDE/ancestral samplers.
 - **Models:** SD 1.x-style **and SDXL** run through the same declarative pipeline. **SDXL is
   validated end-to-end** (`scripts/sdxl_e2e.py`) — the two text encoders' penultimate hidden states
   are concatenated into `encoder_hidden_states`, the pooled `text_embeds` and the `time_ids` vector
@@ -319,8 +338,9 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
   weights (the exact multi-input CFG path is unit-tested to 1e-5). The Mobius **export side is
   done** — `checkpoint_export` auto-detects SDXL and emits the dual-encoder + 5-input-UNet pipeline,
   and `mobius convert-comfyui` routes both conditioning edges automatically. The native `run_comfyui`
-  binary currently drives the plain **SD txt2img** path (+ batched generation); rendering the SDXL /
-  ControlNet / inpaint variants through the one-command runner is not yet ported to native Rust.
+  binary drives both plain **SD txt2img** and **SDXL** (+ batched generation): it discovers every
+  token-id input on the declared prompt encoder, guides every routed conditioning output, and supplies
+  SDXL `time_ids`. ControlNet / inpaint variants remain to be ported to the one-command runner.
 - **ControlNet** ✅ handled by a **combined ControlNet+UNet export** (like SDXL, no runtime change):
   the denoiser is a fused ControlNet+UNet taking an extra constant `controlnet_cond` image input
   (the ControlNet produces down/mid residuals injected into the UNet). The translator collects

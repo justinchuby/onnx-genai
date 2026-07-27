@@ -1,13 +1,15 @@
 use std::{
     cmp::Ordering,
     env, fmt, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command as StdCommand,
+    sync::Arc,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 use tokio::{
@@ -15,7 +17,15 @@ use tokio::{
     process::Command as TokioCommand,
 };
 
+#[cfg(feature = "bench-native")]
+use onnx_genai_engine::{
+    Engine, EngineConfig, EngineDecodeBackend, GenerateRequest, NativeDecodeDevice,
+};
+#[cfg(feature = "bench-native")]
+use onnx_genai_ort::{ChatMessage, ChatTemplate, available_execution_providers};
+
 const SYSTEM_PROMPT: &str = "You are a concise benchmark assistant.";
+const DEFAULT_PROMPT: &str = "Write a short Rust function that reverses a string.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,8 +42,28 @@ struct Args {
     warmups: usize,
 
     /// Maximum generated tokens per request.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, visible_alias = "tokens", default_value_t = 50)]
     max_tokens: usize,
+
+    /// Generated tokens to discard from the decode-throughput window in direct mode.
+    #[arg(long, default_value_t = 2)]
+    decode_skip: usize,
+
+    /// Model directory for direct native CPU EP versus ORT CPU EP comparison.
+    #[arg(long)]
+    model: Option<PathBuf>,
+
+    /// Prompt used by the direct native-vs-ORT comparison.
+    #[arg(long, default_value = DEFAULT_PROMPT)]
+    prompt: String,
+
+    /// Do not apply the model chat template in direct comparison mode.
+    #[arg(long)]
+    raw: bool,
+
+    /// Direct backend to run. Repeat to override the default native+ORT pair.
+    #[arg(long = "direct-backend", value_enum)]
+    direct_backends: Vec<DirectBackend>,
 
     /// Common Qwen tokenizer used to count prompt and generated tokens.
     #[arg(long, default_value = "models/qwen2.5-0.5b/tokenizer.json")]
@@ -46,6 +76,32 @@ struct Args {
     /// Also write the Markdown report to this path.
     #[arg(long)]
     output: Option<PathBuf>,
+
+    /// Also write the machine-readable direct comparison report as JSON. Use '-' for stdout.
+    #[arg(long, value_name = "PATH")]
+    profile_json: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DirectBackend {
+    Native,
+    Ort,
+}
+
+impl DirectBackend {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Ort => "ort",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native CPU EP",
+            Self::Ort => "ORT CPU EP",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -171,16 +227,24 @@ struct Sample {
 
 #[derive(Clone, Copy, Debug)]
 struct Distribution {
+    min: f64,
+    p10: f64,
     median: f64,
     p90: f64,
+    p95: f64,
+    max: f64,
 }
 
 impl Distribution {
     fn from_values(mut values: Vec<f64>) -> Self {
         values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
         Self {
+            min: values.first().copied().unwrap_or(f64::NAN),
+            p10: percentile(&values, 0.1),
             median: percentile(&values, 0.5),
             p90: percentile(&values, 0.9),
+            p95: percentile(&values, 0.95),
+            max: values.last().copied().unwrap_or(f64::NAN),
         }
     }
 }
@@ -241,6 +305,39 @@ enum RuntimeState {
     Skipped { reason: String },
 }
 
+#[derive(Clone, Debug)]
+struct DirectSample {
+    backend: DirectBackend,
+    run: usize,
+    model_load: Duration,
+    ttft: Duration,
+    total: Duration,
+    generated_tokens: usize,
+    decode_tokens_per_second: f64,
+    end_to_end_tokens_per_second: f64,
+}
+
+#[derive(Clone, Debug)]
+struct DirectSummary {
+    backend: DirectBackend,
+    model_load_ms: Distribution,
+    ttft_ms: Distribution,
+    decode_tokens_per_second: Distribution,
+    end_to_end_tokens_per_second: Distribution,
+    total_ms: Distribution,
+    generated_tokens: Distribution,
+}
+
+#[derive(Clone, Debug)]
+struct DirectRoofline {
+    measured_bandwidth_gbps: f64,
+    model_weight_bytes: u64,
+    ceiling_tokens_per_second: f64,
+    threads: usize,
+    bytes_per_thread: usize,
+    repetitions: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -249,6 +346,9 @@ async fn main() -> Result<()> {
     }
     if args.max_tokens == 0 {
         bail!("--max-tokens must be at least 1");
+    }
+    if let Some(model) = args.model.as_ref() {
+        return run_direct_compare(&args, model);
     }
 
     let tokenizer = Tokenizer::from_file(&args.tokenizer)
@@ -313,7 +413,19 @@ async fn main() -> Result<()> {
     }
 
     let report = render_report(&args, &runtimes, &states, &prompts, &summaries, &run_notes);
-    print!("{report}");
+    if args
+        .profile_json
+        .as_ref()
+        .is_some_and(|path| path.as_os_str() == "-")
+    {
+        eprint!("{report}");
+        write_json_arg(Path::new("-"), &json!({ "report_markdown": report }))?;
+    } else {
+        print!("{report}");
+        if let Some(path) = &args.profile_json {
+            write_json_arg(path, &json!({ "report_markdown": report }))?;
+        }
+    }
     if let Some(output) = args.output {
         if let Some(parent) = output
             .parent()
@@ -327,6 +439,647 @@ async fn main() -> Result<()> {
         eprintln!("wrote {}", output.display());
     }
     Ok(())
+}
+
+#[cfg(not(feature = "bench-native"))]
+fn run_direct_compare(_args: &Args, _model: &Path) -> Result<()> {
+    bail!(
+        "direct native-vs-ORT comparison requires `cargo run -p onnx-genai-bench \
+         --features bench-native --bin compare -- --model {}`",
+        "models/qwen2.5-0.5b"
+    )
+}
+
+#[cfg(feature = "bench-native")]
+fn run_direct_compare(args: &Args, model: &Path) -> Result<()> {
+    if args.max_tokens < 2 {
+        bail!("direct comparison needs at least two generated tokens for decode throughput");
+    }
+    if args.decode_skip >= args.max_tokens {
+        bail!("--decode-skip must be smaller than --tokens/--max-tokens");
+    }
+    let model_dir = if model.is_file() {
+        model
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .context("--model file has no parent directory")?
+    } else {
+        model
+    };
+    if !model_dir.is_dir() {
+        bail!("model directory does not exist: {}", model_dir.display());
+    }
+    let backends = if args.direct_backends.is_empty() {
+        vec![DirectBackend::Native, DirectBackend::Ort]
+    } else {
+        args.direct_backends.clone()
+    };
+    if backends.is_empty() {
+        bail!("at least one direct backend is required");
+    }
+    let (prompt_mode, rendered_prompt) = resolve_direct_prompt(model_dir, &args.prompt, args.raw)?;
+    let prompt_tokens = Tokenizer::from_file(model_dir.join("tokenizer.json"))
+        .map_err(|err| {
+            anyhow!(
+                "failed to load tokenizer beside {}: {err}",
+                model_dir.display()
+            )
+        })?
+        .encode(rendered_prompt.clone(), false)
+        .map_err(|err| anyhow!("failed to tokenize direct comparison prompt: {err}"))?
+        .len();
+
+    let roofline = measure_direct_roofline(model_dir)?;
+
+    for warmup in 1..=args.warmups {
+        for &backend in &backends {
+            eprintln!(
+                "direct warmup {warmup}/{}: {}",
+                args.warmups,
+                backend.label()
+            );
+            std::hint::black_box(run_direct_once(
+                args,
+                model_dir,
+                &rendered_prompt,
+                backend,
+                0,
+            )?);
+        }
+    }
+
+    let mut samples = Vec::with_capacity(args.runs * backends.len());
+    for run in 1..=args.runs {
+        for &backend in &backends {
+            eprintln!(
+                "direct measured run {run}/{}: {}",
+                args.runs,
+                backend.label()
+            );
+            samples.push(run_direct_once(
+                args,
+                model_dir,
+                &rendered_prompt,
+                backend,
+                run,
+            )?);
+        }
+    }
+    let summaries = summarize_direct_samples(&backends, &samples)?;
+    let report = render_direct_report(
+        args,
+        model_dir,
+        &prompt_mode,
+        prompt_tokens,
+        &summaries,
+        roofline.as_ref(),
+    );
+    let json_report = direct_json_report(
+        args,
+        model_dir,
+        &prompt_mode,
+        prompt_tokens,
+        &samples,
+        &summaries,
+        roofline.as_ref(),
+    );
+
+    if args
+        .profile_json
+        .as_ref()
+        .is_some_and(|path| path.as_os_str() == "-")
+    {
+        eprint!("{report}");
+        write_json_arg(Path::new("-"), &json_report)?;
+    } else {
+        print!("{report}");
+        if let Some(path) = &args.profile_json {
+            write_json_arg(path, &json_report)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bench-native")]
+fn resolve_direct_prompt(model_dir: &Path, prompt: &str, raw: bool) -> Result<(String, String)> {
+    if raw {
+        return Ok(("raw (--raw)".to_string(), prompt.to_string()));
+    }
+    let standalone = model_dir.join("chat_template.jinja");
+    let tokenizer_config = model_dir.join("tokenizer_config.json");
+    let has_template = standalone.is_file()
+        || (tokenizer_config.is_file()
+            && std::fs::read_to_string(&tokenizer_config)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|value| value.get("chat_template").cloned())
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .is_some());
+    if !has_template {
+        return Ok((
+            "raw (no chat template in model dir)".to_string(),
+            prompt.to_string(),
+        ));
+    }
+    let template = ChatTemplate::from_model_dir(model_dir)
+        .with_context(|| format!("load chat template from {}", model_dir.display()))?;
+    let rendered = template
+        .render(&[ChatMessage::new("user", prompt.to_string())], None, true)
+        .with_context(|| format!("render chat template from {}", model_dir.display()))?;
+    Ok(("chat template".to_string(), rendered))
+}
+
+#[cfg(feature = "bench-native")]
+fn run_direct_once(
+    args: &Args,
+    model_dir: &Path,
+    prompt: &str,
+    backend: DirectBackend,
+    run: usize,
+) -> Result<DirectSample> {
+    configure_direct_backend(backend)?;
+    let mut config = EngineConfig {
+        decode_backend: match backend {
+            DirectBackend::Native => EngineDecodeBackend::Native,
+            DirectBackend::Ort => EngineDecodeBackend::Ort,
+        },
+        ..EngineConfig::default()
+    };
+    config.native_device = Some(NativeDecodeDevice::Cpu);
+
+    let load_started = Instant::now();
+    let mut engine = Engine::from_dir(model_dir, config)
+        .with_context(|| format!("load {} from {}", backend.label(), model_dir.display()))?;
+    let model_load = load_started.elapsed();
+    if backend == DirectBackend::Ort && engine.decode_backend() != EngineDecodeBackend::Ort {
+        bail!(
+            "requested ORT CPU backend but engine resolved {:?}",
+            engine.decode_backend()
+        );
+    }
+    if backend == DirectBackend::Native && engine.decode_backend() != EngineDecodeBackend::Native {
+        bail!(
+            "requested native CPU backend but engine resolved {:?}",
+            engine.decode_backend()
+        );
+    }
+
+    let mut request = GenerateRequest::new(prompt.to_string());
+    request.options.max_new_tokens = args.max_tokens;
+    request.options.temperature = 0.0;
+    request.options.top_p = 1.0;
+    request.options.greedy = true;
+    request.options.seed = Some(0);
+    request.options.stop_on_eos = false;
+
+    let generate_started = Instant::now();
+    let mut token_times = Vec::with_capacity(args.max_tokens);
+    let mut callback = |_| {
+        token_times.push(generate_started.elapsed());
+        Ok(())
+    };
+    let result = engine
+        .generate_with_callback(request, Some(&mut callback))
+        .with_context(|| format!("generate with {}", backend.label()))?;
+    let total = generate_started.elapsed();
+    let generated_tokens = result.token_ids.len();
+    if generated_tokens == 0 || token_times.is_empty() {
+        bail!("{} generated no tokens", backend.label());
+    }
+    let ttft = token_times[0];
+    let (_decode_tokens, _decode_window, decode_tokens_per_second) =
+        decode_throughput(&token_times, generated_tokens, args.decode_skip).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} emitted too few timed tokens for decode throughput: tokens={} decode_skip={}",
+                backend.label(),
+                generated_tokens,
+                args.decode_skip
+            )
+        })?;
+    Ok(DirectSample {
+        backend,
+        run,
+        model_load,
+        ttft,
+        total,
+        generated_tokens,
+        decode_tokens_per_second,
+        end_to_end_tokens_per_second: generated_tokens as f64 / total.as_secs_f64(),
+    })
+}
+
+#[cfg(feature = "bench-native")]
+fn configure_direct_backend(backend: DirectBackend) -> Result<()> {
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", "cpu");
+    }
+    if backend == DirectBackend::Ort {
+        let available =
+            available_execution_providers().context("query linked ONNX Runtime providers")?;
+        if !available
+            .iter()
+            .any(|provider| provider.eq_ignore_ascii_case("CPUExecutionProvider"))
+        {
+            bail!(
+                "ORT CPU backend requested, but CPUExecutionProvider is unavailable \
+                 (available: {available:?})"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn measure_direct_roofline(model_dir: &Path) -> Result<Option<DirectRoofline>> {
+    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+        return Ok(None);
+    }
+    let model_weight_bytes = model_weight_bytes(model_dir)?;
+    if model_weight_bytes == 0 {
+        bail!(
+            "cannot compute roofline fraction: no model weight bytes found under {}",
+            model_dir.display()
+        );
+    }
+    let available_threads = thread::available_parallelism().map_or(1, usize::from);
+    let threads = sysctl_usize("hw.perflevel0.physicalcpu")
+        .unwrap_or(available_threads)
+        .clamp(1, available_threads);
+    let bytes_per_thread = 256 * 1024 * 1024;
+    let repetitions = 3;
+    let measured_bandwidth_gbps =
+        measure_sequential_read_bandwidth_gbps(threads, bytes_per_thread, repetitions);
+    if !measured_bandwidth_gbps.is_finite() || measured_bandwidth_gbps <= 0.0 {
+        bail!("measured invalid Apple-Silicon memory bandwidth: {measured_bandwidth_gbps}");
+    }
+    Ok(Some(DirectRoofline {
+        measured_bandwidth_gbps,
+        model_weight_bytes,
+        ceiling_tokens_per_second: measured_bandwidth_gbps * 1_000_000_000.0
+            / model_weight_bytes as f64,
+        threads,
+        bytes_per_thread,
+        repetitions,
+    }))
+}
+
+fn model_weight_bytes(model_dir: &Path) -> Result<u64> {
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(model_dir).with_context(|| format!("read {}", model_dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "model.onnx" || name.starts_with("model.onnx.data") {
+            bytes += entry.metadata()?.len();
+        }
+    }
+    Ok(bytes)
+}
+
+fn sysctl_usize(name: &str) -> Option<usize> {
+    command_output("sysctl", &["-n", name])?.trim().parse().ok()
+}
+
+fn measure_sequential_read_bandwidth_gbps(
+    threads: usize,
+    bytes_per_thread: usize,
+    repetitions: usize,
+) -> f64 {
+    let len = bytes_per_thread / std::mem::size_of::<u64>();
+    let buffers = Arc::new(
+        (0..threads)
+            .map(|thread_index| {
+                (0..len)
+                    .map(|index| (index as u64).wrapping_mul(0x9E37_79B9) ^ thread_index as u64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut best = 0.0_f64;
+    for _ in 0..repetitions {
+        let started = Instant::now();
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for buffer in buffers.iter() {
+                handles.push(scope.spawn(move || {
+                    let mut sum = 0_u64;
+                    for value in buffer {
+                        sum = sum.wrapping_add(std::hint::black_box(*value));
+                    }
+                    std::hint::black_box(sum);
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("bandwidth worker panicked");
+            }
+        });
+        let elapsed = started.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            best = best.max((threads * bytes_per_thread) as f64 / elapsed / 1_000_000_000.0);
+        }
+    }
+    best
+}
+
+fn summarize_direct_samples(
+    backends: &[DirectBackend],
+    samples: &[DirectSample],
+) -> Result<Vec<DirectSummary>> {
+    backends
+        .iter()
+        .copied()
+        .map(|backend| {
+            let backend_samples = samples
+                .iter()
+                .filter(|sample| sample.backend == backend)
+                .collect::<Vec<_>>();
+            if backend_samples.is_empty() {
+                bail!("no samples recorded for {}", backend.label());
+            }
+            Ok(DirectSummary {
+                backend,
+                model_load_ms: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| millis(sample.model_load))
+                        .collect(),
+                ),
+                ttft_ms: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| millis(sample.ttft))
+                        .collect(),
+                ),
+                decode_tokens_per_second: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| sample.decode_tokens_per_second)
+                        .collect(),
+                ),
+                end_to_end_tokens_per_second: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| sample.end_to_end_tokens_per_second)
+                        .collect(),
+                ),
+                total_ms: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| millis(sample.total))
+                        .collect(),
+                ),
+                generated_tokens: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| sample.generated_tokens as f64)
+                        .collect(),
+                ),
+            })
+        })
+        .collect()
+}
+
+fn render_direct_report(
+    args: &Args,
+    model_dir: &Path,
+    prompt_mode: &str,
+    prompt_tokens: usize,
+    summaries: &[DirectSummary],
+    roofline: Option<&DirectRoofline>,
+) -> String {
+    let mut report = String::new();
+    report.push_str("# Native CPU EP vs ORT CPU EP comparison\n\n");
+    report.push_str("| field | value |\n|---|---|\n");
+    metadata_row(&mut report, "model", model_dir.display().to_string());
+    metadata_row(&mut report, "prompt", args.prompt.clone());
+    metadata_row(&mut report, "prompt mode", prompt_mode.to_string());
+    metadata_row(&mut report, "prompt tokens", prompt_tokens.to_string());
+    metadata_row(&mut report, "generated tokens", args.max_tokens.to_string());
+    metadata_row(
+        &mut report,
+        "methodology",
+        format!(
+            "{} warmup pair(s), {} measured pair(s), discard first {} generated token(s) \
+             from decode throughput, median with p10-p95 spread",
+            args.warmups, args.runs, args.decode_skip
+        ),
+    );
+    metadata_row(
+        &mut report,
+        "machine",
+        command_output("uname", &["-srmp"]).unwrap_or_else(|| env::consts::OS.into()),
+    );
+    metadata_row(
+        &mut report,
+        "CPU",
+        command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+            .unwrap_or_else(|| "unknown".into()),
+    );
+    metadata_row(
+        &mut report,
+        "git commit",
+        command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into()),
+    );
+    if let Some(roofline) = roofline {
+        metadata_row(
+            &mut report,
+            "measured CPU bandwidth",
+            format!(
+                "{:.1} GB/s ({} thread(s), {} MiB/thread, best of {})",
+                roofline.measured_bandwidth_gbps,
+                roofline.threads,
+                roofline.bytes_per_thread / (1024 * 1024),
+                roofline.repetitions
+            ),
+        );
+        metadata_row(
+            &mut report,
+            "model weight bytes",
+            roofline.model_weight_bytes.to_string(),
+        );
+        metadata_row(
+            &mut report,
+            "decode roofline ceiling",
+            format!("{:.2} tok/s", roofline.ceiling_tokens_per_second),
+        );
+    } else {
+        metadata_row(
+            &mut report,
+            "decode roofline ceiling",
+            "unavailable on non-Apple-Silicon host".to_string(),
+        );
+    }
+    report.push('\n');
+    report.push_str("| backend | model load ms | TTFT ms | decode tok/s | decode roofline % | end-to-end tok/s | total ms | output tokens |\n");
+    report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    for summary in summaries {
+        let roofline_cell = roofline
+            .map(|roofline| {
+                percent_spread_cell(
+                    distribution_scale(
+                        summary.decode_tokens_per_second,
+                        roofline.model_weight_bytes as f64
+                            / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
+                    ),
+                    2,
+                )
+            })
+            .unwrap_or_else(|| "N/A".to_string());
+        report.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            summary.backend.label(),
+            spread_cell(summary.model_load_ms, 1),
+            spread_cell(summary.ttft_ms, 1),
+            spread_cell(summary.decode_tokens_per_second, 2),
+            roofline_cell,
+            spread_cell(summary.end_to_end_tokens_per_second, 2),
+            spread_cell(summary.total_ms, 1),
+            spread_cell(summary.generated_tokens, 0),
+        ));
+    }
+    if let Some(ratios) = direct_ratios(summaries) {
+        report.push('\n');
+        report.push_str("| native/ORT ratio | value |\n|---|---:|\n");
+        report.push_str(&format!(
+            "| decode tok/s | {:.3}x |\n",
+            ratios.decode_tokens_per_second
+        ));
+        report.push_str(&format!(
+            "| end-to-end tok/s | {:.3}x |\n",
+            ratios.end_to_end_tokens_per_second
+        ));
+        report.push_str(&format!("| TTFT ms | {:.3}x |\n", ratios.ttft_ms));
+        report.push_str(&format!(
+            "| model load ms | {:.3}x |\n",
+            ratios.model_load_ms
+        ));
+    }
+    report
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirectRatios {
+    model_load_ms: f64,
+    ttft_ms: f64,
+    decode_tokens_per_second: f64,
+    end_to_end_tokens_per_second: f64,
+}
+
+fn direct_ratios(summaries: &[DirectSummary]) -> Option<DirectRatios> {
+    let native = summaries
+        .iter()
+        .find(|summary| summary.backend == DirectBackend::Native)?;
+    let ort = summaries
+        .iter()
+        .find(|summary| summary.backend == DirectBackend::Ort)?;
+    Some(DirectRatios {
+        model_load_ms: native.model_load_ms.median / ort.model_load_ms.median,
+        ttft_ms: native.ttft_ms.median / ort.ttft_ms.median,
+        decode_tokens_per_second: native.decode_tokens_per_second.median
+            / ort.decode_tokens_per_second.median,
+        end_to_end_tokens_per_second: native.end_to_end_tokens_per_second.median
+            / ort.end_to_end_tokens_per_second.median,
+    })
+}
+
+fn direct_json_report(
+    args: &Args,
+    model_dir: &Path,
+    prompt_mode: &str,
+    prompt_tokens: usize,
+    samples: &[DirectSample],
+    summaries: &[DirectSummary],
+    roofline: Option<&DirectRoofline>,
+) -> Value {
+    json!({
+        "model": model_dir.display().to_string(),
+        "prompt": args.prompt.clone(),
+        "prompt_mode": prompt_mode,
+        "prompt_tokens": prompt_tokens,
+        "generated_tokens_requested": args.max_tokens,
+        "decode_skip": args.decode_skip,
+        "warmups": args.warmups,
+        "runs": args.runs,
+        "methodology": {
+            "warmups": args.warmups,
+            "measured_repetitions": args.runs,
+            "statistic": "median with p10/p95 spread",
+            "sebastian_methodology": "defaults follow Sebastian's 1 warmup, 5 runs, 50 tokens, decode-skip 2 protocol"
+        },
+        "roofline": roofline.map(direct_roofline_json),
+        "summaries": summaries.iter().map(|summary| direct_summary_json(summary, roofline)).collect::<Vec<_>>(),
+        "ratios": direct_ratios(summaries).map(|ratios| json!({
+            "native_over_ort_model_load_ms": ratios.model_load_ms,
+            "native_over_ort_ttft_ms": ratios.ttft_ms,
+            "native_over_ort_decode_tokens_per_second": ratios.decode_tokens_per_second,
+            "native_over_ort_end_to_end_tokens_per_second": ratios.end_to_end_tokens_per_second,
+        })),
+        "samples": samples.iter().map(direct_sample_json).collect::<Vec<_>>(),
+    })
+}
+
+fn direct_roofline_json(roofline: &DirectRoofline) -> Value {
+    json!({
+        "measured_bandwidth_gbps": roofline.measured_bandwidth_gbps,
+        "model_weight_bytes": roofline.model_weight_bytes,
+        "ceiling_tokens_per_second": roofline.ceiling_tokens_per_second,
+        "threads": roofline.threads,
+        "bytes_per_thread": roofline.bytes_per_thread,
+        "repetitions": roofline.repetitions,
+    })
+}
+
+fn direct_summary_json(summary: &DirectSummary, roofline: Option<&DirectRoofline>) -> Value {
+    json!({
+        "backend": summary.backend.as_str(),
+        "model_load_ms": distribution_json(summary.model_load_ms),
+        "ttft_ms": distribution_json(summary.ttft_ms),
+        "decode_tokens_per_second": distribution_json(summary.decode_tokens_per_second),
+        "decode_roofline_fraction": roofline.map(|roofline| distribution_json(distribution_scale(
+            summary.decode_tokens_per_second,
+            roofline.model_weight_bytes as f64 / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
+        ))),
+        "end_to_end_tokens_per_second": distribution_json(summary.end_to_end_tokens_per_second),
+        "total_ms": distribution_json(summary.total_ms),
+        "generated_tokens": distribution_json(summary.generated_tokens),
+    })
+}
+
+fn direct_sample_json(sample: &DirectSample) -> Value {
+    json!({
+        "backend": sample.backend.as_str(),
+        "run": sample.run,
+        "model_load_ms": millis(sample.model_load),
+        "ttft_ms": millis(sample.ttft),
+        "decode_tokens_per_second": sample.decode_tokens_per_second,
+        "end_to_end_tokens_per_second": sample.end_to_end_tokens_per_second,
+        "total_ms": millis(sample.total),
+        "generated_tokens": sample.generated_tokens,
+    })
+}
+
+fn distribution_json(distribution: Distribution) -> Value {
+    json!({
+        "min": distribution.min,
+        "p10": distribution.p10,
+        "median": distribution.median,
+        "p90": distribution.p90,
+        "p95": distribution.p95,
+        "max": distribution.max,
+    })
+}
+
+fn distribution_scale(distribution: Distribution, scale: f64) -> Distribution {
+    Distribution {
+        min: distribution.min * scale,
+        p10: distribution.p10 * scale,
+        median: distribution.median * scale,
+        p90: distribution.p90 * scale,
+        p95: distribution.p95 * scale,
+        max: distribution.max * scale,
+    }
 }
 
 async fn probe_runtime(runtime: &RuntimeSpec) -> RuntimeState {
@@ -910,6 +1663,37 @@ fn metric_cell(distribution: Distribution, winner: bool, precision: usize) -> St
     }
 }
 
+fn spread_cell(distribution: Distribution, precision: usize) -> String {
+    format!(
+        "{:.*} [{:.*}, {:.*}]",
+        precision, distribution.median, precision, distribution.p10, precision, distribution.p95
+    )
+}
+
+fn percent_spread_cell(distribution: Distribution, precision: usize) -> String {
+    spread_cell(distribution_scale(distribution, 100.0), precision)
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn write_json_arg(path: &Path, value: &Value) -> Result<()> {
+    let json = format!("{}\n", serde_json::to_string_pretty(value)?);
+    if path.as_os_str() == "-" {
+        print!("{json}");
+        return Ok(());
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))
+}
+
 fn relative_latency(onnx: f64, competitor: f64) -> String {
     let percent = (onnx / competitor - 1.0) * 100.0;
     if percent <= 0.0 {
@@ -926,6 +1710,37 @@ fn relative_throughput(onnx: f64, competitor: f64) -> String {
     } else {
         format!("{:.1}% slower", -percent)
     }
+}
+
+/// Compute the decode throughput (tok/s) from a series of cumulative token
+/// timestamps.  `decode_skip` is the number of leading tokens to exclude from
+/// the decode window (e.g. 2 skips the first two tokens so TTFT + second-token
+/// warm-up don't inflate the decode rate).
+///
+/// Returns `(decode_tokens, decode_window, decode_tok_per_sec)`.
+fn decode_throughput(
+    token_times: &[Duration],
+    generated_tokens: usize,
+    decode_skip: usize,
+) -> Option<(usize, Duration, f64)> {
+    if token_times.is_empty() || token_times.len() <= decode_skip {
+        return None;
+    }
+    let decode_tokens = generated_tokens.saturating_sub(decode_skip);
+    let decode_start = if decode_skip > 0 {
+        token_times[decode_skip - 1]
+    } else {
+        Duration::ZERO
+    };
+    let decode_window = token_times[token_times.len() - 1].saturating_sub(decode_start);
+    if decode_tokens == 0 || decode_window.is_zero() {
+        return None;
+    }
+    Some((
+        decode_tokens,
+        decode_window,
+        decode_tokens as f64 / decode_window.as_secs_f64(),
+    ))
 }
 
 #[cfg(test)]
@@ -997,5 +1812,57 @@ tail"#
     fn winner_respects_metric_direction() {
         assert!(is_winner(1.0, [1.0, 2.0].into_iter(), Direction::Lower));
         assert!(is_winner(2.0, [1.0, 2.0].into_iter(), Direction::Higher));
+    }
+
+    /// Synthetic token-time series where correct decode tok/s is known
+    /// analytically.  Tokens arrive at a steady 100 ms cadence after a 500 ms
+    /// TTFT:
+    ///
+    ///   t0 = 500 ms  (TTFT / 1st token)
+    ///   t1 = 600 ms
+    ///   t2 = 700 ms
+    ///   t3 = 800 ms
+    ///   t4 = 900 ms
+    ///
+    /// 5 generated tokens total.
+    #[test]
+    fn decode_throughput_skip_0_1_2() {
+        let token_times: Vec<Duration> = (0..5)
+            .map(|i| Duration::from_millis(500 + i * 100))
+            .collect();
+        let generated = 5usize;
+
+        // skip=0 → all 5 tokens over 900 ms window (from t=0 to t=900ms)
+        let (tokens, window, tps) = decode_throughput(&token_times, generated, 0).unwrap();
+        assert_eq!(tokens, 5);
+        assert_eq!(window, Duration::from_millis(900));
+        let expected_tps_0 = 5.0 / 0.9;
+        assert!(
+            (tps - expected_tps_0).abs() < 0.01,
+            "skip=0: got {tps}, expected {expected_tps_0}"
+        );
+
+        // skip=1 → 4 tokens over window from t0=500ms to t4=900ms = 400 ms
+        let (tokens, window, tps) = decode_throughput(&token_times, generated, 1).unwrap();
+        assert_eq!(tokens, 4);
+        assert_eq!(window, Duration::from_millis(400));
+        let expected_tps_1 = 4.0 / 0.4;
+        assert!(
+            (tps - expected_tps_1).abs() < 0.01,
+            "skip=1: got {tps}, expected {expected_tps_1}"
+        );
+
+        // skip=2 → 3 tokens over window from t1=600ms to t4=900ms = 300 ms
+        let (tokens, window, tps) = decode_throughput(&token_times, generated, 2).unwrap();
+        assert_eq!(tokens, 3);
+        assert_eq!(window, Duration::from_millis(300));
+        let expected_tps_2 = 3.0 / 0.3;
+        assert!(
+            (tps - expected_tps_2).abs() < 0.01,
+            "skip=2: got {tps}, expected {expected_tps_2}"
+        );
+
+        // skip == len → None (not enough tokens)
+        assert!(decode_throughput(&token_times, generated, 5).is_none());
     }
 }

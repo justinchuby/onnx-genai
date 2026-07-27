@@ -48,8 +48,8 @@ cargo test -p onnx-genai-metadata --test metadata_fixtures \
 
 ## Known contract gaps
 
-See `.squad/decisions/inbox/deckard-diffusion-metadata.md` for the full fit/gap
-analysis. In short: the VAE **latent scaling factor** (0.18215) and **latent
-geometry** ([4,64,64], ÷8) are not yet expressible in metadata (the `render_sd`
-driver supplies them out-of-band), and non-`epsilon` `prediction_type`s are
-describable but not yet executable by the engine schedulers.
+See `.squad/decisions/inbox/deckard-diffusion-metadata.md` for the original
+fit/gap analysis. The VAE **latent scaling factor** (0.18215) and **latent
+geometry** ([4,64,64], ÷8) are still supplied out-of-band by `render_sd`.
+Continuous diffusion schedulers now execute `epsilon`, `v_prediction`, and
+`sample`/`x0`; `flow_matching` consumes velocity/vector-field output directly.

@@ -63,12 +63,12 @@ pipeline:
     cfg_conditioning_input: encoder_hidden_states # UNet port zeroed/replaced for uncond pass.
     guidance_scale: 7.5 # Non-negative CFG multiplier; 1.0 means no guidance combination.
     scheduler_config:
-      kind: euler # Scheduler algorithm; registry also includes ddim/euler_ancestral/dpmpp_2m/masked.
+      kind: euler # Registry also includes ddpm/ddim/euler_ancestral/dpmpp_2m/flow_matching/masked.
       num_train_timesteps: 1000 # Training-time schedule length in discrete steps.
       beta_start: 0.00085 # First variance beta in the training noise schedule.
       beta_end: 0.012 # Last variance beta in the training noise schedule.
       beta_schedule: scaled_linear # Stable-Diffusion-style beta schedule shape.
-      prediction_type: epsilon # Denoiser predicts noise; current engine supports only epsilon.
+      prediction_type: epsilon # Diffusion schedulers also support v_prediction and sample/x0.
       use_karras_sigmas: true # Use rho=7 Karras sigma spacing for Euler inference steps.
 
   # Per-component execution-phase gates.
