@@ -81,6 +81,14 @@ fn text(output: &Output) -> String {
     )
 }
 
+fn stdout_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 fn vlm() -> PathBuf {
     fixture("tiny-vlm-image-input")
 }
@@ -106,7 +114,7 @@ fn the_banner_reports_the_modalities_the_model_accepts() {
 
 #[test]
 fn help_lists_every_slash_command() {
-    let output = text(&repl(&text_model(), &[], "/help\n\n"));
+    let output = stdout_text(&repl(&text_model(), &[], "/help\n\n"));
 
     for command in [
         "/help", "/reset", "/raw", "/session", "/system", "/image", "/audio",
@@ -143,32 +151,43 @@ fn session_prints_structured_counts_without_message_content() {
 
 #[test]
 fn unknown_commands_are_reported_without_ending_the_session() {
-    let output = text(&repl(&text_model(), &[], "/nope\n/help\n\n"));
+    let output = repl(&text_model(), &[], "/nope\n/help\n\n");
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
 
-    assert!(output.contains("unknown command: /nope"), "{output}");
+    assert!(stderr.contains("unknown command: /nope"), "{stderr}");
     // The session survived: /help still ran afterwards.
-    assert!(output.contains("/system <text>"), "{output}");
+    assert!(stdout.contains("/system <text>"), "{stdout}");
 }
 
 #[test]
 #[cfg(unix)]
 fn piped_double_slash_remains_an_unknown_command() {
-    let output = text(&repl(&text_model(), &[], "//foo\n/help\n\n"));
+    let output = repl(&text_model(), &[], "//foo\n/help\n\n");
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
 
-    assert!(output.contains("unknown command: //foo"), "{output}");
+    assert!(stderr.contains("unknown command: //foo"), "{stderr}");
     assert!(
-        output.contains("/system <text>"),
-        "the session must continue after reporting the unknown command: {output}"
+        stdout.contains("/system <text>"),
+        "the session must continue after reporting the unknown command: {stdout}"
     );
 }
 
 #[test]
 #[cfg(unix)]
 fn piped_help_with_an_argument_still_prints_full_help() {
-    let bare_help = text(&repl(&text_model(), &[], "/help\n\n"));
-    let help_with_argument = text(&repl(&text_model(), &[], "/help anything\n\n"));
+    let bare_help = stdout_text(&repl(&text_model(), &[], "/help\n\n"));
+    let help_with_argument = stdout_text(&repl(&text_model(), &[], "/help anything\n\n"));
 
-    assert_eq!(help_with_argument, bare_help);
+    assert!(
+        bare_help.contains("/system <text>"),
+        "bare /help must print the full help listing: {bare_help}"
+    );
+    assert_eq!(
+        help_with_argument, bare_help,
+        "/help with an argument on the plain/piped path must print the same stdout help listing as bare /help"
+    );
 }
 
 #[test]
@@ -227,21 +246,25 @@ fn reset_drops_a_staged_attachment_before_it_is_sent() {
 #[test]
 fn a_rejected_attachment_keeps_the_session_alive() {
     let script = "/audio /nonexistent.wav\n/help\n\n";
-    let output = text(&repl(&vlm(), &["--raw"], script));
+    let output = repl(&vlm(), &["--raw"], script);
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
 
     // The VLM declares no audio contract, so the attachment is refused...
-    assert!(output.contains("What:"), "{output}");
-    assert!(output.contains("How:"), "{output}");
+    assert!(stderr.contains("What:"), "{stderr}");
+    assert!(stderr.contains("How:"), "{stderr}");
     // ...and the REPL is still accepting commands afterwards.
-    assert!(output.contains("/system <text>"), "{output}");
+    assert!(stdout.contains("/system <text>"), "{stdout}");
 }
 
 #[test]
 fn a_missing_attachment_path_is_reported_with_usage() {
-    let output = text(&repl(&vlm(), &["--raw"], "/image\n/help\n\n"));
+    let output = repl(&vlm(), &["--raw"], "/image\n/help\n\n");
+    let stdout = stdout_text(&output);
+    let stderr = stderr_text(&output);
 
-    assert!(output.contains("usage: /image <path>"), "{output}");
-    assert!(output.contains("/system <text>"), "{output}");
+    assert!(stderr.contains("usage: /image <path>"), "{stderr}");
+    assert!(stdout.contains("/system <text>"), "{stdout}");
 }
 
 #[test]

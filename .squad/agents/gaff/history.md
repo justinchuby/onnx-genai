@@ -148,3 +148,7 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 ## 2026-07-27T14:50:39-07:00 — PR #289 REPL phase 1 review
 
 - **Verdict:** 🔴 Reject. Non-TTY parser behavior is not byte-stable: `//` and `/help <arg>` now affect the plain piped path. Also found a TTY `--no-stats`/`/stats`-off newline seam where the next reedline prompt can attach to streamed output. Gates passed except targeted `repl_e2e` blocked by local ORT API mismatch (27 vs 17). Rachael locked out; named Zhora to revise.
+
+## 2026-07-27T15:11:14-07:00 — PR #289 REPL phase 1 re-review
+
+- **Verdict:** 🟢 Approve. Zhora's revision closes the plain-path parser drift (`//`, `/help <arg>`) and the live-renderer newline lifecycle bug. Build, lib tests, fmt, clippy, and crossterm tree passed; Windows could not execute Unix-only piped e2e, so parity was manually traced against `main`.
