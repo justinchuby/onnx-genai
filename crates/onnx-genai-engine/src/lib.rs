@@ -41,8 +41,9 @@ pub use engine::{
     GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
     KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion,
     MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId, SharedKvBinding,
-    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
+    PrioritizedGenerateResult, RewindTokenCount, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
+    SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
