@@ -1,7 +1,11 @@
 # Team Focus — now
 
-**Current focus:** Roadmap parallel wave landed (samplers, CPU/CUDA kernels, EP loader, CUDA discovery). Next: GLM/DeepSeek E2E blocked on mobius #404/#423/#430 merge; remaining open roadmap: #67 (more CUDA ops), #58 (SIMD), #13, #86 (flash-tiling).
+**Current focus:** Roadmap CUDA/CPU parity and performance. Wave-5 landed PRs #265/#266/#267: portable half-GEMM SIMD, CUDA coverage batch 2 with stable ReduceLogSumExp, and `pkg.nxrt::VarlenAttention` with bf16 parity coverage.
 
-Concurrent other-squad refactoring (#206/#207/#228/#230) is ongoing.
+**Remaining unblocked:** #67 more CUDA ops, #69 conformance, #13 tracing, #51 VAE.
 
-**Updated:** 2026-07-27T10:09:19+00:00
+**Blocked:** GLM/DeepSeek E2E awaits Justin merging Mobius #404/#423/#430.
+
+Concurrent other-squad refactoring remains active; preserve its split-* decision-inbox records.
+
+**Updated:** 2026-07-27T13:12:20+00:00

@@ -55,3 +55,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-24T15:10:00Z — Qwen decode-correctness locks
 
 Authored bit-exact native-CUDA-versus-ORT 64-token decode locks for Qwen2.5-0.5B and 7B. Chew approved; the shared `common/decode_lock.rs` helper is now co-owned with Leon and Pris for Qwen/Phi coverage.
+
+## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
+
+- Under Leon's lockout, added bf16 harness support and ragged causal/non-causal VarlenAttention parity tests; Bishop approved PR #267.

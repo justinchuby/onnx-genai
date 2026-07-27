@@ -89,3 +89,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-26T20:00:00Z — Scribe update
 
 - 2026-07-26T20:00:04Z — Repaired PR #203 coverage under lockout by changing the split-K numeric test to `n=1152`, exercising `matmul_nbits_gemv_f16_scales_f16_splitk`.
+
+## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
+
+- PR #265 for #58 merged after Hicks approved runtime-dispatched AVX2/F16C and NEON f16/bf16 GEMM SIMD, including scalar/tail fallbacks and parity coverage.
