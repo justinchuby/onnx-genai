@@ -267,9 +267,7 @@ impl NativeDecodeSession {
 
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
-                "native decode requires decoder-with-past I/O; past inputs: {:?}, present outputs: {:?}",
-                kv_inputs,
-                present_outputs
+                "native decode requires decoder-with-past I/O; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
             );
         }
 
@@ -289,8 +287,7 @@ impl NativeDecodeSession {
             for output in &present_outputs {
                 let Some(input) = matching_past_name(output, &kv_inputs) else {
                     bail!(
-                        "native decoder present output '{output}' has no matching past input; inputs: {:?}",
-                        kv_inputs
+                        "native decoder present output '{output}' has no matching past input; inputs: {kv_inputs:?}"
                     );
                 };
                 present_to_past.insert(output.clone(), input);
@@ -298,9 +295,7 @@ impl NativeDecodeSession {
         }
         if present_to_past.len() != kv_inputs.len() {
             bail!(
-                "native decoder has incomplete past/present pairs; past inputs: {:?}, present outputs: {:?}",
-                kv_inputs,
-                present_outputs
+                "native decoder has incomplete past/present pairs; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
             );
         }
 

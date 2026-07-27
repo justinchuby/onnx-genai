@@ -53,7 +53,7 @@ pub(crate) fn genai_config_compat_metadata_from_model_path(
         }
         None => onnx_genai_genai_config::inference_metadata_from_dir(model_dir, None),
     };
-    result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {}", e))
+    result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
 }
 
 /// Best-effort decoder graph inventory read straight from an ONNX model file,

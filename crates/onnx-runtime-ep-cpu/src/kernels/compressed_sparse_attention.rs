@@ -4174,8 +4174,7 @@ mod tests {
                     observed_quantization_error |= error > 0.0;
                     assert!(
                         error <= scale,
-                        "FP4 error {error} exceeds half of the maximum E2M1 gap {}",
-                        scale
+                        "FP4 error {error} exceeds half of the maximum E2M1 gap {scale}"
                     );
                     dense.push(dequantized);
                 }

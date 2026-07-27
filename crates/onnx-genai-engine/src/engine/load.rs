@@ -165,7 +165,7 @@ impl Engine {
             let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
             if let Some(metadata_path) = &model_directory.metadata_path {
                 onnx_genai_metadata::load_metadata(metadata_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
+                    .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"))?
             } else if let Some(compat) = genai_config_compat_metadata_from_model_path(
                 &model_directory.root,
                 &model_directory.model_path,
@@ -178,13 +178,13 @@ impl Engine {
         };
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
         if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
+            anyhow::bail!("Unsupported capabilities: {unsupported:?}");
         }
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
             Tokenizer::from_file(&model_directory.tokenizer_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
         };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let governor_kv_config = governor_kv_config(None, &config)?;
@@ -238,7 +238,7 @@ impl Engine {
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
-                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
 
         Ok(Self {
