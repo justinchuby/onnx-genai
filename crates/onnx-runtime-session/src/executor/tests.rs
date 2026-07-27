@@ -123,6 +123,80 @@ fn zero_copy_output_move_reallocates_and_preserves_producer_less_output() {
     }
 }
 
+fn inplace_chain_graph(keep_input_output: bool, keep_input_live: bool) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([4]));
+    graph.add_input(input);
+    let first = graph.create_named_value("first", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Tanh", vec![Some(input)], vec![first]));
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    if keep_input_live {
+        graph.insert_node(Node::new(
+            NodeId(1),
+            "Add",
+            vec![Some(input), Some(first)],
+            vec![output],
+        ));
+    } else {
+        graph.insert_node(Node::new(
+            NodeId(1),
+            "Tanh",
+            vec![Some(first)],
+            vec![output],
+        ));
+    }
+    if keep_input_output {
+        graph.add_output(input);
+        graph.add_output(first);
+    }
+    graph.add_output(output);
+    graph
+}
+
+#[test]
+fn compute_in_place_chain_is_byte_identical_and_fires() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+    let mut enabled = Executor::build(
+        inplace_chain_graph(false, false),
+        Arc::clone(&weights),
+        Arc::clone(&ep),
+    )
+    .unwrap();
+    let enabled_output = enabled.run(&[("input", &values)]).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+    assert_eq!(enabled.compute_in_place_alias_count, 2);
+
+    let mut disabled = Executor::build(inplace_chain_graph(false, false), weights, ep).unwrap();
+    disabled.compute_in_place_enabled = false;
+    let disabled_output = disabled.run(&[("input", &values)]).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+    assert_eq!(disabled.compute_in_place_alias_count, 0);
+    assert_eq!(enabled_output, disabled_output);
+}
+
+#[test]
+fn compute_in_place_refuses_live_and_graph_output_inputs() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    for (keep_input_output, keep_input_live) in [(true, false), (false, true)] {
+        let mut executor = Executor::build(
+            inplace_chain_graph(keep_input_output, keep_input_live),
+            Arc::new(WeightStore::new()),
+            auto_detect_cpu_ep().unwrap(),
+        )
+        .unwrap();
+        let outputs = executor.run(&[("input", &values)]).unwrap();
+        assert_eq!(executor.compute_in_place_alias_count, 0);
+        if keep_input_output {
+            assert_eq!(outputs[0].as_bytes(), values.as_bytes());
+        }
+    }
+}
+
 struct CaptureDecliningKernel;
 
 impl Kernel for CaptureDecliningKernel {

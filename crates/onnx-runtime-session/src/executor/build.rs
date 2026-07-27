@@ -503,6 +503,8 @@ impl Executor {
             decode_dispatch_elided_count: 0,
             decode_view_plan_sig_mismatch_streak: 0,
             decode_view_plan_disabled: false,
+            compute_in_place_enabled: compute_in_place_env_enabled(),
+            compute_in_place_alias_count: 0,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -513,8 +515,8 @@ impl Executor {
             let mut span = trace_span("session.static_materialize", "session");
             let empty = HashMap::new();
             let resolved = exec.resolve_all(&empty)?;
-            exec.size_buffers(&resolved)?;
             exec.compile_all(&resolved)?;
+            exec.size_buffers(&resolved)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(
                     Args::new()
@@ -893,7 +895,26 @@ impl Executor {
                 outputs,
                 input_dtypes,
                 output_dtypes,
+                inplace_dead_inputs: Vec::new(),
             });
+        }
+        let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
+        let mut last_use = HashMap::new();
+        for (pi, node) in plan.iter().enumerate() {
+            for vid in node.inputs.iter().flatten() {
+                last_use.insert(*vid, pi);
+            }
+        }
+        for (pi, node) in plan.iter_mut().enumerate() {
+            node.inplace_dead_inputs = node
+                .inputs
+                .iter()
+                .map(|input| {
+                    input.is_some_and(|vid| {
+                        last_use.get(&vid) == Some(&pi) && !graph_outputs.contains(&vid)
+                    })
+                })
+                .collect();
         }
         if let Some(span) = plan_span.as_mut() {
             span.set_args(
