@@ -24,6 +24,17 @@ def test_eager_attributes_and_cache_stats():
     assert {"entries", "hits", "misses"} <= stats.keys()
 
 
+def test_eager_dispatch_multi_output_topk():
+    values, indices = nxrt.eager.dispatch(
+        "TopK",
+        [np.array([[2.0, 5.0, 5.0, 1.0]], dtype=np.float32), np.array(2, dtype=np.int64)],
+        {"axis": 1, "largest": 1, "sorted": 1},
+        outputs=2,
+    )
+    np.testing.assert_array_equal(values, [[5.0, 5.0]])
+    np.testing.assert_array_equal(indices, [[1, 2]])
+
+
 def test_genai_submodule_import_and_missing_directory_error():
     from nxrt.genai import Engine, GenerateResult
 
