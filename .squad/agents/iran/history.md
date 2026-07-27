@@ -173,3 +173,32 @@ fusion. Both require significant infrastructure changes. Recommended FP16 as nex
 (model at 959 MB → projected ~85 tok/s, ORT on FP16 gets ~42 tok/s).
 
 **Commits this session:** 708a672c (docs only, attribution update)
+
+## 2026-07-27T09:50:00Z — Session 8: SPMD pool for FP32 + cleanup
+
+**Context:** Coordinator insisted on persistent pool despite session 5 showing only 3%
+improvement. Key insight: session 5 tested BEFORE batch_shape fix → GEMVs went through
+wrong path (outer product). After batch_shape fix, SPMD pool IS effective for col-parallel.
+
+**The breakthrough: SPMD pool with P_cores - 1 workers**
+- Tested SPMD pool thread counts: 5=37, 7=43.5, 8=41, 9=36 tok/s
+- Optimal: 7 workers (P_cores - 1 = 8 - 1) — dispatcher + 7 workers = 8 P-cores
+- Added `performance_core_count()` via hw.perflevel0.physicalcpu for Apple Silicon
+- Enabled auto-calibration for dense FP32 models (was restricted to quantized only)
+
+**Results (M1 Max, Qwen2.5-0.5B FP32):**
+| | p50 ms | tok/s | GB/s | Roof% |
+|---|---|---|---|---|
+| ORT (baseline) | 22.1 | 45.2 | ~87 | 78% |
+| **Native (SPMD)** | **23.5** | **42.6** | **~82** | **73%** |
+| Native (Rayon, before) | 30.0 | 33.3 | ~65 | 58% |
+| Native (original) | ~307 | 3.26 | ~6 | 5% |
+
+**Improvement: 13× from baseline (3.26 → 42.6 tok/s), 94% of ORT.**
+
+**Chew review items folded in:**
+- C1: Fixed SiLU docstring (was ~1 ULP, measured ~28 ULP)
+- C3: Removed 7 dead Accelerate sgemv items + 3 dead tests
+- C4: Removed unused `half` variable
+
+**Commit:** 3a88ba8c
