@@ -57,14 +57,18 @@
 //! workers and non-participating dispatcher contend with the neighbours (the
 //! flat path degrades gracefully; the barrier does not). There is no portable,
 //! reliable "current host load" API across Linux/macOS/Windows and x86_64/aarch64,
-//! so instead of *guessing* the host state we *measure* it: because the pool is
-//! token-exact (N-tile aligned, PR #110), switching paths never changes the
-//! emitted tokens, so Auto can time the *same real decode step* both ways on the
-//! live workload and keep the faster one. See [`Calibrator`] for the state
-//! machine. The default committed path is the flat path (the safe choice under
-//! load), the pool is adopted only when it is measured meaningfully faster
-//! (hysteresis margin), and the choice is periodically re-probed so a host that
-//! becomes loaded mid-generation falls back within one recalibration window.
+//! so instead of *guessing* the host state we *measure* it: Auto times the
+//! *same real decode step* both ways on the live workload and keeps the faster
+//! one. See [`Calibrator`] for the state machine. The default committed path
+//! is the flat path (the safe choice under load), the pool is adopted only
+//! when it is measured meaningfully faster (hysteresis margin).
+//!
+//! **The path is frozen once committed.** The flat and pool paths use different
+//! floating-point reduction orders (single-threaded vs partitioned parallel),
+//! so switching mid-generation changes logits and can produce different tokens
+//! under greedy decode. The calibrator decides once at the start of each
+//! process and stays committed for the remainder of the session.
+//!
 //! This makes "never regress vs the flat path under load" a *measured* property
 //! rather than a heuristic hope, while still winning out-of-the-box on an idle
 //! host. The forced worker count is
@@ -1203,9 +1207,9 @@ fn report_pool_built(mode: PersistenceMode) {
             ),
             _ => eprintln!(
                 "onnx-genai: persistent SPMD decode pool built for auto-calibration \
-                 (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL unset); each decode step is timed \
-                 both ways and the faster path is kept -- the flat path stays committed \
-                 under load. Set =0 to force flat, =1 to force the pool"
+                 (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL unset); the initial decode steps \
+                 are timed both ways and the faster path is kept permanently -- the flat \
+                 path stays committed under load. Set =0 to force flat, =1 to force the pool"
             ),
         }
     }
@@ -1217,9 +1221,10 @@ fn report_pool_built(mode: PersistenceMode) {
 // ---------------------------------------------------------------------------
 
 /// Which decode path a single `Auto`-mode decode step should take. Both paths are
-/// token-exact (the pool is N-tile aligned, PR #110), so switching between them
-/// never changes the emitted tokens -- that is exactly what lets calibration time
-/// the *same real workload* both ways.
+/// The flat and pool paths use different floating-point reduction orders, so
+/// switching between them can produce different logits under greedy decode.
+/// The calibrator freezes the path once committed to avoid mid-generation
+/// non-determinism.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoPath {
     /// Dispatch this step's projections to the persistent SPMD pool.
@@ -1239,11 +1244,6 @@ const CALIB_WARMUP_STEPS: u64 = 2;
 /// keeping the probe short (a probe costs `2 * CALIB_PROBE_SAMPLES` real steps,
 /// half of them possibly-slower pool steps).
 const CALIB_PROBE_SAMPLES: usize = 5;
-/// Committed steps between re-probes. Long enough that probe overhead is
-/// negligible (a probe is `<= 2 * CALIB_PROBE_SAMPLES` steps per period, so
-/// worst-case < ~2% of steps ever run a possibly-slower pool probe), short enough
-/// that a host which becomes loaded mid-generation falls back within one window.
-const CALIB_RECAL_PERIOD: u64 = 600;
 /// Hysteresis margin: the pool is adopted only when its median step time is at
 /// least this percent faster than the flat path. Biases toward the flat path (the
 /// regression-safe default) and prevents flapping when the two paths are close.
@@ -1306,18 +1306,27 @@ enum CalibPhase {
 ///   look slow. (An interleaved probe *did* mis-commit to the pool under load;
 ///   see `.squad/decisions.md`, Hudson 2026-07-24.)
 /// * The only pool work done while the flat path is committed is a bounded probe
-///   (`<= CALIB_PROBE_SAMPLES` pool steps per [`CALIB_RECAL_PERIOD`] steps, plus a
-///   one-time warmup), so the worst case is a small, self-correcting number of
-///   possibly-slower steps -- never a sustained regression.
-/// * Re-probing lets a host that *becomes* loaded mid-generation fall back within
-///   one recalibration window, and a host that *becomes* idle adopt the pool.
+///   (`<= CALIB_PROBE_SAMPLES` pool steps during calibration, plus a one-time
+///   warmup), so the worst case is a small number of possibly-slower steps during
+///   the initial calibration -- never a sustained regression.
 /// * A probe block hit by a *transient* co-tenant burst (non-uniform samples --
 ///   see [`block_contended`]) is discarded and re-collected (bounded by
 ///   [`CALIB_MAX_REPROBES`]) rather than committed, so a momentary spike on the
-///   pool block no longer locks the slower flat path in for a whole window. A
+///   pool block no longer locks the slower flat path in permanently. A
 ///   *uniformly* slow block (genuine sustained load) is never flagged, so this
 ///   only ever avoids acting on unreliable data -- it cannot regress a clean or a
 ///   steadily-loaded measurement.
+///
+/// # Path freezing
+///
+/// Once the calibrator commits to a path (pool or flat), it stays committed
+/// permanently. The flat and pool paths use different floating-point reduction
+/// orders, so switching mid-generation changes logits and produces different
+/// tokens under greedy decode. A host that becomes loaded after commitment will
+/// run the (now-suboptimal) pool path for the rest of the session; this is
+/// the correct trade-off because deterministic output is more important than
+/// adapting to load changes. Use `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0` to
+/// force flat if the host is known to be loaded.
 ///
 /// The decision logic is pure (no threads, no clock; the only env read is an
 /// optional `NXRT_CALIB_DEBUG` diagnostic print that never affects the choice), so
@@ -1329,7 +1338,6 @@ struct Calibrator {
     pool_ns: Vec<u64>,
     flat_ns: Vec<u64>,
     committed: AutoPath,
-    committed_left: u64,
     reprobes_left: u32,
 }
 
@@ -1344,7 +1352,6 @@ impl Calibrator {
             // Default to the flat path: the safe, no-regression baseline that a
             // host which never lets the pool win keeps forever.
             committed: AutoPath::Flat,
-            committed_left: 0,
             reprobes_left: CALIB_MAX_REPROBES,
         }
     }
@@ -1386,10 +1393,9 @@ impl Calibrator {
                 }
             }
             CalibPhase::Committed => {
-                self.committed_left = self.committed_left.saturating_sub(1);
-                if self.committed_left == 0 {
-                    self.enter_flat_probe();
-                }
+                // Path is frozen once committed. The flat and pool paths use
+                // different FP reduction orders, so switching mid-generation
+                // produces non-deterministic tokens under greedy decode.
             }
         }
     }
@@ -1473,7 +1479,8 @@ impl Calibrator {
             );
         }
         self.phase = CalibPhase::Committed;
-        self.committed_left = CALIB_RECAL_PERIOD;
+        // Path is frozen permanently — no re-probe. See the "Path freezing"
+        // section in the struct-level docs.
         self.reprobes_left = CALIB_MAX_REPROBES;
         self.pool_ns.clear();
         self.flat_ns.clear();
@@ -2035,21 +2042,18 @@ mod tests {
     }
 
     #[test]
-    fn calibrator_reprobes_after_the_recal_period_and_can_fall_back() {
-        // Adopt the pool on a quiet probe, then simulate the host becoming loaded:
-        // after CALIB_RECAL_PERIOD committed steps the machine re-probes, measures
-        // the pool as slower, and falls back to the flat path within one window.
+    fn calibrator_stays_committed_permanently_after_initial_probe() {
+        // Adopt the pool on a quiet probe, then verify the path stays frozen
+        // indefinitely — no re-probe, no mid-generation switching.
         let mut calib = run_one_probe(80, 100);
         assert_eq!(calib.committed, AutoPath::Pool);
-        // Burn the committed window; choose() keeps returning Pool until re-probe.
-        for _ in 0..CALIB_RECAL_PERIOD {
+        // Feed many more steps than the old CALIB_RECAL_PERIOD (600):
+        // the path must never leave Committed.
+        for _ in 0..2000 {
             assert_eq!(calib.choose(), AutoPath::Pool);
             calib.record(AutoPath::Pool, 80);
+            assert_eq!(calib.phase, CalibPhase::Committed);
         }
-        assert_eq!(calib.phase, CalibPhase::ProbeFlat);
-        // Now the host is loaded: pool probes slow, flat probes fast.
-        drive_to_commit(&mut calib, 300, 100);
-        assert_eq!(calib.committed, AutoPath::Flat);
     }
 
     #[test]
