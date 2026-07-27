@@ -5021,7 +5021,10 @@ mod tests {
     fn all_pasts_consumed_by_gqa_true_only_when_every_past_feeds_gqa() {
         let past = "past_key_values.0.key".to_string();
         let gqa_graph = graph_with_gqa_consuming_past(&past);
-        assert!(all_pasts_consumed_by_gqa(&gqa_graph, &[past.clone()]));
+        assert!(all_pasts_consumed_by_gqa(
+            &gqa_graph,
+            std::slice::from_ref(&past)
+        ));
         // A past that no GQA node consumes must not enable the in-place path.
         assert!(!all_pasts_consumed_by_gqa(
             &gqa_graph,
