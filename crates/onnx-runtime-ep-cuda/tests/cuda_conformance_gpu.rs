@@ -364,6 +364,237 @@ fn not_case() -> Case {
     }
 }
 
+/// Bitwise binary parity cases (`BitwiseAnd`/`BitwiseOr`/`BitwiseXor`) over a
+/// signed and an unsigned dtype, including a broadcast case. Integer results are
+/// compared byte-exactly against the CPU oracle (`bitwise.rs`).
+fn bitwise_binary_cases(op: &'static str) -> Vec<Case> {
+    let a32: Vec<i32> = vec![0x0f0f, -1, 0x1234, 0, 0x7fff_ffff, -256];
+    let b32: Vec<i32> = vec![0x00ff, 0x0f0f, -1, 123, 0x0f0f_0f0f, 0xff];
+    let a8: Vec<u8> = vec![0xf0, 0x3c, 0x55, 0x81];
+    let b8: Vec<u8> = vec![0x0f, 0x33, 0xaa, 0x81];
+    vec![
+        Case {
+            label: format!("{op}[i32]"),
+            op,
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int32, &[6], &a32),
+                input(DataType::Int32, &[6], &b32),
+            ],
+            outputs: vec![(DataType::Int32, vec![6])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: format!("{op}[u8]"),
+            op,
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[4], &a8),
+                input(DataType::Uint8, &[4], &b8),
+            ],
+            outputs: vec![(DataType::Uint8, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        // Broadcast [3,1] x [1,4] -> [3,4], u8.
+        Case {
+            label: format!("{op}[u8,broadcast]"),
+            op,
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[3, 1], &[0xf0u8, 0x3c, 0x55]),
+                input(DataType::Uint8, &[1, 4], &[0x0fu8, 0x33, 0xaa, 0x81]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![3, 4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+/// `BitwiseNot` parity over a signed and an unsigned dtype.
+fn bitwise_not_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "BitwiseNot[i32]".into(),
+            op: "BitwiseNot",
+            domain: "",
+            opset: 18,
+            inputs: vec![input(DataType::Int32, &[5], &[0i32, -1, 0x1234, 255, -256])],
+            outputs: vec![(DataType::Int32, vec![5])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitwiseNot[u16]".into(),
+            op: "BitwiseNot",
+            domain: "",
+            opset: 18,
+            inputs: vec![input(
+                DataType::Uint16,
+                &[4],
+                &[0u16, 0x00ff, 0xf0f0, 0xffff],
+            )],
+            outputs: vec![(DataType::Uint16, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+/// `BitShift` parity: LEFT and RIGHT over unsigned dtypes, including a shift
+/// amount `>=` the element width (which must yield `0`, matching the CPU
+/// `checked_shl`/`checked_shr` contract) and a broadcast.
+fn bitshift_cases() -> Vec<Case> {
+    let dir = |d: &str| ("direction", Attribute::String(d.as_bytes().to_vec()));
+    vec![
+        Case {
+            label: "BitShift[u32,LEFT]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint32, &[5], &[1u32, 3, 8, 0x8000_0000, 255]),
+                input(DataType::Uint32, &[5], &[0u32, 1, 4, 1, 3]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![5])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u8,RIGHT,overshift]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            // Shift of 8 on a u8 must produce 0 (>= width).
+            inputs: vec![
+                input(DataType::Uint8, &[4], &[0x80u8, 0xff, 0x10, 0x01]),
+                input(DataType::Uint8, &[4], &[1u8, 4, 8, 0]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![4])],
+            attrs: vec![dir("RIGHT")],
+            compare: Compare::ExactBytes,
+        },
+        // Broadcast [2,1] x [1,3] -> [2,3], u16 LEFT.
+        Case {
+            label: "BitShift[u16,LEFT,broadcast]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint16, &[2, 1], &[3u16, 8]),
+                input(DataType::Uint16, &[1, 3], &[0u16, 1, 2]),
+            ],
+            outputs: vec![(DataType::Uint16, vec![2, 3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+/// `LogSoftmax` parity, f32/f16/bf16, opset-13 last-axis and legacy opset-11
+/// coerce-to-2D, including a large-magnitude row to exercise the stable
+/// shifted-logsumexp path (the #266 overflow lesson).
+fn log_softmax_cases() -> Vec<Case> {
+    // Mix of ordinary and large-magnitude logits (last row) so a naive
+    // log(sum(exp(x))) would overflow while the stable path stays finite.
+    let values: Vec<f32> = vec![
+        1.0, 2.0, 3.0, 0.5, //
+        -1.0, 0.0, 1.0, 2.0, //
+        80.0, 79.0, 78.0, 81.0,
+    ];
+    let shape = vec![3usize, 4];
+    let mut cases = Vec::new();
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("LogSoftmax[{dtype:?},opset13]"),
+            op: "LogSoftmax",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &shape, &values)],
+            outputs: vec![(dtype, shape.clone())],
+            attrs: vec![("axis", Attribute::Int(-1))],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        });
+    }
+    // Legacy opset-11 coerce-to-2D over a rank-3 input, f32.
+    cases.push(Case {
+        label: "LogSoftmax[Float32,opset11,coerce2d]".into(),
+        op: "LogSoftmax",
+        domain: "",
+        opset: 11,
+        inputs: vec![input(
+            DataType::Float32,
+            &[2, 2, 2],
+            &[1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
+        )],
+        outputs: vec![(DataType::Float32, vec![2, 2, 2])],
+        attrs: vec![("axis", Attribute::Int(1))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    // Interior-axis reduction (inner > 1), f32.
+    cases.push(Case {
+        label: "LogSoftmax[Float32,axis1,inner]".into(),
+        op: "LogSoftmax",
+        domain: "",
+        opset: 13,
+        inputs: vec![input(
+            DataType::Float32,
+            &[2, 3, 4],
+            &(0..24).map(|v| (v as f32) * 0.3 - 3.0).collect::<Vec<_>>(),
+        )],
+        outputs: vec![(DataType::Float32, vec![2, 3, 4])],
+        attrs: vec![("axis", Attribute::Int(1))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    cases
+}
+
+/// `Hardmax` parity, f32/f16/bf16: one-hot of the first maximum, including a tie
+/// (first index wins) and an interior negative axis. Outputs are canonical
+/// `0`/`1` so bytes match the CPU oracle exactly.
+fn hardmax_cases() -> Vec<Case> {
+    // Row 1 has a tie at indices 1 and 2 (both 5.0) -> index 1 must win.
+    let tie_values: Vec<f32> = vec![1.0, 5.0, 5.0, 2.0, 7.0, 3.0, 6.0, 4.0];
+    let mut cases = Vec::new();
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("Hardmax[{dtype:?},last-axis,tie]"),
+            op: "Hardmax",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &[2, 4], &tie_values)],
+            outputs: vec![(dtype, vec![2, 4])],
+            attrs: vec![("axis", Attribute::Int(-1))],
+            compare: Compare::ExactBytes,
+        });
+    }
+    // Interior negative axis on a rank-3 input, f32.
+    cases.push(Case {
+        label: "Hardmax[Float32,axis-2]".into(),
+        op: "Hardmax",
+        domain: "",
+        opset: 13,
+        inputs: vec![input(
+            DataType::Float32,
+            &[2, 3, 2],
+            &[
+                1.0f32, 4.0, 3.0, 2.0, 3.0, 5.0, 6.0, 1.0, 6.0, 2.0, 1.0, 3.0,
+            ],
+        )],
+        outputs: vec![(DataType::Float32, vec![2, 3, 2])],
+        attrs: vec![("axis", Attribute::Int(-2))],
+        compare: Compare::ExactBytes,
+    });
+    cases
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The conformance profile: one entry per CUDA_COVERED_OPS op.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -522,6 +753,15 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "SkipLayerNormalization",
         vec![skip_layer_norm_case()],
     ));
+
+    // Batch 4 (issue #67): integer bitwise + softmax-family axis reductions.
+    p.push(sweep("BitwiseAnd", bitwise_binary_cases("BitwiseAnd")));
+    p.push(sweep("BitwiseOr", bitwise_binary_cases("BitwiseOr")));
+    p.push(sweep("BitwiseXor", bitwise_binary_cases("BitwiseXor")));
+    p.push(sweep("BitwiseNot", bitwise_not_cases()));
+    p.push(sweep("BitShift", bitshift_cases()));
+    p.push(sweep("LogSoftmax", log_softmax_cases()));
+    p.push(sweep("Hardmax", hardmax_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.
