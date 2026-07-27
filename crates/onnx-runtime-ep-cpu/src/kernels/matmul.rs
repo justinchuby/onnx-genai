@@ -492,19 +492,11 @@ impl MatMulKernel {
                 .saturating_mul(2)
         });
 
-        // Dedicated half-precision path: contiguous f16/bf16 operands stay in
-        // 16-bit storage and are packed in cache-sized panels for f32
-        // accumulation. Bf16 may use the runtime-gated AVX-512 BF16 kernel;
-        // every other host uses the portable blocked implementation.
-        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom)? {
-            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
-        }
-
         // FP16 storage GEMV: when B is a constant Float16 weight and M=1
         // (decode), GEMV directly from the f16 mmap'd data — reading 2 bytes
-        // per weight instead of 4, halving memory bandwidth. Activations (A)
-        // are widened to f32, weights are widened in-register via NEON fcvtl,
-        // accumulation is in f32. The output is f32 and narrowed if needed.
+        // per weight instead of 4, halving memory bandwidth. This MUST be
+        // checked before try_matmul_half: the blocked GEMM is ~4× slower than
+        // the bandwidth-optimal NEON GEMV at M=1 decode shapes.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if backend == CpuBackend::Accelerate
             && geom.m == 1
@@ -524,6 +516,14 @@ impl MatMulKernel {
                 geom.k,
                 geom.n,
             );
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
+        // Dedicated half-precision path: contiguous f16/bf16 operands stay in
+        // 16-bit storage and are packed in cache-sized panels for f32
+        // accumulation. Bf16 may use the runtime-gated AVX-512 BF16 kernel;
+        // every other host uses the portable blocked implementation.
+        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom)? {
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
