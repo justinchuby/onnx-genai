@@ -117,3 +117,6 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 - Wrote `docs\research\cli\05-repl-redesign.md` after Justin clarified the CLI is a maintainer tool and the REPL is the primary CLI investment.
 - Recommended preserving ratatui inline viewport/native scrollback, adding a TTY-only `reedline` editor, generating slash help/completions from a declarative registry, and keeping non-TTY e2e output byte-stable.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.

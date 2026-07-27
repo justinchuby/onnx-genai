@@ -30,3 +30,6 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-27T16:48:00+00:00 — Batch decode correction
 - Batch decode favors the native path at B≥2, but the earlier 15x-vs-ORT claim was retracted after measuring ORT at B=32 (~345 tok/s under high load). Current cautious estimate is ~4–5x pending same-load remeasurement. Commit `ad920725` title is retracted.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.

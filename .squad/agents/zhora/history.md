@@ -114,3 +114,6 @@ Zhora approved Rutger's clippy cleanup; required Clippy and targeted tests passe
 
 ### 2026-07-27 — CLI maintainer-tool backlog queued
 Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.

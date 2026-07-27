@@ -144,3 +144,6 @@ Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path
 - Reconciled Justin's directive that `onnx-genai` CLI is a maintainer/debug harness, not a consumer local-inference product.
 - Wrote `docs/research/cli/00-backlog.md` as the research entry point: P0 now prioritizes hidden live stats, structured output, local bench/batch harness, reachable engine features, and help snapshots.
 - Explicitly rejected remote-client mode, model registry/pull, conversion/fine-tune product loops, and a standalone lib.rs split; Wierzbowski's earlier split makes more refactor only worthwhile when tied to P0/P1 work.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
