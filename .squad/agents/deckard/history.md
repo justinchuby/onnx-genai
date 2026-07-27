@@ -101,3 +101,7 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Under Moss's lockout, repaired PR #266 ReduceLogSumExp numerical stability with a dedicated two-pass reduction; Ferro approved and the PR merged.
+
+### 2026-07-27 — Runtime capability inventory for REPL design
+
+Authored `docs/research/cli/04-runtime-capability-inventory.md` as Deckard. Key finding: the runtime has strong low-level primitives (paged KV CoW fork, rewind/checkpoint, prefix reuse, speculative stats, continuous batching), but the REPL currently drives mostly CLI-side chat history rather than engine persistent sessions. Session fork and real undo/rewind need new engine APIs; many other high-value REPL surfaces are CLI wiring over existing APIs.
