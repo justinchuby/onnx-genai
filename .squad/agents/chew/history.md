@@ -119,3 +119,16 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 
 - Independent APPROVE for PR #208 landed with the merge commit `5eb0d8db`, closing #88. Guard proof remains the key review evidence: removing `!capturing` at `rotary_embedding.rs:495` made the new test fail with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, then restoring it passed.
 
+## 2026-07-27T01:30:00-07:00 — PR #227 CPU EP NEON numerics review
+
+- **APPROVE with concerns** for Iran's 4-commit CPU EP optimization branch (`squad/mac-cpu-ep-roofline`): NEON SiLU, SDPA, GEMV, Accelerate sgemm, dtype fast path.
+- SiLU polynomial: measured ~28 ULP in practical range (claimed ~1 ULP — docstring incorrect). Acceptable for inference.
+- Swish→SiLU canonicalization: exact f32 equality correct, no silent misroute.
+- SDPA NEON: numerics sound (softmax max-subtraction stability inherited), but zero test coverage for the NEON dispatch path — all tests call scalar reference directly.
+- GEMV: transpose correct, tail handling correct, f32 accumulation throughout. Guard-break test passed.
+- dtype.rs f32 memcpy: contiguity guard is sound.
+- matmul_nbits.rs: visibility change only, safe.
+- All NEON intrinsics are ARMv8 baseline. No hardcoded cache/thread counts.
+- 7 dead code items from removed Accelerate sgemv path.
+- Filed to `.squad/decisions/inbox/chew-pr227-numerics-review.md`.
+
