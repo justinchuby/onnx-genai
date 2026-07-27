@@ -102,3 +102,9 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - Took Chew's approved non-blocking C1/C2 follow-ups from Iran's FP16 CPU EP work: documented the `fcvtl`/`fcvtn` inline-asm rationale and future intrinsic replacement path, tightened FP16 GEMV tolerances to 1e-4 relative / 1e-5 absolute, and exercised model-scale parity at 1/3/7/11 workers.
 - Guard proof: perturbing the FP16 batched accumulator by +0.001 made `f16_col_parallel_gemv_matches_reference` fail at max error 0.0010000467 against the new 0.00001 limit; restored code passed the repeated targeted tests and full CPU EP suite.
+
+## 2026-07-27T07:35:00-07:00 — PR #227 review fixes (cache test + SiLU doc)
+
+- Fixed tautological cache-reuse assertion in `matmul.rs`: moved pointer capture before the second `execute()` so the comparison actually spans the call. Guard-break proof: fresh-kernel substitution made the assertion fail with distinct pointers (0x1030b68d0 ≠ 0x1030b6860).
+- Fixed conflicting SiLU accuracy claim in `activations.rs`: slice-level doc now reads "~28 ULP worst-case" matching the implementation comment. Grep-confirmed no other "1 ULP" exp-accuracy claim survives in the crate.
+- Full verification: fmt ✅, clippy aarch64 ✅, clippy x86_64 ✅, 906 tests passed ✅, NEON SDPA dispatch confirmed ✅.

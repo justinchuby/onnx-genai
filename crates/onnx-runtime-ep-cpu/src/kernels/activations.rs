@@ -320,7 +320,7 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
 /// With the `mlas` feature this uses MLAS's fused one-pass SiLU, including its
 /// AVX-512F runtime path. Without `mlas` we keep the scalar reference.
 /// On aarch64 without `mlas`, a NEON-vectorized path processes 4 floats at a
-/// time using a Cephes-style exp polynomial (1 ULP accuracy on [-87, 88]).
+/// time using a Cephes-style exp polynomial (~28 ULP worst-case on [-87, 88]).
 pub(crate) fn silu_f32_slice(input: &[f32], output: &mut [f32]) {
     #[cfg(feature = "mlas")]
     {

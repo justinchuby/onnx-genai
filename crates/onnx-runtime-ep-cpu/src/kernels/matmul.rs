@@ -1719,30 +1719,34 @@ mod tests {
         assert!(kernel.prepack.dense[1].get().is_some());
         assert!(kernel.prepack.dense[0].get().is_none());
 
+        // Capture the cache pointer *before* the second execute so the
+        // comparison below is a real guard: it proves the first call populated
+        // the cache and the second reused it (rather than repopulating).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().as_ptr();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let ptr_before = kernel.prepack.dense[1].get().unwrap().as_ptr();
+
         let a2 = Owned::f32(&[1, 2], &[4., 5.]);
         let mut out2 = Owned::zeros_f32(&[1, 2]);
         kernel
             .execute(&[a2.view(), weight.view()], &mut [out2.view_mut()])
             .unwrap();
         assert_eq!(out2.to_f32(), vec![8., 15.]);
-        // Verify the cache is reused across calls (pointer equality).
+
+        // The pointer must be unchanged — the OnceLock was already populated.
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let cached = kernel.prepack.transposed_b_f16.get().unwrap().as_ptr();
-            // Re-invoke does not reallocate; the OnceLock is already populated.
-            assert_eq!(
-                kernel.prepack.transposed_b_f16.get().unwrap().as_ptr(),
-                cached
-            );
-        }
+        assert_eq!(
+            kernel.prepack.transposed_b_f16.get().unwrap().as_ptr(),
+            ptr_before,
+            "transposed_b_f16 cache was reallocated on the second execute"
+        );
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        {
-            let cached_weight = kernel.prepack.dense[1].get().unwrap().as_ptr();
-            assert_eq!(
-                kernel.prepack.dense[1].get().unwrap().as_ptr(),
-                cached_weight
-            );
-        }
+        assert_eq!(
+            kernel.prepack.dense[1].get().unwrap().as_ptr(),
+            ptr_before,
+            "dense[1] cache was reallocated on the second execute"
+        );
     }
 
     // --- Direct f32 output path (Option A) --------------------------------
