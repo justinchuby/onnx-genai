@@ -4381,3 +4381,742 @@ proven guard (fails when capture-safety is broken).
 **What:** Resch landed pure rustfmt repair commit `63e0ef26` after PR #207 plus `decode_spmd.rs` regressed the BLOCKING fmt gate on main; `cargo fmt --all -- --check` returned exit 0. PR #208 then merged to main as `5eb0d8db` (`test(cuda): cover standalone RoPE graph capture`), closing issue #88.
 **Why:** The batch restored main's formatting health and permanently records that Leon's standalone RoPE capture DoD regression landed with Chew's independent approval and guard-break evidence.
 
+## 2026-07-27 — Roadmap parallel wave (samplers, GEMM, CUDA attention/coverage, EP loader, discovery)
+
+### apone-varlen-attn
+
+<!-- merged from .squad/decisions/inbox/apone-varlen-attn.md -->
+# Decision: pkg.nxrt::PackedVarlenAttention (unpadded/packed varlen attention)
+
+- **Author:** Apone (CUDA attention-kernel dev)
+- **Date:** 2026-07-27
+- **Issue:** #86 — Add unpadded/packed varlen attention kernel + consume ONNX Attention-24 nonpad_kv_seqlen in ragged batching
+- **Branch:** feat/cuda-packed-varlen-attn
+- **Status:** Advances #86 (correct blocked-softmax kernel + full tests shipped; perf-tiling + optimizer lowering are documented follow-ups)
+
+## What landed
+
+A new runtime-domain attention op, registered as `pkg.nxrt::PackedVarlenAttention`
+v1 (`onnx_runtime_ir::RUNTIME_DOMAIN`, **not** `com.microsoft` or the default
+ONNX domain), in the CUDA EP:
+
+- `crates/onnx-runtime-ep-cuda/src/kernels/packed_varlen_attention.rs` — NVRTC
+  kernel + Rust wrapper + claim-time `unsupported_reason`.
+- Registered in `kernels/mod.rs` (`OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1)`,
+  added to `CUDA_COVERED_OPS`) and gated in `provider.rs` (dtype/attr claim).
+- `crates/onnx-runtime-ep-cuda/tests/packed_varlen_attention_gpu.rs` — GPU tests.
+
+## Op schema (v1)
+
+- inputs: `query`, `key`, `value` (packed `[tokens, heads, dim]` rank-3 or
+  `[tokens, heads*dim]` rank-2, f32/f16/bf16), `cu_seqlens_q` (int32 `[B+1]`),
+  `cu_seqlens_kv` (int32 `[B+1]`).
+- output: `output` (packed `[total_q, num_heads, v_head_size]`).
+- attrs: `num_heads` (required), `kv_num_heads` (opt, GQA/MQA), `scale` (opt),
+  `is_causal` (opt), `softcap` (opt).
+- Causal is tail-aligned: query local `i` attends key local `jk` iff
+  `jk <= i + (L_kv - L_q)` — matches flash-attn varlen and the standard
+  Attention kernel's `nonpad_kv_seqlen - q_seq` offset.
+
+## Relationship to ONNX Attention-24 `nonpad_kv_seqlen`
+
+`cu_seqlens_kv` is the **exclusive prefix sum** of the opset-24 `nonpad_kv_seqlen`
+per-batch valid KV lengths once padding is removed. A GPU test builds a padded
+batch with `nonpad_kv_seqlen`, runs the standard `Attention` kernel (which already
+consumes that input), and asserts its valid rows match the packed kernel
+bit-for-bit. The standard `Attention` kernel keeps handling the padded path
+(unchanged) — this op is the packed fast path.
+
+## Kernel approach
+
+Blocked-softmax, one CUDA block per `(query token, query head)`; scores kept in
+fp32 (f16/bf16 converted on load/store), `sqrt(scale)` folded into Q and K,
+lead-thread softmax in ascending key order → bit-identical to the standard
+Attention kernel. Launch geometry is derived from live device props
+(`multiprocessor_count`, `max_threads_per_block` via `runtime.rs`) with a
+grid-stride over rows — **no hardcoded per-GPU constants** (portable across
+compute capabilities via NVRTC JIT). Trailing `synchronize()` after the
+non-default stream launch.
+
+## Correctness evidence
+
+`CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda --test packed_varlen_attention_gpu`
+— 7/7 pass. All f32 cases are **bit-exact** (`max_abs_diff = 0`) vs the padded
+standard `Attention` reference:
+
+- mixed-length causal (incl. length-1 seq), mixed-length non-causal
+- single-sequence degenerate
+- all-equal-length vs dense batched padded (exact)
+- GQA (4 q heads / 2 kv heads)
+- padded + `nonpad_kv_seqlen` equivalence
+- fp16 within fp16 tolerance (`3.5e-4`)
+
+## Residual / follow-ups (still open on #86)
+
+1. **Perf: flash-style tiling.** v1 materializes per-row scores in a device
+   scratch buffer (`total_rows * max_kv_len` fp32) — correct but not memory- or
+   bandwidth-optimal. Streaming/tiled online softmax is the perf follow-up.
+2. **Optimizer lowering / auto-routing.** No pass yet rewrites a ragged opset-24
+   `Attention` (with `nonpad_kv_seqlen`) into `PackedVarlenAttention` + a pack/
+   unpack of Q/K/V. Deliberately deferred to avoid colliding with the concurrent
+   engine/optimizer refactor; the op is invocable directly today. When added,
+   keep the padded `Attention` path as the fallback.
+
+## Notes for the team
+
+- Scope was kept strictly to the CUDA EP attention kernels; no unrelated files
+  touched. Rebased on `origin/main` (through #235) before pushing.
+- `capture_support` returns unsupported (reads `cu_seqlens` off-device +
+  trailing sync), consistent with the other host-syncing pkg.nxrt ops.
+
+### batty-pr239-xtc-fix
+
+<!-- merged from .squad/decisions/inbox/batty-pr239-xtc-fix.md -->
+### 2026-07-27: Make XTC eligibility strict and sampleable
+**By:** Batty
+**What:** XTC candidates must have strictly positive probability and be strictly above the configured threshold. The least-probable eligible token remains unmasked, while masked and boundary-probability tokens are never admitted.
+**Why:** Including zero-probability or threshold-equal tokens could preserve an already masked token while excluding every valid choice. Strict eligibility preserves at least one sampleable token and matches XTC semantics.
+
+### bishop-pr234-review
+
+<!-- merged from .squad/decisions/inbox/bishop-pr234-review.md -->
+# Decision: PR #234 review — legacy ORT plugin EP loader
+
+- **Reviewer:** Bishop (independent merge gate; author Gorman locked out)
+- **Date:** 2026-07-27
+- **PR:** #234 "feat(ep-api): load legacy ORT plugin EPs" (advances #77), +363/-8
+- **VERDICT: APPROVE**
+
+## FFI / unsafe soundness
+- **Library lifetime is correct.** `PluginRuntime` owns `lib: libloading::Library`
+  alongside the raw `factory`/`ep` pointers. `Drop::drop` runs the plugin release
+  callbacks (compute infos → EP → factory) while `lib` is still loaded; struct
+  fields then drop in declaration order (`lib` unloads *after* `Drop::drop`).
+  `PluginExecutionPlan` and every `PluginKernelShared` hold `Arc<PluginRuntime>`,
+  so the library outlives all kernels — the classic dlopen keep-alive bug is
+  avoided.
+- **Null / return-code checks are comprehensive:** `num_factories==0`,
+  `factories[0].is_null()`, `CreateEp` null, resulting `ep` null, `GetName` null,
+  and (in `compile`) `GetCapability`/`Compile`/`CreateState`/`Compute` null are
+  all handled; ORT statuses go through `check_status`/`check_compute_status`.
+- **ABI-version validation ordering is correct.** `ort_version_supported` is read
+  and rejected (`0` or `> ORT_API_VERSION`) *after* `CreateEpFactories` (required
+  to obtain the factory) but *before* `CreateEp` — i.e. before real EP
+  instantiation. Matches ORT's plugin-EP contract.
+- **Drop ordering for per-thread state is correct:** kernels drop (releasing
+  per-thread `state` via `ReleaseState`) before `PluginRuntime` drops (releasing
+  compute infos), because kernels hold `Arc<PluginRuntime>`.
+
+## Error paths
+All three negative cases return `EpError::EpLoadFailed` cleanly (no panic/UB):
+missing `CreateEpFactories` symbol, incompatible ABI version (rejected + factory
+released), null factory/EP. The two negative fixtures exercise the first two;
+verified passing locally.
+
+## Cross-platform C-compile assessment (the flagged risk)
+**Not a defect.** The fixture-compiling tests are gated
+`#[cfg(all(test, target_os = "linux"))]`, so the `cc -shared -fPIC` invocation and
+`.so` output only run on Linux CI. The loader itself is `libloading`-based
+(LoadLibrary on Windows) and compiles everywhere. **All CI green**, including
+Rust (Windows x86_64), Rust (Windows ARM64), and Rust (macOS arm64).
+
+## Local results
+- `cargo test -p onnx-runtime-ep-api` → 41 unit + 7 integration tests pass
+  (incl. `load_legacy_resolves_and_invokes_plugin_factory`,
+  `load_legacy_reports_missing_factory_symbol`,
+  `load_legacy_rejects_an_incompatible_plugin_abi`).
+- `cargo clippy -p onnx-runtime-ep-api` clean; `cargo fmt --all -- --check` clean.
+- The happy-path test genuinely dlopens the stub, calls `CreateEpFactories`
+  (with the registration name), `CreateEp`, and reads `GetName` →
+  `synthetic_legacy_ep`, proving the hand-rolled C `OrtEpFactory` layout matches
+  ORT 1.27's real bindgen struct offsets. Not a no-op.
+
+## Non-blocking observations (follow-ups, not merge blockers)
+1. `PluginExecutionPlan::compile` and fused-subgraph execution
+   (`PluginCompiledKernel::execute`) have **no integration test** — the fixtures
+   only cover the loader. Consider a fixture EP that returns a working
+   `OrtNodeComputeInfo` to cover GetCapability→Compile→Compute.
+2. Minor factory **leak on error paths** in `PluginRuntime::load`: when
+   `CreateEp` fails or returns a null EP, `release_factory` is not called
+   (it *is* on the version-mismatch path). Harmless (per-load, error-only) but
+   inconsistent.
+
+Suggested owner for follow-ups (Gorman locked out): **Hicks**.
+
+### bishop-pr259-review
+
+<!-- merged from .squad/decisions/inbox/bishop-pr259-review.md -->
+# Review: PR #259 — Make CUDA provider availability runtime-accurate
+
+- **Reviewer:** Bishop (independent merge gate; author Zhora locked out)
+- **Date:** 2026-07-27
+- **PR:** #259 `feat/cuda-discovery-runtime-accurate` (+386/-95), Closes #71
+- **VERDICT: REQUEST-CHANGES**
+
+## Summary of findings
+
+| # | Area | Result |
+|---|------|--------|
+| 1 | Provider actually applied | ✅ Correct — no silent CPU drop |
+| 2 | Availability runtime-accurate | ✅ Correct — validated on real GPU |
+| 3 | Wheel discovery safety | ⚠️ Regression — cwd-relative load candidate |
+| 4 | Stream/portability rules | ✅ Preserved |
+| 5 | 88/89 count residual | ❌ Real failing test, unresolved in this PR |
+| 6 | Test quality | ✅ Asserts real behavior |
+| 7 | fmt / clippy / suites | fmt+clippy clean; ep-cuda suite 223 pass / 1 fail |
+
+## 1. Provider application — CORRECT
+`select_provider()` validates the full requested list, selects the first, and threads a
+concrete `Arc<dyn ExecutionProvider>` through `RtSession::builder().execution_provider(..).build()`
+(python/src/lib.rs). CUDA when available constructs the real EP via `cuda_execution_provider()`;
+unavailable CUDA returns a clear `PyValueError`/`PyRuntimeError` — never a silent CPU fallback.
+`get_providers()` now reports the provider actually applied (`active_providers`).
+Rust unit tests `provider_selection_tests::*` (3/3) pass and assert rejection + first-selection.
+
+## 2. Availability runtime-accurate — CORRECT
+`available_providers()` → `cuda_runtime_available()` → `CudaExecutionProvider::is_available(0)`
+→ `initialized(0).is_ok()`, which exercises driver + wheel/system libs + device + thread binding.
+`provider::tests::runtime_availability_matches_constructability` PASSES on GPU5. No compile-time
+false positive.
+
+## 3. Wheel discovery safety — ONE REGRESSION (hardening)
+Layout-relative (`nvidia/<component>/{lib,bin}`), cross-platform (.so vs .dll), wheel candidates
+tried BEFORE ambient with ambient fallback preserved; handles retained in `loaded_libraries`
+(no use-after-free, no leak). SAFETY comments present.
+
+**Defect:** `python_package_search_paths()` (python/src/lib.rs) dropped the previous
+`!entry.is_empty()` guard when reading `sys.path`. An empty entry (`''` = cwd, present under
+`python -c` / `-m` / REPL) becomes a search root, so `load_library` builds a **cwd-relative**
+candidate `nvidia/<component>/lib/libX.so` (verified: `PathBuf::from("").join(...)` is_relative)
+and dlopen's it BEFORE ambient paths — a library-planting vector the old code guarded against.
+**Fix:** restore the empty-string filter (skip empty/relative sys.path roots).
+
+## 4. Stream / portability — PRESERVED
+runtime.rs adds wheel include dirs to `nvrtc_include_paths()` but keeps live-capability arch
+derivation (`derives_{cubin,ptx}_arch_from_compute_capability`, `nvrtc_include_paths_only_returns_cuda_header_dirs`
+all pass) — no hardcoded SM constants. Stream-ordering tests
+(`dtod_async_is_ordered_after_same_stream_producer`, `dtod_waits_for_pending_stream_writes`) pass.
+provider.rs `synchronize()` unchanged.
+
+## 5. The 88/89 residual — REAL FAILING TEST, stale baseline, UNRESOLVED (BLOCKER)
+`kernels::tests::covered_ops_have_no_duplicates` asserts `CUDA_COVERED_OPS.len() == 88` but the
+array holds **89** entries. Determination: **category (ii) brittle/stale baseline**, NOT a
+regression introduced by #259 — `kernels/mod.rs` is untouched by this PR. PR #241 added the 89th
+op `"PackedVarlenAttention"` without bumping the assert. It stayed green because CI keeps
+`onnx-runtime-ep-cuda` OUT of the test lane (GPU-less runners → compile-only; see ci.yml comment
+"CUDA tests stay compile-only"), so `gh pr checks` is green while the test actually fails when run.
+
+Confirmed failing on GPU5 both without and with `--features cuda`:
+`test result: FAILED. 223 passed; 1 failed` — `left: 89, right: 88`.
+
+Per the merge-gate mandate (don't approve while any test fails; the baseline bump belongs in the
+PR that makes CUDA runtime-accurate and touches this crate), this must be fixed in #259. Correct
+action: update the baseline `88 → 89` (and preferably make the assertion self-describing rather
+than a bare magic number).
+
+## 6. Test quality — GOOD
+test_api.py asserts real provider application (`session.get_providers() == ["CUDAExecutionProvider"]`
+when available) and runtime availability (unavailable → raises with "CUDA"); GPU-needing branch is
+gated on `get_available_providers()` so CPU-only CI passes. Rust tests assert selection/rejection,
+not merely "no exception".
+
+## 7. Runs
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings`: clean.
+- `cargo clippy -p onnx-runtime-python --features cuda -- -D warnings`: clean.
+- `cargo test -p onnx-runtime-python --lib`: 22 passed.
+- `CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda --features cuda --lib`: 223 passed, **1 failed** (count test).
+- `gh pr checks 259`: green (but does not exercise ep-cuda tests).
+
+## Required changes (assigned — Zhora locked out)
+**Owner: Deckard** (Systems Dev, CUDA EP — pod owner of `onnx-runtime-ep-cuda`):
+1. **(blocker)** Update `CUDA_COVERED_OPS.len()` baseline `88 → 89` in
+   `crates/onnx-runtime-ep-cuda/src/kernels/mod.rs:729` so `cargo test -p onnx-runtime-ep-cuda`
+   passes. Prefer deriving/annotating the count so a future op addition can't silently rot it.
+2. **(hardening)** Restore the `!entry.is_empty()` guard in `python_package_search_paths()`
+   (`crates/onnx-runtime-python/src/lib.rs`) to prevent cwd-relative CUDA library loading.
+
+Re-review by Bishop after fixes.
+
+### bishop-pr259-rereview
+
+<!-- merged from .squad/decisions/inbox/bishop-pr259-rereview.md -->
+# Decision: Bishop re-review of PR #259 (CUDA discovery + Python provider)
+
+- **Date:** 2026-07-27T04:21:37+00:00
+- **Reviewer:** Bishop (independent reviewer, merge gate)
+- **PR:** #259 "Make CUDA provider availability runtime-accurate" — Advances #71
+- **Branch:** feat/cuda-discovery-runtime-accurate
+- **Fix commit reviewed:** 04294621 (applied by Deckard; author Zhora locked out)
+- **VERDICT: APPROVE**
+
+## Context
+Prior verdict was REQUEST-CHANGES on two defects. Provider-application and
+runtime-availability were already confirmed CORRECT and were not disturbed by
+the rebase (branch merge-base == current origin/main HEAD fbf9dfc7).
+
+## Fix 1 — Security (empty/relative sys.path → cwd-relative dlopen candidate): CORRECT
+- `python_package_search_paths()` (onnx-runtime-python/src/lib.rs) now funnels
+  every candidate through a `push_absolute` closure that pushes only when
+  `path.is_absolute()`. Empty (`""`) and whitespace (`"   "`) sys.path entries
+  are non-absolute and therefore excluded; relative entries excluded too.
+- Defense-in-depth in onnx-runtime-ep-cuda/src/dynamic_library.rs at THREE layers:
+  1. `wheel_candidates_for` returns `Vec::new()` when `!root.is_absolute()`.
+  2. `set_wheel_search_paths` only stores absolute paths.
+  3. `load_library` skips any non-absolute candidate before dlopen.
+  So no relative path can reach dlopen even from a future refactor.
+- Test `empty_python_search_path_produces_no_relative_candidates` asserts `""`,
+  `"   "`, `"site-packages"` all yield empty candidates (prior `is_relative=true`
+  case is gone). **Re-run: PASSED.**
+
+## Fix 2 — Count baseline (stale magic `assert_eq!(len, 88)`): CORRECT
+- `covered_ops_have_no_duplicates` (kernels/mod.rs) now DERIVED: builds a HashSet
+  of the ops and asserts `CUDA_COVERED_OPS.len() == unique_ops.len()`. No magic
+  number remains (grep confirms the only `.len()` reference is this derived check).
+- Auto-reconciles: if sibling PR #263 (Roy, APPROVED) makes the registry 102 ops
+  after a rebase, both sides of the assertion update together — no conflict with
+  #263's `len()==102`. Genuinely derived, not hard-coded 89.
+- **Re-run: PASSED. Zero failing count/dedup tests.**
+
+## Test results
+- `cargo test -p onnx-runtime-ep-cuda` (GPU5): all pass EXCEPT `conv_gpu.rs`
+  (2 failures) which are environment infra failures — `libcudnn.so.9` not
+  installed at runtime — unrelated to this PR.
+- Targeted re-run of the 4 fix-relevant unit tests: 4 passed / 0 failed.
+- `cargo test -p onnx-runtime-python`: 22 passed / 0 failed, including
+  `provider_selection_tests` (provider-application + runtime-availability intact).
+- `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings`: clean (exit 0).
+- `cargo fmt --all -- --check`: only drift in 4 UNTOUCHED files in other crates
+  (batched.rs, speculative.rs, ort-sys/build.rs, selection.rs) = the known
+  main-wide pre-existing drift being cleaned separately. PR's own files are clean.
+- Branch rebased on current main (fbf9dfc7).
+
+## Outcome
+Both fixes are genuinely correct; provider/availability remain correct. Approved
+as merge gate. Since gh auth == PR author, verdict posted as a comment
+("VERDICT: APPROVE") rather than a formal --approve review.
+
+### chico-2bit-gemm
+
+<!-- merged from .squad/decisions/inbox/chico-2bit-gemm.md -->
+### 2026-07-27: Direct packed int2 CPU GEMV and GEMM
+**By:** Chico
+**What:** Route standard `bits=2` MatMulNBits without `g_idx` through portable direct packed GEMV (`M=1`) and GEMM (`M>1`) kernels. Shared NBits row/block helpers own packed-code, scale, and zero-point decoding; grouped configurations retain the f32 dequantization fallback.
+**Why:** Materializing an f32 weight matrix multiplies int2 weight traffic by 16x on decode and adds avoidable prefill allocation. Direct inline decoding preserves ONNX affine semantics for symmetric/asymmetric weights and f32/f16 scales; four parity cases covering block sizes 16/32 and partial K pass within `1e-5`.
+
+### crowe-fp8-csa
+
+<!-- merged from .squad/decisions/inbox/crowe-fp8-csa.md -->
+### 2026-07-27: Ratio-128 FP8 CSA is device-resident and capture-compatible
+**By:** Crowe
+**What:** The CUDA `pkg.nxrt::CompressedSparseAttention` ratio-128 hybrid FP8 path now runs compression, packed-cache/carry writeback, packed-record attention, and decode entirely on the EP stream with pooled stable-address scratch. Runtime transfer counters prove zero H2D/D2H calls inside `execute`, and a decode-boundary CUDA-graph capture/replay test matches the CPU oracle.
+**Why:** Issue #68 identified that ratio-128 FP8 still invoked the host oracle and only overwrote compression results on device. Direct device dispatch removes the steady-path host round trip while preserving byte-exact packed cache output and FP8-appropriate `Y`/carry parity portably through NVRTC.
+
+### deckard-pr259-fix
+
+<!-- merged from .squad/decisions/inbox/deckard-pr259-fix.md -->
+### 2026-07-27: Harden PR #259 CUDA wheel discovery and coverage invariant
+**By:** Deckard
+**What:** CUDA wheel discovery now accepts only absolute Python package roots and defensively rejects relative wheel dlopen candidates. The CUDA covered-op test derives uniqueness from the live registry instead of asserting a hand-maintained count.
+**Why:** Empty `sys.path` entries represent the process CWD and previously enabled library planting. A derived duplicate-free invariant remains correct as CUDA coverage grows, including regardless of PR #263 merge ordering.
+
+### dietrich-debug-tracing
+
+<!-- merged from .squad/decisions/inbox/dietrich-debug-tracing.md -->
+### 2026-07-27: Export one server Perfetto timeline
+**By:** Dietrich
+**What:** The debug trace download now appends native-runtime and execution-provider Chrome trace events to the engine profiler document; the interactive CLI adds `/session` for a content-free session summary.
+**Why:** Native `session_run` spans otherwise hide the provider work beneath them, while a structured session summary makes model settings and usage inspectable without leaking prompt or reply text.
+
+### drake-pr239-review
+
+<!-- merged from .squad/decisions/inbox/drake-pr239-review.md -->
+### 2026-07-27: Request changes on PR #239 advanced samplers
+**By:** Drake
+**What:** PR #239 is rejected. Batty must revise it because Hudson is locked out. Fix XTC to consider only strictly positive probabilities strictly above `xtc_threshold`, add the missing XTC zero-probability/boundary regression tests, and strengthen Mirostat, DRY, and end-to-end seed tests.
+**Why:** XTC currently uses `p >= threshold`; at threshold zero it admits masked zero-probability tokens, can retain an already `-inf` token, and mask every sampleable token. The tests also omit required Mirostat convergence, DRY empty/short-context, XTC zero-probability/boundary, and full token-stream seed coverage.
+
+### drake-pr239-rereview
+
+<!-- merged from .squad/decisions/inbox/drake-pr239-rereview.md -->
+### 2026-07-27: PR #239 advanced samplers re-review approved
+**By:** Drake
+**What:** APPROVE revision `1bb4b551`. XTC now requires `p > 0.0 && p > threshold`, preserving masked tokens and at least one sampleable eligible token. The added XTC boundary/safety, multi-step Mirostat, DRY edge/repetition, and full-stream seed tests are meaningful assertion-based regressions.
+**Why:** Engine tests pass. Server tests have only the known missing `vision.onnx` fixture failure; all other server tests pass when it is skipped. Engine/server clippy, formatting, and every PR check are green.
+
+### ferro-pr241-review
+
+<!-- merged from .squad/decisions/inbox/ferro-pr241-review.md -->
+# Ferro — Independent CUDA Review of PR #241
+
+**PR:** #241 `feat(cuda): packed/unpadded varlen attention op (pkg.nxrt::PackedVarlenAttention)` (Advances #86)
+**Reviewer:** Ferro (independent merge gate; author Apone locked out)
+**Date:** 2026-07-27
+**VERDICT: APPROVE**
+
+## Scope
++1259/-0, all new files: `kernels/packed_varlen_attention.rs` (kernel+host), `kernels/mod.rs`
+(registration + CUDA_COVERED_OPS), `provider.rs` (claim gate), `tests/packed_varlen_attention_gpu.rs`.
+
+## Findings
+
+### Numerical correctness — CORRECT
+- Two-pass softmax over device scratch (running max → exp/sum → normalize), fp32 accumulators
+  around f16/bf16 load/store. Numerically stable (`m` subtracted; all-masked row → zeros).
+- Scale: `sqrt_scale = sqrt(scale)` folded into each Q and K operand; default `1/sqrt(head_size)`. Correct.
+- Causal: `causal_limit = i + (kv_len - q_len)`; `jk > limit` masked. Tail-aligned for ragged q/kv,
+  reduces to lower-triangular when `L_q==L_kv`. Correct.
+- Softcap `softcap*tanh(s/softcap)` applied before mask/softmax. Correct order.
+- GQA/MQA: `kvh = qh / group`, `group = num_heads / kv_num_heads` (repeat-interleave). Correct;
+  divisibility enforced at claim + execute.
+
+### cu_seqlens / nonpad_kv_seqlen — CORRECT
+- Exclusive-prefix-sum semantics; host validates `[0]==0`, non-decreasing, `[B]==total`. No off-by-one.
+- nonpad_kv_seqlen parity test scatters the SAME logical batch into a padded layout, runs padded
+  `Attention` with opset-24 `nonpad_kv_seqlen`, gathers valid rows — non-trivial and passes bit-exact (0e0).
+
+### Memory safety — NO OOB/UB
+- Scratch sized `total_rows * max_kv_len`; every write `srow + jk`, `jk < kv_len <= max_kv_len`. Bounded.
+- Q/K/V/Y indices all provably `< numel`. Length-1 and length-0 sequences handled (all-masked → zeros).
+- q_batch_ids indexed by `gq < total_q`; array is `total_q`. Safe.
+
+### Portability — PORTABLE
+- Only static shared mem (`inv_sum_sh`, `all_masked_sh`, 8 bytes); `shared_mem_bytes: 0`. No dynamic
+  shared mem, no per-GPU / H200 constant. Grid geometry from live `multiprocessor_count` /
+  `max_threads_per_block`; block threads `min(128, max_threads_per_block)`. Grid-stride covers any count.
+
+### Stream / capture — CORRECT
+- Kernel launched on EP non-default stream. `read_cu_seqlens` uses `dtoh`, which synchronizes the EP
+  stream first (repo non-default-stream ordering rule satisfied; same for `dtod`). `htod` is a
+  synchronous copy that completes before launch. Trailing `synchronize()` drains before freeing scratch.
+- `capture_support = unsupported` (honest: off-device cu_seqlens read + trailing sync). No capture violation.
+
+### Registration / gating — CORRECT
+- `OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1)` — RUNTIME_DOMAIN, not com.microsoft/default.
+- Added to `CUDA_COVERED_OPS`; provider claim gate guarded by `op_type == "PackedVarlenAttention" &&
+  domain == "pkg.nxrt"`, rejecting non-f32/f16/bf16, mixed dtypes, non-int32 cu_seqlens, missing num_heads.
+
+## Test run (GPU 6, cuDNN-independent — pure NVRTC kernel)
+`CUDA_VISIBLE_DEVICES=6 taskset -c 1 cargo test -p onnx-runtime-ep-cuda --test packed_varlen_attention_gpu`
+**7/7 pass.** f32 **BIT-EXACT (max_abs_diff = 0e0)** for all f32 cases (per-seq causal/non-causal,
+single-seq, GQA, all-equal-vs-dense-padded, nonpad_kv_seqlen). fp16 causal = 3.46e-4.
+`cargo clippy -p onnx-runtime-ep-cuda` clean; `cargo fmt --all -- --check` clean; `gh pr checks 241` green
+(only unrelated Windows jobs pending).
+
+## Residual (acceptable for "Advances #86")
+Flash-style Q/K/V tiling and auto-routing lowering are deferred — perf/integration, not correctness. The
+op as shipped is correct and tested.
+
+## Non-blocking follow-up suggestions (for a DIFFERENT agent; Apone locked out)
+- Add a **softcap** GPU test and a **bf16** GPU test — both code paths are supported but currently unexercised.
+
+### ferro-pr249-review
+
+<!-- merged from .squad/decisions/inbox/ferro-pr249-review.md -->
+# Ferro — Independent CUDA Review of PR #249 (Closes #68)
+
+**PR:** #249 "Complete ratio-128 FP8 CSA device residency" (+414/-228)
+**Reviewer:** Ferro (independent merge gate; author Crowe locked out)
+**Date:** 2026-07-27
+**VERDICT: APPROVE**
+
+## Residency claim (the crux) — STRUCTURALLY REAL ✅
+- `execute()` short-circuits at the top: `if device_resident_ratio128 && !force_host → run_device_ratio128(...)` and **returns before any host-staging code**. No input D2H, no output H2D.
+- `run_device_ratio128` calls only `run_device_compression(.., sync=false)` + `run_device_attention(.., sync=false)`; each **only launches kernels** on the EP stream. Zero `htod`/`dtoh`.
+- The logical sequence cursor (`total_sequence_length`, input 9) is passed as a **device pointer** and dereferenced on-device (`const long long start = *total_ptr - sequence;` in compress; `total = *total_ptr` in attention). This is genuine structural residency, not "moved the copy to setup".
+- Attention scratch = `device_state.workspace(WS_RATIO128_ATTN)` — **pre-reserved stable-address pool**, replacing the old per-call `alloc_raw`/`free_raw`.
+- `sequence_cursor()` (which does a D2H) is **not** on the resident path — only `record_device_metrics`, which the resident ratio-128 path never calls.
+- Runtime H2D/D2H counters wrap the only two host-transfer entry points (`htod`, `dtoh`); `dtod`/`dtod_async` are device-to-device. Counters are complete → the test assertion is trustworthy.
+
+## Capture safety ✅
+- During capture, `run_device_ratio128` skips the trailing sync (`if !is_capturing()`), compression/attention run with `sync=false`, scratch is pre-reserved (no per-call alloc), cursor read on device.
+- New test `ratio128_fp8_decode_capture_replay_matches_cpu` performs a **real** `cuStreamBeginCapture → execute → cuStreamEndCapture → instantiate → launch → sync`, zeroing outputs before replay, and matches the CPU oracle. An illegal sync/alloc during capture would fail `cuStreamEndCapture`; it passes.
+- Same-stream ordering: attention consumes `outputs[1]` produced by compression on the same EP non-default stream → correct producer/consumer ordering, no cross-stream hazard.
+
+## Stream ordering / portability (repo rules) ✅
+- `runtime.rs` preserves synchronize-before-sync-copy: `dtoh` and `dtod` both `synchronize()` before the driver copy; comments document the non-default-stream vs legacy-default-stream race.
+- NVRTC compiles for the **live device compute capability** (`ptx_arch_for(major,minor)`); no `sm_90`/H200 constants in the kernel; ratio-128 kernels use `shared_mem_bytes: 0` (only tiny fixed `__shared__` reductions) — no shared-mem-size assumption. Safe on consumer GPUs.
+
+## Parity + test quality ✅
+- FP8 dequant matches the packed 583-byte record layout (7×65 e8m0+e4m3 blocks for dims 0–447, BF16 tail for 448–511 = 455+128=583). Bias gather bounds-checked via broadcast index clamping.
+- Tests compare to the **CPU oracle** (trusted reference), not self-referential: `Y`/carry within 1e-4, packed cache **byte-identical**.
+- `run_step` now asserts `observation.transfers == CudaTransferCounts::default()` (zero H2D **and** D2H during `execute`) **and** `capture_supported` — directly proving the residency + capture claims. Snapshot boundary is tight (around `execute` only; input upload/output download excluded — correct).
+- The "1 ignored" test is `mtp_composite_decode_smoke` — ignored for **missing external Mobius/MTP model artifacts** (environmental), not masking a failure.
+
+## Runs (GPU7, `CUDA_VISIBLE_DEVICES=7 taskset -c 1`)
+- `cargo test -p onnx-runtime-ep-cuda --test compressed_sparse_attention_gpu` → **26 passed, 0 failed, 1 ignored** (6.00s).
+- `cargo clippy -p onnx-runtime-ep-cuda --all-targets` → exit 0. Only pre-existing style lints (rust-1.97 `unusual_byte_groupings`, `too_many_arguments`, doc-indent) **outside** the PR diff.
+- `cargo fmt --all -- --check` → clean.
+- `gh pr checks 249` → all green (CUDA compile Lin/Win, Rust all platforms, Rust quality, coverage).
+
+## Conclusion
+Issue #68 is **genuinely closed**: ratio-128 FP8 CSA is structurally device-resident (zero per-decode-step host transfers, asserted by test), CUDA-graph capture is safe (verified by real capture/replay parity), portable, and rigorously tested against the CPU oracle. **APPROVE.**
+
+### ferro-pr263-review
+
+<!-- merged from .squad/decisions/inbox/ferro-pr263-review.md -->
+# Decision: PR #263 CUDA op-coverage batch review (Ferro)
+
+- **Date:** 2026-07-27T04:21:37+00:00
+- **Reviewer:** Ferro (independent CUDA reviewer; author Roy locked out)
+- **PR:** #263 "feat(ep-cuda): trig/hyperbolic + Identity/Flatten/Size/Trilu CUDA kernels (#67)" (+979/-42)
+- **VERDICT: APPROVE**
+
+## Scope
+13 standard-ONNX (domain `""`) CUDA ops: Tan/Sinh/Cosh/Asin/Acos/Atan/Asinh/Acosh/Atanh (pointwise.rs, f32/f16/bf16 half-widened to f32), Identity/Flatten (movement.rs, D2D byte copy), Size (size.rs, host Int64 + H2D), Trilu opset-14 (trilu.rs). Registered in kernels/mod.rs, CUDA_COVERED_OPS 89→102, docs refreshed, tests/op_coverage_batch_gpu.rs.
+
+## Findings (all pass)
+1. **Trig/hyperbolic math** — Correct CUDA intrinsics (`tanf/sinhf/coshf/asinf/acosf/atanf/asinhf/acoshf/atanhf`). f16/bf16 widened via `load_float`→f32 compute→`store_float` round-nearest. Byte-for-byte formula parity with CPU EP `unary_math.rs` (Rust `.tan()/.sinh()/…`). Domain edges yield NaN identically (Acosh x<1, Atanh |x|>1, Asin/Acos |x|>1) — no precision mask hiding a wrong formula. Tolerances sane: f32 tight, f16 3e-3, bf16 3e-2.
+2. **Identity/Flatten/Size/Trilu** — Identity/Flatten = dtype-agnostic `dtod_async` byte copy asserting matching dtype+numel (data unchanged; Flatten shape comes from output tensor/shape-inference). Size = host Int64 element count uploaded to a validated contiguous Int64 scalar. Trilu: `keep = upper?(col-row>=k):(col-row<=k)` == ONNX (upper j≥i+k, lower j≤i+k); zero-byte fill = canonical zero for all fixed-width dtypes; k optional Int64 scalar read via synchronizing `dtoh`.
+3. **Registration/claim gate** — All 13 in domain `""` (Trilu opset 14, rest opset 1). Trilu claim gate present (`standard_claims.rs`: require_fixed_width, k Int64, `upper` 0/1). No over-claim: trig error on non-float at execute (ONNX float-only anyway); Identity/Flatten/Size dtype-agnostic; Trilu gate rejects packed/variable-width.
+4. **Coverage-count honesty** — `CUDA_COVERED_OPS` has exactly 102 entries; unit test `kernels::tests::covered_ops_have_no_duplicates` asserts `len()==102` **and** no duplicates — PASSES. Count updated consistently (+13). The "102 advertised names" doc figure is guarded by that test; the PR's "88" figure is a different metric (CPU std-domain types covered), so no conflict with the len==102 assertion.
+5. **Portability/stream** — NVRTC to live compute capability (no hardcoded SM/H200; runtime arch-derivation tests pass). Byte-copy kernels size via runtime `elem_bytes`. Kernels on `runtime.stream()` (EP non-default stream). Size H2D + Trilu k dtoh synchronize; capture paths use warmed signatures and skip mid-capture sync.
+6. **Tests** — 4 tests exercise ALL 13 ops: trig (9×f32/f16/bf16), Identity+Flatten (byte-exact multi-dtype), Size (=24), Trilu (upper/lower × k None/±1/±2 × f32/i64) — real values vs CPU EP, graceful-skip gated. No untested added op.
+
+## Run results (GPU7)
+- `op_coverage_batch_gpu`: **4 passed**. Lib unit tests: **223 passed / 0 failed** (incl. count/dedup).
+- `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings`: **clean**.
+- `cargo fmt --all -- --check`: **clean** on the PR worktree.
+- `conv_gpu`: 2 failures = pre-existing missing cuDNN (unrelated; ignored per host note).
+
+## Cross-PR / CI notes (not defects in #263)
+- **Sibling PR #259** also edits CUDA coverage. #263 bumps the exact count assertion to 102; whichever lands second must rebase and reconcile the `len()==` assertion on `kernels/mod.rs` — both cannot merge without a conflict resolution. Merge-ordering flag only.
+- **Red CI checks are pre-existing and unrelated:** "Rust quality" (fmt) diffs are in untouched files (`continuous` row-length / `ShapeInferError` / KV-sequence), and "Rust (Windows ARM64)" fails on `clippy::uninlined-format-args` in **onnx-runtime-ep-cpu** — a crate #263 does not touch (24 pre-existing hits reproduced locally). Neither reproduces against this PR's changed files (`cargo fmt --all` clean locally; ep-cuda clippy clean). CUDA compile (Linux/Windows) pass. These block the physical merge button but are not defects in Roy's batch; recommend a separate cleanup PR (candidate owner: a non-Roy agent) to fix the ep-cpu format-args + workspace fmt so #263 can merge.
+
+### frost-pr235-review
+
+<!-- merged from .squad/decisions/inbox/frost-pr235-review.md -->
+### 2026-07-27: PR #235 independent merge-gate approval
+**By:** Frost
+**What:** Approved PR #235 (`feat/debug-endpoints-tracing`) after independent security, trace-format, CLI privacy, test, lint, format, and CI review.
+**Why:** Every `/v1/debug/*` route is conditionally registered only when the default-false `enable_debug_endpoints` flag is explicitly enabled. The configuration/KV responses exclude paths and credentials, session capability IDs are redacted, and `/session` reports only metadata/counts. Engine and native events use the shared monotonic tracer clock, process ID, and lane allocator and serialize valid Chrome/Perfetto phases. The five debug tests passed under `native-backend`; all CLI tests passed. The one server-suite failure is unchanged baseline: the gitignored `vision.onnx` fixture is absent on `origin/main` too.
+
+### gorman-ort2-ep
+
+<!-- merged from .squad/decisions/inbox/gorman-ort2-ep.md -->
+### 2026-07-27: Route legacy ORT plugin loading through the shared ABI adapter
+**By:** Gorman
+**What:** `EpRegistry::load_legacy` now creates and retains `LegacyOrtEp`, which resolves `CreateEpFactories`, instantiates the EP, validates its advertised ORT API version, and preserves the loaded library lifetime. `PluginExecutionPlan` uses the same adapter before graph-level capability discovery and compilation.
+**Why:** ORT plugin EPs select and compile graph subgraphs through the C ABI rather than individual Rust nodes. Sharing the loader removes the final registry TODO while retaining the existing graph execution path and returning actionable failures for absent symbols or incompatible plugin ABIs.
+
+### hicks-pr246-review
+
+<!-- merged from .squad/decisions/inbox/hicks-pr246-review.md -->
+### 2026-07-27: PR #246 portable half GEMM merge gate
+**By:** Hicks
+**What:** Approved PR #246, subject to the recorded CI status.
+**Why:** The contiguous f16/bf16 MatMul and Gemm dispatches retain raw half storage, convert through `half` into f32 panels, accumulate in f32, and narrow only on output. Ragged, transpose, batch, broadcast, GEMV, K=0, and BF16 K-tail cases are covered. The optional AVX-512 BF16 kernel is behind runtime detection; all non-AVX-512 and non-x86 targets take the portable scalar/Rayon implementation. Native parity was 1.870e-6 maximum relative error versus f64 (and ratio 1.000 to widened f32), while the full CPU EP suite, clippy, formatting, and all PR checks passed.
+
+### hicks-pr256-review
+
+<!-- merged from .squad/decisions/inbox/hicks-pr256-review.md -->
+# PR #256 CPU direct 2-bit review
+
+- **Date:** 2026-07-27
+- **Reviewer:** Hicks (independent CPU-kernel merge gate)
+- **Verdict:** APPROVE
+
+The standard-layout `bits=2`, no-`g_idx`, non-prepacked route decodes all four
+LSB-first 2-bit codes per byte inline, applies the per-block scale and either
+the packed affine zero point or the symmetric implicit zero point of 2, and
+accumulates in `f32`. The shared packed-layout helpers are also used by the
+retained dequantization oracle; the parity tests use an independent explicit
+LSB-first dequantize-then-f32-GEMM reference.
+
+Both M=1 GEMV and M>1 GEMM select the direct packed route. `g_idx` deliberately
+continues through the existing dense dequantization fallback, while
+`weight_prepacked=1` retains its MLAS-only behavior. Coverage includes
+symmetric/asymmetric weights, f32/f16 scales, block sizes 16/32, partial K,
+and both regimes. Validation passed: `cargo test -p onnx-runtime-ep-cpu`,
+`cargo clippy -p onnx-runtime-ep-cpu --all-targets -- -D warnings`, and
+`cargo fmt --all -- --check`; all non-coverage PR checks were green.
+
+### hudson-samplers
+
+<!-- merged from .squad/decisions/inbox/hudson-samplers.md -->
+### 2026-07-27: Advanced sampler configuration and ordering
+**By:** Hudson
+**What:** Added Top-A, Typical-P, DRY, Mirostat v1/v2, and XTC to `GenerateOptions` and the canonical processor chain. Chat-completions exposes flat sampler fields (`top_a`, `typical_p`, `dry_*`, `mirostat*`, `xtc_*`) plus top-k, min-p, penalties, and seed. Ordering is penalties/DRY → constraints → temperature → top-k/top-p/min-p/top-a/typical-p → Mirostat → XTC. Defaults are no-ops.
+**Why:** This completes issues #45 and #46 while keeping existing processor composition extensible. Mirostat owns per-request feedback state, XTC owns a seedable request-local RNG, and shared softmax/ranking helpers keep probability-based processors consistent.
+
+### hudson-server-error-hardening
+
+<!-- merged from .squad/decisions/inbox/hudson-server-error-hardening.md -->
+### 2026-07-26
+**By:** Hudson
+
+**What:** Hardened `onnx-genai-server` public error paths: debug config/KV endpoints now return the existing `ApiError` when no model is loaded; multimodal generation now returns 400 errors if a vision or audio contract disappears after admission; and `ModelRegistry` centralizes `RwLock` access through fallible read/write helpers.
+
+**Why:** An unloaded default model and a poisoned registry lock are operational failures, not process-abort invariants. Registry poisoning deliberately fails only the affected request with a 500 `ApiError` rather than recovering with `into_inner()`: recovery could expose state interrupted during a write, while an explicit error preserves the lock's safety signal and keeps the server process available for unrelated work.
+
+### newt-ops-coverage
+
+<!-- merged from .squad/decisions/inbox/newt-ops-coverage.md -->
+### 2026-07-27: CPU registration for ScatterND and QLinearMatMul
+**By:** Newt
+**What:** Added default-domain CPU kernels, registration, claim checks, and shape inference for standard ONNX ScatterND and QLinearMatMul.
+**Why:** ScatterND now supports standard index tuples and none/add/mul/min/max reductions; QLinearMatMul supports int8/uint8 operands, scalar and per-output-column B quantization parameters, and requantized int8/uint8 output. Conv and Resize remain outside this work item.
+
+### pris-pr248-test-fix
+
+<!-- merged from .squad/decisions/inbox/pris-pr248-test-fix.md -->
+### 2026-07-27: PR #248 N-D QLinearMatMul oracle independence
+**By:** Pris
+**What:** Replaced the N-D batched QLinearMatMul test's production-geometry-based reference with explicit first-principles dequantize, matmul, and requantize loops plus a literal expected tensor.
+**Why:** The prior oracle reused the kernel's batch-offset helpers and survived an `a_batch_offset = 0` mutation. The independent oracle fails that mutation with duplicated second-batch output, then passes after the kernel is restored.
+
+### resch-pr248-fix
+
+<!-- merged from .squad/decisions/inbox/resch-pr248-fix.md -->
+### 2026-07-27: PR #248 quantization and claim-gate revision
+**By:** Resch
+**What:** ScatterND now claims only CPU-executable numeric dtypes and has explicit multiply-reduction coverage. QLinearMatMul supports ONNX per-row A and per-column B scale/zero-point shapes for 2-D and N-D batched MatMul, with matching-pair validation, int32 accumulation, ties-to-even requantization, and saturating int8/uint8 output.
+**Why:** Vasquez rejected the prior revision because its claim gates over-claimed unsupported inputs, QLinearMatMul rejected schema-valid per-row/N-D quantization, and the tests did not exercise the required reductions, broadcast shapes, rounding, or saturation.
+
+### roy-cuda-coverage
+
+<!-- merged from .squad/decisions/inbox/roy-cuda-coverage.md -->
+# Decision: CUDA EP operator-coverage batch (issue #67)
+
+**Author:** Roy (CUDA-kernel engineer)
+**Date:** 2026-07-27
+**Issue:** #67 — Finish CUDA EP operator coverage parity
+**PR:** #263 — `feat/cuda-op-coverage-batch`
+
+## Context
+
+Issue #67 tracks raising CUDA EP operator coverage so more decoder/transformer
+LLM and common vision graphs stay native on CUDA instead of falling back to the
+CPU EP. The issue is L-sized; the directive is to land a coherent, high-leverage
+batch per PR, not everything at once.
+
+While scoping, I found the `docs/CUDA_COVERAGE.md` audit snapshot (dated
+2026-07-15, "54 / 103") was **stale**: the CPU EP registry has since grown to
+**168 `(domain, op_type)` pairs / 141 standard-domain op types**. I refreshed the
+audit honestly against the live registries rather than the historical number.
+
+## Decision
+
+Landed 13 new CUDA `(domain, op_type)` kernels, all standard ONNX domain `""`,
+chosen for high graph-unblock value and low implementation risk (no cuDNN, which
+is **absent** on this host — Conv/Pool/Resize deliberately deferred):
+
+- **Trig/hyperbolic unary math** (extends `pointwise.rs` `UnaryMathOp`, NVRTC):
+  `Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`, `Atan`, `Asinh`, `Acosh`, `Atanh`.
+  f32/f16/bf16; half storage widened to f32 compute, matching the CPU EP's
+  f32-widened reference. No new claim gate (follows existing unary-math
+  convention: claim any dtype, reject non-float at execute).
+- **Metadata / movement**: `Identity` and `Flatten` via the `copy_factory!` D2D
+  byte copy (`movement.rs`); `Size` as a host-computed Int64 scalar + H2D
+  (`size.rs`, mirrors `Shape`).
+- **`Trilu` (opset 14)**: NVRTC dtype-agnostic byte copy zeroing the elements
+  outside the retained triangle over the trailing two dims (`trilu.rs`);
+  `upper` attribute + optional Int64 `k` diagonal input. Claim gate added in
+  `standard_claims.rs` (fixed-width input0, optional Int64 `k`). Device-scalar
+  `k` read uses the warmed-signature capture pattern from `cumsum.rs`.
+
+Deferred (data-dependent or library-backed): `Range` (output shape depends on
+input values), `ArgMax`/`ArgMin`/`NonZero` (need cub/thrust), pooling/norm
+reductions and `Resize`/`Conv` (cuDNN, missing on box).
+
+## Coverage impact (honest, live-registry audit)
+
+- CPU standard-domain op types covered by CUDA: **75 → 88 / 141**.
+- CPU `(domain, op_type)` pairs covered by CUDA: **92 → 105 / 168**.
+- `CUDA_COVERED_OPS` advertised names: **89 → 102**.
+
+`docs/CUDA_COVERAGE.md` updated: matrix rows added (trig family; `Identity`
+flipped ⏳→✅; `Flatten`/`Size`/`Trilu` added), audit section refreshed to
+2026-07-27 with the live counts and regenerated shared/gap op lists.
+
+## Tests
+
+`crates/onnx-runtime-ep-cuda/tests/op_coverage_batch_gpu.rs`: 4 GPU parity tests
+vs the CPU EP asserting real values — trig family (f32/f16/bf16), `Identity` +
+`Flatten`, `Size`, and `Trilu` (upper/lower, ±`k`, f32/Int64). Gated by the
+existing graceful-skip pattern so CI without CUDA still passes. All 4 pass on
+GPU6; full `-p onnx-runtime-ep-cuda` suite green except the pre-existing
+`conv_gpu` tests that require cuDNN (absent on this host).
+
+## Notes for the team
+
+- The `54 / 103` figure the issue was originally audited against is obsolete; the
+  denominator is now 168 pairs / 141 std op types. Future coverage PRs should
+  cite the live audit in `docs/CUDA_COVERAGE.md`, not the old snapshot.
+- The `--tests` clippy lane surfaces pre-existing lints in several older GPU test
+  files (conv/pooling/attention); these are out of scope. The CI gate is
+  lib-only `clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings`, which
+  is clean.
+
+### spunkmeyer-cpu-gemm
+
+<!-- merged from .squad/decisions/inbox/spunkmeyer-cpu-gemm.md -->
+### 2026-07-27: Portable half GEMM is the CPU correctness baseline
+**By:** Spunkmeyer
+**What:** Contiguous CPU f16/bf16 MatMul and Gemm operands use a shared blocked, panel-packed GEMM that converts cache-sized panels to f32, accumulates in f32, and narrows once at the output. The existing AVX-512 BF16 MatMul microkernel remains runtime-gated; all other hosts use the portable path.
+**Why:** This removes whole-tensor half-to-f32 materialization from the common half path while preserving deterministic mixed-precision numerics on AVX2-only x86, aarch64, and generic CPUs. Architecture-specific SIMD and Accelerate integration remain follow-up performance work.
+
+### tyrell-fmt-cleanup
+
+<!-- merged from .squad/decisions/inbox/tyrell-fmt-cleanup.md -->
+### 2026-07-27: Apply mechanical Rust quality cleanup
+**By:** Tyrell
+**What:** Created a cleanup branch containing `cargo fmt --all` output plus mechanical `uninlined_format_args` Clippy fixes required by both blocking Rust quality lint steps.
+**Why:** Concurrent merges introduced formatting and Clippy drift on `main`; restoring both checks unblocks pending PR merges without changing behavior.
+
+### vasquez-pr248-review
+
+<!-- merged from .squad/decisions/inbox/vasquez-pr248-review.md -->
+### 2026-07-27: PR #248 independent merge-gate review
+**By:** Vasquez
+**What:** VERDICT: REQUEST-CHANGES for PR #248. Resch must own the revision; Newt remains locked out.
+**Why:** ScatterND's numeric execution is correct for copy/update, partial-index slices, negative/OOB indices, duplicate reductions, and opset-appropriate reduction math, but the CPU EP claims schema-valid string/bool/complex inputs that `dispatch_arith!` cannot execute. Its tests omit `mul`. QLinearMatMul correctly uses ties-to-even rounding and saturating int8/uint8 output, but rejects spec-required per-row A quantization and N-D per-column B parameters, does not enforce matching scale/zero-point shapes, and the shape-blind claim gate still claims those inputs. A temporary spec-valid `[M]` A-scale/A-zero-point probe failed with `QLinearMatMul: a_scale must be a scalar`. Tests also omit per-row/N-D broadcast, ties-even, and saturation cases.
+
+Both operators are registered in the default domain and included in the CPU covered-op set. ScatterND shape inference preserves data shape/type; QLinearMatMul reuses MatMul broadcasting and takes output dtype from `y_zero_point`.
+
+Validation at `8198ad970c0dfb18a62b24df7d96d1b5484afe36`:
+- `cargo test -p onnx-runtime-ep-cpu`: PASS (919 passed, 8 ignored; integration/doc suites also pass).
+- `cargo test -p onnx-runtime-shape-inference`: PASS (16 unit, 17 graph, 195 op-rule, 1 doc test).
+- `cargo clippy -p onnx-runtime-ep-cpu -p onnx-runtime-shape-inference --all-targets -- -D warnings`: PASS.
+- `cargo fmt --all -- --check`: PASS.
+- `gh pr checks 248`: all checks PASS.
+
+### vasquez-pr248-rereview
+
+<!-- merged from .squad/decisions/inbox/vasquez-pr248-rereview.md -->
+### 2026-07-27: PR #248 re-review requests changes
+**By:** Vasquez
+**What:** REQUEST-CHANGES on Resch's `3496ebab`. ScatterND dtype gating and none/add/mul coverage are fixed, and QLinearMatMul computation/claim gating now handles per-row/per-column N-D quantization correctly. Pris must own the next revision because Newt and Resch are locked out.
+**Why:** The N-D QLinearMatMul test oracle reuses production `Geometry` batch-offset helpers; mutating `a_batch_offset` to always return zero still leaves the regression test green, so it cannot catch the original batched bug. Replace it with an independent oracle or literal hand-computed outputs. The branch is also one commit behind current `main` and must be rebased, although `git merge-tree` reports no conflict. CPU EP tests (929 passed, 8 ignored, plus integration suites), shape-inference tests (16 + 17 + 195 + doc), clippy, fmt, and non-coverage CI checks pass.
+
+### vasquez-pr248-final
+
+<!-- merged from .squad/decisions/inbox/vasquez-pr248-final.md -->
+### 2026-07-27: PR #248 final re-review approved
+**By:** Vasquez
+**What:** VERDICT: APPROVE for PR #248 at `eb11dee1`; formal GitHub approval was unavailable because the authenticated account is the PR author, so the verdict was posted as a PR comment.
+**Why:** The N-D QLinearMatMul oracle now uses independent explicit loops and literal expected values. Forcing production `a_batch_offset()` to return zero made the targeted test fail, reverting made it pass, defects 1 and 2 remain resolved, and all requested tests, clippy, fmt, and non-coverage checks passed. The branch became two non-overlapping commits behind `origin/main` after `eb11dee1`; merge-tree found no conflict.
+
+### vasquez-prepacked
+
+<!-- merged from .squad/decisions/inbox/vasquez-prepacked.md -->
+### 2026-07-27: Consume serialized MLAS SQNBit packed weights on CPU
+**By:** Vasquez
+**What:** CPU `MatMulNBits` accepts `weight_prepacked=1` as the exact buffer produced by `MlasQNBitGemmPackQuantBData`, validates its MLAS-reported size, copies it into aligned storage once, caches it for constant inputs, and executes it directly through `MlasQNBitGemmBatch`.
+**Why:** This avoids repacking already-prepacked weights while preserving the standard ONNX block-quantized path as the fallback. MLAS packed bytes are host-ISA and compute-type specific, so models must use matching `N`, `K`, bits, block size, zero-point presence, accuracy level, and MLAS dispatch.
+
+### wierzbowski-pr236-review
+
+<!-- merged from .squad/decisions/inbox/wierzbowski-pr236-review.md -->
+### 2026-07-27: Approve PR #236 MLAS-prepacked MatMulNBits weights
+**By:** Wierzbowski
+**What:** Independently reviewed PR #236 and recorded `VERDICT: APPROVE` in a PR comment because GitHub rejected a formal self-account approval.
+**Why:** Temporary instrumentation proved both parity cases invoked the MLAS prepacked GEMM on initial and cache-reuse calls. Native parity was 9.1552734e-5 and 1.5258789e-4 (tolerance 2e-3); AVX2-only QEMU parity passed with zero diff. MLAS shim/header signatures, exact size checks, 64-byte alignment, canonical CompFp32/CompInt8 serialized roundtrips, fallback behavior, tests, clippy, formatting, and all PR checks passed.
+
+### zhora-cuda-discovery
+
+<!-- merged from .squad/decisions/inbox/zhora-cuda-discovery.md -->
+### 2026-07-27: CUDA provider availability is runtime-validated
+**By:** Zhora
+**What:** Python now reports CUDA only after constructing an initialized CUDA EP and applies the selected provider through `RtSession::builder().execution_provider`; unavailable CUDA requests error instead of silently using CPU.
+**Why:** A CUDA compile feature alone cannot prove that this process has the driver, loadable CUDA libraries, and a reachable device. CUDA wheel libraries are now discovered relative to Python package roots (`nvidia/<component>/lib` on Linux and `bin` on Windows) before ambient loader paths.
