@@ -1,5 +1,11 @@
 use super::*;
 
+struct Stage2RunState {
+    plan: Option<DecodeViewPlan>,
+    candidate: Option<DecodeViewPlan>,
+    excluded: Option<HashSet<ValueId>>,
+}
+
 impl Executor {
     /// Execute the graph with `inputs` bound by name, plus an `outer_scope` of
     /// enclosing named values a nested control-flow subgraph body may capture.
@@ -44,6 +50,42 @@ impl Executor {
         }
         let _depth_guard = DepthGuard;
         let nested = depth > 0;
+        self.reset_run_state()?;
+
+        // Keep the setup span around shape resolution, Stage-2 restoration,
+        // buffer sizing, and host input binding exactly as before.
+        let _phase_setup = phase_span!(if nested {
+            "run_scoped.setup_total.child"
+        } else {
+            "run_scoped.setup_total.top"
+        });
+        let bindings = self.bind_symbols(inputs, external)?;
+        self.validate_required_inputs(inputs, external)?;
+        // Resolve shapes, restore the memoized view plan, then size and populate
+        // buffers before any eager, capture, or replay execution begins.
+        let decode_memo_eligible = self.decode_memo_eligible(mode, nested);
+        let mut resolved =
+            self.prepare_resolved_shapes(&bindings, external, mode, nested, decode_memo_eligible);
+        let stage2 = self.restore_stage2_plan(&mut resolved, decode_memo_eligible);
+        self.prepare_run_buffers(inputs, external, &resolved, stage2.excluded.as_ref())?;
+        drop(_phase_setup);
+
+        if let Some(result) = self.execute_run_plan(
+            mode,
+            nested,
+            outer_scope,
+            external,
+            &mut resolved,
+            decode_memo_eligible,
+            stage2,
+        )? {
+            return Ok(result);
+        }
+
+        self.collect_run_outputs(external, &mut resolved, nested, decode_memo_eligible)
+    }
+
+    fn reset_run_state(&mut self) -> Result<()> {
         // Zero-copy view metadata is run-scoped: a value that aliased another's
         // buffer last run must not leak into this one (buffers may be resized).
         self.views.clear();
@@ -53,15 +95,14 @@ impl Executor {
         self.sequences.clear();
         self.seq_elem_values.clear();
         self.restore_shared_buffers()?;
+        Ok(())
+    }
 
-        // --- Resolve shapes from the actual bound inputs --------------------
-        let _phase_setup = phase_span!(if nested {
-            "run_scoped.setup_total.child"
-        } else {
-            "run_scoped.setup_total.top"
-        });
-        let bindings = self.bind_symbols(inputs, external)?;
-
+    fn validate_required_inputs(
+        &self,
+        inputs: &[(&str, &Tensor)],
+        external: &ExternalBindings,
+    ) -> Result<()> {
         for (name, _) in inputs {
             let vid = self.input_index[*name];
             if external.inputs.contains_key(&vid) {
@@ -88,68 +129,66 @@ impl Executor {
                 return Err(SessionError::InputNotFound { name });
             }
         }
+        Ok(())
+    }
 
-        // Substitute the bindings into every value → concrete shapes, then size
-        // the run-scoped buffers from them (reused when unchanged). Values with a
-        // data-dependent shape stay unresolved here and are filled in during the
-        // execution loop, once their producing node's inputs are concrete.
-        //
-        // F5 Stage 1: on the top-level CPU eager decode path the steady-state
-        // decode-plan memo replays the length-invariant partition of this map
-        // instead of rebuilding it every token. It is a pure optimization of
-        // `resolve_soft` (a function of `bindings` only, since on the eager path
-        // no external/control-flow/warm seeding runs — that is Capture/Replay
-        // only), gated OFF by default and asserted byte-identical under
-        // `decode_memo_verify`.
-        //
-        // Persistent device-I/O bindings (the KV cache) are the NORMAL decode
-        // case, not an exclusion: the real native decode path always carries them
-        // (ext_in/ext_out non-empty), and `bind_symbols` already folds every
-        // external *input* binding's shape into `bindings`, so the growing KV
-        // length symbol L is captured by the replay guard exactly like any other
-        // varying symbol. The memo additionally fingerprints the external binding
-        // set (`decode_external_signature`) with L abstracted to its symbolic
-        // identity, so pure-L growth replays while any structural change (binding
-        // added/removed, role flip, dtype change) forces a rebuild.
-        let decode_memo_eligible = self.decode_memo_enabled
+    fn decode_memo_eligible(&self, mode: RunMode, nested: bool) -> bool {
+        self.decode_memo_enabled
             && mode == RunMode::Eager
             && !nested
-            && self.ep.device_type() != DeviceType::Cuda;
-        let mut resolved = {
-            let _s = phase_span!("run_scoped.resolve_soft");
-            if decode_memo_eligible {
-                self.resolve_soft_decode_memo(&bindings, external)
-            } else {
-                // Observability: if the master switch is on but this step is
-                // structurally ineligible (CUDA, nested, non-eager), count it so
-                // an over-restrictive gate silently excluding the real decode path
-                // is never shipped again (the F5 regression Ripley caught).
-                if self.decode_memo_enabled && !nested {
-                    self.decode_memo_ineligible_count += 1;
-                }
-                let mut resolved = self.resolve_soft(&bindings);
-                if mode != RunMode::Eager {
-                    // Persistent bindings seed the kernel-visible geometry selected by
-                    // their input/output contracts. Seed only unresolved values:
-                    // statically/symbolically resolved shapes remain authoritative.
-                    external.seed_capture_shapes(&mut resolved);
-                    // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
-                    // shape inference but stable within a generation: seed their concrete
-                    // prior-run shape so downstream capturable consumers fold into
-                    // captured segments instead of forming per-consumer eager seams.
-                    self.seed_control_flow_capture_shapes(&mut resolved);
-                    // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
-                    // output shape is data-dependent stay unresolved in `resolve_soft`
-                    // and would each form an eager seam even though their kernels are
-                    // already capture-safe. Seed their exact just-in-time shapes from
-                    // the eager warmup — but only for the identical persistent-binding
-                    // signature the warmup ran under, so a changed pointer/capacity
-                    // withholds the seed instead of baking a stale shape.
-                    self.seed_warm_decode_capture_shapes(&mut resolved, external);
-                }
-                resolved
+            && self.ep.device_type() != DeviceType::Cuda
+    }
+
+    fn prepare_resolved_shapes(
+        &mut self,
+        bindings: &HashMap<SymbolId, usize>,
+        external: &ExternalBindings,
+        mode: RunMode,
+        nested: bool,
+        decode_memo_eligible: bool,
+    ) -> HashMap<ValueId, Vec<usize>> {
+        // F5 Stage 1 replays the invariant shape partition only for top-level
+        // eager CPU decode. Capture and replay retain their shape-seeding path.
+        let _s = phase_span!("run_scoped.resolve_soft");
+        if decode_memo_eligible {
+            self.resolve_soft_decode_memo(bindings, external)
+        } else {
+            // Observability: if the master switch is on but this step is
+            // structurally ineligible (CUDA, nested, non-eager), count it so
+            // an over-restrictive gate silently excluding the real decode path
+            // is never shipped again (the F5 regression Ripley caught).
+            if self.decode_memo_enabled && !nested {
+                self.decode_memo_ineligible_count += 1;
             }
-        };
+            let mut resolved = self.resolve_soft(bindings);
+            if mode != RunMode::Eager {
+                // Persistent bindings seed the kernel-visible geometry selected by
+                // their input/output contracts. Seed only unresolved values:
+                // statically/symbolically resolved shapes remain authoritative.
+                external.seed_capture_shapes(&mut resolved);
+                // Control-flow outputs (e.g. LongRoPE cos/sin caches) are symbolic to
+                // shape inference but stable within a generation: seed their concrete
+                // prior-run shape so downstream capturable consumers fold into
+                // captured segments instead of forming per-consumer eager seams.
+                self.seed_control_flow_capture_shapes(&mut resolved);
+                // Steady-state decode ops (Cast/Mul/QMoE/ScatterElements …) whose
+                // output shape is data-dependent stay unresolved in `resolve_soft`
+                // and would each form an eager seam even though their kernels are
+                // already capture-safe. Seed their exact just-in-time shapes from
+                // the eager warmup — but only for the identical persistent-binding
+                // signature the warmup ran under, so a changed pointer/capacity
+                // withholds the seed instead of baking a stale shape.
+                self.seed_warm_decode_capture_shapes(&mut resolved, external);
+            }
+            resolved
+        }
+    }
+
+    fn restore_stage2_plan(
+        &mut self,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        decode_memo_eligible: bool,
+    ) -> Stage2RunState {
         // --- F5 Stage 2: reinstate the cached invariant view/buffer plan --------
         // On a memo Replayed step whose per-source buffer identity still matches,
         // reinstate the zero-copy view aliases (lever 1) instead of clearing and
@@ -158,8 +197,8 @@ impl Executor {
         // out of `self` for the duration so an errored step drops it (a stale alias
         // can never be reinstated into a later replay); restored on success.
         let mut stage2_plan: Option<DecodeViewPlan> = None;
-        let mut stage2_candidate: Option<DecodeViewPlan> = None;
-        let mut stage2_excluded: Option<HashSet<ValueId>> = None;
+        let mut candidate: Option<DecodeViewPlan> = None;
+        let mut excluded: Option<HashSet<ValueId>> = None;
         if decode_memo_eligible
             && !self.decode_view_plan_disabled
             && self.decode_memo_last_action == DecodeMemoAction::Replayed
@@ -170,7 +209,7 @@ impl Executor {
                 // in full (no reinstate/elide) so every invariant view is freshly
                 // built, then confirm two-real-step byte-identity below before it is
                 // ever used to elide. This is the second-real-step confirmation.
-                stage2_candidate = Some(plan);
+                candidate = Some(plan);
             } else if self.stage2_buffer_sig_matches(&plan) {
                 self.decode_view_plan_sig_mismatch_streak = 0;
                 // Lever 1: reinstate the invariant zero-copy view aliases and
@@ -195,7 +234,7 @@ impl Executor {
                 // signature above); the compute path still self-heals any output
                 // whose length unexpectedly differs.
                 if let Some(memo) = self.decode_memo.as_ref() {
-                    stage2_excluded = Some(memo.invariant_shapes.keys().copied().collect());
+                    excluded = Some(memo.invariant_shapes.keys().copied().collect());
                 }
                 stage2_plan = Some(plan);
             } else {
@@ -209,6 +248,20 @@ impl Executor {
                 }
             }
         }
+        Stage2RunState {
+            plan: stage2_plan,
+            candidate,
+            excluded,
+        }
+    }
+
+    fn prepare_run_buffers(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        external: &ExternalBindings,
+        resolved: &HashMap<ValueId, Vec<usize>>,
+        stage2_excluded: Option<&HashSet<ValueId>>,
+    ) -> Result<()> {
         let external_values = external
             .inputs
             .keys()
@@ -224,17 +277,17 @@ impl Executor {
         }
         {
             let _s = phase_span!("run_scoped.size_buffers");
-            match &stage2_excluded {
+            match stage2_excluded {
                 // Stage 2 (lever 2): size only the values outside the memo's
                 // invariant partition (variant/JIT/external) — the invariant
                 // buffers are reused untouched from the rebuild step.
                 Some(invariant) => {
                     let mut excluded = external_values.clone();
                     excluded.extend(invariant.iter().copied());
-                    self.size_buffers_excluding(&resolved, &excluded)?;
+                    self.size_buffers_excluding(resolved, &excluded)?;
                 }
                 None => {
-                    self.size_buffers_excluding(&resolved, &external_values)?;
+                    self.size_buffers_excluding(resolved, &external_values)?;
                 }
             }
         }
@@ -248,8 +301,20 @@ impl Executor {
                 .expect("input value has a buffer");
             self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
-        drop(_phase_setup);
+        Ok(())
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_run_plan(
+        &mut self,
+        mode: RunMode,
+        nested: bool,
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        decode_memo_eligible: bool,
+        mut stage2: Stage2RunState,
+    ) -> Result<Option<ScopedRunResult>> {
         // --- Execute nodes ---------------------------------------------------
         // Iterate by index so a control-flow node can take `&mut self` (it must
         // build/reuse child executors) while an ordinary kernel node uses the
@@ -265,19 +330,19 @@ impl Executor {
                 // Under `decode_memo_verify` (the R1 safety net) run every node so
                 // the invariant views are freshly rebuilt, then assert each equals
                 // the reinstated alias (bytes/shape/ptr) — proving reuse is exact.
-                let verify_stage2 = self.decode_memo_verify && stage2_plan.is_some();
+                let verify_stage2 = self.decode_memo_verify && stage2.plan.is_some();
                 let verify_snapshot: Option<Vec<(ValueId, ValueView)>> = if verify_stage2 {
-                    stage2_plan.as_ref().map(|p| p.retained_views.clone())
+                    stage2.plan.as_ref().map(|p| p.retained_views.clone())
                 } else {
                     None
                 };
                 let elided = if verify_stage2 {
                     None
                 } else {
-                    stage2_plan.as_ref().map(|p| &p.elided_nodes)
+                    stage2.plan.as_ref().map(|p| &p.elided_nodes)
                 };
-                self.run_plan_eager(&mut resolved, outer_scope, external, elided)?;
-                if let (Some(snapshot), Some(plan)) = (&verify_snapshot, &stage2_plan) {
+                self.run_plan_eager(resolved, outer_scope, external, elided)?;
+                if let (Some(snapshot), Some(plan)) = (&verify_snapshot, &stage2.plan) {
                     for (vid, cached) in snapshot {
                         let fresh = self.views.get(vid).unwrap_or_else(|| {
                             panic!(
@@ -311,13 +376,13 @@ impl Executor {
                             self.decode_view_plan = self.build_decode_view_plan();
                         }
                         DecodeMemoAction::Replayed => {
-                            if let Some(cand) = stage2_candidate.take() {
+                            if let Some(cand) = stage2.candidate.take() {
                                 // This replay ran full dispatch as the candidate's
                                 // second-real-step confirmation: keep only the nodes
                                 // whose view is byte-identical to the built one, and
                                 // promote to validated (or drop if none survive).
                                 self.decode_view_plan = self.validate_decode_view_plan(cand);
-                            } else if let Some(plan) = stage2_plan.take() {
+                            } else if let Some(plan) = stage2.plan.take() {
                                 self.decode_view_plan = Some(plan);
                             }
                         }
@@ -362,15 +427,15 @@ impl Executor {
                 // slots), so retrying is safe. Bounded by the node count.
                 let max_capture_attempts = self.plan.len() + 1;
                 let schedule = 'capture: loop {
-                    let schedule = match self.plan_capture_segments(&resolved, external) {
+                    let schedule = match self.plan_capture_segments(resolved, external) {
                         Ok(schedule) => schedule,
-                        Err(report) => return Ok(ScopedRunResult::NotCapturable(report)),
+                        Err(report) => return Ok(Some(ScopedRunResult::NotCapturable(report))),
                     };
                     self.last_capture_failed_node = None;
                     match self.run_plan_segmented(
                         &schedule,
                         RunMode::Capture,
-                        &mut resolved,
+                        resolved,
                         outer_scope,
                         external,
                     ) {
@@ -398,10 +463,10 @@ impl Executor {
                             self.capture_segmentation.clear();
                             self.capture_cf_shapes.clear();
                             self.capture_warm_seeded.clear();
-                            return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
-                                CaptureDecline::graph(format!(
+                            return Ok(Some(ScopedRunResult::NotCapturable(
+                                CaptureDeclineReport::one(CaptureDecline::graph(format!(
                                     "segmented CUDA graph capture failed: {error}"
-                                )),
+                                ))),
                             )));
                         }
                     }
@@ -425,12 +490,12 @@ impl Executor {
                     self.capture_segmentation.clear();
                     self.capture_cf_shapes.clear();
                     self.capture_warm_seeded.clear();
-                    return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
-                        CaptureDecline::graph(format!(
+                    return Ok(Some(ScopedRunResult::NotCapturable(
+                        CaptureDeclineReport::one(CaptureDecline::graph(format!(
                             "warm decode shape seed for value#{} ({seeded:?}) diverged from the \
                              captured shape ({current:?}); recapturing",
                             vid.0
-                        )),
+                        ))),
                     )));
                 }
                 // Snapshot the concrete control-flow output shapes this capture
@@ -451,16 +516,16 @@ impl Executor {
                 // Move the schedule out so the segmented runner can take `&mut
                 // self`; restore it afterwards for the next step's replay.
                 let Some(schedule) = self.capture_schedule.take() else {
-                    return Ok(ScopedRunResult::NotCapturable(CaptureDeclineReport::one(
-                        CaptureDecline::graph(
+                    return Ok(Some(ScopedRunResult::NotCapturable(
+                        CaptureDeclineReport::one(CaptureDecline::graph(
                             "segmented device graph replay requested without a capture schedule",
-                        ),
+                        )),
                     )));
                 };
                 let still_valid = self.run_plan_segmented(
                     &schedule,
                     RunMode::Replay,
-                    &mut resolved,
+                    resolved,
                     outer_scope,
                     external,
                 )?;
@@ -479,7 +544,16 @@ impl Executor {
                 }
             }
         }
+        Ok(None)
+    }
 
+    fn collect_run_outputs(
+        &mut self,
+        external: &ExternalBindings,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        nested: bool,
+        decode_memo_eligible: bool,
+    ) -> Result<ScopedRunResult> {
         // --- Collect graph outputs into owned tensors -----------------------
         // A view output (a layout op whose result aliases an input buffer) is
         // materialized to contiguous owned bytes here — external consumers and
@@ -539,7 +613,7 @@ impl Executor {
         // token. Only on the memo-eligible CPU decode path; otherwise the buffer
         // stays untouched (and empty).
         if decode_memo_eligible {
-            self.decode_memo_resolved = std::mem::take(&mut resolved);
+            self.decode_memo_resolved = std::mem::take(resolved);
         }
         Ok(ScopedRunResult::Executed(results))
     }
