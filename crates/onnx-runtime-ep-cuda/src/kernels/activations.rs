@@ -11,7 +11,7 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const MODULE: &str = "wave4_activations_float_v2";
+const MODULE: &str = "wave4_activations_float_v3";
 
 const SRC: &str = r#"
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
@@ -45,6 +45,18 @@ __device__ float op_softsign(float v, float unused0, float unused1) { return v /
 __device__ float op_selu(float v, float alpha, float gamma) {
     return gamma * (v >= 0.0f ? v : alpha * expm1f(v));
 }
+__device__ float op_thresholded_relu(float v, float alpha, float unused) { return v > alpha ? v : 0.0f; }
+__device__ float op_swish(float v, float alpha, float unused) {
+    const float z = alpha * v;
+    float s;
+    if (z >= 0.0f) {
+        s = 1.0f / (1.0f + (float)exp((double)-z));
+    } else {
+        const float e = (float)exp((double)z);
+        s = e / (1.0f + e);
+    }
+    return v * s;
+}
 
 #define DEFINE_ACT(NAME, TYPE, SUFFIX) \
 extern "C" __global__ void NAME##_##SUFFIX( \
@@ -58,7 +70,9 @@ DEFINE_ACT(elu, TYPE, SUFFIX) \
 DEFINE_ACT(hard_sigmoid, TYPE, SUFFIX) \
 DEFINE_ACT(clip, TYPE, SUFFIX) \
 DEFINE_ACT(softsign, TYPE, SUFFIX) \
-DEFINE_ACT(selu, TYPE, SUFFIX)
+DEFINE_ACT(selu, TYPE, SUFFIX) \
+DEFINE_ACT(thresholded_relu, TYPE, SUFFIX) \
+DEFINE_ACT(swish, TYPE, SUFFIX)
 DEFINE_FOR_TYPE(float, f32)
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
 DEFINE_FOR_TYPE(__half, f16)
@@ -102,6 +116,8 @@ pub enum ActivationOp {
     Clip { min: f32, max: f32 },
     Softsign,
     Selu { alpha: f32, gamma: f32 },
+    ThresholdedRelu { alpha: f32 },
+    Swish { alpha: f32 },
 }
 
 impl ActivationOp {
@@ -113,6 +129,8 @@ impl ActivationOp {
             Self::Clip { .. } => "clip",
             Self::Softsign => "softsign",
             Self::Selu { .. } => "selu",
+            Self::ThresholdedRelu { .. } => "thresholded_relu",
+            Self::Swish { .. } => "swish",
         }
     }
 
@@ -128,12 +146,17 @@ impl ActivationOp {
             Self::Clip { .. } => "Clip",
             Self::Softsign => "Softsign",
             Self::Selu { .. } => "Selu",
+            Self::ThresholdedRelu { .. } => "ThresholdedRelu",
+            Self::Swish { .. } => "Swish",
         }
     }
 
     fn params(self) -> (f32, f32) {
         match self {
-            Self::LeakyRelu { alpha } | Self::Elu { alpha } => (alpha, 0.0),
+            Self::LeakyRelu { alpha }
+            | Self::Elu { alpha }
+            | Self::ThresholdedRelu { alpha }
+            | Self::Swish { alpha } => (alpha, 0.0),
             Self::HardSigmoid { alpha, beta } => (alpha, beta),
             Self::Clip { min, max } => (min, max),
             Self::Softsign => (0.0, 0.0),
@@ -192,6 +215,12 @@ fn activation_from_node(name: &str, node: &Node) -> Result<ActivationOp> {
                 .attr("gamma")
                 .and_then(|a| a.as_float())
                 .unwrap_or(1.0507),
+        },
+        "ThresholdedRelu" => ActivationOp::ThresholdedRelu {
+            alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
+        },
+        "Swish" => ActivationOp::Swish {
+            alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
         },
         other => {
             return Err(EpError::KernelFailed(format!(
@@ -317,9 +346,12 @@ impl ActivationKernel {
         };
         crate::trace::record_kernel_metrics(inputs, outputs, || {
             let per_element = match self.op {
-                ActivationOp::LeakyRelu { .. } | ActivationOp::Clip { .. } => 1,
+                ActivationOp::LeakyRelu { .. }
+                | ActivationOp::Clip { .. }
+                | ActivationOp::ThresholdedRelu { .. } => 1,
                 ActivationOp::HardSigmoid { .. } | ActivationOp::Softsign => 3,
                 ActivationOp::Elu { .. } | ActivationOp::Selu { .. } => 4,
+                ActivationOp::Swish { .. } => 5,
             };
             (n as u64).saturating_mul(per_element)
         });
@@ -393,6 +425,8 @@ mod tests {
                 alpha: 1.67326,
                 gamma: 1.0507,
             },
+            ActivationOp::ThresholdedRelu { alpha: 1.0 },
+            ActivationOp::Swish { alpha: 1.0 },
         ] {
             assert!(
                 SRC.contains(&format!("DEFINE_ACT({},", op.stem())),
@@ -484,6 +518,32 @@ mod tests {
                 alpha: 1.5,
                 gamma: 1.1
             }
+        );
+
+        assert_eq!(
+            activation_from_node("ThresholdedRelu", &node("ThresholdedRelu")).unwrap(),
+            ActivationOp::ThresholdedRelu { alpha: 1.0 }
+        );
+        let mut thresh = node("ThresholdedRelu");
+        thresh
+            .attributes
+            .insert("alpha".into(), Attribute::Float(2.5));
+        assert_eq!(
+            activation_from_node("ThresholdedRelu", &thresh).unwrap(),
+            ActivationOp::ThresholdedRelu { alpha: 2.5 }
+        );
+
+        assert_eq!(
+            activation_from_node("Swish", &node("Swish")).unwrap(),
+            ActivationOp::Swish { alpha: 1.0 }
+        );
+        let mut swish = node("Swish");
+        swish
+            .attributes
+            .insert("alpha".into(), Attribute::Float(0.5));
+        assert_eq!(
+            activation_from_node("Swish", &swish).unwrap(),
+            ActivationOp::Swish { alpha: 0.5 }
         );
     }
 }

@@ -47,7 +47,9 @@ pub mod index_share;
 pub mod indexing;
 pub mod matmul;
 pub mod matmul_nbits;
+pub mod mod_op;
 pub mod movement;
+pub mod nary;
 pub mod normalization;
 pub mod onehot;
 pub mod packed_varlen_attention;
@@ -95,7 +97,9 @@ use pointwise::{
 /// * **Cast / CastLike** — NVRTC element-wise dtype conversion (f32/f64/f16/bf16/
 ///   int8-64/uint8-64/bool).
 /// * **Reductions** — cuDNN `ReduceSum`/`ReduceMean` (f32/f16/bf16, f32 NVRTC
-///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`; arbitrary axes and keepdims.
+///   fallback) plus NVRTC `ReduceMax`/`ReduceMin`, and the f32 NVRTC family
+///   `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`,
+///   `ReduceLogSumExp`; arbitrary axes and keepdims.
 /// * **Pooling** — cuDNN `MaxPool`/`AveragePool` for 2-D NCHW f32/f16/bf16.
 /// * **Pointwise unary math** — `Abs`, `Neg`, `Reciprocal`, `Exp`, `Log`,
 ///   `Sign`, `Floor`, `Ceil`, `Round`, `Sin`, `Cos`, `Softplus`, and the
@@ -110,6 +114,12 @@ use pointwise::{
 ///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, `Identity`, `Flatten`, plus
 ///   broadcasting `Where` and triangular-mask `Trilu`.
 /// * **Metadata** — `Shape`, `Size` (host-computed Int64, uploaded to device).
+/// * **Activations (extended)** — `Swish` (opset 24) and `ThresholdedRelu`
+///   (opset 10), attribute-driven f32/f16/bf16.
+/// * **Variadic elementwise** — `Sum` and `Mean` (f32/f16/bf16, NumPy
+///   broadcasting across a variadic input list).
+/// * **Modulo** — `Mod` (f32 with `fmod=1`, plus i32/i64 truncated and
+///   floor modulo).
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -157,6 +167,12 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "ReduceMean",
     "ReduceMax",
     "ReduceMin",
+    "ReduceProd",
+    "ReduceSumSquare",
+    "ReduceL1",
+    "ReduceL2",
+    "ReduceLogSum",
+    "ReduceLogSumExp",
     "Abs",
     "Neg",
     "Reciprocal",
@@ -216,6 +232,11 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Flatten",
     "Size",
     "Trilu",
+    "Swish",
+    "ThresholdedRelu",
+    "Sum",
+    "Mean",
+    "Mod",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -525,8 +546,20 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
-
-    // Elementwise binary (NVRTC f32/f16/bf16, NumPy broadcasting).
+    reg.register(
+        OpKey::new("ThresholdedRelu", "", 10),
+        Box::new(ActivationFactory {
+            name: "ThresholdedRelu",
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Swish", "", 24),
+        Box::new(ActivationFactory {
+            name: "Swish",
+            runtime: runtime.clone(),
+        }),
+    );
     for (op_type, op) in [
         ("Add", BinaryOp::Add),
         ("Sub", BinaryOp::Sub),
@@ -669,6 +702,66 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("ReduceProd", "", 1),
+        Box::new(reduce::ReduceProdFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceSumSquare", "", 1),
+        Box::new(reduce::ReduceSumSquareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceL1", "", 1),
+        Box::new(reduce::ReduceL1Factory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceL2", "", 1),
+        Box::new(reduce::ReduceL2Factory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceLogSum", "", 1),
+        Box::new(reduce::ReduceLogSumFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ReduceLogSumExp", "", 1),
+        Box::new(reduce::ReduceLogSumExpFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Variadic elementwise (nary.rs) — Sum/Mean, f32/f16/bf16 broadcasting.
+    reg.register(
+        OpKey::new("Sum", "", 1),
+        Box::new(nary::NaryFactory {
+            is_mean: false,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Mean", "", 1),
+        Box::new(nary::NaryFactory {
+            is_mean: true,
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Mod (mod_op.rs) — f32 (fmod=1) plus i32/i64 truncated and floor modulo.
+    reg.register(
+        OpKey::new("Mod", "", 10),
+        Box::new(mod_op::ModFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // ── CUDA Wave 3 — pointwise math / logical / comparison (pointwise.rs) ──
 
@@ -805,6 +898,28 @@ mod tests {
     #[test]
     fn group_query_attention_is_listed_in_coverage() {
         assert!(CUDA_COVERED_OPS.contains(&"GroupQueryAttention"));
+    }
+
+    #[test]
+    fn coverage_batch2_ops_are_listed_in_coverage() {
+        for op in [
+            "ReduceProd",
+            "ReduceSumSquare",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+            "Swish",
+            "ThresholdedRelu",
+            "Sum",
+            "Mean",
+            "Mod",
+        ] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
     }
 
     #[test]

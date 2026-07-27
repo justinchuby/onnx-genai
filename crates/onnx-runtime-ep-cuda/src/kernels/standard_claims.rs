@@ -21,6 +21,11 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
         "Gelu" => gelu(node, input_dtypes),
         "OneHot" => one_hot(node, input_dtypes),
+        "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
+        | "ReduceLogSumExp" => reduce_f32_only(node, input_dtypes),
+        "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
+        "Sum" | "Mean" => variadic_float(node, input_dtypes),
+        "Mod" => mod_op(node, input_dtypes),
         _ => return None,
     };
     result
@@ -333,4 +338,89 @@ fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
         "depth",
     )?;
     require_fixed_width(input_dtypes, 2, "values")
+}
+
+/// `ReduceProd`/`ReduceSumSquare`/`ReduceL1`/`ReduceL2`/`ReduceLogSum`/
+/// `ReduceLogSumExp`: the NVRTC block-reduction path is f32-only, with an
+/// optional opset-18 int32/int64 `axes` input.
+fn reduce_f32_only(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    if !(1..=2).contains(&node.inputs.len())
+        || node.outputs.len() != 1
+        || node.inputs.first().is_none_or(Option::is_none)
+    {
+        return Err(format!(
+            "requires 1-2 inputs with data present and 1 output, got {} inputs and {} outputs",
+            node.inputs.len(),
+            node.outputs.len()
+        ));
+    }
+    metadata_arity(node, input_dtypes)?;
+    require_dtype(input_dtypes, 0, DataType::Float32, "data")?;
+    if node.inputs.get(1).is_some_and(Option::is_some) {
+        require_one_of(input_dtypes, 1, &[DataType::Int32, DataType::Int64], "axes")?;
+    }
+    bool_attribute(node, "keepdims")?;
+    bool_attribute(node, "noop_with_empty_axes")
+}
+
+/// `Swish`/`ThresholdedRelu`: single float input activations (f32/f16/bf16).
+fn float_activation(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float16, DataType::Float32, DataType::BFloat16],
+        "X",
+    )
+}
+
+/// `Sum`/`Mean`: variadic float inputs (f32/f16/bf16), all sharing one dtype.
+fn variadic_float(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    if node.inputs.is_empty() || node.outputs.len() != 1 || node.inputs.iter().any(Option::is_none)
+    {
+        return Err(format!(
+            "requires 1+ present inputs and 1 output, got {} inputs and {} outputs",
+            node.inputs.len(),
+            node.outputs.len()
+        ));
+    }
+    metadata_arity(node, input_dtypes)?;
+    for index in 0..input_dtypes.len() {
+        require_one_of(
+            input_dtypes,
+            index,
+            &[DataType::Float16, DataType::Float32, DataType::BFloat16],
+            "input",
+        )?;
+        if input_dtypes[index] != input_dtypes[0] {
+            return Err(format!(
+                "input {index} dtype {:?} must match input 0 dtype {:?}",
+                input_dtypes[index], input_dtypes[0]
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `Mod`: two same-dtype operands over f32/i32/i64; f32 requires `fmod=1`.
+fn mod_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float32, DataType::Int32, DataType::Int64],
+        "A",
+    )?;
+    require_dtype(input_dtypes, 1, input_dtypes[0], "B")?;
+    let fmod = match node.attr("fmod") {
+        None => 0,
+        Some(attribute) => match attribute.as_int() {
+            Some(value @ (0 | 1)) => value,
+            _ => return Err("attribute 'fmod' must be 0 or 1".into()),
+        },
+    };
+    if input_dtypes[0] == DataType::Float32 && fmod != 1 {
+        return Err("Float32 Mod requires fmod=1".into());
+    }
+    Ok(())
 }
