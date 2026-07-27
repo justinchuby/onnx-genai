@@ -251,6 +251,8 @@ jobs:
           if (-not $ort) {
             throw 'onnx-genai-ort-sys did not leave a downloaded onnxruntime.dll under target\debug\build'
           }
+          Copy-Item $ort.FullName target\debug\onnxruntime.dll -Force
+          Copy-Item $ort.FullName target\debug\deps\onnxruntime.dll -Force
           $ort.DirectoryName >> $env:GITHUB_PATH
       - name: Test onnx-genai-cli
         run: cargo test --locked -p onnx-genai-cli
