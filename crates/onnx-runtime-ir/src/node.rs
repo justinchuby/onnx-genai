@@ -107,7 +107,32 @@ impl Node {
     pub fn is_default_domain(&self) -> bool {
         self.domain.is_empty()
     }
+
+    /// This node's own opset version, if it names one that could be real.
+    ///
+    /// The single owner of that judgement, so every subsystem reading
+    /// [`Node::version`] agrees about the same node. Values that cannot be an
+    /// opset — negative, zero, or beyond what any opset could plausibly reach —
+    /// yield `None`: a node claiming them describes IR that is already wrong,
+    /// and the graph's own import is the better answer.
+    ///
+    /// Callers with a graph in hand should prefer
+    /// [`Graph::effective_opset`](crate::Graph::effective_opset), which falls
+    /// back to that import. Shape inference has only the node and a map of
+    /// imports, so it uses this directly.
+    #[inline]
+    #[must_use]
+    pub fn local_opset(&self) -> Option<u64> {
+        match self.version {
+            Some(version) if (1..=MAX_PLAUSIBLE_OPSET).contains(&version) => Some(version as u64),
+            _ => None,
+        }
+    }
 }
+
+/// No ONNX opset will plausibly reach this, so a larger `Node::version` is a
+/// mistake rather than a version we do not know yet.
+pub(crate) const MAX_PLAUSIBLE_OPSET: i64 = 1_000;
 
 /// An ONNX operator attribute. Covers all attribute value kinds.
 #[derive(Clone, Debug)]

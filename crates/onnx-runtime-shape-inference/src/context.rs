@@ -271,10 +271,7 @@ impl<'a> InferenceContext<'a> {
     pub fn opset(&self, domain: &str) -> u64 {
         let domain = normalize_domain(domain);
         if domain == self.node.domain
-            && let Some(version) = self
-                .node
-                .version
-                .and_then(|version| u64::try_from(version).ok())
+            && let Some(version) = self.node.local_opset()
         {
             return version;
         }
@@ -421,4 +418,51 @@ pub fn merge_shapes(
         out.push(merged);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod opset_resolution_tests {
+    use super::*;
+    use onnx_runtime_ir::NodeId;
+
+    fn context_for(version: Option<i64>, imports: &HashMap<String, u64>) -> u64 {
+        let mut node = Node::new(NodeId(0), "Swish", vec![], vec![]);
+        node.version = version;
+        let mut interner = SymbolInterner::new(0);
+        let context = InferenceContext::new(
+            &node,
+            Vec::new(),
+            imports,
+            MergePolicy::default(),
+            &mut interner,
+        );
+        context.opset("")
+    }
+
+    /// A usable node-local version wins, which is why the field exists.
+    #[test]
+    fn a_node_version_overrides_the_graph_import() {
+        let imports = HashMap::from([(String::new(), 13)]);
+        assert_eq!(context_for(Some(24), &imports), 24);
+    }
+
+    /// Values that cannot be a version defer to the graph rather than being
+    /// believed.
+    ///
+    /// Shape inference used to convert `Node::version` with a bare
+    /// `u64::try_from`, so `Some(0)` became opset 0 here while
+    /// `Graph::effective_opset` ignored it — the same node meant different
+    /// things to the shape rules and to dispatch, and a rule gated on a
+    /// minimum opset would silently return unknown shapes.
+    #[test]
+    fn implausible_versions_defer_to_the_graph() {
+        let imports = HashMap::from([(String::new(), 13)]);
+        for version in [-1, 0, i64::MAX, i64::from(i32::MAX) + 1] {
+            assert_eq!(
+                context_for(Some(version), &imports),
+                13,
+                "version {version} is not usable and must not override the graph"
+            );
+        }
+    }
 }

@@ -275,7 +275,7 @@ mod error {
             op_type: String,
             node: String,
             domain: String,
-            node_version: i64,
+            node_version: u64,
             graph_version: String,
         },
 
@@ -1266,11 +1266,13 @@ impl InferenceSession {
 
 fn reject_mixed_versions_for_ep_context_export(graph: &onnx_runtime_ir::Graph) -> Result<()> {
     for node in graph.nodes.values() {
-        let Some(node_version) = node.version else {
+        // A version no reader honours is not lost by an export that drops it,
+        // so judge representability with the same rule everything else uses.
+        let Some(node_version) = node.local_opset() else {
             continue;
         };
         let graph_version = graph.opset_imports.get(node.domain.as_str()).copied();
-        if graph_version == u64::try_from(node_version).ok() {
+        if graph_version == Some(node_version) {
             continue;
         }
         return Err(SessionError::EpContextMixedNodeVersion {
