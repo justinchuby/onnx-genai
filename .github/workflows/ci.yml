@@ -165,9 +165,16 @@ jobs:
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
       # Installing from crates.io avoids the personally-owned install action;
-      # cargo install costs build minutes but keeps provenance in Cargo.lock-style resolution.
+      # cargo install costs build minutes on cache misses but keeps provenance in Cargo-style resolution.
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -q '0.8.7'; then
+            echo 'cargo-llvm-cov 0.8.7 already installed'
+          else
+            cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+          fi
 
       # Never replace these explicit packages with bare `cargo test` or
       # `--workspace`: that selects onnx-genai-ort-sys, whose build script
@@ -351,9 +358,15 @@ jobs:
             "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
           }
       # Installing from crates.io avoids the personally-owned install action;
-      # cargo install costs build minutes but keeps provenance in Cargo.lock-style resolution.
+      # cargo install costs build minutes on cache misses but keeps provenance in Cargo-style resolution.
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+        shell: bash
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -q '0.8.7'; then
+            echo 'cargo-llvm-cov 0.8.7 already installed'
+          else
+            cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+          fi
 
       # The portable lane must stay offline, but the CLI is the user-facing ORT
       # entry point and its REPL contract tests catch token-budget regressions.
