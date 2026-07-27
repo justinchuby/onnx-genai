@@ -288,6 +288,13 @@ fn end_of_input_exits_cleanly() {
     );
 }
 
+// Platform gates in this file are for genuine platform dependencies only: keep
+// ordinary piped-stdin REPL tests cross-platform by default.
+//
+// The idle-prompt interrupt test remains Unix-only because it sends terminal
+// Ctrl-C with SIGINT. Windows needs GenerateConsoleCtrlEvent with a compatible
+// console process group, and targeting only the child process reliably from a
+// non-interactive test runner is a separate platform implementation.
 /// Send SIGINT to `pid`, the same signal a terminal Ctrl-C delivers.
 #[cfg(unix)]
 fn send_interrupt(pid: u32) {
@@ -366,7 +373,6 @@ fn two_ctrl_c_presses_are_needed_to_exit_an_idle_prompt() {
 
 /// A copy of the tiny text model whose chat template declares reasoning
 /// delimiters, the way a reasoning model's template does.
-#[cfg(unix)]
 fn reasoning_model() -> PathBuf {
     let source = fixture("tiny-llm");
     let dir = repository_root().join("target/test-fixtures/tiny-llm-reasoning");
@@ -387,7 +393,6 @@ fn reasoning_model() -> PathBuf {
     dir
 }
 
-#[cfg(unix)]
 #[test]
 fn a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer() {
     // Two tokens cannot reach the closing delimiter, so the turn genuinely has
@@ -413,7 +418,6 @@ fn a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_model_without_reasoning_delimiters_reports_nothing_about_them() {
     let output = text(&repl(

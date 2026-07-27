@@ -12,3 +12,6 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 
 ## 2026-07-27 — CLI native CUDA feature plumbing
 Added a first-class `native-cuda` CLI feature for the native backend plus hand-written CUDA EP, clarified ORT-vs-native CUDA feature comments/docs, and recorded the remaining `--backend` CLI gap for one-shot native decode.
+
+## 2026-07-27 — REPL e2e cross-platform gates
+Un-gated the reasoning REPL e2e helper and two reasoning tests that only use portable piped stdin/stdout process driving. Left the idle Ctrl-C test Unix-only with an explicit rationale: it sends SIGINT with `kill`, while Windows needs reliable `GenerateConsoleCtrlEvent` console-process-group plumbing. Recorded the team rule that REPL e2e tests gate only on genuine platform dependencies, never by default.
