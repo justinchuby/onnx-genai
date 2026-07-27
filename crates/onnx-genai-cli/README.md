@@ -163,6 +163,7 @@ backend, and switch models outright:
 >>> /backend ort            # auto | ort | native
 >>> /model ./another-model
 >>> /profile on             # report timings, memory, and cache reuse per turn
+>>> /session                # model, sampling, message counts, and token totals
 ```
 
 On Apple Silicon the MLX/Metal execution provider is offered — and

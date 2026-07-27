@@ -4,8 +4,9 @@
 //! disable it with `--no-default-features` when Prometheus exposition is not needed.
 //! `GET /v1/debug/trace` reports tracing integration status and links to the
 //! Perfetto export at `GET /v1/debug/trace/perfetto`, which serves the recorded
-//! decode timeline as a Chrome Trace Event Format document. OTLP span export is
-//! intentionally deferred (see issue #13).
+//! decode timeline as a Chrome Trace Event Format document. It merges engine,
+//! native-runtime, and execution-provider spans when available. OTLP span export
+//! is intentionally deferred (see issue #13).
 
 use std::{net::SocketAddr, time::Instant};
 
