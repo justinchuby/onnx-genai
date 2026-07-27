@@ -41,6 +41,27 @@ For the native backend, set `ONNX_GENAI_BACKEND=native`.
 Add `--profile-trace out.json` for a Perfetto timeline instead of these
 aggregates; see [`../traces/`](../traces/).
 
+## One-command native CPU vs ORT CPU comparison
+
+Use the bench crate's `compare` binary when optimizing the native CPU execution
+provider against ONNX Runtime's CPU EP. It loads the same model, renders the
+same prompt through the model chat template, alternates native and ORT CPU runs,
+discards warmups, then reports medians with p10-p95 spread plus JSON for
+plotting:
+
+```bash
+cargo run --release -p onnx-genai-bench --features bench-native --bin compare -- \
+  --model models/qwen2.5-0.5b \
+  --prompt "Write a short Rust function that reverses a string." \
+  --tokens 50 --decode-skip 2 --warmups 1 --runs 5 \
+  --profile-json target/pris-cpu-compare.json
+```
+
+This follows Sebastian's M1 Max methodology: one discarded full-generation
+warmup, at least five measured repetitions, a fixed 40-token prompt, 50 generated
+tokens, and the first two generated tokens excluded from the decode-throughput
+window. Keep the machine idle and cool between final runs.
+
 ## What the samples show
 
 ```
