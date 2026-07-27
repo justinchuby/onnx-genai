@@ -8,14 +8,11 @@
 //! `Concat`/`Squeeze`/`Unsqueeze` on a shape vector), which is what keeps a
 //! `Shape → … → Reshape` chain resolvable without executing the graph.
 
-use onnx_runtime_ir::{Attribute, DataType};
+use onnx_runtime_ir::Attribute;
 
-use crate::context::{InferenceContext, TypeInfo};
-use crate::dim_expr::DimExpr;
+use crate::context::InferenceContext;
 use crate::error::ShapeInferError;
-use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
-use crate::shape_data::ShapeData;
 
 /// Read a shape-data operand (input `i`) as concrete `i64`s, if every element is
 /// a constant.
