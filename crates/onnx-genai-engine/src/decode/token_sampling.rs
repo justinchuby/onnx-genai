@@ -377,18 +377,36 @@ fn consume_windowed_prefix(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Bundled inputs for [`propose_draft_tokens`]: the draft model and its session,
+/// the decode context (generated tokens/text and starting step), and the
+/// sampling configuration (options, processor chain, and RNG) used to
+/// speculatively propose a linear chain of draft tokens.
+pub(crate) struct DraftProposalRequest<'a> {
+    pub(crate) draft_model: &'a mut DraftModel,
+    pub(crate) draft_state: &'a mut DraftSession,
+    pub(crate) width: usize,
+    pub(crate) generated_tokens: &'a [TokenId],
+    pub(crate) generated_text: &'a str,
+    pub(crate) first_step: usize,
+    pub(crate) options: &'a GenerateOptions,
+    pub(crate) chain: &'a ProcessorChain,
+    pub(crate) rng: &'a mut SamplingRng,
+}
+
 pub(crate) fn propose_draft_tokens(
-    draft_model: &mut DraftModel,
-    draft_state: &mut DraftSession,
-    width: usize,
-    generated_tokens: &[TokenId],
-    generated_text: &str,
-    first_step: usize,
-    options: &GenerateOptions,
-    chain: &ProcessorChain,
-    rng: &mut SamplingRng,
+    request: DraftProposalRequest<'_>,
 ) -> anyhow::Result<Vec<TokenId>> {
+    let DraftProposalRequest {
+        draft_model,
+        draft_state,
+        width,
+        generated_tokens,
+        generated_text,
+        first_step,
+        options,
+        chain,
+        rng,
+    } = request;
     let prompt_len = draft_state
         .tokens
         .len()

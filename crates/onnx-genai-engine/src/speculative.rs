@@ -7,9 +7,10 @@
 use crate::TokenId;
 use crate::config::{MtpCacheScope, MtpHiddenLayout};
 use crate::decode::{
-    apply_paged_sliding_window, extract_logits_sequence_with_io, next_session_token_logits,
-    next_session_token_logits_and_hidden, next_session_token_logits_and_hiddens,
-    propose_draft_tokens, run_decode_session_logits, run_decode_step,
+    DraftProposalRequest, apply_paged_sliding_window, extract_logits_sequence_with_io,
+    next_session_token_logits, next_session_token_logits_and_hidden,
+    next_session_token_logits_and_hiddens, propose_draft_tokens, run_decode_session_logits,
+    run_decode_step,
 };
 use crate::decode_loop::{
     DecodeLoopState, commit_selected_token, logprob_for_token, reached_context_limit,
@@ -1041,17 +1042,17 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
     ) -> anyhow::Result<SpeculativeProposal> {
         let mut fallback_rng = SamplingRng::new(context.options.seed);
         let rng = self.rng.as_deref_mut().unwrap_or(&mut fallback_rng);
-        let tokens = propose_draft_tokens(
-            self.draft_model,
-            self.draft_state,
-            context.width,
-            context.generated_tokens,
-            context.generated_text,
-            context.first_step,
-            context.options,
-            context.chain,
+        let tokens = propose_draft_tokens(DraftProposalRequest {
+            draft_model: self.draft_model,
+            draft_state: self.draft_state,
+            width: context.width,
+            generated_tokens: context.generated_tokens,
+            generated_text: context.generated_text,
+            first_step: context.first_step,
+            options: context.options,
+            chain: context.chain,
             rng,
-        )?;
+        })?;
         Ok(SpeculativeProposal::linear(tokens))
     }
 
