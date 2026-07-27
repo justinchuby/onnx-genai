@@ -189,3 +189,8 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Recommended enforcement: every new dispatch branch ships with a `_TEST_HITS` reachability test.
 - Decision filed: `.squad/decisions/inbox/pris-dispatch-coverage-audit.md`.
 - Commit: `17be7087` (coordinated with Iran's fix in same commit).
+
+## 2026-07-27T16:31:27-07:00 — CI concurrency cancellation
+- Added top-level concurrency cancellation to `ci.yml` using PR-number grouping for pull requests and SHA grouping for push/main runs, preserving post-merge `main` signal while cancelling stale PR coverage runs.
+- Added top-level concurrency cancellation to `audit.yml`, grouped by ref because audit has no pull request trigger.
+- Deliberately exempted release/state-mutating workflows: `publish.yml`, `wheels.yml`, and the squad issue/label workflows.

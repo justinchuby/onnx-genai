@@ -68,3 +68,32 @@ Out of scope for this change, still present and should get a dedicated release-w
 
 - `.github/workflows/publish.yml` uses `dtolnay/rust-toolchain@stable` at four call sites.
 - `.github/workflows/wheels.yml` uses `dtolnay/rust-toolchain@stable` at two call sites.
+
+## Concurrency policy — 2026-07-27
+
+Justin directed CI to cancel superseded runs so rapid PR pushes do not keep burning full coverage minutes after a newer commit exists.
+
+### Applied
+
+- `.github/workflows/ci.yml` now uses:
+  - `group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}`
+  - `cancel-in-progress: true`
+  - Why this key: pull request events group by PR number, so newer pushes to PR #296 cancel older PR runs. Push events to `main` group by commit SHA, so post-merge `main` runs are not cancelled by later commits and keep their health signal. The workflow-dispatch boolean separates manual runs from normal PR/push groups.
+- `.github/workflows/audit.yml` now uses:
+  - `group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' }}`
+  - `cancel-in-progress: true`
+  - Why this key: audit has no `pull_request` trigger, so grouping by ref cancels stale branch audits when Cargo manifests/lockfiles change repeatedly. The latest completed audit is the useful signal.
+
+### Exempted / unchanged
+
+- `.github/workflows/publish.yml`: already serializes by tag/ref with `cancel-in-progress: false`; left unchanged. Cancelling release publication can leave crates or wheels half-published.
+- `.github/workflows/wheels.yml`: left unchanged because it has tag and manual publish paths (`publish-cpu` uses PyPI trusted publishing). Treat it like release infrastructure; cancelling mid-publish is riskier than wasted minutes.
+- `.github/workflows/squad-heartbeat.yml`: left unchanged because it mutates issues/comments/assignments; cancellation mid-run can leave partial GitHub state.
+- `.github/workflows/squad-issue-assign.yml`: left unchanged because it comments on and assigns issues; cancellation/retry can duplicate or partially apply state.
+- `.github/workflows/squad-triage.yml`: left unchanged because it comments/labels issues; cancellation can leave partial triage state.
+- `.github/workflows/sync-squad-labels.yml`: left unchanged because it creates/updates many labels; although mostly idempotent, cancellation can leave a partially synced label set until a later run.
+
+### Verification
+
+- First PR run after rapid pushes: pending in final report.
+- Second PR run after rapid pushes: pending in final report.
