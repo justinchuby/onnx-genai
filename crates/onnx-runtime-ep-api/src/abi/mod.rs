@@ -57,6 +57,7 @@ pub struct SubgraphClaim {
 /// infos, and per-subgraph compute states so the executor can treat each fused
 /// subgraph as a normal kernel while preserving the ORT callback lifetimes.
 pub struct PluginExecutionPlan {
+    // Kept as a lifetime anchor so plugin callbacks remain loaded until all kernels are dropped.
     #[allow(dead_code)]
     inner: Arc<PluginRuntime>,
     kernels: Vec<Arc<PluginKernelShared>>,

@@ -1222,11 +1222,16 @@ impl CsaStageDispatch {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct CsaGoldenBoundary {
+    // Kept for the planned CSA golden-boundary diff consumer.
+    #[allow(dead_code)]
     stage: CsaPipelineStage,
+    // Kept for the planned CSA golden-boundary diff consumer.
+    #[allow(dead_code)]
     mode: CsaStageMode,
+    // Kept for the planned CSA golden-boundary diff consumer.
+    #[allow(dead_code)]
     payload: Vec<u8>,
 }
 #[derive(Debug)]

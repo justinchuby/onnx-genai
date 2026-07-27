@@ -3,28 +3,40 @@
 use libloading::Library;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum CudaLibrary {
     Driver,
+    // Kept for the crate-local loader surface; no production caller probes cudart yet.
+    #[allow(dead_code)]
     Runtime,
+    // Kept for the crate-local loader surface; kernels currently load cuBLASLt instead.
+    #[allow(dead_code)]
     Cublas,
     CublasLt,
     Cudnn,
     Nvrtc,
+    // Kept for the crate-local loader surface; CUPTI loading currently lives in the tracer crate.
+    #[allow(dead_code)]
     Cupti,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum TargetOs {
+    // Kept for cross-target library discovery; constructed only in Linux builds and tests.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Linux,
+    // Kept for cross-target library discovery; constructed only in macOS builds and tests.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Macos,
     Windows,
+    // Kept for cross-target library discovery; constructed only on unsupported target OSes and tests.
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        allow(dead_code)
+    )]
     Other,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum TargetArch {
     Aarch64,
     Other,
