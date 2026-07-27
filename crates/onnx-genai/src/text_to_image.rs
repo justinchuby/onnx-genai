@@ -108,6 +108,39 @@ pub fn validate_batch_size(batch_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// Reject non-finite values produced by an image decode stage.
+///
+/// Widening an fp16 output to f32 preserves NaN and infinity, so callers must
+/// validate after conversion rather than allowing corrupt pixels to reach an
+/// encoder or API response.
+pub fn validate_finite_decode_output(values: &[f32], stage: &str) -> Result<()> {
+    let mut nan_count = 0usize;
+    let mut positive_infinity_count = 0usize;
+    let mut negative_infinity_count = 0usize;
+
+    for &value in values {
+        if value.is_nan() {
+            nan_count += 1;
+        } else if value == f32::INFINITY {
+            positive_infinity_count += 1;
+        } else if value == f32::NEG_INFINITY {
+            negative_infinity_count += 1;
+        }
+    }
+
+    let non_finite_count = nan_count + positive_infinity_count + negative_infinity_count;
+    if non_finite_count > 0 {
+        bail!(
+            "What: the {stage} produced {non_finite_count} non-finite values \
+             (NaN: {nan_count}, +Inf: {positive_infinity_count}, -Inf: {negative_infinity_count}). \
+             Why: fp16 decode overflow can produce NaN or infinity, and widening those values to f32 cannot recover the image. \
+             How: export or run this decode stage in fp32 (for example, use an fp32 VAE decoder) and retry."
+        );
+    }
+
+    Ok(())
+}
+
 /// Standalone VAE decoder for packages whose pipeline ends at the latent.
 #[derive(Debug, Clone)]
 pub struct VaeDecoder {
@@ -430,7 +463,9 @@ pub fn vae_decode(
     let image_shape = image.shape().to_vec();
     let height = image_shape[image_shape.len() - 2] as usize;
     let width = image_shape[image_shape.len() - 1] as usize;
-    Ok((image.to_vec_f32_lossy()?, height, width))
+    let image_data = image.to_vec_f32_lossy()?;
+    validate_finite_decode_output(&image_data, "VAE decoder")?;
+    Ok((image_data, height, width))
 }
 
 /// Convert one rendered image to an RGB8 buffer, mapping `[-1, 1]` to `[0, 255]`.
@@ -440,6 +475,7 @@ pub fn to_rgb8(image: &RenderedImage) -> Result<image::RgbImage> {
         height,
         pixels_chw,
     } = image;
+    validate_finite_decode_output(pixels_chw, "image decoder")?;
     let plane = width * height;
     if pixels_chw.len() < plane * 3 {
         bail!(
@@ -652,6 +688,7 @@ pub fn render(
         let height = shape[shape.len() - 2] as usize;
         let width = shape[shape.len() - 1] as usize;
         let data = image_value.to_vec_f32_lossy()?;
+        validate_finite_decode_output(&data, "pipeline image decoder")?;
         return Ok(split_batch(data, width, height, batch_size));
     }
 
@@ -827,6 +864,55 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("What:"), "message: {message}");
         assert!(message.contains("How:"), "message: {message}");
+    }
+
+    #[test]
+    fn fp16_decode_output_rejects_every_non_finite_class_with_actionable_error() {
+        let output = Value::from_slice_f16_bits(&[0x0000, 0x7e00, 0x7c00, 0xfc00, 0x3c00], &[5])
+            .expect("fp16 VAE output");
+        let widened = output.to_vec_f32_lossy().expect("widen fp16 output");
+        let error = validate_finite_decode_output(&widened, "test VAE")
+            .expect_err("non-finite decoder output must fail closed");
+
+        let message = error.to_string();
+        assert!(message.contains("test VAE"), "message: {message}");
+        assert!(message.contains("NaN: 1"), "message: {message}");
+        assert!(message.contains("+Inf: 1"), "message: {message}");
+        assert!(message.contains("-Inf: 1"), "message: {message}");
+        assert!(message.contains("fp32 VAE decoder"), "message: {message}");
+    }
+
+    #[test]
+    fn fp16_decode_output_accepts_all_finite_values_without_modification() {
+        let output = Value::from_slice_f16_bits(
+            &[0xfbff, 0xbc00, 0x8000, 0x0000, 0x3c00, 0x0001, 0x7bff],
+            &[7],
+        )
+        .expect("fp16 VAE output");
+        let widened = output.to_vec_f32_lossy().expect("widen fp16 output");
+        let original = widened.clone();
+
+        validate_finite_decode_output(&widened, "test VAE")
+            .expect("all finite decoder values must pass through");
+        assert_eq!(widened, original);
+        assert!(widened.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn rgb_conversion_fails_closed_on_non_finite_pixels() {
+        let image = RenderedImage {
+            width: 1,
+            height: 1,
+            pixels_chw: vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+        };
+
+        let error = to_rgb8(&image).expect_err("PNG conversion must reject corrupt pixels");
+        assert!(
+            error
+                .to_string()
+                .contains("image decoder produced 3 non-finite values"),
+            "message: {error}"
+        );
     }
 
     #[test]

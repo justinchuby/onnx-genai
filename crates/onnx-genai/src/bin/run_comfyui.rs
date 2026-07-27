@@ -26,7 +26,7 @@ use onnx_genai::engine::{
 use onnx_genai::ort::{Environment, Value};
 use onnx_genai::text_to_image::{
     CLIP_CONTEXT_LENGTH, RenderedImage, latent_channels, load_clip_tokenizer, save_png,
-    text_encode, tile_ids, tokenize_clip as tokenize,
+    text_encode, tile_ids, tokenize_clip as tokenize, validate_finite_decode_output,
 };
 use onnx_genai_comfyui_config::parse_workflow_file;
 use rand::SeedableRng;
@@ -246,7 +246,8 @@ fn main() -> Result<()> {
         .get("vae.image")
         .context("pipeline did not produce 'vae.image'")?;
     let image_shape = image_value.shape().to_vec();
-    let image_data = image_value.to_vec_f32()?;
+    let image_data = image_value.to_vec_f32_lossy()?;
+    validate_finite_decode_output(&image_data, "VAE decoder")?;
     let height = image_shape[image_shape.len() - 2] as usize;
     let width = image_shape[image_shape.len() - 1] as usize;
     let per_image = 3 * height * width;
