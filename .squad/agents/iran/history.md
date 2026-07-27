@@ -156,3 +156,27 @@ Profiled at M=11: non-GEMM ops are only **2.1% (8 ms)** of prefill time. The "~2
 - **Column-major = row-major transpose** — this algebraic identity eliminates copies for any column-major weight; future non-contiguous weights should check for this pattern.
 - **Trivial batch dims block dispatch** — the engine promotes 2-D to 3-D with batch [1]. Any dispatch gate using `batch_shape.is_empty()` silently blocks the fast path. Use `trivial_batch` (all dims == 1) instead.
 - **Env-var probes are essential** — the `NXRT_BNNS_TRANS_B_PROBE` technique found the bug in seconds after the benchmark showed no improvement. Always probe the production path, never trust the unit test alone.
+
+---
+
+### Session 2026-07-27T15:20 — Prefill Fusion Instrumentation
+
+**Task:** Instrument optimizer passes on Qwen2.5-0.5b-f16 prefill graph, diagnose which fusions fire, count actual ops, and test highest-value missing fusion.
+
+#### Findings
+1. **SDPA fusion correctly not firing** — model has 24 pre-fused `Attention` contrib ops from exporter; no decomposed pattern to match.
+2. **Fusions that fire:** MatMul+Bias (120), CpuSiluFusion (24). Fusions that correctly don't: SDPA, LayerNorm, GELU.
+3. **Actual ops dispatched during prefill:** 350 (after full optimization from 590 raw).
+4. **SiblingProjectionMerge implemented** — merges Q/K/V and gate/up siblings into wider GEMMs, 350→326 ops. Fully correct (bit-for-bit parity + dispatch reachability tests).
+5. **Measurement: fusion REGRESSES TTFT** — 91→153ms (+68%). BNNS prefers individual smaller GEMMs over one wider merged GEMM. Gated behind `ONNX_RT_SIBLING_MERGE=1`.
+
+#### Performance (Apple M1 Max, load 6–8)
+- TTFT: 90ms (40 tokens) — baseline unchanged (fusion disabled by default)
+- Decode: 70 tok/s (55–61% roofline) — no regression
+- End-to-end: 55 tok/s
+
+#### Durable lessons
+- **Wider GEMMs ≠ faster on BNNS** — Apple's BNNS internal tiling handles individual [M,K]×[K,N] calls very efficiently. Merging siblings into one wider call hits worse tile utilization at non-power-of-2 N dimensions.
+- **Dispatch overhead is not the prefill bottleneck** — at 90ms for 350 ops, per-op average is 0.26ms (compute-dominated). The "dispatch overhead" theory holds only under high system load.
+- **Always measure after implementing** — the op-count-reduction argument was logically sound but empirically wrong for this hardware/backend combination.
+- **Pre-fused contrib ops from the exporter** — when the model exporter already fuses SDPA/RMSNorm/RotaryEmbedding into contrib ops, runtime fusion passes have nothing to match. This is expected for optimized HF exports.
