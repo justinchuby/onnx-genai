@@ -821,6 +821,26 @@ pub fn sqnbit_gemm_available(bits: usize, blk_len: usize, comp: SQNBitComputeTyp
     unsafe { mlas_qnbit_gemm_available(bits, blk_len, comp.raw()) != 0 }
 }
 
+/// Return the exact MLAS packed-B buffer size for a blocked n-bit weight.
+///
+/// The packed representation is specific to the current MLAS dispatch, compute
+/// type, and host ISA. `None` means MLAS cannot consume this configuration.
+pub fn sqnbit_packed_b_size(
+    n: usize,
+    k: usize,
+    bits: usize,
+    blk_len: usize,
+    has_zp: bool,
+    comp: SQNBitComputeType,
+) -> Option<usize> {
+    if !sqnbit_gemm_available(bits, blk_len, comp) {
+        return None;
+    }
+    let size =
+        unsafe { mlas_qnbit_gemm_pack_b_size(n, k, bits, blk_len, has_zp as c_int, comp.raw()) };
+    (size != 0).then_some(size)
+}
+
 /// MLAS-packed blockwise-quantized B weight for [`sqnbit_gemm`], mirroring how
 /// ORT pre-packs the constant `MatMulNBits` initializer once and reuses it.
 ///
@@ -868,16 +888,8 @@ impl SQNBitPackedB {
         scale: &[f32],
         zp: Option<&[u8]>,
     ) -> Option<Self> {
-        if !sqnbit_gemm_available(bits, blk_len, comp) {
-            return None;
-        }
         let has_zp = zp.is_some();
-        let size = unsafe {
-            mlas_qnbit_gemm_pack_b_size(n, k, bits, blk_len, has_zp as c_int, comp.raw())
-        };
-        if size == 0 {
-            return None;
-        }
+        let size = sqnbit_packed_b_size(n, k, bits, blk_len, has_zp, comp)?;
         let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "SQNBit packed-B allocation failed");
@@ -908,6 +920,52 @@ impl SQNBitPackedB {
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
         })
+    }
+
+    /// Reconstruct an MLAS packed weight from a previously packed buffer.
+    ///
+    /// The bytes must have been produced by [`SQNBitPackedB::new`] (or
+    /// `MlasQNBitGemmPackQuantBData`) for the same host dispatch, dimensions,
+    /// quantization parameters, and compute type. The buffer is copied into a
+    /// 64-byte-aligned allocation so MLAS's internal aligned offsets remain
+    /// valid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_prepacked(
+        n: usize,
+        k: usize,
+        bits: usize,
+        blk_len: usize,
+        comp: SQNBitComputeType,
+        packed: &[u8],
+        scale: &[f32],
+        zp: Option<&[u8]>,
+    ) -> Option<Self> {
+        let has_zp = zp.is_some();
+        let size = sqnbit_packed_b_size(n, k, bits, blk_len, has_zp, comp)?;
+        if packed.len() != size {
+            return None;
+        }
+        let layout = std::alloc::Layout::from_size_align(size, 64).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        assert!(!ptr.is_null(), "SQNBit prepacked-B allocation failed");
+        unsafe { std::ptr::copy_nonoverlapping(packed.as_ptr(), ptr, size) };
+        Some(Self {
+            ptr,
+            layout,
+            n,
+            k,
+            bits,
+            blk_len,
+            comp,
+            has_zp,
+            scale: scale.to_vec(),
+            zp: zp.map(<[u8]>::to_vec),
+        })
+    }
+
+    /// Serialized bytes of this host- and compute-type-specific MLAS layout.
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.layout.size()) }
     }
 
     /// Logical `(k, n)` dimensions of the packed weight.
