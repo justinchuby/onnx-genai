@@ -57,4 +57,22 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 - **Threading safety**: BNNS calls from dispatch level only, never inside Rayon parallel regions (avoids 4× GCD oversubscription).
 - **Tests**: dispatch reachability (atomic counter), bf16 exclusion (output parity), numerics vs f64 reference at model-scale 128×896×4864, edge values (fp16 max/denorm/NaN/zero), bitwise determinism, guard-break proof.
 - **Verification**: `cargo fmt` clean, clippy clean on aarch64 + x86_64 `--all-targets -D warnings`, all 140 matmul tests pass, full CPU EP suite green. Decode guard `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` passes (unregressed).
-- **TTFT measurement deferred**: System load 83 on 10-core M1 Max during implementation; measurement unreliable. Sebastian's microbenchmark (2451 GFLOPS) projects ~37 ms TTFT vs ORT's 107 ms.
+- **Initial TTFT measurement: null result** — Justin measured 989 ms (unchanged from baseline). BNNS dispatch was reaching the unit test but two production bottlenecks masked the gain.
+
+### 2026-07-27 — Diagnosed and fixed null-result TTFT (filter cache + contiguous B rescue)
+- **Commit `58bafd0d`** on `squad/mac-prefill-bnns`: Two fixes that reduced TTFT from 989 ms to **347 ms** (2.8× improvement).
+- **Root cause 1 — BNNS filter cold-start**: `BNNSFilterCreateLayerBroadcastMatMul` costs 3–19 ms cold per unique (M,K,N) shape (GCD dispatch setup / AMX micro-code compilation). With ~20 unique shapes, first prefill paid ~60–380 ms. **Fix**: Thread-local `FilterCache` — `HashMap<(usize,usize,usize), BNNSFilter>` + Drop cleanup. Filter created once per shape, reused forever. Subsequent calls: ~0.3 ms → cached: 0 ms.
+- **Root cause 2 — Non-contiguous vocab weight**: lm_head weight (896×151936, 272 MB) stored column-major in ONNX model. `try_matmul_half` requires contiguous inputs, so vocab bypassed BNNS entirely and fell through to element-by-element `to_dense_f32_widen` (1066 ms for 136M elements). **Fix**: `MatMulPrepack::contiguous_b_f16` — parallel strided copy via Rayon, cached per session in `OnceLock`. Rescue dispatch in `execute_with_backend` routes non-contiguous f16 B to cached copy → BNNS.
+- **Measurements** (M1 Max, load 25–32, qwen2.5-0.5b-f16, 40-token prompt, 5 runs median):
+  - TTFT: **347.4 ms** [346.8, 351.1] vs ORT 108.5 ms — 3.2× ratio (down from 9.1×)
+  - decode: **58.36 tok/s** [57.32, 59.76] vs ORT 41.98 — 1.390× (unregressed)
+  - end-to-end: 22.94 [22.24, 23.34] vs ORT 38.50 — 0.596× (up from 0.464×)
+- **BNNS call profile**: 168 calls at M=40, 260–346 GFLOPS per call. Total BNNS GEMM time ~150 ms. Remaining ~200 ms is non-GEMM overhead (LayerNorm, SoftMax, RoPE, embedding, graph dispatch).
+- **All guards green**: `fp16_m1_decode_reaches_neon_gemv_not_half_gemm`, `fp16_m_ge2_prefill_reaches_bnns_not_half_gemm`, `bf16_m_ge2_does_not_reach_bnns`, `bnns_f16_prefill_matches_f64_reference_via_matmul_kernel`. Full suite: 936 passed, 0 failed.
+- **Verification**: cargo fmt clean, clippy clean aarch64 + x86_64 `--all-targets -D warnings`.
+
+#### Durable lessons
+- **BNNS filter creation is expensive cold** — always cache filters. Thread-local with Drop is the safe pattern (BNNSFilter is `*mut c_void`, not Send).
+- **Non-contiguous weights are invisible performance cliffs** — `is_contiguous()` gates throughout the codebase silently fall through to element-by-element conversion. Any new fast path must handle or explicitly diagnose non-contiguous weights.
+- **Microbenchmark ≠ production performance** — BNNS reached 2451 GFLOPS in microbenchmark but production TTFT includes filter creation, weight materialization, and non-GEMM ops. Always verify with the real model path.
+- **compare benchmark creates new Engine per run** — OnceLock caches (e.g. contiguous_b_f16) are NOT shared across measured runs. Thread-local BNNS filter cache IS shared. Production (persistent Engine) TTFT is ~30 ms better than compare reports.
