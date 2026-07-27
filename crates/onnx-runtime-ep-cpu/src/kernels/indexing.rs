@@ -208,6 +208,51 @@ impl KernelFactory for ScatterNDFactory {
     }
 }
 
+pub(crate) fn scatter_nd_unsupported_reason(input_dtypes: &[DataType]) -> Option<String> {
+    if input_dtypes.is_empty() {
+        return None;
+    }
+    if input_dtypes.len() != 3 {
+        return Some(format!(
+            "ScatterND requires 3 inputs, got {}",
+            input_dtypes.len()
+        ));
+    }
+    let data_dtype = input_dtypes[0];
+    if !matches!(
+        data_dtype,
+        DataType::Float32
+            | DataType::Float16
+            | DataType::BFloat16
+            | DataType::Float64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Uint8
+            | DataType::Uint16
+            | DataType::Uint32
+            | DataType::Uint64
+    ) {
+        return Some(format!(
+            "ScatterND: data dtype {data_dtype:?} is not implemented by the CPU kernel"
+        ));
+    }
+    if input_dtypes[1] != DataType::Int64 {
+        return Some(format!(
+            "ScatterND: indices must have Int64 dtype, got {:?}",
+            input_dtypes[1]
+        ));
+    }
+    if input_dtypes[2] != data_dtype {
+        return Some(format!(
+            "ScatterND: updates dtype {:?} must match data dtype {data_dtype:?}",
+            input_dtypes[2]
+        ));
+    }
+    None
+}
+
 fn parse_scatter_reduction(op: &str, node: &Node) -> Result<ScatterReduction> {
     match node.attr("reduction").and_then(Attribute::as_str) {
         None | Some("none") => Ok(ScatterReduction::None),
@@ -630,6 +675,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.to_i32(), vec![11, 22, 83, 104]);
+    }
+
+    #[test]
+    fn scatter_nd_mul_reduces_duplicate_indices() {
+        let data = Owned::i32(&[2, 2], &[2, 3, 4, 5]);
+        let indices = Owned::i64(&[3, 1], &[0, 1, 1]);
+        let updates = Owned::i32(&[3, 2], &[7, 11, 2, 3, 5, 7]);
+        let mut out = Owned::zeros(DataType::Int32, &[2, 2]);
+        ScatterNDKernel {
+            reduction: ScatterReduction::Mul,
+        }
+        .execute(
+            &[data.view(), indices.view(), updates.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
+        assert_eq!(out.to_i32(), vec![14, 33, 40, 105]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! `QLinearMatMul`: integer matrix multiplication with linear quantization.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{DataType, Dim, Node, Shape, broadcast_shapes, compute_contiguous_strides};
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
@@ -18,42 +18,173 @@ impl KernelFactory for QLinearMatMulFactory {
 /// Return a claim-time denial for metadata the CPU reference kernel cannot run.
 pub(crate) fn unsupported_reason(
     input_dtypes: &[DataType],
-    _input_shapes: &[onnx_runtime_ir::Shape],
+    input_shapes: &[Shape],
 ) -> Option<String> {
-    if input_dtypes.is_empty() {
+    if !input_dtypes.is_empty() {
+        if input_dtypes.len() != 8 {
+            return Some(format!(
+                "QLinearMatMul requires 8 inputs, got {}",
+                input_dtypes.len()
+            ));
+        }
+        for &(index, name) in &[(0, "A"), (3, "B"), (7, "y_zero_point")] {
+            if !is_quantized(input_dtypes[index]) {
+                return Some(format!(
+                    "QLinearMatMul: {name} must have Int8 or Uint8 dtype, got {:?}",
+                    input_dtypes[index]
+                ));
+            }
+        }
+        for &(integer, value, name) in &[(0, 2, "a_zero_point"), (3, 5, "b_zero_point")] {
+            if input_dtypes[value] != input_dtypes[integer] {
+                return Some(format!(
+                    "QLinearMatMul: {name} dtype {:?} must match input dtype {:?}",
+                    input_dtypes[value], input_dtypes[integer]
+                ));
+            }
+        }
+        for &index in &[1, 4, 6] {
+            if input_dtypes[index] != DataType::Float32 {
+                return Some(format!(
+                    "QLinearMatMul: scale input {index} must be Float32, got {:?}",
+                    input_dtypes[index]
+                ));
+            }
+        }
+    }
+    if input_shapes.is_empty() {
         return None;
     }
-    if input_dtypes.len() != 8 {
+    if input_shapes.len() != 8 {
         return Some(format!(
-            "QLinearMatMul requires 8 inputs, got {}",
-            input_dtypes.len()
+            "QLinearMatMul requires 8 input shapes, got {}",
+            input_shapes.len()
         ));
     }
-    for &(index, name) in &[(0, "A"), (3, "B"), (7, "y_zero_point")] {
-        if !is_quantized(input_dtypes[index]) {
-            return Some(format!(
-                "QLinearMatMul: {name} must have Int8 or Uint8 dtype, got {:?}",
-                input_dtypes[index]
-            ));
-        }
-    }
-    for &(integer, value, name) in &[(0, 2, "a_zero_point"), (3, 5, "b_zero_point")] {
-        if input_dtypes[value] != input_dtypes[integer] {
-            return Some(format!(
-                "QLinearMatMul: {name} dtype {:?} must match input dtype {:?}",
-                input_dtypes[value], input_dtypes[integer]
-            ));
-        }
-    }
-    for &index in &[1, 4, 6] {
-        if input_dtypes[index] != DataType::Float32 {
-            return Some(format!(
-                "QLinearMatMul: scale input {index} must be Float32, got {:?}",
-                input_dtypes[index]
-            ));
-        }
+    if let Err(reason) = validate_claim_shapes(input_shapes) {
+        return Some(reason);
     }
     None
+}
+
+fn validate_claim_shapes(shapes: &[Shape]) -> std::result::Result<(), String> {
+    let a = &shapes[0];
+    let b = &shapes[3];
+    if a.is_empty() || b.is_empty() {
+        return Err("QLinearMatMul: operands must be at least 1-D".into());
+    }
+    if !dims_compatible(
+        a[a.len() - 1],
+        b[if b.len() == 1 { 0 } else { b.len() - 2 }],
+    ) {
+        return Err("QLinearMatMul: inner dimensions are not provably equal".into());
+    }
+    validate_batch_broadcast(
+        &a[..a.len().saturating_sub(2)],
+        &b[..b.len().saturating_sub(2)],
+    )?;
+    validate_claim_quant_pair("a", &shapes[1], &shapes[2], a, QuantAxis::Row)?;
+    validate_claim_quant_pair("b", &shapes[4], &shapes[5], b, QuantAxis::Column)?;
+    if shapes[6] != shapes[7] {
+        return Err("QLinearMatMul: y_scale and y_zero_point shapes must match".into());
+    }
+    if !is_claim_scalar_shape(&shapes[6]) {
+        return Err("QLinearMatMul: output scale and zero point must be scalar".into());
+    }
+    Ok(())
+}
+
+fn validate_batch_broadcast(a: &[Dim], b: &[Dim]) -> std::result::Result<(), String> {
+    let rank = a.len().max(b.len());
+    for trailing in 0..rank {
+        let a_dim = a
+            .len()
+            .checked_sub(trailing + 1)
+            .map_or(Dim::Static(1), |index| a[index]);
+        let b_dim = b
+            .len()
+            .checked_sub(trailing + 1)
+            .map_or(Dim::Static(1), |index| b[index]);
+        if !dims_broadcastable(a_dim, b_dim) {
+            return Err("QLinearMatMul: batch dimensions are not provably broadcastable".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_claim_quant_pair(
+    name: &str,
+    scale: &Shape,
+    zero_point: &Shape,
+    operand: &Shape,
+    axis: QuantAxis,
+) -> std::result::Result<(), String> {
+    if scale != zero_point {
+        return Err(format!(
+            "QLinearMatMul: {name}_scale and {name}_zero_point shapes must match"
+        ));
+    }
+    if is_claim_scalar_shape(scale) || is_claim_axis_shape(scale, operand, axis) {
+        Ok(())
+    } else {
+        Err(format!(
+            "QLinearMatMul: invalid {name} scale/zero-point shape"
+        ))
+    }
+}
+
+fn is_claim_scalar_shape(shape: &[Dim]) -> bool {
+    shape.is_empty() || shape == [Dim::Static(1)]
+}
+
+fn is_claim_axis_shape(shape: &[Dim], operand: &[Dim], axis: QuantAxis) -> bool {
+    match operand.len() {
+        0 | 1 => false,
+        2 => {
+            shape.len() == 1
+                && dims_equal(
+                    shape[0],
+                    operand[match axis {
+                        QuantAxis::Row => 0,
+                        QuantAxis::Column => 1,
+                    }],
+                )
+        }
+        rank => {
+            if shape.len() != rank {
+                return false;
+            }
+            let batch = rank - 2;
+            if !shape[..batch]
+                .iter()
+                .zip(&operand[..batch])
+                .all(|(&left, &right)| dims_equal(left, right))
+            {
+                return false;
+            }
+            match axis {
+                QuantAxis::Row => {
+                    dims_equal(shape[batch], operand[batch]) && shape[batch + 1] == Dim::Static(1)
+                }
+                QuantAxis::Column => {
+                    shape[batch] == Dim::Static(1)
+                        && dims_equal(shape[batch + 1], operand[batch + 1])
+                }
+            }
+        }
+    }
+}
+
+fn dims_equal(left: Dim, right: Dim) -> bool {
+    left == right
+}
+
+fn dims_compatible(left: Dim, right: Dim) -> bool {
+    dims_equal(left, right)
+}
+
+fn dims_broadcastable(left: Dim, right: Dim) -> bool {
+    dims_equal(left, right) || left == Dim::Static(1) || right == Dim::Static(1)
 }
 
 impl Kernel for QLinearMatMulKernel {
@@ -91,33 +222,32 @@ impl Kernel for QLinearMatMulKernel {
                 outputs[0].shape, geometry.output_shape
             )));
         }
-        let a_scale = scalar_scale("a_scale", &inputs[1])?;
-        let b_scale = b_scales(&inputs[4], geometry.n)?;
-        let y_scale = scalar_scale("y_scale", &inputs[6])?;
-        let a_zero_point = scalar_integer("a_zero_point", &inputs[2])?;
-        let b_zero_point = b_zero_points(&inputs[5], geometry.n)?;
-        let y_zero_point = scalar_integer("y_zero_point", &inputs[7])?;
+        let a_quant = QuantParams::load("a", &inputs[1], &inputs[2], a.shape, QuantAxis::Row)?;
+        let b_quant = QuantParams::load("b", &inputs[4], &inputs[5], b.shape, QuantAxis::Column)?;
+        let (y_scale, y_zero_point) = output_quant_params(&inputs[6], &inputs[7])?;
 
         let a = read_quantized(&inputs[0])?;
         let b = read_quantized(&inputs[3])?;
         let mut output = Vec::with_capacity(geometry.result_len);
         let mut batch_index = vec![0; geometry.batch_shape.len()];
         for batch in 0..geometry.batch_count {
-            let a_offset = geometry.a_offset(&batch_index);
-            let b_offset = geometry.b_offset(&batch_index);
+            let a_batch = geometry.a_batch_offset(&batch_index);
+            let b_batch = geometry.b_batch_offset(&batch_index);
+            let a_offset = a_batch * geometry.m * geometry.k;
+            let b_offset = b_batch * geometry.k * geometry.n;
             for row in 0..geometry.m {
                 for column in 0..geometry.n {
-                    let mut accumulated = 0i64;
+                    let (a_scale, a_zero_point) = a_quant.at(a_batch, row);
+                    let (b_scale, b_zero_point) = b_quant.at(b_batch, column);
+                    let mut accumulated = 0i32;
                     for inner in 0..geometry.k {
                         let av = a[a_offset + row * geometry.k + inner] - a_zero_point;
-                        let bv = b[b_offset + inner * geometry.n + column]
-                            - b_zero_point[if b_zero_point.len() == 1 { 0 } else { column }];
-                        accumulated += av * bv;
+                        let bv = b[b_offset + inner * geometry.n + column] - b_zero_point;
+                        accumulated = accumulated.wrapping_add(av * bv);
                     }
-                    let scale =
-                        a_scale * b_scale[if b_scale.len() == 1 { 0 } else { column }] / y_scale;
-                    let value =
-                        (accumulated as f32 * scale).round_ties_even() as i64 + y_zero_point;
+                    let scale = a_scale * b_scale / y_scale;
+                    let value = (accumulated as f32 * scale).round_ties_even() as i64
+                        + i64::from(y_zero_point);
                     push_quantized(&mut output, outputs[0].dtype, value)?;
                 }
             }
@@ -137,27 +267,113 @@ fn is_quantized(dtype: DataType) -> bool {
     matches!(dtype, DataType::Int8 | DataType::Uint8)
 }
 
-fn scalar_scale(name: &str, view: &TensorView) -> Result<f32> {
-    if view.numel() != 1 {
-        return Err(EpError::KernelFailed(format!(
-            "QLinearMatMul: {name} must be a scalar"
-        )));
-    }
-    let value = f32::from_le_bytes(to_dense_bytes(view)?[..4].try_into().unwrap());
-    if value <= 0.0 || !value.is_finite() {
-        return Err(EpError::KernelFailed(format!(
-            "QLinearMatMul: {name} must be finite and positive"
-        )));
-    }
-    Ok(value)
+#[derive(Clone, Copy)]
+enum QuantAxis {
+    Row,
+    Column,
 }
 
-fn b_scales(view: &TensorView, n: usize) -> Result<Vec<f32>> {
-    if view.shape.len() > 1 || !(view.numel() == 1 || view.numel() == n) {
-        return Err(EpError::KernelFailed(format!(
-            "QLinearMatMul: b_scale must be scalar or a 1-D tensor of length {n}"
-        )));
+struct QuantParams {
+    scales: Vec<f32>,
+    zero_points: Vec<i32>,
+    axis_len: usize,
+    per_axis: bool,
+}
+
+impl QuantParams {
+    fn load(
+        name: &str,
+        scale: &TensorView,
+        zero_point: &TensorView,
+        operand_shape: &[usize],
+        axis: QuantAxis,
+    ) -> Result<Self> {
+        if scale.shape != zero_point.shape {
+            return Err(EpError::KernelFailed(format!(
+                "QLinearMatMul: {name}_scale and {name}_zero_point shapes must match"
+            )));
+        }
+        let per_axis = if is_scalar_shape(scale.shape) {
+            false
+        } else if is_axis_shape(scale.shape, operand_shape, axis) {
+            true
+        } else {
+            return Err(EpError::KernelFailed(format!(
+                "QLinearMatMul: invalid {name} scale/zero-point shape {:?} for operand shape {:?}",
+                scale.shape, operand_shape
+            )));
+        };
+        let scales = read_scales(scale)?;
+        let zero_points = read_quantized(zero_point)?;
+        let axis_len = match axis {
+            QuantAxis::Row => {
+                if operand_shape.len() == 1 {
+                    1
+                } else {
+                    operand_shape[operand_shape.len() - 2]
+                }
+            }
+            QuantAxis::Column => *operand_shape.last().unwrap_or(&1),
+        };
+        Ok(Self {
+            scales,
+            zero_points,
+            axis_len,
+            per_axis,
+        })
     }
+
+    fn at(&self, source_batch: usize, axis_index: usize) -> (f32, i32) {
+        let index = if self.per_axis {
+            source_batch * self.axis_len + axis_index
+        } else {
+            0
+        };
+        (self.scales[index], self.zero_points[index])
+    }
+}
+
+fn is_scalar_shape(shape: &[usize]) -> bool {
+    shape.is_empty() || shape == [1]
+}
+
+fn is_axis_shape(shape: &[usize], operand: &[usize], axis: QuantAxis) -> bool {
+    match operand.len() {
+        0 | 1 => false,
+        2 => {
+            shape
+                == [operand[match axis {
+                    QuantAxis::Row => 0,
+                    QuantAxis::Column => 1,
+                }]]
+        }
+        rank => {
+            if shape.len() != rank || shape[..rank - 2] != operand[..rank - 2] {
+                return false;
+            }
+            match axis {
+                QuantAxis::Row => shape[rank - 2] == operand[rank - 2] && shape[rank - 1] == 1,
+                QuantAxis::Column => shape[rank - 2] == 1 && shape[rank - 1] == operand[rank - 1],
+            }
+        }
+    }
+}
+
+fn output_quant_params(scale: &TensorView, zero_point: &TensorView) -> Result<(f32, i32)> {
+    if scale.shape != zero_point.shape {
+        return Err(EpError::KernelFailed(
+            "QLinearMatMul: y_scale and y_zero_point shapes must match".into(),
+        ));
+    }
+    if !is_scalar_shape(scale.shape) {
+        return Err(EpError::KernelFailed(
+            "QLinearMatMul: output scale and zero point must be scalar".into(),
+        ));
+    }
+    Ok((read_scales(scale)?[0], read_quantized(zero_point)?[0]))
+}
+
+fn read_scales(view: &TensorView) -> Result<Vec<f32>> {
     let bytes = to_dense_bytes(view)?;
     let scales: Vec<f32> = bytes
         .chunks_exact(4)
@@ -168,35 +384,17 @@ fn b_scales(view: &TensorView, n: usize) -> Result<Vec<f32>> {
         .any(|value| *value <= 0.0 || !value.is_finite())
     {
         return Err(EpError::KernelFailed(
-            "QLinearMatMul: b_scale values must be finite and positive".into(),
+            "QLinearMatMul: scales must be finite and positive".into(),
         ));
     }
     Ok(scales)
 }
 
-fn scalar_integer(name: &str, view: &TensorView) -> Result<i64> {
-    if view.numel() != 1 {
-        return Err(EpError::KernelFailed(format!(
-            "QLinearMatMul: {name} must be a scalar"
-        )));
-    }
-    Ok(read_quantized(view)?[0])
-}
-
-fn b_zero_points(view: &TensorView, n: usize) -> Result<Vec<i64>> {
-    if view.shape.len() > 1 || !(view.numel() == 1 || view.numel() == n) {
-        return Err(EpError::KernelFailed(format!(
-            "QLinearMatMul: b_zero_point must be scalar or a 1-D tensor of length {n}"
-        )));
-    }
-    read_quantized(view)
-}
-
-fn read_quantized(view: &TensorView) -> Result<Vec<i64>> {
+fn read_quantized(view: &TensorView) -> Result<Vec<i32>> {
     let bytes = to_dense_bytes(view)?;
     match view.dtype {
-        DataType::Int8 => Ok(bytes.into_iter().map(|value| value as i8 as i64).collect()),
-        DataType::Uint8 => Ok(bytes.into_iter().map(i64::from).collect()),
+        DataType::Int8 => Ok(bytes.into_iter().map(|value| value as i8 as i32).collect()),
+        DataType::Uint8 => Ok(bytes.into_iter().map(i32::from).collect()),
         other => Err(EpError::KernelFailed(format!(
             "QLinearMatMul: expected Int8 or Uint8 tensor, got {other:?}"
         ))),
@@ -279,12 +477,12 @@ impl Geometry {
         })
     }
 
-    fn a_offset(&self, batch_index: &[usize]) -> usize {
-        broadcast_offset(batch_index, &self.a_batch, &self.a_batch_strides) * self.m * self.k
+    fn a_batch_offset(&self, batch_index: &[usize]) -> usize {
+        broadcast_offset(batch_index, &self.a_batch, &self.a_batch_strides)
     }
 
-    fn b_offset(&self, batch_index: &[usize]) -> usize {
-        broadcast_offset(batch_index, &self.b_batch, &self.b_batch_strides) * self.k * self.n
+    fn b_batch_offset(&self, batch_index: &[usize]) -> usize {
+        broadcast_offset(batch_index, &self.b_batch, &self.b_batch_strides)
     }
 }
 
@@ -329,36 +527,86 @@ mod tests {
         }
     }
 
-    fn reference(
-        a: &[i64],
-        b: &[i64],
-        a_scale: f32,
-        b_scales: &[f32],
+    struct Reference<'a> {
+        a: &'a [i32],
+        a_shape: &'a [usize],
+        a_scales: &'a [f32],
+        a_zeros: &'a [i32],
+        b: &'a [i32],
+        b_shape: &'a [usize],
+        b_scales: &'a [f32],
+        b_zeros: &'a [i32],
         y_scale: f32,
-        a_zero: i64,
-        b_zeros: &[i64],
-        y_zero: i64,
-        m: usize,
-        k: usize,
-        n: usize,
-    ) -> Vec<i64> {
-        (0..m)
-            .flat_map(|row| {
-                (0..n).map(move |column| {
-                    let sum: i64 = (0..k)
-                        .map(|inner| {
-                            (a[row * k + inner] - a_zero)
-                                * (b[inner * n + column]
-                                    - b_zeros[if b_zeros.len() == 1 { 0 } else { column }])
-                        })
-                        .sum();
-                    (sum as f32 * a_scale * b_scales[if b_scales.len() == 1 { 0 } else { column }]
-                        / y_scale)
-                        .round_ties_even() as i64
-                        + y_zero
-                })
-            })
-            .collect()
+        y_zero: i32,
+        output_dtype: DataType,
+    }
+
+    fn reference(input: Reference<'_>) -> Vec<i64> {
+        let geometry = Geometry::new(input.a_shape, input.b_shape).unwrap();
+        let a_per_row = input.a_scales.len() > 1 || input.a_zeros.len() > 1;
+        let b_per_column = input.b_scales.len() > 1 || input.b_zeros.len() > 1;
+        let mut batch_index = vec![0; geometry.batch_shape.len()];
+        let mut output = Vec::with_capacity(geometry.result_len);
+        for batch in 0..geometry.batch_count {
+            let a_batch = geometry.a_batch_offset(&batch_index);
+            let b_batch = geometry.b_batch_offset(&batch_index);
+            for row in 0..geometry.m {
+                for column in 0..geometry.n {
+                    let a_quant_index = if a_per_row {
+                        a_batch * geometry.m + row
+                    } else {
+                        0
+                    };
+                    let b_quant_index = if b_per_column {
+                        b_batch * geometry.n + column
+                    } else {
+                        0
+                    };
+                    let mut product = 0.0f64;
+                    for inner in 0..geometry.k {
+                        let a_index = a_batch * geometry.m * geometry.k + row * geometry.k + inner;
+                        let b_index =
+                            b_batch * geometry.k * geometry.n + inner * geometry.n + column;
+                        let a = f64::from(input.a[a_index] - input.a_zeros[a_quant_index])
+                            * f64::from(input.a_scales[a_quant_index]);
+                        let b = f64::from(input.b[b_index] - input.b_zeros[b_quant_index])
+                            * f64::from(input.b_scales[b_quant_index]);
+                        product += a * b;
+                    }
+                    let quantized = (product / f64::from(input.y_scale)).round_ties_even() as i64
+                        + i64::from(input.y_zero);
+                    output.push(match input.output_dtype {
+                        DataType::Int8 => quantized.clamp(i8::MIN as i64, i8::MAX as i64),
+                        DataType::Uint8 => quantized.clamp(0, u8::MAX as i64),
+                        _ => unreachable!(),
+                    });
+                }
+            }
+            if batch + 1 < geometry.batch_count {
+                next_index(&geometry.batch_shape, &mut batch_index);
+            }
+        }
+        output
+    }
+
+    fn execute(inputs: [&Owned; 8], output_dtype: DataType, output_shape: &[usize]) -> Owned {
+        let mut output = Owned::zeros(output_dtype, output_shape);
+        QLinearMatMulKernel
+            .execute(&inputs.map(|input| input.view()), &mut [output.view_mut()])
+            .unwrap();
+        output
+    }
+
+    fn output_values(output: &Owned) -> Vec<i64> {
+        match output.dtype {
+            DataType::Int8 => output
+                .bytes
+                .iter()
+                .map(|&value| i64::from(value as i8))
+                .collect(),
+            DataType::Uint8 => output.bytes.iter().map(|&value| i64::from(value)).collect(),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -371,42 +619,27 @@ mod tests {
         let b_zero = Owned::u8(&[], &[128]);
         let y_scale = Owned::f32(&[], &[0.125]);
         let y_zero = Owned::u8(&[], &[127]);
-        let mut out = Owned::zeros(DataType::Uint8, &[2, 2]);
-        QLinearMatMulKernel
-            .execute(
-                &[
-                    a.view(),
-                    a_scale.view(),
-                    a_zero.view(),
-                    b.view(),
-                    b_scale.view(),
-                    b_zero.view(),
-                    y_scale.view(),
-                    y_zero.view(),
-                ],
-                &mut [out.view_mut()],
-            )
-            .unwrap();
-        let expected = reference(
-            &[130, 125, 140, 120, 135, 128],
-            &[131, 126, 120, 140, 128, 130],
-            0.25,
-            &[0.5],
-            0.125,
-            128,
-            &[128],
-            127,
-            2,
-            3,
-            2,
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[2, 2],
         );
-        assert_eq!(
-            out.to_u8(),
-            expected
-                .into_iter()
-                .map(|value| value as u8)
-                .collect::<Vec<_>>()
-        );
+        let expected = reference(Reference {
+            a: &[130, 125, 140, 120, 135, 128],
+            a_shape: &[2, 3],
+            a_scales: &[0.25],
+            a_zeros: &[128],
+            b: &[131, 126, 120, 140, 128, 130],
+            b_shape: &[3, 2],
+            b_scales: &[0.5],
+            b_zeros: &[128],
+            y_scale: 0.125,
+            y_zero: 127,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(output_values(&out), expected);
     }
 
     #[test]
@@ -419,8 +652,149 @@ mod tests {
         let b_zero = i8(&[3], &[1, -2, 3]);
         let y_scale = Owned::f32(&[], &[0.25]);
         let y_zero = i8(&[], &[2]);
-        let mut out = Owned::zeros(DataType::Int8, &[1, 3]);
-        QLinearMatMulKernel
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Int8,
+            &[1, 3],
+        );
+        let expected = reference(Reference {
+            a: &[-2, 5],
+            a_shape: &[1, 2],
+            a_scales: &[0.25],
+            a_zeros: &[-1],
+            b: &[3, -4, 7, 2, 5, -6],
+            b_shape: &[2, 3],
+            b_scales: &[0.5, 0.25, 0.125],
+            b_zeros: &[1, -2, 3],
+            y_scale: 0.25,
+            y_zero: 2,
+            output_dtype: DataType::Int8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    #[test]
+    fn qlinear_matmul_uint8_per_row_a_scales_matches_reference() {
+        let a_values = [10, 14, 7, 20];
+        let a = Owned::u8(&[2, 2], &a_values.map(|value| value as u8));
+        let a_scale = Owned::f32(&[2], &[0.5, 0.125]);
+        let a_zero = Owned::u8(&[2], &[8, 6]);
+        let b_values = [3, 9, 5, 1];
+        let b = Owned::u8(&[2, 2], &b_values.map(|value| value as u8));
+        let b_scale = Owned::f32(&[2], &[0.25, 0.5]);
+        let b_zero = Owned::u8(&[2], &[2, 4]);
+        let y_scale = Owned::f32(&[], &[0.125]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[2, 2],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[2, 2],
+            a_scales: &[0.5, 0.125],
+            a_zeros: &[8, 6],
+            b: &b_values,
+            b_shape: &[2, 2],
+            b_scales: &[0.25, 0.5],
+            b_zeros: &[2, 4],
+            y_scale: 0.125,
+            y_zero: 100,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    #[test]
+    fn qlinear_matmul_batched_per_row_and_per_column_broadcasts_match_reference() {
+        let a_values = [12, 8, 7, 15, 5, 20, 9, 4];
+        let a = Owned::u8(&[2, 2, 2], &a_values.map(|value| value as u8));
+        let a_scale = Owned::f32(&[2, 2, 1], &[0.5, 0.25, 0.125, 0.75]);
+        let a_zero = Owned::u8(&[2, 2, 1], &[10, 8, 6, 5]);
+        let b_values = [3, -4, 6, 2];
+        let b = i8(&[1, 2, 2], &b_values);
+        let b_scale = Owned::f32(&[1, 1, 2], &[0.5, 0.25]);
+        let b_zero = i8(&[1, 1, 2], &[1, -2]);
+        let y_scale = Owned::f32(&[1], &[0.125]);
+        let y_zero = Owned::u8(&[1], &[120]);
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[2, 2, 2],
+        );
+        let expected = reference(Reference {
+            a: &a_values,
+            a_shape: &[2, 2, 2],
+            a_scales: &[0.5, 0.25, 0.125, 0.75],
+            a_zeros: &[10, 8, 6, 5],
+            b: &b_values.map(i32::from),
+            b_shape: &[1, 2, 2],
+            b_scales: &[0.5, 0.25],
+            b_zeros: &[1, -2],
+            y_scale: 0.125,
+            y_zero: 120,
+            output_dtype: DataType::Uint8,
+        });
+        assert_eq!(output_values(&out), expected);
+    }
+
+    #[test]
+    fn qlinear_matmul_rounds_ties_to_even_and_saturates_int8() {
+        let a_values = [1, 1, 1, 1];
+        let a = i8(&[1, 4], &a_values);
+        let a_scale = Owned::f32(&[], &[1.0]);
+        let a_zero = i8(&[], &[0]);
+        let b_values = [
+            1, 3, 127, -128, 0, 0, 127, -128, 0, 0, 127, -128, 0, 0, 127, -128,
+        ];
+        let b = i8(&[4, 4], &b_values);
+        let b_scale = Owned::f32(&[], &[1.0]);
+        let b_zero = i8(&[], &[0]);
+        let y_scale = Owned::f32(&[], &[2.0]);
+        let y_zero = i8(&[], &[0]);
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Int8,
+            &[1, 4],
+        );
+        let expected = reference(Reference {
+            a: &a_values.map(i32::from),
+            a_shape: &[1, 4],
+            a_scales: &[1.0],
+            a_zeros: &[0],
+            b: &b_values.map(i32::from),
+            b_shape: &[4, 4],
+            b_scales: &[1.0],
+            b_zeros: &[0],
+            y_scale: 2.0,
+            y_zero: 0,
+            output_dtype: DataType::Int8,
+        });
+        assert_eq!(output_values(&out), expected);
+        assert_eq!(expected, vec![0, 2, 127, -128]);
+    }
+
+    #[test]
+    fn qlinear_matmul_rejects_mismatched_scale_and_zero_point_shapes() {
+        let a = Owned::u8(&[2, 2], &[1, 2, 3, 4]);
+        let a_scale = Owned::f32(&[2], &[0.5, 0.25]);
+        let a_zero = Owned::u8(&[], &[0]);
+        let b = Owned::u8(&[2, 1], &[1, 1]);
+        let b_scale = Owned::f32(&[], &[1.0]);
+        let b_zero = Owned::u8(&[], &[0]);
+        let y_scale = Owned::f32(&[], &[1.0]);
+        let y_zero = Owned::u8(&[], &[0]);
+        let mut out = Owned::zeros(DataType::Uint8, &[2, 1]);
+        let error = QLinearMatMulKernel
             .execute(
                 &[
                     a.view(),
@@ -434,26 +808,7 @@ mod tests {
                 ],
                 &mut [out.view_mut()],
             )
-            .unwrap();
-        let expected = reference(
-            &[-2, 5],
-            &[3, -4, 7, 2, 5, -6],
-            0.25,
-            &[0.5, 0.25, 0.125],
-            0.25,
-            -1,
-            &[1, -2, 3],
-            2,
-            1,
-            2,
-            3,
-        );
-        assert_eq!(
-            out.bytes
-                .iter()
-                .map(|&value| value as i8 as i64)
-                .collect::<Vec<_>>(),
-            expected
-        );
+            .unwrap_err();
+        assert!(error.to_string().contains("shapes must match"), "{error}");
     }
 }
