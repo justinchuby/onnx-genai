@@ -25,17 +25,10 @@
 //!   [`run`] through `_run_cli`. A raw binary cannot run that loader shim, so
 //!   the Python entry point is how the wheel finds ONNX Runtime at exec time.
 
-use std::fmt;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use onnx_genai::ort::profile::TraceVerbosity;
-use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-
-use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
 
 mod commands;
@@ -48,41 +41,34 @@ mod output;
 mod pages;
 mod profile;
 mod transcribe;
-use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
-use onnx_genai::metadata::load_metadata;
-use onnx_genai::ort::{ChatMessage, ChatRole, ChatTemplate, ModelDirectory, Tokenizer};
-use onnx_genai::ort::{SessionOptions, ep_selection};
-use onnx_genai::preprocess::audio::{
-    AudioSegment, SegmentConfig, StreamSegmenter, decode_wav_pcm16,
-};
-use onnx_genai::reasoning::{ReasoningMarkers, ReasoningStream};
-use onnx_genai::text_to_audio::{self, TextToAudioRequest};
-use onnx_genai::text_to_image::{self, TextToImageRequest, VaeDecoder};
-use onnx_genai::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, StopSequence,
-};
-use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
-use onnx_genai_server::{ServeArgs, from_models_dir, run_serve};
-use commands::{
-    ProfileSetting, ReplCommand, ReplLine, available_execution_providers, parse_decode_backend,
-    parse_profile_setting, parse_repl_line, reload, resolved_default_providers, set_trace_recording,
-};
 use generate::generate;
-use interactive::{
-    Backend, EXIT_INTERRUPTED, GENERATING, INTERRUPT_REQUESTED, Interrupted, SessionSettings,
-    TurnInput, install_ctrlc_handler, is_interrupt_error, run_repl,
-};
+use interactive::run_repl;
 #[cfg(test)]
-use interactive::{InterruptAction, interrupt_action, stage_attachment};
-use model_inspection::{list, show, version};
-use output::{
-    build_turn_prompt, detect_reasoning, display_paths, emit_stats_line,
-    load_chat_template, run_generation_turn, write_merged_trace,
+use interactive::{
+    InterruptAction, Interrupted, interrupt_action, is_interrupt_error, stage_attachment,
 };
+use model_inspection::{list, show, version};
+use onnx_genai::text_to_audio::TextToAudioRequest;
+use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
+use onnx_genai::{EngineConfig, GenerateOptions, StopSequence};
+use onnx_genai_server::{ServeArgs, run_serve};
+use output::write_merged_trace;
 use profile::RunProfile;
 use transcribe::transcribe;
 
+#[cfg(test)]
+use anyhow::Context as _;
+#[cfg(test)]
+use commands::{
+    ProfileSetting, ReplCommand, ReplLine, parse_decode_backend, parse_profile_setting,
+    parse_repl_line,
+};
+#[cfg(test)]
+use onnx_genai::engine::EngineDecodeBackend;
+#[cfg(test)]
+use onnx_genai::ort::{ChatMessage, profile::TraceVerbosity};
+#[cfg(test)]
+use output::{build_turn_prompt, load_chat_template};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -644,8 +630,6 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

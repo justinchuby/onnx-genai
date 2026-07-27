@@ -1,4 +1,10 @@
-use super::*;
+use std::path::Path;
+
+use onnx_genai::metadata::load_metadata;
+use onnx_genai::ort::ModelDirectory;
+use onnx_genai_server::from_models_dir;
+
+use super::resolve_model_dir;
 
 pub(super) fn show(model: &Path) -> anyhow::Result<()> {
     let model_dir = resolve_model_dir(model);

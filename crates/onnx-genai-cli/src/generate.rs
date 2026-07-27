@@ -1,4 +1,20 @@
-use super::*;
+use std::path::Path;
+
+use anyhow::Context as _;
+use onnx_genai::EngineConfig;
+use onnx_genai::engine::PipelineEngine;
+use onnx_genai::ort::{ChatMessage, Tokenizer};
+use onnx_genai::text_to_audio;
+use onnx_genai::text_to_image;
+use onnx_genai_server::multimodal;
+
+use super::commands::resolved_default_providers;
+use super::interactive::{
+    Backend, EXIT_INTERRUPTED, TurnInput, install_ctrlc_handler, is_interrupt_error,
+};
+use super::output::{build_turn_prompt, detect_reasoning, load_chat_template, run_generation_turn};
+use super::profile::{self, RunProfile};
+use super::{GenerateArgs, ProfileArgs, resolve_model_dir};
 
 pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();

@@ -1,4 +1,9 @@
-use super::*;
+use std::path::PathBuf;
+
+use onnx_genai::engine::EngineDecodeBackend;
+use onnx_genai::ort::{SessionOptions, profile::TraceVerbosity};
+
+use super::interactive::{Backend, SessionSettings};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ReplCommand {

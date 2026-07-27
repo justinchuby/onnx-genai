@@ -1,4 +1,20 @@
-use super::*;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+
+use anyhow::Context as _;
+use onnx_genai::engine::{PipelineEngine, PipelineGenerateRequest};
+use onnx_genai::ort::Tokenizer;
+use onnx_genai::preprocess::audio::{
+    AudioSegment, SegmentConfig, StreamSegmenter, decode_wav_pcm16,
+};
+use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest, GenerateToken};
+use onnx_genai_server::multimodal;
+
+use super::commands::resolved_default_providers;
+use super::interactive::{GENERATING, INTERRUPT_REQUESTED, Interrupted, install_ctrlc_handler};
+use super::profile::RunProfile;
+use super::{ProfileArgs, TranscribeArgs, TranscriptFormat, resolve_model_dir};
 
 struct Transcript {
     index: usize,

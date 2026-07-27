@@ -1,4 +1,30 @@
-use super::*;
+use std::fmt;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::Context as _;
+use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
+use onnx_genai::ort::profile::TraceVerbosity;
+use onnx_genai::ort::{ChatMessage, ChatRole, SessionOptions, Tokenizer, ep_selection};
+use onnx_genai::{
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    GenerateTokenCallback,
+};
+use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
+
+use super::commands::{
+    ProfileSetting, ReplCommand, ReplLine, available_execution_providers, parse_decode_backend,
+    parse_profile_setting, parse_repl_line, reload, set_trace_recording,
+};
+use super::output::{
+    build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
+    run_generation_turn,
+};
+use super::{EngineArgs, ProfileArgs, RunArgs, resolve_model_dir};
+use super::{live_turn, pages, profile};
+use profile::RunProfile;
 
 /// Process exit code for termination via SIGINT (Ctrl-C), matching the POSIX
 /// convention of `128 + SIGINT`.
