@@ -562,6 +562,16 @@ impl Executor {
                 let Some(buf) = exec.buffers.get(&b_vid) else {
                     continue;
                 };
+                // Verify the buffer is dense (no padding/gaps). ONNX format
+                // guarantees initializer tensors are contiguous, but assert so
+                // a future change cannot silently produce wrong transposes.
+                debug_assert_eq!(
+                    buf.len(),
+                    k * n * 2,
+                    "precompute_f16_weight_transpose: buffer size {} != expected {} for shape [{k}, {n}]",
+                    buf.len(),
+                    k * n * 2,
+                );
                 let ptr = buf.as_ptr() as *const u16;
                 // SAFETY: `ptr` comes from a materialized DeviceBuffer backed by
                 // the model's mmap. The buffer holds k*n contiguous f16 values
