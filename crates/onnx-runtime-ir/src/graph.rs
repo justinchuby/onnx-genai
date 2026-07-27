@@ -45,8 +45,6 @@ pub struct Graph {
 /// not a version but a corrupted or misinterpreted value. Bounding it here
 /// means every consumer agrees on which versions are usable, rather than each
 /// discovering its own limit when converting to a narrower integer.
-const MAX_PLAUSIBLE_OPSET: i64 = 1_000;
-
 impl Graph {
     /// An empty graph.
     pub fn new() -> Self {
@@ -69,12 +67,8 @@ impl Graph {
     /// them describes IR that is already wrong and the graph's own import is the
     /// better answer.
     pub fn effective_opset(&self, node: &Node) -> Option<u64> {
-        if let Some(version) = node.version
-            && (1..=MAX_PLAUSIBLE_OPSET).contains(&version)
-        {
-            return Some(version as u64);
-        }
-        self.opset_imports.get(node.domain.as_str()).copied()
+        node.local_opset()
+            .or_else(|| self.opset_imports.get(node.domain.as_str()).copied())
     }
 
     /// Borrow a node. Panics if `id` is not live; use

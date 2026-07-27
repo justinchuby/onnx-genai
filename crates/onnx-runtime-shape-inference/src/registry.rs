@@ -79,18 +79,17 @@ impl InferenceRegistry {
         policy: MergePolicy,
         interner: &mut SymbolInterner,
     ) -> Result<Vec<NodeIo>, ShapeInferError> {
-        let version =
-            if let Some(version) = node.version.and_then(|version| u64::try_from(version).ok()) {
-                version
+        let version = if let Some(version) = node.local_opset() {
+            version
+        } else {
+            // Loaded IR is canonical (`normalize_domain` applied at load), so the
+            // default domain is `""` for both node domains and opset-import keys.
+            if node.is_default_domain() {
+                opset_imports.get("").copied().unwrap_or(1)
             } else {
-                // Loaded IR is canonical (`normalize_domain` applied at load), so the
-                // default domain is `""` for both node domains and opset-import keys.
-                if node.is_default_domain() {
-                    opset_imports.get("").copied().unwrap_or(1)
-                } else {
-                    opset_imports.get(&node.domain).copied().unwrap_or(1)
-                }
-            };
+                opset_imports.get(&node.domain).copied().unwrap_or(1)
+            }
+        };
         let Some(rule) = self.get(&node.domain, &node.op_type, version) else {
             return Ok(vec![NodeIo::default(); node.outputs.len()]);
         };

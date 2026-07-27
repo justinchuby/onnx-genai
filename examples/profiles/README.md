@@ -45,18 +45,24 @@ aggregates; see [`../traces/`](../traces/).
 
 ```
                        ORT+CPU    ORT+Metal      native    native+MLX
-model load             1413 ms       505 ms      131 ms        309 ms
-time to first token     106 ms       440 ms     2219 ms        458 ms
-decode throughput     46.7 tok/s   69.2 tok/s   3.5 tok/s    36.6 tok/s
-end-to-end            42.3 tok/s   42.3 tok/s   3.1 tok/s    27.6 tok/s
+model load             1343 ms       492 ms      125 ms        216 ms
+time to first token     120 ms       504 ms     2396 ms        342 ms
+decode throughput     45.5 tok/s   69.3 tok/s   3.5 tok/s    62.8 tok/s
+end-to-end            40.8 tok/s   40.1 tok/s   3.0 tok/s    44.0 tok/s
 ```
 
 **The fourth column is new, and is the reason the other three are worth
 keeping.** The native backend is our own executor: it loads an order of
 magnitude faster than ONNX Runtime because it maps weights instead of building
 a session graph, and then decodes 13x slower because it has no comparable
-kernel library. Running it through the MLX plugin closes almost all of that
-gap -- 3.5 to 36.6 tok/s, **10.4x** -- while keeping the fast load.
+kernel library. Running it through the MLX plugin recovers that and more --
+3.5 to 62.8 tok/s, **18x** -- while keeping the fast load, which is why the
+fourth column leads every other on end-to-end throughput despite ORT+Metal
+still decoding fastest.
+
+Every number above is read out of the committed `.txt` files by
+[`../../scripts/check_profile_table.py`](../../scripts/check_profile_table.py),
+which CI runs, so the table cannot drift from the samples it describes.
 
 That combination could not run at all until the plugin-EP bridge landed. It is
 also the honest limit of what the native backend does alone: on this model it
