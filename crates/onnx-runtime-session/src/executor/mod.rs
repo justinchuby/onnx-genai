@@ -522,9 +522,11 @@ mod capture;
 mod control_flow;
 mod dispatch;
 mod platform;
+mod prefetch;
 mod run;
 mod sequence_ops;
 pub(crate) use platform::auto_detect_cpu_ep;
+pub use prefetch::{PrefetchStep, drive_double_buffer, plan_double_buffer};
 
 #[cfg(test)]
 mod tests;
