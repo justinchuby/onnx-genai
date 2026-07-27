@@ -50,6 +50,36 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 - **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
 - **half_gemm.rs overlap**: Complementary, not duplicated. GEMV (M=1 bandwidth-optimal, inline asm fcvtl ARMv8 base) vs GEMM (M>1 compute-optimal, vcvt_f32_f16 intrinsic requiring FEAT_FP16). Dispatch collision fixed in `ed7a65e3`. Consolidation deferred to separate PR.
 
+### 2026-07-27 — PR #275 Mac prefill campaign (BNNS/AMX + first-decode spike elimination)
+
+#### Phase 1: BNNS prefill (commits `f0cbd786`, `aa219b4b`)
+- Implemented three-regime dispatch: M=1→NEON GEMV, M≥2+macOS→BNNS `BNNSMatMul` f16→f32 (AMX), M≥2+other→`half_gemm.rs`
+- Initial null result (TTFT unchanged at 989ms) — diagnosed non-contiguous f16 weights bypassing BNNS. Fixed via `FilterCache` + `contiguous_b_f16` OnceLock.
+- Second null for lm_head (column-major B) — fixed via `bnns_matmul_f16_trans_b()` zero-copy column-major path and `trivial_batch` fix for engine's `[1,M,K]` A shape.
+- **TTFT: 989→348→167 ms** (5.9× prefill speedup). Production BNNS at 260–346 GFLOPS across 168 calls.
+
+#### Phase 2: First-decode spike elimination (commit `9f1e7684`)
+- Justin identified ~967ms unaccounted end-to-end gap: expected 1013ms (167+846), measured 1980ms.
+- Diagnosed root cause: shape-keyed kernel cache → prefill M=40 → decode M=1 creates new kernel instances with cold OnceLock caches → 169 kernels re-transpose ~776 MB.
+- Critically, lm_head (K=896, N=151936, column-major) fell through ALL fast paths to f32 densification (544 MB alloc) → ~960ms alone.
+- **Fix 1:** Global weight-transpose cache (`LazyLock<Mutex<HashMap<usize, Arc<Vec<u16>>>>>`). Key = data pointer, value = `Arc<Vec>` shared across kernel instances. Eager pre-transpose during model load (+7ms load, saves 30ms on first decode).
+- **Fix 2:** Column-major GEMV — recognized B[K,N] with strides [1,K] = B^T[N,K] in row-major memory. Route directly to `neon_gemv_f16_col_parallel` at M=1. Zero-copy, no transpose needed.
+- **End-to-end arithmetic reconciles:** TTFT(170) + 49×14.2 = 865ms ≈ 865ms measured. Spike gone.
+
+#### Final results (measured at load ~12, 5 runs with 1 warmup)
+| metric | before campaign | after | ORT | vs ORT |
+|---|---:|---:|---:|---:|
+| TTFT | 989 ms | 170 ms | 109 ms | 1.56× |
+| decode | 57.6 tok/s | 70.6 tok/s | 42.2 tok/s | **1.67×** |
+| end-to-end | 17.7 tok/s | 57.8 tok/s | 38.7 tok/s | **1.50×** |
+| model load | 105 ms | 114 ms | 1671 ms | 0.068× |
+
+Guard tests green: `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` ✓, `fp16_m_ge2_prefill_reaches_bnns_not_half_gemm` ✓. 959 CPU EP tests pass. Both aarch64 and x86_64 clippy clean.
+
+#### Remaining leads
+1. TTFT gap: 170ms vs ORT 109ms (1.56×). BNNS production at 260–346 GFLOPS vs 2451 microbenchmark — per-call M may be too small for AMX to reach steady state, plus ~200ms non-GEMM overhead.
+2. Further end-to-end: currently 1.50× ORT; decode dominates at 1.67× but TTFT holds it back.
+
 ### 2026-07-27 — PR #275 BNNS fp16→f32 prefill via AMX
 - **Commit `a855f826`** on `squad/mac-prefill-bnns`: Implemented BNNS-based fp16→f32 MatMul for M≥2 prefill/batch-decode on Apple Silicon, reaching AMX at 2451 GFLOPS (vs 52 GFLOPS portable NEON).
 - **Three-regime dispatch**: M=1 → NEON GEMV (decode), M≥2 macOS → BNNS BNNSMatMul fp16→f32 (prefill/AMX), M≥2 non-Mac → half_gemm.rs (portable).
