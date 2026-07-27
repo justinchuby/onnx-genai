@@ -413,9 +413,18 @@ async fn main() -> Result<()> {
     }
 
     let report = render_report(&args, &runtimes, &states, &prompts, &summaries, &run_notes);
-    print!("{report}");
-    if let Some(path) = &args.profile_json {
-        write_json_arg(path, &json!({ "report_markdown": report }))?;
+    if args
+        .profile_json
+        .as_ref()
+        .is_some_and(|path| path.as_os_str() == "-")
+    {
+        eprint!("{report}");
+        write_json_arg(Path::new("-"), &json!({ "report_markdown": report }))?;
+    } else {
+        print!("{report}");
+        if let Some(path) = &args.profile_json {
+            write_json_arg(path, &json!({ "report_markdown": report }))?;
+        }
     }
     if let Some(output) = args.output {
         if let Some(parent) = output
@@ -638,26 +647,15 @@ fn run_direct_once(
         bail!("{} generated no tokens", backend.label());
     }
     let ttft = token_times[0];
-    if token_times.len() <= args.decode_skip {
-        bail!(
-            "{} emitted {} timed tokens, not enough for --decode-skip {}",
-            backend.label(),
-            token_times.len(),
-            args.decode_skip
-        );
-    }
-    let decode_tokens = generated_tokens.saturating_sub(args.decode_skip);
-    let decode_window = token_times[token_times.len() - 1]
-        .saturating_sub(token_times[args.decode_skip.saturating_sub(1)]);
-    if decode_tokens == 0 || decode_window.is_zero() {
-        bail!(
-            "{} emitted too few timed tokens for decode throughput: tokens={} decode_skip={} window={:?}",
-            backend.label(),
-            generated_tokens,
-            args.decode_skip,
-            decode_window
-        );
-    }
+    let (decode_tokens, _decode_window, decode_tokens_per_second) =
+        decode_throughput(&token_times, generated_tokens, args.decode_skip).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} emitted too few timed tokens for decode throughput: tokens={} decode_skip={}",
+                backend.label(),
+                generated_tokens,
+                args.decode_skip
+            )
+        })?;
     Ok(DirectSample {
         backend,
         run,
@@ -665,7 +663,7 @@ fn run_direct_once(
         ttft,
         total,
         generated_tokens,
-        decode_tokens_per_second: decode_tokens as f64 / decode_window.as_secs_f64(),
+        decode_tokens_per_second,
         end_to_end_tokens_per_second: generated_tokens as f64 / total.as_secs_f64(),
     })
 }
@@ -1714,6 +1712,37 @@ fn relative_throughput(onnx: f64, competitor: f64) -> String {
     }
 }
 
+/// Compute the decode throughput (tok/s) from a series of cumulative token
+/// timestamps.  `decode_skip` is the number of leading tokens to exclude from
+/// the decode window (e.g. 2 skips the first two tokens so TTFT + second-token
+/// warm-up don't inflate the decode rate).
+///
+/// Returns `(decode_tokens, decode_window, decode_tok_per_sec)`.
+fn decode_throughput(
+    token_times: &[Duration],
+    generated_tokens: usize,
+    decode_skip: usize,
+) -> Option<(usize, Duration, f64)> {
+    if token_times.is_empty() || token_times.len() <= decode_skip {
+        return None;
+    }
+    let decode_tokens = generated_tokens.saturating_sub(decode_skip);
+    let decode_start = if decode_skip > 0 {
+        token_times[decode_skip - 1]
+    } else {
+        Duration::ZERO
+    };
+    let decode_window = token_times[token_times.len() - 1].saturating_sub(decode_start);
+    if decode_tokens == 0 || decode_window.is_zero() {
+        return None;
+    }
+    Some((
+        decode_tokens,
+        decode_window,
+        decode_tokens as f64 / decode_window.as_secs_f64(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1783,5 +1812,57 @@ tail"#
     fn winner_respects_metric_direction() {
         assert!(is_winner(1.0, [1.0, 2.0].into_iter(), Direction::Lower));
         assert!(is_winner(2.0, [1.0, 2.0].into_iter(), Direction::Higher));
+    }
+
+    /// Synthetic token-time series where correct decode tok/s is known
+    /// analytically.  Tokens arrive at a steady 100 ms cadence after a 500 ms
+    /// TTFT:
+    ///
+    ///   t0 = 500 ms  (TTFT / 1st token)
+    ///   t1 = 600 ms
+    ///   t2 = 700 ms
+    ///   t3 = 800 ms
+    ///   t4 = 900 ms
+    ///
+    /// 5 generated tokens total.
+    #[test]
+    fn decode_throughput_skip_0_1_2() {
+        let token_times: Vec<Duration> = (0..5)
+            .map(|i| Duration::from_millis(500 + i * 100))
+            .collect();
+        let generated = 5usize;
+
+        // skip=0 → all 5 tokens over 900 ms window (from t=0 to t=900ms)
+        let (tokens, window, tps) = decode_throughput(&token_times, generated, 0).unwrap();
+        assert_eq!(tokens, 5);
+        assert_eq!(window, Duration::from_millis(900));
+        let expected_tps_0 = 5.0 / 0.9;
+        assert!(
+            (tps - expected_tps_0).abs() < 0.01,
+            "skip=0: got {tps}, expected {expected_tps_0}"
+        );
+
+        // skip=1 → 4 tokens over window from t0=500ms to t4=900ms = 400 ms
+        let (tokens, window, tps) = decode_throughput(&token_times, generated, 1).unwrap();
+        assert_eq!(tokens, 4);
+        assert_eq!(window, Duration::from_millis(400));
+        let expected_tps_1 = 4.0 / 0.4;
+        assert!(
+            (tps - expected_tps_1).abs() < 0.01,
+            "skip=1: got {tps}, expected {expected_tps_1}"
+        );
+
+        // skip=2 → 3 tokens over window from t1=600ms to t4=900ms = 300 ms
+        let (tokens, window, tps) = decode_throughput(&token_times, generated, 2).unwrap();
+        assert_eq!(tokens, 3);
+        assert_eq!(window, Duration::from_millis(300));
+        let expected_tps_2 = 3.0 / 0.3;
+        assert!(
+            (tps - expected_tps_2).abs() < 0.01,
+            "skip=2: got {tps}, expected {expected_tps_2}"
+        );
+
+        // skip == len → None (not enough tokens)
+        assert!(decode_throughput(&token_times, generated, 5).is_none());
     }
 }
