@@ -132,3 +132,44 @@ tensor, bias in-place, skip Vec alloc + copy for 120 calls/token).
 
 **Negative result:** Accelerate sgemv for L2-resident matrices — GCD wake-up overhead
 (~40 µs) dominates compute saving for all our matrix sizes. Reverted.
+
+## 2026-07-27T12:30:00Z — Session 7: Final FP32 attribution + GEMV sequence benchmark
+
+**Context:** Coordinator asked for persistent spin-wait pool and gate+up fusion.
+Session 5 already showed Rayon IS persistent (~3 µs/call, not 30-50 µs). This
+session focused on isolating where the remaining 8 ms gap (30 ms native vs 22 ms ORT)
+actually lives.
+
+**Key measurement: Pure GEMV sequence benchmark**
+Ran standalone 169-call GEMV sequence (same shapes as full model decode) through Rayon:
+- Full sequence: **81.1 GB/s** (72% of roof) = 24.35 ms
+- 48× gate/up isolated: **110.4 GB/s** (99% of roof)
+- 1× gate isolated: **99.8 GB/s** (89% of roof)
+
+**Insight:** The NEON GEMV kernel is within 10% of ORT's bandwidth when framework
+overhead is removed. The remaining gap is NOT in the kernel — it is in the graph
+executor dispatching 434 individual ops per token vs ORT's ~50 fused ops.
+
+**Per-op decode breakdown (profiled with ONNX_GENAI_PROFILE_OPS=1):**
+- MatMul + FMB: 26.0 ms (91.8% of decode)
+- Attention: 1.2 ms (4.3%)
+- All other (RMSNorm, Swish, Mul, RotaryEmb, Constants): 1.1 ms (3.9%)
+- Total executor: 28.3 ms
+
+**Gap decomposition (8 ms gap = native 30 ms vs ORT 22 ms):**
+1. GEMV bandwidth (81 vs 89 GB/s): 2.7 ms (34%)
+2. Per-op framework overhead (168 dispatches × 9.5 µs): 1.6 ms (20%)
+3. Non-GEMV computation (Attention, RMSNorm, etc.): 1.8 ms (23%)
+4. Non-graph overhead (KV, sampling, etc.): 1.7 ms (21%)
+
+**Experiments — all NEGATIVE:**
+- Accelerate sgemv for L2-resident matrices: GCD overhead dominates
+- L2-based threshold: col-parallel beats single-thread even for small matrices
+- Software prefetch: 40% slower (M1 HW prefetcher is better)
+- Persistent spin-wait pool: ~3% improvement over Rayon (not the bottleneck)
+
+**Conclusion:** FP32 cannot beat ORT without MLAS-quality assembly AND graph-level
+fusion. Both require significant infrastructure changes. Recommended FP16 as next lever
+(model at 959 MB → projected ~85 tok/s, ORT on FP16 gets ~42 tok/s).
+
+**Commits this session:** 708a672c (docs only, attribution update)

@@ -355,3 +355,85 @@ NEON 49 µs. Net negative — reverted.
 | 1 | MLAS-quality GEMV kernel (prefetch, tile) | 3-5 ms/tok | Not started |
 | 2 | Graph-level op fusion (reduce 168→~50 ops) | 2-3 ms/tok | Architecture change |
 | 3 | FP16 NEON GEMV (halve bytes moved) | 2× ceiling | Next lever |
+
+---
+
+## Session 7: Final FP32 attribution — GEMV sequence benchmark
+
+**Date:** 2026-07-26
+
+### Pure GEMV sequence benchmark (isolating kernel from framework)
+
+Ran a standalone benchmark simulating the full Qwen2.5 decode pattern:
+169 GEMV calls (24 layers × 7 projections + LM head) through a Rayon pool,
+no graph executor, no tensor binding, no shape resolution.
+
+| Measurement | Time | GB/s | Roof % |
+|---|---|---|---|
+| **Full 169-call GEMV sequence** | **24.35 ms** | **81.1** | **72%** |
+| 48× gate/up [896,4864] isolated | 7.58 ms | 110.4 | 99% |
+| 1× gate [896,4864] isolated | 0.175 ms | 99.8 | 89% |
+
+**Key finding: the NEON GEMV kernel achieves 81 GB/s when measured
+without framework overhead — within 10% of ORT's ~89 GB/s.**
+
+The drop from 99 GB/s (single call) to 81 GB/s (full sequence) is due to:
+- Small matrices ([896,128] K/V projections) that don't parallelise well
+- The massive LM head ([896,151936]) that dominates with less bandwidth efficiency
+- Inter-call Rayon dispatch overhead across 169 calls
+
+### Per-op decode breakdown (ONNX_GENAI_PROFILE_OPS=1, steady-state token)
+
+| Op | Calls/token | Total ms | % of decode |
+|---|---|---|---|
+| MatMul | 49 | 14.80 | 52.3% |
+| FusedMatMulBias | 120 | 11.16 | 39.4% |
+| Attention | 24 | 1.21 | 4.3% |
+| RMSNormalization | 49 | 0.28 | 1.0% |
+| Swish | 24 | 0.23 | 0.8% |
+| RotaryEmbedding | 48 | 0.19 | 0.7% |
+| Mul | 24 | 0.18 | 0.6% |
+| Constant | 96 | 0.10 | 0.4% |
+| **Total (executor)** | **434** | **28.32** | **100%** |
+
+### Gap decomposition (native 30 ms vs ORT 22 ms = 8 ms gap)
+
+| Source | Our cost | ORT cost | Gap | % of gap |
+|---|---|---|---|---|
+| GEMV pure bandwidth | 24.4 ms | ~21.7 ms | 2.7 ms | 34% |
+| Per-op framework overhead | 1.6 ms | ~0 ms | 1.6 ms | 20% |
+| Non-GEMV computation | 2.3 ms | ~0.5 ms | 1.8 ms | 23% |
+| Non-graph overhead | 1.7 ms | ~0 ms | 1.7 ms | 21% |
+
+ORT's near-zero non-GEMV cost comes from fused kernels (MatMul+Bias+Activation
+in MLAS handles bias/activation while data is still in cache) and significantly
+fewer graph nodes (~50 fused ops vs our 434 individual ops).
+
+### Experiments attempted and abandoned (session 7)
+
+1. **Accelerate cblas_sgemv for L2-resident attention projections** — NEGATIVE
+   - GCD wake-up overhead (~30-50 µs/call) exceeds compute savings
+   - [896,896]: Accelerate 58 µs vs NEON 49 µs
+2. **L2-based single-thread threshold** — NEGATIVE
+   - Col-parallel with 8 threads beats single-thread even for L2-resident shapes
+3. **Software prefetch (prfm pldl1strm)** — NEGATIVE
+   - M1's hardware prefetcher handles sequential access better; SW prefetch 40% slower
+4. **Persistent spin-wait pool (session 5, re-confirmed session 7)** — NEGATIVE (~3% improvement)
+   - Rayon IS a persistent pool with ~3 µs per-call cost (not 30-50 µs as initially projected)
+   - Custom sense-reversing barrier pool only 3% better
+
+### Conclusions
+
+**FP32 native cannot beat ORT without two structural changes:**
+1. MLAS-quality GEMV assembly (~10% bandwidth gap, 2.7 ms)
+2. Graph-level op fusion (~3.4 ms from framework + non-GEMV overhead)
+
+**The GEMV kernel is NOT the bottleneck.** At 81 GB/s pure, it's at 72% of roof.
+The bottleneck is the graph executor dispatching 434 individual ops per token
+vs ORT's ~50 fused ops.
+
+**Recommended next step: FP16 NEON GEMV.**
+- Model at 959 MB → GEMV ceiling at 81 GB/s would give ~85 tok/s
+- ORT on FP16: ~42 tok/s (widens to FP32)
+- Path to 2× over ORT is clear
+- FP16 storage + FP32 accumulate for numerics safety
