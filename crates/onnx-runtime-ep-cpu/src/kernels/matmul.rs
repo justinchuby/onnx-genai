@@ -47,6 +47,10 @@ mod simd_gemm;
 #[path = "bf16_gemm.rs"]
 mod bf16_gemm;
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "accelerate_gemm.rs"]
+mod accelerate_gemm;
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -57,6 +61,11 @@ pub(crate) struct MatMulPrepack {
     dense: [OnceLock<Vec<f32>>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
+    /// Lazily-computed transpose of the B weight matrix for the Accelerate
+    /// column-parallel GEMV path. Only populated for constant (model weight)
+    /// inputs on macOS/iOS.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    transposed_b: OnceLock<Vec<f32>>,
 }
 
 impl MatMulPrepack {
@@ -85,6 +94,47 @@ impl MatMulPrepack {
                 ))
             }
         }
+    }
+
+    /// Returns a cached transpose of B[K,N] -> B_T[N,K] row-major.
+    /// Only transposes constant (model weight) inputs. Returns `None` for
+    /// activations. Uses Rayon + cache-blocking to hide the one-time cost.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn transposed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&[f32]> {
+        if !self.constant_inputs[1] {
+            return None;
+        }
+        Some(
+            self.transposed_b
+                .get_or_init(|| {
+                    use rayon::prelude::*;
+                    let mut bt = vec![0.0f32; n * k];
+                    // Parallel tiled transpose: each Rayon task handles a strip
+                    // of output rows (columns of B), using a tile size that keeps
+                    // both read and write working sets in L1 cache.
+                    let threads = rayon::current_num_threads();
+                    let rows_per_thread = n.div_ceil(threads).max(1);
+                    bt.par_chunks_mut(rows_per_thread * k)
+                        .enumerate()
+                        .for_each(|(t, bt_chunk)| {
+                            let j0 = t * rows_per_thread;
+                            let j_end = (j0 + rows_per_thread).min(n);
+                            let chunk_n = j_end - j0;
+                            const TILE: usize = 64;
+                            for i0 in (0..k).step_by(TILE) {
+                                let ie = (i0 + TILE).min(k);
+                                for jj in 0..chunk_n {
+                                    let j = j0 + jj;
+                                    for i in i0..ie {
+                                        bt_chunk[jj * k + i] = b[i * n + j];
+                                    }
+                                }
+                            }
+                        });
+                    bt
+                })
+                .as_slice(),
+        )
     }
 
     #[cfg(feature = "mlas")]
@@ -164,8 +214,15 @@ fn gemm_with_backend(
             simd_gemm::sgemm_simd(a, b, c, m, k, n);
             Ok(())
         }
-        // Xnnpack / Accelerate placeholders (and Generic) share the pure-Rust
-        // kernel until their native backends are wired.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        CpuBackend::Accelerate => {
+            if m == 1 {
+                accelerate_gemm::neon_gemv_parallel(a, b, c, k, n);
+            } else {
+                accelerate_gemm::sgemm(a, b, c, m, k, n);
+            }
+            Ok(())
+        }
         _ => {
             gemm_generic(a, b, c, m, k, n);
             Ok(())
@@ -193,6 +250,10 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
         return;
     }
     let threads = rayon::current_num_threads();
+    if threads > 1 && m < threads && n > 1 {
+        gemm_generic_col_parallel(a, b, c, m, k, n, threads);
+        return;
+    }
     let mc = if threads <= 1 {
         MAX_MC.min(m)
     } else {
@@ -219,6 +280,42 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
             gemm_block(a_block, b, c_block, rows, k, n);
         },
     );
+}
+
+fn gemm_generic_col_parallel(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: usize,
+) {
+    use rayon::prelude::*;
+    let cols_per_strip = n.div_ceil(threads).max(1);
+    let strips: Vec<(usize, usize)> = (0..n)
+        .step_by(cols_per_strip)
+        .map(|j0| (j0, cols_per_strip.min(n - j0)))
+        .collect();
+    let results: Vec<(usize, usize, Vec<f32>)> = strips
+        .into_par_iter()
+        .map(|(j0, strip_n)| {
+            let mut b_strip = vec![0.0f32; k * strip_n];
+            for row in 0..k {
+                b_strip[row * strip_n..row * strip_n + strip_n]
+                    .copy_from_slice(&b[row * n + j0..row * n + j0 + strip_n]);
+            }
+            let mut c_strip = vec![0.0f32; m * strip_n];
+            gemm_block(a, &b_strip, &mut c_strip, m, k, strip_n);
+            (j0, strip_n, c_strip)
+        })
+        .collect();
+    for (j0, strip_n, c_strip) in results {
+        for row in 0..m {
+            c[row * n + j0..row * n + j0 + strip_n]
+                .copy_from_slice(&c_strip[row * strip_n..row * strip_n + strip_n]);
+        }
+    }
 }
 
 /// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row
@@ -364,7 +461,6 @@ impl MatMulKernel {
                 &self.prepack.dense(1, &inputs[1])?,
                 &geom,
                 backend,
-                #[cfg(feature = "mlas")]
                 Some(&self.prepack),
                 out_slice,
             );
@@ -527,7 +623,6 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
         to_dense_f32_widen("MatMul", a)?,
         to_dense_f32_widen("MatMul", b)?,
         CpuBackend::auto_detect(),
-        #[cfg(feature = "mlas")]
         None,
     )
 }
@@ -556,7 +651,6 @@ fn matmul_dense_prepacked_with_backend(
         prepack.dense(0, a)?,
         prepack.dense(1, b)?,
         backend,
-        #[cfg(feature = "mlas")]
         Some(prepack),
     )
 }
@@ -567,7 +661,7 @@ fn matmul_dense_impl_with_backend(
     a_dense: Cow<'_, [f32]>,
     b_dense: Cow<'_, [f32]>,
     backend: CpuBackend,
-    #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
+    prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
     // Owned-vector wrapper: compute geometry, allocate the result buffer, then
     // GEMM into it via the shared `_into` helper. Used by callers that need an
@@ -575,15 +669,7 @@ fn matmul_dense_impl_with_backend(
     // fallback in `MatMulKernel::execute`.
     let geom = matmul_geometry(a, b)?;
     let mut out = vec![0.0f32; geom.result_len];
-    matmul_dense_into_with_backend(
-        &a_dense,
-        &b_dense,
-        &geom,
-        backend,
-        #[cfg(feature = "mlas")]
-        prepack,
-        &mut out,
-    )?;
+    matmul_dense_into_with_backend(&a_dense, &b_dense, &geom, backend, prepack, &mut out)?;
     Ok(out)
 }
 
@@ -683,7 +769,7 @@ fn matmul_dense_into_with_backend(
     b_dense: &[f32],
     geom: &MatMulGeometry,
     backend: CpuBackend,
-    #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
+    prepack: Option<&MatMulPrepack>,
     out: &mut [f32],
 ) -> Result<()> {
     if out.len() != geom.result_len {
@@ -711,6 +797,19 @@ fn matmul_dense_into_with_backend(
     } else {
         None
     };
+
+    // Accelerate fast path: column-parallel GEMV on pre-transposed B.
+    // Yields 100–117 GB/s vs Accelerate sgemm's 35–40 GB/s at M=1.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if backend == CpuBackend::Accelerate
+        && m == 1
+        && geom.batch_shape.is_empty()
+        && geom.b_promoted_rank == 2
+        && let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n))
+    {
+        accelerate_gemm::neon_gemv_col_parallel(a_dense, bt, out, k, n);
+        return Ok(());
+    }
 
     if geom.batch_shape.is_empty() {
         // No batch dims: a single matmul.
@@ -1731,5 +1830,82 @@ mod tests {
         MatMulKernel::default().execute(&[a, b], &mut [c]).unwrap();
         // Fallback computed the full result into a temp buffer before writing.
         assert_eq!(shared, vec![2.0, 1.0, 4.0, 3.0]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn accelerate_sgemm_matches_generic_for_small_shapes() {
+        let shapes = [(1, 4, 4), (2, 3, 5), (4, 8, 4), (1, 16, 16), (8, 8, 8)];
+        for (m, k, n) in shapes {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| (i as f32 * 0.7 + 0.3).sin() * 2.0)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| (i as f32 * 1.3 + 0.7).cos() * 2.0)
+                .collect();
+            let mut generic_out = vec![0.0f32; m * n];
+            let mut accel = vec![0.0f32; m * n];
+            gemm_with_backend(CpuBackend::Generic, &a, &b, &mut generic_out, m, k, n).unwrap();
+            gemm_with_backend(CpuBackend::Accelerate, &a, &b, &mut accel, m, k, n).unwrap();
+            for idx in 0..m * n {
+                let diff = (generic_out[idx] - accel[idx]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "[{m},{k},{n}][{idx}]: g={} a={} d={}",
+                    generic_out[idx],
+                    accel[idx],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn accelerate_decode_gemv_matches_generic_at_model_scale() {
+        let shapes = [(1, 896, 896), (1, 896, 4864), (1, 4864, 896)];
+        for (m, k, n) in shapes {
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.31 + 0.17).sin()).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.13 + 0.71).cos()).collect();
+            let mut generic_out = vec![0.0f32; m * n];
+            let mut accel = vec![0.0f32; m * n];
+            gemm_with_backend(CpuBackend::Generic, &a, &b, &mut generic_out, m, k, n).unwrap();
+            gemm_with_backend(CpuBackend::Accelerate, &a, &b, &mut accel, m, k, n).unwrap();
+            let max_rel = generic_out
+                .iter()
+                .zip(accel.iter())
+                .map(|(g, a)| (g - a).abs() / g.abs().max(1e-8))
+                .fold(0.0f32, f32::max);
+            assert!(max_rel < 2e-2, "[{m},{k},{n}]: max_rel={max_rel}");
+        }
+    }
+
+    #[test]
+    fn col_parallel_gemm_matches_reference_for_m1() {
+        let (m, k, n) = (1, 256, 512);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.41 + 0.13).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.23 + 0.57).cos()).collect();
+        let mut reference = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for p in 0..k {
+                    s += a[i * k + p] * b[p * n + j];
+                }
+                reference[i * n + j] = s;
+            }
+        }
+        let mut col_par = vec![0.0f32; m * n];
+        gemm_generic_col_parallel(&a, &b, &mut col_par, m, k, n, 8);
+        for idx in 0..m * n {
+            let diff = (reference[idx] - col_par[idx]).abs();
+            assert!(
+                diff < 1e-4,
+                "[{m},{k},{n}][{idx}]: ref={} col={} d={}",
+                reference[idx],
+                col_par[idx],
+                diff
+            );
+        }
     }
 }
