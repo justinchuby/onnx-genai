@@ -167,7 +167,7 @@ jobs:
       # Installing from crates.io avoids the personally-owned install action;
       # cargo install costs build minutes but keeps provenance in Cargo.lock-style resolution.
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked --force
 
       # Never replace these explicit packages with bare `cargo test` or
       # `--workspace`: that selects onnx-genai-ort-sys, whose build script
@@ -353,7 +353,7 @@ jobs:
       # Installing from crates.io avoids the personally-owned install action;
       # cargo install costs build minutes but keeps provenance in Cargo.lock-style resolution.
       - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
+        run: cargo install cargo-llvm-cov --version 0.8.7 --locked --force
 
       # The portable lane must stay offline, but the CLI is the user-facing ORT
       # entry point and its REPL contract tests catch token-budget regressions.
