@@ -11,7 +11,10 @@ use onnx_genai_ort::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use super::{DdimSchedule, Dpmpp2m, EulerAncestral, EulerSchedule, MaskedDiffusion, Remasking};
+mod masked_diffusion;
+
+use super::{DdimSchedule, Dpmpp2m, EulerAncestral, EulerSchedule};
+use masked_diffusion::{MaskedDiffusion, Remasking};
 
 /// A loop-carried transform applied to a denoiser's output at each iterative
 /// step. **Implement this trait to plug in a custom scheduler** and register it
