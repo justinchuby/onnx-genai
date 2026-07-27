@@ -64,3 +64,24 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 - Non-GEMV ops: 6.5 ms (ORT ~0.1 ms due to op fusion)
 - **FP32 alone cannot reach 45.5 with kernel-only changes** — needs graph-level op fusion or FP16 weights
 - FP16 projected: ~62 tok/s (doubles ceiling, NEON FP16 universal on Apple Silicon)
+
+## 2026-07-27: Session 3 — SDPA NEON + Dispatch Simplification (commit c1dbc71f)
+
+### Changes
+1. **NEON SDPA fast path** (sdpa.rs): Added `dot_neon()`, `axpy_neon()`, and `sdpa_f32_neon()`
+   - Same bug class as original GEMV scalar fallback: `dot_f32`/`axpy_f32` had AVX2 for x86 but scalar on aarch64
+   - Attention: 111 µs/call → 75 µs/call, saving 0.86 ms per token
+2. **Unified M=1 GEMV dispatch** (matmul.rs): Removed Accelerate sgemv L2-resident path
+   - Measured: Accelerate sgemv has ~30-50 µs GCD overhead, equivalent to Rayon NEON
+   - All M=1 decode now uses NEON col-parallel (simpler, no oversubscription hazard)
+
+### Results (Pris compare harness, 5 runs, median)
+- **Native: 29.17 tok/s** (was 27.96, +4.3%), 47.6% of roof
+- ORT: 45.82 tok/s, 74.7% of roof
+- 904 unit tests pass, cargo fmt clean, clippy clean
+
+### Key finding: FP32 wall is now tighter
+- Non-GEMV reduced from 6.5 → 5.0 ms (Attention savings)
+- At 100% GEMV roof: 16.3 + 5.0 = 21.3 ms → 46.9 tok/s — barely clears ORT
+- But reaching 100% GEMV requires closing 30% BW gap (66 → 95+ GB/s)
+- **Conclusion: FP16 remains the lever to definitively beat ORT**

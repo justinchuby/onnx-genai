@@ -170,10 +170,63 @@ Accelerate has no FP16 GEMV, so this would be our custom kernel path.
 4. **Accelerate/AMX**: Was unwired placeholder. Now wired: sgemm for M>1, sgemv for L2-resident M=1, NEON for DRAM-bound M=1.
 5. **TTFT/prefill**: Was 38× slower because prefill also ran scalar single-threaded GEMM. Now uses Accelerate sgemm. TTFT ~1120 ms vs ORT's 118 ms — still 10× slower, attributed to non-MLAS GEMM path.
 
-## SPMD Pool Investigation
+## Session 3: SDPA NEON + Dispatch Simplification
 
-Attempted activating the persistent SPMD decode pool for FP32:
-- Default SPMD pool: 5 workers (`available/2`), dispatcher doesn't compute → worse than Rayon 8T
-- Even at 10 SPMD workers: 22.15 tok/s vs Rayon's 27.9 tok/s
-- Root cause: SPMD is designed for int4 (compute-bound), not FP32 (bandwidth-bound)
-- Decision: keep SPMD for quantized models, use Rayon dense pool for FP32
+### Changes
+1. **NEON SDPA fast path** (sdpa.rs):
+   - Added `dot_neon()` and `axpy_neon()` — 4×-unrolled NEON intrinsics for aarch64
+   - New `sdpa_f32_neon()` function using NEON dot/AXPY for QK and AttnV inner loops
+   - Attention: 111 µs/call → 75 µs/call (32% faster), saving **0.86 ms per token**
+   - Same bug class as the original GEMV scalar fallback: `dot_f32` and `axpy_f32` 
+     had AVX2 paths for x86 but fell through to scalar on aarch64
+
+2. **Unified GEMV dispatch** (matmul.rs):
+   - Removed Accelerate sgemv L2-resident path
+   - Measured: Accelerate sgemv has ~30-50 µs GCD thread wake-up overhead, making it
+     equivalent to Rayon NEON for L2-resident matrices
+   - All M=1 decode now routes to NEON col-parallel (neutral on performance, simpler)
+
+### Updated Per-Op Attribution (post-session 3)
+
+| Op Type | Count | ms/token | µs/call | % of decode | Change |
+|---|---|---|---|---|---|
+| MatMul | 49 | 16.9 | 345 | 49% | — |
+| FusedMatMulBias | 120 | 12.6 | 105 | 37% | — |
+| **Attention** | **24** | **1.8** | **75** | **5%** | **-0.86 ms** |
+| Swish | 24 | 1.0 | 43 | 3% | — |
+| Other | ~200 | ~1.2 | — | 3% | — |
+| Session overhead | — | ~0.8 | — | 2% | — |
+| **Total** | **~417** | **~34.5** | — | **100%** | **-1.2 ms** |
+
+### Updated Measurements (Pris compare harness, 5 runs, median)
+
+| Configuration | p50 ms | tok/s | Roof % | Effective GB/s |
+|---|---|---|---|---|
+| Native + CPU (session 3) | 34.3 | **29.17** | 47.6% | ~58 |
+| Native + CPU (session 2) | 35.7 | 27.96 | 45.5% | ~55.5 |
+| ORT + CPU | 22.0 | **45.82** | 74.7% | ~91 |
+
+### Updated FP32 Wall (with session 3 non-GEMV reduction)
+
+| Scenario | GEMV ms | + Non-GEMV | Total | tok/s | Roof % |
+|---|---|---|---|---|---|
+| **Current** | 29.5 | 5.0 | 34.5 | **29.0** | 47.3% |
+| Match ORT GEMV BW (91 GB/s) | 21.8 | 5.0 | 26.8 | 37.3 | 60.8% |
+| **100% GEMV roof (121.9 GB/s)** | 16.3 | 5.0 | 21.3 | **46.9** | **76.5%** |
+| ORT (for reference) | ~21.8 | ~0.1 | 21.9 | 45.83 | 74.6% |
+
+Progress: reduced non-GEMV from 6.5 → 5.0 ms. At 100% GEMV roof, native EP 
+would now reach **46.9 tok/s — just barely above ORT's 45.83**. But achieving 
+100% GEMV roof requires closing a 30% gap (66 → 95+ GB/s), which is limited by
+Rayon fork-join overhead vs ORT's MLAS persistent pool.
+
+### What Didn't Work This Session
+
+1. **Accelerate sgemv for L2-resident**: 30-50 µs GCD overhead per call makes it 
+   equivalent to NEON multi-threaded for small matrices. Not a win.
+2. **L2-aware single-threaded threshold**: Routing q/o [896,896] to single-threaded 
+   NEON was slightly WORSE than multi-threaded. L2-resident matrices are still 
+   large enough that 8T parallelism helps.
+3. **Persistent barrier pool (GCD/pthread)**: Deadlocked in standalone test, but the 
+   concept is sound — Rayon's ~5 µs per fork-join × 169 calls = 0.85 ms overhead.
+
