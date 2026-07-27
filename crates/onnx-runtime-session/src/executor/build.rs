@@ -525,6 +525,70 @@ impl Executor {
                 );
             }
         }
+
+        // Pre-compute weight transposes for the GEMV decode path on Apple
+        // Silicon. Model load is 15× faster than ORT (105 ms vs 1596 ms), so
+        // spending ~1 s here still wins the model-load metric while eliminating
+        // a ~1 s spike on the first decode step.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            use onnx_runtime_ir::DataType;
+            let mut _span = trace_span("session.precompute_weight_transposes", "session");
+            let mut transposed_count = 0_u64;
+            for node_plan in &exec.plan {
+                let node = exec.graph.node(node_plan.node_id);
+                if node.op_type != "MatMul" && node.op_type != "FusedMatMulBias" {
+                    continue;
+                }
+                let Some(b_vid) = node_plan.inputs.get(1).copied().flatten() else {
+                    continue;
+                };
+                if !exec.graph.initializers.contains_key(&b_vid) {
+                    continue;
+                }
+                if node_plan.input_dtypes.get(1) != Some(&DataType::Float16) {
+                    continue;
+                }
+                let Some(shape) = exec.value_shapes.get(&b_vid) else {
+                    continue;
+                };
+                if shape.len() != 2 {
+                    continue;
+                }
+                let (k, n) = match (shape[0].as_static(), shape[1].as_static()) {
+                    (Some(k), Some(n)) => (k, n),
+                    _ => continue,
+                };
+                let Some(buf) = exec.buffers.get(&b_vid) else {
+                    continue;
+                };
+                // Verify the buffer is dense (no padding/gaps). ONNX format
+                // guarantees initializer tensors are contiguous, but assert so
+                // a future change cannot silently produce wrong transposes.
+                debug_assert_eq!(
+                    buf.len(),
+                    k * n * 2,
+                    "precompute_f16_weight_transpose: buffer size {} != expected {} for shape [{k}, {n}]",
+                    buf.len(),
+                    k * n * 2,
+                );
+                let ptr = buf.as_ptr() as *const u16;
+                // SAFETY: `ptr` comes from a materialized DeviceBuffer backed by
+                // the model's mmap. The buffer holds k*n contiguous f16 values
+                // (verified by the initializer dtype + shape checks above) and
+                // outlives this call (model lifetime).
+                unsafe {
+                    onnx_runtime_ep_cpu::kernels::matmul::precompute_f16_weight_transpose(
+                        ptr, k, n,
+                    );
+                }
+                transposed_count += 1;
+            }
+            if let Some(span) = _span.as_mut() {
+                span.set_args(Args::new().with("transposed_weights", transposed_count));
+            }
+        }
+
         Ok(exec)
     }
 

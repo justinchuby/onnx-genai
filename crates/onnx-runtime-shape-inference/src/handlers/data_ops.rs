@@ -216,6 +216,19 @@ pub fn identity(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `Dropout`: data is passed through and its optional trailing mask has the
+/// same shape with a boolean element type.
+pub fn dropout(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(t) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    ctx.set_output_type(0, t.clone());
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(1, DataType::Bool, t.shape);
+    }
+    Ok(())
+}
+
 /// Read the `value` attribute of a `ConstantOfShape` as `(dtype, fill_scalar)`.
 fn value_attr_scalar(node: &onnx_runtime_ir::Node) -> (DataType, Option<DimExpr>) {
     if let Some(Attribute::Tensor(t)) = node.attr("value") {
@@ -235,6 +248,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Cast", 1, cast);
     reg.register("", "CastLike", 1, cast_like);
     reg.register("", "Identity", 1, identity);
+    reg.register("", "Dropout", 1, dropout);
     for version in [10, 13, 19, 21, 23, 25] {
         reg.register("", "QuantizeLinear", version, quantize_linear);
         reg.register("", "DequantizeLinear", version, dequantize_linear);

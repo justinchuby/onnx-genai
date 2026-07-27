@@ -488,6 +488,10 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
+        // Evict the global weight-transpose cache to prevent address-reuse
+        // staleness: if a subsequently loaded model's mmap recycles a virtual
+        // address, the cache must not serve the old model's transposed weights.
+        onnx_runtime_ep_cpu::kernels::matmul::clear_weight_transpose_caches();
         let _ = self.ep.reset_device_graph();
         self.device_graph_signature = None;
         // Free every buffer via the owning EP (DeviceBuffer has no Drop).

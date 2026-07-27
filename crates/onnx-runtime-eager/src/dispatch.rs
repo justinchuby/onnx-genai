@@ -29,7 +29,9 @@ use std::ffi::c_void;
 
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, EpError, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId, compute_contiguous_strides};
-use onnx_runtime_shape_inference::{DimExpr, MergePolicy, NodeIo, SymbolInterner, TypeInfo};
+use onnx_runtime_shape_inference::{
+    DimExpr, MergePolicy, NodeIo, ShapeData, SymbolInterner, TypeInfo,
+};
 
 use crate::EagerContext;
 use crate::cache::KernelCacheKey;
@@ -40,10 +42,6 @@ use crate::tensor::Tensor;
 /// inference. Input/output value ids are positional placeholders — no real
 /// graph exists in eager mode.
 ///
-/// DEFERRED (EAGER.md §9): multi-output arity. Phase-1 dispatch materialises a
-/// single output slot, which covers every Phase-1 op. Multi-output ops (e.g.
-/// `TopK`, `Split`) need the true output count here (from an op schema or an
-/// explicit argument) before their extra outputs are inferred/allocated.
 fn ephemeral_node(
     op_type: &str,
     domain: &str,
@@ -70,7 +68,7 @@ impl EagerContext {
     /// 3. build the compiled-kernel cache key,
     /// 4. get-or-compile the kernel via the device's EP (missing kernel =
     ///    [`EagerError::NoKernel`]),
-    /// 5. infer output shapes/dtypes for the single op,
+    /// 5. infer output shapes/dtypes for the single requested output,
     /// 6. allocate the output tensors on the device,
     /// 7. build zero-copy views and execute.
     pub fn dispatch(
@@ -81,6 +79,29 @@ impl EagerContext {
         attrs: &HashMap<String, Attribute>,
         explicit_opset: Option<u64>,
     ) -> Result<Vec<Tensor>> {
+        self.dispatch_with_outputs(op_type, domain, inputs, attrs, 1, explicit_opset)
+    }
+
+    /// Dispatch a single ONNX op, materialising `output_count` leading output
+    /// slots in ONNX order.
+    ///
+    /// The output count is explicit because ONNX encodes variadic and optional
+    /// outputs in the node's output list, rather than in a universal kernel
+    /// metadata API. Requesting only leading outputs represents omitted
+    /// trailing optional outputs (for example, `Dropout` without its mask).
+    /// The returned vector is ordered identically to those requested slots.
+    pub fn dispatch_with_outputs(
+        &self,
+        op_type: &str,
+        domain: &str,
+        inputs: &[&Tensor],
+        attrs: &HashMap<String, Attribute>,
+        output_count: usize,
+        explicit_opset: Option<u64>,
+    ) -> Result<Vec<Tensor>> {
+        if output_count == 0 {
+            return Err(EagerError::InvalidOutputCount);
+        }
         // 1. Effective opset for this domain.
         let opset = self
             .domains
@@ -95,8 +116,7 @@ impl EagerContext {
         // Concrete input shapes, reused for the kernel, cache key, and views.
         let input_shapes: Vec<Vec<usize>> = inputs.iter().map(|t| t.shape().to_vec()).collect();
 
-        // DEFERRED (EAGER.md §9): single output slot only (see `ephemeral_node`).
-        let node = ephemeral_node(op_type, domain, attrs, inputs.len(), 1);
+        let node = ephemeral_node(op_type, domain, attrs, inputs.len(), output_count);
 
         // 3 + 4. Cache key, then get-or-compile the kernel through the EP.
         let cache_key = KernelCacheKey {
@@ -105,6 +125,15 @@ impl EagerContext {
             opset,
             input_shapes: input_shapes.clone(),
             input_dtypes: inputs.iter().map(|t| t.dtype()).collect(),
+            attributes: {
+                let mut attributes: Vec<_> = attrs
+                    .iter()
+                    .map(|(name, value)| (name.clone(), format!("{value:?}")))
+                    .collect();
+                attributes.sort_unstable();
+                attributes
+            },
+            output_count,
             device,
         };
         let kernel = self
@@ -126,7 +155,7 @@ impl EagerContext {
                 },
             )?;
 
-        // 5. Infer output shapes/dtypes for the single op.
+        // 5. Infer output shapes/dtypes for every requested output slot.
         let output_meta = self.infer_output_meta(&node, op_type, domain, opset, inputs)?;
 
         // 6. Allocate output tensors on the target device.
@@ -204,7 +233,16 @@ impl EagerContext {
                     .iter()
                     .map(|&d| DimExpr::constant(d as i64))
                     .collect();
-                NodeIo::typed(TypeInfo::new(t.dtype(), shape))
+                NodeIo {
+                    type_info: Some(TypeInfo::new(t.dtype(), shape)),
+                    // Shape inference needs concrete scalar/vector control
+                    // inputs (for example TopK's K and Split's split sizes).
+                    // Device tensors cannot be synchronously read here; their
+                    // runtime-dependent extents remain intentionally unknown.
+                    shape_data: (t.device() == onnx_runtime_ir::DeviceId::cpu())
+                        .then(|| ShapeData::from_tensor(t.dtype(), t.shape(), t.as_bytes()))
+                        .flatten(),
+                }
             })
             .collect();
 
