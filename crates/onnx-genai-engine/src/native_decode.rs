@@ -2324,17 +2324,18 @@ fn all_pasts_consumed_by_gqa(graph: &onnx_runtime_ir::Graph, past_names: &[Strin
 }
 
 impl NativeDecodeSession {
-    fn decode_cpu(
-        &mut self,
+    /// Build the non-KV step input tensors (token ids, attention mask, position
+    /// ids, and routed / inputs_embeds ports) shared by both CPU decode paths,
+    /// validating that every supplied routed tensor maps to a declared graph
+    /// port. KV inputs are appended by the caller: `decode_cpu` adds growable
+    /// host past tensors, while `decode_cpu_inplace` binds them on-device.
+    fn prepare_cpu_step_inputs(
+        &self,
         token_ids: &[TokenId],
         past_len: usize,
-        greedy: bool,
+        total_len: usize,
         supplied_inputs: &[(String, Tensor)],
-    ) -> anyhow::Result<NativeCpuDecodeResult> {
-        let total_len = past_len
-            .checked_add(token_ids.len())
-            .context("native decode context length overflow")?;
-        let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
+    ) -> anyhow::Result<Vec<(String, Tensor)>> {
         let ids = token_ids
             .iter()
             .map(|&id| i64::from(id))
@@ -2346,7 +2347,7 @@ impl NativeDecodeSession {
             }
         }
 
-        let mut owned = Vec::with_capacity(self.step_inputs.len() + self.kv_inputs.len());
+        let mut owned = Vec::with_capacity(self.step_inputs.len());
         for binding in &self.step_inputs {
             let tensor = match binding.source {
                 NativeStepInputSource::TokenIds => {
@@ -2391,6 +2392,58 @@ impl NativeDecodeSession {
                 "native decode received routed step inputs that are not declared graph ports: {unknown:?}"
             );
         }
+        Ok(owned)
+    }
+
+    /// Turn the raw logits / hidden outputs of a CPU forward pass into a decode
+    /// result: greedy argmax or full-logits extraction plus recording the
+    /// declared hidden state. Shared by both CPU decode paths; per-mode KV
+    /// output handling stays in each caller.
+    fn finalize_cpu_logits_and_hidden(
+        &mut self,
+        logits: Option<Tensor>,
+        hidden: Option<Tensor>,
+        greedy: bool,
+    ) -> anyhow::Result<NativeCpuDecodeResult> {
+        let logits = logits
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        let result = if greedy {
+            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
+            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
+        } else {
+            let logits = extract_logits(&logits)?;
+            if logits.iter().flatten().any(|value| !value.is_finite()) {
+                bail!("native decoder produced non-finite logits");
+            }
+            NativeCpuDecodeResult::Logits(logits)
+        };
+        self.last_hidden = match (&self.hidden_output, hidden) {
+            (Some(name), Some(tensor)) => Some(
+                extract_last_row(&tensor)
+                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
+            ),
+            (Some(name), None) => {
+                bail!("native decoder omitted declared hidden output '{name}'")
+            }
+            (None, _) => None,
+        };
+        Ok(result)
+    }
+
+    fn decode_cpu(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        greedy: bool,
+        supplied_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<NativeCpuDecodeResult> {
+        let total_len = past_len
+            .checked_add(token_ids.len())
+            .context("native decode context length overflow")?;
+        let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
+        let mut owned =
+            self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
+        owned.reserve(self.kv_inputs.len());
         for name in &self.kv_inputs {
             let tensor = match self.past.remove(name) {
                 Some(tensor) => tensor,
@@ -2465,28 +2518,7 @@ impl NativeDecodeSession {
                 next_past.insert(past.clone(), tensor);
             }
         }
-        let logits = logits
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let result = if greedy {
-            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
-            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
-        } else {
-            let logits = extract_logits(&logits)?;
-            if logits.iter().flatten().any(|value| !value.is_finite()) {
-                bail!("native decoder produced non-finite logits");
-            }
-            NativeCpuDecodeResult::Logits(logits)
-        };
-        self.last_hidden = match (&self.hidden_output, hidden) {
-            (Some(name), Some(tensor)) => Some(
-                extract_last_row(&tensor)
-                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
-            ),
-            (Some(name), None) => {
-                bail!("native decoder omitted declared hidden output '{name}'")
-            }
-            (None, _) => None,
-        };
+        let result = self.finalize_cpu_logits_and_hidden(logits, hidden, greedy)?;
         for (present, past) in &self.present_to_past {
             if !next_past.contains_key(past) {
                 bail!("native decoder omitted present output '{present}'");
@@ -2530,63 +2562,10 @@ impl NativeDecodeSession {
         }
 
         let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
-        let ids = token_ids
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect::<Vec<_>>();
-        let mut supplied = HashMap::with_capacity(supplied_inputs.len());
-        for (name, tensor) in supplied_inputs {
-            if supplied.insert(name.as_str(), tensor).is_some() {
-                bail!("native decode received duplicate routed step input '{name}'");
-            }
-        }
         // The KV ports are device-bound (present==past), so only the generated
         // and routed non-KV step inputs are fed as fresh host tensors here.
-        let mut owned = Vec::with_capacity(self.step_inputs.len());
-        for binding in &self.step_inputs {
-            let tensor = match binding.source {
-                NativeStepInputSource::TokenIds => {
-                    Tensor::from_i64(&[1, token_ids.len()], &ids)?
-                }
-                NativeStepInputSource::AttentionMask => {
-                    Tensor::from_i64(&[1, total_len], &vec![1; total_len])?
-                }
-                NativeStepInputSource::PositionIds => {
-                    let positions = (past_len..total_len)
-                        .map(|position| {
-                            i64::try_from(position).context("position id exceeds i64 range")
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    Tensor::from_i64(&[1, token_ids.len()], &positions)?
-                }
-                NativeStepInputSource::InputsEmbeds => supplied
-                    .remove(binding.name.as_str())
-                    .cloned()
-                    .with_context(|| {
-                        format!(
-                            "declared inputs_embeds input '{}' was not supplied to the native decode step; route the current embedding component output to this exact decoder port",
-                            binding.name
-                        )
-                    })?,
-                NativeStepInputSource::Routed => supplied
-                    .remove(binding.name.as_str())
-                    .cloned()
-                    .with_context(|| {
-                        format!(
-                            "native decode graph input '{}' has no generated role and no routed step tensor; declare a pipeline dataflow edge to this exact decoder port",
-                            binding.name
-                        )
-                    })?,
-            };
-            owned.push((binding.name.clone(), tensor));
-        }
-        if !supplied.is_empty() {
-            let mut unknown = supplied.keys().copied().collect::<Vec<_>>();
-            unknown.sort_unstable();
-            bail!(
-                "native decode received routed step inputs that are not declared graph ports: {unknown:?}"
-            );
-        }
+        let owned =
+            self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
@@ -2655,28 +2634,7 @@ impl NativeDecodeSession {
                 );
             }
         }
-        let logits = logits
-            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
-        let result = if greedy {
-            let _sampling_span = onnx_genai_ort::prof_span!("native.sampling");
-            NativeCpuDecodeResult::Token(argmax_logits_tensor(&logits)?)
-        } else {
-            let logits = extract_logits(&logits)?;
-            if logits.iter().flatten().any(|value| !value.is_finite()) {
-                bail!("native decoder produced non-finite logits");
-            }
-            NativeCpuDecodeResult::Logits(logits)
-        };
-        self.last_hidden = match (&self.hidden_output, hidden) {
-            (Some(name), Some(tensor)) => Some(
-                extract_last_row(&tensor)
-                    .with_context(|| format!("read native decoder hidden output '{name}'"))?,
-            ),
-            (Some(name), None) => {
-                bail!("native decoder omitted declared hidden output '{name}'")
-            }
-            (None, _) => None,
-        };
+        let result = self.finalize_cpu_logits_and_hidden(logits, hidden, greedy)?;
         drop(fetch_span);
 
         self.current_len = total_len;
