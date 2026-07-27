@@ -83,13 +83,13 @@ fn dispatch_unknown_op_is_no_kernel() {
     let ctx = EagerContext::new().unwrap();
     let x = Tensor::from_f32(&[2], &[1.0, 2.0]).unwrap();
     let err = ctx
-        .dispatch("Conv", "", &[&x], &HashMap::new(), None)
+        .dispatch("ThisOpDoesNotExist", "", &[&x], &HashMap::new(), None)
         .unwrap_err();
     match err {
         EagerError::NoKernel {
             op_type, domain, ..
         } => {
-            assert_eq!(op_type, "Conv");
+            assert_eq!(op_type, "ThisOpDoesNotExist");
             assert_eq!(domain, "");
         }
         other => panic!("expected NoKernel, got {other:?}"),
