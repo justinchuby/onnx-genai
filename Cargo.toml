@@ -166,3 +166,9 @@ ctrlc = { version = "3.4", features = ["termination"] }
 tower = { version = "0.5", features = ["util"] }
 hound = "3.5"
 rustfft = "6.4"
+half = "2"
+prost = "0.13"
+image = { version = "0.25", default-features = false }
+libloading = "0.8"
+memmap2 = "0.9"
+prost-reflect = { version = "0.14" }

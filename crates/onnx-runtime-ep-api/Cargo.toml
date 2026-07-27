@@ -11,8 +11,8 @@ categories = ["science", "hardware-support"]
 [dependencies]
 # Maps a model's external weight file once and shares it across every tensor a
 # plugin asks about, instead of re-reading the file per lookup.
-memmap2 = "0.9"
-libloading = "0.8"
+memmap2 = { workspace = true }
+libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-optimizer = { workspace = true }

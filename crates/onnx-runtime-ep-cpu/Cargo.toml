@@ -26,7 +26,7 @@ mlas-sys = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-tracer = { workspace = true, optional = true }
 thiserror = { workspace = true }
-half = "2"
+half = { workspace = true }
 rayon = "1"
 libc = "0.2"
 # Cross-platform futex (Linux FUTEX_WAIT/WAKE, macOS __ulock, Windows

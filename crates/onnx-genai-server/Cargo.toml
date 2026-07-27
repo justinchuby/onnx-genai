@@ -56,5 +56,5 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [dev-dependencies]
 tower = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true, features = ["png"] }
 tempfile = "3"

@@ -31,8 +31,8 @@ cuda-12090 = ["cudarc?/cuda-12090"]
 cuda-13000 = ["cudarc?/cuda-13000"]
 
 [dependencies]
-half = { version = "2", features = ["use-intrinsics"] }
-libloading = { version = "0.8", optional = true }
+half = { workspace = true, features = ["use-intrinsics"] }
+libloading = { workspace = true, optional = true }
 # Only compiled under the `cuda` feature. `dynamic-loading` dlopen's the driver
 # (nvcuda) and NVRTC at runtime, so `cargo build` needs no CUDA toolkit. We use
 # the driver + NVRTC surface only (no cuBLAS/cuDNN). The concrete CUDA API
