@@ -132,3 +132,9 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 2026-07-22T22:15:00Z — Approved Holden’s `82e44be` portable GQA SIMD test revision, including scalar fallback coverage.
 ### 2026-07-23T11:40Z
 Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path was independently approved by Buster and merged to main as 0a2422d; Iran also recorded PROGRESS.md follow-up a933ffe.
+
+## 2026-07-27T09:15:14-07:00 — CLI architecture triage
+
+- Reviewed `crates/onnx-genai-cli` command surface and module boundaries for Justin's CLI-improvements research track.
+- Filed `docs/research/cli/01-architecture-triage.md`: current command surface is useful, but `lib.rs` is a 1,134-line parser/dispatch/test god module; top priorities are parser refactor, JSON/output contracts, model-source grammar normalization, and exit-code taxonomy.
+- Dropped decision inbox note `roy-cli-improvements.md` recommending the next CLI wave be treated as an interface-contract project before adding model-management/config features.
