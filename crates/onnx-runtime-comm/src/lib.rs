@@ -14,6 +14,18 @@
 //!   refined against `specs/tla/BufferOwnership.tla`, emitting contract-revision
 //!   trace events at each linearization point for the independent replay
 //!   checker.
+//!
+//! # Why this crate has no inbound workspace dependencies
+//!
+//! This crate currently has **zero inbound Cargo edges** inside the workspace,
+//! and that is deliberate. It is the Phase-1 building block of the distributed
+//! runtime (see `docs/DISTRIBUTED_RUNTIME.md`): the [`Communicator`] trait, the
+//! [`InProcessCommunicator`] reference backend/test oracle, and the
+//! [`OwnershipRegistry`] lease machinery are validated *in isolation* via the
+//! independent replay-checker conformance harness (`tests/`) against the TLA+
+//! specs before the session/EP layers are wired to consume them. It is kept in
+//! the workspace (`publish = false`) so those conformance campaigns build and
+//! run in CI; do not remove it as "dead weight".
 
 #![forbid(unsafe_code)]
 

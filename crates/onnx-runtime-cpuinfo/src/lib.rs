@@ -16,6 +16,16 @@
 //! println!("AVX2: {}", cpu.isa().has_avx2());
 //! println!("L2 cache: {} KB", cpu.cache_l2_size() / 1024);
 //! ```
+//!
+//! # Why this crate has no inbound workspace dependencies
+//!
+//! This is a **standalone, publishable** library (no `publish = false`) wrapping
+//! the vendored `pytorch/cpuinfo` C library via FFI. It intentionally has zero
+//! inbound Cargo edges inside the workspace today: it exists as a
+//! self-contained hardware-detection dependency that the CPU execution-provider
+//! and thread-pool/topology tuning layers will consume as they land. It is kept
+//! in the workspace so it is versioned, built, and published alongside the rest
+//! of the `onnx-runtime-*` layer; do not remove it as "dead weight".
 
 mod ffi;
 
