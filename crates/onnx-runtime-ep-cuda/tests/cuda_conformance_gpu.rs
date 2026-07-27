@@ -546,6 +546,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "block-quantized weights",
     ));
     p.push(dedicated(
+        "BlockQuantizedMoE",
+        "block_quantized_moe_gpu.rs",
+        "block-quantized MoE expert GEMV + routing",
+    ));
+    p.push(dedicated(
         "FusedMatMulBias",
         "fused_epilogue_gpu.rs",
         "cuBLASLt BIAS epilogue",

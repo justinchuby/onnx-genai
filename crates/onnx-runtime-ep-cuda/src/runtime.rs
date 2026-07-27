@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUfunction_attribute_enum};
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ep_api::Kernel;
@@ -34,6 +34,9 @@ pub struct CudaAllocationCounts {
 pub struct CudaTransferCounts {
     pub host_to_device: u64,
     pub device_to_host: u64,
+    /// Stream-ordered asynchronous host→device copies issued on the dedicated
+    /// transfer stream by [`CudaRuntime::htod_async`] (Phase-4 weight prefetch).
+    pub async_host_to_device: u64,
 }
 
 fn nvrtc_include_paths() -> Vec<String> {
@@ -187,6 +190,13 @@ fn dynamic_shared_memory_optin(
 pub struct CudaRuntime {
     context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    /// Dedicated non-blocking transfer stream, distinct from the compute
+    /// `stream`, used by [`CudaRuntime::htod_async`] so weight-paging host→device
+    /// copies overlap kernels already queued on the compute stream (Phase-4
+    /// compute/transfer overlap). Cross-stream ordering between the two streams
+    /// is established explicitly through completion events, never an implicit
+    /// default-stream barrier.
+    copy_stream: Arc<CudaStream>,
     graph: CudaGraphLifecycle,
     blas: CublasLt,
     cudnn: CudnnBackend,
@@ -206,6 +216,14 @@ pub struct CudaRuntime {
     frees: AtomicU64,
     host_to_device_copies: AtomicU64,
     device_to_host_copies: AtomicU64,
+    async_host_to_device_copies: AtomicU64,
+    /// Completion events recorded on a transfer/compute stream, keyed by an
+    /// opaque fence id handed out to the executor inside an
+    /// [`onnx_runtime_ep_api::Fence`]. `wait_*_fence` removes and waits on the
+    /// event, establishing a stream-ordered (non host-blocking) cross-stream
+    /// dependency. See [`CudaRuntime::record_copy_fence`].
+    fences: Mutex<HashMap<u64, CudaEvent>>,
+    next_fence_id: AtomicU64,
     /// Persistent four-byte device word into which capture-safe kernels latch an
     /// out-of-range bounds violation detected during CUDA-graph replay. It is set
     /// (via `atomicOr`) by device kernels and never auto-cleared on the device;
@@ -299,12 +317,21 @@ impl CudaRuntime {
         let stream = context
             .new_stream()
             .map_err(|e| driver_err("create compute stream", e))?;
+        // A second dedicated non-blocking stream for host→device weight
+        // prefetch. Keeping transfers off the compute stream is what lets a
+        // prefetch of expert N+1's weights overlap the wave-N kernel; the two
+        // streams are ordered against each other only through explicit
+        // completion events (see `record_copy_fence` / `compute_wait_fence`).
+        let copy_stream = context
+            .new_stream()
+            .map_err(|e| driver_err("create transfer stream", e))?;
         let blas = CublasLt::new()?;
         let cudnn = CudnnBackend::new(stream.clone());
         let graph = CudaGraphLifecycle::new(stream.clone());
         Self {
             context,
             stream,
+            copy_stream,
             graph,
             blas,
             cudnn,
@@ -318,6 +345,9 @@ impl CudaRuntime {
             frees: AtomicU64::new(0),
             host_to_device_copies: AtomicU64::new(0),
             device_to_host_copies: AtomicU64::new(0),
+            async_host_to_device_copies: AtomicU64::new(0),
+            fences: Mutex::new(HashMap::new()),
+            next_fence_id: AtomicU64::new(1),
             capture_error: 0,
         }
         .with_capture_error_word()
@@ -363,6 +393,14 @@ impl CudaRuntime {
     /// The EP's compute stream (for `launch_builder`-based kernel launches).
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// The EP's dedicated host→device transfer stream, used for asynchronous
+    /// weight prefetch that overlaps compute (Phase-4). Kept distinct from the
+    /// compute [`stream`](Self::stream) so a prefetch of the next expert's
+    /// weights runs concurrently with the current wave's kernels.
+    pub fn copy_stream(&self) -> &Arc<CudaStream> {
+        &self.copy_stream
     }
 
     /// Begin capture on the EP stream after auditing the complete kernel sequence.
@@ -462,6 +500,7 @@ impl CudaRuntime {
         CudaTransferCounts {
             host_to_device: self.host_to_device_copies.load(Ordering::Relaxed),
             device_to_host: self.device_to_host_copies.load(Ordering::Relaxed),
+            async_host_to_device: self.async_host_to_device_copies.load(Ordering::Relaxed),
         }
     }
 
@@ -880,6 +919,222 @@ impl CudaRuntime {
         }
         .map_err(|e| driver_err("cuMemcpyDtoDAsync", e))
     }
+
+    // ── Phase-4 compute/transfer overlap: async H2D prefetch primitives ──────
+    //
+    // These build the EP-side *mechanism* the executor's double-buffering
+    // *strategy* drives: a stream-ordered host→device copy on the dedicated
+    // `copy_stream`, plus completion events that order the compute stream after a
+    // transfer (`compute_wait_fence`) and — for double-buffer reuse — the copy
+    // stream after a prior consumer (`copy_wait_fence`). No primitive blocks the
+    // host; ordering is entirely through CUDA events so a prefetch of the next
+    // expert's weights overlaps the current wave's kernels.
+
+    /// Enqueue an asynchronous host → device copy of `src` on the dedicated
+    /// transfer stream (not the compute stream), so it overlaps compute.
+    /// For genuine overlap `src` should be page-locked (pinned) host memory —
+    /// see [`CudaRuntime::alloc_pinned`]; a pageable `src` still copies correctly
+    /// but the driver may stage it synchronously.
+    ///
+    /// # Safety
+    /// `dst` is a live device allocation of at least `src.len()` bytes and `src`
+    /// must remain valid and unmoved until the transfer completes (order a
+    /// consumer after it with [`CudaRuntime::record_copy_fence`] +
+    /// [`CudaRuntime::compute_wait_fence`], or drain with [`CudaRuntime::sync_copy_stream`]).
+    pub unsafe fn htod_async(&self, src: &[u8], dst: CUdeviceptr) -> Result<()> {
+        self.bind()?;
+        if src.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: bound context; `dst` covers `src.len()` bytes per the contract,
+        // and the copy is ordered on the runtime-owned transfer stream.
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(dst, src, self.copy_stream.cu_stream())
+        }
+        .map_err(|e| driver_err("cuMemcpyHtoDAsync", e))?;
+        self.async_host_to_device_copies
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Enqueue an asynchronous device → device copy on the transfer stream, so
+    /// it overlaps compute the same way [`CudaRuntime::htod_async`] does. Used by
+    /// [`copy_async`](onnx_runtime_ep_api::ExecutionProvider::copy_async) when the
+    /// source already resides on-device.
+    ///
+    /// # Safety
+    /// Both pointers are live allocations of at least `bytes` bytes and remain
+    /// live until the transfer stream completes the copy (order with a fence).
+    pub unsafe fn dtod_async_on_copy_stream(
+        &self,
+        src: CUdeviceptr,
+        dst: CUdeviceptr,
+        bytes: usize,
+    ) -> Result<()> {
+        self.bind()?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        // SAFETY: bound context; both endpoints cover `bytes` and the copy is
+        // ordered on the runtime-owned transfer stream.
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.copy_stream.cu_stream())
+        }
+        .map_err(|e| driver_err("cuMemcpyDtoDAsync", e))
+    }
+
+    /// Record a completion event for all work so far enqueued on the transfer
+    /// stream and register it under a fresh, opaque fence id (always non-zero).
+    /// Await it later on the compute stream with [`CudaRuntime::compute_wait_fence`].
+    pub fn record_copy_fence(&self) -> Result<u64> {
+        self.record_fence_on(&self.copy_stream)
+    }
+
+    /// Record a completion event for all work so far enqueued on the compute
+    /// stream and register it under a fresh fence id. Used for double-buffer
+    /// reuse: the transfer stream must wait on the previous consumer (via
+    /// [`CudaRuntime::copy_wait_fence`]) before overwriting a staging buffer.
+    pub fn record_compute_fence(&self) -> Result<u64> {
+        self.record_fence_on(&self.stream)
+    }
+
+    fn record_fence_on(&self, stream: &CudaStream) -> Result<u64> {
+        self.bind()?;
+        let event = self
+            .context
+            .new_event(None)
+            .map_err(|e| driver_err("cuEventCreate", e))?;
+        event
+            .record(stream)
+            .map_err(|e| driver_err("cuEventRecord", e))?;
+        let id = self.next_fence_id.fetch_add(1, Ordering::Relaxed);
+        self.fences
+            .lock()
+            .expect("cuda fence registry poisoned")
+            .insert(id, event);
+        Ok(id)
+    }
+
+    /// Make the compute stream wait on the transfer completion event named by
+    /// `fence_id` (a stream-ordered, non host-blocking cross-stream wait), then
+    /// release the event. A later kernel launched on the compute stream is
+    /// therefore ordered after the prefetch and observes the full transfer. Id
+    /// `0` (an already-signalled fence) and an unknown id are no-ops.
+    pub fn compute_wait_fence(&self, fence_id: u64) -> Result<()> {
+        self.wait_fence_on(&self.stream, fence_id)
+    }
+
+    /// Make the transfer stream wait on the compute completion event named by
+    /// `fence_id`, then release the event. Used before reusing a double-buffer
+    /// staging region so the incoming prefetch never overwrites bytes a prior
+    /// wave's kernel is still reading (write-after-read hazard).
+    pub fn copy_wait_fence(&self, fence_id: u64) -> Result<()> {
+        self.wait_fence_on(&self.copy_stream, fence_id)
+    }
+
+    fn wait_fence_on(&self, waiter: &CudaStream, fence_id: u64) -> Result<()> {
+        if fence_id == 0 {
+            return Ok(());
+        }
+        let event = self
+            .fences
+            .lock()
+            .expect("cuda fence registry poisoned")
+            .remove(&fence_id);
+        let Some(event) = event else {
+            return Ok(());
+        };
+        self.bind()?;
+        // The cross-stream dependency is captured by cuStreamWaitEvent here; the
+        // event may be released (dropped) immediately afterwards.
+        waiter
+            .wait(&event)
+            .map_err(|e| driver_err("cuStreamWaitEvent", e))
+    }
+
+    /// Block the host until every transfer queued on the copy stream completes.
+    /// Used on teardown / test paths that read a prefetched buffer without an
+    /// intervening event wait.
+    pub fn sync_copy_stream(&self) -> Result<()> {
+        self.copy_stream
+            .synchronize()
+            .map_err(|e| driver_err("transfer stream synchronize", e))
+    }
+
+    /// Allocate `bytes` of page-locked (pinned) host staging memory suitable as
+    /// the source of [`CudaRuntime::htod_async`]. Pinned memory lets the driver
+    /// DMA host→device without an internal pageable-staging copy, which is what
+    /// makes the transfer genuinely asynchronous and overlappable.
+    pub fn alloc_pinned(&self, bytes: usize) -> Result<PinnedStaging> {
+        self.bind()?;
+        // SAFETY: `malloc_host` returns a fresh page-locked host allocation on
+        // the bound context; `PinnedStaging` owns it and frees it once on drop.
+        let ptr = unsafe { cudarc::driver::result::malloc_host(bytes.max(1), 0) }
+            .map_err(|e| driver_err("cuMemHostAlloc", e))?;
+        Ok(PinnedStaging {
+            ptr: ptr.cast::<u8>(),
+            len: bytes,
+            context: self.context.clone(),
+        })
+    }
+}
+
+/// Owned page-locked (pinned) host staging buffer used as the source of an
+/// asynchronous host→device weight prefetch. Freed exactly once on drop through
+/// the owning CUDA context.
+pub struct PinnedStaging {
+    ptr: *mut u8,
+    len: usize,
+    context: Arc<CudaContext>,
+}
+
+// SAFETY: `PinnedStaging` owns a single page-locked host allocation; the raw
+// pointer is a plain address that is safe to move between threads. Concurrent
+// access to the *contents* is governed by `&`/`&mut self` like any `Vec<u8>`.
+unsafe impl Send for PinnedStaging {}
+unsafe impl Sync for PinnedStaging {}
+
+impl PinnedStaging {
+    /// Number of bytes in the staging buffer.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the staging buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Host-writable view of the staging bytes (fill this before prefetching).
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` names a live `len`-byte host allocation uniquely borrowed
+        // through `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Host-readable view of the staging bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` names a live `len`-byte host allocation shared through
+        // `&self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl std::fmt::Debug for PinnedStaging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedStaging")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl Drop for PinnedStaging {
+    fn drop(&mut self) {
+        let _ = self.context.bind_to_thread();
+        // SAFETY: `ptr` came from `malloc_host` on this context and is freed
+        // exactly once here.
+        let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast::<c_void>()) };
+    }
 }
 
 impl Drop for CudaRuntime {
@@ -1169,5 +1424,221 @@ extern "C" __global__ void slow_fill(float* out, unsigned long long n, long long
 
         unsafe { runtime.free_raw(src) }.unwrap();
         unsafe { runtime.free_raw(dst) }.unwrap();
+    }
+
+    // Phase-4 compute/transfer overlap — read-after-write ordering.
+    //
+    // A weight prefetch is an *asynchronous* host→device copy issued on the
+    // dedicated transfer stream, while the consuming kernel runs on the separate
+    // compute stream. The two non-blocking streams have NO implicit ordering, so
+    // the compute kernel must wait on the transfer's completion event before it
+    // may read the destination. This test delays the async copy behind a spin
+    // kernel on the transfer stream, then relies solely on
+    // `record_copy_fence` + `compute_wait_fence` to order the consumer after it.
+    // With the event wait the consumer always reads the fully-transferred
+    // payload; if the fence were a no-op placeholder the consumer would race
+    // ahead and read the pre-transfer poison.
+    #[test]
+    fn async_prefetch_h2d_event_orders_copy_before_consume() {
+        const MODULE: &str = "runtime_async_prefetch_raw_test";
+        const SOURCE: &str = r#"
+extern "C" __global__ void spin_delay(long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+}
+extern "C" __global__ void copy_out(const float* in, float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = in[i];
+}
+"#;
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping async prefetch RAW test: CUDA runtime unavailable");
+            return;
+        };
+        let spin_delay = runtime
+            .nvrtc_function(MODULE, SOURCE, "spin_delay")
+            .unwrap();
+        let copy_out = runtime.nvrtc_function(MODULE, SOURCE, "copy_out").unwrap();
+        let n = 4096usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let dst = runtime.alloc_raw(bytes).unwrap();
+        let out = runtime.alloc_raw(bytes).unwrap();
+
+        let mut staging = runtime.alloc_pinned(bytes).unwrap();
+        let payload: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32).collect();
+        staging.as_mut_slice().copy_from_slice(unsafe {
+            std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), bytes)
+        });
+
+        for _ in 0..8 {
+            // Poison the destination so a premature (racing) read is detectable.
+            let poison = vec![-999.0f32; n];
+            let poison_bytes =
+                unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.htod(poison_bytes, dst) }.unwrap();
+            runtime.synchronize().unwrap();
+
+            // Occupy the transfer stream so the async H2D copy cannot complete
+            // immediately, widening the race the event wait must close.
+            let spin: i64 = 8_000_000;
+            let mut delay = runtime.copy_stream().launch_builder(&spin_delay);
+            delay.arg(&spin);
+            unsafe { delay.launch(LaunchConfig::for_num_elems(1)).unwrap() };
+
+            // Async prefetch on the transfer stream, then fence it.
+            unsafe { runtime.htod_async(staging.as_slice(), dst) }.unwrap();
+            let fence = runtime.record_copy_fence().unwrap();
+
+            // Order the compute stream after the transfer, then consume.
+            runtime.compute_wait_fence(fence).unwrap();
+            let n_u64 = n as u64;
+            let mut consume = runtime.stream().launch_builder(&copy_out);
+            consume.arg(&dst).arg(&out).arg(&n_u64);
+            unsafe {
+                consume
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap()
+            };
+
+            let mut host = vec![0.0f32; n];
+            let host_bytes =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(host_bytes, out) }.unwrap();
+
+            for (i, value) in host.iter().enumerate() {
+                let expected = 1.0f32 + (i % 7) as f32;
+                assert_eq!(
+                    *value, expected,
+                    "async prefetch consumer read poison at index {i}: got {value}, \
+                     expected {expected} (transfer→compute event ordering violated)"
+                );
+            }
+        }
+
+        unsafe { runtime.free_raw(dst) }.unwrap();
+        unsafe { runtime.free_raw(out) }.unwrap();
+    }
+
+    // Phase-4 double-buffering — write-after-read safety across waves.
+    //
+    // The executor prefetches wave N+1's weights into the *alternate* of two
+    // device staging buffers while wave N's kernel consumes the current one.
+    // With only two buffers, buffer B is reused every second wave, so the
+    // transfer that refills B for wave N+2 must not overwrite it while wave N's
+    // (still-running) consumer is reading it. `copy_wait_fence` makes the
+    // transfer stream wait on the consumer's completion event before the reuse
+    // copy; `compute_wait_fence` makes each consumer wait on its transfer. Every
+    // wave's output must equal that wave's distinct payload; a missing WAR fence
+    // would let a later prefetch clobber a buffer mid-read and corrupt an
+    // earlier wave's result.
+    #[test]
+    fn double_buffered_prefetch_is_race_free_across_waves() {
+        const MODULE: &str = "runtime_double_buffer_war_test";
+        const SOURCE: &str = r#"
+extern "C" __global__ void slow_copy(const float* in, float* out, unsigned long long n, long long spin) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+    out[i] = in[i];
+}
+"#;
+        let Some(runtime) = maybe_runtime() else {
+            eprintln!("skipping double-buffer WAR test: CUDA runtime unavailable");
+            return;
+        };
+        let slow_copy = runtime.nvrtc_function(MODULE, SOURCE, "slow_copy").unwrap();
+        let waves = 6usize;
+        let n = 2048usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let n_u64 = n as u64;
+        let spin: i64 = 8_000_000;
+        let payload = |w: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| 1.0 + (w as f32) * 13.0 + (i % 5) as f32)
+                .collect()
+        };
+
+        // Two double-buffered device staging regions, poisoned up front.
+        let buf = [
+            runtime.alloc_raw(bytes).unwrap(),
+            runtime.alloc_raw(bytes).unwrap(),
+        ];
+        let poison = vec![-777.0f32; n];
+        let poison_bytes =
+            unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
+        for b in buf {
+            unsafe { runtime.htod(poison_bytes, b) }.unwrap();
+        }
+        // Per-wave output buffers and pre-filled pinned host payloads.
+        let results: Vec<CUdeviceptr> = (0..waves)
+            .map(|_| runtime.alloc_raw(bytes).unwrap())
+            .collect();
+        let pinned: Vec<PinnedStaging> = (0..waves)
+            .map(|w| {
+                let mut p = runtime.alloc_pinned(bytes).unwrap();
+                let src = payload(w);
+                p.as_mut_slice().copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), bytes)
+                });
+                p
+            })
+            .collect();
+        runtime.synchronize().unwrap();
+
+        let mut copy_fence = [0u64; 2];
+        let mut last_compute_fence = [0u64; 2];
+
+        // Prime the first buffer (no prior consumer, so no WAR wait), then run
+        // the double-buffered loop.
+        unsafe { runtime.htod_async(pinned[0].as_slice(), buf[0]) }.unwrap();
+        copy_fence[0] = runtime.record_copy_fence().unwrap();
+        for w in 0..waves {
+            let cur = w % 2;
+            if w + 1 < waves {
+                let nxt = (w + 1) % 2;
+                // WAR: do not overwrite buffer `nxt` until the prior wave that
+                // consumed it has finished (no-op the first time it is used).
+                runtime.copy_wait_fence(last_compute_fence[nxt]).unwrap();
+                unsafe { runtime.htod_async(pinned[w + 1].as_slice(), buf[nxt]) }.unwrap();
+                copy_fence[nxt] = runtime.record_copy_fence().unwrap();
+            }
+            // RAW: consumer waits on this buffer's transfer, then reads it.
+            runtime.compute_wait_fence(copy_fence[cur]).unwrap();
+            let mut consume = runtime.stream().launch_builder(&slow_copy);
+            let result = results[w];
+            let src = buf[cur];
+            consume.arg(&src).arg(&result).arg(&n_u64).arg(&spin);
+            unsafe {
+                consume
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap()
+            };
+            // Mark the buffer busy until this consumer completes so a future
+            // reuse prefetch waits for it.
+            last_compute_fence[cur] = runtime.record_compute_fence().unwrap();
+        }
+        runtime.synchronize().unwrap();
+
+        for (w, &result) in results.iter().enumerate() {
+            let mut host = vec![0.0f32; n];
+            let host_bytes =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(host_bytes, result) }.unwrap();
+            let expected = payload(w);
+            assert_eq!(
+                host, expected,
+                "wave {w} output corrupted — a reuse prefetch clobbered its \
+                 staging buffer mid-read (write-after-read fence violated)"
+            );
+        }
+
+        for b in buf {
+            unsafe { runtime.free_raw(b) }.unwrap();
+        }
+        for result in results {
+            unsafe { runtime.free_raw(result) }.unwrap();
+        }
     }
 }

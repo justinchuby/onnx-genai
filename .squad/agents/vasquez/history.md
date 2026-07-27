@@ -8,3 +8,6 @@
 - Approved `dbff29c`: real Environment lifecycle, last-drop cache clearing, and fresh registration attempt are covered; PR #25 merged.
 
 - 2026-07-27T10:09:19Z: Roadmap wave landed: #239/#246/#249/#248/#256/#263/#259 plus fmt gate #264; reviewer-lockout protocol enforced where required.
+
+## 2026-07-27T16:44:54Z — Wave 8 update
+- Approved Dallas PR #272 for #47 DDPM + flow-matching schedulers; merged as 229c1401.

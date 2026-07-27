@@ -1,16 +1,47 @@
+[2m2026-07-27T11:22:49.086992Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
+onnx-genai: persistent SPMD decode pool forced on via ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 (always dispatches to the pool)
+Certainly! Below is a simple Rust function that reverses a string:
+
+```rust
+fn reverse_string(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+fn main() {
+    let original_string = "hello";
+    let reversed_string = reverse_string(original_string);
+    println!("Original: {}", original_string);
+    println!("Reversed: {}", reversed_string);
+}
+```
+
+### Explanation:
+- The function `reverse_string` takes a reference to a string `s` as its parameter.
+- It uses the `chars()` method to get a mutable iterator over the characters of the string.
+- The `rev()` method is then applied to the iterator to reverse the order of the characters.
+- Finally, the `collect()` method is used to convert the iterator back into a string.
+
+### Example Output:
+```
+Original: hello
+Reversed: olleh
+```
+
+This function works by first converting the string into an iterator of characters, then reversing this iterator,
+
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b
 execution provider       cpu
-model load                    124.6 ms
+model load                    134.1 ms
 prompt tokens                    40
-generated tokens                 48
-time to first token          2396.2 ms
-generation wall time        15890.9 ms
-decode throughput              3.48 tok/s
-end-to-end throughput          3.02 tok/s
-inter-token latency      mean 287.1 / p50 262.7 / p90 277.7 / p99 1197.6 / max 1197.6 ms
+generated tokens                200
+time to first token          1022.5 ms
+generation wall time         6951.6 ms
+decode throughput             33.56 tok/s
+end-to-end throughput         28.77 tok/s
+inter-token latency      mean 29.8 / p50 24.0 / p90 25.6 / p99 42.9 / max 1044.2 ms
 finish reason            MaxTokens
-peak resident memory        3.1 GiB
+peak resident memory        4.9 GiB
 kv cache budget             5.4 GiB (5746063200 tokens)
 device memory breakdown:
   model weights             1.8 GiB   25.7%
@@ -21,25 +52,25 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-loop.next_logits              15890.266         48      331047.22    331047.22
-native.session_run            15881.753         48      330869.85    330869.85
-loop.step                     13494.638         47      287119.95    281138.29
-loop.prefill                   2396.173          1     2396172.62     49920.26
-engine.tokenizer_load            99.991          1       99991.17      2083.15
-engine.ort_environment            9.638          1        9638.17       200.80
-engine.native_session_load        8.197          1        8196.83       170.77
-native.logits_fetch               7.396         48         154.08       154.08
-native.sampling                   6.770         48         141.04       141.04
-engine.metadata_load              6.361          1        6361.25       132.53
-loop.commit_selected              0.510         48          10.62        10.62
-loop.commit_selected_token        0.484         48          10.08        10.08
-native.prepare_inputs             0.436         48           9.08         9.08
-loop.detokenize                   0.428         48           8.92         8.92
-engine.resolve_model_directory        0.097          1          97.08         2.02
-engine.resource_governor          0.060          1          60.38         1.26
-native.kv_update                  0.015         48           0.32         0.32
-native.inspect_decode_io          0.015          1          14.83         0.31
-native.cpu_kv_alloc               0.012          1          11.54         0.24
-engine.resolve_decode_backend        0.008          1           7.71         0.16
-loop.commit_token                 0.001         48           0.03         0.03
-engine.connector_bridge           0.000          1           0.33         0.01
+loop.next_logits               6950.186        200       34750.93     34750.93
+native.session_run             6924.672        200       34623.36     34623.36
+loop.step                      5929.006        199       29794.00     29645.03
+loop.prefill                   1022.433          1     1022432.58      5112.16
+engine.tokenizer_load           104.295          1      104294.96       521.47
+native.logits_fetch              21.940        200         109.70       109.70
+native.sampling                  19.372        200          96.86        96.86
+engine.metadata_load             11.337          1       11336.79        56.68
+engine.native_session_load        8.786          1        8785.75        43.93
+engine.ort_environment            8.719          1        8719.04        43.60
+native.prepare_inputs             1.694        200           8.47         8.47
+loop.commit_selected              1.139        200           5.70         5.70
+loop.commit_selected_token        1.089        200           5.44         5.44
+loop.detokenize                   0.915        200           4.58         4.58
+engine.resolve_model_directory        0.156          1         156.25         0.78
+engine.resource_governor          0.103          1         103.21         0.52
+native.kv_update                  0.066        200           0.33         0.33
+native.cpu_kv_alloc               0.054          1          53.54         0.27
+native.inspect_decode_io          0.047          1          47.08         0.24
+engine.resolve_decode_backend        0.035          1          35.04         0.18
+engine.connector_bridge           0.012          1          11.62         0.06
+loop.commit_token                 0.005        200           0.03         0.03

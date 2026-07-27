@@ -28,6 +28,11 @@ half = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }
+# Test-only: the CUDA driver-path WAR regression test (cuda feature) launches a
+# custom slow-read consumer kernel on the compute stream to open a write-after-
+# read window across double-buffer reuse. Same spec as onnx-runtime-ep-cuda:
+# dynamic-loading means no CUDA toolkit is needed at build time.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13000", "dynamic-loading"] }
 
 [lints]
 workspace = true
