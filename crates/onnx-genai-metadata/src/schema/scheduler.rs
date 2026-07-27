@@ -3,13 +3,14 @@ use super::*;
 /// Diffusion scheduler configuration for an iterative strategy.
 ///
 /// The runtime treats the denoiser's loop-carried output as a noise prediction
-/// (or, for `masked_diffusion`, as token logits) and applies one scheduler step
-/// per iteration. Supported `kind`s: `ddim`, `euler`, `dpmpp_2m` (image
-/// diffusion, with optional Karras/exponential sigmas) and `masked_diffusion`
-/// (discrete language diffusion).
+/// (or, for `flow_matching`, as a vector field and, for `masked_diffusion`, as
+/// token logits) and applies one scheduler step per iteration. Supported
+/// `kind`s: `ddpm`, `ddim`, `euler`, `euler_ancestral`, `dpmpp_2m`,
+/// `flow_matching`, and `masked_diffusion`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 pub struct SchedulerSpec {
-    /// Scheduler algorithm: `"ddim"`, `"euler"`, `"dpmpp_2m"`, or
+    /// Scheduler algorithm: `"ddpm"`, `"ddim"`, `"euler"`,
+    /// `"euler_ancestral"`, `"dpmpp_2m"`, `"flow_matching"`, or
     /// `"masked_diffusion"`.
     pub kind: String,
 
@@ -32,9 +33,17 @@ pub struct SchedulerSpec {
     /// Model output parameterization: `"epsilon"` (default, noise prediction),
     /// `"v_prediction"` (velocity; SD 2.x, SDXL refiner, many fine-tunes), or
     /// `"sample"`/`"x0"` (the model predicts the clean sample directly). All
-    /// built-in continuous schedulers (`ddim`, `euler`, `euler_ancestral`,
-    /// `dpmpp_2m`) support every parameterization.
+    /// built-in diffusion schedulers (`ddpm`, `ddim`, `euler`,
+    /// `euler_ancestral`, `dpmpp_2m`) support every parameterization.
+    /// `flow_matching` instead consumes the model's velocity/vector-field output
+    /// directly and accepts an omitted value or `"flow"`/`"velocity"`.
     pub prediction_type: Option<String>,
+
+    /// Static timestep shift for `flow_matching` (default `1.0`). The base
+    /// rectified-flow sigma `s` is transformed to
+    /// `shift * s / (1 + (shift - 1) * s)`.
+    #[schemars(range(min = 0.0))]
+    pub shift: Option<f32>,
 
     /// Mask token id for a `masked_diffusion` (language-diffusion) scheduler:
     /// each step commits the highest-confidence still-masked positions.

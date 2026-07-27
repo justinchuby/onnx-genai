@@ -7,3 +7,6 @@
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Reviewed PR #267: requested missing bf16 coverage, then approved Batty's ragged causal/non-causal bf16 CPU-oracle parity tests and the merge.
+
+## 2026-07-27T16:44:54Z — Wave 8 update
+- Approved Moss PR #273 for #79 CUDA BlockQuantizedMoE kernel; merged as 4e4dd25d.

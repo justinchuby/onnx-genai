@@ -44,49 +44,47 @@
 //! unpinned worker group -- it still replaces the per-op Rayon barrier with the
 //! lightweight one, and stays correct.
 //!
-//! # Auto-calibrated by default, with an env override (rule 5)
+//! # Deterministic by default, with opt-in adaptive calibration (rule 5)
 //!
-//! The pool's activation is **auto-calibrated**. `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL`
-//! selects the policy: `=1` forces the pool on (operator override for dedicated
-//! hosts), `=0` forces it off (always the flat path), and **unset (the default)
-//! is `Auto`** -- a runtime calibrate-and-pick heuristic.
+//! The pool is **on by default** -- the deterministic, predictable choice.
+//! `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` selects the policy:
 //!
-//! Auto exists because this busy-wait barrier *beats* the flat Rayon decode path
-//! on a quiet host (int4 decode; e.g. Qwen3-0.6B ~32->74 tok/s, Phi-3.5-mini
-//! ~12->30 tok/s) but *regresses* under co-tenant load, where its spinning
-//! workers and non-participating dispatcher contend with the neighbours (the
-//! flat path degrades gracefully; the barrier does not). There is no portable,
-//! reliable "current host load" API across Linux/macOS/Windows and x86_64/aarch64,
-//! so instead of *guessing* the host state we *measure* it: because the pool is
-//! token-exact (N-tile aligned, PR #110), switching paths never changes the
-//! emitted tokens, so Auto can time the *same real decode step* both ways on the
-//! live workload and keep the faster one. See [`Calibrator`] for the state
-//! machine. The default committed path is the flat path (the safe choice under
-//! load), the pool is adopted only when it is measured meaningfully faster
-//! (hysteresis margin), and the choice is periodically re-probed so a host that
-//! becomes loaded mid-generation falls back within one recalibration window.
-//! This makes "never regress vs the flat path under load" a *measured* property
-//! rather than a heuristic hope, while still winning out-of-the-box on an idle
-//! host. The forced worker count is
+//! * **unset (the default) or `=1`**: the persistent SPMD pool is always used.
+//!   No host probing, no calibration, fully deterministic. The same prompt at
+//!   temperature 0 always follows the same floating-point reduction order.
+//! * **`=auto`**: opt-in load-adaptive calibration. A runtime heuristic times
+//!   the pool and flat paths on the live workload and keeps the faster one
+//!   (see [`Calibrator`]). Under co-tenant load the flat path usually wins;
+//!   on a quiet host the pool wins. The tradeoff is that the selected path
+//!   depends on transient system state, so results are not reproducible across
+//!   runs on differently-loaded machines.
+//! * **`=0`**: explicit opt-out; the decode path stays on the flat legacy pool.
+//!
+//! **The path is frozen once committed.** Whether the pool was selected by the
+//! default, by `=1`, or by the adaptive calibrator, the path stays fixed for
+//! the lifetime of the generation. The flat and pool paths use different
+//! floating-point reduction orders (single-threaded vs partitioned parallel),
+//! so switching mid-generation changes logits and can produce different tokens
+//! under greedy decode.
+//!
+//! The worker count is
 //! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (about
 //! half the logical CPUs); a `THREADS=0` opt-out leaves the decode path unchanged.
 //!
-//! # Precedence when forced (`=1`) vs the affinity control
+//! # Precedence when on (default or `=1`) vs the affinity control
 //!
-//! When the pool is forced on (`=1`), the decode strategy precedence is, highest
-//! first:
+//! When the pool is on (the default, or `=1`), the decode strategy precedence is,
+//! highest first:
 //!
 //! 1. **`ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split`** -- the explicit multi-node
 //!    split wins when its two-level layout can be built (the mutually-exclusive
-//!    selection vs the forced persistent pool is reported once).
-//! 2. **Forced persistent SPMD** (`=1`) -- its own per-node pinning applies.
-//! 3. **Flat Rayon + auto-`compact`** legacy path -- reached by `=0` (Off) and by
-//!    the `Auto` default whenever calibration has the flat path committed, which
-//!    also honors any explicit `ONNX_GENAI_CPU_DECODE_AFFINITY` via
-//!    [`crate::decode_affinity::plan_decode_affinity`] as before. Under `Auto`,
-//!    an explicit `numa-split` affinity likewise takes precedence over calibration
-//!    (the user picked a specific strategy), so Auto calibrates the persistent
-//!    SPMD pool against the flat path only.
+//!    selection vs the persistent pool is reported once).
+//! 2. **Persistent SPMD pool** (default or `=1`) -- its own per-node pinning applies.
+//! 3. **Flat Rayon + auto-`compact`** legacy path -- reached by `=0` (Off). Under
+//!    `=auto` (adaptive), an explicit `numa-split` affinity likewise takes
+//!    precedence over calibration (the user picked a specific strategy), so the
+//!    adaptive calibrator measures the persistent SPMD pool against the flat path
+//!    only.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -98,14 +96,13 @@ use crate::decode_affinity::{NodeShard, NumaTopology};
 use crate::kernels::matmul_nbits::output_chunk_len;
 
 /// Environment switch selecting the persistent SPMD decode pool policy:
-/// `=1` forces the pool on, `=0` forces it off (flat path), and **unset (the
-/// default) is `Auto`** -- a runtime calibrate-and-pick heuristic (see
-/// [`Calibrator`]). The pool beats the flat path on a quiet host but regresses
-/// under co-tenant load, so Auto times the same token-exact decode step both
-/// ways on the live workload, keeps the flat path committed by default (the safe
-/// choice under load), and adopts the pool only when it measures meaningfully
-/// faster -- re-probing periodically so it falls back if the host becomes loaded.
-/// See `.squad/decisions.md` (Voight 2026-07-24; Hudson 2026-07-24 auto-enable).
+/// **unset (the default) or `=1`** uses the persistent SPMD pool deterministically
+/// (no host probing); `=auto` opts in to load-adaptive calibration (see
+/// [`Calibrator`]); `=0` forces the flat legacy path. The pool beats the flat
+/// path on a quiet or dedicated host; under heavy co-tenant load the flat path
+/// degrades more gracefully, which is why the adaptive mode exists -- but the
+/// default prioritises predictability over adaptation.
+/// See `.squad/decisions.md` (Voight 2026-07-24; Chu 2026-07-27 opt-in adaptive).
 pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 
 /// Bounded active-spin window before a worker parks, mirroring the
@@ -936,6 +933,24 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
 /// without forcing a build.
 static POOLS: OnceLock<Option<SpmdDecodePools>> = OnceLock::new();
 
+/// The label describing the active decode path, set once at pool build time.
+/// Queryable via [`decode_path_label`] so callers can inspect which strategy is
+/// active without parsing stderr or comparing throughput numbers.
+static DECODE_PATH_LABEL: OnceLock<&'static str> = OnceLock::new();
+
+/// Human-readable label for the decode path that was selected. Returns the
+/// path name once the pool initialization has run, or `"unresolved"` if it
+/// has not been queried yet.
+///
+/// Examples:
+/// - `"spmd-pool"` — the persistent SPMD pool (default or `=1`)
+/// - `"adaptive"` — load-adaptive calibration (`=auto`)
+/// - `"flat"` — the flat legacy path (`=0` or fallback)
+/// - `"unresolved"` — pool initialization has not run yet
+pub fn decode_path_label() -> &'static str {
+    DECODE_PATH_LABEL.get().copied().unwrap_or("unresolved")
+}
+
 /// The lazily built persistent SPMD layout, or `None` when the mode is opted out
 /// or the safe auto-enable gate declines. Built once and reused for the whole
 /// process.
@@ -980,22 +995,24 @@ fn default_threads() -> Option<usize> {
 pub(crate) enum PersistenceMode {
     /// `=0`: explicit opt-out; the decode path stays on the flat legacy pool.
     Off,
-    /// Unset (or an unrecognized value): the default. The pool is opt-in, so this
-    /// leaves decode on the flat path (same effective path as `Off`).
-    Auto,
-    /// `=1`: opt in to the persistent pool (operator override for dedicated hosts).
-    Forced,
+    /// Unset (or `=1`, or an unrecognized value): the default. The persistent
+    /// SPMD pool is always used, deterministically -- no host probing.
+    On,
+    /// `=auto`: opt-in load-adaptive calibration. The pool is built but the
+    /// [`Calibrator`] times the live decode step both ways and keeps the faster
+    /// path. Under co-tenant load the flat path usually wins.
+    Adaptive,
 }
 
-/// Parse the persistence mode from the raw env value (`None` = unset). Only the
-/// exact string `1` opts in to the persistent pool; `0` is the explicit opt-out
-/// and unset or any other value maps to `Auto`, which uses the flat path by
-/// default (the pool is opt-in).
+/// Parse the persistence mode from the raw env value (`None` = unset). Unset,
+/// `=1`, and any unrecognized value map to `On` (the deterministic pool
+/// default); `=0` is the explicit opt-out; `=auto` enables load-adaptive
+/// calibration.
 pub(crate) fn persistence_mode_from_raw(raw: Option<&str>) -> PersistenceMode {
     match raw.map(str::trim) {
         Some("0") => PersistenceMode::Off,
-        Some("1") => PersistenceMode::Forced,
-        _ => PersistenceMode::Auto,
+        Some(v) if v.eq_ignore_ascii_case("auto") => PersistenceMode::Adaptive,
+        _ => PersistenceMode::On,
     }
 }
 
@@ -1003,55 +1020,55 @@ fn persistence_mode() -> PersistenceMode {
     persistence_mode_from_raw(std::env::var(PERSISTENT_POOL_ENV).ok().as_deref())
 }
 
-/// Whether a persistence mode **builds** the persistent SPMD pool. Both `Forced`
-/// (`=1`) and `Auto` (the unset default) build it: `Forced` always dispatches to
-/// it, and `Auto` needs it available so calibration can time the real workload on
-/// it and adopt it when it is faster. Only `Off` (`=0`) never builds it. Pure so
-/// the gating is unit-tested without env races.
+/// Whether a persistence mode **builds** the persistent SPMD pool. Both `On`
+/// (the default or `=1`) and `Adaptive` (`=auto`) build it: `On` always
+/// dispatches to it, and `Adaptive` needs it available so calibration can time
+/// the real workload on it. Only `Off` (`=0`) never builds it. Pure so the
+/// gating is unit-tested without env races.
 fn pool_mode_builds(mode: PersistenceMode) -> bool {
-    matches!(mode, PersistenceMode::Forced | PersistenceMode::Auto)
+    matches!(mode, PersistenceMode::On | PersistenceMode::Adaptive)
 }
 
 /// Whether a persistence mode **unconditionally** dispatches to the pool (no
-/// calibration): only `Forced` (`=1`). `Auto` builds the pool but lets the
-/// [`Calibrator`] pick per step; `Off` never uses it.
+/// calibration): `On` (the default or `=1`). `Adaptive` builds the pool but
+/// lets the [`Calibrator`] pick per step; `Off` never uses it.
 fn pool_mode_forces(mode: PersistenceMode) -> bool {
-    matches!(mode, PersistenceMode::Forced)
+    matches!(mode, PersistenceMode::On)
 }
 
-/// Whether the persistent pool was **explicitly opted into** (`PERSISTENT_POOL=1`).
-/// Used to keep the `numa-split` mutual-exclusion diagnostic scoped to users who
-/// actually asked for the persistent pool, to make dense-f32 decode still
-/// eligible for the pool when forced, and to skip calibration (always dispatch).
+/// Whether the persistent pool is unconditionally dispatched to (the default,
+/// or `PERSISTENT_POOL=1`). Used to keep the `numa-split` mutual-exclusion
+/// diagnostic scoped to users who actually asked for the persistent pool, to
+/// make dense-f32 decode still eligible for the pool, and to skip calibration.
 pub(crate) fn is_forced() -> bool {
     pool_mode_forces(persistence_mode())
 }
 
-/// Build the persistent SPMD layout when the mode builds it (`=1` Forced or the
-/// unset `Auto` default); `=0` (Off) or `THREADS=0` return `None` so decode stays
-/// on the flat path. Under `Auto` the pool is built but only *used* when
-/// calibration adopts it (see [`Calibrator`]); under `Forced` it is always used.
+/// Build the persistent SPMD layout when the mode builds it (`On` -- the default
+/// or `=1` -- and `Adaptive` `=auto`); `=0` (Off) or `THREADS=0` return `None`
+/// so decode stays on the flat path. Under `Adaptive` the pool is built but only
+/// *used* when calibration adopts it (see [`Calibrator`]); under `On` it is
+/// always used.
 ///
 /// Two or more usable NUMA nodes yield the two-level node-pinned layout; a
 /// single-node host, a non-NUMA machine, or a platform without pinning yields a
 /// single unpinned worker group (still the lightweight barrier, still correct).
 pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
-    // Build for `Forced` (`=1`) and the `Auto` default (unset). `Auto` needs the
-    // pool available so the calibrator can time the live decode step on it and
-    // adopt it only when it is measured faster than the flat path (it stays on
-    // the flat path under load); `Forced` always dispatches to it. `Off` (`=0`)
-    // and `THREADS=0` leave decode on the flat Rayon path. See `PERSISTENT_POOL_ENV`.
+    // Build for `On` (the default or `=1`) and `Adaptive` (`=auto`). `On` always
+    // dispatches to the pool; `Adaptive` needs the pool available so the
+    // calibrator can time the live decode step on it. `Off` (`=0`) and `THREADS=0`
+    // leave decode on the flat Rayon path. See `PERSISTENT_POOL_ENV`.
     let mode = persistence_mode();
     if !pool_mode_builds(mode) {
         return None;
     }
-    // Auto defers to an explicit decode-affinity request: if the user set
+    // Adaptive defers to an explicit decode-affinity request: if the user set
     // `ONNX_GENAI_CPU_DECODE_AFFINITY` (numa-split, compact, node:N, off, ...),
-    // they picked a specific strategy, so Auto does not build/calibrate the
+    // they picked a specific strategy, so Adaptive does not build/calibrate the
     // persistent pool and lets that request drive decode (numa-split via
     // `numa_pools`, everything else via the flat path + `plan_decode_affinity`).
-    // `Forced` (`=1`) still builds the pool and keeps its documented precedence.
-    if matches!(mode, PersistenceMode::Auto) && explicit_decode_affinity_set() {
+    // `On` still builds the pool and keeps its documented precedence.
+    if matches!(mode, PersistenceMode::Adaptive) && explicit_decode_affinity_set() {
         return None;
     }
     let Some(total) = threads else {
@@ -1089,9 +1106,9 @@ pub fn build_from_env(threads: Option<usize>) -> Option<SpmdDecodePools> {
     Some(SpmdDecodePools::build(&shards))
 }
 
-/// Whether `ONNX_GENAI_CPU_DECODE_AFFINITY` is set to a non-empty value. Auto
-/// calibration only engages when it is unset, so an explicit affinity request is
-/// honored on the flat/numa path exactly as before.
+/// Whether `ONNX_GENAI_CPU_DECODE_AFFINITY` is set to a non-empty value.
+/// Adaptive calibration only engages when it is unset, so an explicit affinity
+/// request is honored on the flat/numa path exactly as before.
 fn explicit_decode_affinity_set() -> bool {
     std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
         .ok()
@@ -1182,44 +1199,76 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 
 /// Log the first persistent-pool fallback/pinning problem once so a restricted
 /// or unsupported host surfaces the reason without spamming every worker.
+/// Emitted as `tracing::debug!` when the `tracing` feature is enabled, or
+/// gated behind `NXRT_CALIB_DEBUG` otherwise.
 fn report_spmd_fallback(message: &str) {
+    DECODE_PATH_LABEL.get_or_init(|| "flat");
     static REPORTED: OnceLock<()> = OnceLock::new();
     if REPORTED.set(()).is_ok() {
-        eprintln!("onnx-genai: persistent SPMD decode pool: {message}");
+        #[cfg(feature = "tracing")]
+        tracing_crate::debug!(path = "flat", reason = %message, "cpu decode pool fallback");
+        #[cfg(not(feature = "tracing"))]
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!("onnx-genai: persistent SPMD decode pool: {message}");
+        }
     }
 }
 
-/// Announce once how the persistent SPMD pool was built so the non-default
-/// decode path is inspectable: `Forced` (`=1`) always dispatches to it, while the
-/// `Auto` default builds it but only adopts it when calibration measures it
-/// faster than the flat path (and stays on the flat path under load).
+/// Record the selected decode path in the queryable [`DECODE_PATH_LABEL`] static
+/// so callers can inspect it via [`decode_path_label`]. Emitted as
+/// `tracing::debug!` when the `tracing` feature is enabled (visible to any
+/// subscriber at `debug` level or below), or gated behind `NXRT_CALIB_DEBUG`
+/// otherwise. See `docs/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
-    static REPORTED: OnceLock<()> = OnceLock::new();
-    if REPORTED.set(()).is_ok() {
-        match mode {
-            PersistenceMode::Forced => eprintln!(
-                "onnx-genai: persistent SPMD decode pool forced on via \
-                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 (always dispatches to the pool)"
-            ),
-            _ => eprintln!(
-                "onnx-genai: persistent SPMD decode pool built for auto-calibration \
-                 (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL unset); each decode step is timed \
-                 both ways and the faster path is kept -- the flat path stays committed \
-                 under load. Set =0 to force flat, =1 to force the pool"
-            ),
+    let label = match mode {
+        PersistenceMode::On => "spmd-pool",
+        PersistenceMode::Adaptive => "adaptive",
+        PersistenceMode::Off => "flat",
+    };
+    DECODE_PATH_LABEL.get_or_init(|| label);
+
+    #[cfg(feature = "tracing")]
+    {
+        let workers = POOLS
+            .get()
+            .and_then(|p| p.as_ref())
+            .map(|p| p.total_workers())
+            .unwrap_or(0);
+        tracing_crate::debug!(path = label, workers, "cpu decode path selected");
+    }
+    #[cfg(not(feature = "tracing"))]
+    if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+        static REPORTED: OnceLock<()> = OnceLock::new();
+        if REPORTED.set(()).is_ok() {
+            match mode {
+                PersistenceMode::On => eprintln!(
+                    "NXRT_CALIB: decode path = persistent SPMD pool (default). \
+                     Set ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto for load-adaptive \
+                     selection, =0 for the flat legacy path"
+                ),
+                PersistenceMode::Adaptive => eprintln!(
+                    "NXRT_CALIB: decode path = adaptive \
+                     (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto); \
+                     the initial decode steps are timed both ways and the faster path is \
+                     kept permanently. Set =1 or unset for the deterministic pool, =0 for flat"
+                ),
+                PersistenceMode::Off => {}
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Auto-calibration: pick the pool or the flat path by measuring the live decode
-// step both ways, keeping the faster one.
+// Adaptive calibration (opt-in via =auto): pick the pool or the flat path by
+// measuring the live decode step both ways, keeping the faster one.
 // ---------------------------------------------------------------------------
 
-/// Which decode path a single `Auto`-mode decode step should take. Both paths are
-/// token-exact (the pool is N-tile aligned, PR #110), so switching between them
-/// never changes the emitted tokens -- that is exactly what lets calibration time
-/// the *same real workload* both ways.
+/// Which decode path a single adaptive-mode decode step should take. Both paths
+/// are token-exact, so the choice never changes the emitted tokens -- only how
+/// fast the step runs. The flat and pool paths use different floating-point
+/// reduction orders, so switching between them can produce different logits under
+/// greedy decode. The calibrator freezes the path once committed to avoid
+/// mid-generation non-determinism.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AutoPath {
     /// Dispatch this step's projections to the persistent SPMD pool.
@@ -1239,11 +1288,6 @@ const CALIB_WARMUP_STEPS: u64 = 2;
 /// keeping the probe short (a probe costs `2 * CALIB_PROBE_SAMPLES` real steps,
 /// half of them possibly-slower pool steps).
 const CALIB_PROBE_SAMPLES: usize = 5;
-/// Committed steps between re-probes. Long enough that probe overhead is
-/// negligible (a probe is `<= 2 * CALIB_PROBE_SAMPLES` steps per period, so
-/// worst-case < ~2% of steps ever run a possibly-slower pool probe), short enough
-/// that a host which becomes loaded mid-generation falls back within one window.
-const CALIB_RECAL_PERIOD: u64 = 600;
 /// Hysteresis margin: the pool is adopted only when its median step time is at
 /// least this percent faster than the flat path. Biases toward the flat path (the
 /// regression-safe default) and prevents flapping when the two paths are close.
@@ -1277,7 +1321,7 @@ const CALIB_MAX_REPROBES: u32 = 3;
 /// (all flat, then all pool) rather than interleaving them, so a just-finished
 /// pool step's still-spinning workers never pollute a flat measurement. Flat is
 /// measured first, while the pool is quiesced (parked), which is exactly the
-/// steady state a committed-flat `Auto` run experiences.
+/// steady state a committed-flat adaptive run experiences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CalibPhase {
     /// Warm the pool (prepack + node-local first-touch) before any measurement.
@@ -1290,7 +1334,7 @@ enum CalibPhase {
     Committed,
 }
 
-/// Runtime calibrate-and-pick state machine for `Auto` mode.
+/// Runtime calibrate-and-pick state machine for `Adaptive` mode (`=auto`).
 ///
 /// # Why this cannot regress under load
 ///
@@ -1306,18 +1350,27 @@ enum CalibPhase {
 ///   look slow. (An interleaved probe *did* mis-commit to the pool under load;
 ///   see `.squad/decisions.md`, Hudson 2026-07-24.)
 /// * The only pool work done while the flat path is committed is a bounded probe
-///   (`<= CALIB_PROBE_SAMPLES` pool steps per [`CALIB_RECAL_PERIOD`] steps, plus a
-///   one-time warmup), so the worst case is a small, self-correcting number of
-///   possibly-slower steps -- never a sustained regression.
-/// * Re-probing lets a host that *becomes* loaded mid-generation fall back within
-///   one recalibration window, and a host that *becomes* idle adopt the pool.
+///   (`<= CALIB_PROBE_SAMPLES` pool steps during calibration, plus a one-time
+///   warmup), so the worst case is a small number of possibly-slower steps during
+///   the initial calibration -- never a sustained regression.
 /// * A probe block hit by a *transient* co-tenant burst (non-uniform samples --
 ///   see [`block_contended`]) is discarded and re-collected (bounded by
 ///   [`CALIB_MAX_REPROBES`]) rather than committed, so a momentary spike on the
-///   pool block no longer locks the slower flat path in for a whole window. A
+///   pool block no longer locks the slower flat path in permanently. A
 ///   *uniformly* slow block (genuine sustained load) is never flagged, so this
 ///   only ever avoids acting on unreliable data -- it cannot regress a clean or a
 ///   steadily-loaded measurement.
+///
+/// # Path freezing
+///
+/// Once the calibrator commits to a path (pool or flat), it stays committed
+/// permanently. The flat and pool paths use different floating-point reduction
+/// orders, so switching mid-generation changes logits and produces different
+/// tokens under greedy decode. A host that becomes loaded after commitment will
+/// run the (now-suboptimal) pool path for the rest of the session; this is
+/// the correct trade-off because deterministic output is more important than
+/// adapting to load changes. Use `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0` to
+/// force flat if the host is known to be loaded.
 ///
 /// The decision logic is pure (no threads, no clock; the only env read is an
 /// optional `NXRT_CALIB_DEBUG` diagnostic print that never affects the choice), so
@@ -1329,7 +1382,6 @@ struct Calibrator {
     pool_ns: Vec<u64>,
     flat_ns: Vec<u64>,
     committed: AutoPath,
-    committed_left: u64,
     reprobes_left: u32,
 }
 
@@ -1344,7 +1396,6 @@ impl Calibrator {
             // Default to the flat path: the safe, no-regression baseline that a
             // host which never lets the pool win keeps forever.
             committed: AutoPath::Flat,
-            committed_left: 0,
             reprobes_left: CALIB_MAX_REPROBES,
         }
     }
@@ -1386,10 +1437,9 @@ impl Calibrator {
                 }
             }
             CalibPhase::Committed => {
-                self.committed_left = self.committed_left.saturating_sub(1);
-                if self.committed_left == 0 {
-                    self.enter_flat_probe();
-                }
+                // Path is frozen once committed. The flat and pool paths use
+                // different FP reduction orders, so switching mid-generation
+                // produces non-deterministic tokens under greedy decode.
             }
         }
     }
@@ -1473,7 +1523,8 @@ impl Calibrator {
             );
         }
         self.phase = CalibPhase::Committed;
-        self.committed_left = CALIB_RECAL_PERIOD;
+        // Path is frozen permanently — no re-probe. See the "Path freezing"
+        // section in the struct-level docs.
         self.reprobes_left = CALIB_MAX_REPROBES;
         self.pool_ns.clear();
         self.flat_ns.clear();
@@ -1512,7 +1563,7 @@ fn calibrator() -> &'static Mutex<Calibrator> {
     CALIBRATOR.get_or_init(|| Mutex::new(Calibrator::new()))
 }
 
-/// The path the next `Auto`-mode decode step should take (see [`Calibrator`]).
+/// The path the next adaptive-mode decode step should take (see [`Calibrator`]).
 pub(crate) fn auto_choose_path() -> AutoPath {
     calibrator()
         .lock()
@@ -1522,7 +1573,7 @@ pub(crate) fn auto_choose_path() -> AutoPath {
         .unwrap_or(AutoPath::Flat)
 }
 
-/// Feed the measured wall time of an `Auto`-mode decode step back to calibration.
+/// Feed the measured wall time of an adaptive-mode decode step back to calibration.
 pub(crate) fn auto_record_sample(path: AutoPath, elapsed: Duration) {
     let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
     if let Ok(mut calib) = calibrator().lock() {
@@ -1871,60 +1922,89 @@ mod tests {
 
     #[test]
     fn persistence_mode_parses_env_values() {
-        // Mode parsing (the pool is opt-in): unset -> Auto (flat path), `0` -> Off
-        // (flat path), `1` -> Forced (pool). Whitespace is trimmed, and any
-        // unrecognized value maps to Auto rather than surprising the user.
-        assert_eq!(persistence_mode_from_raw(None), PersistenceMode::Auto);
-        assert_eq!(persistence_mode_from_raw(Some("")), PersistenceMode::Auto);
-        assert_eq!(
-            persistence_mode_from_raw(Some("   ")),
-            PersistenceMode::Auto
-        );
+        // Mode parsing (pool is the default): unset -> On (pool), `0` -> Off
+        // (flat path), `1` -> On (pool), `auto` -> Adaptive (calibrated).
+        // Whitespace is trimmed; unrecognized values map to On (the pool default).
+        assert_eq!(persistence_mode_from_raw(None), PersistenceMode::On);
+        assert_eq!(persistence_mode_from_raw(Some("")), PersistenceMode::On);
+        assert_eq!(persistence_mode_from_raw(Some("   ")), PersistenceMode::On);
         assert_eq!(persistence_mode_from_raw(Some("0")), PersistenceMode::Off);
         assert_eq!(persistence_mode_from_raw(Some(" 0 ")), PersistenceMode::Off);
+        assert_eq!(persistence_mode_from_raw(Some("1")), PersistenceMode::On);
+        assert_eq!(persistence_mode_from_raw(Some(" 1 ")), PersistenceMode::On);
+        // `auto` (case-insensitive) enables load-adaptive calibration.
         assert_eq!(
-            persistence_mode_from_raw(Some("1")),
-            PersistenceMode::Forced
+            persistence_mode_from_raw(Some("auto")),
+            PersistenceMode::Adaptive
         );
         assert_eq!(
-            persistence_mode_from_raw(Some(" 1 ")),
-            PersistenceMode::Forced
+            persistence_mode_from_raw(Some(" Auto ")),
+            PersistenceMode::Adaptive
         );
-        // Unknown values map to Auto (flat path), never a surprise pool activation.
         assert_eq!(
-            persistence_mode_from_raw(Some("true")),
-            PersistenceMode::Auto
+            persistence_mode_from_raw(Some("AUTO")),
+            PersistenceMode::Adaptive
         );
-        assert_eq!(persistence_mode_from_raw(Some("2")), PersistenceMode::Auto);
+        // Unknown values map to On (pool), never a surprise flat path.
+        assert_eq!(persistence_mode_from_raw(Some("true")), PersistenceMode::On);
+        assert_eq!(persistence_mode_from_raw(Some("2")), PersistenceMode::On);
 
-        // The pool is BUILT for `Forced` (`=1`) and the `Auto` default (unset);
-        // only `Off` (`=0`) skips building. Auto is not *forced* (calibrated).
+        // The pool is BUILT for `On` (default/`=1`) and `Adaptive` (`=auto`);
+        // only `Off` (`=0`) skips building. On is forced (no calibration).
         assert!(pool_mode_builds(persistence_mode_from_raw(Some("1"))));
         assert!(pool_mode_builds(persistence_mode_from_raw(None)));
+        assert!(pool_mode_builds(persistence_mode_from_raw(Some("auto"))));
         assert!(!pool_mode_builds(persistence_mode_from_raw(Some("0"))));
         assert!(pool_mode_forces(persistence_mode_from_raw(Some("1"))));
-        assert!(!pool_mode_forces(persistence_mode_from_raw(None)));
+        assert!(pool_mode_forces(persistence_mode_from_raw(None)));
+        assert!(!pool_mode_forces(persistence_mode_from_raw(Some("auto"))));
     }
 
     #[test]
-    fn auto_and_forced_build_the_pool_but_only_forced_dispatches_unconditionally() {
-        // Auto-enable design (Hudson, 2026-07-24): the pool is built for `Auto`
-        // (the unset default) so calibration can time the live decode step on it
-        // and adopt it only when it is measured faster than the flat path -- while
-        // `Off` (`=0`) never builds it. `Forced` (`=1`) both builds it and forces
-        // dispatch (no calibration). This preserves the no-regression guarantee:
-        // Auto's committed default is the flat path (see `Calibrator`).
-        assert!(pool_mode_builds(PersistenceMode::Auto));
-        assert!(pool_mode_builds(PersistenceMode::Forced));
+    fn default_selects_pool_without_probing() {
+        // The default (unset) must deterministically select the pool with no
+        // calibration — the core guarantee of the opt-in adaptive design.
+        let mode = persistence_mode_from_raw(None);
+        assert_eq!(mode, PersistenceMode::On, "default must be On (pool)");
+        assert!(
+            pool_mode_forces(mode),
+            "default must force the pool (no calibration)"
+        );
+        assert!(pool_mode_builds(mode), "default must build the pool");
+    }
+
+    #[test]
+    fn adaptive_flag_enables_calibration() {
+        // `=auto` must enable adaptive calibration: build the pool but do NOT
+        // force it — the calibrator decides.
+        let mode = persistence_mode_from_raw(Some("auto"));
+        assert_eq!(mode, PersistenceMode::Adaptive);
+        assert!(
+            pool_mode_builds(mode),
+            "adaptive must build the pool for calibration"
+        );
+        assert!(
+            !pool_mode_forces(mode),
+            "adaptive must NOT force the pool — the calibrator picks"
+        );
+    }
+
+    #[test]
+    fn on_and_adaptive_build_the_pool_but_only_on_dispatches_unconditionally() {
+        // The pool is built for `On` (the default) and `Adaptive` (`=auto`);
+        // `Off` (`=0`) never builds it. `On` always dispatches (no calibration);
+        // `Adaptive` lets the calibrator pick.
+        assert!(pool_mode_builds(PersistenceMode::On));
+        assert!(pool_mode_builds(PersistenceMode::Adaptive));
         assert!(!pool_mode_builds(PersistenceMode::Off));
 
-        assert!(pool_mode_forces(PersistenceMode::Forced));
-        assert!(!pool_mode_forces(PersistenceMode::Auto));
+        assert!(pool_mode_forces(PersistenceMode::On));
+        assert!(!pool_mode_forces(PersistenceMode::Adaptive));
         assert!(!pool_mode_forces(PersistenceMode::Off));
 
-        // The default env value (unset) maps to Auto: built, calibrated, not forced.
+        // The default env value (unset) maps to On: built, forced, not calibrated.
         assert!(pool_mode_builds(persistence_mode_from_raw(None)));
-        assert!(!pool_mode_forces(persistence_mode_from_raw(None)));
+        assert!(pool_mode_forces(persistence_mode_from_raw(None)));
         assert!(!pool_mode_builds(persistence_mode_from_raw(Some("0"))));
         assert!(pool_mode_builds(persistence_mode_from_raw(Some("2"))));
         assert!(pool_mode_forces(persistence_mode_from_raw(Some("1"))));
@@ -2035,21 +2115,18 @@ mod tests {
     }
 
     #[test]
-    fn calibrator_reprobes_after_the_recal_period_and_can_fall_back() {
-        // Adopt the pool on a quiet probe, then simulate the host becoming loaded:
-        // after CALIB_RECAL_PERIOD committed steps the machine re-probes, measures
-        // the pool as slower, and falls back to the flat path within one window.
+    fn calibrator_stays_committed_permanently_after_initial_probe() {
+        // Adopt the pool on a quiet probe, then verify the path stays frozen
+        // indefinitely — no re-probe, no mid-generation switching.
         let mut calib = run_one_probe(80, 100);
         assert_eq!(calib.committed, AutoPath::Pool);
-        // Burn the committed window; choose() keeps returning Pool until re-probe.
-        for _ in 0..CALIB_RECAL_PERIOD {
+        // Feed many more steps than the old CALIB_RECAL_PERIOD (600):
+        // the path must never leave Committed.
+        for _ in 0..2000 {
             assert_eq!(calib.choose(), AutoPath::Pool);
             calib.record(AutoPath::Pool, 80);
+            assert_eq!(calib.phase, CalibPhase::Committed);
         }
-        assert_eq!(calib.phase, CalibPhase::ProbeFlat);
-        // Now the host is loaded: pool probes slow, flat probes fast.
-        drive_to_commit(&mut calib, 300, 100);
-        assert_eq!(calib.committed, AutoPath::Flat);
     }
 
     #[test]

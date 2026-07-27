@@ -50,6 +50,69 @@ pub use schedulers::{Scheduler, SchedulerFactory, SchedulerRegistry};
 /// `component.output_name`.
 pub type PipelineTensors = HashMap<String, Value>;
 
+/// A typed request for an iterative image pipeline.
+///
+/// `pipeline` carries the package-specific prompt embeddings, seed latent, and
+/// optional scheduler overrides.  Keeping those inputs in the existing generic
+/// request lets model packages declare their own ports while this API owns the
+/// image-specific result and latent-stream contract.
+pub struct ImageRequest {
+    pub pipeline: PipelineGenerateRequest,
+    /// Fully-qualified final image endpoint. When omitted, the sole output of
+    /// the final pipeline component is used.
+    pub image_output: Option<String>,
+}
+
+impl ImageRequest {
+    pub fn new(pipeline: PipelineGenerateRequest) -> Self {
+        Self {
+            pipeline,
+            image_output: None,
+        }
+    }
+
+    pub fn with_image_output(mut self, endpoint: impl Into<String>) -> Self {
+        self.image_output = Some(endpoint.into());
+        self
+    }
+}
+
+impl From<PipelineGenerateRequest> for ImageRequest {
+    fn from(pipeline: PipelineGenerateRequest) -> Self {
+        Self::new(pipeline)
+    }
+}
+
+/// The loop-carried latents after one denoising step.
+pub struct ImageStep {
+    /// The zero-based scheduler step.
+    pub step: usize,
+    /// Values keyed by their fully-qualified denoiser input endpoints.
+    pub latents: PipelineTensors,
+}
+
+/// A fallible observer invoked immediately after every scheduler update.
+pub type ImageStepCallback<'a> = dyn FnMut(&ImageStep) -> anyhow::Result<()> + 'a;
+
+/// Typed final image result from an iterative pipeline.
+pub struct ImageOutput {
+    /// The image tensor selected from the final pipeline stage.
+    pub image: Value,
+    /// The final loop-carried latents, keyed by denoiser input endpoint.
+    pub latents: PipelineTensors,
+}
+
+/// Stepwise image-generation result.
+///
+/// Rust does not yet have stable generator traits suitable for borrowing a
+/// mutable pipeline engine, so [`PipelineEngine::generate_image`] records the
+/// same per-step events exposed live by
+/// [`PipelineEngine::generate_image_with_callback`].
+pub struct ImageStream {
+    pub steps: Vec<ImageStep>,
+    pub output: ImageOutput,
+}
+
 /// The result of a post-decode (text-to-speech-shaped) pipeline run: the
 /// autoregressive decoder's generated code tokens plus the final tensor pool
 /// produced by the post-decode single-pass stages (e.g. a vocoder waveform).
@@ -617,6 +680,76 @@ impl PipelineEngine {
         }
     }
 
+    /// Add noise to an encoded diffusion latent at the scheduler state for `step`.
+    pub fn diffusion_add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        let PipelinePlan::Iterative(iterative) = &self.plan else {
+            anyhow::bail!("pipeline is not iterative");
+        };
+        if step > num_steps {
+            anyhow::bail!("start step ({step}) must be <= num_steps ({num_steps})");
+        }
+        let rebuilt;
+        let scheduler = if num_steps == iterative.num_steps {
+            iterative.scheduler.as_ref()
+        } else {
+            rebuilt = iterative
+                .scheduler_spec
+                .as_ref()
+                .map(|spec| iterative.scheduler_registry.build(spec, num_steps))
+                .transpose()?;
+            rebuilt.as_ref()
+        }
+        .context("iterative pipeline declares no diffusion scheduler")?;
+        scheduler.add_noise(step, num_steps, original, noise)
+    }
+
+    /// Generate an image and retain the post-scheduler latent for every step.
+    pub fn generate_image(&mut self, request: ImageRequest) -> anyhow::Result<ImageStream> {
+        let mut steps = Vec::new();
+        let output = self.generate_image_with_callback(request, &mut |step| {
+            let latents = step
+                .latents
+                .iter()
+                .map(|(endpoint, value)| Ok((endpoint.clone(), clone_value(value)?)))
+                .collect::<anyhow::Result<_>>()?;
+            steps.push(ImageStep {
+                step: step.step,
+                latents,
+            });
+            Ok(())
+        })?;
+        Ok(ImageStream { steps, output })
+    }
+
+    /// Generate an image while observing each post-scheduler latent immediately.
+    ///
+    /// The callback is invoked once per denoise step for every scheduler through
+    /// the shared `step` / `step_with_noise` dispatch.
+    pub fn generate_image_with_callback(
+        &mut self,
+        request: ImageRequest,
+        callback: &mut ImageStepCallback<'_>,
+    ) -> anyhow::Result<ImageOutput> {
+        let ImageRequest {
+            pipeline,
+            image_output,
+        } = request;
+        let tensors = self.run_iterative_with_callback(pipeline, Some(callback))?;
+        let image_endpoint = self.image_output_endpoint(image_output.as_deref())?;
+        let image = tensors.get(&image_endpoint).with_context(|| {
+            format!("iterative pipeline did not produce requested image '{image_endpoint}'")
+        })?;
+        let image = clone_value(image)?;
+        let latents = self.final_image_latents(&tensors)?;
+        Ok(ImageOutput { image, latents })
+    }
+
     /// Execute a **non-autoregressive** pipeline (single-pass or iterative /
     /// diffusion) and return the final named output tensors, keyed by
     /// `component.output_name`.
@@ -641,6 +774,47 @@ impl PipelineEngine {
                  a nested-autoregressive (multi-decoder TTS) pipeline"
             ),
         }
+    }
+
+    fn image_output_endpoint(&self, requested: Option<&str>) -> anyhow::Result<String> {
+        if let Some(endpoint) = requested {
+            return Ok(endpoint.to_string());
+        }
+        let PipelinePlan::Iterative(plan) = &self.plan else {
+            anyhow::bail!("generate_image() requires an iterative pipeline");
+        };
+        let component = plan.final_components.last().with_context(|| {
+            "generate_image() requires a final image component or ImageRequest::with_image_output()"
+        })?;
+        let session = self
+            .models
+            .session(component)
+            .with_context(|| format!("final image component '{component}' was not loaded"))?;
+        let outputs = session.output_names();
+        if outputs.len() != 1 {
+            anyhow::bail!(
+                "final image component '{component}' has {} outputs; select one with \
+                 ImageRequest::with_image_output()",
+                outputs.len()
+            );
+        }
+        Ok(format!("{component}.{}", outputs[0]))
+    }
+
+    fn final_image_latents(&self, tensors: &PipelineTensors) -> anyhow::Result<PipelineTensors> {
+        let PipelinePlan::Iterative(plan) = &self.plan else {
+            anyhow::bail!("generate_image() requires an iterative pipeline");
+        };
+        plan.loop_edges
+            .iter()
+            .map(|(_, input)| {
+                let endpoint = format!("{}.{}", plan.denoiser, input);
+                let value = tensors.get(&endpoint).with_context(|| {
+                    format!("final iterative latent '{endpoint}' was not produced")
+                })?;
+                Ok((endpoint, clone_value(value)?))
+            })
+            .collect()
     }
 
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
@@ -1506,9 +1680,9 @@ impl PipelinePlan {
             anyhow::bail!("iterative strategy 'num_steps' must be greater than zero");
         }
         let start_step = spec.strategy.start_step.unwrap_or(0);
-        if start_step >= num_steps {
+        if start_step > num_steps {
             anyhow::bail!(
-                "iterative strategy 'start_step' ({start_step}) must be less than 'num_steps' ({num_steps})"
+                "iterative strategy 'start_step' ({start_step}) must be <= 'num_steps' ({num_steps})"
             );
         }
 

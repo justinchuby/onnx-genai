@@ -5,7 +5,7 @@
 
 use onnx_genai_ort::Value;
 
-use super::{PredictionType, Scheduler, epsilon_from_model_output};
+use super::{PredictionType, Scheduler, epsilon_from_model_output, training_alpha_cumprod};
 
 /// DDIM (η = 0) noise schedule, precomputed per inference
 /// step as `(alpha_cumprod_t, alpha_cumprod_prev)`.
@@ -34,27 +34,8 @@ impl DdimSchedule {
         if num_steps == 0 || num_steps > num_train_timesteps {
             anyhow::bail!("scheduler num_steps ({num_steps}) must be in 1..={num_train_timesteps}");
         }
-        // Beta schedule -> cumulative product of alphas.
-        //   linear:        beta_i = lerp(beta_start, beta_end)
-        //   scaled_linear: beta_i = lerp(sqrt(beta_start), sqrt(beta_end))^2  (Stable Diffusion)
-        let denom = (num_train_timesteps - 1) as f32;
-        let (lo, hi, square) = match beta_schedule {
-            "linear" => (beta_start, beta_end, false),
-            "scaled_linear" => (beta_start.sqrt(), beta_end.sqrt(), true),
-            other => anyhow::bail!(
-                "unsupported scheduler beta_schedule '{other}' (expected 'linear' or 'scaled_linear')"
-            ),
-        };
-        let mut alpha_cumprod = Vec::with_capacity(num_train_timesteps);
-        let mut prod = 1.0f32;
-        for i in 0..num_train_timesteps {
-            let mut beta = lo + (hi - lo) * (i as f32) / denom;
-            if square {
-                beta *= beta;
-            }
-            prod *= 1.0 - beta;
-            alpha_cumprod.push(prod);
-        }
+        let alpha_cumprod =
+            training_alpha_cumprod(num_train_timesteps, beta_start, beta_end, beta_schedule)?;
         // Evenly spaced inference timesteps, descending (diffusers convention).
         let step_ratio = num_train_timesteps / num_steps;
         let ascending: Vec<usize> = (0..num_steps).map(|i| i * step_ratio).collect();
@@ -134,6 +115,21 @@ impl Scheduler for DdimSchedule {
     fn timesteps(&self) -> Option<Vec<f32>> {
         Some(self.timesteps.clone())
     }
+
+    fn add_noise(
+        &self,
+        step: usize,
+        num_steps: usize,
+        original: &Value,
+        noise: &Value,
+    ) -> anyhow::Result<Value> {
+        if step == num_steps {
+            return Value::from_slice_f32(&original.to_vec_f32_lossy()?, original.shape())
+                .map_err(Into::into);
+        }
+        let (alpha, _) = self.steps[step];
+        super::mix_noise(original, noise, alpha.sqrt(), (1.0 - alpha).sqrt())
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +153,23 @@ mod tests {
             (n1[0] - (std::f32::consts::SQRT_2 - 1.0)).abs() < 1e-5,
             "{}",
             n1[0]
+        );
+    }
+
+    #[test]
+    fn ddim_add_noise_matches_hand_computed_alpha_mix() {
+        let scheduler = DdimSchedule::with_schedule(2, 0.5, 0.5, "linear", 1).unwrap();
+        let original = Value::from_slice_f32(&[2.0], &[1]).unwrap();
+        let noise = Value::from_slice_f32(&[3.0], &[1]).unwrap();
+        let noised = Scheduler::add_noise(&scheduler, 0, 1, &original, &noise).unwrap();
+        let expected = 2.0 * 0.5f32.sqrt() + 3.0 * 0.5f32.sqrt();
+        assert!((noised.to_vec_f32_lossy().unwrap()[0] - expected).abs() < 1e-6);
+        assert_eq!(
+            Scheduler::add_noise(&scheduler, 1, 1, &original, &noise)
+                .unwrap()
+                .to_vec_f32_lossy()
+                .unwrap(),
+            vec![2.0]
         );
     }
 

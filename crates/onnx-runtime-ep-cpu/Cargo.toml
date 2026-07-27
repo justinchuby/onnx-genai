@@ -15,7 +15,7 @@ mlas = ["dep:mlas-sys"]
 # gated further at runtime by ONNX_GENAI_PROFILE_GQA=1. Off by default; adds no
 # code to production builds.
 gqa_phase_profile = []
-tracing = ["dep:onnx-runtime-tracer"]
+tracing = ["dep:onnx-runtime-tracer", "dep:tracing-crate"]
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }
@@ -25,6 +25,7 @@ onnx-runtime-quantization = { workspace = true }
 mlas-sys = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-tracer = { workspace = true, optional = true }
+tracing-crate = { package = "tracing", version = "0.1", optional = true }
 thiserror = { workspace = true }
 half = { workspace = true }
 rayon = "1"
