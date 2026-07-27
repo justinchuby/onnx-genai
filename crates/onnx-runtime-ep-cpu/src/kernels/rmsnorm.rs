@@ -110,8 +110,7 @@ pub(crate) fn rms_norm_dense(
     let axis = if axis < 0 { axis + rank as i64 } else { axis };
     if axis < 0 || axis as usize >= rank {
         return Err(EpError::KernelFailed(format!(
-            "RMSNormalization: axis {} out of range for rank {rank}",
-            axis
+            "RMSNormalization: axis {axis} out of range for rank {rank}"
         )));
     }
     let axis = axis as usize;

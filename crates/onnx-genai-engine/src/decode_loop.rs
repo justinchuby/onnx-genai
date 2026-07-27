@@ -298,7 +298,7 @@ pub(crate) fn commit_selected_token(
         let _span = onnx_genai_ort::prof_span!("loop.detokenize");
         tokenizer
             .decode(&[token_id])
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to detokenize token {token_id}: {e}"))?
     } else {
         String::new()
     };
@@ -341,7 +341,7 @@ pub(crate) fn finish_result(
     Ok(GenerateResult {
         text: tokenizer
             .decode(generated_tokens)
-            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {}", e))?,
+            .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
         token_ids: generated_tokens.to_vec(),
         finish_reason,
         prefix_cache_hit_len,

@@ -215,8 +215,7 @@ fn extract_hidden_sequence(
             (*positions as usize, *hidden as usize)
         }
         other => anyhow::bail!(
-            "hidden-state output '{output_name}' must contain one row per input token; input length is {input_len}, output shape is {:?}",
-            other
+            "hidden-state output '{output_name}' must contain one row per input token; input length is {input_len}, output shape is {other:?}"
         ),
     };
     if data.len() != positions * hidden_size {

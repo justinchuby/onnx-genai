@@ -90,9 +90,7 @@ fn align_runner_cursor(
         decode_state.rewind_runner(past_len)?;
     } else if current_len < past_len {
         anyhow::bail!(
-            "decode session cursor {} is behind requested past length {}; replay is required",
-            current_len,
-            past_len
+            "decode session cursor {current_len} is behind requested past length {past_len}; replay is required"
         );
     }
     Ok(())
@@ -102,8 +100,7 @@ fn map_decode_context_error(error: anyhow::Error) -> anyhow::Error {
     let message = error.to_string();
     if is_gather_out_of_bounds(&message) {
         anyhow::anyhow!(
-            "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {}",
-            error
+            "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {error}"
         )
     } else {
         error
@@ -242,11 +239,10 @@ pub(crate) fn run_decode_step_with_extra(
         let message = e.to_string();
         if is_gather_out_of_bounds(&message) {
             anyhow::anyhow!(
-                "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {}",
-                e
+                "model context length exceeded during ORT decode; configure inference metadata `model.max_sequence_length` or GenerateOptions::max_context to stop cleanly before the context window is exceeded: {e}"
             )
         } else {
-            anyhow::anyhow!("ORT session run failed: {}", e)
+            anyhow::anyhow!("ORT session run failed: {e}")
         }
     })?;
 

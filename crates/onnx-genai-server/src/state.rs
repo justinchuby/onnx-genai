@@ -361,10 +361,10 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
         );
     }
     let model_directory = ModelDirectory::load(model_dir)
-        .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?;
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
     let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
     let fim_config = engine.fim_config().cloned();
     let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);

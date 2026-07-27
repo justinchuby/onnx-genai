@@ -65,3 +65,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
 # Used only by the `perfetto` feature's export test to decode and validate the
 # emitted `Trace` protobuf. Not part of the library's dependency surface.
 prost = { workspace = true }
+
+[lints]
+workspace = true

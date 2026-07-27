@@ -50,7 +50,7 @@ pub(super) fn extract_next_token_logits_from_outputs(
     let shape = logits.shape();
     let data = logits
         .to_vec_f32_lossy()
-        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {e}"))?;
 
     match shape {
         [vocab] if *vocab > 0 => Ok(data),
@@ -65,7 +65,7 @@ pub(super) fn extract_next_token_logits_from_outputs(
             let start = (*seq as usize - 1) * vocab;
             Ok(data[start..start + vocab].to_vec())
         }
-        other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
+        other => anyhow::bail!("unsupported logits tensor shape: {other:?}"),
     }
 }
 
@@ -110,8 +110,7 @@ pub(super) fn extract_last_hidden(
             Ok(data[start..start + state_width].to_vec())
         }
         other => anyhow::bail!(
-            "unsupported target hidden-state tensor shape for '{output_name}': {:?}",
-            other
+            "unsupported target hidden-state tensor shape for '{output_name}': {other:?}"
         ),
     }
 }
@@ -128,7 +127,7 @@ pub(crate) fn extract_logits_sequence_with_io(
     let shape = logits.shape();
     let data = logits
         .to_vec_f32_lossy()
-        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {e}"))?;
 
     match shape {
         [vocab] if *vocab > 0 => Ok(vec![data]),
@@ -148,7 +147,7 @@ pub(crate) fn extract_logits_sequence_with_io(
                 .map(|chunk| chunk.to_vec())
                 .collect())
         }
-        other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
+        other => anyhow::bail!("unsupported logits tensor shape: {other:?}"),
     }
 }
 
@@ -164,7 +163,7 @@ pub(super) fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Ve
     let shape = logits.shape();
     let data = logits
         .to_vec_f32_lossy()
-        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read logits tensor: {e}"))?;
 
     match shape {
         [vocab] if *vocab > 0 => Ok(vec![data]),
@@ -184,6 +183,6 @@ pub(super) fn extract_logits_value_sequence(logits: &Value) -> anyhow::Result<Ve
                 .map(|chunk| chunk.to_vec())
                 .collect())
         }
-        other => anyhow::bail!("unsupported logits tensor shape: {:?}", other),
+        other => anyhow::bail!("unsupported logits tensor shape: {other:?}"),
     }
 }

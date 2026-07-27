@@ -10,3 +10,6 @@ categories = ["science", "data-structures"]
 
 [dependencies]
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

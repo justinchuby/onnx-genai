@@ -26,3 +26,6 @@ protox = "0.7"
 
 [dev-dependencies]
 prost = { workspace = true }
+
+[lints]
+workspace = true

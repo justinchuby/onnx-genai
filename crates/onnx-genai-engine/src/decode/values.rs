@@ -159,18 +159,18 @@ pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
     // cross-attention KV) are bound as no-copy aliases over a shared owner.
     // Re-alias them in O(1) instead of deep-copying the underlying buffer.
     if let Some(aliased) = value.try_alias_clone() {
-        return aliased.map_err(|e| anyhow::anyhow!("Failed to alias-clone ORT value: {}", e));
+        return aliased.map_err(|e| anyhow::anyhow!("Failed to alias-clone ORT value: {e}"));
     }
     match value.dtype() {
         DataType::Float32 => Value::from_slice_f32(&value.to_vec_f32()?, value.shape())
-            .map_err(|e| anyhow::anyhow!("Failed to clone Float32 ORT value: {}", e)),
+            .map_err(|e| anyhow::anyhow!("Failed to clone Float32 ORT value: {e}")),
         DataType::Float16 => Value::from_vec_f16_bits(value.to_vec_f16_bits()?, value.shape())
-            .map_err(|e| anyhow::anyhow!("Failed to clone Float16 ORT value: {}", e)),
+            .map_err(|e| anyhow::anyhow!("Failed to clone Float16 ORT value: {e}")),
         DataType::BFloat16 => Value::from_vec_bf16_bits(value.to_vec_bf16_bits()?, value.shape())
-            .map_err(|e| anyhow::anyhow!("Failed to clone BFloat16 ORT value: {}", e)),
+            .map_err(|e| anyhow::anyhow!("Failed to clone BFloat16 ORT value: {e}")),
         DataType::Int64 => Value::from_slice_i64(&value.to_vec_i64()?, value.shape())
-            .map_err(|e| anyhow::anyhow!("Failed to clone Int64 ORT value: {}", e)),
-        dtype => anyhow::bail!("unsupported cached ORT value dtype: {:?}", dtype),
+            .map_err(|e| anyhow::anyhow!("Failed to clone Int64 ORT value: {e}")),
+        dtype => anyhow::bail!("unsupported cached ORT value dtype: {dtype:?}"),
     }
 }
 

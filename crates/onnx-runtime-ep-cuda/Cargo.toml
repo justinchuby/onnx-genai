@@ -38,3 +38,6 @@ features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "cuda-13000", 
 
 [dev-dependencies]
 onnx-runtime-loader = { workspace = true }
+
+[lints]
+workspace = true

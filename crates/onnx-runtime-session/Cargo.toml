@@ -28,3 +28,6 @@ half = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }
+
+[lints]
+workspace = true

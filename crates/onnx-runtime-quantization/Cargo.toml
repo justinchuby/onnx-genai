@@ -7,3 +7,6 @@ license.workspace = true
 repository.workspace = true
 keywords = ["onnx", "quantization", "inference"]
 categories = ["science"]
+
+[lints]
+workspace = true

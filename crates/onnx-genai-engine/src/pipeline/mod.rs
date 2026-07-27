@@ -403,7 +403,7 @@ impl PipelineEngine {
             EngineDecodeBackend::Native => PipelineBackend::Native,
             EngineDecodeBackend::Auto => {
                 let directory = PipelineModelDirectory::load(pipeline_dir)
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
                 resolve_auto_pipeline_backend(&directory)?
             }
         };
@@ -424,7 +424,7 @@ impl PipelineEngine {
             }
         }
         let models = PipelineModels::load_with_options(pipeline_dir, session_options)
-            .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {e}"))?;
         let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
         let memoizable_components = deterministic_components(&models.directory);
         // Only autoregressive pipelines drive a token-by-token decode loop and
@@ -682,7 +682,7 @@ fn tokenize_with(tokenizer: &Tokenizer, prompt: &GeneratePrompt) -> anyhow::Resu
         GeneratePrompt::TokenIds(tokens) => Ok(tokens.clone()),
         GeneratePrompt::Text(text) => tokenizer
             .encode(text)
-            .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e)),
+            .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}")),
     }
 }
 

@@ -109,8 +109,7 @@ impl CollectiveSequencer {
                 Ok(hash)
             }
             Some(_) => Err(CommError::Ordering(format!(
-                "group {:?} was registered with different membership",
-                group
+                "group {group:?} was registered with different membership"
             ))),
             None => {
                 state.groups.insert(
@@ -174,8 +173,7 @@ impl CollectiveSequencer {
         };
         if !state.active.insert(active) {
             return Err(CommError::Ordering(format!(
-                "rank {:?} submitted duplicate collective {:?}",
-                rank, instance
+                "rank {rank:?} submitted duplicate collective {instance:?}"
             )));
         }
         self.inner.emit_rank_locked(
@@ -254,8 +252,7 @@ impl CollectiveSequencer {
                 return Ok(());
             }
             return Err(CommError::Ordering(format!(
-                "rank {:?} completed non-active collective {:?}",
-                rank, instance
+                "rank {rank:?} completed non-active collective {instance:?}"
             )));
         }
         let (members, membership_hash) = Self::group_identity(&state, group)?;
@@ -334,8 +331,7 @@ impl CollectiveSequencer {
             .ok_or_else(|| CommError::Ordering("execution decision prefix overflowed".into()))?;
         if execution.0 != expected {
             return Err(CommError::Ordering(format!(
-                "execution decision {:?} is not next prefix value {expected}",
-                execution
+                "execution decision {execution:?} is not next prefix value {expected}"
             )));
         }
         state.decisions.insert(execution, decision.clone());
@@ -359,7 +355,7 @@ impl CollectiveSequencer {
         let group_state = state
             .groups
             .get_mut(&group)
-            .ok_or_else(|| CommError::Ordering(format!("unknown group {:?}", group)))?;
+            .ok_or_else(|| CommError::Ordering(format!("unknown group {group:?}")))?;
         let cursor = group_state
             .cursors
             .get_mut(&rank)

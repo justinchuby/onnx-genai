@@ -48,7 +48,7 @@ pub(crate) fn next_session_token_argmax(
     let _kv_span = onnx_genai_ort::prof_span!("engine.kv_bookkeeping");
     kv_cache
         .append(seq, input_len)
-        .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {e}"))?;
     state.kv_token_count += input_len;
     Ok(Some(token))
 }
@@ -94,7 +94,7 @@ pub(crate) fn next_session_token_sampled(
             .context("sample-capable decode runner returned no token")?;
     kv_cache
         .append(seq, input_len)
-        .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {e}"))?;
     state.kv_token_count += input_len;
     Ok(Some(token))
 }
@@ -121,7 +121,7 @@ pub(crate) fn next_session_token_logits(
         let logits = run_decode_session_logits(&mut state.decode_state, &input_tokens, past_len)?;
         kv_cache
             .append(seq, input_len)
-            .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {e}"))?;
         state.kv_token_count += input_len;
         return logits
             .into_iter()
@@ -144,7 +144,7 @@ pub(crate) fn next_session_token_logits(
         } else {
             kv_cache
                 .append(seq, input_len)
-                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {e}"))?;
         }
         state.kv_token_count += input_len;
         apply_paged_sliding_window(
@@ -195,8 +195,7 @@ pub(crate) fn next_session_token_logits_and_hiddens(
 ) -> anyhow::Result<(Vec<f32>, Vec<Vec<f32>>)> {
     if state.decode_state.has_runner() {
         anyhow::bail!(
-            "speculative hidden-state outputs {:?} are not exposed by the optimized decode runner; initialize the target with the legacy output-preserving decode path",
-            hidden_outputs
+            "speculative hidden-state outputs {hidden_outputs:?} are not exposed by the optimized decode runner; initialize the target with the legacy output-preserving decode path"
         );
     }
     let (mut input_tokens, mut past_len) = session_decode_input_tokens(state)?;
@@ -226,7 +225,7 @@ pub(crate) fn next_session_token_logits_and_hiddens(
         } else {
             kv_cache
                 .append(seq, input_len)
-                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {seq}: {e}"))?;
         }
         state.kv_token_count += input_len;
         apply_paged_sliding_window(
@@ -260,7 +259,7 @@ pub(crate) fn next_draft_token_logits(
         draft_model
             .kv_cache
             .append(draft_state.seq, input_len)
-            .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {e}"))?;
         draft_state.kv_token_count += input_len;
         return logits
             .into_iter()
@@ -289,7 +288,7 @@ pub(crate) fn next_draft_token_logits(
             draft_model
                 .kv_cache
                 .append(draft_state.seq, input_len)
-                .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to advance draft KV sequence: {e}"))?;
         }
         draft_state.kv_token_count += input_len;
         apply_paged_sliding_window(

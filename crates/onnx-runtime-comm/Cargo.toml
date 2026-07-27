@@ -19,3 +19,6 @@ half = { workspace = true }
 # Enables the test-only independent replay-checker harness for the
 # buffer-ownership conformance campaigns.
 onnx-runtime-protocol-trace = { workspace = true, features = ["conformance"] }
+
+[lints]
+workspace = true

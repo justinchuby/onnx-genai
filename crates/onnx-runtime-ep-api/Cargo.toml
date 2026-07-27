@@ -21,3 +21,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 onnx-runtime-loader = { workspace = true }
+
+[lints]
+workspace = true

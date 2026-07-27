@@ -77,3 +77,6 @@ version = "0.29"
 # requires-python and the onnxruntime dependency.
 features = ["abi3-py310"]
 optional = true
+
+[lints]
+workspace = true

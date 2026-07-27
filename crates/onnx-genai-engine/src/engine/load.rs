@@ -17,7 +17,7 @@ impl Engine {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
             ModelDirectory::load(model_dir)
-                .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
         let decode_backend = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_decode_backend");
@@ -39,7 +39,7 @@ impl Engine {
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
-                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
         let session = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_session_load");
@@ -49,7 +49,7 @@ impl Engine {
                     &model_directory.model_path,
                     session_options.clone(),
                 )
-                .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {}", e)),
+                .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {e}")),
                 EngineDecodeBackend::Ort,
             )?
         };
@@ -64,7 +64,7 @@ impl Engine {
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
             Tokenizer::from_file(&model_directory.tokenizer_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
         };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
@@ -303,7 +303,7 @@ fn resolve_metadata_and_decode_path(
         let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
         if let Some(metadata_path) = &model_directory.metadata_path {
             onnx_genai_metadata::load_metadata(metadata_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load metadata: {}", e))?
+                .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"))?
         } else if let Some(compat) = genai_config_compat_metadata(&model_directory.root, session)? {
             tracing::info!(
                 "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
@@ -318,7 +318,7 @@ fn resolve_metadata_and_decode_path(
     // Validate capabilities
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
     if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Unsupported capabilities: {:?}", unsupported);
+        anyhow::bail!("Unsupported capabilities: {unsupported:?}");
     }
 
     // Optional cap on the runtime-owned fixed-capacity KV buffer. Foundry /
@@ -397,13 +397,13 @@ fn load_draft_model(
 ) -> anyhow::Result<Option<DraftModel>> {
     let draft = if let Some(draft_model_path) = &config.draft_model {
         let draft_directory = ModelDirectory::load(draft_model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {e}"))?;
         let draft_session = Session::new(
             environment,
             &draft_directory.model_path,
             session_options.clone(),
         )
-        .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {e}"))?;
         let draft_decode_path =
             // Draft models are loaded with sliding_window=None and sink_tokens=0:
             // draft architectures are typically distinct from the target (e.g. a

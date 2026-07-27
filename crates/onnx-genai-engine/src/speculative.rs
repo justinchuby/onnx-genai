@@ -344,8 +344,7 @@ pub(crate) fn load_target_initializer_adapters(
     let embedding_dims = embedding_weight.dims();
     if embedding_dims.len() != 2 || embedding_dims[1] != hidden_size {
         anyhow::bail!(
-            "target embedding initializer '{embedding_name}' shape {:?} must be [vocab, {hidden_size}]",
-            embedding_dims
+            "target embedding initializer '{embedding_name}' shape {embedding_dims:?} must be [vocab, {hidden_size}]"
         );
     }
     let vocab_size = embedding_dims[0];
@@ -364,8 +363,7 @@ pub(crate) fn load_target_initializer_adapters(
         )
     } else {
         anyhow::bail!(
-            "target LM-head initializer '{lm_head_name}' shape {:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]",
-            lm_head_dims
+            "target LM-head initializer '{lm_head_name}' shape {lm_head_dims:?} must be [{hidden_size}, {vocab_size}] or [{vocab_size}, {hidden_size}]"
         );
     };
     let embedder = TargetInitializerEmbedder {
@@ -1614,7 +1612,7 @@ impl Engine {
             self.kv_cache
                 .append(session_id, draft_tokens.len())
                 .map_err(|e| {
-                    anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                    anyhow::anyhow!("Failed to advance KV sequence {session_id}: {e}")
                 })?;
             state.kv_token_count += draft_tokens.len();
             logits
@@ -1645,7 +1643,7 @@ impl Engine {
                     self.kv_cache
                         .append(session_id, draft_tokens.len())
                         .map_err(|e| {
-                            anyhow::anyhow!("Failed to advance KV sequence {session_id}: {}", e)
+                            anyhow::anyhow!("Failed to advance KV sequence {session_id}: {e}")
                         })?;
                 }
                 state.kv_token_count += draft_tokens.len();
@@ -1703,7 +1701,7 @@ impl Engine {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
+                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
                     })?,
                 step: step + idx,
             };
@@ -1800,7 +1798,7 @@ impl Engine {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to detokenize speculative context: {}", e)
+                        anyhow::anyhow!("Failed to detokenize speculative context: {e}")
                     })?,
                 step: step + draft_tokens.len(),
             };
@@ -1933,7 +1931,7 @@ impl Engine {
         let materialized = self
             .kv_cache
             .materialize_sequence(session_id)
-            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to materialize target KV for shared_kv: {e}"))?;
         shared_kv_slices_from_materialized(&assistant.config.shared_kv, &materialized)
     }
 

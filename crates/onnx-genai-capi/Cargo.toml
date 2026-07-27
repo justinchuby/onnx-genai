@@ -21,3 +21,6 @@ cuda = ["onnx-genai-engine/cuda"]
 [dependencies]
 onnx-genai-engine = { workspace = true }
 anyhow = { workspace = true }
+
+[lints]
+workspace = true

@@ -11,3 +11,6 @@ categories = ["science", "memory-management"]
 [dependencies]
 onnx-runtime-ir = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

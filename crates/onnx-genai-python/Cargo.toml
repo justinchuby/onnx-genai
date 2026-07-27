@@ -50,3 +50,6 @@ default = []
 # `ONNX_GENAI_EP`; without this feature a `cuda` request falls back to CPU. The
 # Windows/Linux x86_64 wheels build with this feature; macOS does not.
 cuda = ["onnx-genai-engine/ort-cuda"]
+
+[lints]
+workspace = true

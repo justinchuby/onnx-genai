@@ -162,7 +162,7 @@ pub(crate) fn genai_config_compat_metadata(
         kv_native_dtype,
         &decoder_graph,
     )
-    .map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {}", e))
+    .map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
 }
 
 /// Build a [`ModelGraphInfo`] inventory from a loaded session's input/output

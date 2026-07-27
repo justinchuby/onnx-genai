@@ -152,7 +152,7 @@ impl<'a> ContinuousBatchManager<'a> {
             GeneratePrompt::Text(text) => self
                 .tokenizer
                 .encode(&text)
-                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
         };
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -198,7 +198,7 @@ impl<'a> ContinuousBatchManager<'a> {
             if finished {
                 self.decode
                     .deactivate_row(row.physical_row)
-                    .map_err(|e| anyhow::anyhow!("Failed to deactivate continuous row: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to deactivate continuous row: {e}"))?;
             } else {
                 self.rows[row_index] = Some(row);
             }
@@ -246,7 +246,7 @@ impl<'a> ContinuousBatchManager<'a> {
             let pending = self.queue.pop_front().expect("queue checked non-empty");
             self.decode
                 .assign_row(row_index)
-                .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {e}"))?;
             let rng = SamplingRng::for_row(pending.options.seed, row_index);
             let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
             let mut row = ContinuousBatchRow {
@@ -370,14 +370,14 @@ impl<'a> ContinuousBatchManager<'a> {
                 input_ids[active_index] = i64::from(token);
                 position_ids[active_index] =
                     self.decode.row_len(logical_row).map_err(|e| {
-                        anyhow::anyhow!("Failed to read continuous row length: {}", e)
+                        anyhow::anyhow!("Failed to read continuous row length: {e}")
                     })? as i64;
             }
             let logits = self
                 .decode
                 .step_active(&input_ids, &position_ids)
                 .map_err(|e| {
-                    anyhow::anyhow!("Continuous active static-cache step failed: {}", e)
+                    anyhow::anyhow!("Continuous active static-cache step failed: {e}")
                 })?;
             for (active_index, logical_row) in active_rows.into_iter().enumerate() {
                 let row = self.rows[logical_row]
@@ -400,7 +400,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 input_ids[row.physical_row] = i64::from(token);
                 position_ids[row.physical_row] =
                     self.decode.row_len(row.physical_row).map_err(|e| {
-                        anyhow::anyhow!("Failed to read continuous row length: {}", e)
+                        anyhow::anyhow!("Failed to read continuous row length: {e}")
                     })? as i64;
                 advance_rows[row.physical_row] = true;
             }
@@ -408,7 +408,7 @@ impl<'a> ContinuousBatchManager<'a> {
         let logits = self
             .decode
             .step_select(&input_ids, &position_ids, &advance_rows)
-            .map_err(|e| anyhow::anyhow!("Continuous static-cache decode step failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Continuous static-cache decode step failed: {e}"))?;
         for row in self.rows.iter_mut().flatten() {
             if advance_rows[row.physical_row] {
                 row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
@@ -453,7 +453,7 @@ impl Engine {
                 GeneratePrompt::Text(text) => self
                     .tokenizer
                     .encode(&text)
-                    .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {}", e))?,
+                    .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
             };
             if prompt_tokens.is_empty() {
                 anyhow::bail!("prompt must contain at least one token");
@@ -499,7 +499,7 @@ impl Engine {
                 batch_size: i64::try_from(rows.len()).context("batch size exceeds i64")?,
             },
         )
-        .map_err(|e| anyhow::anyhow!("Failed to create batched static-cache session: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create batched static-cache session: {e}"))?;
 
         prefill_batched_rows(&mut decode, &mut rows)?;
         let mut active_rows = rows.len();
@@ -565,7 +565,7 @@ impl Engine {
                     )?);
                     decode
                         .deactivate_row(row.physical_row)
-                        .map_err(|e| anyhow::anyhow!("Failed to deactivate batch row: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Failed to deactivate batch row: {e}"))?;
                     row.active = false;
                     active_rows -= 1;
                 }
@@ -599,7 +599,7 @@ impl Engine {
                     StaticCacheDecodeOptions { batch_size },
                 )
                 .map_err(|e| {
-                    anyhow::anyhow!("Failed to create continuous static-cache session: {}", e)
+                    anyhow::anyhow!("Failed to create continuous static-cache session: {e}")
                 })?,
             ),
             ModelDecodePath::PastPresent {
@@ -618,7 +618,7 @@ impl Engine {
                         },
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to create continuous shared-buffer session: {}", e)
+                        anyhow::anyhow!("Failed to create continuous shared-buffer session: {e}")
                     })?,
                 )
             }
@@ -698,12 +698,12 @@ fn prefill_continuous_row(
         input_ids[row.physical_row] = i64::from(row.context_tokens[offset]);
         position_ids[row.physical_row] = decode
             .row_len(row.physical_row)
-            .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
             as i64;
         advance_rows[row.physical_row] = true;
         let logits = decode
             .step_select(&input_ids, &position_ids, &advance_rows)
-            .map_err(|e| anyhow::anyhow!("Continuous static-cache prefill failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Continuous static-cache prefill failed: {e}"))?;
         row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
     }
     Ok(())
@@ -741,7 +741,7 @@ fn prefill_batched_rows(
         }
         let logits = decode
             .prefill(&input_ids, &position_ids)
-            .map_err(|e| anyhow::anyhow!("Batched static-cache prefill failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Batched static-cache prefill failed: {e}"))?;
         for row in rows.iter_mut() {
             row.pending_logits = Some(row_logits(&logits, row.physical_row, prompt_len - 1)?);
         }
@@ -762,14 +762,14 @@ fn prefill_batched_rows(
                 input_ids[row.physical_row] = i64::from(token);
                 position_ids[row.physical_row] = decode
                     .row_len(row.physical_row)
-                    .map_err(|e| anyhow::anyhow!("Failed to read batch row length: {}", e))?
+                    .map_err(|e| anyhow::anyhow!("Failed to read batch row length: {e}"))?
                     as i64;
                 advance_rows[row.physical_row] = true;
             }
         }
         let logits = decode
             .step_select(&input_ids, &position_ids, &advance_rows)
-            .map_err(|e| anyhow::anyhow!("Batched static-cache ragged prefill failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Batched static-cache ragged prefill failed: {e}"))?;
         for row in rows.iter_mut().filter(|row| advance_rows[row.physical_row]) {
             row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
         }
@@ -792,13 +792,13 @@ fn decode_next_batched_tokens(
         input_ids[row.physical_row] = i64::from(token);
         position_ids[row.physical_row] = decode
             .row_len(row.physical_row)
-            .map_err(|e| anyhow::anyhow!("Failed to read batch row length: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to read batch row length: {e}"))?
             as i64;
         advance_rows[row.physical_row] = true;
     }
     let logits = decode
         .step_select(&input_ids, &position_ids, &advance_rows)
-        .map_err(|e| anyhow::anyhow!("Batched static-cache decode step failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Batched static-cache decode step failed: {e}"))?;
     for row in rows.iter_mut().filter(|row| row.active) {
         row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
     }
@@ -811,7 +811,7 @@ fn row_logits(
     seq_index: usize,
 ) -> anyhow::Result<Vec<f32>> {
     BatchedStaticCacheDecodeSession::row_logits(logits, row, seq_index)
-        .map_err(|e| anyhow::anyhow!("Failed to extract row logits: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to extract row logits: {e}"))
 }
 
 fn collect_batch_results(

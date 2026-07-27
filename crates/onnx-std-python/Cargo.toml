@@ -24,3 +24,6 @@ default = []
 # Wheel builds should enable this feature. Keeping it out of normal workspace
 # builds lets Rust test binaries link libpython.
 extension-module = ["pyo3/extension-module"]
+
+[lints]
+workspace = true
