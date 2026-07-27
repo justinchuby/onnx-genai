@@ -241,6 +241,17 @@ jobs:
       # ort-sys checksums, and paid only by the crate that needs it.
       - name: Build onnx-genai-cli
         run: cargo build --locked -p onnx-genai-cli
+      - name: Expose downloaded ORT on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ort = Get-ChildItem -Path target\debug\build -Recurse -Filter onnxruntime.dll |
+            Where-Object { $_.FullName -like '*ort-prebuilt*' } |
+            Select-Object -First 1
+          if (-not $ort) {
+            throw 'onnx-genai-ort-sys did not leave a downloaded onnxruntime.dll under target\debug\build'
+          }
+          $ort.DirectoryName >> $env:GITHUB_PATH
       - name: Test onnx-genai-cli
         run: cargo test --locked -p onnx-genai-cli
       - name: Clippy onnx-genai-cli
