@@ -729,19 +729,28 @@ mod tests {
             DataType::Uint8,
             &[2, 2, 2],
         );
-        let expected = reference(Reference {
-            a: &a_values,
-            a_shape: &[2, 2, 2],
-            a_scales: &[0.5, 0.25, 0.125, 0.75],
-            a_zeros: &[10, 8, 6, 5],
-            b: &b_values.map(i32::from),
-            b_shape: &[1, 2, 2],
-            b_scales: &[0.5, 0.25],
-            b_zeros: &[1, -2],
-            y_scale: 0.125,
-            y_zero: 120,
-            output_dtype: DataType::Uint8,
-        });
+        let a_scales = [0.5, 0.25, 0.125, 0.75];
+        let a_zeros = [10, 8, 6, 5];
+        let b_scales = [0.5, 0.25];
+        let b_zeros = [1, -2];
+        let mut expected = Vec::with_capacity(8);
+        for batch in 0..2 {
+            for row in 0..2 {
+                for column in 0..2 {
+                    let mut product = 0.0f64;
+                    for inner in 0..2 {
+                        let a_index = batch * 4 + row * 2 + inner;
+                        let b_index = inner * 2 + column;
+                        let a = f64::from(a_values[a_index] - a_zeros[batch * 2 + row])
+                            * a_scales[batch * 2 + row];
+                        let b = f64::from(b_values[b_index] - b_zeros[column]) * b_scales[column];
+                        product += a * b;
+                    }
+                    expected.push(((product / 0.125).round_ties_even() as i64 + 120).clamp(0, 255));
+                }
+            }
+        }
+        assert_eq!(expected, vec![108, 108, 153, 135, 154, 134, 129, 102]);
         assert_eq!(output_values(&out), expected);
     }
 
