@@ -39,6 +39,12 @@ use onnx_runtime_loader::WeightStore;
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod tree;
+pub use tree::{
+    KvRetentionPlan, SpecTree, SpecTreeBuilder, Topology, TreeNode, TreeScorer,
+    ancestor_attention_mask, relative_position_ids, verify_tree,
+};
+
 /// Produces a target-model token embedding for an MTP proposal step.
 pub trait TokenEmbedder {
     fn hidden_size(&self) -> usize;
@@ -447,10 +453,18 @@ pub fn argmax(logits: &[f32]) -> Option<usize> {
 }
 
 /// Speculative acceptance rule implemented by the Phase 3 engine path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Greedy` is the rule exercised by the live target-verification loop today.
+/// `RejectionSampling` and `Typical` are declared per DESIGN §3.5 and consumed
+/// by the tree-verification core in [`tree`]; the linear path is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AcceptanceRule {
     /// Accept a draft token iff it matches the target model's greedy argmax.
     Greedy,
+    /// Accept a draft token via the speculative rejection-sampling test.
+    RejectionSampling,
+    /// Accept a draft token iff its target probability clears `threshold`.
+    Typical { threshold: f32 },
 }
 
 /// Result of a single greedy speculative verification step.
