@@ -289,3 +289,26 @@ was from auto-calibrator path-switching under load (flat vs pool → different
 floating-point reduction order → different logits → different argmax).
 
 **TTFT still ~10× worse** (1070 ms vs 107 ms). Known, documented weakness.
+
+## Session 9 — Calibrator freeze + profile regeneration (2026-07-27)
+
+**Priority 1 — Load testing (complete):** Measured forced-pool vs auto-cal vs
+forced-flat under moderate load (4 `yes` processes, ~25% idle). Forced flat
+wins at 32.55 tok/s; forced pool worst at 19.43 (spin-wait steals CPU).
+Conclusion: auto-calibrator IS correct; pool cannot be default under load.
+
+**Priority 2 — Calibrator freeze (commit `177e8a73`):**
+- Removed `CALIB_RECAL_PERIOD` re-probe mechanism — path frozen permanently
+  once committed
+- Fixed false "token-exact" claims in module and `AutoPath` docs
+- Replaced re-probe test with permanent-commitment test
+- All 906 tests pass, `cargo fmt --check` clean
+
+**Priority 3 — Profile regeneration (commit `d8793f33`):**
+- Regenerated all 4 CPU profiles (ORT FP32/FP16, native FP32/FP16) on quiet
+  machine after calibrator freeze
+- Updated README table and prose with verified numbers
+- Native FP16: 43.6 tok/s decode (p50 steady-state 57.8 tok/s) vs ORT FP16
+  40.5 tok/s — architectural win via direct FP16 read
+- TTFT weakness documented: 1023-1366 ms vs 114-119 ms (~10× worse)
+- `check_profile_table.py` passes: 6 samples × 4 rows all agree

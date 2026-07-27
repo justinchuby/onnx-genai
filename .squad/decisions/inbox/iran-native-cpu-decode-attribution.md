@@ -437,3 +437,51 @@ vs ORT's ~50 fused ops.
 - ORT on FP16: ~42 tok/s (widens to FP32)
 - Path to 2× over ORT is clear
 - FP16 storage + FP32 accumulate for numerics safety
+
+## Final Results — Calibrator Freeze + Verified Numbers (session 9)
+
+### Calibrator Mid-Generation Freeze (commit 177e8a73)
+
+The auto-calibrator could switch between flat (single-threaded) and pool
+(multi-threaded SPMD) decode paths every 600 steps. Because these paths use
+different floating-point reduction orders, switching mid-generation produced
+different logits under greedy decode — Fact Checker observed non-deterministic
+output at 500+ tokens.
+
+**Fix:** Removed re-probing entirely. The calibrator decides once during the
+initial ~14 calibration steps and stays committed permanently. The trade-off
+is that a host becoming loaded after commitment will run a suboptimal pool
+path for the rest of the session, but deterministic output is more important
+than adapting to load changes.
+
+**Load behaviour (measured under 4 `yes` processes, ~25% idle):**
+| Config | Decode tok/s |
+|---|---|
+| forced flat (=0) | 32.55 (best under load) |
+| auto-cal (unset) | 31.00 |
+| forced pool (=1) | 19.43 (worst — spin-wait workers consume CPU) |
+
+**Conclusion:** The auto-calibrator IS correct — pool genuinely loses under
+load due to spin-wait contention. Cannot make pool the unconditional default.
+The fix is freezing the path (not changing which path is selected).
+
+### Verified Profile Numbers (commit d8793f33)
+
+Regenerated on a quiet Apple M1 Max after the calibrator freeze:
+
+| Backend | Model | Load | TTFT | Decode | End-to-end |
+|---|---|---|---|---|---|
+| **ORT FP32** | qwen2.5-0.5b | 2710 ms | 114 ms | **45.5 tok/s** | 44.4 tok/s |
+| **ORT FP16** | qwen2.5-0.5b-f16 | 1988 ms | 119 ms | **40.5 tok/s** | 39.5 tok/s |
+| **Native FP32** | qwen2.5-0.5b | 134 ms | 1023 ms | **33.6 tok/s** | 28.8 tok/s |
+| **Native FP16** | qwen2.5-0.5b-f16 | 138 ms | 1366 ms | **43.6 tok/s** | 33.7 tok/s |
+
+Native FP16 steady-state (p50): 17.3 ms = 57.8 tok/s.
+
+### Further Work (not pursued in this campaign)
+
+1. **FP16 at ~49% of GEMV roof.** At ORT-level 80% efficiency: ~90 tok/s.
+2. **Gate+up GEMV fusion** — ~228 µs savings + one fewer activation read/layer.
+3. **Graph-level op fusion** — 434 individual op dispatches vs ORT's ~50.
+4. **Prefill/TTFT** — compute-bound regime, ~10× worse than ORT, untouched.
+5. **Q4** — ~450 tok/s ceiling, needs int4 aarch64 kernel + compatible export.
