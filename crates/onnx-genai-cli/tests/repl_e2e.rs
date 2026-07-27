@@ -108,9 +108,37 @@ fn the_banner_reports_the_modalities_the_model_accepts() {
 fn help_lists_every_slash_command() {
     let output = text(&repl(&text_model(), &[], "/help\n\n"));
 
-    for command in ["/help", "/reset", "/raw", "/system", "/image", "/audio"] {
+    for command in [
+        "/help", "/reset", "/raw", "/session", "/system", "/image", "/audio",
+    ] {
         assert!(output.contains(command), "{command} missing from: {output}");
     }
+}
+
+#[test]
+fn session_prints_structured_counts_without_message_content() {
+    let output = text(&repl(
+        &text_model(),
+        &[],
+        "/system private instruction\n/session\n\n",
+    ));
+
+    for field in [
+        "session",
+        "model:",
+        "execution provider:",
+        "decode backend:",
+        "sampling:",
+        "messages: 1 (system: 1, user: 0, assistant: 0)",
+        "completed turns: 0",
+        "tokens: prompt=0 generated=0",
+    ] {
+        assert!(output.contains(field), "{field} missing from: {output}");
+    }
+    assert!(
+        !output.contains("private instruction"),
+        "session summary must not print message content: {output}"
+    );
 }
 
 #[test]
