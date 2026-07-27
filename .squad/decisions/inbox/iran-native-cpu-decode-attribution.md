@@ -78,15 +78,55 @@ When M < threads, partition over N instead of M. Helps all backends.
 
 *Overall includes one-time ~830 ms transpose on first decode token.
 
-Improvement from baseline: **3.26 → 27.9 tok/s** steady-state (**8.6× speedup**).
+Improvement from baseline: **3.26 → 27.96 tok/s** steady-state (**8.6× speedup**).
 
-## Remaining Gap Analysis (27.9 vs 45.5 tok/s)
+## Revised Roofline (Pris's harness, authoritative)
 
-Target p50: 22 ms. Current: 35.8 ms. Need to save **13.8 ms**.
+| Metric | Value |
+|---|---|
+| Measured achievable BW (8T, 256 MiB/thread) | **121.9 GB/s** |
+| FP32 decode ceiling | **61.41 tok/s** |
+| ORT decode | 45.83 tok/s = **74.6% of roof** |
+| Native decode | 27.96 tok/s = **45.5% of roof** |
 
-### GEMV bandwidth gap: 66 vs 88 GB/s (saves 7.3 ms)
-- GEMV takes 29.3 ms at 66 GB/s. At ORT's 88 GB/s: 22 ms.
-- Our 66 GB/s = 33% of 197 GB/s DRAM roof; ORT's 88 = 45%.
+Note: Sebastian's 197 GB/s was a pure sequential-stream measurement; the achievable
+GEMV bandwidth is 121.9 GB/s (Pris's probe), consistent with Sebastian's own
+"achievable MT GEMV" figure of 112 GB/s. The FP32 opportunity is much thinner
+than earlier estimates suggested.
+
+## The FP32 Wall — Cannot Beat ORT with Kernel Changes Alone
+
+| Scenario | GEMV ms | + Non-GEMV | Total | tok/s | Roof % |
+|---|---|---|---|---|---|
+| **Current** | 35.8 | 6.5 | 42.3 | **27.96** | 45.5% |
+| Match ORT GEMV BW (91 GB/s) | 21.8 | 6.5 | 28.3 | 35.3 | 57.5% |
+| **100% GEMV roof (121.9 GB/s)** | 16.3 | 6.5 | 22.8 | **43.9** | **71.5%** |
+| ORT (for reference) | ~21.8 | ~0.1 | 21.9 | 45.83 | 74.6% |
+
+**Even at theoretical maximum GEMV bandwidth, non-GEMV overhead (6.5 ms)
+caps the native EP at 43.9 tok/s — below ORT's 45.83.**
+
+ORT achieves near-zero non-GEMV overhead through op fusion (MatMul+Bias, fused
+attention, fused activation). Our native EP executes 417 ops/token individually,
+each with dispatch overhead and intermediate buffer allocation.
+
+## FP16 is the Lever
+
+| Scenario | GEMV ms | + Non-GEMV | Total | tok/s |
+|---|---|---|---|---|
+| FP16 @ current BW (55.5 GB/s) | 17.9 | 6.5 | 24.4 | **41.0** |
+| FP16 @ ORT BW (91 GB/s) | 10.9 | 6.5 | 17.4 | **57.4** |
+
+FP16 halves the bytes moved per token. At ORT-level GEMV bandwidth, FP16 clears
+ORT by 25%. NEON FP16 arithmetic (FMLA/half) is ARMv8.2 baseline — universal
+across all Apple Silicon. Accelerate has no FP16 GEMV, so this path is ours
+regardless.
+
+## Remaining Gap Analysis (27.96 vs 45.83 tok/s)
+
+### GEMV bandwidth: 55.5 vs ~91 GB/s effective
+- Pure GEMV at ~66 GB/s; total effective 55.5 GB/s (diluted by non-GEMV)
+- 45.5% of achievable roof vs ORT's 74.6%
 - Root causes investigated:
   - E-core scheduling: tested with `taskpolicy -c utility`, no effect
   - Thread count: saturates at 6-8 threads, more doesn't help
@@ -94,26 +134,33 @@ Target p50: 22 ms. Current: 35.8 ms. Need to save **13.8 ms**.
   - Rayon per-call overhead: ~5 µs × 169 = 0.85 ms (3% of GEMV time)
   - ORT uses MLAS packed weight format + persistent pool, achieving higher BW
 
-### Non-GEMV op time: 6.5 ms (saves 6.5 ms if eliminated)
+### Non-GEMV op time: 6.5 ms (the hard wall)
 - ORT has near-zero non-GEMV overhead (~0.1 ms) due to op fusion
 - Our Attention (2.9 ms), Swish (1.1 ms), RMSNorm/RotaryEmb/etc. (2.5 ms) = 6.5 ms
-- These are real computations, not reducible by kernel optimization alone
+- Not reducible by kernel optimization alone
 - Op fusion (graph-level) would amortize dispatch and eliminate intermediate buffers
 
-### Breakdown of achievable gains
+### Ranked fixes
 
-| Optimization | Saves | Classification |
-|---|---|---|
-| Match ORT GEMV BW (66→88 GB/s) | 7.3 ms | Needs MLAS-like packing or better pool |
-| Op fusion (Attention, SiLU, etc.) | 5-6 ms | Graph-level, outside CPU EP scope |
-| FP16 weights (halves bytes moved) | ~13 ms | Doubles ceiling to ~100 tok/s |
-| First-token transpose elimination | 830 ms one-time | Background precompute |
+| # | Fix | Tok/s gain | Classification |
+|---|---|---|---|
+| 1 | **FP16 weight GEMV** | +13-30 tok/s | Universal, THE lever |
+| 2 | **Op fusion** (gate+up, QKV, MatMul+bias+act) | +5-8 tok/s | Universal, graph-level |
+| 3 | **MLAS-like packed weights** (higher GEMV BW) | +4-7 tok/s | Universal |
+| 4 | **Background weight transpose** | -830 ms TTFT | Universal, one-time |
+| 5 | **Prefill opt** (TTFT 1105→102 ms) | 10× TTFT | Universal |
 
-### Path to beating ORT (45.5 tok/s)
+### Path to beating ORT (45.83 tok/s)
 
-**FP32 alone cannot reach 45.5 on kernel optimizations only.** Even at 88 GB/s (ORT's BW) + current 6.5 ms non-GEMV = 28.5 ms → 35.1 tok/s. Matching ORT requires BOTH higher GEMV BW AND eliminating non-GEMV overhead through graph-level fusion.
+**FP32 alone cannot reach ORT with kernel-only changes.** Even at 100% GEMV roof
+(121.9 GB/s) + current 6.5 ms non-GEMV = 22.8 ms → 43.9 tok/s < ORT 45.83.
+This is a hard wall: the non-GEMV overhead is 6.5 ms that ORT doesn't pay
+because it fuses those ops into the GEMM dispatch.
 
-**FP16 weights would clear ORT comfortably.** At 100 GB/s effective FP16 BW, GEMV = 9.7 ms + 6.5 ms non-GEMV = 16.2 ms → 61.7 tok/s. NEON FP16 arithmetic is universal across Apple Silicon; notably Accelerate has no FP16 GEMV, so this would be our custom path.
+**FP16 weights clears ORT.** At current 55.5 GB/s effective BW, FP16 gives
+41.0 tok/s. At ORT-level BW (91 GB/s), FP16 gives 57.4 tok/s. NEON FP16
+(FMLA half-precision) is ARMv8.2 baseline — universal on Apple Silicon.
+Accelerate has no FP16 GEMV, so this would be our custom kernel path.
 
 ## Answers to Five Questions
 
