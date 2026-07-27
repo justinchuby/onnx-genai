@@ -10,6 +10,10 @@ on:
       - "**/Cargo.toml"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
