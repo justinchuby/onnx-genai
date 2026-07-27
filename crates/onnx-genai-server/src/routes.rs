@@ -433,6 +433,11 @@ fn map_generate_submit_error(err: GenerateSubmitError) -> ApiError {
     }
 }
 
+fn map_registry_error(err: crate::registry::RegistryError) -> ApiError {
+    tracing::error!(error = %err, "model registry operation failed");
+    ApiError::internal("model registry failed")
+}
+
 /// Route a request to the correct loaded model.
 ///
 /// - **Non-empty `requested`** — resolves the exact id.  If the model is
@@ -446,18 +451,22 @@ async fn resolve_model(
     requested: &str,
 ) -> Result<Arc<ModelHandle>, ApiError> {
     // Fast path: already loaded (handles empty -> default).
-    if let Some(handle) = registry.resolve(requested) {
+    if let Some(handle) = registry.resolve(requested).map_err(map_registry_error)? {
         return Ok(handle);
     }
     // Determine the concrete id to lazily load.
     let id = if requested.trim().is_empty() {
         registry
             .default_id()
+            .map_err(map_registry_error)?
             .ok_or_else(|| ApiError::internal("no model loaded"))?
     } else {
         requested.to_string()
     };
-    if !registry.contains_available(&id) {
+    if !registry
+        .contains_available(&id)
+        .map_err(map_registry_error)?
+    {
         return Err(ApiError::not_found(format!(
             "model '{requested}' not found"
         )));
@@ -468,19 +477,28 @@ async fn resolve_model(
         .map_err(|err| ApiError::internal(format!("failed to load model '{id}': {err}")))
 }
 
-pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
+pub(crate) async fn health(
+    State(state): State<AppState>,
+) -> Result<Json<HealthResponse>, ApiError> {
+    Ok(Json(HealthResponse {
         status: "ok",
-        model: state.registry.default_id().unwrap_or_default().to_string(),
-    })
+        model: state
+            .registry
+            .default_id()
+            .map_err(map_registry_error)?
+            .unwrap_or_default(),
+    }))
 }
 
-pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse> {
-    Json(ModelsResponse {
+pub(crate) async fn models(
+    State(state): State<AppState>,
+) -> Result<Json<ModelsResponse>, ApiError> {
+    Ok(Json(ModelsResponse {
         object: "list",
         data: state
             .registry
             .ids()
+            .map_err(map_registry_error)?
             .into_iter()
             .map(|id| ModelObject {
                 id,
@@ -489,7 +507,7 @@ pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse
                 owned_by: "onnx-genai",
             })
             .collect(),
-    })
+    }))
 }
 
 /// `GET /v1/status` — node-status contract for the cluster router (§34.8).
@@ -497,13 +515,17 @@ pub(crate) async fn models(State(state): State<AppState>) -> Json<ModelsResponse
 /// Real values: `queue_depth` (admission queue), `active_sessions` (session
 /// registry), `healthy`, `node_id`. Everything else is a documented placeholder
 /// because the underlying getter does not exist yet — see per-field comments.
-pub(crate) async fn status(State(state): State<AppState>) -> Json<NodeStatus> {
+pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeStatus>, ApiError> {
     let snapshot = crate::metrics::snapshot();
-    Json(NodeStatus {
+    Ok(Json(NodeStatus {
         // Node-level id from server config; independent of any loaded model.
         node_id: state.config.node_id.clone(),
         // Healthy while the node has a default model registered to serve.
-        healthy: state.registry.default_id().is_some(),
+        healthy: state
+            .registry
+            .default_id()
+            .map_err(map_registry_error)?
+            .is_some(),
         // KV page statistics: the engine does not yet expose paged-KV
         // introspection (see /v1/debug/kv), so these stay 0 until a getter exists.
         kv_usage: 0.0,      // not yet tracked
@@ -534,22 +556,25 @@ pub(crate) async fn status(State(state): State<AppState>) -> Json<NodeStatus> {
             .collect(),
         // System-prompt prefix hashes are not yet surfaced by the engine.
         prefix_hashes: Vec::new(),
-    })
+    }))
 }
 
-pub(crate) async fn debug_config(State(state): State<AppState>) -> Json<DebugConfigResponse> {
+pub(crate) async fn debug_config(
+    State(state): State<AppState>,
+) -> Result<Json<DebugConfigResponse>, ApiError> {
     let handle = state
         .registry
         .resolve("")
-        .expect("at least one model is loaded");
-    Json(DebugConfigResponse {
+        .map_err(map_registry_error)?
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
+    Ok(Json(DebugConfigResponse {
         model_id: handle.id.clone(),
         pipeline: handle.pipeline,
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,
         model_max_context: handle.model_max_context,
-    })
+    }))
 }
 
 pub(crate) async fn debug_sessions(
@@ -567,18 +592,21 @@ pub(crate) async fn debug_sessions(
     }))
 }
 
-pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvResponse> {
+pub(crate) async fn debug_kv(
+    State(state): State<AppState>,
+) -> Result<Json<DebugKvResponse>, ApiError> {
     let handle = state
         .registry
         .resolve("")
-        .expect("at least one model is loaded");
+        .map_err(map_registry_error)?
+        .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let snapshot = crate::metrics::snapshot();
     let prefix_cache_hit_rate = if snapshot.prefix_cache_lookups == 0 {
         0.0
     } else {
         snapshot.prefix_cache_hits as f64 / snapshot.prefix_cache_lookups as f64
     };
-    Json(DebugKvResponse {
+    Ok(Json(DebugKvResponse {
         prefix_cache_hits: snapshot.prefix_cache_hits,
         prefix_cache_lookups: snapshot.prefix_cache_lookups,
         prefix_cache_hit_rate,
@@ -587,7 +615,7 @@ pub(crate) async fn debug_kv(State(state): State<AppState>) -> Json<DebugKvRespo
         available_admission_slots: handle.engine.generation_capacity.available_permits(),
         rejected_requests: snapshot.rejections,
         engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics",
-    })
+    }))
 }
 
 pub(crate) async fn resources(
@@ -596,6 +624,7 @@ pub(crate) async fn resources(
     let handle = state
         .registry
         .resolve("")
+        .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let snapshot = handle
         .engine
@@ -614,6 +643,7 @@ pub(crate) async fn admin_set_vram_limit(
     let handle = state
         .registry
         .resolve("")
+        .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let snapshot = handle
         .engine
@@ -713,10 +743,13 @@ pub(crate) async fn debug_trace_perfetto() -> Response {
 
 /// `GET /v1/admin/models` — list every configured model with loaded/available
 /// status and, for loaded models, the last-request timestamp.
-pub(crate) async fn admin_list_models(State(state): State<AppState>) -> Json<AdminModelsResponse> {
+pub(crate) async fn admin_list_models(
+    State(state): State<AppState>,
+) -> Result<Json<AdminModelsResponse>, ApiError> {
     let data = state
         .registry
         .statuses()
+        .map_err(map_registry_error)?
         .into_iter()
         .map(|status| AdminModelObject {
             id: status.id,
@@ -725,10 +758,10 @@ pub(crate) async fn admin_list_models(State(state): State<AppState>) -> Json<Adm
             last_request_at: status.last_request_at,
         })
         .collect();
-    Json(AdminModelsResponse {
+    Ok(Json(AdminModelsResponse {
         object: "list",
         data,
-    })
+    }))
 }
 
 /// `POST /v1/admin/models/{id}/load` — load a configured model.  404 if the id is
@@ -737,7 +770,11 @@ pub(crate) async fn admin_load_model(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<AdminLoadResponse>, ApiError> {
-    if !state.registry.contains_available(&id) {
+    if !state
+        .registry
+        .contains_available(&id)
+        .map_err(map_registry_error)?
+    {
         return Err(ApiError::not_found(format!("model '{id}' not found")));
     }
     state
@@ -755,29 +792,37 @@ pub(crate) async fn admin_unload_model(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .registry
-        .unload(&id)
-        .map_err(|_| ApiError::not_found(format!("model '{id}' is not loaded")))?;
+    state.registry.unload(&id).map_err(|err| {
+        if err
+            .downcast_ref::<crate::registry::RegistryError>()
+            .is_some()
+        {
+            map_registry_error(crate::registry::RegistryError)
+        } else {
+            ApiError::not_found(format!("model '{id}' is not loaded"))
+        }
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(feature = "metrics")]
-pub(crate) async fn prometheus_metrics(State(state): State<AppState>) -> Response {
+pub(crate) async fn prometheus_metrics(
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
     let mut output = crate::metrics::encode_prometheus();
-    if let Some(handle) = state.registry.resolve("")
+    if let Some(handle) = state.registry.resolve("").map_err(map_registry_error)?
         && let Ok(snapshot) = handle.engine.resource_snapshot().await
     {
         output.push_str(&crate::metrics::encode_resource_governor(&snapshot));
     }
-    (
+    Ok((
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         output,
     )
-        .into_response()
+        .into_response())
 }
 
 impl From<GovernorSnapshot> for ResourcesResponse {
@@ -833,6 +878,7 @@ pub(crate) async fn create_session(
     let handle = state
         .registry
         .resolve("")
+        .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     if handle.pipeline {
         return Err(ApiError::bad_request(
@@ -868,6 +914,7 @@ pub(crate) async fn delete_session(
     let handle = state
         .registry
         .resolve("")
+        .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let engine_session_id = state
         .sessions
@@ -1589,7 +1636,11 @@ async fn run_chat_completion(
                     .multimodal
                     .as_ref()
                     .and_then(|multimodal| multimodal.vision.as_ref())
-                    .expect("vision input checked before generation"),
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "image input requires a model with a declared vision input",
+                        )
+                    })?,
                 &mut prepared,
                 handle.model_max_context,
                 request.max_tokens,
@@ -1742,7 +1793,11 @@ async fn stream_chat_completion(
                     .multimodal
                     .as_ref()
                     .and_then(|multimodal| multimodal.vision.as_ref())
-                    .expect("vision input checked before generation"),
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            "image input requires a model with a declared vision input",
+                        )
+                    })?,
                 &mut prepared,
                 handle.model_max_context,
                 request.max_tokens,
@@ -1972,7 +2027,9 @@ fn preprocess_chat_audio(
         .multimodal
         .as_ref()
         .and_then(|multimodal| multimodal.audio.as_ref())
-        .expect("audio input checked before generation");
+        .ok_or_else(|| {
+            ApiError::bad_request("audio input requires a model with a declared audio input")
+        })?;
     MultimodalInput::from_wav(spec, &bytes)
         .map_err(|err| ApiError::bad_request(format!("invalid audio input: {err}")))
 }
