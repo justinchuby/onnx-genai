@@ -12,6 +12,7 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "RotaryEmbedding" => rotary_embedding(node, input_dtypes),
         "TopK" => topk(node, input_dtypes),
         "CumSum" => cumsum(node, input_dtypes),
+        "Trilu" => trilu(node, input_dtypes),
         "Gather" => gather(node, input_dtypes),
         "GatherElements" => gather_elements(node, input_dtypes),
         "ScatterElements" => scatter_elements(node, input_dtypes),
@@ -193,6 +194,25 @@ fn cumsum(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     require_dtype(input_dtypes, 1, DataType::Int64, "axis")?;
     bool_attribute(node, "exclusive")?;
     bool_attribute(node, "reverse")
+}
+
+fn trilu(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    if !(1..=2).contains(&node.inputs.len())
+        || node.outputs.len() != 1
+        || node.inputs.first().is_none_or(Option::is_none)
+    {
+        return Err(format!(
+            "requires 1-2 inputs with the matrix present and 1 output, got {} inputs and {} outputs",
+            node.inputs.len(),
+            node.outputs.len()
+        ));
+    }
+    metadata_arity(node, input_dtypes)?;
+    require_fixed_width(input_dtypes, 0, "input")?;
+    if node.inputs.get(1).is_some_and(Option::is_some) {
+        require_dtype(input_dtypes, 1, DataType::Int64, "k")?;
+    }
+    bool_attribute(node, "upper")
 }
 
 fn gather(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

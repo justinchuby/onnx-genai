@@ -485,6 +485,15 @@ macro_rules! copy_factory {
 }
 copy_factory!(SqueezeFactory, SqueezeKernel, "Squeeze", 1, 2);
 
+pub struct IdentityFactory {
+    pub runtime: Arc<CudaRuntime>,
+}
+pub struct FlattenFactory {
+    pub runtime: Arc<CudaRuntime>,
+}
+copy_factory!(IdentityFactory, IdentityKernel, "Identity", 1, 1);
+copy_factory!(FlattenFactory, FlattenKernel, "Flatten", 1, 1);
+
 pub struct UnsqueezeFactory {
     pub runtime: Arc<CudaRuntime>,
 }
