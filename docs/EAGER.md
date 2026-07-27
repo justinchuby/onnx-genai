@@ -69,6 +69,12 @@ out = nxrt.ops.relu(out)
 
 # Generic dispatch — any ONNX op
 out = nxrt.dispatch("MatMul", inputs=[a, b])
+
+# `outputs` declares how many leading ONNX output slots to materialize.
+# Multi-output operators return a list in ONNX output order.
+values, indices = nxrt.eager.dispatch("TopK", [a, k], outputs=2)
+# Optional trailing outputs may be omitted.
+(dropped,) = nxrt.eager.dispatch("Dropout", [a], outputs=1)
 ```
 
 ### 2.2 Device Context

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use onnx_runtime_eager::{EagerContext, EagerError, Tensor};
+use onnx_runtime_ir::Attribute;
 
 /// f32 comparison helper with a tight tolerance for exact-arithmetic ops.
 fn assert_close(got: &[f32], want: &[f32], tol: f32) {
@@ -145,4 +146,108 @@ fn explicit_opset_is_accepted() {
         .dispatch("Add", "", &[&a, &b], &HashMap::new(), Some(17))
         .unwrap();
     assert_close(&out[0].to_vec_f32(), &[4.0, 6.0], 1e-6);
+}
+
+#[test]
+fn dispatch_split_materializes_all_requested_outputs_in_order() {
+    let ctx = EagerContext::new().unwrap();
+    let x = Tensor::from_f32(
+        &[2, 3, 2],
+        &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+    )
+    .unwrap();
+    let attrs = HashMap::from([
+        ("axis".to_string(), Attribute::Int(1)),
+        ("split".to_string(), Attribute::Ints(vec![1, 2])),
+    ]);
+
+    let outputs = ctx
+        .dispatch_with_outputs("Split", "", &[&x], &attrs, 2, None)
+        .unwrap();
+
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].shape(), &[2, 1, 2]);
+    assert_close(&outputs[0].to_vec_f32(), &[1., 2., 7., 8.], 1e-6);
+    assert_eq!(outputs[1].shape(), &[2, 2, 2]);
+    assert_close(
+        &outputs[1].to_vec_f32(),
+        &[3., 4., 5., 6., 9., 10., 11., 12.],
+        1e-6,
+    );
+}
+
+#[test]
+fn dispatch_topk_returns_values_and_indices_for_largest_and_smallest() {
+    let ctx = EagerContext::new().unwrap();
+    let x = Tensor::from_f32(&[2, 4], &[2., 5., 5., 1., 4., 3., 2., 3.]).unwrap();
+    let k = Tensor::from_i64(&[], &[2]).unwrap();
+
+    let largest = ctx
+        .dispatch_with_outputs(
+            "TopK",
+            "",
+            &[&x, &k],
+            &HashMap::from([
+                ("axis".to_string(), Attribute::Int(1)),
+                ("largest".to_string(), Attribute::Int(1)),
+                ("sorted".to_string(), Attribute::Int(1)),
+            ]),
+            2,
+            None,
+        )
+        .unwrap();
+    assert_eq!(largest[0].shape(), &[2, 2]);
+    assert_close(&largest[0].to_vec_f32(), &[5., 5., 4., 3.], 1e-6);
+    assert_eq!(largest[1].to_vec_i64(), vec![1, 2, 0, 1]);
+
+    let smallest = ctx
+        .dispatch_with_outputs(
+            "TopK",
+            "",
+            &[&x, &k],
+            &HashMap::from([
+                ("axis".to_string(), Attribute::Int(1)),
+                ("largest".to_string(), Attribute::Int(0)),
+                ("sorted".to_string(), Attribute::Int(0)),
+            ]),
+            2,
+            None,
+        )
+        .unwrap();
+    assert_close(&smallest[0].to_vec_f32(), &[1., 2., 2., 3.], 1e-6);
+    assert_eq!(smallest[1].to_vec_i64(), vec![3, 0, 2, 1]);
+}
+
+#[test]
+fn dispatch_allows_omitting_optional_trailing_output() {
+    let ctx = EagerContext::new().unwrap();
+    let x = Tensor::from_f32(&[2], &[3., 4.]).unwrap();
+
+    let outputs = ctx
+        .dispatch_with_outputs("Dropout", "", &[&x], &HashMap::new(), 1, None)
+        .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_close(&outputs[0].to_vec_f32(), &[3., 4.], 1e-6);
+}
+
+#[test]
+fn dispatch_rejects_invalid_or_unsupported_output_counts_cleanly() {
+    let ctx = EagerContext::new().unwrap();
+    let x = Tensor::from_f32(&[2], &[1., 2.]).unwrap();
+    let zero = ctx
+        .dispatch_with_outputs("Relu", "", &[&x], &HashMap::new(), 0, None)
+        .unwrap_err();
+    assert!(matches!(zero, EagerError::InvalidOutputCount));
+
+    let too_many = ctx
+        .dispatch_with_outputs("Relu", "", &[&x], &HashMap::new(), 2, None)
+        .unwrap_err();
+    assert!(matches!(too_many, EagerError::ShapeInference { .. }));
+
+    let k = Tensor::from_i64(&[], &[1]).unwrap();
+    let too_few = ctx
+        .dispatch_with_outputs("TopK", "", &[&x, &k], &HashMap::new(), 1, None)
+        .unwrap_err();
+    assert!(matches!(too_few, EagerError::Kernel(_)));
 }

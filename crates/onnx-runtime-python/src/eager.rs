@@ -18,6 +18,7 @@ fn eager_error(op_type: &str, domain: &str, err: EagerError) -> PyErr {
         EagerError::NoKernel { .. }
         | EagerError::MixedDeviceInputs { .. }
         | EagerError::NoEpForDevice(_)
+        | EagerError::InvalidOutputCount
         | EagerError::ShapeInference { .. }
         | EagerError::ShapeInferEngine(_)
         | EagerError::Ir(_) => PyValueError::new_err(message),
@@ -115,12 +116,13 @@ fn attributes_from_dict(
 }
 
 #[pyfunction]
-#[pyo3(signature = (op_type, inputs, attributes=None, *, domain="", opset=None))]
+#[pyo3(signature = (op_type, inputs, attributes=None, *, outputs=1, domain="", opset=None))]
 fn dispatch(
     py: Python<'_>,
     op_type: &str,
     inputs: &Bound<'_, PyAny>,
     attributes: Option<&Bound<'_, PyDict>>,
+    outputs: usize,
     domain: &str,
     opset: Option<u64>,
 ) -> PyResult<Vec<Py<PyAny>>> {
@@ -154,7 +156,7 @@ fn dispatch(
     let refs: Vec<&EagerTensor> = tensors.iter().collect();
     let attrs = attributes_from_dict(attributes)?;
     let outputs = global_context()
-        .dispatch(op_type, domain, &refs, &attrs, opset)
+        .dispatch_with_outputs(op_type, domain, &refs, &attrs, outputs, opset)
         .map_err(|err| eager_error(op_type, domain, err))?;
 
     outputs
