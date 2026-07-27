@@ -970,8 +970,16 @@ impl DecodeCudaState {
         let mut bytes = [0_u8; 2 * std::mem::size_of::<u32>()];
         self.greedy_result.read_bytes_into(&mut bytes)?;
         Ok((
-            u32::from_ne_bytes(bytes[..4].try_into().expect("four token-id bytes")),
-            u32::from_ne_bytes(bytes[4..].try_into().expect("four capture-error bytes")),
+            u32::from_ne_bytes(
+                bytes[..4]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("four token-id bytes"))?,
+            ),
+            u32::from_ne_bytes(
+                bytes[4..]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("four capture-error bytes"))?,
+            ),
         ))
     }
 

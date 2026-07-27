@@ -26,8 +26,10 @@ pub(super) fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
             .inputs()
             .iter()
             .find(|input| input.name == *past_name)
-            .expect("past name came from session inputs")
-            .clone();
+            .cloned()
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("past name came from session inputs".into())
+            })?;
         if !matches!(
             input.dtype,
             DataType::Float32 | DataType::Float16 | DataType::BFloat16
@@ -161,9 +163,12 @@ pub(super) fn detect_static_cache(
     pairs.sort_by_key(|pair| pair.index);
     let signature = StaticCacheSignature {
         layers: pairs.len(),
-        max_len: max_len.expect("non-empty static cache pairs"),
-        kv_dim: kv_dim.expect("non-empty static cache pairs"),
-        dtype: dtype.expect("non-empty static cache pairs"),
+        max_len: max_len
+            .ok_or_else(|| OrtError::InvalidArgument("non-empty static cache pairs".into()))?,
+        kv_dim: kv_dim
+            .ok_or_else(|| OrtError::InvalidArgument("non-empty static cache pairs".into()))?,
+        dtype: dtype
+            .ok_or_else(|| OrtError::InvalidArgument("non-empty static cache pairs".into()))?,
         has_position_ids: session
             .input_names()
             .iter()
