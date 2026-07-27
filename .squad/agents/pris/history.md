@@ -184,3 +184,14 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Recommended enforcement: every new dispatch branch ships with a `_TEST_HITS` reachability test.
 - Decision filed: `.squad/decisions/inbox/pris-dispatch-coverage-audit.md`.
 - Commit: `17be7087` (coordinated with Iran's fix in same commit).
+
+## 2026-07-27T15:17:00-07:00 — Dispatch-reachability CI lint
+
+- Implemented `scripts/check_dispatch_reachability.py`: enforces that every `static ...TEST_HITS` counter has a corresponding `#[test]` reading it.
+- Wired into `.github/workflows/ci.yml` alongside `check_platform_naming.py`.
+- Guard-break proof: commenting out `GEMV_F16_TEST_HITS.load(...)` → lint fails with instructive message citing PR #275 history.
+- False-positive analysis: no matches on non-dispatch statics (requires `TEST_HITS` suffix), strips `//` comments before matching.
+- Documented known gap: lint cannot catch a missing counter on a new branch (review-time responsibility).
+- BNNS-fail fallback (13th combination) confirmed unreachable on current hardware; documented as acceptable risk.
+- 91 files scanned, 5 counters all paired with tests on main.
+- Decision filed: `.squad/decisions/inbox/pris-dispatch-reachability-lint.md`.
