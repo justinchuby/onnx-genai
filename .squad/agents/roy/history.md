@@ -138,3 +138,9 @@ Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path
 - Reviewed `crates/onnx-genai-cli` command surface and module boundaries for Justin's CLI-improvements research track.
 - Filed `docs/research/cli/01-architecture-triage.md`: current command surface is useful, but `lib.rs` is a 1,134-line parser/dispatch/test god module; top priorities are parser refactor, JSON/output contracts, model-source grammar normalization, and exit-code taxonomy.
 - Dropped decision inbox note `roy-cli-improvements.md` recommending the next CLI wave be treated as an interface-contract project before adding model-management/config features.
+
+## 2026-07-27T09:27:53-07:00 — CLI dev-tool backlog consolidation
+
+- Reconciled Justin's directive that `onnx-genai` CLI is a maintainer/debug harness, not a consumer local-inference product.
+- Wrote `docs/research/cli/00-backlog.md` as the research entry point: P0 now prioritizes hidden live stats, structured output, local bench/batch harness, reachable engine features, and help snapshots.
+- Explicitly rejected remote-client mode, model registry/pull, conversion/fine-tune product loops, and a standalone lib.rs split; Wierzbowski's earlier split makes more refactor only worthwhile when tied to P0/P1 work.

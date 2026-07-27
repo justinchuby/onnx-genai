@@ -27,3 +27,9 @@ Verified the model-specific claims in `docs/PROJECTION_FUSION.md`: QKV is alread
 
 ### 2026-07-16T00:00:00Z — Native CUDA decode design fact check
 Audited `docs/NATIVE_CUDA_DECODE.md`: 14 central claims verified, including concrete CPU EP wiring, object-safe dynamic EP dispatch, packed-QKV GQA and O(capacity) KV blockers, and cudarc graph APIs. Required M4 corrections—a real non-null stream and serialized ownership of non-Send/Sync CUDA graphs—were incorporated in `33beb8d`; virtual-dispatch cost remains unmeasured.
+
+## 2026-07-27T09:15:14-07:00 — CLI competitive/devil's advocate research
+
+- Verified `onnx-genai` CLI surface against `crates\onnx-genai-cli\src\lib.rs`, `commands.rs`, and server `ServeArgs`.
+- Compared current CLI UX against Ollama, llama.cpp, vLLM, mlx_lm, LM Studio `lms`, and Microsoft `onnxruntime-genai` builder/API docs.
+- Findings written to `docs\research\cli\03-competitive-and-devils-advocate.md`: top gaps are model acquisition, conversion/quant/fine-tuning, and benchmark/batch commands; strongest counter-argument is that CLI polish may distract from CUDA/perf/model enablement.
