@@ -36,6 +36,14 @@ impl PipelineEngine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        self.run_iterative_with_callback(request, None)
+    }
+
+    pub(crate) fn run_iterative_with_callback(
+        &self,
+        request: PipelineGenerateRequest,
+        mut callback: Option<&mut ImageStepCallback<'_>>,
+    ) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::Iterative(plan) = &self.plan else {
             anyhow::bail!("internal error: run_iterative on a non-iterative plan");
         };
@@ -356,6 +364,20 @@ impl PipelineEngine {
                         step_start.elapsed().as_secs_f64() * 1e3,
                     );
                     carried.insert(in_port.clone(), next);
+                }
+                if let Some(callback) = callback.as_deref_mut() {
+                    let latents = plan
+                        .loop_edges
+                        .iter()
+                        .map(|(_, input)| {
+                            let endpoint = format!("{}.{}", plan.denoiser, input);
+                            let value = carried.get(input).with_context(|| {
+                                format!("iterative latent '{endpoint}' was not produced")
+                            })?;
+                            Ok((endpoint, clone_value(value)?))
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    callback(&ImageStep { step, latents })?;
                 }
                 last_outputs = out_map;
             }

@@ -14,7 +14,7 @@
 //! `s_3 = cond * (7/8)` and `image = s_3 * 2 + 1`.
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    Engine, EngineConfig, GeneratePrompt, GenerateRequest, ImageRequest, PipelineGenerateRequest,
 };
 use onnx_genai_ort::Value;
 use std::fs;
@@ -80,6 +80,114 @@ fn iterative_diffusion_pipeline_runs_denoise_loop_and_final_vae() -> anyhow::Res
         assert!((got - want).abs() < 1e-5, "image {got} != {want}");
     }
 
+    Ok(())
+}
+
+#[test]
+fn generate_image_returns_typed_final_image_and_all_step_latents() -> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
+    let cond = [2.0f32, 4.0, 6.0, 8.0];
+    let request = empty_request()
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
+        .with_input("denoiser.cond", Value::from_slice_f32(&cond, &[1, 4])?);
+
+    let stream = engine.generate_image(ImageRequest::new(request))?;
+
+    // s_k = (s_{k-1} + c) / 2: s_1=c/2, s_2=3c/4, s_3=7c/8.
+    assert_eq!(stream.steps.len(), 3);
+    for (step, factor) in stream.steps.iter().zip([0.5, 0.75, 0.875]) {
+        let latent = step.latents["denoiser.sample"].to_vec_f32()?;
+        for (got, c) in latent.iter().zip(cond) {
+            assert!((got - c * factor).abs() < 1e-5, "{got} != {}", c * factor);
+        }
+    }
+    let image = stream.output.image.to_vec_f32()?;
+    for (got, c) in image.iter().zip(cond) {
+        // The final VAE computes image = 2 * s_3 + 1.
+        assert!(
+            (got - (c * 1.75 + 1.0)).abs() < 1e-5,
+            "{got} != {}",
+            c * 1.75 + 1.0
+        );
+    }
+    assert_eq!(
+        stream.output.latents["denoiser.sample"].to_vec_f32()?,
+        stream.steps.last().unwrap().latents["denoiser.sample"].to_vec_f32()?
+    );
+    Ok(())
+}
+
+#[test]
+fn image_callback_is_stepwise_and_matches_non_streaming_final_latent() -> anyhow::Result<()> {
+    let cond = [4.0f32, 8.0, 12.0, 16.0];
+    let make_request = || {
+        empty_request()
+            .with_input(
+                "denoiser.sample",
+                Value::from_slice_f32(&[0.0; 4], &[1, 4]).unwrap(),
+            )
+            .with_input(
+                "denoiser.cond",
+                Value::from_slice_f32(&cond, &[1, 4]).unwrap(),
+            )
+    };
+
+    let mut collected = Vec::new();
+    let mut callback_engine =
+        Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
+    let callback_output = callback_engine.generate_image_with_callback(
+        ImageRequest::new(make_request()),
+        &mut |step| {
+            collected.push((step.step, step.latents["denoiser.sample"].to_vec_f32()?));
+            Ok(())
+        },
+    )?;
+    assert_eq!(
+        collected.iter().map(|(step, _)| *step).collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+
+    let mut stream_engine =
+        Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
+    let stream = stream_engine.generate_image(ImageRequest::new(make_request()))?;
+    assert_eq!(
+        collected.last().unwrap().1,
+        stream.steps.last().unwrap().latents["denoiser.sample"].to_vec_f32()?
+    );
+    assert_eq!(
+        callback_output.latents["denoiser.sample"].to_vec_f32()?,
+        stream.output.latents["denoiser.sample"].to_vec_f32()?
+    );
+    Ok(())
+}
+
+#[test]
+fn image_stream_honors_single_step_override() -> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&diffusion_fixture()?, EngineConfig::default())?;
+    let request = empty_request()
+        .with_input(
+            "denoiser.sample",
+            Value::from_slice_f32(&[0.0; 4], &[1, 4])?,
+        )
+        .with_input(
+            "denoiser.cond",
+            Value::from_slice_f32(&[2.0, 4.0, 6.0, 8.0], &[1, 4])?,
+        )
+        .with_iterative_overrides(onnx_genai_engine::IterativeOverrides {
+            num_steps: Some(1),
+            guidance_scale: None,
+            start_step: None,
+        });
+    let stream = engine.generate_image(ImageRequest::new(request))?;
+    assert_eq!(stream.steps.len(), 1);
+    assert_eq!(stream.steps[0].step, 0);
+    assert_eq!(
+        stream.output.latents["denoiser.sample"].to_vec_f32()?,
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
     Ok(())
 }
 
