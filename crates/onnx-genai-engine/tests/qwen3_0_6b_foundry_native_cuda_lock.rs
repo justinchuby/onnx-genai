@@ -11,6 +11,7 @@
 //!      `/model/embed_tokens` (no CUDA handler existed at all), and
 //!   2. 105 `MatMulNBits(bits=8, block_size=128, accuracy_level=4)` nodes (the
 //!      CUDA factory only claimed int8 at `block_size=32`).
+//!
 //! With both configurations now claimed and served by capture-safe CUDA
 //! kernels, the whole decoder runs on the GPU (verified: one CUDA-graph capture,
 //! zero fallbacks, and `ONNX_GENAI_REQUIRE_CUDA=1` no longer reports a CPU-EP
