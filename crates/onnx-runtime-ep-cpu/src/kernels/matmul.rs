@@ -25,7 +25,9 @@
 //! marks graph-initializer inputs so this kernel can safely prepack constants.
 
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
