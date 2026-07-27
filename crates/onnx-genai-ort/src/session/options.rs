@@ -16,7 +16,7 @@ use super::ep_compat::{EpCapabilities, ResolvedEp, capability, resolve_execution
 /// Convenience constructor for an [`EpSelection`] from a bare provider name.
 ///
 /// The runtime core stays EP-agnostic: name resolution happens in
-/// [`ep_compat`]. This helper only saves callers from importing [`BTreeMap`].
+/// the `ep_compat` module. This helper only saves callers from importing `BTreeMap`.
 #[must_use]
 pub fn ep_selection(name: impl Into<String>) -> EpSelection {
     EpSelection::new(name.into())
