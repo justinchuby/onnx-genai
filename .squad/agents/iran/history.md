@@ -202,3 +202,34 @@ wrong path (outer product). After batch_shape fix, SPMD pool IS effective for co
 - C4: Removed unused `half` variable
 
 **Commit:** 3a88ba8c
+
+## 2026-07-27T10:15:00Z — Session 8 cont: FP16 GEMV + NEON bulk conversion
+
+**THE WIN: Native FP16 is 27% faster than ORT's best.**
+
+| Backend | Model | p50 ms | Steady tok/s | vs ORT best |
+|---|---|---|---|---|
+| ORT | FP32 | 22.2 | 45.0 | — |
+| ORT | FP16 | 24.5 | 40.8 | — |
+| Native | FP32 | 24.2 | 41.3 | 0.92× |
+| **Native** | **FP16** | **17.4** | **57.5** | **1.27×** |
+
+**Why ORT cannot compete on FP16:** ORT's CPU EP widens FP16→FP32 before GEMM
+(no native FP16 kernel). It pays the conversion cost and gets no bandwidth
+benefit — actually 8% SLOWER than FP32. Our kernel reads FP16 directly from
+mmap via NEON fcvtl (ARMv8 base, all Apple Silicon), halving memory bandwidth.
+
+**Implementation:**
+1. `neon_gemv_f16_col_parallel`: f16 weight GEMV, same dispatch as f32 (SPMD pool)
+2. `load_f16x4_to_f32x4`: inline-asm fcvtl wrapper (stable Rust, no nightly)
+3. `MatMulPrepack::transposed_b_f16`: lazy f16 transpose cache
+4. `neon_f16_to_f32_bulk` / `neon_f32_to_f16_bulk`: bulk conversion for non-GEMV ops
+5. Dispatch in both MatMulKernel and FusedMatMulBiasKernel
+
+**Critical finding: NEON bulk f16↔f32 was load-bearing.** Without it, non-GEMV
+ops (RMSNorm, Swish, Attention) fell through to scalar conversion, adding
+~1.8 ms/token overhead that erased the GEMV bandwidth savings. FP16 was
+actually SLOWER than FP32 before adding the bulk conversion.
+
+**906 tests pass, cargo fmt clean, clippy clean.**
+**Commit:** 75311827
