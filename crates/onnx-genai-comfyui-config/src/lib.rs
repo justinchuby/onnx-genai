@@ -212,7 +212,9 @@ pub struct ComfyUiWorkflow {
 pub struct ControlNet {
     /// ControlNet checkpoint name from the loader node.
     pub name: String,
-    /// Runtime conditioning scale from the apply node.
+    /// Conditioning strength from the apply node. This is metadata only: mobius
+    /// fuses ControlNet strength at export (`checkpoint_export(controlnet=...)`),
+    /// so it is not fed as a runtime denoiser input.
     pub strength: f64,
     /// Hint image referenced by the apply node, when directly recoverable.
     pub image: Option<String>,

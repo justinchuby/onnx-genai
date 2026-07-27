@@ -348,8 +348,14 @@ per-request inputs. Together these give ComfyUI-like interactive editing without
   `mobius convert-comfyui --controlnet NAME=PATH` resolves it; `controlnet_cond` is an external
   denoiser input (like SDXL `time_ids`) shared across the CFG cond/uncond passes. Validated
   (`scripts/controlnet_e2e.py`): a fused export matches diffusers to 5.8e-6 and differs from base by
-  0.45 (ControlNet takes effect). *Remaining:* native `run_comfyui` rendering of ControlNet / LoRA /
-  SDXL ControlNet / inpaint workflows (conversion via `mobius convert-comfyui` already supports them).
+  0.45 (ControlNet takes effect). Native `run_comfyui` renders **single-ControlNet** workflows by
+  feeding the one declared `denoiser.controlnet_cond` image input (batched RGB CHW in `[0,1]`,
+  shape `[batch, conditioning_channels, height*8, width*8]`). ControlNet **strength is fused at
+  export** (`checkpoint_export(controlnet=...)`), so it is *not* a runtime input — the runner never
+  feeds a `conditioning_scale` gate the denoiser does not declare. Mobius exports a **single** fused
+  ControlNet only; a workflow declaring more than one ControlNet is **rejected loudly** rather than
+  silently dropping unbacked per-adapter ports. *Remaining:* SDXL ControlNet / inpaint workflows in
+  the native runner (conversion via `mobius convert-comfyui` already supports them).
 - **img2img** is supported. **Inpainting** (9-channel UNet) runs through the declarative pipeline
   engine, but native `run_comfyui` rendering of inpaint (mask) workflows is not yet wired up
   (conversion via `mobius convert-comfyui` already supports them).
