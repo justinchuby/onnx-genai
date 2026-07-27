@@ -45,3 +45,7 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
   - Quiet (load ~4-5): pool 53.35 [46.03,57.61], adaptive 56.10 [50.43,58.57], flat 42.84 [42.01,43.16], ORT 42.19 [41.79,42.61]
   - Under 4×`yes` load (~10): pool 18.96 [18.18,20.48], adaptive 31.95 [31.77,33.30], flat 31.57 [31.16,31.75], ORT 37.76
 - Verified: clean stderr (no unconditional prints), all 33 decode_spmd tests pass, Deckard's dispatch test passes, x86_64 clippy clean, `check_profile_table.py` passes.
+
+### 2026-07-27 — Tracing + half_gemm overlap analysis (post main merge)
+- **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
+- **half_gemm.rs overlap**: Complementary, not duplicated. GEMV (M=1 bandwidth-optimal, inline asm fcvtl ARMv8 base) vs GEMM (M>1 compute-optimal, vcvt_f32_f16 intrinsic requiring FEAT_FP16). Dispatch collision fixed in `ed7a65e3`. Consolidation deferred to separate PR.
