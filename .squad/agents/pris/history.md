@@ -121,6 +121,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ## 2026-07-27T12:11:15-07:00 — CLI CI coverage lane
 - Added a dedicated `onnx-genai-cli` CI lane so ORT-linked CLI build/test/clippy coverage is no longer hidden behind the offline crate allowlist. The lane is isolated because `onnx-genai-ort-sys` downloads pinned ONNX Runtime 1.27.0 prebuilt archives when no local ORT is configured.
+- Verified the Linux lane ran `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`; observed green run 30298789423 cost 1m13s on Linux and 6m48s on Windows.
 
 ## 2026-07-22T15:05:00+0000 — WP-B1 optional-modality schema landed
 
