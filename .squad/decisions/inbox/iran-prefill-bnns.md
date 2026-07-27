@@ -4,7 +4,7 @@
 **Date:** 2026-07-27
 **PR:** #275
 **Branch:** `squad/mac-prefill-bnns`
-**Commits:** `a855f826` (initial BNNS dispatch), `58bafd0d` (filter cache + contiguous B rescue)
+**Commits:** `a855f826` (initial BNNS dispatch), `58bafd0d` (filter cache + contiguous B rescue), `f0cbd786` (trans_b zero-copy)
 
 ## Context
 
@@ -24,11 +24,21 @@ Plus two critical performance fixes discovered after initial dispatch was null-r
 
 ### Fix 1: BNNS filter cache (thread-local)
 
-`BNNSFilterCreateLayerBroadcastMatMul` costs 3–19 ms cold (GCD dispatch setup / AMX micro-code compilation). A `HashMap<(M,K,N), BNNSFilter>` in thread-local storage amortises this to zero for subsequent calls. Filters are cleaned up via `Drop` when the thread exits. A typical 24-layer model has only 4–5 unique weight shapes (~20 total entries).
+`BNNSFilterCreateLayerBroadcastMatMul` costs 3–19 ms cold (GCD dispatch setup / AMX micro-code compilation). A `HashMap<(M,K,N,trans_b), BNNSFilter>` in thread-local storage amortises this to zero for subsequent calls. Filters are cleaned up via `Drop` when the thread exits. A typical 24-layer model has ~25 entries (including trans_b variants for the vocab projection).
 
-### Fix 2: Non-contiguous vocab weight rescue
+### Fix 2: Non-contiguous vocab weight — trans_b zero-copy
 
-The lm_head vocab projection weight (896×151936, 272 MB) is stored column-major (non-contiguous) in the ONNX model. `try_matmul_half` requires contiguous inputs and skips it, causing fallthrough to element-by-element `to_dense_f32_widen` — measured at **1066 ms** for 136M elements. The fix materialises a contiguous row-major f16 copy via `MatMulPrepack::contiguous_b_f16` (parallel Rayon strided copy, cached per session via `OnceLock`). Subsequent prefill calls use the cached copy at zero cost.
+The lm_head vocab projection weight (896×151936, 272 MB) is stored column-major (non-contiguous) in the ONNX model. `try_matmul_half` requires contiguous inputs and skips it, causing fallthrough to element-by-element `to_dense_f32_widen` — measured at **1066 ms** for 136M elements.
+
+Initial fix materialised a contiguous row-major f16 copy via `MatMulPrepack::contiguous_b_f16` (parallel Rayon strided copy, cached per session via `OnceLock`). This worked but the copy still cost ~180 ms (warm pages) per Engine lifetime.
+
+**Final fix:** Column-major B[K,N] in memory is row-major B^T[N,K]. BNNS's `trans_b: true` flag computes C = A @ (B^T)^T = A @ B — passing the raw data directly with zero copy. The FilterCache key was extended to `(M,K,N,trans_b)` and the B descriptor is created as [N,K] when trans_b is true.
+
+Two sub-bugs found:
+- FilterCache needed trans_b in the key to avoid shape collisions
+- The `batch_shape.is_empty()` check blocked the trans_b path because the engine emits A as [1,M,K], producing a trivial batch [1]. Fixed by checking `trivial_batch` (all dims == 1) instead.
+
+This eliminated the remaining ~180 ms vocab copy: TTFT **347 → 167 ms**.
 
 ## Why BNNS
 
@@ -82,7 +92,15 @@ M1 Max 10-core, 64 GB, `qwen2.5-0.5b-f16`, 40-token prompt, 50 gen tokens.
 | decode | **58.36 tok/s** [57.32, 59.76] | 41.98 [41.76, 42.56] |
 | end-to-end | 22.94 [22.24, 23.34] | 38.50 [38.37, 39.02] |
 
-**TTFT: 2.8× faster** (989 → 347 ms). Even at load 25–32, this is a substantial improvement. At low load the improvement should be larger.
+### After trans_b (commit `f0cbd786`, load 24–27):
+| | native | ORT |
+|---|---:|---:|
+| TTFT | **167.4 ms** [166.8, 168.6] | 108.4 ms [108.3, 109.0] |
+| decode | **55.31 tok/s** [42.58, 56.45] | 41.88 [40.80, 41.93] |
+| end-to-end | 24.54 [21.65, 24.83] | 38.42 [37.61, 38.48] |
+
+**Overall TTFT: 5.9× faster** (989 → 167 ms). Now only 1.54× behind ORT (was 9.1×).
+**Decode: 1.32× ORT** — unregressed.
 
 **TTFT breakdown** (168 BNNS calls, M=40, measured per-call):
 - 24×3 large GEMMs (K=896,N=4864 / K=4864,N=896): ~1.3 ms each, total ~94 ms
@@ -102,4 +120,11 @@ Two root causes, both fixed:
 
 ## Remaining gap to ORT
 
-TTFT is 347 ms vs ORT 109 ms (3.2× at load 25). The remaining gap is **non-GEMM overhead** (~200 ms) — LayerNorm, SoftMax, RoPE, token embedding, and graph dispatch. GEMM itself (150 ms) is already competitive. Further improvement requires optimizing non-GEMM ops, which is beyond the BNNS campaign scope.
+TTFT is 167 ms vs ORT 108 ms (1.54× at load 24–27). The remaining 59 ms gap breaks down as:
+- **~105 ms BNNS GEMM** (168 calls at ~260–1270 GFLOPS depending on shape)
+- **~55 ms non-GEMM** (LayerNorm, SoftMax, RoPE, embedding, graph dispatch — only 2.1% of original TTFT)
+- **~7 ms filter cache** (amortised to zero after first inference)
+
+Production BNNS runs at 260–346 GFLOPS vs microbenchmark 966–2451 GFLOPS (3.7× gap). The gap is attributable to M=40 vs M=128 tile utilization (~2×) and production environment effects (mmap'd weights, TLB pressure from 994 MB model mapping, GCD scheduling — ~2×). Further GEMM improvement requires model tiling or engine-level batching.
+
+End-to-end is 0.64× ORT, limited by TTFT. Decode remains 1.32× ORT (unregressed).

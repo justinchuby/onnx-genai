@@ -76,3 +76,53 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 - **Non-contiguous weights are invisible performance cliffs** — `is_contiguous()` gates throughout the codebase silently fall through to element-by-element conversion. Any new fast path must handle or explicitly diagnose non-contiguous weights.
 - **Microbenchmark ≠ production performance** — BNNS reached 2451 GFLOPS in microbenchmark but production TTFT includes filter creation, weight materialization, and non-GEMM ops. Always verify with the real model path.
 - **compare benchmark creates new Engine per run** — OnceLock caches (e.g. contiguous_b_f16) are NOT shared across measured runs. Thread-local BNNS filter cache IS shared. Production (persistent Engine) TTFT is ~30 ms better than compare reports.
+
+### Session 2026-07-27-c: trans_b zero-copy for column-major vocab weights
+
+**Commit:** `f0cbd786`
+**Branch:** `squad/mac-prefill-bnns`
+
+#### Key finding: trans_b eliminates the 180 ms contiguous copy
+
+Column-major B[K,N] in memory is row-major B^T[N,K]. BNNS supports `trans_b: true`, allowing C = A @ (B^T)^T = A @ B without any data copy. The lm_head vocab projection (896×151936, 272 MB column-major) now passes directly to BNNS — zero copy.
+
+Two bugs blocked the path initially:
+1. **FilterCache key**: needed `(M,K,N,trans_b)` not just `(M,K,N)` to avoid shape collisions
+2. **batch_shape check**: engine emits A as [1,M,K] producing trivial batch [1]. Changed from `batch_shape.is_empty()` to `trivial_batch` (all dims == 1).
+
+Probe technique: added diagnostic `eprintln!` behind env var `NXRT_BNNS_TRANS_B_PROBE`, discovered `batch_empty=false` was blocking the path. This is the 6th instance of "works in unit test, not in production" in this crate.
+
+#### Lead 1 results (BNNS GFLOPS gap)
+
+Production BNNS at 260–346 GFLOPS vs microbenchmark 966–2451 GFLOPS. The gap decomposes as:
+- ~2× from M=40 vs M=128 (AMX tile utilization)
+- ~3.7× from production environment (mmap'd weights, TLB pressure, GCD scheduling)
+- NOT explained by: cold cache, NEON interleaving, Rayon pool, or SPMD pool
+
+#### Lead 2 results (non-GEMM attribution)
+
+Profiled at M=11: non-GEMM ops are only **2.1% (8 ms)** of prefill time. The "~200 ms non-GEMM" hypothesis was wrong — the lm_head contiguous copy (287 ms at M=11 with cold mmap pages) was the real cost, and trans_b eliminates it.
+
+#### Measurements (load 24–27)
+
+| | native | ORT | ratio |
+|---|---:|---:|---|
+| TTFT | **167.4 ms** [166.8, 168.6] | 108.4 ms | 1.54× |
+| decode | 55.31 tok/s | 41.88 | 1.32× ✅ |
+| end-to-end | 24.54 | 38.42 | 0.639× |
+
+**Overall: 989 → 167 ms = 5.9× speedup.**
+**Decode unregressed**: guard test green, 1.32× ORT.
+
+#### Verification
+- `cargo fmt --all -- --check`: clean
+- clippy aarch64 `--all-targets -D warnings`: clean
+- clippy x86_64 `--all-targets -D warnings`: clean
+- Full CPU EP suite: 953 passed, 0 failed
+- All BNNS tests green including new `bnns_matmul_f16_trans_b_matches_normal`
+- Decode guard `fp16_m1_decode_reaches_neon_gemv_not_half_gemm`: green
+
+#### Durable lessons
+- **Column-major = row-major transpose** — this algebraic identity eliminates copies for any column-major weight; future non-contiguous weights should check for this pattern.
+- **Trivial batch dims block dispatch** — the engine promotes 2-D to 3-D with batch [1]. Any dispatch gate using `batch_shape.is_empty()` silently blocks the fast path. Use `trivial_batch` (all dims == 1) instead.
+- **Env-var probes are essential** — the `NXRT_BNNS_TRANS_B_PROBE` technique found the bug in seconds after the benchmark showed no improvement. Always probe the production path, never trust the unit test alone.
