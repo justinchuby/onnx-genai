@@ -374,10 +374,69 @@ impl ExecutionProvider for CudaExecutionProvider {
     }
 
     fn copy_async(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> Result<Fence> {
-        // Phase 2a: perform the copy synchronously and return a signalled fence.
-        // A true stream-ordered async copy + event fence lands in Phase 2b.
-        self.copy(src, dst, size)?;
-        Ok(Fence::default())
+        assert_eq!(
+            dst.device(),
+            self.device,
+            "cuda_ep::copy_async: foreign dst buffer"
+        );
+        if size > dst.len() || size > src.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep::copy_async: size {size} exceeds src {} or dst {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        if size == 0 {
+            return Ok(Fence::signalled());
+        }
+        let dst_p = cuptr(dst.as_mut_ptr());
+        if src.device().is_host_accessible() {
+            // Host → device weight prefetch: the real Phase-4 overlap path. The
+            // copy is enqueued on the dedicated transfer stream and the returned
+            // fence names its completion event.
+            // SAFETY: a host-accessible src buffer exposes a dereferenceable host
+            // pointer to at least `size` bytes (checked); the async copy keeps
+            // reading `src` until the transfer stream completes, which the caller
+            // orders via `wait_fence` before mutating or freeing `src`.
+            let host = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), size) };
+            // SAFETY: `dst` is a live device allocation of >= `size` bytes.
+            unsafe { self.runtime.htod_async(host, dst_p) }?;
+        } else {
+            assert_eq!(
+                src.device(),
+                self.device,
+                "cuda_ep::copy_async: foreign device src buffer"
+            );
+            let src_p = cuptr(src.as_ptr());
+            // SAFETY: both endpoints are live device allocations of >= `size`
+            // bytes (checked) on this EP's device; `dst` is `&mut` so it cannot
+            // alias `src`. The transfer-stream copy is ordered via the fence.
+            unsafe { self.runtime.dtod_async_on_copy_stream(src_p, dst_p, size) }?;
+        }
+        let fence_id = self.runtime.record_copy_fence()?;
+        Ok(Fence::new(fence_id))
+    }
+
+    fn wait_fence(&self, fence: &Fence) -> Result<()> {
+        // Order the compute stream after the prefetch transfer: a stream-ordered,
+        // non host-blocking cross-stream wait so the next kernel reads the fully
+        // transferred bytes. An already-signalled fence is a no-op.
+        self.runtime.compute_wait_fence(fence.id)
+    }
+
+    fn record_compute_fence(&self) -> Result<Fence> {
+        // Record a completion event over the compute stream so a later reuse
+        // prefetch (via `copy_wait_fence`) waits for this consumer to finish
+        // reading a double-buffer slot before overwriting it (WAR ordering).
+        let fence_id = self.runtime.record_compute_fence()?;
+        Ok(Fence::new(fence_id))
+    }
+
+    fn copy_wait_fence(&self, fence: &Fence) -> Result<()> {
+        // Order the transfer stream after the prior consumer's compute: a
+        // stream-ordered, non host-blocking cross-stream wait so a reuse prefetch
+        // never clobbers a staging buffer mid-read. Already-signalled is a no-op.
+        self.runtime.copy_wait_fence(fence.id)
     }
 
     fn device_argmax_supported(&self) -> bool {
@@ -523,5 +582,112 @@ mod tests {
         let available = CudaExecutionProvider::is_available(0);
         let constructible = CudaExecutionProvider::initialized(0).is_ok();
         assert_eq!(available, constructible);
+    }
+
+    // Phase-4 overlap through the public `ExecutionProvider` surface: a host→
+    // device `copy_async` returns an awaitable `Fence`, and `wait_fence` orders
+    // the compute stream after the transfer. The async copy is delayed behind a
+    // spin kernel on the transfer stream, so a consumer launched on the compute
+    // stream reads the correct payload only because `wait_fence` established the
+    // cross-stream dependency — an already-signalled placeholder fence would let
+    // it race ahead and read the pre-transfer poison.
+    #[test]
+    fn copy_async_fence_orders_h2d_prefetch_through_ep_api() {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use std::ffi::c_void;
+
+        const MODULE: &str = "cuda_ep_copy_async_api_test";
+        const SOURCE: &str = r#"
+extern "C" __global__ void spin_delay(long long spin) {
+    long long start = clock64();
+    while (clock64() - start < spin) { }
+}
+extern "C" __global__ void copy_out(const float* in, float* out, unsigned long long n) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = in[i];
+}
+"#;
+        let Ok(ep) = CudaExecutionProvider::initialized(0) else {
+            eprintln!("skipping copy_async API test: CUDA EP unavailable");
+            return;
+        };
+        let runtime = ep.runtime().clone();
+        let spin_delay = runtime
+            .nvrtc_function(MODULE, SOURCE, "spin_delay")
+            .unwrap();
+        let copy_out = runtime.nvrtc_function(MODULE, SOURCE, "copy_out").unwrap();
+
+        let n = 4096usize;
+        let bytes = n * std::mem::size_of::<f32>();
+        let n_u64 = n as u64;
+
+        // Pinned host staging holds the payload; wrap it as a borrowed,
+        // host-accessible source buffer for `copy_async`.
+        let mut staging = runtime.alloc_pinned(bytes).unwrap();
+        let payload: Vec<f32> = (0..n).map(|i| 2.0 + (i % 11) as f32).collect();
+        staging.as_mut_slice().copy_from_slice(unsafe {
+            std::slice::from_raw_parts(payload.as_ptr().cast::<u8>(), bytes)
+        });
+        // SAFETY: the pinned staging outlives `src` and every use of it, and it
+        // is only read (never written) through the borrowed handle.
+        let src = unsafe {
+            DeviceBuffer::from_borrowed_parts(
+                staging.as_slice().as_ptr() as *mut c_void,
+                DeviceId::cpu(),
+                bytes,
+                1,
+            )
+        };
+
+        let mut dst = ep.allocate(bytes, 256).unwrap();
+        let out = ep.allocate(bytes, 256).unwrap();
+        let out_p = cuptr(out.as_ptr());
+
+        for _ in 0..8 {
+            // Poison the device destination so a premature read is detectable.
+            let poison = vec![-321.0f32; n];
+            let poison_bytes =
+                unsafe { std::slice::from_raw_parts(poison.as_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.htod(poison_bytes, cuptr(dst.as_ptr())) }.unwrap();
+            runtime.synchronize().unwrap();
+
+            // Occupy the transfer stream so the async copy cannot finish at once.
+            let spin: i64 = 8_000_000;
+            let mut delay = runtime.copy_stream().launch_builder(&spin_delay);
+            delay.arg(&spin);
+            unsafe { delay.launch(LaunchConfig::for_num_elems(1)).unwrap() };
+
+            // Public EP surface: async prefetch, then await its fence.
+            let fence = ep.copy_async(&src, &mut dst, bytes).unwrap();
+            assert!(
+                !fence.is_signalled(),
+                "a real transfer must return an unsignalled fence"
+            );
+            ep.wait_fence(&fence).unwrap();
+
+            // Consume the prefetched buffer on the compute stream.
+            let dst_p = cuptr(dst.as_ptr());
+            let mut consume = runtime.stream().launch_builder(&copy_out);
+            consume.arg(&dst_p).arg(&out_p).arg(&n_u64);
+            unsafe {
+                consume
+                    .launch(LaunchConfig::for_num_elems(n as u32))
+                    .unwrap()
+            };
+
+            let mut host = vec![0.0f32; n];
+            let host_bytes =
+                unsafe { std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), bytes) };
+            unsafe { runtime.dtoh(host_bytes, out_p) }.unwrap();
+            assert_eq!(
+                host, payload,
+                "copy_async consumer read poison — the fence did not order the \
+                 transfer before the compute-stream read"
+            );
+        }
+
+        ep.deallocate(dst).unwrap();
+        ep.deallocate(out).unwrap();
     }
 }
