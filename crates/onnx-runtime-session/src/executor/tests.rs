@@ -1364,6 +1364,29 @@ fn view_bounds_rejects_offset_overrun() {
     assert!(view_bounds(&shape, &strides, 0, DataType::Float32, 16).is_ok());
 }
 
+#[test]
+fn sub_byte_view_bounds_rejects_geometry_overflow() {
+    let shape = [usize::MAX, 2];
+    let strides = compute_contiguous_strides(&shape);
+    let error = view_bounds(&shape, &strides, 0, DataType::Int4, usize::MAX);
+    assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
+}
+
+#[test]
+fn sub_byte_view_bounds_rejects_offset_overflow() {
+    let shape = [1usize];
+    let strides = compute_contiguous_strides(&shape);
+    let error = view_bounds(&shape, &strides, usize::MAX, DataType::Int4, usize::MAX);
+    assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
+}
+
+#[test]
+fn device_binding_validation_rejects_geometry_overflow() {
+    let element_count = usize::MAX / 4;
+    let error = bindings::required_binding_bytes(DataType::Float64, &[element_count], "huge");
+    assert!(matches!(error, Err(SessionError::ShapeOverflow { .. })));
+}
+
 /// Symbol substitution: static dims pass through, bound symbols resolve, an
 /// unbound symbol yields `None` (the uninferred-shape signal).
 #[test]

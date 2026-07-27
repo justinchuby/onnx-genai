@@ -674,8 +674,15 @@ fn resolve_initializer(
         })?;
         let path = resolve_external_path(model_dir, &location)?;
         store.mmap_file(&path)?;
-        let numel: usize = dims.iter().product();
-        let length = length.unwrap_or_else(|| dtype.storage_bytes(numel));
+        let expected_length = TensorData::from_raw(dtype, dims.clone(), Vec::new())
+            .checked_expected_bytes()
+            .ok_or_else(|| {
+                LoaderError::GraphBuild(format!(
+                    "external initializer {:?} geometry overflows for shape {dims:?} and dtype {dtype:?}",
+                    init.name
+                ))
+            })?;
+        let length = length.unwrap_or(expected_length);
         // Validate the window lies within the mapped file (catches truncated or
         // mis-described external data early).
         if let Some(mmap) = store.mmaps.get(&path) {
@@ -856,6 +863,43 @@ mod tests {
         let data = tensor_data_from_proto(&proto, DataType::Int2, &[5]).expect("tensor data");
         assert_eq!(data.data, [0b11_10_01_00, 0b0000_0001]);
         assert_eq!(data.data.len(), DataType::Int2.storage_bytes(5));
+    }
+
+    #[test]
+    fn external_initializer_rejects_geometry_overflow() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let model_dir = std::env::current_dir().expect("cwd").join("target");
+        std::fs::create_dir_all(&model_dir).expect("create target");
+        let file_name = format!(
+            "overflowing-external-weight-{}-{stamp}.bin",
+            std::process::id()
+        );
+        let path = model_dir.join(&file_name);
+        std::fs::write(&path, [0u8]).expect("write external data");
+
+        let initializer = TensorProto {
+            name: "huge".to_string(),
+            data_type: DataType::Float32.to_onnx(),
+            dims: vec![i64::MAX, 3],
+            external_data: vec![crate::proto::onnx::StringStringEntryProto {
+                key: "location".to_string(),
+                value: file_name,
+            }],
+            data_location: tensor_proto::DataLocation::External as i32,
+            ..Default::default()
+        };
+        let mut store = WeightStore::new();
+        let error = resolve_initializer(&mut store, &initializer, &model_dir)
+            .expect_err("overflowing external tensor geometry must be rejected");
+        assert!(
+            matches!(error, LoaderError::GraphBuild(message) if message.contains("geometry overflows"))
+        );
+
+        drop(store);
+        std::fs::remove_file(path).expect("remove external data");
     }
 
     #[test]

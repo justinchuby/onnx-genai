@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{DataType, DeviceId, TensorLayout};
+use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes};
 
 use crate::error::{Result, SessionError};
 
@@ -268,14 +268,12 @@ impl DeviceIoBinding {
             expose_logical_input_shape,
         } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
-        let numel = physical_shape.iter().try_fold(1usize, |product, &dim| {
-            product.checked_mul(dim).ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "device binding '{input_name}' physical shape overflows: {physical_shape:?}"
-                ))
-            })
-        })?;
-        let bytes = dtype.storage_bytes(numel).max(1);
+        let bytes = checked_expected_bytes(dtype, &physical_shape)
+            .ok_or_else(|| SessionError::ShapeOverflow {
+                value: format!("device binding '{input_name}'"),
+                dims: physical_shape.clone(),
+            })?
+            .max(1);
         let allocator_for_buffer = allocator.clone();
         let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
         Ok(Self {
@@ -507,8 +505,11 @@ impl Tensor {
         shape: Vec<usize>,
         bytes: &[u8],
     ) -> Result<Self> {
-        let numel: usize = shape.iter().product();
-        let expected = dtype.storage_bytes(numel);
+        let expected =
+            checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "Tensor::from_raw_in".to_string(),
+                dims: shape.clone(),
+            })?;
         if bytes.len() != expected {
             return Err(SessionError::Internal(format!(
                 "Tensor::from_raw_in: {} bytes for shape {shape:?} dtype {dtype:?}, expected {expected}",
@@ -854,6 +855,32 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn from_raw_rejects_geometry_overflow() {
+        let error = Tensor::from_raw(DataType::Float32, vec![usize::MAX, 2], &[])
+            .expect_err("overflowing tensor geometry must be rejected");
+        assert!(matches!(error, SessionError::ShapeOverflow { .. }));
+    }
+
+    #[test]
+    fn device_binding_allocation_rejects_byte_overflow() {
+        let element_count = usize::MAX / 4;
+        let error = DeviceIoBinding::allocate(
+            shared_cpu_ep(),
+            DeviceBindingSpec {
+                input_name: "huge".into(),
+                bind_input: true,
+                output_name: None,
+                dtype: DataType::Float64,
+                physical_shape: vec![element_count],
+                logical_shape: vec![element_count],
+                expose_logical_input_shape: false,
+            },
+        )
+        .expect_err("overflowing device binding byte count must be rejected");
+        assert!(matches!(error, SessionError::ShapeOverflow { .. }));
     }
 
     #[test]
