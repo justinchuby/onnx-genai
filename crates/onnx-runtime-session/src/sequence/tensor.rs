@@ -5,10 +5,7 @@ use onnx_runtime_ir::{DataType, TensorLayout, compute_contiguous_strides};
 use crate::Tensor;
 use crate::tensor::{SharedTensorBuffer, host_bytes};
 
-use super::{
-    ConcatCopyStats, SequenceError, SequenceResult, checked_add, checked_mul, checked_product,
-    gather_strided, overflow, validate_tensor_bytes, validate_view_bounds, zeroed_bytes,
-};
+use super::{ConcatCopyStats, SequenceError, SequenceResult};
 
 /// An immutable tensor view used as one sequence element.
 ///
@@ -381,4 +378,253 @@ impl SeqTensor {
             .get(self.byte_offset..end)
             .ok_or_else(|| overflow(OP, "tensor byte range", &self.shape))
     }
+}
+
+pub(super) fn normalize_axis(
+    op: &'static str,
+    axis: i64,
+    rank: usize,
+    new_axis: bool,
+) -> SequenceResult<usize> {
+    let rank_i64 =
+        i64::try_from(rank).map_err(|_| SequenceError::LengthOverflow { op, len: rank })?;
+    let normalized = if axis < 0 {
+        rank_i64.checked_add(axis)
+    } else {
+        Some(axis)
+    };
+    match normalized {
+        Some(axis) if axis >= 0 && axis < rank_i64 => Ok(axis as usize),
+        _ => Err(SequenceError::InvalidAxis {
+            op,
+            axis,
+            rank: rank - usize::from(new_axis),
+            new_axis,
+        }),
+    }
+}
+
+pub(super) fn overflow(op: &'static str, context: &'static str, shape: &[usize]) -> SequenceError {
+    SequenceError::ShapeOverflow {
+        op,
+        context,
+        shape: shape.to_vec(),
+    }
+}
+
+/// Multiply dimensions while still detecting overflow hidden by a zero extent.
+pub(super) fn checked_product(
+    op: &'static str,
+    context: &'static str,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    let mut product = 1usize;
+    let mut has_zero = false;
+    for &dimension in shape {
+        if dimension == 0 {
+            has_zero = true;
+        } else {
+            product = product
+                .checked_mul(dimension)
+                .ok_or_else(|| overflow(op, context, shape))?;
+        }
+    }
+    Ok(if has_zero { 0 } else { product })
+}
+
+pub(super) fn checked_mul(
+    op: &'static str,
+    context: &'static str,
+    lhs: usize,
+    rhs: usize,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| overflow(op, context, shape))
+}
+
+pub(super) fn checked_add(
+    op: &'static str,
+    context: &'static str,
+    lhs: usize,
+    rhs: usize,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| overflow(op, context, shape))
+}
+
+pub(super) fn addressable(
+    op: &'static str,
+    context: &'static str,
+    bytes: usize,
+    shape: &[usize],
+) -> SequenceResult<usize> {
+    if bytes > isize::MAX as usize {
+        return Err(overflow(op, context, shape));
+    }
+    Ok(bytes)
+}
+
+pub(super) fn zeroed_bytes(
+    op: &'static str,
+    context: &'static str,
+    bytes: usize,
+    shape: &[usize],
+) -> SequenceResult<Vec<u8>> {
+    addressable(op, context, bytes, shape)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(bytes)
+        .map_err(|_| SequenceError::Allocation { op, context, bytes })?;
+    output.resize(bytes, 0);
+    Ok(output)
+}
+
+pub(super) fn clone_shape(op: &'static str, shape: &[usize]) -> SequenceResult<Vec<usize>> {
+    let bytes = shape
+        .len()
+        .checked_mul(std::mem::size_of::<usize>())
+        .ok_or_else(|| overflow(op, "shape allocation", shape))?;
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(shape.len())
+        .map_err(|_| SequenceError::Allocation {
+            op,
+            context: "shape",
+            bytes,
+        })?;
+    cloned.extend_from_slice(shape);
+    Ok(cloned)
+}
+
+pub(super) fn validate_tensor_bytes(
+    op: &'static str,
+    data: &[u8],
+    dtype: DataType,
+    shape: &[usize],
+) -> SequenceResult<()> {
+    if dtype.byte_size() == 0 {
+        return Err(SequenceError::UnsupportedDtype { op, dtype });
+    }
+    let numel = checked_product(op, "tensor element count", shape)?;
+    let expected = dtype
+        .checked_storage_bytes(numel)
+        .ok_or_else(|| overflow(op, "tensor byte count", shape))?;
+    addressable(op, "tensor byte count", expected, shape)?;
+    if data.len() != expected {
+        return Err(SequenceError::ByteLengthMismatch {
+            op,
+            dtype,
+            shape: clone_shape(op, shape)?,
+            expected,
+            actual: data.len(),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn validate_view_bounds(
+    op: &'static str,
+    shape: &[usize],
+    strides: &[i64],
+    byte_offset: usize,
+    dtype: DataType,
+    root_len: usize,
+) -> SequenceResult<()> {
+    if shape.len() != strides.len() {
+        return Err(SequenceError::InvalidSplit {
+            op,
+            reason: format!(
+                "view rank mismatch: shape has {} dims but strides has {}",
+                shape.len(),
+                strides.len()
+            ),
+        });
+    }
+    let esize = dtype.byte_size();
+    if esize == 0 {
+        return Err(SequenceError::UnsupportedDtype { op, dtype });
+    }
+    if shape.contains(&0) {
+        return Ok(());
+    }
+    let mut min_element = 0i128;
+    let mut max_element = 0i128;
+    for (&dim, &stride) in shape.iter().zip(strides) {
+        let span = (dim.saturating_sub(1) as i128)
+            .checked_mul(stride as i128)
+            .ok_or_else(|| overflow(op, "view stride span", shape))?;
+        if span < 0 {
+            min_element = min_element
+                .checked_add(span)
+                .ok_or_else(|| overflow(op, "view minimum offset", shape))?;
+        } else {
+            max_element = max_element
+                .checked_add(span)
+                .ok_or_else(|| overflow(op, "view maximum offset", shape))?;
+        }
+    }
+    let origin = byte_offset as i128;
+    let min_byte = origin
+        .checked_add(
+            min_element
+                .checked_mul(esize as i128)
+                .ok_or_else(|| overflow(op, "view minimum byte offset", shape))?,
+        )
+        .ok_or_else(|| overflow(op, "view minimum byte offset", shape))?;
+    let end_byte = origin
+        .checked_add(
+            max_element
+                .checked_mul(esize as i128)
+                .ok_or_else(|| overflow(op, "view maximum byte offset", shape))?,
+        )
+        .and_then(|offset| offset.checked_add(esize as i128))
+        .ok_or_else(|| overflow(op, "view byte range", shape))?;
+    if min_byte < 0 || end_byte > root_len as i128 {
+        return Err(SequenceError::InvalidSplit {
+            op,
+            reason: format!(
+                "view byte range [{min_byte}, {end_byte}) exceeds backing allocation of {root_len} bytes"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn gather_strided(
+    root: &[u8],
+    shape: &[usize],
+    strides: &[i64],
+    byte_offset: usize,
+    dtype: DataType,
+    esize: usize,
+) -> SequenceResult<Vec<u8>> {
+    const OP: &str = "SequenceTensor";
+    validate_view_bounds(OP, shape, strides, byte_offset, dtype, root.len())?;
+    let numel = checked_product(OP, "view element count", shape)?;
+    let bytes = checked_mul(OP, "view byte count", numel, esize, shape)?;
+    let mut output = zeroed_bytes(OP, "strided tensor materialization", bytes, shape)?;
+    if numel == 0 {
+        return Ok(output);
+    }
+    let logical_strides = compute_contiguous_strides(shape);
+    for linear in 0..numel {
+        let mut remainder = linear;
+        let mut source_element = 0i128;
+        for dimension in 0..shape.len() {
+            let coordinate = if shape[dimension] == 0 {
+                0
+            } else {
+                remainder / logical_strides[dimension] as usize
+            };
+            if shape[dimension] != 0 {
+                remainder %= logical_strides[dimension] as usize;
+            }
+            source_element += coordinate as i128 * strides[dimension] as i128;
+        }
+        let source = (byte_offset as i128 + source_element * esize as i128) as usize;
+        output[linear * esize..(linear + 1) * esize].copy_from_slice(&root[source..source + esize]);
+    }
+    Ok(output)
 }

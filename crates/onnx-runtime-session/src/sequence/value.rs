@@ -1,6 +1,6 @@
 use onnx_runtime_ir::DataType;
 
-use super::{SeqTensor, SequenceError, SequenceResult, resolve_index};
+use super::{SeqTensor, SequenceError, SequenceResult};
 
 /// An ordered homogeneous list of immutable, shared tensors.
 #[derive(Clone, Debug)]
@@ -127,4 +127,36 @@ impl SequenceValue {
     pub fn elements(&self) -> &[SeqTensor] {
         &self.items
     }
+}
+
+fn resolve_index(
+    op: &'static str,
+    index: i64,
+    len: usize,
+    insertion: bool,
+) -> SequenceResult<usize> {
+    let length = i64::try_from(len).map_err(|_| SequenceError::LengthOverflow { op, len })?;
+    let resolved = if index < 0 {
+        length.checked_add(index)
+    } else {
+        Some(index)
+    };
+    let valid = resolved.is_some_and(|value| {
+        value >= 0
+            && if insertion {
+                value <= length
+            } else {
+                value < length
+            }
+    });
+    if !valid {
+        return Err(SequenceError::IndexOutOfBounds {
+            op,
+            index,
+            len,
+            insertion,
+        });
+    }
+    usize::try_from(resolved.unwrap_or_default())
+        .map_err(|_| SequenceError::LengthOverflow { op, len })
 }
