@@ -118,3 +118,7 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 ## 2026-07-26T22:38:02+00:00 — #88 RoPE capture DoD dispatched
 
 - Dispatched on `test/rope-capture-dod` to add the standalone-RoPE graph record/replay or unfused-model zero-fallback token-parity DoD regression for issue #88. Status at Scribe handoff: in progress.
+## 2026-07-26T22:38:02+00:00 — #88 RoPE capture DoD merged
+
+- PR #208 (`test(cuda): cover standalone RoPE graph capture`) merged to main as `5eb0d8db`, closing #88. Chew independently approved with guard-break evidence; Resch's `63e0ef26` fmt-gate repair kept main green for the merge.
+

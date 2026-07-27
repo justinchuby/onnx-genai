@@ -115,3 +115,7 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 ## 2026-07-26T20:00:00Z — Scribe update
 
 - 2026-07-26T20:00:01Z — Approved PR #201 after independently reproducing the `dtod` revert failure (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) and verifying persistent workspace staging preserved #193 copy-back safety.
+## 2026-07-26T22:38:02+00:00 — PR #208 RoPE capture review landed
+
+- Independent APPROVE for PR #208 landed with the merge commit `5eb0d8db`, closing #88. Guard proof remains the key review evidence: removing `!capturing` at `rotary_embedding.rs:495` made the new test fail with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`, then restoring it passed.
+

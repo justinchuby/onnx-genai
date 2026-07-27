@@ -1,5 +1,5 @@
 # Team Focus — now
 
-**Current focus:** Mobius PRs #404/#423/#430 are ready for Justin review/merge; issue backlog triaged with #1, #52, and #64 closed; #88 RoPE capture DoD regression test is in progress on `test/rope-capture-dod`.
+**Current focus:** #88 RoPE capture DoD test merged (#208); mobius #404/#423/#430 await Justin; issue backlog triaged (3 closed); main green.
 
 **Updated:** 2026-07-26T22:38:02+00:00

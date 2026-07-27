@@ -4323,3 +4323,61 @@ Plain-text summary: 2 closed, 23 partial, 0 doable-now.
 按明确定义的 **ORT2 Phase-1 foundation**，已经 **100% 完成**：不再有 skeleton，BERT parity milestone 已通过，七个 crate 当前全部能 build。若看完整 `ORT2.md` runtime 愿景，粗估约 **65–70% 完成**；剩下的主要不是“把 skeleton 填完”，而是 ORT drop-in/plugin execution、全 schema/operator parity、异构 placement、model package 和跨平台发布。`DESIGN.md` 的核心单机 GenAI 产品能力约 **70% 左右**，但把 distributed KV/multi-model/multi-GPU/MoE、完整 continuous batching/offload、所有 diffusion/sampling 与生态绑定都算进“大愿景”，整体更接近 **55–60%**。换句话说：基础已经成型且能跑真实模型，余下约三到四成主要是广度、兼容性、调度/内存系统和产品化收口，而不是重写核心。
 
 <!-- scribe-merge-2026-07-26T22-38-02+00-00-mobius-issue-ort2-batch-end -->
+
+<!-- scribe-merge-2026-07-26T22-38-02Z-rope-capture-88 -->
+## 2026-07-26 — RoPE capture DoD, PR #208 review, and fmt gate recovery
+
+Decision archive gate checked at 2026-07-26T22:38:02+00:00: active ledger was 435274 bytes before this merge. No dated ledger entries older than 2026-07-19T22:38:02+00:00 were present, so no archive file was created or updated.
+
+<!-- merged from .squad/decisions/inbox/leon-rope-capture-dod.md -->
+### 2026-07-26: Standalone RoPE capture regression closes #88
+**By:** Leon
+**What:** Added a GPU regression that constructs a default-domain, standalone fp16 `RotaryEmbedding` decode graph, warms its exact signature, captures/replays three decode steps, and requires bitwise eager parity, an installed graph executable, and a clear capture-error latch.
+**Why:** This locks the unfused RoPE path directly, so a capture-time host synchronization or a silent eager fallback cannot regress unnoticed. Deliberately restoring the host position-id D2H validation during recording made the test fail with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; the guarded implementation passes.
+
+<!-- merged from .squad/decisions/inbox/chew-pr208-review.md -->
+# PR #208 Review — VERDICT: APPROVE
+
+- **Reviewer:** Chew (independent gate; author Leon locked out)
+- **Date:** 2026-07-26
+- **PR:** #208 "test(cuda): cover standalone RoPE graph capture" — closes #88
+- **Change:** +257/-0, single new file `crates/onnx-runtime-ep-cuda/tests/rope_capture_gpu.rs`
+
+## Checklist results
+
+1. **Standalone (unfused) path — CONFIRMED.** The test builds a single-node `RotaryEmbedding`
+   graph (default domain, opset 23) and calls `ep.get_kernel` directly. `get_kernel`
+   (`provider.rs:254`) looks up the factory registry by `("RotaryEmbedding","",23)`
+   (`kernels/mod.rs:514`) → `RotaryEmbeddingFactory` → `RotaryEmbeddingKernel`. No optimizer/
+   fusion runs on a directly-requested single node, so it categorically cannot route to a fused
+   GQA/Attention op. This is structurally immune to #201's shape-misroute trap. The test also
+   asserts `kernel.cuda_graph_compatible()` after an eager warm.
+2. **Parity + zero-fallback — CONFIRMED.** Byte-exact `assert_eq!(captured, eager)`; plus the
+   real capture gates: `begin_graph_capture` (audits `capture_support`), `end_graph_capture`
+   (errors if a host sync occurs mid-capture), `has_graph_executable()`, `check_capture_error()==0`,
+   `reset_graph()`. Not an eager fallback that trivially passes.
+3. **GPU gate — CONFIRMED.** `gpu()` returns `None` and the test returns early with a skip
+   message when CUDA is unavailable. Fixed deterministic inputs; loops 3 decode steps.
+4. **RUN — PASS.** `CUDA_VISIBLE_DEVICES=6 taskset -c 1 cargo test ... --test rope_capture_gpu`
+   → `1 passed` (24.5s).
+5. **GUARD PROOF — PASS.** Independently broke capture-safety by removing the `!capturing`
+   gate at `kernels/rotary_embedding.rs:495` (`if has_position_ids && !capturing` →
+   `if has_position_ids`), forcing the host `dtoh` (synchronize + sync memcpy) to run *during*
+   capture. Re-run → test **FAILED** with
+   `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED ("operation not permitted when stream is capturing")`
+   at the decode execute. Restored the line; git tree clean; test passes again. The test
+   genuinely guards the capture-safety property.
+6. **fmt/clippy — CLEAN.** `cargo fmt --all -- --check` clean; `cargo clippy -p onnx-runtime-ep-cuda`
+   clean; `cargo clippy --test rope_capture_gpu` clean (remaining clippy warnings are pre-existing
+   in unrelated test files: matmul_nbits_gpu, conv_gpu, etc.).
+
+## Verdict
+**APPROVE.** Merge-ready. The test exercises the true standalone RoPE decode kernel, asserts
+parity and real capture success (no fallback), gates cleanly on GPU availability, and is a
+proven guard (fails when capture-safety is broken).
+
+### 2026-07-26: Resch restored the fmt gate and PR #208 closed #88
+**By:** Scribe, from coordinator manifest
+**What:** Resch landed pure rustfmt repair commit `63e0ef26` after PR #207 plus `decode_spmd.rs` regressed the BLOCKING fmt gate on main; `cargo fmt --all -- --check` returned exit 0. PR #208 then merged to main as `5eb0d8db` (`test(cuda): cover standalone RoPE graph capture`), closing issue #88.
+**Why:** The batch restored main's formatting health and permanently records that Leon's standalone RoPE capture DoD regression landed with Chew's independent approval and guard-break evidence.
+
