@@ -81,10 +81,40 @@ unset, keeps it on.
 
 ## Runtime selection
 
-Choose an execution provider at runtime with `ONNX_GENAI_EP` (e.g. `cpu`,
-`cuda`). CUDA requires the `[cuda]` extra (or a separately installed
-`onnxruntime-gpu`). On Apple Silicon, the `onnxruntime-ep-mlx` plugin is
-installed by default.
+CUDA has two independent switches:
+
+1. Build-time features select which CUDA code is compiled in. `--features cuda`
+   enables ONNX Runtime's built-in `CUDAExecutionProvider` path only. `--features
+   native-cuda` enables the native backend plus the project's hand-written CUDA
+   EP (`onnx-runtime-ep-cuda`).
+2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
+   session to use CUDA, while the decode backend selects the decoder. In the REPL
+   (`run`), use `/backend native` to use the native decoder.
+
+CUDA failure modes are intentionally distinct:
+
+- If CUDA support was not compiled into the ORT layer, `ONNX_GENAI_EP=cuda`
+  fails session creation with a "CUDA support not compiled in" error; request
+  `cpu` (or rebuild with `--features cuda` / `--features native-cuda`) instead.
+- If CUDA support was compiled in but the provider is unavailable at runtime
+  (for example, no loadable CUDA provider library, driver, or GPU),
+  `ONNX_GENAI_EP=cuda` also fails session creation and tells you to request
+  `ONNX_GENAI_EP=cpu` when CPU execution is intentional.
+- When CUDA is compiled in and available for the ORT/native session but the
+  native CUDA EP cannot claim every executable node, the native runtime falls
+  back to its CPU EP. Set `ONNX_GENAI_REQUIRE_CUDA=1` to reject that node-level
+  CPU fallback. On Apple Silicon, the `onnxruntime-ep-mlx` plugin is installed
+  by default.
+
+Windows PowerShell example for the native CUDA path:
+
+```powershell
+$env:ONNX_GENAI_EP = "cuda"
+$env:ONNX_GENAI_REQUIRE_CUDA = "1"
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- run .\path\to\model
+# In the REPL:
+# /backend native
+```
 
 Python 3.11+ is required (the `onnxruntime` dependency ships no earlier wheels).
 
