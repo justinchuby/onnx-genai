@@ -165,3 +165,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Added a dispatcher reach test proving `sdpa_f32(...)` executes the NEON path on Apple Silicon when MLAS is not selected.
 - Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.
 - Tightened model-scale GEMV max-relative tolerance from 2.0% to 1.8%, based on Chew's 1.57% measured worst legitimate f32 accumulation-order drift.
+
+## 2026-07-27T14:08:06-07:00 — CI supply-chain hardening and coverage
+- Replaced personally-owned Rust setup/cache/install actions in `ci.yml` and `audit.yml` with direct `rustup`, GitHub-owned `actions/cache@v4`, and direct pinned `cargo install cargo-llvm-cov 0.8.7`.
+- Converted coverage-capable test lanes to upload Codecov flags: `offline`, `mlas`, `cli-ort-linux`, and `cli-ort-windows`; verified final CI green at https://github.com/justinchuby/onnx-genai/actions/runs/30309111341.
+- Confirmed CLI ORT Linux still executes `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`; Windows CLI ORT stages the DLL into cargo-llvm-cov target paths with `--no-clean`.
+- Documented Windows ARM64 coverage blocker (rust-lang/rust#150123) and release workflow debt in `.squad/decisions/inbox/pris-ci-supply-chain-and-coverage.md`.
