@@ -125,3 +125,6 @@ Authored `docs/research/cli/04-runtime-capability-inventory.md` as Deckard. Key 
 
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/neutering proof; re-review approved and merged as 9ab24fa5.
+
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- Fixed PR #288 tests after Moss lockout: LogSoftmax overflow-stability is value-falsifiable; BitShift width guard is locked by source-contract test.

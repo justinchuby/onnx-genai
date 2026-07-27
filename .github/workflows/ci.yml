@@ -67,6 +67,9 @@ jobs:
       - name: Check platform-specific kernel files are named accordingly
         run: python3 scripts/check_platform_naming.py
 
+      - name: Check dispatch branches have reachability tests
+        run: python3 scripts/check_dispatch_reachability.py
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.

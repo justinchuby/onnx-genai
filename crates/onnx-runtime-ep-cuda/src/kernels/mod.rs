@@ -23,6 +23,7 @@ use crate::runtime::CudaRuntime;
 
 pub mod activations;
 pub mod attention;
+pub mod bitwise;
 pub mod block_quant;
 pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
@@ -44,8 +45,10 @@ pub mod gemm;
 mod gqa_decode;
 mod gqa_decode_fp16;
 pub mod group_query_attention;
+pub mod hardmax;
 pub mod index_share;
 pub mod indexing;
+pub mod log_softmax;
 pub mod matmul;
 pub mod matmul_nbits;
 pub mod mod_op;
@@ -124,6 +127,12 @@ use pointwise::{
 ///   broadcasting across a variadic input list).
 /// * **Modulo** — `Mod` (f32 with `fmod=1`, plus i32/i64 truncated and
 ///   floor modulo).
+/// * **Bitwise** — `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
+///   (all integer dtypes, broadcasting) and unsigned `BitShift`
+///   (LEFT/RIGHT), matched to the CPU EP `bitwise.rs`/`bitshift.rs`.
+/// * **LogSoftmax / Hardmax** — numerically-stable axis-reduction ops
+///   (f32/f16/bf16), matched to the CPU EP; `LogSoftmax` uses the stable
+///   shifted-logsumexp formulation.
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -246,6 +255,13 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "IsInf",
     "IsNaN",
     "PRelu",
+    "BitwiseAnd",
+    "BitwiseOr",
+    "BitwiseXor",
+    "BitwiseNot",
+    "BitShift",
+    "LogSoftmax",
+    "Hardmax",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -889,6 +905,62 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
 
+    // ── CUDA op-coverage batch 4 (issue #67) ──
+
+    // Integer bitwise binary (same-dtype operands → same-dtype output; NumPy
+    // broadcasting). Matches the CPU EP `bitwise.rs` across every integer dtype.
+    for (op_type, op) in [
+        ("BitwiseAnd", bitwise::BitwiseBinaryOp::And),
+        ("BitwiseOr", bitwise::BitwiseBinaryOp::Or),
+        ("BitwiseXor", bitwise::BitwiseBinaryOp::Xor),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 18),
+            Box::new(bitwise::BitwiseBinaryFactory {
+                op,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("BitwiseNot", "", 18),
+        Box::new(bitwise::BitwiseNotFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    // Unsigned BitShift (LEFT/RIGHT via the `direction` attribute); matches the
+    // CPU EP `bitshift.rs` checked-shift contract.
+    reg.register(
+        OpKey::new("BitShift", "", 11),
+        Box::new(bitwise::BitShiftFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // LogSoftmax (numerically-stable shifted-logsumexp NVRTC kernel). Shares
+    // Softmax's opset split: legacy coerce-to-2D at opset ≤ 12, per-axis at
+    // opset ≥ 13.
+    reg.register(
+        OpKey::new("LogSoftmax", "", 1),
+        Box::new(log_softmax::LogSoftmaxLegacyFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("LogSoftmax", "", 13),
+        Box::new(log_softmax::LogSoftmaxFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
+    // Hardmax (first-argmax one-hot along `axis`, opset ≥ 13 semantics).
+    reg.register(
+        OpKey::new("Hardmax", "", 13),
+        Box::new(hardmax::HardmaxFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+
     reg
 }
 
@@ -922,6 +994,24 @@ mod tests {
     #[test]
     fn coverage_batch3_ops_are_listed_in_coverage() {
         for op in ["IsInf", "IsNaN", "PRelu"] {
+            assert!(
+                CUDA_COVERED_OPS.contains(&op),
+                "{op} missing from CUDA_COVERED_OPS"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_batch4_ops_are_listed_in_coverage() {
+        for op in [
+            "BitwiseAnd",
+            "BitwiseOr",
+            "BitwiseXor",
+            "BitwiseNot",
+            "BitShift",
+            "LogSoftmax",
+            "Hardmax",
+        ] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),
                 "{op} missing from CUDA_COVERED_OPS"

@@ -14,3 +14,6 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 - Native Mac CPU EP now has Apple-Silicon-general NEON paths for multi-thread GEMV, SDPA, SiLU, and direct-from-mmap FP16 GEMV; runtime feature detection/dispatch is expected for SIMD paths instead of machine-specific tuning.
 - FP16 works because Apple Silicon NEON can widen f16 loads directly while ORT CPU widens before GEMM; keep this architectural distinction in mind for CPU EP work on other platforms.
 - The campaign learned that untested SIMD paths are as risky as placeholders; new AVX/NEON/SVE/QNN paths need guard-break tests and paired scalar/reference checks.
+
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- Fixed PR #294 aarch64 build by cfg-gating the x86-only perf probe after Drake lockout.
