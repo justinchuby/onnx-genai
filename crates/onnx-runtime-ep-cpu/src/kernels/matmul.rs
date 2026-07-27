@@ -74,6 +74,24 @@ static GEMV_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 #[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
 static BNNS_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Always-on counter: tracks total BNNS fp16 prefill calls for diagnostics.
+/// Queryable via [`bnns_prefill_stats`].
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static BNNS_PREFILL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Cumulative nanoseconds spent in BNNS fp16 prefill calls.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static BNNS_PREFILL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns (call_count, cumulative_nanos) for BNNS fp16 prefill calls.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn bnns_prefill_stats() -> (usize, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        BNNS_PREFILL_CALLS.load(Ordering::Relaxed),
+        BNNS_PREFILL_NANOS.load(Ordering::Relaxed),
+    )
+}
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -95,6 +113,13 @@ pub(crate) struct MatMulPrepack {
     /// constant Float16 input on macOS/iOS.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     transposed_b_f16: OnceLock<Vec<u16>>,
+    /// Lazily-computed contiguous f16 copy of B for non-contiguous weight
+    /// matrices (e.g. lm_head vocab projection stored column-major in the ONNX
+    /// model). Stores raw u16 bit patterns in row-major K×N layout. Only
+    /// populated for constant Float16 inputs on macOS/iOS where the original
+    /// is non-contiguous.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    contiguous_b_f16: OnceLock<Vec<u16>>,
 }
 
 impl MatMulPrepack {
@@ -219,6 +244,83 @@ impl MatMulPrepack {
                             }
                         });
                     bt
+                })
+                .as_slice(),
+        )
+    }
+
+    /// Returns a cached contiguous f16 copy of a non-contiguous B weight.
+    ///
+    /// When a model stores a weight matrix with non-row-major strides (e.g.
+    /// the lm_head vocab projection stored column-major), `try_matmul_half`
+    /// skips it because BNNS requires contiguous input.  This method
+    /// materialises the contiguous K×N row-major copy once and caches it
+    /// for the session lifetime, so subsequent prefill calls avoid both:
+    ///   - the element-by-element `to_dense_f32_widen` (~1 s at 136 M elements)
+    ///   - the 2× memory of f16→f32 widening
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn contiguous_b_f16(&self, b_view: &TensorView) -> Option<&[u16]> {
+        use onnx_runtime_ir::DataType;
+        if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || b_view.is_contiguous() {
+            return None; // already contiguous or not cacheable
+        }
+        Some(
+            self.contiguous_b_f16
+                .get_or_init(|| {
+                    let numel = b_view.numel();
+                    let shape = b_view.shape;
+                    let strides = b_view.strides;
+                    let base = b_view.data_ptr::<u16>();
+                    let mut out = vec![0u16; numel];
+
+                    // Optimised 2-D path (covers all weight matrices).
+                    if shape.len() == 2 {
+                        let (rows, cols) = (shape[0], shape[1]);
+                        let (sr, sc) = (strides[0] as isize, strides[1] as isize);
+                        // Parallel + tiled for cache-friendly access on large
+                        // matrices (e.g. 896×151936 = 136 M elements).
+                        use rayon::prelude::*;
+                        let threads = rayon::current_num_threads();
+                        let rows_per_thread = rows.div_ceil(threads).max(1);
+                        // SAFETY: `base` points into the model's mmap'd weight
+                        // buffer which is immutable for the session lifetime.
+                        // Each Rayon task reads a disjoint set of source rows
+                        // and writes a disjoint output chunk.
+                        let base_usize = base as usize;
+                        out.par_chunks_mut(rows_per_thread * cols)
+                            .enumerate()
+                            .for_each(|(t, chunk)| {
+                                let base = base_usize as *const u16;
+                                let i0 = t * rows_per_thread;
+                                let i_end = (i0 + rows_per_thread).min(rows);
+                                for i in i0..i_end {
+                                    let row_base = unsafe { base.offset(i as isize * sr) };
+                                    let dst = &mut chunk[(i - i0) * cols..(i - i0 + 1) * cols];
+                                    for (j, d) in dst.iter_mut().enumerate() {
+                                        *d = unsafe { *row_base.offset(j as isize * sc) };
+                                    }
+                                }
+                            });
+                    } else {
+                        // General N-D fallback (rare).
+                        let mut idx = vec![0usize; shape.len()];
+                        for o in out.iter_mut() {
+                            let off: isize = idx
+                                .iter()
+                                .zip(strides.iter())
+                                .map(|(&i, &s)| i as isize * s as isize)
+                                .sum();
+                            *o = unsafe { *base.offset(off) };
+                            for d in (0..shape.len()).rev() {
+                                idx[d] += 1;
+                                if idx[d] < shape[d] {
+                                    break;
+                                }
+                                idx[d] = 0;
+                            }
+                        }
+                    }
+                    out
                 })
                 .as_slice(),
         )
@@ -534,6 +636,46 @@ impl MatMulKernel {
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
+        // Non-contiguous f16 weight rescue: when B is a constant Float16 weight
+        // stored with non-standard strides (e.g. lm_head stored column-major),
+        // `try_matmul_half` above skips it.  Rather than falling through to
+        // `to_dense_f32_widen` (which converts 136 M elements one-by-one,
+        // measured at ~1 s for the vocab projection), materialise a contiguous
+        // f16 copy once and route through BNNS / half GEMM.  The copy is cached
+        // for the session lifetime, amortising the one-time cost.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if inputs[0].dtype == onnx_runtime_ir::DataType::Float16
+            && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
+            && !inputs[1].is_contiguous()
+            && geom.m >= 2
+            && inputs[0].is_contiguous()
+            && let Some(b_contig) = self.prepack.contiguous_b_f16(&inputs[1])
+        {
+            let a_len = inputs[0].numel();
+            let a_bits = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<u16>(), a_len) };
+            let mut out = vec![0.0f32; geom.result_len];
+            if !out.is_empty() && geom.k > 0 {
+                if geom.batch_shape.is_empty() {
+                    if !accelerate_gemm::bnns_matmul_f16(
+                        a_bits, b_contig, &mut out, geom.m, geom.k, geom.n,
+                    ) {
+                        half_gemm_tile(
+                            HalfFormat::F16,
+                            a_bits,
+                            b_contig,
+                            &mut out,
+                            geom.m,
+                            geom.k,
+                            geom.n,
+                        );
+                    }
+                } else {
+                    bnns_half_dense_into(a_bits, b_contig, &geom, &mut out);
+                }
+            }
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &out);
+        }
+
         // Direct f32 output fast path: when the output is a contiguous Float32
         // CPU tensor that does not alias either input, GEMM writes straight into
         // its backing buffer, skipping both the intermediate result `Vec<f32>`
@@ -686,7 +828,27 @@ fn try_matmul_half(
     if format == HalfFormat::F16 && geom.m >= 2 && accelerate_gemm::bnns_matmul_available() {
         #[cfg(test)]
         BNNS_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
         bnns_half_dense_into(a_bits, b_bits, geom, &mut out);
+        let elapsed = t0.elapsed();
+        BNNS_PREFILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BNNS_PREFILL_NANOS.fetch_add(
+            elapsed.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if std::env::var("NXRT_BNNS_DEBUG").is_ok() {
+            let flops = 2.0 * geom.m as f64 * geom.k as f64 * geom.n as f64;
+            let gflops = flops / elapsed.as_secs_f64() / 1e9;
+            eprintln!(
+                "[bnns] M={} K={} N={} {:.3}ms {:.0} GFLOPS (call #{})",
+                geom.m,
+                geom.k,
+                geom.n,
+                elapsed.as_secs_f64() * 1e3,
+                gflops,
+                BNNS_PREFILL_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
         return Ok(Some(out));
     }
 

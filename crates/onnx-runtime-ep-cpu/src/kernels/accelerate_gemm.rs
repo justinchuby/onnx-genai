@@ -172,39 +172,82 @@ pub fn bnns_matmul_available() -> bool {
 
 /// C[m,n] = A[m,k] @ B[k,n] via BNNS, fp16 inputs → f32 output.
 /// Returns `true` on success, `false` if the filter could not be created.
+/// Thread-local BNNS filter cache.  Creating a `BNNSFilter` involves GCD
+/// dispatch setup and possibly AMX micro-code compilation — measured at 3–19 ms
+/// cold and ~50 µs warm.  Caching by (M, K, N) amortises this to zero for the
+/// second and subsequent calls at each shape (a typical 24-layer model has only
+/// 4–5 unique weight shapes, so the cache stays tiny).
+///
+/// Filters are destroyed when the thread exits via the `Drop` impl on
+/// `FilterCache`.
+struct FilterCache {
+    map: std::collections::HashMap<(usize, usize, usize), BNNSFilter>,
+}
+
+impl FilterCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    fn get_or_create(&mut self, m: usize, k: usize, n: usize) -> BNNSFilter {
+        *self.map.entry((m, k, n)).or_insert_with(|| {
+            let params = BNNSLayerParametersBroadcastMatMul {
+                alpha: 1.0,
+                beta: 0.0,
+                trans_a: false,
+                trans_b: false,
+                quadratic: false,
+                a_is_weights: false,
+                b_is_weights: false,
+                _pad: [0; 3],
+                i_a_desc: make_nd_desc(m, k, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
+                i_b_desc: make_nd_desc(k, n, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
+                o_desc: make_nd_desc(m, n, BNNS_DATA_TYPE_FLOAT32, std::ptr::null_mut()),
+            };
+            unsafe { BNNSFilterCreateLayerBroadcastMatMul(&params, std::ptr::null()) }
+        })
+    }
+}
+
+impl Drop for FilterCache {
+    fn drop(&mut self) {
+        for (_, filter) in self.map.drain() {
+            if !filter.is_null() {
+                unsafe {
+                    BNNSFilterDestroy(filter);
+                }
+            }
+        }
+    }
+}
+
+std::thread_local! {
+    static BNNS_FILTER_CACHE: std::cell::RefCell<FilterCache> =
+        std::cell::RefCell::new(FilterCache::new());
+}
+
 pub fn bnns_matmul_f16(a: &[u16], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) -> bool {
     debug_assert_eq!(a.len(), m * k);
     debug_assert_eq!(b.len(), k * n);
     debug_assert_eq!(c.len(), m * n);
 
-    let params = BNNSLayerParametersBroadcastMatMul {
-        alpha: 1.0,
-        beta: 0.0,
-        trans_a: false,
-        trans_b: false,
-        quadratic: false,
-        a_is_weights: false,
-        b_is_weights: false,
-        _pad: [0; 3],
-        i_a_desc: make_nd_desc(m, k, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
-        i_b_desc: make_nd_desc(k, n, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
-        o_desc: make_nd_desc(m, n, BNNS_DATA_TYPE_FLOAT32, std::ptr::null_mut()),
-    };
-
-    unsafe {
-        let filter = BNNSFilterCreateLayerBroadcastMatMul(&params, std::ptr::null());
+    BNNS_FILTER_CACHE.with(|cache| {
+        let filter = cache.borrow_mut().get_or_create(m, k, n);
         if filter.is_null() {
             return false;
         }
-        let rc = BNNSFilterApplyTwoInput(
-            filter,
-            a.as_ptr() as *const std::ffi::c_void,
-            b.as_ptr() as *const std::ffi::c_void,
-            c.as_mut_ptr() as *mut std::ffi::c_void,
-        );
-        BNNSFilterDestroy(filter);
-        rc == 0
-    }
+        unsafe {
+            let rc = BNNSFilterApplyTwoInput(
+                filter,
+                a.as_ptr() as *const std::ffi::c_void,
+                b.as_ptr() as *const std::ffi::c_void,
+                c.as_mut_ptr() as *mut std::ffi::c_void,
+            );
+            rc == 0
+        }
+    })
 }
 
 // ─── Column-parallel GEMV on pre-transposed B ───────────────────────
