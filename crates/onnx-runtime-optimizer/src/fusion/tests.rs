@@ -1395,8 +1395,7 @@ fn serialized_graph_bytes(mut graph: Graph) -> Vec<u8> {
     // observable state is the sequence of IDs returned by future inserts.
     // The generated graphs are far smaller than this probe count.
     for _ in 0..128 {
-        let node =
-            graph.insert_node(Node::new(NodeId(0), "ArenaProbe", Vec::new(), Vec::new()));
+        let node = graph.insert_node(Node::new(NodeId(0), "ArenaProbe", Vec::new(), Vec::new()));
         let value = graph.create_value(DataType::Float32, static_shape([1]));
         writeln!(&mut snapshot, "probe={node:?}|{value:?}").unwrap();
     }
@@ -1456,11 +1455,8 @@ impl DifferentialGraphBuilder {
     fn value(&mut self, prefix: &str, dims: &[usize]) -> ValueId {
         let name = format!("{prefix}_{}", self.next_name);
         self.next_name += 1;
-        self.graph.create_named_value(
-            name,
-            DataType::Float32,
-            static_shape(dims.iter().copied()),
-        )
+        self.graph
+            .create_named_value(name, DataType::Float32, static_shape(dims.iter().copied()))
     }
 
     fn input(&mut self, prefix: &str, dims: &[usize]) -> ValueId {
@@ -1981,12 +1977,8 @@ fn affected_candidate_starts_revisits_newly_eligible_lower_ids() {
             .apply_fusion_returning_id(&mut reclaim_probe, &first_match)
             .unwrap();
         assert_eq!(first_fused, case.later_start);
-        let probe_id = reclaim_probe.insert_node(Node::new(
-            NodeId(0),
-            "ReclaimProbe",
-            Vec::new(),
-            Vec::new(),
-        ));
+        let probe_id =
+            reclaim_probe.insert_node(Node::new(NodeId(0), "ReclaimProbe", Vec::new(), Vec::new()));
         assert_eq!(probe_id, case.first_middle);
         reclaimable_low_slot_trials += 1;
 
