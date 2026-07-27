@@ -12,10 +12,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 mod ddim;
+mod euler;
 mod masked_diffusion;
 
-use super::{Dpmpp2m, EulerAncestral, EulerSchedule};
+use super::Dpmpp2m;
 use ddim::DdimSchedule;
+use euler::{EulerAncestral, EulerSchedule};
 use masked_diffusion::{MaskedDiffusion, Remasking};
 
 /// A loop-carried transform applied to a denoiser's output at each iterative
