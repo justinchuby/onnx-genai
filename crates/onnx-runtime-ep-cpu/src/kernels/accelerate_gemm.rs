@@ -421,6 +421,10 @@ fn scalar_outer_product(
 unsafe fn load_f16x4_to_f32x4(ptr: *const u16) -> std::arch::aarch64::float32x4_t {
     let result: std::arch::aarch64::float32x4_t;
     unsafe {
+        // TODO: replace this asm with `vld1_f16`/`vcvt_f32_f16` or the stable
+        // f16 widening intrinsic once Rust's `f16` type and aarch64 f16
+        // conversion intrinsics stabilize. Chew verified bit-exactness vs
+        // scalar edge cases; see `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
         std::arch::asm!(
             "ldr {v:d}, [{ptr}]",
             "fcvtl {v:v}.4s, {v:v}.4h",
@@ -739,6 +743,14 @@ mod tests {
         y.iter().map(|&v| v as f32).collect()
     }
 
+    // Chew's PR #227 review measured 2.38e-7 max relative drift vs an f64
+    // reference and 1.73e-6 FP16-vs-F32 GEMV parity. Use 1e-4 relative
+    // (>50× measured parity) and 1e-5 absolute (>40× the odd-tail measured
+    // 2.28e-7) so M1 Air/M1 Max/M4 Max worker-count differences can move rows
+    // between batched and scalar-tail code paths without hiding real regressions.
+    const F16_GEMV_MAX_REL_TOLERANCE: f32 = 1e-4;
+    const F16_GEMV_MAX_ABS_TOLERANCE: f32 = 1e-5;
+
     #[test]
     fn f16_col_parallel_gemv_matches_reference() {
         let (k, n) = (64, 128);
@@ -761,8 +773,8 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            max_err < 1e-3,
-            "f16 col_parallel_gemv max error {max_err} exceeds 1e-3"
+            max_err < F16_GEMV_MAX_ABS_TOLERANCE,
+            "f16 col_parallel_gemv max error {max_err} exceeds {F16_GEMV_MAX_ABS_TOLERANCE}"
         );
     }
 
@@ -778,19 +790,26 @@ mod tests {
                 bt_f16[j * k + i] = b_f16[i * n + j];
             }
         }
-        let mut y = vec![0.0f32; n];
-        neon_gemv_f16_col_parallel(&x, &bt_f16, &mut y, k, n);
         let ref_y = reference_gemv_f16(&x, &b_f16, k, n);
-        let max_rel = y
-            .iter()
-            .zip(&ref_y)
-            .filter(|(_, r)| r.abs() > 1e-6)
-            .map(|(a, r)| ((a - r) / r).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_rel < 0.02,
-            "f16 col_parallel model-scale max relative error {max_rel} exceeds 2%"
-        );
+        for workers in [1, 3, 7, 11] {
+            let max_rel = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut y = vec![0.0f32; n];
+                    neon_gemv_f16_col_parallel(&x, &bt_f16, &mut y, k, n);
+                    y.iter()
+                        .zip(&ref_y)
+                        .filter(|(_, r)| r.abs() > 1e-6)
+                        .map(|(a, r)| ((a - r) / r).abs())
+                        .fold(0.0f32, f32::max)
+                });
+            assert!(
+                max_rel < F16_GEMV_MAX_REL_TOLERANCE,
+                "f16 col_parallel model-scale max relative error {max_rel} with {workers} workers exceeds {F16_GEMV_MAX_REL_TOLERANCE}"
+            );
+        }
     }
 
     #[test]
@@ -815,8 +834,8 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(
-            max_err < 1e-2,
-            "f16 gemv odd tail max error {max_err} exceeds 1e-2"
+            max_err < F16_GEMV_MAX_ABS_TOLERANCE,
+            "f16 gemv odd tail max error {max_err} exceeds {F16_GEMV_MAX_ABS_TOLERANCE}"
         );
     }
 }

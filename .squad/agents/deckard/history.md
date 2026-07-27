@@ -97,3 +97,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 ## 2026-07-26T20:00:00Z — Scribe update
 
 - 2026-07-26T20:00:02Z — Delivered portable device-gated symmetric int4 GEMV split-K; after Sebastian fixed the ineffective coverage shape, PR #203 merged to main at `b80a8c83`.
+
+## 2026-07-27T03:45:00-07:00 — PR #227 FP16 GEMV review follow-ups
+
+- Took Chew's approved non-blocking C1/C2 follow-ups from Iran's FP16 CPU EP work: documented the `fcvtl`/`fcvtn` inline-asm rationale and future intrinsic replacement path, tightened FP16 GEMV tolerances to 1e-4 relative / 1e-5 absolute, and exercised model-scale parity at 1/3/7/11 workers.
+- Guard proof: perturbing the FP16 batched accumulator by +0.001 made `f16_col_parallel_gemv_matches_reference` fail at max error 0.0010000467 against the new 0.00001 limit; restored code passed the repeated targeted tests and full CPU EP suite.

@@ -780,6 +780,10 @@ fn neon_f16_to_f32_bulk(src: &[u16], dst: &mut [f32]) {
     while i + 4 <= n {
         unsafe {
             let f32x4: float32x4_t;
+            // TODO: replace this `fcvtl` asm with `vcvt_f32_f16` or the stable
+            // f16 widening intrinsic once Rust's `f16` type and aarch64 f16
+            // conversion intrinsics stabilize. Chew verified bit-exactness vs
+            // scalar edge cases; see `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
             std::arch::asm!(
                 "ldr {v:d}, [{ptr}]",
                 "fcvtl {v:v}.4s, {v:v}.4h",
@@ -810,6 +814,10 @@ fn neon_f32_to_f16_bulk(src: &[f32], dst: &mut [u16]) {
             let f32x4 = vld1q_f32(src.as_ptr().add(i));
             // fcvtn narrows 4 × f32 → 4 × f16, stored in the low 64 bits of a
             // NEON register. We store those 8 bytes (4 × u16) to dst.
+            // TODO: replace this asm with the stable f32→f16 NEON narrowing
+            // intrinsic once Rust's `f16` type and aarch64 f16 conversion
+            // intrinsics stabilize. Chew verified bit-exactness vs scalar edge
+            // cases; see `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
             std::arch::asm!(
                 "fcvtn {v:v}.4h, {src:v}.4s",
                 "str {v:d}, [{ptr}]",
