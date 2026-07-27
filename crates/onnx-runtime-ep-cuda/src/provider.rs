@@ -85,6 +85,13 @@ impl CudaExecutionProvider {
         Self::new(0)
     }
 
+    /// Return whether a fully initialized CUDA EP can be constructed for this
+    /// device right now. This checks the driver, wheel/system libraries, device,
+    /// and thread binding rather than reporting a compile-time feature.
+    pub fn is_available(ordinal: u32) -> bool {
+        Self::initialized(ordinal).is_ok()
+    }
+
     /// Borrow the CUDA op registry (shared with the session layer).
     pub fn registry(&self) -> &OpRegistry {
         &self.registry
@@ -477,5 +484,17 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn sync(&self) -> Result<()> {
         self.runtime.synchronize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_availability_matches_constructability() {
+        let available = CudaExecutionProvider::is_available(0);
+        let constructible = CudaExecutionProvider::initialized(0).is_ok();
+        assert_eq!(available, constructible);
     }
 }

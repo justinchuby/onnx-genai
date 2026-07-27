@@ -179,9 +179,17 @@ and treats a CUDA input as a copy-fallback; the GPU tests
 ### Providers
 
 The default is `["CPUExecutionProvider"]`, always available (pure-Rust,
-offline). `"CUDAExecutionProvider"` is available **only** when the crate is
-built with the `cuda` Cargo feature; requesting an unknown or unbuilt provider
-raises a `ValueError` that lists what this build supports.
+offline). `"CUDAExecutionProvider"` is reported only when nxrt can construct it
+at runtime: the wheel/system CUDA libraries must load, the NVIDIA driver must
+be available, and a CUDA device must be reachable. A CUDA request that fails
+those checks raises an actionable error; nxrt never silently runs that request
+on CPU. Provider lists are validated in full and the first provider is the one
+applied to the session (visible through `session.get_providers()`).
+
+CUDA wheel discovery starts from the installed `site-packages` layout, probing
+each NVIDIA component under `nvidia/<component>/lib` on Linux and
+`nvidia/<component>/bin` on Windows before ambient loader paths. This supports
+`nxrt[cuda]` without requiring CUDA toolkit paths.
 
 ### GPU tracing (CUPTI) in the CUDA wheel
 

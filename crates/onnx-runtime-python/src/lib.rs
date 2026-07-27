@@ -59,38 +59,129 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 /// The `nxrt` distribution version, kept in lockstep with the crate version.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Execution providers this build can actually service, most-preferred first.
-///
-/// The CPU provider is always present; `CUDAExecutionProvider` appears only when
-/// the crate is compiled with the `cuda` feature (so the list never advertises a
-/// provider the wheel cannot honor — `RULES.md` §2/§5).
+/// Execution providers this process can construct right now, most-preferred
+/// first. CUDA is a runtime fact: it requires a loadable driver and wheel/system
+/// libraries plus a usable device.
 fn available_providers() -> Vec<&'static str> {
+    let mut providers = Vec::new();
     #[cfg(feature = "cuda")]
-    let v = vec!["CUDAExecutionProvider", "CPUExecutionProvider"];
-    #[cfg(not(feature = "cuda"))]
-    let v = vec!["CPUExecutionProvider"];
-    v
+    if cuda_runtime_available() {
+        providers.push("CUDAExecutionProvider");
+    }
+    providers.push("CPUExecutionProvider");
+    providers
 }
 
-/// Map a requested provider string to a concrete, buildable EP, or return an
-/// actionable error naming what is available.
-fn validate_provider(name: &str) -> PyResult<()> {
-    let available = available_providers();
-    if available.contains(&name) {
-        return Ok(());
-    }
-    // Distinguish "real ORT provider we simply don't build" from an outright
-    // typo, so the message can nudge toward the right next step.
-    let hint = if name == "CUDAExecutionProvider" {
-        " (this wheel was built without CUDA support; install a CUDA-enabled \
-         nxrt build or select \"CPUExecutionProvider\")"
-    } else {
-        ""
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedProvider {
+    Cpu,
+    Cuda,
+}
+
+fn select_provider(providers: &[String], cuda_available: bool) -> Result<SelectedProvider, String> {
+    let Some(first) = providers.first() else {
+        return Err(
+            "providers must be a non-empty list; pass [\"CPUExecutionProvider\"] or omit the argument for the default"
+                .to_string(),
+        );
     };
-    Err(PyValueError::new_err(format!(
-        "unknown execution provider {name:?}{hint}. Available providers in this \
-         build: {available:?}"
-    )))
+    for provider in providers {
+        match provider.as_str() {
+            "CPUExecutionProvider" => {}
+            "CUDAExecutionProvider" if cuda_available => {}
+            "CUDAExecutionProvider" => {
+                return Err(
+                    "CUDAExecutionProvider is unavailable at runtime: nxrt could not construct \
+                     a CUDA provider with a loadable driver, CUDA libraries, and device. Install \
+                     a CUDA-enabled nxrt wheel plus its `cuda` extra, verify the NVIDIA driver, \
+                     or request only \"CPUExecutionProvider\"."
+                        .to_string(),
+                );
+            }
+            _ => {
+                return Err(format!(
+                    "unknown execution provider {provider:?}. Available providers on this \
+                     machine: {:?}",
+                    available_providers()
+                ));
+            }
+        }
+    }
+    Ok(match first.as_str() {
+        "CPUExecutionProvider" => SelectedProvider::Cpu,
+        "CUDAExecutionProvider" => SelectedProvider::Cuda,
+        // Every name was validated above.
+        _ => unreachable!("validated execution provider"),
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_runtime_available() -> bool {
+    onnx_runtime_ep_cuda::CudaExecutionProvider::is_available(0)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_runtime_available() -> bool {
+    false
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_execution_provider() -> PyResult<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>
+{
+    use onnx_runtime_ep_cuda::CudaExecutionProvider;
+
+    CudaExecutionProvider::initialized(0)
+        .map(|provider| std::sync::Arc::new(provider) as _)
+        .map_err(|error| {
+            PyRuntimeError::new_err(format!(
+                "CUDAExecutionProvider is unavailable at runtime: {error}. Install nxrt's \
+                 `cuda` extra and verify the NVIDIA driver, or request \
+                 \"CPUExecutionProvider\"."
+            ))
+        })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_execution_provider() -> PyResult<std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>>
+{
+    Err(PyRuntimeError::new_err(
+        "CUDAExecutionProvider is unavailable because this nxrt wheel was built without CUDA \
+         support. Install a CUDA-enabled nxrt build or request \"CPUExecutionProvider\".",
+    ))
+}
+
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::*;
+
+    #[test]
+    fn cpu_provider_is_always_selectable() {
+        assert_eq!(
+            select_provider(&["CPUExecutionProvider".to_string()], false),
+            Ok(SelectedProvider::Cpu)
+        );
+    }
+
+    #[test]
+    fn unavailable_cuda_provider_is_rejected() {
+        let error = select_provider(&["CUDAExecutionProvider".to_string()], false)
+            .expect_err("unavailable CUDA must not fall back silently");
+        assert!(error.contains("unavailable at runtime"));
+    }
+
+    #[test]
+    fn available_cuda_provider_is_selected_first() {
+        assert_eq!(
+            select_provider(
+                &[
+                    "CUDAExecutionProvider".to_string(),
+                    "CPUExecutionProvider".to_string(),
+                ],
+                true,
+            ),
+            Ok(SelectedProvider::Cuda)
+        );
+    }
 }
 
 /// numpy dtype canonical `.name` → nxrt [`DataType`].
@@ -288,9 +379,10 @@ impl InferenceSession {
     ///
     /// * `path_or_bytes` — `str`/`os.PathLike` path, or a `bytes` object holding
     ///   a serialized `ModelProto`.
-    /// * `providers` — ordered execution-provider preference list; defaults to
-    ///   `["CPUExecutionProvider"]`. Unknown or unbuilt providers raise
-    ///   `ValueError` listing what this build supports.
+    /// * `providers` — ordered provider preference list; nxrt validates every
+    ///   requested provider at runtime and executes with the first one. Defaults
+    ///   to `["CPUExecutionProvider"]`; unavailable providers raise an error
+    ///   rather than being silently dropped.
     #[new]
     #[pyo3(signature = (path_or_bytes, providers=None))]
     fn new(
@@ -299,22 +391,27 @@ impl InferenceSession {
         providers: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let providers = providers.unwrap_or_else(|| vec!["CPUExecutionProvider".to_string()]);
-        if providers.is_empty() {
-            return Err(PyValueError::new_err(
-                "providers must be a non-empty list; pass \
-                 [\"CPUExecutionProvider\"] or omit the argument for the default",
-            ));
-        }
-        for p in &providers {
-            validate_provider(p)?;
-        }
+        let selected =
+            select_provider(&providers, cuda_runtime_available()).map_err(PyValueError::new_err)?;
+        let execution_provider = match selected {
+            SelectedProvider::Cpu => None,
+            SelectedProvider::Cuda => Some(cuda_execution_provider()?),
+        };
+        let active_providers = match selected {
+            SelectedProvider::Cpu => vec!["CPUExecutionProvider".to_string()],
+            SelectedProvider::Cuda => vec!["CUDAExecutionProvider".to_string()],
+        };
 
         // Accept raw model bytes directly; otherwise treat the argument as a
         // path (covering str and os.PathLike via Python's str()).
         let session = if let Ok(pybytes) = path_or_bytes.cast::<PyBytes>() {
             let bytes = pybytes.as_bytes();
-            RtSession::load_bytes(bytes)
-                .map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
+            let builder = RtSession::builder().model_bytes(bytes);
+            let result = match execution_provider {
+                Some(provider) => builder.execution_provider(provider).build(),
+                None => builder.build(),
+            };
+            result.map_err(|e| load_error(&format!("<{} bytes>", bytes.len()), e))?
         } else {
             let path: String = path_or_bytes
                 .str()
@@ -332,7 +429,12 @@ impl InferenceSession {
                      .onnx file, or pass the serialized model as bytes."
                 )));
             }
-            RtSession::load(&path).map_err(|e| load_error(&path, e))?
+            let builder = RtSession::builder().model(&path);
+            let result = match execution_provider {
+                Some(provider) => builder.execution_provider(provider).build(),
+                None => builder.build(),
+            };
+            result.map_err(|e| load_error(&path, e))?
         };
 
         let inputs = session.inputs().to_vec();
@@ -342,7 +444,7 @@ impl InferenceSession {
             inner: Mutex::new(session),
             inputs,
             outputs,
-            providers,
+            providers: active_providers,
         })
     }
 
@@ -425,7 +527,7 @@ impl InferenceSession {
         })
     }
 
-    /// The execution providers this session was created with (as requested).
+    /// The execution provider actually applied to this session.
     fn get_providers(&self) -> Vec<String> {
         self.providers.clone()
     }
@@ -994,9 +1096,8 @@ impl BoundSession {
 }
 
 /// Map a friendly `device` string to the execution-provider list the session
-/// constructor understands. `cuda`/`cuda:N` fall back to CPU; `metal` maps to
-/// the CoreML provider name (unavailable in the pure-Rust build, so it raises an
-/// actionable error listing what is buildable).
+/// constructor understands. A CUDA request remains explicit: it errors if CUDA
+/// cannot be constructed rather than silently selecting CPU.
 fn device_to_providers(device: Option<&str>) -> PyResult<Vec<String>> {
     let dev = device.unwrap_or("cpu");
     let kind = dev.split(':').next().unwrap_or(dev).to_ascii_lowercase();
@@ -1004,8 +1105,9 @@ fn device_to_providers(device: Option<&str>) -> PyResult<Vec<String>> {
         "cpu" => vec!["CPUExecutionProvider".to_string()],
         "cuda" | "gpu" => {
             // A `cuda:N` suffix must be a non-negative integer ordinal. The
-            // ordinal has no effect yet (CUDA falls back to CPU in this build),
-            // but malformed input like `cuda:abc` is rejected up front.
+            // malformed input like `cuda:abc` is rejected up front. The
+            // currently selected CUDA EP is device 0; ordinal routing is a
+            // separate API extension.
             if let Some((_, ordinal)) = dev.split_once(':')
                 && (ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()))
             {
@@ -1355,7 +1457,7 @@ fn cupti_available() -> bool {
     onnx_runtime_tracer::cupti::CuptiProfiler::new().is_ok_and(|profiler| profiler.available())
 }
 
-/// Feed the CUPTI loader the interpreter's real search paths at import time.
+/// Return the interpreter's real package roots for CUDA wheel discovery.
 ///
 /// The tracer dlopen's `libcupti` lazily and caches the discovery result, so we
 /// must inject before any tracing begins. We hand it the live `sys.path` (which
@@ -1367,7 +1469,7 @@ fn cupti_available() -> bool {
 ///
 /// Best-effort: any lookup failure is ignored (env hints remain as fallback).
 #[cfg(feature = "cuda")]
-fn inject_cupti_search_paths(m: &Bound<'_, PyModule>) {
+fn python_package_search_paths(m: &Bound<'_, PyModule>) -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
 
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -1375,14 +1477,12 @@ fn inject_cupti_search_paths(m: &Bound<'_, PyModule>) {
     // The loaded extension module's own directory (…/site-packages/nxrt/…) and
     // its parent (the site-packages root where `nvidia/` is a sibling).
     if let Ok(file) = m.getattr("__file__")
-        && let Ok(file) = file.extract::<String>()
+        && let Ok(file) = file.extract::<PathBuf>()
+        && let Some(dir) = file.parent()
     {
-        let path = PathBuf::from(file);
-        if let Some(dir) = path.parent() {
-            paths.push(dir.to_path_buf());
-            if let Some(parent) = dir.parent() {
-                paths.push(parent.to_path_buf());
-            }
+        paths.push(dir.to_path_buf());
+        if let Some(parent) = dir.parent() {
+            paths.push(parent.to_path_buf());
         }
     }
 
@@ -1391,14 +1491,20 @@ fn inject_cupti_search_paths(m: &Bound<'_, PyModule>) {
         && let Ok(iter) = sys_path.try_iter()
     {
         for entry in iter.flatten() {
-            if let Ok(entry) = entry.extract::<String>()
-                && !entry.is_empty()
-            {
-                paths.push(PathBuf::from(entry));
+            if let Ok(entry) = entry.extract::<PathBuf>() {
+                paths.push(entry);
             }
         }
     }
 
+    paths
+}
+
+/// Feed CUDA loaders the interpreter's real search paths at import time.
+#[cfg(feature = "cuda")]
+fn inject_cuda_search_paths(m: &Bound<'_, PyModule>) {
+    let paths = python_package_search_paths(m);
+    onnx_runtime_ep_cuda::set_wheel_search_paths(paths.clone());
     onnx_runtime_tracer::cupti::set_search_paths(paths);
 }
 
@@ -1406,9 +1512,9 @@ fn inject_cupti_search_paths(m: &Bound<'_, PyModule>) {
 #[pymodule]
 fn nxrt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Inject the interpreter's real library search paths before anything can
-    // trigger CUPTI discovery (its OnceLock caches on first use).
+    // trigger CUDA or CUPTI discovery.
     #[cfg(feature = "cuda")]
-    inject_cupti_search_paths(m);
+    inject_cuda_search_paths(m);
 
     m.add("__version__", VERSION)?;
     let doc = "nxrt — Python bindings for ONNX inference, eager op dispatch, and generative AI.";
