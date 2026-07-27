@@ -1,5 +1,6 @@
-//! `MatMul`: numpy-style matrix multiplication for f32, including batched and
-//! broadcast leading dimensions and 1-D vector operands (`docs/ORT2.md` §4.4).
+//! `MatMul`: numpy-style matrix multiplication for floating-point tensors,
+//! including batched and broadcast leading dimensions and 1-D vector operands
+//! (`docs/ORT2.md` §4.4).
 //!
 //! ## Perf seam (Phase-1.5)
 //!
@@ -31,6 +32,7 @@ use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
 use rayon::prelude::*;
 
 use super::check_arity;
+use super::half_gemm::{self, HalfFormat, MatrixLayout};
 use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::{next_index, numel};
@@ -41,9 +43,8 @@ use crate::strided::{next_index, numel};
 #[path = "simd_gemm.rs"]
 mod simd_gemm;
 
-// Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. Same
-// inclusion pattern as `simd_gemm`: an internal perf detail of the bf16 MatMul
-// hot path, runtime-detected with a widen-to-f32 fallback, not a new op.
+// Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. It is
+// runtime-detected and otherwise falls back to the portable blocked half GEMM.
 #[path = "bf16_gemm.rs"]
 mod bf16_gemm;
 
@@ -315,11 +316,11 @@ impl MatMulKernel {
                 .saturating_mul(2)
         });
 
-        // Native bf16 fast path: both operands contiguous BFloat16 on an
-        // avx512_bf16 host → GEMM via `_mm512_dpbf16_ps` (f32 accumulate), then
-        // narrow into the output dtype. Falls through to the widen-to-f32 paths
-        // below on any other dtype/layout or host (the correctness reference).
-        if let Some(result) = try_matmul_bf16_native(&inputs[0], &inputs[1], &geom)? {
+        // Dedicated half-precision path: contiguous f16/bf16 operands stay in
+        // 16-bit storage and are packed in cache-sized panels for f32
+        // accumulation. Bf16 may use the runtime-gated AVX-512 BF16 kernel;
+        // every other host uses the portable blocked implementation.
+        if let Some(result) = try_matmul_half(&inputs[0], &inputs[1], &geom)? {
             return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
@@ -430,63 +431,55 @@ fn output_overlaps_input(
     out_origin < in_end && in_start < out_end
 }
 
-/// Attempt the native bf16 GEMM path: when both operands are contiguous
-/// `BFloat16` tensors and the host has `avx512_bf16`, compute `A @ B` (batched /
-/// broadcast) into a fresh f32 result via `_mm512_dpbf16_ps`, returning
-/// `Ok(Some(result))`. Returns `Ok(None)` when the native path does not apply
-/// (wrong dtype/layout, or no runtime support), so the caller falls back to the
-/// widen-to-f32 GEMM — the correctness reference that keeps the same binary
-/// correct on AVX2-only and non-x86 hosts.
-///
-/// The accumulator is f32 (the instruction's native accumulate width); operands
-/// stay bf16, halving operand bandwidth versus the upcast path.
-#[allow(unused_variables)]
-fn try_matmul_bf16_native(
+/// Attempt the dedicated portable half GEMM path. Both operands must be
+/// contiguous and have the same `Float16` or `BFloat16` dtype. The operands stay
+/// in 16-bit storage until cache-panel packing, accumulation is always `f32`,
+/// and the caller narrows once into the requested output dtype.
+fn try_matmul_half(
     a: &TensorView,
     b: &TensorView,
     geom: &MatMulGeometry,
 ) -> Result<Option<Vec<f32>>> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use onnx_runtime_ir::DataType;
-        if a.dtype != DataType::BFloat16
-            || b.dtype != DataType::BFloat16
-            || !a.is_contiguous()
-            || !b.is_contiguous()
-            || !bf16_gemm::native_available()
-        {
-            return Ok(None);
-        }
-        a.validate()?;
-        b.validate()?;
-        let mut out = vec![0.0f32; geom.result_len];
-        if out.is_empty() {
-            return Ok(Some(out));
-        }
-        let a_len = a.numel();
-        let b_len = b.numel();
-        // SAFETY: validated contiguous BFloat16 views address exactly `a_len` /
-        // `b_len` 2-byte elements; `half::bf16` is `repr(transparent)` over
-        // `u16`, so the same storage reads soundly as bf16 bit patterns.
-        let a_bits = unsafe { std::slice::from_raw_parts(a.data_ptr::<u16>(), a_len) };
-        let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), b_len) };
-        bf16_native_dense_into(a_bits, b_bits, geom, &mut out);
-        Ok(Some(out))
+    use onnx_runtime_ir::DataType;
+
+    let format = match (a.dtype, b.dtype) {
+        (DataType::Float16, DataType::Float16) => HalfFormat::F16,
+        (DataType::BFloat16, DataType::BFloat16) => HalfFormat::Bf16,
+        _ => return Ok(None),
+    };
+    if !a.is_contiguous() || !b.is_contiguous() {
+        return Ok(None);
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        Ok(None)
+    a.validate()?;
+    b.validate()?;
+    let mut out = vec![0.0f32; geom.result_len];
+    if out.is_empty() || geom.k == 0 {
+        return Ok(Some(out));
     }
+    let a_len = a.numel();
+    let b_len = b.numel();
+    // SAFETY: validated contiguous Float16/BFloat16 views address exactly
+    // `a_len`/`b_len` two-byte elements. Both half types are transparent over
+    // `u16`, so reading their storage as raw bit patterns is sound.
+    let a_bits = unsafe { std::slice::from_raw_parts(a.data_ptr::<u16>(), a_len) };
+    let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), b_len) };
+    half_dense_into(format, a_bits, b_bits, geom, &mut out);
+    Ok(Some(out))
 }
 
-/// Drive the native bf16 GEMM over a single, batched, or broadcast operand pair
-/// into `out` (row-major f32), reusing the shared batch-broadcast walk.
-#[cfg(target_arch = "x86_64")]
-fn bf16_native_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut [f32]) {
+/// Drive the half GEMM over a single, batched, or broadcast operand pair into
+/// `out` (row-major f32), reusing the shared batch-broadcast walk.
+fn half_dense_into(
+    format: HalfFormat,
+    a: &[u16],
+    b: &[u16],
+    geom: &MatMulGeometry,
+    out: &mut [f32],
+) {
     let (m, k, n) = (geom.m, geom.k, geom.n);
     let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
     if geom.batch_shape.is_empty() {
-        bf16_gemm::gemm(a, b, out, m, k, n);
+        half_gemm_tile(format, a, b, out, m, k, n);
         return;
     }
     let mut bidx = vec![0usize; geom.batch_shape.len()];
@@ -494,7 +487,8 @@ fn bf16_native_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut
     loop {
         let a_off = broadcast_offset(&bidx, &geom.a_batch, &geom.a_batch_strides) * a_mat;
         let b_off = broadcast_offset(&bidx, &geom.b_batch, &geom.b_batch_strides) * b_mat;
-        bf16_gemm::gemm(
+        half_gemm_tile(
+            format,
             &a[a_off..a_off + a_mat],
             &b[b_off..b_off + b_mat],
             &mut out[b_out * c_mat..b_out * c_mat + c_mat],
@@ -509,16 +503,46 @@ fn bf16_native_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut
     }
 }
 
+/// Select the runtime-gated AVX-512 BF16 microkernel when available; otherwise
+/// use the portable blocked half GEMM. The f16 path is always portable today.
+fn half_gemm_tile(
+    format: HalfFormat,
+    a: &[u16],
+    b: &[u16],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if format == HalfFormat::Bf16 && bf16_gemm::native_available() {
+        bf16_gemm::gemm(a, b, c, m, k, n);
+        return;
+    }
+
+    half_gemm::gemm(
+        format,
+        a,
+        MatrixLayout::row_major(k),
+        b,
+        MatrixLayout::row_major(n),
+        c,
+        m,
+        k,
+        n,
+    );
+}
+
 /// Compute `A @ B` (numpy semantics: batched, broadcast leading dims, 1-D
 /// operand promotion) into a dense row-major `Vec<f32>`.
 ///
-/// Operands may be any float dtype (`f32`/`f16`/`bf16`/`f64`); low/medium
-/// precision inputs are widened to `f32` and the GEMM accumulates in `f32`
-/// (standard mixed-precision matmul). Shared by [`MatMulKernel`] and the fused
-/// `FusedMatMulBias` kernel so both go through exactly one GEMM implementation.
+/// Operands may be any float dtype (`f32`/`f16`/`bf16`/`f64`). Contiguous half
+/// inputs use the blocked half GEMM; other low/medium precision layouts widen to
+/// dense `f32`. Both routes accumulate in `f32`. Shared by [`MatMulKernel`] and
+/// the fused `FusedMatMulBias` kernel.
 pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     let geom = matmul_geometry(a, b)?;
-    if let Some(result) = try_matmul_bf16_native(a, b, &geom)? {
+    if let Some(result) = try_matmul_half(a, b, &geom)? {
         return Ok(result);
     }
     matmul_dense_impl_with_backend(
@@ -547,7 +571,7 @@ fn matmul_dense_prepacked_with_backend(
     backend: CpuBackend,
 ) -> Result<Vec<f32>> {
     let geom = matmul_geometry(a, b)?;
-    if let Some(result) = try_matmul_bf16_native(a, b, &geom)? {
+    if let Some(result) = try_matmul_half(a, b, &geom)? {
         return Ok(result);
     }
     matmul_dense_impl_with_backend(
@@ -894,6 +918,101 @@ mod tests {
     }
 
     #[test]
+    fn matmul_half_dispatch_matches_widened_reference_across_irregular_shapes() {
+        use onnx_runtime_ir::DataType;
+
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (1, 127, 65),
+            (3, 5, 7),
+            (17, 130, 11),
+            (5, 257, 2),
+            (2, 0, 3),
+        ];
+        let mut state = 0x51A7_CAFE_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_216.0 - 0.5) * 0.5
+        };
+
+        for dtype in [DataType::Float16, DataType::BFloat16] {
+            for &(m, k, n) in SHAPES {
+                let a_source: Vec<f32> = (0..m * k).map(|_| next()).collect();
+                let b_source: Vec<f32> = (0..k * n).map(|_| next()).collect();
+                let round = |value: f32| match dtype {
+                    DataType::Float16 => half::f16::from_f32(value).to_f32(),
+                    DataType::BFloat16 => half::bf16::from_f32(value).to_f32(),
+                    _ => unreachable!(),
+                };
+                let a_wide: Vec<f32> = a_source.iter().copied().map(round).collect();
+                let b_wide: Vec<f32> = b_source.iter().copied().map(round).collect();
+                let a = match dtype {
+                    DataType::Float16 => Owned::f16(&[m, k], &a_source),
+                    DataType::BFloat16 => Owned::bf16(&[m, k], &a_source),
+                    _ => unreachable!(),
+                };
+                let b = match dtype {
+                    DataType::Float16 => Owned::f16(&[k, n], &b_source),
+                    DataType::BFloat16 => Owned::bf16(&[k, n], &b_source),
+                    _ => unreachable!(),
+                };
+                let geometry = matmul_geometry(&a.view(), &b.view()).unwrap();
+                assert!(
+                    try_matmul_half(&a.view(), &b.view(), &geometry)
+                        .unwrap()
+                        .is_some(),
+                    "{dtype:?} should select the dedicated half GEMM"
+                );
+
+                let mut expected = vec![0.0f32; m * n];
+                for row in 0..m {
+                    for column in 0..n {
+                        for depth in 0..k {
+                            expected[row * n + column] +=
+                                a_wide[row * k + depth] * b_wide[depth * n + column];
+                        }
+                        expected[row * n + column] = round(expected[row * n + column]);
+                    }
+                }
+
+                let mut first = Owned::zeros(dtype, &[m, n]);
+                let mut second = Owned::zeros(dtype, &[m, n]);
+                MatMulKernel::default()
+                    .execute(&[a.view(), b.view()], &mut [first.view_mut()])
+                    .unwrap();
+                MatMulKernel::default()
+                    .execute(&[a.view(), b.view()], &mut [second.view_mut()])
+                    .unwrap();
+                let first = match dtype {
+                    DataType::Float16 => first.to_f16_as_f32(),
+                    DataType::BFloat16 => first.to_bf16_as_f32(),
+                    _ => unreachable!(),
+                };
+                let second = match dtype {
+                    DataType::Float16 => second.to_f16_as_f32(),
+                    DataType::BFloat16 => second.to_bf16_as_f32(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(first, second, "{dtype:?} {m}x{k}x{n} was not deterministic");
+
+                let tolerance = match dtype {
+                    DataType::Float16 => 2e-3,
+                    DataType::BFloat16 => 3e-2,
+                    _ => unreachable!(),
+                };
+                let max_error = first
+                    .iter()
+                    .zip(expected)
+                    .map(|(actual, expected)| (actual - expected).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_error <= tolerance,
+                    "{dtype:?} {m}x{k}x{n}: max error {max_error} exceeds {tolerance}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn matmul_f16_preserves_near_tie_argmax_after_f32_accumulation() {
         // The f32 reference margin (0.01171875) is below one f16 ULP at 20.
         // Widened accumulation must still retain the correct first-column winner
@@ -969,7 +1088,7 @@ mod tests {
 
             // f64 reference over the bf16-rounded values.
             let mut reference = vec![0.0f64; m * n];
-            // Upcast path: widen bf16 -> f32, accumulate in f32 (current default).
+            // Upcast reference: widen bf16 -> f32, accumulate in f32.
             let mut upcast = vec![0.0f32; m * n];
             for row in 0..m {
                 for col in 0..n {
@@ -1116,8 +1235,8 @@ mod tests {
                 }))
             };
 
-            // Upcast path: widen bf16 -> f32 (what the current bf16 path does),
-            // then the crate's f32 SGEMM.
+            // Upcast reference: widen bf16 -> f32, then use the crate's f32
+            // SGEMM.
             let upcast_ms = {
                 let (a, b) = (a_bits.clone(), b_bits.clone());
                 median3(Box::new(move || {

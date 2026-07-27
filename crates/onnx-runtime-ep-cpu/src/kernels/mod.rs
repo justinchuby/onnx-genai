@@ -61,6 +61,7 @@ pub mod gelu;
 pub mod gemm;
 pub mod grid_sample;
 pub mod group_query_attention;
+mod half_gemm;
 pub mod hardmax;
 pub mod identity;
 pub mod index_share;
