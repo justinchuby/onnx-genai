@@ -1,8 +1,11 @@
-//! Apple Accelerate + NEON GEMV for the M=1 decode hot path.
+//! Apple Accelerate + NEON GEMV for the M=1 decode hot path,
+//! plus BNNS fp16→f32 MatMul for M≥2 prefill/batch-decode (reaches AMX).
 //!
-//! Three routes, selected per-op by matrix geometry:
+//! Four routes, selected per-op by matrix geometry:
 //!
-//! - `sgemm`: Accelerate `cblas_sgemm` for M>1 prefill (reaches AMX).
+//! - `sgemm`: Accelerate `cblas_sgemm` for M>1 f32 prefill (reaches AMX).
+//! - `bnns_matmul_f16`: BNNS `BNNSFilterCreateLayerBroadcastMatMul` for M≥2
+//!   fp16→f32 prefill/batch-decode (~2451 GFLOPS on M1 Max via AMX).
 //! - `neon_gemv_col_parallel`: Column-parallel NEON GEMV on pre-transposed B
 //!   for M=1 decode (65-93 GB/s with Rayon on M1 Max).
 //! - `neon_gemv_parallel`: Row-parallel NEON GEMV fallback for M=1 when
@@ -53,6 +56,154 @@ pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) 
             c.as_mut_ptr(),
             n as i32,
         );
+    }
+}
+
+// ─── BNNS fp16→f32 MatMul (prefill / batch-decode, M≥2) ─────────────
+
+/// BNNS NDArray descriptor — matches Apple's C struct layout exactly (176 bytes).
+/// Row-major convention: `size[0]` = columns (N), `size[1]` = rows (M).
+#[repr(C)]
+struct BNNSNDArrayDescriptor {
+    flags: u32,
+    layout: u32,
+    size: [usize; 8],
+    stride: [usize; 8],
+    data: *mut std::ffi::c_void,
+    data_type: u32,
+    _pad0: u32,
+    table_data: *mut std::ffi::c_void,
+    table_data_type: u32,
+    data_scale: f32,
+    data_bias: f32,
+    _pad1: u32,
+}
+
+/// BNNS broadcast matmul parameters — matches Apple's C struct (544 bytes).
+#[repr(C)]
+struct BNNSLayerParametersBroadcastMatMul {
+    alpha: f32,
+    beta: f32,
+    trans_a: bool,
+    trans_b: bool,
+    quadratic: bool,
+    a_is_weights: bool,
+    b_is_weights: bool,
+    _pad: [u8; 3],
+    i_a_desc: BNNSNDArrayDescriptor,
+    i_b_desc: BNNSNDArrayDescriptor,
+    o_desc: BNNSNDArrayDescriptor,
+}
+
+/// Opaque BNNS filter handle.
+type BNNSFilter = *mut std::ffi::c_void;
+
+/// BNNSFilterParameters — pass null for defaults.
+#[repr(C)]
+struct BNNSFilterParameters {
+    _opaque: [u8; 0],
+}
+
+const BNNS_DATA_TYPE_FLOAT16: u32 = 0x10010;
+const BNNS_DATA_TYPE_FLOAT32: u32 = 0x10020;
+const BNNS_DATA_LAYOUT_ROW_MAJOR_MATRIX: u32 = 0x20000;
+
+unsafe extern "C" {
+    fn BNNSFilterCreateLayerBroadcastMatMul(
+        params: *const BNNSLayerParametersBroadcastMatMul,
+        filter_params: *const BNNSFilterParameters,
+    ) -> BNNSFilter;
+
+    fn BNNSFilterApplyTwoInput(
+        filter: BNNSFilter,
+        input1: *const std::ffi::c_void,
+        input2: *const std::ffi::c_void,
+        output: *mut std::ffi::c_void,
+    ) -> i32;
+
+    fn BNNSFilterDestroy(filter: BNNSFilter);
+}
+
+fn make_nd_desc(
+    rows: usize,
+    cols: usize,
+    data_type: u32,
+    data: *mut std::ffi::c_void,
+) -> BNNSNDArrayDescriptor {
+    let mut size = [0usize; 8];
+    let mut stride = [0usize; 8];
+    size[0] = cols;
+    size[1] = rows;
+    stride[0] = 1;
+    stride[1] = cols;
+    BNNSNDArrayDescriptor {
+        flags: 0,
+        layout: BNNS_DATA_LAYOUT_ROW_MAJOR_MATRIX,
+        size,
+        stride,
+        data,
+        data_type,
+        _pad0: 0,
+        table_data: std::ptr::null_mut(),
+        table_data_type: 0,
+        data_scale: 0.0,
+        data_bias: 0.0,
+        _pad1: 0,
+    }
+}
+
+/// Returns `true` if BNNS fp16→f32 matmul is available on this system.
+/// Result is cached after the first probe.
+pub fn bnns_matmul_available() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 = unchecked, 1 = available, 2 = unavailable
+    static CACHED: AtomicU8 = AtomicU8::new(0);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != 0 {
+        return v == 1;
+    }
+    let a: [u16; 1] = [0x3C00]; // fp16 1.0
+    let b: [u16; 1] = [0x3C00];
+    let mut c: [f32; 1] = [0.0];
+    let ok = bnns_matmul_f16(&a, &b, &mut c, 1, 1, 1) && (c[0] - 1.0).abs() < 1e-3;
+    CACHED.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    ok
+}
+
+/// C[m,n] = A[m,k] @ B[k,n] via BNNS, fp16 inputs → f32 output.
+/// Returns `true` on success, `false` if the filter could not be created.
+pub fn bnns_matmul_f16(a: &[u16], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(b.len(), k * n);
+    debug_assert_eq!(c.len(), m * n);
+
+    let params = BNNSLayerParametersBroadcastMatMul {
+        alpha: 1.0,
+        beta: 0.0,
+        trans_a: false,
+        trans_b: false,
+        quadratic: false,
+        a_is_weights: false,
+        b_is_weights: false,
+        _pad: [0; 3],
+        i_a_desc: make_nd_desc(m, k, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
+        i_b_desc: make_nd_desc(k, n, BNNS_DATA_TYPE_FLOAT16, std::ptr::null_mut()),
+        o_desc: make_nd_desc(m, n, BNNS_DATA_TYPE_FLOAT32, std::ptr::null_mut()),
+    };
+
+    unsafe {
+        let filter = BNNSFilterCreateLayerBroadcastMatMul(&params, std::ptr::null());
+        if filter.is_null() {
+            return false;
+        }
+        let rc = BNNSFilterApplyTwoInput(
+            filter,
+            a.as_ptr() as *const std::ffi::c_void,
+            b.as_ptr() as *const std::ffi::c_void,
+            c.as_mut_ptr() as *mut std::ffi::c_void,
+        );
+        BNNSFilterDestroy(filter);
+        rc == 0
     }
 }
 
@@ -836,6 +987,142 @@ mod tests {
         assert!(
             max_err < F16_GEMV_MAX_ABS_TOLERANCE,
             "f16 gemv odd tail max error {max_err} exceeds {F16_GEMV_MAX_ABS_TOLERANCE}"
+        );
+    }
+
+    // ─── BNNS fp16→f32 tests ───────────────────────────────────
+
+    #[test]
+    fn bnns_availability_probe_returns_consistent_result() {
+        let first = bnns_matmul_available();
+        let second = bnns_matmul_available();
+        assert_eq!(
+            first, second,
+            "BNNS availability probe must be deterministic"
+        );
+    }
+
+    /// Numerics parity: BNNS fp16→f32 vs f64 reference at multiple shapes.
+    /// Tolerance scales with sqrt(K) to account for fp16 mantissa errors
+    /// accumulating during the K-dimension reduction.
+    #[test]
+    fn bnns_matmul_f16_matches_f64_reference() {
+        if !bnns_matmul_available() {
+            eprintln!("BNNS not available, skipping");
+            return;
+        }
+        let shapes: &[(usize, usize, usize)] = &[
+            (2, 4, 3),
+            (4, 8, 6),
+            (16, 64, 32),
+            (128, 896, 4864), // model-scale prefill
+        ];
+        for &(m, k, n) in shapes {
+            let a_f32: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 997) as f32) * 0.001 - 0.5)
+                .collect();
+            let b_f32: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 991) as f32) * 0.001 - 0.5)
+                .collect();
+            let a_f16 = f32_to_f16_bits(&a_f32);
+            let b_f16 = f32_to_f16_bits(&b_f32);
+            let a_f64: Vec<f64> = a_f16
+                .iter()
+                .map(|&v| half::f16::from_bits(v).to_f64())
+                .collect();
+            let b_f64: Vec<f64> = b_f16
+                .iter()
+                .map(|&v| half::f16::from_bits(v).to_f64())
+                .collect();
+            let mut ref_c = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f64;
+                    for p in 0..k {
+                        sum += a_f64[i * k + p] * b_f64[p * n + j];
+                    }
+                    ref_c[i * n + j] = sum;
+                }
+            }
+            let mut c = vec![0.0f32; m * n];
+            assert!(
+                bnns_matmul_f16(&a_f16, &b_f16, &mut c, m, k, n),
+                "BNNS filter creation failed for ({m},{k},{n})"
+            );
+            let max_rel = c
+                .iter()
+                .zip(&ref_c)
+                .filter(|(_, r)| r.abs() > 1e-6)
+                .map(|(a, r)| (((*a as f64) - r) / r).abs())
+                .fold(0.0f64, f64::max);
+            // fp16 has ~9.77e-4 relative precision; f32 accumulation over K
+            // elements introduces ~sqrt(K) * eps_fp16 expected error.
+            let tol = 0.005 + (k as f64).sqrt() * 2e-3;
+            assert!(
+                max_rel < tol,
+                "BNNS f16 matmul ({m},{k},{n}) max relative error {max_rel:.6} \
+                 exceeds tolerance {tol:.4}"
+            );
+        }
+    }
+
+    /// Edge values: fp16 max, denormals, NaN, zero.
+    #[test]
+    fn bnns_matmul_f16_handles_edge_values() {
+        if !bnns_matmul_available() {
+            eprintln!("BNNS not available, skipping");
+            return;
+        }
+        let max_f16: u16 = 0x7BFF; // 65504.0
+        let one_f16: u16 = 0x3C00; // 1.0
+        let mut c = [0.0f32; 1];
+        assert!(bnns_matmul_f16(&[max_f16], &[one_f16], &mut c, 1, 1, 1));
+        assert!(
+            (c[0] - 65504.0).abs() < 1.0,
+            "fp16 max * 1.0 = {} (expected ~65504.0)",
+            c[0]
+        );
+
+        let zero: u16 = 0x0000;
+        c[0] = 999.0;
+        assert!(bnns_matmul_f16(&[zero], &[max_f16], &mut c, 1, 1, 1));
+        assert!(c[0].abs() < 1e-6, "zero * max = {} (expected 0.0)", c[0]);
+
+        let nan_f16: u16 = 0x7E00;
+        c[0] = 0.0;
+        assert!(bnns_matmul_f16(&[nan_f16], &[one_f16], &mut c, 1, 1, 1));
+        assert!(c[0].is_nan(), "NaN * 1.0 should be NaN, got {}", c[0]);
+
+        let denorm: u16 = 0x0001;
+        c[0] = 999.0;
+        assert!(bnns_matmul_f16(&[denorm], &[one_f16], &mut c, 1, 1, 1));
+        assert!(
+            c[0].abs() < 1e-4,
+            "denorm * 1.0 = {} (expected near zero)",
+            c[0]
+        );
+    }
+
+    /// Bitwise determinism: same inputs produce identical output bytes.
+    #[test]
+    fn bnns_matmul_f16_deterministic() {
+        if !bnns_matmul_available() {
+            eprintln!("BNNS not available, skipping");
+            return;
+        }
+        let (m, k, n) = (16, 64, 32);
+        let a_f32: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_f32: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+        let a = f32_to_f16_bits(&a_f32);
+        let b = f32_to_f16_bits(&b_f32);
+        let mut c1 = vec![0.0f32; m * n];
+        let mut c2 = vec![0.0f32; m * n];
+        assert!(bnns_matmul_f16(&a, &b, &mut c1, m, k, n));
+        assert!(bnns_matmul_f16(&a, &b, &mut c2, m, k, n));
+        assert_eq!(
+            c1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            c2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "BNNS must be bitwise deterministic"
         );
     }
 }

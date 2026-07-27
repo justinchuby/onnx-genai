@@ -67,6 +67,13 @@ pub(crate) use accelerate_gemm::neon_gemv_f16_col_parallel;
 ))]
 static GEMV_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter: incremented each time the BNNS fp16→f32 prefill path is
+/// reached inside [`try_matmul_half`]. Guards against dispatch regressions where
+/// the portable half GEMM intercepts M≥2 fp16 on macOS before the AMX-backed
+/// BNNS path.
+#[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
+static BNNS_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
 /// Contiguous f32 constants already have the ideal representation, so they stay
@@ -671,6 +678,18 @@ fn try_matmul_half(
     // `u16`, so reading their storage as raw bit patterns is sound.
     let a_bits = unsafe { std::slice::from_raw_parts(a.data_ptr::<u16>(), a_len) };
     let b_bits = unsafe { std::slice::from_raw_parts(b.data_ptr::<u16>(), b_len) };
+
+    // BNNS fp16→f32 path for M≥2 on macOS: reaches AMX, ~15–25× faster than
+    // the portable NEON blocked GEMM at prefill shapes. Only for f16 (not bf16).
+    // Called from the dispatch level, NOT from inside a Rayon parallel region.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if format == HalfFormat::F16 && geom.m >= 2 && accelerate_gemm::bnns_matmul_available() {
+        #[cfg(test)]
+        BNNS_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bnns_half_dense_into(a_bits, b_bits, geom, &mut out);
+        return Ok(Some(out));
+    }
+
     half_dense_into(format, a_bits, b_bits, geom, &mut out);
     Ok(Some(out))
 }
@@ -704,6 +723,38 @@ fn half_dense_into(
             k,
             n,
         );
+        b_out += 1;
+        if !next_index(&geom.batch_shape, &mut bidx) {
+            break;
+        }
+    }
+}
+
+/// Drive BNNS fp16→f32 matmul over a single, batched, or broadcast operand pair.
+/// Each per-tile call is made from the dispatch level (not inside a Rayon parallel
+/// region) to avoid oversubscribing GCD threads. Falls back to the portable
+/// half GEMM if BNNS fails for a particular tile.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn bnns_half_dense_into(a: &[u16], b: &[u16], geom: &MatMulGeometry, out: &mut [f32]) {
+    let (m, k, n) = (geom.m, geom.k, geom.n);
+    let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
+    if geom.batch_shape.is_empty() {
+        if !accelerate_gemm::bnns_matmul_f16(a, b, out, m, k, n) {
+            half_gemm_tile(HalfFormat::F16, a, b, out, m, k, n);
+        }
+        return;
+    }
+    let mut bidx = vec![0usize; geom.batch_shape.len()];
+    let mut b_out = 0usize;
+    loop {
+        let a_off = broadcast_offset(&bidx, &geom.a_batch, &geom.a_batch_strides) * a_mat;
+        let b_off = broadcast_offset(&bidx, &geom.b_batch, &geom.b_batch_strides) * b_mat;
+        let a_tile = &a[a_off..a_off + a_mat];
+        let b_tile = &b[b_off..b_off + b_mat];
+        let c_tile = &mut out[b_out * c_mat..b_out * c_mat + c_mat];
+        if !accelerate_gemm::bnns_matmul_f16(a_tile, b_tile, c_tile, m, k, n) {
+            half_gemm_tile(HalfFormat::F16, a_tile, b_tile, c_tile, m, k, n);
+        }
         b_out += 1;
         if !next_index(&geom.batch_shape, &mut bidx) {
             break;
@@ -2256,6 +2307,148 @@ mod tests {
         assert!(
             out.to_f32().iter().all(|v| v.is_finite()),
             "GEMV produced non-finite output"
+        );
+    }
+
+    // ─── BNNS prefill dispatch reachability ─────────────────────────
+
+    /// Guard: FP16 M≥2 prefill on macOS must reach the BNNS path, not
+    /// the portable half_gemm. The BNNS path reaches AMX at ~2451 GFLOPS
+    /// vs 52 GFLOPS for the NEON blocked GEMM.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn fp16_m_ge2_prefill_reaches_bnns_not_half_gemm() {
+        use std::sync::atomic::Ordering;
+
+        if !accelerate_gemm::bnns_matmul_available() {
+            eprintln!("BNNS not available, skipping dispatch guard");
+            return;
+        }
+
+        let (m, k, n) = (4, 64, 32);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = BNNS_F16_TEST_HITS.load(Ordering::SeqCst);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = BNNS_F16_TEST_HITS.load(Ordering::SeqCst);
+
+        assert!(
+            after > before,
+            "FP16 M≥2 prefill did not reach BNNS path — \
+             the portable half_gemm.rs is likely intercepting before BNNS, \
+             which would regress prefill by ~47×"
+        );
+        assert!(
+            out.to_f32().iter().all(|v| v.is_finite()),
+            "BNNS produced non-finite output"
+        );
+    }
+
+    /// Guard: BF16 M≥2 must NOT reach the BNNS path (BNNS only supports f16).
+    /// Verified by checking that bf16 output matches the portable half_gemm
+    /// reference — if BNNS were used, it would reinterpret bf16 bits as f16,
+    /// producing wildly incorrect results.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn bf16_m_ge2_does_not_reach_bnns() {
+        let (m, k, n) = (4, 64, 32);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::bf16(&[m, k], &a_data);
+        let b = Owned::bf16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        // Compute f64 reference from the actual bf16-rounded values
+        let a_bf16: Vec<half::bf16> = a_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let b_bf16: Vec<half::bf16> = b_data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a_bf16[i * k + p].to_f64() * b_bf16[p * n + j].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+
+        let result = out.to_f32();
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.05,
+            "BF16 M≥2 max relative error {max_rel:.6} — if extremely large, \
+             BNNS may be reinterpreting bf16 bits as f16"
+        );
+    }
+
+    /// Numerics parity: end-to-end MatMulKernel with f16 at M≥2 must match
+    /// the f64 reference, exercising the BNNS dispatch path on macOS.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn bnns_f16_prefill_matches_f64_reference_via_matmul_kernel() {
+        let (m, k, n) = (8, 64, 32);
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 997) as f32) * 0.001 - 0.5)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 991) as f32) * 0.001 - 0.5)
+            .collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        let a_f16: Vec<half::f16> = a_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let b_f16: Vec<half::f16> = b_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let mut ref_c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for p in 0..k {
+                    sum += a_f16[i * k + p].to_f64() * b_f16[p * n + j].to_f64();
+                }
+                ref_c[i * n + j] = sum;
+            }
+        }
+
+        let result = out.to_f32();
+        let max_rel = result
+            .iter()
+            .zip(&ref_c)
+            .filter(|(_, r)| r.abs() > 1e-6)
+            .map(|(a, r)| (((*a as f64) - r) / r).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_rel < 0.01,
+            "BNNS f16 prefill max relative error {max_rel:.6} exceeds 1%"
         );
     }
 }
