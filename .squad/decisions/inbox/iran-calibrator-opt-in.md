@@ -23,18 +23,15 @@ The `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` env var semantics changed:
 
 A library should be predictable by default, adaptive on request.
 
-**Measurements (M1 Max, FP16 Qwen2.5-0.5B):**
+**Measurements (M1 Max, FP16 Qwen2.5-0.5B, post GEMV dispatch fix):**
 
-| Condition | Default (pool) | Old default (would have picked) |
-|---|---|---|
-| Quiet host | 43.75 tok/s | 43.75 tok/s (pool) |
-| 8x load | 3.09 tok/s | ~13 tok/s (flat, via calibrator) |
+| Condition | Default (pool) | Adaptive (`=auto`) | Flat (`=0`) | ORT |
+|---|---|---|---|---|
+| Quiet (load ~4-5) | 53.35 tok/s | 56.10 tok/s | 42.84 tok/s | 42.19 tok/s |
+| 4×`yes` load (~10) | 18.96 tok/s | 31.95 tok/s | 31.57 tok/s | 37.76 tok/s |
 
-The pool is worse under heavy load — this is the accepted tradeoff for predictability. Users who need adaptation set `=auto`.
+Under moderate load (4 contending cores), the pool degrades ~2× more than flat because its pinned workers compete with load processes. This is the accepted tradeoff for predictability and reproducibility. Users who need adaptation set `=auto`.
 
-**Observability:** The selected path is logged once at pool build time via `eprintln!`, e.g.:
-```
-onnx-genai: decode path = persistent SPMD pool (default). Set ...=auto for load-adaptive selection, =0 for the flat legacy path
-```
+**Observability:** The selected path is queryable via `decode_path_label()` → `"spmd-pool"`, `"adaptive"`, `"flat"`, or `"unresolved"`. Diagnostic prints are gated behind `NXRT_CALIB_DEBUG` env var (no unconditional stderr output from the library).
 
 **Fallback:** Single-core hosts (cpuset=1) and `THREADS=0` fall back to the flat path with a diagnostic. The `P-1` worker formula produces `max(1,0)=1` on a 1-P-core host.

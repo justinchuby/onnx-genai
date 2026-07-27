@@ -37,3 +37,11 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 - Quiet: 43.75 tok/s (pool default). Under 8×load: 3.09 tok/s (accepted tradeoff for predictability; old adaptive would have chosen flat ~13 tok/s).
 - x86_64-apple-darwin cross-compilation confirmed clean with `cargo clippy -D warnings`.
 - Per-generation freeze from `177e8a73` preserved (orthogonal, not touched).
+
+### 2026-07-27 — Coordinator review fixes (eprintln removal + GEMV dispatch)
+- **Commit `69f00b83`**: Replaced unconditional `eprintln!` in `report_pool_built()` and `report_spmd_fallback()` with queryable `decode_path_label()` API (`DECODE_PATH_LABEL` OnceLock) + `NXRT_CALIB_DEBUG` gated diagnostics. A library must not print to streams the caller owns.
+- **Commit `ed7a65e3`**: Fixed M=1 decode dispatch regression — moved NEON GEMV check *before* `try_matmul_half` in `MatMulKernel::execute_with_backend`. Sebastian's `half_gemm.rs` (50184994) intercepted f16×f16 at all M, causing 14.5→53.4 tok/s recovery (4× regression). Deckard's `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` test now passes.
+- **Measurement matrix** (load avg 1-min stated, machine shared with Copilot ~251% CPU baseline):
+  - Quiet (load ~4-5): pool 53.35 [46.03,57.61], adaptive 56.10 [50.43,58.57], flat 42.84 [42.01,43.16], ORT 42.19 [41.79,42.61]
+  - Under 4×`yes` load (~10): pool 18.96 [18.18,20.48], adaptive 31.95 [31.77,33.30], flat 31.57 [31.16,31.75], ORT 37.76
+- Verified: clean stderr (no unconditional prints), all 33 decode_spmd tests pass, Deckard's dispatch test passes, x86_64 clippy clean, `check_profile_table.py` passes.
