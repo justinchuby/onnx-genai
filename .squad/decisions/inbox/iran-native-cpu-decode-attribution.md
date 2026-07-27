@@ -230,3 +230,67 @@ Rayon fork-join overhead vs ORT's MLAS persistent pool.
 3. **Persistent barrier pool (GCD/pthread)**: Deadlocked in standalone test, but the 
    concept is sound — Rayon's ~5 µs per fork-join × 169 calls = 0.85 ms overhead.
 
+
+## Session 4 Update — Dispatch Overhead Reduction
+
+**Authoritative harness result: 31.30 tok/s (50.7% of roof) — up from 29.17 tok/s (+7.3%)**
+
+### Optimizations Applied
+
+| Change | Savings | Scope |
+|---|---|---|
+| f32 memcpy fast path in `write_dense_f32_narrow` | ~1.5 ms/token | Universal (all architectures) |
+| NEON SiLU vectorization (Cephes exp, ~1 ULP) | ~0.8 ms/token | aarch64 (scalar fallback elsewhere) |
+| Swish(1.0) → Silu canonicalization | ~0.2 ms/token | Universal |
+| Redundant `matmul_geometry` elimination | ~0.1 ms/token | Universal |
+| FMB fast 1-D bias add | ~0.1 ms/token | Universal |
+| **Total** | **~2.7 ms/token** | |
+
+### Updated Per-Op Breakdown (31.5 ms/token steady-state)
+
+| Op Type | Count | ms/token | % of decode | vs Session 3 |
+|---|---|---|---|---|
+| MatMul | 49 | 16.5 | 54.2% | -0.4 ms |
+| FusedMatMulBias | 120 | 11.3 | 37.2% | -1.3 ms |
+| Attention | 24 | 1.26 | 4.2% | -0.55 ms |
+| RMSNormalization | 49 | 0.36 | 1.2% | -0.10 ms |
+| Swish | 24 | 0.25 | 0.8% | -0.78 ms |
+| Other | 151 | 0.87 | 2.9% | ~same |
+| **Total** | **417** | **30.5** | **100%** | **-3.1 ms** |
+
+### FP32 Wall Analysis (revised)
+
+| Scenario | GEMV ms | Non-GEMV ms | Total ms | tok/s | Roofline % |
+|---|---|---|---|---|---|
+| **Current** | 27.8 | 3.5 | 31.3 | **31.9** | **51.7%** |
+| Non-GEMV → 1 ms | 27.8 | 1.0 | 28.8 | 34.7 | 56.2% |
+| GEMV at ORT's 91 GB/s | 21.8 | 3.5 | 25.3 | 39.5 | 64.0% |
+| GEMV at 91 GB/s + non-GEMV → 1 ms | 21.8 | 1.0 | 22.8 | 43.9 | 71.1% |
+| GEMV at 100% roof (122.5 GB/s) + 1 ms | 16.2 | 1.0 | 17.2 | 58.1 | 94.1% |
+| ORT (for reference) | ~21.8 | ~0.1 | ~21.9 | 45.96 | 74.5% |
+
+### Gap to ORT — Two Independent Bottlenecks
+
+1. **GEMV BW: 62 GB/s vs 91 GB/s (68% of ORT)**
+   - MLAS uses hand-tuned ARM assembly GEMV kernels
+   - ORT's intra-op thread pool has lower fork-join overhead than Rayon (~2 µs vs ~5 µs per dispatch)
+   - ORT fuses gate+up projections into single GEMV, halving dispatches
+
+2. **Non-GEMV overhead: 3.5 ms vs ~0.1 ms (35× worse)**
+   - ORT fuses entire subgraphs (attention, norm, activation) into mega-ops
+   - Our EP dispatches 417 individual ops with per-op executor overhead
+   - Not fixable at the kernel level — requires graph-level fusion
+
+### Conclusion
+
+**FP32 native decode is unlikely to beat ORT (45.96 tok/s) without graph-level op fusion.**
+
+Even at 100% GEMV roof AND non-GEMV reduced to 1 ms, we reach 58 tok/s. But our GEMV realistically caps at ~80-85 GB/s (without MLAS-quality kernels), giving ~40 tok/s even with perfect non-GEMV.
+
+**The honest FP32 ceiling with current architecture: ~35-40 tok/s.** This requires GEMV at 80+ GB/s (via better prefetching, reduced Rayon overhead, or graph-level GEMV batching) + non-GEMV reduced to ~1 ms (via op fusion).
+
+### Next Lever: FP16
+
+FP16 model exists at `models/qwen2.5-0.5b-f16` (959 MB — half the bytes).
+Sebastian measured FP16 NEON at 46.3 tok/s with pthread spawn, ~97 tok/s projected with persistent pool.
+Must compare native-FP16 vs ORT-FP16 per Justin's fairness rule.

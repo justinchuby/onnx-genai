@@ -85,3 +85,30 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 - At 100% GEMV roof: 16.3 + 5.0 = 21.3 ms → 46.9 tok/s — barely clears ORT
 - But reaching 100% GEMV requires closing 30% BW gap (66 → 95+ GB/s)
 - **Conclusion: FP16 remains the lever to definitively beat ORT**
+
+## Session 4 — Dispatch Overhead Reduction (2026-07-27)
+
+**Campaign:** PR #227 (squad/mac-cpu-ep-roofline)
+
+### Result
+- **31.30 tok/s** (50.7% of roof), up from 29.17 tok/s (+7.3%)
+- **9.6× improvement** from baseline 3.26 tok/s
+- Still 0.681× ORT (45.96 tok/s)
+
+### Changes (commit `77296fab`)
+- `dtype.rs`: Contiguous f32→f32 memcpy fast path in `write_dense_f32_narrow`
+- `activations.rs`: NEON SiLU (Cephes exp polynomial) + Swish(1.0)→Silu canonicalization
+- `matmul.rs`: Eliminate redundant `matmul_geometry` computation, remove dead code
+- `fused_matmul_bias.rs`: Fast 1-D bias add path
+
+### Key Findings
+- `write_dense_f32_narrow` was doing redundant Vec copy + per-element strided write for f32→f32: **1.5 ms/token waste**
+- Swish(alpha=1.0) wasn't using the SiLU fast path: **0.8 ms/token from scalar exp()**
+- `broadcast_apply` in FMB does multi-dim index walk for what should be simple vector add
+- **FP32 wall confirmed**: even at 100% GEMV roof + 1 ms non-GEMV, native EP reaches ~58 tok/s ceiling. But realistic FP32 achievable is ~35-40 tok/s due to GEMV BW (~80 GB/s max) + op dispatch overhead.
+- Gap to ORT is TWO independent bottlenecks: GEMV kernel quality (62 vs 91 GB/s) AND non-GEMV dispatch (3.5 vs 0.1 ms)
+
+### Tests
+- 920 tests pass (904 + 10 + 1 + 1 + 4)
+- `cargo fmt --all -- --check` clean
+- `cargo clippy -p onnx-runtime-ep-cpu` clean
