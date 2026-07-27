@@ -147,3 +147,5 @@ Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path
 
 ### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+## 2026-07-27T16:44:54Z — Wave 9 update
+Approved PR #282 after mutation-proven equivalence for tree speculative decoding core.

@@ -9,6 +9,9 @@
 Decision archive gate rechecked after inbox merge at 2026-07-27T04:35:00-07:00: archived 25 newly merged dated entries older than 2026-07-20 to `.squad/decisions-archive/2026-07.md`.
 
 <!-- scribe-merge-2026-07-27T04-35-00-07-00-pr227-lessons -->
+
+Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 734629 bytes; archived 0 dated entries older than 2026-07-20 to `.squad/decisions/archive/2026-07-27T16-44-54Z-wave9-older-than-7-days.md`.
+
 ## 2026-07-27 — PR #227 roofline and benchmark lessons
 
 **By:** Scribe, preserving overnight Mac CPU EP campaign learnings.
@@ -8571,6 +8574,218 @@ The CLI is a developer/maintainer tool and should follow the loaded model instea
 **By:** Leon
 **What:** The CLI now treats `prompt_tokens >= effective_max_context` as a pre-decode context-exhaustion condition. In the REPL it drops the just-added user turn, does not append an assistant message, tells the user to use `/reset` or shorten/change context, and continues. In one-shot `generate` it returns an actionable error instead of silent empty success.
 **Why:** At equality or above the engine has provably zero room to emit even one token, so decoding can only produce an empty `Length` result that poisons conversation history. This is a correctness guard for the degenerate zero-room boundary, not a heuristic budget policy: when `prompt_tokens < effective_max_context`, even by one token, the existing automatic `max_new_tokens` sizing remains unchanged and the model still decides when to stop within the safety ceiling.
+<!-- merged from .squad/decisions/inbox/apone-pr281-review.md -->
+# Decision: PR #281 (issue #49) — native img2img & inpainting in run_comfyui
+
+- **Reviewer:** Apone (independent/adversarial). Author: Newt.
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE (non-blocking notes)
+
+## Verification of the classic img2img/inpainting failure points
+- **strength→start_step:** `strength_to_start_step = num_steps − round_ties_even(num_steps·strength)`,
+  clamped to `0..=num_steps` (comfyui-config/src/lib.rs). Matches diffusers `get_timesteps` and
+  DIFFUSION.md §4. Unit test `strength_mapping_matches_hand_computed_diffusers_steps` pins the exact
+  endpoints: `strength=0.0 → start_step=num_steps` (zero denoise) and `strength=1.0 → 0` (full denoise
+  from noise), plus the banker's-rounding tie (`0.5, 21 → 11`). Would catch an inversion or off-by-one. ✓
+- **Noise init (not pure random):** img2img VAE-encodes the source, then calls
+  `engine.diffusion_add_noise(start_step, num_steps, encoded, noise)`; only txt2img keeps the
+  `noise · init_noise_sigma` seed. Each scheduler's `add_noise` uses correct diffusers semantics —
+  DDIM/DDPM `√ᾱ·x + √(1−ᾱ)·noise` (ᾱ = alpha_cumprod at the step's timestep), Euler/EulerA
+  `x + σ·noise`, DPM++ `α_t·x + σ_t·noise`, FlowMatch `(1−σ)·x + σ·noise`. `step==num_steps → 0` sigma /
+  returns original. `ddim_add_noise_matches_hand_computed_alpha_mix` pins the mix + zero-step identity. ✓
+- **9-channel inpaint layout:** UNet input is `[4 noisy latent | 1 downsampled mask | 4 masked-image
+  latent]` = 9. `build_inpaint_conditioning` emits the 5-ch conditioning `[mask | masked latent]`;
+  `append_loop_conditioning` (iterative.rs) concatenates it AFTER the (already scale_model_input-scaled)
+  4-ch latent — matching diffusers (scale then cat). Test `inpaint_loop_input_is_nine_channels_in_declared_order`
+  asserts exact shape `[1,9,1,2]` and exact element order. Scheduler state stays 4-ch. Would catch a
+  swapped/short channel layout. ✓
+- **Masked-image latent:** `VAE-encode(source · (1−mask))`; mask=1 means repaint (ComfyUI semantics),
+  so repaint region is zeroed before encode. Mask downsampled to latent res via `VAE_DOWNSCALE=8`. ✓
+- **VAE-encode generality:** driven off the workflow graph — detects `VAEEncode`/`VAEEncodeTiled` and
+  `VAEEncodeForInpaint`/`InpaintModelConditioning` on the sampler's `latent_image` link; encoder chosen
+  by component `role == "vae_encoder"` (filename fallback), NOT hard-coded model names. ✓
+- **txt2img non-regression:** `start_step` passed only when `source_image` is Some; else `None` →
+  pure-noise `init_noise_sigma` seed path is byte-for-byte unchanged. Detection is presence-of-node
+  driven. `iterative_override_allows_zero_step_tail` confirms the zero-step boundary publishes the seed
+  unchanged; the `< num_steps` → `<= num_steps` guard relaxations are consistent across mod.rs/iterative.rs. ✓
+- **DRY:** shared `mix_noise` helper, one `add_noise` trait method, one `strength_to_start_step`, one
+  `build_inpaint_conditioning`, one `append_loop_conditioning`. No per-checkpoint/per-benchmark casing. ✓
+- **Docs:** DIFFUSION.md §4/§4.1 additions (zero-strength edge, VAE-encoder discovery, 9-ch order) are
+  genuine additions describing new behavior — not doc-moved-to-match-code; the pre-existing
+  `start_step = num_steps − round(num_steps·denoise)` formula already matched the impl.
+
+## Validation evidence (worktree @ 6358c963, origin/squad/49-img2img-inpaint)
+- `cargo fmt --all -- --check` → exit 0
+- `cargo clippy -p onnx-genai-engine -p onnx-genai --all-targets -- -D warnings` → `Finished` exit 0
+- `cargo test -p onnx-genai-engine` → 233 unit (0 failed) + all integration suites incl. 32/32 iterative e2e
+- `cargo test -p onnx-genai` → 28 unit + 6 audio + 5 image e2e, 0 failed
+- `cargo test -p onnx-genai-comfyui-config` → 14 pass (strength mapping + detection routing)
+
+## Non-blocking notes (owner: Newt is LOCKED OUT — assign **Hudson**)
+1. **VAE encode uses the distribution mode (mean), not `latent_dist.sample()`.** `vae_encode` slices the
+   first `latent_channels` from moment output and drops logvar. Deterministic and reasonable, and guarded
+   by `scripts/img2img_e2e.py` (~1e-2). Consider a one-line comment noting the intentional mode choice.
+2. **`downsample_mask` uses nearest top-left pixel per 8×8 block.** Fine approximation of ComfyUI's
+   nearest downsample; a doc/comment noting it isn't area-averaged would help future readers.
+
+Neither note affects correctness of the reviewed paths; both are guarded by the e2e parity script.
+
+<!-- merged from .squad/decisions/inbox/bishop-pr283-review.md -->
+### 2026-07-27: PR #283 (issue #50) ControlNet/LoRA wiring — REQUEST-CHANGES
+**By:** Bishop (independent review; author Dallas locked out)
+**Verdict:** REQUEST-CHANGES. Fix owner: **Batty** (Engine Dev), with **Roy** (Lead) to arbitrate the cross-repo run_comfyui↔mobius input contract.
+
+**What is correct (keep):**
+- Control-image preprocessing (`preprocess_control_image`): batched RGB CHW in `[0,1]`, resize-to-output-resolution. Matches diffusers ControlNet `prepare_image` and mobius `controlnet_cond` shape `[batch, conditioning_channels, height*8, width*8]` (pixel resolution). Unit-tested with real oracle values.
+- LoRA gate: `lora_gate.{stem}` matches the documented + real mobius runtime convention (`models/unet.py` `_lora_gates`, `_diffusers_builder.py` bakes scale=1.0, runtime gate supplies strength). DIFFUSION.md §8b.
+- Additive / non-regression: plain txt2img/img2img/inpaint/SDXL take the empty-`denoiser_inputs` wrapper path; verify-A bit-identical check retained. Graph-driven routing (not hard-coded node names).
+- All validations pass (fmt, clippy -D warnings, engine/genai/comfyui-config tests).
+
+**Blocking concerns:**
+1. **`conditioning_scale` is an invented runtime gate with no exporter contract.** It appears NOWHERE in `../mobius`. DIFFUSION.md §9 says ControlNet strength is collected at translate time and **fused at export** (`checkpoint_export(controlnet=...)`), i.e. bake-at-export, NOT a runtime gate. Engine `routing.rs::component_inputs` iterates the model's *declared* inputs and looks up matching endpoints, so an undeclared `denoiser.conditioning_scale` is **silently dropped** → strength silently not applied (or dead code if baked). This is exactly the invented-mechanism / wrong export-fuse-vs-runtime convention pattern to avoid.
+2. **Multi-ControlNet `.{adapter}` suffix ports have zero backing.** mobius supports a *single* ControlNet only (`integrations/onnx_genai/comfyui.py::_find_controlnet` → `tuple|None`; `models/controlnet.py`/`tasks/_controlnet.py` declare unsuffixed `controlnet_cond`). No fused multi-CN export exists. Suffixed `controlnet_cond.{adapter}` / `conditioning_scale.{adapter}` would all silently drop → multi-CN non-functional against any real model.
+3. **Tests give false confidence.** They validate only the driver's internal math/routing; none asserts against a real denoiser's declared input set. They stay green even though ControlNet feeding silently no-ops. A swapped scale or missing port is not caught.
+
+**Requested fix (owner Batty + Roy):** Reconcile the runtime↔exporter contract before merge: either (a) mobius grows a real `conditioning_scale` denoiser input (+ multi-CN port scheme) and DIFFUSION.md is updated to document runtime scaling, or (b) run_comfyui drops `conditioning_scale`/multi-CN suffixes and relies on export-baked strength per current doc. Add a contract-level test (or gate the CN path as experimental) so silent input-drop cannot pass as success. LoRA + preprocessing work can land as-is.
+
+<!-- merged from .squad/decisions/inbox/deckard-fix-pr276-87.md -->
+# Decision: PR #276 (issue #87) async prefetch overlap — Deckard revision
+
+**Fix owner:** Deckard (Systems Dev, CUDA & Perf pod)
+**Author (locked out):** Keaton
+**Date:** 2026-07-27
+**Branch:** feat/async-prefetch-overlap-87 (pushed, force-with-lease after rebase onto origin/main)
+**Status:** Both of Ferro's REQUEST-CHANGES blockers fixed; awaiting Ferro re-review (do NOT self-merge).
+
+## Blocker 1 — GPU test suite build break (fixed)
+Adding `async_host_to_device` to `CudaTransferCounts` left the pre-existing
+struct literal in `crates/onnx-runtime-ep-cuda/tests/compressed_sparse_attention_gpu.rs`
+missing the new field, so `cargo test -p onnx-runtime-ep-cuda --features cuda`
+failed to compile. Fixed by populating the field with the observed
+before/after delta (consistent with the other two counters), so the existing
+"ratio-128 FP8 must not stage through host memory" assertion now also covers
+async H2D copies. Verified all `CudaTransferCounts` construction sites compile
+(runtime.rs:500 already had the field; the `::default()` site is unaffected).
+
+## Blocker 2 — WAR race in shipped driver + doc overclaim (fixed)
+The public `drive_double_buffer` reused a double-buffer slot without ordering the
+reuse copy after the prior consumer, so on the CUDA EP a copy stream could
+overwrite a buffer while the previous wave's compute was still reading it
+(write-after-read hazard). The WAR fence existed only in a hand-rolled ep-cuda
+test loop, not the driven path.
+
+Fix (generic over any `&dyn ExecutionProvider`, no per-EP / per-buffer-count
+special-casing):
+- New `ExecutionProvider` trait methods: `record_compute_fence` (default
+  `Fence::signalled()`) and `copy_wait_fence` (default no-op). Implemented on the
+  CUDA EP over the compute/transfer streams (`record_compute_fence` /
+  `copy_wait_fence` runtime primitives). Non-CUDA EPs stay safe no-ops.
+- `drive_double_buffer` records a compute fence over each consumer and makes the
+  transfer stream wait on the prior consumer of a slot before issuing the reuse
+  copy. The WAR fence is now enforced by the shipped driver itself.
+- New GPU regression test `drive_double_buffer_war_safe_across_waves`
+  (`crates/onnx-runtime-session/tests/cuda_prefetch_war.rs`, session `cuda`
+  feature) drives the PUBLIC path across 6 waves (both slots reused) with a slow
+  compute-stream consumer; corrupts if the driver WAR fence is removed. Added
+  `cudarc` as a session dev-dependency (test-only, dynamic-loading, no toolkit).
+- Rewrote the `prefetch.rs` module + driver docs and `docs/WEIGHT_OFFLOAD.md` to
+  state plainly that the driver enforces WAR (removed the hand-rolled-loop
+  overclaim).
+
+Kept intact: RAW ordering, `copy_wait_fence`/`compute_wait_fence` primitives,
+pinned-staging lifetime, dtoh/dtod synchronize-first discipline, honest deferral
+of live-MoE-loop wiring.
+
+## WAR-fence neutering experiment (load-bearing proof) — on the NEW driver-path test
+Neutered the driver's `ep.copy_wait_fence(&last_compute_fence[next_slot])?` call
+in `drive_double_buffer`, then restored it. Pinned GPU7.
+- Neutered: `drive_double_buffer_war_safe_across_waves` FAILED —
+  "wave 0 output corrupted — the driver WAR fence was violated: a reuse prefetch
+  clobbered a staging buffer while this wave's consumer was reading it"
+  (wave 0 read wave 4's payload: got [53,54,55,...]).
+- Restored: PASS (1 passed; 0 failed).
+Not theater — the driver's own WAR fence is load-bearing.
+
+## Validation (pinned GPU7: `CUDA_VISIBLE_DEVICES=7 taskset -c 1`)
+- `cargo test -p onnx-runtime-ep-cuda --features cuda` (lib): 244 passed, 0 failed
+  (incl. the 3 overlap tests). `--test compressed_sparse_attention_gpu`: 26
+  passed, 1 ignored. Provider `copy_async_fence_orders_h2d_prefetch_through_ep_api`:
+  pass.
+- `cargo test -p onnx-runtime-session` (lib): 90 passed, 0 failed (incl. prefetch
+  strategy tests).
+- `cargo test -p onnx-runtime-session --features cuda --test cuda_prefetch_war`:
+  1 passed (the new driver-path WAR test).
+- Clippy PR's own code (`-p onnx-runtime-ep-api -p onnx-runtime-ep-cuda --features
+  cuda -p onnx-runtime-session --lib -- -D warnings`): clean. `--all-targets`
+  fails only in unrelated pre-existing test/kernel files (matmul_nbits.rs,
+  normalization.rs, standard_attention.rs, several *_gpu.rs test files) — all
+  byte-identical to origin/main (verified via `git diff origin/main`).
+- `cargo fmt --all -- --check`: clean.
+
+## Ignorable environmental failures (NOT this PR — confirmed on parent 6654a168)
+- `conv_gpu` / `pooling_gpu` (cuDNN libcudnn.so.9 absent) — as Ferro noted.
+- `matmul_gpu::matmul_f32_on_gpu_matches_cpu_reference` — 4-D batched mismatch;
+  reproduces BYTE-IDENTICALLY on parent commit 6654a168 (matmul_gpu.rs is
+  unchanged by the PR). Pre-existing GPU7 environmental failure, not a
+  regression. (Ferro tested on GPU6 and did not flag this; documented here for
+  transparency.)
+- A `fused_attention`/standard-attention bf16 tolerance case is the `1 ignored`
+  in the CSA test binary.
+
+## Follow-ups
+- Live MoE decode-loop wiring still depends on Phase-3b live device weight
+  binding (unchanged, honestly deferred).
+
+<!-- merged from .squad/decisions/inbox/ferro-pr276-rereview.md -->
+# Decision: PR #276 (issue #87) re-review — APPROVE
+
+- **Reviewer:** Ferro (concurrency) — independent, not the author
+- **Date:** 2026-07-27
+- **Artifact:** feat/async-prefetch-overlap-87 @ f47916e7 (rebased onto origin/main, force-with-lease)
+- **Prior verdict:** REQUEST-CHANGES (2 blockers). Fixer: Deckard (Keaton locked out as author).
+
+## Verdict: APPROVE — both blockers genuinely fixed, WAR fence proven load-bearing.
+
+### Blocker 1 (build break) — RESOLVED
+`compressed_sparse_attention_gpu.rs:706` now populates `async_host_to_device`
+with the observed delta (`after - before`). `cargo test -p onnx-runtime-ep-cuda
+--features cuda` compiles; CSA 26 pass / 1 ignored. The value is CORRECT, not a
+placeholder: the assertion is `observation.transfers == CudaTransferCounts::default()`
+(all-zero), so populating the field actually STRENGTHENS the "no host staging"
+check (async H2D copies must also be 0) rather than making it vacuous.
+
+### Blocker 2 (WAR race + doc overclaim) — RESOLVED
+- New generic `ExecutionProvider::record_compute_fence` (default already-signalled)
+  + `copy_wait_fence` (default no-op); CUDA EP records over compute stream / waits
+  on copy stream via non-host-blocking cuStreamWaitEvent.
+- `drive_double_buffer` now, over any `&dyn ExecutionProvider`: waits the transfer
+  stream on the prior consumer's fence of a slot (`copy_wait_fence`) BEFORE the
+  reuse `copy_async`, and records the consumer fence AFTER `compute(n)`. Ordering
+  is correct; enforced in the shared driver, no hand-rolled test loop, no-op-safe
+  on sync EPs.
+- Docs (prefetch.rs + WEIGHT_OFFLOAD.md) rewritten to state the driver enforces
+  WAR and the public-path test proves it — no residual overclaim.
+
+## Load-bearing neutering experiment (driver-path test)
+`drive_double_buffer_war_safe_across_waves` (session `cuda` feature, public path,
+6 waves both slots reused):
+- Fence intact -> PASS.
+- Neutered CUDA EP `copy_wait_fence` to a no-op (dropped cuStreamWaitEvent) ->
+  FAIL: `wave 0 output corrupted ... reuse prefetch clobbered a staging buffer`
+  (wave 0 read wave 4's payload, 53.0). Not theater.
+- Restored -> PASS.
+RAW guards (prior 3 ep-cuda tests) still present/pass in the 244-lib run.
+
+## Validation (pinned GPU6: CUDA_VISIBLE_DEVICES=6 taskset -c 1)
+- ep-cuda `--features cuda`: 244 lib pass; CSA 26/1-ign; only conv_gpu/pooling_gpu
+  fail (cuDNN absent — ignorable env, reproduces on parent).
+- session host: 90 lib pass. session `--features cuda` WAR test: 1 pass.
+- clippy PR-owned targets (ep-cuda lib, ep-api lib, session lib+tests) clean under
+  `-D warnings`. `--all-targets` fails only in pre-existing untouched
+  `fused_epilogue_gpu.rs` (too_many_arguments, fails on base).
+- `cargo fmt --all -- --check`: clean.
+
+No follow-up owner needed — merge-ready.
 
 <!-- merged from .squad/decisions/inbox/newt-img2img-inpaint-49.md -->
 ### 2026-07-27: Keep inpainting conditioning outside scheduler state
@@ -8633,3 +8848,105 @@ The lane covers CLI build, unit tests, and integration tests that can run agains
 **Why:** The missed defect would have recorded an empty assistant turn in the non-reasoning path and permanently poisoned the conversation. The independent pass materially changed the outcome.
 
 Decision archive gate fired at 2026-07-27T13:10:00-07:00: active ledger was 753542 bytes; archived 9 dated entries on or before 2026-07-20 to `.squad/decisions/archive/2026-07.md`.
+<!-- merged from .squad/decisions/inbox/parker-pr280-review.md -->
+# Decision: PR #280 (issue #48) — SDXL dual-encoder conditioning in run_comfyui
+
+- **Reviewer:** Parker (independent/adversarial). Author: Ripley.
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE (non-blocking notes)
+
+## Verification of the classic SDXL failure points
+- **time_ids order:** `build_time_ids` emits `[original_h, original_w, crop_top, crop_left, target_h, target_w]`,
+  matching diffusers `list(original_size + crops_coords_top_left + target_size)`. Unit test pins the exact
+  12-value vector incl. batch tiling — would catch a swapped order or an h/w flip. ✓
+- **time_ids fed as a single `[batch, 6]` denoiser input (no `.uncond`)** — correct: SDXL shares time_ids
+  across both CFG passes; DIFFUSION.md §9 documents "sharing time_ids". ✓
+- **Dual-encoder concat:** performed inside the exported ONNX text_encoder (per DIFFUSION.md §9), not at
+  runtime. Runner routes conditioning declaratively via dataflow edges. ✓
+- **Detection is filename-free:** `conditioning_kind` = DualWithPooled iff a `text_embeds` denoiser
+  conditioning edge exists — driven off declared edges, not checkpoint names. DRY, general. ✓
+- **Pooled text_embeds + per-edge uncond:** each encoder→denoiser edge routed individually, uncond fed
+  as `{denoiser}.{port}.uncond`. ✓
+- **SD1.x non-regression:** single-edge path → ConditioningKind::Single, no time_ids; replay/verify contract
+  preserved. Existing endpoint tests updated and pass. ✓
+
+## Validation evidence (worktree @ a78a5834)
+- `cargo fmt --all -- --check` → exit 0
+- `cargo clippy -p onnx-genai-engine -p onnx-genai --all-targets -- -D warnings` → exit 0
+- `cargo test -p onnx-genai-engine` → ok (0 failed; env-gated ignored)
+- `cargo test -p onnx-genai` → 27 + 6 + 5 pass; 0 failed
+
+## Non-blocking notes (owner: Ripley is LOCKED OUT — assign Hicks)
+1. `concatenate_hidden_states` is **dead code** — only referenced by its own unit test; the real concat is
+   export-side. The test gives false confidence it guards the runtime concat axis. Either drop it (add a
+   comment that concat is export-owned) or wire it. Low priority.
+2. Encoder-input→tokenizer mapping relies on graph input declaration order (index 0→primary,
+   1→tokenizer_2.json). Safe in practice (SDXL's two tokenizers share vocab) but add a clarifying comment.
+3. Repeated `spec().strategy.denoiser.as_deref().unwrap()` — safe (guarded by `resolve_endpoints`) but
+   reuse the already-resolved denoiser name for clarity.
+
+None of these corrupt conditioning; approving.
+
+<!-- merged from .squad/decisions/inbox/ripley-sdxl-dual-encoders-48.md -->
+### 2026-07-27: Reuse typed image generation for native ComfyUI SDXL
+**By:** Ripley
+**What:** `run_comfyui` delegates normal renders to the metadata-driven typed image generator. SDXL is detected from a pooled `text_embeds` conditioning edge; all encoder token inputs and CFG outputs are wired, and `[original H/W, crop top/left, target H/W]` time IDs are supplied.
+**Why:** The engine already executes multi-output prompt conditioning and multi-input CFG. Keeping conditioning construction in one shared renderer avoids a second checkpoint-specific path while preserving the hidden SD1.x replay verifier.
+
+<!-- merged from .squad/decisions/inbox/roy-pr282-review.md -->
+# Decision: PR #282 (issue #84) — Tree-structured speculative decoding review
+
+- **Reviewer:** Roy (independent, adversarial)
+- **Author:** Hicks (locked out of fixes)
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE
+
+## Summary
+Adversarial correctness review of tree-structured speculative decoding core.
+All scrutiny points pass. Greedy-equivalence invariant is genuinely proven.
+
+## Key findings
+1. **Greedy-equivalence test is GENUINE.** `tests/tree_speculative.rs` drives a
+   full tree-speculative loop against the real `tiny-llm` fixture and compares
+   byte-for-byte to an *independent* plain-greedy reference engine. It asserts
+   `saw_branching` (tree wider than its roots) and `saw_multi_accept`
+   (accepted path >= 2) so it is NOT a degenerate 1-node/single-chain pass.
+   Two prompts covered. Per-node scorer uses full independent forwards on each
+   ancestor path — the exact context a correct 2D tree mask would supply — which
+   is consistent with the deferral (mask itself guarded separately).
+2. **Ancestor-only mask correct.** `ancestor_attention_mask`: `mask[q][k]` iff k
+   is ancestor of q or k==q. Unit test hand-builds a real multi-branch tree
+   (root→{a,b}; a→{c,d}; b→{e,f}), asserts the exact edge set + explicit
+   no-sibling-leak asserts. **Mutation-verified:** injecting a sibling edge made
+   the mask unit test FAIL; reverted → pass. Test genuinely guards correctness.
+3. **Position ids == depth**, siblings share a slot ([0,1,1,2,2,2,2]). Correct.
+4. **Acceptance walk** generic over rule; full/partial/root-reject/typical all
+   tested. Greedy follows target argmax → reproduces greedy exactly, bonus token
+   = target argmax, length 1..=path_len+1. RejectionSampling coincides with
+   Greedy at T=0 (sound: spec decode runs at temp 0). Typical gates on softmax
+   mass ≥ threshold.
+5. **KV retention** keeps exactly the accepted path in order,
+   `final_len == base_len + accepted_len`; asserted in both unit and real-model
+   integration tests (`retained_nodes == outcome.nodes`).
+6. **Linear non-regression.** mod.rs diff is a pure file move + additive
+   (module decl, re-exports, enum extension). `Eq` dropped from `AcceptanceRule`
+   (required by `Typical{f32}`); nothing in the linear path relied on it. All
+   pre-existing engine tests pass unchanged.
+7. **Deferral is HONEST.** `decode/step.rs:138` (and decode/mod.rs) build
+   `vec![1_i64; total_len]` — a 1D key mask, no per-query 2D input; a real
+   batched tree forward needs graph/session changes. The tree core is NOT wired
+   into the live decode path (no refs in src outside `speculative/`), sits behind
+   the `TreeScorer` seam, and is fully tested (not dead scaffolding). PR body
+   states the deferral plainly. No false "live tree overlap" claim.
+
+## Validation evidence
+- `cargo test -p onnx-genai-engine` → all pass; 8 tree unit tests + 2 real-model
+  greedy-equivalence integration tests all `ok`.
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `cargo clippy -p onnx-genai-engine --all-targets -- -D warnings` → clean.
+- Mutation check on the mask → test FAILED as expected, then reverted.
+
+## Note
+No fix owner needed (APPROVE). A stale-mtime incremental-build gotcha was hit
+during the mutation revert (`mv` restored old mtime → cargo reused stale binary);
+`touch` + rebuild confirmed the clean tree passes.

@@ -120,3 +120,6 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 Authored `docs/research/cli/04-runtime-capability-inventory.md` as Deckard. Key finding: the runtime has strong low-level primitives (paged KV CoW fork, rewind/checkpoint, prefix reuse, speculative stats, continuous batching), but the REPL currently drives mostly CLI-side chat history rather than engine persistent sessions. Session fork and real undo/rewind need new engine APIs; many other high-value REPL surfaces are CLI wiring over existing APIs.
 ## 2026-07-27T16:44:54Z — Wave 8 update
 - Took ownership of PR #276 / #87 fix cycle after Ferro REQUEST-CHANGES; must address GPU test build break and WAR-safe driver semantics/docs.
+
+## 2026-07-27T16:44:54Z — Wave 9 update
+Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/neutering proof; re-review approved and merged as 9ab24fa5.

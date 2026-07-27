@@ -69,3 +69,6 @@ Authored bit-exact native-CUDA-versus-ORT 64-token decode locks for Qwen2.5-0.5B
 - Added shared `--max-context` plumbing for `generate` and `run`.
 ### 2026-07-27 — CLI maintainer-tool backlog queued
 Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
+
+## 2026-07-27T16:44:54Z — Wave 9 update
+Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_scale semantics and multi-ControlNet port backing before re-review.
