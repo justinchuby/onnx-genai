@@ -3,8 +3,8 @@
 //! Pure code motion from `pipeline.rs`: the single-decoder autoregressive
 //! decode driver and its paged-sequence and prefix-reuse helpers.
 
-use super::*;
 use super::paged_decode::{PagedMirror, PipelineDecodeLoopBackend};
+use super::*;
 impl PipelineEngine {
     /// Core autoregressive execution shared by [`generate_with_callback`] and
     /// [`synthesize`]: run the prompt-phase components, drive the decode loop,

@@ -16,7 +16,10 @@ impl PipelineEngine {
     /// components run once. `guidance_scale` is carried but not yet applied —
     /// classifier-free guidance and timestep/sigma schedules are supplied by the
     /// scheduler-registry follow-up.
-    pub(crate) fn run_iterative(&self, request: PipelineGenerateRequest) -> anyhow::Result<PipelineTensors> {
+    pub(crate) fn run_iterative(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::Iterative(plan) = &self.plan else {
             anyhow::bail!("internal error: run_iterative on a non-iterative plan");
         };
@@ -497,7 +500,10 @@ impl PipelineEngine {
     /// once, in declared order, over a shared tensor pool. A stage's model reads
     /// its inputs from the pool (routed by the pipeline dataflow) and writes its
     /// outputs back, so an earlier stage's outputs feed later stages.
-    pub(crate) fn run_composite(&self, request: PipelineGenerateRequest) -> anyhow::Result<PipelineTensors> {
+    pub(crate) fn run_composite(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::Composite(plan) = &self.plan else {
             anyhow::bail!("internal error: run_composite on a non-composite plan");
         };
@@ -519,7 +525,10 @@ impl PipelineEngine {
         Ok(tensors)
     }
 
-    pub(crate) fn run_single_pass(&self, request: PipelineGenerateRequest) -> anyhow::Result<PipelineTensors> {
+    pub(crate) fn run_single_pass(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineTensors> {
         let PipelinePlan::SinglePass(plan) = &self.plan else {
             anyhow::bail!("internal error: run_single_pass on a non-single-pass plan");
         };

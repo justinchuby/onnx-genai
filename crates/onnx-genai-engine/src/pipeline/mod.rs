@@ -596,8 +596,6 @@ impl PipelineEngine {
         })
     }
 
-
-
     pub fn spec(&self) -> &PipelineSpec {
         &self.models.directory.spec
     }
@@ -645,13 +643,11 @@ impl PipelineEngine {
         }
     }
 
-
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
         self.models
             .tokenizer_for(&self.tokenizer_component)
             .with_context(|| format!("no tokenizer available for '{}'", self.tokenizer_component))
     }
-
 
     /// KV page counters, when the decoder's KV is paged.
     ///
@@ -679,7 +675,6 @@ impl PipelineEngine {
     pub fn reset_cache_stats(&self) {
         self.component_cache.borrow_mut().reset_stats();
     }
-
 }
 
 fn tokenize_with(tokenizer: &Tokenizer, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
@@ -805,7 +800,7 @@ fn expand_image_placeholders_count_based(
 /// are refreshed. This is the architecture-neutral replacement for the former
 /// one-output `inputs_embeds` fusion special case: it refreshes every declared
 /// sequence-dependent output, and never inspects tensor names to decide roles.
-struct StepComponentBinding {
+pub(crate) struct StepComponentBinding {
     /// Component name (pool endpoints are `component.port`).
     component: String,
     /// The port seeded with the running token(s), from explicit `io.token_input`
@@ -819,7 +814,7 @@ struct StepComponentBinding {
 /// A single non-token input of a [`StepComponentBinding`], resolved from the
 /// shared pool each step (directly by `endpoint`, else via the `routed_from`
 /// dataflow source).
-struct StepComponentInput {
+pub(crate) struct StepComponentInput {
     /// Graph input port name on the component.
     port: String,
     /// This port's own pool endpoint (`component.port`).
@@ -831,7 +826,6 @@ struct StepComponentInput {
     /// Presence-aware diagnostic if neither direct nor routed binding exists.
     missing_message: String,
 }
-
 
 /// Executable plan for a pipeline, discriminated by strategy family.
 ///
@@ -1097,7 +1091,6 @@ fn coerce_value_to_dtype(value: &Value, target: DataType) -> anyhow::Result<Valu
         _ => clone_value(value),
     }
 }
-
 
 #[derive(Debug, Clone)]
 struct IterativePlan {
@@ -1821,7 +1814,6 @@ fn endpoint_component(endpoint: &str) -> Option<&str> {
         .ok()
         .map(|(component, _)| component)
 }
-
 
 #[cfg(test)]
 mod tests {
