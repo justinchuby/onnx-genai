@@ -265,11 +265,22 @@ fn out_dtype(outs: &[NodeIo]) -> DataType {
     outs[0].type_info.as_ref().unwrap().dtype
 }
 
+fn assert_symbolic(dim: &DimExpr) {
+    assert!(
+        dim.as_const().is_none(),
+        "expected symbolic dim, got {dim:?}"
+    );
+    assert!(
+        dim.as_symbol().is_some(),
+        "expected fresh symbol, got {dim:?}"
+    );
+}
+
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
     assert_eq!(registry.operator_count(), 164);
-    assert_eq!(registry.entry_count(), 203);
+    assert_eq!(registry.entry_count(), 202);
 }
 
 #[test]
@@ -341,10 +352,9 @@ fn predicates_dropout_and_eye_like_resolve_all_outputs() {
             vec![sym(4), c(7)]
         );
     }
-    assert!(
-        run(&node("Dropout", 1, 2), vec![f32in(vec![c(2)])], 12)[0]
-            .type_info
-            .is_none()
+    assert_eq!(
+        out_shape(&run(&node("Dropout", 1, 2), vec![f32in(vec![c(2)])], 12)),
+        vec![c(2)]
     );
 
     let eye = with_attr(
@@ -367,7 +377,9 @@ fn unique_tracks_axis_and_flattened_inverse_lengths() {
         vec![sym(2).mul(&c(4))]
     );
     for output in [&flat[0], &flat[1], &flat[3]] {
-        assert_eq!(output.type_info.as_ref().unwrap().shape.len(), 1);
+        let shape = &output.type_info.as_ref().unwrap().shape;
+        assert_eq!(shape.len(), 1);
+        assert_symbolic(&shape[0]);
     }
 
     let axis = with_attr(node("Unique", 1, 4), "axis", Attribute::Int(-1));
@@ -375,6 +387,9 @@ fn unique_tracks_axis_and_flattened_inverse_lengths() {
     assert_eq!(output[0].type_info.as_ref().unwrap().shape[0], sym(8));
     assert_eq!(output[0].type_info.as_ref().unwrap().shape.len(), 2);
     assert_eq!(output[2].type_info.as_ref().unwrap().shape, vec![c(6)]);
+    assert_symbolic(&output[0].type_info.as_ref().unwrap().shape[1]);
+    assert_symbolic(&output[1].type_info.as_ref().unwrap().shape[0]);
+    assert_symbolic(&output[3].type_info.as_ref().unwrap().shape[0]);
     assert!(
         try_run(
             &with_attr(node("Unique", 1, 4), "axis", Attribute::Int(2)),
