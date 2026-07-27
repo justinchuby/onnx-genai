@@ -203,6 +203,64 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --locked -p mlas-sys
 
+  cli-ort:
+    name: CLI ORT coverage (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+          - name: Windows x86_64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux bindgen dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Locate Windows libclang
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $llvm = Join-Path $env:ProgramFiles 'LLVM\bin'
+          if (Test-Path (Join-Path $llvm 'libclang.dll')) {
+            "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          }
+
+      # The portable lane must stay offline, but the CLI is the user-facing ORT
+      # entry point and its REPL contract tests catch token-budget regressions.
+      # Keep this isolated so the native ORT download is intentional, pinned by
+      # ort-sys checksums, and paid only by the crate that needs it.
+      - name: Build onnx-genai-cli
+        run: cargo build --locked -p onnx-genai-cli
+      - name: Expose downloaded ORT on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ort = Get-ChildItem -Path target\debug\build -Recurse -Filter onnxruntime.dll |
+            Where-Object { $_.FullName -like '*ort-prebuilt*' } |
+            Select-Object -First 1
+          if (-not $ort) {
+            throw 'onnx-genai-ort-sys did not leave a downloaded onnxruntime.dll under target\debug\build'
+          }
+          Copy-Item $ort.FullName target\debug\onnxruntime.dll -Force
+          Copy-Item $ort.FullName target\debug\deps\onnxruntime.dll -Force
+          $ort.DirectoryName >> $env:GITHUB_PATH
+      - name: Test onnx-genai-cli
+        run: cargo test --locked -p onnx-genai-cli
+      - name: Clippy onnx-genai-cli
+        run: cargo clippy --locked -p onnx-genai-cli --all-targets -- -D warnings
+
   coverage:
     name: Rust coverage
     runs-on: ubuntu-latest
