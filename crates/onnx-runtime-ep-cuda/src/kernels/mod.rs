@@ -25,6 +25,7 @@ pub mod activations;
 pub mod attention;
 pub mod block_quant;
 pub mod block_quantized_matmul;
+pub mod block_quantized_moe;
 pub mod cast;
 pub mod compressed_sparse_attention;
 pub mod constant;
@@ -131,6 +132,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMulNBits",
     "QMoE",
     "BlockQuantizedMatMul",
+    "BlockQuantizedMoE",
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
@@ -442,6 +444,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
+        Box::new(block_quantized_moe::BlockQuantizedMoEFactory {
             runtime: runtime.clone(),
         }),
     );

@@ -13,3 +13,6 @@
 # 2026-07-27 — Roadmap wave-6
 
 Approved PR #269 after confirming IsInf, IsNaN, PRelu, CPU IsNaN parity, claim gates, and targeted CPU/GPU validation.
+
+## 2026-07-27T16:44:54Z — Wave 8 update
+- Reviewed Keaton PR #276 for #87 and requested changes: GPU test literal build break plus WAR-racy `drive_double_buffer` path; Deckard owns fixes.

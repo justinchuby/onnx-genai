@@ -25,8 +25,10 @@ README = PROFILES / "README.md"
 # Table column -> sample file.
 COLUMNS = {
     "ORT+CPU": "qwen2.5-0.5b-cpu.txt",
-    "ORT+Metal": "qwen2.5-0.5b-metal.txt",
+    "ORT+CPU f16": "qwen2.5-0.5b-f16-cpu.txt",
     "native": "qwen2.5-0.5b-native.txt",
+    "native f16": "qwen2.5-0.5b-f16-native.txt",
+    "ORT+Metal": "qwen2.5-0.5b-metal.txt",
     "native+MLX": "qwen2.5-0.5b-native-mlx.txt",
 }
 

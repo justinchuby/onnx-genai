@@ -448,6 +448,8 @@ impl ImageOutputArgs {
                 model_path,
                 scaling_factor: self.vae_scaling_factor,
             }),
+            source_image: None,
+            vae_encoder: None,
         }
     }
 }

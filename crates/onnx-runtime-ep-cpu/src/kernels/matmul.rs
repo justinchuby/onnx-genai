@@ -11,7 +11,7 @@
 //!   register-tiled, rayon-parallelized pure-Rust f32 GEMM ([`gemm_generic`]).
 //!   It is the correctness baseline and contains no `unsafe`.
 //! * **`SimdX86`** (default on AVX2/FMA x86-64, runtime-detected): an
-//!   MLAS-style packed SIMD f32 SGEMM ([`simd_gemm`]) — panel packing + a
+//!   MLAS-style packed SIMD f32 SGEMM ([`x86_sgemm`]) — panel packing + a
 //!   `6×16` AVX2/FMA register microkernel + K/N cache blocking, parallelized
 //!   over column strips. Selected automatically with no cargo feature; falls
 //!   back to Generic when AVX2/FMA is absent.
@@ -40,13 +40,32 @@ use crate::strided::{next_index, numel};
 // MLAS-style packed SIMD f32 GEMM (the `SimdX86` backend). Kept in a sibling
 // file but included here so `kernels/mod.rs` needs no edit; it is an internal
 // perf detail of the MatMul hot path, not a new op.
-#[path = "simd_gemm.rs"]
-mod simd_gemm;
+#[path = "x86_sgemm.rs"]
+mod x86_sgemm;
 
 // Native BF16×BF16→FP32 GEMM (`_mm512_dpbf16_ps`) for avx512_bf16 hosts. It is
 // runtime-detected and otherwise falls back to the portable blocked half GEMM.
-#[path = "bf16_gemm.rs"]
-mod bf16_gemm;
+#[path = "x86_bf16.rs"]
+mod x86_bf16;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "accelerate_gemm.rs"]
+mod accelerate_gemm;
+
+/// Re-export the f16 GEMV for use by sibling kernels (FusedMatMulBias).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) use accelerate_gemm::neon_gemv_f16_col_parallel;
+
+/// Test-only counter: incremented each time the FP16 GEMV decode path is reached
+/// inside [`MatMulKernel::execute_with_backend`]. Guards against dispatch
+/// regressions where a broader half-precision GEMM intercepts M=1 decode before
+/// the bandwidth-optimal GEMV.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "ios")
+))]
+static GEMV_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Per-kernel cache for immutable MatMul operands that require materialization.
 ///
@@ -58,6 +77,17 @@ pub(crate) struct MatMulPrepack {
     dense: [OnceLock<Vec<f32>>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
+    /// Lazily-computed transpose of the B weight matrix for the Accelerate
+    /// column-parallel GEMV path. Only populated for constant (model weight)
+    /// inputs on macOS/iOS.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    transposed_b: OnceLock<Vec<f32>>,
+    /// Lazily-computed f16 transpose of the B weight matrix. Stores the raw
+    /// u16 bit patterns of half::f16 in N×K layout, read directly from the
+    /// mmap'd model file without widening to f32. Only populated when B is a
+    /// constant Float16 input on macOS/iOS.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    transposed_b_f16: OnceLock<Vec<u16>>,
 }
 
 impl MatMulPrepack {
@@ -67,7 +97,11 @@ impl MatMulPrepack {
         }
     }
 
-    fn dense<'a>(&'a self, index: usize, view: &'a TensorView<'_>) -> Result<Cow<'a, [f32]>> {
+    pub(crate) fn dense<'a>(
+        &'a self,
+        index: usize,
+        view: &'a TensorView<'_>,
+    ) -> Result<Cow<'a, [f32]>> {
         if !self.constant_inputs[index] {
             return to_dense_f32_widen("MatMul", view);
         }
@@ -86,6 +120,101 @@ impl MatMulPrepack {
                 ))
             }
         }
+    }
+
+    /// Returns a cached transpose of B[K,N] -> B_T[N,K] row-major.
+    /// Only transposes constant (model weight) inputs. Returns `None` for
+    /// activations. Uses Rayon + cache-blocking to hide the one-time cost.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn transposed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&[f32]> {
+        if !self.constant_inputs[1] {
+            return None;
+        }
+        Some(
+            self.transposed_b
+                .get_or_init(|| {
+                    use rayon::prelude::*;
+                    let mut bt = vec![0.0f32; n * k];
+                    // Parallel tiled transpose: each Rayon task handles a strip
+                    // of output rows (columns of B), using a tile size that keeps
+                    // both read and write working sets in L1 cache.
+                    let threads = rayon::current_num_threads();
+                    let rows_per_thread = n.div_ceil(threads).max(1);
+                    bt.par_chunks_mut(rows_per_thread * k)
+                        .enumerate()
+                        .for_each(|(t, bt_chunk)| {
+                            let j0 = t * rows_per_thread;
+                            let j_end = (j0 + rows_per_thread).min(n);
+                            let chunk_n = j_end - j0;
+                            const TILE: usize = 64;
+                            for i0 in (0..k).step_by(TILE) {
+                                let ie = (i0 + TILE).min(k);
+                                for jj in 0..chunk_n {
+                                    let j = j0 + jj;
+                                    for i in i0..ie {
+                                        bt_chunk[jj * k + i] = b[i * n + j];
+                                    }
+                                }
+                            }
+                        });
+                    bt
+                })
+                .as_slice(),
+        )
+    }
+
+    /// Returns a cached f16 transpose of B[K,N] → B_T[N,K] row-major.
+    ///
+    /// Like [`transposed_b`] but preserves the original f16 storage format
+    /// (as raw u16 bit patterns), reading directly from the mmap'd model
+    /// buffer. Only populated for constant Float16 inputs on macOS/iOS.
+    /// Returns `None` for non-constant inputs or non-Float16 dtypes.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub(crate) fn transposed_b_f16(
+        &self,
+        b_view: &TensorView,
+        k: usize,
+        n: usize,
+    ) -> Option<&[u16]> {
+        use onnx_runtime_ir::DataType;
+        if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
+        {
+            return None;
+        }
+        Some(
+            self.transposed_b_f16
+                .get_or_init(|| {
+                    let numel = k * n;
+                    // SAFETY: validated contiguous Float16 view → exactly `numel`
+                    // 2-byte elements at `data_ptr`; `half::f16` is
+                    // `repr(transparent)` over `u16`.
+                    let src =
+                        unsafe { std::slice::from_raw_parts(b_view.data_ptr::<u16>(), numel) };
+                    use rayon::prelude::*;
+                    let mut bt = vec![0u16; n * k];
+                    let threads = rayon::current_num_threads();
+                    let rows_per_thread = n.div_ceil(threads).max(1);
+                    bt.par_chunks_mut(rows_per_thread * k)
+                        .enumerate()
+                        .for_each(|(t, bt_chunk)| {
+                            let j0 = t * rows_per_thread;
+                            let j_end = (j0 + rows_per_thread).min(n);
+                            let chunk_n = j_end - j0;
+                            const TILE: usize = 64;
+                            for i0 in (0..k).step_by(TILE) {
+                                let ie = (i0 + TILE).min(k);
+                                for jj in 0..chunk_n {
+                                    let j = j0 + jj;
+                                    for i in i0..ie {
+                                        bt_chunk[jj * k + i] = src[i * n + j];
+                                    }
+                                }
+                            }
+                        });
+                    bt
+                })
+                .as_slice(),
+        )
     }
 
     #[cfg(feature = "mlas")]
@@ -162,11 +291,18 @@ fn gemm_with_backend(
         // Built-in MLAS-style packed SIMD backend for AVX2/FMA x86-64 hosts.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         CpuBackend::SimdX86 => {
-            simd_gemm::sgemm_simd(a, b, c, m, k, n);
+            x86_sgemm::sgemm_simd(a, b, c, m, k, n);
             Ok(())
         }
-        // Xnnpack / Accelerate placeholders (and Generic) share the pure-Rust
-        // kernel until their native backends are wired.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        CpuBackend::Accelerate => {
+            if m == 1 {
+                accelerate_gemm::neon_gemv_parallel(a, b, c, k, n);
+            } else {
+                accelerate_gemm::sgemm(a, b, c, m, k, n);
+            }
+            Ok(())
+        }
         _ => {
             gemm_generic(a, b, c, m, k, n);
             Ok(())
@@ -194,6 +330,10 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
         return;
     }
     let threads = rayon::current_num_threads();
+    if threads > 1 && m < threads && n > 1 {
+        gemm_generic_col_parallel(a, b, c, m, k, n, threads);
+        return;
+    }
     let mc = if threads <= 1 {
         MAX_MC.min(m)
     } else {
@@ -220,6 +360,42 @@ fn gemm_generic(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usiz
             gemm_block(a_block, b, c_block, rows, k, n);
         },
     );
+}
+
+fn gemm_generic_col_parallel(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    threads: usize,
+) {
+    use rayon::prelude::*;
+    let cols_per_strip = n.div_ceil(threads).max(1);
+    let strips: Vec<(usize, usize)> = (0..n)
+        .step_by(cols_per_strip)
+        .map(|j0| (j0, cols_per_strip.min(n - j0)))
+        .collect();
+    let results: Vec<(usize, usize, Vec<f32>)> = strips
+        .into_par_iter()
+        .map(|(j0, strip_n)| {
+            let mut b_strip = vec![0.0f32; k * strip_n];
+            for row in 0..k {
+                b_strip[row * strip_n..row * strip_n + strip_n]
+                    .copy_from_slice(&b[row * n + j0..row * n + j0 + strip_n]);
+            }
+            let mut c_strip = vec![0.0f32; m * strip_n];
+            gemm_block(a, &b_strip, &mut c_strip, m, k, strip_n);
+            (j0, strip_n, c_strip)
+        })
+        .collect();
+    for (j0, strip_n, c_strip) in results {
+        for row in 0..m {
+            c[row * n + j0..row * n + j0 + strip_n]
+                .copy_from_slice(&c_strip[row * strip_n..row * strip_n + strip_n]);
+        }
+    }
 }
 
 /// Compute `c_block[rows,n] = a_block[rows,k] @ b[k,n]` (overwrite) for one row
@@ -316,6 +492,33 @@ impl MatMulKernel {
                 .saturating_mul(2)
         });
 
+        // FP16 storage GEMV: when B is a constant Float16 weight and M=1
+        // (decode), GEMV directly from the f16 mmap'd data — reading 2 bytes
+        // per weight instead of 4, halving memory bandwidth. This MUST be
+        // checked before try_matmul_half: the blocked GEMM is ~4× slower than
+        // the bandwidth-optimal NEON GEMV at M=1 decode shapes.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if backend == CpuBackend::Accelerate
+            && geom.m == 1
+            && numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
+            && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n)
+        {
+            #[cfg(all(test, target_arch = "aarch64"))]
+            GEMV_F16_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let a_dense = self.prepack.dense(0, &inputs[0])?;
+            let mut result = vec![0.0f32; geom.n];
+            accelerate_gemm::neon_gemv_f16_col_parallel(
+                &a_dense,
+                bt_f16,
+                &mut result,
+                geom.k,
+                geom.n,
+            );
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+        }
+
         // Dedicated half-precision path: contiguous f16/bf16 operands stay in
         // 16-bit storage and are packed in cache-sized panels for f32
         // accumulation. Bf16 may use the runtime-gated AVX-512 BF16 kernel;
@@ -365,7 +568,6 @@ impl MatMulKernel {
                 &self.prepack.dense(1, &inputs[1])?,
                 &geom,
                 backend,
-                #[cfg(feature = "mlas")]
                 Some(&self.prepack),
                 out_slice,
             );
@@ -393,7 +595,13 @@ impl MatMulKernel {
 /// straight from its own contiguous `numel * 4` byte range, which this test
 /// covers exactly; any other input dtype/layout is materialized into a fresh
 /// owned buffer before the GEMM, so it cannot alias the output at all.
-fn output_is_direct_f32_eligible(a: &TensorView, b: &TensorView, out: &TensorMut) -> bool {
+/// Whether an output tensor is eligible for direct f32 GEMM writes: must be
+/// contiguous Float32 on CPU, not aliasing either input.
+pub(crate) fn output_is_direct_f32_eligible(
+    a: &TensorView,
+    b: &TensorView,
+    out: &TensorMut,
+) -> bool {
     use onnx_runtime_ir::DataType;
     use onnx_runtime_ir::DeviceType;
 
@@ -515,8 +723,8 @@ fn half_gemm_tile(
     n: usize,
 ) {
     #[cfg(target_arch = "x86_64")]
-    if format == HalfFormat::Bf16 && bf16_gemm::native_available() {
-        bf16_gemm::gemm(a, b, c, m, k, n);
+    if format == HalfFormat::Bf16 && x86_bf16::native_available() {
+        x86_bf16::gemm(a, b, c, m, k, n);
         return;
     }
 
@@ -545,13 +753,11 @@ pub(crate) fn matmul_dense(a: &TensorView, b: &TensorView) -> Result<Vec<f32>> {
     if let Some(result) = try_matmul_half(a, b, &geom)? {
         return Ok(result);
     }
-    matmul_dense_impl_with_backend(
-        a,
-        b,
+    matmul_dense_impl_with_geom(
         to_dense_f32_widen("MatMul", a)?,
         to_dense_f32_widen("MatMul", b)?,
+        &geom,
         CpuBackend::auto_detect(),
-        #[cfg(feature = "mlas")]
         None,
     )
 }
@@ -564,6 +770,37 @@ pub(crate) fn matmul_dense_prepacked(
     matmul_dense_prepacked_with_backend(a, b, prepack, CpuBackend::auto_detect())
 }
 
+/// Compute `MatMul(A, B)` directly into a caller-supplied output slice,
+/// skipping the intermediate `Vec<f32>` allocation. Returns the number of
+/// elements written (equal to the result length from matmul_geometry).
+/// Used by FusedMatMulBias's direct-output path.
+pub(crate) fn matmul_dense_prepacked_into(
+    a: &TensorView,
+    b: &TensorView,
+    prepack: &MatMulPrepack,
+    out: &mut [f32],
+) -> Result<usize> {
+    let backend = CpuBackend::auto_detect();
+    let geom = matmul_geometry(a, b)?;
+    if out.len() < geom.result_len {
+        return Err(EpError::KernelFailed(format!(
+            "FusedMatMulBias direct: output buffer {} < result length {}",
+            out.len(),
+            geom.result_len
+        )));
+    }
+    let out_slice = &mut out[..geom.result_len];
+    matmul_dense_into_with_backend(
+        &prepack.dense(0, a)?,
+        &prepack.dense(1, b)?,
+        &geom,
+        backend,
+        Some(prepack),
+        out_slice,
+    )?;
+    Ok(geom.result_len)
+}
+
 fn matmul_dense_prepacked_with_backend(
     a: &TensorView,
     b: &TensorView,
@@ -574,40 +811,26 @@ fn matmul_dense_prepacked_with_backend(
     if let Some(result) = try_matmul_half(a, b, &geom)? {
         return Ok(result);
     }
-    matmul_dense_impl_with_backend(
-        a,
-        b,
+    matmul_dense_impl_with_geom(
         prepack.dense(0, a)?,
         prepack.dense(1, b)?,
+        &geom,
         backend,
-        #[cfg(feature = "mlas")]
         Some(prepack),
     )
 }
 
-fn matmul_dense_impl_with_backend(
-    a: &TensorView,
-    b: &TensorView,
+/// Shared owned-vector GEMM: allocate the result buffer and GEMM into it.
+/// Geometry is pre-computed by the caller to avoid redundant derivation.
+fn matmul_dense_impl_with_geom(
     a_dense: Cow<'_, [f32]>,
     b_dense: Cow<'_, [f32]>,
+    geom: &MatMulGeometry,
     backend: CpuBackend,
-    #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
+    prepack: Option<&MatMulPrepack>,
 ) -> Result<Vec<f32>> {
-    // Owned-vector wrapper: compute geometry, allocate the result buffer, then
-    // GEMM into it via the shared `_into` helper. Used by callers that need an
-    // owned result (fused attention / fused MatMul+bias) and by the narrowing
-    // fallback in `MatMulKernel::execute`.
-    let geom = matmul_geometry(a, b)?;
     let mut out = vec![0.0f32; geom.result_len];
-    matmul_dense_into_with_backend(
-        &a_dense,
-        &b_dense,
-        &geom,
-        backend,
-        #[cfg(feature = "mlas")]
-        prepack,
-        &mut out,
-    )?;
+    matmul_dense_into_with_backend(&a_dense, &b_dense, geom, backend, prepack, &mut out)?;
     Ok(out)
 }
 
@@ -707,7 +930,7 @@ fn matmul_dense_into_with_backend(
     b_dense: &[f32],
     geom: &MatMulGeometry,
     backend: CpuBackend,
-    #[cfg(feature = "mlas")] prepack: Option<&MatMulPrepack>,
+    prepack: Option<&MatMulPrepack>,
     out: &mut [f32],
 ) -> Result<()> {
     if out.len() != geom.result_len {
@@ -729,6 +952,12 @@ fn matmul_dense_into_with_backend(
     let (m, k, n) = (geom.m, geom.k, geom.n);
     let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
 
+    // `prepack` is consumed on macOS/iOS (Accelerate transposed_b) and with the
+    // `mlas` feature (packed_b). On other platforms it is passed through for API
+    // consistency but not yet consumed.
+    #[cfg(not(any(feature = "mlas", target_os = "macos", target_os = "ios")))]
+    let _ = &prepack;
+
     #[cfg(feature = "mlas")]
     let packed_b = if backend == CpuBackend::Mlas && geom.b_promoted_rank == 2 {
         prepack.and_then(|prepack| prepack.packed_b(b_dense, k, n))
@@ -736,8 +965,39 @@ fn matmul_dense_into_with_backend(
         None
     };
 
-    if geom.batch_shape.is_empty() {
-        // No batch dims: a single matmul.
+    // Accelerate hybrid M=1 fast path (macOS/iOS):
+    //
+    // Column-parallel NEON GEMV on pre-transposed B_T, parallelized via the
+    // Rayon decode pool. Single-threaded for small matrices (dispatch > compute).
+    // Accelerate sgemv was measured at ~30-50 µs GCD wake-up overhead per call,
+    // making it SLOWER than single-threaded NEON for L2-resident matrices (the
+    // wake-up dominates the compute saving). Accelerate sgemm is retained for
+    // M>1 prefill where AMX provides genuine compute benefit.
+    //
+    // Treat batch_shape with product ≤ 1 as non-batched: during decode the
+    // activation is typically [1, 1, K] against a [K, N] weight, giving
+    // batch_shape = [1]. The single-element batch is equivalent to no batch
+    // and must not skip this optimized path.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if backend == CpuBackend::Accelerate
+        && m == 1
+        && numel(&geom.batch_shape) <= 1
+        && geom.b_promoted_rank == 2
+    {
+        if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
+            accelerate_gemm::neon_gemv_col_parallel(a_dense, bt, out, k, n);
+        } else {
+            accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n);
+        }
+        return Ok(());
+    }
+
+    // A batch product of 1 (e.g. batch_shape = [1] from a [1,1,K] activation
+    // against a [K,N] weight) is equivalent to no batch. Use the non-batched
+    // path to pick up packed_b, avoid the per-batch iteration overhead, and
+    // stay consistent with the Accelerate M=1 fast path above.
+    if numel(&geom.batch_shape) <= 1 {
+        // No effective batch dims: a single matmul.
         #[cfg(feature = "mlas")]
         if let Some(packed_b) = packed_b {
             gemm_packed(a_dense, packed_b, out, m, k, n)?;
@@ -1052,7 +1312,7 @@ mod tests {
         // SAME bf16-rounded operands within bf16 tolerance, and (b) be no worse
         // than the widen-to-f32 upcast path — bf16-input products are exact in
         // f32, so both paths differ from f64 only by f32 summation rounding.
-        if !bf16_gemm::native_available() {
+        if !x86_bf16::native_available() {
             eprintln!("skipping: host lacks avx512_bf16");
             return;
         }
@@ -1105,7 +1365,7 @@ mod tests {
 
             // Native bf16 path.
             let mut native = vec![0.0f32; m * n];
-            bf16_gemm::gemm(&a_bits, &b_bits, &mut native, m, k, n);
+            x86_bf16::gemm(&a_bits, &b_bits, &mut native, m, k, n);
 
             let rel = |got: f32, want: f64| -> f64 {
                 let denom = want.abs().max(1.0);
@@ -1143,7 +1403,7 @@ mod tests {
         // The public MatMul kernel (which auto-routes to the native path on this
         // host) must produce a bf16 result matching a direct f64 reference for a
         // K that is not a multiple of the 32-lane bf16 width.
-        if !bf16_gemm::native_available() {
+        if !x86_bf16::native_available() {
             eprintln!("skipping: host lacks avx512_bf16");
             return;
         }
@@ -1191,7 +1451,7 @@ mod tests {
     #[ignore = "microbench: run explicitly with --ignored --nocapture"]
     fn bench_bf16_native_vs_upcast() {
         use std::time::Instant;
-        if !bf16_gemm::native_available() {
+        if !x86_bf16::native_available() {
             eprintln!("skipping bench: host lacks avx512_bf16");
             return;
         }
@@ -1229,7 +1489,7 @@ mod tests {
                 median3(Box::new(move || {
                     let mut c = vec![0.0f32; m * n];
                     let t = Instant::now();
-                    bf16_gemm::gemm(&a, &b, &mut c, m, k, n);
+                    x86_bf16::gemm(&a, &b, &mut c, m, k, n);
                     std::hint::black_box(&c);
                     t.elapsed().as_secs_f64() * 1e3
                 }))
@@ -1582,19 +1842,42 @@ mod tests {
             .execute(&[a1.view(), weight.view()], &mut [out1.view_mut()])
             .unwrap();
         assert_eq!(out1.to_f32(), vec![2., 6.]);
+        // On macOS with M=1 and f16 weights, the f16 GEMV path reads weights
+        // directly as f16 (via transposed_b_f16) and never widens to f32 —
+        // so dense[1] is NOT populated. On other platforms, dense[1] IS populated.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(kernel.prepack.transposed_b_f16.get().is_some());
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert!(kernel.prepack.dense[1].get().is_some());
         assert!(kernel.prepack.dense[0].get().is_none());
 
-        let cached_weight = kernel.prepack.dense[1].get().unwrap().as_ptr();
+        // Capture the cache pointer *before* the second execute so the
+        // comparison below is a real guard: it proves the first call populated
+        // the cache and the second reused it (rather than repopulating).
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let ptr_before = kernel.prepack.transposed_b_f16.get().unwrap().as_ptr();
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let ptr_before = kernel.prepack.dense[1].get().unwrap().as_ptr();
+
         let a2 = Owned::f32(&[1, 2], &[4., 5.]);
         let mut out2 = Owned::zeros_f32(&[1, 2]);
         kernel
             .execute(&[a2.view(), weight.view()], &mut [out2.view_mut()])
             .unwrap();
         assert_eq!(out2.to_f32(), vec![8., 15.]);
+
+        // The pointer must be unchanged — the OnceLock was already populated.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert_eq!(
+            kernel.prepack.transposed_b_f16.get().unwrap().as_ptr(),
+            ptr_before,
+            "transposed_b_f16 cache was reallocated on the second execute"
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         assert_eq!(
             kernel.prepack.dense[1].get().unwrap().as_ptr(),
-            cached_weight
+            ptr_before,
+            "dense[1] cache was reallocated on the second execute"
         );
     }
 
@@ -1850,5 +2133,129 @@ mod tests {
         MatMulKernel::default().execute(&[a, b], &mut [c]).unwrap();
         // Fallback computed the full result into a temp buffer before writing.
         assert_eq!(shared, vec![2.0, 1.0, 4.0, 3.0]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn accelerate_sgemm_matches_generic_for_small_shapes() {
+        let shapes = [(1, 4, 4), (2, 3, 5), (4, 8, 4), (1, 16, 16), (8, 8, 8)];
+        for (m, k, n) in shapes {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| (i as f32 * 0.7 + 0.3).sin() * 2.0)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| (i as f32 * 1.3 + 0.7).cos() * 2.0)
+                .collect();
+            let mut generic_out = vec![0.0f32; m * n];
+            let mut accel = vec![0.0f32; m * n];
+            gemm_with_backend(CpuBackend::Generic, &a, &b, &mut generic_out, m, k, n).unwrap();
+            gemm_with_backend(CpuBackend::Accelerate, &a, &b, &mut accel, m, k, n).unwrap();
+            for idx in 0..m * n {
+                let diff = (generic_out[idx] - accel[idx]).abs();
+                assert!(
+                    diff < 1e-4,
+                    "[{m},{k},{n}][{idx}]: g={} a={} d={}",
+                    generic_out[idx],
+                    accel[idx],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn accelerate_decode_gemv_matches_generic_at_model_scale() {
+        let shapes = [(1, 896, 896), (1, 896, 4864), (1, 4864, 896)];
+        for (m, k, n) in shapes {
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.31 + 0.17).sin()).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.13 + 0.71).cos()).collect();
+            let mut generic_out = vec![0.0f32; m * n];
+            let mut accel = vec![0.0f32; m * n];
+            gemm_with_backend(CpuBackend::Generic, &a, &b, &mut generic_out, m, k, n).unwrap();
+            gemm_with_backend(CpuBackend::Accelerate, &a, &b, &mut accel, m, k, n).unwrap();
+            let max_rel = generic_out
+                .iter()
+                .zip(accel.iter())
+                .map(|(g, a)| (g - a).abs() / g.abs().max(1e-8))
+                .fold(0.0f32, f32::max);
+            // Chew measured the worst model-scale accumulation-order drift at
+            // 1.57%; 1.8% keeps modest cross-machine headroom without letting a
+            // real GEMV regression hide behind the old 2% envelope.
+            assert!(max_rel < 1.8e-2, "[{m},{k},{n}]: max_rel={max_rel}");
+        }
+    }
+
+    #[test]
+    fn col_parallel_gemm_matches_reference_for_m1() {
+        let (m, k, n) = (1, 256, 512);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.41 + 0.13).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.23 + 0.57).cos()).collect();
+        let mut reference = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for p in 0..k {
+                    s += a[i * k + p] * b[p * n + j];
+                }
+                reference[i * n + j] = s;
+            }
+        }
+        let mut col_par = vec![0.0f32; m * n];
+        gemm_generic_col_parallel(&a, &b, &mut col_par, m, k, n, 8);
+        for idx in 0..m * n {
+            let diff = (reference[idx] - col_par[idx]).abs();
+            assert!(
+                diff < 1e-4,
+                "[{m},{k},{n}][{idx}]: ref={} col={} d={}",
+                reference[idx],
+                col_par[idx],
+                diff
+            );
+        }
+    }
+
+    /// Guard: an FP16 weight MatMul at M=1 (decode shape) must reach the NEON
+    /// GEMV path on Apple Silicon, not the half-precision blocked GEMM.  If the
+    /// dispatch order changes so `try_matmul_half` intercepts M=1 before the
+    /// GEMV, decode throughput drops ~4×.  This test would have caught the
+    /// `half_gemm.rs` regression that took native FP16 from 60→13 tok/s.
+    ///
+    /// Both A and B are Float16 to exercise the real fp16-model dispatch: the
+    /// regression occurs precisely when `try_matmul_half` matches (f16, f16) at
+    /// M=1 before the GEMV path can claim it.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn fp16_m1_decode_reaches_neon_gemv_not_half_gemm() {
+        use std::sync::atomic::Ordering;
+
+        let (k, n) = (64, 32);
+        let a_data: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = GEMV_F16_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = GEMV_F16_TEST_HITS.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "FP16 M=1 decode did not reach neon_gemv_f16_col_parallel — \
+             half_gemm.rs is likely intercepting M=1 before the GEMV path, \
+             which causes a ~4× decode throughput regression"
+        );
+        // Sanity: output should be finite
+        assert!(
+            out.to_f32().iter().all(|v| v.is_finite()),
+            "GEMV produced non-finite output"
+        );
     }
 }

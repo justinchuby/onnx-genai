@@ -39,7 +39,7 @@ fn render(request: &TextToImageRequest) -> RenderedImage {
     let pipeline_dir = fixture();
     let mut engine = PipelineEngine::from_dir_with_config(&pipeline_dir, EngineConfig::default())
         .expect("the tiny txt2img fixture must load as a pipeline");
-    let mut images = text_to_image::render(&pipeline_dir, &mut engine, request)
+    let mut images = text_to_image::generate_image(&pipeline_dir, &mut engine, request)
         .expect("the tiny txt2img fixture must render");
     assert_eq!(images.len(), 1, "one image was requested");
     images.remove(0)
