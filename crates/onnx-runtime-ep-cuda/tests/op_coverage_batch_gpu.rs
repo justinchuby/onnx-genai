@@ -572,6 +572,45 @@ fn reduce_log_sum_exp_axes_input_matches_cpu() {
     eprintln!("ReduceLogSumExp (axes-input, opset 18): CUDA matches CPU EP");
 }
 
+/// Regression guard for the numerical-stability defect fixed in PR #266: a naive
+/// `log(sum(exp(x)))` overflows to `+inf` for large-magnitude inputs, while the
+/// CPU EP (and now the CUDA kernel) stabilizes as `m + log(sum(exp(x - m)))`.
+/// These inputs (≈90 and a wide negative-to-positive spread) return `+inf` under
+/// the old naive kernel, so this test fails on it and passes on the stable one.
+#[test]
+fn reduce_log_sum_exp_large_values_match_cpu() {
+    let Some(ep) = cuda_ep() else { return };
+    // Row 0: the classic overflow case `[90, 91, 92, 93]` (naive exp -> +inf).
+    // Row 1: a wide spread mixing large negatives and positives; exp(120) also
+    // overflows f32 (~3.4e38) without max-subtraction.
+    let in_shape = vec![2usize, 4];
+    let values: Vec<f32> = vec![90.0, 91.0, 92.0, 93.0, -100.0, 5.0, 120.0, -3.0];
+    let axes: Vec<i64> = vec![1];
+    let out_shape = reduce_out_shape(&in_shape, &axes, false);
+    let inputs = [input(DataType::Float32, &in_shape, &values)];
+    let outputs = [(DataType::Float32, out_shape)];
+    let attrs = [
+        ("axes", Attribute::Ints(axes.clone())),
+        ("keepdims", Attribute::Int(0)),
+    ];
+    let cuda = run_cuda(&ep, "ReduceLogSumExp", 13, &inputs, &outputs, &attrs);
+    let cpu = run_cpu("ReduceLogSumExp", 13, &inputs, &outputs, &attrs);
+    let cuda_f = decode_floats(&cuda[0], DataType::Float32);
+    let cpu_f = decode_floats(&cpu[0], DataType::Float32);
+    // The CPU reference must stay finite — proving the stabilization is the point
+    // of this test (a naive kernel would emit `+inf` here).
+    assert!(
+        cpu_f.iter().all(|v| v.is_finite()),
+        "CPU reference should be finite, got {cpu_f:?}"
+    );
+    assert!(
+        cuda_f.iter().all(|v| v.is_finite()),
+        "CUDA output overflowed (naive log(sum(exp))?): {cuda_f:?}"
+    );
+    assert_close("ReduceLogSumExp", DataType::Float32, &cuda_f, &cpu_f, 2e-3);
+    eprintln!("ReduceLogSumExp (large values): CUDA matches CPU EP, no overflow");
+}
+
 /// `Swish` and `ThresholdedRelu` across f32/f16/bf16 with default and explicit
 /// `alpha`, compared against the CPU EP.
 #[test]

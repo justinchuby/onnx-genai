@@ -166,6 +166,70 @@ extern "C" __global__ void reduce_ext_f32(
     }
 }
 
+extern "C" __global__ void reduce_logsumexp_f32(
+    const float*     x,
+    float*           y,
+    const long long* base_off,     // [out_count]
+    const long long* delta_off,    // [reduce_count]
+    const int        out_count,
+    const int        reduce_count,
+    const unsigned int* capture_error)
+{
+    if (capture_error && *capture_error) return;
+    const int o = blockIdx.x;
+    if (o >= out_count) return;
+
+    const float NEG_INF = __int_as_float(0xff800000);
+    const float QNAN    = __int_as_float(0x7fc00000);
+
+    extern __shared__ float red[];
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const size_t base = (size_t)base_off[o];
+
+    // Pass 1 — group max with NaN propagation (numpy / CPU-EP semantics).
+    // Stabilizes `log(sum(exp(x)))` as `m + log(sum(exp(x - m)))`, matching the
+    // CPU EP's max-subtraction (reduce_ops.rs:179-226).
+    float m = NEG_INF;
+    for (int r = tid; r < reduce_count; r += nt) {
+        const float v = x[base + (size_t)delta_off[r]];
+        m = (isnan(m) || isnan(v)) ? QNAN : fmaxf(m, v);
+    }
+    red[tid] = m;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) {
+            const float a = red[tid], b = red[tid + off];
+            red[tid] = (isnan(a) || isnan(b)) ? QNAN : fmaxf(a, b);
+        }
+        __syncthreads();
+    }
+    const float gmax = red[0];
+    __syncthreads();
+
+    // Non-finite maxima short-circuit exactly like the CPU EP: an all `-inf`
+    // group yields `-inf`, any `+inf` yields `+inf`, any NaN yields NaN. This
+    // also avoids the `inf - inf = NaN` that a blind `exp(v - m)` would produce.
+    if (!isfinite(gmax)) {
+        if (tid == 0) y[o] = gmax;
+        return;
+    }
+
+    // Pass 2 — sum of exp(v - gmax) in the shifted frame.
+    float acc = 0.0f;
+    for (int r = tid; r < reduce_count; r += nt) {
+        const float v = x[base + (size_t)delta_off[r]];
+        acc += expf(v - gmax);
+    }
+    red[tid] = acc;
+    __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) y[o] = gmax + logf(red[0]);
+}
+
 extern "C" __global__ void reduce_i64_sum(
     const long long* x,
     long long*       y,
@@ -201,6 +265,7 @@ extern "C" __global__ void reduce_i64_sum(
 const REDUCE_MODULE: &str = "reduce_f32";
 const REDUCE_ENTRY: &str = "reduce_f32";
 const REDUCE_EXT_ENTRY: &str = "reduce_ext_f32";
+const REDUCE_LOGSUMEXP_ENTRY: &str = "reduce_logsumexp_f32";
 const REDUCE_I64_SUM_ENTRY: &str = "reduce_i64_sum";
 const REDUCE_VALIDATE_AXES_ENTRY: &str = "validate_reduce_axes_i64";
 pub const REDUCE_CAPTURE_ERROR_AXES: u32 = 128;
@@ -225,8 +290,11 @@ pub enum ReduceOp {
     L2,
     /// `log(sum(x))` (`ReduceLogSum`).
     LogSum,
-    /// `log(sum(exp(x)))`, evaluated naively to match the CPU EP
-    /// (`ReduceLogSumExp`).
+    /// `log(sum(exp(x)))`, evaluated with max-subtraction stabilization to
+    /// match the CPU EP (`reduce_ops.rs:179-226`): `m + log(sum(exp(x - m)))`
+    /// where `m` is the group max. Routed through a dedicated two-pass kernel
+    /// (`reduce_logsumexp_f32`) rather than the generic `(pre,combine,post)`
+    /// pipeline, since the max must be known before the exp-sum (`ReduceLogSumExp`).
     LogSumExp,
 }
 
@@ -262,6 +330,10 @@ impl ReduceOp {
     /// `pre` transforms each element (0 id, 1 abs, 2 square, 3 exp), `combine`
     /// folds the group (0 add, 1 mul), and `post` maps the accumulator (0 none,
     /// 1 sqrt, 2 ln). Returns `None` for the four base reductions.
+    ///
+    /// `LogSumExp` returns `Some(..)` only so it routes past the cudnn/identity
+    /// paths; its numerics use the dedicated two-pass `reduce_logsumexp_f32`
+    /// kernel, so the tag values themselves are inert for that op.
     fn ext_tags(self) -> Option<(i32, i32, i32)> {
         match self {
             ReduceOp::Prod => Some((0, 1, 0)),
@@ -918,6 +990,7 @@ impl ReduceKernel {
         })?;
         let (op_tag, is_mean) = self.op.kernel_tags();
         let ext_tags = self.op.ext_tags();
+        let is_logsumexp = self.op == ReduceOp::LogSumExp;
 
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
@@ -929,6 +1002,8 @@ impl ReduceKernel {
 
         let entry = if x.dtype == DataType::Int64 {
             REDUCE_I64_SUM_ENTRY
+        } else if is_logsumexp {
+            REDUCE_LOGSUMEXP_ENTRY
         } else if ext_tags.is_some() {
             REDUCE_EXT_ENTRY
         } else {
@@ -956,6 +1031,9 @@ impl ReduceKernel {
             .arg(&red_i);
         let (pre, combine, post) = ext_tags.unwrap_or((0, 0, 0));
         if x.dtype == DataType::Int64 {
+            builder.arg(&capture_error);
+        } else if is_logsumexp {
+            // Dedicated two-pass kernel (max, then exp-sum); no pre/combine/post.
             builder.arg(&capture_error);
         } else if ext_tags.is_some() {
             builder
@@ -1084,6 +1162,7 @@ mod tests {
     #[test]
     fn ext_tags_map_extended_ops_and_entry_present() {
         assert!(REDUCE_SRC.contains(REDUCE_EXT_ENTRY));
+        assert!(REDUCE_SRC.contains(REDUCE_LOGSUMEXP_ENTRY));
         // Base reductions do not route through the extended kernel.
         for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min] {
             assert_eq!(op.ext_tags(), None);
@@ -1095,6 +1174,8 @@ mod tests {
         assert_eq!(ReduceOp::L1.ext_tags(), Some((1, 0, 0)));
         assert_eq!(ReduceOp::L2.ext_tags(), Some((2, 0, 1)));
         assert_eq!(ReduceOp::LogSum.ext_tags(), Some((0, 0, 2)));
+        // LogSumExp keeps a Some(..) tag only to route past cudnn/identity; its
+        // actual math lives in the dedicated two-pass `reduce_logsumexp_f32`.
         assert_eq!(ReduceOp::LogSumExp.ext_tags(), Some((3, 0, 2)));
         for op in [
             ReduceOp::Prod,
