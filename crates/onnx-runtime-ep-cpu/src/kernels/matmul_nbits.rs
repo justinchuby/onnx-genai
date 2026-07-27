@@ -2246,23 +2246,19 @@ pub fn with_decode_pool_scope<R: Send>(
     // The persistent SPMD pool benefits both quantized and dense-f32 models when
     // the NEON GEMV kernel dispatches to it (aarch64 without MLAS). With MLAS the
     // SPMD workers contend with the MLAS GEMM's own Rayon workers, so the pool
-    // is skipped. Without MLAS, let the auto-calibrator measure both paths and
-    // adopt the pool only when it is faster (no regression under load).
+    // is skipped. Without MLAS, the pool is built and used by default.
     #[cfg(not(feature = "mlas"))]
     let spmd_pool_eligible = model_uses_spmd_pool
         || crate::decode_spmd::is_forced()
-        || crate::decode_spmd::pools().is_some(); // auto-calibration for dense FP32
+        || crate::decode_spmd::pools().is_some(); // default or adaptive
     #[cfg(feature = "mlas")]
     let spmd_pool_eligible = model_uses_spmd_pool || crate::decode_spmd::is_forced();
     if !spmd_pool_eligible {
         return with_dense_decode_pool_scope(f);
     }
-    // The persistent SPMD pool is opt-in (`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`;
-    // unset/`=0` use the flat path). Precedence when forced: explicit numa-split
-    // env > forced persistent SPMD > flat + auto-compact. The "mutually exclusive"
-    // diagnostic below is scoped to users who *explicitly* forced the persistent
-    // pool (`PERSISTENT_POOL=1`); the default never builds it, so there is no
-    // conflict to log there.
+    // The persistent SPMD pool is the default (unset or `=1`). Precedence:
+    // explicit numa-split env > persistent SPMD > flat + auto-compact. The
+    // "mutually exclusive" diagnostic below is scoped to users who set both.
     let both_requested = crate::decode_spmd::is_forced()
         && std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV)
             .is_ok_and(|value| value.trim() == "numa-split");
@@ -2275,11 +2271,11 @@ pub fn with_decode_pool_scope<R: Send>(
     if let Some(numa) = numa_pools() {
         if both_requested {
             report_decode_strategy_precedence(
-                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the forced persistent \
-                 SPMD decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1) are mutually \
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the persistent \
+                 SPMD decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL) are mutually \
                  exclusive; numa-split is active because it has precedence and its two-level \
-                 NUMA layout was built successfully. Unset \
-                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL to silence this if intentional",
+                 NUMA layout was built successfully. Set \
+                 ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=0 to silence this if intentional",
             );
         }
         return numa.install_scope(move || {
@@ -2295,16 +2291,15 @@ pub fn with_decode_pool_scope<R: Send>(
     // re-install the flat pool); the SPMD-scope flag routes `parallel_output_rows`
     // through the persistent pool.
     //
-    // The pool is built for both `Forced` (`=1`) and the `Auto` default (unset).
-    // When forced, every step dispatches to it. Under `Auto` the calibrator times
-    // the same token-exact step both ways and commits the faster path (defaulting
-    // to the flat path, the safe choice under load), so decode never regresses on
-    // a loaded host -- see `crate::decode_spmd::Calibrator`.
+    // The pool is built for both `On` (default/`=1`) and `Adaptive` (`=auto`).
+    // `On` always dispatches to it. `Adaptive` lets the calibrator time the same
+    // token-exact step both ways and commit the faster path (defaulting to flat,
+    // the safe choice under load) -- see `crate::decode_spmd::Calibrator`.
     if crate::decode_spmd::pools().is_some() {
         if both_requested {
             report_decode_strategy_precedence(
-                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the forced persistent \
-                 SPMD decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1) are mutually \
+                "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the persistent \
+                 SPMD decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL) are mutually \
                  exclusive; persistent SPMD is active because the higher-precedence \
                  numa-split layout was unavailable",
             );
@@ -2312,14 +2307,14 @@ pub fn with_decode_pool_scope<R: Send>(
         if crate::decode_spmd::is_forced() {
             return with_spmd_decode_scope(f);
         }
-        // `Auto`: measure the live decode step on the chosen path and feed the
-        // timing back so the pool is adopted only while it is genuinely faster.
+        // `Adaptive` (`=auto`): measure the live decode step on the chosen path
+        // and feed the timing back so the pool is adopted only when genuinely faster.
         return with_auto_calibrated_decode_scope(f);
     }
     if both_requested {
         report_decode_strategy_precedence(
-            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the forced persistent SPMD \
-             decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1) are mutually exclusive; \
+            "ONNX_GENAI_CPU_DECODE_AFFINITY=numa-split and the persistent SPMD \
+             decode pool (ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL) are mutually exclusive; \
              neither strategy is active because no bounded decode worker count or usable \
              numa-split layout is available",
         );
@@ -2336,9 +2331,10 @@ fn with_spmd_decode_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     f()
 }
 
-/// Install the forward on the flat, bounded [`DECODE_POOL`] (today's default
-/// decode path). When the pool opts out (`ONNX_GENAI_CPU_DECODE_THREADS=0`) or
-/// fails to build, `f` runs on the global Rayon pool, preserving correctness.
+/// Install the forward on the flat, bounded [`DECODE_POOL`] (the legacy decode
+/// path, used by `=0` or when the SPMD pool cannot be built). When the pool opts
+/// out (`ONNX_GENAI_CPU_DECODE_THREADS=0`) or fails to build, `f` runs on the
+/// global Rayon pool, preserving correctness.
 fn with_flat_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => pool.install(move || {
@@ -2349,12 +2345,13 @@ fn with_flat_decode_pool_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     }
 }
 
-/// `Auto`-mode calibrate-and-pick: ask the calibrator which path this decode step
-/// should take, time the *real* step on it, and feed the wall time back. Both
-/// paths are token-exact, so the choice never changes the emitted tokens -- only
-/// how fast the step runs. The calibrator keeps the flat path committed by
-/// default and adopts the pool only when it measures faster, so a loaded host
-/// stays on the flat path (no regression); see `crate::decode_spmd::Calibrator`.
+/// Adaptive-mode calibrate-and-pick (`=auto`): ask the calibrator which path this
+/// decode step should take, time the *real* step on it, and feed the wall time
+/// back. Both paths are token-exact, so the choice never changes the emitted
+/// tokens -- only how fast the step runs. The calibrator keeps the flat path
+/// committed by default and adopts the pool only when it measures faster, so a
+/// loaded host stays on the flat path (no regression); see
+/// `crate::decode_spmd::Calibrator`.
 fn with_auto_calibrated_decode_scope<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     use crate::decode_spmd::AutoPath;
     let path = crate::decode_spmd::auto_choose_path();
@@ -7793,7 +7790,7 @@ mod tests {
 
     fn parity_child_output(persistent: bool) -> Vec<u8> {
         parity_child_output_mode(if persistent {
-            SpmdParityMode::Forced
+            SpmdParityMode::On
         } else {
             SpmdParityMode::Off
         })
@@ -7804,19 +7801,19 @@ mod tests {
     enum SpmdParityMode {
         /// `=0`: the flat legacy path (baseline).
         Off,
-        /// `=1`: force the persistent pool.
-        Forced,
-        /// unset: the `Auto` calibrated default (warmup routes the fixture through
+        /// `=1` or unset: the persistent pool (the default).
+        On,
+        /// `=auto`: adaptive calibrated mode (warmup routes the fixture through
         /// the pool, so its bytes must still match the flat baseline).
-        Auto,
+        Adaptive,
     }
 
     impl SpmdParityMode {
         fn child_tag(self) -> &'static str {
             match self {
                 Self::Off => "off",
-                Self::Forced => "on",
-                Self::Auto => "auto",
+                Self::On => "on",
+                Self::Adaptive => "auto",
             }
         }
     }
@@ -7834,7 +7831,7 @@ mod tests {
             .env("RAYON_NUM_THREADS", &workers)
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
         match mode {
-            SpmdParityMode::Forced => {
+            SpmdParityMode::On => {
                 command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
             }
             SpmdParityMode::Off => {
@@ -7842,14 +7839,14 @@ mod tests {
                 // the pool children.
                 command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "0");
             }
-            SpmdParityMode::Auto => {
-                // Unset: the calibrated `Auto` default. The pool is built and the
+            SpmdParityMode::Adaptive => {
+                // `=auto`: the adaptive calibrated mode. The pool is built and the
                 // warmup step routes the fixture through it, so this exercises the
-                // real auto entry point end-to-end.
-                command.env_remove(crate::decode_spmd::PERSISTENT_POOL_ENV);
+                // real adaptive entry point end-to-end.
+                command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "auto");
             }
         }
-        let persistent = matches!(mode, SpmdParityMode::Forced);
+        let persistent = matches!(mode, SpmdParityMode::On);
         let output = command.output().expect("run SPMD parity child process");
         assert!(
             output.status.success(),
@@ -7941,19 +7938,19 @@ mod tests {
     }
 
     #[test]
-    fn spmd_auto_calibrated_decode_is_bit_identical_to_flat() {
-        // Token-exactness of the auto-enable path (Hudson, 2026-07-24): with
-        // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` unset (the `Auto` default), the
-        // calibrator may route a decode step through the persistent pool. Because
-        // both paths are token-exact (N-tile aligned, PR #110), the auto child's
-        // bytes must be identical to the flat (`=0`) baseline. This guards the
-        // constraint that auto can never route a non-exact config: it only ever
-        // selects between the exact pool and the exact flat path.
+    fn spmd_adaptive_calibrated_decode_is_bit_identical_to_flat() {
+        // Token-exactness of the adaptive path: with
+        // `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto`, the calibrator may route
+        // a decode step through the persistent pool. Because both paths are
+        // token-exact (N-tile aligned, PR #110), the adaptive child's bytes must
+        // be identical to the flat (`=0`) baseline. This guards the constraint
+        // that adaptive can never route a non-exact config: it only ever selects
+        // between the exact pool and the exact flat path.
         let baseline = parity_child_output_mode(SpmdParityMode::Off);
-        let auto = parity_child_output_mode(SpmdParityMode::Auto);
+        let adaptive = parity_child_output_mode(SpmdParityMode::Adaptive);
         assert_eq!(
-            auto, baseline,
-            "auto-calibrated decode output must be byte-identical to the flat baseline"
+            adaptive, baseline,
+            "adaptive-calibrated decode output must be byte-identical to the flat baseline"
         );
     }
 
@@ -8481,28 +8478,28 @@ mod tests {
             return;
         };
         match scenario.as_str() {
-            // (a) Auto default + explicit non-numa-split affinity -> defer to the
+            // (a) Adaptive + explicit non-numa-split affinity -> defer to the
             // flat path: the persistent SPMD pool must NOT be built.
             "auto_off" | "auto_node" | "auto_compact" => {
                 assert!(
                     crate::decode_spmd::pools().is_none(),
-                    "Auto default + explicit affinity ({scenario}) must defer to the flat \
+                    "Adaptive + explicit affinity ({scenario}) must defer to the flat \
                      path and build no persistent SPMD pool"
                 );
             }
-            // (b) Forced (`=1`) + affinity set -> SPMD still wins.
+            // (b) On (default or `=1`) + affinity set -> SPMD still wins.
             "forced_off" => {
                 assert!(
                     crate::decode_spmd::pools().is_some(),
-                    "Forced persistent pool must ignore the affinity defer and build SPMD"
+                    "On (default) persistent pool must ignore the affinity defer and build SPMD"
                 );
             }
-            // (c) Auto + malformed affinity -> deferred to flat AND the flat path
+            // (c) Adaptive + malformed affinity -> deferred to flat AND the flat path
             // still surfaces the malformed-value error.
             "auto_malformed" => {
                 assert!(
                     crate::decode_spmd::pools().is_none(),
-                    "Auto default + malformed affinity must defer to the flat path"
+                    "Adaptive + malformed affinity must defer to the flat path"
                 );
                 assert!(
                     crate::decode_affinity::plan_decode_affinity(4).is_err(),
@@ -8591,10 +8588,10 @@ mod tests {
         if forced {
             command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1");
         } else {
-            // Auto: the persistence env is unset. With an explicit decode-affinity
-            // set (as these scenarios do), Auto defers to that request and builds
-            // no persistent SPMD pool, routing decode through the flat/affinity path.
-            command.env_remove(crate::decode_spmd::PERSISTENT_POOL_ENV);
+            // Adaptive (`=auto`): with an explicit decode-affinity set (as these
+            // scenarios do), Adaptive defers to that request and builds no persistent
+            // SPMD pool, routing decode through the flat/affinity path.
+            command.env(crate::decode_spmd::PERSISTENT_POOL_ENV, "auto");
         }
 
         // Bounded retry loop scoped to *exactly* the known environmental crash
@@ -8642,7 +8639,7 @@ mod tests {
         }
     }
 
-    /// (a) Auto default (`PERSISTENT_POOL` unset) with an explicit non-numa-split
+    /// (a) Adaptive (`=auto`) with an explicit non-numa-split
     /// affinity defers to the flat path and builds no persistent SPMD pool.
     #[test]
     fn auto_default_with_explicit_affinity_defers_to_flat() {
@@ -8651,8 +8648,8 @@ mod tests {
         run_affinity_defer_child("auto_compact", "compact", false);
     }
 
-    /// (b) Forced (`=1`) keeps the persistent SPMD pool even when an explicit
-    /// affinity is set -- the affinity defer must not apply.
+    /// (b) On (default or `=1`) keeps the persistent SPMD pool even when an
+    /// explicit affinity is set -- the affinity defer must not apply.
     ///
     /// The spawned child (`run_affinity_defer_child`) is wrapped in a bounded
     /// retry that fires *only* on the known native Windows ARM64 environmental

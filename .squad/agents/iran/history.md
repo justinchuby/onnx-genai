@@ -27,3 +27,13 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 - State benchmark metrics exactly; compare `tokens/total_time`, p50-derived tok/s, and init-inclusive means separately.
 - Use access-pattern-specific rooflines: streaming bandwidth is not GEMV bandwidth.
 - Every SIMD path needs direct tests plus guard-break coverage before performance claims ship.
+
+### 2026-07-27 — Load-adaptive path selection made opt-in (Chu directive)
+- Changed `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL` default from `Auto` (calibrator) to `On` (deterministic pool).
+- Added `=auto` value for explicit opt-in to load-adaptive calibration.
+- Renamed enum variants: `Auto`→`Adaptive`, `Forced`→`On`; `Off` unchanged.
+- Updated module docs, `report_pool_built` observability message, tests (3 new: `default_selects_pool_without_probing`, `adaptive_flag_enables_calibration`, `on_and_adaptive_build_the_pool`), README.
+- Guard-break proof: broke `persistence_mode_from_raw` default→Off, test caught it, restored.
+- Quiet: 43.75 tok/s (pool default). Under 8×load: 3.09 tok/s (accepted tradeoff for predictability; old adaptive would have chosen flat ~13 tok/s).
+- x86_64-apple-darwin cross-compilation confirmed clean with `cargo clippy -D warnings`.
+- Per-generation freeze from `177e8a73` preserved (orthogonal, not touched).

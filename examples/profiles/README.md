@@ -35,9 +35,8 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai --profile \
   --prompt "Write a short Rust function that reverses a string." \
   --max-new-tokens 200 --temperature 0
 
-# native CPU FP32 (force the SPMD pool to measure kernel capability)
+# native CPU FP32 (the SPMD pool is the default; no env var needed)
 ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu \
-  ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 \
   ./target/release/onnx-genai --profile \
   generate models/qwen2.5-0.5b \
   --prompt "Write a short Rust function that reverses a string." \
@@ -45,7 +44,6 @@ ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu \
 
 # native CPU FP16
 ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu \
-  ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 \
   ./target/release/onnx-genai --profile \
   generate models/qwen2.5-0.5b-f16 \
   --prompt "Write a short Rust function that reverses a string." \
@@ -61,9 +59,9 @@ print(os.path.join(os.path.dirname(onnxruntime_mlx.__file__), "libonnxruntime_ml
 ./target/release/onnx-genai --profile generate models/qwen2.5-0.5b ...
 ```
 
-For the native backend, set `ONNX_GENAI_BACKEND=native` and
-`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`. For the FP16 model, point at
-`models/qwen2.5-0.5b-f16`.
+For the native backend, set `ONNX_GENAI_BACKEND=native`. The persistent SPMD
+pool is the default; no additional env var is needed. For the FP16 model, point
+at `models/qwen2.5-0.5b-f16`.
 
 Add `--profile-trace out.json` for a Perfetto timeline instead of these
 aggregates; see [`../traces/`](../traces/).
@@ -124,15 +122,19 @@ rather than bandwidth-bound and has not been optimised in this campaign; it is a
 separate regime from the decode path that these changes target. This pulls
 native's end-to-end throughput well below its decode rate.
 
-The native CPU profiles were captured with `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`
-(forced SPMD pool). The auto-calibrator decides once at the start of each
-session and freezes the path permanently (it does not re-probe mid-generation);
-under heavy system load it selects the single-threaded flat path, which is
-correct behaviour for a contended machine but does not reflect the kernel's
-capability. The decode throughput shown above is the mean across all generated
-tokens including a ~1 s pool-initialisation spike on the first decode step; the
-p50 inter-token latency in the `.txt` files is the better measure of
-steady-state performance.
+The native CPU profiles use the persistent SPMD decode pool, which is the
+default. The pool is deterministically selected — no host probing or
+load-adaptive calibration runs unless explicitly requested via
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto`. Under heavy co-tenant load the
+pool's busy-wait barrier contends with neighbours, so throughput degrades more
+than the flat legacy path (`=0`). This is the accepted tradeoff for
+predictability: the same prompt at temperature 0 always follows the same
+floating-point reduction order, regardless of system load. Users on shared
+machines who prefer adaptation can set `=auto` to let a startup calibrator pick
+the faster path (pool on quiet hosts, flat under load). The decode throughput
+shown above is the mean across all generated tokens including a ~1 s
+pool-initialisation spike on the first decode step; the p50 inter-token latency
+in the `.txt` files is the better measure of steady-state performance.
 
 The native backend loads an order of magnitude faster than ONNX Runtime (134 ms
 vs 2710 ms) because it memory-maps weights instead of building a session graph.
