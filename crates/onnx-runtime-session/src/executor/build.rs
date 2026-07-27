@@ -1,9 +1,5 @@
 use super::*;
 
-/// Lower an exact `x * Sigmoid(x)` pair to the CPU EP's fused SiLU kernel.
-///
-/// The Sigmoid result must have exactly one consumer and must not be a graph
-
 pub(super) struct WeightStoreInitializerResolver(Arc<WeightStore>);
 
 impl InitializerResolver for WeightStoreInitializerResolver {
