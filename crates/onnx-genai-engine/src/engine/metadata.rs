@@ -170,7 +170,9 @@ pub(crate) fn genai_config_compat_metadata(
 /// converter consumes (names, dtype spelling, and per-axis static/symbolic
 /// dimensions). ORT reports dynamic axes as negative dimensions, which map to
 /// symbolic (`None`) entries.
-pub(crate) fn session_model_graph_info(session: &Session) -> onnx_genai_genai_config::ModelGraphInfo {
+pub(crate) fn session_model_graph_info(
+    session: &Session,
+) -> onnx_genai_genai_config::ModelGraphInfo {
     fn tensor_info(meta: &onnx_genai_ort::TensorInfo) -> onnx_genai_genai_config::GraphTensorInfo {
         onnx_genai_genai_config::GraphTensorInfo {
             name: meta.name.clone(),
@@ -307,4 +309,3 @@ pub(crate) fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
             && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
     }))
 }
-

@@ -126,7 +126,9 @@ pub(crate) fn model_requires_native_backend(model_path: &Path) -> anyhow::Result
 }
 
 #[cfg(feature = "native-backend")]
-pub(crate) fn model_proto_requires_native_backend(model: &onnx_runtime_loader::proto::ModelProto) -> bool {
+pub(crate) fn model_proto_requires_native_backend(
+    model: &onnx_runtime_loader::proto::ModelProto,
+) -> bool {
     const DOMAIN: &str = "pkg.nxrt";
     const OP_TYPE: &str = "BlockQuantizedMatMul";
     const OPSET_VERSION: i64 = 1;

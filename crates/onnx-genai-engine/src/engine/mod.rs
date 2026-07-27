@@ -23,7 +23,9 @@ pub(crate) use crate::processors::{
 pub(crate) use crate::sampling::{Sampler, SamplingRng};
 pub(crate) use crate::session::{ActiveGenerate, DraftModel, DraftSession, EngineSession};
 pub(crate) use anyhow::Context;
-pub(crate) use onnx_genai_kv::{Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache};
+pub(crate) use onnx_genai_kv::{
+    Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache,
+};
 pub(crate) use onnx_genai_metadata::{InferenceMetadata, ProposalType, SpeculatorProposerStatus};
 pub(crate) use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
@@ -60,14 +62,13 @@ mod model;
 mod runtime;
 mod speculative_load;
 
-pub use governor::{EngineGovernorError, EngineResourceGovernor};
-pub use model::Engine;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
+pub use governor::{EngineGovernorError, EngineResourceGovernor};
 pub(crate) use metadata::*;
+pub use model::Engine;
 pub(crate) use model::*;
 pub(crate) use speculative_load::*;
-
 
 #[cfg(test)]
 mod tests {

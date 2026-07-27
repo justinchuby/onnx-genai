@@ -263,4 +263,3 @@ pub(crate) fn resolved_host_ram_budget(
     .context("failed to resolve the engine memory budget for decoder fixed state")?;
     Ok(governor.snapshot().resolved_limits.host_ram_bytes)
 }
-

@@ -1250,4 +1250,3 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
         self.state.sampled_fastpath_failed = true;
     }
 }
-

@@ -150,7 +150,10 @@ pub(crate) fn mtp_config_from_metadata(
 /// The target hidden output name is not part of the shared metadata contract,
 /// so it is auto-detected: the first Float32 output whose last dimension equals
 /// the advertised backbone hidden size (excluding `logits`).
-pub(crate) fn shared_kv_mode_from_metadata(model_dir: &Path, session: &Session) -> Option<SpeculativeMode> {
+pub(crate) fn shared_kv_mode_from_metadata(
+    model_dir: &Path,
+    session: &Session,
+) -> Option<SpeculativeMode> {
     let descriptor = onnx_genai_metadata::detect_speculator(model_dir)?;
     let onnx_genai_metadata::SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
         return None;
