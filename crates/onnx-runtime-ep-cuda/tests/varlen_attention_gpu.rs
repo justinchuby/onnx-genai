@@ -13,7 +13,7 @@
 //! `CUDA_VISIBLE_DEVICES=5 taskset -c 1 cargo test -p onnx-runtime-ep-cuda \
 //!   --test varlen_attention_gpu -- --nocapture`
 
-use half::f16;
+use half::{bf16, f16};
 use onnx_runtime_ep_api::{
     DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, Result, TensorMut, TensorView,
 };
@@ -48,6 +48,17 @@ fn f16_tensor(shape: &[usize], values: &[f32]) -> Tensor {
         bytes: values
             .iter()
             .flat_map(|v| f16::from_f32(*v).to_bits().to_ne_bytes())
+            .collect(),
+    }
+}
+
+fn bf16_tensor(shape: &[usize], values: &[f32]) -> Tensor {
+    Tensor {
+        dtype: DataType::BFloat16,
+        shape: shape.to_vec(),
+        bytes: values
+            .iter()
+            .flat_map(|v| bf16::from_f32(*v).to_bits().to_ne_bytes())
             .collect(),
     }
 }
@@ -93,6 +104,10 @@ fn decode(dtype: DataType, bytes: &[u8]) -> Vec<f32> {
         DataType::Float16 => bytes
             .chunks_exact(2)
             .map(|c| f16::from_bits(u16::from_ne_bytes(c.try_into().unwrap())).to_f32())
+            .collect(),
+        DataType::BFloat16 => bytes
+            .chunks_exact(2)
+            .map(|c| bf16::from_bits(u16::from_ne_bytes(c.try_into().unwrap())).to_f32())
             .collect(),
         other => panic!("unexpected output dtype {other:?}"),
     }
@@ -250,14 +265,16 @@ impl Batch {
         self.nonpad.len()
     }
 
-    /// Round Q/K/V through f16 so the CPU reference sees the same operands the
-    /// kernel loads when `fp16` is set.
-    fn quantized_inputs(&self, fp16: bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        if !fp16 {
-            return (self.q.clone(), self.k.clone(), self.v.clone());
-        }
-        let q16 = |xs: &[f32]| xs.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
-        (q16(&self.q), q16(&self.k), q16(&self.v))
+    /// Round Q/K/V through the storage dtype so the CPU reference sees the same
+    /// operands the kernel loads.
+    fn quantized_inputs(&self, dtype: DataType) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let quantize = |xs: &[f32]| match dtype {
+            DataType::Float32 => xs.to_vec(),
+            DataType::Float16 => xs.iter().map(|&x| f16::from_f32(x).to_f32()).collect(),
+            DataType::BFloat16 => xs.iter().map(|&x| bf16::from_f32(x).to_f32()).collect(),
+            other => panic!("unsupported varlen test dtype {other:?}"),
+        };
+        (quantize(&self.q), quantize(&self.k), quantize(&self.v))
     }
 
     /// Run the varlen kernel. `rank4` picks the `[batch, q_seq, heads, dim]`
@@ -272,13 +289,29 @@ impl Batch {
         scale: Option<f32>,
         softcap: f32,
     ) -> Vec<f32> {
+        let dtype = if fp16 {
+            DataType::Float16
+        } else {
+            DataType::Float32
+        };
+        self.run_dtype(ep, is_causal, dtype, rank4, scale, softcap)
+    }
+
+    fn run_dtype(
+        &self,
+        ep: &CudaExecutionProvider,
+        is_causal: bool,
+        dtype: DataType,
+        rank4: bool,
+        scale: Option<f32>,
+        softcap: f32,
+    ) -> Vec<f32> {
         let batch = self.batch();
-        let make = |shape: &[usize], data: &[f32]| {
-            if fp16 {
-                f16_tensor(shape, data)
-            } else {
-                f32_tensor(shape, data)
-            }
+        let make = |shape: &[usize], data: &[f32]| match dtype {
+            DataType::Float32 => f32_tensor(shape, data),
+            DataType::Float16 => f16_tensor(shape, data),
+            DataType::BFloat16 => bf16_tensor(shape, data),
+            other => panic!("unsupported varlen test dtype {other:?}"),
         };
         let q_shape = if rank4 {
             vec![batch, self.q_seq, self.num_heads, self.head_size]
@@ -301,11 +334,6 @@ impl Batch {
             make(&v_shape, &self.v),
             i64_tensor(&[batch], &self.nonpad),
         ];
-        let out_dtype = if fp16 {
-            DataType::Float16
-        } else {
-            DataType::Float32
-        };
         let mut attrs = vec![
             ("num_heads", Attribute::Int(self.num_heads as i64)),
             ("kv_num_heads", Attribute::Int(self.kv_num_heads as i64)),
@@ -324,13 +352,13 @@ impl Batch {
             1,
             &inputs,
             (
-                out_dtype,
+                dtype,
                 vec![batch, self.q_seq, self.num_heads, self.v_head_size],
             ),
             &attrs,
         )
         .expect("varlen attention must run");
-        decode(out_dtype, &bytes)
+        decode(dtype, &bytes)
     }
 
     /// Independent CPU oracle: scaled-dot-product attention over each batch's
@@ -342,7 +370,22 @@ impl Batch {
         scale: Option<f32>,
         softcap: f32,
     ) -> Vec<f32> {
-        let (q, k, v) = self.quantized_inputs(fp16);
+        let dtype = if fp16 {
+            DataType::Float16
+        } else {
+            DataType::Float32
+        };
+        self.cpu_reference_dtype(is_causal, dtype, scale, softcap)
+    }
+
+    fn cpu_reference_dtype(
+        &self,
+        is_causal: bool,
+        dtype: DataType,
+        scale: Option<f32>,
+        softcap: f32,
+    ) -> Vec<f32> {
+        let (q, k, v) = self.quantized_inputs(dtype);
         let group = self.num_heads / self.kv_num_heads;
         let scale = scale.unwrap_or_else(|| 1.0 / (self.head_size as f32).sqrt());
         let batch = self.batch();
@@ -420,7 +463,18 @@ fn check(
     );
 }
 
-// ---- ragged batch [3, 7, 2], f32 and f16, causal and non-causal ----
+fn check_dtype(batch: &Batch, is_causal: bool, dtype: DataType, tolerance: f32) {
+    let Some(ep) = gpu() else { return };
+    let got = batch.run_dtype(&ep, is_causal, dtype, true, None, 0.0);
+    let want = batch.cpu_reference_dtype(is_causal, dtype, None, 0.0);
+    let diff = max_abs_diff(&got, &want);
+    assert!(
+        diff <= tolerance,
+        "varlen output diverged from CPU reference: max_abs_diff={diff} (tol={tolerance}, dtype={dtype:?}, causal={is_causal})"
+    );
+}
+
+// ---- ragged batch [3, 7, 2], f32, f16, and bf16, causal and non-causal ----
 
 #[test]
 fn varlen_ragged_non_causal_f32() {
@@ -444,6 +498,18 @@ fn varlen_ragged_non_causal_f16() {
 fn varlen_ragged_causal_f16() {
     let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
     check(&batch, true, true, true, None, 0.0);
+}
+
+#[test]
+fn varlen_ragged_non_causal_bf16() {
+    let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
+    check_dtype(&batch, false, DataType::BFloat16, 1e-1);
+}
+
+#[test]
+fn varlen_ragged_causal_bf16() {
+    let batch = Batch::new(3, 3, 8, 8, 4, &[3, 7, 2]);
+    check_dtype(&batch, true, DataType::BFloat16, 1e-1);
 }
 
 // ---- rank-3 collapsed layout must match rank-4 semantics ----
