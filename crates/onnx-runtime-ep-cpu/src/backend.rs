@@ -15,6 +15,10 @@
 //! * Everything else falls back to the **Generic** pure-Rust blocked GEMM,
 //!   which compiles anywhere and is the correctness baseline.
 //!
+//! Half-precision MatMul/Gemm uses a separate portable blocked `f16`/`bf16`
+//! path with `f32` accumulation. It is backend-independent today; bf16 can
+//! additionally select a runtime-gated AVX-512 BF16 microkernel.
+//!
 //! The `Xnnpack` (Android) and `Accelerate` (Apple) variants are present for
 //! design fidelity with §25.2 but are not wired to kernels yet; they degrade to
 //! the Generic path. Nothing above the [`onnx_runtime_ep_api::Kernel`] trait
