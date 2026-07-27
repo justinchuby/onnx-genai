@@ -390,7 +390,12 @@ fn gemm_src() -> &'static str {
     SOURCE.get_or_init(|| module_src(GEMM_KERNEL, Some(GEMM_TILE_M)))
 }
 
-fn module_src(kernel: &str, gemm_tile_m: Option<u32>) -> String {
+/// Build the shared NVRTC device prelude: the E2M1/IQ4 codebooks, every IQ grid
+/// table, the fp16/E8M0 helpers, the `decode_weight` GGUF block decoder, and the
+/// `warp_sum`/`block_sum` reductions. Other kernels (e.g. `BlockQuantizedMoE`)
+/// concatenate their own `__global__` entry points after this to reuse the exact
+/// same per-weight decode numerics as the parity oracle.
+pub(crate) fn decoder_prelude() -> String {
     let mut source = String::from(PREFIX);
     append_u8_table(&mut source, "iq2xs_signs", &IQ2XS_SIGNS);
     append_u64_table(&mut source, "iq2xxs_grid", &IQ2XXS_GRID);
@@ -400,6 +405,11 @@ fn module_src(kernel: &str, gemm_tile_m: Option<u32>) -> String {
     append_u32_table(&mut source, "iq3s_grid", &IQ3S_GRID);
     append_u64_table(&mut source, "iq1s_grid", &IQ1S_GRID);
     source.push_str(SUFFIX);
+    source
+}
+
+fn module_src(kernel: &str, gemm_tile_m: Option<u32>) -> String {
+    let mut source = decoder_prelude();
     if let Some(tile_m) = gemm_tile_m {
         writeln!(source, "#define GEMM_TILE_M {tile_m}")
             .expect("writing CUDA source to String cannot fail");
@@ -458,7 +468,7 @@ fn append_u64_table(source: &mut String, name: &str, values: &[u64]) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockFormat {
+pub(crate) enum BlockFormat {
     Mxfp4,
     Iq4Nl,
     Iq4Xs,
@@ -472,7 +482,7 @@ enum BlockFormat {
 }
 
 impl BlockFormat {
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "mxfp4" => Ok(Self::Mxfp4),
             "iq4_nl" => Ok(Self::Iq4Nl),
@@ -490,7 +500,7 @@ impl BlockFormat {
         }
     }
 
-    fn qk(self) -> usize {
+    pub(crate) fn qk(self) -> usize {
         match self {
             Self::Mxfp4 | Self::Iq4Nl => SMALL_QK,
             Self::Iq4Xs
@@ -504,7 +514,7 @@ impl BlockFormat {
         }
     }
 
-    fn block_bytes(self) -> usize {
+    pub(crate) fn block_bytes(self) -> usize {
         match self {
             Self::Mxfp4 => MXFP4_BLOCK_BYTES,
             Self::Iq4Nl => IQ4_NL_BLOCK_BYTES,
@@ -519,7 +529,7 @@ impl BlockFormat {
         }
     }
 
-    fn kernel_id(self) -> i32 {
+    pub(crate) fn kernel_id(self) -> i32 {
         match self {
             Self::Mxfp4 => 0,
             Self::Iq4Nl => 1,

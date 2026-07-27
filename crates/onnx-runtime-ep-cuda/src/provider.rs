@@ -185,6 +185,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "BlockQuantizedMoE"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::block_quantized_moe::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "CompressedSparseAttention"
             && op.domain == "pkg.nxrt"
             && let Some(reason) = crate::kernels::compressed_sparse_attention::unsupported_reason(
