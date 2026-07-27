@@ -8,7 +8,8 @@ use onnx_runtime_ep_api::{
     KernelMatch, OpKey, OpRegistry, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ir::{
-    DataType, DeviceId, DeviceType, Node, NodeId, Shape, TensorLayout, static_shape,
+    DataType, DeviceId, DeviceType, FrozenGraph, Graph, Node, NodeId, Shape, TensorLayout,
+    static_shape,
 };
 
 /// A trivial kernel that does nothing but report success.
@@ -281,4 +282,93 @@ fn mock_ep_allocate_deallocate_roundtrip() {
     assert_eq!(buf.alignment(), 64);
     // Single deallocation — a double free would trip ASan/Miri.
     ep.deallocate(buf).unwrap();
+}
+
+fn graph_chain(ops: &[(&str, &str)]) -> FrozenGraph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("ai.onnx".into(), 17);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+    let input = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let mut previous = input;
+    for &(op_type, domain) in ops {
+        let output = graph.create_value(DataType::Float32, static_shape([2]));
+        let mut node = Node::new(
+            NodeId(0),
+            op_type,
+            vec![Some(previous), Some(previous)],
+            vec![output],
+        );
+        node.domain = domain.into();
+        graph.insert_node(node);
+        previous = output;
+    }
+    if !ops.is_empty() {
+        graph.add_output(previous);
+    }
+    FrozenGraph::build(graph).unwrap()
+}
+
+fn native_claims(frozen: &FrozenGraph, ep: &MockEp) -> Vec<onnx_runtime_ep_api::SubgraphClaim> {
+    let view = frozen.view();
+    onnx_runtime_ep_api::abi::OrtGraphView::new(&view).query_capabilities(ep)
+}
+
+#[test]
+fn graph_view_capability_claims_all_supported_connected_nodes() {
+    let frozen = graph_chain(&[("Add", ""), ("Add", "ai.onnx")]);
+    let ep = MockEp::new();
+    let claims = native_claims(&frozen, &ep);
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].node_ids.len(), 2);
+    assert_eq!(claims[0].input_values, frozen.view().graph().inputs);
+    assert_eq!(claims[0].output_values, frozen.view().graph().outputs);
+    for &node in &claims[0].node_ids {
+        let node = frozen.view().graph().node(node);
+        assert!(ep.registry.supports(&node.op_type, &node.domain, 17));
+    }
+}
+
+#[test]
+fn graph_view_capability_splits_regions_at_unsupported_nodes() {
+    let frozen = graph_chain(&[("Add", ""), ("Custom", ""), ("Add", "")]);
+    let ep = MockEp::new();
+    let claims = native_claims(&frozen, &ep);
+    assert_eq!(claims.len(), 2);
+    assert_eq!(claims[0].node_ids.len(), 1);
+    assert_eq!(claims[1].node_ids.len(), 1);
+
+    let graph = frozen.view().graph();
+    let nodes: Vec<_> = graph.topological_order().unwrap();
+    assert_eq!(claims[0].node_ids, vec![nodes[0]]);
+    assert_eq!(claims[0].output_values, graph.node(nodes[0]).outputs);
+    assert_eq!(claims[1].node_ids, vec![nodes[2]]);
+    assert_eq!(
+        claims[1].input_values,
+        vec![graph.node(nodes[2]).inputs[0].unwrap()]
+    );
+    assert!(!ep.registry.supports(
+        &graph.node(nodes[1]).op_type,
+        &graph.node(nodes[1]).domain,
+        17
+    ));
+}
+
+#[test]
+fn graph_view_capability_handles_empty_and_unregistered_graphs() {
+    let ep = MockEp::new();
+    assert!(native_claims(&graph_chain(&[]), &ep).is_empty());
+    assert!(native_claims(&graph_chain(&[("Custom", "")]), &ep).is_empty());
+}
+
+#[test]
+fn graph_view_capability_keeps_contrib_domains_distinct() {
+    let ep = MockEp::new();
+    let standard = graph_chain(&[("Add", "")]);
+    let canonical_alias = graph_chain(&[("Add", "ai.onnx")]);
+    let contrib = graph_chain(&[("Add", "com.microsoft")]);
+    assert_eq!(native_claims(&standard, &ep).len(), 1);
+    assert_eq!(native_claims(&canonical_alias, &ep).len(), 1);
+    assert!(native_claims(&contrib, &ep).is_empty());
 }
