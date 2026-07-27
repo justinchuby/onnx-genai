@@ -93,3 +93,7 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 ## 2026-07-26T19:45:52Z — Scribe update
 
 - Spawned as deckard-22 on `perf/cuda-next-wave` for profile-first portable CUDA decode-performance work; outcome pending.
+
+## 2026-07-26T20:00:00Z — Scribe update
+
+- 2026-07-26T20:00:02Z — Delivered portable device-gated symmetric int4 GEMV split-K; after Sebastian fixed the ineffective coverage shape, PR #203 merged to main at `b80a8c83`.

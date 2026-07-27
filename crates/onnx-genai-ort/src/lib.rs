@@ -14,6 +14,7 @@ pub mod component;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_rt;
 pub mod decode;
+pub mod decode_contract;
 #[cfg(feature = "cuda")]
 pub(crate) mod device_sampler;
 pub mod eagle3;

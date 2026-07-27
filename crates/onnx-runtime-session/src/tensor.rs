@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 
 use onnx_runtime_ep_api::{DeviceBuffer, ExecutionProvider};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
-use onnx_runtime_ir::{DataType, DeviceId, TensorLayout};
+use onnx_runtime_ir::{DataType, DeviceId, TensorLayout, checked_expected_bytes};
 
 use crate::error::{Result, SessionError};
 
@@ -224,6 +224,19 @@ pub struct DeviceBindingTransferStats {
     pub host_download_bytes: u64,
 }
 
+/// The parameters for [`DeviceIoBinding::allocate`], grouped so the constructor
+/// takes a single spec rather than a long positional argument list.
+pub(crate) struct DeviceBindingSpec {
+    pub(crate) input_name: String,
+    pub(crate) bind_input: bool,
+    pub(crate) output_name: Option<String>,
+    pub(crate) dtype: DataType,
+    pub(crate) physical_shape: Vec<usize>,
+    pub(crate) logical_shape: Vec<usize>,
+    /// Whether graph inputs see the valid prefix rather than allocation capacity.
+    pub(crate) expose_logical_input_shape: bool,
+}
+
 /// An externally owned persistent device allocation bound to a graph input and
 /// optionally aliased by a graph output.
 pub struct DeviceIoBinding {
@@ -243,23 +256,24 @@ pub struct DeviceIoBinding {
 impl DeviceIoBinding {
     pub(crate) fn allocate(
         allocator: Arc<dyn ExecutionProvider>,
-        input_name: String,
-        bind_input: bool,
-        output_name: Option<String>,
-        dtype: DataType,
-        physical_shape: Vec<usize>,
-        logical_shape: Vec<usize>,
-        expose_logical_input_shape: bool,
+        spec: DeviceBindingSpec,
     ) -> Result<Self> {
+        let DeviceBindingSpec {
+            input_name,
+            bind_input,
+            output_name,
+            dtype,
+            physical_shape,
+            logical_shape,
+            expose_logical_input_shape,
+        } = spec;
         validate_logical_shape(&physical_shape, &logical_shape)?;
-        let numel = physical_shape.iter().try_fold(1usize, |product, &dim| {
-            product.checked_mul(dim).ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "device binding '{input_name}' physical shape overflows: {physical_shape:?}"
-                ))
-            })
-        })?;
-        let bytes = dtype.storage_bytes(numel).max(1);
+        let bytes = checked_expected_bytes(dtype, &physical_shape)
+            .ok_or_else(|| SessionError::ShapeOverflow {
+                value: format!("device binding '{input_name}'"),
+                dims: physical_shape.clone(),
+            })?
+            .max(1);
         let allocator_for_buffer = allocator.clone();
         let buffer = allocator_for_buffer.allocate(bytes, TensorLayout::contiguous().alignment)?;
         Ok(Self {
@@ -491,8 +505,11 @@ impl Tensor {
         shape: Vec<usize>,
         bytes: &[u8],
     ) -> Result<Self> {
-        let numel: usize = shape.iter().product();
-        let expected = dtype.storage_bytes(numel);
+        let expected =
+            checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "Tensor::from_raw_in".to_string(),
+                dims: shape.clone(),
+            })?;
         if bytes.len() != expected {
             return Err(SessionError::Internal(format!(
                 "Tensor::from_raw_in: {} bytes for shape {shape:?} dtype {dtype:?}, expected {expected}",
@@ -841,6 +858,32 @@ mod tests {
     }
 
     #[test]
+    fn from_raw_rejects_geometry_overflow() {
+        let error = Tensor::from_raw(DataType::Float32, vec![usize::MAX, 2], &[])
+            .expect_err("overflowing tensor geometry must be rejected");
+        assert!(matches!(error, SessionError::ShapeOverflow { .. }));
+    }
+
+    #[test]
+    fn device_binding_allocation_rejects_byte_overflow() {
+        let element_count = usize::MAX / 4;
+        let error = DeviceIoBinding::allocate(
+            shared_cpu_ep(),
+            DeviceBindingSpec {
+                input_name: "huge".into(),
+                bind_input: true,
+                output_name: None,
+                dtype: DataType::Float64,
+                physical_shape: vec![element_count],
+                logical_shape: vec![element_count],
+                expose_logical_input_shape: false,
+            },
+        )
+        .expect_err("overflowing device binding byte count must be rejected");
+        assert!(matches!(error, SessionError::ShapeOverflow { .. }));
+    }
+
+    #[test]
     fn borrowed_guard_ctor_runs_guard_exactly_once_on_drop() {
         let drops = Arc::new(AtomicUsize::new(0));
         // Some real host memory the borrowed buffer can alias.
@@ -905,13 +948,15 @@ mod tests {
         // logical == physical (the state at decode construction time).
         let mut logical_mask = DeviceIoBinding::allocate(
             shared_cpu_ep(),
-            "attention_mask".into(),
-            true,
-            None,
-            DataType::Int64,
-            vec![1, 4096],
-            vec![1, 4096],
-            true,
+            DeviceBindingSpec {
+                input_name: "attention_mask".into(),
+                bind_input: true,
+                output_name: None,
+                dtype: DataType::Int64,
+                physical_shape: vec![1, 4096],
+                logical_shape: vec![1, 4096],
+                expose_logical_input_shape: true,
+            },
         )
         .unwrap();
         assert!(logical_mask.exposes_logical_input_shape());
@@ -929,13 +974,15 @@ mod tests {
         // the current logical shape, so kernels always see the padded width.
         let mut physical_mask = DeviceIoBinding::allocate(
             shared_cpu_ep(),
-            "attention_mask".into(),
-            true,
-            None,
-            DataType::Int64,
-            vec![1, 4096],
-            vec![1, 5],
-            false,
+            DeviceBindingSpec {
+                input_name: "attention_mask".into(),
+                bind_input: true,
+                output_name: None,
+                dtype: DataType::Int64,
+                physical_shape: vec![1, 4096],
+                logical_shape: vec![1, 5],
+                expose_logical_input_shape: false,
+            },
         )
         .unwrap();
         assert!(!physical_mask.exposes_logical_input_shape());

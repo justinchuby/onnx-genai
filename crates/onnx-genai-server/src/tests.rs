@@ -1044,7 +1044,7 @@ async fn status_node_id_reflects_configured_value() {
 #[tokio::test]
 async fn status_active_sessions_reflect_real_state() {
     let state = tiny_state();
-    let handle = state.registry.resolve("").unwrap();
+    let handle = state.registry.resolve("").unwrap().unwrap();
     // Create a real engine session and register it, mirroring the session route.
     let engine_session = handle
         .engine
@@ -1188,6 +1188,32 @@ async fn debug_endpoints_expose_config_sessions_cache_and_trace_state() {
         trace["otlp_export"].as_str().unwrap().contains("deferred"),
         "OTLP export must be reported as deferred"
     );
+}
+
+#[tokio::test]
+async fn debug_endpoints_report_no_loaded_model_without_panicking() {
+    let state = lazy_state(ServerConfig {
+        enable_debug_endpoints: true,
+        ..ServerConfig::default()
+    });
+    state
+        .registry
+        .unload("model-a")
+        .expect("unload the only loaded model");
+    let router = app(state);
+
+    for path in ["/v1/debug/config", "/v1/debug/kv"] {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(error_message(&body), "no model loaded");
+    }
 }
 
 #[tokio::test]
@@ -1477,7 +1503,7 @@ fn completion_suffix_maps_to_fim_generation() {
             suffix_token: "<SUF>".to_string(),
             format: onnx_genai_engine::FimFormat::PSM,
         }));
-    let handle = state.registry.resolve("").unwrap();
+    let handle = state.registry.resolve("").unwrap().unwrap();
     let request: CompletionRequest = serde_json::from_value(json!({
         "model": "tiny-llm",
         "prompt": "prefix",
@@ -1580,7 +1606,7 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
         },
     )
     .unwrap();
-    let handle = state.registry.resolve("").unwrap();
+    let handle = state.registry.resolve("").unwrap().unwrap();
     let _occupied = handle
         .engine
         .generation_capacity
@@ -1993,8 +2019,11 @@ async fn single_model_startup_still_works_via_load_with_config() {
     )
     .expect("single-model load must still work");
     // Registry has exactly one entry with the expected id.
-    assert_eq!(state.registry.ids().len(), 1);
-    assert_eq!(state.registry.default_id().as_deref(), Some("tiny-llm"));
+    assert_eq!(state.registry.ids().unwrap().len(), 1);
+    assert_eq!(
+        state.registry.default_id().unwrap().as_deref(),
+        Some("tiny-llm")
+    );
 
     let resp = app(state)
         .oneshot(
@@ -2065,8 +2094,8 @@ async fn json_body(resp: axum::response::Response) -> Value {
 async fn lazy_model_is_loaded_on_first_request() {
     let state = lazy_state(ServerConfig::default());
     // Only the eager model is loaded at startup.
-    assert_eq!(state.registry.ids(), vec!["model-a"]);
-    assert!(state.registry.contains_available("model-b"));
+    assert_eq!(state.registry.ids().unwrap(), vec!["model-a"]);
+    assert!(state.registry.contains_available("model-b").unwrap());
 
     // Routing to the lazy model triggers a load and succeeds.
     let resp = app(state.clone())
@@ -2078,7 +2107,7 @@ async fn lazy_model_is_loaded_on_first_request() {
     assert_eq!(body["model"], "model-b");
 
     // The shared registry now has both models loaded.
-    let mut ids = state.registry.ids();
+    let mut ids = state.registry.ids().unwrap();
     ids.sort();
     assert_eq!(ids, vec!["model-a", "model-b"]);
 }
@@ -2102,7 +2131,7 @@ async fn admin_load_then_route_to_lazy_model() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(state.registry.resolve("model-b").is_some());
+    assert!(state.registry.resolve("model-b").unwrap().is_some());
 
     // Subsequent routing works without re-loading.
     let resp = app(state.clone())
@@ -2130,14 +2159,14 @@ async fn admin_unload_then_lazy_reload() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert!(state.registry.resolve("model-a").is_none());
+    assert!(state.registry.resolve("model-a").unwrap().is_none());
     // The spec is retained for lazy reload.
-    assert!(state.registry.contains_available("model-a"));
+    assert!(state.registry.contains_available("model-a").unwrap());
 
     // A subsequent request for the default (empty model) lazily reloads it.
     let resp = app(state.clone()).oneshot(chat_request("")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(state.registry.resolve("model-a").is_some());
+    assert!(state.registry.resolve("model-a").unwrap().is_some());
 }
 
 #[tokio::test]
@@ -2158,6 +2187,61 @@ async fn admin_unload_unknown_model_returns_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_unload_distinguishes_poisoned_registry_from_absent_model() {
+    let absent_model_state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    let absent_model_response = app(absent_model_state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/admin/models/model-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(absent_model_response.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(absent_model_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_well_formed_error_without_internal_path(&body);
+    assert_eq!(error_message(&body), "model 'model-b' is not loaded");
+
+    let poisoned_registry_state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    poisoned_registry_state.registry.poison_for_test();
+    let poisoned_registry_response = app(poisoned_registry_state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/admin/models/model-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("poisoned registry must produce an HTTP response");
+    assert_eq!(
+        poisoned_registry_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: Value = serde_json::from_slice(
+        &to_bytes(poisoned_registry_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_well_formed_error_without_internal_path(&body);
+    assert_eq!(error_message(&body), "model registry failed");
 }
 
 #[tokio::test]
@@ -2187,7 +2271,7 @@ async fn max_loaded_models_evicts_least_recently_used() {
         ..ServerConfig::default()
     });
     // model-a is loaded at startup (cap = 1).
-    assert_eq!(state.registry.ids(), vec!["model-a"]);
+    assert_eq!(state.registry.ids().unwrap(), vec!["model-a"]);
 
     // Loading model-b must evict model-a to respect the cap.
     let resp = app(state.clone())
@@ -2202,11 +2286,11 @@ async fn max_loaded_models_evicts_least_recently_used() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        state.registry.ids(),
+        state.registry.ids().unwrap(),
         vec!["model-b"],
         "model-a should be evicted"
     );
-    assert!(state.registry.contains_available("model-a"));
+    assert!(state.registry.contains_available("model-a").unwrap());
 }
 
 #[tokio::test]
@@ -2340,8 +2424,8 @@ async fn concurrent_lazy_loads_of_same_id_load_once() {
         assert_eq!(handle.await.unwrap(), StatusCode::OK);
     }
     // Exactly one loaded instance of model-b exists in the registry.
-    assert!(state.registry.resolve("model-b").is_some());
-    let mut ids = state.registry.ids();
+    assert!(state.registry.resolve("model-b").unwrap().is_some());
+    let mut ids = state.registry.ids().unwrap();
     ids.sort();
     assert_eq!(ids, vec!["model-a", "model-b"]);
 }
@@ -2378,6 +2462,22 @@ fn error_message(body: &Value) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+fn assert_well_formed_error_without_internal_path(body: &Value) {
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error response must contain a message");
+    assert!(!message.is_empty());
+    assert_eq!(body["error"]["type"], "server_error");
+    assert!(
+        !message.contains(env!("CARGO_MANIFEST_DIR")),
+        "error must not expose the crate path: {body}"
+    );
+    assert!(
+        !message.contains("tests/fixtures"),
+        "error must not expose an internal fixture path: {body}"
+    );
 }
 
 fn assert_actionable(message: &str) {
@@ -2564,6 +2664,27 @@ async fn content_parts_must_be_objects_with_a_type() {
         assert_actionable(&message);
         assert!(message.contains(expected), "message: {message}");
     }
+}
+
+#[tokio::test]
+async fn poisoned_model_registry_returns_http_500() {
+    let state = tiny_state();
+    state.registry.poison_for_test();
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("poisoned registry must produce an HTTP response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_well_formed_error_without_internal_path(&body);
+    assert_eq!(error_message(&body), "model registry failed");
 }
 
 #[tokio::test]
@@ -2944,6 +3065,7 @@ async fn interleaved_image_parts_keep_their_position_in_the_prompt() {
     let handle = state
         .registry
         .resolve("tiny-vlm")
+        .expect("registry lock must be available")
         .expect("fixture has a default model");
     let placeholder = crate::routes::image_placeholder_text(&handle)
         .expect("the fixture declares an image placeholder");

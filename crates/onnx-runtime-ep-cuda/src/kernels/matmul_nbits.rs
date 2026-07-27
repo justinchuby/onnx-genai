@@ -93,17 +93,16 @@ const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
 /// path). Weights that actually carry zero points launch this `_zp` entry so
 /// only the asymmetric path pays for the extra per-block load.
 const GEMV_F16_SCALES_F16_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp";
-/// Split-K specialization of [`GEMV_F16_SCALES_F16_ZP_ENTRY`] for the standalone
-/// asymmetric int4 GEMV. ncu showed the plain `_zp` kernel is grid-starved
+const GEMV_F16_SCALES_F16_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_splitk";
+/// Split-K specialization for standalone fp16/scales-fp16 int4 GEMV. ncu showed
+/// the plain single-warp kernel can be grid-starved
 /// (~0.36 waves/SM, ~64% of the SMs idle) and memory-latency bound: partitioning
 /// the K reduction across [`GEMV_F16_SCALES_F16_ZP_SPLITK`] cooperating warps per
 /// output column multiplies the grid, filling the machine so the extra in-flight
 /// loads hide the Long-Scoreboard latency. The K-slice partials are summed in
 /// fp32 (a new block-sum association vs the single-warp kernel), so this path is
 /// near-equal — not byte-identical — to the plain `_zp` kernel; the asymmetric-zp
-/// parity test tracks a dequant reference to tolerance. Only launched when
-/// `K % 256 == 0` (whole 256-wide steps, no divergent tail); other K fall back to
-/// the plain `_zp` entry.
+/// parity tests track a dequant reference to tolerance.
 const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_zp_splitk";
 /// Warps cooperating per output column in the split-K asymmetric int4 GEMV. Must
 /// match `K_SPLIT` in `matmul_nbits_gemv_f16_scales_f16_splitk`. A block keeps
@@ -116,6 +115,8 @@ const GEMV_F16_SCALES_F16_ZP_SPLITK: usize = 2;
 /// before the standard `scales_f16` int4 dot, folding a
 /// `SkipSimplifiedLayerNormalization` normalization into the following GEMV.
 const GEMV_F16_SCALES_F16_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_rmsnorm";
+const GEMV_F16_SCALES_F16_RMSNORM_SPLITK_ENTRY: &str =
+    "matmul_nbits_gemv_f16_scales_f16_rmsnorm_splitk";
 /// Asymmetric-zero-point specialization of [`GEMV_F16_SCALES_F16_RMSNORM_ENTRY`]
 /// (see [`GEMV_F16_SCALES_F16_ZP_ENTRY`] for the `HasZp` specialization scheme).
 const GEMV_F16_SCALES_F16_RMSNORM_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16_rmsnorm_zp";
@@ -1707,17 +1708,15 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp(
     matmul_nbits_gemv_f16_scales_f16_tpl<true>(activation, packed, scales_raw, zero_points, bias, output, k, n, block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16, bias_post_round);
 }
 
-// Split-K asymmetric int4 GEMV: K_SPLIT warps cooperate on one output column,
+// Split-K int4 GEMV: K_SPLIT warps cooperate on one output column,
 // each reducing a strided subset of the 256-wide K steps, then summing their
 // fp32 partials through shared memory. The launch grid is K_SPLIT x larger than
 // the single-warp `_zp` kernel, which fills the SMs on this grid-starved,
-// latency-bound decode GEMV. Requires K % 256 == 0 (whole steps, no divergent
-// tail) — the launch only routes here in that case. The fp32 partial sum is a
-// new block-sum association, so results are near-equal (not byte-identical) to
-// the single-warp kernel; asymmetric-zp parity is validated against a dequant
-// reference to tolerance. Always HasZp (only the zp path is grid-starved enough
-// to benefit); the symmetric path keeps its byte-identical single-warp kernel.
-extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
+// latency-bound decode GEMV. The fp32 partial sum is a new block-sum
+// association, so results are near-equal (not byte-identical) to the
+// single-warp kernel.
+template <bool HasZp>
+__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
     const void* __restrict__ scales_raw,
@@ -1753,6 +1752,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     __half2 sum1 = __float2half2_rn(0.0f);
     __half2 sum2 = __float2half2_rn(0.0f);
     __half2 sum3 = __float2half2_rn(0.0f);
+    float tail = 0.0f;
     if (column < n) {
         const int lane_depth = lane * 8;
         int depth_base = ks * 256;
@@ -1762,14 +1762,36 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
             (long)(depth_base >> 5) * blob_size + lane * 4;
         const __half* scale_ptr =
             scales + (long)column * k_blocks + (depth_base >> 5) + (lane >> 2);
-        for (; depth_base + 256 <= k; depth_base += K_SPLIT * 256) {
+        for (; depth_base < k; depth_base += K_SPLIT * 256) {
+            const int depth = depth_base + lane_depth;
+            if (depth >= k) {
+                activation_ptr += K_SPLIT * 256;
+                packed_ptr += K_SPLIT * 128;
+                scale_ptr += K_SPLIT * 8;
+                continue;
+            }
             const unsigned int packed_word =
                 *reinterpret_cast<const unsigned int*>(packed_ptr);
             const int block = (depth_base >> 5) + (lane >> 2);
             const unsigned int sub2 =
-                block_sub2<true>(zero_points, column, block, zp_row_bytes);
-            accumulate_int4x8_f16_zp(
-                packed_word, activation_ptr, *scale_ptr, sub2, sum0, sum1, sum2, sum3);
+                block_sub2<HasZp>(zero_points, column, block, zp_row_bytes);
+            if (depth + 8 <= k) {
+                accumulate_int4x8_f16_zp(
+                    packed_word, activation_ptr, *scale_ptr, sub2, sum0, sum1, sum2, sum3);
+            } else {
+                const float scale = __half2float(*scale_ptr);
+                const int zero_point =
+                    block_zp<HasZp>(zero_points, column, block, zp_row_bytes);
+                const int valid = k - depth;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        const int q =
+                            (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                        tail += (float)q * __half2float(activation_ptr[i]) * scale;
+                    }
+                }
+            }
             activation_ptr += K_SPLIT * 256;
             packed_ptr += K_SPLIT * 128;
             scale_ptr += K_SPLIT * 8;
@@ -1779,7 +1801,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     const float2 value15 = __half22float2(sum1);
     const float2 value26 = __half22float2(sum2);
     const float2 value37 = __half22float2(sum3);
-    float value = value04.x;
+    float value = tail + value04.x;
     value += value15.x;
     value += value26.x;
     value += value37.x;
@@ -1800,6 +1822,50 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
         }
         output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
     }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<false>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round);
 }
 
 // Half4 view matching `skip_rmsnorm_f16_warp_half4` so the fused prologue below
@@ -1834,7 +1900,7 @@ __device__ __forceinline__ float load_rmsnorm_gamma(
 // int4 dot over that staged, normalized activation. Every arithmetic step
 // mirrors the standalone norm + GEMV pair, so tokens stay bit-for-bit identical
 // while the separate normalization kernel is removed from the decode graph.
-template <bool HasZp>
+template <bool HasZp, bool SplitK = false>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -1856,6 +1922,7 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl(
     // the `scales_f16` `uint4` activation loads unchanged.
     extern __shared__ __align__(16) __half staged_activation[];
     __shared__ float shared_inv_std;
+    __shared__ float partials[8][2];
 
     const int tid = (int)threadIdx.x;
     const int lane = tid & 31;
@@ -1901,8 +1968,11 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl(
     __syncthreads();
 
     // --- Standard `scales_f16` int4 dot over the staged, normalized input. ---
-    const int columns_per_block = (int)blockDim.x >> 5;
-    const int column = (int)blockIdx.x * columns_per_block + warp;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int columns_per_block = SplitK ? warps_per_block / 2 : warps_per_block;
+    const int column_local = SplitK ? warp / 2 : warp;
+    const int k_split = SplitK ? warp & 1 : 0;
+    const int column = (int)blockIdx.x * columns_per_block + column_local;
     const __half* __restrict__ scales =
         reinterpret_cast<const __half*>(scales_raw);
 
@@ -1913,13 +1983,15 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl(
     float tail = 0.0f;
     if (column < n) {
         const int lane_depth = lane * 8;
-        const __half* activation_ptr = staged_activation + lane_depth;
+        int depth_base = k_split * 256;
+        const __half* activation_ptr = staged_activation + depth_base + lane_depth;
         const unsigned char* packed_ptr =
-            packed + (long)column * k_blocks * blob_size + lane * 4;
+            packed + (long)column * k_blocks * blob_size
+                + (long)(depth_base >> 5) * blob_size + lane * 4;
         const __half* scale_ptr =
-            scales + (long)column * k_blocks + (lane >> 2);
-        int depth_base = 0;
-        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+            scales + (long)column * k_blocks + (depth_base >> 5) + (lane >> 2);
+        const int depth_step = SplitK ? 512 : 256;
+        for (; depth_base + lane_depth + 8 <= k; depth_base += depth_step) {
             const unsigned int packed_word =
                 *reinterpret_cast<const unsigned int*>(packed_ptr);
             const int block = (depth_base >> 5) + (lane >> 2);
@@ -1934,9 +2006,9 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl(
                 sum1,
                 sum2,
                 sum3);
-            activation_ptr += 256;
-            packed_ptr += 128;
-            scale_ptr += 8;
+            activation_ptr += depth_step;
+            packed_ptr += depth_step / 2;
+            scale_ptr += depth_step / 32;
         }
         const int tail_depth = depth_base + lane_depth;
         if (tail_depth < k) {
@@ -1969,7 +2041,19 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl(
     value += value26.y;
     value += value37.y;
     value = warp_sum(value);
-    if (lane == 0 && column < n) {
+    if constexpr (SplitK) {
+        if (lane == 0) {
+            partials[column_local][k_split] = column < n ? value : 0.0f;
+        }
+        __syncthreads();
+        if (k_split == 0 && lane == 0 && column < n) {
+            output[column] = fold_bias_f16(
+                partials[column_local][0] + partials[column_local][1],
+                bias,
+                column,
+                bias_post_round);
+        }
+    } else if (lane == 0 && column < n) {
         output[column] = fold_bias_f16(value, bias, column, bias_post_round);
     }
 }
@@ -1992,6 +2076,26 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm(
     const float epsilon)
 {
     matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl<false>(activation, packed, scales_raw, zero_points, gamma, bias, output, k, n, k_blocks, blob_size, zp_row_bytes, bias_post_round, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const void* __restrict__ gamma,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int bias_post_round,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_scales_f16_rmsnorm_tpl<false, true>(activation, packed, scales_raw, zero_points, gamma, bias, output, k, n, k_blocks, blob_size, zp_row_bytes, bias_post_round, gamma_is_half, epsilon);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_rmsnorm_zp(
@@ -3219,6 +3323,20 @@ fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static 
 /// down-projection launch — it keeps improving past one wave; aim for ~2 waves
 /// of resident CTAs.
 const ACCURACY4_GEMV_FILL_CTAS_PER_SM: usize = 12;
+const F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM: usize = 16;
+
+fn use_f16_symmetric_splitk(
+    k: usize,
+    n: usize,
+    multiprocessor_count: u32,
+    max_threads_per_block: u32,
+) -> bool {
+    k >= 512
+        && k.is_multiple_of(32)
+        && max_threads_per_block >= GEMV_F16_LARGE_THREADS
+        && n < (multiprocessor_count.max(1) as usize)
+            .saturating_mul(F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM)
+}
 
 /// Warps-per-CTA (one warp reduces one output column) for the accuracy_level=4
 /// blockwise GEMV, chosen so the `ceil(N / warps)` grid fills the device. The
@@ -5088,9 +5206,10 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 GEMV")?;
-        // Split-K routing for the standalone asymmetric int4 GEMV: only the
-        // block-32, scales-fp16, General-variant zp path is grid-starved enough to
-        // benefit, and the split-K kernel assumes whole 256-wide K steps (no tail).
+        // Split-K routing for standalone block-32, scales-fp16 general GEMVs.
+        // The existing asymmetric path retains its measured gate; symmetric
+        // projections opt in only when the live SM count says their warp grid is
+        // too narrow, so smaller consumer GPUs keep the current single-warp path.
         let use_scales_f16_zp_splitk = self.block_size == 32
             && scales_fp16
             && zero_points.is_some()
@@ -5099,6 +5218,18 @@ impl MatMulNBitsKernel {
             // Split-K needs >= K_SPLIT warps/block; the small-shape path uses only
             // 64 threads (2 warps), so restrict to the 256-thread large path.
             && !(self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX);
+        let capabilities = self.runtime.capabilities();
+        let use_scales_f16_symmetric_splitk = self.block_size == 32
+            && scales_fp16
+            && zero_points.is_none()
+            && matches!(selection.variant, F16GemvVariant::General)
+            && use_f16_symmetric_splitk(
+                self.k,
+                self.n,
+                capabilities.multiprocessor_count(),
+                capabilities.max_threads_per_block(),
+            );
+        let use_scales_f16_splitk = use_scales_f16_zp_splitk || use_scales_f16_symmetric_splitk;
         // Down projection grid-fill: choose columns-per-CTA (8/4/2) from the
         // device SM count so a small-N (grid-starved) down launch splits enough
         // to fill the multiprocessors, bit-identically. A developer env override
@@ -5138,7 +5269,11 @@ impl MatMulNBitsKernel {
                             GEMV_F16_SCALES_F16_ZP_ENTRY
                         }
                     } else {
-                        GEMV_F16_SCALES_F16_ENTRY
+                        if use_scales_f16_symmetric_splitk {
+                            GEMV_F16_SCALES_F16_SPLITK_ENTRY
+                        } else {
+                            GEMV_F16_SCALES_F16_ENTRY
+                        }
                     }
                 }
                 F16GemvVariant::General => GEMV_F16_ENTRY,
@@ -5177,7 +5312,7 @@ impl MatMulNBitsKernel {
                 // Split-K assigns K_SPLIT warps per output column, so a block of
                 // `threads/32` warps now covers `warps / K_SPLIT` columns and the
                 // grid grows by K_SPLIT to fill the SMs.
-                let columns_per_block = if use_scales_f16_zp_splitk {
+                let columns_per_block = if use_scales_f16_splitk {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
                 } else {
                     (threads / 32) as usize
@@ -5268,8 +5403,18 @@ impl MatMulNBitsKernel {
                 );
             }
         }
+        let capabilities = self.runtime.capabilities();
+        let use_splitk = zero_points.is_none()
+            && use_f16_symmetric_splitk(
+                self.k,
+                self.n,
+                capabilities.multiprocessor_count(),
+                capabilities.max_threads_per_block(),
+            );
         let entry = if zero_points.is_some() {
             GEMV_F16_SCALES_F16_RMSNORM_ZP_ENTRY
+        } else if use_splitk {
+            GEMV_F16_SCALES_F16_RMSNORM_SPLITK_ENTRY
         } else {
             GEMV_F16_SCALES_F16_RMSNORM_ENTRY
         };
@@ -5300,7 +5445,12 @@ impl MatMulNBitsKernel {
         } else {
             GEMV_F16_LARGE_THREADS
         };
-        let columns_per_block = (threads / 32) as usize;
+        let columns_per_block = (threads / 32) as usize
+            / if use_splitk {
+                GEMV_F16_SCALES_F16_ZP_SPLITK
+            } else {
+                1
+            };
         let shared_mem_bytes = (self.k * std::mem::size_of::<half::f16>()) as u32;
         let mut builder = self.runtime.stream().launch_builder(&function);
         builder
@@ -7056,6 +7206,14 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         assert!(!use_accuracy4_stage64(4608, 28, (8, 6), 48 * 1024));
         assert!(!use_accuracy4_stage64(4608, 132, (9, 0), 1024));
         assert!(!use_accuracy4_stage64(65_536, 132, (9, 0), 64 * 1024));
+    }
+
+    #[test]
+    fn symmetric_fp16_splitk_is_device_driven_and_falls_back_on_small_gpus() {
+        assert!(use_f16_symmetric_splitk(896, 1152, 132, 1024));
+        assert!(!use_f16_symmetric_splitk(896, 1152, 46, 1024));
+        assert!(!use_f16_symmetric_splitk(896, 1152, 132, 128));
+        assert!(!use_f16_symmetric_splitk(256, 1024, 132, 1024));
     }
 
     #[test]

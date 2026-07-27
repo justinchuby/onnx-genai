@@ -85,3 +85,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - Raised capture-safe fp16 GQA `MAX_SPLITS` 8→16; Holden approved and `3b972bf` merged. Independent H200 review measured about 647→693 tok/s at 1024 tokens (+7.1%), flat at 256, with identical tokens and zero fallbacks.
 
 - 2026-07-22T23:20:00Z — Revised the rejected persistent SPMD pool under lockout; `cee3c20` added real 31-worker parity, precedence diagnostics, and panic-safe poisoning, then merged after approval.
+
+## 2026-07-26T20:00:00Z — Scribe update
+
+- 2026-07-26T20:00:04Z — Repaired PR #203 coverage under lockout by changing the split-K numeric test to `n=1152`, exercising `matmul_nbits_gemv_f16_scales_f16_splitk`.

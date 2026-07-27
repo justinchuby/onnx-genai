@@ -127,3 +127,6 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 ## 2026-07-24T15:10:00Z — Shared decode-lock helper revision
 
 Revised the Phi decode lock after Holden's rejection: environment-gated real-model coverage and generalized `common/decode_lock.rs` across Phi and Qwen. Holden approved; Pris co-owns the shared helper with Batty and Leon.
+## 2026-07-26T22:38:02+00:00 — ORT2 remaining-work audit
+
+- Recorded that ORT2 Phase 1 is complete, full ORT2 runtime vision is roughly 65–70% complete, and core GenAI functionality is roughly 70% complete; remaining work is breadth, compatibility, heterogeneous placement, packages, CI, and productization.

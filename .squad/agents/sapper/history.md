@@ -142,3 +142,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Sapper's WP-B3 v3 admission fix landed at `3d84b9b`, making raw `GraphProto.input` authoritative for optional fallback validation.
+## 2026-07-26T22:38:02+00:00 — Mobius PR triage handoff
+
+- Prepared Mobius PRs #404/#423/#430 for Justin review without merging. #404 replacement branch `sapper/404-rebase` at `fa30534` resolves conflicts and review comments; #423 `squad/hythe-deepseek-moe-phase1` at `40846bb` and #430 `test/l4-l5-golden-new-models` at `d1d235e` have current review fixes, Ruff clean, and focused tests passing.

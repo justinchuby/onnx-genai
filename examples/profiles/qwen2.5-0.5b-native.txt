@@ -1,14 +1,14 @@
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b
 execution provider       cpu
-model load                    130.6 ms
+model load                    124.6 ms
 prompt tokens                    40
 generated tokens                 48
-time to first token          2218.6 ms
-generation wall time        15522.5 ms
-decode throughput              3.53 tok/s
-end-to-end throughput          3.09 tok/s
-inter-token latency      mean 283.1 / p50 266.3 / p90 271.0 / p99 1050.9 / max 1050.9 ms
+time to first token          2396.2 ms
+generation wall time        15890.9 ms
+decode throughput              3.48 tok/s
+end-to-end throughput          3.02 tok/s
+inter-token latency      mean 287.1 / p50 262.7 / p90 277.7 / p99 1197.6 / max 1197.6 ms
 finish reason            MaxTokens
 peak resident memory        3.1 GiB
 kv cache budget             5.4 GiB (5746063200 tokens)
@@ -21,25 +21,25 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-loop.next_logits              15521.911         48      323373.15    323373.15
-native.session_run            15513.448         48      323196.84    323196.84
-loop.step                     13303.889         47      283061.48    277164.36
-loop.prefill                   2218.505          1     2218505.29     46218.86
-engine.tokenizer_load           104.467          1      104466.62      2176.39
-engine.native_session_load        9.933          1        9932.58       206.93
-engine.ort_environment            9.189          1        9188.92       191.44
-native.logits_fetch               7.293         48         151.93       151.93
-native.sampling                   6.662         48         138.80       138.80
-engine.metadata_load              6.502          1        6502.00       135.46
-loop.commit_selected              0.453         48           9.45         9.45
-loop.commit_selected_token        0.435         48           9.06         9.06
-native.prepare_inputs             0.433         48           9.03         9.03
-loop.detokenize                   0.379         48           7.89         7.89
-engine.resolve_model_directory        0.093          1          93.29         1.94
-engine.resource_governor          0.091          1          90.62         1.89
-native.kv_update                  0.017         48           0.36         0.36
-native.inspect_decode_io          0.015          1          15.25         0.32
-native.cpu_kv_alloc               0.013          1          12.88         0.27
-engine.resolve_decode_backend        0.007          1           7.46         0.16
-loop.commit_token                 0.003         48           0.06         0.06
-engine.connector_bridge           0.000          1           0.21         0.00
+loop.next_logits              15890.266         48      331047.22    331047.22
+native.session_run            15881.753         48      330869.85    330869.85
+loop.step                     13494.638         47      287119.95    281138.29
+loop.prefill                   2396.173          1     2396172.62     49920.26
+engine.tokenizer_load            99.991          1       99991.17      2083.15
+engine.ort_environment            9.638          1        9638.17       200.80
+engine.native_session_load        8.197          1        8196.83       170.77
+native.logits_fetch               7.396         48         154.08       154.08
+native.sampling                   6.770         48         141.04       141.04
+engine.metadata_load              6.361          1        6361.25       132.53
+loop.commit_selected              0.510         48          10.62        10.62
+loop.commit_selected_token        0.484         48          10.08        10.08
+native.prepare_inputs             0.436         48           9.08         9.08
+loop.detokenize                   0.428         48           8.92         8.92
+engine.resolve_model_directory        0.097          1          97.08         2.02
+engine.resource_governor          0.060          1          60.38         1.26
+native.kv_update                  0.015         48           0.32         0.32
+native.inspect_decode_io          0.015          1          14.83         0.31
+native.cpu_kv_alloc               0.012          1          11.54         0.24
+engine.resolve_decode_backend        0.008          1           7.71         0.16
+loop.commit_token                 0.001         48           0.03         0.03
+engine.connector_bridge           0.000          1           0.33         0.01

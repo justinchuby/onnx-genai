@@ -69,5 +69,7 @@ pub use node::{Attribute, Node, NodeId, RUNTIME_DOMAIN};
 pub use shape::{
     Dim, Shape, SymbolConstraints, SymbolId, as_static_shape, is_fully_static, static_shape,
 };
-pub use tensor::{SparseTensorData, TensorData, TypeProto, WeightRef};
+pub use tensor::{
+    SparseTensorData, TensorData, TypeProto, WeightRef, checked_expected_bytes, checked_numel,
+};
 pub use value::{Consumers, Usage, Value, ValueId};
