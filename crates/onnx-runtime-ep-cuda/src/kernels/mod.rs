@@ -68,6 +68,7 @@ pub mod standard_attention;
 pub(crate) mod standard_claims;
 pub mod topk;
 pub mod trilu;
+pub mod varlen_attention;
 pub mod where_op;
 
 use activations::ActivationFactory;
@@ -132,6 +133,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "CompressedSparseAttention",
     "IndexShare",
     "PackedVarlenAttention",
+    "VarlenAttention",
     "Gemm",
     "FusedMatMulBias",
     "FusedGemm",
@@ -462,6 +464,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("VarlenAttention", "pkg.nxrt", 1),
+        Box::new(varlen_attention::VarlenAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
