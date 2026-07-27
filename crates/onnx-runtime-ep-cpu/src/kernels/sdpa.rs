@@ -285,6 +285,14 @@ pub fn sdpa_f32(
             return;
         }
     }
+    // NEON-vectorized path for aarch64: uses dot_f32 and axpy_f32 which
+    // dispatch to 4×-unrolled NEON intrinsics. Same semantics as the scalar
+    // reference, just faster inner loops.
+    #[cfg(target_arch = "aarch64")]
+    if qk.is_none() {
+        sdpa_f32_neon(t, cfg, bias, mask, y);
+        return;
+    }
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
 }
 
@@ -509,7 +517,7 @@ fn softmax_in_place(scores: &mut [f32], exp: SoftmaxExp) {
 }
 
 /// Dot product using the decode path's AVX2+FMA accumulation order when
-/// available, with a scalar fallback on other targets.
+/// available, NEON on aarch64, with a scalar fallback on other targets.
 #[inline(always)]
 fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -518,11 +526,18 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
         // SAFETY: `has_simd_x86()` confirms AVX2 + FMA at runtime.
         return unsafe { dot_avx2_fma(a, b) };
     }
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    #[cfg(target_arch = "aarch64")]
+    {
+        return dot_neon(a, b);
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
 }
 
 /// AXPY using the decode path's AVX2+FMA accumulation order when available,
-/// with a scalar fallback on other targets.
+/// NEON on aarch64, with a scalar fallback on other targets.
 #[inline(always)]
 fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -532,8 +547,117 @@ fn axpy_f32(dst: &mut [f32], scalar: f32, src: &[f32]) {
         unsafe { axpy_avx2_fma(dst, scalar, src) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        axpy_neon(dst, scalar, src);
+        return;
+    }
+    #[allow(unreachable_code)]
     for (d, s) in dst.iter_mut().zip(src) {
         *d += scalar * s;
+    }
+}
+
+/// NEON 4×-unrolled dot product for aarch64 (ARMv8 baseline).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let mut acc0 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc1 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc2 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc3 = unsafe { vdupq_n_f32(0.0) };
+    let mut j = 0;
+    while j + 16 <= n {
+        unsafe {
+            acc0 = vfmaq_f32(
+                acc0,
+                vld1q_f32(a.as_ptr().add(j)),
+                vld1q_f32(b.as_ptr().add(j)),
+            );
+            acc1 = vfmaq_f32(
+                acc1,
+                vld1q_f32(a.as_ptr().add(j + 4)),
+                vld1q_f32(b.as_ptr().add(j + 4)),
+            );
+            acc2 = vfmaq_f32(
+                acc2,
+                vld1q_f32(a.as_ptr().add(j + 8)),
+                vld1q_f32(b.as_ptr().add(j + 8)),
+            );
+            acc3 = vfmaq_f32(
+                acc3,
+                vld1q_f32(a.as_ptr().add(j + 12)),
+                vld1q_f32(b.as_ptr().add(j + 12)),
+            );
+        }
+        j += 16;
+    }
+    while j + 4 <= n {
+        unsafe {
+            acc0 = vfmaq_f32(
+                acc0,
+                vld1q_f32(a.as_ptr().add(j)),
+                vld1q_f32(b.as_ptr().add(j)),
+            );
+        }
+        j += 4;
+    }
+    let mut sum = unsafe { vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3))) };
+    while j < n {
+        sum += a[j] * b[j];
+        j += 1;
+    }
+    sum
+}
+
+/// NEON 4×-unrolled AXPY for aarch64: dst[i] += scalar * src[i].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn axpy_neon(dst: &mut [f32], scalar: f32, src: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = dst.len();
+    let vs = unsafe { vdupq_n_f32(scalar) };
+    let mut j = 0;
+    while j + 16 <= n {
+        unsafe {
+            let d0 = vld1q_f32(dst.as_ptr().add(j));
+            let d1 = vld1q_f32(dst.as_ptr().add(j + 4));
+            let d2 = vld1q_f32(dst.as_ptr().add(j + 8));
+            let d3 = vld1q_f32(dst.as_ptr().add(j + 12));
+            vst1q_f32(
+                dst.as_mut_ptr().add(j),
+                vfmaq_f32(d0, vs, vld1q_f32(src.as_ptr().add(j))),
+            );
+            vst1q_f32(
+                dst.as_mut_ptr().add(j + 4),
+                vfmaq_f32(d1, vs, vld1q_f32(src.as_ptr().add(j + 4))),
+            );
+            vst1q_f32(
+                dst.as_mut_ptr().add(j + 8),
+                vfmaq_f32(d2, vs, vld1q_f32(src.as_ptr().add(j + 8))),
+            );
+            vst1q_f32(
+                dst.as_mut_ptr().add(j + 12),
+                vfmaq_f32(d3, vs, vld1q_f32(src.as_ptr().add(j + 12))),
+            );
+        }
+        j += 16;
+    }
+    while j + 4 <= n {
+        unsafe {
+            let d = vld1q_f32(dst.as_ptr().add(j));
+            vst1q_f32(
+                dst.as_mut_ptr().add(j),
+                vfmaq_f32(d, vs, vld1q_f32(src.as_ptr().add(j))),
+            );
+        }
+        j += 4;
+    }
+    while j < n {
+        dst[j] += scalar * src[j];
+        j += 1;
     }
 }
 
@@ -607,6 +731,87 @@ unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
         while i < n {
             *dst_ptr.add(i) += scalar * *src_ptr.add(i);
             i += 1;
+        }
+    }
+}
+
+/// NEON-vectorized SDPA for aarch64 — same semantics as the scalar reference
+/// but uses 4×-unrolled NEON dot product and AXPY for the inner loops.
+///
+/// Handles all features (GQA, causal, softcap, bias, mask) with identical
+/// control flow to the scalar reference, just faster inner math.
+#[cfg(target_arch = "aarch64")]
+fn sdpa_f32_neon(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    y: &mut [f32],
+) {
+    let SdpaTensors {
+        q,
+        k,
+        v,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_seq,
+        kv_seq,
+        head_size,
+        v_head_size,
+    } = *t;
+
+    debug_assert_eq!(q.len(), batch * num_heads * q_seq * head_size);
+    debug_assert_eq!(k.len(), batch * num_kv_heads * kv_seq * head_size);
+    debug_assert_eq!(v.len(), batch * num_kv_heads * kv_seq * v_head_size);
+    debug_assert_eq!(y.len(), batch * num_heads * q_seq * v_head_size);
+    debug_assert!(num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads));
+
+    let heads_per_kv = num_heads / num_kv_heads;
+
+    let (post_scale, operand_scale) = match cfg.scale {
+        ScaleMode::PostDot(s) => (s, 1.0f32),
+        ScaleMode::SplitSqrt(s) => (1.0f32, s.sqrt()),
+    };
+    let combined_scale = post_scale * operand_scale * operand_scale;
+
+    let mut scores = vec![0.0f32; kv_seq];
+    for b in 0..batch {
+        for n in 0..num_heads {
+            let kv_n = n / heads_per_kv;
+            for i in 0..q_seq {
+                let q_base = ((b * num_heads + n) * q_seq + i) * head_size;
+                let q_slice = &q[q_base..q_base + head_size];
+
+                // scores[j] = combined_scale * dot(Q, K_j) [+softcap] + bias + mask
+                for (j, sc) in scores.iter_mut().enumerate() {
+                    let k_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * head_size;
+                    let mut s = dot_f32(q_slice, &k[k_base..k_base + head_size]) * combined_scale;
+                    if let Some(softcap) = cfg.softcap {
+                        s = softcap * (s / softcap).tanh();
+                    }
+                    s += bias.at(b, n, i, j);
+                    s += mask.at(b, i, j);
+                    if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+                        s = cfg.causal_fill;
+                    }
+                    *sc = s;
+                }
+
+                softmax_in_place(&mut scores, SoftmaxExp::F32);
+
+                // context: Y[i] = sum_j(probs[j] * V[j, :]) via NEON AXPY
+                let y_base = ((b * num_heads + n) * q_seq + i) * v_head_size;
+                let y_slice = &mut y[y_base..y_base + v_head_size];
+                y_slice.fill(0.0);
+                for (j, &probability) in scores.iter().enumerate() {
+                    if probability == 0.0 {
+                        continue;
+                    }
+                    let v_base = ((b * num_kv_heads + kv_n) * kv_seq + j) * v_head_size;
+                    axpy_f32(y_slice, probability, &v[v_base..v_base + v_head_size]);
+                }
+            }
         }
     }
 }
