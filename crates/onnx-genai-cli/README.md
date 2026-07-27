@@ -89,8 +89,13 @@ CUDA has two independent switches:
    EP (`onnx-runtime-ep-cuda`).
 2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
    session to use CUDA, while `--backend auto|ort|native` selects the decoder
-   for `generate` and the starting decoder for `run`. In the REPL, `/backend`
-   can still reload the model and switch the decoder without restarting.
+   for `generate`, `transcribe`, and the starting decoder for `run`. Speech
+   transcription uses the same autoregressive pipeline decoder as multimodal
+   generation, so backend selection is meaningful there too. In the REPL,
+   `/backend` can still reload the model and switch the decoder without
+   restarting. Profile output, `/session`, bare `/backend`, and `/stats` report
+   the resolved backend (`auto` is shown separately as the request when it
+   resolved to `ort` or `native`).
 
 CUDA failure modes are intentionally distinct:
 
@@ -204,7 +209,7 @@ cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm --ma
 per-turn stats enabled
 >>> hello
 dogtok29over,dog
-[ 7 in · 5 out · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
+[ 7 in · 5 out · backend ort · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
 ```
 
 Piping a script into the REPL exercises the plain-text fallback instead, which is

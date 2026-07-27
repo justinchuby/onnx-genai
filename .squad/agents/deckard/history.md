@@ -123,3 +123,9 @@ Authored `docs/research/cli/04-runtime-capability-inventory.md` as Deckard. Key 
 
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/neutering proof; re-review approved and merged as 9ab24fa5.
+
+## 2026-07-27T14:56:47-07:00 — PR #287 backend flag lockout revision
+
+- Fixed Batty's rejected CLI backend flag revision: profile output, REPL /session, bare /backend, and /stats now use the loaded engine's resolved backend; auto is only shown as a requested backend when it differs.
+- Kept --backend on transcribe deliberately because speech transcription drives the same autoregressive pipeline decoder; added parser and invalid-backend coverage plus README documentation.
+- Verified cargo build -p onnx-genai-cli, cargo test -p onnx-genai-cli --lib, cargo fmt -p onnx-genai-cli -- --check, cargo clippy -p onnx-genai-cli --all-targets -- -D warnings, and cargo build -p onnx-genai-server.

@@ -217,6 +217,7 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 pub struct PipelineEngine {
     models: PipelineModels,
     plan: PipelinePlan,
+    decode_backend: EngineDecodeBackend,
     /// Autoregressive decode state; `None` for non-autoregressive pipelines
     /// (single-pass, iterative/diffusion) which produce tensors, not tokens.
     decoder_state: Option<DecodeState>,
@@ -418,6 +419,11 @@ impl PipelineEngine {
         Self::from_dir_with_schedulers(pipeline_dir, config, &SchedulerRegistry::builtin())
     }
 
+    /// Resolved decoder execution backend.
+    pub fn decode_backend(&self) -> EngineDecodeBackend {
+        self.decode_backend
+    }
+
     /// Load a pipeline with explicit session options, chiefly to pin the
     /// execution provider.
     ///
@@ -561,6 +567,10 @@ impl PipelineEngine {
         Ok(Self {
             models,
             plan,
+            decode_backend: match backend {
+                PipelineBackend::Ort => EngineDecodeBackend::Ort,
+                PipelineBackend::Native => EngineDecodeBackend::Native,
+            },
             decoder_state,
             tokenizer_component,
             fixed_state_budget_bytes,

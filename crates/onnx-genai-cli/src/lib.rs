@@ -249,10 +249,6 @@ impl EngineArgs {
         }
         config
     }
-
-    fn backend_name(&self) -> &'static str {
-        decode_backend_name(self.backend)
-    }
 }
 
 fn decode_backend_name(backend: EngineDecodeBackend) -> &'static str {
@@ -923,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_is_shared_by_generate_and_run() {
+    fn backend_is_shared_by_generate_run_and_transcribe() {
         let generate = Cli::try_parse_from([
             "onnx-genai",
             "generate",
@@ -935,6 +931,9 @@ mod tests {
         ])
         .unwrap();
         let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--backend", "ort"]).unwrap();
+        let transcribe =
+            Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "native"])
+                .unwrap();
 
         match generate.command {
             Commands::Generate(args) => {
@@ -956,6 +955,25 @@ mod tests {
             }
             _ => panic!("expected run command"),
         }
+        match transcribe.command {
+            Commands::Transcribe(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Native
+                );
+            }
+            _ => panic!("expected transcribe command"),
+        }
+    }
+
+    #[test]
+    fn transcribe_rejects_unknown_backend_loudly() {
+        let error = Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "cuda"])
+            .expect_err("cuda is an execution provider, not a decode backend")
+            .to_string();
+
+        assert!(error.contains("auto, ort, or native"), "{error}");
     }
 
     #[test]
@@ -1444,6 +1462,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            resolved_decode_backend: EngineDecodeBackend::Ort,
             options: &options,
             history: &history,
             usage: &usage,
@@ -1455,7 +1474,8 @@ mod tests {
             "session\n\
              \x20\x20model: models/tiny\n\
              \x20\x20execution provider: cpu\n\
-             \x20\x20decode backend: auto\n\
+             \x20\x20decode backend: ort\n\
+             \x20\x20requested backend: auto\n\
              \x20\x20sampling: max_new_tokens=32 max_context=auto temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
              \x20\x20messages: 3 (system: 1, user: 1, assistant: 1)\n\
              \x20\x20completed turns: 1\n\

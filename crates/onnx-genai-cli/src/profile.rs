@@ -229,6 +229,9 @@ impl RunProfile {
         if let Some(context) = self.context {
             parts.push(format!("ctx {context}"));
         }
+        if let Some(backend) = &self.decode_backend {
+            parts.push(format!("backend {backend}"));
+        }
         if let Some(rate) = self.timings.decode_tokens_per_second() {
             parts.push(format!("{rate:.1} tok/s"));
         }
@@ -676,6 +679,9 @@ impl RunProfile {
                 json_string(&self.execution_provider)
             ),
         ];
+        if let Some(backend) = &self.decode_backend {
+            fields.push(format!("\"decode_backend\":{}", json_string(backend)));
+        }
         for phase in &self.phases {
             fields.push(format!(
                 "\"{}_ms\":{:.3}",
@@ -1140,5 +1146,18 @@ mod tests {
         let line = profile.to_stats_line();
 
         assert!(line.contains("ctx 3.1k / 8.2k"), "{line}");
+    }
+
+    #[test]
+    fn stats_line_reports_resolved_backend() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.decode_backend = Some("ort".to_string());
+
+        let line = profile.to_stats_line();
+        let json: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+
+        assert!(line.contains("backend ort"), "{line}");
+        assert!(!line.contains("backend auto"), "{line}");
+        assert_eq!(json["decode_backend"], "ort");
     }
 }
