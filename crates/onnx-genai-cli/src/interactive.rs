@@ -22,7 +22,7 @@ use super::output::{
     build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
     run_generation_turn,
 };
-use super::{EngineArgs, ProfileArgs, RunArgs, resolve_model_dir};
+use super::{EngineArgs, ProfileArgs, RunArgs, decode_backend_name, resolve_model_dir};
 use super::{live_turn, pages, profile};
 use profile::RunProfile;
 
@@ -177,11 +177,12 @@ pub(super) struct SessionSettings {
 
 impl SessionSettings {
     pub(super) fn new(model_dir: PathBuf, engine: &EngineArgs) -> Self {
+        let config = engine.to_config();
         Self {
             model_dir,
             execution_provider: None,
-            decode_backend: EngineDecodeBackend::Auto,
-            limits: engine.to_config().limits,
+            decode_backend: config.decode_backend,
+            limits: config.limits,
         }
     }
 
@@ -224,11 +225,7 @@ impl SessionSettings {
     }
 
     pub(super) fn backend_name(&self) -> &'static str {
-        match self.decode_backend {
-            EngineDecodeBackend::Auto => "auto",
-            EngineDecodeBackend::Ort => "ort",
-            EngineDecodeBackend::Native => "native",
-        }
+        decode_backend_name(self.decode_backend)
     }
 }
 

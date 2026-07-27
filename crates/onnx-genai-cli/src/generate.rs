@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use onnx_genai::EngineConfig;
 use onnx_genai::engine::PipelineEngine;
 use onnx_genai::ort::{ChatMessage, Tokenizer};
 use onnx_genai::text_to_audio;
@@ -24,6 +23,7 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
     profile.execution_provider = resolved_default_providers();
+    profile.decode_backend = Some(args.engine.backend_name().to_string());
     if args.image_output.output_image.is_some() && args.audio_output.output_audio.is_some() {
         anyhow::bail!(
             "What: --output-image and --output-audio were combined. \
@@ -123,7 +123,7 @@ fn generate_image(
         .expect("image output path checked by the caller");
     let request = args.image_output.to_request(args.prompt.clone());
     let load_started = std::time::Instant::now();
-    let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())
+    let mut engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())
         .map_err(|error| {
             anyhow::anyhow!(
                 "What: {} could not be loaded as a diffusion pipeline. \

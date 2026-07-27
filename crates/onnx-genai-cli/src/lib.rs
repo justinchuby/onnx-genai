@@ -41,6 +41,7 @@ mod output;
 mod pages;
 mod profile;
 mod transcribe;
+use commands::parse_decode_backend;
 use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
@@ -50,6 +51,7 @@ use interactive::{
     stage_attachment,
 };
 use model_inspection::{list, show, version};
+use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
 use onnx_genai::{EngineConfig, GenerateOptions, StopSequence};
@@ -61,12 +63,7 @@ use transcribe::transcribe;
 const CLI_FALLBACK_MAX_NEW_TOKENS: usize = 512;
 
 #[cfg(test)]
-use commands::{
-    ProfileSetting, ReplCommand, ReplLine, parse_decode_backend, parse_profile_setting,
-    parse_repl_line,
-};
-#[cfg(test)]
-use onnx_genai::engine::EngineDecodeBackend;
+use commands::{ProfileSetting, ReplCommand, ReplLine, parse_profile_setting, parse_repl_line};
 #[cfg(test)]
 use onnx_genai::ort::{ChatMessage, profile::TraceVerbosity};
 #[cfg(test)]
@@ -219,6 +216,10 @@ impl SamplingArgs {
 /// Shared engine-tuning flags.
 #[derive(Debug, Args, Default, Clone)]
 struct EngineArgs {
+    /// Decoder backend for text generation.
+    #[arg(long, value_name = "auto|ort|native", value_parser = parse_decode_backend, default_value = "auto")]
+    backend: EngineDecodeBackend,
+
     /// Memory ceiling the engine may use for weights and KV cache: a byte count
     /// (`8GiB`), a fraction of detected capacity (`0.9`), or `auto`.
     ///
@@ -236,7 +237,10 @@ struct EngineArgs {
 
 impl EngineArgs {
     fn to_config(&self) -> EngineConfig {
-        let mut config = EngineConfig::default();
+        let mut config = EngineConfig {
+            decode_backend: self.backend,
+            ..EngineConfig::default()
+        };
         if let Some(limit) = self.vram_limit {
             config.limits.vram_limit = limit;
         }
@@ -244,6 +248,18 @@ impl EngineArgs {
             config.limits.host_ram_limit = limit;
         }
         config
+    }
+
+    fn backend_name(&self) -> &'static str {
+        decode_backend_name(self.backend)
+    }
+}
+
+fn decode_backend_name(backend: EngineDecodeBackend) -> &'static str {
+    match backend {
+        EngineDecodeBackend::Auto => "auto",
+        EngineDecodeBackend::Ort => "ort",
+        EngineDecodeBackend::Native => "native",
     }
 }
 
@@ -904,6 +920,80 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn backend_is_shared_by_generate_and_run() {
+        let generate = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--backend",
+            "native",
+        ])
+        .unwrap();
+        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--backend", "ort"]).unwrap();
+
+        match generate.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Native
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+        match run.command {
+            Commands::Run(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Ort);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Ort
+                );
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn backend_defaults_to_auto() {
+        let parsed =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Auto);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Auto
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn backend_reuses_repl_parser_error() {
+        let error = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--backend",
+            "cuda",
+        ])
+        .expect_err("cuda is an execution provider, not a decode backend")
+        .to_string();
+
+        assert!(
+            error.contains("What: \"cuda\" is not a decode backend"),
+            "{error}"
+        );
+        assert!(error.contains("How: use auto, ort, or native."), "{error}");
     }
 
     #[test]

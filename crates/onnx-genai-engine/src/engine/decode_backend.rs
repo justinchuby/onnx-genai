@@ -18,9 +18,12 @@ pub(crate) fn resolve_decode_backend(
             {
                 let _ = model_path;
                 anyhow::bail!(
-                    "native decoder backend requires building onnx-genai-engine with the \
-                     'native-backend' feature; set decode_backend = EngineDecodeBackend::Ort \
-                     (or ONNX_GENAI_BACKEND=ort) to run this model on ONNX Runtime"
+                    "native decoder backend was requested, but this binary was not built with \
+                     native decoder support. Rebuild the CLI with \
+                     `cargo build -p onnx-genai-cli --features native-backend` for the native \
+                     CPU/backend path, or `--features native-cuda` when you need the native CUDA \
+                     EP. To run this model on ONNX Runtime instead, pass --backend ort, set \
+                     decode_backend = EngineDecodeBackend::Ort, or set ONNX_GENAI_BACKEND=ort."
                 )
             }
         }
@@ -34,7 +37,8 @@ pub(crate) fn resolve_decode_backend(
                 {
                     anyhow::bail!(
                         "model contains native-only operators (pkg.nxrt::BlockQuantizedMatMul); \
-                         rebuild with the 'native-backend' feature and select \
+                         rebuild the CLI with --features native-backend (or --features \
+                         native-cuda for the native CUDA EP) and select \
                          decode_backend = EngineDecodeBackend::Native \
                          (or ONNX_GENAI_BACKEND=native)"
                     );

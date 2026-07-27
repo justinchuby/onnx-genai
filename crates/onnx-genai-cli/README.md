@@ -88,8 +88,9 @@ CUDA has two independent switches:
    native-cuda` enables the native backend plus the project's hand-written CUDA
    EP (`onnx-runtime-ep-cuda`).
 2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
-   session to use CUDA, while the decode backend selects the decoder. In the REPL
-   (`run`), use `/backend native` to use the native decoder.
+   session to use CUDA, while `--backend auto|ort|native` selects the decoder
+   for `generate` and the starting decoder for `run`. In the REPL, `/backend`
+   can still reload the model and switch the decoder without restarting.
 
 CUDA failure modes are intentionally distinct:
 
@@ -111,10 +112,25 @@ Windows PowerShell example for the native CUDA path:
 ```powershell
 $env:ONNX_GENAI_EP = "cuda"
 $env:ONNX_GENAI_REQUIRE_CUDA = "1"
-cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- run .\path\to\model
-# In the REPL:
-# /backend native
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- `
+  generate .\path\to\model --prompt "Hello" --max-new-tokens 64 --backend native --profile
 ```
+
+PowerShell native-vs-ORT decode comparison, with the same ORT execution provider
+for both runs:
+
+```powershell
+$env:ONNX_GENAI_EP = "cuda"  # or "cpu"
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- `
+  generate .\path\to\model --prompt "Hello" --max-new-tokens 128 --backend native --profile
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- `
+  generate .\path\to\model --prompt "Hello" --max-new-tokens 128 --backend ort --profile
+```
+
+If `--backend native` is passed to a binary built without native decoder support,
+the command fails and tells you to rebuild with `--features native-backend` (CPU
+native/backend path) or `--features native-cuda` (native CUDA EP). It does not
+fall back to ORT.
 
 Python 3.11+ is required (the `onnxruntime` dependency ships no earlier wheels).
 
