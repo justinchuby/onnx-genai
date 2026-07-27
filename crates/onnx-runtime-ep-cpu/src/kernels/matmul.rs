@@ -488,7 +488,13 @@ impl MatMulKernel {
 /// straight from its own contiguous `numel * 4` byte range, which this test
 /// covers exactly; any other input dtype/layout is materialized into a fresh
 /// owned buffer before the GEMM, so it cannot alias the output at all.
-fn output_is_direct_f32_eligible(a: &TensorView, b: &TensorView, out: &TensorMut) -> bool {
+/// Whether an output tensor is eligible for direct f32 GEMM writes: must be
+/// contiguous Float32 on CPU, not aliasing either input.
+pub(crate) fn output_is_direct_f32_eligible(
+    a: &TensorView,
+    b: &TensorView,
+    out: &TensorMut,
+) -> bool {
     use onnx_runtime_ir::DataType;
     use onnx_runtime_ir::DeviceType;
 
@@ -632,6 +638,37 @@ pub(crate) fn matmul_dense_prepacked(
     prepack: &MatMulPrepack,
 ) -> Result<Vec<f32>> {
     matmul_dense_prepacked_with_backend(a, b, prepack, CpuBackend::auto_detect())
+}
+
+/// Compute `MatMul(A, B)` directly into a caller-supplied output slice,
+/// skipping the intermediate `Vec<f32>` allocation. Returns the number of
+/// elements written (equal to the result length from matmul_geometry).
+/// Used by FusedMatMulBias's direct-output path.
+pub(crate) fn matmul_dense_prepacked_into(
+    a: &TensorView,
+    b: &TensorView,
+    prepack: &MatMulPrepack,
+    out: &mut [f32],
+) -> Result<usize> {
+    let backend = CpuBackend::auto_detect();
+    let geom = matmul_geometry(a, b)?;
+    if out.len() < geom.result_len {
+        return Err(EpError::KernelFailed(format!(
+            "FusedMatMulBias direct: output buffer {} < result length {}",
+            out.len(),
+            geom.result_len
+        )));
+    }
+    let out_slice = &mut out[..geom.result_len];
+    matmul_dense_into_with_backend(
+        &prepack.dense(0, a)?,
+        &prepack.dense(1, b)?,
+        &geom,
+        backend,
+        Some(prepack),
+        out_slice,
+    )?;
+    Ok(geom.result_len)
 }
 
 fn matmul_dense_prepacked_with_backend(
@@ -795,20 +832,20 @@ fn matmul_dense_into_with_backend(
     // Accelerate hybrid M=1 fast path (macOS/iOS):
     //
     // Column-parallel NEON GEMV on pre-transposed B_T, parallelized via the
-    // Rayon decode pool. The `neon_gemv_col_parallel` kernel handles
-    // single-threaded vs multi-threaded dispatch internally based on matrix
-    // size. Accelerate `sgemm` is retained for M>1 prefill where AMX
-    // provides genuine benefit.
+    // Rayon decode pool. Single-threaded for small matrices (dispatch > compute).
+    // Accelerate sgemv was measured at ~30-50 µs GCD wake-up overhead per call,
+    // making it SLOWER than single-threaded NEON for L2-resident matrices (the
+    // wake-up dominates the compute saving). Accelerate sgemm is retained for
+    // M>1 prefill where AMX provides genuine compute benefit.
     //
-    // Note: Accelerate `cblas_sgemv` was measured at ~30-50 µs GCD wake-up
-    // overhead per call, making it equivalent to Rayon NEON for L2-resident
-    // matrices (q/k/v/o projections). The unified NEON path simplifies
-    // dispatch and avoids the Accelerate-inside-Rayon oversubscription
-    // hazard without sacrificing bandwidth.
+    // Treat batch_shape with product ≤ 1 as non-batched: during decode the
+    // activation is typically [1, 1, K] against a [K, N] weight, giving
+    // batch_shape = [1]. The single-element batch is equivalent to no batch
+    // and must not skip this optimized path.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     if backend == CpuBackend::Accelerate
         && m == 1
-        && geom.batch_shape.is_empty()
+        && numel(&geom.batch_shape) <= 1
         && geom.b_promoted_rank == 2
     {
         if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
@@ -819,8 +856,12 @@ fn matmul_dense_into_with_backend(
         return Ok(());
     }
 
-    if geom.batch_shape.is_empty() {
-        // No batch dims: a single matmul.
+    // A batch product of 1 (e.g. batch_shape = [1] from a [1,1,K] activation
+    // against a [K,N] weight) is equivalent to no batch. Use the non-batched
+    // path to pick up packed_b, avoid the per-batch iteration overhead, and
+    // stay consistent with the Accelerate M=1 fast path above.
+    if numel(&geom.batch_shape) <= 1 {
+        // No effective batch dims: a single matmul.
         #[cfg(feature = "mlas")]
         if let Some(packed_b) = packed_b {
             gemm_packed(a_dense, packed_b, out, m, k, n)?;
