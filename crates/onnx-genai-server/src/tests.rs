@@ -2409,6 +2409,22 @@ fn error_message(body: &Value) -> String {
         .to_string()
 }
 
+fn assert_well_formed_error_without_internal_path(body: &Value) {
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error response must contain a message");
+    assert!(!message.is_empty());
+    assert_eq!(body["error"]["type"], "server_error");
+    assert!(
+        !message.contains(env!("CARGO_MANIFEST_DIR")),
+        "error must not expose the crate path: {body}"
+    );
+    assert!(
+        !message.contains("tests/fixtures"),
+        "error must not expose an internal fixture path: {body}"
+    );
+}
+
 fn assert_actionable(message: &str) {
     assert!(message.contains("What:"), "message: {message}");
     assert!(message.contains("Why:"), "message: {message}");
@@ -2593,6 +2609,116 @@ async fn content_parts_must_be_objects_with_a_type() {
         assert_actionable(&message);
         assert!(message.contains(expected), "message: {message}");
     }
+}
+
+#[tokio::test]
+async fn non_streaming_vision_contract_failure_returns_http_400() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
+                ]
+            }],
+            "max_tokens": 1,
+            "stream": false
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_well_formed_error_without_internal_path(&body);
+    assert!(
+        error_message(&body).contains("image input was rejected"),
+        "body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_vision_contract_failure_returns_http_400() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_uri()}}
+                ]
+            }],
+            "max_tokens": 1,
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_well_formed_error_without_internal_path(&body);
+    assert!(
+        error_message(&body).contains("image input was rejected"),
+        "body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn audio_contract_failure_returns_http_400() {
+    let (status, body) = post_json(
+        tiny_state(),
+        "/v1/chat/completions",
+        json!({
+            "model": "tiny-llm",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": tiny_wav_base64(),
+                        "format": "wav"
+                    }
+                }]
+            }],
+            "max_tokens": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_well_formed_error_without_internal_path(&body);
+    assert!(
+        error_message(&body).contains("audio input was rejected"),
+        "body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn poisoned_model_registry_returns_http_500() {
+    let state = tiny_state();
+    state.registry.poison_for_test();
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("poisoned registry must produce an HTTP response");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_well_formed_error_without_internal_path(&body);
+    assert_eq!(
+        error_message(&body),
+        "model registry failed: registry lock poisoned"
+    );
 }
 
 #[tokio::test]

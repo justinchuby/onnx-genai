@@ -487,6 +487,15 @@ impl ModelRegistry {
         inner.insert_loaded(handle);
     }
 
+    pub(crate) fn poison_for_test(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = inner.write().expect("test registry lock must be available");
+            panic!("poison registry lock for HTTP error test");
+        })
+        .join();
+    }
+
     /// Enforce eviction directly (used by eviction unit tests).
     pub(crate) fn enforce_eviction_for_test(&self, max_loaded: Option<usize>, loading_id: &str) {
         let mut inner = self.inner.write().unwrap();
