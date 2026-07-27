@@ -1611,9 +1611,7 @@ impl Engine {
                 run_decode_session_logits(&mut state.decode_state, draft_tokens, base_len)?;
             self.kv_cache
                 .append(session_id, draft_tokens.len())
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to advance KV sequence {session_id}: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("Failed to advance KV sequence {session_id}: {e}"))?;
             state.kv_token_count += draft_tokens.len();
             logits
         } else {

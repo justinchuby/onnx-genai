@@ -188,9 +188,7 @@ fn one_hot(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if !(0..output_rank as i64).contains(&axis) {
         return Err(ShapeInferError::Invalid {
             op: "OneHot".into(),
-            detail: format!(
-                "axis {axis_attr} is outside [-{output_rank}, {output_rank})"
-            ),
+            detail: format!("axis {axis_attr} is outside [-{output_rank}, {output_rank})"),
         });
     }
 
