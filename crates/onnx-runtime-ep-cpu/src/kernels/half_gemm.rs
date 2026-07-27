@@ -1,18 +1,45 @@
-//! Portable blocked `f16`/`bf16` GEMM with `f32` accumulation.
+//! Runtime-dispatched blocked `f16`/`bf16` GEMM with `f32` accumulation.
 //!
 //! Operands stay in their 16-bit storage format until they are packed into
 //! cache-sized `f32` panels. The shared register-tiled kernel then accumulates
 //! in `f32`; callers perform one final narrowing step to the requested output
-//! dtype. This is the portable correctness path on every CPU, including
-//! AVX2-only x86-64 and aarch64 hosts.
+//! dtype. AVX2 widens bf16 directly and uses F16C when available for f16; NEON
+//! widens bf16 directly and uses FP16 conversion when available. Both SIMD
+//! paths share the same packed-panel structure and fall back to scalar widening
+//! for unsupported layouts or conversion features. A scalar micro-kernel
+//! remains the correctness path on every other CPU.
 
 use rayon::prelude::*;
 
 const MR: usize = 4;
-const NR: usize = 4;
+const NR: usize = 8;
 const KC: usize = 128;
 const NC: usize = 64;
 const MAX_MC: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionPath {
+    Scalar,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Avx2,
+    #[cfg(target_arch = "aarch64")]
+    Aarch64Neon,
+}
+
+#[inline]
+fn selected_execution_path() -> ExecutionPath {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return ExecutionPath::X86Avx2;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return ExecutionPath::Aarch64Neon;
+    }
+
+    ExecutionPath::Scalar
+}
 
 /// The 16-bit floating-point storage format used by a GEMM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +76,7 @@ impl MatrixLayout {
 
 trait HalfElement: Send + Sync {
     fn to_f32(bits: u16) -> f32;
+    fn pack_contiguous(source: &[u16], destination: &mut [f32], path: ExecutionPath);
 }
 
 struct F16;
@@ -57,6 +85,29 @@ impl HalfElement for F16 {
     #[inline]
     fn to_f32(bits: u16) -> f32 {
         half::f16::from_bits(bits).to_f32()
+    }
+
+    #[inline]
+    fn pack_contiguous(source: &[u16], destination: &mut [f32], path: ExecutionPath) {
+        debug_assert_eq!(source.len(), destination.len());
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if path == ExecutionPath::X86Avx2 && std::arch::is_x86_feature_detected!("f16c") {
+            // SAFETY: both features required by the conversion routine were
+            // runtime-detected, and its slices have equal lengths.
+            unsafe { widen_f16_x86(source, destination) };
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if path == ExecutionPath::Aarch64Neon && std::arch::is_aarch64_feature_detected!("fp16") {
+            // SAFETY: NEON and FP16 were runtime-detected, and the slices have
+            // equal lengths.
+            unsafe { widen_f16_neon(source, destination) };
+            return;
+        }
+
+        widen_scalar::<Self>(source, destination);
     }
 }
 
@@ -67,6 +118,128 @@ impl HalfElement for Bf16 {
     fn to_f32(bits: u16) -> f32 {
         half::bf16::from_bits(bits).to_f32()
     }
+
+    #[inline]
+    fn pack_contiguous(source: &[u16], destination: &mut [f32], path: ExecutionPath) {
+        debug_assert_eq!(source.len(), destination.len());
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if path == ExecutionPath::X86Avx2 {
+            // SAFETY: AVX2 was runtime-detected, and the slices have equal
+            // lengths.
+            unsafe { widen_bf16_x86(source, destination) };
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if path == ExecutionPath::Aarch64Neon {
+            // SAFETY: NEON was runtime-detected, and the slices have equal
+            // lengths.
+            unsafe { widen_bf16_neon(source, destination) };
+            return;
+        }
+
+        widen_scalar::<Self>(source, destination);
+    }
+}
+
+#[inline]
+fn widen_scalar<T: HalfElement>(source: &[u16], destination: &mut [f32]) {
+    for (output, &bits) in destination.iter_mut().zip(source) {
+        *output = T::to_f32(bits);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn widen_f16_x86(source: &[u16], destination: &mut [f32]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let vectorized_length = source.len() / 8 * 8;
+    let mut index = 0;
+    // SAFETY: the caller guarantees AVX2/F16C. Each vector iteration reads and
+    // writes eight elements inside equal-length slices.
+    unsafe {
+        while index < vectorized_length {
+            let packed = _mm_loadu_si128(source.as_ptr().add(index).cast());
+            let wide = _mm256_cvtph_ps(packed);
+            _mm256_storeu_ps(destination.as_mut_ptr().add(index), wide);
+            index += 8;
+        }
+    }
+    widen_scalar::<F16>(&source[index..], &mut destination[index..]);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn widen_bf16_x86(source: &[u16], destination: &mut [f32]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let vectorized_length = source.len() / 8 * 8;
+    let mut index = 0;
+    // SAFETY: the caller guarantees AVX2. Each vector iteration reads and
+    // writes eight elements inside equal-length slices.
+    unsafe {
+        while index < vectorized_length {
+            let packed = _mm_loadu_si128(source.as_ptr().add(index).cast());
+            let wide = _mm256_slli_epi32(_mm256_cvtepu16_epi32(packed), 16);
+            _mm256_storeu_ps(
+                destination.as_mut_ptr().add(index),
+                _mm256_castsi256_ps(wide),
+            );
+            index += 8;
+        }
+    }
+    widen_scalar::<Bf16>(&source[index..], &mut destination[index..]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,fp16")]
+unsafe fn widen_f16_neon(source: &[u16], destination: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let vectorized_length = source.len() / 4 * 4;
+    let mut index = 0;
+    // SAFETY: the caller guarantees NEON/FP16. Each vector iteration reads and
+    // writes four elements inside equal-length slices.
+    unsafe {
+        while index < vectorized_length {
+            let packed = vld1_u16(source.as_ptr().add(index));
+            let wide = vcvt_f32_f16(vreinterpret_f16_u16(packed));
+            vst1q_f32(destination.as_mut_ptr().add(index), wide);
+            index += 4;
+        }
+    }
+    widen_scalar::<F16>(&source[index..], &mut destination[index..]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn widen_bf16_neon(source: &[u16], destination: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let vectorized_length = source.len() / 4 * 4;
+    let mut index = 0;
+    // SAFETY: the caller guarantees NEON. Each vector iteration reads and
+    // writes four elements inside equal-length slices.
+    unsafe {
+        while index < vectorized_length {
+            let packed = vld1_u16(source.as_ptr().add(index));
+            let wide_bits = vshlq_n_u32::<16>(vmovl_u16(packed));
+            vst1q_f32(
+                destination.as_mut_ptr().add(index),
+                vreinterpretq_f32_u32(wide_bits),
+            );
+            index += 4;
+        }
+    }
+    widen_scalar::<Bf16>(&source[index..], &mut destination[index..]);
 }
 
 /// Compute `c[m,n] = a[m,k] @ b[k,n]` with `f32` accumulation.
@@ -85,10 +258,37 @@ pub(crate) fn gemm(
     k: usize,
     n: usize,
 ) {
+    gemm_with_path(
+        format,
+        a,
+        a_layout,
+        b,
+        b_layout,
+        c,
+        m,
+        k,
+        n,
+        selected_execution_path(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_with_path(
+    format: HalfFormat,
+    a: &[u16],
+    a_layout: MatrixLayout,
+    b: &[u16],
+    b_layout: MatrixLayout,
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    path: ExecutionPath,
+) {
     debug_assert_eq!(c.len(), m * n);
     match format {
-        HalfFormat::F16 => gemm_impl::<F16>(a, a_layout, b, b_layout, c, m, k, n),
-        HalfFormat::Bf16 => gemm_impl::<Bf16>(a, a_layout, b, b_layout, c, m, k, n),
+        HalfFormat::F16 => gemm_impl::<F16>(a, a_layout, b, b_layout, c, m, k, n, path),
+        HalfFormat::Bf16 => gemm_impl::<Bf16>(a, a_layout, b, b_layout, c, m, k, n, path),
     }
 }
 
@@ -102,6 +302,7 @@ fn gemm_impl<T: HalfElement>(
     m: usize,
     k: usize,
     n: usize,
+    path: ExecutionPath,
 ) {
     if m == 0 || n == 0 {
         return;
@@ -125,7 +326,9 @@ fn gemm_impl<T: HalfElement>(
         .for_each(|(block_index, c_block)| {
             let first_row = block_index * mc;
             let rows = c_block.len() / n;
-            gemm_block::<T>(a, a_layout, b, b_layout, c_block, first_row, rows, k, n);
+            gemm_block::<T>(
+                a, a_layout, b, b_layout, c_block, first_row, rows, k, n, path,
+            );
         });
 }
 
@@ -140,6 +343,7 @@ fn gemm_block<T: HalfElement>(
     rows: usize,
     k: usize,
     n: usize,
+    path: ExecutionPath,
 ) {
     let mut a_panel = Vec::with_capacity(rows * KC);
     let mut b_panel = Vec::with_capacity(KC * NC);
@@ -154,6 +358,7 @@ fn gemm_block<T: HalfElement>(
             depth_start,
             panel_depth,
             &mut a_panel,
+            path,
         );
 
         for column_start in (0..n).step_by(NC) {
@@ -166,6 +371,7 @@ fn gemm_block<T: HalfElement>(
                 column_start,
                 panel_columns,
                 &mut b_panel,
+                path,
             );
 
             for row_start in (0..rows).step_by(MR) {
@@ -173,6 +379,7 @@ fn gemm_block<T: HalfElement>(
                 for panel_column_start in (0..panel_columns).step_by(NR) {
                     let tile_columns = NR.min(panel_columns - panel_column_start);
                     micro_kernel(
+                        path,
                         &a_panel,
                         &b_panel,
                         c,
@@ -200,14 +407,25 @@ fn pack_a<T: HalfElement>(
     depth_start: usize,
     panel_depth: usize,
     packed: &mut Vec<f32>,
+    path: ExecutionPath,
 ) {
     packed.clear();
     packed.resize(rows * panel_depth, 0.0);
     for row in 0..rows {
-        for depth in 0..panel_depth {
-            let source_index = (first_row + row) * layout.row_stride
-                + (depth_start + depth) * layout.column_stride;
-            packed[row * panel_depth + depth] = T::to_f32(source[source_index]);
+        let destination = &mut packed[row * panel_depth..(row + 1) * panel_depth];
+        if layout.column_stride == 1 {
+            let source_start = (first_row + row) * layout.row_stride + depth_start;
+            T::pack_contiguous(
+                &source[source_start..source_start + panel_depth],
+                destination,
+                path,
+            );
+        } else {
+            for (depth, output) in destination.iter_mut().enumerate() {
+                let source_index = (first_row + row) * layout.row_stride
+                    + (depth_start + depth) * layout.column_stride;
+                *output = T::to_f32(source[source_index]);
+            }
         }
     }
 }
@@ -221,14 +439,25 @@ fn pack_b<T: HalfElement>(
     column_start: usize,
     panel_columns: usize,
     packed: &mut Vec<f32>,
+    path: ExecutionPath,
 ) {
     packed.clear();
     packed.resize(panel_depth * panel_columns, 0.0);
     for depth in 0..panel_depth {
-        for column in 0..panel_columns {
-            let source_index = (depth_start + depth) * layout.row_stride
-                + (column_start + column) * layout.column_stride;
-            packed[depth * panel_columns + column] = T::to_f32(source[source_index]);
+        let destination = &mut packed[depth * panel_columns..(depth + 1) * panel_columns];
+        if layout.column_stride == 1 {
+            let source_start = (depth_start + depth) * layout.row_stride + column_start;
+            T::pack_contiguous(
+                &source[source_start..source_start + panel_columns],
+                destination,
+                path,
+            );
+        } else {
+            for (column, output) in destination.iter_mut().enumerate() {
+                let source_index = (depth_start + depth) * layout.row_stride
+                    + (column_start + column) * layout.column_stride;
+                *output = T::to_f32(source[source_index]);
+            }
         }
     }
 }
@@ -236,6 +465,81 @@ fn pack_b<T: HalfElement>(
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn micro_kernel(
+    path: ExecutionPath,
+    a_panel: &[f32],
+    b_panel: &[f32],
+    c: &mut [f32],
+    c_columns: usize,
+    row_start: usize,
+    panel_column_start: usize,
+    column_start: usize,
+    panel_depth: usize,
+    panel_columns: usize,
+    tile_rows: usize,
+    tile_columns: usize,
+) {
+    if tile_columns == NR {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if path == ExecutionPath::X86Avx2 {
+            // SAFETY: AVX2 was runtime-detected when the path was selected, and
+            // the tile/slice bounds are established by the blocked driver.
+            unsafe {
+                micro_kernel_avx2(
+                    a_panel,
+                    b_panel,
+                    c,
+                    c_columns,
+                    row_start,
+                    panel_column_start,
+                    column_start,
+                    panel_depth,
+                    panel_columns,
+                    tile_rows,
+                )
+            };
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if path == ExecutionPath::Aarch64Neon {
+            // SAFETY: NEON was runtime-detected when the path was selected, and
+            // the tile/slice bounds are established by the blocked driver.
+            unsafe {
+                micro_kernel_neon(
+                    a_panel,
+                    b_panel,
+                    c,
+                    c_columns,
+                    row_start,
+                    panel_column_start,
+                    column_start,
+                    panel_depth,
+                    panel_columns,
+                    tile_rows,
+                )
+            };
+            return;
+        }
+    }
+
+    micro_kernel_scalar(
+        a_panel,
+        b_panel,
+        c,
+        c_columns,
+        row_start,
+        panel_column_start,
+        column_start,
+        panel_depth,
+        panel_columns,
+        tile_rows,
+        tile_columns,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn micro_kernel_scalar(
     a_panel: &[f32],
     b_panel: &[f32],
     c: &mut [f32],
@@ -271,6 +575,107 @@ fn micro_kernel(
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn micro_kernel_avx2(
+    a_panel: &[f32],
+    b_panel: &[f32],
+    c: &mut [f32],
+    c_columns: usize,
+    row_start: usize,
+    panel_column_start: usize,
+    column_start: usize,
+    panel_depth: usize,
+    panel_columns: usize,
+    tile_rows: usize,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    // SAFETY: the caller guarantees AVX2 and a full NR-wide tile. The driver
+    // establishes all A/B/C bounds.
+    unsafe {
+        let mut accumulators = [_mm256_setzero_ps(); MR];
+        for depth in 0..panel_depth {
+            let b_row = _mm256_loadu_ps(
+                b_panel
+                    .as_ptr()
+                    .add(depth * panel_columns + panel_column_start),
+            );
+            for (tile_row, accumulator) in accumulators.iter_mut().enumerate().take(tile_rows) {
+                let a_value = a_panel[(row_start + tile_row) * panel_depth + depth];
+                *accumulator =
+                    _mm256_add_ps(*accumulator, _mm256_mul_ps(_mm256_set1_ps(a_value), b_row));
+            }
+        }
+
+        for (tile_row, accumulator) in accumulators.iter().enumerate().take(tile_rows) {
+            let output_start =
+                (row_start + tile_row) * c_columns + column_start + panel_column_start;
+            let output = c.as_mut_ptr().add(output_start);
+            let previous = _mm256_loadu_ps(output);
+            _mm256_storeu_ps(output, _mm256_add_ps(previous, *accumulator));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn micro_kernel_neon(
+    a_panel: &[f32],
+    b_panel: &[f32],
+    c: &mut [f32],
+    c_columns: usize,
+    row_start: usize,
+    panel_column_start: usize,
+    column_start: usize,
+    panel_depth: usize,
+    panel_columns: usize,
+    tile_rows: usize,
+) {
+    use std::arch::aarch64::*;
+
+    // SAFETY: the caller guarantees NEON and a full NR-wide tile. The driver
+    // establishes all A/B/C bounds.
+    unsafe {
+        let mut accumulator_low = [vdupq_n_f32(0.0); MR];
+        let mut accumulator_high = [vdupq_n_f32(0.0); MR];
+        for depth in 0..panel_depth {
+            let b_row = b_panel
+                .as_ptr()
+                .add(depth * panel_columns + panel_column_start);
+            let b_low = vld1q_f32(b_row);
+            let b_high = vld1q_f32(b_row.add(4));
+            for tile_row in 0..tile_rows {
+                let a_value = a_panel[(row_start + tile_row) * panel_depth + depth];
+                let a_vector = vdupq_n_f32(a_value);
+                accumulator_low[tile_row] =
+                    vaddq_f32(accumulator_low[tile_row], vmulq_f32(a_vector, b_low));
+                accumulator_high[tile_row] =
+                    vaddq_f32(accumulator_high[tile_row], vmulq_f32(a_vector, b_high));
+            }
+        }
+
+        for tile_row in 0..tile_rows {
+            let output_start =
+                (row_start + tile_row) * c_columns + column_start + panel_column_start;
+            let output = c.as_mut_ptr().add(output_start);
+            vst1q_f32(
+                output,
+                vaddq_f32(vld1q_f32(output), accumulator_low[tile_row]),
+            );
+            vst1q_f32(
+                output.add(4),
+                vaddq_f32(vld1q_f32(output.add(4)), accumulator_high[tile_row]),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +690,91 @@ mod tests {
             }
         }
         output
+    }
+
+    fn detected_simd_path() -> Option<ExecutionPath> {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return Some(ExecutionPath::X86Avx2);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return Some(ExecutionPath::Aarch64Neon);
+        }
+
+        None
+    }
+
+    fn half_bits(format: HalfFormat, value: f32) -> u16 {
+        match format {
+            HalfFormat::F16 => half::f16::from_f32(value).to_bits(),
+            HalfFormat::Bf16 => half::bf16::from_f32(value).to_bits(),
+        }
+    }
+
+    #[test]
+    fn runtime_simd_half_gemm_matches_scalar_for_square_skinny_and_tail_shapes() {
+        let Some(simd_path) = detected_simd_path() else {
+            return;
+        };
+        assert_eq!(selected_execution_path(), simd_path);
+
+        const SHAPES: &[(usize, usize, usize)] = &[
+            (8, 16, 16),
+            (1, 33, 17),
+            (3, 129, 13),
+            (7, 15, 24),
+            (9, 257, 70),
+        ];
+
+        for format in [HalfFormat::F16, HalfFormat::Bf16] {
+            for &(m, k, n) in SHAPES {
+                let a: Vec<u16> = (0..m * k)
+                    .map(|index| half_bits(format, ((index as f32 * 0.071 + 0.13).sin()) * 0.375))
+                    .collect();
+                let b: Vec<u16> = (0..k * n)
+                    .map(|index| half_bits(format, ((index as f32 * 0.053 - 0.29).cos()) * 0.375))
+                    .collect();
+                let mut scalar = vec![0.0; m * n];
+                let mut simd = vec![0.0; m * n];
+
+                gemm_with_path(
+                    format,
+                    &a,
+                    MatrixLayout::row_major(k),
+                    &b,
+                    MatrixLayout::row_major(n),
+                    &mut scalar,
+                    m,
+                    k,
+                    n,
+                    ExecutionPath::Scalar,
+                );
+                gemm_with_path(
+                    format,
+                    &a,
+                    MatrixLayout::row_major(k),
+                    &b,
+                    MatrixLayout::row_major(n),
+                    &mut simd,
+                    m,
+                    k,
+                    n,
+                    simd_path,
+                );
+
+                let max_error = scalar
+                    .iter()
+                    .zip(&simd)
+                    .map(|(scalar, simd)| (scalar - simd).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_error <= 1e-6,
+                    "{format:?} {simd_path:?} {m}x{k}x{n} differs from scalar by {max_error}"
+                );
+            }
+        }
     }
 
     #[test]
