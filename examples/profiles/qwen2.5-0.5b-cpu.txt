@@ -1,18 +1,50 @@
+[2m2026-07-27T10:37:17.513341Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
+[2m2026-07-27T10:37:18.781112Z[0m [32m INFO[0m [2monnx_genai_ort::session[0m[2m:[0m Loading model: models/qwen2.5-0.5b/model.onnx
+[2m2026-07-27T10:37:18.781316Z[0m [32m INFO[0m [2monnx_genai_engine::engine::load[0m[2m:[0m No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)
+Certainly! Below is a simple Rust function that reverses a string:
+
+```rust
+fn reverse_string(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+fn main() {
+    let original_string = "hello";
+    let reversed_string = reverse_string(original_string);
+    println!("Original: {}", original_string);
+    println!("Reversed: {}", reversed_string);
+}
+```
+
+### Explanation:
+- The function `reverse_string` takes a reference to a string `s` as its parameter.
+- It uses the `chars()` method to get a mutable iterator over the characters of the string.
+- The `rev()` method is then applied to the iterator to reverse the order of the characters.
+- Finally, the `collect()` method is used to convert the iterator back into a string.
+
+### Example Output:
+```
+Original: hello
+Reversed: olleh
+```
+
+This function works by first converting the string into an iterator of characters, then reversing this iterator,
+
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b
 execution provider       cpu
-model load                   1343.1 ms
+model load                   1388.4 ms
 prompt tokens                    40
-generated tokens                 48
-time to first token           120.0 ms
-generation wall time         1177.6 ms
-decode throughput             45.45 tok/s
-end-to-end throughput         40.76 tok/s
-inter-token latency      mean 22.0 / p50 22.0 / p90 22.5 / p99 22.8 / max 22.8 ms
+generated tokens                200
+time to first token           124.1 ms
+generation wall time         4607.5 ms
+decode throughput             44.62 tok/s
+end-to-end throughput         43.41 tok/s
+inter-token latency      mean 22.4 / p50 22.2 / p90 23.5 / p99 31.0 / max 31.2 ms
 finish reason            MaxTokens
 kv page activity:
-  allocated                       6
-  freed                           6
+  allocated                      15
+  freed                          15
 peak resident memory        2.5 GiB
 kv cache budget             5.4 GiB (233792 tokens)
 device memory breakdown:
@@ -24,28 +56,28 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-engine.ort_session_load        1220.073          1     1220073.00     25418.19
-ort.session_run                1167.835         49       23833.36     24329.89
-loop.next_logits               1153.258         48       24026.20     24026.20
-loop.step                      1034.058         47       22001.24     21542.88
-loop.prefill                    119.778          1      119777.62      2495.37
-engine.tokenizer_load           109.912          1      109912.50      2289.84
-engine.ort_environment            9.763          1        9762.83       203.39
-ort.extract_outputs               2.704         49          55.18        56.33
-ort.bind_inputs                   2.280         49          46.53        47.50
-engine.resolve_decode_backend        1.123          1        1122.83        23.39
-engine.kv_cache_alloc             1.060          1        1059.83        22.08
-ort.sampling                      0.900         48          18.75        18.75
-loop.commit_selected              0.530         48          11.04        11.04
-loop.commit_selected_token        0.515         48          10.72        10.72
-loop.detokenize                   0.465         48           9.68         9.68
-engine.kv_bookkeeping             0.361         48           7.52         7.52
-engine.detect_decode_path         0.248          1         248.46         5.18
-engine.metadata_load              0.222          1         222.29         4.63
-engine.logits_to_vec              0.197          1         196.71         4.10
-engine.resolve_model_directory        0.102          1         101.79         2.12
-engine.kv_model_info              0.092          1          91.75         1.91
-engine.resource_governor          0.054          1          53.96         1.12
-loop.commit_token                 0.023         48           0.47         0.47
-engine.ort_prepare_inputs         0.022         48           0.46         0.46
-engine.connector_bridge           0.001          1           1.29         0.03
+ort.session_run                4585.350        201       22812.69     22926.75
+loop.next_logits               4582.535        200       22912.68     22912.68
+loop.step                      4460.345        199       22413.80     22301.73
+engine.ort_session_load        1267.716          1     1267715.88      6338.58
+loop.prefill                    123.880          1      123879.67       619.40
+engine.tokenizer_load           107.983          1      107983.25       539.92
+engine.ort_environment            9.850          1        9850.08        49.25
+ort.bind_inputs                   7.968        201          39.64        39.84
+ort.extract_outputs               5.999        201          29.84        29.99
+ort.sampling                      3.512        200          17.56        17.56
+loop.commit_selected              1.522        200           7.61         7.61
+loop.commit_selected_token        1.467        200           7.34         7.34
+loop.detokenize                   1.331        200           6.65         6.65
+engine.kv_cache_alloc             1.197          1        1197.17         5.99
+engine.resolve_decode_backend        1.032          1        1031.58         5.16
+engine.kv_bookkeeping             0.909        200           4.55         4.55
+engine.metadata_load              0.179          1         179.42         0.90
+engine.logits_to_vec              0.170          1         170.42         0.85
+engine.ort_prepare_inputs         0.112        200           0.56         0.56
+engine.kv_model_info              0.099          1          99.46         0.50
+engine.resolve_model_directory        0.082          1          82.33         0.41
+loop.commit_token                 0.080        200           0.40         0.40
+engine.resource_governor          0.072          1          72.38         0.36
+engine.detect_decode_path         0.008          1           7.62         0.04
+engine.connector_bridge           0.000          1           0.25         0.00

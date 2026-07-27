@@ -233,3 +233,26 @@ actually SLOWER than FP32 before adding the bulk conversion.
 
 **906 tests pass, cargo fmt clean, clippy clean.**
 **Commit:** 75311827
+
+### Session 8 — Profile regeneration + README update
+
+Regenerated all CPU profiles and added FP16 pair:
+
+| Backend | Decode tok/s | Model |
+|---|---|---|
+| ORT+CPU | 44.6 | FP32 |
+| ORT+CPU f16 | 40.6 | FP16 |
+| native | 33.6 | FP32 |
+| **native f16** | **43.9** | **FP16** |
+
+Native FP16 beats ORT FP16 (43.9 vs 40.6, like-for-like). Updated
+`check_profile_table.py` to validate 6 columns. Rewrote README prose:
+documented FP16 architectural advantage (direct mmap read vs widen-before-GEMM),
+honest TTFT weakness (1174–1291 ms vs 109–124 ms for ORT), further headroom
+notes (gate+up fusion, op fusion, prefill, Q4).
+
+Machine was under heavy load from concurrent agents. Used
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1` to force the SPMD pool (auto-calibrator
+falls back to flat under load). Used 200 tokens to dilute the ~1s pool init spike.
+
+`check_profile_table.py` passes (6 samples × 4 rows). `cargo fmt --check` clean.

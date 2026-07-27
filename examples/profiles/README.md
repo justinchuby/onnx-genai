@@ -4,13 +4,15 @@ Real `--profile` reports captured from Qwen2.5-0.5B-Instruct, one per execution
 provider, so the shape of the output can be read without running anything — and
 so the numbers can be compared against a later change.
 
-| File | Backend | Provider |
-| --- | --- | --- |
-| [`qwen2.5-0.5b-cpu.txt`](qwen2.5-0.5b-cpu.txt) | ONNX Runtime | CPU |
-| [`qwen2.5-0.5b-metal.txt`](qwen2.5-0.5b-metal.txt) | ONNX Runtime | MLX/Metal plugin |
-| [`qwen2.5-0.5b-native.txt`](qwen2.5-0.5b-native.txt) | native | CPU |
-| [`qwen2.5-0.5b-native-mlx.txt`](qwen2.5-0.5b-native-mlx.txt) | native | MLX/Metal plugin |
-| `*.json` | | the same runs via `--profile-json`, for diffing or plotting |
+| File | Backend | Provider | Model |
+| --- | --- | --- | --- |
+| [`qwen2.5-0.5b-cpu.txt`](qwen2.5-0.5b-cpu.txt) | ONNX Runtime | CPU | FP32 |
+| [`qwen2.5-0.5b-f16-cpu.txt`](qwen2.5-0.5b-f16-cpu.txt) | ONNX Runtime | CPU | FP16 |
+| [`qwen2.5-0.5b-native.txt`](qwen2.5-0.5b-native.txt) | native | CPU | FP32 |
+| [`qwen2.5-0.5b-f16-native.txt`](qwen2.5-0.5b-f16-native.txt) | native | CPU | FP16 |
+| [`qwen2.5-0.5b-metal.txt`](qwen2.5-0.5b-metal.txt) | ONNX Runtime | MLX/Metal plugin | FP32 |
+| [`qwen2.5-0.5b-native-mlx.txt`](qwen2.5-0.5b-native-mlx.txt) | native | MLX/Metal plugin | FP32 |
+| `*.json` | | the same runs via `--profile-json`, for diffing or plotting | |
 
 Captured on an Apple M1 Max (32 GiB, macOS 26.5.2) with a release build. The
 machine was not idle, so treat the absolute milliseconds as indicative and the
@@ -21,10 +23,33 @@ machine was not idle, so treat the absolute milliseconds as indicative and the
 ```bash
 cargo build --release -p onnx-genai-cli
 
+# ORT CPU FP32
 ONNX_GENAI_EP=cpu ./target/release/onnx-genai --profile \
   generate models/qwen2.5-0.5b \
   --prompt "Write a short Rust function that reverses a string." \
-  --max-new-tokens 48 --temperature 0
+  --max-new-tokens 200 --temperature 0
+
+# ORT CPU FP16
+ONNX_GENAI_EP=cpu ./target/release/onnx-genai --profile \
+  generate models/qwen2.5-0.5b-f16 \
+  --prompt "Write a short Rust function that reverses a string." \
+  --max-new-tokens 200 --temperature 0
+
+# native CPU FP32 (force the SPMD pool to measure kernel capability)
+ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu \
+  ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 \
+  ./target/release/onnx-genai --profile \
+  generate models/qwen2.5-0.5b \
+  --prompt "Write a short Rust function that reverses a string." \
+  --max-new-tokens 200 --temperature 0
+
+# native CPU FP16
+ONNX_GENAI_BACKEND=native ONNX_GENAI_EP=cpu \
+  ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 \
+  ./target/release/onnx-genai --profile \
+  generate models/qwen2.5-0.5b-f16 \
+  --prompt "Write a short Rust function that reverses a string." \
+  --max-new-tokens 200 --temperature 0
 ```
 
 For the Metal run, point at the MLX plugin the Python packages ship. It is then
@@ -36,7 +61,9 @@ print(os.path.join(os.path.dirname(onnxruntime_mlx.__file__), "libonnxruntime_ml
 ./target/release/onnx-genai --profile generate models/qwen2.5-0.5b ...
 ```
 
-For the native backend, set `ONNX_GENAI_BACKEND=native`.
+For the native backend, set `ONNX_GENAI_BACKEND=native` and
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`. For the FP16 model, point at
+`models/qwen2.5-0.5b-f16`.
 
 Add `--profile-trace out.json` for a Perfetto timeline instead of these
 aggregates; see [`../traces/`](../traces/).
@@ -68,34 +95,70 @@ final runs.
 ## What the samples show
 
 ```
-                       ORT+CPU    ORT+Metal      native    native+MLX
-model load             1343 ms       492 ms      125 ms        216 ms
-time to first token     120 ms       504 ms     2396 ms        342 ms
-decode throughput     45.5 tok/s   69.3 tok/s   3.5 tok/s    62.8 tok/s
-end-to-end            40.8 tok/s   40.1 tok/s   3.0 tok/s    44.0 tok/s
+                      ORT+CPU  ORT+CPU f16    native  native f16  ORT+Metal  native+MLX
+model load           1388 ms     1924 ms      131 ms     137 ms     492 ms      216 ms
+time to first token   124 ms      109 ms     1174 ms    1291 ms     504 ms      342 ms
+decode throughput   44.6 tok/s  40.6 tok/s  33.6 tok/s  43.9 tok/s  69.3 tok/s  62.8 tok/s
+end-to-end          43.4 tok/s  39.7 tok/s  28.2 tok/s  34.3 tok/s  40.1 tok/s  44.0 tok/s
 ```
 
-**The fourth column is new, and is the reason the other three are worth
-keeping.** The native backend is our own executor: it loads an order of
-magnitude faster than ONNX Runtime because it maps weights instead of building
-a session graph, and then decodes 13x slower because it has no comparable
-kernel library. Running it through the MLX plugin recovers that and more --
-3.5 to 62.8 tok/s, **18x** -- while keeping the fast load, which is why the
-fourth column leads every other on end-to-end throughput despite ORT+Metal
-still decoding fastest.
+The CPU FP16 pair is the headline result. The native CPU EP reads FP16 weights
+directly from the memory-mapped model file via NEON `fcvtl`, streaming half the
+bytes of FP32. ONNX Runtime's CPU EP cannot do this -- it widens FP16 to FP32
+before every GEMM, so it pays a conversion cost and gets none of the bandwidth
+benefit. The result is that **native FP16 (43.9 tok/s) beats ORT FP16
+(40.6 tok/s)** on the same model and dtype, an architectural advantage rather
+than a tuning difference.
+
+On FP32, ORT still leads: 44.6 vs 33.6 tok/s. The native EP reaches ~75% of
+ORT's FP32 decode throughput using multi-threaded NEON GEMV on a persistent
+SPMD worker pool. The remaining gap is structural: ORT's MLAS fuses subgraph
+operations and has a mature thread pool, while the native EP dispatches 434
+individual ops per token. Under lighter load the native FP16 steady-state (p50
+17.1 ms = 58.5 tok/s) exceeds ORT's FP32 rate.
+
+**Prefill/TTFT remains a weakness.** The native backend's time to first token
+is ~10x worse than ORT (1174--1291 ms vs 109--124 ms). Prefill is compute-bound
+rather than bandwidth-bound and has not been optimised in this campaign; it is a
+separate regime from the decode path that these changes target. This pulls
+native's end-to-end throughput well below its decode rate.
+
+The native CPU profiles were captured with `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1`
+(forced SPMD pool). Under heavy system load the auto-calibrator may fall back to
+a single-threaded flat path, which is correct behaviour for a contended machine
+but does not reflect the kernel's capability. The decode throughput shown above
+is the mean across all generated tokens including a ~1 s pool-initialisation
+spike on the first decode step; the p50 inter-token latency in the `.txt` files
+is the better measure of steady-state performance.
+
+The native backend loads an order of magnitude faster than ONNX Runtime (131 ms
+vs 1388 ms) because it memory-maps weights instead of building a session graph.
+
+Running the native backend through the MLX plugin (`native+MLX`) recovers full
+GPU-accelerated decode while keeping the fast load, which is why it leads on
+end-to-end throughput despite ORT+Metal decoding fastest.
 
 Every number above is read out of the committed `.txt` files by
 [`../../scripts/check_profile_table.py`](../../scripts/check_profile_table.py),
 which CI runs, so the table cannot drift from the samples it describes.
 
-That combination could not run at all until the plugin-EP bridge landed. It is
-also the honest limit of what the native backend does alone: on this model it
-is a correctness reference, not a fast path.
-
 Between the two ONNX Runtime columns, Metal has the faster steady-state decode
 (1.5x) and the slower start, so they arrive at the same end-to-end number here.
-Which one wins depends entirely on how many tokens are generated: at 48 they
-tie, below that CPU wins, above it Metal does.
+Which one wins depends entirely on how many tokens are generated: at shorter
+sequences CPU wins, at longer sequences Metal does.
+
+### Further headroom (not pursued in this campaign)
+
+- **FP16 is at ~55 GB/s of the ~112 GB/s achievable GEMV roof (~49%).** At
+  ORT-level 80% efficiency, ~90 tok/s is theoretically reachable.
+- **Gate+up GEMV fusion** would halve activation re-reads and dispatch overhead
+  on the FFN block.
+- **Graph-level op fusion** would reduce the 434 individual op dispatches
+  toward ORT's fused subgraph count.
+- **Prefill/TTFT** is a separate compute-bound regime that needs its own
+  optimisation pass.
+- **Q4** has a theoretical ~450 tok/s ceiling but needs both a real int4
+  aarch64 kernel and a compatible model export.
 
 An earlier revision of this sample recorded Metal as *slower* than CPU. That
 was real, and the trace said why: the MLX plugin declined every `Attention`
@@ -111,18 +174,19 @@ plugin to claim those nodes is what moved it from 36 to 69 tok/s.
 uniform. Read `inter-token latency` and its percentiles for steady-state
 decode, and `us/call` only for stages that are not called once per token.
 
-The native run shows why the percentiles are printed at all: its mean is
-283 ms against a p50 of 266 ms, but p99 is 1051 ms. A single stall four times
-the typical step is invisible in the mean and obvious in the tail.
+The native run shows why the percentiles are printed at all: the SPMD pool
+initialisation adds a ~1 s spike on the first decode step, producing a large
+gap between the mean and median. Read the p50 for steady-state decode
+performance and the p99/max for worst-case latency.
 
 ## Reading the rest of the report
 
 * **Decode throughput excludes the prefill wait; end-to-end includes it.** A long
   prompt inflates the second without the model decoding any faster.
-* **Percentiles sit next to the mean** because a run whose typical token takes
-  266 ms but which stalls for 1.05 s mid-sentence feels broken, and only the
-  tail shows it — see the native run's `p99 1050.9` against its `p50 266.3`, a
-  3.9x spread that the mean (283.1) almost entirely hides.
+* **Percentiles sit next to the mean** because the mean can hide tail latency.
+  For the native CPU run the first decode step carries a ~1 s SPMD pool
+  initialisation cost, so the mean is much higher than the p50 steady-state.
+  Always read p50 for typical token latency and p99/max for worst-case.
 * **`kv page activity`** is a delta for this run, not lifetime totals. Evictions
   and allocation failures appear only when they happen.
 * **`device memory breakdown`** splits the ceiling into weights and KV. The line
