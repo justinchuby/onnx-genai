@@ -45,8 +45,9 @@ use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
 use interactive::{
-    InterruptAction, Interrupted, apply_context_sized_max_new_tokens, context_exhaustion_error,
-    context_window_is_full, drop_exhausted_repl_turn, interrupt_action, is_interrupt_error,
+    InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
+    context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
+    initial_repl_show_stats, interrupt_action, is_interrupt_error, repl_input_mode,
     stage_attachment,
 };
 use model_inspection::{list, show, version};
@@ -62,8 +63,8 @@ const CLI_FALLBACK_MAX_NEW_TOKENS: usize = 512;
 
 #[cfg(test)]
 use commands::{
-    ProfileSetting, ReplCommand, ReplLine, parse_decode_backend, parse_profile_setting,
-    parse_repl_line,
+    ProfileSetting, ReplCommand, ReplLine, command_registry, complete_repl_line,
+    parse_decode_backend, parse_profile_setting, parse_repl_line, render_repl_help,
 };
 #[cfg(test)]
 use onnx_genai::engine::EngineDecodeBackend;
@@ -517,6 +518,10 @@ struct GenerateArgs {
 struct RunArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
     model: PathBuf,
+
+    /// Do not show compact per-turn stats by default in an interactive terminal.
+    #[arg(long)]
+    no_stats: bool,
 
     #[command(flatten)]
     sampling: SamplingArgs,
@@ -1002,6 +1007,28 @@ mod tests {
     }
 
     #[test]
+    fn run_accepts_no_stats_opt_out() {
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "run", "./m", "--no-stats"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Run(args) => assert!(args.no_stats),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn tty_split_keeps_pipes_plain_and_stats_tty_only() {
+        assert_eq!(repl_input_mode(true, true), ReplInputMode::Tty);
+        assert_eq!(repl_input_mode(false, true), ReplInputMode::Plain);
+        assert_eq!(repl_input_mode(true, false), ReplInputMode::Plain);
+
+        assert!(initial_repl_show_stats(ReplInputMode::Tty, false));
+        assert!(!initial_repl_show_stats(ReplInputMode::Tty, true));
+        assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
+    }
+
+    #[test]
     fn one_ctrl_c_stops_the_generation_and_two_exit() {
         // Idle prompt: the first press only warns, the second leaves.
         assert_eq!(
@@ -1231,7 +1258,7 @@ mod tests {
     fn parse_repl_line_recognizes_control_commands() {
         assert_eq!(
             parse_repl_line("/help"),
-            ReplLine::Command(ReplCommand::Help)
+            ReplLine::Command(ReplCommand::Help(None))
         );
         assert_eq!(
             parse_repl_line("/reset"),
@@ -1294,9 +1321,64 @@ mod tests {
             ReplLine::Prompt("  explain this".to_string())
         );
         assert_eq!(
+            parse_repl_line("//literal slash"),
+            ReplLine::Prompt("/literal slash".to_string())
+        );
+        assert_eq!(
             parse_repl_line("/unsupported extra"),
             ReplLine::Command(ReplCommand::Unknown("/unsupported".to_string()))
         );
+    }
+
+    #[test]
+    fn command_registry_drives_help_and_parser() {
+        let help = render_repl_help();
+        for command in command_registry() {
+            assert!(
+                help.lines().any(|line| line == command.usage),
+                "{} missing from help",
+                command.usage
+            );
+            assert!(
+                !matches!(
+                    parse_repl_line(&format!("/{}", command.name)),
+                    ReplLine::Command(ReplCommand::Unknown(_))
+                ),
+                "{} did not parse through registry",
+                command.name
+            );
+        }
+        assert_eq!(
+            help,
+            "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/session\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+        );
+    }
+
+    #[test]
+    fn slash_completion_covers_commands_and_arguments() {
+        let command_names = complete_repl_line("/ba", 3)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(command_names, vec!["/backend"]);
+
+        let backends = complete_repl_line("/backend n", 10)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(backends, vec!["native"]);
+
+        let providers = complete_repl_line("/ep a", 5)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert!(providers.contains(&"auto".to_string()));
+
+        let verbosity = complete_repl_line("/profile verbosity f", 20)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(verbosity, vec!["full"]);
     }
 
     #[test]
