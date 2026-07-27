@@ -112,3 +112,23 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 - 920 tests pass (904 + 10 + 1 + 1 + 4)
 - `cargo fmt --all -- --check` clean
 - `cargo clippy -p onnx-runtime-ep-cpu` clean
+
+## 2026-07-27T09:25:00Z — Session 6: batch_shape dispatch bug + FMB direct output
+
+**Context:** Investigating why GEMV bandwidth was 69 GB/s (55% of roof) despite the NEON
+kernel benchmarking at 75-86 GB/s in isolation.
+
+**Critical finding:** CPU sampling revealed ALL decode GEMV calls were going through
+`neon_gemv_parallel` (outer product, non-transposed B) instead of `neon_gemv_col_parallel`
+(dot product, pre-transposed B_T). Root cause: `batch_shape.is_empty()` check excluded
+inputs with shape [1,1,K] (which have batch_shape = [1], not empty).
+
+**Fix:** Changed to `numel(&batch_shape) <= 1` in both the Accelerate M=1 fast path and
+the general non-batched path. Also added FusedMatMulBias direct output (GEMV into output
+tensor, bias in-place, skip Vec alloc + copy for 120 calls/token).
+
+**Results:** p50 32.5 → 29.7 ms, 30.8 → 33.7 tok/s (+9.4%), 55% → 60% of roof.
+**Commit:** d65e5c38
+
+**Negative result:** Accelerate sgemv for L2-resident matrices — GCD wake-up overhead
+(~40 µs) dominates compute saving for all our matrix sizes. Reverted.

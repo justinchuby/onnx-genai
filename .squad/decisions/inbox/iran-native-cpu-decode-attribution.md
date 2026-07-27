@@ -294,3 +294,64 @@ Even at 100% GEMV roof AND non-GEMV reduced to 1 ms, we reach 58 tok/s. But our 
 FP16 model exists at `models/qwen2.5-0.5b-f16` (959 MB — half the bytes).
 Sebastian measured FP16 NEON at 46.3 tok/s with pthread spawn, ~97 tok/s projected with persistent pool.
 Must compare native-FP16 vs ORT-FP16 per Justin's fairness rule.
+
+---
+
+## Session 6 — batch_shape dispatch bug fix + FMB direct output
+
+**Date:** 2026-07-27T09:25Z
+
+### Critical Discovery: batch_shape dispatch bug
+
+The Accelerate M=1 GEMV fast path in `matmul_dense_into_with_backend` checked
+`geom.batch_shape.is_empty()`, but during decode with input shape [1,1,K],
+`batch_shape = [1]` (not empty). This caused ALL GEMV calls to fall through
+to `gemm_with_backend` → `neon_gemv_parallel` (outer product approach) instead
+of the optimized `neon_gemv_col_parallel` (dot product with pre-transposed B_T).
+
+**Evidence:** CPU sampling confirmed 672/672 GEMV samples in `neon_gemv_parallel`,
+0 in `neon_gemv_col_parallel`. After fix: 247/247 samples in `neon_gemv_col_parallel`.
+
+**Fix:** `numel(&geom.batch_shape) <= 1` treats single-element batch shapes as
+non-batched. Also applied to the general non-batched path (line 826).
+
+### Performance results (commit d65e5c38)
+
+| | p50 ms/tok | tok/s | Eff. GB/s | Roof % |
+|---|---|---|---|---|
+| Before (session 5) | 32.5 | 30.8 | 61 | 55% |
+| **After (session 6)** | **29.7** | **33.7** | **65** | **60%** |
+| ORT | 22.2 | 45.0 | 87 | 78% |
+| Ceiling | 17.3 | 56.7 | 112 | 100% |
+
+### Also: FMB direct output path
+
+FusedMatMulBias now writes directly into the output tensor when eligible
+(contiguous f32, no alias), skipping Vec<f32> allocation + write_dense_f32_narrow
+copy for 120 calls/token. Measured at parity — the allocation overhead was
+already small (~200 µs), but eliminates unnecessary allocation traffic.
+
+### Accelerate sgemv experiment — NEGATIVE result
+
+Tested Accelerate cblas_sgemv for L2-resident attention projections. Result:
+GCD wake-up overhead (~30-50 µs per call) dominates compute saving. For [896,896]
+at 3.2 MB: Accelerate 58 µs (18 µs compute + 40 µs wake-up) vs single-thread
+NEON 49 µs. Net negative — reverted.
+
+### Remaining gap analysis (29.7 ms vs ORT 22.2 ms = 7.5 ms gap)
+
+1. **GEMV bandwidth:** ~75 GB/s (col-parallel NEON) vs ~91 GB/s (MLAS) = 4.5 ms gap
+   - MLAS uses hand-written aarch64 assembly with explicit prefetch
+   - Our NEON intrinsics generate good code (5 ldp + 8 fmla) but ~20% lower BW
+2. **Non-GEMV overhead:** ~3.5 ms vs ~1 ms = 2.5 ms gap
+   - Graph executor dispatches 168 individual ops per token
+   - ORT fuses subgraphs into fewer mega-ops
+3. **Both must improve to beat ORT in FP32**
+
+### Updated fix ranking
+
+| Priority | Fix | Est. gain | Status |
+|---|---|---|---|
+| 1 | MLAS-quality GEMV kernel (prefetch, tile) | 3-5 ms/tok | Not started |
+| 2 | Graph-level op fusion (reduce 168→~50 ops) | 2-3 ms/tok | Architecture change |
+| 3 | FP16 NEON GEMV (halve bytes moved) | 2× ceiling | Next lever |
