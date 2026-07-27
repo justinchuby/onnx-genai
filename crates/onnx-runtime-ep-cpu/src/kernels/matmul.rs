@@ -1884,7 +1884,10 @@ mod tests {
                 .zip(accel.iter())
                 .map(|(g, a)| (g - a).abs() / g.abs().max(1e-8))
                 .fold(0.0f32, f32::max);
-            assert!(max_rel < 2e-2, "[{m},{k},{n}]: max_rel={max_rel}");
+            // Chew measured the worst model-scale accumulation-order drift at
+            // 1.57%; 1.8% keeps modest cross-machine headroom without letting a
+            // real GEMV regression hide behind the old 2% envelope.
+            assert!(max_rel < 1.8e-2, "[{m},{k},{n}]: max_rel={max_rel}");
         }
     }
 

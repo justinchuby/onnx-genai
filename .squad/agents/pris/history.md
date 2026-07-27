@@ -135,3 +135,9 @@ Revised the Phi decode lock after Holden's rejection: environment-gated real-mod
 - Extended `crates/onnx-genai-bench/src/bin/compare.rs` with direct native CPU EP vs ORT CPU EP comparison, JSON output, warmups, repeated medians, p10-p95 spread, and measured-roofline fraction.
 - Measured Qwen2.5-0.5B on M1 Max: native decode median 3.83 tok/s (7.02% measured roofline) vs ORT CPU 45.45 tok/s (83.33% roofline), ratio 0.084x; model-load median native 108.5 ms vs ORT 1199.6 ms.
 - Added M1 Max absolute release-harness regression floor `NATIVE_CPU_DECODE_FLOOR_TOK_PER_S = 3.50` plus non-rig Apple-Silicon roofline-fraction floor in `crates/onnx-genai-bench/tests/profile_native.rs`.
+
+## 2026-07-27T00:55:00-07:00 — SDPA NEON coverage and GEMV tolerance follow-up
+- Added aarch64-only `sdpa_f32_neon` parity coverage against scalar and f64 references on Qwen-style decode, odd/tail dimensions, masks/`-inf`, causal/softcap, and large-score softmax stability cases.
+- Added a dispatcher reach test proving `sdpa_f32(...)` executes the NEON path on Apple Silicon when MLAS is not selected.
+- Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.
+- Tightened model-scale GEMV max-relative tolerance from 2.0% to 1.8%, based on Chew's 1.57% measured worst legitimate f32 accumulation-order drift.
