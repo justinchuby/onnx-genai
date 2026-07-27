@@ -21,6 +21,7 @@ use super::matmul::{
     MatMulPrepack, matmul_dense_prepacked, matmul_dense_prepacked_into,
     output_is_direct_f32_eligible,
 };
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 

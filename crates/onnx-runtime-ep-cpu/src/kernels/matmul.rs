@@ -27,7 +27,7 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
 use rayon::prelude::*;
 
 use super::check_arity;
@@ -164,6 +164,7 @@ impl MatMulPrepack {
         k: usize,
         n: usize,
     ) -> Option<&[u16]> {
+        use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
         {
             return None;
@@ -497,7 +498,7 @@ impl MatMulKernel {
             && geom.m == 1
             && numel(&geom.batch_shape) <= 1
             && geom.b_promoted_rank == 2
-            && inputs[1].dtype == DataType::Float16
+            && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
             && let Some(bt_f16) = self.prepack.transposed_b_f16(&inputs[1], geom.k, geom.n)
         {
             let a_dense = self.prepack.dense(0, &inputs[0])?;
@@ -913,6 +914,12 @@ fn matmul_dense_into_with_backend(
 
     let (m, k, n) = (geom.m, geom.k, geom.n);
     let (a_mat, b_mat, c_mat) = (geom.a_mat, geom.b_mat, geom.c_mat);
+
+    // `prepack` is consumed on macOS/iOS (Accelerate transposed_b) and with the
+    // `mlas` feature (packed_b). On other platforms it is passed through for API
+    // consistency but not yet consumed.
+    #[cfg(not(any(feature = "mlas", target_os = "macos", target_os = "ios")))]
+    let _ = &prepack;
 
     #[cfg(feature = "mlas")]
     let packed_b = if backend == CpuBackend::Mlas && geom.b_promoted_rank == 2 {

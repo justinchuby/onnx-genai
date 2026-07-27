@@ -364,6 +364,7 @@ fn silu_f32_neon(input: &[f32], output: &mut [f32]) {
 
     // Process 4 elements at a time using NEON intrinsics.
     // exp(-x) is computed via Cody-Waite range reduction + degree-5 polynomial.
+    #[allow(clippy::excessive_precision)]
     unsafe {
         // Constants for exp computation:
         let log2ef = vdupq_n_f32(std::f32::consts::LOG2_E);

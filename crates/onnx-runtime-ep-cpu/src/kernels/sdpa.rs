@@ -531,12 +531,10 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        dot_neon(a, b)
+        return dot_neon(a, b);
     }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        a.iter().zip(b).map(|(x, y)| x * y).sum()
-    }
+    #[allow(unreachable_code)]
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// AXPY using the decode path's AVX2+FMA accumulation order when available,
