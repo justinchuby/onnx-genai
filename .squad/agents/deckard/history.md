@@ -101,3 +101,7 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 ## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
 
 - Under Moss's lockout, repaired PR #266 ReduceLogSumExp numerical stability with a dedicated two-pass reduction; Ferro approved and the PR merged.
+
+## 2026-07-27T12:30:00-07:00 — PR #279 CUDA fallback semantics
+
+- Adjudicated Copilot's CUDA documentation findings against source. `ONNX_GENAI_EP=cuda` without `onnx-genai-ort/cuda` is rejected at ORT session creation, runtime CUDA-provider unavailability is also a hard session error, and `ONNX_GENAI_REQUIRE_CUDA=1` only gates native CUDA node-level fallback to CPU after CUDA is compiled and selected. Corrected CLI/cargo/CAPI/Python docs and comments; verified `cargo tree`, `cargo fmt --check`, and `cargo build -p onnx-genai-cli`.

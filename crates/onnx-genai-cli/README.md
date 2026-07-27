@@ -74,9 +74,20 @@ CUDA has two independent switches:
    session to use CUDA, while the decode backend selects the decoder. In the REPL
    (`run`), use `/backend native` to use the native decoder.
 
-If CUDA was not compiled in, a `cuda` request silently falls back to CPU. Set
-`ONNX_GENAI_REQUIRE_CUDA=1` to make that failure loud instead. On Apple Silicon,
-the `onnxruntime-ep-mlx` plugin is installed by default.
+CUDA failure modes are intentionally distinct:
+
+- If CUDA support was not compiled into the ORT layer, `ONNX_GENAI_EP=cuda`
+  fails session creation with a "CUDA support not compiled in" error; request
+  `cpu` (or rebuild with `--features cuda` / `--features native-cuda`) instead.
+- If CUDA support was compiled in but the provider is unavailable at runtime
+  (for example, no loadable CUDA provider library, driver, or GPU),
+  `ONNX_GENAI_EP=cuda` also fails session creation and tells you to request
+  `ONNX_GENAI_EP=cpu` when CPU execution is intentional.
+- When CUDA is compiled in and available for the ORT/native session but the
+  native CUDA EP cannot claim every executable node, the native runtime falls
+  back to its CPU EP. Set `ONNX_GENAI_REQUIRE_CUDA=1` to reject that node-level
+  CPU fallback. On Apple Silicon, the `onnxruntime-ep-mlx` plugin is installed
+  by default.
 
 Windows PowerShell example for the native CUDA path:
 
