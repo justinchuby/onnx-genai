@@ -1402,7 +1402,7 @@ impl LogitProcessor for XtcProcessor {
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, probability)| *probability >= self.threshold.max(0.0))
+            .filter(|(_, probability)| *probability > 0.0 && *probability > self.threshold.max(0.0))
             .collect();
         if candidates.len() < 2 {
             return;
@@ -1648,13 +1648,52 @@ mod tests {
     }
 
     #[test]
-    fn mirostat_v2_cutoff_and_feedback_move_mu_toward_target_surprise() {
+    fn mirostat_v2_state_persists_and_surprise_converges_toward_tau() {
+        let processor = MirostatProcessor::new(2.0, 0.5, MirostatVersion::V2);
+        let probabilities = [0.5_f32, 0.25, 0.125, 0.0625, 0.0625];
+        let base_logits: Vec<_> = probabilities
+            .iter()
+            .map(|probability| probability.ln())
+            .collect();
+        let mut generated_tokens = Vec::new();
+        let mut observed_surprises = Vec::new();
+        let mut mu_by_step = Vec::new();
+
+        for _ in 0..5 {
+            let mut logits = base_logits.clone();
+            processor.process(
+                &mut logits,
+                &ProcessorContext {
+                    generated_tokens: generated_tokens.clone(),
+                    ..Default::default()
+                },
+            );
+            mu_by_step.push(processor.current_mu());
+
+            let selected = logits
+                .iter()
+                .rposition(|logit| logit.is_finite())
+                .expect("Mirostat must retain a sampleable token");
+            observed_surprises.push(-probabilities[selected].log2());
+            generated_tokens.push(selected as TokenId);
+        }
+
+        assert_eq!(observed_surprises, vec![4.0, 3.0, 2.0, 2.0, 2.0]);
+        assert!((mu_by_step[0] - 4.0).abs() < f32::EPSILON);
+        assert!((mu_by_step[1] - 3.0).abs() < f32::EPSILON);
+        assert!((mu_by_step[2] - 2.5).abs() < f32::EPSILON);
+        assert!(
+            mu_by_step.windows(2).all(|pair| pair[1] <= pair[0]),
+            "surprise above tau must lower mu across decode steps"
+        );
+        assert_eq!(&mu_by_step[2..], &[2.5, 2.5, 2.5]);
+    }
+
+    #[test]
+    fn mirostat_feedback_moves_mu_in_both_directions() {
         let processor = MirostatProcessor::new(0.5, 0.25, MirostatVersion::V2);
         let mut first = vec![0.6_f32.ln(), 0.3_f32.ln(), 0.1_f32.ln()];
         processor.process(&mut first, &ProcessorContext::default());
-        assert!(first[0].is_finite());
-        assert_eq!(first[1], f32::NEG_INFINITY);
-        assert_eq!(first[2], f32::NEG_INFINITY);
 
         let initial_mu = processor.current_mu();
         let mut second = vec![0.9_f32.ln(), 0.1_f32.ln()];
@@ -1713,7 +1752,26 @@ mod tests {
     }
 
     #[test]
-    fn dry_penalty_grows_and_sequence_breakers_stop_matching() {
+    fn dry_empty_and_short_contexts_are_noops() {
+        let processor = DryProcessor {
+            multiplier: 2.0,
+            base: 1.5,
+            allowed_length: 2,
+            sequence_breakers: vec![],
+        };
+        let original = vec![1.0; 5];
+
+        let mut empty = original.clone();
+        processor.process(&mut empty, &ProcessorContext::default());
+        assert_eq!(empty, original);
+
+        let mut short = original.clone();
+        processor.process(&mut short, &context(vec![1], vec![2]));
+        assert_eq!(short, original);
+    }
+
+    #[test]
+    fn dry_penalty_grows_for_longer_repeated_suffix() {
         let mut logits = vec![0.0; 10];
         DryProcessor {
             multiplier: 2.0,
@@ -1723,6 +1781,24 @@ mod tests {
         }
         .process(&mut logits, &context(vec![1, 2, 3, 4], vec![1, 2, 3]));
         assert_eq!(logits[4], -3.0);
+    }
+
+    #[test]
+    fn dry_sequence_breaker_resets_suffix_matching() {
+        let prompt_tokens = vec![1, 9, 2, 3];
+        let generated_tokens = vec![1, 9, 2];
+        let mut unbroken = vec![0.0; 10];
+        DryProcessor {
+            multiplier: 2.0,
+            base: 1.5,
+            allowed_length: 2,
+            sequence_breakers: vec![],
+        }
+        .process(
+            &mut unbroken,
+            &context(prompt_tokens.clone(), generated_tokens.clone()),
+        );
+        assert_eq!(unbroken[3], -3.0);
 
         let mut broken = vec![0.0; 10];
         DryProcessor {
@@ -1731,7 +1807,7 @@ mod tests {
             allowed_length: 2,
             sequence_breakers: vec![9],
         }
-        .process(&mut broken, &context(vec![1, 9, 2, 3], vec![1, 9, 2]));
+        .process(&mut broken, &context(prompt_tokens, generated_tokens));
         assert!(broken.iter().all(|logit| *logit == 0.0));
     }
 
@@ -1750,25 +1826,63 @@ mod tests {
     }
 
     #[test]
-    fn xtc_probability_one_excludes_top_choices_except_least_probable() {
+    fn xtc_probability_one_keeps_exact_expected_set() {
         let processor = XtcProcessor::new(1.0, 0.25, Some(7));
         let mut logits = vec![0.5_f32.ln(), 0.3_f32.ln(), 0.2_f32.ln()];
         processor.process(&mut logits, &ProcessorContext::default());
         assert_eq!(logits[0], f32::NEG_INFINITY);
         assert!(logits[1].is_finite());
         assert!(logits[2].is_finite());
+        assert_eq!(
+            logits
+                .iter()
+                .enumerate()
+                .filter_map(|(index, logit)| logit.is_finite().then_some(index))
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[test]
-    fn xtc_probability_zero_is_noop_and_single_token_is_safe() {
+    fn xtc_threshold_zero_never_admits_masked_tokens_or_masks_every_valid_token() {
+        let processor = XtcProcessor::new(1.0, 0.0, Some(7));
+        let mut logits = vec![0.7_f32.ln(), 0.3_f32.ln(), f32::NEG_INFINITY];
+        processor.process(&mut logits, &ProcessorContext::default());
+
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert!(logits[1].is_finite());
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits.iter().filter(|logit| logit.is_finite()).count(), 1);
+    }
+
+    #[test]
+    fn xtc_excludes_probability_exactly_at_threshold() {
+        let processor_logits = vec![0.4_f32.ln(), 0.3_f32.ln(), 0.2_f32.ln(), 0.1_f32.ln()];
+        let threshold = softmax_probabilities(&processor_logits).expect("valid distribution")[2];
+        let processor = XtcProcessor::new(1.0, threshold, Some(7));
+        let mut logits = processor_logits;
+        processor.process(&mut logits, &ProcessorContext::default());
+
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert!(logits[1].is_finite());
+        assert!(logits[2].is_finite(), "the boundary token is excluded");
+        assert!(logits[3].is_finite());
+    }
+
+    #[test]
+    fn xtc_probability_zero_is_noop() {
         let original = vec![2.0, 1.0];
         let mut disabled = original.clone();
         XtcProcessor::new(0.0, 0.1, Some(7)).process(&mut disabled, &ProcessorContext::default());
         assert_eq!(disabled, original);
+    }
 
-        let mut single = vec![2.0];
-        XtcProcessor::new(1.0, 0.0, Some(7)).process(&mut single, &ProcessorContext::default());
-        assert_eq!(single, vec![2.0]);
+    #[test]
+    fn xtc_one_token_above_threshold_is_noop() {
+        let original = vec![0.8_f32.ln(), 0.15_f32.ln(), 0.05_f32.ln()];
+        let mut logits = original.clone();
+        XtcProcessor::new(1.0, 0.5, Some(7)).process(&mut logits, &ProcessorContext::default());
+        assert_eq!(logits, original);
     }
 
     #[test]
