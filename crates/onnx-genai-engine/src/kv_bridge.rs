@@ -294,6 +294,15 @@ pub(crate) fn load_materialized_past(
     decode_state: &mut DecodeState,
     materialized: &onnx_genai_kv::MaterializedKv,
 ) -> anyhow::Result<()> {
+    decode_state.past = materialized_past_values(session, kv_model, materialized)?;
+    Ok(())
+}
+
+fn materialized_past_values(
+    session: &Session,
+    kv_model: &KvModelInfo,
+    materialized: &onnx_genai_kv::MaterializedKv,
+) -> anyhow::Result<HashMap<String, Value>> {
     if materialized.start_position != 0 || materialized.sink_len != 0 {
         anyhow::bail!(
             "cannot load paged KV starting at absolute position {} (sink_len {}) into a contiguous past/present graph; discontinuous attention-sink positions require explicit position_ids support",
@@ -311,7 +320,7 @@ pub(crate) fn load_materialized_past(
         .iter()
         .map(|info| (info.name.as_str(), info.dtype))
         .collect::<HashMap<_, _>>();
-    decode_state.past.clear();
+    let mut past = HashMap::new();
     for (idx, layer) in kv_model.layers.iter().enumerate() {
         let key_shape = past_shape(
             input_shapes
@@ -339,16 +348,16 @@ pub(crate) fn load_materialized_past(
             .get(layer.value_past.as_str())
             .copied()
             .context("missing value past input dtype")?;
-        decode_state.past.insert(
+        past.insert(
             layer.key_past.clone(),
             Value::from_f32_slice_as(&materialized.layers[idx].key, &key_shape, key_dtype)?,
         );
-        decode_state.past.insert(
+        past.insert(
             layer.value_past.clone(),
             Value::from_f32_slice_as(&materialized.layers[idx].value, &value_shape, value_dtype)?,
         );
     }
-    Ok(())
+    Ok(past)
 }
 
 pub(crate) fn past_shape(shape: &[i64], sequence_len: usize) -> anyhow::Result<Vec<i64>> {
@@ -400,6 +409,7 @@ pub(crate) fn rewind_target_state_to_len(
     state: &mut EngineSession,
     len: usize,
 ) -> anyhow::Result<()> {
+    validate_target_state_rewind_to_len(kv_model, kv_cache, seq, state, len)?;
     state.tokens.truncate(len);
     rewind_decode_state_to_len(
         session,
@@ -408,6 +418,23 @@ pub(crate) fn rewind_target_state_to_len(
         seq,
         &mut state.decode_state,
         &mut state.kv_token_count,
+        len,
+    )
+}
+
+pub(crate) fn validate_target_state_rewind_to_len(
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &PagedKvCache,
+    seq: SessionId,
+    state: &EngineSession,
+    len: usize,
+) -> anyhow::Result<()> {
+    validate_decode_state_rewind_to_len(
+        kv_model,
+        kv_cache,
+        seq,
+        &state.decode_state,
+        state.kv_token_count,
         len,
     )
 }
@@ -430,6 +457,7 @@ pub(crate) fn rewind_draft_state_to_len(
     state: &mut DraftSession,
     len: usize,
 ) -> anyhow::Result<()> {
+    validate_draft_state_rewind_to_len(draft_model, state, len)?;
     state.tokens.truncate(len);
     rewind_decode_state_to_len(
         &draft_model.session,
@@ -442,11 +470,46 @@ pub(crate) fn rewind_draft_state_to_len(
     )
 }
 
+pub(crate) fn validate_draft_state_rewind_to_len(
+    draft_model: &DraftModel,
+    state: &DraftSession,
+    len: usize,
+) -> anyhow::Result<()> {
+    validate_decode_state_rewind_to_len(
+        draft_model.kv_model.as_ref(),
+        &draft_model.kv_cache,
+        state.seq,
+        &state.decode_state,
+        state.kv_token_count,
+        len,
+    )
+}
+
 pub(crate) fn common_prefix_len(left: &[TokenId], right: &[TokenId]) -> usize {
     left.iter()
         .zip(right.iter())
         .take_while(|(left, right)| left == right)
         .count()
+}
+
+pub(crate) fn validate_decode_state_rewind_to_len(
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &PagedKvCache,
+    seq: SessionId,
+    decode_state: &DecodeState,
+    kv_token_count: usize,
+    len: usize,
+) -> anyhow::Result<()> {
+    decode_state.validate_rewind_to_len(kv_token_count, len, kv_model.is_some())?;
+    if decode_state.use_kv
+        && kv_token_count != len
+        && (decode_state.has_runner() || decode_state.is_windowed() || kv_model.is_some())
+    {
+        kv_cache.validate_rewind_to(seq, len).map_err(|e| {
+            anyhow::anyhow!("Failed to validate KV sequence {seq} rewind to {len}: {e}")
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn rewind_decode_state_to_len(
@@ -458,6 +521,14 @@ pub(crate) fn rewind_decode_state_to_len(
     kv_token_count: &mut usize,
     len: usize,
 ) -> anyhow::Result<()> {
+    validate_decode_state_rewind_to_len(
+        kv_model,
+        kv_cache,
+        seq,
+        decode_state,
+        *kv_token_count,
+        len,
+    )?;
     if !decode_state.use_kv {
         *kv_token_count = 0;
         return Ok(());
@@ -484,19 +555,29 @@ pub(crate) fn rewind_decode_state_to_len(
     if kv_model.is_none() && *kv_token_count != len {
         anyhow::bail!("cannot rewind ORT KV tensors without paged KV materialization");
     }
-    kv_cache
-        .rewind_to(seq, len)
-        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
-    *kv_token_count = len;
     if len == 0 {
+        kv_cache
+            .rewind_to(seq, len)
+            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
+        *kv_token_count = len;
         decode_state.past.clear();
         return Ok(());
     }
     let kv_model = kv_model.context("missing KV model after rewind check")?;
-    let materialized = kv_cache
+    let mut validated_cache = kv_cache.clone();
+    validated_cache
+        .rewind_to(seq, len)
+        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
+    let materialized = validated_cache
         .materialize_sequence(seq)
         .map_err(|e| anyhow::anyhow!("Failed to materialize rewound KV sequence {seq}: {e}"))?;
-    load_materialized_past(session, kv_model, decode_state, &materialized)
+    let past = materialized_past_values(session, kv_model, &materialized)?;
+    kv_cache
+        .rewind_to(seq, len)
+        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
+    *kv_token_count = len;
+    decode_state.past = past;
+    Ok(())
 }
 
 pub(crate) fn sequence_pages_for_len(

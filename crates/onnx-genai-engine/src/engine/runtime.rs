@@ -583,28 +583,44 @@ impl Engine {
 
     /// Rewind a persistent session to an absolute logical token position.
     ///
-    /// Rewind reuses the same KV truncation path as speculative decoding. It
-    /// rejects positions past the current logical length and propagates backend
-    /// errors for decode paths whose KV cannot be safely truncated.
+    /// Rewind reuses the same KV truncation path as speculative decoding, after
+    /// validating the requested target against the logical length and backend KV
+    /// support so rejected rewinds leave the session untouched.
     pub fn rewind_session_to(
         &mut self,
         session_id: SessionId,
         position: SessionPosition,
     ) -> anyhow::Result<()> {
         self.require_ort_backend("session rewind")?;
+        let position = position.get();
+        let state = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        let current = state.tokens.len();
+        if position > current {
+            anyhow::bail!(
+                "cannot rewind session {session_id} to token {position}; current length is {current}"
+            );
+        }
+        validate_target_state_rewind_to_len(
+            self.kv_model.as_ref(),
+            &self.kv_cache,
+            session_id,
+            state,
+            position,
+        )?;
+        if let (Some(draft_model), Some(draft)) = (&self.draft, &state.draft) {
+            let draft_target = position.min(draft.tokens.len());
+            validate_draft_state_rewind_to_len(draft_model, draft, draft_target)?;
+        }
+
         self.scheduler.complete(session_id);
         let mut state = self
             .sessions
             .remove(&session_id)
             .with_context(|| format!("session {session_id} not found"))?;
         let result = (|| {
-            let position = position.get();
-            let current = state.tokens.len();
-            if position > current {
-                anyhow::bail!(
-                    "cannot rewind session {session_id} to token {position}; current length is {current}"
-                );
-            }
             let session = self.session.as_deref().context(MISSING_ORT_SESSION)?;
             rewind_target_state_to_len(
                 session,

@@ -131,3 +131,9 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 
 - Repaired PR #277 lockout defect in `fix/cli-sampling-and-context`: CLI now rejects `prompt_tokens >= effective_max_context` before decode, so exhausted turns do not append empty assistant history.
 - Added equality/greater-than boundary unit coverage and preserved the one-token-room healthy path; clippy is clean with the known `pages.rs:129` lint allowed.
+
+## 2026-07-27T15:30:00-07:00 — PR #291 fork/rewind review
+
+- 🔴 Rejected Deckard's runtime fork/rewind PR. Public rewind reuses speculative helpers, but failed/rejected rewinds truncate logical tokens before backend KV/runner rewind succeeds, then reinsert the partially mutated session; this can leave tokens, kv_token_count, KV pages, and decode cursor inconsistent.
+- Prefix-cache page retention and fork capability gating looked sound; support matrix is not acceptable until unsupported/rejected rewind paths are transactional. Batty should own revision under Deckard lockout.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; model-free new KV tests passed. Full engine lib suite failed locally from known ORT API/null-pointer environment mismatch (180 passed, 66 failed, 1 ignored).
