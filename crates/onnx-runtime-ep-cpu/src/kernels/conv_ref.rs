@@ -1160,6 +1160,111 @@ mod tests {
         );
     }
 
+    // ─── Scalar reference reachability and exclusion ────────────────────
+
+    #[test]
+    fn scalar_ref_fires_for_non_rank4_safety_net() {
+        // Construct a ConvKernel directly with a 5D shape to force the scalar
+        // reference path. This bypasses the factory (which rejects rank != 3|4)
+        // and proves the counter is live. The scalar reference handles arbitrary
+        // spatial rank correctly.
+        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+
+        // 3D convolution: [N=1, C=1, D=2, H=2, W=2], kernel [1, 1, 1, 1, 1]
+        let kernel = super::ConvKernel {
+            x_shape: vec![1, 1, 2, 2, 2],
+            w_shape: vec![1, 1, 1, 1, 1],
+            output_shape: vec![1, 1, 2, 2, 2],
+            group: 1,
+            strides: vec![1, 1, 1],
+            dilations: vec![1, 1, 1],
+            pads: vec![0, 0, 0, 0, 0, 0],
+            relu: false,
+        };
+        let x = Owned::f32(&[1, 1, 2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let w = Owned::f32(&[1, 1, 1, 1, 1], &[2.0]);
+        let mut output = Owned::zeros_f32(&[1, 1, 2, 2, 2]);
+        kernel
+            .execute(&[x.view(), w.view()], &mut [output.view_mut()])
+            .unwrap();
+
+        let after = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "5D conv did not reach scalar reference path"
+        );
+        // Verify correctness: 1x1x1 kernel with weight=2 is a pointwise multiply
+        assert_eq!(output.to_f32(), vec![2., 4., 6., 8., 10., 12., 14., 16.]);
+    }
+
+    #[test]
+    fn scalar_ref_excluded_for_standard_2d_conv() {
+        // A standard rank-4 conv MUST NOT fall to the scalar reference —
+        // it should be served by BNNS (macOS) or im2col+GEMM. We verify by
+        // checking that im2col or BNNS incremented their counter instead.
+        let before_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let input = vec![1.0; 3 * 8 * 8];
+        let weight = vec![0.01; 16 * 3 * 3 * 3];
+        let bias = vec![0.0; 16];
+        let _ = run(
+            &[1, 3, 8, 8],
+            &input,
+            &[16, 3, 3, 3],
+            &weight,
+            Some(&bias),
+            &[1, 16, 6, 6],
+            &[],
+        );
+        let after_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let reached_fast = after_im2col > before_im2col || after_bnns > before_bnns;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let reached_fast = after_im2col > before_im2col;
+        assert!(
+            reached_fast,
+            "Standard 2D conv fell to scalar reference — a faster tier should have handled it"
+        );
+    }
+
+    #[test]
+    fn scalar_ref_excluded_for_1d_conv() {
+        // Rank-3 (1D) convs are promoted to rank-4 and must NOT fall to scalar ref.
+        // This is the exact bug that made Whisper's Conv path 643× slower.
+        // Verify by checking that a fast tier fired.
+        let before_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let x = (1..=16).map(|v| v as f32).collect::<Vec<_>>();
+        let w = (1..=18).map(|v| v as f32 * 0.1).collect::<Vec<_>>();
+        let _ = run(
+            &[1, 2, 8],
+            &x,
+            &[3, 2, 3],
+            &w,
+            Some(&[0.5, -0.5, 1.0]),
+            &[1, 3, 4],
+            &[
+                ("strides", Attribute::Ints(vec![2])),
+                ("pads", Attribute::Ints(vec![1, 1])),
+            ],
+        );
+        let after_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let reached_fast = after_im2col > before_im2col || after_bnns > before_bnns;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let reached_fast = after_im2col > before_im2col;
+        assert!(
+            reached_fast,
+            "1D conv fell to scalar reference — rank-3 promotion should route to im2col/BNNS"
+        );
+    }
+
     // ─── Numerics parity ────────────────────────────────────────────────
 
     fn parity_check(
