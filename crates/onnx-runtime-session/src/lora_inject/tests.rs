@@ -30,13 +30,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use super::{
-    build_manifest, inject, inject_grouped, inject_grouped_lora_adapter, FusedGroup,
-    LoraAdapterSpec, LoraInjectError, LoraManifest, LoraModuleSpec, LoraTarget, Placement, QkvRole,
-    TargetEntry,
+    build_manifest, inject, inject_grouped, inject_grouped_lora_adapter, inject_grouped_multi,
+    FusedGroup, LoraAdapterSpec, LoraInjectError, LoraManifest, LoraModuleSpec, LoraTarget,
+    Placement, QkvRole, TargetEntry,
 };
 use crate::Tensor;
 use crate::executor::{auto_detect_cpu_ep, Executor};
-use onnx_runtime_ep_api::LoraPoolRegistry;
+use onnx_runtime_ep_api::{AdapterId, LoraPoolRegistry};
 
 const F32: DataType = DataType::Float32;
 
@@ -1283,6 +1283,136 @@ fn grouped_null_route_is_base_only() {
     for (g, e) in got.iter().zip(&base) {
         assert!((g - e).abs() < 1e-6, "null route must be base-only");
     }
+}
+
+// Multi-adapter grouped injection (design §J.3/§J.4): two adapters live in one
+// pool, and the per-row `segments` routing input selects, per token, which
+// adapter's delta the shared GroupedLoraDelta op applies. This is the
+// end-to-end proof of per-request adapter selection at the injection layer:
+// rows routed to adapter A get A's delta, rows routed to adapter B get B's, and
+// a base-only row (-1) gets no delta — all in a single mixed batch.
+#[test]
+fn grouped_two_adapters_route_per_row() {
+    let (k, n, r) = (4usize, 3usize, 2usize);
+    let (scale_a, scale_b) = (0.5f32, 1.25f32);
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    // Adapter A and adapter B factors differ, so their deltas are distinct.
+    let a_a: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 0.3).collect();
+    let b_a: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.2).collect();
+    let a_b: Vec<f32> = (0..k * r).map(|i| (i as f32) * -0.2 + 0.4).collect();
+    let b_b: Vec<f32> = (0..r * n).map(|i| (i as f32) * 0.15 - 0.1).collect();
+
+    // Four rows: row 0 -> adapter A, row 1 -> adapter B, row 2 -> base (-1),
+    // row 3 -> adapter A again (proves grouping is per-row, not contiguous).
+    let m = 4usize;
+    let x: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.13 - 1.0).collect();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter_a = LoraAdapterSpec {
+        name: "alpha".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale_a, &a_a, &b_a, k, n)],
+    };
+    let adapter_b = LoraAdapterSpec {
+        name: "beta".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale_b, &a_b, &b_b, k, n)],
+    };
+    let injection = inject_grouped_multi(
+        &mut graph,
+        &manifest,
+        &[(AdapterId(0), &adapter_a), (AdapterId(1), &adapter_b)],
+    )
+    .expect("inject_grouped_multi");
+    let pool_id = injection.pool_id;
+
+    // Both adapters are name-addressable through the injection's map.
+    assert_eq!(
+        injection.adapters,
+        vec![
+            ("alpha".to_string(), AdapterId(0)),
+            ("beta".to_string(), AdapterId(1)),
+        ]
+    );
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 1);
+    assert!(has_input_named(&graph, "lora.segments"));
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    // Row routing: adapter A (0), adapter B (1), base (-1), adapter A (0).
+    let seg = i32_segments(m, &[0, 1, -1, 0]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    // Reference: base + the per-row adapter delta (or base only for row 2).
+    let base = reference_base(m, k, n, &x, &w);
+    let delta_a = reference_delta(m, k, r, n, scale_a, &x, &a_a, &b_a);
+    let delta_b = reference_delta(m, k, r, n, scale_b, &x, &a_b, &b_b);
+    let mut expected = base.clone();
+    for j in 0..n {
+        expected[0 * n + j] += delta_a[0 * n + j]; // row 0 -> A
+        expected[1 * n + j] += delta_b[1 * n + j]; // row 1 -> B
+        // row 2 -> base only (no delta)
+        expected[3 * n + j] += delta_a[3 * n + j]; // row 3 -> A
+    }
+    assert_eq!(got.len(), expected.len());
+    for (idx, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert!(
+            (g - e).abs() < 1e-5,
+            "row {}/col — grouped multi-adapter got {got:?} expected {expected:?}",
+            idx / n
+        );
+    }
+    // Adapter A and B deltas must actually differ, or the test proves nothing.
+    assert!(
+        (0..n).any(|j| (delta_a[j] - delta_b[j]).abs() > 1e-4),
+        "adapter A and B deltas must be distinct for a meaningful selection test"
+    );
+}
+
+// A divergent module set across adapters is a fail-loud injection error.
+#[test]
+fn grouped_multi_adapter_module_mismatch_fails_loud() {
+    let (k, n, r) = (4usize, 3usize, 2usize);
+    let w = vec![0.0f32; k * n];
+    let a = vec![0.0f32; k * r];
+    let b = vec![0.0f32; r * n];
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, 2, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter_a = LoraAdapterSpec {
+        name: "alpha".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, 1.0, &a, &b, k, n)],
+    };
+    let adapter_b = LoraAdapterSpec {
+        name: "beta".into(),
+        modules: vec![f32_module("self_attn.k_proj", r, 1.0, &a, &b, k, n)],
+    };
+    let error = inject_grouped_multi(
+        &mut graph,
+        &manifest,
+        &[(AdapterId(0), &adapter_a), (AdapterId(1), &adapter_b)],
+    );
+    assert!(matches!(
+        error,
+        Err(LoraInjectError::AdapterModuleSetMismatch { .. })
+    ));
 }
 
 // Grouped fused-QKV: three GroupedLoraDelta ops share one Concat + Add (§J's
