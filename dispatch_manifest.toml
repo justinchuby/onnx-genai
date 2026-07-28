@@ -231,3 +231,12 @@ op = "BatchNormalization"
 variant = "fusion_elimination"
 platform = "all"
 reason = "Optimization is graph-level Conv+BN fusion (elimination), not dispatch tier. Unguarded pending optimizer-level counter."
+
+[[claim]]
+op = "Clip"
+variant = "contiguous_f32"
+platform = "all"
+minimum_tier = "tier1"
+counter = "CLIP_F32_FAST_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/selection.rs"
+description = "Contiguous f32 Clip uses zero-copy NEON SIMD clamp (aarch64) or scalar loop, avoiding allocating to_dense"

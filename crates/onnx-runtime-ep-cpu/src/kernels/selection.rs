@@ -32,6 +32,9 @@ impl Kernel for ClipKernel {
         if clip_contiguous_f32(self, inputs, &mut outputs[0])? {
             return Ok(());
         }
+        if clip_contiguous_f32_fast(self, inputs, &mut outputs[0])? {
+            return Ok(());
+        }
         dispatch_arith!(inputs[0].dtype, "Clip", T => {
             clip_typed::<T>(self, inputs, outputs)
         })
@@ -40,6 +43,138 @@ impl Kernel for ClipKernel {
     fn supports_strided_input(&self, _: usize) -> bool {
         true
     }
+}
+
+/// Fast contiguous f32 Clip without MLAS. Uses NEON SIMD on aarch64,
+/// plain scalar loop elsewhere. Avoids the `to_dense` allocation that
+/// dominates MobileNetV2 inference (35 Clip nodes × large spatial tensors).
+fn clip_contiguous_f32_fast(
+    kernel: &ClipKernel,
+    inputs: &[TensorView],
+    output: &mut TensorMut,
+) -> Result<bool> {
+    if inputs[0].dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || inputs[0].shape != output.shape
+        || !inputs[0].is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let minimum = if inputs.len() > 1 && !inputs[1].is_absent() {
+        require_same_dtype("Clip", &inputs[1], DataType::Float32)?;
+        scalar_typed::<f32>("Clip min", &inputs[1])?
+    } else {
+        kernel.min.unwrap_or(f32::NEG_INFINITY)
+    };
+    let maximum = if inputs.len() > 2 && !inputs[2].is_absent() {
+        require_same_dtype("Clip", &inputs[2], DataType::Float32)?;
+        scalar_typed::<f32>("Clip max", &inputs[2])?
+    } else {
+        kernel.max.unwrap_or(f32::INFINITY)
+    };
+    if minimum > maximum {
+        return Err(EpError::KernelFailed(
+            "Clip: min must not exceed max".into(),
+        ));
+    }
+
+    let len = numel(inputs[0].shape);
+    // Overlap guard: if input and output alias, fall back to the generic path
+    // which allocates a separate buffer. This crate previously shipped a rescue
+    // block that silently returned zeros on aliasing — no appetite for that class.
+    let input_start = inputs[0].data_ptr::<u8>() as usize;
+    let input_end = input_start.saturating_add(inputs[0].byte_size());
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if output_start < input_end && input_start < output_end {
+        return Ok(false);
+    }
+
+    // SAFETY: validated contiguous Float32 views — `len` elements are accessible,
+    // and the overlap check above proves the ranges are disjoint.
+    let src = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<f32>(), len) };
+    let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), len) };
+
+    clip_f32_bulk(src, dst, minimum, maximum);
+    CLIP_F32_FAST_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Dispatch counter proving the fast Clip path fires.
+#[doc(hidden)]
+pub static CLIP_F32_FAST_TEST_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bulk f32 clamp: dst[i] = clamp(src[i], minimum, maximum).
+/// Uses NEON fmax/fmin on aarch64; scalar loop elsewhere.
+#[inline]
+fn clip_f32_bulk(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        clip_f32_neon(src, dst, minimum, maximum);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        clip_f32_scalar(src, dst, minimum, maximum);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn clip_f32_neon(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    // SAFETY: NEON is always available on aarch64. We process 16 elements per
+    // iteration (4 lanes × 4 registers) for throughput, then handle the tail.
+    unsafe {
+        let vmin = vdupq_n_f32(minimum);
+        let vmax = vdupq_n_f32(maximum);
+        let mut i = 0usize;
+        let bulk_end = n & !15; // round down to multiple of 16
+        while i < bulk_end {
+            let a0 = vld1q_f32(src.as_ptr().add(i));
+            let a1 = vld1q_f32(src.as_ptr().add(i + 4));
+            let a2 = vld1q_f32(src.as_ptr().add(i + 8));
+            let a3 = vld1q_f32(src.as_ptr().add(i + 12));
+            let c0 = vminq_f32(vmaxq_f32(a0, vmin), vmax);
+            let c1 = vminq_f32(vmaxq_f32(a1, vmin), vmax);
+            let c2 = vminq_f32(vmaxq_f32(a2, vmin), vmax);
+            let c3 = vminq_f32(vmaxq_f32(a3, vmin), vmax);
+            vst1q_f32(dst.as_mut_ptr().add(i), c0);
+            vst1q_f32(dst.as_mut_ptr().add(i + 4), c1);
+            vst1q_f32(dst.as_mut_ptr().add(i + 8), c2);
+            vst1q_f32(dst.as_mut_ptr().add(i + 12), c3);
+            i += 16;
+        }
+        // Tail: process remaining elements 4 at a time, then scalar.
+        while i + 4 <= n {
+            let a = vld1q_f32(src.as_ptr().add(i));
+            let c = vminq_f32(vmaxq_f32(a, vmin), vmax);
+            vst1q_f32(dst.as_mut_ptr().add(i), c);
+            i += 4;
+        }
+        while i < n {
+            dst[i] = clamp_nan_propagating(src[i], minimum, maximum);
+            i += 1;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clip_f32_scalar(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d = clamp_nan_propagating(s, minimum, maximum);
+    }
+}
+
+/// NaN-propagating clamp matching the old `clip_typed<T>` PartialOrd semantics
+/// and the aarch64 NEON `FMAX`/`FMIN` instruction behaviour. If `x` is NaN,
+/// both comparisons are false and NaN passes through unchanged.
+#[inline(always)]
+fn clamp_nan_propagating(x: f32, minimum: f32, maximum: f32) -> f32 {
+    let x = if x < minimum { minimum } else { x };
+    if x > maximum { maximum } else { x }
 }
 
 #[cfg(feature = "mlas")]
@@ -903,5 +1038,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.to_i64(), vec![0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn clip_f32_fast_path_fires_on_contiguous_input() {
+        let before = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        // 1×3×8×8 mimics a small spatial feature map (contiguous f32).
+        let data: Vec<f32> = (0..192).map(|i| (i as f32) * 0.1 - 5.0).collect();
+        let x = Owned::f32(&[1, 3, 8, 8], &data);
+        let lo = Owned::f32(&[], &[0.0]);
+        let hi = Owned::f32(&[], &[6.0]);
+        let mut y = Owned::zeros_f32(&[1, 3, 8, 8]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        let after = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "CLIP_F32_FAST_TEST_HITS did not increment: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn clip_f32_fast_path_matches_scalar_reference() {
+        // Verify NEON SIMD path produces identical results to scalar clamp.
+        let data: Vec<f32> = (0..300)
+            .map(|i| ((i as f32) * 0.037 - 4.5).sin() * 10.0)
+            .collect();
+        let min_val = -2.5f32;
+        let max_val = 3.7f32;
+        let x = Owned::f32(&[300], &data);
+        let lo = Owned::f32(&[], &[min_val]);
+        let hi = Owned::f32(&[], &[max_val]);
+        let mut y = Owned::zeros_f32(&[300]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        let result = y.to_f32();
+        for (i, (&src, &out)) in data.iter().zip(result.iter()).enumerate() {
+            let expected = src.max(min_val).min(max_val);
+            assert_eq!(
+                out, expected,
+                "mismatch at index {i}: src={src}, got={out}, expected={expected}"
+            );
+        }
+    }
+
+    /// Documents the NaN semantics of the fast Clip path.
+    ///
+    /// NaN propagates on all platforms, matching the old `clip_typed<T>` behaviour
+    /// which used `PartialOrd` comparisons (NaN < x and NaN > x are both false,
+    /// so both clamp arms are skipped and NaN passes through).
+    ///
+    /// On aarch64 the NEON bulk uses `FMAX`/`FMIN` (NaN-propagating). The scalar
+    /// tail and non-aarch64 fallback use explicit PartialOrd comparisons via
+    /// `clamp_nan_propagating`. This guarantees identical NaN semantics across
+    /// all targets and is a no-behaviour-change from the old path on every
+    /// supported platform.
+    #[test]
+    fn clip_f32_fast_path_nan_semantics() {
+        let before = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let data = [f32::NAN, 1.0, f32::NAN, -f32::NAN, 3.0];
+        let x = Owned::f32(&[5], &data);
+        let lo = Owned::f32(&[], &[0.0]);
+        let hi = Owned::f32(&[], &[6.0]);
+        let mut y = Owned::zeros_f32(&[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        let after = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "fast path did not fire for NaN test: before={before} after={after}"
+        );
+        let result = y.to_f32();
+        // NaN propagates on all platforms — no behaviour change from old path.
+        assert!(result[0].is_nan(), "NaN must propagate (index 0)");
+        assert_eq!(result[1], 1.0);
+        assert!(result[2].is_nan(), "NaN must propagate (index 2)");
+        assert!(result[3].is_nan(), "-NaN must propagate (index 3)");
+        assert_eq!(result[4], 3.0);
     }
 }
