@@ -25,14 +25,16 @@ use onnx_runtime_ir::{
     static_shape,
 };
 use onnx_runtime_loader::WeightStore;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::{
-    build_manifest, inject, FusedGroup, LoraAdapterSpec, LoraInjectError, LoraManifest,
-    LoraModuleSpec, LoraTarget, Placement, QkvRole, TargetEntry,
+    build_manifest, inject, inject_grouped, FusedGroup, LoraAdapterSpec, LoraInjectError,
+    LoraManifest, LoraModuleSpec, LoraTarget, Placement, QkvRole, TargetEntry,
 };
 use crate::Tensor;
 use crate::executor::{auto_detect_cpu_ep, Executor};
+use onnx_runtime_ep_api::LoraPoolRegistry;
 
 const F32: DataType = DataType::Float32;
 
@@ -969,5 +971,311 @@ fn injected_branch_survives_optimization() {
         // And unfed still collapses to base-only after optimization.
         let outputs = exec.run(&[("x", &x_t)]).unwrap();
         assert_eq!(outputs[0].to_vec_f32(), base, "{level:?}: unfed must be base-only");
+    }
+}
+
+// ===========================================================================
+// P2c — grouped injection (GroupedLoraDelta) single-adapter parity (§J.5).
+// ===========================================================================
+
+/// Build an `Int32` routing tensor.
+fn i32_segments(len: usize, data: &[i32]) -> Tensor {
+    assert_eq!(data.len(), len);
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Tensor::from_raw(DataType::Int32, vec![len], &bytes).unwrap()
+}
+
+/// Run the Phase-1 4-node direct injection and return the output row-major f32.
+fn run_phase1_direct(
+    m: usize,
+    k: usize,
+    n: usize,
+    r: usize,
+    scale: f32,
+    w: &[f32],
+    x: &[f32],
+    a: &[f32],
+    b: &[f32],
+) -> Vec<f32> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale, a, b, k, n)],
+    };
+    let overrides = inject(&mut graph, &manifest, &adapter).expect("inject");
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], x).unwrap();
+    let a_t = Tensor::from_f32(&[k, r], a).unwrap();
+    let b_t = Tensor::from_f32(&[r, n], b).unwrap();
+    exec.run(&[
+        ("x", &x_t),
+        ("lora.adapter.layers.0.q_proj.A_t", &a_t),
+        ("lora.adapter.layers.0.q_proj.B_t", &b_t),
+    ])
+    .unwrap()[0]
+        .to_vec_f32()
+}
+
+// §E golden parity: the grouped GroupedLoraDelta op, run as a pool-of-one with
+// every row routed to adapter 0, is bit-parity with the Phase-1 4-node subgraph.
+#[test]
+fn grouped_single_adapter_matches_phase1_subgraph() {
+    let (m, k, n, r) = (2, 4, 3, 2);
+    let scale = 0.5f32;
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    let x: Vec<f32> = vec![1.0, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 0.3).collect();
+    let b: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.2).collect();
+
+    let phase1 = run_phase1_direct(m, k, n, r, scale, &w, &x, &a, &b);
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale, &a, &b, k, n)],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped");
+    let pool_id = injection.pool_id;
+
+    // One custom op, one Add, one shared segments input, no A_t/B_t inputs.
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 1);
+    assert_eq!(count_op(&graph, "Add"), 1);
+    assert_eq!(count_op(&graph, "MatMul"), 1, "only the base MatMul remains");
+    assert!(has_input_named(&graph, "lora.segments"));
+    assert!(!has_input_named(&graph, "lora.adapter.layers.0.q_proj.A_t"));
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![0i32; m]);
+    let grouped = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    assert_eq!(phase1.len(), grouped.len());
+    for (p, g) in phase1.iter().zip(&grouped) {
+        assert!(
+            (p - g).abs() < 1e-6,
+            "grouped {grouped:?} must match Phase-1 {phase1:?}"
+        );
+    }
+}
+
+// A null route (negative segment id) collapses the grouped delta to base-only,
+// the batched analogue of the Phase-1 unfed no-op.
+#[test]
+fn grouped_null_route_is_base_only() {
+    let (m, k, n, r) = (2, 4, 3, 2);
+    let scale = 0.5f32;
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    let x: Vec<f32> = vec![1.0, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 0.3).collect();
+    let b: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.2).collect();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale, &a, &b, k, n)],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped");
+    let pool_id = injection.pool_id;
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![-1i32; m]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    let base = reference_base(m, k, n, &x, &w);
+    for (g, e) in got.iter().zip(&base) {
+        assert!((g - e).abs() < 1e-6, "null route must be base-only");
+    }
+}
+
+// Grouped fused-QKV: three GroupedLoraDelta ops share one Concat + Add (§J's
+// simpler option). Full-adapter numerics match the per-slice reference.
+#[test]
+fn grouped_fused_qkv_matches_reference() {
+    let (m, k) = (2, 3);
+    let fused_n = 8;
+    let w: Vec<f32> = (0..k * fused_n).map(|i| (i as f32) * 0.05 - 0.5).collect();
+    let x: Vec<f32> = vec![0.5, -1.0, 2.0, 1.5, 0.0, -0.5];
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, fused_n, &w);
+    let group = tiny_fused_group(node_id);
+
+    let (rq, rk, rv) = (2usize, 3usize, 1usize);
+    let (sq, sk, sv) = (0.5f32, 1.0f32, 2.0f32);
+    let aq: Vec<f32> = (0..k * rq).map(|i| (i as f32) * 0.1 - 0.2).collect();
+    let bq: Vec<f32> = (0..rq * 4).map(|i| (i as f32) * 0.05).collect();
+    let ak: Vec<f32> = (0..k * rk).map(|i| (i as f32) * -0.1 + 0.3).collect();
+    let bk: Vec<f32> = (0..rk * 2).map(|i| (i as f32) * 0.07).collect();
+    let av: Vec<f32> = (0..k * rv).map(|i| (i as f32) * 0.2).collect();
+    let bv: Vec<f32> = (0..rv * 2).map(|i| (i as f32) * -0.1 + 0.4).collect();
+
+    let manifest = LoraManifest {
+        entries: vec![
+            fused_entry(node_id, base_v, x_v, k, QkvRole::Q, 4, &group),
+            fused_entry(node_id, base_v, x_v, k, QkvRole::K, 2, &group),
+            fused_entry(node_id, base_v, x_v, k, QkvRole::V, 2, &group),
+        ],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![
+            f32_module("self_attn.q_proj", rq, sq, &aq, &bq, k, 4),
+            f32_module("self_attn.k_proj", rk, sk, &ak, &bk, k, 2),
+            f32_module("self_attn.v_proj", rv, sv, &av, &bv, k, 2),
+        ],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped fused");
+    let pool_id = injection.pool_id;
+
+    // Three ops, one Concat, one Add.
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 3);
+    assert_eq!(count_op(&graph, "Concat"), 1);
+    assert_eq!(count_op(&graph, "Add"), 1);
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![0i32; m]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    let base = reference_base(m, k, fused_n, &x, &w);
+    let dq = reference_delta(m, k, rq, 4, sq, &x, &aq, &bq);
+    let dk = reference_delta(m, k, rk, 2, sk, &x, &ak, &bk);
+    let dv = reference_delta(m, k, rv, 2, sv, &x, &av, &bv);
+    let mut expected = base.clone();
+    for i in 0..m {
+        for j in 0..4 {
+            expected[i * fused_n + j] += dq[i * 4 + j];
+        }
+        for j in 0..2 {
+            expected[i * fused_n + 4 + j] += dk[i * 2 + j];
+        }
+        for j in 0..2 {
+            expected[i * fused_n + 6 + j] += dv[i * 2 + j];
+        }
+    }
+    for (g, e) in got.iter().zip(&expected) {
+        assert!((g - e).abs() < 1e-4, "grouped fused got {got:?} expected {expected:?}");
+    }
+}
+
+// Grouped partial fused-QKV: only q targeted; the untargeted K/V slices admit
+// zero-rank pages and contribute nothing, so those columns equal the base.
+#[test]
+fn grouped_fused_qkv_partial_is_zero_on_untargeted() {
+    let (m, k) = (2, 3);
+    let fused_n = 8;
+    let w: Vec<f32> = (0..k * fused_n).map(|i| (i as f32) * 0.05 - 0.5).collect();
+    let x: Vec<f32> = vec![0.5, -1.0, 2.0, 1.5, 0.0, -0.5];
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, fused_n, &w);
+    let group = tiny_fused_group(node_id);
+
+    let (rq, sq) = (2usize, 0.5f32);
+    let aq: Vec<f32> = (0..k * rq).map(|i| (i as f32) * 0.1 - 0.2).collect();
+    let bq: Vec<f32> = (0..rq * 4).map(|i| (i as f32) * 0.05).collect();
+
+    let manifest = LoraManifest {
+        entries: vec![fused_entry(node_id, base_v, x_v, k, QkvRole::Q, 4, &group)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", rq, sq, &aq, &bq, k, 4)],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped partial");
+    let pool_id = injection.pool_id;
+
+    // Still three ops (q real, k/v zero-rank), one Concat, one Add.
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 3);
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![0i32; m]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    let base = reference_base(m, k, fused_n, &x, &w);
+    let dq = reference_delta(m, k, rq, 4, sq, &x, &aq, &bq);
+    let mut expected = base.clone();
+    for i in 0..m {
+        for j in 0..4 {
+            expected[i * fused_n + j] += dq[i * 4 + j];
+        }
+    }
+    for (g, e) in got.iter().zip(&expected) {
+        assert!((g - e).abs() < 1e-4, "partial fused mismatch");
+    }
+    // K/V columns are exactly the base (zero-rank contributes nothing).
+    for i in 0..m {
+        for j in 4..8 {
+            assert_eq!(got[i * fused_n + j], base[i * fused_n + j]);
+        }
     }
 }

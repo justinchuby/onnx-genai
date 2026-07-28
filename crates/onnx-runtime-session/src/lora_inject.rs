@@ -40,9 +40,13 @@
 //! [`MatMulNBits`]: https://github.com/microsoft/onnxruntime
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
+use onnx_runtime_ep_api::{
+    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolId, LoraPoolRegistry, LoraWeightPool,
+};
 use onnx_runtime_ir::{
-    DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
+    Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
 };
 
 /// The op type of every int4 base projection this pass injects onto. Both the
@@ -298,6 +302,16 @@ pub enum LoraInjectError {
 
     #[error("internal: manifest has {entries} entries but the adapter spec has {modules} modules")]
     SpecCountMismatch { entries: usize, modules: usize },
+
+    #[error(
+        "LoRA module {module:?}: could not admit factor pages into the adapter weight pool: \
+         {source}"
+    )]
+    PoolAdmission {
+        module: String,
+        #[source]
+        source: onnx_runtime_ep_api::LoraPoolError,
+    },
 }
 
 // ===========================================================================
@@ -1073,6 +1087,443 @@ pub fn inject_lora_adapter(
         feeds,
         manifest,
     })
+}
+
+// ===========================================================================
+// Phase-2 grouped injection (design §J.1, §J.5) — the `GroupedLoraDelta` op.
+// ===========================================================================
+
+/// The `pkg.nxrt` custom op emitted by the grouped injection path.
+const GROUPED_OP: &str = "GroupedLoraDelta";
+/// The private operator domain the grouped op is registered under (mirrors the
+/// other `pkg.nxrt` custom ops in `build_cpu_registry`).
+const NXRT_DOMAIN: &str = "pkg.nxrt";
+/// The single reserved adapter id a pool-of-one (single-adapter unify, §J.5)
+/// routes every row to. Multi-tenant batching (P2 follow-up) assigns distinct
+/// ids per active adapter.
+const SINGLE_ADAPTER_ID: AdapterId = AdapterId(0);
+
+/// The result of a successful grouped injection (design §J.1). The graph now
+/// carries one [`GroupedLoraDelta`](GROUPED_OP) op per targeted projection,
+/// each reading the shared per-run `segments` routing input and reading its
+/// factor pages from the registered [`LoraWeightPool`]; the base int4 weights
+/// are never touched.
+///
+/// Unlike the Phase-1 [`inject`] path, the factors are *not* graph inputs — they
+/// live in the pool, admitted once at load time — so the only per-run input the
+/// caller must feed (beyond the model's activations) is `segments`.
+pub struct GroupedLoraInjection {
+    /// The name of the shared non-constant per-run routing input (`Int32`,
+    /// shape `[tokens]`): `segments[row]` is the adapter id that row routes to,
+    /// or a negative value / the reserved null id for a base-only row. It has no
+    /// initializer, so the executor treats it as a required runtime input that
+    /// is never a graph constant (never prepacked).
+    pub segments_input: String,
+    /// The id under which the populated pool is registered in the process
+    /// [`LoraPoolRegistry`]; baked into every emitted op's `pool_id` attribute.
+    pub pool_id: LoraPoolId,
+    /// The populated, registered pool. Holding this handle keeps the pool
+    /// resident; dropping the registry entry (see [`LoraPoolRegistry::unregister`])
+    /// releases it.
+    pub pool: Arc<LoraWeightPool>,
+    /// The adapter id every row routes to for the single-adapter unify case.
+    pub adapter_id: AdapterId,
+    pub manifest: LoraManifest,
+}
+
+/// Round a byte count up to the pool's page alignment so a computed capacity is
+/// never short of what [`LoraWeightPool::admit`] will actually reserve.
+fn aligned_page_bytes(bytes: usize) -> u64 {
+    const ALIGN: usize = 64;
+    (bytes.div_ceil(ALIGN) * ALIGN) as u64
+}
+
+/// Borrow one already-transposed factor of a spec as a pool admission input.
+fn factor_input(data: &TensorData) -> LoraFactorInput<'_> {
+    LoraFactorInput {
+        dtype: data.dtype,
+        rows: data.dims.first().copied().unwrap_or(0),
+        cols: data.dims.get(1).copied().unwrap_or(0),
+        bytes: &data.data,
+    }
+}
+
+/// Emit one `GroupedLoraDelta` op reading `(activation, segments)` and producing
+/// a `[.., width]` delta shaped from `base_output`, returning the delta value.
+/// The op carries the `pkg.nxrt` domain and the five integer attributes the CPU
+/// kernel factory requires (`K`, `N`, `module_id`, `max_rank`, `pool_id`).
+#[allow(clippy::too_many_arguments)]
+fn emit_grouped_op(
+    graph: &mut Graph,
+    prefix: &str,
+    activation: ValueId,
+    segments: ValueId,
+    base_output: ValueId,
+    k: usize,
+    width: usize,
+    module_id: u32,
+    max_rank: usize,
+    pool_id: u64,
+    dtype: DataType,
+) -> ValueId {
+    let base_shape = graph.value(base_output).shape.clone();
+    let delta = graph.create_named_value(
+        format!("{prefix}.delta"),
+        dtype,
+        shape_with_last(&base_shape, Dim::Static(width)),
+    );
+    let mut node = Node::new(
+        NodeId(0),
+        GROUPED_OP,
+        vec![Some(activation), Some(segments)],
+        vec![delta],
+    );
+    node.domain = NXRT_DOMAIN.to_string();
+    node.version = Some(1);
+    node.attributes
+        .insert("K".to_string(), Attribute::Int(k as i64));
+    node.attributes
+        .insert("N".to_string(), Attribute::Int(width as i64));
+    node.attributes
+        .insert("module_id".to_string(), Attribute::Int(module_id as i64));
+    // `max_rank` is a per-op upper bound the kernel validates against; a
+    // permanently zero-rank (untargeted fused slice) still needs a positive
+    // bound, so never emit zero.
+    node.attributes.insert(
+        "max_rank".to_string(),
+        Attribute::Int(max_rank.max(1) as i64),
+    );
+    node.attributes
+        .insert("pool_id".to_string(), Attribute::Int(pool_id as i64));
+    graph.insert_node(node);
+    delta
+}
+
+/// One planned op emission, resolved after the pool has been built and
+/// registered (so `pool_id` is known).
+struct GroupedOpPlan {
+    prefix: String,
+    activation: ValueId,
+    base_output: ValueId,
+    k: usize,
+    width: usize,
+    module_id: u32,
+    max_rank: usize,
+    dtype: DataType,
+    /// `None` for a standalone projection (delta added directly); `Some(role)`
+    /// for one slice of a fused `qkv_proj` (deltas concatenated then added).
+    fused: Option<(NodeId, QkvRole)>,
+}
+
+/// Inject an adapter as Phase-2 [`GroupedLoraDelta`](GROUPED_OP) ops (design
+/// §J.1, §J.5), the batched-LoRA unify of the Phase-1 4-node subgraph.
+///
+/// This is the second selector of the injection pass (the first is [`inject`],
+/// the Phase-1 4-node path, which is kept in place — §J.5 retirement is a later
+/// phase once parity and performance are proven). It:
+///
+/// 1. builds a fresh [`LoraWeightPool`] sized to hold exactly this adapter,
+///    admits every targeted module's `A_t`/`B_t` factor pair (adapter-major,
+///    64-byte aligned pages), and registers it in the process
+///    [`LoraPoolRegistry`];
+/// 2. creates one shared non-constant `segments` routing input;
+/// 3. emits one `GroupedLoraDelta` op per standalone projection, folded onto the
+///    base output by the reused Phase-1 `Add`; and one op per Q/K/V slice of a
+///    fused `qkv_proj`, concatenated in `[Q, K, V]` order and added once (§J's
+///    simpler "three op instances sharing one Add" option — no sub-descriptors,
+///    so each factor keeps its natural `[r, N_slice]` `B_t` and the slice
+///    offsets are baked into the concat order exactly as the Phase-1 fused path
+///    does).
+///
+/// For the single-adapter case every row routes to [`SINGLE_ADAPTER_ID`] (feed
+/// `segments = [0, 0, …]`), and the op's group-by-adapter dense path runs the
+/// same two fp32-accumulator matmuls as the Phase-1 branch, in the same order —
+/// so it is bit-parity with [`inject`] on the §E golden test.
+pub fn inject_grouped(
+    graph: &mut Graph,
+    manifest: &LoraManifest,
+    adapter: &LoraAdapterSpec,
+) -> Result<GroupedLoraInjection, LoraInjectError> {
+    if manifest.entries.len() != adapter.modules.len() {
+        return Err(LoraInjectError::SpecCountMismatch {
+            entries: manifest.entries.len(),
+            modules: adapter.modules.len(),
+        });
+    }
+
+    // --- Grouping pass: separate standalone projections from fused Q/K/V. ---
+    struct DirectAcc<'a> {
+        entry: &'a TargetEntry,
+        spec: &'a LoraModuleSpec,
+    }
+    struct FusedAcc<'a> {
+        group: FusedGroup,
+        base_output: ValueId,
+        activation: ValueId,
+        k: usize,
+        dtype: DataType,
+        layer_semantic: String,
+        role_specs: HashMap<QkvRole, &'a LoraModuleSpec>,
+    }
+    let mut directs: Vec<DirectAcc> = Vec::new();
+    let mut fused_plans: BTreeMap<usize, FusedAcc> = BTreeMap::new();
+
+    for (entry, spec) in manifest.entries.iter().zip(&adapter.modules) {
+        match &entry.placement {
+            Placement::Direct => {
+                validate_module(spec, entry.k, entry.n, entry.dtype)?;
+                directs.push(DirectAcc { entry, spec });
+            }
+            Placement::FusedSlice { group, role } => {
+                let layer_semantic = entry
+                    .semantic
+                    .rsplit_once('.')
+                    .map(|(prefix, _)| prefix.to_string())
+                    .unwrap_or_else(|| entry.semantic.clone());
+                let acc = fused_plans
+                    .entry(group.node_id.0 as usize)
+                    .or_insert_with(|| FusedAcc {
+                        group: group.clone(),
+                        base_output: entry.base_output,
+                        activation: entry.activation,
+                        k: entry.k,
+                        dtype: entry.dtype,
+                        layer_semantic,
+                        role_specs: HashMap::new(),
+                    });
+                acc.role_specs.insert(*role, spec);
+            }
+        }
+    }
+
+    // --- Build the pool: assign module ids and admit every page. ---
+    // Capacity is sized to hold exactly this adapter (aligned page bytes plus a
+    // small slack), so nothing is evicted at load time; the real byte budget
+    // governs admission one layer up in the engine (design §J.2 control plane).
+    let mut capacity: u64 = 0;
+    let account = |cap: &mut u64, data: &TensorData| {
+        *cap = cap.saturating_add(aligned_page_bytes(data.data.len()));
+    };
+    for d in &directs {
+        account(&mut capacity, &d.spec.a_t);
+        account(&mut capacity, &d.spec.b_t);
+    }
+    for f in fused_plans.values() {
+        for (_role, _offset, _width) in f.group.slices {
+            // Untargeted slices admit an empty zero-rank page (0 bytes → one
+            // aligned slot); targeted slices admit their real factors.
+            capacity = capacity.saturating_add(2 * aligned_page_bytes(0));
+        }
+        for spec in f.role_specs.values() {
+            account(&mut capacity, &spec.a_t);
+            account(&mut capacity, &spec.b_t);
+        }
+    }
+    // Slack so page-alignment rounding can never overrun the ceiling.
+    capacity = capacity.saturating_add(64 * (2 * manifest.entries.len() as u64 + 8));
+
+    let mut pool = LoraWeightPool::with_capacity_bytes(capacity);
+    let mut next_module_id: u32 = 0;
+    let mut plans: Vec<GroupedOpPlan> = Vec::new();
+
+    for d in &directs {
+        let module_id = next_module_id;
+        next_module_id += 1;
+        let prefix = format!("lora.{}.{}", adapter.name, d.entry.semantic);
+        pool.admit(
+            SINGLE_ADAPTER_ID,
+            LoraModuleId(module_id),
+            factor_input(&d.spec.a_t),
+            factor_input(&d.spec.b_t),
+            d.spec.scale,
+        )
+        .map_err(|source| LoraInjectError::PoolAdmission {
+            module: d.spec.module_name.clone(),
+            source,
+        })?;
+        plans.push(GroupedOpPlan {
+            prefix,
+            activation: d.entry.activation,
+            base_output: d.entry.base_output,
+            k: d.entry.k,
+            width: d.entry.n,
+            module_id,
+            max_rank: d.spec.rank,
+            dtype: d.entry.dtype,
+            fused: None,
+        });
+    }
+
+    for f in fused_plans.values() {
+        for (role, _offset, width) in f.group.slices {
+            let module_id = next_module_id;
+            next_module_id += 1;
+            let prefix = format!("lora.{}.{}.{}", adapter.name, f.layer_semantic, role.as_str());
+            let (max_rank, module_name) = match f.role_specs.get(&role) {
+                Some(spec) => {
+                    validate_module(spec, f.k, width, f.dtype)?;
+                    pool.admit(
+                        SINGLE_ADAPTER_ID,
+                        LoraModuleId(module_id),
+                        factor_input(&spec.a_t),
+                        factor_input(&spec.b_t),
+                        spec.scale,
+                    )
+                    .map_err(|source| LoraInjectError::PoolAdmission {
+                        module: spec.module_name.clone(),
+                        source,
+                    })?;
+                    (spec.rank, spec.module_name.clone())
+                }
+                None => {
+                    // Untargeted slice: a permanently zero-rank page yields a
+                    // zero delta for that role (the fused output stays base-only
+                    // there), mirroring the Phase-1 zero-rank default branch.
+                    let a0 = LoraFactorInput {
+                        dtype: f.dtype,
+                        rows: f.k,
+                        cols: 0,
+                        bytes: &[],
+                    };
+                    let b0 = LoraFactorInput {
+                        dtype: f.dtype,
+                        rows: 0,
+                        cols: width,
+                        bytes: &[],
+                    };
+                    pool.admit(SINGLE_ADAPTER_ID, LoraModuleId(module_id), a0, b0, 1.0)
+                        .map_err(|source| LoraInjectError::PoolAdmission {
+                            module: format!("{}.{} (untargeted)", f.layer_semantic, role.as_str()),
+                            source,
+                        })?;
+                    (1, String::new())
+                }
+            };
+            let _ = module_name;
+            plans.push(GroupedOpPlan {
+                prefix,
+                activation: f.activation,
+                base_output: f.base_output,
+                k: f.k,
+                width,
+                module_id,
+                max_rank,
+                dtype: f.dtype,
+                fused: Some((f.group.node_id, role)),
+            });
+        }
+    }
+
+    let pool = Arc::new(pool);
+    let pool_id = LoraPoolRegistry::global().register(Arc::clone(&pool));
+
+    // --- Create the single shared non-constant `segments` routing input. ---
+    let tokens_symbol = graph.create_symbol(Some("lora.segments.tokens".to_string()));
+    let segments = graph.create_named_value(
+        "lora.segments".to_string(),
+        DataType::Int32,
+        vec![Dim::Symbolic(tokens_symbol)],
+    );
+    graph.add_input(segments);
+
+    // --- Emit ops: standalone deltas added directly, fused slices concatenated
+    //     in [Q, K, V] order and added once. ---
+    let mut fused_slice_values: BTreeMap<usize, Vec<(QkvRole, ValueId)>> = BTreeMap::new();
+    let mut fused_meta: BTreeMap<usize, (FusedGroup, ValueId, DataType, String)> = BTreeMap::new();
+    for f in fused_plans.values() {
+        fused_meta.insert(
+            f.group.node_id.0 as usize,
+            (
+                f.group.clone(),
+                f.base_output,
+                f.dtype,
+                f.layer_semantic.clone(),
+            ),
+        );
+    }
+
+    for plan in &plans {
+        let delta = emit_grouped_op(
+            graph,
+            &plan.prefix,
+            plan.activation,
+            segments,
+            plan.base_output,
+            plan.k,
+            plan.width,
+            plan.module_id,
+            plan.max_rank,
+            pool_id.0,
+            plan.dtype,
+        );
+        match plan.fused {
+            None => {
+                add_delta_onto_base(graph, &plan.prefix, plan.base_output, delta);
+            }
+            Some((node_id, role)) => {
+                fused_slice_values
+                    .entry(node_id.0 as usize)
+                    .or_default()
+                    .push((role, delta));
+            }
+        }
+    }
+
+    // Concat each fused group's [Q, K, V] slices, then a single Add onto base.
+    for (node_key, mut slices) in fused_slice_values {
+        let (group, base_output, dtype, layer_semantic) = fused_meta
+            .remove(&node_key)
+            .expect("fused metadata recorded for every fused group");
+        // Order slices as [Q, K, V] to match the fused base output columns.
+        let order = |role: QkvRole| group.slices.iter().position(|(r, _, _)| *r == role);
+        slices.sort_by_key(|(role, _)| order(*role));
+        let fused_prefix = format!("lora.{}.{}.qkv", adapter.name, layer_semantic);
+        let base_shape = graph.value(base_output).shape.clone();
+        let concat = graph.create_named_value(
+            format!("{fused_prefix}.delta_fused"),
+            dtype,
+            shape_with_last(&base_shape, Dim::Static(group.fused_n)),
+        );
+        let mut concat_node = Node::new(
+            NodeId(0),
+            "Concat",
+            slices.iter().map(|(_, v)| Some(*v)).collect(),
+            vec![concat],
+        );
+        concat_node
+            .attributes
+            .insert("axis".to_string(), Attribute::Int(-1));
+        graph.insert_node(concat_node);
+        add_delta_onto_base(graph, &fused_prefix, base_output, concat);
+    }
+
+    Ok(GroupedLoraInjection {
+        segments_input: "lora.segments".to_string(),
+        pool_id,
+        pool,
+        adapter_id: SINGLE_ADAPTER_ID,
+        manifest: manifest.clone(),
+    })
+}
+
+/// Resolve the target manifest and inject an adapter as grouped
+/// [`GroupedLoraDelta`](GROUPED_OP) ops in one step (the grouped analogue of
+/// [`inject_lora_adapter`]). Fails loud if any targeted module cannot be
+/// resolved.
+pub fn inject_grouped_lora_adapter(
+    graph: &mut Graph,
+    adapter: &LoraAdapterSpec,
+) -> Result<GroupedLoraInjection, LoraInjectError> {
+    let targets: Vec<LoraTarget> = adapter
+        .modules
+        .iter()
+        .map(|m| LoraTarget {
+            module_name: m.module_name.clone(),
+            layer_index: m.layer_index,
+        })
+        .collect();
+    let manifest = build_manifest(graph, &targets)?;
+    inject_grouped(graph, &manifest, adapter)
 }
 
 #[cfg(test)]
