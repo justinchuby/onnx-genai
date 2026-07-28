@@ -127,3 +127,6 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 - Chose `reedline` after verifying it shares `crossterm v0.29.0` with ratatui 0.30.2; it provides multiline Alt+Enter input, cursor movement, persistent file-backed history, bracketed paste, and slash completion.
 - Replaced the hand slash-command parser/help with a declarative registry that also drives command and argument completion; `/fork` and `/rewind` remain out of Phase 1.
 - Made compact stats default-on only for interactive TTY sessions and added `run --no-stats`; non-TTY scripts keep stats opt-in via `/stats`.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Fixed PR #300 / #76 after author lockout: capability projection now rejects non-convex merges with deterministic union-find + Kahn check; merged after Leon approval.

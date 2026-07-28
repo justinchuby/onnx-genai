@@ -1,15 +1,12 @@
 # Iran — History
 
-## Project Context
-- Mac CPU Optimization Engineer for Apple Silicon CPU-EP perf (NEON, Accelerate/AMX), aarch64-apple-darwin GEMV/GEMM hot paths.
-- Joined 2026-07-26. Full pre-summary detail archived at `.squad/agents/iran/history-archive-2026-07-27T02-00-00Z.md` and earlier archive(s).
+## Project Context (joined day)
+- **Project:** onnx-genai — Rust inference runtime for generative AI on ONNX Runtime.
+- **Role:** Mac CPU Optimization Engineer — Apple Silicon CPU-EP perf (NEON, Accelerate/AMX), aarch64-apple-darwin GEMV/GEMM hot paths.
+- **Requested by:** Justin Chu
+- **Joined:** 2026-07-26
 
-## Summary through 2026-07-27T02:00:00Z
-- PR #227 roofline campaign established access-pattern-specific rooflines, removed dead Accelerate SGEMV paths, fixed decode dispatch, and made SIMD testing mandatory for performance claims.
-- CPU decode persistent pool default became deterministic (`On`), with adaptive load probing opt-in; unconditional library stderr was replaced by queryable/tracing diagnostics.
-- Mac f16 prefill campaign added BNNS/AMX M>=2 dispatch, filter caching, non-contiguous/column-major handling, and guarded M=1 NEON GEMV dispatch; TTFT improved from ~989ms to ~167ms while decode stayed faster than ORT.
-- First-decode spike root cause was shape-keyed cold caches and lm_head column-major densification; global transpose cache and column-major GEMV/BNNS paths removed the spike.
-- SiblingProjectionMerge reduced op count but regressed TTFT on BNNS, so it stayed opt-in; wider GEMMs are not automatically faster on Apple Silicon.
+## History summary through 2026-07-27T04:35:00-07:00
 
 Full pre-summary detail archived at `.squad/agents/iran/history-archive-2026-07-27T04-35-00-07-00.md`.
 
@@ -183,47 +180,3 @@ Profiled at M=11: non-GEMM ops are only **2.1% (8 ms)** of prefill time. The "~2
 - **Dispatch overhead is not the prefill bottleneck** — at 90ms for 350 ops, per-op average is 0.26ms (compute-dominated). The "dispatch overhead" theory holds only under high system load.
 - **Always measure after implementing** — the op-count-reduction argument was logically sound but empirically wrong for this hardware/backend combination.
 - **Pre-fused contrib ops from the exporter** — when the model exporter already fuses SDPA/RMSNorm/RotaryEmbedding into contrib ops, runtime fusion passes have nothing to match. This is expected for optimized HF exports.
-
----
-
-### Session 2026-07-27T16:50 — Prefill Overhead Attribution (Research)
-
-**Task:** Measure where the non-GEMM ~24ms of prefill time goes. Settle whether the overhead is concentrated or spread. Decompose per-call cost. Compare against ORT.
-
-**Branch:** `squad/iran-prefill-overhead-attribution` (research only, no optimizations)
-
-#### Findings
-
-1. **Distribution is CONCENTRATED** — 87% of non-GEMM time is in three ops: Attention SDPA (11ms, 45%), Swish/SiLU (7ms, 27%), Mul (3ms, 14%). The remaining ~350 ops contribute <0.2ms combined. Per-dispatch mechanism cost <1µs/op.
-
-2. **The "~136ms overhead" premise was wrong** — at low load (3.5), TTFT=80ms with 52ms GEMM + 24ms non-GEMM + 4ms engine overhead. The 160ms figure was CPU contention under load 15+ (BNNS GCD thread pool starvation).
-
-3. **Per-call fp16↔f32 widening is the dominant non-GEMM cost** — every non-GEMM op goes through `to_dense_f32_widen()` + compute + `write_dense_f32_narrow()`. For the Mul op (gate×up), 90% of the 141µs/call is widen/narrow for a trivial multiply. Aggregate widen/narrow cost: ~8-10ms across all non-GEMM ops.
-
-4. **AMX state switching is NOT a factor** — AMX is a coprocessor, not a CPU mode switch. The per-call cost decomposition fully accounts for measured time through compute + widen/narrow with no unexplained residual.
-
-5. **SDPA uses NEON dot+axpy, not Accelerate/AMX** — the `sdpa_f32_neon` path runs single-threaded NEON loops. The MLAS fast path exists but is gated behind `--features mlas`. Using `cblas_sgemm` for the Q·Kᵀ and P·V matmuls would be 3–5× faster.
-
-6. **Native already beats ORT on prefill** — at matched load ~2.7: native 78ms vs ORT 108ms (28% faster). Native also beats ORT on decode: 13.2 vs 23.2 ms/tok. ORT's fewer ops don't compensate for weaker GEMM kernels.
-
-#### Performance (Apple M1 Max, load 2.7–3.5)
-- Native TTFT: 78–80ms (40 tokens, Qwen 0.5B fp16)
-- ORT TTFT: 108ms (same model/prompt)
-- Decode: 13.2 ms/tok native, 23.2 ms/tok ORT
-
-#### Recommendations (ranked by ms recovered)
-1. Accelerate sgemm for Attention SDPA: ~5–8ms
-2. Native fp16 elementwise ops (Mul, RMSNorm, RotaryEmb): ~3–5ms
-3. Fused SiLU·Mul: ~3–4ms
-4. Don't chase dispatch count or wider GEMM fusion — confirmed wrong lever.
-
-#### Durable lessons
-- **Measure at controlled load before attributing overhead** — the 160ms→80ms gap was 100% load contention, not a dispatch problem. Always report `uptime` with benchmarks.
-- **Widen/narrow cost dominates trivial ops** — for Mul (gate×up), fp16↔f32 conversion is 90% of the per-call cost. The fix is native fp16 compute, not graph fusion.
-- **Concentrated overhead ≠ "fuse everything"** — the top three non-GEMM ops (Attention, SiLU, Mul) need individual kernel improvements, not a dispatch mechanism change.
-## Durable lessons
-- Always state benchmark metric and load conditions; quiet and loaded measurements can choose different winners.
-- Streaming bandwidth is not GEMV bandwidth; use access-pattern-specific ceilings.
-- Production-path probes are required because unit-test dispatch often differs from real `[1,M,K]` and strided-weight shapes.
-- Every SIMD/fast dispatch path needs direct reachability and parity guards before claims ship.
-- Future non-contiguous weights should first check algebraic layout identities such as column-major-as-transpose before copying.

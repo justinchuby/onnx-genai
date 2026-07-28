@@ -133,3 +133,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-26T22:38:02+00:00 — Issue triage #45–#77
 
 - Closed #52 and #64 with merged-code and targeted-test evidence; left the remaining audited issues open/partial with posted gaps and no doable-now small item.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Authored PR #301 / #85 compute-in-place; Roy found capture-liveness bug, Deckard fixed under author lockout, and the PR merged.
