@@ -149,3 +149,6 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 - **Non-blocking concerns:** C1 = add TODO for intrinsic migration; C2 = tighten test error thresholds (2% → 1e-4).
 - Filed to `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
 
+
+## 2026-07-28T09-10-28+00-00 — PR #339 review
+- Approved Coco's #75 shape-inference batch 2 after specification-verifying Det, LpPool, GlobalLpPool, MaxUnpool, Col2Im, and CenterCropPad and confirming the mutation probe. PR #339 merged as `b1f9d3bb`; Sequence/Optional/Map propagation remains blocked on an SSA type-model change.

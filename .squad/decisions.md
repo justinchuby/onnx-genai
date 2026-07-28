@@ -11032,3 +11032,31 @@ Decision archive gate checked at 2026-07-28T07:46:01+00:00: active ledger was 87
 **Open gap:** #326 remains open: macOS x86_64 extraction of the upstream `onnxruntime-osx-x86_64-1.27.0.tgz` fails because the archive is unavailable/returns an unrecognized format. This needs an ORT version bump or alternate source and is held for Justin; it is separate from the merged Linux/Windows fix.
 
 Decision archive hard gate checked at 2026-07-28T08:28:52+00:00: active ledger was 872849 bytes before this merge. No dated decision sections older than 2026-07-21 were eligible for archival.
+
+
+<!-- scribe-archive-2026-07-28T09-10-28+00-00-wave7 -->
+Decision archive hard gate checked at 2026-07-28T09:10:28+00:00: active ledger was 874273 bytes and exceeded 51200 bytes. Applied the seven-day policy (dated sections before 2026-07-21); no eligible dated decision sections remained after prior reconciliation, so archived 0 entries and created no archive file.
+
+<!-- scribe-merge-2026-07-28T09-10-28+00-00-luv-67-cuda-batch7 -->
+## 2026-07-28 — CUDA operator coverage batch 7
+
+### Issue #67 — CUDA `Pad` and `Range` (PR #338, `c59383db`)
+**By:** Luv (implementation); Freysa (independent review)
+
+**What:** Added standard-domain CUDA EP coverage for `Pad` and `Range`, increasing `CUDA_COVERED_OPS` from 134 to 136 and standard CPU-parity coverage from 105/141 to 107/141. `Pad` covers constant, reflect, edge, wrap, negative cropping, and subset axes. `Range` covers f32/f16/bf16/Int64 positive and negative sequences.
+
+**Verification:** Freysa approved after the H200 GPU 2 parity suite passed all 174 cases, the coverage gate passed, a content-corrupting mutation probe failed as expected, and default-target warnings-denied Clippy was clean.
+
+**Deferred:** `ScatterND`, quantization operators, and cuDNN-dependent work remain separate follow-ups; deterministic duplicate-index reductions and scale/zero-point broadcasting need focused treatment. #67 remains open as a coverage series.
+
+<!-- scribe-merge-2026-07-28T09-10-28+00-00-coco-75-shape-inference-b2 -->
+### Issue #75 — Shape-inference catalog batch 2 (PR #339, `b1f9d3bb`)
+**By:** Coco (implementation); Chew (independent specification review)
+
+**What:** Added six standard tensor rules: `Det`, `LpPool`, `GlobalLpPool`, `MaxUnpool`, `Col2Im`, and `CenterCropPad`. The registry advances from 181 to 187 operators and from 219 to 226 versioned registrations. Rules preserve symbolic-dimension behavior and use version-gated registration.
+
+**Verification:** Chew approved after spec-verifying all six rules and confirming a mutation probe. Coco's targeted format, warnings-denied Clippy, and shape-inference test suite passed.
+
+**Deferred:** `DFT`, `STFT`, `MelWeightMatrix`, `AffineGrid`, and loss operators remain later tensor-rule work. Sequence/Optional/Map propagation needs an SSA `Value`/`TypeInfo` container element-type model change, so #75 remains open.
+
+<!-- sources: decisions/inbox/luv-67-cuda-batch7.md; decisions/inbox/coco-75-shape-inference-b2.md; wave-7 manifest -->
