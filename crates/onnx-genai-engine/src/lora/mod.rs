@@ -1,5 +1,14 @@
 //! LoRA adapter loading and representation.
 
+#[allow(
+    dead_code,
+    mismatched_lifetime_syntaxes,
+    unused_imports,
+    unsafe_op_in_unsafe_fn,
+    clippy::all,
+    clippy::pedantic
+)]
+mod adapter_schema_generated;
 pub mod format;
 
 /// The native-LoRA runtime manager and PEFT → session-spec bridge (design §D,
