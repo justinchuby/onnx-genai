@@ -106,9 +106,22 @@ For the FP32 `qwen2.5-0.5b` model, decode weight bytes are ~1.43 GiB of the
 fraction of e.g. 45% means the backend achieves 45% of the theoretical maximum
 set by DRAM bandwidth alone.
 
-If the reported ceiling is exceeded (fraction > 100%), this indicates either
-(a) the bandwidth measurement was taken under host load and is pessimistic, or
-(b) the working set fits partially in cache. The tool warns in both cases.
+**Cache-assisted models:** For models whose decode working set is small enough
+that the Apple SLC (system-level cache, ~48 MiB on M1 Max) covers ≥10% of the
+decode set, the DRAM ceiling is **not binding** — inter-token temporal locality
+means a significant fraction of weights are served from cache, not DRAM. The
+tool marks such models with `⚠️ NOT BINDING` in the ceiling row and `*` in the
+roofline% column. Examples:
+
+| Model | Decode set | SLC/decode | Ceiling binding? |
+|---|---|---|---|
+| TinyStories-1M | 14 MiB | 348% | No (fully cache-resident) |
+| TinyStories-33M | 255 MiB | 19% | No (partially cache-assisted) |
+| qwen2.5-0.5b FP16 | 682 MiB | 7% | Yes |
+| qwen2.5-0.5b FP32 | 1365 MiB | 3.5% | Yes |
+
+For DRAM-bound models (qwen2.5-0.5b), exceeding 100% should not occur on a
+quiet host. If it does, the bandwidth probe was depressed by host load.
 
 ## What the samples show
 
