@@ -150,3 +150,44 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
 - Chew approved PR #347 and PR #349 after numerics/reachability gates.
 
 <!-- History before 2026-07-28T11:35:49Z was archived by size. Keep this file small. -->
+
+## 2026-07-28T04:30:00-07:00 — CLI improvement track durable lessons
+
+- Recurring verification defects are a durable review pattern: do not accept code that merely appears to verify, preserve, or clean up its claim. Empty-turn handling, flaky tests, speculative rewind placement, benchmark caps, cache keys, broad assertions, and stale fixture inventories were each caught by different review/automation layers; keep redundant review layers in place.
+- Bugs live where automation cannot reach. The CLI track widened automation coverage as first-class product work: CLI CI, cross-platform contract tests, visible ORT-library reporting, and Miri in CI all closed places where defects had been invisible.
+- PR #315 proved observability pays for itself: `cargo test -p onnx-genai-engine --lib` moved from 178 passed / 64 failed to 253 passed / 0 failed once agents could select a working ORT and see which ORT library was actually loaded.
+- Silent behavior is a bug class to eliminate. Ignored `--temperature`, silent CUDA fallback, empty turns on context exhaustion, requested-vs-resolved backend reporting, and invisible budget caps were fixed by making behavior observable, not just internally correct.
+- Coordinator merge and diagnosis discipline: distinguish allocator growth from scheduler worst-case reservation, and verify merges by building or equivalent validation; conflict markers and scratch files can survive if git output is trusted without inspection.
+
+## CLI charter — standing directives
+
+These two govern all ongoing CLI work and outlive the PRs that produced them. They were
+compacted into `.squad/decisions-archive/2026-07.md` on 2026-07-28 and are restated here
+because they are live policy, not history: an agent reading only this ledger must see them.
+
+### The CLI is a developer/maintainer tool, not a consumer product
+**By:** Justin Chu (2026-07-27)
+
+The `onnx-genai` CLI is scoped as a development and maintainer instrument. It is not
+competing with consumer local-inference tools. Rank CLI work by *does this shorten a
+maintainer's debug/iterate loop, or expose engine behavior we cannot otherwise observe?* —
+not by *does a competitor have it?*
+
+**Explicitly rejected, do not re-propose:** remote-client mode against an OpenAI-compatible
+server (third-party CLIs cover it); model registry / pull / consumer model lifecycle;
+conversion, quantization and fine-tune loops as CLI product features. See
+`docs/research/cli/00-backlog.md`.
+
+### The REPL is the primary CLI investment
+**By:** Justin Chu (2026-07-27)
+
+Target quality bar is GitHub Copilot CLI's interactive shell, with one deliberate
+divergence: **the terminal model is ratatui's inline viewport, not a full-screen alternate
+screen.** Native scrollback and terminal-native copy are features for a tool whose output is
+pasted into issues, benchmarks and traces, and the alternate screen costs both. Justin was
+shown the tradeoff and chose inline; see `docs/research/cli/05-repl-redesign.md` §2.
+
+Phase 1 landed in #289. Remaining phases cover session/runtime interaction — `/fork` and
+`/rewind` — which depend on runtime APIs tracked in
+`docs/research/cli/04-runtime-capability-inventory.md` and `06-fork-rewind-api.md`.
+Fork is reserved behind a type gate and **not yet enabled on any backend**.
