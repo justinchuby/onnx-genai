@@ -10995,3 +10995,26 @@ Decision archive gate checked at 2026-07-28T06-44-16+0000: active ledger was 868
 **What:** PR #327 (`64d99919`) keeps `full` default-on, fully gates the representative CPU `ops-cnn` group, and drives minimal builds from a shared operator catalog plus deterministic manifests. The `onnx-runtime-ep-cpu` and `onnx-runtime-operator-selection` catalog machinery retains unchanged default builds and mutation-proof minimal exclusions.
 
 **Why:** This provides a usable, testable minimal-build path without destabilizing the default registry or forcing a risky one-PR split of every kernel dependency. Issue #73 remains open for full gating of the remaining operator groups beyond CNN/pooling/spatial.
+
+<!-- scribe-merge-2026-07-28T07-46-01+00-00-wave5 -->
+## 2026-07-28 — Wave 5 shape-inference and CUDA parity reconciliation
+
+Decision archive gate checked at 2026-07-28T07:46:01+00:00: active ledger was 870368 bytes and exceeded 51200 bytes. Reviewed dated decision-entry headings against the seven-day cutoff (before 2026-07-21); none were eligible for archival. Historical date references were retained in their current entries.
+
+### Issue #75 — shape-inference catalog batch (PR #333, `6ba382b6`)
+**By:** Ricks (implementation); Karine (independent specification review)
+
+**What:** Added 16 standard tensor operators: `ConvTranspose`, `GridSample`, `Einsum`, `Celu`, `Shrink`, `Mish`, `HardSwish`, `LRN`, `MeanVarianceNormalization`, `ReverseSequence`, `RandomNormal`, `RandomUniform`, `RandomNormalLike`, `RandomUniformLike`, `Bernoulli`, and `Multinomial`. The registry advanced from 165 to 181 operators and from 203 to 219 versioned registrations. Karine approved after verifying specification math and running a mutation probe.
+
+**Why:** The additions close common tensor-op shape-inference gaps while retaining symbolic-dimension correctness and existing range-based version registration.
+
+**Deferred:** Sequence (8 operators), Optional (3), Map, Loop, Scan, recurrent, and ONNX-ML families remain outside #75. `Value` and `TypeInfo` currently carry only tensor dtype and shape, so container element-type propagation requires a separate SSA IR type-model change. Create/track this follow-up under #75, particularly for Sequence and Optional.
+
+### Issue #67 — CUDA operator coverage batch (PR #331, `52b1fc59`)
+**By:** Sapper (implementation); Hallett (independent review)
+
+**What:** Added CUDA coverage for `GatherND`, `SpaceToDepth`, and `EyeLike`, increasing `CUDA_COVERED_OPS` from 131 to 134 and standard CPU-parity coverage from 105/141. The batch was tested on an H200 across 165 parity cases. Hallett approved after coverage-of-coverage validation, a GPU4 parity rerun, and a content-corrupting mutation probe.
+
+**Why:** Structural byte kernels provide correct dtype-agnostic coverage for indexing and layout operators while reducing heterogeneous fallback. The all-target Clippy warnings were independently verified as identical and pre-existing on `main`; the default-target CI gate remains clean. Issue #67 stays open as a series.
+
+<!-- sources: decisions/inbox/ricks-75-shape-inference.md; decisions/inbox/sapper-67-cuda-coverage.md; wave-5 manifest -->
