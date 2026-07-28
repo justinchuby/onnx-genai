@@ -58,10 +58,12 @@ fn main() {
         );
     }
 
-    // Link
+    // Make the build-time ORT location available to dependents and, on ELF/Mach-O
+    // targets, as a loader search path. The runtime itself is opened explicitly
+    // from Rust so users can select the exact shared library before the first ORT
+    // API call; do not emit `rustc-link-lib=onnxruntime` here.
     ensure_major_version_runtime_link(&lib_dir);
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=onnxruntime");
     if target_os() == "macos" || target_os() == "linux" {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     }
@@ -76,6 +78,7 @@ fn main() {
         .allowlist_function("Ort.*")
         .allowlist_type("Ort.*")
         .allowlist_var("ORT_.*")
+        .blocklist_function("OrtGetApiBase")
         .derive_debug(true)
         .derive_default(true)
         .prepend_enum_name(false)

@@ -67,5 +67,9 @@ pub(super) fn version() {
         providers.push("cuda");
     }
     println!("execution providers: {}", providers.join(", "));
+    println!(
+        "onnx runtime: {}",
+        onnx_genai::ort::onnxruntime_library_report()
+    );
     println!("select an execution provider at runtime with ONNX_GENAI_EP (e.g. cpu, cuda).");
 }

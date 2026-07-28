@@ -133,3 +133,9 @@ Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/
 - Verified cargo build -p onnx-genai-cli, cargo test -p onnx-genai-cli --lib, cargo fmt -p onnx-genai-cli -- --check, cargo clippy -p onnx-genai-cli --all-targets -- -D warnings, and cargo build -p onnx-genai-server.
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #288 tests after Moss lockout: LogSoftmax overflow-stability is value-falsifiable; BitShift width guard is locked by source-contract test.
+
+## 2026-07-27T17:25:00-07:00 — ORT runtime library selection
+
+- Implemented explicit runtime ORT selection for native binaries: `ONNX_GENAI_ORT_LIB`, `ONNX_GENAI_ORT_LIB_DIR`, active conda/venv probing, target-cache fallback, and pathful API-mismatch diagnostics. The approach is valid because `ort-sys` now resolves `OrtGetApiBase` with `libloading` instead of import-library linking the final binary.
+- Found Justin's ORT 1.27.0 at `C:\Users\justinchu\AppData\Local\anaconda3\Lib\site-packages\onnxruntime\capi\onnxruntime.dll`; `onnxwin` exists but has no `onnxruntime` package installed.
+- Corrected README after Justin's feedback: document machine-independent build/runtime resolution order and inspection via `onnx-genai version`; keep host-specific conda paths as validation evidence, not as the documented answer.
