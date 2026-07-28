@@ -119,4 +119,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "DepthToSpace", 13, depth_to_space);
     reg.register("", "SpaceToDepth", 1, space_to_depth);
     reg.register("", "SpaceToDepth", 13, space_to_depth);
+    // `Col2Im` (opset 18) folds columns back into an image; `CenterCropPad`
+    // (opset 18) center-crops/pads selected axes to a target `shape`.
+    reg.register("", "Col2Im", 18, col2im);
+    reg.register("", "CenterCropPad", 18, center_crop_pad);
 }
