@@ -106,7 +106,12 @@ pub(super) fn emit_stats_line(show_stats: bool, show_profile: bool, profile: &mu
         return;
     }
     profile.memory.sample_peak();
-    eprintln!("{}", profile.to_stats_line());
+    let stats = if io::stdout().is_terminal() {
+        profile.to_stats_block()
+    } else {
+        profile.to_stats_line()
+    };
+    eprintln!("{stats}");
 }
 
 fn budget_cap_notice(cap: GenerationBudgetCap) -> String {
@@ -233,8 +238,11 @@ pub(super) fn run_generation_turn(
         print!("\x1b[0m");
         let _ = io::stdout().flush();
     }
+    let output_needs_trailing_newline = !output.is_empty() && !output.ends_with('\n');
     if let Some(live) = live {
-        live.finish()?;
+        live.finish(output_needs_trailing_newline)?;
+    } else if stream && io::stdout().is_terminal() && output_needs_trailing_newline {
+        println!();
     }
     GENERATING.store(false, Ordering::SeqCst);
     timings.finish();

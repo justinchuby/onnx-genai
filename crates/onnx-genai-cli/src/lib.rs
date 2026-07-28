@@ -1165,11 +1165,21 @@ mod tests {
     fn plain_stream_newline_depends_on_this_turns_renderer_usage() {
         let pending_live_renderer = live_turn::LiveTurn::Pending;
         assert!(pending_live_renderer.is_active());
-        assert!(plain_stream_needs_trailing_newline(false));
-        assert!(!plain_stream_needs_trailing_newline(true));
+        assert!(plain_stream_needs_trailing_newline(
+            ReplInputMode::Plain,
+            false
+        ));
+        assert!(!plain_stream_needs_trailing_newline(
+            ReplInputMode::Plain,
+            true
+        ));
         assert!(
-            plain_stream_needs_trailing_newline(false),
+            plain_stream_needs_trailing_newline(ReplInputMode::Plain, false),
             "a pending reusable live renderer must not suppress the newline when this turn did not use it"
+        );
+        assert!(
+            !plain_stream_needs_trailing_newline(ReplInputMode::Tty, false),
+            "TTY plain streaming emits the owed newline from the turn finalizer so errors and interrupts are covered too"
         );
     }
 
