@@ -35,8 +35,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
-    AdapterId, EpError, Kernel, KernelFactory, LoraModuleId, LoraPoolId, LoraPoolRegistry,
-    LoraWeightPool, Result, TensorMut, TensorView,
+    AdapterId, EpError, Kernel, KernelFactory, LoraFactorView, LoraModuleId, LoraPagePair,
+    LoraPoolId, LoraPoolRegistry, LoraWeightPool, Result, TensorMut, TensorView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
@@ -243,18 +243,37 @@ impl GroupedLoraDeltaKernel {
         _rows: Option<&[usize]>,
         scratch: &mut Scratch,
     ) -> Result<()> {
-        let (rank, n, scale) = self.load_factors(adapter, scratch)?;
-        // t = X @ A_t  -> [m, rank]   (fp32 accumulators)
-        scratch.t.clear();
-        scratch.t.resize(m * rank, 0.0);
-        gemm(x_f32, &scratch.a_f32, &mut scratch.t, m, self.k, rank)?;
-        // d = t @ B_t  -> [m, N]      (fp32 accumulators)
-        scratch.d.clear();
-        scratch.d.resize(m * n, 0.0);
-        gemm(&scratch.t, &scratch.b_f32, &mut scratch.d, m, rank, n)?;
-        for (dst, value) in scratch.delta.iter_mut().zip(&scratch.d) {
+        let pair = self.pair_for(adapter)?;
+        let (rank, n, scale) = self.validate_pair(adapter, &pair)?;
+
+        // Take the reusable factor/intermediate buffers out of `scratch` so the
+        // factor slices (which may borrow `scratch`) do not collide with the
+        // `&mut` intermediates. For f32 pool factors the factor slice is a
+        // zero-copy reinterpret of the aligned pool bytes and the buffers stay
+        // empty — the decode hot path performs no per-call widening copy.
+        let mut a_buf = std::mem::take(&mut scratch.a_f32);
+        let mut b_buf = std::mem::take(&mut scratch.b_f32);
+        let mut t = std::mem::take(&mut scratch.t);
+        let mut d = std::mem::take(&mut scratch.d);
+        {
+            let a_slice = factor_slice(&pair.a, self.k * rank, &mut a_buf)?;
+            let b_slice = factor_slice(&pair.b, rank * n, &mut b_buf)?;
+            // t = X @ A_t -> [m, rank]   (fp32 accumulators)
+            t.clear();
+            t.resize(m * rank, 0.0);
+            gemm(x_f32, a_slice, &mut t, m, self.k, rank)?;
+            // d = t @ B_t -> [m, N]      (fp32 accumulators)
+            d.clear();
+            d.resize(m * n, 0.0);
+            gemm(&t, b_slice, &mut d, m, rank, n)?;
+        }
+        for (dst, value) in scratch.delta.iter_mut().zip(&d) {
             *dst = value * scale;
         }
+        scratch.a_f32 = a_buf;
+        scratch.b_f32 = b_buf;
+        scratch.t = t;
+        scratch.d = d;
         Ok(())
     }
 
@@ -267,38 +286,57 @@ impl GroupedLoraDeltaKernel {
         rows: &[usize],
         scratch: &mut Scratch,
     ) -> Result<()> {
-        let (rank, n, scale) = self.load_factors(adapter, scratch)?;
-        scratch.t.clear();
-        scratch.t.resize(m * rank, 0.0);
-        // Move xg out to satisfy the borrow checker (gemm needs &xg + &mut t).
+        let pair = self.pair_for(adapter)?;
+        let (rank, n, scale) = self.validate_pair(adapter, &pair)?;
+
+        let mut a_buf = std::mem::take(&mut scratch.a_f32);
+        let mut b_buf = std::mem::take(&mut scratch.b_f32);
         let xg = std::mem::take(&mut scratch.xg);
-        gemm(&xg, &scratch.a_f32, &mut scratch.t, m, self.k, rank)?;
-        scratch.xg = xg;
-        scratch.d.clear();
-        scratch.d.resize(m * n, 0.0);
-        let t = std::mem::take(&mut scratch.t);
-        gemm(&t, &scratch.b_f32, &mut scratch.d, m, rank, n)?;
-        scratch.t = t;
+        let mut t = std::mem::take(&mut scratch.t);
+        let mut d = std::mem::take(&mut scratch.d);
+        {
+            let a_slice = factor_slice(&pair.a, self.k * rank, &mut a_buf)?;
+            let b_slice = factor_slice(&pair.b, rank * n, &mut b_buf)?;
+            t.clear();
+            t.resize(m * rank, 0.0);
+            gemm(&xg, a_slice, &mut t, m, self.k, rank)?;
+            d.clear();
+            d.resize(m * n, 0.0);
+            gemm(&t, b_slice, &mut d, m, rank, n)?;
+        }
         for (local, &row) in rows.iter().enumerate() {
-            let src = &scratch.d[local * n..(local + 1) * n];
+            let src = &d[local * n..(local + 1) * n];
             let dst = &mut scratch.delta[row * self.n..(row + 1) * self.n];
-            for (d, value) in dst.iter_mut().zip(src) {
-                *d = value * scale;
+            for (delta, value) in dst.iter_mut().zip(src) {
+                *delta = value * scale;
             }
         }
+        scratch.a_f32 = a_buf;
+        scratch.b_f32 = b_buf;
+        scratch.xg = xg;
+        scratch.t = t;
+        scratch.d = d;
         Ok(())
     }
 
-    /// Widen this adapter/module's `A_t`/`B_t` into `scratch.a_f32`/`b_f32` and
-    /// return `(rank, n, scale)`. Fails loud if the page is missing or its `N`
-    /// disagrees with this op's declared width.
-    fn load_factors(&self, adapter: AdapterId, scratch: &mut Scratch) -> Result<(usize, usize, f32)> {
-        let pair = self.pool.pair(adapter, self.module_id).ok_or_else(|| {
+    /// Look up this adapter/module's resident factor pair, failing loud if the
+    /// page is missing.
+    fn pair_for(&self, adapter: AdapterId) -> Result<LoraPagePair<'_>> {
+        self.pool.pair(adapter, self.module_id).ok_or_else(|| {
             error(format!(
                 "adapter {} module {} has no resident page in the pool",
                 adapter.0, self.module_id.0
             ))
-        })?;
+        })
+    }
+
+    /// Validate a resident pair's geometry against this op's declared dims and
+    /// return `(rank, n, scale)`. Fails loud on any disagreement.
+    fn validate_pair(
+        &self,
+        adapter: AdapterId,
+        pair: &LoraPagePair<'_>,
+    ) -> Result<(usize, usize, f32)> {
         let rank = pair.a.cols;
         if pair.b.rows != rank {
             return Err(error(format!(
@@ -324,13 +362,47 @@ impl GroupedLoraDeltaKernel {
                 adapter.0, self.module_id.0, self.max_rank
             )));
         }
-        decode_f32(pair.a.bytes, pair.a.dtype, self.k * rank, &mut scratch.a_f32)?;
-        decode_f32(pair.b.bytes, pair.b.dtype, rank * self.n, &mut scratch.b_f32)?;
         Ok((rank, self.n, pair.scale))
     }
 
     fn store(&self, scratch: &Scratch, out: &mut TensorMut) -> Result<()> {
         write_dense_f32_narrow(OP, out, &scratch.delta)
+    }
+}
+
+/// Reinterpret 64-byte-aligned f32 factor bytes as `&[f32]` with no copy — the
+/// zero-copy decode hot path for f32 pool factors.
+fn f32_bytes_as_slice(bytes: &[u8]) -> &[f32] {
+    // SAFETY: pool factor pages are 64-byte aligned (LORA_PAGE_ALIGNMENT), so the
+    // start is f32-aligned, and an f32 factor stores exactly 4 bytes per element,
+    // so `bytes.len()` is a multiple of 4. The returned slice borrows the same
+    // immutable bytes for the same lifetime; no mutable alias exists (the pool
+    // hands out `&self` views only).
+    debug_assert_eq!(bytes.as_ptr() as usize % std::mem::align_of::<f32>(), 0);
+    debug_assert_eq!(bytes.len() % 4, 0);
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), bytes.len() / 4) }
+}
+
+/// Produce a contiguous `&[f32]` view of a factor: zero-copy for an f32 pool
+/// page, or widened once into the reusable `buf` for an f16/bf16 page (both
+/// matmuls then accumulate in fp32 regardless — design §J.3).
+fn factor_slice<'a>(
+    view: &LoraFactorView<'a>,
+    count: usize,
+    buf: &'a mut Vec<f32>,
+) -> Result<&'a [f32]> {
+    if view.dtype == DataType::Float32 {
+        let slice = f32_bytes_as_slice(view.bytes);
+        if slice.len() != count {
+            return Err(error(format!(
+                "adapter factor has {} elements, expected {count}",
+                slice.len()
+            )));
+        }
+        Ok(slice)
+    } else {
+        decode_f32(view.bytes, view.dtype, count, buf)?;
+        Ok(&*buf)
     }
 }
 
