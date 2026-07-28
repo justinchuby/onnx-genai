@@ -140,5 +140,12 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - Adopted Pris's `ci.yml`/`audit.yml` hardening onto this branch too, removing the remaining personal `dtolnay`, `Swatinem/rust-cache`, and `taiki-e/install-action` uses from the full workflow set.
 - Added/strengthened no-cancel release serialization: `publish.yml` now serializes by workflow rather than ref, and `wheels.yml` gained workflow-level concurrency with `cancel-in-progress: false`.
 - Recorded owner-approved kept-action adjudication: keep PyPA trusted publishing and cibuildwheel, keep Codecov as vendor-owned; recommend immutable SHA pinning as a follow-up PR.
+## 2026-07-27T21:56:00Z — Miri CI enforcement
+
+Added a dedicated Miri CI job for tractable unsafe Rust surfaces: full `onnx-runtime-memory` and `onnx-runtime-dlpack`; targeted `onnx-runtime-ep-api`, `onnx-runtime-ep-cpu`, `onnx-runtime-session`, and `onnx-runtime-capi` subsets. Miri found and fixed a test-only cross-device deallocation panic-path leak in `onnx-runtime-ep-cpu::provider::tests`. CUDA/native ORT crates remain excluded because Miri cannot execute those FFI/native-library paths.
+
+## 2026-07-28T00:59:00Z — Miri PR #302 review fixes
+
+Moved Miri out of general CI into `.github/workflows/miri.yml`, so the weekly schedule triggers only the Miri lane while PR/main/ci branch path filters still run Miri on covered crate changes. Strengthened the `onnx-runtime-ep-cpu` cross-device deallocate test to assert the specific panic payload before reclaiming the fabricated allocation.
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Authored PR #301 / #85 compute-in-place; Roy found capture-liveness bug, Deckard fixed under author lockout, and the PR merged.

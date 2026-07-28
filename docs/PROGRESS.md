@@ -4,9 +4,15 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-25T01:42:00Z_
+_Last updated: 2026-07-27T21:56:00Z_
 
 **Current `origin/main` implementation HEAD:** `5a8c3dc9`.
+
+## 2026-07-27 — Miri unsafe-crate CI enforcement
+
+- **Miri is now enforced instead of ad-hoc for the tractable unsafe Rust surface.** A dedicated `Miri` workflow now owns the `Miri unsafe-crate soundness` job, separate from general CI. It runs on PR/`main`/`ci/**` changes touching covered crates, Cargo manifests, or `.github/workflows/miri.yml`, plus manual dispatch and a weekly schedule for nightly/toolchain drift.
+- **Covered fully:** `onnx-runtime-memory` and `onnx-runtime-dlpack`. **Covered by targeted Miri subsets:** `onnx-runtime-ep-api` ABI/DeviceBuffer/registry/tensor/weight/mock-EP tests, `onnx-runtime-ep-cpu` allocator/copy/dtype/strided-view tests, `onnx-runtime-session` tensor/sequence/view-bounds/size/prefetch/device-binding tests, and `onnx-runtime-capi` C-handle/status/null/session-option pointer-safety tests. CUDA/native ORT crates remain out of scope because Miri cannot execute those FFI/native-library paths.
+- **Finding fixed while enabling CI:** Miri caught a test-only leak in `onnx-runtime-ep-cpu::provider::tests::deallocate_rejects_cross_device_buffer`; the test now catches the expected panic and reclaims the fabricated allocation, preserving the single-free/cross-device invariant check without leaking under Miri.
 
 ## 2026-07-25 — Valid CUDA-artifact native-vs-ORT large-model sweep
 
