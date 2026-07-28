@@ -469,6 +469,9 @@ pub struct SessionBuilder {
     /// `A_t`/`B_t` feeds on the built session (active by default). `None` leaves
     /// the graph and run path byte-identical to a non-LoRA session.
     lora_adapter: Option<lora_inject::LoraAdapterSpec>,
+    /// Authoritative metadata-declared LoRA target manifest. When absent, target
+    /// resolution falls back to graph discovery.
+    lora_target_manifest: Option<onnx_genai_metadata::LoraTargetManifest>,
     options: HashMap<String, String>,
 }
 
@@ -535,6 +538,15 @@ impl SessionBuilder {
     /// the graph (fail-loud, design §C).
     pub fn lora_adapter(mut self, adapter: lora_inject::LoraAdapterSpec) -> Self {
         self.lora_adapter = Some(adapter);
+        self
+    }
+
+    /// Use the model metadata's authoritative LoRA target manifest.
+    pub fn lora_target_manifest(
+        mut self,
+        manifest: onnx_genai_metadata::LoraTargetManifest,
+    ) -> Self {
+        self.lora_target_manifest = Some(manifest);
         self
     }
 
@@ -723,7 +735,11 @@ impl SessionBuilder {
         // byte-identically to a non-LoRA session.
         let lora_feeds = if let Some(adapter) = &self.lora_adapter {
             let mut span = trace_span("session.lora_inject", "session");
-            let injection = lora_inject::inject_lora_adapter(&mut graph, adapter)?;
+            let injection = lora_inject::inject_lora_adapter(
+                &mut graph,
+                adapter,
+                self.lora_target_manifest.as_ref(),
+            )?;
             let feeds = injection
                 .feeds
                 .into_iter()

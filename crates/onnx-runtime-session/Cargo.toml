@@ -15,6 +15,7 @@ mlas = ["onnx-runtime-ep-cpu/mlas"]
 
 [dependencies]
 onnx-genai-runtime-config = { workspace = true }
+onnx-genai-metadata = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
 onnx-runtime-shape-inference = { workspace = true }

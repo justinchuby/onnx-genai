@@ -3,14 +3,12 @@
 //! Two cooperating passes, both operating on the freshly-loaded [`Graph`] IR,
 //! mirroring the structure of the sibling [`crate::fp16_decode`] rewrite:
 //!
-//! 1. [`build_manifest`] (design §C, §H — **P3**) walks the graph and maps each
-//!    semantic PEFT target module (`q_proj`, `k_proj`, …) to a concrete graph
-//!    target: the base [`MatMulNBits`](https://onnx.ai) node, its output value
-//!    (the injection point), the activation input, and the inner/outer dims. It
-//!    detects — **structurally**, not by name guessing — whether a projection is
-//!    kept split (Qwen3), fused into one `qkv_proj` (Qwen2.5), or is a layout it
-//!    does not recognize (Qwen3.5 linear attention), and **fails loud** on any
-//!    module it cannot resolve to exactly one node + slice.
+//! 1. [`build_manifest`] (design §C, §H — **P3**) maps each semantic PEFT target
+//!    module (`q_proj`, `k_proj`, …) to a concrete graph target. An explicit
+//!    inference-metadata declaration is authoritative and validated against the
+//!    graph. When it is absent, the builder falls back to structural discovery,
+//!    detecting split Qwen3 projections and fused Qwen2.5 `qkv_proj` nodes while
+//!    failing loud on unrecognized layouts such as Qwen3.5 linear attention.
 //!
 //! 2. [`inject`] (design §B — **P2b**) rewrites the graph, adding a separate
 //!    fp16/fp32 delta branch onto each targeted projection's output:
@@ -42,6 +40,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use onnx_genai_metadata::{LoraTargetDescriptor, LoraTargetManifest};
 use onnx_runtime_ep_api::{
     AdapterId, LoraFactorInput, LoraModuleId, LoraPoolId, LoraPoolRegistration,
     LoraPoolRegistry, LoraWeightPool,
@@ -108,7 +107,7 @@ pub struct LoraTarget {
 }
 
 // ===========================================================================
-// Manifest — the graph-derived target map (design §C).
+// Manifest — the validated target map (design §C).
 // ===========================================================================
 
 /// Q/K/V role within a fused `qkv_proj` projection.
@@ -141,7 +140,7 @@ pub struct FusedGroup {
     pub node_id: NodeId,
     /// The fused projection's total output width `N = N_q + N_k + N_v`.
     pub fused_n: usize,
-    /// The three ordered `(role, offset, width)` slices, in `[Q, K, V]` order.
+    /// The three `(role, offset, width)` slices, ordered by output offset.
     pub slices: [(QkvRole, usize, usize); 3],
 }
 
@@ -313,6 +312,49 @@ pub enum LoraInjectError {
         #[source]
         source: onnx_runtime_ep_api::LoraPoolError,
     },
+
+    #[error(
+        "declared LoRA target module {module:?} (layer {layer}) is absent from the declared target manifest"
+    )]
+    DeclaredModuleMissing { module: String, layer: usize },
+
+    #[error(
+        "declared LoRA target module {module:?} (layer {layer}) matches {count} manifest descriptors"
+    )]
+    DeclaredModuleAmbiguous {
+        module: String,
+        layer: usize,
+        count: usize,
+    },
+
+    #[error("declared LoRA projection node {node:?} does not exist in the loaded graph")]
+    DeclaredNodeMissing { node: String },
+
+    #[error("declared LoRA projection node name {node:?} identifies {count} graph nodes")]
+    DeclaredNodeAmbiguous { node: String, count: usize },
+
+    #[error("declared LoRA projection node {node:?} has op type {actual:?}, expected {expected:?}")]
+    DeclaredNodeType {
+        node: String,
+        actual: String,
+        expected: &'static str,
+    },
+
+    #[error("declared LoRA output value {output:?} is not an output of projection node {node:?}")]
+    DeclaredOutputMismatch { node: String, output: String },
+
+    #[error(
+        "declared LoRA projection node {node:?} has {dimension}={actual}, but the manifest declares {declared}"
+    )]
+    DeclaredDimensionMismatch {
+        node: String,
+        dimension: &'static str,
+        declared: usize,
+        actual: usize,
+    },
+
+    #[error("declared fused LoRA projection {node:?} has invalid slices: {reason}")]
+    DeclaredFusedSlices { node: String, reason: String },
 }
 
 // ===========================================================================
@@ -630,7 +672,7 @@ fn resolve_target(
 
 /// Build the per-model target manifest (design §C, **P3**). Fails loud if any
 /// target cannot be resolved to exactly one node + slice.
-pub fn build_manifest(
+fn build_graph_manifest(
     graph: &Graph,
     targets: &[LoraTarget],
 ) -> Result<LoraManifest, LoraInjectError> {
@@ -640,6 +682,241 @@ pub fn build_manifest(
         entries.push(resolve_target(graph, &projections, target)?);
     }
     Ok(LoraManifest { entries })
+}
+
+fn declared_qkv_role(name: &str) -> Option<QkvRole> {
+    match leaf_token(name) {
+        "q_proj" => Some(QkvRole::Q),
+        "k_proj" => Some(QkvRole::K),
+        "v_proj" => Some(QkvRole::V),
+        _ => None,
+    }
+}
+
+fn declared_descriptor_for_target<'a>(
+    manifest: &'a LoraTargetManifest,
+    target: &LoraTarget,
+) -> Result<(&'a LoraTargetDescriptor, Option<QkvRole>), LoraInjectError> {
+    let target_leaf = leaf_token(&target.module_name);
+    let mut matches = Vec::new();
+    for descriptor in &manifest.targets {
+        if descriptor.layer_index != target.layer_index {
+            continue;
+        }
+        if leaf_token(&descriptor.module_name) == target_leaf {
+            matches.push((descriptor, None));
+        }
+        if descriptor
+            .slices
+            .keys()
+            .any(|child| leaf_token(child) == target_leaf)
+        {
+            let role = declared_qkv_role(target_leaf).ok_or_else(|| {
+                LoraInjectError::DeclaredFusedSlices {
+                    node: descriptor.node_name.clone(),
+                    reason: format!(
+                        "child {target_leaf:?} is not supported by the current fused-Q/K/V injection pass"
+                    ),
+                }
+            })?;
+            matches.push((descriptor, Some(role)));
+        }
+    }
+    match matches.len() {
+        0 => Err(LoraInjectError::DeclaredModuleMissing {
+            module: target.module_name.clone(),
+            layer: target.layer_index,
+        }),
+        1 => Ok(matches[0]),
+        count => Err(LoraInjectError::DeclaredModuleAmbiguous {
+            module: target.module_name.clone(),
+            layer: target.layer_index,
+            count,
+        }),
+    }
+}
+
+fn declared_node<'a>(
+    graph: &'a Graph,
+    descriptor: &LoraTargetDescriptor,
+) -> Result<(NodeId, &'a Node), LoraInjectError> {
+    let matches: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.name == descriptor.node_name)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(LoraInjectError::DeclaredNodeMissing {
+            node: descriptor.node_name.clone(),
+        }),
+        [(node_id, node)] => {
+            if node.op_type != BASE_OP {
+                return Err(LoraInjectError::DeclaredNodeType {
+                    node: descriptor.node_name.clone(),
+                    actual: node.op_type.clone(),
+                    expected: BASE_OP,
+                });
+            }
+            Ok((*node_id, *node))
+        }
+        many => Err(LoraInjectError::DeclaredNodeAmbiguous {
+            node: descriptor.node_name.clone(),
+            count: many.len(),
+        }),
+    }
+}
+
+fn declared_fused_group(
+    descriptor: &LoraTargetDescriptor,
+    node_id: NodeId,
+) -> Result<FusedGroup, LoraInjectError> {
+    let mut slices = Vec::with_capacity(descriptor.slices.len());
+    for (name, slice) in &descriptor.slices {
+        let role = declared_qkv_role(name).ok_or_else(|| LoraInjectError::DeclaredFusedSlices {
+            node: descriptor.node_name.clone(),
+            reason: format!("unsupported child role {name:?}"),
+        })?;
+        slices.push((role, slice.offset, slice.width));
+    }
+    if slices.len() != 3
+        || ![QkvRole::Q, QkvRole::K, QkvRole::V].iter().all(|role| {
+            slices
+                .iter()
+                .filter(|(candidate, _, _)| candidate == role)
+                .count()
+                == 1
+        })
+    {
+        return Err(LoraInjectError::DeclaredFusedSlices {
+            node: descriptor.node_name.clone(),
+            reason: "exactly one q_proj, k_proj, and v_proj slice is required".to_string(),
+        });
+    }
+    slices.sort_by_key(|(_, offset, _)| *offset);
+    let mut expected_offset = 0;
+    for (_, offset, width) in &slices {
+        if *offset != expected_offset {
+            return Err(LoraInjectError::DeclaredFusedSlices {
+                node: descriptor.node_name.clone(),
+                reason: format!(
+                    "slice at offset {offset} does not continue the preceding range ending at {expected_offset}"
+                ),
+            });
+        }
+        expected_offset = expected_offset.checked_add(*width).ok_or_else(|| {
+            LoraInjectError::DeclaredFusedSlices {
+                node: descriptor.node_name.clone(),
+                reason: "slice range overflows usize".to_string(),
+            }
+        })?;
+    }
+    if expected_offset != descriptor.n {
+        return Err(LoraInjectError::DeclaredFusedSlices {
+            node: descriptor.node_name.clone(),
+            reason: format!(
+                "slice widths cover {expected_offset} columns, but declared N is {}",
+                descriptor.n
+            ),
+        });
+    }
+    let slices: [(QkvRole, usize, usize); 3] =
+        slices
+            .try_into()
+            .map_err(|_| LoraInjectError::DeclaredFusedSlices {
+                node: descriptor.node_name.clone(),
+                reason: "exactly three slices are required".to_string(),
+            })?;
+    Ok(FusedGroup {
+        node_id,
+        fused_n: descriptor.n,
+        slices,
+    })
+}
+
+fn build_declared_manifest(
+    graph: &Graph,
+    targets: &[LoraTarget],
+    declared: &LoraTargetManifest,
+) -> Result<LoraManifest, LoraInjectError> {
+    let mut entries = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (descriptor, role) = declared_descriptor_for_target(declared, target)?;
+        let (node_id, node) = declared_node(graph, descriptor)?;
+        let actual_k = required_int_attr(node, "K")?;
+        let actual_n = required_int_attr(node, "N")?;
+        for (dimension, declared, actual) in
+            [("K", descriptor.k, actual_k), ("N", descriptor.n, actual_n)]
+        {
+            if declared != actual {
+                return Err(LoraInjectError::DeclaredDimensionMismatch {
+                    node: descriptor.node_name.clone(),
+                    dimension,
+                    declared,
+                    actual,
+                });
+            }
+        }
+        let base_output = node
+            .outputs
+            .iter()
+            .copied()
+            .find(|value_id| {
+                graph.value(*value_id).name.as_deref() == Some(descriptor.output_name.as_str())
+            })
+            .ok_or_else(|| LoraInjectError::DeclaredOutputMismatch {
+                node: descriptor.node_name.clone(),
+                output: descriptor.output_name.clone(),
+            })?;
+        let activation = node.inputs.first().and_then(|slot| *slot).ok_or_else(|| {
+            LoraInjectError::MissingActivation {
+                node: descriptor.node_name.clone(),
+            }
+        })?;
+        let placement = if let Some(role) = role {
+            Placement::FusedSlice {
+                group: declared_fused_group(descriptor, node_id)?,
+                role,
+            }
+        } else {
+            Placement::Direct
+        };
+        let n = match &placement {
+            Placement::Direct => descriptor.n,
+            Placement::FusedSlice { group, role } => group
+                .slices
+                .iter()
+                .find_map(|(candidate, _, width)| (candidate == role).then_some(*width))
+                .expect("declared fused role was validated"),
+        };
+        entries.push(TargetEntry {
+            semantic: format!(
+                "layers.{}.{}",
+                target.layer_index,
+                leaf_token(&target.module_name)
+            ),
+            node_id,
+            base_output,
+            activation,
+            k: descriptor.k,
+            n,
+            dtype: graph.value(activation).dtype,
+            placement,
+        });
+    }
+    Ok(LoraManifest { entries })
+}
+
+/// Build the target manifest from an authoritative metadata declaration when
+/// present; otherwise use fail-loud graph discovery.
+pub fn build_manifest(
+    graph: &Graph,
+    targets: &[LoraTarget],
+    declared: Option<&LoraTargetManifest>,
+) -> Result<LoraManifest, LoraInjectError> {
+    match declared {
+        Some(manifest) => build_declared_manifest(graph, targets, manifest),
+        None => build_graph_manifest(graph, targets),
+    }
 }
 
 // ===========================================================================
@@ -1071,6 +1348,7 @@ fn inject_collecting_feeds(
 pub fn inject_lora_adapter(
     graph: &mut Graph,
     adapter: &LoraAdapterSpec,
+    declared_manifest: Option<&LoraTargetManifest>,
 ) -> Result<LoraInjection, LoraInjectError> {
     let targets: Vec<LoraTarget> = adapter
         .modules
@@ -1080,7 +1358,7 @@ pub fn inject_lora_adapter(
             layer_index: m.layer_index,
         })
         .collect();
-    let manifest = build_manifest(graph, &targets)?;
+    let manifest = build_manifest(graph, &targets, declared_manifest)?;
     let mut feeds = Vec::new();
     let override_ids = inject_collecting_feeds(graph, &manifest, adapter, &mut feeds)?;
     Ok(LoraInjection {
@@ -1513,9 +1791,17 @@ pub fn inject_grouped(
 /// [`GroupedLoraDelta`](GROUPED_OP) ops in one step (the grouped analogue of
 /// [`inject_lora_adapter`]). Fails loud if any targeted module cannot be
 /// resolved.
+///
+/// `declared_manifest` mirrors [`inject_lora_adapter`]: when the model metadata
+/// carries an authoritative [`LoraTargetManifest`], it is validated against the
+/// graph and becomes the source of the resolved manifest that drives grouped
+/// `GroupedLoraDelta` emission; when it is absent, resolution falls back to
+/// fail-loud graph discovery. Either way, the single resolved manifest is what
+/// feeds the grouped injection — there is no parallel discovery path.
 pub fn inject_grouped_lora_adapter(
     graph: &mut Graph,
     adapter: &LoraAdapterSpec,
+    declared_manifest: Option<&LoraTargetManifest>,
 ) -> Result<GroupedLoraInjection, LoraInjectError> {
     let targets: Vec<LoraTarget> = adapter
         .modules
@@ -1525,7 +1811,7 @@ pub fn inject_grouped_lora_adapter(
             layer_index: m.layer_index,
         })
         .collect();
-    let manifest = build_manifest(graph, &targets)?;
+    let manifest = build_manifest(graph, &targets, declared_manifest)?;
     inject_grouped(graph, &manifest, adapter)
 }
 

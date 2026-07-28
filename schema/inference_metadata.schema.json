@@ -1343,7 +1343,7 @@
       "type": "object"
     },
     "LoraCapabilities": {
-      "description": "Author-declared LoRA adapter capabilities for a model (design §G).\n\nThis is the metadata contract only — it declares intent and defaults; the\nruntime still discovers and validates each adapter against the actual graph\n(target manifest, §C) before applying it.",
+      "description": "Author-declared LoRA adapter capabilities for a model (design §G).\n\nThis is the metadata contract only — it declares intent and defaults. When\n[`target_manifest`](Self::target_manifest) is present it is authoritative;\nruntimes validate it against the loaded graph rather than inferring target\nstructure from graph naming.",
       "properties": {
         "available": {
           "description": "Adapter directories or package-relative paths shipped with the model.\n\nEach entry is a PEFT adapter (an `adapter_config.json` plus its\n`adapter_model.safetensors`). Absent or empty means the model declares no\nbundled adapters.",
@@ -1368,6 +1368,17 @@
             "null"
           ]
         },
+        "target_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoraTargetManifest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authoritative mapping from semantic LoRA modules to graph projections.\n\nAbsent preserves compatibility with older metadata and asks the runtime\nto use its fail-loud graph-discovery fallback."
+        },
         "target_module_policy": {
           "default": null,
           "description": "Author policy describing which module types the shipped adapters target\n(for example `\"attention_projections\"` or `\"all_linear\"`). Advisory only:\nthe runtime derives the authoritative target set from the graph.",
@@ -1377,6 +1388,132 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "LoraTargetDescriptor": {
+      "description": "One declared base projection and its optional fused child slices.",
+      "properties": {
+        "alpha": {
+          "description": "Optional adapter alpha policy for a direct target.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "k": {
+          "description": "Base projection inner dimension.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "layer_index": {
+          "description": "Decoder layer containing this projection.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "module_name": {
+          "description": "Semantic base-module name, for example `q_proj`, `qkv_proj`, or\n`linear_attn.in_proj_qkv`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "n": {
+          "description": "Full base projection output dimension.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "node_name": {
+          "description": "Exact ONNX node name of the base projection.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "output_name": {
+          "description": "Exact ONNX value name produced by the base projection.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "rank": {
+          "description": "Optional adapter rank policy for a direct target.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "slices": {
+          "additionalProperties": {
+            "$ref": "#/$defs/LoraTargetSlice"
+          },
+          "description": "Child semantic role to output slice for a fused projection.\n\nEmpty means the declared module spans the complete output.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "module_name",
+        "layer_index",
+        "node_name",
+        "output_name",
+        "k",
+        "n"
+      ],
+      "type": "object"
+    },
+    "LoraTargetManifest": {
+      "description": "Explicit LoRA target map for one model graph.",
+      "properties": {
+        "targets": {
+          "description": "Base projections that adapters may target.",
+          "items": {
+            "$ref": "#/$defs/LoraTargetDescriptor"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "LoraTargetSlice": {
+      "description": "One semantic child within a fused projection output.",
+      "properties": {
+        "alpha": {
+          "description": "Optional adapter alpha policy for this child.",
+          "format": "float",
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "offset": {
+          "description": "Zero-based column offset in the fused output.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rank": {
+          "description": "Optional adapter rank policy for this child.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "width": {
+          "description": "Number of output columns occupied by this child.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset",
+        "width"
+      ],
       "type": "object"
     },
     "MixtureOfExpertsSpec": {
@@ -3947,7 +4084,7 @@
           "type": "null"
         }
       ],
-      "description": "Author-declared LoRA adapter capabilities (native LoRA design §G).\n\nPurely additive: declares which PEFT adapters ship with the model, an\noptional default, the target-module policy, and hot-swap support. Absent\nmeans the model declares no bundled adapters. The runtime still validates\nevery adapter against the actual graph before applying it."
+      "description": "Author-declared LoRA adapter capabilities (native LoRA design §G).\n\nPurely additive: declares which PEFT adapters ship with the model, an\noptional default, an authoritative target manifest, target-module policy,\nand hot-swap support. Absent means the model declares no bundled adapters."
     },
     "generation": {
       "anyOf": [
