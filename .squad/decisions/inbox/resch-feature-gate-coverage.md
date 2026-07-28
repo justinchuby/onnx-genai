@@ -67,3 +67,25 @@ this lint catches missing *instrumentation* on fallback paths, not missing
 slow fallback satisfies the lint — but the manifest then makes the tier visible,
 and a human can ask "why is this tier3 on macOS?". The layered defense works by
 making silence impossible, not by automating performance engineering.
+
+## Observation: subsumption potential
+
+The manifest gap for fusions and this blind spot (machinery keyed on existing
+counters) share a general form: **the lints can only verify things that are
+explicitly declared.** The manifest requires a row; the reachability lint requires
+a counter; this lint requires a cfg gate in an execute function. Anything that
+doesn't fit one of these shapes is invisible.
+
+A single coherent layer that would subsume both would be an **op-coverage
+manifest**: every op the EP implements declares its expected minimum tier per
+platform (aarch64-macos, x86_64-linux, etc.), and any op whose actual tier on a
+platform is lower than declared — or any op with no declaration at all — is a
+violation. This would catch:
+- MLAS-only fast paths (Clip: declared tier2, actual tier3 on macOS)
+- Fusions that don't fire (declared tier1, actual tier3 when fusion disabled)
+- New ops added without any performance claim
+
+However, this requires instrumenting *every* op's actual dispatch tier at test
+time (not just ops with counters), which is a larger project. The current
+gate-level lint is a targeted fix for instances #8/#14 that can ship now. The
+op-coverage manifest is the right long-term direction but should not block #360.

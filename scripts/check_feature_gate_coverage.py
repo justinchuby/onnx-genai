@@ -66,6 +66,13 @@ Known gaps (what this check CANNOT catch)
    at CI time. A developer can write a gated path and push — the lint catches
    it at PR, not at `cargo check` time. A pre-commit hook is the mitigation
    (see scripts/check_pre_commit.sh).
+
+6. Exemptions. An [[exemption]] in `feature_gate_exemptions.toml` suppresses a
+   violation with a stated justification. The exemption mechanism allows a
+   human to assert "this fallback is acceptable" — but the human can be wrong.
+   An exemption that becomes stale (e.g. the op moves from 1 node to 35 nodes
+   in a new model) is invisible to this lint. Periodic review of the exemption
+   file is the mitigation, not automation.
 """
 
 from __future__ import annotations
@@ -73,6 +80,14 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -84,6 +99,9 @@ UNREACHABLE_FEATURES = [
 
 # Directory containing kernel implementations.
 KERNEL_DIR = Path("crates/onnx-runtime-ep-cpu/src/kernels")
+
+# Exemption file: deliberate decisions not to optimize, with Amdahl reasoning.
+EXEMPTION_FILE = Path("feature_gate_exemptions.toml")
 
 # Pattern for cfg(feature = "X") where X is an unreachable feature.
 CFG_FEATURE_PATTERN = re.compile(
@@ -224,28 +242,152 @@ def find_gated_calls_in_execute(source: str, start: int, end: int) -> list[dict]
     return violations
 
 
-def check_file(path: Path) -> list[str]:
-    """Check a single file for unmonitored feature-gated fast paths."""
+def check_file(path: Path) -> list[dict]:
+    """Check a single file for unmonitored feature-gated fast paths.
+    
+    Returns a list of violation dicts with 'file', 'line', 'feature' keys.
+    """
     source = path.read_text()
-    errors = []
+    results = []
     
     execute_blocks = find_execute_blocks(source)
     if not execute_blocks:
-        return errors
+        return results
     
     for start, end in execute_blocks:
         violations = find_gated_calls_in_execute(source, start, end)
         for v in violations:
-            errors.append(
-                f"{path}:{v['line']}: cfg(feature = \"{v['feature']}\") guards a "
-                f"fast path in `execute` but the fallback has no non-gated fast "
-                f"path and no _TEST_HITS counter. The optimization is unreachable "
-                f"on platforms where '{v['feature']}' is unavailable (macOS/aarch64). "
-                f"Add a platform-native fast path or instrument the fallback with "
-                f"a _TEST_HITS counter so the dispatch manifest can track it."
-            )
+            results.append({
+                'file': str(path),
+                'line': v['line'],
+                'feature': v['feature'],
+            })
     
-    return errors
+    return results
+
+
+# ─── Exemption mechanism ────────────────────────────────────────────────────
+#
+# Modelled on dispatch_manifest.toml's [[exclusion]] semantics. Each exemption
+# is a deliberate decision not to optimize, carrying Amdahl reasoning. An
+# exemption without a justification is itself a lint failure — "we chose not
+# to" must be distinguishable from "we forgot".
+
+
+def load_exemptions(path: Path) -> tuple[dict[tuple[str, int], dict], list[str]]:
+    """Load exemptions from TOML file.
+    
+    Returns (exemptions_dict, errors).
+    exemptions_dict maps (file, line) -> exemption record.
+    errors is a list of validation failures in the exemption file itself.
+    """
+    if not path.exists():
+        return {}, []
+    
+    if tomllib is None:
+        # Minimal inline TOML parser for the subset we use (array of tables
+        # with string/int fields). Matches check_dispatch_manifest.py pattern.
+        return _parse_exemptions_fallback(path)
+    
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    
+    exemptions: dict[tuple[str, int], dict] = {}
+    errors: list[str] = []
+    
+    for i, ex in enumerate(data.get("exemption", [])):
+        # Validate required fields.
+        file_field = ex.get("file")
+        line = ex.get("line")
+        feature = ex.get("feature")
+        reason = ex.get("reason")
+        
+        if not file_field:
+            errors.append(f"[[exemption]] #{i+1}: missing 'file' field")
+            continue
+        if not line:
+            errors.append(f"[[exemption]] #{i+1} ({file_field}): missing 'line' field")
+            continue
+        if not feature:
+            errors.append(f"[[exemption]] #{i+1} ({file_field}:{line}): missing 'feature' field")
+            continue
+        if not reason or len(reason.strip()) < 20:
+            errors.append(
+                f"[[exemption]] #{i+1} ({file_field}:{line}): 'reason' must be a "
+                f"substantive justification (≥20 chars). An exemption without Amdahl "
+                f"reasoning is indistinguishable from 'we forgot'. Got: {reason!r}"
+            )
+            continue
+        
+        exemptions[(file_field, int(line))] = ex
+    
+    return exemptions, errors
+
+
+def _parse_exemptions_fallback(path: Path) -> tuple[dict[tuple[str, int], dict], list[str]]:
+    """Minimal TOML parser for [[exemption]] arrays when tomllib is unavailable."""
+    text = path.read_text()
+    exemptions: dict[tuple[str, int], dict] = {}
+    errors: list[str] = []
+    current: dict | None = None
+    idx = 0
+
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('#') or not stripped:
+            continue
+        if stripped == '[[exemption]]':
+            if current is not None:
+                _validate_and_add(current, idx, exemptions, errors)
+            current = {}
+            idx += 1
+            continue
+        if current is not None and '=' in stripped:
+            key, _, val = stripped.partition('=')
+            key = key.strip()
+            val = val.strip()
+            if val.startswith('"') and val.endswith('"'):
+                current[key] = val[1:-1]
+            elif val.isdigit():
+                current[key] = int(val)
+            else:
+                current[key] = val
+
+    if current is not None:
+        _validate_and_add(current, idx, exemptions, errors)
+
+    return exemptions, errors
+
+
+def _validate_and_add(
+    ex: dict, idx: int,
+    exemptions: dict[tuple[str, int], dict],
+    errors: list[str],
+) -> None:
+    """Validate a single exemption record and add to dict or errors."""
+    file_field = ex.get("file")
+    line = ex.get("line")
+    feature = ex.get("feature")
+    reason = ex.get("reason")
+
+    if not file_field:
+        errors.append(f"[[exemption]] #{idx}: missing 'file' field")
+        return
+    if not line:
+        errors.append(f"[[exemption]] #{idx} ({file_field}): missing 'line' field")
+        return
+    if not feature:
+        errors.append(f"[[exemption]] #{idx} ({file_field}:{line}): missing 'feature' field")
+        return
+    if not reason or len(str(reason).strip()) < 20:
+        errors.append(
+            f"[[exemption]] #{idx} ({file_field}:{line}): 'reason' must be a "
+            f"substantive justification (≥20 chars). An exemption without Amdahl "
+            f"reasoning is indistinguishable from 'we forgot'. Got: {reason!r}"
+        )
+        return
+
+    exemptions[(str(file_field), int(line))] = ex
 
 
 def main() -> int:
@@ -253,34 +395,95 @@ def main() -> int:
         print(f"ERROR: kernel directory not found: {KERNEL_DIR}", file=sys.stderr)
         return 1
     
-    all_errors: list[str] = []
-    
-    for rs_file in sorted(KERNEL_DIR.glob("*.rs")):
-        errors = check_file(rs_file)
-        all_errors.extend(errors)
-    
-    if all_errors:
+    # Load exemptions.
+    exemptions, exemption_errors = load_exemptions(EXEMPTION_FILE)
+    if exemption_errors:
         print("=" * 72)
-        print("FEATURE GATE COVERAGE: unmonitored performance cliffs detected")
+        print("FEATURE GATE COVERAGE: exemption file has errors")
         print("=" * 72)
         print()
-        for error in all_errors:
-            print(f"  ✗ {error}")
+        for err in exemption_errors:
+            print(f"  ✗ {err}")
             print()
-        print(f"{len(all_errors)} violation(s) found.")
-        print()
-        print("Why this matters: cfg(feature = \"mlas\") is unreachable on macOS/")
-        print("aarch64 (mlas-sys is x86_64-linux-gnu only). Without a non-gated")
-        print("fast path or a monitored fallback, the op silently degrades to a")
-        print("pathologically slow scalar implementation on Apple Silicon.")
-        print()
-        print("Fix options:")
-        print("  1. Add a platform-native fast path (NEON/vDSP/Accelerate)")
-        print("  2. Add a _TEST_HITS counter on the fallback and a manifest row")
-        print("     declaring the expected tier (even if tier3/scalar)")
         return 1
     
-    print("✓ All feature-gated fast paths have fallback coverage.")
+    # Collect all violations.
+    all_violations: list[dict] = []
+    for rs_file in sorted(KERNEL_DIR.glob("*.rs")):
+        all_violations.extend(check_file(rs_file))
+    
+    # Separate exempted from unexempted.
+    unexempted: list[dict] = []
+    exempted: list[dict] = []
+    for v in all_violations:
+        key = (v['file'], v['line'])
+        if key in exemptions:
+            exempted.append(v)
+        else:
+            unexempted.append(v)
+    
+    # Check for stale exemptions (exemptions that don't match any violation).
+    stale: list[tuple[str, int]] = []
+    violation_keys = {(v['file'], v['line']) for v in all_violations}
+    for key in exemptions:
+        if key not in violation_keys:
+            stale.append(key)
+    
+    has_failures = bool(unexempted) or bool(stale)
+    
+    if has_failures:
+        print("=" * 72)
+        print("FEATURE GATE COVERAGE: violations detected")
+        print("=" * 72)
+        print()
+        
+        if unexempted:
+            for v in unexempted:
+                print(
+                    f"  ✗ {v['file']}:{v['line']}: cfg(feature = \"{v['feature']}\") "
+                    f"guards a fast path in `execute` but the fallback has no "
+                    f"non-gated fast path and no _TEST_HITS counter. The optimization "
+                    f"is unreachable on platforms where '{v['feature']}' is unavailable "
+                    f"(macOS/aarch64). Add a platform-native fast path or instrument "
+                    f"the fallback with a _TEST_HITS counter so the dispatch manifest "
+                    f"can track it."
+                )
+                print()
+            print(f"{len(unexempted)} unexempted violation(s).")
+            print()
+            print("Why this matters: cfg(feature = \"mlas\") is unreachable on macOS/")
+            print("aarch64 (mlas-sys is x86_64-linux-gnu only). Without a non-gated")
+            print("fast path or a monitored fallback, the op silently degrades to a")
+            print("pathologically slow scalar implementation on Apple Silicon.")
+            print()
+            print("Fix options:")
+            print("  1. Add a platform-native fast path (NEON/vDSP/Accelerate)")
+            print("  2. Add a _TEST_HITS counter on the fallback and a manifest row")
+            print("     declaring the expected tier (even if tier3/scalar)")
+            print("  3. If the fallback is genuinely acceptable (Amdahl: negligible")
+            print("     share of runtime), add an [[exemption]] to")
+            print(f"     {EXEMPTION_FILE} with substantive reasoning.")
+            print()
+        
+        if stale:
+            print("  Stale exemptions (no longer match a violation — remove them):")
+            for file, line in stale:
+                ex = exemptions[(file, line)]
+                print(f"    • {file}:{line} (feature={ex.get('feature')})")
+            print()
+        
+        return 1
+    
+    # Success output.
+    if exempted:
+        print(f"✓ All feature-gated fast paths have fallback coverage.")
+        print(f"  ({len(exempted)} deliberate exemption(s) acknowledged:)")
+        for v in exempted:
+            key = (v['file'], v['line'])
+            ex = exemptions[key]
+            print(f"    • {v['file']}:{v['line']} — {ex.get('reason', '?')[:60]}")
+    else:
+        print("✓ All feature-gated fast paths have fallback coverage.")
     return 0
 
 
