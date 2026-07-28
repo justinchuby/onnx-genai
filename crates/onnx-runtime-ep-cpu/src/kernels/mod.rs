@@ -43,6 +43,7 @@ pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
 pub mod dense_elementwise;
+pub mod dft;
 pub mod dropout;
 pub mod elementwise;
 pub mod expand;
@@ -944,6 +945,7 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("BlackmanWindow", "", 17),
         Box::new(window::BlackmanWindowFactory),
     );
+    reg.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
     reg.register(
         OpKey::new("BitwiseAnd", "", 18),
         Box::new(bitwise::BitwiseAndFactory),
@@ -1690,7 +1692,7 @@ mod tests {
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 98 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 99 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1706,6 +1708,7 @@ mod tests {
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
+        assert!(reg.lookup("DFT", "", 17).is_some());
         assert!(reg.lookup("Conv", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());

@@ -304,3 +304,23 @@ minimum_tier = "tier2"
 counter = "DENSE_ELEM_BF16_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
 description = "Dense bf16 elementwise Clip via f32 widen/narrow, avoiding full to_dense allocation"
+# DFT — Accelerate vDSP fast path (macOS/iOS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "DFT"
+variant = "vdsp_pow2"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "DFT_VDSP_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
+description = "Power-of-two DFT uses Accelerate vDSP_DFT_zop for hardware-optimized FFT on macOS/iOS"
+
+[[claim]]
+op = "DFT"
+variant = "radix2_fft"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DFT_FFT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
+description = "Power-of-two DFT uses Cooley-Tukey radix-2 FFT when vDSP unavailable"
