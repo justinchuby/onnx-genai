@@ -162,3 +162,4 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 - **12× gap judgement:** im2col is structurally wrong for depthwise (memory-bound, K=9, M=1). Direct NEON kernel would be 4–8× faster (eliminates im2col buffer entirely). This PR is a correct intermediate step. Schedule NEON depthwise follow-up targeting 2–3× ORT.
 - **Revision agent:** Iran.
 - Filed to `.squad/decisions/inbox/chew-pr334-review.md`.
+- 2026-07-28: Reviews of PR #347 and #349 approved after verifying numerical bounds and real decode firing. Documentation rationales are reviewable correctness artifacts: wrong L1-cache premises and derived-looking fitted constants must be corrected before merge.

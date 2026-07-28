@@ -27,3 +27,4 @@
 - Result: ResNet-18 8792ms → 93ms (94× faster), now 0.15× ORT (from 0.0016×). Whisper-tiny unchanged (MatMul-bound). Decode unregressed.
 - Remaining ResNet-18 gap (6.7×) is non-Conv ops (BatchNorm, Pool, Add on scalar paths).
 - BNNS Filter API deprecated but no replacement for per-op use. `cblas_sgemm` is durable fallback.
+- 2026-07-28: Small-shape GEMV investigation produced a valid negative result: existing inline paths and cblas already cover the remaining cases. SDPA decode PR #349 merged after attribution and after correcting the headline from 1.9x to 1.37x by naming the model (TinyStories-1M vs -33M). Always state which model each ratio refers to.

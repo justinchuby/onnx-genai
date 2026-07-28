@@ -155,3 +155,4 @@ Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/
 - Reachability: PREBIND_FAST_PATH_TEST_HITS + PREBIND_FALLBACK_TEST_HITS counters with paired tests.
 - All session tests pass (211+), both clippy targets clean, format clean, dispatch/platform lints pass.
 - Decision: `.squad/decisions/inbox/deckard-kernel-prebinding.md`.
+- 2026-07-28: 1x1 Conv routing PR #347 merged after replacing a magic threshold with spatial-size-dependent evidence and measuring EfficientNet-B0 (-8.9%). Fitted constants are acceptable only when labelled as fitted and bracketed by measured data; a false rationale is worse than no rationale.
