@@ -2165,7 +2165,7 @@ mod tests {
 
     #[test]
     fn prefetch_pipeline_is_byte_and_stat_identical_to_serial() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         const EXPERTS: usize = 8;
         const HIDDEN: usize = 64;
         const INTER: usize = 128;
@@ -2199,7 +2199,7 @@ mod tests {
 
     #[test]
     fn prefetch_pipeline_survives_cache_smaller_than_working_set() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         const EXPERTS: usize = 6;
         const HIDDEN: usize = 32;
         const INTER: usize = 64;
@@ -2244,7 +2244,7 @@ mod tests {
     /// reintroduces the divergences, failing this test.
     #[test]
     fn prefetch_matches_serial_across_routing_and_budget_sweep() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         // Dimensions chosen so the host-side working set exceeds a few-expert
         // budget, forcing real cross-step admission/eviction (the regime where
         // an extra in-flight lease can perturb victim selection).
@@ -2351,7 +2351,7 @@ mod tests {
     /// disable prefetch.
     #[test]
     fn prefetch_guard_holds_stats_in_gaff_divergent_regime() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         const EXPERTS: usize = 6;
         const HIDDEN: usize = 32;
         const INTER: usize = 64;
@@ -2418,7 +2418,7 @@ mod tests {
     #[test]
     #[ignore = "timing benchmark; run explicitly with --ignored --nocapture"]
     fn prefetch_ab_benchmark() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         const EXPERTS: usize = 16;
         const HIDDEN: usize = 256;
         const INTER: usize = 512;
@@ -2502,6 +2502,24 @@ mod tests {
     fn metrics_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Serialize the offload tests on the shared process-global metrics, and do
+    /// so *robustly against poisoning*.
+    ///
+    /// These tests all mutate the same process-wide `metrics()` singleton, so
+    /// they must run one at a time. If any one of them panics (a genuine
+    /// assertion failure) while holding this mutex, the standard library marks
+    /// the mutex poisoned; every subsequent `lock().expect(...)` then panics
+    /// with `PoisonError` instead of running. That amplifies a single real
+    /// failure into a cascade of unrelated "failures" that hides the true
+    /// culprit. We therefore recover the guard from a poisoned mutex: the
+    /// offending test still reports its own failure, but the remaining tests
+    /// continue to run and report honestly (one failure stays one failure).
+    fn hold_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        metrics_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reset_offload_test_state(host_cache_budget: u64) {
@@ -2694,7 +2712,7 @@ mod tests {
 
     #[test]
     fn route_first_mmap_matches_full_dequant_on_pseudorandom_inputs() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x1234_5678);
         let router = pseudo_random_values(4 * 4, 0x9876_5432);
         reset_offload_test_state(0);
@@ -2707,7 +2725,7 @@ mod tests {
 
     #[test]
     fn route_first_preserves_exact_accumulation_order_for_top_k() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x0a11_ce55);
         let router = pseudo_random_values(4 * 4, 0x5151_5151);
         let baseline = run_mmap_qmoe_with_k(false, false, &input, &router, 3);
@@ -2718,7 +2736,7 @@ mod tests {
 
     #[test]
     fn route_first_reads_only_unique_selected_expert_ranges() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0xfeed_beef);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, // expert 1
@@ -2744,9 +2762,44 @@ mod tests {
         assert_eq!(layer.unique_experts, 2);
     }
 
+    /// Route-first dequantized-expert residency must stay *bounded* — the point
+    /// of the #364 offload design is that we never resident every selected
+    /// expert at once, even when all of them are routed to.
+    ///
+    /// The peak residency depends on which path runs:
+    ///
+    ///   * The serial route-first loop holds exactly the working set: one
+    ///     dequantized expert is materialized, computed, and dropped before the
+    ///     next is leased, so the peak is deterministically `WORKING_SET`.
+    ///   * The single-ahead prefetch pipeline (engaged at `budget == 0`) holds
+    ///     the current expert's lease while the worker leases and dequantizes
+    ///     the next one, so residency may transiently reach
+    ///     `WORKING_SET + IN_FLIGHT_PREFETCH_DEPTH`. Whether it actually does is
+    ///     a *timing* question: if the prefetch overlaps compute the peak is 2,
+    ///     otherwise it stays 1. Under coverage instrumentation the overlap is
+    ///     far more likely, which is exactly why a fragile `== 1` assertion
+    ///     flaked in CI while passing locally.
+    ///
+    /// We therefore assert the honest invariant — residency is bounded to the
+    /// working set plus at most one in-flight prefetch, and never grows to hold
+    /// all selected experts — instead of an exact peak that is nondeterministic
+    /// by design.
     #[test]
     fn route_first_bounds_dequantized_residency_when_all_experts_are_selected() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        /// Route-first computes one expert at a time, so the working set is a
+        /// single dequantized expert.
+        const WORKING_SET: u64 = 1;
+        /// The prefetch pipeline keeps a single lease in flight (single-ahead),
+        /// so it can add at most one more resident expert on top of the working
+        /// set.
+        const IN_FLIGHT_PREFETCH_DEPTH: u64 = 1;
+        /// Upper bound on concurrent dequantized-expert residency for the
+        /// route-first path, whether or not the prefetch overlaps compute.
+        const RESIDENCY_BOUND: u64 = WORKING_SET + IN_FLIGHT_PREFETCH_DEPTH;
+        /// Every one of the four experts is routed to by this fixture.
+        const SELECTED_EXPERTS: u64 = 4;
+
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x1234);
         let router = vec![
             9.0, 0.0, 0.0, 0.0, // expert 0
@@ -2755,17 +2808,45 @@ mod tests {
             0.0, 0.0, 0.0, 9.0, // expert 3
         ];
         let baseline = run_mmap_qmoe(false, false, &input, &router);
+
+        // Serial route-first (prefetch disabled): with no prefetch ever in
+        // flight the peak is deterministically the working set. This pins the
+        // lower edge of the bound and proves the accounting itself is correct.
+        reset_offload_test_state(0);
+        let serial = run_mmap_qmoe_sequence_prefetch(true, false, &input, &[&router], 1, false);
+        let serial_stats = crate::weight_offload_stats();
+        assert_close(&serial.output, &baseline.output);
+        assert_eq!(serial_stats.unique_experts_per_batch, 4);
+        assert_eq!(serial_stats.peak_dequantized_experts, WORKING_SET);
+
+        // Single-ahead prefetch pipeline (engaged at `budget == 0`): residency
+        // may reach `WORKING_SET + IN_FLIGHT_PREFETCH_DEPTH` when the prefetch
+        // overlaps compute, but must never exceed it and must never resident
+        // every selected expert. Asserting the bound — not an exact peak — is
+        // stable regardless of scheduling, which is what makes this test
+        // deterministic under coverage-instrumented timing.
         reset_offload_test_state(0);
         let route_first = run_mmap_qmoe(true, false, &input, &router);
         let stats = crate::weight_offload_stats();
         assert_close(&route_first.output, &baseline.output);
         assert_eq!(stats.unique_experts_per_batch, 4);
-        assert_eq!(stats.peak_dequantized_experts, 1);
+        assert!(
+            (WORKING_SET..=RESIDENCY_BOUND).contains(&stats.peak_dequantized_experts),
+            "route-first peak dequantized residency {} escaped the expected \
+             bound {WORKING_SET}..={RESIDENCY_BOUND}",
+            stats.peak_dequantized_experts,
+        );
+        assert!(
+            stats.peak_dequantized_experts < SELECTED_EXPERTS,
+            "route-first must bound residency, not resident all {SELECTED_EXPERTS} \
+             selected experts at once (peak was {})",
+            stats.peak_dequantized_experts,
+        );
     }
 
     #[test]
     fn interleaved_expert_layout_falls_back_without_error() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x55aa);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
@@ -2780,7 +2861,7 @@ mod tests {
 
     #[test]
     fn flag_off_preserves_legacy_path_and_counters() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 7);
         let router = pseudo_random_values(4 * 4, 11);
         reset_offload_test_state(0);
@@ -2796,7 +2877,7 @@ mod tests {
 
     #[test]
     fn zero_byte_host_cache_matches_phase1_direct_mmap() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x0bad_f00d);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
@@ -2819,7 +2900,7 @@ mod tests {
     #[test]
     fn host_cache_enforces_expanded_byte_cap_for_oversubscribed_working_set() {
         const EXPANDED_EXPERT_BYTES: u64 = 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0xcafe_babe);
         let router = vec![
             9.0, 0.0, 0.0, 0.0, // expert 0
@@ -2847,7 +2928,7 @@ mod tests {
     #[test]
     fn repeated_routing_working_set_converges_to_host_cache_hits() {
         const TWO_EXPANDED_EXPERTS: u64 = 2 * 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x1234_abcd);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
@@ -2874,7 +2955,7 @@ mod tests {
     #[test]
     fn one_off_rare_route_does_not_evict_pinned_hot_expert() {
         const EXPANDED_EXPERT_BYTES: u64 = 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x55aa_aa55);
         let hot = vec![
             0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0,
@@ -2902,7 +2983,7 @@ mod tests {
     #[test]
     fn cached_and_uncached_routes_and_logits_are_bit_identical() {
         const TWO_EXPANDED_EXPERTS: u64 = 2 * 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0xdec0_de01);
         let router = pseudo_random_values(4 * 4, 0xface_feed);
         reset_offload_test_state(0);
@@ -2915,7 +2996,7 @@ mod tests {
 
     #[test]
     fn two_engine_cache_partitions_respect_independent_budgets() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         metrics().reset();
         let engine_a = WeightOffloadHostCache::new(4).unwrap();
         let engine_b = WeightOffloadHostCache::new(8).unwrap();
@@ -2945,7 +3026,7 @@ mod tests {
 
     #[test]
     fn process_metrics_aggregate_live_cache_residency_and_release_on_drop() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         metrics().reset();
         let engine_a = WeightOffloadHostCache::new(4).unwrap();
         let engine_b = WeightOffloadHostCache::new(8).unwrap();
@@ -2988,7 +3069,7 @@ mod tests {
 
     #[test]
     fn admission_history_skips_uncacheable_keys_and_expires_churn() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         metrics().reset();
         let mut cache = HostExpertCache::default();
         let weights = || DequantizedExpert {
@@ -3028,7 +3109,7 @@ mod tests {
 
     #[test]
     fn active_host_cache_lease_blocks_eviction_until_drop() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         reset_offload_test_state(4);
         let weights = |value| DequantizedExpert {
             fc1: vec![value],
