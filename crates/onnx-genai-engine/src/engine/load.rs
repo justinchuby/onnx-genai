@@ -251,6 +251,10 @@ impl Engine {
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                 config.decode_precision,
                 lora_spec,
+                metadata
+                    .adapters
+                    .as_ref()
+                    .and_then(|adapters| adapters.target_manifest.clone()),
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };

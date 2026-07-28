@@ -8,6 +8,7 @@ impl NativeDecodeSession {
         io: Option<&ModelIoSpec>,
         decode_precision: DecodePrecision,
         lora_adapter: Option<onnx_runtime_session::lora_inject::LoraAdapterSpec>,
+        lora_target_manifest: Option<onnx_genai_metadata::LoraTargetManifest>,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -29,6 +30,9 @@ impl NativeDecodeSession {
                 );
             }
             builder = builder.lora_adapter(adapter);
+        }
+        if let Some(manifest) = lora_target_manifest {
+            builder = builder.lora_target_manifest(manifest);
         }
         if device == NativeDecodeDevice::Cpu {
             let ep =

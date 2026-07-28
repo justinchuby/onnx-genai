@@ -24,7 +24,9 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
     static_shape,
 };
+use onnx_genai_metadata::{LoraTargetDescriptor, LoraTargetManifest, LoraTargetSlice};
 use onnx_runtime_loader::WeightStore;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::{
@@ -108,6 +110,33 @@ fn add_activation(graph: &mut Graph, k: usize) -> ValueId {
     x
 }
 
+fn declared_fused_qkv(node_name: &str, k: usize, n: usize) -> LoraTargetManifest {
+    let slices = BTreeMap::from([
+        ("q_proj".to_string(), LoraTargetSlice {
+            offset: 0, width: 3584, rank: None, alpha: None,
+        }),
+        ("k_proj".to_string(), LoraTargetSlice {
+            offset: 3584, width: 512, rank: None, alpha: None,
+        }),
+        ("v_proj".to_string(), LoraTargetSlice {
+            offset: 4096, width: 512, rank: None, alpha: None,
+        }),
+    ]);
+    LoraTargetManifest {
+        targets: vec![LoraTargetDescriptor {
+            module_name: "self_attn.qkv_proj".to_string(),
+            layer_index: 0,
+            node_name: node_name.to_string(),
+            output_name: format!("{node_name}.out"),
+            k,
+            n,
+            slices,
+            rank: None,
+            alpha: None,
+        }],
+    }
+}
+
 // ===========================================================================
 // P3 — discovery / manifest tests (structural, no execution).
 // ===========================================================================
@@ -161,7 +190,7 @@ fn discovery_split_qwen3_resolves_direct() {
         LoraTarget { module_name: "self_attn.v_proj".into(), layer_index: 0 },
         LoraTarget { module_name: "self_attn.o_proj".into(), layer_index: 0 },
     ];
-    let manifest = build_manifest(&graph, &targets).expect("split layout resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("split layout resolves");
     assert_eq!(manifest.entries.len(), 4);
     for (entry, expected_n) in manifest.entries.iter().zip([2048, 1024, 1024, 2048]) {
         assert!(
@@ -208,7 +237,7 @@ fn discovery_fused_qwen25_resolves_slices() {
         LoraTarget { module_name: "self_attn.k_proj".into(), layer_index: 0 },
         LoraTarget { module_name: "self_attn.v_proj".into(), layer_index: 0 },
     ];
-    let manifest = build_manifest(&graph, &targets).expect("fused layout resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("fused layout resolves");
 
     let expected = [
         (QkvRole::Q, 0usize, 3584usize),
@@ -237,6 +266,107 @@ fn discovery_fused_qwen25_resolves_slices() {
     }
 }
 
+#[test]
+fn declared_manifest_matches_graph_discovery_for_fused_qkv() {
+    let mut graph = Graph::new();
+    let k = 3584;
+    let node_name = "/model/layers.0/attn/qkv_proj/MatMul_Q4";
+    let x = add_activation(&mut graph, k);
+    add_matmulnbits(
+        &mut graph, node_name,
+        "model.layers.0.attn.qkv_proj.MatMul.weight_Q4", x, k, 4608,
+    );
+    add_gqa(&mut graph, "/model/layers.0/attn/GroupQueryAttention", 28, 4);
+    let targets = vec![
+        LoraTarget { module_name: "self_attn.q_proj".into(), layer_index: 0 },
+        LoraTarget { module_name: "self_attn.k_proj".into(), layer_index: 0 },
+        LoraTarget { module_name: "self_attn.v_proj".into(), layer_index: 0 },
+    ];
+
+    let discovered = build_manifest(&graph, &targets, None).expect("graph discovery");
+    let declaration = declared_fused_qkv(node_name, k, 4608);
+    let declared =
+        build_manifest(&graph, &targets, Some(&declaration)).expect("declared manifest");
+
+    assert_eq!(declared.entries.len(), discovered.entries.len());
+    for (declared, discovered) in declared.entries.iter().zip(&discovered.entries) {
+        assert_eq!(declared.semantic, discovered.semantic);
+        assert_eq!(declared.node_id, discovered.node_id);
+        assert_eq!(declared.base_output, discovered.base_output);
+        assert_eq!(declared.activation, discovered.activation);
+        assert_eq!(declared.k, discovered.k);
+        assert_eq!(declared.n, discovered.n);
+        assert_eq!(declared.dtype, discovered.dtype);
+        assert_eq!(declared.placement, discovered.placement);
+    }
+}
+
+#[test]
+fn declared_manifest_missing_node_returns_typed_error() {
+    let mut graph = Graph::new();
+    let x = add_activation(&mut graph, 3584);
+    add_matmulnbits(
+        &mut graph, "/model/layers.0/attn/qkv_proj/MatMul_Q4",
+        "model.layers.0.attn.qkv_proj.MatMul.weight_Q4", x, 3584, 4608,
+    );
+    let declaration =
+        declared_fused_qkv("/model/layers.0/attn/missing/MatMul_Q4", 3584, 4608);
+    let targets = [LoraTarget {
+        module_name: "self_attn.q_proj".into(),
+        layer_index: 0,
+    }];
+
+    let error = build_manifest(&graph, &targets, Some(&declaration))
+        .expect_err("missing declared node must fail");
+    assert!(matches!(error, LoraInjectError::DeclaredNodeMissing { .. }));
+}
+
+#[test]
+fn declared_manifest_dimension_mismatch_returns_typed_error() {
+    let mut graph = Graph::new();
+    let node_name = "/model/layers.0/attn/qkv_proj/MatMul_Q4";
+    let x = add_activation(&mut graph, 3584);
+    add_matmulnbits(
+        &mut graph, node_name,
+        "model.layers.0.attn.qkv_proj.MatMul.weight_Q4", x, 3584, 4608,
+    );
+    let declaration = declared_fused_qkv(node_name, 4096, 4608);
+    let targets = [LoraTarget {
+        module_name: "self_attn.q_proj".into(),
+        layer_index: 0,
+    }];
+
+    let error = build_manifest(&graph, &targets, Some(&declaration))
+        .expect_err("declared K mismatch must fail");
+    assert!(matches!(
+        error,
+        LoraInjectError::DeclaredDimensionMismatch {
+            dimension: "K",
+            declared: 4096,
+            actual: 3584,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn absent_declared_manifest_falls_back_to_graph_discovery() {
+    let mut graph = Graph::new();
+    let x = add_activation(&mut graph, 2048);
+    add_matmulnbits(
+        &mut graph, "/model/layers.0/attn/q_proj/MatMulNBits",
+        "model.layers.0.attn.q_proj.MatMulNBits.qweight", x, 2048, 2048,
+    );
+    let targets = [LoraTarget {
+        module_name: "self_attn.q_proj".into(),
+        layer_index: 0,
+    }];
+
+    let manifest = build_manifest(&graph, &targets, None).expect("fallback discovery");
+    assert_eq!(manifest.entries.len(), 1);
+    assert!(matches!(manifest.entries[0].placement, Placement::Direct));
+}
+
 // Qwen3.5-style LINEAR attention: the projection is `in_proj_qkv`, a token the
 // pass does not recognize as q/k/v or as a fused `qkv_proj`. A q_proj target
 // must FAIL LOUD (UnresolvedModule) rather than silently mapping onto the
@@ -259,7 +389,7 @@ fn discovery_linear_attn_fails_loud() {
         module_name: "self_attn.q_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("q_proj must not resolve");
+    let err = build_manifest(&graph, &targets, None).expect_err("q_proj must not resolve");
     match err {
         LoraInjectError::UnresolvedModule { module, layer } => {
             assert_eq!(module, "self_attn.q_proj");
@@ -290,7 +420,7 @@ fn discovery_linear_attn_direct_token_resolves() {
         module_name: "linear_attn.in_proj_qkv".into(),
         layer_index: 0,
     }];
-    let manifest = build_manifest(&graph, &targets).expect("direct token resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("direct token resolves");
     assert!(matches!(manifest.entries[0].placement, Placement::Direct));
     assert_eq!(manifest.entries[0].n, 4096);
 }
@@ -316,7 +446,7 @@ fn discovery_fused_missing_attention_fails_loud() {
         module_name: "self_attn.q_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("no GQA => cannot slice");
+    let err = build_manifest(&graph, &targets, None).expect_err("no GQA => cannot slice");
     match err {
         LoraInjectError::MissingAttention { fused_n, layer, .. } => {
             assert_eq!(fused_n, 4608);
@@ -348,7 +478,7 @@ fn discovery_fused_geometry_mismatch_fails_loud() {
         module_name: "self_attn.q_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("bad geometry must fail");
+    let err = build_manifest(&graph, &targets, None).expect_err("bad geometry must fail");
     assert!(
         matches!(err, LoraInjectError::FusedGeometry { .. }),
         "expected FusedGeometry, got {err:?}"
@@ -382,7 +512,7 @@ fn discovery_missing_attribute_fails_loud() {
         module_name: "mlp.gate_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("missing K must fail");
+    let err = build_manifest(&graph, &targets, None).expect_err("missing K must fail");
     match err {
         LoraInjectError::MissingAttribute { attr, .. } => assert_eq!(attr, "K"),
         other => panic!("expected MissingAttribute, got {other:?}"),
@@ -415,7 +545,7 @@ fn discovery_mlp_projections_resolve_direct() {
         LoraTarget { module_name: "mlp.gate_proj".into(), layer_index: 0 },
         LoraTarget { module_name: "mlp.down_proj".into(), layer_index: 0 },
     ];
-    let manifest = build_manifest(&graph, &targets).expect("mlp resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("mlp resolves");
     assert!(matches!(manifest.entries[0].placement, Placement::Direct));
     assert_eq!(manifest.entries[0].n, 18944);
     assert!(matches!(manifest.entries[1].placement, Placement::Direct));
