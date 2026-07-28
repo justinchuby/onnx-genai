@@ -3,20 +3,17 @@
 The runtime uses one KV capacity policy for ORT shared-buffer KV and native CUDA
 KV: `onnx_genai_kv::kv_capacity_bucket(required, hard_max)`. The policy rounds
 demand to a power-of-two bucket, applies the `ONNX_GENAI_KV_MIN_BUCKET` floor,
-and clamps to a hard maximum derived from model metadata and device capacity.
+and clamps only to factual limits: model metadata or an explicit user cap.
 
 ## Hard maximum
 
-The hard maximum is not a model-family constant. It comes from explicit caller
-configuration first (`load_with_cuda_kv_max_len`, `ONNX_GENAI_CUDA_KV_MAX_LEN`),
-otherwise from `model.max_sequence_length`, clamped by a queried CUDA
-free-memory growth budget using the graph's actual KV bytes per token. The
-growth budget accounts for the allocation-before-free sequence used by both
-backends: at a bucket boundary the old bucket remains live while the larger
-bucket and mask are allocated and filled, so the default ceiling is the largest
-capacity whose worst bucket transition fits inside the headroom budget. If
-neither metadata nor a CUDA memory query can provide a limit, native CUDA fails
-during load with an actionable configuration error instead of guessing.
+The hard maximum is not a VRAM prediction. It comes from explicit caller
+configuration first (`load_with_cuda_kv_max_len`, `ONNX_GENAI_CUDA_KV_MAX_LEN`,
+or the ORT shared-buffer cap), otherwise from `model.max_sequence_length`. Those
+are facts: the user asked for a cap, or the model cannot attend beyond its
+declared context. Native CUDA does not derive a ceiling from a free-memory
+snapshot; if metadata is unavailable and the user did not set a cap, it grows
+until allocation fails and reports that failure transactionally.
 
 ## Growth
 
@@ -30,6 +27,15 @@ capture, then commit the new capacity. ORT implements the primitive seam with
 `DeviceIoBinding` allocation, direct device-to-device prefix copies, and mask
 rewrites. Adding another backend should implement those primitives rather than
 re-derive the growth policy.
+
+Growth deliberately asks the device to allocate instead of predicting a safe
+VRAM ceiling. A failed grow is expected to be graceful and transactional: the old
+bucket, logical length, and capture state remain live, and the error reports the
+target bucket, approximate new allocation, approximate transient peak, current
+device free/total memory when available, bytes per token, and user levers. The
+transient peak matters because growth keeps the old bucket alive while allocating
+and filling the new bucket; peak KV+mask memory is roughly `(old + new) *
+bytes_per_token`, not just `new * bytes_per_token`.
 
 ## CUDA graph capture
 
@@ -46,3 +52,13 @@ path was exercised manually on an RTX 4060 Laptop GPU by forcing early buckets
 with `ONNX_GENAI_KV_MIN_BUCKET=4`, observing native CUDA growth from 4→8→16
 with graph recapture at each bucket and coherent continued generation. Automated
 CUDA coverage still depends on a GPU runner and model fixtures being available.
+
+On Windows/WDDM, forcing a real CUDA allocation failure is not reliable: the GPU
+memory manager virtualizes device memory and may page instead of making
+`cudaMalloc` fail, even after a separate process reserves enough VRAM for
+`cudaMemGetInfo` to report little or no free memory. The graceful-failure path is
+therefore covered by injected model-free tests at the shared
+`KvCapacityGrowthBackend` seam: allocation, prefix-copy, mask-allocation, and
+capture-invalidation failures assert actionable errors and unchanged session
+state. Linux/TCC GPU runners should still exercise real allocator failures when
+available.

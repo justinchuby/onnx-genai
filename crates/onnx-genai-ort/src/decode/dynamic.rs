@@ -1291,28 +1291,32 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for DecodeSession<'_> {
         // Build the replacement buffers first; only swap them in once every KV
         // tensor has been copied successfully, so a mid-way failure leaves the
         // session's existing state intact.
-        let mut grown = HashMap::with_capacity(self.kv_pairs.len());
-        for pair in &self.kv_pairs {
-            let old = self.current_kv.get(&pair.past).ok_or_else(|| {
-                OrtError::InvalidArgument(format!(
-                    "cannot grow KV: missing shared buffer for '{}'",
-                    pair.past
-                ))
-            })?;
-            let mut new_shape = old.shape().to_vec();
-            new_shape[pair.seq_axis] = i64::try_from(new_capacity)
-                .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
-            let new_value = grow_kv_value(
-                old,
-                &new_shape,
-                pair.seq_axis,
-                valid_len,
-                device,
-                self.kv_allocator.as_ref(),
-            )?;
-            grown.insert(pair.past.clone(), Arc::new(new_value));
-        }
-        Ok(grown)
+        let old_capacity = self.kv_capacity;
+        (|| {
+            let mut grown = HashMap::with_capacity(self.kv_pairs.len());
+            for pair in &self.kv_pairs {
+                let old = self.current_kv.get(&pair.past).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "cannot grow KV: missing shared buffer for '{}'",
+                        pair.past
+                    ))
+                })?;
+                let mut new_shape = old.shape().to_vec();
+                new_shape[pair.seq_axis] = i64::try_from(new_capacity)
+                    .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
+                let new_value = grow_kv_value(
+                    old,
+                    &new_shape,
+                    pair.seq_axis,
+                    valid_len,
+                    device,
+                    self.kv_allocator.as_ref(),
+                )?;
+                grown.insert(pair.past.clone(), Arc::new(new_value));
+            }
+            Ok(grown)
+        })()
+        .map_err(|error| self.kv_growth_failed_error(old_capacity, new_capacity, error))
     }
 
     fn build_grown_mask(
@@ -1333,13 +1337,15 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for DecodeSession<'_> {
         {
             let mask_len = i64::try_from(new_capacity)
                 .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
-            Ok(Some(self.build_grown_capture_mask(
+            self.build_grown_capture_mask(
                 new_capacity,
                 mask_len,
                 valid_ones,
                 on_device,
                 mask_device_id,
-            )?))
+            )
+            .map(Some)
+            .map_err(|error| self.kv_growth_failed_error(self.kv_capacity, new_capacity, error))
         } else {
             Ok(None)
         }
@@ -1370,6 +1376,76 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for DecodeSession<'_> {
 }
 
 impl DecodeSession<'_> {
+    fn kv_growth_bytes_per_token(&self) -> Option<usize> {
+        let mut bytes = if self.capture.is_some() {
+            std::mem::size_of::<i64>()
+        } else {
+            0
+        };
+        for pair in &self.kv_pairs {
+            let value = self.current_kv.get(&pair.past)?;
+            let shape = value.shape();
+            let mut elements = 1usize;
+            for (axis, dim) in shape.iter().copied().enumerate() {
+                if axis == pair.seq_axis {
+                    continue;
+                }
+                let dim = usize::try_from(dim).ok()?;
+                elements = elements.checked_mul(dim)?;
+            }
+            bytes = bytes.checked_add(elements.checked_mul(value.dtype().size_of())?)?;
+        }
+        Some(bytes)
+    }
+
+    fn kv_growth_failed_error(
+        &self,
+        old_capacity: usize,
+        new_capacity: usize,
+        error: OrtError,
+    ) -> OrtError {
+        let bytes_per_token = self.kv_growth_bytes_per_token();
+        let byte_summary = bytes_per_token
+            .map(|bytes_per_token| {
+                let new_bytes = new_capacity.saturating_mul(bytes_per_token);
+                let transient_bytes = old_capacity
+                    .saturating_add(new_capacity)
+                    .saturating_mul(bytes_per_token);
+                format!(
+                    "The attempted new KV allocation is approximately {new_bytes} bytes and the transient peak is approximately {transient_bytes} bytes because growth keeps the old bucket live until the new bucket and valid-prefix copy are complete. KV bytes/token: {bytes_per_token}."
+                )
+            })
+            .unwrap_or_else(|| {
+                "KV bytes/token could not be derived from the current shared buffers.".to_owned()
+            });
+        let memory = self
+            .session
+            .cuda_device_id()
+            .and_then(|device_id| {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda_rt::device_memory_info(device_id)
+                        .ok()
+                        .map(|memory| {
+                            format!(
+                                "CUDA free={} bytes, total={} bytes",
+                                memory.free_bytes, memory.total_bytes
+                            )
+                        })
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = device_id;
+                    None
+                }
+            })
+            .unwrap_or_else(|| "device free-memory query unavailable".to_owned());
+        OrtError::InvalidArgument(format!(
+            "shared-buffer KV capacity growth failed while growing from {old_capacity} to {new_capacity} tokens: {error}. \
+             {byte_summary} {memory}. The session state was left unchanged; reset or retry with a shorter prompt/max_new_tokens, set an explicit KV max length cap, or free VRAM used by other processes."
+        ))
+    }
+
     /// Build a replacement captured attention mask of `capacity` elements
     /// (shape `[1, mask_len]`) with the leading `valid_ones` set to 1 and the
     /// rest zero, preserving the mask's residency: device-resident when

@@ -197,3 +197,15 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 
 - Justin challenged the "metadata 131072, not clamped" DeepSeek result on the 8 GiB RTX 4060. The first clamp only checked final KV size (`0.85 * free / bytes_per_token`), but growth allocates the new bucket before freeing the old bucket.
 - Tightened the default hard maximum to the largest capacity whose worst old+new bucket transition fits inside the CUDA free-memory headroom budget. For the observed DeepSeek numbers (`free=5925502976`, `bytes/token=28680`), that clamps metadata 131072 to 110080 instead of allowing the 65536→131072 transition to exceed the 85% growth budget.
+
+## 2026-07-28T10:53:59-07:00 — VRAM ceiling removed; growth fails gracefully
+
+- Justin rejected the derived free-memory ceiling as guesswork. Removed the 85% CUDA-memory budget and the transient-growth hard-max arithmetic; only explicit user caps and `model.max_sequence_length` remain as factual ceilings.
+- Kept the transient peak insight in docs/diagnostics: growth holds old and new buckets simultaneously, so failure can happen at roughly `(old + new) * bytes_per_token`.
+- Native CUDA grow allocation/copy/mask failures now translate to an actionable, transactional error that says the old/new bucket, approximate new allocation, approximate transient peak, current CUDA free/total memory, bytes/token, recovery levers, and that session state was left unchanged.
+
+## 2026-07-28T11:43:45-07:00 — Injected KV grow-failure coverage
+
+- Documented the Windows/WDDM finding: exhausting reported free memory does not reliably produce CUDA allocator failure because the GPU memory manager can page/virtualize.
+- Added model-free injected-failure coverage at the shared `KvCapacityGrowthBackend` seam. Allocation failure now asserts the translated actionable error and proves the fake session's buffer id, logical length, capture generation, and capture-valid state remain unchanged before a successful retry.
+- Added mid-sequence injected failures for prefix-copy, mask allocation, and capture invalidation; all prove no commit and unchanged session state. Native/ORT commit phases remain effectively infallible assignments after all fallible work has completed.
