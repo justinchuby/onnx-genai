@@ -944,3 +944,85 @@ know):**
    `fused_slice`) sharing one `Add`, or (b) one op with a per-role sub-descriptor.
    (a) is simpler and reuses the Phase-1 slice logic (`FusedGroup.slices`); it
    means up to 3× the op count on fused exports. Acceptable, but note it.
+
+### J.9 What is wired end-to-end today (multi-adapter reachability)
+
+*Status as of 2026-07-28 (branch `feat/native-lora-p2`, PR #374).* The grouped
+subsystem (§J.1 op, §J.2 pool, §J.6 declared-manifest resolution) was fully
+built and unit-tested but had **zero production callers**. This section records
+what is now reachable end-to-end versus what remains deferred. Nothing here
+re-litigates §J.1–§J.8; it only states the current wiring.
+
+**User-facing surface (CPU, native backend).**
+
+* **CLI.** The existing `--adapter <PATH>` (single, always-on) is unchanged. A
+  new **repeatable** `--adapters <NAME=PATH>` preloads several named adapters at
+  once, and `--select-adapter <NAME>` on `generate`/`run` chooses which
+  preloaded adapter applies to that request (omit ⇒ base model). `--adapter` and
+  `--adapters` are mutually exclusive. A **single** `--adapters` entry collapses
+  to the same always-on single-adapter fast path as `--adapter` (see fast-path
+  note below) — the plural, per-request-selectable path engages only with **two
+  or more** adapters.
+* **Config.** `EngineConfig.lora_adapters: Vec<(String, PathBuf)>` (the plural,
+  grouped form) sits beside the existing `lora_adapter: Option<PathBuf>` (single,
+  DIRECT). `GenerateOptions.adapter: Option<String>` selects a preloaded adapter
+  by its identifier per request. The identifier is the explicit `NAME`, else the
+  file stem.
+
+**Fast-path preservation (the hard perf gate).** The grouped pool, the
+`GroupedLoraDelta` op, and the `lora.segments` feed are constructed **only when
+two or more adapters are configured**. Zero adapters and a single adapter both
+stay on the Phase-1 DIRECT 4-node path — the pool/registry/segments machinery is
+never built for ≤1 adapter, so the no-adapter and single-adapter paths are
+byte-for-byte the code they were before this change.
+
+**How an adapter identifier threads request → segments.**
+`GenerateOptions.adapter` (a name) → `NativeDecodeSession::select_lora_adapter`
+resolves it to an `AdapterId` via the session's name→id map (unknown name ⇒
+typed `UnknownLoraAdapter` error at admission, **never** a silent base
+fallback) → the resolved id is held as the session's *active route* → each
+decode step writes that route into a **reused** `lora.segments` Int32 buffer
+(cleared and refilled in place; capacity retained across steps, so there is no
+per-token heap allocation for the routing tensor after warmup) and binds it as
+the non-constant runtime input the grouped op reads. A `None` route (no adapter)
+writes `-1`, which the kernel treats as base-only.
+
+**Injection generalization.** `inject_grouped_multi` admits **N** adapters under
+distinct `AdapterId`s sharing one op set per target projection; adapter identity
+comes **only** from `segments`. All adapters in one grouped session must target
+an identical module set (same module name + layer index per position), enforced
+fail-loud via `AdapterModuleSetMismatch`; this is an honest constraint for this
+pass, not a silent truncation.
+
+**Wired (reachable + tested).**
+
+* config → CLI → engine load of N adapters → grouped injection + `BudgetedLoraPool`
+  registration (RAII-owned for the session lifetime, so budget/registry release
+  on teardown — no reintroduced leaks) → session build → per-request selection →
+  decode-loop `segments` feed.
+* **Per-request adapter selection on the native single-session backend**: each
+  `generate` call runs under one selected adapter (or base). Because a single
+  generation is one sequence, every run hits the kernel's uniform-batch fast
+  path. This is the shipped product surface.
+* Tests: `onnx-runtime-session` `grouped_two_adapters_route_per_row` (per-row
+  routing `[A,B,base,A]` through the executor) and
+  `grouped_multi_adapter_module_mismatch_fails_loud`; engine
+  `engine_multi_adapter_grouped_selects_per_request` (builds one session
+  preloading two adapters via `SessionBuilder::lora_adapters`, then selects
+  adapter A vs B vs base per run and asserts each output equals that adapter's
+  delta, A ≠ B, and an unknown name fails loud). The single-adapter
+  `engine_lora_path_applies_and_reverts_adapter_delta` still passes unchanged.
+
+**Deferred (honestly not done in this pass).**
+
+* **Mixed-adapter rows within ONE continuous batch** (§J.4/§J.5 P2e): threading a
+  per-row `adapter_id` through `scheduler::Request` / `RunningSequence` /
+  `ContinuousBatchRow` in the batched `ContinuousBatchManager` backend so a
+  single batch carries several adapters at once. The native single-session
+  backend delivers **per-request-grouped** selection (one adapter per generate
+  call), which is end-to-end reachable and tested; the batched backend still
+  routes a whole batch to base. This is the remaining step to the full §J vision.
+* **CUDA** grouped LoRA (§J.7): the grouped path is CPU-only and fails loud if a
+  grouped pool meets a CUDA execution provider.
+* **Speculative decoding + grouped adapter** combined: rejected fail-loud (the
+  draft/verify paths do not yet thread the route).
