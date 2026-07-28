@@ -42,6 +42,7 @@ cudarc = { version = "0.19", default-features = false, features = ["std", "drive
 minijinja = { version = "2", features = ["json"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 onnx-genai-genai-config = { workspace = true }
+onnx-genai-kv = { workspace = true }
 # The shared absolute trace time base, so these spans land on the same timeline
 # as the ones the runtime and its execution providers record.
 onnx-runtime-tracer = { workspace = true }

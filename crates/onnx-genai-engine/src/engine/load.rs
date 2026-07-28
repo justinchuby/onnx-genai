@@ -222,6 +222,10 @@ impl Engine {
                 native_device.clone(),
                 governor.weight_offload_host_cache(),
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.max_sequence_length),
                 config.decode_precision,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?

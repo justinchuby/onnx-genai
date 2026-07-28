@@ -160,3 +160,40 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 - 🟢 Approved Sapper's revision. `RewindRunnerPolicy` now keeps public `Engine::rewind_session_to` on `RejectRunnerRewind` while speculative draft alignment, draft rewind, target accept/reject rewind, and overmaterialized cleanup use `AllowRunnerRewind`.
 - Verified public runner-backed rewind rejects before scheduler/session/token/KV/runner mutation; policy-boundary tests would fail if allow/reject were flipped. Support matrix now matches the public API contract, with prepared/infallible runner rewind recorded as follow-up.
 - Validation: engine build/fmt/clippy passed; server/CLI builds passed; full engine lib suite now runs locally with ORT 1.27/API 27 (252 passed, 0 failed, 1 ignored); targeted failed-rewind/speculative/checkpoint tests passed.
+
+## 2026-07-28T08:22:00-07:00 — Native CUDA KV capacity derivation
+
+- Replaced the hardcoded 4096 native-CUDA KV fallback with capacity resolution from explicit programmatic/env overrides, otherwise `model.max_sequence_length` clamped to an 85% queried CUDA free-memory budget using actual KV bytes/token.
+- Kept the native path fixed-capacity: growing would replace device allocations/IoBinding pointers and invalidate CUDA graph capture, unlike ORT shared-buffer GQA's grow/rebind/recapture path.
+- Expanded capacity errors to include the source, metadata max length, CUDA free/total bytes when available, KV bytes/token, and both override knobs.
+- Validation: `cargo build -p onnx-genai-engine`, `cargo test -p onnx-genai-engine --lib`, `cargo fmt -p onnx-genai-engine -- --check`, and `cargo clippy -p onnx-genai-engine --all-targets -- -D warnings` passed locally; no CUDA device was available for real native-CUDA allocation/capture execution.
+
+## 2026-07-28T08:53:10-07:00 — Native/ORT KV capacity unification correction
+
+- Justin rejected the narrower "better native default" framing: native and ORT must share one KV capacity mechanism/capability, not two strategies for the same resource.
+- Moved/used `kv_capacity_bucket` as shared policy in `onnx-genai-kv`; ORT imports it and native CUDA now grows by the same bucket policy.
+- Native CUDA growth is compatible with graph capture when treated as a capture boundary: invalidate the graph, replace/copy device KV buffers, then re-warm/re-capture on subsequent single-token steps. Real recapture-after-growth still needs GPU validation.
+- Added `docs/native-ort-kv-capacity.md` to preserve the rationale and remaining validation gap.
+
+## 2026-07-28T09:10:46-07:00 — Capture/growth compatibility clarified
+
+- Justin clarified that dynamic growth and CUDA graph capture are compatible; ORT shared-buffer GQA is the reference, not a counterexample to native growth.
+- Updated the native CUDA comments/design note to describe bucket growth as a graph boundary and removed the obsolete framing that fixed capacity might be required for capture.
+- Native behavior now matches the ORT mechanism: grow by shared bucket, preserve the valid prefix, invalidate the stale capture, then re-capture on the new bucket.
+
+## 2026-07-28T09:16:58-07:00 — DRY shared KV grow driver
+
+- Justin asked for DRY after native mirrored ORT growth. Factored growth orchestration into `onnx-genai-kv::ensure_kv_capacity` with `KvCapacityGrowthBackend`.
+- Both ORT shared-buffer KV and native CUDA consume the shared driver; backend implementations only provide primitives for allocation, prefix preservation, mask replacement, capture invalidation, and commit.
+- Added policy-order tests proving fallible buffer/mask preparation happens before capture invalidation/commit and failure leaves current capacity untouched.
+
+## 2026-07-28T10:05:00-07:00 — Native CUDA KV growth verified on local GPU
+
+- Corrected the earlier bad assumption that this machine had no CUDA device: `nvidia-smi` reports an RTX 4060 Laptop GPU with 8188 MiB.
+- With `ONNX_GENAI_EP=cuda`, `ONNX_GENAI_REQUIRE_CUDA=1`, NVIDIA Python package DLL/header paths, and `ONNX_GENAI_KV_MIN_BUCKET=4`, real native CUDA DeepSeek generation grew KV 4→8→16, re-captured at each bucket, and continued coherently.
+- Capacity diagnostics were also exercised with `ONNX_GENAI_CUDA_KV_MAX_LEN=4`; the error now reports requested length, configured max/source, metadata max, CUDA free/total bytes, KV bytes/token, and the override/remediation knobs.
+
+## 2026-07-28T10:26:45-07:00 — CUDA KV clamp corrected for transient growth
+
+- Justin challenged the "metadata 131072, not clamped" DeepSeek result on the 8 GiB RTX 4060. The first clamp only checked final KV size (`0.85 * free / bytes_per_token`), but growth allocates the new bucket before freeing the old bucket.
+- Tightened the default hard maximum to the largest capacity whose worst old+new bucket transition fits inside the CUDA free-memory headroom budget. For the observed DeepSeek numbers (`free=5925502976`, `bytes/token=28680`), that clamps metadata 131072 to 110080 instead of allowing the 65536→131072 transition to exceed the 85% growth budget.

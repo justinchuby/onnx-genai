@@ -39,6 +39,95 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
 }
 
 #[test]
+fn cuda_kv_capacity_uses_metadata_with_memory_clamp() {
+    let capacity = resolve_cuda_kv_capacity(
+        None,
+        None,
+        Some(4096),
+        10,
+        Some(CudaDeviceMemorySnapshot {
+            free_bytes: 20_000,
+            total_bytes: 40_000,
+        }),
+    )
+    .unwrap();
+    assert_eq!(capacity.max_len, 1024);
+    assert!(
+        capacity
+            .source
+            .contains("model.max_sequence_length clamped by CUDA free-memory growth budget")
+    );
+}
+
+#[test]
+fn cuda_kv_capacity_clamp_accounts_for_allocate_before_free_growth() {
+    let capacity = resolve_cuda_kv_capacity(
+        None,
+        None,
+        Some(131_072),
+        28_680,
+        Some(CudaDeviceMemorySnapshot {
+            free_bytes: 5_925_502_976,
+            total_bytes: 8_585_281_536,
+        }),
+    )
+    .unwrap();
+    assert_eq!(capacity.max_len, 110_080);
+    assert!(
+        capacity
+            .source
+            .contains("model.max_sequence_length clamped by CUDA free-memory growth budget")
+    );
+}
+
+#[test]
+fn cuda_kv_capacity_honors_env_before_metadata() {
+    let capacity = resolve_cuda_kv_capacity(
+        None,
+        Some(8192),
+        Some(4096),
+        10,
+        Some(CudaDeviceMemorySnapshot {
+            free_bytes: 20_000,
+            total_bytes: 40_000,
+        }),
+    )
+    .unwrap();
+    assert_eq!(capacity.max_len, 8192);
+    assert_eq!(capacity.source, "ONNX_GENAI_CUDA_KV_MAX_LEN");
+}
+
+#[test]
+fn cuda_kv_capacity_error_explains_source_and_device_memory() {
+    let capacity = CudaKvCapacity {
+        max_len: 1024,
+        source: "model.max_sequence_length clamped by CUDA free-memory growth budget".to_owned(),
+        metadata_max_len: Some(4096),
+        device_memory: Some(CudaDeviceMemorySnapshot {
+            free_bytes: 20_000,
+            total_bytes: 40_000,
+        }),
+        bytes_per_token: 10,
+    };
+    let message = cuda_kv_capacity_exceeded_message(1025, &capacity);
+    assert!(
+        message.contains("requested context length 1025"),
+        "{message}"
+    );
+    assert!(message.contains("configured max_len 1024"), "{message}");
+    assert!(
+        message.contains("source: model.max_sequence_length"),
+        "{message}"
+    );
+    assert!(
+        message.contains("model.max_sequence_length: 4096"),
+        "{message}"
+    );
+    assert!(message.contains("CUDA free=20000 bytes"), "{message}");
+    assert!(message.contains("ONNX_GENAI_CUDA_KV_MAX_LEN"), "{message}");
+}
+
+#[test]
 fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     let shared = GraphCaptureStructuralSafety {
         device_is_cuda: true,
@@ -751,6 +840,7 @@ fn build_cuda_decoder(
         session,
         NativeDecodeCudaOptions {
             kv_max_len: Some(max_len),
+            metadata_max_len: None,
             graph_capture: Some(graph_capture),
         },
     )
@@ -1432,6 +1522,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         NativeDecodeDevice::Cuda { index: Some(0) },
         NativeDecodeCudaOptions {
             kv_max_len: Some(128),
+            metadata_max_len: None,
             graph_capture: Some(false),
         },
     )?;
@@ -1450,6 +1541,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         NativeDecodeDevice::Cuda { index: Some(0) },
         NativeDecodeCudaOptions {
             kv_max_len: Some(128),
+            metadata_max_len: None,
             graph_capture: Some(true),
         },
     )?;
@@ -1536,6 +1628,7 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
             NativeDecodeDevice::Cuda { index: Some(0) },
             NativeDecodeCudaOptions {
                 kv_max_len: Some(128),
+                metadata_max_len: None,
                 graph_capture: Some(graph),
             },
         )

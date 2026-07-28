@@ -64,6 +64,7 @@ pub enum NativeDecodeDevice {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeDecodeCudaOptions {
     pub kv_max_len: Option<usize>,
+    pub metadata_max_len: Option<usize>,
     pub graph_capture: Option<bool>,
 }
 

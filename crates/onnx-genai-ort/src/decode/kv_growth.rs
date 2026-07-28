@@ -1,4 +1,5 @@
 use super::*;
+pub(super) use onnx_genai_kv::kv_capacity_bucket;
 
 /// Where a shared-KV buffer lives, selecting the prefix-copy transfer used when
 /// growing it. Non-CUDA device EPs are rejected earlier (see
@@ -10,32 +11,6 @@ pub(super) enum GrowDevice {
     /// CUDA device-resident buffer: copy the prefix device-to-device via
     /// `cudart` (`cudaMemcpy` / `cudaMemset`).
     Cuda,
-}
-
-/// Round a required sequence length up to the shared-KV bucket capacity.
-///
-/// Buckets are powers of two (at least the minimum bucket floor), clamped to the
-/// model's hard `max_length`. The caller must reject lengths above that ceiling
-/// before bucketing. Sizing the shared KV buffers to the bucket rather than the
-/// full `max_length` keeps captured-decode
-/// per-step attention cost ~O(actual length) — matching onnxruntime-genai —
-/// while the sequence only crosses O(log length) bucket boundaries, so the
-/// buffers (and the captured CUDA graph) are grown/re-captured that few times.
-/// See [`DecodeSession::kv_capacity`] for the measured motivation.
-///
-/// The minimum bucket floor defaults to 256 and can be overridden with the
-/// `ONNX_GENAI_KV_MIN_BUCKET` environment variable. The default is a good
-/// balance across models (a large `max_length` model that generates few tokens
-/// pays no capacity tax, while short generations avoid frequent early growth);
-/// the override exists for per-deployment tuning without a rebuild.
-pub(super) fn kv_capacity_bucket(len: usize, hard_max: usize) -> usize {
-    const MIN_BUCKET_DEFAULT: usize = 256;
-    let min_bucket = std::env::var("ONNX_GENAI_KV_MIN_BUCKET")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(MIN_BUCKET_DEFAULT);
-    len.next_power_of_two().max(min_bucket).min(hard_max)
 }
 
 /// Allocate a `new_shape` shared-KV buffer and copy the valid sequence prefix

@@ -2303,6 +2303,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "onnx-genai-genai-config",
+ "onnx-genai-kv",
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
