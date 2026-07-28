@@ -43,3 +43,18 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 - Guard-break proven: restoring old names triggers lint failure with actionable error.
 - All 945 tests pass; clippy green on both aarch64 and x86_64; dispatch-reachability tests unchanged.
 - Filed to `.squad/decisions/inbox/resch-platform-naming-lint.md`.
+
+## 2026-07-27 — Cross-Target Compilation Check (PR #319)
+
+Phase 0 of Roy's structural fix plan.  Added `scripts/check_cross_compile.sh` —
+catches `cfg(target_os)` gating errors that the `x86_64-apple-darwin` recipe misses.
+
+- Script targets `x86_64-unknown-linux-gnu` (changes both arch AND os).
+- On CI (ubuntu-latest): full offline crate set, native target — no overhead.
+- On macOS (local dev): FFI-free subset (ort-sys/cpuinfo excluded due to missing Linux headers).
+- Uses `--all-targets` (is_undilated and #227 were in lib-test builds).
+- Teaching failure message explains WHY x86_64-apple-darwin is insufficient, cites PR #317.
+- Guard-break proof: synthetic `is_undilated` in onnx-runtime-ir — old recipe passes, new script fails.
+- Wired into `.github/workflows/ci.yml` quality job.
+- Known gaps: can't check ep-cpu from macOS; can't catch runtime dispatch; Windows cfg via portable matrix.
+- Filed to `.squad/decisions/inbox/resch-cross-compile-check.md`.

@@ -117,6 +117,12 @@ jobs:
           -p onnx-std-python
           -- -D warnings
 
+      # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
+      # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
+      # target that exercises BOTH dimensions.  PR #317 proved the gap.
+      - name: Cross-target compile check (catches os-gating errors)
+        run: bash scripts/check_cross_compile.sh
+
       # onnx-genai-engine's native decode path only compiles when this feature
       # is on. Without this step a refactor can leave it uncompilable while
       # every other job still passes -- which is exactly what happened when
