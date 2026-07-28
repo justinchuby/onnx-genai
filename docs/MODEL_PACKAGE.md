@@ -96,8 +96,11 @@ Its schema has:
 - consumer-owned `executor_info` namespaces. The standalone library deliberately
   knows nothing about ONNX, sessions, EPs, or the JSON under
   `executor_info["ort"]`;
-- `portable` layout confinement by default, while `installed` may use absolute
-  paths and `..`;
+- `portable` layout confinement by default; the `installed` layout may use
+  absolute paths and `..` **only** when the embedding application explicitly
+  opts in via the caller-supplied `HostTrust::AllowInstalledLayout` policy. The
+  manifest declaring `"layout": "installed"` never, on its own, escapes the
+  package root — untrusted packages are always confined;
 - content-addressed shared-asset directories referenced as
   `sha256:<digest>[/confined/tail]`.
 
@@ -922,7 +925,13 @@ engine = nxrt.genai.Engine.from_model("phi4.nxpkg", device="auto")
 
 Packages are untrusted input. Before session creation:
 
-- enforce portable path confinement and reject traversal;
+- enforce path confinement and reject traversal by canonicalizing every
+  manifest-derived path (including implicit files such as an external
+  component's `component.json`) and verifying the real path stays under the
+  canonicalized package root, so an in-package symlink cannot escape it. The
+  `installed` layout may relax confinement only under an explicit
+  caller-supplied `HostTrust::AllowInstalledLayout` policy; the manifest alone
+  can never grant itself escape;
 - reject archive path collisions after normalization, symlinks, hardlinks,
   devices, FIFOs, and extraction outside the cache root;
 - cap manifest/config size, archive entry count, expanded bytes, and compression
