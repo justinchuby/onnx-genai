@@ -33,3 +33,6 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Reviewed PR #303 / #59 and approved after byte-identical scheduled-vs-greedy/sequential parity plus mutation probes.

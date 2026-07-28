@@ -9706,3 +9706,481 @@ integration-tested via `matmul_half_dispatch_matches_widened_reference_across_ir
 The manifest listed the following inbox note(s), but they were not present in `.squad/decisions/inbox/` at merge time: gorman-kv-preemption-61.md, deckard-pr288-testfix-67.md. The durable PR outcome is preserved in the wave summary and reviewer notes above where available.
 
 <!-- scribe-merge-2026-07-27T19-35-00Z-roadmap-wave-end -->
+
+<!-- scribe-merge-2026-07-27T02-00-00Z-roadmap-59-62-76-85-start -->
+
+<!-- merged from .squad/decisions/inbox/brett-graphview-lens-76.md -->
+### 2026-07-27: GraphView capability claims preserve connected partition boundaries
+**By:** Brett
+**What:** Implement native EP capability discovery over a validated `FrozenGraph`/cached `GraphView`. `OrtGraphView::query_capabilities` emits one deterministic maximal connected claim per supported region, with crossing-edge boundaries derived in topological order. Unsupported nodes split claims; disconnected claims for one EP are never flattened.
+**Why:** This follows the GraphView lens design's immutable structural layer and atomic-claim model while deriving support through `ExecutionProvider::supports_node` and each EP's existing `supports_op`/kernel registry. Executor placement and the broader `FrozenPlan` migration remain separate follow-up work because the current executor still performs structural rewrites and graph-field placement.
+
+<!-- merged from .squad/decisions/inbox/lambert-paged-gqa-kv-62.md -->
+# Decision — GQA Tier B: runtime-managed (paged) KV materialization (#62)
+
+**Author:** Lambert (attention/KV-cache)
+**Date:** 2026-07-27
+**PR:** https://github.com/justinchuby/onnx-genai/pull/304
+**Branch:** `squad/62-paged-gqa-kv` (worktree `/home/justinchu/wt-lambert-62`)
+
+## What
+Implemented a correct, well-tested slice of Tier B (runtime-managed paged KV) for
+the pure-Rust CPU GroupQueryAttention path, composing with the existing
+`onnx_genai_kv::PagedKvCache` rather than duplicating paging.
+
+- `onnx-runtime-ep-cpu/kernels/sdpa.rs`: extracted `sdpa_decode_row_accessor`
+  (row-accessor SDPA core); `sdpa_decode_row` now delegates to it. Bit-identical
+  refactor — the reuse point that lets attention read paged KV in place.
+- `onnx-genai-kv`: zero-copy `Page::head_token_f32` +
+  `PagedKvCache::head_token_row` (borrow a head's contiguous f32 K/V row from its
+  owning page; `None` for quantized components).
+- `onnx-genai-engine/native_decode/paged_gqa.rs`: `paged_gqa_decode_step`
+  (append into persistent pages, attend over pages), a fresh-present oracle
+  `flat_gqa_decode_step`, and the `GQA_PRESENT_ALLOCATIONS` counter.
+
+## Why this shape
+Full Tier B (rewiring the live engine session to decode the whole model through
+paged storage) is the cross-cutting change the design doc explicitly defers and
+risks breaking end-to-end decode. Per the task's escape hatch, shipped the CPU
+paged-append + in-place-read primitive with the two decisive, falsifiable
+guarantees, and documented the remainder as deferred.
+
+## Proofs
+- **Byte-identical**: paged output == Tier A fresh-present output bit-for-bit
+  (`f32::to_bits`) across multi-step growth, page-boundary crossings
+  (incl. `page_size=1`), MHA/GQA/MQA, softcap, sliding window, prefill→decode.
+  Guaranteed because both paths share one SDPA core (identical dot/scale/softcap/
+  f64-softmax/axpy order).
+- **Zero per-step present allocation**: `GQA_PRESENT_ALLOCATIONS` stays flat for
+  the paged path over 16 steps; the flat reference increments once per step
+  (mirrors #286 eviction-counter style).
+
+## Validation
+- `cargo test -p onnx-genai-kv` → 92 passed (2 new).
+- `cargo test -p onnx-runtime-ep-cpu` → 945 passed / 9 ignored.
+- `cargo test -p onnx-genai-engine` → green (default). `--features native-backend
+  --lib` → 282 passed (8 new paged_gqa tests).
+- `cargo fmt --all -- --check` clean; `cargo clippy -p onnx-runtime-ep-cpu
+  -p onnx-genai-kv --all-targets -- -D warnings` clean (engine module also linted
+  under native-backend).
+- `cargo build --workspace` fails ONLY in `onnx-runtime-cpuinfo` (uninitialized
+  `vendor/cpuinfo` submodule — pre-existing env issue). Touched crates build.
+
+## Deferred
+- Live-session wiring (retire kernel present materialization on the paged path).
+  A complementary in-place present==past aliasing form already exists in
+  `group_query_attention.rs::detect_inplace_kv` + `native_decode/cpu.rs`.
+- CUDA GQA Tier B.
+- Composing sliding-window/attention-sink eviction with the in-place paged read.
+
+## Reviewer notes
+- Cross-crate surface: ep-cpu sdpa accessor (bit-identical), kv row accessor,
+  engine `native_decode::paged_gqa` (gated on `native-backend`).
+- Run the new engine tests with `cargo test -p onnx-genai-engine
+  --features native-backend --lib paged_gqa`.
+- Not self-merged; worktree left in place.
+
+<!-- merged from .squad/decisions/inbox/sebastian-pr303-review-59.md -->
+# Sebastian — Adversarial review of PR #303 (issue #59: wire continuous batching / Scheduler into engine serving loop)
+
+**Verdict: APPROVE**
+Author: Kane. Reviewer: Sebastian (independent, fresh worktree `/home/justinchu/wt-sebastian-303` @ `634da8b8`).
+
+## Scope of change (diff read in full)
+- `crates/onnx-genai-engine/src/batched.rs`: new `Engine::run_continuous_batch_scheduled(requests, max_batch)`; extracted `admit_pending_into_row` helper (pure refactor of existing greedy admission).
+- `crates/onnx-genai-scheduler/src/lib.rs`: additive `Scheduler::config()` getter only.
+- New test `tests/engine_continuous_batch_scheduled.rs` (CPU tiny-llm-scatter static-cache, greedy/temp=0, 1 intra-op thread).
+- Public `generate`/`generate_in_session` APIs unchanged. Session path (`drive_next_fcfs`) untouched.
+
+## Byte-identical parity — REAL and mutation-proof (checklist #2)
+Tests assert scheduled output == sequential per-request baseline AND == greedy `run_continuous_batch`, exact `GenerateResult` equality (token ids + text), across: ragged prefill, admission+mid-batch finish/row-refill (max_batch=3, 7 reqs), batch-of-1 == `generate`, and max_batch invariance (1/2/4/16).
+- Clean run: 4/4 parity tests pass; scheduler crate 15/15 pass.
+- **MUTATION PROBE:** perturbed physical row 1's logits (`logits[0] += 100.0`) in `advance_row` (batched.rs:~283, batched path only — does not touch sequential `generate`). Result: `scheduled_continuous_batch_matches_sequential_under_admission_eviction` and `scheduled_matches_greedy_and_is_batch_size_invariant` **FAILED** as required; batch-of-1 and empty correctly still passed (row 1 unused). Reverted; `git diff` clean; re-confirmed green. Tests are not hollow.
+
+## Stable row occupancy / KV hazard (checklist #3)
+Scheduled path submits the *entire* scheduler-eligible set into the manager queue before `step()`, so greedy same-step backfill keeps occupancy stable (no lazily-fed one-per-freed-row). Under default config (no effective byte gating) all requests are admitted on the first `schedule()` → queue is full → decode path is bit-identical to greedy. The mid-batch-finish parity test exercises eviction/refill and the mutation proves it detects per-row divergence. A finished row is deactivated then later prefilled with a *fresh* sequence (normal admission), never a live-row idle-then-reactivate. OK.
+
+## Scheduler governance (checklist #4)
+Admission genuinely flows from `scheduler.schedule().prefill` (lib.rs:271–336), gated by FCFS ordering + `max_total_tokens` token budget; `PreemptionPolicy::Disabled` set explicitly and honestly documented. Progress guard bails on a true stall. `scheduler.complete()` released on manager finish. No silent self-admission.
+
+## Deferred scope honestly documented (checklist #5)
+Session-level batching (`generate_in_session` one-per-forward) and manager-row preemption/swap are called out as deferred in both code doc-comment and PR body; the diff does not silently implement them. Honest.
+
+## CI / quality gates (checklist #6)
+`gh pr checks 303`: ALL green — Rust (Linux x86_64, Windows x86_64, Windows ARM64, macOS arm64), Rust quality, Rust coverage, CUDA compile (Linux/Windows), CLI ORT coverage, codecov. Locally on touched crates: `cargo fmt --all -- --check` clean; `cargo clippy -p onnx-genai-engine -p onnx-genai-scheduler --all-targets -- -D warnings` clean; tests green. No arch-specific breakage observed.
+
+## Minor finding (non-blocking)
+The engine's real scheduler is built with `Scheduler::with_byte_budget(config, governor.byte_budget())` (engine/load.rs:209,388), but the dedicated per-call scheduler uses `Scheduler::new(scheduler_config)` (batched.rs:741), which leaves `byte_budget = None`. Only the token budget (`max_total_tokens`) is effective; the shared cross-session **ByteBudget is NOT inherited**, so `try_reserve_bytes` always succeeds and byte-budget admission is effectively inert in this path. The PR body wording ("byte/token budget inherited"; "byte-budget admission still holds") is therefore slightly overstated. This does NOT affect the byte-identical output invariant (byte budget only gates admission ordering/throttling) and physical concurrency remains bounded by `max_batch` rows, so it is not a correctness/parity issue. Recommend either wiring the governor byte budget in (consistent with the global device ceiling) or softening the wording; either way a non-blocking follow-up, cleanly aligned with the #286 paged-KV budget work.
+
+## Bottom line
+Correctness invariant is upheld and defended by mutation-proof tests; refactor is faithful; APIs stable; CI + local quality gates green. One documentation/governance nit, non-blocking. APPROVE.
+
+<!-- merged from .squad/decisions/inbox/tyrell-pr304-review-62.md -->
+# Tyrell — Adversarial Review: PR #304 (issue #62, Tier B paged GQA KV)
+
+**Verdict: APPROVE**
+Reviewer: Tyrell (independent adversarial). Author: Lambert. Worktree: `/home/justinchu/wt-tyrell-304` @ `3a52ca9c` (`origin/squad/62-paged-gqa-kv`).
+
+## Scope reviewed
+Additive Tier B primitive: ep-cpu `sdpa_decode_row_accessor` extraction; kv `Page::head_token_f32` + `PagedKvCache::head_token_row` (zero-copy f32 page read); engine `native_decode::paged_gqa` (`paged_gqa_decode_step`, `flat_gqa_decode_step` oracle, `GQA_PRESENT_ALLOCATIONS`). Docs updated.
+
+## Invariant A (byte-identical Tier A vs Tier B) — VERIFIED
+- Parity tests assert `f32::to_bits` equality every step, covering: MHA multistep, GQA group broadcast (8h/2kv), MQA (4h/1kv), prefill→decode (q_seq=5), **page_size=1 boundary**, softcap, sliding window. All 8 tests pass.
+- Refactor is genuine delegation: `sdpa_decode_row` now supplies contiguous slices to the shared accessor core; math order (`dot`→`scale`→`softcap`→f64 softmax→`axpy`) unchanged (sdpa.rs:307-401).
+- `head_token_f32` offset formula `head*head_len + token_offset*head_dim` (page_table.rs:551-553) matches `write_head_token`/`value_at_slot` exactly. kv test cross-checks against `materialize_sequence` element-for-element.
+
+## Invariant B (zero per-step present alloc) — VERIFIED
+- `GQA_PRESENT_ALLOCATIONS` incremented at the ACTUAL present-alloc site in `flat_gqa_decode_step` (paged_gqa.rs:245); paged path never allocates a present buffer. Test asserts flat grows by exactly `steps`, paged stays flat.
+
+## Mutation probes (all bit)
+1. `score *= scale * 1.0001` in accessor core → ep-cpu `decode_row_f64_intermediate_is_bit_exact_with_gqa_reference` + `split_decode...` FAIL. Restored.
+2. `head_token_row(...s)` → `s.saturating_sub(1)` (one-token offset) → 7/8 parity tests FAIL. Restored.
+3. paged `kvh = qh/group` → `qh % num_kv_heads` (wrong GQA map) → all 4 GQA/broadcast tests FAIL; MHA/MQA pass (formulas coincide there — correct). Restored.
+4. Stray `GQA_PRESENT_ALLOCATIONS.fetch_add` on paged path → zero-alloc test FAIL (16 vs 0). Restored.
+
+Worktree confirmed clean after all probes (`git diff --stat` empty).
+
+## Group broadcast (#5) — CORRECT
+`kvh = qh / group`, `group = num_heads/num_kv_heads` (paged path, paged_gqa.rs:156), identical to flat oracle. Probe 3 proves the test bites on a wrong map.
+
+## In-place restride/alias hazard (#6) — NOT touched
+`paged_gqa_decode_step` is only re-exported from mod.rs; NOT invoked from live decode (`cpu.rs`). Does not touch `group_query_attention.rs` in-place path. Deferred scope (live-session wiring, CUDA Tier B, sliding-window+paged eviction composition) is honestly documented in the design doc, not silently claimed.
+
+## CI / quality
+- `cargo test -p onnx-genai-kv -p onnx-runtime-ep-cpu`: pass. `-p onnx-genai-engine --features native-backend --lib paged_gqa`: 8/8 pass.
+- `cargo fmt --all -- --check`: clean. `cargo clippy` (touched crates, native-backend, all-targets, `-D warnings`): clean.
+- `gh pr checks 304`: all green except "Rust (Windows ARM64)" pending (unrelated). Rust quality gate green.
+
+## Conclusion
+Refactor is a real bit-identical extraction; parity + zero-alloc invariants are falsifiable and bite correctly; deferred scope is honest; quality gates green. APPROVE.
+
+<!-- merged from .squad/decisions/inbox/leon-pr300-review-76.md -->
+# Decision note — Leon adversarial review of PR #300 (issue #76: GraphView/lens EP capability projection)
+
+**Reviewer:** Leon (independent adversarial reviewer, not the author)
+**Author:** Brett
+**Branch:** squad/76-graphview-lens @ a42c95ce
+**Worktree:** /home/justinchu/wt-leon-300
+**Date:** 2026-07-28
+
+## VERDICT: REQUEST-CHANGES
+
+One high-confidence correctness defect: the partitioner can emit a **non-convex
+(cyclic / unschedulable) partition**. Everything else in the checklist passes and
+is genuinely falsifiable.
+
+## Checklist results
+
+1. Diff read in full. ✓
+2. **Registry-derived capability — CONFIRMED.** `query_capabilities`
+   (abi/mod.rs:365-420) filters via `ep.supports_node` → default adapter
+   (provider.rs:389-419) → `supports_op` → CPU `registry.supports`
+   (registry.rs:85-92). Not a hardcoded op list.
+   - Mutation Probe A: stubbed `OpRegistry::supports` to `return true`.
+     `onnx-runtime-ep-cpu::graph_view_capabilities_follow_the_cpu_kernel_registry`
+     FAILED (provider.rs:443) and mock `graph_view_capability_splits_regions_at_unsupported_nodes`
+     FAILED. Restored. → claims cannot silently drift from the registry.
+3. **Read-only lens — CONFIRMED.** `GraphView` holds `&Graph` + `&GraphViewCache`
+   (graph_view.rs), is `Copy`, exposes no `&mut` and no interior mutability.
+   Mutation is only possible after `FrozenGraph::into_graph()` consumes `self`
+   and drops the cache. Borrow-checker enforced.
+4. **Partition correctness — DEFECT (non-convex partition).** See below.
+5. **Domain normalization — CONFIRMED.** `registry::norm_domain` maps
+   `"ai.onnx"`→`""` (registry.rs:34) and IR canonicalizes default domain to `""`.
+   - Mutation Probe C: broke `norm_domain` to not normalize. `mock_ep`
+     `graph_view_capability_claims_all_supported_connected_nodes` and
+     `graph_view_capability_keeps_contrib_domains_distinct` FAILED. Restored.
+   - Cosmetic nit: `CpuExecutionProvider::supports_op` (provider.rs:141-145)
+     builds a `domain` var spelled `"ai.onnx"` for diagnostics only; dispatch
+     correctly uses `op.domain` through the normalizing registry. No functional
+     drift.
+6. **Falsifiability — CONFIRMED.** 3 mutation probes each flipped the relevant
+   test to FAIL; tests are real guarantees, not smoke tests.
+7. **CI — GREEN.** `gh pr checks 300`: all pass (Rust Linux x86_64, Windows
+   ARM64/x86_64, macOS arm64, coverage, quality). Locally: `cargo test -p
+   onnx-runtime-ep-api -p onnx-runtime-ep-cpu -p onnx-runtime-ir` all pass;
+   `cargo fmt --all -- --check` clean; `cargo clippy` on the 3 touched crates
+   with `-D warnings` clean. Workspace build blocked only by pre-existing
+   uninitialized cpuinfo submodule (environmental, also red on main — not this PR).
+8. **Executor/FrozenPlan deferral — honest.** PR body "Follow-up" and design doc
+   §3-4 clearly mark executor consumption + FrozenPlan migration as deferred.
+
+## The defect (checklist #4): non-convex partition
+
+`query_capabilities` (abi/mod.rs:388-420) grows each claim by **undirected
+connectivity** over supported nodes: it walks both producer edges (lines 398-406)
+and consumer edges (lines 407-415), merging any two supported nodes joined by a
+data edge into one component. It never checks convexity — i.e. whether two
+supported nodes are also linked by a path through *unsupported* nodes.
+
+Minimal reproducer (verified with a temporary test using `CpuExecutionProvider`,
+which supports `Add` but not `UnregisteredCustom`):
+
+```
+A = Add(i, i)            -> v1     (supported)
+U = UnregisteredCustom(v1) -> v2   (UNsupported)
+B = Add(v1, v2)          -> v3     (supported, graph output)
+```
+
+Result: `claims.len()==1`, `claim[0].node_ids=[A,B]`,
+`inputs=[i, v2]`, `outputs=[v1, v3]`.
+
+The single claim {A,B} **consumes v2 (produced by U) and produces v1 (consumed by
+U)** → a dependency cycle between the fused claim and U. This partition is
+unschedulable: you cannot topologically order {claim, U}. ORT's `GetCapability`
+avoids exactly this by requiring convex partitions; connected-components alone is
+insufficient.
+
+This is realistic (a supported op feeding both a supported and an unsupported op,
+whose result rejoins — e.g. residual branches). No existing test covers it, and
+the PR advertises "deterministic maximal connected SubgraphClaim regions ...
+preserving partition boundaries" without documenting this limitation.
+
+### Requested change
+Make the partitioner convex: after connected-component grouping, split any
+component that has a back-path through non-member nodes (or grow components only
+along edges that preserve acyclicity of the quotient graph), and add a boundary
+test for the A→U→B rejoining pattern. Alternatively, if convexity is intentionally
+deferred, document it explicitly and add a `#[test]`/doc note stating the
+primitive may emit non-convex claims that the (deferred) executor must reject.
+
+## Strengths
+- Registry-sourced, read-only, and domain-normalized guarantees are all real and
+  falsifiable (verified by mutation).
+- Cache build (graph_view.rs) preserves deterministic topo order and existing
+  `(NodeId, slot)` consumer ordering; good boundary/empty/unregistered/contrib
+  tests.
+- CI fully green incl. cross-arch; deferral is documented honestly.
+
+---
+
+## RE-REVIEW (2026-07-28, commit 1b3fdbd7 by Rachael) — VERDICT: APPROVE
+
+The blocking non-convex-partition defect is fixed. Delta is exactly the convexity
+fix + regression test (`abi/mod.rs` +185/-30, `tests/mock_ep.rs` +84); **no scope
+creep**, and my previously-verified properties (registry-derived capability in
+`registry.rs`, domain normalization, read-only `graph_view.rs` lens) are untouched
+by this commit.
+
+**Fix design (abi/mod.rs):** deterministic `UnionFind` (union-by-size, lowest-index
+tie-break, `find` w/o path compression so it works behind `&self`). Two supported
+nodes fuse across a producer→consumer edge only if `merge_preserves_convexity`
+(trial-merge clone + `condensed_graph_is_acyclic`, Kahn over partition reps with
+cross-partition value deps as edges). Non-convex merges are rejected → region
+splits into multiple convex claims.
+
+**Re-ran my original mutation probe (independently):** forced
+`merge_preserves_convexity → true`. `graph_view_capability_splits_nonconvex_partitions`
+FAILED with the exact cyclic claim `node_ids=[0,2], inputs=[.,ValueId(2)],
+outputs=[ValueId(1),.]` ({A,B} consuming U's output and producing A consumed by U).
+Restored → PASS. The test is a real guarantee, not a smoke test.
+
+**Harder adversarial cases I constructed (temp CpuExecutionProvider test, all PASS,
+verified convex via independent Kahn check on emitted claims):**
+- Adjacency + 2-hop unsupported bypass (A→U1→U2→B while A→B adjacent): splits to 2. ✓
+- Diamond, two unsupported paths: 2 convex claims. ✓
+- Alternating chain A→U1→B→U2→C: 3 convex claims. ✓
+- Partial fusion (A→B→C + A→U→C bypass): fuses {A,B}, splits {C} → sizes [2,1]. ✓
+- Pure supported chain A→B→C: fuses to 1 claim of 3 (no over-split). ✓
+- Determinism: identical claim ordering across 50 runs. ✓
+I could NOT construct a non-convex claim.
+
+**CI:** `gh pr checks 300` all green (Rust quality + Linux/Windows-ARM64/Windows-x86_64/
+macOS-arm64 + coverage). Local: `cargo test -p onnx-runtime-ep-api -p onnx-runtime-ep-cpu
+-p onnx-runtime-ir` all pass (incl. new test); `cargo fmt --all -- --check` clean;
+`cargo clippy` on the 3 touched crates `-D warnings` clean. Workspace build still
+blocked only by the pre-existing cpuinfo submodule (environmental).
+
+Final verdict: **APPROVE.**
+
+<!-- merged from .squad/decisions/inbox/rachael-pr300-convexfix-76.md -->
+# Decision: convex partitioning in `query_capabilities` (PR #300, issue #76)
+
+- **Author:** Rachael (graph/EP-API)
+- **Context:** Independent reviewer Leon issued REQUEST-CHANGES on PR #300
+  (branch `squad/76-graphview-lens`, authored by Brett). Brett was locked out;
+  Rachael owned the fix independently.
+
+## Defect
+
+`OrtGraphView::query_capabilities` grew EP capability claims by **undirected**
+connectivity over supported nodes with **no convexity check**. That could
+produce a non-convex, unschedulable partition: a fused claim that both consumes
+a value produced by an excluded node and produces a value that same excluded
+node consumes, forming a dependency cycle. ORT's `GetCapability` requires convex
+partitions.
+
+Reproducer: `A = Add -> a` (supported), `U = Custom(a) -> u` (unsupported),
+`B = Add(a, u) -> b` (supported). The old code fused `{A, B}` (inputs `[i, u]`,
+outputs `[a, b]`) — a cycle `{A,B} -> U -> {A,B}`.
+
+## Fix
+
+`crates/onnx-runtime-ep-api/src/abi/mod.rs`:
+
+- Replaced the undirected DFS component growth with a deterministic union-find
+  (`UnionFind`, union-by-size, lowest-index tie-break) over all nodes.
+- Two supported nodes are fused only when the merge keeps the **condensed graph**
+  (partition representatives as vertices, cross-partition value dependencies as
+  edges) **acyclic** — verified with Kahn's algorithm in
+  `condensed_graph_is_acyclic`, gated by `merge_preserves_convexity` (trial-clone
+  of the union-find). This is a general, reusable convexity guard, not a
+  special-case for the reproducer.
+- On a convexity conflict the region splits into multiple valid convex claims.
+- Claim ordering (by first topological node) and boundary input/output value
+  sets are preserved deterministically; `claim_for_component` is unchanged.
+
+## Test / mutation proof
+
+- New regression test `graph_view_capability_splits_nonconvex_partitions`
+  (`crates/onnx-runtime-ep-api/tests/mock_ep.rs`) encodes Leon's exact A/Custom/B
+  reproducer and asserts two single-node convex claims with no consume-and-produce
+  cycle through an external node.
+- **Mutation:** forcing the merge unconditionally (revert of the convexity check)
+  makes the new test FAIL — it yields the cyclic `{A, B}` claim (node_ids
+  `[0, 2]`, input `v2`, output `v1`). Restoring the check makes it PASS.
+- Brett's existing capability tests (all-supported connected, split at
+  unsupported, empty/unregistered, contrib-domain distinct) remain green.
+
+## Validation
+
+- `cargo test -p onnx-runtime-ep-api -p onnx-runtime-ep-cpu -p onnx-runtime-ir`
+  — all pass (ep-api 41+12, ep-cpu 946+16, ir 62).
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy -p onnx-runtime-ep-api -p onnx-runtime-ep-cpu -p onnx-runtime-ir
+  --all-targets -- -D warnings` — clean.
+
+Committed `1b3fdbd7` and pushed to `squad/76-graphview-lens`. Worktree left in
+place at `/home/justinchu/wt-rachael-76` for re-review.
+
+<!-- merged from .squad/decisions/inbox/roy-pr301-review.md -->
+### 2026-07-27: PR #301 (issue #85) compute-in-place — VERDICT: REQUEST-CHANGES
+
+**By:** Roy (independent adversarial review; author Holden locked out)
+**PR:** #301 `squad/85-compute-in-place` — graph-level compute-in-place aliasing for eligible ops.
+
+**Verdict:** REQUEST-CHANGES. A reachable, **default-ON** correctness break: the
+in-place liveness analysis ignores implicit control-flow subgraph captures.
+
+**Root cause:** `executor/build.rs` computes `last_use` only over `node.inputs`
+(formal inputs). If/Loop/Scan bodies capture outer values *by name* at runtime
+(`control_flow.rs::prepare_subgraph` → `value_tensor`), and those captures are
+NOT in any plan node's `inputs`. A value whose last *formal* use is an
+in-place-eligible unary but which is *also* captured by a later control-flow node
+is wrongly marked dead; `alias_input_as_output` removes its buffer → the later
+capture reads corrupted/missing data.
+
+**Repro (proven):** parent graph `Tanh(X)->t` (X's last formal use) + `If(cond)`
+whose branches capture `X`. Default (enabled) → run FAILS: "control-flow body
+'then_branch' captures free variable 'X', but it is not available in the
+enclosing scope" (X's buffer was aliased away). `ONNX_GENAI_COMPUTE_IN_PLACE=0`
+→ passes, Y=[3,4]. Pure regression on previously-working models.
+
+**Mutation probes (both pass — the two shipped tests are real):**
+- Unsafe-alias (force predicate true, ignore `dead`): still-live refusal test
+  FAILS ("missing buffer for input value#0"). Corruption is caught.
+- Neuter firing (`inplace_input = None`): firing test FAILS (alias_count 0 vs 2).
+
+**Validation:** session/ep-cpu/ep-api/engine tests, fmt, clippy all pass; all CI
+green. The gap is untested behavior, not a failing test.
+
+**Required fix:** extend last-use/liveness to include implicit control-flow
+captures (walk each control-flow node's subgraphs, resolve `required_outer_names`
+to outer ValueIds, and treat those as live through that node) — OR refuse
+aliasing for any value referenced by any subgraph capture. Add a control-flow
+capture regression test.
+
+**Fix owner:** Leon (Engine Dev — KV & Buffers). Backup: Deckard. NOT Holden.
+
+---
+
+### 2026-07-28: PR #301 RE-REVIEW — VERDICT: APPROVE
+
+**By:** Roy. **Delta:** `8b6bdc45..ebef8823` (Deckard, Strategy A; Holden locked out).
+
+My REQUEST-CHANGES (in-place liveness ignored implicit control-flow captures) is
+fixed. `build.rs` adds `control_flow_captures_by_node` (resolves each If/Loop/Scan
+node's `required_outer_names` to outer ValueIds) and records the capturing node as
+a use site in the `last_use` loop. Alias-safety predicate (dispatch.rs) untouched.
+
+**Evidence:**
+- My original repro (`Tanh(X)+If capturing X`) now succeeds, byte-identical to
+  the disabled path.
+- Mutation probe: neuter the helper → regression test FAILS with my exact
+  free-variable error; restore → PASS.
+- Nested control flow (If-in-If capturing top-level value): my own repro PASSES
+  with fix, FAILS when neutered — `required_outer_names` recursion propagates
+  deeply-nested captures to the top-level owner. No remaining hole.
+- Loop/Scan carried deps are formal inputs (already covered); graph-output
+  captures already excluded; multiple captures → monotonic-max last_use. All safe.
+- Holden's refusal + firing tests still pass; aliasing still fires (not
+  over-refused).
+- Tests: session 213 / ep-cpu 962 / ep-api 48 / engine 334 pass; fmt + clippy
+  (-D warnings) clean; all CI green.
+
+Approved.
+
+<!-- merged from .squad/decisions/inbox/holden-compute-in-place-85.md -->
+### 2026-07-27: Conservative graph-level compute-in-place slice for #85
+**By:** Holden
+**What:** Added `Kernel::can_run_in_place(input_index)` (default false) and executor dead-input transfer for one-output, equal-shape/dtype, contiguous, exclusively owned inputs. CPU unary elementwise opts in. `ONNX_GENAI_COMPUTE_IN_PLACE=0` keeps the out-of-place reference path.
+**Why:** The executor's structural last-use plan plus runtime exclusions for graph/external outputs, views, pinned/shared/sequence storage, external bindings, and layout mismatch keeps aliasing conservative. Binary, normalization, CUDA, and capture-aware persistent-buffer planning remain deferred until each kernel proves identical-range read/write safety.
+
+<!-- merged from .squad/decisions/inbox/deckard-pr301-capturefix-85.md -->
+# Decision: compute-in-place liveness must account for control-flow captures (#85 / PR #301)
+
+**Author:** Deckard (Engine/session)
+**Date:** 2026-07-28
+**Context:** PR #301 (issue #85) added graph-level compute-in-place aliasing.
+Reviewer Roy issued REQUEST-CHANGES after finding a default-ON correctness break.
+
+## Problem
+The liveness / `last_use` analysis in `build_node_plan`
+(`crates/onnx-runtime-session/src/executor/build.rs`) computed each value's
+last use **only** over `node.inputs` (formal plan-node inputs). But `If`/`Loop`/
+`Scan` subgraph bodies capture outer values **by name** at runtime
+(`prepare_subgraph` → `required_outer_names` → name index), and those implicit
+captures never appear in any plan node's `inputs`. A value whose last *formal*
+consumer was an in-place unary op but which was *also* captured by a later
+control-flow node was wrongly marked dead, so `alias_input_as_output` freed/
+reused its buffer and the control-flow body then read freed memory.
+
+Repro (Roy): `h = Relu(x); t = Tanh(h); y = If(cond){ Identity(h) }` — default
+path failed with "captures free variable 'h', but it is not available in the
+enclosing scope"; `ONNX_GENAI_COMPUTE_IN_PLACE=0` passed.
+
+## Decision (strategy A — extend liveness)
+Made the last-use analysis capture-aware rather than refusing aliasing wholesale.
+Added a reusable helper `Executor::control_flow_captures_by_node(graph)` that maps
+each control-flow node to the outer `ValueId`s its subgraph bodies capture (via the
+existing `required_outer_names` free-variable resolver + a graph name index — no
+per-op hardcoding). The `last_use` loop now treats a capturing node as a use site
+for every captured value, so a captured value is never `dead` before its
+capturing node runs and is never aliased away.
+
+- Fix: `crates/onnx-runtime-session/src/executor/build.rs`
+  - `build_node_plan`: capture-aware `last_use` loop (~L901-920)
+  - new helper `control_flow_captures_by_node` (~L946-972)
+
+## Verification
+- New regression test `compute_in_place_preserves_control_flow_captures`
+  (`executor/tests.rs`): asserts the default path succeeds, returns `Relu(x)`,
+  and is byte-identical to the `compute_in_place_enabled = false` path.
+- Mutation probe: revert the capture extension → new test FAILS with Roy's exact
+  capture error; restore → PASSES.
+- Holden's two safety tests (`..._refuses_live_and_graph_output_inputs`,
+  `..._chain_is_byte_identical_and_fires`, alias_count == 2) still pass — the fix
+  does not over-refuse legitimate in-place firing.
+- `cargo test -p onnx-runtime-session -p onnx-runtime-ep-cpu -p onnx-runtime-ep-api`
+  and `-p onnx-genai-engine` all green; `cargo fmt --all --check` and
+  `cargo clippy` (touched crates, `-D warnings`) clean.
+
+## Implication for the team
+Any future memory/liveness/buffer-reuse optimization in the session executor MUST
+consult `control_flow_captures_by_node` (or otherwise account for `If`/`Loop`/
+`Scan` by-name captures), because implicit captures are invisible to formal
+`node.inputs`-based analyses.
+
+<!-- scribe-merge-2026-07-27T02-00-00Z-roadmap-59-62-76-85-end -->
+
+Decision archive gate checked at 2026-07-27T02:00:00Z: active ledger exceeded 50KB; archived 0 dated entries older than 2026-07-20. Recent 2026-07-21..2026-07-27 entries remain active.

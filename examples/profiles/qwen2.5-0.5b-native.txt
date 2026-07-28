@@ -1,5 +1,4 @@
-[2m2026-07-27T11:22:49.086992Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
-onnx-genai: persistent SPMD decode pool forced on via ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=1 (always dispatches to the pool)
+[2m2026-07-28T00:25:50.851800Z[0m [32m INFO[0m [2monnx_genai_ort::env[0m[2m:[0m Creating ORT environment: onnx-genai-engine
 Certainly! Below is a simple Rust function that reverses a string:
 
 ```rust
@@ -32,14 +31,14 @@ This function works by first converting the string into an iterator of character
 ── profile ──────────────────────────────────
 model                    models/qwen2.5-0.5b
 execution provider       cpu
-model load                    134.1 ms
+model load                    120.3 ms
 prompt tokens                    40
 generated tokens                200
-time to first token          1022.5 ms
-generation wall time         6951.6 ms
-decode throughput             33.56 tok/s
-end-to-end throughput         28.77 tok/s
-inter-token latency      mean 29.8 / p50 24.0 / p90 25.6 / p99 42.9 / max 1044.2 ms
+time to first token          1074.8 ms
+generation wall time         7282.7 ms
+decode throughput             32.06 tok/s
+end-to-end throughput         27.46 tok/s
+inter-token latency      mean 31.2 / p50 24.5 / p90 26.9 / p99 45.8 / max 1208.9 ms
 finish reason            MaxTokens
 peak resident memory        4.9 GiB
 kv cache budget             5.4 GiB (5746063200 tokens)
@@ -52,25 +51,25 @@ device memory breakdown:
 per-stage breakdown:
 stage                          total_ms      calls        us/call     us/token
 ------------------------------------------------------------------------------
-loop.next_logits               6950.186        200       34750.93     34750.93
-native.session_run             6924.672        200       34623.36     34623.36
-loop.step                      5929.006        199       29794.00     29645.03
-loop.prefill                   1022.433          1     1022432.58      5112.16
-engine.tokenizer_load           104.295          1      104294.96       521.47
-native.logits_fetch              21.940        200         109.70       109.70
-native.sampling                  19.372        200          96.86        96.86
-engine.metadata_load             11.337          1       11336.79        56.68
-engine.native_session_load        8.786          1        8785.75        43.93
-engine.ort_environment            8.719          1        8719.04        43.60
-native.prepare_inputs             1.694        200           8.47         8.47
-loop.commit_selected              1.139        200           5.70         5.70
-loop.commit_selected_token        1.089        200           5.44         5.44
-loop.detokenize                   0.915        200           4.58         4.58
-engine.resolve_model_directory        0.156          1         156.25         0.78
-engine.resource_governor          0.103          1         103.21         0.52
-native.kv_update                  0.066        200           0.33         0.33
-native.cpu_kv_alloc               0.054          1          53.54         0.27
-native.inspect_decode_io          0.047          1          47.08         0.24
-engine.resolve_decode_backend        0.035          1          35.04         0.18
-engine.connector_bridge           0.012          1          11.62         0.06
-loop.commit_token                 0.005        200           0.03         0.03
+loop.next_logits               7280.736        200       36403.68     36403.68
+native.session_run             7254.870        200       36274.35     36274.35
+loop.step                      6207.787        199       31194.91     31038.93
+loop.prefill                   1074.703          1     1074702.88      5373.51
+engine.tokenizer_load            96.790          1       96790.25       483.95
+native.logits_fetch              22.377        200         111.88       111.88
+native.sampling                  19.929        200          99.65        99.65
+engine.ort_environment            8.739          1        8739.17        43.70
+engine.native_session_load        7.970          1        7970.00        39.85
+engine.metadata_load              6.409          1        6409.21        32.05
+loop.commit_selected              1.655        200           8.27         8.27
+native.prepare_inputs             1.606        200           8.03         8.03
+loop.commit_selected_token        1.571        200           7.86         7.86
+loop.detokenize                   1.376        200           6.88         6.88
+engine.resolve_model_directory        0.084          1          83.83         0.42
+engine.resource_governor          0.065          1          65.29         0.33
+native.kv_update                  0.060        200           0.30         0.30
+native.inspect_decode_io          0.015          1          14.58         0.07
+native.cpu_kv_alloc               0.012          1          12.25         0.06
+loop.commit_token                 0.006        200           0.03         0.03
+engine.resolve_decode_backend        0.004          1           4.08         0.02
+engine.connector_bridge           0.000          1           0.21         0.00

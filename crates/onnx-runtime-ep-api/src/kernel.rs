@@ -507,6 +507,17 @@ pub trait Kernel: Send {
         None
     }
 
+    /// Whether the output may overwrite the input at `input_index`.
+    ///
+    /// This is an opt-in semantic promise: the executor performs the separate
+    /// liveness, ownership, shape, dtype, and layout checks before it reuses an
+    /// input allocation. Kernels must return `false` unless their read/write
+    /// ordering is correct when the two tensor ranges are identical.
+    fn can_run_in_place(&self, input_index: usize) -> bool {
+        let _ = input_index;
+        false
+    }
+
     /// Whether the kernel accepts a non-contiguous (strided) input at `idx`.
     fn supports_strided_input(&self, input_idx: usize) -> bool {
         let _ = input_idx;

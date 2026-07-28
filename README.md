@@ -111,8 +111,14 @@ peak-throughput default. This is a decode-worker budget, not a hard cpuset for
 prefill or ONNX Runtime threads; combine it with an OS cpuset/taskset when the
 entire process must be confined.
 
-`onnx-genai run <model>` starts an interactive REPL. One Ctrl-C stops the
-current generation; two in a row exit. Slash commands control the session:
+`onnx-genai run <model>` starts an interactive REPL. In a terminal it uses a
+rich line editor with cursor movement, persistent history, bracketed paste,
+slash-command completion, and multiline input via Alt+Enter (Enter submits).
+Interactive terminal sessions show compact per-turn stats by default; pass
+`--no-stats` to start with them hidden. If stdin or stdout is piped, the REPL
+keeps the original plain `>>> ` line loop for script compatibility. One Ctrl-C
+stops the current generation; two in a row exit. Slash commands control the
+session:
 
 ```text
 >>> /help
@@ -120,7 +126,7 @@ current generation; two in a row exit. Slash commands control the session:
 >>> /image ./cat.png What is in this image?
 >>> /audio ./speech.wav
 >>> /raw
->>> /stats
+>>> /stats                  # runtime toggle for compact per-turn stats
 >>> /profile on
 >>> /model ./other-model
 >>> /ep cpu
