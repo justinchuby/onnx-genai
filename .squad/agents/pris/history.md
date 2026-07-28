@@ -98,3 +98,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Added `pull_request` `labeled` handling and created the `ci:full` label so labeling an open PR starts slow/full CI without a new push.
 - Preserved #296 supply-chain/concurrency constraints: direct `rustup`, GitHub-owned `actions/cache`, arch-aware keys, and SHA-keyed non-PR concurrency.
 - Measured fast dispatch run 30324179873 at 7m57s wall-clock; final slow dispatch run 30324584315 passed after rerunning a flaky Windows ARM64 failure, earlier equivalent slow dispatch 30322967863 passed at 15m30s, and audit run 30322969130 passed at 3m08s. Fast remains above the ~4m target because Windows x86_64 Rust tests are the critical path, but Windows correctness stayed on PRs.
+
+## 2026-07-27T22:56:00-07:00 — CI tier refinement: Windows CLI-only fast path
+- Refined fast CI so the broad offline-crate suite runs per PR only on Linux x86_64; Windows x86_64 stays per PR only for the CLI ORT lane (build/test/e2e/clippy), where Windows platform differences have actually bitten: CLI contracts, ORT DLL loading, filesystem/terminal/dynamic-linking boundaries.
+- Kept the full Windows x86_64 offline-crate suite in slow CI via the Windows `Rust coverage` job.
+- Audited offline crates for Windows-specific cfg tests before moving broad Windows tests out of fast PR CI; found `onnx-runtime-loader::pathsafe::tests::rejects_rooted_path` as the meaningful Windows-only test that now relies on slow CI, plus Windows-specific implementation code in tracer and CPU decode affinity.
+- Remeasured steady-state fast dispatch run 30333847821 at 3m59s wall-clock; critical path is now `Rust (Linux x86_64)` at 3m55s, with `CLI ORT (Windows x86_64)` at 2m51s. The first refined run was 8m09s due a Windows cache-save post step, so I used the repeat run as the steady-state number.

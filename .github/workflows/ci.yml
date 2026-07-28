@@ -5,9 +5,9 @@
 #   sees platform bugs: CLI, ORT loading, filesystem, terminal, and dynamic
 #   linking boundaries.
 # - Slow tier: push to main, nightly schedule, manual dispatch (default), or
-#   adding the `ci:full` label to an open PR. Adds coverage uploads, Windows
-#   ARM64, macOS arm64, and CUDA compile checks. Audit lives in audit.yml with
-#   the same slow-tier triggers.
+#   adding the `ci:full` label to an open PR. Adds coverage uploads, the full
+#   Windows x86_64 offline-crate suite, Windows ARM64, macOS arm64, and CUDA
+#   compile checks. Audit lives in audit.yml with the same slow-tier triggers.
 name: CI
 
 on:
