@@ -137,3 +137,7 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-27T21:56:00Z — Miri CI enforcement
 
 Added a dedicated Miri CI job for tractable unsafe Rust surfaces: full `onnx-runtime-memory` and `onnx-runtime-dlpack`; targeted `onnx-runtime-ep-api`, `onnx-runtime-ep-cpu`, `onnx-runtime-session`, and `onnx-runtime-capi` subsets. Miri found and fixed a test-only cross-device deallocation panic-path leak in `onnx-runtime-ep-cpu::provider::tests`. CUDA/native ORT crates remain excluded because Miri cannot execute those FFI/native-library paths.
+
+## 2026-07-28T00:59:00Z — Miri PR #302 review fixes
+
+Moved Miri out of general CI into `.github/workflows/miri.yml`, so the weekly schedule triggers only the Miri lane while PR/main/ci branch path filters still run Miri on covered crate changes. Strengthened the `onnx-runtime-ep-cpu` cross-device deallocate test to assert the specific panic payload before reclaiming the fabricated allocation.

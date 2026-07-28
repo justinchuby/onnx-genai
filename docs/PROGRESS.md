@@ -10,7 +10,7 @@ _Last updated: 2026-07-27T21:56:00Z_
 
 ## 2026-07-27 — Miri unsafe-crate CI enforcement
 
-- **Miri is now enforced instead of ad-hoc for the tractable unsafe Rust surface.** The CI workflow has a dedicated `Miri unsafe-crate soundness` job that runs on weekly schedule, `main`, manual dispatch, and PR/`ci/**` branch changes touching the covered crates, Cargo manifests, or the workflow itself.
+- **Miri is now enforced instead of ad-hoc for the tractable unsafe Rust surface.** A dedicated `Miri` workflow now owns the `Miri unsafe-crate soundness` job, separate from general CI. It runs on PR/`main`/`ci/**` changes touching covered crates, Cargo manifests, or `.github/workflows/miri.yml`, plus manual dispatch and a weekly schedule for nightly/toolchain drift.
 - **Covered fully:** `onnx-runtime-memory` and `onnx-runtime-dlpack`. **Covered by targeted Miri subsets:** `onnx-runtime-ep-api` ABI/DeviceBuffer/registry/tensor/weight/mock-EP tests, `onnx-runtime-ep-cpu` allocator/copy/dtype/strided-view tests, `onnx-runtime-session` tensor/sequence/view-bounds/size/prefetch/device-binding tests, and `onnx-runtime-capi` C-handle/status/null/session-option pointer-safety tests. CUDA/native ORT crates remain out of scope because Miri cannot execute those FFI/native-library paths.
 - **Finding fixed while enabling CI:** Miri caught a test-only leak in `onnx-runtime-ep-cpu::provider::tests::deallocate_rejects_cross_device_buffer`; the test now catches the expected panic and reclaims the fabricated allocation, preserving the single-free/cross-device invariant check without leaking under Miri.
 

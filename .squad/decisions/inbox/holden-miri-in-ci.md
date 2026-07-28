@@ -23,13 +23,13 @@ The CI job keeps Miri's default Stacked Borrows model. I deliberately did not sw
 
 ## Cost and scheduling
 
-Miri is slow, so the job runs fully on `main`, weekly schedule, and manual dispatch. On PRs and `ci/**` branch pushes it runs only when Cargo, CI, or one of the covered crate paths changes. The job prints `MIRI_TIMING <lane>: <seconds>` per lane for durable per-crate timing from GitHub logs.
+Miri now lives in `.github/workflows/miri.yml` instead of the general CI workflow. That scopes the weekly `schedule` trigger to Miri only, keeps nightly-toolchain failures from being read as general CI failures, and reflects that Miri has a different cadence/owner/toolchain. The workflow runs per-PR and on `main`/`ci/**` pushes when Cargo, `.github/workflows/miri.yml`, or one of the covered crate paths changes; it also runs weekly to catch nightly Miri/toolchain drift even when code is quiet. The measured Linux lane is about seven minutes, so per-PR path-limited execution is cheap enough and is the primary signal; weekly is only a drift backstop. The job prints `MIRI_TIMING <lane>: <seconds>` per lane for durable per-crate timing from GitHub logs.
 
 Local Windows smoke timings before CI were: `onnx-runtime-memory` 166s, `onnx-runtime-dlpack` 33s, `onnx-runtime-ep-api` 155s, `onnx-runtime-ep-cpu strided` about 6s interpreted time, `provider` about 140s interpreted time, and `dtype` about 6s interpreted time. Linux CI timings are authoritative and should be read from `MIRI_TIMING` lines.
 
 ## Findings
 
-Miri found one small, unambiguous issue while enabling the lane: `onnx-runtime-ep-cpu::provider::tests::deallocate_rejects_cross_device_buffer` intentionally panicked before freeing a fabricated allocation. That was test-only, but it would make Miri red and could hide real leaks, so the test now catches the expected panic and reconstructs/drops the boxed slice. No production soundness defect was found in the covered local smoke run.
+Miri found one small, unambiguous issue while enabling the lane: `onnx-runtime-ep-cpu::provider::tests::deallocate_rejects_cross_device_buffer` intentionally panicked before freeing a fabricated allocation. That was test-only, but it would make Miri red and could hide real leaks, so the test now catches the expected cross-device panic payload and reconstructs/drops the boxed slice, so unrelated panics no longer satisfy the invariant test. No production soundness defect was found in the covered local smoke run.
 
 ## Coverage
 

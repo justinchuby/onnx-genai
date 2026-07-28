@@ -497,7 +497,22 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = ep.deallocate(foreign); // must panic before freeing
         }));
-        assert!(result.is_err());
+        let panic = result.expect_err("cross-device deallocate must panic before freeing");
+        let message = if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic.downcast_ref::<&str>() {
+            *message
+        } else {
+            panic!("cross-device deallocate panic used a non-string payload");
+        };
+        assert!(
+            message.contains("cpu_ep: refusing to deallocate a buffer from device"),
+            "unexpected deallocate panic: {message}"
+        );
+        assert!(
+            message.contains("Cuda") || message.contains("cuda"),
+            "cross-device deallocate panic did not identify the foreign CUDA device: {message}"
+        );
         // SAFETY: `deallocate` panicked before freeing, so `ptr` still names the
         // original boxed slice allocation.
         unsafe {
