@@ -279,8 +279,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 187);
-    assert_eq!(registry.entry_count(), 226);
+    assert_eq!(registry.operator_count(), 196);
+    assert_eq!(registry.entry_count(), 236);
 }
 
 #[test]
@@ -4794,6 +4794,445 @@ fn center_crop_pad_resizes_selected_axes() {
             &node("CenterCropPad", 2, 1),
             vec![f32in(vec![c(4), c(5)]), sd_vec(vec![c(2), c(2)])],
             17,
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+// --- signal-processing family --------------------------------------------
+
+/// An int64 scalar shape-data input (e.g. a DFT length or window size).
+fn i64_scalar(value: i64) -> NodeIo {
+    sd_int_scalar(DataType::Int64, c(value))
+}
+
+#[test]
+fn dft_v17_real_to_complex_with_length_and_onesided() {
+    // Real input [batch, N, 1] with no dft_length: axis (default 1) unchanged,
+    // trailing dim coerced to complex 2.
+    let plain = run(
+        &node("DFT", 1, 1),
+        vec![f32in(vec![sym(1), c(16), c(1)])],
+        17,
+    );
+    assert_eq!(out_dtype(&plain), DataType::Float32);
+    assert_eq!(out_shape(&plain)[0], sym(1));
+    assert_eq!(out_shape(&plain)[1..], [c(16), c(2)]);
+
+    // dft_length overrides the signal axis.
+    let with_length = run(
+        &node("DFT", 2, 1),
+        vec![f32in(vec![c(2), c(16), c(1)]), i64_scalar(10)],
+        17,
+    );
+    assert_eq!(out_shape(&with_length), vec![c(2), c(10), c(2)]);
+
+    // onesided halves the (dft_length) axis to floor(n/2)+1 = 6.
+    let onesided = run(
+        &with_attr(node("DFT", 2, 1), "onesided", Attribute::Int(1)),
+        vec![f32in(vec![c(2), c(16), c(1)]), i64_scalar(10)],
+        17,
+    );
+    assert_eq!(out_shape(&onesided), vec![c(2), c(6), c(2)]);
+}
+
+#[test]
+fn dft_v17_axis_attribute_negative_and_symbolic_axis_degrades() {
+    // Negative axis counts from the back; axis=-2 on rank 4 targets index 2.
+    let neg_axis = run(
+        &with_attr(node("DFT", 1, 1), "axis", Attribute::Int(-2)),
+        vec![f32in(vec![c(2), c(3), c(8), c(2)])],
+        17,
+    );
+    assert_eq!(out_shape(&neg_axis), vec![c(2), c(3), c(8), c(2)]);
+
+    // onesided over a symbolic signal axis cannot be computed -> fresh symbol.
+    let symbolic = run(
+        &with_attr(node("DFT", 1, 1), "onesided", Attribute::Int(1)),
+        vec![f32in(vec![c(2), sym(5), c(1)])],
+        17,
+    );
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape[0], c(2));
+    assert_symbolic(&shape[1]);
+    assert_eq!(shape[2], c(2));
+}
+
+#[test]
+fn dft_since_version_rank_and_axis_validation() {
+    // since_version 17: opset 16 leaves the output unresolved.
+    assert!(
+        run(&node("DFT", 1, 1), vec![f32in(vec![c(2), c(8), c(1)])], 16)[0]
+            .type_info
+            .is_none()
+    );
+
+    // Rank < 2 is a contract violation.
+    assert!(matches!(
+        try_run(&node("DFT", 1, 1), vec![f32in(vec![c(8)])], 17),
+        Err(ShapeInferError::InvalidRank { .. })
+    ));
+
+    // The trailing complex dimension is never a valid axis.
+    let bad_axis = with_attr(node("DFT", 1, 1), "axis", Attribute::Int(2));
+    assert_invalid(
+        try_run(&bad_axis, vec![f32in(vec![c(2), c(8), c(2)])], 17).unwrap_err(),
+        "DFT",
+        "axis 2 is invalid",
+    );
+}
+
+#[test]
+fn dft_v20_axis_input_default_and_unknown() {
+    // Opset 20 default axis is -2 (last signal axis).
+    let default_axis = run(&node("DFT", 1, 1), vec![f32in(vec![c(2), c(8), c(1)])], 20);
+    assert_eq!(out_shape(&default_axis), vec![c(2), c(8), c(2)]);
+
+    // Axis supplied as a resolved input (dft_length slot omitted).
+    let mut axis_only = node("DFT", 3, 1);
+    axis_only.inputs[1] = None;
+    let axis_input = run(
+        &axis_only,
+        vec![
+            f32in(vec![c(2), c(8), c(4), c(1)]),
+            NodeIo::default(),
+            i64_scalar(1),
+        ],
+        20,
+    );
+    assert_eq!(out_shape(&axis_input), vec![c(2), c(8), c(4), c(2)]);
+
+    // Axis input present but unknown, without onesided/dft_length: the input
+    // shape is preserved except the trailing complex 2.
+    let mut unknown = node("DFT", 3, 1);
+    unknown.inputs[1] = None;
+    let unknown_plain = run(
+        &unknown,
+        vec![
+            f32in(vec![c(2), c(8), c(1)]),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        20,
+    );
+    assert_eq!(out_shape(&unknown_plain), vec![c(2), c(8), c(2)]);
+
+    // Axis input unknown *and* onesided: every signal extent is unknowable, so
+    // each becomes a fresh symbol, with the trailing 2 pinned.
+    let mut unknown_os = with_attr(node("DFT", 3, 1), "onesided", Attribute::Int(1));
+    unknown_os.inputs[1] = None;
+    let unknown_onesided = run(
+        &unknown_os,
+        vec![
+            f32in(vec![c(2), c(8), c(1)]),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        20,
+    );
+    let shape = out_shape(&unknown_onesided);
+    assert_eq!(shape.len(), 3);
+    assert_symbolic(&shape[0]);
+    assert_symbolic(&shape[1]);
+    assert_eq!(shape[2], c(2));
+}
+
+#[test]
+fn stft_frame_length_window_and_onesided_default() {
+    // frame_length = 16, frame_step = 4, signal_length = 64, onesided default 1
+    // -> frames = (64-16)/4 + 1 = 13, bins = 16/2 + 1 = 9.
+    let with_frame_length = run(
+        &node("STFT", 4, 1),
+        vec![
+            f32in(vec![c(2), c(64), c(1)]),
+            i64_scalar(4),
+            NodeIo::default(),
+            i64_scalar(16),
+        ],
+        17,
+    );
+    assert_eq!(out_shape(&with_frame_length), vec![c(2), c(13), c(9), c(2)]);
+
+    // Two-sided: bins == frame_length.
+    let two_sided = run(
+        &with_attr(node("STFT", 4, 1), "onesided", Attribute::Int(0)),
+        vec![
+            f32in(vec![c(2), c(64), c(1)]),
+            i64_scalar(4),
+            NodeIo::default(),
+            i64_scalar(16),
+        ],
+        17,
+    );
+    assert_eq!(out_shape(&two_sided), vec![c(2), c(13), c(16), c(2)]);
+
+    // Transform size taken from the window vector length when frame_length is
+    // absent (input slot 3 skipped).
+    let mut windowed = node("STFT", 4, 1);
+    windowed.inputs[3] = None;
+    let window_driven = run(
+        &windowed,
+        vec![
+            f32in(vec![c(1), c(32), c(1)]),
+            i64_scalar(8),
+            f32in(vec![c(8)]),
+            NodeIo::default(),
+        ],
+        17,
+    );
+    // frames = (32-8)/8 + 1 = 4, bins = 8/2 + 1 = 5.
+    assert_eq!(out_shape(&window_driven), vec![c(1), c(4), c(5), c(2)]);
+}
+
+#[test]
+fn stft_symbolic_signal_degrades_frame_count() {
+    // Unknown signal length -> unknown frame count (fresh), but batch/bins/2
+    // stay resolved.
+    let symbolic = run(
+        &node("STFT", 4, 1),
+        vec![
+            tin(DataType::Float32, vec![sym(3), sym(4), c(1)]),
+            i64_scalar(4),
+            NodeIo::default(),
+            i64_scalar(16),
+        ],
+        17,
+    );
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape[0], sym(3));
+    assert_symbolic(&shape[1]);
+    assert_eq!(shape[2], c(9));
+    assert_eq!(shape[3], c(2));
+
+    // since_version boundary: opset 16 is unresolved.
+    assert!(
+        run(
+            &node("STFT", 4, 1),
+            vec![
+                f32in(vec![c(2), c(64), c(1)]),
+                i64_scalar(4),
+                NodeIo::default(),
+                i64_scalar(16),
+            ],
+            16,
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+#[test]
+fn mel_weight_matrix_shape_and_output_datatype() {
+    // dft_length = 16 -> rows = 16/2 + 1 = 9; num_mel_bins = 4 -> cols = 4.
+    let concrete = run(
+        &with_attr(
+            node("MelWeightMatrix", 5, 1),
+            "output_datatype",
+            Attribute::Int(11),
+        ),
+        vec![
+            i64_scalar(4),
+            i64_scalar(16),
+            i64_scalar(16000),
+            sd_float_scalar(DataType::Float32, 0.0),
+            sd_float_scalar(DataType::Float32, 8000.0),
+        ],
+        17,
+    );
+    assert_eq!(out_dtype(&concrete), DataType::Float64);
+    assert_eq!(out_shape(&concrete), vec![c(9), c(4)]);
+
+    // Unknown extents degrade to fresh symbols, but the rank-2 shape and the
+    // default Float32 dtype are still emitted.
+    let symbolic = run(
+        &node("MelWeightMatrix", 5, 1),
+        vec![
+            NodeIo::default(),
+            NodeIo::default(),
+            NodeIo::default(),
+            NodeIo::default(),
+            NodeIo::default(),
+        ],
+        17,
+    );
+    assert_eq!(out_dtype(&symbolic), DataType::Float32);
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape.len(), 2);
+    assert_symbolic(&shape[0]);
+    assert_symbolic(&shape[1]);
+}
+
+#[test]
+fn window_generators_length_dtype_and_since_version() {
+    for op in ["HannWindow", "HammingWindow", "BlackmanWindow"] {
+        // Concrete size with an explicit output_datatype (10 = Float16).
+        let concrete = run(
+            &with_attr(node(op, 1, 1), "output_datatype", Attribute::Int(10)),
+            vec![i64_scalar(320)],
+            17,
+        );
+        assert_eq!(out_dtype(&concrete), DataType::Float16, "{op}");
+        assert_eq!(out_shape(&concrete), vec![c(320)], "{op}");
+
+        // Unknown size -> rank-1 with a fresh symbol; default Float32 dtype.
+        let symbolic = run(&node(op, 1, 1), vec![NodeIo::default()], 17);
+        assert_eq!(out_dtype(&symbolic), DataType::Float32, "{op}");
+        let shape = out_shape(&symbolic);
+        assert_eq!(shape.len(), 1, "{op}");
+        assert_symbolic(&shape[0]);
+
+        // since_version 17: opset 16 leaves the output unresolved.
+        assert!(
+            run(&node(op, 1, 1), vec![i64_scalar(320)], 16)[0]
+                .type_info
+                .is_none(),
+            "{op}"
+        );
+    }
+}
+
+#[test]
+fn affine_grid_2d_3d_symbolic_and_since_version() {
+    // 2-D: theta (N, 2, 3), size = [N, C, H, W] -> grid [N, H, W, 2].
+    let two_d = run(
+        &node("AffineGrid", 2, 1),
+        vec![
+            f32in(vec![c(5), c(2), c(3)]),
+            sd_vec(vec![c(5), c(3), c(8), c(9)]),
+        ],
+        20,
+    );
+    assert_eq!(out_shape(&two_d), vec![c(5), c(8), c(9), c(2)]);
+
+    // 3-D: size = [N, C, D, H, W] -> grid [N, D, H, W, 3].
+    let three_d = run(
+        &node("AffineGrid", 2, 1),
+        vec![
+            f32in(vec![c(5), c(3), c(4)]),
+            sd_vec(vec![c(5), c(3), c(6), c(8), c(9)]),
+        ],
+        20,
+    );
+    assert_eq!(out_shape(&three_d), vec![c(5), c(6), c(8), c(9), c(3)]);
+
+    // Symbolic extents in the size vector propagate through.
+    let symbolic = run(
+        &node("AffineGrid", 2, 1),
+        vec![
+            f32in(vec![sym(1), c(2), c(3)]),
+            sd_vec(vec![sym(1), c(3), sym(2), c(9)]),
+        ],
+        20,
+    );
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape[0], sym(1));
+    assert_eq!(shape[1], sym(2));
+    assert_eq!(shape[2..], [c(9), c(2)]);
+
+    // since_version 20: opset 19 leaves the output unresolved.
+    assert!(
+        run(
+            &node("AffineGrid", 2, 1),
+            vec![
+                f32in(vec![c(5), c(2), c(3)]),
+                sd_vec(vec![c(5), c(3), c(8), c(9)])
+            ],
+            19,
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+// --- loss family ----------------------------------------------------------
+
+#[test]
+fn negative_log_likelihood_loss_reduction_shapes() {
+    // reduction = none -> (N, d1, ..., dk) from input (N, C, d1, ..., dk).
+    let none = run(
+        &with_attr(
+            node("NegativeLogLikelihoodLoss", 2, 1),
+            "reduction",
+            Attribute::String(b"none".to_vec()),
+        ),
+        vec![
+            f32in(vec![sym(1), c(7), c(4), c(5)]),
+            tin(DataType::Int64, vec![sym(1), c(4), c(5)]),
+        ],
+        13,
+    );
+    assert_eq!(out_dtype(&none), DataType::Float32);
+    assert_eq!(out_shape(&none)[0], sym(1));
+    assert_eq!(out_shape(&none)[1..], [c(4), c(5)]);
+
+    // Default reduction (mean) -> scalar.
+    let mean = run(
+        &node("NegativeLogLikelihoodLoss", 2, 1),
+        vec![f32in(vec![c(3), c(7)]), tin(DataType::Int64, vec![c(3)])],
+        13,
+    );
+    assert_eq!(out_shape(&mean), Vec::<DimExpr>::new());
+
+    // Rank < 2 input is a contract violation.
+    assert!(matches!(
+        try_run(
+            &node("NegativeLogLikelihoodLoss", 2, 1),
+            vec![f32in(vec![c(3)]), tin(DataType::Int64, vec![])],
+            13,
+        ),
+        Err(ShapeInferError::InvalidRank { .. })
+    ));
+
+    // since_version 12: opset 11 leaves the output unresolved.
+    assert!(
+        run(
+            &node("NegativeLogLikelihoodLoss", 2, 1),
+            vec![f32in(vec![c(3), c(7)]), tin(DataType::Int64, vec![c(3)])],
+            11,
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+#[test]
+fn softmax_cross_entropy_loss_reduction_and_log_prob() {
+    // reduction = none -> loss follows the labels' shape; log_prob mirrors
+    // scores.
+    let none = run(
+        &with_attr(
+            node("SoftmaxCrossEntropyLoss", 2, 2),
+            "reduction",
+            Attribute::String(b"none".to_vec()),
+        ),
+        vec![
+            f32in(vec![sym(1), c(10), c(4)]),
+            tin(DataType::Int64, vec![sym(1), c(4)]),
+        ],
+        13,
+    );
+    assert_eq!(out_shape(&none)[0], sym(1));
+    assert_eq!(out_shape(&none)[1..], [c(4)]);
+    let log_prob = &none[1].type_info.as_ref().unwrap();
+    assert_eq!(log_prob.dtype, DataType::Float32);
+    assert_eq!(log_prob.shape, vec![sym(1), c(10), c(4)]);
+
+    // Default reduction (mean) -> scalar loss; log_prob still mirrors scores.
+    let mean = run(
+        &node("SoftmaxCrossEntropyLoss", 2, 2),
+        vec![f32in(vec![c(3), c(10)]), tin(DataType::Int64, vec![c(3)])],
+        13,
+    );
+    assert_eq!(out_shape(&mean), Vec::<DimExpr>::new());
+    assert_eq!(mean[1].type_info.as_ref().unwrap().shape, vec![c(3), c(10)]);
+
+    // since_version 12: opset 11 leaves the output unresolved.
+    assert!(
+        run(
+            &node("SoftmaxCrossEntropyLoss", 2, 1),
+            vec![f32in(vec![c(3), c(10)]), tin(DataType::Int64, vec![c(3)])],
+            11,
         )[0]
         .type_info
         .is_none()
