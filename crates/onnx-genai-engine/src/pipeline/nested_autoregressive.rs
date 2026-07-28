@@ -539,6 +539,7 @@ fn publish_generation_result(
         finish_reason: crate::FinishReason::MaxTokens,
         prefix_cache_hit_len: 0,
         logprobs: None,
+        budget_cap: None,
     })
 }
 

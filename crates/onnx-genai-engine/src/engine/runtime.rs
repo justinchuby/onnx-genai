@@ -6,6 +6,16 @@ fn generate_uses_scheduler(backend: EngineDecodeBackend) -> bool {
     backend != EngineDecodeBackend::Native
 }
 
+fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
+    GenerationBudgetCap {
+        requested_max_new_tokens: cap.requested_max_tokens,
+        admitted_max_new_tokens: cap.admitted_max_tokens,
+        requested_bytes: cap.requested_bytes,
+        admitted_bytes: cap.admitted_bytes,
+        available_bytes: cap.available_bytes,
+    }
+}
+
 impl Engine {
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
@@ -366,6 +376,7 @@ impl Engine {
                 session_id
             );
         }
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
         options.max_new_tokens = scheduled.max_tokens;
 
         let Some(mut state) = self.sessions.remove(&session_id) else {
@@ -418,11 +429,12 @@ impl Engine {
                 callback.as_deref_mut(),
             )
         })()
-        .and_then(|result| {
+        .and_then(|mut result| {
             if !exceeded_context_limit(state.tokens.len(), max_context) {
                 self.ensure_session_kv_current(session_id, &mut state)?;
                 self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
             }
+            result.budget_cap = budget_cap;
             Ok(result)
         });
         self.sessions.insert(session_id, state);
@@ -509,6 +521,10 @@ impl Engine {
                     format!("active request for session {session_id} not found")
                 })?;
                 if let Some(max_tokens) = self.scheduler.running_max_tokens(session_id) {
+                    active_request.budget_cap = self
+                        .scheduler
+                        .running_budget_cap(session_id)
+                        .map(generation_budget_cap);
                     active_request.options.max_new_tokens = max_tokens;
                 }
                 let step_result = self.step_active_generate(&mut active_request)?;
@@ -1009,6 +1025,7 @@ impl Engine {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             logprobs,
+            budget_cap: None,
             step: 0,
             rng,
         })
@@ -1054,8 +1071,9 @@ impl Engine {
         active.logprobs = loop_state.logprobs;
         active.step = loop_state.step;
         active.rng = loop_state.rng;
-        if step_result.is_some() {
-            return Ok(step_result);
+        if let Some(mut result) = step_result {
+            result.budget_cap = active.budget_cap;
+            return Ok(Some(result));
         }
         if active.generated_tokens.len() >= active.options.max_new_tokens {
             ensure_constrained_finish(
@@ -1070,7 +1088,10 @@ impl Engine {
                     active.prefix_cache_hit_len,
                     active.logprobs.as_deref(),
                 )
-                .map(Some);
+                .map(|mut result| {
+                    result.budget_cap = active.budget_cap;
+                    Some(result)
+                });
         }
 
         Ok(None)
@@ -1231,6 +1252,7 @@ impl Engine {
             finish_reason,
             prefix_cache_hit_len,
             logprobs: logprobs.map(<[crate::config::TokenLogprob]>::to_vec),
+            budget_cap: None,
         })
     }
 }

@@ -1243,6 +1243,17 @@ pub enum FinishReason {
     Length,
 }
 
+/// Scheduler admission reduced the requested generation ceiling to preserve the
+/// shared KV byte-budget guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationBudgetCap {
+    pub requested_max_new_tokens: usize,
+    pub admitted_max_new_tokens: usize,
+    pub requested_bytes: u64,
+    pub admitted_bytes: u64,
+    pub available_bytes: u64,
+}
+
 /// Final generation output.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateResult {
@@ -1256,6 +1267,9 @@ pub struct GenerateResult {
     pub prefix_cache_hit_len: usize,
     /// Per-generated-token log probabilities, or `None` when not requested.
     pub logprobs: Option<Vec<TokenLogprob>>,
+    /// Present when scheduler admission capped `max_new_tokens` below the
+    /// requested value to keep the conservative KV byte reservation valid.
+    pub budget_cap: Option<GenerationBudgetCap>,
 }
 
 /// Log-probability metadata for one generated token.

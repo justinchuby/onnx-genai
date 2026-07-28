@@ -60,6 +60,18 @@ pub struct ScheduledRequest {
     /// ceiling when the shared byte budget can conservatively guarantee a
     /// smaller run but not the caller's larger safety ceiling.
     pub max_tokens: usize,
+    /// Details when `max_tokens` was capped below the request's original ceiling.
+    pub budget_cap: Option<ScheduledBudgetCap>,
+}
+
+/// A scheduler admission cap applied to preserve conservative byte reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledBudgetCap {
+    pub requested_max_tokens: usize,
+    pub admitted_max_tokens: usize,
+    pub requested_bytes: u64,
+    pub admitted_bytes: u64,
+    pub available_bytes: u64,
 }
 
 /// Why a queued request could not be admitted.
@@ -114,6 +126,7 @@ pub struct RunningSequence {
     /// [`ByteBudget`], if byte accounting is enabled. Released when the sequence
     /// completes or is preempted to CPU, re-reserved on swap-in.
     reserved_bytes: u64,
+    budget_cap: Option<ScheduledBudgetCap>,
 }
 
 /// The scheduler's decision for one iteration.
@@ -300,43 +313,55 @@ impl Scheduler {
             return Ok(None);
         }
         let request = self.waiting.remove(0);
-        let (request, bytes) = match self.reserve_or_cap_request(&request) {
+        let (request, bytes, budget_cap) = match self.reserve_or_cap_request(&request) {
             Ok(admitted) => admitted,
             Err(error) => {
                 self.waiting.insert(0, request);
                 return Err(error);
             }
         };
-        self.push_admitted_request(request.clone(), bytes);
+        self.push_admitted_request(request.clone(), bytes, budget_cap);
         Ok(Some(ScheduledRequest {
             request_id: request.id,
             seq_id: request.seq_id,
             max_tokens: request.max_tokens,
+            budget_cap,
         }))
     }
 
     fn reserve_or_cap_request(
         &self,
         request: &Request,
-    ) -> Result<(Request, u64), SchedulerAdmissionError> {
+    ) -> Result<(Request, u64, Option<ScheduledBudgetCap>), SchedulerAdmissionError> {
         let mut admitted = request.clone();
         let requested_bytes = self.estimated_bytes(request.prompt_tokens, request.max_tokens);
         match self.try_reserve_bytes(requested_bytes) {
-            Ok(()) => return Ok((admitted, requested_bytes)),
+            Ok(()) => Ok((admitted, requested_bytes, None)),
             Err(error) => {
+                let available_bytes = error.available;
                 let Some(admitted_max_tokens) =
                     self.max_tokens_for_available_bytes(request.prompt_tokens, error.available)
                 else {
                     return Err(self.admission_byte_error(request, requested_bytes, error));
                 };
                 admitted.max_tokens = admitted_max_tokens.min(request.max_tokens);
+                let capped_bytes =
+                    self.estimated_bytes(admitted.prompt_tokens, admitted.max_tokens);
+                match self.try_reserve_bytes(capped_bytes) {
+                    Ok(()) => Ok((
+                        admitted,
+                        capped_bytes,
+                        Some(ScheduledBudgetCap {
+                            requested_max_tokens: request.max_tokens,
+                            admitted_max_tokens: admitted_max_tokens.min(request.max_tokens),
+                            requested_bytes,
+                            admitted_bytes: capped_bytes,
+                            available_bytes,
+                        }),
+                    )),
+                    Err(error) => Err(self.admission_byte_error(request, requested_bytes, error)),
+                }
             }
-        }
-
-        let capped_bytes = self.estimated_bytes(admitted.prompt_tokens, admitted.max_tokens);
-        match self.try_reserve_bytes(capped_bytes) {
-            Ok(()) => Ok((admitted, capped_bytes)),
-            Err(error) => Err(self.admission_byte_error(request, requested_bytes, error)),
         }
     }
 
@@ -379,7 +404,12 @@ impl Scheduler {
         }
     }
 
-    fn push_admitted_request(&mut self, request: Request, bytes: u64) -> SequenceId {
+    fn push_admitted_request(
+        &mut self,
+        request: Request,
+        bytes: u64,
+        budget_cap: Option<ScheduledBudgetCap>,
+    ) -> SequenceId {
         let seq_id = request.seq_id;
         self.running.push(RunningSequence {
             seq_id: request.seq_id,
@@ -390,6 +420,7 @@ impl Scheduler {
             priority: request.priority,
             arrived_at: request.arrived_at,
             reserved_bytes: bytes,
+            budget_cap,
         });
         seq_id
     }
@@ -423,7 +454,7 @@ impl Scheduler {
             };
             match candidate {
                 Candidate::Waiting(request) => {
-                    let (request, bytes) = match self.reserve_or_cap_request(&request) {
+                    let (request, bytes, budget_cap) = match self.reserve_or_cap_request(&request) {
                         Ok(admitted) => admitted,
                         Err(_) => {
                             self.waiting.push(request);
@@ -431,7 +462,7 @@ impl Scheduler {
                         }
                     };
                     let seq_id = request.seq_id;
-                    self.push_admitted_request(request, bytes);
+                    self.push_admitted_request(request, bytes, budget_cap);
                     decision.prefill.push(seq_id);
                 }
                 Candidate::Swapped(mut sequence) => {
@@ -441,6 +472,7 @@ impl Scheduler {
                         break;
                     }
                     sequence.reserved_bytes = bytes;
+                    sequence.budget_cap = None;
                     decision.swap_in.push(sequence.seq_id);
                     self.running.push(sequence);
                 }
@@ -513,6 +545,15 @@ impl Scheduler {
             .iter()
             .find(|sequence| sequence.seq_id == seq_id)
             .map(|sequence| sequence.max_tokens)
+    }
+
+    /// Budget cap applied to a running sequence, if admission lowered its
+    /// requested generation ceiling.
+    pub fn running_budget_cap(&self, seq_id: SequenceId) -> Option<ScheduledBudgetCap> {
+        self.running
+            .iter()
+            .find(|sequence| sequence.seq_id == seq_id)
+            .and_then(|sequence| sequence.budget_cap)
     }
 
     fn apply_preemption(&mut self, decision: &mut ScheduleDecision) {
@@ -961,7 +1002,18 @@ mod tests {
 
         assert_eq!(scheduled.seq_id, 42);
         assert_eq!(scheduled.max_tokens, 128);
+        assert_eq!(
+            scheduled.budget_cap,
+            Some(ScheduledBudgetCap {
+                requested_max_tokens: 3584,
+                admitted_max_tokens: 128,
+                requested_bytes: 4096,
+                admitted_bytes: 640,
+                available_bytes: 640,
+            })
+        );
         assert_eq!(scheduler.running_max_tokens(42), Some(128));
+        assert_eq!(scheduler.running_budget_cap(42), scheduled.budget_cap);
         assert_eq!(budget.used(), 640);
         assert_eq!(scheduler.waiting_count(), 0);
     }

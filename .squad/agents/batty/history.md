@@ -85,5 +85,6 @@ Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_
 
 - Confirmed by reading and scheduler regression test that PR #277 exposed an ORT-only path issue: native `generate` bypasses scheduler admission, while ORT direct/session generation goes through `drive_next_fcfs`; both load paths set `bytes_per_token`.
 - Preserved DESIGN §26.4/§26.11 conservative reservation: scheduler still reserves full `prompt + admitted max_tokens` up front. If the requested ceiling cannot fit but prompt + at least one token can, admission caps `max_tokens` to what the byte budget can guarantee; the engine decodes with that admitted ceiling.
+- Scheduler caps must be observable: expose cap metadata on `GenerateResult`, warn on stderr in the CLI, and include the cap in stats/profile output so benchmark runs do not silently shorten their generation budget.
 - Kept error reporting actionable for true rejection: batch-full vs KV-budget cause, requested/minimum/available/used/limit/shortfall bytes, running/max batch counts, and concrete mitigation hints.
 - Added model-free scheduler tests for full-context ceiling capping, long multi-turn ceiling growth, repeated-turn accounting non-leakage, and error text; added an engine unit test locking that ORT generate uses the scheduler while native generate bypasses it.

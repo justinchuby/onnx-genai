@@ -346,6 +346,7 @@ pub(crate) fn finish_result(
         finish_reason,
         prefix_cache_hit_len,
         logprobs: logprobs.map(<[TokenLogprob]>::to_vec),
+        budget_cap: None,
     })
 }
 

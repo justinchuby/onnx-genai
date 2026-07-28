@@ -39,10 +39,11 @@ pub use engine::{
     DryConfig, Eagle3Config, Engine, EngineConfig, EngineConfigError, EngineDecodeBackend,
     EngineGovernorError, EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions,
     GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
-    KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion,
-    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId, SharedKvBinding,
-    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
+    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig,
+    MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig,
+    parse_resource_limit,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
