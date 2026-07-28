@@ -106,12 +106,25 @@ pub(super) fn emit_stats_line(show_stats: bool, show_profile: bool, profile: &mu
         return;
     }
     profile.memory.sample_peak();
-    let stats = if io::stdout().is_terminal() {
+    // Stats go to stderr — probe stderr, not stdout.  Probing stdout inverts
+    // the decision when stdout is redirected (`> out.txt` gives a file on
+    // stdout but a terminal on stderr) or when stderr is redirected
+    // (`2> log` gives a file on stderr but a terminal on stdout).
+    let stats = stats_text(io::stderr().is_terminal(), profile);
+    eprintln!("{stats}");
+}
+
+/// Choose the stats rendering for the given stderr terminal state.
+///
+/// Extracted from `emit_stats_line` so the branching logic is unit-testable
+/// without a real terminal.  Pass `io::stderr().is_terminal()` at the call
+/// site; pass `true`/`false` in tests.
+fn stats_text(stderr_is_terminal: bool, profile: &RunProfile) -> String {
+    if stderr_is_terminal {
         profile.to_stats_block()
     } else {
         profile.to_stats_line()
-    };
-    eprintln!("{stats}");
+    }
 }
 
 fn budget_cap_notice(cap: GenerationBudgetCap) -> String {
@@ -307,5 +320,61 @@ mod tests {
         assert!(should_emit_stats_line(true, false));
         assert!(!should_emit_stats_line(true, true));
         assert!(!should_emit_stats_line(false, false));
+    }
+
+    /// The stats format is determined by stderr's terminal state, not stdout's.
+    ///
+    /// `stats_text` takes only `stderr_is_terminal`; stdout's state is
+    /// deliberately absent from the signature.  The two cases that motivated
+    /// the fix:
+    ///
+    ///   A) `> out.txt` in a terminal: stdout=file, stderr=terminal → block
+    ///   B) `2> stats.log` in a terminal: stdout=terminal, stderr=file → line
+    ///
+    /// A profile with both headline data (`prompt_tokens`) and resource data
+    /// (`context`) is used so the block form produces two `[ … ]` lines joined
+    /// by `\n`, making it structurally distinct from the single-line form.
+    #[test]
+    fn stats_format_follows_stderr_not_stdout() {
+        use crate::profile::{ContextUsage, RunProfile};
+
+        let profile = RunProfile {
+            prompt_tokens: Some(10),
+            context: Some(ContextUsage {
+                used_tokens: 10,
+                max_tokens: 4096,
+            }),
+            ..Default::default()
+        };
+
+        // stderr=terminal → two-line block (headline \n resources)
+        let block = stats_text(true, &profile);
+        assert!(
+            block.contains('\n'),
+            "stderr=terminal should produce two-line block; got: {block:?}"
+        );
+
+        // stderr=plain → single line (no embedded newline)
+        let line = stats_text(false, &profile);
+        assert!(
+            !line.contains('\n'),
+            "stderr=plain should produce single line; got: {line:?}"
+        );
+
+        // Case A: stdout redirected (not terminal), stderr on terminal → block
+        // (the old stdout probe would have chosen line here)
+        let case_a = stats_text(/* stderr */ true, &profile);
+        assert!(
+            case_a.contains('\n'),
+            "case A: stderr=terminal must give block"
+        );
+
+        // Case B: stdout on terminal, stderr redirected (not terminal) → line
+        // (the old stdout probe would have chosen block here)
+        let case_b = stats_text(/* stderr */ false, &profile);
+        assert!(
+            !case_b.contains('\n'),
+            "case B: stderr=plain must give line"
+        );
     }
 }
