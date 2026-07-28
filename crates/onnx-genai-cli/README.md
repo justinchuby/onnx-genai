@@ -33,6 +33,13 @@ that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
 **Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
 run is also cancelled by **Ctrl-C** mid-generation.
 
+When both stdin and stdout are terminals, the REPL uses a rich line editor:
+arrow-key cursor movement, persistent history, bracketed paste, slash-command
+completion, and multiline input with **Alt+Enter** (plain **Enter** submits).
+Interactive terminal sessions show compact per-turn stats by default; pass
+`--no-stats` to start with them hidden. When stdin or stdout is piped, the REPL
+keeps the original plain `>>> ` line-loop behavior for scripts and tests.
+
 ### Generation budget and sampling
 
 When `--max-new-tokens` is omitted, `generate` and `run` follow the model's
@@ -88,8 +95,14 @@ CUDA has two independent switches:
    native-cuda` enables the native backend plus the project's hand-written CUDA
    EP (`onnx-runtime-ep-cuda`).
 2. Runtime settings select which path to use. `ONNX_GENAI_EP=cuda` asks the ORT
-   session to use CUDA, while the decode backend selects the decoder. In the REPL
-   (`run`), use `/backend native` to use the native decoder.
+   session to use CUDA, while `--backend auto|ort|native` selects the decoder
+   for `generate`, `transcribe`, and the starting decoder for `run`. Speech
+   transcription uses the same autoregressive pipeline decoder as multimodal
+   generation, so backend selection is meaningful there too. In the REPL,
+   `/backend` can still reload the model and switch the decoder without
+   restarting. Profile output, `/session`, bare `/backend`, and `/stats` report
+   the resolved backend (`auto` is shown separately as the request when it
+   resolved to `ort` or `native`).
 
 CUDA failure modes are intentionally distinct:
 
@@ -111,10 +124,25 @@ Windows PowerShell example for the native CUDA path:
 ```powershell
 $env:ONNX_GENAI_EP = "cuda"
 $env:ONNX_GENAI_REQUIRE_CUDA = "1"
-cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- run .\path\to\model
-# In the REPL:
-# /backend native
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- `
+  generate .\path\to\model --prompt "Hello" --max-new-tokens 64 --backend native --profile
 ```
+
+PowerShell native-vs-ORT decode comparison, with the same ORT execution provider
+for both runs:
+
+```powershell
+$env:ONNX_GENAI_EP = "cuda"  # or "cpu"
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- `
+  generate .\path\to\model --prompt "Hello" --max-new-tokens 128 --backend native --profile
+cargo run --release -p onnx-genai-cli --features native-cuda --bin onnx-genai -- `
+  generate .\path\to\model --prompt "Hello" --max-new-tokens 128 --backend ort --profile
+```
+
+If `--backend native` is passed to a binary built without native decoder support,
+the command fails and tells you to rebuild with `--features native-backend` (CPU
+native/backend path) or `--features native-cuda` (native CUDA EP). It does not
+fall back to ORT.
 
 Python 3.11+ is required (the `onnxruntime` dependency ships no earlier wheels).
 
@@ -175,24 +203,24 @@ generated text.
 
 ### Checking the REPL's live view
 
-`/stats` renders the reply and its live numbers together, and that path is only
-taken when stdout is a real terminal. It therefore cannot be seen through a pipe
-— run the REPL directly in a terminal and type `/stats`, then a prompt:
+Interactive terminal sessions render the reply and live numbers together by
+default. That path is only taken when stdin and stdout are real terminals, so it
+cannot be seen through a pipe. Run the REPL directly in a terminal and type a
+prompt:
 
 ```bash
 cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm --max-new-tokens 5
 ```
 
 ```text
->>> /stats
-per-turn stats enabled
 >>> hello
 dogtok29over,dog
-[ 7 in · 5 out · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
+[ 7 in · 5 out · backend ort · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
 ```
 
-Piping a script into the REPL exercises the plain-text fallback instead, which is
-what the tests do:
+Use `/stats` to toggle the compact line at runtime, or start with
+`--no-stats`. Piping a script into the REPL exercises the byte-stable plain-text
+fallback instead, which is what the tests do:
 
 ```bash
 printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \

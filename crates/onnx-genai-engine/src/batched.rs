@@ -19,7 +19,8 @@ use onnx_genai_ort::decode::{
     BatchedDecodeSession, BatchedSharedBufferDecodeSession, SharedBufferBatchOptions,
 };
 use onnx_genai_ort::{BatchedStaticCacheDecodeSession, StaticCacheDecodeOptions};
-use std::collections::VecDeque;
+use onnx_genai_scheduler::{PreemptionPolicy, Priority, PriorityPolicy, Scheduler};
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContinuousBatchHandle {
@@ -244,24 +245,33 @@ impl<'a> ContinuousBatchManager<'a> {
                 break;
             };
             let pending = self.queue.pop_front().expect("queue checked non-empty");
-            self.decode
-                .assign_row(row_index)
-                .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {e}"))?;
-            let rng = SamplingRng::for_row(pending.options.seed, row_index);
-            let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
-            let mut row = ContinuousBatchRow {
-                handle: pending.handle,
-                physical_row: row_index,
-                context_tokens: pending.prompt_tokens,
-                options: pending.options,
-                chain: pending.chain,
-                max_context: pending.max_context,
-                state: loop_state,
-                pending_logits: None,
-            };
-            prefill_continuous_row(&mut *self.decode, &mut row)?;
-            self.rows[row_index] = Some(row);
+            self.admit_pending_into_row(pending, row_index)?;
         }
+        Ok(())
+    }
+
+    fn admit_pending_into_row(
+        &mut self,
+        pending: PendingContinuousRequest,
+        row_index: usize,
+    ) -> anyhow::Result<()> {
+        self.decode
+            .assign_row(row_index)
+            .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {e}"))?;
+        let rng = SamplingRng::for_row(pending.options.seed, row_index);
+        let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
+        let mut row = ContinuousBatchRow {
+            handle: pending.handle,
+            physical_row: row_index,
+            context_tokens: pending.prompt_tokens,
+            options: pending.options,
+            chain: pending.chain,
+            max_context: pending.max_context,
+            state: loop_state,
+            pending_logits: None,
+        };
+        prefill_continuous_row(&mut *self.decode, &mut row)?;
+        self.rows[row_index] = Some(row);
         Ok(())
     }
 
@@ -659,6 +669,140 @@ impl Engine {
             manager.step()?;
             collect_finished_events(manager.poll(), &mut results)?;
         }
+        collect_batch_results(results)
+    }
+
+    /// Run requests to completion through a continuous batch whose formation is
+    /// driven by the [`Scheduler`], rather than by the manager's greedy
+    /// self-admission.
+    ///
+    /// This is the engine-serving counterpart to [`Self::run_continuous_batch`]:
+    /// instead of self-admitting every arrival, each iteration the scheduler
+    /// decides which waiting requests are *eligible* to enter the batch — FCFS
+    /// order gated by the shared KV byte budget and total-token ceiling — and
+    /// only those requests are handed to the batch. Physical concurrency is
+    /// bounded by the manager's `max_batch` decode rows, which run one *shared*
+    /// batched forward pass per iteration; finished rows are backfilled from the
+    /// admitted set so the batch stays continuously occupied.
+    ///
+    /// Because a request's tokens never depend on which rows share its batch,
+    /// the per-request output is byte-identical to running each request on its
+    /// own (`Engine::generate`) and to the greedy [`Self::run_continuous_batch`]
+    /// — batching here is a throughput optimization, not an output change.
+    ///
+    /// The scheduler is run with preemption disabled: this batch owns its KV in
+    /// the batched decode session's physical rows, which cannot be swapped out
+    /// and resumed in place, so mid-flight eviction/swap of a running row is
+    /// deferred (tracked with session-level continuous batching). Byte-budget
+    /// admission still holds because each row reserves its worst-case footprint
+    /// up front.
+    pub fn run_continuous_batch_scheduled(
+        &mut self,
+        requests: Vec<GenerateRequest>,
+        max_batch: usize,
+    ) -> anyhow::Result<Vec<GenerateResult>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
+        }
+        let expected_results = requests.len();
+
+        // Tokenize every prompt up front so the scheduler and the batch manager
+        // agree on the exact prompt length, and feed the manager token ids so no
+        // re-tokenization can drift between the two.
+        let mut prepared = Vec::with_capacity(expected_results);
+        let mut token_requests = Vec::with_capacity(expected_results);
+        for mut request in requests {
+            let prompt_tokens = match &request.prompt {
+                GeneratePrompt::TokenIds(tokens) => tokens.clone(),
+                GeneratePrompt::Text(text) => self
+                    .tokenizer
+                    .encode(text)
+                    .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?,
+            };
+            prepared.push((prompt_tokens.len(), request.options.max_new_tokens));
+            request.prompt = GeneratePrompt::TokenIds(prompt_tokens);
+            token_requests.push(request);
+        }
+
+        // A dedicated FCFS scheduler governs admission for this batch. Physical
+        // concurrency is enforced by the manager's `max_batch` decode rows, so
+        // the scheduler's own batch-size cap is opened up to the request count:
+        // its role here is admission *eligibility* — ordering plus the shared
+        // token/byte budget — not row count. Preemption is disabled because this
+        // batch owns its KV in the decode session's physical rows, which cannot
+        // be swapped out and resumed in place.
+        let mut scheduler_config = self.scheduler.config().clone();
+        scheduler_config.max_batch_size = expected_results.max(max_batch);
+        scheduler_config.preemption_policy = PreemptionPolicy::Disabled;
+        scheduler_config.priority_policy = PriorityPolicy::Fcfs;
+        let mut scheduler = Scheduler::new(scheduler_config);
+
+        // Every request waits in the scheduler keyed by its result index. Each
+        // iteration the scheduler decides which waiting requests are eligible to
+        // admit (subject to the token/byte budget); those — and only those — are
+        // submitted into the manager, whose greedy `step()` then keeps its
+        // physical rows continuously occupied via same-step backfill. Because the
+        // eligible set is fed to the manager as spare queue entries (never fewer
+        // rows than the manager can fill), the decode path is byte-identical to
+        // `run_continuous_batch`; the scheduler simply gates which requests are
+        // allowed into the batch.
+        for (index, (prompt_len, max_new_tokens)) in prepared.iter().enumerate() {
+            scheduler.enqueue_generate_request(
+                index as u64,
+                *prompt_len,
+                (*max_new_tokens).max(1),
+                Priority::Normal,
+            );
+        }
+
+        let mut manager = self.continuous_batch_manager(max_batch)?;
+        let mut results = vec![None; expected_results];
+        let mut pending_requests: Vec<Option<GenerateRequest>> =
+            token_requests.into_iter().map(Some).collect();
+        // Manager handle id -> original result index (handles are minted lazily
+        // as requests are admitted, so this preserves the caller's ordering).
+        let mut handle_to_index: HashMap<usize, usize> = HashMap::new();
+
+        while results.iter().any(|result| result.is_none()) {
+            let decision = scheduler.schedule();
+            let admitted_this_iter = decision.prefill.len();
+            for seq_id in &decision.prefill {
+                let index = *seq_id as usize;
+                let request = pending_requests[index]
+                    .take()
+                    .with_context(|| format!("request {index} admitted twice"))?;
+                let handle = manager.submit(request)?;
+                handle_to_index.insert(handle.id, index);
+            }
+
+            // Progress guard: if nothing is running and the scheduler admitted
+            // nothing this iteration, the batch cannot make progress (e.g. the
+            // token budget is too small to fit even one queued request).
+            if admitted_this_iter == 0 && manager.active_len() == 0 && !manager.has_pending_work() {
+                if scheduler.waiting_count() > 0 {
+                    anyhow::bail!(
+                        "scheduler-driven continuous batch stalled: {} request(s) queued but none could be admitted (scheduler budget too small for max_batch={max_batch})",
+                        scheduler.waiting_count()
+                    );
+                }
+                break;
+            }
+
+            manager.step()?;
+            for event in manager.poll() {
+                if let ContinuousBatchEvent::Finished { handle, result } = event {
+                    let index = *handle_to_index
+                        .get(&handle.id)
+                        .with_context(|| format!("continuous handle {} is unmapped", handle.id))?;
+                    results[index] = Some(result);
+                    scheduler.complete(index as u64);
+                }
+            }
+        }
+
         collect_batch_results(results)
     }
 

@@ -47,6 +47,10 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Converted coverage-capable test lanes to upload Codecov flags: `offline`, `mlas`, `cli-ort-linux`, and `cli-ort-windows`; verified final CI green at https://github.com/justinchuby/onnx-genai/actions/runs/30309892830.
 - Confirmed CLI ORT Linux still executes `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`; Windows CLI ORT stages the DLL into cargo-llvm-cov target paths with `--no-clean`.
 - Documented Windows ARM64 coverage blocker (rust-lang/rust#150123) and release workflow debt in `.squad/decisions/inbox/pris-ci-supply-chain-and-coverage.md`.
+## 2026-07-27T15:25:00-07:00 — REPL e2e output assertion hardening
+- Fixed the flaky `piped_help_with_an_argument_still_prints_full_help` regression test by comparing stdout-only REPL help listings instead of merged stdout+stderr, which can contain ONNX Runtime/tracing timestamps.
+- Audited `crates/onnx-genai-cli/tests/repl_e2e.rs` and split several command/error assertions so stdout help/session-continuation checks are not coupled to stderr logs.
+- Guard reasoning: a pre-fix plain/piped `/help anything` that prints command-specific help would still differ from bare `/help` on stdout and fail the equality check.
 ## 2026-07-27T14:35:00-07:00 — Dispatch-branch coverage audit (PR #275 blocking bugs)
 
 - **Finding: 12 of 13 reachable dispatch combinations in `matmul.rs` had zero test coverage** while codecov reported PASS. Line coverage (78%) masked the gap.

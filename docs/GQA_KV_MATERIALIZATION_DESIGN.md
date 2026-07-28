@@ -1,7 +1,7 @@
 # CPU GroupQueryAttention — KV materialization design
 
 Author: Roy (CPU-kernel performance)
-Status: Tier A implemented; Tier B deferred (documented only)
+Status: Tier A implemented; Tier B runtime-managed (paged) KV slice implemented (#62) — live-session wiring and CUDA GQA Tier B deferred
 Kernel: `crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`
 
 ## 1. Problem
@@ -108,7 +108,7 @@ The double output pass (item 4 above) is left as-is: it is part of the SSA
 contract (the engine binds the present K/V as owned outputs), so removing it
 belongs to Tier B.
 
-### Tier B — deferred (cross-cutting, document only; NOT implemented)
+### Tier B — runtime-managed (paged) KV materialization (slice implemented)
 
 The residual O(S²) comes from allocating and writing a full `present_k`/
 `present_v` every step. The real fix is a **shared append-only KV buffer**:
@@ -118,18 +118,46 @@ The residual O(S²) comes from allocating and writing a full `present_k`/
   and attention reads `[0, past_seq + 1)` directly from that buffer — no
   per-step concat, no fresh present allocation, no output copy.
 
-This requires kernel input/output **aliasing** (present K/V alias past K/V) plus
-engine-side KV-lifecycle / binding changes so the runtime hands the kernel a
-persistent, growable buffer. The ORT-backed runner already models this via
-`SharedBuffer` metadata (see `docs/KV_INSERTION_DESIGN.md:48-57`), but the
-**pure-Rust CPU kernel/runtime path does not** — it always materializes
-present outputs. Wiring that through is out of scope for this kernel-local
-slice.
+Two composable forms of this land in the pure-Rust CPU path:
+
+1. **In-place present==past aliasing** (kernel-local, `#105`). When the engine
+   binds each `present` output onto its `past` input at full physical capacity
+   `[1, H, max_len, D]`, `group_query_attention.rs::detect_inplace_kv` detects
+   the aliasing purely structurally and appends only the current step's rows in
+   place, attending directly over the buffer — no past widen/copy and no present
+   round-trip. `native_decode/cpu.rs` sets up that binding for CPU decode.
+
+2. **Runtime-managed paged KV** (`#62`). Rather than one monolithic
+   `[1, H, max_len, D]` buffer, the sequence's KV lives in the existing paged
+   store (`onnx_genai_kv::PagedKvCache`): each step appends one token's `D` f32
+   per KV head into persistent pages (`append_token_kv`, O(1); a new page is
+   allocated only when the previous fills), and attention reads each attended
+   token's row **in place** from its owning page (`head_token_row`) via the
+   shared, accessor-based SDPA core
+   (`onnx_runtime_ep_cpu::kernels::sdpa::sdpa_decode_row_accessor`). The
+   accessor runs the exact `dot`/`scale`/`softcap`/f64-softmax/`axpy` sequence as
+   the contiguous `sdpa_decode_row`, so the output is **bit-for-bit identical**
+   to the Tier A fresh-present path (proven across multi-step decode, group
+   broadcast, softcap, sliding window, prefill→decode, and page-boundary
+   crossings). The steady decode step allocates **zero** present buffers — a
+   process-global `GQA_PRESENT_ALLOCATIONS` counter stays flat for the paged
+   path while the fresh-present reference increments it once per step, so the
+   optimization is falsifiable. The primitive lives in
+   `onnx_genai_engine::native_decode::paged_gqa`.
+
+**Still deferred.** Wiring the paged primitive into the *live* engine session so
+the whole model decodes through it (binding the decoder's `present.*`/`past.*`
+ports onto paged storage and retiring the kernel's present materialization on
+that path), and the CUDA GQA Tier B path, remain out of scope. The ORT-backed
+runner already models the aliasing form via `SharedBuffer` metadata (see
+`docs/KV_INSERTION_DESIGN.md:48-57`).
 
 Additionally, sliding-window / attention-sink eviction (`local_window_size`)
-breaks the naive append-only model once `past_seq` reaches `max_len`: it needs
-an explicit **compaction / ring-buffer / paged** policy to decide what to evict
-and how to keep the live window contiguous. That policy is deferred with Tier B.
+past `max_len` under the paged form relies on the paged store's own
+compaction / sliding-window policy (`apply_sliding_window*`); the CPU paged
+primitive above is validated for the contiguous (non-evicted) window and for
+`local_window` masking, but composing eviction with the in-place read path is
+deferred with the live-session wiring above.
 
 ## 4. Correctness invariants (preserved)
 

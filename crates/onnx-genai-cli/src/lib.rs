@@ -41,15 +41,18 @@ mod output;
 mod pages;
 mod profile;
 mod transcribe;
+use commands::parse_decode_backend;
 use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
 use interactive::{
-    InterruptAction, Interrupted, apply_context_sized_max_new_tokens, context_exhaustion_error,
-    context_window_is_full, drop_exhausted_repl_turn, interrupt_action, is_interrupt_error,
-    stage_attachment,
+    InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
+    context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
+    initial_repl_show_stats, interrupt_action, is_interrupt_error,
+    plain_stream_needs_trailing_newline, repl_input_mode, stage_attachment,
 };
 use model_inspection::{list, show, version};
+use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
 use onnx_genai::{EngineConfig, GenerateOptions, StopSequence};
@@ -62,11 +65,9 @@ const CLI_FALLBACK_MAX_NEW_TOKENS: usize = 512;
 
 #[cfg(test)]
 use commands::{
-    ProfileSetting, ReplCommand, ReplLine, parse_decode_backend, parse_profile_setting,
-    parse_repl_line,
+    ProfileSetting, ReplCommand, ReplLine, command_registry, complete_repl_line,
+    parse_profile_setting, parse_repl_line, render_repl_help,
 };
-#[cfg(test)]
-use onnx_genai::engine::EngineDecodeBackend;
 #[cfg(test)]
 use onnx_genai::ort::{ChatMessage, profile::TraceVerbosity};
 #[cfg(test)]
@@ -219,6 +220,10 @@ impl SamplingArgs {
 /// Shared engine-tuning flags.
 #[derive(Debug, Args, Default, Clone)]
 struct EngineArgs {
+    /// Decoder backend for text generation.
+    #[arg(long, value_name = "auto|ort|native", value_parser = parse_decode_backend, default_value = "auto")]
+    backend: EngineDecodeBackend,
+
     /// Memory ceiling the engine may use for weights and KV cache: a byte count
     /// (`8GiB`), a fraction of detected capacity (`0.9`), or `auto`.
     ///
@@ -236,7 +241,10 @@ struct EngineArgs {
 
 impl EngineArgs {
     fn to_config(&self) -> EngineConfig {
-        let mut config = EngineConfig::default();
+        let mut config = EngineConfig {
+            decode_backend: self.backend,
+            ..EngineConfig::default()
+        };
         if let Some(limit) = self.vram_limit {
             config.limits.vram_limit = limit;
         }
@@ -244,6 +252,14 @@ impl EngineArgs {
             config.limits.host_ram_limit = limit;
         }
         config
+    }
+}
+
+fn decode_backend_name(backend: EngineDecodeBackend) -> &'static str {
+    match backend {
+        EngineDecodeBackend::Auto => "auto",
+        EngineDecodeBackend::Ort => "ort",
+        EngineDecodeBackend::Native => "native",
     }
 }
 
@@ -517,6 +533,10 @@ struct GenerateArgs {
 struct RunArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
     model: PathBuf,
+
+    /// Do not show compact per-turn stats by default in an interactive terminal.
+    #[arg(long)]
+    no_stats: bool,
 
     #[command(flatten)]
     sampling: SamplingArgs,
@@ -907,6 +927,102 @@ mod tests {
     }
 
     #[test]
+    fn backend_is_shared_by_generate_run_and_transcribe() {
+        let generate = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--backend",
+            "native",
+        ])
+        .unwrap();
+        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--backend", "ort"]).unwrap();
+        let transcribe =
+            Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "native"])
+                .unwrap();
+
+        match generate.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Native
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+        match run.command {
+            Commands::Run(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Ort);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Ort
+                );
+            }
+            _ => panic!("expected run command"),
+        }
+        match transcribe.command {
+            Commands::Transcribe(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Native
+                );
+            }
+            _ => panic!("expected transcribe command"),
+        }
+    }
+
+    #[test]
+    fn transcribe_rejects_unknown_backend_loudly() {
+        let error = Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "cuda"])
+            .expect_err("cuda is an execution provider, not a decode backend")
+            .to_string();
+
+        assert!(error.contains("auto, ort, or native"), "{error}");
+    }
+
+    #[test]
+    fn backend_defaults_to_auto() {
+        let parsed =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Auto);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Auto
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn backend_reuses_repl_parser_error() {
+        let error = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--backend",
+            "cuda",
+        ])
+        .expect_err("cuda is an execution provider, not a decode backend")
+        .to_string();
+
+        assert!(
+            error.contains("What: \"cuda\" is not a decode backend"),
+            "{error}"
+        );
+        assert!(error.contains("How: use auto, ort, or native."), "{error}");
+    }
+
+    #[test]
     fn sampling_flags_disable_greedy_unless_temperature_is_zero_or_greedy_is_forced() {
         let stochastic = Cli::try_parse_from([
             "onnx-genai",
@@ -999,6 +1115,40 @@ mod tests {
     #[test]
     fn run_rejects_model_flag() {
         assert!(Cli::try_parse_from(["onnx-genai", "run", "--model", "./m"]).is_err());
+    }
+
+    #[test]
+    fn run_accepts_no_stats_opt_out() {
+        let parsed_command_line =
+            Cli::try_parse_from(["onnx-genai", "run", "./m", "--no-stats"]).unwrap();
+
+        match parsed_command_line.command {
+            Commands::Run(args) => assert!(args.no_stats),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn tty_split_keeps_pipes_plain_and_stats_tty_only() {
+        assert_eq!(repl_input_mode(true, true), ReplInputMode::Tty);
+        assert_eq!(repl_input_mode(false, true), ReplInputMode::Plain);
+        assert_eq!(repl_input_mode(true, false), ReplInputMode::Plain);
+
+        assert!(initial_repl_show_stats(ReplInputMode::Tty, false));
+        assert!(!initial_repl_show_stats(ReplInputMode::Tty, true));
+        assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
+    }
+
+    #[test]
+    fn plain_stream_newline_depends_on_this_turns_renderer_usage() {
+        let pending_live_renderer = live_turn::LiveTurn::Pending;
+        assert!(pending_live_renderer.is_active());
+        assert!(plain_stream_needs_trailing_newline(false));
+        assert!(!plain_stream_needs_trailing_newline(true));
+        assert!(
+            plain_stream_needs_trailing_newline(false),
+            "a pending reusable live renderer must not suppress the newline when this turn did not use it"
+        );
     }
 
     #[test]
@@ -1230,15 +1380,15 @@ mod tests {
     #[test]
     fn parse_repl_line_recognizes_control_commands() {
         assert_eq!(
-            parse_repl_line("/help"),
-            ReplLine::Command(ReplCommand::Help)
+            parse_repl_line("/help", ReplInputMode::Tty),
+            ReplLine::Command(ReplCommand::Help(None))
         );
         assert_eq!(
-            parse_repl_line("/reset"),
+            parse_repl_line("/reset", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Reset)
         );
         assert_eq!(
-            parse_repl_line("/raw"),
+            parse_repl_line("/raw", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::ToggleRaw)
         );
     }
@@ -1246,11 +1396,11 @@ mod tests {
     #[test]
     fn parse_repl_line_recognizes_system_commands() {
         assert_eq!(
-            parse_repl_line("/system keep answers short"),
+            parse_repl_line("/system keep answers short", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::System(Some("keep answers short".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/system   "),
+            parse_repl_line("/system   ", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::System(None))
         );
     }
@@ -1258,28 +1408,28 @@ mod tests {
     #[test]
     fn parse_repl_line_recognizes_image_and_audio_attachments() {
         assert_eq!(
-            parse_repl_line("/image cat.png"),
+            parse_repl_line("/image cat.png", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Image {
                 path: Some("cat.png".to_string()),
                 prompt: None,
             })
         );
         assert_eq!(
-            parse_repl_line("/image cat.png describe this"),
+            parse_repl_line("/image cat.png describe this", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Image {
                 path: Some("cat.png".to_string()),
                 prompt: Some("describe this".to_string()),
             })
         );
         assert_eq!(
-            parse_repl_line("/audio speech.wav summarize it"),
+            parse_repl_line("/audio speech.wav summarize it", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Audio {
                 path: Some("speech.wav".to_string()),
                 prompt: Some("summarize it".to_string()),
             })
         );
         assert_eq!(
-            parse_repl_line("/audio"),
+            parse_repl_line("/audio", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Audio {
                 path: None,
                 prompt: None,
@@ -1290,41 +1440,112 @@ mod tests {
     #[test]
     fn parse_repl_line_preserves_prompts_and_rejects_unknown_commands() {
         assert_eq!(
-            parse_repl_line("  explain this"),
+            parse_repl_line("  explain this", ReplInputMode::Tty),
             ReplLine::Prompt("  explain this".to_string())
         );
         assert_eq!(
-            parse_repl_line("/unsupported extra"),
+            parse_repl_line("//literal slash", ReplInputMode::Tty),
+            ReplLine::Prompt("/literal slash".to_string())
+        );
+        assert_eq!(
+            parse_repl_line("/unsupported extra", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Unknown("/unsupported".to_string()))
         );
     }
 
     #[test]
+    fn parse_repl_line_keeps_plain_mode_compatible_with_piped_repl() {
+        assert_eq!(
+            parse_repl_line("//literal slash", ReplInputMode::Plain),
+            ReplLine::Command(ReplCommand::Unknown("//literal".to_string()))
+        );
+        assert_eq!(
+            parse_repl_line("/help anything", ReplInputMode::Plain),
+            ReplLine::Command(ReplCommand::Help(None))
+        );
+        assert_eq!(
+            parse_repl_line("/help anything", ReplInputMode::Tty),
+            ReplLine::Command(ReplCommand::Help(Some("anything".to_string())))
+        );
+    }
+
+    #[test]
+    fn command_registry_drives_help_and_parser() {
+        let help = render_repl_help();
+        for command in command_registry() {
+            assert!(
+                help.lines().any(|line| line == command.usage),
+                "{} missing from help",
+                command.usage
+            );
+            assert!(
+                !matches!(
+                    parse_repl_line(&format!("/{}", command.name), ReplInputMode::Tty),
+                    ReplLine::Command(ReplCommand::Unknown(_))
+                ),
+                "{} did not parse through registry",
+                command.name
+            );
+        }
+        assert_eq!(
+            help,
+            "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/session\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
+        );
+    }
+
+    #[test]
+    fn slash_completion_covers_commands_and_arguments() {
+        let command_names = complete_repl_line("/ba", 3)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(command_names, vec!["/backend"]);
+
+        let backends = complete_repl_line("/backend n", 10)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(backends, vec!["native"]);
+
+        let providers = complete_repl_line("/ep a", 5)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert!(providers.contains(&"auto".to_string()));
+
+        let verbosity = complete_repl_line("/profile verbosity f", 20)
+            .into_iter()
+            .map(|item| item.replacement)
+            .collect::<Vec<_>>();
+        assert_eq!(verbosity, vec!["full"]);
+    }
+
+    #[test]
     fn session_control_commands_parse_with_and_without_an_argument() {
         assert_eq!(
-            parse_repl_line("/profile on"),
+            parse_repl_line("/profile on", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Profile(Some("on".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/profile"),
+            parse_repl_line("/profile", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Profile(None)),
             "a bare command reports the current state"
         );
         assert_eq!(
-            parse_repl_line("/ep  cuda "),
+            parse_repl_line("/ep  cuda ", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::ExecutionProvider(Some("cuda".to_string()))),
             "surrounding whitespace is not part of the name"
         );
         assert_eq!(
-            parse_repl_line("/backend native"),
+            parse_repl_line("/backend native", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::DecodeBackend(Some("native".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/model ./m"),
+            parse_repl_line("/model ./m", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Model(Some("./m".to_string())))
         );
         assert_eq!(
-            parse_repl_line("/session"),
+            parse_repl_line("/session", ReplInputMode::Tty),
             ReplLine::Command(ReplCommand::Session)
         );
     }
@@ -1354,6 +1575,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            resolved_decode_backend: EngineDecodeBackend::Ort,
             options: &options,
             history: &history,
             usage: &usage,
@@ -1365,7 +1587,8 @@ mod tests {
             "session\n\
              \x20\x20model: models/tiny\n\
              \x20\x20execution provider: cpu\n\
-             \x20\x20decode backend: auto\n\
+             \x20\x20decode backend: ort\n\
+             \x20\x20requested backend: auto\n\
              \x20\x20sampling: max_new_tokens=32 max_context=auto temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
              \x20\x20messages: 3 (system: 1, user: 1, assistant: 1)\n\
              \x20\x20completed turns: 1\n\
@@ -1391,8 +1614,8 @@ mod tests {
 
     #[test]
     fn parse_repl_line_treats_empty_and_whitespace_lines_as_empty() {
-        assert_eq!(parse_repl_line(""), ReplLine::Empty);
-        assert_eq!(parse_repl_line(" \t "), ReplLine::Empty);
+        assert_eq!(parse_repl_line("", ReplInputMode::Tty), ReplLine::Empty);
+        assert_eq!(parse_repl_line(" \t ", ReplInputMode::Tty), ReplLine::Empty);
     }
 
     #[test]
