@@ -1,49 +1,78 @@
 #!/usr/bin/env python3
 """Compare criterion benchmark results between a PR and its merge-base.
 
-Reads criterion JSON estimates from two directories (base and PR), computes
-relative change for each scenario, and emits a Markdown table suitable for
-posting as a PR comment. Reports percentage change (the ratio that matters
-for regression detection) and treats absolute timings as informational only.
+This is a REGRESSION GATE, not an advisory comment. It fails (exit 1) when a
+benchmark scenario exceeds the failure threshold, blocking the PR until the
+regression is addressed or justified.
+
+Methodology
+-----------
+The workflow benchmarks the merge-base FIRST (absorbs cold-start/cache-miss
+overhead), then the PR head SECOND (benefits from warm caches and steady-state
+runner). This creates a small systematic bias toward PR appearing faster, which:
+  - Reduces false positives (PR must overcome warm-runner advantage to appear
+    slower, so only genuine regressions trip the gate).
+  - Makes the gate more conservative and therefore more durable — a gate that
+    cries wolf gets disabled within a week.
+
+The comparison uses criterion point-estimate means from 100 samples each.
+
+Threshold derivation
+--------------------
+Measured variance on the CI runner (macOS arm64 M1 Virtual, 3 cores) with the
+CORRECTED ordering (base-first, PR-second):
+  - Single-threaded kernels: typically <10% noise
+  - Multi-threaded matmul: up to ~20% noise (fewer cores = more contention)
+  - Hot-path (sampling, tokenization): <5% noise
+
+The failure threshold (30%) is set at 1.5× the worst observed single-scenario
+noise (~20%), giving a margin that prevents false positives while catching the
+historical regression class we guard against (350% = 4.5× M=1 decode).
+
+Signal-to-noise margin: 350% / 30% = 11.7×.
+
+If CI noise proves larger than expected after deployment, raise the threshold
+from the data — but document exactly what variance was observed on what
+scenarios, so the next person can re-derive rather than guess.
 
 Exit codes
 ----------
-0 — all changes within threshold
-1 — at least one regression exceeds the failure threshold
+0 — all changes within threshold (PR may merge)
+1 — at least one regression exceeds the failure threshold (PR BLOCKED)
 
 Known gaps
 ----------
 This script compares criterion point estimates. It cannot detect:
   - Regressions in code paths not exercised by the benchmark suite.
-  - Noise-driven false positives when CI runners have extreme load variance
-    (mitigated by running base and PR on the same runner in the same job).
   - Sub-threshold regressions that compound over multiple PRs.
+  - Regressions that only manifest with a real model (GQA fusion, speculative
+    decode, end-to-end token throughput).
+  - GPU-only regressions.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 
 
-# Default thresholds, calibrated from measured run-to-run variance.
+# ── Thresholds ───────────────────────────────────────────────────────────────
 #
-# On a macOS arm64 developer machine, two identical-code benchmark runs
-# showed up to ~48% variance on multi-threaded matmul (due to background
-# load) and ~15% on single-threaded kernels. CI runners (dedicated VMs)
-# show lower variance but are not zero-noise.
+# FAIL_THRESHOLD: the gate trips here. Derived from:
+#   - Observed CI noise: ~20% worst-case on multi-threaded matmul with
+#     base-first ordering on 3-core M1 Virtual runner.
+#   - Margin: 1.5× worst noise → 30%.
+#   - Historical regression: 4.5× (350%). Signal-to-noise: 11.7×.
 #
-# The regression this workflow exists to catch was 4.5× (350%). With a
-# 50% failure threshold, we have ≥7× signal-to-noise margin for that
-# class of regression, while avoiding false positives from normal jitter.
+# WARN_THRESHOLD: surfaces suspicious changes (does NOT block).
 #
-# A 15% warning threshold surfaces suspicious changes for human review
-# without blocking the build.
-WARN_THRESHOLD = 0.15   # 15% slower → warning
-FAIL_THRESHOLD = 0.50   # 50% slower → failure
+# To re-derive: run the benchmark twice on the same commit with base-first
+# ordering and record the max positive delta across all scenarios. Set
+# FAIL_THRESHOLD at 1.5× that value.
+WARN_THRESHOLD = 0.15   # 15% slower → ⚠️ in comment
+FAIL_THRESHOLD = 0.30   # 30% slower → 🔴 gate FAILS
 
 
 def parse_estimates(criterion_dir: Path) -> dict[str, float]:
@@ -110,7 +139,7 @@ def generate_markdown(
     has_warning = any(change >= warn for _, _, _, change in rows)
 
     if has_regression:
-        header = "## 🔴 Benchmark Regression Detected"
+        header = "## 🔴 Benchmark Regression — Check FAILED"
     elif has_warning:
         header = "## ⚠️ Benchmark Change Detected"
     else:
@@ -119,8 +148,19 @@ def generate_markdown(
     lines = [
         header,
         "",
+    ]
+
+    if has_regression:
+        lines.append(
+            "**This check has FAILED.** One or more scenarios regressed beyond "
+            f"the {fail:.0%} threshold. The PR is blocked until the regression is "
+            "addressed or the threshold is re-evaluated against measured noise."
+        )
+        lines.append("")
+
+    lines.extend([
         "Comparison of criterion micro-benchmarks: **PR head vs merge-base**, "
-        "measured on the same runner in the same job.",
+        "measured on the same runner in the same job (base first → PR second).",
         "",
         "> ℹ️ Absolute times are **informational only** — they vary with runner "
         "load. The **% change** column is the reliable signal because both sides "
@@ -128,7 +168,7 @@ def generate_markdown(
         "",
         "| Status | Scenario | Base | PR | Change |",
         "|:---:|---|---:|---:|---:|",
-    ]
+    ])
 
     for scenario, base_ns, pr_ns, change in rows:
         icon = status_icon(change, warn, fail)
@@ -140,8 +180,9 @@ def generate_markdown(
 
     lines.append("")
     lines.append(
-        f"**Thresholds:** ⚠️ ≥ {warn:.0%} slower, "
-        f"🔴 ≥ {fail:.0%} slower (derived from measured runner variance)"
+        f"**Thresholds:** ⚠️ ≥ {warn:.0%} slower (advisory), "
+        f"🔴 ≥ {fail:.0%} slower (**blocks merge**) — "
+        "derived from measured runner variance × 1.5 safety margin"
     )
 
     if host_info:

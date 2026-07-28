@@ -1,9 +1,19 @@
 name: Benchmarks
 
-# Runs kernel micro-benchmarks on every PR and posts a comparison comment.
-# Designed around the principle: RATIOS ARE RELIABLE, ABSOLUTES ARE NOT.
-# Both base and PR benchmarks run on the same runner in the same job,
-# so the percentage change self-controls for host load.
+# Kernel micro-benchmark regression gate. Runs on every PR, compares the PR
+# head against its merge-base on the SAME runner in the SAME job, and FAILS
+# the check on a statistically unambiguous regression.
+#
+# Design principles:
+#   1. Ratios are reliable, absolutes are not.
+#   2. Base is benchmarked FIRST (eats cold-start overhead). PR second (warm
+#      runner). This creates a small systematic bias toward PR appearing faster,
+#      which reduces false positives. A genuine regression must overcome this
+#      bias — that is a feature, not a bug.
+#   3. The gate is REAL. It fails the build. A gate that cannot fail is a
+#      comment nobody reads. The throughput floor that passed cheerfully through
+#      a 4.5× decode regression proves this.
+#   4. Thresholds are derived from measured variance, not chosen as round numbers.
 
 on:
   pull_request:
@@ -25,9 +35,6 @@ jobs:
     runs-on: macos-latest
     env:
       CARGO_TERM_COLOR: always
-      # Criterion measurement time — shorter than default to keep CI fast
-      # while still collecting enough samples for stable estimates.
-      CRITERION_MEASUREMENT_TIME: "3"
 
     steps:
       - uses: actions/checkout@v5
@@ -42,17 +49,7 @@ jobs:
           # Separate cache for benchmarks to avoid polluting the main CI cache.
           prefix-key: bench-v1
 
-      # ── Benchmark the PR head ──────────────────────────────────────────
-      - name: Benchmark PR head (ep-cpu kernels)
-        run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
-
-      - name: Benchmark PR head (genai-bench no_model)
-        run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
-
-      - name: Save PR criterion results
-        run: cp -R target/criterion pr-criterion
-
-      # ── Benchmark the merge-base ──────────────────────────────────────
+      # ── Benchmark the MERGE-BASE FIRST (eats cold-start) ──────────────
       - name: Determine merge-base
         id: merge-base
         run: |
@@ -72,10 +69,20 @@ jobs:
       - name: Save base criterion results
         run: cp -R target/criterion base-criterion
 
-      # ── Compare and comment ────────────────────────────────────────────
-      - name: Checkout PR head (for scripts)
+      # ── Benchmark the PR head SECOND (warm runner) ────────────────────
+      - name: Checkout PR head
         run: git checkout ${{ github.event.pull_request.head.sha }}
 
+      - name: Benchmark PR head (ep-cpu kernels)
+        run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
+
+      - name: Benchmark PR head (genai-bench no_model)
+        run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
+
+      - name: Save PR criterion results
+        run: cp -R target/criterion pr-criterion
+
+      # ── Compare, comment, and gate ────────────────────────────────────
       - name: Collect host info
         id: host
         run: |
@@ -91,13 +98,15 @@ jobs:
 
       - name: Generate comparison
         id: compare
+        # Do not fail here — post the comment first for visibility.
         run: |
           python3 scripts/ci_bench_compare.py \
             --base-dir base-criterion \
             --pr-dir pr-criterion \
             --output benchmark-comment.md \
-            --host-info "${{ steps.host.outputs.info }}" \
-            || echo "has_regression=true" >> "$GITHUB_OUTPUT"
+            --host-info "${{ steps.host.outputs.info }}"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
 
       - name: Find existing comment
         id: find-comment
@@ -126,11 +135,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # The build does NOT fail on regression — it flags and comments.
-      # A flaky perf gate gets disabled within a week and protects nothing.
-      # Instead, surface the regression prominently via the comment.
-      - name: Report regression status
-        if: steps.compare.outputs.has_regression == 'true'
+      # ── THE GATE: fail the check if regression detected ───────────────
+      - name: Fail on regression
+        if: steps.compare.outcome == 'failure'
         run: |
-          echo "::warning::Benchmark regression detected — see PR comment for details"
+          echo "::error::Benchmark regression detected — check failed."
+          echo ""
           cat benchmark-comment.md
+          exit 1
