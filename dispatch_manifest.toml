@@ -73,7 +73,7 @@ platform = "aarch64-apple-darwin"
 minimum_tier = "tier1"
 counter = "CONV_BNNS_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
-description = "Standard Conv dispatches to BNNS on Apple Silicon"
+description = "Standard Conv (including 1D promoted to 2D) dispatches to BNNS on Apple Silicon"
 # Tier1=BNNS, Tier2=im2col+cblas_sgemm, Tier3=scalar
 
 [[claim]]
@@ -98,6 +98,15 @@ counter = "SDPA_NEON_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
 description = "SDPA uses NEON-accelerated dot/axpy on aarch64"
 # Proves: sdpa_dispatcher_reaches_neon_on_aarch64
+
+[[claim]]
+op = "SDPA"
+variant = "accelerate"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "SDPA_ACCELERATE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA uses Accelerate cblas_sgemm (AMX) on macOS for QKT and PV matmuls"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Kernel dispatch — all platforms
@@ -159,11 +168,14 @@ description = "Contiguous same-shape f32 Add uses vDSP_vadd"
 # Deliberate exclusions (not optimized — by design)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-[[exclusion]]
+[[claim]]
 op = "Conv"
-variant = "depthwise"
-platform = "aarch64-apple-darwin"
-reason = "Depthwise conv (groups > 1) deliberately on scalar reference pending profiling"
+variant = "grouped_depthwise"
+platform = "all"
+minimum_tier = "tier2"
+counter = "CONV_IM2COL_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "Grouped/depthwise Conv dispatches to im2col+GEMM (BNNS legacy API rejects groups>1)"
 
 [[exclusion]]
 op = "MatMul"
