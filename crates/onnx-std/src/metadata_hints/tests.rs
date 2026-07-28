@@ -4,12 +4,13 @@ use super::*;
 use crate::model::Model;
 use onnx_runtime_ir::{DataType, Graph, Node, NodeId, static_shape};
 use onnx_runtime_loader::ModelMetadata;
+use onnx_runtime_loader::proto::onnx::{AttributeProto, GraphProto, NodeProto, attribute_proto};
 
-/// Build an `onnx_runtime.*` entry attached to a node.
+/// Build an `onnx_runtime.*` entry attached to a node by name (external source).
 fn node_entry(node: &str, key: &str, value: &str, source: HintSource) -> HintEntry {
     HintEntry {
-        scope: HintScope::Node {
-            node_name: node.to_string(),
+        scope: HintScope::NamedNode {
+            name: node.to_string(),
         },
         source,
         key: key.to_string(),
@@ -404,10 +405,415 @@ fn from_model_reads_node_level_metadata_props() {
 }
 
 #[test]
+fn control_flow_subgraph_hints_are_scanned_with_qualified_paths() {
+    for (op_type, owner_name, attribute_name) in [
+        ("Loop", "loop", "body"),
+        ("If", "if", "then_branch"),
+        ("If", "if", "else_branch"),
+        ("Scan", "scan", "body"),
+    ] {
+        let subgraph = GraphProto {
+            metadata_props: vec![string_entry("onnx_runtime.model.architecture", "nested")],
+            node: vec![proto_node("inner", [("onnx_runtime.device", "gpu:1")])],
+            ..Default::default()
+        };
+        let hints = scan_proto_graph(GraphProto {
+            node: vec![proto_node_with_graph(
+                op_type,
+                owner_name,
+                attribute_name,
+                subgraph,
+            )],
+            ..Default::default()
+        });
+
+        assert!(hints.warnings.is_empty(), "{op_type}/{attribute_name}");
+        assert_eq!(hints.model.architecture.as_deref(), Some("nested"));
+        assert_eq!(
+            hints
+                .nodes
+                .get(&format!("{owner_name}/{attribute_name}/inner"))
+                .and_then(|node| node.device.as_deref()),
+            Some("gpu:1"),
+            "{op_type}/{attribute_name}"
+        );
+    }
+}
+
+#[test]
+fn unknown_key_inside_subgraph_warns_with_qualified_node() {
+    let hints = scan_proto_graph(graph_with_nested_node(
+        "loop",
+        "body",
+        proto_node("inner", [("onnx_runtime.devcie", "gpu")]),
+    ));
+
+    assert_eq!(
+        hints.warnings,
+        vec![MetadataWarning::UnknownKey {
+            node: "loop/body/inner".to_string(),
+            key: "onnx_runtime.devcie".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn invalid_value_inside_subgraph_warns_with_qualified_node() {
+    let hints = scan_proto_graph(graph_with_nested_node(
+        "scan",
+        "body",
+        proto_node("inner", [("onnx_runtime.layer", "first")]),
+    ));
+
+    assert_eq!(
+        hints.warnings,
+        vec![MetadataWarning::InvalidValue {
+            node: "scan/body/inner".to_string(),
+            key: "onnx_runtime.layer".to_string(),
+            value: "first".to_string(),
+            expected: "an integer",
+        }]
+    );
+}
+
+#[test]
+fn deeply_nested_graph_attributes_are_scanned() {
+    let leaf = proto_node("leaf", [("onnx_runtime.offloadable", "true")]);
+    let loop_node = proto_node_with_graph(
+        "Loop",
+        "loop",
+        "body",
+        GraphProto {
+            node: vec![leaf],
+            ..Default::default()
+        },
+    );
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![proto_node_with_graph(
+            "If",
+            "if",
+            "then_branch",
+            GraphProto {
+                node: vec![loop_node],
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        hints
+            .nodes
+            .get("if/then_branch/loop/body/leaf")
+            .and_then(|node| node.offloadable),
+        Some(true)
+    );
+}
+
+#[test]
+fn top_level_node_identity_is_unchanged_when_subgraphs_are_scanned() {
+    let mut top = proto_node("shared", [("onnx_runtime.layer", "1")]);
+    top.attribute.push(graph_attribute(
+        "body",
+        GraphProto {
+            node: vec![proto_node("shared", [("onnx_runtime.layer", "2")])],
+            ..Default::default()
+        },
+    ));
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![top],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        hints.nodes.get("shared").and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get("shared/body/shared")
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn nested_node_identity_does_not_collide_with_slash_named_top_level_node() {
+    let nested_path = NodePath::root_node("owner".to_string(), 1)
+        .with_attribute("body".to_string(), 0, None)
+        .with_node("inner".to_string(), 0);
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("owner/body/inner", [("onnx_runtime.layer", "1")]),
+            proto_node_with_graph(
+                "Loop",
+                "owner",
+                "body",
+                GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "2")])],
+                    ..Default::default()
+                },
+            ),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get("owner/body/inner")
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&nested_path)
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn graph_and_graphs_paths_that_render_the_same_stay_distinct() {
+    let singular_path = NodePath::root_node("owner".to_string(), 0)
+        .with_attribute("branches[0]".to_string(), 0, None)
+        .with_node("inner".to_string(), 0);
+    let repeated_path = NodePath::root_node("owner".to_string(), 0)
+        .with_attribute("branches".to_string(), 1, Some(0))
+        .with_node("inner".to_string(), 0);
+    let owner = NodeProto {
+        name: "owner".to_string(),
+        attribute: vec![
+            graph_attribute(
+                "branches[0]",
+                GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "10")])],
+                    ..Default::default()
+                },
+            ),
+            AttributeProto {
+                name: "branches".to_string(),
+                r#type: attribute_proto::AttributeType::Graphs as i32,
+                graphs: vec![GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "20")])],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![owner],
+        ..Default::default()
+    });
+
+    assert_eq!(singular_path.display_name(), repeated_path.display_name());
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&singular_path)
+            .and_then(|node| node.layer),
+        Some(10)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&repeated_path)
+            .and_then(|node| node.layer),
+        Some(20)
+    );
+}
+
+#[test]
 fn from_model_with_no_metadata_is_safe() {
     let model = Model::new(add_graph());
     let hints = MetadataHints::from_model(&model);
     assert_eq!(hints, MetadataHints::default());
+}
+
+// --- Node-identity collision classes ------------------------------------
+//
+// Node names in ONNX are optional and non-unique, so they must never key a
+// node. Each test below pins one collision class shut. The `_path` helpers
+// rebuild the structural key the scan produces; if any node were keyed by its
+// raw name string again, the `len()`/per-node assertions would regress.
+
+/// Structural key of the top-level node at `index` named `name`.
+fn top_level_path(name: &str, index: usize) -> NodePath {
+    NodePath::root_node(name.to_string(), index)
+}
+
+#[test]
+fn two_anonymous_top_level_nodes_stay_distinct() {
+    // The round-3 reviewer probe: two unnamed top-level nodes must not merge
+    // under an empty-string key. Each keeps its own hints.
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("", [("onnx_runtime.layer", "1")]),
+            proto_node("", [("onnx_runtime.layer", "2")]),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("", 1))
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn two_same_named_top_level_nodes_stay_distinct() {
+    // ONNX does not require node names to be unique; duplicate names must not
+    // collide.
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("dup", [("onnx_runtime.layer", "1")]),
+            proto_node("dup", [("onnx_runtime.layer", "2")]),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("dup", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("dup", 1))
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn top_level_name_matching_a_subgraph_display_path_stays_distinct() {
+    // A top-level node literally named "owner/body/inner" must not merge with a
+    // nested node whose display path renders to the same string.
+    let nested_path = NodePath::root_node("owner".to_string(), 1)
+        .with_attribute("body".to_string(), 0, None)
+        .with_node("inner".to_string(), 0);
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("owner/body/inner", [("onnx_runtime.layer", "1")]),
+            proto_node_with_graph(
+                "Loop",
+                "owner",
+                "body",
+                GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "2")])],
+                    ..Default::default()
+                },
+            ),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("owner/body/inner", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&nested_path)
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn external_named_hint_resolves_onto_the_structural_node_it_names() {
+    // External sources address nodes by name; the name must resolve to the
+    // model's structural node so priorities merge, not create a second entry.
+    let hints = MetadataHints::scan([
+        // Model-embedded structural hint on top-level node "attn" (index 0).
+        HintEntry {
+            scope: HintScope::Node {
+                path: top_level_path("attn", 0),
+            },
+            source: HintSource::OnnxMetadata,
+            key: "onnx_runtime.layer".to_string(),
+            value: "1".to_string(),
+        },
+        // External JSON references the same node by name with higher priority.
+        node_entry(
+            "attn",
+            "onnx_runtime.layer",
+            "9",
+            HintSource::ExecutionHintsJson,
+        ),
+    ]);
+
+    assert_eq!(hints.nodes.len(), 1);
+    assert_eq!(hints.nodes.get("attn").and_then(|node| node.layer), Some(9));
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("attn", 0))
+            .and_then(|node| node.layer),
+        Some(9)
+    );
+}
+
+#[test]
+fn external_named_hint_for_unknown_node_is_kept_without_colliding() {
+    // A name that matches no scanned node stays in its own external keyspace and
+    // never merges with an anonymous structural node.
+    let hints = MetadataHints::scan([
+        HintEntry {
+            scope: HintScope::Node {
+                path: top_level_path("", 0),
+            },
+            source: HintSource::OnnxMetadata,
+            key: "onnx_runtime.layer".to_string(),
+            value: "1".to_string(),
+        },
+        node_entry(
+            "ghost",
+            "onnx_runtime.layer",
+            "7",
+            HintSource::ProgrammaticBuilder,
+        ),
+    ]);
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints.nodes.get("ghost").and_then(|node| node.layer),
+        Some(7)
+    );
 }
 
 fn string_entry(
@@ -418,6 +824,62 @@ fn string_entry(
         key: key.to_string(),
         value: value.to_string(),
     }
+}
+
+fn proto_node<const N: usize>(name: &str, metadata: [(&str, &str); N]) -> NodeProto {
+    NodeProto {
+        name: name.to_string(),
+        op_type: "Identity".to_string(),
+        metadata_props: metadata
+            .into_iter()
+            .map(|(key, value)| string_entry(key, value))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn proto_node_with_graph(
+    op_type: &str,
+    name: &str,
+    attribute_name: &str,
+    graph: GraphProto,
+) -> NodeProto {
+    NodeProto {
+        name: name.to_string(),
+        op_type: op_type.to_string(),
+        attribute: vec![graph_attribute(attribute_name, graph)],
+        ..Default::default()
+    }
+}
+
+fn graph_attribute(name: &str, graph: GraphProto) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: attribute_proto::AttributeType::Graph as i32,
+        g: Some(graph),
+        ..Default::default()
+    }
+}
+
+fn graph_with_nested_node(owner: &str, attribute: &str, node: NodeProto) -> GraphProto {
+    GraphProto {
+        node: vec![proto_node_with_graph(
+            "CustomControlFlow",
+            owner,
+            attribute,
+            GraphProto {
+                node: vec![node],
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    }
+}
+
+fn scan_proto_graph(graph: GraphProto) -> MetadataHints {
+    let mut entries = Vec::new();
+    collect_graph_hint_entries(&graph, &mut entries);
+    MetadataHints::scan(entries)
 }
 
 /// Build a tiny `Z = Add(X, Y)` graph with a named node.

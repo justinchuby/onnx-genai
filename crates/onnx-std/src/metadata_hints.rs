@@ -77,11 +77,121 @@ pub enum HintScope {
         /// The graph's name (may be empty for an unnamed graph).
         graph_name: String,
     },
-    /// `NodeProto.metadata_props` — applies to a single node.
+    /// `NodeProto.metadata_props` — applies to a single node addressed by its
+    /// structural position.
+    ///
+    /// A top-level node is a single-segment path (its index in the root graph);
+    /// a nested node carries its full owner/attribute/subgraph path. The node's
+    /// raw name never participates in identity, so anonymous (`name == ""`) or
+    /// duplicate names stay distinct.
     Node {
-        /// The node's name (may be empty for an unnamed node).
-        node_name: String,
+        /// Collision-proof structural path to the node.
+        path: NodePath,
     },
+    /// A node addressed by raw name from an external hint source (builder API,
+    /// `execution_hints.json`, or `inference_metadata.yaml`).
+    ///
+    /// Name addressing is a source-level convenience: during the scan each name
+    /// is resolved to the structural identity of the node it uniquely names, so
+    /// external hints merge with the model's own structural hints under one key.
+    /// The name is never used as the internal storage key.
+    NamedNode {
+        /// The raw node name supplied by the external source.
+        name: String,
+    },
+}
+
+/// One typed segment in a nested ONNX node path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NodePathSegment {
+    /// A node at `index` in its containing graph.
+    Node {
+        /// Raw ONNX node name.
+        name: String,
+        /// Node index in the containing graph.
+        index: usize,
+    },
+    /// A graph-valued attribute on the preceding node.
+    Attribute {
+        /// Raw ONNX attribute name.
+        name: String,
+        /// Attribute index on the owner node.
+        index: usize,
+        /// `None` for `GRAPH`; `Some(index)` for an entry in `GRAPHS`.
+        graph_index: Option<usize>,
+    },
+}
+
+/// Structural identity of a node nested in graph-valued attributes.
+///
+/// Names are retained for diagnostics, while typed segments and structural
+/// indices make equality and ordering unambiguous even when names contain `/`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NodePath {
+    segments: Vec<NodePathSegment>,
+}
+
+impl NodePath {
+    /// Start a path at a top-level owner node.
+    pub fn root_node(name: String, index: usize) -> Self {
+        Self {
+            segments: vec![NodePathSegment::Node { name, index }],
+        }
+    }
+
+    /// Append a node in the currently selected subgraph.
+    pub fn with_node(mut self, name: String, index: usize) -> Self {
+        self.segments.push(NodePathSegment::Node { name, index });
+        self
+    }
+
+    /// Append a graph-valued attribute selection.
+    pub fn with_attribute(
+        mut self,
+        name: String,
+        index: usize,
+        graph_index: Option<usize>,
+    ) -> Self {
+        self.segments.push(NodePathSegment::Attribute {
+            name,
+            index,
+            graph_index,
+        });
+        self
+    }
+
+    /// Human-readable path used in diagnostics.
+    pub fn display_name(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                NodePathSegment::Node { name, index } => path_segment(name, "node", *index),
+                NodePathSegment::Attribute {
+                    name,
+                    index,
+                    graph_index,
+                } => {
+                    let name = path_segment(name, "attribute", *index);
+                    match graph_index {
+                        Some(graph_index) => format!("{name}[{graph_index}]"),
+                        None => name,
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The raw name of a top-level node, if this path is a single node segment.
+    ///
+    /// Used only to resolve name-based lookups to the right structural node; the
+    /// name is never a key. Returns `None` for nested paths.
+    pub fn top_level_name(&self) -> Option<&str> {
+        match self.segments.as_slice() {
+            [NodePathSegment::Node { name, .. }] => Some(name.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// A single raw `key = value` metadata entry to be scanned.
@@ -388,10 +498,109 @@ pub struct ModelHints {
 pub struct MetadataHints {
     /// Resolved model-level / graph-level hints.
     pub model: ModelHints,
-    /// Resolved per-node hints, keyed by node name.
-    pub nodes: BTreeMap<String, NodeHints>,
+    /// Resolved per-node hints.
+    pub nodes: NodeHintMap,
     /// Warnings and errors gathered during the scan, in discovery order.
     pub warnings: Vec<MetadataWarning>,
+}
+
+/// Internal, collision-proof storage key for a node's resolved hints.
+///
+/// [`NodeIdentity::Structural`] is the only identity produced by the ONNX
+/// `metadata_props` scan: it is a structural [`NodePath`], so a node's raw name
+/// never participates in key identity. [`NodeIdentity::ExternalName`] holds a
+/// name-addressed hint from an external source that did not resolve to a unique
+/// structural node; it lives in a separate keyspace and can never collide with
+/// a scanned node.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NodeIdentity {
+    /// Structural position of a scanned node (top-level or nested).
+    Structural(NodePath),
+    /// An external, name-addressed reference that did not resolve to a unique
+    /// structural node.
+    ExternalName(String),
+}
+
+impl NodeIdentity {
+    fn display_name(&self) -> String {
+        match self {
+            Self::Structural(path) => path.display_name(),
+            Self::ExternalName(name) => name.clone(),
+        }
+    }
+}
+
+/// Resolved node hints keyed by collision-proof node identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeHintMap {
+    entries: BTreeMap<NodeIdentity, NodeHints>,
+}
+
+impl NodeHintMap {
+    /// Look up a node by the name an external caller would use.
+    ///
+    /// Resolution order: an unresolved external name-addressed entry first, then
+    /// a uniquely matching top-level node by its raw name, then any uniquely
+    /// matching node by its human-readable structural path.
+    pub fn get(&self, name: &str) -> Option<&NodeHints> {
+        if let Some(hints) = self
+            .entries
+            .get(&NodeIdentity::ExternalName(name.to_string()))
+        {
+            return Some(hints);
+        }
+        if let Some(hints) = self.unique_match(|identity| match identity {
+            NodeIdentity::Structural(path) => path.top_level_name() == Some(name),
+            NodeIdentity::ExternalName(_) => false,
+        }) {
+            return Some(hints);
+        }
+        self.unique_match(|identity| identity.display_name() == name)
+    }
+
+    /// The single entry whose identity satisfies `predicate`, or `None` if there
+    /// is no match or the match is ambiguous.
+    fn unique_match(&self, predicate: impl Fn(&NodeIdentity) -> bool) -> Option<&NodeHints> {
+        let mut hits = self
+            .entries
+            .iter()
+            .filter(|(identity, _)| predicate(identity))
+            .map(|(_, hints)| hints);
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
+    /// Look up a node by its structural path.
+    pub fn get_path(&self, path: &NodePath) -> Option<&NodeHints> {
+        self.entries.get(&NodeIdentity::Structural(path.clone()))
+    }
+
+    /// Whether a top-level node or unique display path is present.
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Whether no node hints were resolved.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of structurally distinct nodes with resolved hints.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate over all resolved node hints.
+    pub fn values(&self) -> impl Iterator<Item = &NodeHints> {
+        self.entries.values()
+    }
+
+    fn entry(
+        &mut self,
+        identity: NodeIdentity,
+    ) -> std::collections::btree_map::Entry<'_, NodeIdentity, NodeHints> {
+        self.entries.entry(identity)
+    }
 }
 
 impl MetadataHints {
@@ -440,15 +649,50 @@ struct DevicePlacement {
 #[derive(Default)]
 struct Scanner {
     model: ModelHints,
-    nodes: BTreeMap<String, NodeHints>,
+    nodes: NodeHintMap,
     warnings: Vec<MetadataWarning>,
     /// Highest-priority winner seen so far for each `(node_key, full_key)`.
     /// A `None` node_key denotes model/graph level.
-    winners: BTreeMap<(Option<String>, String), Winner>,
+    winners: BTreeMap<(Option<NodeIdentity>, String), Winner>,
     /// Per-node, per-source device placement. Keeping device and strength
     /// paired by source is what lets a `force` from one source override a
     /// `prefer` from another and lets contradicting forces be detected.
-    device_placements: BTreeMap<String, BTreeMap<HintSource, DevicePlacement>>,
+    device_placements: BTreeMap<NodeIdentity, BTreeMap<HintSource, DevicePlacement>>,
+    /// Display-name → structural identity of every scanned node, used to resolve
+    /// external name-addressed hints onto the structural node they name.
+    name_index: BTreeMap<String, NameLookup>,
+    /// External, name-addressed entries held until the structural name index is
+    /// complete, then resolved and processed like any other node hint.
+    deferred_named: Vec<HintEntry>,
+}
+
+/// How a display name maps onto scanned structural nodes.
+enum NameLookup {
+    /// Exactly one scanned node renders to this name.
+    Unique(NodePath),
+    /// More than one distinct scanned node renders to this name.
+    Ambiguous,
+}
+
+/// Classify a non-external scope into its registry, diagnostic label, and
+/// internal node key. External [`HintScope::NamedNode`] entries are resolved
+/// separately in [`Scanner::finish`], so they map to their name here only as a
+/// safe fallback.
+fn classify_scope(scope: &HintScope) -> (&'static [KnownHint], String, Option<NodeIdentity>) {
+    match scope {
+        HintScope::Model => (GRAPH_HINTS, String::new(), None),
+        HintScope::Graph { graph_name } => (GRAPH_HINTS, graph_name.clone(), None),
+        HintScope::Node { path } => (
+            NODE_HINTS,
+            path.display_name(),
+            Some(NodeIdentity::Structural(path.clone())),
+        ),
+        HintScope::NamedNode { name } => (
+            NODE_HINTS,
+            name.clone(),
+            Some(NodeIdentity::ExternalName(name.clone())),
+        ),
+    }
 }
 
 impl Scanner {
@@ -456,27 +700,74 @@ impl Scanner {
         if !entry.key.starts_with(NAMESPACE_PREFIX) {
             return;
         }
-        let (registry, node_label, node_key) = match &entry.scope {
-            HintScope::Model => (GRAPH_HINTS, String::new(), None),
-            HintScope::Graph { graph_name } => (GRAPH_HINTS, graph_name.clone(), None),
-            HintScope::Node { node_name } => {
-                (NODE_HINTS, node_name.clone(), Some(node_name.clone()))
-            }
-        };
+        // External name-addressed hints are resolved to a structural node once
+        // the whole name index is known; buffer them until finish().
+        if matches!(entry.scope, HintScope::NamedNode { .. }) {
+            self.deferred_named.push(entry);
+            return;
+        }
 
-        let Some(value_type) = lookup(registry, &entry.key) else {
+        let (registry, node_label, node_key) = classify_scope(&entry.scope);
+        if let Some(NodeIdentity::Structural(path)) = node_key.as_ref() {
+            self.index_name(path);
+        }
+        self.process(
+            registry,
+            node_label,
+            node_key,
+            entry.source,
+            entry.key,
+            entry.value,
+        );
+    }
+
+    /// Record that `path` renders to its display name, tracking ambiguity so an
+    /// external name that maps to several nodes is not silently misresolved.
+    fn index_name(&mut self, path: &NodePath) {
+        let display = path.display_name();
+        match self.name_index.get_mut(&display) {
+            None => {
+                self.name_index
+                    .insert(display, NameLookup::Unique(path.clone()));
+            }
+            Some(NameLookup::Unique(existing)) if existing == path => {}
+            Some(slot) => *slot = NameLookup::Ambiguous,
+        }
+    }
+
+    /// Resolve an external name to the structural node it uniquely names, or an
+    /// [`NodeIdentity::ExternalName`] fallback when the name is unknown or maps
+    /// to more than one node.
+    fn resolve_named(&self, name: &str) -> NodeIdentity {
+        match self.name_index.get(name) {
+            Some(NameLookup::Unique(path)) => NodeIdentity::Structural(path.clone()),
+            _ => NodeIdentity::ExternalName(name.to_string()),
+        }
+    }
+
+    /// Validate and accumulate one already-classified entry.
+    fn process(
+        &mut self,
+        registry: &'static [KnownHint],
+        node_label: String,
+        node_key: Option<NodeIdentity>,
+        source: HintSource,
+        key: String,
+        value: String,
+    ) {
+        let Some(value_type) = lookup(registry, &key) else {
             self.warnings.push(MetadataWarning::UnknownKey {
                 node: node_label,
-                key: entry.key,
+                key,
             });
             return;
         };
 
-        let Some(typed) = value_type.parse(&entry.value) else {
+        let Some(typed) = value_type.parse(&value) else {
             self.warnings.push(MetadataWarning::InvalidValue {
                 node: node_label,
-                key: entry.key,
-                value: entry.value,
+                key,
+                value,
                 expected: value_type.expected(),
             });
             return;
@@ -485,21 +776,21 @@ impl Scanner {
         // Device placement is resolved specially: a `force` overrides a
         // `prefer` regardless of source priority. Device and strength are kept
         // paired per source so each source's intent stays intact until the end.
-        if let HintScope::Node { node_name } = &entry.scope {
-            match (entry.key.as_str(), &typed) {
+        if let Some(node_identity) = node_key.as_ref() {
+            match (key.as_str(), &typed) {
                 ("onnx_runtime.device", HintValue::Text(device)) => {
                     self.device_placements
-                        .entry(node_name.clone())
+                        .entry(node_identity.clone())
                         .or_default()
-                        .entry(entry.source)
+                        .entry(source)
                         .or_default()
                         .device = Some(device.clone());
                 }
                 ("onnx_runtime.device.strength", HintValue::Enumerated(token)) => {
                     self.device_placements
-                        .entry(node_name.clone())
+                        .entry(node_identity.clone())
                         .or_default()
-                        .entry(entry.source)
+                        .entry(source)
                         .or_default()
                         .strength = Some(parse_strength(token));
                 }
@@ -507,13 +798,13 @@ impl Scanner {
             }
         }
 
-        self.record_winner(node_key, entry.key, entry.source, typed);
+        self.record_winner(node_key, key, source, typed);
     }
 
     /// Keep the highest-priority contribution for a `(node, key)` pair.
     fn record_winner(
         &mut self,
-        node_key: Option<String>,
+        node_key: Option<NodeIdentity>,
         key: String,
         source: HintSource,
         value: HintValue,
@@ -528,6 +819,25 @@ impl Scanner {
     }
 
     fn finish(mut self) -> MetadataHints {
+        // Now that every structural node is indexed, resolve the buffered
+        // external name-addressed hints and fold them in through the same path.
+        let deferred = std::mem::take(&mut self.deferred_named);
+        for entry in deferred {
+            let HintScope::NamedNode { name } = entry.scope else {
+                continue;
+            };
+            let identity = self.resolve_named(&name);
+            let node_label = identity.display_name();
+            self.process(
+                NODE_HINTS,
+                node_label,
+                Some(identity),
+                entry.source,
+                entry.key,
+                entry.value,
+            );
+        }
+
         self.settle_device_placement();
         self.apply_winners();
         MetadataHints {
@@ -541,7 +851,7 @@ impl Scanner {
     /// device/strength placement, and flag contradicting forces.
     fn settle_device_placement(&mut self) {
         let placements = std::mem::take(&mut self.device_placements);
-        for (node_name, by_source) in placements {
+        for (node_identity, by_source) in placements {
             // One (source, device, strength) contribution per source that named
             // a device. A source that only set a strength contributes nothing.
             let contributions: Vec<(HintSource, String, PlacementStrength)> = by_source
@@ -564,7 +874,7 @@ impl Scanner {
                 && let Some(conflicting) = forced.iter().find(|(_, device, _)| *device != first.1)
             {
                 self.warnings.push(MetadataWarning::ConflictingForce {
-                    node: node_name.clone(),
+                    node: node_identity.display_name(),
                     source_a: first.0,
                     source_b: conflicting.0,
                 });
@@ -582,7 +892,7 @@ impl Scanner {
                 })
                 .map(|(_, device, strength)| (device.clone(), *strength));
             if let Some((device, resolved_strength)) = effective {
-                let node = self.nodes.entry(node_name.clone()).or_default();
+                let node = self.nodes.entry(node_identity.clone()).or_default();
                 node.device = Some(device);
                 node.device_strength = Some(resolved_strength);
             }
@@ -594,13 +904,13 @@ impl Scanner {
         for ((node_key, key), winner) in winners {
             match node_key {
                 None => apply_model_hint(&mut self.model, &key, winner.value),
-                Some(node_name) => {
+                Some(node_identity) => {
                     // Device fields were already settled with strength/force
                     // semantics; skip re-applying the raw winner for them.
                     if key == "onnx_runtime.device" || key == "onnx_runtime.device.strength" {
                         continue;
                     }
-                    let node = self.nodes.entry(node_name).or_default();
+                    let node = self.nodes.entry(node_identity).or_default();
                     apply_node_hint(node, &key, winner.value);
                 }
             }
@@ -663,35 +973,124 @@ fn model_hint_entries(model: &Model) -> Vec<HintEntry> {
     if let Some(proto) = model.retained_proto()
         && let Some(graph) = proto.graph.as_ref()
     {
-        for entry in &graph.metadata_props {
-            if entry.key.starts_with(NAMESPACE_PREFIX) {
-                entries.push(HintEntry {
-                    scope: HintScope::Graph {
-                        graph_name: graph.name.clone(),
-                    },
-                    source: HintSource::OnnxMetadata,
-                    key: entry.key.clone(),
-                    value: entry.value.clone(),
-                });
+        collect_graph_hint_entries(graph, &mut entries);
+    }
+
+    entries
+}
+
+fn collect_graph_hint_entries(
+    root: &onnx_runtime_loader::proto::onnx::GraphProto,
+    entries: &mut Vec<HintEntry>,
+) {
+    use onnx_runtime_loader::proto::onnx::{GraphProto, NodeProto};
+
+    enum Work<'a> {
+        Graph {
+            graph: &'a GraphProto,
+            display_path: String,
+            parent_path: Option<NodePath>,
+        },
+        Node {
+            node: &'a NodeProto,
+            structural_path: NodePath,
+        },
+    }
+
+    let mut work = vec![Work::Graph {
+        graph: root,
+        display_path: root.name.clone(),
+        parent_path: None,
+    }];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Graph {
+                graph,
+                display_path,
+                parent_path,
+            } => {
+                entries.extend(
+                    graph
+                        .metadata_props
+                        .iter()
+                        .filter(|entry| entry.key.starts_with(NAMESPACE_PREFIX))
+                        .map(|entry| HintEntry {
+                            scope: HintScope::Graph {
+                                graph_name: display_path.clone(),
+                            },
+                            source: HintSource::OnnxMetadata,
+                            key: entry.key.clone(),
+                            value: entry.value.clone(),
+                        }),
+                );
+                for (index, node) in graph.node.iter().enumerate().rev() {
+                    let structural_path = match &parent_path {
+                        Some(parent_path) => {
+                            parent_path.clone().with_node(node.name.clone(), index)
+                        }
+                        None => NodePath::root_node(node.name.clone(), index),
+                    };
+                    work.push(Work::Node {
+                        node,
+                        structural_path,
+                    });
+                }
             }
-        }
-        for node in &graph.node {
-            for entry in &node.metadata_props {
-                if entry.key.starts_with(NAMESPACE_PREFIX) {
-                    entries.push(HintEntry {
-                        scope: HintScope::Node {
-                            node_name: node.name.clone(),
-                        },
-                        source: HintSource::OnnxMetadata,
-                        key: entry.key.clone(),
-                        value: entry.value.clone(),
+            Work::Node {
+                node,
+                structural_path,
+            } => {
+                entries.extend(
+                    node.metadata_props
+                        .iter()
+                        .filter(|entry| entry.key.starts_with(NAMESPACE_PREFIX))
+                        .map(|entry| HintEntry {
+                            scope: HintScope::Node {
+                                path: structural_path.clone(),
+                            },
+                            source: HintSource::OnnxMetadata,
+                            key: entry.key.clone(),
+                            value: entry.value.clone(),
+                        }),
+                );
+
+                let mut subgraphs = Vec::new();
+                for (attribute_index, attribute) in node.attribute.iter().enumerate() {
+                    if let Some(graph) = attribute.g.as_ref() {
+                        let path = structural_path.clone().with_attribute(
+                            attribute.name.clone(),
+                            attribute_index,
+                            None,
+                        );
+                        subgraphs.push((graph, path));
+                    }
+                    for (graph_index, graph) in attribute.graphs.iter().enumerate() {
+                        let path = structural_path.clone().with_attribute(
+                            attribute.name.clone(),
+                            attribute_index,
+                            Some(graph_index),
+                        );
+                        subgraphs.push((graph, path));
+                    }
+                }
+                for (graph, parent_path) in subgraphs.into_iter().rev() {
+                    work.push(Work::Graph {
+                        graph,
+                        display_path: parent_path.display_name(),
+                        parent_path: Some(parent_path),
                     });
                 }
             }
         }
     }
+}
 
-    entries
+fn path_segment(name: &str, kind: &str, index: usize) -> String {
+    if name.is_empty() {
+        format!("<{kind}:{index}>")
+    } else {
+        name.to_string()
+    }
 }
 
 #[cfg(test)]

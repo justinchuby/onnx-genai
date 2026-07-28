@@ -38,6 +38,7 @@ pub(crate) use onnx_genai_scheduler::{
     GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
     ResourceLimits, ScheduleDecision, ScheduledBudgetCap, Scheduler, VramBreakdown,
 };
+pub(crate) use onnx_std::{MetadataHints, MetadataWarning, PlacementStrength};
 pub(crate) use std::collections::HashMap;
 pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
@@ -183,6 +184,7 @@ mod tests {
         Ok(Engine {
             decode_backend: EngineDecodeBackend::Ort,
             metadata: InferenceMetadata::default(),
+            metadata_hints: MetadataHints::default(),
             kv_cache,
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),

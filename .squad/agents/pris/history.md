@@ -128,3 +128,25 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Confirmed `miri.yml` has no matrix/gated job-name issue. Repo-wide scan found analogous conditional matrices only in release/manual workflows (`publish.yml`, `wheels.yml`), not PR CI; left them outside this PR.
 - Recorded Justin's live `ci:full` verification on PR #340: CI run 30345861354 and audit run 30345861425 started via label.
 - Added CLI-specific cache keys after the main merge exposed a shared-cache collision/incomplete-restore pattern in the Windows CLI lane. Remeasured final-head fast run 30349042835 at 4m33s wall-clock; critical path `Rust (Linux x86_64)` at 4m22s, with Windows CLI at 3m14s. The preceding workflow-code run 30348596658 was 3m51s; current variance is in Linux Rust/quality after the main merge, not the skipped-name fix.
+
+## 2026-07-28T08:45:38-07:00 — CI tiering rejected; full coverage on PRs
+- Superseded the short-lived corrected-axis plan. Final Justin direction: run coverage everywhere; PR runtime is acceptable.
+- CI now has no fast/slow run-shape distinction: PRs, `main`, nightly, and manual dispatch all run quality checks, audit, coverage-instrumented offline tests on Linux x86_64 / Windows x86_64 / Windows ARM64 / macOS arm64, Linux MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes. Windows ARM64 uses `cargo llvm-cov --no-report` after run 30377171127 reproduced rust-lang/rust#150123 malformed profraw merge failures.
+- Removed `ci:full` labeled triggers because the label would be a no-op, and reset Codecov carryforward to false because PRs upload the same four flags as `main` (`offline`, `mlas`, `cli-ort-linux`, `cli-ort-windows`).
+- Preserved #296/#340 independent hardening: direct `rustup`, GitHub-owned `actions/cache`, arch-aware cache keys, concurrency cancellation, and stable expanded names via always-expanded matrices/no gated matrix jobs.
+- Decision filed: `.squad/decisions/inbox/pris-ci-fast-slow-tiers.md`.
+- Verification: manual CI dispatch 30379369830 on `ci/platforms-on-pr` passed in 27m26s wall-clock with critical path `Rust coverage (Windows ARM64)` at 27m22s; audit dispatch 30377173441 passed in 3m18s. Earlier dispatch 30377171127 proved Windows ARM64 report merging still fails with malformed profraw/no profile can be merged, so the final workflow uses `cargo llvm-cov --no-report` on that target while keeping instrumentation.
+
+## 2026-07-28T10:10:34-07:00 — Added parallel Linux fast CI
+- Added a separate no-dependencies `Fast (Linux x86_64)` job inside `.github/workflows/ci.yml`, running uninstrumented Linux fmt/build/test/clippy for early PR feedback. It starts immediately in parallel with the full coverage gate; passing it alone is not merge-ready.
+- Kept full CI unchanged in scope: coverage-instrumented full matrix plus CLI ORT, CUDA, audit, no `ci:full`, and Codecov carryforward disabled.
+- Split the full Rust coverage job cache so `~/.cargo/registry`/`~/.cargo/git` can share the same registry key shape as fast CI while `target` is keyed separately with a `coverage` marker; fast `target` uses a distinct `fast` marker to avoid instrumented/uninstrumented artifact contamination.
+- Verification: manual CI dispatch 30382113387 passed. `Fast (Linux x86_64)` completed in 9m09s on cold caches; full gate wall-clock was 21m27s with critical path `Rust coverage (Windows ARM64)` at 21m20s. Cache logs showed shared registry key `Linux-X64-x86_64-unknown-linux-gnu-cargo-registry-...`, fast target key `...-fast-rust-...`, and coverage target/tools key `...-coverage-rust-...-cargo-tools-0.8.7-...`.
+- Follow-up warm measurement: run 30387825072 hit the fast target cache and `Fast (Linux x86_64)` still took 5m43s; cache miss is not the main issue. The lane spends about 1m26s build, 1m35s test, 1m30s clippy, plus 43s restoring a ~3GB target cache. Clean full run 30386077420 passed in 18m27s; Windows ARM64 coverage remained critical at 18m22s, with prior observed ARM64 variance up to 26m19s.
+
+## 2026-07-28T12:02:34-07:00 — Dropped Windows ARM64 coverage, kept tests
+- Replaced `Rust coverage (Windows ARM64)` with uninstrumented `Rust (Windows ARM64)`: same offline crate tests and clippy on Windows ARM64, no cargo-llvm-cov/no Codecov upload.
+- Reason: platform tests are signal; ARM64 coverage of pure-Rust crates is low-information and owned the full-gate critical path. The job previously uploaded the shared `offline` flag, which remains covered by Linux, Windows x86_64, and macOS.
+- Verification after dropping ARM64 coverage: run 30390299025 passed in 18m54s wall-clock. New critical path was `CLI ORT (Windows x86_64)` at 18m50s; uninstrumented `Rust (Windows ARM64)` was 15m12s. Codecov still uploaded all intended flags because ARM64 had shared the `offline` flag, which Linux/Windows x86_64/macOS still upload.
+## 2026-07-28T17:40:00+0000
+#54 model-package and #299 LoRA were confirmed out of scope for this squad; no artifacts retained.

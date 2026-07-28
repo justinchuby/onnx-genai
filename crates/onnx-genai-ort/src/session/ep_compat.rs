@@ -239,7 +239,11 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
     match selection.name.as_str() {
         // Permanent built-in.
         "cuda" => {
-            let device_id = super::cuda_device_id_from_env();
+            let device_id = selection
+                .options
+                .get("device_id")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or_else(super::cuda_device_id_from_env);
             let caps = EpCapabilities::new(
                 "cuda",
                 HardwareKind::Gpu,
