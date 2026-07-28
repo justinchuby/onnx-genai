@@ -51,6 +51,26 @@
 //!   expressed as an IR [`Dim`](onnx_runtime_ir::Dim).
 //! * **Permissive by default, never panics on unknown input.** Errors are
 //!   reserved for genuine contract violations (see [`ShapeInferError`]).
+//!
+//! ## Control flow and the container-type limitation
+//!
+//! Control-flow ops that carry subgraph bodies are inferred by propagating
+//! shapes *through* the body: `If` reconciles its two branch
+//! outputs, while `Loop` and `Scan` seed the body's formal inputs from the
+//! node's operands, infer the body, then map the body outputs back (stacking a
+//! trip-count / scan axis where the op requires one).
+//!
+//! The **Sequence** family (`SequenceEmpty`/`Construct`/`Insert`/`Erase`/`At`/
+//! `Length`/`ConcatFromSequence`/`SplitToSequence`), **Optional**
+//! (`Optional`/`OptionalHasElement`/`OptionalGetElement`), and **Map** ops are
+//! deliberately **deferred**: an SSA [`Value`](onnx_runtime_ir::Value) and this
+//! crate's [`TypeInfo`] carry only a tensor `dtype` + `shape`, with no way to
+//! represent a *container element type*. Correctly propagating, say, the
+//! element shape produced by `SequenceAt` would require an IR/type-model
+//! extension (a sum type over tensor/sequence/optional/map element types).
+//! Rather than fabricate a bogus tensor shape for a sequence-typed edge, these
+//! ops are left unregistered — their outputs stay *unresolved* (the permissive
+//! outcome) instead of *wrong*. See issue #355.
 
 #![forbid(unsafe_code)]
 
