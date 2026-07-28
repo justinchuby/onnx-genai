@@ -1,7 +1,7 @@
-# CI deliberately runs the full platform and coverage signal on every PR,
-# main push, nightly schedule, and manual dispatch. Earlier fast/slow tiering
-# was rejected: platforms are high-signal for this repo and Justin accepted the
-# coverage-instrumentation runtime cost.
+# CI deliberately runs tests on every platform on every PR, main push, nightly
+# schedule, and manual dispatch. Coverage instrumentation runs where it is
+# informative; Windows ARM64 keeps platform tests but skips coverage because the
+# coverage signal duplicates x64/macOS while owning the critical path.
 name: CI
 
 on:
@@ -409,8 +409,8 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  rust-coverage-windows-arm64:
-    name: Rust coverage (Windows ARM64)
+  rust-windows-arm64:
+    name: Rust (Windows ARM64)
     runs-on: windows-11-arm
     env:
       CARGO_TERM_COLOR: always
@@ -424,7 +424,7 @@ jobs:
         id: rust-toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       - name: Resolve cargo cache target
@@ -437,33 +437,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-platform-test-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-platform-test-rust-${{ steps.rust-toolchain.outputs.version }}-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
-      - name: Install cargo-llvm-cov
-        shell: bash
-        run: |
-          if cargo llvm-cov --version 2>/dev/null | grep -q "$CARGO_LLVM_COV_VERSION"; then
-            echo "cargo-llvm-cov $CARGO_LLVM_COV_VERSION already installed"
-          else
-            cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
-          fi
-      # Windows ARM64 rustc currently emits malformed profraw files
-      # (rust-lang/rust#150123). Keep instrumentation on for test execution, but
-      # skip report merging/upload until that upstream bug is fixed.
-      - name: Test cross-platform offline crates with coverage instrumentation
+      # Platform execution is the signal here; coverage for these pure-Rust crates
+      # is already reported by x64/macOS lanes, and ARM64 instrumentation owned the
+      # critical path.
+      - name: Test cross-platform offline crates
         run: >-
-          cargo llvm-cov --locked --no-report
-          --target aarch64-pc-windows-msvc
+          cargo test --locked
           -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
