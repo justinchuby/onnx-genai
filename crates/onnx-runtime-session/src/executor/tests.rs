@@ -277,6 +277,123 @@ fn compute_in_place_preserves_control_flow_captures() {
     assert_eq!(enabled_output, disabled_output);
 }
 
+/// A multi-layer, decode-shaped graph over a length-4 activation vector,
+/// mixing the two hazards a real transformer decode step combines and that a
+/// single-op unit graph cannot exercise together:
+///
+///   * **residual reuse** — each layer computes `n = Tanh(prev)` then
+///     `r = Add(prev, n)`, so `prev` is read *twice* and stays live across the
+///     activation; and
+///   * **a long-lived carry** (`k = Relu(x)`, a stand-in for a KV/cache value)
+///     that is produced first and consumed only at the very end, staying live
+///     across every intervening layer.
+///
+/// A pure activation chain (`t = Tanh(a); u = Tanh(t); ...`) is layered on the
+/// tail so compute-in-place *does* fire (each link's input is genuinely dead),
+/// while the residual and carry values above must be recognised as still-live
+/// and left un-aliased. If liveness ever mis-marks a residual input or the carry
+/// as dead and aliases its buffer away — the regression class issue #85 guards —
+/// the enabled path reads clobbered memory and diverges from the out-of-place
+/// reference, so the byte-identical assertion below fails.
+fn decode_shaped_residual_graph() -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+
+    // Long-lived carry produced first, consumed last (KV/cache stand-in).
+    let k = graph.create_named_value("k", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![k]));
+
+    // Three residual layers: `prev` feeds both the activation and the add, so it
+    // must stay live across `Tanh` — a naive "dead at its next single use"
+    // liveness would wrongly alias it away.
+    let mut prev = x;
+    let mut nid = 1u32;
+    for layer in 0..3 {
+        let n = graph.create_named_value(format!("n{layer}"), DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(NodeId(nid), "Tanh", vec![Some(prev)], vec![n]));
+        nid += 1;
+        let r = graph.create_named_value(format!("r{layer}"), DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(
+            NodeId(nid),
+            "Add",
+            vec![Some(prev), Some(n)],
+            vec![r],
+        ));
+        nid += 1;
+        prev = r;
+    }
+
+    // Merge the carry back in — this is `k`'s only (and therefore last) use.
+    let merged = graph.create_named_value("merged", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(nid),
+        "Add",
+        vec![Some(prev), Some(k)],
+        vec![merged],
+    ));
+    nid += 1;
+
+    // Pure activation tail: each link's input is genuinely dead, so
+    // compute-in-place is *expected* to fire here (proving the optimization is
+    // active in this graph, not silently disabled).
+    let mut cur = merged;
+    for tail in 0..3 {
+        let out =
+            graph.create_named_value(format!("tail{tail}"), DataType::Float32, static_shape([4]));
+        graph.insert_node(Node::new(NodeId(nid), "Tanh", vec![Some(cur)], vec![out]));
+        nid += 1;
+        cur = out;
+    }
+    graph.add_output(cur);
+    graph
+}
+
+/// Regression guard for the issue #85 class the reported native/CUDA decode
+/// scare pointed at: a still-live value (a residual input or a long-lived
+/// KV/cache carry) must never be aliased away by an earlier in-place op on a
+/// *real, multi-layer* decode-shaped graph — the shape a single-op unit test
+/// cannot reproduce. Asserts the default (enabled) path (a) actually aliases
+/// (so the guard is exercised, not vacuously satisfied) and (b) is byte-for-byte
+/// identical to the fully out-of-place reference. Weakening the liveness guard
+/// so a residual/carry input is aliased away makes the enabled output diverge
+/// and this test fail (verified by mutation).
+#[test]
+fn compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+
+    let mut enabled = Executor::build(
+        decode_shaped_residual_graph(),
+        Arc::clone(&weights),
+        Arc::clone(&ep),
+    )
+    .unwrap();
+    let enabled_output = enabled.run(&[("x", &values)]).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+    assert!(
+        enabled.compute_in_place_alias_count >= 3,
+        "compute-in-place must fire on the decode-shaped graph's activation tail \
+         (expected >= 3 aliases, got {}); a zero count would make this guard vacuous",
+        enabled.compute_in_place_alias_count,
+    );
+
+    let mut disabled = Executor::build(decode_shaped_residual_graph(), weights, ep).unwrap();
+    disabled.compute_in_place_enabled = false;
+    let disabled_output = disabled.run(&[("x", &values)]).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+    assert_eq!(disabled.compute_in_place_alias_count, 0);
+    assert_eq!(
+        enabled_output, disabled_output,
+        "compute-in-place aliased a still-live residual/carry value on a multi-layer \
+         decode-shaped graph — the exact corruption class issue #85 must prevent",
+    );
+}
+
 struct CaptureDecliningKernel;
 
 impl Kernel for CaptureDecliningKernel {
