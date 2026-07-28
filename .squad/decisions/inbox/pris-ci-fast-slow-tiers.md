@@ -15,3 +15,12 @@ Full-gate clean run 30386077420 passed in 18m27s with per-job timings: `Rust cov
 **By:** Pris
 **What:** Removed the `Rust coverage (Windows ARM64)` job and replaced it with `Rust (Windows ARM64)`, which runs the same offline crate tests and clippy without coverage instrumentation or Codecov upload. The ARM64 job had uploaded under the shared `offline` flag, so no Codecov flag disappears: `offline` is still uploaded by Linux, Windows x86_64, and macOS; `mlas`, `cli-ort-linux`, and `cli-ort-windows` are unchanged.
 **Why:** Durable rule: run tests on every platform; instrument for coverage only where the coverage is informative. Windows ARM64 platform execution catches real platform bugs, but coverage for these pure-Rust crates duplicates x64/macOS coverage while owning the full-gate critical path. Justin chose to drop ARM64 coverage after seeing the timings.
+
+
+
+### 2026-07-28: Windows ARM64 coverage removal verified
+**By:** Pris
+**What:** Verified run 30390299025 after removing ARM64 coverage. Full CI passed in 18m54s wall-clock. New critical path is `CLI ORT (Windows x86_64)` at 18m50s, followed by uninstrumented `Rust (Windows ARM64)` at 15m12s, `Rust coverage (Windows x86_64)` at 14m38s, `Rust coverage (macOS arm64)` at 9m32s, `Fast (Linux x86_64)` at 9m21s, `Rust coverage (Linux x86_64)` at 8m34s, `CLI ORT (Linux x86_64)` at 7m16s, `Rust quality` at 6m29s, `CUDA compile (Windows x86_64)` at 1m37s, and `CUDA compile (Linux x86_64)` at 0m48s.
+
+Codecov consequence: no flag disappeared. The removed ARM64 job did not have its own flag; it had only contributed to the shared `offline` flag. In run 30390299025, Codecov uploads succeeded for `offline` from Linux, Windows x86_64, and macOS; `mlas` from Linux; `cli-ort-linux`; and `cli-ort-windows`. Carryforward remains unnecessary and disabled.
+**Why:** Dropping ARM64 coverage alone did not materially reduce this measured wall-clock because Windows CLI ORT was nearly as slow as the old ARM64 critical path and became the new critical path. The durable rule still stands: run tests on every platform; instrument for coverage only where coverage is informative.
