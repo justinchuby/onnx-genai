@@ -10971,3 +10971,27 @@ fields; the `block_quantized_moe` signature change is applied to all callers
 **By:** Scribe, preserving Holden's security fix from the wave-3 manifest
 **What:** Holden repaired PR #322's path-traversal findings by adding `HostTrust` (`Confined` by default, `AllowInstalledLayout` caller opt-in), routing package opens through `open_with_trust`, and enforcing `canonicalize_confined()` symlink-resolving confinement. Manifest-derived paths alone can no longer escape the package root; trusted installed layouts require explicit caller policy.
 **Why:** Ankor's initial review found two traversal vulnerabilities: attacker-controlled `layout: "installed"` could reference arbitrary host paths, and external component directories could use a `component.json` symlink outside the package root. Holden's fix added nine adversarial tests and mutation-proved the confinement, after which Ankor re-approved and PR #322 merged as `cd8e7b34`. Issue #54 remains open for CLI tooling, format registry, advanced EP ranking, hashes/signatures, multi-component packages, archives, and registries.
+
+
+<!-- scribe-archive-2026-07-28T06-44-16+0000-wave4 -->
+Decision archive gate checked at 2026-07-28T06-44-16+0000: active ledger was 868508 bytes and exceeded 51200 bytes. Applied the 7-day policy (entries on or before 2026-07-21); no eligible dated decision sections remained after the prior reconciliation, so archived 0 entries and created no archive file.
+
+
+<!-- scribe-merge-2026-07-28T06-44-16+0000-millburn-55-metadata-hints -->
+## 2026-07-28 — Incremental `onnx_runtime.*` metadata-hints subsystem
+
+**By:** Millburn; reviewed by Ravel (**APPROVE**).
+
+**What:** PR #329 (`7876a7ad`) added the typed `onnx_runtime.*` metadata-hints subsystem in `crates/onnx-std/src/metadata_hints.rs`, including validation, precedence, provenance, and warnings for recognized runtime metadata.
+
+**Why:** It establishes a safe metadata contract for runtime consumers while retaining forward-compatible warning behavior for unsupported or malformed hints. Issue #55 remains open for scheduler/consumer wiring and `execution_hints.json`/YAML/builder merging.
+
+
+<!-- scribe-merge-2026-07-28T06-44-16+0000-fifield-73-minimal-builds -->
+## 2026-07-28 — Incremental model-driven minimal operator builds
+
+**By:** Fifield; reviewed by Holloway (**APPROVE**).
+
+**What:** PR #327 (`64d99919`) keeps `full` default-on, fully gates the representative CPU `ops-cnn` group, and drives minimal builds from a shared operator catalog plus deterministic manifests. The `onnx-runtime-ep-cpu` and `onnx-runtime-operator-selection` catalog machinery retains unchanged default builds and mutation-proof minimal exclusions.
+
+**Why:** This provides a usable, testable minimal-build path without destabilizing the default registry or forcing a risky one-PR split of every kernel dependency. Issue #73 remains open for full gating of the remaining operator groups beyond CNN/pooling/spatial.
