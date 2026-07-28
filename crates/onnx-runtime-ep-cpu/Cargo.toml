@@ -9,6 +9,26 @@ keywords = ["onnx", "cpu", "execution-provider", "inference", "runtime"]
 categories = ["science", "hardware-support"]
 
 [features]
+default = ["full"]
+# Default-on compatibility umbrella. Minimal builds disable defaults and select
+# only the capability groups emitted by the operator-selection manifest.
+full = [
+    "ops-core",
+    "ops-elementwise",
+    "ops-reduction",
+    "ops-transformer",
+    "ops-cnn",
+    "ops-quantized",
+    "ops-sequence",
+]
+ops-core = []
+ops-elementwise = []
+ops-reduction = []
+ops-transformer = []
+# Phase 1 representative fully-gated group.
+ops-cnn = []
+ops-quantized = []
+ops-sequence = []
 # Opt-in vendored MLAS f32 SGEMM. Kept off by default because it builds C++/asm.
 mlas = ["dep:mlas-sys"]
 # Temporary: within-GroupQueryAttention phase timing (widen/present/attn/out),
@@ -55,6 +75,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 criterion = "0.5"
+onnx-runtime-operator-selection = { workspace = true }
 
 [[bench]]
 name = "kernels"

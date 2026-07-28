@@ -34,7 +34,7 @@ pub mod decode_numa;
 pub mod decode_spmd;
 pub mod dtype;
 pub mod kernels;
-#[cfg(feature = "mlas")]
+#[cfg(all(feature = "mlas", feature = "ops-cnn"))]
 pub mod nchwc_layout;
 pub mod optimizer;
 pub mod provider;
