@@ -23,6 +23,8 @@ pub(crate) struct DecodeState {
     pub(super) sink_tokens: usize,
     pub(super) retained_kv_len: usize,
     pub(super) runner: Option<DecodeRunner>,
+    #[cfg(test)]
+    pub(super) test_runner_marker: bool,
 }
 
 impl DecodeState {
@@ -90,6 +92,8 @@ impl DecodeState {
                 sink_tokens: 0,
                 retained_kv_len: 0,
                 runner: None,
+                #[cfg(test)]
+                test_runner_marker: false,
             });
         }
 
@@ -122,6 +126,8 @@ impl DecodeState {
                 sink_tokens: 0,
                 retained_kv_len: 0,
                 runner: None,
+                #[cfg(test)]
+                test_runner_marker: false,
             });
         }
 
@@ -154,6 +160,8 @@ impl DecodeState {
             sink_tokens: 0,
             retained_kv_len: 0,
             runner: None,
+            #[cfg(test)]
+            test_runner_marker: false,
         })
     }
 
@@ -208,6 +216,8 @@ impl DecodeState {
                         stable_session_ref(session),
                         StaticCacheDecodeOptions { batch_size: 1 },
                     )?)),
+                    #[cfg(test)]
+                    test_runner_marker: false,
                 })
             }
             ModelDecodePath::PastPresent {
@@ -244,7 +254,17 @@ impl DecodeState {
     }
 
     pub(crate) fn has_runner(&self) -> bool {
-        self.runner.is_some()
+        self.runner.is_some() || self.has_test_runner_marker()
+    }
+
+    #[cfg(test)]
+    fn has_test_runner_marker(&self) -> bool {
+        self.test_runner_marker
+    }
+
+    #[cfg(not(test))]
+    fn has_test_runner_marker(&self) -> bool {
+        false
     }
 
     pub(crate) fn is_windowed(&self) -> bool {
@@ -274,12 +294,9 @@ impl DecodeState {
             return Ok(());
         }
         if self.has_runner() {
-            if target_len != 0 && !self.loop_state.is_empty() {
-                anyhow::bail!(
-                    "cannot rewind fixed loop-carried decoder state to token {target_len}; reset to zero and replay the prefix instead"
-                );
-            }
-            return Ok(());
+            anyhow::bail!(
+                "cannot rewind runner-backed decoder state to token {target_len}; start a fresh session and replay the prefix instead"
+            );
         }
         if self.is_windowed() {
             return self.validate_windowed_rewind(absolute_current_len, target_len);
@@ -380,6 +397,7 @@ impl DecodeState {
             sink_tokens: 0,
             retained_kv_len: 0,
             runner: None,
+            test_runner_marker: false,
         }
     }
 
@@ -398,6 +416,26 @@ impl DecodeState {
             sink_tokens: 0,
             retained_kv_len,
             runner: None,
+            test_runner_marker: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_runner_backed() -> Self {
+        Self {
+            use_kv: true,
+            past: HashMap::new(),
+            present_to_past: HashMap::new(),
+            kv_inputs: Vec::new(),
+            io: ResolvedIo::default(),
+            loop_state: HashMap::new(),
+            positions: None,
+            next_positions: None,
+            sliding_window: None,
+            sink_tokens: 0,
+            retained_kv_len: 0,
+            runner: None,
+            test_runner_marker: true,
         }
     }
 

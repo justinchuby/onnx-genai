@@ -276,6 +276,51 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn failed_rewind_of_runner_backed_state_leaves_session_unchanged() -> anyhow::Result<()> {
+        let mut kv_cache = PagedKvCache::new(4, 8);
+        let session_id = kv_cache.create_sequence();
+        kv_cache.append(session_id, 4)?;
+        let original_kv_len = kv_cache.len(session_id)?;
+        let original_pages = kv_cache
+            .page_table
+            .get_sequence(session_id)
+            .expect("sequence exists")
+            .to_vec();
+        let state = EngineSession {
+            tokens: vec![30, 31, 32, 33],
+            kv_token_count: 4,
+            decode_state: DecodeState::for_test_runner_backed(),
+            draft: None,
+            sampled_fastpath_failed: false,
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(session_id, state);
+        let mut engine = model_free_rewind_test_engine(kv_cache, sessions)?;
+
+        let error = engine
+            .rewind_session_to(session_id, SessionPosition::new(2))
+            .expect_err("runner-backed rewind must fail closed");
+
+        assert!(
+            error.to_string().contains("runner-backed decoder state"),
+            "unexpected error: {error:#}"
+        );
+        let state = engine.sessions.get(&session_id).expect("session remains");
+        assert_eq!(state.tokens, [30, 31, 32, 33]);
+        assert_eq!(state.kv_token_count, 4);
+        assert_eq!(engine.kv_cache.len(session_id)?, original_kv_len);
+        assert_eq!(
+            engine
+                .kv_cache
+                .page_table
+                .get_sequence(session_id)
+                .expect("sequence remains"),
+            original_pages.as_slice()
+        );
+        Ok(())
+    }
+
     #[derive(Debug, Clone)]
     enum KvOp {
         Append { session: usize, tokens: usize },

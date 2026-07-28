@@ -39,10 +39,10 @@ speculative-decoding machinery:
 - draft state, when loaded: `rewind_draft_state_to_len`
 - decode internals: `rewind_decode_state_to_len`
 
-Cost is `O(pages removed)` for paged KV plus backend-specific runner mutation:
+Cost is `O(pages removed)` for paged KV plus backend-specific mutation:
 
-- runner-backed static-cache / shared-buffer paths use the runner's own
-  `rewind(target_len)`;
+- runner-backed static-cache / shared-buffer paths are rejected before session
+  mutation because the runner rewind is not yet transactional;
 - sliding-window past/present rewinds only positions still physically retained;
 - paged materialized past rewinds pages and reloads materialized past tensors;
 - ORT-owned KV without paged materialization is rejected by
@@ -93,8 +93,8 @@ backend is advertised as fork-capable until it can satisfy the invariants.
 | Decode path | Rewind | Fork |
 |---|---|---|
 | Native single-session backend | Not supported by persistent-session APIs; `require_ort_backend` rejects it | Not supported |
-| ORT static-cache runner | Supported via runner rewind | Not enabled; runner state is not cloneable/importable |
-| ORT shared-buffer GQA / PastPresent runner | Supported via runner rewind | Not enabled; mutable shared buffers cannot be aliased safely |
+| ORT static-cache runner | Not supported; rejected before session mutation until runner rewind has a transactional prepare/commit path | Not enabled; runner state is not cloneable/importable |
+| ORT shared-buffer GQA / PastPresent runner | Not supported; rejected before session mutation until ORT PastPresent rewind can be prepared without mutating shared buffers | Not enabled; mutable shared buffers cannot be aliased safely |
 | ORT sliding-window past/present | Supported only to retained positions; evicted gaps reject cleanly before session mutation | Not enabled; fork positions before retained start must reject, and state cloning is unresolved |
 | ORT materialized paged KV without runner | Supported when paged KV metadata exists; ORT-owned KV without paged materialization rejects cleanly before session mutation | Low-level KV can CoW, but engine-level decode state still needs safe reconstruction/import |
 | Draft/speculative session state | Rewound alongside target to the aligned prefix | Not enabled |
@@ -117,7 +117,9 @@ The model-free engine tests now cover:
   (`cached_prefix_pages_survive_rewind_and_divergent_write`);
 - transactional failure for unsupported rewind paths
   (`failed_rewind_of_windowed_evicted_position_leaves_session_unchanged` and
-  `failed_rewind_of_ort_owned_kv_leaves_session_unchanged`);
+  `failed_rewind_of_ort_owned_kv_leaves_session_unchanged`) plus
+  runner-backed rejection before tokens or paged KV are touched
+  (`failed_rewind_of_runner_backed_state_leaves_session_unchanged`);
 - randomized fork / rewind / append / remove operation sequences with
   `proptest`, checking that every live session's length is independent and every
   page refcount exactly matches live sequence references
@@ -138,3 +140,8 @@ and proptest coverage; the engine-level fork is still disabled. A TLA+ model
 becomes worthwhile when enabling a real fork backend with runner import/clone
 ordering or cross-session prefix sharing beyond the current single-threaded
 `Rc`-style page accounting.
+
+Follow-up: enable runner-backed rewind only after ORT static-cache and
+shared-buffer/PastPresent runners expose a prepared rewind whose validation
+prebuilds all fallible artifacts and whose commit cannot fail after logical
+tokens or paged KV are truncated.

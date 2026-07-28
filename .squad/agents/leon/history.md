@@ -137,3 +137,9 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 - 🔴 Rejected Deckard's runtime fork/rewind PR. Public rewind reuses speculative helpers, but failed/rejected rewinds truncate logical tokens before backend KV/runner rewind succeeds, then reinsert the partially mutated session; this can leave tokens, kv_token_count, KV pages, and decode cursor inconsistent.
 - Prefix-cache page retention and fork capability gating looked sound; support matrix is not acceptable until unsupported/rejected rewind paths are transactional. Batty should own revision under Deckard lockout.
 - Validation: engine build/fmt/clippy passed; server/CLI builds passed; model-free new KV tests passed. Full engine lib suite failed locally from known ORT API/null-pointer environment mismatch (180 passed, 66 failed, 1 ignored).
+
+## 2026-07-27T17:13:01-07:00 — PR #291 Batty revision re-review
+
+- 🔴 Rejected Batty's transaction-boundary revision. Unsupported sliding-window and ORT-owned-KV paths are now clean and model-free regressions pass, but runner-backed rewind still truncates logical tokens and rewinds paged KV before fallible ORT runner rewind can finish.
+- Verified paged materialized rewind uses an independent deep `PagedKvCache` clone before materialization; support matrix remains too strong for static-cache/shared-buffer rows until runner rewind is transactional. Gaff should own next revision under Deckard/Batty lockout.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; targeted model-free tests passed. Full engine lib suite remained at known local ORT mismatch baseline (182 passed, 66 failed, 1 ignored).

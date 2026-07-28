@@ -1269,7 +1269,7 @@ mod tests {
         Ok(())
     }
 
-    fn rewinds_static_and_past_present_decode_runners() -> anyhow::Result<()> {
+    fn rejects_static_and_past_present_decode_runner_rewind() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         for (fixture_name, path) in [
             (
@@ -1294,11 +1294,18 @@ mod tests {
             cache.append(seq, 3)?;
             let mut count = 3;
 
-            rewind_decode_state_to_len(&session, None, &mut cache, seq, &mut state, &mut count, 1)?;
+            let error = rewind_decode_state_to_len(
+                &session, None, &mut cache, seq, &mut state, &mut count, 1,
+            )
+            .expect_err("runner-backed rewind must fail closed");
 
-            assert_eq!(count, 1);
-            assert_eq!(state.runner_len(), 1);
-            assert_eq!(cache.len(seq)?, 1);
+            assert!(
+                error.to_string().contains("runner-backed decoder state"),
+                "unexpected error: {error:#}"
+            );
+            assert_eq!(count, 3);
+            assert_eq!(state.runner_len(), 3);
+            assert_eq!(cache.len(seq)?, 3);
         }
         Ok(())
     }
@@ -1479,7 +1486,7 @@ mod tests {
         mirrors_present_append_range_into_paged_cache()?;
         materializes_past_values_in_model_input_layout()?;
         rewinds_materialized_ort_past_and_handles_edge_branches()?;
-        rewinds_static_and_past_present_decode_runners()?;
+        rejects_static_and_past_present_decode_runner_rewind()?;
         rewinds_target_state_and_trims_overmaterialized_kv()
     }
 

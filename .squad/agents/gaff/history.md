@@ -144,3 +144,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+
+## 2026-07-27T17:30:00-07:00 — PR #291 runner-backed rewind boundary
+
+- Revision owner for Leon's second rejection on session rewind transactional safety; Deckard and Batty remained locked out.
+- Chose Route B: runner-backed static-cache/shared-buffer rewind now rejects during validation instead of relying on fallible ORT runner rewind after logical/KV mutation.
+- Added model-free regression `failed_rewind_of_runner_backed_state_leaves_session_unchanged` and updated `docs/research/cli/06-fork-rewind-api.md` so the REPL contract marks runner-backed rows unsupported until a transactional prepared rewind exists.
