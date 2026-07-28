@@ -364,6 +364,427 @@ fn not_case() -> Case {
     }
 }
 
+/// Bitwise binary parity cases (`BitwiseAnd`/`BitwiseOr`/`BitwiseXor`) over a
+/// signed and an unsigned dtype, including a broadcast case. Integer results are
+/// compared byte-exactly against the CPU oracle (`bitwise.rs`).
+fn bitwise_binary_cases(op: &'static str) -> Vec<Case> {
+    let a32: Vec<i32> = vec![0x0f0f, -1, 0x1234, 0, 0x7fff_ffff, -256];
+    let b32: Vec<i32> = vec![0x00ff, 0x0f0f, -1, 123, 0x0f0f_0f0f, 0xff];
+    let a8: Vec<u8> = vec![0xf0, 0x3c, 0x55, 0x81];
+    let b8: Vec<u8> = vec![0x0f, 0x33, 0xaa, 0x81];
+    vec![
+        Case {
+            label: format!("{op}[i32]"),
+            op,
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int32, &[6], &a32),
+                input(DataType::Int32, &[6], &b32),
+            ],
+            outputs: vec![(DataType::Int32, vec![6])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: format!("{op}[u8]"),
+            op,
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[4], &a8),
+                input(DataType::Uint8, &[4], &b8),
+            ],
+            outputs: vec![(DataType::Uint8, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        // Broadcast [3,1] x [1,4] -> [3,4], u8.
+        Case {
+            label: format!("{op}[u8,broadcast]"),
+            op,
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[3, 1], &[0xf0u8, 0x3c, 0x55]),
+                input(DataType::Uint8, &[1, 4], &[0x0fu8, 0x33, 0xaa, 0x81]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![3, 4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+/// `BitwiseNot` parity over a signed and an unsigned dtype.
+fn bitwise_not_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "BitwiseNot[i32]".into(),
+            op: "BitwiseNot",
+            domain: "",
+            opset: 18,
+            inputs: vec![input(DataType::Int32, &[5], &[0i32, -1, 0x1234, 255, -256])],
+            outputs: vec![(DataType::Int32, vec![5])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitwiseNot[u16]".into(),
+            op: "BitwiseNot",
+            domain: "",
+            opset: 18,
+            inputs: vec![input(
+                DataType::Uint16,
+                &[4],
+                &[0u16, 0x00ff, 0xf0f0, 0xffff],
+            )],
+            outputs: vec![(DataType::Uint16, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+/// `BitShift` parity: LEFT and RIGHT over unsigned dtypes, a broadcast, and a
+/// battery of width-guard overshift rows (amounts `==` and `>` the element
+/// width, both directions, every dtype) that lock the CPU
+/// `checked_shl`/`checked_shr` "overshift → 0" contract.
+///
+/// NOTE on the width guard's falsifiability (Bishop mutation probe #2): on GPU5
+/// (Ampere) these overshift rows do **not** by themselves fail when the kernel's
+/// `(amount >= bits) ? 0` guard is deleted — the hardware already yields `0` for
+/// an out-of-range shift, so the guard is *value-redundant on this target*. This
+/// was verified three ways (see `.squad/decisions/inbox/deckard-pr288-testfix-67`):
+/// (a) SASS shows a non-wrap `SHF.L.U32` funnel shift, which clamps counts `>=`
+/// the register width to `0`; (b) an exhaustive device brute force over every
+/// overshift `(dtype, value, amount)` found no non-zero raw result — native
+/// types clamp, and small types promote to `int` then narrow back to `0`; and
+/// (c) a real-kernel neuter (guard deleted) left this whole sweep green. The
+/// guard's removal *is* still caught by the source-contract lib unit test
+/// `shift_guard_matches_cpu_checked_shift_contract`. These rows remain valuable:
+/// they pin the overshift → 0 CPU contract against wrong-width / wrong-direction
+/// / narrowing regressions and against ports to any target whose shift does not
+/// clamp. The near-boundary in-range rows below additionally fail if the guard
+/// threshold is mutated too low (e.g. `>= bits - 1`), which the hardware does
+/// not mask.
+fn bitshift_cases() -> Vec<Case> {
+    let dir = |d: &str| ("direction", Attribute::String(d.as_bytes().to_vec()));
+    vec![
+        Case {
+            label: "BitShift[u32,LEFT]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint32, &[5], &[1u32, 3, 8, 0x8000_0000, 255]),
+                input(DataType::Uint32, &[5], &[0u32, 1, 4, 1, 3]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![5])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u8,RIGHT,overshift]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            // Shift of 8 on a u8 must produce 0 (>= width).
+            inputs: vec![
+                input(DataType::Uint8, &[4], &[0x80u8, 0xff, 0x10, 0x01]),
+                input(DataType::Uint8, &[4], &[1u8, 4, 8, 0]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![4])],
+            attrs: vec![dir("RIGHT")],
+            compare: Compare::ExactBytes,
+        },
+        // Broadcast [2,1] x [1,3] -> [2,3], u16 LEFT.
+        Case {
+            label: "BitShift[u16,LEFT,broadcast]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint16, &[2, 1], &[3u16, 8]),
+                input(DataType::Uint16, &[1, 3], &[0u16, 1, 2]),
+            ],
+            outputs: vec![(DataType::Uint16, vec![2, 3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        // ── Width-guard overshift cases (CPU checked-shift contract lock) ──
+        //
+        // Any amount `>=` the operand width must yield `0`, matching the CPU
+        // `checked_shl`/`checked_shr(amount as u32)` contract (`None -> 0`). The
+        // kernel enforces this with `(amount >= bits) ? 0`. On GPU5 the *raw* C
+        // shift ALSO yields 0 for these (SASS `SHF` clamps native-type overshift
+        // to 0; small types promote to `int` and narrow back to 0), so deleting
+        // the guard does not change these outputs on this target — see the
+        // function docstring. They are kept as a portable regression lock on the
+        // overshift → 0 contract (amount `==` width AND `>` width, LEFT & RIGHT,
+        // every dtype). The prior sole overshift case (`u8 >> 8`) already could
+        // not diverge: under int promotion `(int)0x10 >> 8 == 0`.
+        //
+        // `amount == width` AND `amount > width`, for both LEFT and RIGHT.
+        Case {
+            label: "BitShift[u32,LEFT,overshift>=width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint32, &[4], &[1u32, 3, 0x00FF_00FF, 7]),
+                input(DataType::Uint32, &[4], &[32u32, 40, 33, 64]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![4])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u32,RIGHT,overshift>=width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Uint32,
+                    &[4],
+                    &[0x8000_0000u32, 0xFFFF_FFFF, 0x00FF_00FF, 7],
+                ),
+                input(DataType::Uint32, &[4], &[32u32, 40, 33, 64]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![4])],
+            attrs: vec![dir("RIGHT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u64,LEFT,overshift>=width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Uint64,
+                    &[3],
+                    &[1u64, 0xFFFF_FFFF_FFFF_FFFF, 0x1234_5678],
+                ),
+                input(DataType::Uint64, &[3], &[64u64, 100, 64]),
+            ],
+            outputs: vec![(DataType::Uint64, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        // Small types promote to `int` before the shift and narrow back on
+        // store; an overshift therefore lands as 0 (guard or not) on GPU5. Kept
+        // to pin `u16`/`u8` overshift → 0 across LEFT and RIGHT.
+        Case {
+            label: "BitShift[u16,LEFT,overshift>width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint16, &[3], &[0xFFFFu16, 0xF0F0, 0x0F0F]),
+                input(DataType::Uint16, &[3], &[32u16, 40, 33]),
+            ],
+            outputs: vec![(DataType::Uint16, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u8,LEFT,overshift>width]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint8, &[3], &[0xFFu8, 0x0F, 0x03]),
+                input(DataType::Uint8, &[3], &[32u8, 33, 34]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        // ── Near-boundary IN-RANGE rows (guard-threshold falsifiability) ──
+        //
+        // Max valid shift `amount == width - 1` produces a non-zero result. The
+        // hardware does NOT mask these (they are legal shifts), so they FAIL if
+        // the guard threshold is mutated one too low (e.g. `amount >= bits - 1`),
+        // which would wrongly zero a valid shift — the one guard-boundary bug
+        // that IS behaviorally observable on this target. Both directions.
+        Case {
+            label: "BitShift[u32,LEFT,max-valid=31]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint32, &[3], &[1u32, 3, 0x0000_00FF]),
+                input(DataType::Uint32, &[3], &[31u32, 31, 24]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u32,RIGHT,max-valid=31]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Uint32,
+                    &[3],
+                    &[0x8000_0000u32, 0xFFFF_FFFF, 0xFF00_0000],
+                ),
+                input(DataType::Uint32, &[3], &[31u32, 31, 24]),
+            ],
+            outputs: vec![(DataType::Uint32, vec![3])],
+            attrs: vec![dir("RIGHT")],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "BitShift[u8,LEFT,max-valid=7]".into(),
+            op: "BitShift",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Uint8, &[3], &[1u8, 3, 0x03]),
+                input(DataType::Uint8, &[3], &[7u8, 6, 5]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![3])],
+            attrs: vec![dir("LEFT")],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+/// `LogSoftmax` parity, f32/f16/bf16, opset-13 last-axis and legacy opset-11
+/// coerce-to-2D, including a large-magnitude row to exercise the stable
+/// shifted-logsumexp path (the #266 overflow lesson).
+fn log_softmax_cases() -> Vec<Case> {
+    // Mix of ordinary and large-magnitude logits (last row) so a naive
+    // log(sum(exp(x))) would overflow while the stable path stays finite.
+    let values: Vec<f32> = vec![
+        1.0, 2.0, 3.0, 0.5, //
+        -1.0, 0.0, 1.0, 2.0, //
+        80.0, 79.0, 78.0, 81.0,
+    ];
+    let shape = vec![3usize, 4];
+    let mut cases = Vec::new();
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("LogSoftmax[{dtype:?},opset13]"),
+            op: "LogSoftmax",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &shape, &values)],
+            outputs: vec![(dtype, shape.clone())],
+            attrs: vec![("axis", Attribute::Int(-1))],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        });
+    }
+    // Legacy opset-11 coerce-to-2D over a rank-3 input, f32.
+    cases.push(Case {
+        label: "LogSoftmax[Float32,opset11,coerce2d]".into(),
+        op: "LogSoftmax",
+        domain: "",
+        opset: 11,
+        inputs: vec![input(
+            DataType::Float32,
+            &[2, 2, 2],
+            &[1.0f32, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
+        )],
+        outputs: vec![(DataType::Float32, vec![2, 2, 2])],
+        attrs: vec![("axis", Attribute::Int(1))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    // Interior-axis reduction (inner > 1), f32.
+    cases.push(Case {
+        label: "LogSoftmax[Float32,axis1,inner]".into(),
+        op: "LogSoftmax",
+        domain: "",
+        opset: 13,
+        inputs: vec![input(
+            DataType::Float32,
+            &[2, 3, 4],
+            &(0..24).map(|v| (v as f32) * 0.3 - 3.0).collect::<Vec<_>>(),
+        )],
+        outputs: vec![(DataType::Float32, vec![2, 3, 4])],
+        attrs: vec![("axis", Attribute::Int(1))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    // Overflow-stability proof (Bishop mutation probe / the #266 lesson).
+    //
+    // Logits reach 100, and the reduction widens every dtype to f32 before the
+    // `exp`. A *naive* `log(sum(exp(x)))` therefore evaluates `exp(100) ~ 2.7e43`,
+    // which overflows f32's ~3.4e38 range to `+inf` and drives the result to
+    // `-inf`/`nan` — diverging hard from the CPU oracle. Only the stable
+    // shifted-logsumexp (`x - max` before `exp`) stays finite here, so DELETING
+    // the kernel's max-subtraction makes this row FAIL. The earlier ~81 logit
+    // stayed inside f32 range (`exp(81) ~ 1.6e35 < 3.4e38`), which is exactly why
+    // it could not falsify the guard.
+    //
+    // The stable outputs are `[0, -100, -200]`, all exactly representable in
+    // f32/f16/bf16, so the CUDA-vs-CPU parity is byte-tight despite the large
+    // magnitudes. Every float dtype widens to f32 for the reduction, so a naive
+    // path overflows for all three and each row bites independently.
+    let overflow_logits: Vec<f32> = vec![100.0, 0.0, -100.0];
+    let overflow_shape = vec![1usize, 3];
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("LogSoftmax[{dtype:?},overflow-stability]"),
+            op: "LogSoftmax",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &overflow_shape, &overflow_logits)],
+            outputs: vec![(dtype, overflow_shape.clone())],
+            attrs: vec![("axis", Attribute::Int(-1))],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        });
+    }
+    cases
+}
+
+/// `Hardmax` parity, f32/f16/bf16: one-hot of the first maximum, including a tie
+/// (first index wins) and an interior negative axis. Outputs are canonical
+/// `0`/`1` so bytes match the CPU oracle exactly.
+fn hardmax_cases() -> Vec<Case> {
+    // Row 1 has a tie at indices 1 and 2 (both 5.0) -> index 1 must win.
+    let tie_values: Vec<f32> = vec![1.0, 5.0, 5.0, 2.0, 7.0, 3.0, 6.0, 4.0];
+    let mut cases = Vec::new();
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("Hardmax[{dtype:?},last-axis,tie]"),
+            op: "Hardmax",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &[2, 4], &tie_values)],
+            outputs: vec![(dtype, vec![2, 4])],
+            attrs: vec![("axis", Attribute::Int(-1))],
+            compare: Compare::ExactBytes,
+        });
+    }
+    // Interior negative axis on a rank-3 input, f32.
+    cases.push(Case {
+        label: "Hardmax[Float32,axis-2]".into(),
+        op: "Hardmax",
+        domain: "",
+        opset: 13,
+        inputs: vec![input(
+            DataType::Float32,
+            &[2, 3, 2],
+            &[
+                1.0f32, 4.0, 3.0, 2.0, 3.0, 5.0, 6.0, 1.0, 6.0, 2.0, 1.0, 3.0,
+            ],
+        )],
+        outputs: vec![(DataType::Float32, vec![2, 3, 2])],
+        attrs: vec![("axis", Attribute::Int(-2))],
+        compare: Compare::ExactBytes,
+    });
+    cases
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The conformance profile: one entry per CUDA_COVERED_OPS op.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -522,6 +943,15 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "SkipLayerNormalization",
         vec![skip_layer_norm_case()],
     ));
+
+    // Batch 4 (issue #67): integer bitwise + softmax-family axis reductions.
+    p.push(sweep("BitwiseAnd", bitwise_binary_cases("BitwiseAnd")));
+    p.push(sweep("BitwiseOr", bitwise_binary_cases("BitwiseOr")));
+    p.push(sweep("BitwiseXor", bitwise_binary_cases("BitwiseXor")));
+    p.push(sweep("BitwiseNot", bitwise_not_cases()));
+    p.push(sweep("BitShift", bitshift_cases()));
+    p.push(sweep("LogSoftmax", log_softmax_cases()));
+    p.push(sweep("Hardmax", hardmax_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.

@@ -7,7 +7,9 @@
 //! widens bf16 directly and uses FP16 conversion when available. Both SIMD
 //! paths share the same packed-panel structure and fall back to scalar widening
 //! for unsupported layouts or conversion features. A scalar micro-kernel
-//! remains the correctness path on every other CPU.
+//! remains the correctness path on every other CPU. When the host also has FMA
+//! (the common AVX2-class case, including CI runners) the x86 inner loop uses a
+//! fused `_mm256_fmadd_ps`; aarch64 uses baseline `vfmaq_f32`.
 
 use rayon::prelude::*;
 
@@ -22,14 +24,31 @@ enum ExecutionPath {
     Scalar,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     X86Avx2,
+    /// AVX2 packing plus a fused-multiply-add (`_mm256_fmadd_ps`) inner loop.
+    /// Selected only when the host also has FMA (the common AVX2-class case,
+    /// including CI runners); halves the inner-loop op count versus the plain
+    /// AVX2 mul+add microkernel on the prefill (M>1) hot path.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    X86Avx2Fma,
     #[cfg(target_arch = "aarch64")]
     Aarch64Neon,
+}
+
+/// Whether `path` uses the AVX2 widening/packing helpers (both the mul+add and
+/// the FMA microkernels share identical F16C/AVX2 conversion).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn is_x86_avx2(path: ExecutionPath) -> bool {
+    matches!(path, ExecutionPath::X86Avx2 | ExecutionPath::X86Avx2Fma)
 }
 
 #[inline]
 fn selected_execution_path() -> ExecutionPath {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("avx2") {
+        if std::arch::is_x86_feature_detected!("fma") {
+            return ExecutionPath::X86Avx2Fma;
+        }
         return ExecutionPath::X86Avx2;
     }
 
@@ -92,7 +111,7 @@ impl HalfElement for F16 {
         debug_assert_eq!(source.len(), destination.len());
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if path == ExecutionPath::X86Avx2 && std::arch::is_x86_feature_detected!("f16c") {
+        if is_x86_avx2(path) && std::arch::is_x86_feature_detected!("f16c") {
             // SAFETY: both features required by the conversion routine were
             // runtime-detected, and its slices have equal lengths.
             unsafe { widen_f16_x86(source, destination) };
@@ -124,7 +143,7 @@ impl HalfElement for Bf16 {
         debug_assert_eq!(source.len(), destination.len());
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if path == ExecutionPath::X86Avx2 {
+        if is_x86_avx2(path) {
             // SAFETY: AVX2 was runtime-detected, and the slices have equal
             // lengths.
             unsafe { widen_bf16_x86(source, destination) };
@@ -480,6 +499,27 @@ fn micro_kernel(
 ) {
     if tile_columns == NR {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if path == ExecutionPath::X86Avx2Fma {
+            // SAFETY: AVX2+FMA were runtime-detected when the path was selected,
+            // and the tile/slice bounds are established by the blocked driver.
+            unsafe {
+                micro_kernel_avx2_fma(
+                    a_panel,
+                    b_panel,
+                    c,
+                    c_columns,
+                    row_start,
+                    panel_column_start,
+                    column_start,
+                    panel_depth,
+                    panel_columns,
+                    tile_rows,
+                )
+            };
+            return;
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if path == ExecutionPath::X86Avx2 {
             // SAFETY: AVX2 was runtime-detected when the path was selected, and
             // the tile/slice bounds are established by the blocked driver.
@@ -622,6 +662,54 @@ unsafe fn micro_kernel_avx2(
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn micro_kernel_avx2_fma(
+    a_panel: &[f32],
+    b_panel: &[f32],
+    c: &mut [f32],
+    c_columns: usize,
+    row_start: usize,
+    panel_column_start: usize,
+    column_start: usize,
+    panel_depth: usize,
+    panel_columns: usize,
+    tile_rows: usize,
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    // SAFETY: the caller guarantees AVX2+FMA and a full NR-wide tile. The driver
+    // establishes all A/B/C bounds.
+    unsafe {
+        let mut accumulators = [_mm256_setzero_ps(); MR];
+        for depth in 0..panel_depth {
+            let b_row = _mm256_loadu_ps(
+                b_panel
+                    .as_ptr()
+                    .add(depth * panel_columns + panel_column_start),
+            );
+            for (tile_row, accumulator) in accumulators.iter_mut().enumerate().take(tile_rows) {
+                let a_value = a_panel[(row_start + tile_row) * panel_depth + depth];
+                // Fused multiply-add: `acc = a*b + acc` in one instruction,
+                // halving the inner-loop op count versus separate mul + add.
+                *accumulator = _mm256_fmadd_ps(_mm256_set1_ps(a_value), b_row, *accumulator);
+            }
+        }
+
+        for (tile_row, accumulator) in accumulators.iter().enumerate().take(tile_rows) {
+            let output_start =
+                (row_start + tile_row) * c_columns + column_start + panel_column_start;
+            let output = c.as_mut_ptr().add(output_start);
+            let previous = _mm256_loadu_ps(output);
+            _mm256_storeu_ps(output, _mm256_add_ps(previous, *accumulator));
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
@@ -653,10 +741,11 @@ unsafe fn micro_kernel_neon(
             for tile_row in 0..tile_rows {
                 let a_value = a_panel[(row_start + tile_row) * panel_depth + depth];
                 let a_vector = vdupq_n_f32(a_value);
-                accumulator_low[tile_row] =
-                    vaddq_f32(accumulator_low[tile_row], vmulq_f32(a_vector, b_low));
+                // Fused multiply-add (`vfmaq_f32` is baseline aarch64 NEON):
+                // `acc = a*b + acc` in one instruction.
+                accumulator_low[tile_row] = vfmaq_f32(accumulator_low[tile_row], a_vector, b_low);
                 accumulator_high[tile_row] =
-                    vaddq_f32(accumulator_high[tile_row], vmulq_f32(a_vector, b_high));
+                    vfmaq_f32(accumulator_high[tile_row], a_vector, b_high);
             }
         }
 
@@ -692,18 +781,112 @@ mod tests {
         output
     }
 
-    fn detected_simd_path() -> Option<ExecutionPath> {
+    /// Ignored perf probe: single-thread f16 GEMM at a representative prefill
+    /// shape, comparing the plain AVX2 (mul+add) microkernel against the AVX2
+    /// FMA microkernel. Iterations are interleaved so shared-machine load drift
+    /// cancels out; the reported speedup is load-independent. Run pinned:
+    /// `taskset -c 1 cargo test -p onnx-runtime-ep-cpu --release half_gemm_prefill_gflops -- --ignored --nocapture`
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "perf probe; run manually pinned to one core"]
+    fn half_gemm_prefill_gflops() {
+        use std::time::Instant;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("single-thread pool");
+        let (m, k, n) = (512usize, 4096usize, 4096usize);
+        let format = HalfFormat::F16;
+        let a: Vec<u16> = (0..m * k)
+            .map(|i| half_bits(format, ((i as f32 * 0.017).sin()) * 0.25))
+            .collect();
+        let b: Vec<u16> = (0..k * n)
+            .map(|i| half_bits(format, ((i as f32 * 0.013).cos()) * 0.25))
+            .collect();
+        let flop = 2.0 * m as f64 * k as f64 * n as f64;
+
+        let paths: &[(&str, ExecutionPath)] = &[
+            ("avx2 (mul+add)", ExecutionPath::X86Avx2),
+            ("avx2+fma", ExecutionPath::X86Avx2Fma),
+        ];
+
+        pool.install(|| {
+            let mut c = vec![0.0f32; m * n];
+            let run = |path: ExecutionPath, c: &mut [f32]| {
+                gemm_with_path(
+                    format,
+                    &a,
+                    MatrixLayout::row_major(k),
+                    &b,
+                    MatrixLayout::row_major(n),
+                    c,
+                    m,
+                    k,
+                    n,
+                    path,
+                );
+            };
+            // Warm up both.
+            for &(_, path) in paths {
+                run(path, &mut c);
+            }
+            let mut times = vec![Vec::new(); paths.len()];
+            for _ in 0..7 {
+                for (slot, &(_, path)) in paths.iter().enumerate() {
+                    let start = Instant::now();
+                    run(path, &mut c);
+                    times[slot].push(start.elapsed().as_secs_f64());
+                }
+            }
+            let mut medians = Vec::new();
+            for (slot, &(label, _)) in paths.iter().enumerate() {
+                times[slot].sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let median = times[slot][times[slot].len() / 2];
+                medians.push(median);
+                println!(
+                    "half_gemm f16 {m}x{k}x{n} 1-thread {label}: median {:.3} ms, {:.2} GFLOPS",
+                    median * 1e3,
+                    flop / median / 1e9,
+                );
+            }
+            println!(
+                "half_gemm f16 FMA speedup vs mul+add: {:.2}x",
+                medians[0] / medians[1]
+            );
+        });
+    }
+
+    /// All hardware-accelerated paths available on this host, most-preferred
+    /// first. Each is validated against the scalar path so both the plain AVX2
+    /// (mul+add) and AVX2+FMA microkernels stay honest on machines that have
+    /// FMA, while CI without FMA still exercises the plain AVX2 path.
+    fn detected_simd_paths() -> Vec<ExecutionPath> {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if std::arch::is_x86_feature_detected!("avx2") {
-            return Some(ExecutionPath::X86Avx2);
+        {
+            let mut paths = Vec::new();
+            if std::arch::is_x86_feature_detected!("avx2") {
+                paths.push(ExecutionPath::X86Avx2);
+                if std::arch::is_x86_feature_detected!("fma") {
+                    paths.push(ExecutionPath::X86Avx2Fma);
+                }
+            }
+            paths
         }
 
         #[cfg(target_arch = "aarch64")]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return Some(ExecutionPath::Aarch64Neon);
+        {
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                vec![ExecutionPath::Aarch64Neon]
+            } else {
+                Vec::new()
+            }
         }
 
-        None
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Vec::new()
+        }
     }
 
     fn half_bits(format: HalfFormat, value: f32) -> u16 {
@@ -715,10 +898,12 @@ mod tests {
 
     #[test]
     fn runtime_simd_half_gemm_matches_scalar_for_square_skinny_and_tail_shapes() {
-        let Some(simd_path) = detected_simd_path() else {
+        let simd_paths = detected_simd_paths();
+        if simd_paths.is_empty() {
             return;
-        };
-        assert_eq!(selected_execution_path(), simd_path);
+        }
+        // The auto-selected path must be one of the accelerated paths we test.
+        assert!(simd_paths.contains(&selected_execution_path()));
 
         const SHAPES: &[(usize, usize, usize)] = &[
             (8, 16, 16),
@@ -728,51 +913,57 @@ mod tests {
             (9, 257, 70),
         ];
 
-        for format in [HalfFormat::F16, HalfFormat::Bf16] {
-            for &(m, k, n) in SHAPES {
-                let a: Vec<u16> = (0..m * k)
-                    .map(|index| half_bits(format, ((index as f32 * 0.071 + 0.13).sin()) * 0.375))
-                    .collect();
-                let b: Vec<u16> = (0..k * n)
-                    .map(|index| half_bits(format, ((index as f32 * 0.053 - 0.29).cos()) * 0.375))
-                    .collect();
-                let mut scalar = vec![0.0; m * n];
-                let mut simd = vec![0.0; m * n];
+        for &simd_path in &simd_paths {
+            for format in [HalfFormat::F16, HalfFormat::Bf16] {
+                for &(m, k, n) in SHAPES {
+                    let a: Vec<u16> = (0..m * k)
+                        .map(|index| {
+                            half_bits(format, ((index as f32 * 0.071 + 0.13).sin()) * 0.375)
+                        })
+                        .collect();
+                    let b: Vec<u16> = (0..k * n)
+                        .map(|index| {
+                            half_bits(format, ((index as f32 * 0.053 - 0.29).cos()) * 0.375)
+                        })
+                        .collect();
+                    let mut scalar = vec![0.0; m * n];
+                    let mut simd = vec![0.0; m * n];
 
-                gemm_with_path(
-                    format,
-                    &a,
-                    MatrixLayout::row_major(k),
-                    &b,
-                    MatrixLayout::row_major(n),
-                    &mut scalar,
-                    m,
-                    k,
-                    n,
-                    ExecutionPath::Scalar,
-                );
-                gemm_with_path(
-                    format,
-                    &a,
-                    MatrixLayout::row_major(k),
-                    &b,
-                    MatrixLayout::row_major(n),
-                    &mut simd,
-                    m,
-                    k,
-                    n,
-                    simd_path,
-                );
+                    gemm_with_path(
+                        format,
+                        &a,
+                        MatrixLayout::row_major(k),
+                        &b,
+                        MatrixLayout::row_major(n),
+                        &mut scalar,
+                        m,
+                        k,
+                        n,
+                        ExecutionPath::Scalar,
+                    );
+                    gemm_with_path(
+                        format,
+                        &a,
+                        MatrixLayout::row_major(k),
+                        &b,
+                        MatrixLayout::row_major(n),
+                        &mut simd,
+                        m,
+                        k,
+                        n,
+                        simd_path,
+                    );
 
-                let max_error = scalar
-                    .iter()
-                    .zip(&simd)
-                    .map(|(scalar, simd)| (scalar - simd).abs())
-                    .fold(0.0f32, f32::max);
-                assert!(
-                    max_error <= 1e-6,
-                    "{format:?} {simd_path:?} {m}x{k}x{n} differs from scalar by {max_error}"
-                );
+                    let max_error = scalar
+                        .iter()
+                        .zip(&simd)
+                        .map(|(scalar, simd)| (scalar - simd).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_error <= 1e-6,
+                        "{format:?} {simd_path:?} {m}x{k}x{n} differs from scalar by {max_error}"
+                    );
+                }
             }
         }
     }

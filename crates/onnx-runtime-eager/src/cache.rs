@@ -35,8 +35,11 @@ pub type CachedKernel = Arc<Mutex<Box<dyn Kernel>>>;
 ///
 /// Two dispatches share a compiled kernel iff they agree on the op identity
 /// (`op_type`, `domain`, `opset`), the input shapes, the input dtypes, and the
-/// device. Shapes and dtypes are part of the key because kernels are compiled
-/// specialised to concrete shapes (§4.2 / §8.2).
+/// device, and the requested leading output count. Shapes and dtypes are part
+/// of the key because kernels are compiled specialised to concrete shapes
+/// (§4.2 / §8.2); output count is part of the ephemeral ONNX node and can
+/// change a variadic-output kernel's contract. Canonicalized attributes are
+/// included because factories may specialize a kernel on them.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct KernelCacheKey {
     pub op_type: String,
@@ -44,6 +47,8 @@ pub struct KernelCacheKey {
     pub opset: u64,
     pub input_shapes: Vec<Vec<usize>>,
     pub input_dtypes: Vec<DataType>,
+    pub attributes: Vec<(String, String)>,
+    pub output_count: usize,
     pub device: DeviceId,
 }
 
@@ -152,6 +157,8 @@ mod tests {
             opset: 26,
             input_shapes: vec![shape],
             input_dtypes: vec![DataType::Float32],
+            attributes: Vec::new(),
+            output_count: 1,
             device: DeviceId::cpu(),
         }
     }
