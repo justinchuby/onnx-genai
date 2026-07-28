@@ -125,7 +125,7 @@ impl Engine {
             scheduler,
             governor,
             sessions: HashMap::new(),
-            _environment: environment,
+            _environment: Some(environment),
             session: Some(Box::new(session)),
             #[cfg(feature = "native-backend")]
             native_session: None,
@@ -266,7 +266,7 @@ impl Engine {
             speculative_mode,
             last_speculative_stats: SpeculativeStats::default(),
             connector,
-            _environment: environment,
+            _environment: Some(environment),
         })
     }
 

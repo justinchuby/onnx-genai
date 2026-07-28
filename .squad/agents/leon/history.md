@@ -132,8 +132,31 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 - Repaired PR #277 lockout defect in `fix/cli-sampling-and-context`: CLI now rejects `prompt_tokens >= effective_max_context` before decode, so exhausted turns do not append empty assistant history.
 - Added equality/greater-than boundary unit coverage and preserved the one-token-room healthy path; clippy is clean with the known `pages.rs:129` lint allowed.
 
+## 2026-07-27T15:30:00-07:00 — PR #291 fork/rewind review
+
+- 🔴 Rejected Deckard's runtime fork/rewind PR. Public rewind reuses speculative helpers, but failed/rejected rewinds truncate logical tokens before backend KV/runner rewind succeeds, then reinsert the partially mutated session; this can leave tokens, kv_token_count, KV pages, and decode cursor inconsistent.
+- Prefix-cache page retention and fork capability gating looked sound; support matrix is not acceptable until unsupported/rejected rewind paths are transactional. Batty should own revision under Deckard lockout.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; model-free new KV tests passed. Full engine lib suite failed locally from known ORT API/null-pointer environment mismatch (180 passed, 66 failed, 1 ignored).
+
+## 2026-07-27T17:13:01-07:00 — PR #291 Batty revision re-review
+
+- 🔴 Rejected Batty's transaction-boundary revision. Unsupported sliding-window and ORT-owned-KV paths are now clean and model-free regressions pass, but runner-backed rewind still truncates logical tokens and rewinds paged KV before fallible ORT runner rewind can finish.
+- Verified paged materialized rewind uses an independent deep `PagedKvCache` clone before materialization; support matrix remains too strong for static-cache/shared-buffer rows until runner rewind is transactional. Gaff should own next revision under Deckard/Batty lockout.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; targeted model-free tests passed. Full engine lib suite remained at known local ORT mismatch baseline (182 passed, 66 failed, 1 ignored).
+
+## 2026-07-27T20:54:14-07:00 — PR #291 Gaff Route-B third review
+
+- 🔴 Rejected Gaff's Route-B revision. Public runner-backed `rewind_session_to` now rejects before session removal/token/KV mutation, but the reject policy was implemented in shared `rewind_target_state_to_len` / `rewind_draft_state_to_len`, accidentally disabling speculative runner rewinds for static-cache/PastPresent generation.
+- Also flagged stale model-backed checkpoint test still expecting `tiny-llm` PastPresent rewind success despite the support matrix marking runner-backed public rewind unsupported. Sapper should revise under Deckard/Batty/Gaff lockout by splitting public API validation from internal speculative rewind policy.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; targeted model-free tests passed. Full engine lib suite remained at local ORT mismatch baseline (183 passed, 66 failed, 1 ignored). Conda ORT probe still loaded ORT 1.17/API 17, so model-loading verification remained blocked.
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Reviewed PR #300 / #76, requested changes for non-convex capability claims, then approved Rachael union-find + Kahn convexity fix.
 
 ## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - Approved PR #316 CJK renderer fix and mutation-proof wide-character tests.
+
+## 2026-07-28T03:11:03-07:00 — PR #291 Sapper policy-split fourth review
+
+- 🟢 Approved Sapper's revision. `RewindRunnerPolicy` now keeps public `Engine::rewind_session_to` on `RejectRunnerRewind` while speculative draft alignment, draft rewind, target accept/reject rewind, and overmaterialized cleanup use `AllowRunnerRewind`.
+- Verified public runner-backed rewind rejects before scheduler/session/token/KV/runner mutation; policy-boundary tests would fail if allow/reject were flipped. Support matrix now matches the public API contract, with prepared/infallible runner rewind recorded as follow-up.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; full engine lib suite now runs locally with ORT 1.27/API 27 (252 passed, 0 failed, 1 ignored); targeted failed-rewind/speculative/checkpoint tests passed.

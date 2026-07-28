@@ -86,6 +86,7 @@ toktrie_hf_tokenizers = "1.7.6"
 onnx-genai-preprocess = { workspace = true }
 onnx-std = { workspace = true }
 async-trait = { workspace = true }
+proptest = "1.9"
 
 [lints]
 workspace = true

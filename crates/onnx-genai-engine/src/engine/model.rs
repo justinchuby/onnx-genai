@@ -64,7 +64,10 @@ pub struct Engine {
     /// Rust drops struct fields in declaration order; if the env dropped first, ORT would tear down
     /// the plugin EP factory before the sessions, causing a teardown use-after-free (segfault) in
     /// the Metal/MLX plugin EP's allocator/data-transfer/context release path.
-    pub(crate) _environment: Environment,
+    ///
+    /// Tests that exercise pre-session validation may set this to `None` so they
+    /// stay model-free and do not touch the local ORT library.
+    pub(crate) _environment: Option<Environment>,
 }
 
 // SAFETY: `Engine` owns every ORT or native-runtime handle reachable through

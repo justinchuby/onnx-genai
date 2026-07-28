@@ -294,6 +294,15 @@ pub(crate) fn load_materialized_past(
     decode_state: &mut DecodeState,
     materialized: &onnx_genai_kv::MaterializedKv,
 ) -> anyhow::Result<()> {
+    decode_state.past = materialized_past_values(session, kv_model, materialized)?;
+    Ok(())
+}
+
+fn materialized_past_values(
+    session: &Session,
+    kv_model: &KvModelInfo,
+    materialized: &onnx_genai_kv::MaterializedKv,
+) -> anyhow::Result<HashMap<String, Value>> {
     if materialized.start_position != 0 || materialized.sink_len != 0 {
         anyhow::bail!(
             "cannot load paged KV starting at absolute position {} (sink_len {}) into a contiguous past/present graph; discontinuous attention-sink positions require explicit position_ids support",
@@ -311,7 +320,7 @@ pub(crate) fn load_materialized_past(
         .iter()
         .map(|info| (info.name.as_str(), info.dtype))
         .collect::<HashMap<_, _>>();
-    decode_state.past.clear();
+    let mut past = HashMap::new();
     for (idx, layer) in kv_model.layers.iter().enumerate() {
         let key_shape = past_shape(
             input_shapes
@@ -339,16 +348,16 @@ pub(crate) fn load_materialized_past(
             .get(layer.value_past.as_str())
             .copied()
             .context("missing value past input dtype")?;
-        decode_state.past.insert(
+        past.insert(
             layer.key_past.clone(),
             Value::from_f32_slice_as(&materialized.layers[idx].key, &key_shape, key_dtype)?,
         );
-        decode_state.past.insert(
+        past.insert(
             layer.value_past.clone(),
             Value::from_f32_slice_as(&materialized.layers[idx].value, &value_shape, value_dtype)?,
         );
     }
-    Ok(())
+    Ok(past)
 }
 
 pub(crate) fn past_shape(shape: &[i64], sequence_len: usize) -> anyhow::Result<Vec<i64>> {
@@ -392,15 +401,34 @@ pub(crate) fn attach_pages_to_sequence(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewindRunnerPolicy {
+    AllowRunnerRewind,
+    RejectRunnerRewind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RewindRequest {
+    pub(crate) len: usize,
+    pub(crate) runner_policy: RewindRunnerPolicy,
+}
+
+impl RewindRequest {
+    pub(crate) fn new(len: usize, runner_policy: RewindRunnerPolicy) -> Self {
+        Self { len, runner_policy }
+    }
+}
+
 pub(crate) fn rewind_target_state_to_len(
     session: &Session,
     kv_model: Option<&KvModelInfo>,
     kv_cache: &mut PagedKvCache,
     seq: SessionId,
     state: &mut EngineSession,
-    len: usize,
+    request: RewindRequest,
 ) -> anyhow::Result<()> {
-    state.tokens.truncate(len);
+    validate_target_state_rewind_to_len(kv_model, kv_cache, seq, state, request)?;
+    state.tokens.truncate(request.len);
     rewind_decode_state_to_len(
         session,
         kv_model,
@@ -408,7 +436,24 @@ pub(crate) fn rewind_target_state_to_len(
         seq,
         &mut state.decode_state,
         &mut state.kv_token_count,
-        len,
+        request,
+    )
+}
+
+pub(crate) fn validate_target_state_rewind_to_len(
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &PagedKvCache,
+    seq: SessionId,
+    state: &EngineSession,
+    request: RewindRequest,
+) -> anyhow::Result<()> {
+    validate_decode_state_rewind_to_len(
+        kv_model,
+        kv_cache,
+        seq,
+        &state.decode_state,
+        state.kv_token_count,
+        request,
     )
 }
 
@@ -418,9 +463,17 @@ pub(crate) fn trim_overmaterialized_target_kv(
     kv_cache: &mut PagedKvCache,
     seq: SessionId,
     state: &mut EngineSession,
+    runner_policy: RewindRunnerPolicy,
 ) -> anyhow::Result<()> {
     if state.kv_token_count > state.tokens.len() {
-        rewind_target_state_to_len(session, kv_model, kv_cache, seq, state, state.tokens.len())?;
+        rewind_target_state_to_len(
+            session,
+            kv_model,
+            kv_cache,
+            seq,
+            state,
+            RewindRequest::new(state.tokens.len(), runner_policy),
+        )?;
     }
     Ok(())
 }
@@ -428,9 +481,10 @@ pub(crate) fn trim_overmaterialized_target_kv(
 pub(crate) fn rewind_draft_state_to_len(
     draft_model: &mut DraftModel,
     state: &mut DraftSession,
-    len: usize,
+    request: RewindRequest,
 ) -> anyhow::Result<()> {
-    state.tokens.truncate(len);
+    validate_draft_state_rewind_to_len(draft_model, state, request)?;
+    state.tokens.truncate(request.len);
     rewind_decode_state_to_len(
         &draft_model.session,
         draft_model.kv_model.as_ref(),
@@ -438,7 +492,22 @@ pub(crate) fn rewind_draft_state_to_len(
         state.seq,
         &mut state.decode_state,
         &mut state.kv_token_count,
-        len,
+        request,
+    )
+}
+
+pub(crate) fn validate_draft_state_rewind_to_len(
+    draft_model: &DraftModel,
+    state: &DraftSession,
+    request: RewindRequest,
+) -> anyhow::Result<()> {
+    validate_decode_state_rewind_to_len(
+        draft_model.kv_model.as_ref(),
+        &draft_model.kv_cache,
+        state.seq,
+        &state.decode_state,
+        state.kv_token_count,
+        request,
     )
 }
 
@@ -449,6 +518,32 @@ pub(crate) fn common_prefix_len(left: &[TokenId], right: &[TokenId]) -> usize {
         .count()
 }
 
+pub(crate) fn validate_decode_state_rewind_to_len(
+    kv_model: Option<&KvModelInfo>,
+    kv_cache: &PagedKvCache,
+    seq: SessionId,
+    decode_state: &DecodeState,
+    kv_token_count: usize,
+    request: RewindRequest,
+) -> anyhow::Result<()> {
+    let len = request.len;
+    decode_state.validate_rewind_to_len(
+        kv_token_count,
+        len,
+        kv_model.is_some(),
+        request.runner_policy,
+    )?;
+    if decode_state.use_kv
+        && kv_token_count != len
+        && (decode_state.has_runner() || decode_state.is_windowed() || kv_model.is_some())
+    {
+        kv_cache.validate_rewind_to(seq, len).map_err(|e| {
+            anyhow::anyhow!("Failed to validate KV sequence {seq} rewind to {len}: {e}")
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rewind_decode_state_to_len(
     session: &Session,
     kv_model: Option<&KvModelInfo>,
@@ -456,8 +551,17 @@ pub(crate) fn rewind_decode_state_to_len(
     seq: SessionId,
     decode_state: &mut DecodeState,
     kv_token_count: &mut usize,
-    len: usize,
+    request: RewindRequest,
 ) -> anyhow::Result<()> {
+    let len = request.len;
+    validate_decode_state_rewind_to_len(
+        kv_model,
+        kv_cache,
+        seq,
+        decode_state,
+        *kv_token_count,
+        request,
+    )?;
     if !decode_state.use_kv {
         *kv_token_count = 0;
         return Ok(());
@@ -484,19 +588,29 @@ pub(crate) fn rewind_decode_state_to_len(
     if kv_model.is_none() && *kv_token_count != len {
         anyhow::bail!("cannot rewind ORT KV tensors without paged KV materialization");
     }
-    kv_cache
-        .rewind_to(seq, len)
-        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
-    *kv_token_count = len;
     if len == 0 {
+        kv_cache
+            .rewind_to(seq, len)
+            .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
+        *kv_token_count = len;
         decode_state.past.clear();
         return Ok(());
     }
     let kv_model = kv_model.context("missing KV model after rewind check")?;
-    let materialized = kv_cache
+    let mut validated_cache = kv_cache.clone();
+    validated_cache
+        .rewind_to(seq, len)
+        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
+    let materialized = validated_cache
         .materialize_sequence(seq)
         .map_err(|e| anyhow::anyhow!("Failed to materialize rewound KV sequence {seq}: {e}"))?;
-    load_materialized_past(session, kv_model, decode_state, &materialized)
+    let past = materialized_past_values(session, kv_model, &materialized)?;
+    kv_cache
+        .rewind_to(seq, len)
+        .map_err(|e| anyhow::anyhow!("Failed to rewind KV sequence {seq} to {len}: {e}"))?;
+    *kv_token_count = len;
+    decode_state.past = past;
+    Ok(())
 }
 
 pub(crate) fn sequence_pages_for_len(
@@ -762,7 +876,7 @@ pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) ->
 mod tests {
     use super::*;
     use crate::decode::{
-        ModelDecodePath, detect_model_decode_path, extract_next_token_logits_with_io,
+        DecodeState, ModelDecodePath, detect_model_decode_path, extract_next_token_logits_with_io,
         run_decode_session_logits, run_decode_step,
     };
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
@@ -816,6 +930,59 @@ mod tests {
                 }],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn speculative_target_rejection_allows_runner_backed_rewind_validation() -> anyhow::Result<()> {
+        let mut cache = PagedKvCache::new(4, 8);
+        let seq = cache.create_sequence();
+        cache.append(seq, 4)?;
+        let state = EngineSession {
+            tokens: vec![10, 11, 12, 13],
+            kv_token_count: 4,
+            decode_state: DecodeState::for_test_runner_backed(),
+            draft: None,
+            sampled_fastpath_failed: false,
+        };
+
+        validate_target_state_rewind_to_len(
+            None,
+            &cache,
+            seq,
+            &state,
+            RewindRequest::new(2, RewindRunnerPolicy::AllowRunnerRewind),
+        )?;
+        let error = validate_target_state_rewind_to_len(
+            None,
+            &cache,
+            seq,
+            &state,
+            RewindRequest::new(2, RewindRunnerPolicy::RejectRunnerRewind),
+        )
+        .expect_err("public rewind policy must still reject runner-backed state");
+        assert!(
+            error.to_string().contains("runner-backed decoder state"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_draft_realignment_allows_runner_backed_rewind_validation() -> anyhow::Result<()>
+    {
+        let mut cache = PagedKvCache::new(4, 8);
+        let seq = cache.create_sequence();
+        cache.append(seq, 5)?;
+        let decode_state = DecodeState::for_test_runner_backed();
+
+        validate_decode_state_rewind_to_len(
+            None,
+            &cache,
+            seq,
+            &decode_state,
+            5,
+            RewindRequest::new(3, RewindRunnerPolicy::AllowRunnerRewind),
+        )
     }
 
     fn infers_past_present_model_and_rejects_static_cache_as_kv_bridge_model() -> anyhow::Result<()>
@@ -1137,7 +1304,7 @@ mod tests {
             seq,
             &mut decode_state,
             &mut count,
-            2,
+            RewindRequest::new(2, RewindRunnerPolicy::AllowRunnerRewind),
         )?;
         assert_eq!(count, 2);
         assert_eq!(
@@ -1152,7 +1319,7 @@ mod tests {
             seq,
             &mut decode_state,
             &mut count,
-            0,
+            RewindRequest::new(0, RewindRunnerPolicy::AllowRunnerRewind),
         )?;
         assert_eq!(count, 0);
         assert!(decode_state.past.is_empty());
@@ -1165,7 +1332,7 @@ mod tests {
             seq,
             &mut decode_state,
             &mut count,
-            0,
+            RewindRequest::new(0, RewindRunnerPolicy::AllowRunnerRewind),
         )
         .unwrap_err();
         assert!(
@@ -1182,13 +1349,13 @@ mod tests {
             seq,
             &mut decode_state,
             &mut count,
-            5,
+            RewindRequest::new(5, RewindRunnerPolicy::AllowRunnerRewind),
         )?;
         assert_eq!(count, 0);
         Ok(())
     }
 
-    fn rewinds_static_and_past_present_decode_runners() -> anyhow::Result<()> {
+    fn rejects_static_and_past_present_decode_runner_rewind() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         for (fixture_name, path) in [
             (
@@ -1213,11 +1380,24 @@ mod tests {
             cache.append(seq, 3)?;
             let mut count = 3;
 
-            rewind_decode_state_to_len(&session, None, &mut cache, seq, &mut state, &mut count, 1)?;
+            let error = rewind_decode_state_to_len(
+                &session,
+                None,
+                &mut cache,
+                seq,
+                &mut state,
+                &mut count,
+                RewindRequest::new(1, RewindRunnerPolicy::RejectRunnerRewind),
+            )
+            .expect_err("runner-backed rewind must fail closed");
 
-            assert_eq!(count, 1);
-            assert_eq!(state.runner_len(), 1);
-            assert_eq!(cache.len(seq)?, 1);
+            assert!(
+                error.to_string().contains("runner-backed decoder state"),
+                "unexpected error: {error:#}"
+            );
+            assert_eq!(count, 3);
+            assert_eq!(state.runner_len(), 3);
+            assert_eq!(cache.len(seq)?, 3);
         }
         Ok(())
     }
@@ -1379,13 +1559,27 @@ mod tests {
             sampled_fastpath_failed: false,
         };
 
-        trim_overmaterialized_target_kv(&session, None, &mut cache, seq, &mut state)?;
+        trim_overmaterialized_target_kv(
+            &session,
+            None,
+            &mut cache,
+            seq,
+            &mut state,
+            RewindRunnerPolicy::AllowRunnerRewind,
+        )?;
         assert_eq!(state.kv_token_count, 0);
         assert_eq!(cache.len(seq)?, 4);
 
         state.decode_state.use_kv = true;
         state.kv_token_count = 4;
-        rewind_target_state_to_len(&session, None, &mut cache, seq, &mut state, 4)?;
+        rewind_target_state_to_len(
+            &session,
+            None,
+            &mut cache,
+            seq,
+            &mut state,
+            RewindRequest::new(4, RewindRunnerPolicy::AllowRunnerRewind),
+        )?;
         assert_eq!(state.tokens, [2, 4, 3]);
         assert_eq!(state.kv_token_count, 4);
         assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 4, 5]), 2);
@@ -1398,7 +1592,7 @@ mod tests {
         mirrors_present_append_range_into_paged_cache()?;
         materializes_past_values_in_model_input_layout()?;
         rewinds_materialized_ort_past_and_handles_edge_branches()?;
-        rewinds_static_and_past_present_decode_runners()?;
+        rejects_static_and_past_present_decode_runner_rewind()?;
         rewinds_target_state_and_trims_overmaterialized_kv()
     }
 
