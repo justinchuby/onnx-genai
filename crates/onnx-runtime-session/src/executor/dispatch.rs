@@ -357,9 +357,10 @@ impl Executor {
 
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
         // whole while the kernel (from `cache`) and the buffers/views are held.
-        // `cache` is kept as a separate local because the resolved kernel
-        // reference borrows it for the rest of the dispatch.
+        // `cache` and `kernel_bindings` are kept as separate locals because the
+        // resolved kernel reference borrows `cache` for the rest of the dispatch.
         let cache = &mut self.cache;
+        let kernel_bindings = &mut self.kernel_bindings;
         let mut ctx = KernelDispatchContext {
             ep: &ep,
             graph: &self.graph,
@@ -393,29 +394,68 @@ impl Executor {
         }
 
         let opset = effective_opset(ctx.graph, node);
-        let constant_inputs: Vec<bool> = inputs
-            .iter()
-            .map(|input| {
-                input.is_some_and(|vid| {
-                    ctx.graph.initializers.contains_key(&vid)
-                        || ctx
-                            .views_meta
-                            .get(&vid)
-                            .is_some_and(|view| ctx.graph.initializers.contains_key(&view.source))
-                })
-            })
-            .collect();
         let kernel = {
             let _s = phase_span!("exec_kernel.get_kernel");
-            cache.get_or_create(
-                node_id,
-                node,
-                input_shapes,
-                input_dtypes,
-                &constant_inputs,
-                opset,
-                ep.as_ref(),
-            )?
+            // Pre-bound fast path: if the binding exists and shapes match, skip
+            // the HashMap-key allocation entirely. This is the hot path during
+            // steady-state decode — shapes are fixed, so every call after warmup
+            // hits here. The binding is populated on miss (below) or at build.
+            if let Some(binding) = &kernel_bindings[pi] {
+                if let Some(k) = cache.get_prebound(binding, input_shapes) {
+                    k
+                } else {
+                    // Shape changed (prefill→decode or batch change). Fall through
+                    // to get_or_create which allocates the key and compiles/fetches.
+                    let constant_inputs: Vec<bool> = inputs
+                        .iter()
+                        .map(|input| {
+                            input.is_some_and(|vid| {
+                                ctx.graph.initializers.contains_key(&vid)
+                                    || ctx.views_meta.get(&vid).is_some_and(|view| {
+                                        ctx.graph.initializers.contains_key(&view.source)
+                                    })
+                            })
+                        })
+                        .collect();
+                    let (k, key) = cache.get_or_create(
+                        node_id,
+                        node,
+                        input_shapes,
+                        input_dtypes,
+                        &constant_inputs,
+                        opset,
+                        ep.as_ref(),
+                    )?;
+                    kernel_bindings[pi] = Some(key);
+                    k
+                }
+            } else {
+                // No binding yet (first dispatch of this node for a symbolic
+                // graph, or a control-flow/sequence node that was skipped at
+                // build). Compute constant_inputs and go through get_or_create.
+                let constant_inputs: Vec<bool> = inputs
+                    .iter()
+                    .map(|input| {
+                        input.is_some_and(|vid| {
+                            ctx.graph.initializers.contains_key(&vid)
+                                || ctx.views_meta.get(&vid).is_some_and(|view| {
+                                    ctx.graph.initializers.contains_key(&view.source)
+                                })
+                        })
+                    })
+                    .collect();
+                let (k, key) = cache.get_or_create(
+                    node_id,
+                    node,
+                    input_shapes,
+                    input_dtypes,
+                    &constant_inputs,
+                    opset,
+                    ep.as_ref(),
+                )?;
+                kernel_bindings[pi] = Some(key);
+                k
+            }
         };
         // --- Zero-copy view fast path ---------------------------------------
         // Ask the kernel whether its outputs are strided views over its inputs

@@ -11,6 +11,7 @@ use onnx_genai_metadata::{
     PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator, load_metadata,
     load_pipeline_spec,
 };
+use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
 use crate::{Environment, OrtError, Result, Session, SessionOptions, Tokenizer};
 
@@ -22,6 +23,8 @@ pub struct ModelDirectory {
     pub tokenizer_path: PathBuf,
     /// Optional Phase 1 metadata path. Missing metadata is tolerated.
     pub metadata_path: Option<PathBuf>,
+    /// Resolved compatibility configuration path, including package references.
+    pub genai_config_path: Option<PathBuf>,
     /// Detected standalone speculator declaration, if present.
     pub speculator: Option<SpeculatorDescriptor>,
 }
@@ -38,6 +41,27 @@ impl ModelDirectory {
             )));
         }
 
+        if is_model_package_directory(root) {
+            return Self::load_package(root, &SelectionRequest::default());
+        }
+
+        Self::load_flat(root)
+    }
+
+    /// Resolve a flat model directory or select a variant from an ORT package.
+    pub fn load_with_package_selection(
+        root: impl AsRef<Path>,
+        selection: &SelectionRequest,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        if is_model_package_directory(root) {
+            Self::load_package(root, selection)
+        } else {
+            Self::load_flat(root)
+        }
+    }
+
+    fn load_flat(root: &Path) -> Result<Self> {
         let tokenizer_path = root.join("tokenizer.json");
         if !tokenizer_path.is_file() {
             return Err(OrtError::Io(std::io::Error::new(
@@ -56,12 +80,69 @@ impl ModelDirectory {
         .map(|name| root.join(name))
         .find(|path| path.is_file());
         let speculator = detect_speculator(root);
+        let genai_config_path = onnx_genai_genai_config::find_in_dir(root);
 
         Ok(Self {
             root: root.to_path_buf(),
             model_path,
             tokenizer_path,
             metadata_path,
+            genai_config_path,
+            speculator,
+        })
+    }
+
+    fn load_package(root: &Path, selection: &SelectionRequest) -> Result<Self> {
+        let package = ModelPackage::open(root)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        package
+            .validate()
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let component_name = if package.manifest().components.contains_key("model") {
+            "model"
+        } else if package.manifest().components.len() == 1 {
+            package
+                .manifest()
+                .components
+                .first()
+                .map(|(name, _)| name.as_str())
+                .expect("non-empty components validated by ModelPackage::open")
+        } else {
+            return Err(OrtError::InvalidArgument(
+                "model package must contain a 'model' component when multiple components exist"
+                    .to_string(),
+            ));
+        };
+        let selected = package
+            .select(component_name, selection)
+            .map_err(|error| OrtError::InvalidArgument(error.to_string()))?;
+        let tokenizer_directory = selected
+            .tokenizer_directory
+            .clone()
+            .unwrap_or_else(|| selected.variant_directory.clone());
+        let tokenizer_path = tokenizer_directory.join("tokenizer.json");
+        if !tokenizer_path.is_file() {
+            return Err(OrtError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "tokenizer.json not found in resolved tokenizer directory {}",
+                    tokenizer_directory.display()
+                ),
+            )));
+        }
+        let metadata_path = selected
+            .inference_metadata_path
+            .or_else(|| find_metadata_path(&selected.variant_directory));
+        let genai_config_path = selected
+            .genai_config_path
+            .or_else(|| onnx_genai_genai_config::find_in_dir(&selected.variant_directory));
+        let speculator = detect_speculator(&selected.variant_directory);
+        Ok(Self {
+            root: selected.variant_directory,
+            model_path: selected.model_path,
+            tokenizer_path,
+            metadata_path,
+            genai_config_path,
             speculator,
         })
     }
@@ -362,6 +443,42 @@ fn is_onnx_model_file(path: &Path) -> bool {
             .and_then(|stem| Path::new(stem).extension())
             .is_some_and(|inner| inner.eq_ignore_ascii_case("onnx")),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod model_package_tests {
+    use super::*;
+
+    #[test]
+    fn package_directory_resolves_selected_model_and_shared_tokenizer() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../onnx-model-package/tests/fixtures/valid-package")
+            .canonicalize()
+            .unwrap();
+        let selection = SelectionRequest {
+            execution_provider: Some("CPUExecutionProvider".to_string()),
+            precision: Some("float32".to_string()),
+            ..Default::default()
+        };
+        let directory = ModelDirectory::load_with_package_selection(&root, &selection).unwrap();
+        assert_eq!(directory.model_path, root.join("cpu-fp32/model.onnx"));
+        assert_eq!(
+            directory.tokenizer_path,
+            root.join(format!(
+                "shared_assets/sha256-{}/tokenizer.json",
+                "a".repeat(64)
+            ))
+        );
+    }
+
+    #[test]
+    fn flat_directory_with_unrelated_manifest_remains_backward_compatible() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+        let directory = ModelDirectory::load(&root).unwrap();
+        assert_eq!(directory.model_path, root.join("model.onnx.textproto"));
+        assert_eq!(directory.tokenizer_path, root.join("tokenizer.json"));
     }
 }
 

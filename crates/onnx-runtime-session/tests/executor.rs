@@ -1168,6 +1168,7 @@ fn shape_keyed_cache_is_reused_across_runs() {
     assert_eq!(after_build.entries, 2, "two nodes compiled");
     assert_eq!(after_build.misses, 2);
     assert_eq!(after_build.hits, 0);
+    assert_eq!(after_build.prebind_hits, 0);
 
     let x_tensor = Tensor::from_f32(&[2, 2], &[1.0, 2.0, 3.0, 4.0]).unwrap();
 
@@ -1175,13 +1176,24 @@ fn shape_keyed_cache_is_reused_across_runs() {
     let after_run1 = session.cache_stats();
     assert_eq!(after_run1.entries, 2, "no new entries on run");
     assert_eq!(after_run1.misses, 2, "no recompilation");
-    assert_eq!(after_run1.hits, 2, "each node served from cache");
+    // With kernel pre-binding, static-shape graphs serve lookups via the
+    // zero-alloc pre-bound path (prebind_hits) instead of the HashMap path
+    // (hits). Either way, each node is served from the cache.
+    assert_eq!(
+        after_run1.hits + after_run1.prebind_hits,
+        2,
+        "each node served from cache (via HashMap or pre-binding)"
+    );
 
     let out2 = session.run(&[("X", &x_tensor)]).unwrap();
     let after_run2 = session.cache_stats();
     assert_eq!(after_run2.entries, 2);
     assert_eq!(after_run2.misses, 2);
-    assert_eq!(after_run2.hits, 4, "second run hit the cache again");
+    assert_eq!(
+        after_run2.hits + after_run2.prebind_hits,
+        4,
+        "second run hit the cache again"
+    );
 
     // Identity matmul + relu of [1,2,3,4] → [1,2,3,4].
     assert_close(&out1[0].to_vec_f32(), &[1.0, 2.0, 3.0, 4.0]);

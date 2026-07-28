@@ -481,8 +481,15 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("RMSNormalization", "", 23),
         Box::new(rmsnorm::RmsNormFactory),
     );
+    // BatchNormalization inference semantics (5 inputs → 1 output) are stable
+    // since opset 7 (when the legacy `is_test` attribute was removed). Opset 9
+    // added the `spatial` attribute (default 1, always 1 in practice), opset 14
+    // deprecated it, and opset 15 simplified the spec — none of these changes
+    // affect the kernel's computation. Registering at 7 lets the runtime handle
+    // older vision models (e.g. ResNet-18 at opset 8) that the BN-fold optimizer
+    // pass also needs to fuse.
     reg.register(
-        OpKey::new("BatchNormalization", "", 15),
+        OpKey::new("BatchNormalization", "", 7),
         Box::new(norm_ops::BatchNormFactory),
     );
     reg.register(
@@ -1771,7 +1778,8 @@ mod tests {
         assert!(reg.lookup("RMSNormalization", "", 23).is_some());
         assert!(reg.lookup("RMSNormalization", "", 22).is_none());
         assert!(reg.lookup("BatchNormalization", "", 15).is_some());
-        assert!(reg.lookup("BatchNormalization", "", 14).is_none());
+        assert!(reg.lookup("BatchNormalization", "", 7).is_some());
+        assert!(reg.lookup("BatchNormalization", "", 6).is_none());
         assert!(reg.lookup("InstanceNormalization", "", 6).is_some());
         assert!(reg.lookup("GroupNormalization", "", 18).is_some());
         assert!(reg.lookup("GroupNormalization", "", 21).is_some());

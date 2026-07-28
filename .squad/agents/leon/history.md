@@ -134,3 +134,6 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Reviewed PR #300 / #76, requested changes for non-convex capability claims, then approved Rachael union-find + Kahn convexity fix.
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Approved PR #316 CJK renderer fix and mutation-proof wide-character tests.

@@ -16,7 +16,8 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
-            ModelDirectory::load(model_dir)
+            let package_selection = package_selection_from_session_options(&session_options);
+            ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
         let decode_backend = {
@@ -167,7 +168,7 @@ impl Engine {
                 onnx_genai_metadata::load_metadata(metadata_path)
                     .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"))?
             } else if let Some(compat) = genai_config_compat_metadata_from_model_path(
-                &model_directory.root,
+                model_directory.genai_config_path.as_deref(),
                 &model_directory.model_path,
             )? {
                 compat
@@ -281,6 +282,26 @@ impl Engine {
     }
 }
 
+fn package_selection_from_session_options(
+    session_options: &SessionOptions,
+) -> onnx_genai_ort::ModelPackageSelection {
+    let execution_provider = session_options.execution_providers.first().map(|provider| {
+        match provider.selection.name.as_str() {
+            "cpu" => "CPUExecutionProvider".to_string(),
+            "cuda" => "CUDAExecutionProvider".to_string(),
+            "coreml" | "core-ml" | "core_ml" => "CoreMLExecutionProvider".to_string(),
+            "webgpu" | "web-gpu" | "web_gpu" => "WebGpuExecutionProvider".to_string(),
+            "metal" => "MlxExecutionProvider".to_string(),
+            name if name.ends_with("ExecutionProvider") => name.to_string(),
+            name => format!("{name}ExecutionProvider"),
+        }
+    });
+    onnx_genai_ort::ModelPackageSelection {
+        execution_provider,
+        ..Default::default()
+    }
+}
+
 /// Resolved model inference metadata plus the decode-path derived from it.
 /// Produced by [`resolve_metadata_and_decode_path`] as the first construction stage.
 struct MetadataResolution {
@@ -304,7 +325,9 @@ fn resolve_metadata_and_decode_path(
         if let Some(metadata_path) = &model_directory.metadata_path {
             onnx_genai_metadata::load_metadata(metadata_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"))?
-        } else if let Some(compat) = genai_config_compat_metadata(&model_directory.root, session)? {
+        } else if let Some(compat) =
+            genai_config_compat_metadata(model_directory.genai_config_path.as_deref(), session)?
+        {
             tracing::info!(
                 "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
             );

@@ -174,3 +174,5 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 - Centered the design on invariants rather than exact stochastic output: termination, non-empty committed turns, reasoning progress, repetition bounds, token/history/KV consistency, scheduler liveness, sampling observability, feature-state coherence, and reproducible failure packets.
 - Recommended phase 1 as a committed tiny reasoning fixture plus per-PR CPU ORT REPL stress; CUDA DeepSeek/native and ORT CUDA shared-GQA failures require self-hosted/manual GPU lanes.
 - Dropped decision inbox note `.squad/decisions/inbox/roy-stress-test-design.md`.
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Approved PR #313 decode-garble triage and byte-identity/fires regression guard; repeated-sentence output classified as natural greedy behavior.

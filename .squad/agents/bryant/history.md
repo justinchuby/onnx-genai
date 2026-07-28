@@ -82,3 +82,6 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Bryant approved WP-B3 v3 after raw-shape authority, loader-unchanged, mutation, fmt, clippy, and full ORT gates passed.
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Reviewed PR #311, requested changes, then re-approved Daniels' BF16 CUDA fix; #67 advanced to next batch.
