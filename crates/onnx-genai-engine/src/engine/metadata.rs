@@ -62,25 +62,17 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
             graph: ScanGraphProto,
             display_path: String,
             parent_path: Option<onnx_std::NodePath>,
-            top_level: bool,
         },
         Node {
             node: ScanNodeProto,
-            identity: ScanNodeIdentity,
             structural_path: onnx_std::NodePath,
         },
-    }
-
-    enum ScanNodeIdentity {
-        TopLevel(String),
-        Nested(onnx_std::NodePath),
     }
 
     let mut work = vec![Work::Graph {
         display_path: root.name.clone(),
         parent_path: None,
         graph: root,
-        top_level: true,
     }];
     while let Some(item) = work.pop() {
         match item {
@@ -88,7 +80,6 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
                 graph,
                 display_path,
                 parent_path,
-                top_level,
             } => {
                 entries.extend(
                     graph
@@ -104,17 +95,13 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
                         }),
                 );
                 for (index, node) in graph.node.into_iter().enumerate().rev() {
-                    let structural_path = if let Some(parent_path) = &parent_path {
-                        parent_path.clone().with_node(node.name.clone(), index)
-                    } else {
-                        onnx_std::NodePath::root_node(node.name.clone(), index)
+                    let structural_path = match &parent_path {
+                        Some(parent_path) => {
+                            parent_path.clone().with_node(node.name.clone(), index)
+                        }
+                        None => onnx_std::NodePath::root_node(node.name.clone(), index),
                     };
                     work.push(Work::Node {
-                        identity: if top_level {
-                            ScanNodeIdentity::TopLevel(node.name.clone())
-                        } else {
-                            ScanNodeIdentity::Nested(structural_path.clone())
-                        },
                         node,
                         structural_path,
                     });
@@ -122,22 +109,14 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
             }
             Work::Node {
                 node,
-                identity,
                 structural_path,
             } => {
                 entries.extend(
                     node.metadata_props
                         .into_iter()
                         .map(|entry| onnx_std::HintEntry {
-                            scope: match &identity {
-                                ScanNodeIdentity::TopLevel(node_name) => {
-                                    onnx_std::HintScope::Node {
-                                        node_name: node_name.clone(),
-                                    }
-                                }
-                                ScanNodeIdentity::Nested(path) => {
-                                    onnx_std::HintScope::NestedNode { path: path.clone() }
-                                }
+                            scope: onnx_std::HintScope::Node {
+                                path: structural_path.clone(),
                             },
                             source: onnx_std::HintSource::OnnxMetadata,
                             key: entry.key,
@@ -169,7 +148,6 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
                         graph,
                         display_path: parent_path.display_name(),
                         parent_path: Some(parent_path),
-                        top_level: false,
                     });
                 }
             }
@@ -766,8 +744,8 @@ mod metadata_hint_tests {
 
     fn node_hint(node: &str, key: &str, value: &str) -> HintEntry {
         HintEntry {
-            scope: HintScope::Node {
-                node_name: node.to_string(),
+            scope: HintScope::NamedNode {
+                name: node.to_string(),
             },
             source: HintSource::OnnxMetadata,
             key: key.to_string(),
@@ -988,6 +966,64 @@ mod metadata_hint_tests {
             MetadataWarning::InvalidValue { key, expected, .. }
                 if key == "onnx_runtime.layer" && *expected == "an integer"
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn lightweight_scan_keeps_anonymous_top_level_nodes_distinct() -> anyhow::Result<()> {
+        // Round-3 reviewer probe through the real load path: two unnamed
+        // top-level nodes must each keep their hints instead of collapsing under
+        // an empty-string key.
+        let model = ScanModelProto {
+            graph: Some(ScanGraphProto {
+                node: vec![
+                    ScanNodeProto {
+                        name: String::new(),
+                        metadata_props: vec![ScanStringEntryProto {
+                            key: "onnx_runtime.layer".to_string(),
+                            value: "1".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                    ScanNodeProto {
+                        name: String::new(),
+                        metadata_props: vec![ScanStringEntryProto {
+                            key: "onnx_runtime.layer".to_string(),
+                            value: "2".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("metadata_hints_anonymous.onnx");
+        std::fs::write(&path, model.encode_to_vec())?;
+
+        let hints = load_model_metadata_hints(&path)?;
+        std::fs::remove_file(path)?;
+
+        assert_eq!(hints.nodes.len(), 2);
+        let mut layers: Vec<i64> = hints.nodes.values().filter_map(|node| node.layer).collect();
+        layers.sort_unstable();
+        assert_eq!(layers, vec![1, 2]);
+        assert_eq!(
+            hints
+                .nodes
+                .get_path(&onnx_std::NodePath::root_node(String::new(), 0))
+                .and_then(|node| node.layer),
+            Some(1)
+        );
+        assert_eq!(
+            hints
+                .nodes
+                .get_path(&onnx_std::NodePath::root_node(String::new(), 1))
+                .and_then(|node| node.layer),
+            Some(2)
+        );
         Ok(())
     }
 

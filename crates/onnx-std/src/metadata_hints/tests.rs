@@ -6,11 +6,11 @@ use onnx_runtime_ir::{DataType, Graph, Node, NodeId, static_shape};
 use onnx_runtime_loader::ModelMetadata;
 use onnx_runtime_loader::proto::onnx::{AttributeProto, GraphProto, NodeProto, attribute_proto};
 
-/// Build an `onnx_runtime.*` entry attached to a node.
+/// Build an `onnx_runtime.*` entry attached to a node by name (external source).
 fn node_entry(node: &str, key: &str, value: &str, source: HintSource) -> HintEntry {
     HintEntry {
-        scope: HintScope::Node {
-            node_name: node.to_string(),
+        scope: HintScope::NamedNode {
+            name: node.to_string(),
         },
         source,
         key: key.to_string(),
@@ -635,6 +635,185 @@ fn from_model_with_no_metadata_is_safe() {
     let model = Model::new(add_graph());
     let hints = MetadataHints::from_model(&model);
     assert_eq!(hints, MetadataHints::default());
+}
+
+// --- Node-identity collision classes ------------------------------------
+//
+// Node names in ONNX are optional and non-unique, so they must never key a
+// node. Each test below pins one collision class shut. The `_path` helpers
+// rebuild the structural key the scan produces; if any node were keyed by its
+// raw name string again, the `len()`/per-node assertions would regress.
+
+/// Structural key of the top-level node at `index` named `name`.
+fn top_level_path(name: &str, index: usize) -> NodePath {
+    NodePath::root_node(name.to_string(), index)
+}
+
+#[test]
+fn two_anonymous_top_level_nodes_stay_distinct() {
+    // The round-3 reviewer probe: two unnamed top-level nodes must not merge
+    // under an empty-string key. Each keeps its own hints.
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("", [("onnx_runtime.layer", "1")]),
+            proto_node("", [("onnx_runtime.layer", "2")]),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("", 1))
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn two_same_named_top_level_nodes_stay_distinct() {
+    // ONNX does not require node names to be unique; duplicate names must not
+    // collide.
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("dup", [("onnx_runtime.layer", "1")]),
+            proto_node("dup", [("onnx_runtime.layer", "2")]),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("dup", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("dup", 1))
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn top_level_name_matching_a_subgraph_display_path_stays_distinct() {
+    // A top-level node literally named "owner/body/inner" must not merge with a
+    // nested node whose display path renders to the same string.
+    let nested_path = NodePath::root_node("owner".to_string(), 1)
+        .with_attribute("body".to_string(), 0, None)
+        .with_node("inner".to_string(), 0);
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("owner/body/inner", [("onnx_runtime.layer", "1")]),
+            proto_node_with_graph(
+                "Loop",
+                "owner",
+                "body",
+                GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "2")])],
+                    ..Default::default()
+                },
+            ),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("owner/body/inner", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&nested_path)
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn external_named_hint_resolves_onto_the_structural_node_it_names() {
+    // External sources address nodes by name; the name must resolve to the
+    // model's structural node so priorities merge, not create a second entry.
+    let hints = MetadataHints::scan([
+        // Model-embedded structural hint on top-level node "attn" (index 0).
+        HintEntry {
+            scope: HintScope::Node {
+                path: top_level_path("attn", 0),
+            },
+            source: HintSource::OnnxMetadata,
+            key: "onnx_runtime.layer".to_string(),
+            value: "1".to_string(),
+        },
+        // External JSON references the same node by name with higher priority.
+        node_entry(
+            "attn",
+            "onnx_runtime.layer",
+            "9",
+            HintSource::ExecutionHintsJson,
+        ),
+    ]);
+
+    assert_eq!(hints.nodes.len(), 1);
+    assert_eq!(hints.nodes.get("attn").and_then(|node| node.layer), Some(9));
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("attn", 0))
+            .and_then(|node| node.layer),
+        Some(9)
+    );
+}
+
+#[test]
+fn external_named_hint_for_unknown_node_is_kept_without_colliding() {
+    // A name that matches no scanned node stays in its own external keyspace and
+    // never merges with an anonymous structural node.
+    let hints = MetadataHints::scan([
+        HintEntry {
+            scope: HintScope::Node {
+                path: top_level_path("", 0),
+            },
+            source: HintSource::OnnxMetadata,
+            key: "onnx_runtime.layer".to_string(),
+            value: "1".to_string(),
+        },
+        node_entry(
+            "ghost",
+            "onnx_runtime.layer",
+            "7",
+            HintSource::ProgrammaticBuilder,
+        ),
+    ]);
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&top_level_path("", 0))
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints.nodes.get("ghost").and_then(|node| node.layer),
+        Some(7)
+    );
 }
 
 fn string_entry(
