@@ -376,7 +376,7 @@ pub(super) fn build_lazy_weight_handles(
         let shape = weight.dims().to_vec();
         let weight = weight.clone();
         let store = Arc::clone(weights);
-        let lazy = LazyWeight::block_quantized_moe(vec![region], move || {
+        let lazy = LazyWeight::block_quantized_moe(dtype, shape.clone(), vec![region], move || {
             let bytes = store.bytes(&weight).ok_or_else(|| {
                 onnx_runtime_ep_api::WeightHandleError::InvalidResident(
                     "external weight bytes are no longer available".into(),

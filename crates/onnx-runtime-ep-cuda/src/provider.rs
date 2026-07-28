@@ -109,6 +109,17 @@ impl CudaExecutionProvider {
     pub fn csa_metrics(&self) -> &Arc<CsaMetrics> {
         &self.csa_metrics
     }
+
+    /// Build a live GPU weight pager (WEIGHT_OFFLOAD Phase 3b) that binds an
+    /// offloaded `pkg.nxrt::BlockQuantizedMoE` weight into a VRAM page, copying
+    /// its canonical bytes from `source` host→device. The returned binding is
+    /// byte-identical to a resident upload of the same weight.
+    pub fn weight_pager<'a, S: onnx_runtime_ep_api::MmapRegionSource>(
+        &self,
+        source: &'a S,
+    ) -> crate::weight_paging::CudaWeightPager<'a, S> {
+        crate::weight_paging::CudaWeightPager::new(Arc::clone(&self.runtime), source)
+    }
 }
 
 impl ExecutionProvider for CudaExecutionProvider {
