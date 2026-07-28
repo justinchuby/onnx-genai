@@ -44,7 +44,7 @@ jobs:
 
       # ── Benchmark the PR head ──────────────────────────────────────────
       - name: Benchmark PR head (ep-cpu kernels)
-        run: cargo bench -p onnx-runtime-ep-cpu -- --noplot
+        run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
 
       - name: Benchmark PR head (genai-bench no_model)
         run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
@@ -64,7 +64,7 @@ jobs:
         run: git checkout ${{ steps.merge-base.outputs.sha }}
 
       - name: Benchmark merge-base (ep-cpu kernels)
-        run: cargo bench -p onnx-runtime-ep-cpu -- --noplot
+        run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
 
       - name: Benchmark merge-base (genai-bench no_model)
         run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
