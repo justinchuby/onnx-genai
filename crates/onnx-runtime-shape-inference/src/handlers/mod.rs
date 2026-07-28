@@ -15,6 +15,7 @@ mod elementwise;
 mod generator;
 mod linalg;
 mod loss;
+mod ml;
 mod movement;
 mod norm;
 mod pooling;
@@ -61,4 +62,5 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     einsum::register(registry);
     signal::register(registry);
     loss::register(registry);
+    ml::register(registry);
 }

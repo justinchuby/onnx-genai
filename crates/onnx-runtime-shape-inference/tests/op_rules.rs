@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, SymbolId, ValueId};
+use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, SymbolId, TensorData, ValueId};
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, ShapeInferError, SymbolInterner,
     TypeInfo,
@@ -279,8 +279,191 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 196);
-    assert_eq!(registry.entry_count(), 236);
+    assert_eq!(registry.operator_count(), 205);
+    assert_eq!(registry.entry_count(), 247);
+}
+
+#[test]
+fn ml_tensor_rules_preserve_symbolic_shapes_and_gate_versions() {
+    let ml = |op: &str, inputs: Vec<NodeIo>, version| {
+        run(
+            &with_version(
+                with_domain(node(op, inputs.len(), 1), "ai.onnx.ml"),
+                version,
+            ),
+            inputs,
+            25,
+        )
+    };
+
+    for op in ["Binarizer", "Imputer"] {
+        let output = ml(op, vec![tin(DataType::Int32, vec![sym(71), c(4)])], 1);
+        assert_eq!(out_dtype(&output), DataType::Int32, "{op}");
+        assert_eq!(out_shape(&output), vec![sym(71), c(4)], "{op}");
+    }
+    for op in ["Normalizer", "Scaler"] {
+        let output = ml(op, vec![tin(DataType::Int32, vec![sym(72), c(4)])], 1);
+        assert_eq!(out_dtype(&output), DataType::Float32, "{op}");
+        assert_eq!(out_shape(&output), vec![sym(72), c(4)], "{op}");
+    }
+
+    // StringNormalizer is a DEFAULT-domain (ai.onnx) string op since v10.
+    let before = run(
+        &node("StringNormalizer", 1, 1),
+        vec![tin(DataType::String, vec![c(3)])],
+        9,
+    );
+    assert!(before[0].type_info.is_none());
+    let output = run(
+        &node("StringNormalizer", 1, 1),
+        vec![tin(DataType::String, vec![c(1), sym(73)])],
+        10,
+    );
+    assert_eq!(out_shape(&output)[0], c(1));
+    assert_symbolic(&out_shape(&output)[1]);
+    // 1-D input: rank preserved, filtered extent is a fresh symbolic dim.
+    let one_dim = run(
+        &node("StringNormalizer", 1, 1),
+        vec![tin(DataType::String, vec![sym(73)])],
+        10,
+    );
+    assert_eq!(out_dtype(&one_dim), DataType::String);
+    assert_symbolic(&out_shape(&one_dim)[0]);
+    let invalid = node("StringNormalizer", 1, 1);
+    assert!(try_run(&invalid, vec![tin(DataType::String, vec![])], 25).is_err());
+}
+
+#[test]
+fn ml_mapping_and_feature_rules_propagate_shapes_and_types() {
+    let category = with_attr(
+        with_domain(node("CategoryMapper", 1, 1), "ai.onnx.ml"),
+        "default_string",
+        Attribute::String(b"unknown".to_vec()),
+    );
+    let output = run(
+        &category,
+        vec![tin(DataType::Int64, vec![sym(74), c(2)])],
+        25,
+    );
+    assert_eq!(out_dtype(&output), DataType::String);
+    assert_eq!(out_shape(&output), vec![sym(74), c(2)]);
+
+    // LabelEncoder-1 chooses direction (and output dtype) by which default_*
+    // attribute is set: default_int64 → int64 output (string→int64 encoding);
+    // default_string → string output (int64→string decoding). classes_strings
+    // is present in BOTH directions and must NOT drive the output dtype.
+    let label_v1_str_to_int = with_attr(
+        with_attr(
+            with_version(with_domain(node("LabelEncoder", 1, 1), "ai.onnx.ml"), 1),
+            "classes_strings",
+            Attribute::Strings(vec![b"a".to_vec()]),
+        ),
+        "default_int64",
+        Attribute::Int(-1),
+    );
+    assert_eq!(
+        out_dtype(&run(
+            &label_v1_str_to_int,
+            vec![tin(DataType::String, vec![sym(75)])],
+            25
+        )),
+        DataType::Int64
+    );
+    let label_v1_int_to_str = with_attr(
+        with_attr(
+            with_version(with_domain(node("LabelEncoder", 1, 1), "ai.onnx.ml"), 1),
+            "classes_strings",
+            Attribute::Strings(vec![b"a".to_vec()]),
+        ),
+        "default_string",
+        Attribute::String(b"?".to_vec()),
+    );
+    assert_eq!(
+        out_dtype(&run(
+            &label_v1_int_to_str,
+            vec![tin(DataType::Int64, vec![sym(75)])],
+            25
+        )),
+        DataType::String
+    );
+    let label_v2 = with_attr(
+        with_version(with_domain(node("LabelEncoder", 1, 1), "ai.onnx.ml"), 2),
+        "values_floats",
+        Attribute::Floats(vec![1.0]),
+    );
+    let output = run(
+        &label_v2,
+        vec![tin(DataType::String, vec![sym(76), c(2)])],
+        25,
+    );
+    assert_eq!(out_dtype(&output), DataType::Float32);
+    assert_eq!(out_shape(&output), vec![sym(76), c(2)]);
+    let label_v4 = with_attr(
+        with_version(with_domain(node("LabelEncoder", 1, 1), "ai.onnx.ml"), 4),
+        "values_tensor",
+        Attribute::Tensor(TensorData::from_raw(
+            DataType::Int16,
+            vec![1],
+            9i16.to_le_bytes().to_vec(),
+        )),
+    );
+    assert_eq!(
+        out_dtype(&run(
+            &label_v4,
+            vec![tin(DataType::String, vec![sym(76)])],
+            25
+        )),
+        DataType::Int16
+    );
+
+    let extractor = with_domain(node("ArrayFeatureExtractor", 2, 1), "ai.onnx.ml");
+    let output = run(
+        &extractor,
+        vec![
+            f32in(vec![sym(77), c(8)]),
+            tin(DataType::Int64, vec![sym(78)]),
+        ],
+        25,
+    );
+    assert_eq!(out_shape(&output), vec![sym(77), sym(78)]);
+    assert!(
+        try_run(
+            &extractor,
+            vec![f32in(vec![c(2)]), tin(DataType::Int64, vec![c(1), c(1)])],
+            25,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn tfidf_vectorizer_replaces_sequence_extent_and_gates_opset() {
+    // TfIdfVectorizer is a DEFAULT-domain (ai.onnx) op since v9.
+    let vectorizer = with_attr(
+        node("TfIdfVectorizer", 1, 1),
+        "ngram_indexes",
+        Attribute::Ints(vec![3, 0, 7]),
+    );
+    let unresolved = run(&vectorizer, vec![tin(DataType::String, vec![c(5)])], 8);
+    assert!(unresolved[0].type_info.is_none());
+
+    let one_dim = run(&vectorizer, vec![tin(DataType::String, vec![sym(79)])], 9);
+    assert_eq!(out_dtype(&one_dim), DataType::Float32);
+    assert_eq!(out_shape(&one_dim), vec![c(8)]);
+    let two_dim = run(
+        &vectorizer,
+        vec![tin(DataType::Int64, vec![sym(80), c(5)])],
+        9,
+    );
+    assert_eq!(out_shape(&two_dim), vec![sym(80), c(8)]);
+    assert!(
+        try_run(
+            &vectorizer,
+            vec![tin(DataType::String, vec![c(1), c(2), c(3)])],
+            9,
+        )
+        .is_err()
+    );
 }
 
 #[test]
