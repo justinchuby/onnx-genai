@@ -108,6 +108,15 @@ counter = "SDPA_ACCELERATE_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
 description = "SDPA uses Accelerate cblas_sgemm (AMX) on macOS for QKT and PV matmuls"
 
+[[claim]]
+op = "SDPA"
+variant = "neon_decode_small"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "SDPA_NEON_DECODE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA decode (q_seq=1) with small per-head work bypasses Accelerate for inline NEON"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Kernel dispatch — all platforms
 # ═══════════════════════════════════════════════════════════════════════════════
