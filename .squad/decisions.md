@@ -305,3 +305,14 @@ offload assertions now reflect the scheduler contract: serial execution peaks at
 expert; prefetch peaks in `[1, 2]` and remains below selected experts. The shared
 `hold_metrics_test_lock` helper is poison-recovering across 20 call sites, preventing a
 previous test panic from cascading into phantom residency regressions on unrelated PRs.
+
+## 2026-07-29 — Core decode ports must not depend on exporter names
+
+**PR #380 / issue #377 (Melina; reviewed by Cohaagen; merged `47c3331d`).** The core decode
+path resolves roles only from explicit metadata or a unique tensor-shape match, and reports
+the required metadata key for ambiguity. Encoder-decoder Whisper/TTS fixtures declare
+component decoder I/O explicitly, rather than restoring decoder-name guessing.
+
+**Review rule:** metadata or I/O-detection changes must run the CLI ORT E2E suite in addition
+to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate successfully
+(23/23).
