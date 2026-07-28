@@ -88,6 +88,15 @@ impl Engine {
         // speculative driver. Every other request stays on the untouched plain
         // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
         if let Some(plan) = native_speculation_plan(&options, &chain) {
+            // Per-request grouped-LoRA selection is wired for the plain decode
+            // path; combining it with native speculation is deferred (§J), so
+            // reject rather than silently ignoring the requested adapter.
+            if options.adapter.is_some() {
+                anyhow::bail!(
+                    "per-request LoRA adapter selection is not yet supported together with native \
+                     speculative decoding; disable speculation for adapter-selected requests"
+                );
+            }
             let mut stats = SpeculativeStats::default();
             let native_session = self
                 .native_session
@@ -135,6 +144,20 @@ impl Engine {
             .native_session
             .as_mut()
             .context("native decoder session is unavailable")?;
+        // Phase-2 per-request adapter selection (design §J.4): route every token
+        // of this request to the requested adapter (or base-only when unset).
+        // Fails loud on an unknown name at admission, never a silent base
+        // fallback. A no-op when the session carries no grouped adapters.
+        if native_session.has_grouped_lora() {
+            native_session
+                .select_lora_adapter(options.adapter.as_deref())
+                .context("select per-request LoRA adapter")?;
+        } else if options.adapter.is_some() {
+            anyhow::bail!(
+                "a per-request LoRA adapter was requested, but this session was not loaded with a \
+                 multi-adapter grouped-LoRA pool (configure EngineConfig::lora_adapters)"
+            );
+        }
         augment_backend_error(
             native_session.generate_with_callback(
                 &prompt_tokens,
