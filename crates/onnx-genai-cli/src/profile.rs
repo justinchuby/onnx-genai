@@ -1008,6 +1008,7 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     fn timings(first_ms: u64, gaps_ms: &[u64]) -> TokenTimings {
         // Build the timings directly: sleeping for real would make the test slow
@@ -1407,14 +1408,39 @@ mod tests {
         );
         assert_eq!(lines.len(), 2, "rendered stats block:\n{block}");
         assert_eq!(
-            lines[0].chars().count(),
+            UnicodeWidthStr::width(lines[0]),
             114,
-            "headline width changed; rendered stats block:\n{block}"
+            "headline display width changed; rendered stats block:\n{block}"
         );
         assert_eq!(
-            lines[1].chars().count(),
+            UnicodeWidthStr::width(lines[1]),
             100,
-            "resource width changed; rendered stats block:\n{block}"
+            "resource display width changed; rendered stats block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn stats_block_width_uses_display_width_not_scalar_count() {
+        // An unknown finish reason passes through `compact_finish_reason`
+        // unchanged, so a CJK character in a model's stop token reaches the
+        // rendered line. "字" is U+5B57: one scalar value, two terminal columns.
+        // This test exists to prove that `UnicodeWidthStr::width` and
+        // `chars().count()` disagree for such input — if they agreed, the
+        // width assertion in `stats_block_has_a_deliberate_two_line_full_layout`
+        // above would pass even with `chars().count()`, giving false confidence.
+        let mut profile = RunProfile::new("m".to_string());
+        profile.finish_reason = Some("字".to_string());
+
+        let block = profile.to_stats_block();
+        let line = block.lines().next().unwrap_or("");
+
+        let char_count = line.chars().count();
+        let display_width = UnicodeWidthStr::width(line);
+
+        assert!(
+            display_width > char_count,
+            "a line containing a wide character must have display_width > chars().count(); \
+             got display_width={display_width}, chars={char_count}; line: {line:?}"
         );
     }
 

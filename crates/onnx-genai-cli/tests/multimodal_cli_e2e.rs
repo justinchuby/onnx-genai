@@ -245,6 +245,32 @@ fn piped_generate_stdout_is_byte_identical_with_or_without_default_stats() {
 }
 
 #[test]
+fn piped_stream_output_always_ends_with_a_trailing_newline() {
+    // `--stream` piped output has always ended with a trailing newline.
+    // This pins the byte-stable guarantee: removing the unconditional
+    // newline on the grounds that the model "already ended with one"
+    // would silently break any script or pipeline that depends on the
+    // line boundary.
+    let output = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+        "--stream",
+    ]);
+
+    assert!(output.status.success(), "failed: {}", stderr(&output));
+    assert!(
+        output.stdout.last() == Some(&b'\n'),
+        "piped --stream output must end with a trailing newline; got: {:?}",
+        stdout(&output)
+    );
+}
+
+#[test]
 fn generate_renders_a_prompt_to_a_png() {
     let out = repository_root().join("target/test-fixtures/cli-render.png");
     let _ = std::fs::remove_file(&out);

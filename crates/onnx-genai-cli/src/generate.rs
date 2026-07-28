@@ -130,9 +130,7 @@ fn generate_text(
         None,
     ) {
         Ok(output) => {
-            if args.stream && !io::stdout().is_terminal() {
-                println!();
-            } else if !args.stream {
+            if !args.stream {
                 println!("{output}");
             }
             if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {

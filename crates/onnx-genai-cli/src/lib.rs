@@ -49,7 +49,7 @@ use interactive::{
     InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
     context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
     initial_repl_show_stats, interrupt_action, is_interrupt_error,
-    plain_stream_needs_trailing_newline, repl_input_mode, stage_attachment,
+    repl_input_mode, stage_attachment,
 };
 use model_inspection::{list, show, version};
 use onnx_genai::engine::EngineDecodeBackend;
@@ -1159,28 +1159,6 @@ mod tests {
         assert!(initial_repl_show_stats(ReplInputMode::Tty, false));
         assert!(!initial_repl_show_stats(ReplInputMode::Tty, true));
         assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
-    }
-
-    #[test]
-    fn plain_stream_newline_depends_on_this_turns_renderer_usage() {
-        let pending_live_renderer = live_turn::LiveTurn::Pending;
-        assert!(pending_live_renderer.is_active());
-        assert!(plain_stream_needs_trailing_newline(
-            ReplInputMode::Plain,
-            false
-        ));
-        assert!(!plain_stream_needs_trailing_newline(
-            ReplInputMode::Plain,
-            true
-        ));
-        assert!(
-            plain_stream_needs_trailing_newline(ReplInputMode::Plain, false),
-            "a pending reusable live renderer must not suppress the newline when this turn did not use it"
-        );
-        assert!(
-            !plain_stream_needs_trailing_newline(ReplInputMode::Tty, false),
-            "TTY plain streaming emits the owed newline from the turn finalizer so errors and interrupts are covered too"
-        );
     }
 
     #[test]

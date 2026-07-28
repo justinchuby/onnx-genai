@@ -72,13 +72,6 @@ pub(super) fn initial_repl_show_stats(mode: ReplInputMode, no_stats: bool) -> bo
     matches!(mode, ReplInputMode::Tty) && !no_stats
 }
 
-pub(super) fn plain_stream_needs_trailing_newline(
-    input_mode: ReplInputMode,
-    used_live_this_turn: bool,
-) -> bool {
-    matches!(input_mode, ReplInputMode::Plain) && !used_live_this_turn
-}
-
 struct ReplPrompt;
 
 impl Prompt for ReplPrompt {
@@ -1298,7 +1291,6 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             profile.memory = memory;
         }
         let pages_before = backend.page_stats();
-        let used_live_this_turn = show_stats && live.is_active();
         match run_generation_turn(
             &mut backend,
             turn,
@@ -1311,9 +1303,6 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             show_stats.then_some(&mut live),
         ) {
             Ok(output) => {
-                if plain_stream_needs_trailing_newline(input_mode, used_live_this_turn) {
-                    println!();
-                }
                 // Reasoning models are trained with earlier turns' thinking
                 // removed, so replaying it degrades quality and inflates the
                 // context. Only the answer becomes history.
@@ -1410,21 +1399,5 @@ mod tests {
         assert!(initial_repl_show_stats(ReplInputMode::Tty, false));
         assert!(!initial_repl_show_stats(ReplInputMode::Tty, true));
         assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
-    }
-
-    #[test]
-    fn only_the_piped_plain_path_keeps_the_legacy_unconditional_separator() {
-        assert!(plain_stream_needs_trailing_newline(
-            ReplInputMode::Plain,
-            false
-        ));
-        assert!(!plain_stream_needs_trailing_newline(
-            ReplInputMode::Plain,
-            true
-        ));
-        assert!(!plain_stream_needs_trailing_newline(
-            ReplInputMode::Tty,
-            false
-        ));
     }
 }

@@ -254,8 +254,26 @@ pub(super) fn run_generation_turn(
     let output_needs_trailing_newline = !output.is_empty() && !output.ends_with('\n');
     if let Some(live) = live {
         live.finish(output_needs_trailing_newline)?;
-    } else if stream && io::stdout().is_terminal() && output_needs_trailing_newline {
-        println!();
+    } else if stream {
+        if io::stdout().is_terminal() {
+            // TTY: conditional — skip when the reply already ended with a
+            // newline. A model that terminates with `\n` would otherwise
+            // produce a visible blank line before the next prompt.
+            if output_needs_trailing_newline {
+                println!();
+            }
+        } else {
+            // Piped: always emit a trailing newline, unconditionally.
+            //
+            // Piped consumers of `--stream` output have always received a
+            // terminating newline on every release. Making this conditional
+            // (like the TTY path above) would silently break any script or
+            // pipeline that depends on the line boundary — the extra newline
+            // is invisible to the consumer, but its absence is a byte-stable
+            // regression. The TTY path is conditional because a double blank
+            // line is a visible defect there; here it is not.
+            println!();
+        }
     }
     GENERATING.store(false, Ordering::SeqCst);
     timings.finish();
