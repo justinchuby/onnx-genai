@@ -93,15 +93,34 @@ fn checked_shape_product(shape: &[usize]) -> Result<usize, WeightHandleError> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LazyWeightBoundary {
-    /// `pkg.nxrt::BlockQuantizedMoE`, the Phase-3 offload binding boundary.
+    /// `pkg.nxrt::BlockQuantizedMoE`, the Phase-3 weight-offload binding boundary.
     BlockQuantizedMoe,
+    /// `pkg.nxrt::GroupedLoraDelta`, the Phase-2 paged adapter-pool binding
+    /// boundary (design §J.1 step 3). A *paging* EP (CUDA, P2g) binds the LoRA
+    /// pool on device through this boundary; the stock CPU EP does not page and
+    /// binds the host pool by id (see [`crate::lora_pool::LoraPoolRegistry`]).
+    GroupedLora,
 }
 
 impl LazyWeightBoundary {
+    /// Every boundary this contract knows about, so the executor can gate lazy
+    /// delivery on "any boundary matches" instead of one hard-coded variant.
+    pub const ALL: [LazyWeightBoundary; 2] =
+        [Self::BlockQuantizedMoe, Self::GroupedLora];
+
     pub fn matches(self, domain: &str, op_type: &str) -> bool {
-        matches!(self, Self::BlockQuantizedMoe)
-            && domain == "pkg.nxrt"
-            && op_type == "BlockQuantizedMoE"
+        match self {
+            Self::BlockQuantizedMoe => domain == "pkg.nxrt" && op_type == "BlockQuantizedMoE",
+            Self::GroupedLora => domain == "pkg.nxrt" && op_type == "GroupedLoraDelta",
+        }
+    }
+
+    /// Whether *any* known lazy-weight boundary claims this `(domain, op_type)`.
+    /// The executor uses this to decide whether a node may receive lazy inputs.
+    pub fn any_matches(domain: &str, op_type: &str) -> bool {
+        Self::ALL
+            .iter()
+            .any(|boundary| boundary.matches(domain, op_type))
     }
 }
 
@@ -124,6 +143,11 @@ pub struct LazyWeight {
     /// Validated external mmap ranges that back this initializer.
     pub regions: Vec<ExternalMmapRegion>,
     resident_materializer: Arc<dyn ResidentWeightMaterializer>,
+    /// The paged adapter pool, present only for the
+    /// [`LazyWeightBoundary::GroupedLora`] boundary. A paging (device) EP binds
+    /// this pool on device; the stock CPU EP binds the host pool by id and does
+    /// not consume this handle.
+    lora_pool: Option<Arc<crate::lora_pool::LoraWeightPool>>,
 }
 
 impl std::fmt::Debug for LazyWeight {
@@ -152,7 +176,39 @@ impl LazyWeight {
             boundary: LazyWeightBoundary::BlockQuantizedMoe,
             regions,
             resident_materializer: Arc::new(resident_materializer),
+            lora_pool: None,
         })
+    }
+
+    /// Construct the [`LazyWeightBoundary::GroupedLora`] handle carrying a shared
+    /// paged adapter pool (design §J.1 step 3). Unlike the block-quantized-MoE
+    /// boundary this has no external mmap regions and no resident tensor
+    /// materialization: the pool is a live host structure a paging EP binds, so
+    /// `materialize` deliberately errors.
+    pub fn grouped_lora(pool: Arc<crate::lora_pool::LoraWeightPool>) -> Self {
+        Self {
+            boundary: LazyWeightBoundary::GroupedLora,
+            regions: Vec::new(),
+            resident_materializer: Arc::new(|| {
+                Err(WeightHandleError::Unsupported(
+                    "the GroupedLora pool handle is not a resident tensor; bind the pool instead"
+                        .into(),
+                ))
+            }),
+            lora_pool: None,
+        }
+        .with_lora_pool(pool)
+    }
+
+    fn with_lora_pool(mut self, pool: Arc<crate::lora_pool::LoraWeightPool>) -> Self {
+        self.lora_pool = Some(pool);
+        self
+    }
+
+    /// The paged adapter pool, present only for the
+    /// [`LazyWeightBoundary::GroupedLora`] boundary.
+    pub fn lora_pool(&self) -> Option<&Arc<crate::lora_pool::LoraWeightPool>> {
+        self.lora_pool.as_ref()
     }
 
     /// Materialize the unchanged stock-EP resident behavior.
