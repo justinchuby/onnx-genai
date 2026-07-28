@@ -17,6 +17,7 @@ pub mod engine;
 pub mod fim;
 pub(crate) mod kv_bridge;
 pub mod logits;
+pub mod lora;
 #[cfg(feature = "native-backend")]
 pub mod native_component;
 #[cfg(feature = "native-backend")]
