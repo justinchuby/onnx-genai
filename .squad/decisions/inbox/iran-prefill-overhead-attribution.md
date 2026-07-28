@@ -252,3 +252,25 @@ workloads.
 
 `uptime` at measurement time: `load averages: 3.48 5.19 4.73` (prefill profiling),
 `load averages: 2.70 6.96 6.55` (ORT comparison).
+
+---
+
+## Known issue: MLX plugin debug noise
+
+The MLX/Metal EP plugin (`onnxruntime-mlx`) prints once per subgraph execution
+in a hot loop:
+
+```
+[rust-mlx-ep] Compute: subgraph run via mlx-c COMPILED general (17 node(s))
+```
+
+This produces thousands of lines of output during a profile capture, polluting
+committed artifacts. The workspace convention (`docs/ERROR_AND_LOGGING_CONVENTIONS.md`)
+requires `tracing` crate instrumentation, not ad-hoc `println!`/`eprintln!`.
+
+**Action:** The Metal pod should replace these prints with `tracing::debug!`
+gated behind the `debug` level, consistent with the same defect class fixed in
+the calibrator (`eprintln!` → `tracing::debug!`) and in `compare.rs`
+(stdout pollution from `--profile-json -`).
+
+The plugin lives in `../onnxruntime-mlx` (out of scope for this PR).
