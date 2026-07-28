@@ -149,3 +149,6 @@ Added a dedicated Miri CI job for tractable unsafe Rust surfaces: full `onnx-run
 Moved Miri out of general CI into `.github/workflows/miri.yml`, so the weekly schedule triggers only the Miri lane while PR/main/ci branch path filters still run Miri on covered crate changes. Strengthened the `onnx-runtime-ep-cpu` cross-device deallocate test to assert the specific panic payload before reclaiming the fabricated allocation.
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Authored PR #301 / #85 compute-in-place; Roy found capture-liveness bug, Deckard fixed under author lockout, and the PR merged.
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Release workflow supply-chain and Miri CI notes were merged into decisions.

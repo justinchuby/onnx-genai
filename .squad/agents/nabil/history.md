@@ -40,3 +40,6 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 - Verified: build clean (`-D warnings`), 1106 tests pass, stderr is empty by default.
 - PR: https://github.com/justinchuby/onnxruntime-mlx/pull/9 (not merged)
 - Decision: `.squad/decisions/inbox/nabil-mlx-logging.md`
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- MLX logging decision note was merged into decisions for future backend logging work.
