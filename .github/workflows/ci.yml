@@ -25,6 +25,145 @@ env:
   CARGO_LLVM_COV_VERSION: "0.8.7"
 
 jobs:
+  fast-linux:
+    name: Fast (Linux x86_64)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-D warnings"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install Rust stable toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cargo-registry-
+      - name: Cache fast cargo target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-fast-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-fast-rust-${{ steps.rust-toolchain.outputs.version }}-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python test dependencies
+        run: python -m pip install --upgrade numpy onnxscript
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build Linux offline crates
+        run: >-
+          cargo build --locked
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
+          -p mlas-sys
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-std
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-std-python
+      - name: Test Linux offline crates
+        run: >-
+          cargo test --locked
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
+          -p mlas-sys
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-std
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-std-python
+      - name: Clippy Linux offline crates
+        run: >-
+          cargo clippy --locked --all-targets
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
+          -p mlas-sys
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-std
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-std-python
+          -- -D warnings
+
   rust-quality:
     name: Rust quality
     runs-on: ubuntu-latest
