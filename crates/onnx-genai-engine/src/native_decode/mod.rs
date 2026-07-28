@@ -78,6 +78,39 @@ pub struct NativeDecodeSession {
     last_hidden: Option<Vec<f32>>,
     uses_decode_pool: bool,
     has_plugin_fused: bool,
+    /// Phase-2 multi-adapter grouped-LoRA routing (design §J). `None` for a
+    /// base-only or single-adapter (DIRECT) session, so the fast path carries no
+    /// grouped state. When set it names the `segments` graph input, the loaded
+    /// adapter name → id map, the currently selected adapter (per request), and
+    /// a reused `Int32` buffer so building the per-step routing tensor allocates
+    /// nothing in the decode loop.
+    lora_segments: Option<LoraSegmentsState>,
+}
+
+/// Per-run routing state for a Phase-2 grouped-LoRA native session (design §J).
+struct LoraSegmentsState {
+    /// The `segments` graph input name the routing tensor is fed under.
+    input_name: String,
+    /// The loaded adapters' name → [`AdapterId`] map (admission order).
+    adapter_ids: Vec<(String, onnx_runtime_ep_api::AdapterId)>,
+    /// The adapter every token row currently routes to, or `None` for base-only
+    /// (routing id `-1`). Updated per request by [`NativeDecodeSession::select_lora_adapter`].
+    active: Option<onnx_runtime_ep_api::AdapterId>,
+    /// Reused little-endian `Int32` routing bytes, refilled in place each step so
+    /// building the per-step `segments` tensor allocates nothing in the decode
+    /// loop after warmup (design perf gate). Holds `tokens` repeated copies of
+    /// the active adapter's routing id.
+    buffer: Vec<u8>,
+}
+
+impl LoraSegmentsState {
+    /// The `i32` routing id for the active adapter (or `-1` for base-only).
+    fn active_route(&self) -> i32 {
+        match self.active {
+            Some(id) => id.0 as i32,
+            None => -1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +120,10 @@ enum NativeStepInputSource {
     AttentionMask,
     PositionIds,
     Routed,
+    /// The Phase-2 grouped-LoRA `segments` routing input (design §J). Generated
+    /// internally each step from the session's selected adapter, not routed by
+    /// the pipeline, so it is excluded from the generic `Routed` handling.
+    LoraSegments,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,6 +259,60 @@ impl NativeDecodeSession {
     /// Whether the injected LoRA adapter is currently active.
     pub fn lora_active(&self) -> bool {
         self.session.lora_active()
+    }
+
+    /// Whether this session was built with a Phase-2 multi-adapter grouped-LoRA
+    /// pool (design §J), so per-request adapter selection is available.
+    pub fn has_grouped_lora(&self) -> bool {
+        self.lora_segments.is_some()
+    }
+
+    /// The loaded grouped-LoRA adapter names, in admission order (empty when the
+    /// session has no grouped adapters).
+    pub fn lora_adapter_names(&self) -> Vec<&str> {
+        self.lora_segments
+            .as_ref()
+            .map(|state| state.adapter_ids.iter().map(|(name, _)| name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Select the grouped-LoRA adapter that subsequent decode steps route every
+    /// token row to (design §J.4 per-request selection). `Some(name)` resolves to
+    /// its [`AdapterId`]; `None` routes to base-only (no delta). Fails loud with a
+    /// typed error when `name` is not a loaded adapter — the request-admission
+    /// point, never a silent base fallback. A no-op-eligible error when the
+    /// session has no grouped adapters at all.
+    pub fn select_lora_adapter(&mut self, name: Option<&str>) -> anyhow::Result<()> {
+        let state = self.lora_segments.as_mut().context(
+            "native decode session was not built with a multi-adapter grouped-LoRA pool; \
+             per-request adapter selection is unavailable",
+        )?;
+        match name {
+            None => {
+                state.active = None;
+                Ok(())
+            }
+            Some(name) => {
+                let id = state
+                    .adapter_ids
+                    .iter()
+                    .find(|(adapter_name, _)| adapter_name == name)
+                    .map(|(_, id)| *id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown LoRA adapter {name:?}; loaded adapters: [{}]",
+                            state
+                                .adapter_ids
+                                .iter()
+                                .map(|(adapter_name, _)| adapter_name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                state.active = Some(id);
+                Ok(())
+            }
+        }
     }
 
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK

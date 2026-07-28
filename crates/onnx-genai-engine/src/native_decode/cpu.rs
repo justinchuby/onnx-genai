@@ -167,6 +167,32 @@ impl NativeDecodeSession {
     /// validating that every supplied routed tensor maps to a declared graph
     /// port. KV inputs are appended by the caller: `decode_cpu` adds growable
     /// host past tensors, while `decode_cpu_inplace` binds them on-device.
+    /// Feed the Phase-2 grouped-LoRA `segments` routing input (design §J) from a
+    /// reused byte buffer. Every token row routes to the currently selected
+    /// adapter's [`AdapterId`] (or `-1` for base-only). The buffer is cleared and
+    /// refilled in place, so after warmup no per-token heap allocation happens in
+    /// the decode loop (the tensor payload is `tokens * 4` bytes; decode is one
+    /// token → 4 bytes). A no-op when the session has no grouped adapters.
+    fn push_lora_segments(
+        &mut self,
+        tokens: usize,
+        owned: &mut Vec<(String, Tensor)>,
+    ) -> anyhow::Result<()> {
+        let Some(state) = self.lora_segments.as_mut() else {
+            return Ok(());
+        };
+        let route_bytes = state.active_route().to_le_bytes();
+        state.buffer.clear();
+        state.buffer.reserve(tokens * 4);
+        for _ in 0..tokens {
+            state.buffer.extend_from_slice(&route_bytes);
+        }
+        let tensor = Tensor::from_raw(DataType::Int32, vec![tokens], &state.buffer)
+            .context("build native grouped-LoRA segments routing tensor")?;
+        owned.push((state.input_name.clone(), tensor));
+        Ok(())
+    }
+
     fn prepare_cpu_step_inputs(
         &self,
         token_ids: &[TokenId],
@@ -220,6 +246,10 @@ impl NativeDecodeSession {
                             binding.name
                         )
                     })?,
+                // Generated after the loop by `push_lora_segments` from the
+                // reused routing buffer, so the borrow of `self.step_inputs`
+                // here never overlaps the mutable borrow of the buffer.
+                NativeStepInputSource::LoraSegments => continue,
             };
             owned.push((binding.name.clone(), tensor));
         }
@@ -281,6 +311,7 @@ impl NativeDecodeSession {
         let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
         let mut owned =
             self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
+        self.push_lora_segments(token_ids.len(), &mut owned)?;
         owned.reserve(self.kv_inputs.len());
         for name in &self.kv_inputs {
             let tensor = match self.past.remove(name) {
@@ -402,8 +433,9 @@ impl NativeDecodeSession {
         let prepare_span = onnx_genai_ort::prof_span!("native.prepare_inputs");
         // The KV ports are device-bound (present==past), so only the generated
         // and routed non-KV step inputs are fed as fresh host tensors here.
-        let owned =
+        let mut owned =
             self.prepare_cpu_step_inputs(token_ids, past_len, total_len, supplied_inputs)?;
+        self.push_lora_segments(token_ids.len(), &mut owned)?;
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
