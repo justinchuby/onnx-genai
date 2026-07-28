@@ -10,6 +10,10 @@ pub enum OrtError {
     NullPointer,
     #[error("ORT API function unavailable: {0}")]
     ApiUnavailable(&'static str),
+    #[error("{0}")]
+    RuntimeLibrary(String),
+    #[error("{0}")]
+    ApiVersionMismatch(String),
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
     #[error("Session creation failed: {0}")]
@@ -31,12 +35,35 @@ pub(crate) fn api() -> Result<&'static onnx_genai_ort_sys::OrtApi> {
     unsafe {
         let base = onnx_genai_ort_sys::OrtGetApiBase();
         if base.is_null() {
-            return Err(OrtError::NullPointer);
+            return Err(OrtError::RuntimeLibrary(
+                onnx_genai_ort_sys::ort_load_error().unwrap_or_else(|| {
+                    "Failed to load ONNX Runtime: OrtGetApiBase returned null".to_owned()
+                }),
+            ));
         }
         let get_api = (*base).GetApi.ok_or(OrtError::ApiUnavailable("GetApi"))?;
         let api = get_api(onnx_genai_ort_sys::ORT_API_VERSION);
         if api.is_null() {
-            return Err(OrtError::NullPointer);
+            let loaded_path = onnx_genai_ort_sys::loaded_ort_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown path>".to_owned());
+            let loaded_version =
+                onnx_genai_ort_sys::loaded_ort_version().unwrap_or_else(|| "unknown".to_owned());
+            let loaded_api = onnx_genai_ort_sys::loaded_ort_api_version()
+                .map_or_else(|| "unknown".to_owned(), |version| version.to_string());
+            let reason = onnx_genai_ort_sys::loaded_ort_reason()
+                .unwrap_or_else(|| "dynamic loader search path".to_owned());
+            return Err(OrtError::ApiVersionMismatch(format!(
+                "ONNX Runtime API version mismatch: loaded {loaded_path} ({reason}), \
+                 ORT version {loaded_version}, API {loaded_api}; onnx-genai was built \
+                 against API {} (ORT 1.27.x).\n\
+                 Fix: set ONNX_GENAI_ORT_LIB to the full path of the ORT 1.27 library \
+                 (for example a conda env's onnxruntime.dll), set ONNX_GENAI_ORT_LIB_DIR \
+                 to its containing directory, activate that conda env and put its library \
+                 directory first on PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, or rebuild so \
+                 ort-sys downloads ORT 1.27.0.",
+                onnx_genai_ort_sys::ORT_API_VERSION
+            )));
         }
         Ok(&*api)
     }

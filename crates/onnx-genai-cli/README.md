@@ -90,6 +90,72 @@ unset, keeps it on.
 
 ## Runtime selection
 
+### Selecting the ONNX Runtime library
+
+There are two separate resolution steps:
+
+- **Build time (`ort-sys/build.rs`)** finds headers and a link/development
+  install in this order: `ORT_LIB_DIR`, `ORT_ROOT`, `pkg-config`, then a
+  SHA-256-pinned ORT 1.27.0 download into Cargo's `OUT_DIR`.
+- **Run time** chooses the shared library the process actually loads in this
+  order: `ONNX_GENAI_ORT_LIB` (exact file), `ONNX_GENAI_ORT_LIB_DIR`
+  (containing directory), active `CONDA_PREFIX`, active `VIRTUAL_ENV`, the
+  pinned `ort-sys` download under `target/.../ort-prebuilt/lib`, then the
+  platform dynamic-loader default search path.
+
+Native `cargo run` / binary builds can honor the runtime variables because
+`ort-sys` resolves `OrtGetApiBase` with `libloading` before the first ORT API
+call instead of link-loading `onnxruntime` into the final binary. If that ever
+changes back to a normal import-library link, runtime variables cannot override
+the OS loader; put the desired directory first in `PATH` (Windows),
+`LD_LIBRARY_PATH` (Linux), or `DYLD_LIBRARY_PATH` (macOS) before process start.
+
+Ask the tool what it actually loaded:
+
+```bash
+onnx-genai version
+cargo run -p onnx-genai-cli --bin onnx-genai -- version
+```
+
+The output includes the ORT path, ORT version, API version, and why that library
+was selected. Any explicit or auto-discovered selection also prints the same
+line on first ORT use. API mismatches name the loaded library path, loaded API
+version, required API version, and concrete fixes.
+
+Examples only — adapt paths to your machine:
+
+```powershell
+# Windows PowerShell, conda or venv with a pip onnxruntime wheel.
+$prefix = if ($env:CONDA_PREFIX) { $env:CONDA_PREFIX } else { $env:VIRTUAL_ENV }
+$env:ONNX_GENAI_ORT_LIB_DIR = "$prefix\Lib\site-packages\onnxruntime\capi"
+$env:PATH = "$env:ONNX_GENAI_ORT_LIB_DIR;$env:PATH"
+onnx-genai version
+```
+
+```bash
+# Linux/macOS shell, pip onnxruntime inside the active Python environment.
+export ONNX_GENAI_ORT_LIB_DIR="$(python - <<'PY'
+import pathlib, onnxruntime
+print(pathlib.Path(onnxruntime.__file__).resolve().parent / "capi")
+PY
+)"
+export LD_LIBRARY_PATH="$ONNX_GENAI_ORT_LIB_DIR:${LD_LIBRARY_PATH:-}"  # Linux
+export DYLD_LIBRARY_PATH="$ONNX_GENAI_ORT_LIB_DIR:${DYLD_LIBRARY_PATH:-}"  # macOS
+onnx-genai version
+```
+
+```bash
+# System package or from-source ORT install.
+export ONNX_GENAI_ORT_LIB=/opt/onnxruntime/lib/libonnxruntime.so.1
+onnx-genai version
+```
+
+```bash
+# From-source build using the pinned ort-sys download: leave ORT vars unset.
+unset ONNX_GENAI_ORT_LIB ONNX_GENAI_ORT_LIB_DIR
+cargo run -p onnx-genai-cli --bin onnx-genai -- version
+```
+
 CUDA has two independent switches:
 
 1. Build-time features select which CUDA code is compiled in. `--features cuda`
