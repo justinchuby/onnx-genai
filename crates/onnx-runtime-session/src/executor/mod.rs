@@ -320,6 +320,9 @@ pub(crate) struct NodePlan {
     pub input_dtypes: Vec<DataType>,
     /// Element types of the outputs.
     pub output_dtypes: Vec<DataType>,
+    /// Inputs consumed for the final time by this node and therefore eligible for
+    /// a kernel-authorized in-place overwrite after additional runtime guards.
+    pub inplace_dead_inputs: Vec<bool>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
