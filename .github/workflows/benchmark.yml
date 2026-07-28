@@ -1,0 +1,136 @@
+name: Benchmarks
+
+# Runs kernel micro-benchmarks on every PR and posts a comparison comment.
+# Designed around the principle: RATIOS ARE RELIABLE, ABSOLUTES ARE NOT.
+# Both base and PR benchmarks run on the same runner in the same job,
+# so the percentage change self-controls for host load.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Cancel in-progress benchmark runs for the same PR when new commits arrive.
+concurrency:
+  group: benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  micro-benchmarks:
+    name: Kernel micro-benchmarks
+    # macOS arm64 runner to exercise the Apple Silicon path.
+    runs-on: macos-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Criterion measurement time — shorter than default to keep CI fast
+      # while still collecting enough samples for stable estimates.
+      CRITERION_MEASUREMENT_TIME: "3"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          # Fetch enough history to find the merge-base.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache for benchmarks to avoid polluting the main CI cache.
+          prefix-key: bench-v1
+
+      # ── Benchmark the PR head ──────────────────────────────────────────
+      - name: Benchmark PR head (ep-cpu kernels)
+        run: cargo bench -p onnx-runtime-ep-cpu -- --noplot
+
+      - name: Benchmark PR head (genai-bench no_model)
+        run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
+
+      - name: Save PR criterion results
+        run: cp -R target/criterion pr-criterion
+
+      # ── Benchmark the merge-base ──────────────────────────────────────
+      - name: Determine merge-base
+        id: merge-base
+        run: |
+          BASE=$(git merge-base HEAD origin/${{ github.event.pull_request.base.ref }})
+          echo "sha=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Merge-base: $BASE"
+
+      - name: Checkout merge-base
+        run: git checkout ${{ steps.merge-base.outputs.sha }}
+
+      - name: Benchmark merge-base (ep-cpu kernels)
+        run: cargo bench -p onnx-runtime-ep-cpu -- --noplot
+
+      - name: Benchmark merge-base (genai-bench no_model)
+        run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
+
+      - name: Save base criterion results
+        run: cp -R target/criterion base-criterion
+
+      # ── Compare and comment ────────────────────────────────────────────
+      - name: Checkout PR head (for scripts)
+        run: git checkout ${{ github.event.pull_request.head.sha }}
+
+      - name: Collect host info
+        id: host
+        run: |
+          {
+            echo 'info<<EOF'
+            echo "CPU: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+            echo "Cores: $(sysctl -n hw.logicalcpu 2>/dev/null || echo unknown)"
+            echo "OS: $(uname -srm)"
+            echo "Rust: $(rustc --version)"
+            echo "Load avg: $(sysctl -n vm.loadavg 2>/dev/null || uptime | sed 's/.*load averages: //')"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate comparison
+        id: compare
+        run: |
+          python3 scripts/ci_bench_compare.py \
+            --base-dir base-criterion \
+            --pr-dir pr-criterion \
+            --output benchmark-comment.md \
+            --host-info "${{ steps.host.outputs.info }}" \
+            || echo "has_regression=true" >> "$GITHUB_OUTPUT"
+
+      - name: Find existing comment
+        id: find-comment
+        run: |
+          COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --paginate --jq '.[] | select(.body | startswith("## ")) | select(.body | contains("Benchmark")) | .id' \
+            | head -1)
+          echo "id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post or update PR comment
+        run: |
+          BODY=$(cat benchmark-comment.md)
+          if [ -n "${{ steps.find-comment.outputs.id }}" ]; then
+            gh api \
+              --method PATCH \
+              "repos/${{ github.repository }}/issues/comments/${{ steps.find-comment.outputs.id }}" \
+              -f body="$BODY"
+            echo "Updated existing comment ${{ steps.find-comment.outputs.id }}"
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+            echo "Posted new comment"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The build does NOT fail on regression — it flags and comments.
+      # A flaky perf gate gets disabled within a week and protects nothing.
+      # Instead, surface the regression prominently via the comment.
+      - name: Report regression status
+        if: steps.compare.outputs.has_regression == 'true'
+        run: |
+          echo "::warning::Benchmark regression detected — see PR comment for details"
+          cat benchmark-comment.md
