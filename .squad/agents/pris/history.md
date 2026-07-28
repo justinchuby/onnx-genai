@@ -131,7 +131,7 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-28T08:45:38-07:00 — CI tiering rejected; full coverage on PRs
 - Superseded the short-lived corrected-axis plan. Final Justin direction: run coverage everywhere; PR runtime is acceptable.
-- CI now has no fast/slow run-shape distinction: PRs, `main`, nightly, and manual dispatch all run quality checks, audit, coverage-instrumented offline tests on Linux x86_64 / Windows x86_64 / Windows ARM64 / macOS arm64, Linux MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes.
+- CI now has no fast/slow run-shape distinction: PRs, `main`, nightly, and manual dispatch all run quality checks, audit, coverage-instrumented offline tests on Linux x86_64 / Windows x86_64 / Windows ARM64 / macOS arm64, Linux MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes. Windows ARM64 uses `cargo llvm-cov --no-report` after run 30377171127 reproduced rust-lang/rust#150123 malformed profraw merge failures.
 - Removed `ci:full` labeled triggers because the label would be a no-op, and reset Codecov carryforward to false because PRs upload the same four flags as `main` (`offline`, `mlas`, `cli-ort-linux`, `cli-ort-windows`).
 - Preserved #296/#340 independent hardening: direct `rustup`, GitHub-owned `actions/cache`, arch-aware cache keys, concurrency cancellation, and stable expanded names via always-expanded matrices/no gated matrix jobs.
 - Decision filed: `.squad/decisions/inbox/pris-ci-fast-slow-tiers.md`.

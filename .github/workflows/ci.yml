@@ -311,9 +311,12 @@ jobs:
           else
             cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
           fi
-      - name: Test cross-platform offline crates with coverage
+      # Windows ARM64 rustc currently emits malformed profraw files
+      # (rust-lang/rust#150123). Keep instrumentation on for test execution, but
+      # skip report merging/upload until that upstream bug is fixed.
+      - name: Test cross-platform offline crates with coverage instrumentation
         run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-offline.json
+          cargo llvm-cov --locked --no-report
           --target aarch64-pc-windows-msvc
           -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
@@ -341,14 +344,6 @@ jobs:
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
           -p onnx-std-python
-      - name: Upload offline coverage to Codecov
-        if: always()
-        uses: codecov/codecov-action@v4
-        with:
-          files: codecov-offline.json
-          flags: offline
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
       - name: Clippy Windows ARM64 offline crates
         run: >-
           cargo clippy --locked --all-targets
