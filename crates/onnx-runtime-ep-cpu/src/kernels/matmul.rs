@@ -120,6 +120,21 @@ pub fn bnns_prefill_stats() -> (usize, u64) {
     )
 }
 
+/// Returns the number of entries in the process-global weight-transpose caches.
+/// (f16_entries, f32_entries). Used by benchmarks to verify cache reuse across turns.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub fn weight_transpose_cache_sizes() -> (usize, usize) {
+    let f16 = WEIGHT_TRANSPOSE_F16.lock().map(|g| g.len()).unwrap_or(0);
+    let f32_count = WEIGHT_TRANSPOSE_F32.lock().map(|g| g.len()).unwrap_or(0);
+    (f16, f32_count)
+}
+
+/// Stub for non-Apple targets.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn weight_transpose_cache_sizes() -> (usize, usize) {
+    (0, 0)
+}
+
 /// Process-global cache for transposed f16 weight matrices, keyed by the
 /// source data pointer (stable for the lifetime of an mmap'd model file).
 /// Ensures the O(N×K) transpose is computed at most once per weight per
