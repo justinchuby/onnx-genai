@@ -70,10 +70,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 KERNELS = REPO / "crates" / "onnx-runtime-ep-cpu" / "src" / "kernels"
 
-# Matches: static SOMETHING_TEST_HITS: ... AtomicUsize ...
+# Matches: static SOMETHING_TEST_HITS: ... AtomicUsize/AtomicU64 ...
 COUNTER_DECL_RE = re.compile(
-    r"^static\s+(\w+TEST_HITS)\s*:\s*"
-    r"(?:std::sync::atomic::)?AtomicUsize",
+    r"^(?:pub(?:\([^)]*\))?\s+)?static\s+(\w+TEST_HITS)\s*:\s*"
+    r"(?:std::sync::atomic::)?Atomic(?:Usize|U64)",
     re.MULTILINE,
 )
 
@@ -148,7 +148,7 @@ def check_file(path: Path) -> list[str]:
         if not has_test_read:
             # Find the declaration line for the error message
             for i, line in enumerate(lines):
-                if re.search(rf"^static\s+{re.escape(counter)}\b", line):
+                if re.search(rf"^(?:pub(?:\([^)]*\))?\s+)?static\s+{re.escape(counter)}\b", line):
                     decl_line = i + 1
                     break
             else:
