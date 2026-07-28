@@ -16,3 +16,5 @@
 ## 2026-07-26T19:45:52Z — Scribe update
 
 - Merged 14 decision inbox notes, wrote Deckard/Leon orchestration logs, updated session focus, and checked archive/history gates; no history file exceeded 15 KB.
+## 2026-07-28T11:35:49Z — Decision-ledger compaction rebase lesson
+- Size-compaction of shared append-only files is not rebase-safe: concurrent appends can silently reinflate `.squad/decisions.md` while preserving a compacted header. Re-run compaction against tip immediately before merging a compaction PR.
