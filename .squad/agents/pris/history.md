@@ -128,3 +128,6 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Confirmed `miri.yml` has no matrix/gated job-name issue. Repo-wide scan found analogous conditional matrices only in release/manual workflows (`publish.yml`, `wheels.yml`), not PR CI; left them outside this PR.
 - Recorded Justin's live `ci:full` verification on PR #340: CI run 30345861354 and audit run 30345861425 started via label.
 - Added CLI-specific cache keys after the main merge exposed a shared-cache collision/incomplete-restore pattern in the Windows CLI lane. Remeasured final-head fast run 30349042835 at 4m33s wall-clock; critical path `Rust (Linux x86_64)` at 4m22s, with Windows CLI at 3m14s. The preceding workflow-code run 30348596658 was 3m51s; current variance is in Linux Rust/quality after the main merge, not the skipped-name fix.
+
+## 2026-07-28T17:40:00+0000
+#54 model-package and #299 LoRA were confirmed out of scope for this squad; no artifacts retained.

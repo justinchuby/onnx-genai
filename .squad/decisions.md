@@ -151,6 +151,39 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
 
 <!-- History before 2026-07-28T11:35:49Z was archived by size. Keep this file small. -->
 
+## 2026-07-28T17:40:00+0000 — control flow, metadata, and QMoE offload wave
+
+- PR #362 (`5a079029`) completed #355's tensor control-flow work: `If`, `Loop`, and
+  `Scan` infer child graphs after formal body inputs are seeded from their owning
+  node; Loop scan dimensions stay symbolic because a constant trip count is only
+  an early-exit upper bound. Fully-static control-flow results whose byte size
+  overflows degrade to dtype-only rather than triggering eager-planning overflow.
+  Sequence, Optional, and Map propagation remains deliberately unresolved until
+  the tensor-only SSA `TypeInfo` gains a container-aware representation.
+- The cache roofline ceiling is informational when SLC covers at least 10% of a
+  model's decode set (`cache_assisted`); retain the DRAM ceiling only for larger
+  working sets and never report an unexplained roofline percentage above 100%.
+- PR #364 (`3b08c025`) established route-first CPU QMoE's one-ahead prefetch
+  strategy. It may engage only in eviction-neutral regimes: mmap streaming
+  (`budget == 0`) or a fully resident layer. Partial-cache budgets execute the
+  serial path. This preserves output, cache statistics, and `pipe_bytes <=
+  serial` while retaining a measured 36–47% streaming throughput gain. Unifying
+  this host path with GPU prefetch awaits Phase-3b live device binding; Granite's
+  unfused MatMul MoE cannot currently engage it.
+- PR #365 (`83f4c293`) made `onnx_runtime.*` metadata effective at engine load,
+  with explicit programmatic settings retaining priority. Metadata collection
+  recursively scans GRAPH/GRAPHS attributes. Every scanned node now uses a
+  uniform structural `NodePath` identity (including anonymous and duplicate-name
+  top-level nodes); names are diagnostic labels only. External name-addressed
+  hints resolve to a unique structural node or remain in a separate external-name
+  keyspace, so they cannot collide.
+- Large-model smoke status is a blocker, not an offload regression: the 27B
+  native path hits the Unsqueeze rank bug, ORT lacks
+  `past_key_values.*.recurrent_state`, and the needed Mobius #432 mapping remains
+  unmerged; all H200 capacity was occupied externally. Granite MoE runs on ORT
+  CUDA but exports unfused MatMuls, while the fused fixture verifies route-first
+  CPU paging independently.
+
 ## 2026-07-28T04:30:00-07:00 — CLI improvement track durable lessons
 
 - Recurring verification defects are a durable review pattern: do not accept code that merely appears to verify, preserve, or clean up its claim. Empty-turn handling, flaky tests, speculative rewind placement, benchmark caps, cache keys, broad assertions, and stale fixture inventories were each caught by different review/automation layers; keep redundant review layers in place.

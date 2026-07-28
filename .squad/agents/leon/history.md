@@ -160,3 +160,6 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 - 🟢 Approved Sapper's revision. `RewindRunnerPolicy` now keeps public `Engine::rewind_session_to` on `RejectRunnerRewind` while speculative draft alignment, draft rewind, target accept/reject rewind, and overmaterialized cleanup use `AllowRunnerRewind`.
 - Verified public runner-backed rewind rejects before scheduler/session/token/KV/runner mutation; policy-boundary tests would fail if allow/reject were flipped. Support matrix now matches the public API contract, with prepared/infallible runner rewind recorded as follow-up.
 - Validation: engine build/fmt/clippy passed; server/CLI builds passed; full engine lib suite now runs locally with ORT 1.27/API 27 (252 passed, 0 failed, 1 ignored); targeted failed-rewind/speculative/checkpoint tests passed.
+
+## 2026-07-28T17:40:00+0000
+#365 metadata-hints integration merged after the structural identity remediation chain.
