@@ -5,7 +5,7 @@ use super::*;
 impl Engine {
     /// Load a model from a directory.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        Self::from_dir_with_session_options(model_dir, config, SessionOptions::default())
+        Self::from_dir_impl(model_dir, config, SessionOptions::default(), false)
     }
 
     /// Load a model from a directory with explicit ORT session options.
@@ -14,19 +14,46 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
+        Self::from_dir_impl(model_dir, config, session_options, true)
+    }
+
+    fn from_dir_impl(
+        model_dir: &Path,
+        mut config: EngineConfig,
+        mut session_options: SessionOptions,
+        session_options_are_programmatic: bool,
+    ) -> anyhow::Result<Self> {
         let model_directory = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_model_directory");
             let package_selection = package_selection_from_session_options(&session_options);
             ModelDirectory::load_with_package_selection(model_dir, &package_selection)
                 .map_err(|e| anyhow::anyhow!("Failed to resolve model directory: {e}"))?
         };
+        let metadata_hints = load_model_metadata_hints(&model_directory.model_path)?;
+        report_metadata_hint_warnings(&metadata_hints);
+        if metadata_hints.has_errors() {
+            anyhow::bail!(
+                "ONNX model metadata contains conflicting forced placement hints; remove one of the contradictory onnx_runtime.device declarations"
+            );
+        }
+        apply_model_memory_hints(&mut config, &metadata_hints)?;
+        apply_model_placement_hints(
+            &mut session_options,
+            &metadata_hints,
+            session_options_are_programmatic,
+        )?;
         let decode_backend = {
             let _span = onnx_genai_ort::prof_span!("engine.resolve_decode_backend");
             resolve_decode_backend(&model_directory.model_path, config.decode_backend)?
         };
         if decode_backend == EngineDecodeBackend::Native {
             return augment_backend_error(
-                Self::from_native_model_directory(model_directory, config, &session_options),
+                Self::from_native_model_directory(
+                    model_directory,
+                    config,
+                    &session_options,
+                    metadata_hints,
+                ),
                 EngineDecodeBackend::Native,
             );
         }
@@ -34,7 +61,6 @@ impl Engine {
         // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
         // outputs on some Foundry exports. SessionOptions still honors an explicit
         // ONNX_GENAI_CUDA_GRAPH=1 request; native whole-step capture is separate.
-        let mut session_options = session_options;
         configure_ort_cuda_graph(&mut session_options, &model_directory.model_path);
 
         let environment = {
@@ -117,6 +143,7 @@ impl Engine {
         Ok(Self {
             decode_backend,
             metadata,
+            metadata_hints,
             kv_cache,
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
@@ -149,6 +176,7 @@ impl Engine {
         model_directory: ModelDirectory,
         config: EngineConfig,
         session_options: &SessionOptions,
+        metadata_hints: MetadataHints,
     ) -> anyhow::Result<Self> {
         if config.draft_model.is_some() || !matches!(config.speculative_mode, SpeculativeMode::None)
         {
@@ -245,6 +273,7 @@ impl Engine {
         Ok(Self {
             decode_backend: EngineDecodeBackend::Native,
             metadata,
+            metadata_hints,
             kv_cache: PagedKvCache::new(config.page_size, config.num_gpu_pages),
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
@@ -275,6 +304,7 @@ impl Engine {
         _model_directory: ModelDirectory,
         _config: EngineConfig,
         _session_options: &SessionOptions,
+        _metadata_hints: MetadataHints,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
             "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
