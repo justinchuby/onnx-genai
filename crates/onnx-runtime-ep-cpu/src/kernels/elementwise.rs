@@ -286,9 +286,9 @@ fn binary_contiguous(op: BinOp, inputs: &[TensorView], output: &mut TensorMut) -
         || inputs[1].dtype != output.dtype
         || inputs[0].shape != output.shape
         || inputs[1].shape != output.shape
-        || !inputs[0].is_contiguous()
-        || !inputs[1].is_contiguous()
-        || !output.is_contiguous()
+        || inputs[0].strides != output.strides
+        || inputs[1].strides != output.strides
+        || !onnx_runtime_ir::is_dense(output.shape, output.strides)
     {
         return false;
     }

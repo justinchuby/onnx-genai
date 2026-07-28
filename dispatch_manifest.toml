@@ -266,3 +266,41 @@ minimum_tier = "tier2"
 counter = "NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS"
 file = "crates/onnx-genai-engine/src/native_decode/mod.rs"
 description = "Multi-turn session reuses KV cache and prefills only new tokens instead of full context reset"
+# Dense elementwise infrastructure — shared by Relu/Clip/future unary ops
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Relu"
+variant = "dense_f16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_F16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense f16 elementwise Relu via NEON widen/narrow (aarch64) or scalar widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Relu"
+variant = "dense_bf16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_BF16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense bf16 elementwise Relu via f32 widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Clip"
+variant = "dense_f16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_F16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense f16 elementwise Clip via NEON widen/narrow (aarch64) or scalar widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Clip"
+variant = "dense_bf16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_BF16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense bf16 elementwise Clip via f32 widen/narrow, avoiding full to_dense allocation"

@@ -22,6 +22,52 @@ pub fn is_contiguous(shape: &[usize], strides: &[i64]) -> bool {
     strides == compute_contiguous_strides(shape).as_slice()
 }
 
+/// Whether a tensor with `shape` and `strides` is **dense**: it occupies a
+/// contiguous block of memory (no holes, no overlaps) even though the logical
+/// axis order may differ from row-major. This is exactly the condition under
+/// which a per-element unary op can process the backing buffer wholesale —
+/// every element lives at a unique offset in `[0, numel)` and the operation
+/// is order-independent.
+///
+/// Formally: when dimensions are sorted by ascending absolute stride, each
+/// stride must equal the product of all preceding dimensions' sizes. Dimensions
+/// of size 0 or 1 are ignored (their stride is unconstrained because they
+/// contribute no extent).
+///
+/// This is strictly weaker than [`is_contiguous`]: every contiguous tensor is
+/// dense, but a column-major or NHWC-permuted tensor is dense without being
+/// row-major contiguous.
+pub fn is_dense(shape: &[usize], strides: &[i64]) -> bool {
+    if shape.len() != strides.len() {
+        return false;
+    }
+    // Collect (abs_stride, dim_size) for non-trivial dimensions.
+    let mut pairs: Vec<(i64, usize)> = shape
+        .iter()
+        .zip(strides)
+        .filter(|&(&d, _)| d > 1)
+        .map(|(&d, &s)| (s.unsigned_abs() as i64, d))
+        .collect();
+    if pairs.is_empty() {
+        return true; // scalar or all-ones shape
+    }
+    // Sort by stride ascending.
+    pairs.sort_unstable_by_key(|&(s, _)| s);
+    // The smallest stride must be 1 (element-adjacent).
+    if pairs[0].0 != 1 {
+        return false;
+    }
+    // Each subsequent stride must equal the product of all preceding sizes.
+    let mut expected_stride: i64 = 1;
+    for &(stride, size) in &pairs {
+        if stride != expected_stride {
+            return false;
+        }
+        expected_stride *= size as i64;
+    }
+    true
+}
+
 /// Compute the output shape of a numpy-style broadcast of `a` and `b`.
 pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>, IrError> {
     let max_ndim = a.len().max(b.len());

@@ -27,9 +27,8 @@
 //! via `==`. Tests assert equality, not bit-identity, for zero values.
 
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
-use crate::strided::numel;
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::Node;
 
 use super::check_arity;
 
@@ -95,103 +94,18 @@ impl Kernel for ReluKernel {
 /// plain scalar loop elsewhere. Avoids the `to_dense` allocation that
 /// dominates the non-Conv portion of ResNet-18 inference (8 Relu nodes ×
 /// up to 784 KB spatial tensors after Conv+BN+Relu fusion eliminates the rest).
+///
+/// Accepts any **dense** tensor (strides are a permutation of contiguous strides),
+/// not just strictly row-major contiguous. For per-element Relu, logical layout
+/// (NCHW vs NHWC) is irrelevant — only memory density matters.
 fn relu_contiguous_f32_fast(input: &TensorView, output: &mut TensorMut) -> Result<bool> {
-    if input.dtype != DataType::Float32
-        || output.dtype != DataType::Float32
-        || input.shape != output.shape
-        || !input.is_contiguous()
-        || !output.is_contiguous()
-    {
-        return Ok(false);
+    use super::dense_elementwise::{ReluOp, try_dense_elementwise};
+    let op = ReluOp;
+    let handled = try_dense_elementwise(&op, input, output)?;
+    if handled {
+        RELU_F32_FAST_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-
-    let len = numel(input.shape);
-
-    // Overlap guard: if input and output alias, fall back to the generic path
-    // which allocates a separate buffer.
-    let input_start = input.data_ptr::<u8>() as usize;
-    let input_end = input_start.saturating_add(input.byte_size());
-    let output_start = output.data_ptr_mut::<u8>() as usize;
-    let output_end = output_start.saturating_add(output.byte_size());
-    if output_start < input_end && input_start < output_end {
-        return Ok(false);
-    }
-
-    // SAFETY: validated contiguous Float32 views — `len` elements are accessible,
-    // and the overlap check above proves the ranges are disjoint.
-    let src = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), len) };
-    let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), len) };
-
-    relu_f32_bulk(src, dst);
-    RELU_F32_FAST_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(true)
-}
-
-/// Bulk f32 relu: dst[i] = max(src[i], 0).
-/// Uses NEON on aarch64; scalar loop elsewhere.
-#[inline]
-fn relu_f32_bulk(src: &[f32], dst: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        relu_f32_neon(src, dst);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        relu_f32_scalar(src, dst);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn relu_f32_neon(src: &[f32], dst: &mut [f32]) {
-    use std::arch::aarch64::*;
-    debug_assert_eq!(src.len(), dst.len());
-    let n = src.len();
-    // SAFETY: NEON is always available on aarch64. We process 16 elements per
-    // iteration (4 lanes × 4 registers) for throughput, then handle the tail.
-    // vmaxq_f32 propagates NaN (ARM FMAX semantics): max(NaN, 0) = NaN.
-    unsafe {
-        let vzero = vdupq_n_f32(0.0);
-        let mut i = 0usize;
-        let bulk_end = n & !15; // round down to multiple of 16
-        while i < bulk_end {
-            let a0 = vld1q_f32(src.as_ptr().add(i));
-            let a1 = vld1q_f32(src.as_ptr().add(i + 4));
-            let a2 = vld1q_f32(src.as_ptr().add(i + 8));
-            let a3 = vld1q_f32(src.as_ptr().add(i + 12));
-            let r0 = vmaxq_f32(a0, vzero);
-            let r1 = vmaxq_f32(a1, vzero);
-            let r2 = vmaxq_f32(a2, vzero);
-            let r3 = vmaxq_f32(a3, vzero);
-            vst1q_f32(dst.as_mut_ptr().add(i), r0);
-            vst1q_f32(dst.as_mut_ptr().add(i + 4), r1);
-            vst1q_f32(dst.as_mut_ptr().add(i + 8), r2);
-            vst1q_f32(dst.as_mut_ptr().add(i + 12), r3);
-            i += 16;
-        }
-        // Tail: process remaining elements 4 at a time, then scalar.
-        while i + 4 <= n {
-            let a = vld1q_f32(src.as_ptr().add(i));
-            let r = vmaxq_f32(a, vzero);
-            vst1q_f32(dst.as_mut_ptr().add(i), r);
-            i += 4;
-        }
-        while i < n {
-            let v = *src.get_unchecked(i);
-            // PartialOrd: NaN < 0.0 is false → NaN passes through unchanged.
-            // Do NOT use f32::max — it suppresses NaN.
-            *dst.get_unchecked_mut(i) = if v < 0.0 { 0.0 } else { v };
-            i += 1;
-        }
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn relu_f32_scalar(src: &[f32], dst: &mut [f32]) {
-    for (d, &s) in dst.iter_mut().zip(src.iter()) {
-        // PartialOrd: NaN < 0.0 is false → NaN passes through unchanged.
-        // Do NOT use f32::max — it suppresses NaN.
-        *d = if s < 0.0 { 0.0 } else { s };
-    }
+    Ok(handled)
 }
 
 #[cfg(feature = "mlas")]
@@ -372,5 +286,49 @@ mod tests {
         assert_eq!(result[3], 0.0); // -1 → 0
         assert_eq!(result[4], 1.0);
         assert!(result[5].is_nan(), "NaN[5] not propagated");
+    }
+
+    /// Proves the dense f16 dispatch path fires for contiguous f16 Relu input.
+    #[test]
+    fn relu_f16_dense_path_fires() {
+        use crate::kernels::dense_elementwise::DENSE_ELEM_F16_HITS;
+        let before = DENSE_ELEM_F16_HITS.load(Ordering::Relaxed);
+        let a = Owned::f16(&[8], &[f32::NAN, -1.0, 0.0, 1.0, -0.5, 2.0, -3.0, 0.5]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[8]);
+        ReluKernel
+            .execute(&[a.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = DENSE_ELEM_F16_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "DENSE_ELEM_F16_HITS did not increment: before={before} after={after}"
+        );
+        let result = out.to_f16_as_f32();
+        assert!(result[0].is_nan(), "NaN must propagate through f16 Relu");
+        assert_eq!(result[1], 0.0);
+        assert_eq!(result[2], 0.0);
+        assert_eq!(result[3], 1.0);
+    }
+
+    /// Proves the dense bf16 dispatch path fires for contiguous bf16 Relu input.
+    #[test]
+    fn relu_bf16_dense_path_fires() {
+        use crate::kernels::dense_elementwise::DENSE_ELEM_BF16_HITS;
+        let before = DENSE_ELEM_BF16_HITS.load(Ordering::Relaxed);
+        let a = Owned::bf16(&[4], &[f32::NAN, -1.0, 0.0, 1.0]);
+        let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[4]);
+        ReluKernel
+            .execute(&[a.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = DENSE_ELEM_BF16_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "DENSE_ELEM_BF16_HITS did not increment: before={before} after={after}"
+        );
+        let result = out.to_bf16_as_f32();
+        assert!(result[0].is_nan(), "NaN must propagate through bf16 Relu");
+        assert_eq!(result[1], 0.0);
+        assert_eq!(result[2], 0.0);
+        assert_eq!(result[3], 1.0);
     }
 }
