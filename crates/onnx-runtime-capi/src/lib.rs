@@ -127,7 +127,8 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::DynamicShape { .. }
         | E::SymbolConflict { .. }
         | E::RankMismatch { .. }
-        | E::RuntimeBroadcastIncompatible { .. } => OrtErrorCode::InvalidArgument,
+        | E::RuntimeBroadcastIncompatible { .. }
+        | E::LoraOverrideUnknown { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,
@@ -139,7 +140,8 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::Ir(_)
         | E::Graph(_)
         | E::Optimize(_)
-        | E::ShapeInfer(_) => OrtErrorCode::InvalidGraph,
+        | E::ShapeInfer(_)
+        | E::Lora(_) => OrtErrorCode::InvalidGraph,
         E::Load(load) => map_loader_error(load),
         E::NotInitialized
         | E::Internal(_)

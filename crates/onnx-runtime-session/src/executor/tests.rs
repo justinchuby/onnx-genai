@@ -3155,6 +3155,74 @@ fn optional_override_restores_default_after_feed() {
     assert_eq!(exec.buffer_shapes[&exec.input_index["A_t"]], vec![k, 0]);
 }
 
+#[test]
+fn optional_override_fed_unfed_fed_cycle() {
+    let (m, k, n) = (2, 4, 3);
+    let base = [7.0f32, 8.0, 9.0, 1.0, 2.0, 3.0];
+    let (graph, overrides) = build_override_graph(m, k, n, &base);
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+
+    let r = 8usize;
+    let x_vals = [1.0f32, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a_vals: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.2 - 0.5).collect();
+    let b_vals: Vec<f32> = (0..r * n).map(|i| (i as f32) * 0.05 - 0.1).collect();
+    let x = Tensor::from_f32(&[m, k], &x_vals).unwrap();
+    let a_t = Tensor::from_f32(&[k, r], &a_vals).unwrap();
+    let b_t = Tensor::from_f32(&[r, n], &b_vals).unwrap();
+    let expected = reference_output(m, k, n, r, &x_vals, &base, &a_vals, &b_vals);
+
+    let first_fed = exec
+        .run(&[("x", &x), ("A_t", &a_t), ("B_t", &b_t)])
+        .unwrap()[0]
+        .to_vec_f32();
+    for (got, expected) in first_fed.iter().zip(&expected) {
+        assert!((got - expected).abs() < 1e-3);
+    }
+
+    let unfed = exec.run(&[("x", &x)]).unwrap()[0].to_vec_f32();
+    assert_eq!(unfed, base);
+
+    let second_fed = exec
+        .run(&[("x", &x), ("A_t", &a_t), ("B_t", &b_t)])
+        .unwrap()[0]
+        .to_vec_f32();
+    for (got, expected) in second_fed.iter().zip(&expected) {
+        assert!((got - expected).abs() < 1e-3);
+    }
+    assert_eq!(second_fed, first_fed);
+}
+
+#[test]
+fn optional_override_missing_required_input_still_errors_when_override_registered() {
+    let (m, k, n) = (2, 4, 3);
+    let base = [0.0f32; 6];
+    let (graph, overrides) = build_override_graph(m, k, n, &base);
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+
+    let r = 8usize;
+    let a_t = Tensor::from_f32(&[k, r], &vec![0.0; k * r]).unwrap();
+    let b_t = Tensor::from_f32(&[r, n], &vec![0.0; r * n]).unwrap();
+    let error = exec
+        .run(&[("A_t", &a_t), ("B_t", &b_t)])
+        .expect_err("omitting required input x must fail");
+    assert!(matches!(
+        error,
+        SessionError::InputNotFound { ref name } if name == "x"
+    ));
+}
+
 // rank change: feeding r=8 then r=16 rebinds the declared symbol and resizes the
 // owned buffers each time without error and with correct output.
 #[test]
