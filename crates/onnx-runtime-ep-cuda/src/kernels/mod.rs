@@ -22,6 +22,7 @@ use onnx_runtime_ep_api::{OpKey, OpRegistry};
 use crate::runtime::CudaRuntime;
 
 pub mod activations;
+pub mod argreduce;
 pub mod attention;
 pub mod bitwise;
 pub mod block_quant;
@@ -34,10 +35,12 @@ pub mod constant_of_shape;
 pub mod conv;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
+pub mod cumprod;
 pub mod cumsum;
 pub(crate) mod device_argmax;
 pub mod elementwise;
 mod flash_attention;
+pub mod fused_gelu;
 pub mod fused_gemm;
 pub mod gather;
 pub mod gather_block_quantized;
@@ -71,6 +74,7 @@ pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
+pub mod structural;
 pub mod topk;
 pub mod trilu;
 pub mod unary_predicate;
@@ -133,6 +137,15 @@ use pointwise::{
 /// * **LogSoftmax / Hardmax** — numerically-stable axis-reduction ops
 ///   (f32/f16/bf16), matched to the CPU EP; `LogSoftmax` uses the stable
 ///   shifted-logsumexp formulation.
+/// * **Fused GELU (`com.microsoft`)** — `BiasGelu` (exact GELU of `X+bias`),
+///   `FastGelu` (tanh GELU of `X`+ optional bias), and `QuickGelu`
+///   (`X·sigmoid(alpha·X)`), f32/f16/bf16, matched to the CPU EP
+///   `contrib_fused.rs` (GELU evaluated in `double`).
+/// * **CumProd** — deterministic per-lane cumulative product (f32/i64) with the
+///   `exclusive`/`reverse` attributes, mirroring the `CumSum` scan.
+/// * **ArgMax / ArgMin** — axis reduction to `Int64` indices (f32/f16/bf16)
+///   honouring `keepdims` and `select_last_index`, matched to the CPU EP
+///   `selection.rs` tie-breaking.
 ///
 /// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
@@ -262,6 +275,15 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "BitShift",
     "LogSoftmax",
     "Hardmax",
+    "BiasGelu",
+    "FastGelu",
+    "QuickGelu",
+    "CumProd",
+    "ArgMax",
+    "ArgMin",
+    "GatherND",
+    "SpaceToDepth",
+    "EyeLike",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -315,6 +337,44 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("CumSum", "", 11),
         Box::new(cumsum::CumSumFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("CumProd", "", 26),
+        Box::new(cumprod::CumProdFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ArgMax", "", 1),
+        Box::new(argreduce::ArgReduceFactory {
+            op: argreduce::ArgOp::Max,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("ArgMin", "", 1),
+        Box::new(argreduce::ArgReduceFactory {
+            op: argreduce::ArgOp::Min,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("GatherND", "", 11),
+        Box::new(structural::GatherNdFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("SpaceToDepth", "", 13),
+        Box::new(structural::SpaceToDepthFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("EyeLike", "", 9),
+        Box::new(structural::EyeLikeFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -565,6 +625,22 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+
+    // Fused GELU activations (`com.microsoft`): BiasGelu / FastGelu add a
+    // broadcast bias before an exact / tanh GELU; QuickGelu is x*sigmoid(alpha*x).
+    for (op_type, op) in [
+        ("BiasGelu", fused_gelu::FusedGeluOp::Bias),
+        ("FastGelu", fused_gelu::FusedGeluOp::Fast),
+        ("QuickGelu", fused_gelu::FusedGeluOp::Quick),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "com.microsoft", 1),
+            Box::new(fused_gelu::FusedGeluFactory {
+                op,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
 
     // CUDA Wave 4 — attribute-driven f32/f16/bf16 activations.
     for op_type in [

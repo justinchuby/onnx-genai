@@ -72,3 +72,8 @@ htmlcov/
 # Timeline written by `/profile on` when no destination is named. The curated
 # samples under examples/traces/ are committed deliberately and are not this.
 onnx-genai-session.perfetto.json
+
+# Scratch files used to pass long commit messages to git commit -F.
+.msg.txt
+.pr-body.md
+.git-msg.txt

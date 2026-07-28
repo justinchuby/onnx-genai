@@ -159,6 +159,15 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `Tile` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic repeated indexed copy across arbitrary axes. |
 | `Where` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic branch selection with right-aligned broadcasting across condition, x, and y. |
 | `Constant` | `` | ✅ | **host + H2D** | Uploads `value` tensors and numeric `value_*` attribute forms to the device. |
+| `BiasGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Exact (erf) GELU of `X + bias` with the bias broadcast over the last dimension; f32/f16/bf16, GELU evaluated in `double` and the `-inf → 0` guard matched to the CPU EP (`fused_gelu.rs`). |
+| `FastGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | Tanh-approximation GELU of `X` plus an optional last-dim bias (1- or 2-input arity); f32/f16/bf16, matched to the CPU EP. |
+| `QuickGelu` | `com.microsoft` | ✅ | **NVRTC-custom** | `X · sigmoid(alpha · X)` with the `com.microsoft` default `alpha=1.702`; f32/f16/bf16, numerically stable sigmoid matched to the CPU EP. |
+| `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane cumulative product (f32/i64) honouring `exclusive`/`reverse`, mirroring the `CumSum` scan (`cumprod.rs`). |
+| `ArgMax` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
+| `ArgMin` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
+| `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
+| `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic NCHW spatial-block rearrangement with runtime `blocksize`, including multi-channel and empty-batch tensors (`structural.rs`). |
+| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
 
 ## Source-derived coverage audit (2026-07-27)
 
@@ -289,6 +298,38 @@ and negative interior axes). This brings the machine-verified
 "113" figure above is a stale pre-batch-3 snapshot; the authoritative count is the
 `CUDA_COVERED_OPS` slice length, which the `covered_ops_have_no_duplicates` test
 guards.)
+
+The issue #67 operator-coverage batch 5 adds six more advertised op names — the
+`com.microsoft` fused GELU activations `BiasGelu` (exact GELU of `X + bias`),
+`FastGelu` (tanh GELU of `X` + optional broadcast bias), and `QuickGelu`
+(`X · sigmoid(alpha · X)`) in f32/f16/bf16; the cumulative product `CumProd`
+(f32/i64, `exclusive`/`reverse`); and the index reductions `ArgMax`/`ArgMin`
+(f32/f16/bf16 → Int64, honouring `keepdims` and `select_last_index`). All are
+**NVRTC-custom** kernels matched to the CPU EP: the fused GELUs evaluate the
+error/tanh GELU in `double` to stay bit-close to the CPU oracle
+(`contrib_fused.rs`) and guard the `-inf → 0` case; `CumProd` mirrors the
+deterministic per-lane `CumSum` scan; and `ArgMax`/`ArgMin` reproduce the CPU
+first-index (or, with `select_last_index`, last-index) tie-break. Each is
+GPU-validated against the CPU oracle on the local CUDA host across the
+dtypes/attributes it claims (bias broadcasting, the `FastGelu` no-bias arity and
+`-inf` guard, `CumProd` exclusive/reverse/negative-axis and i64 byte-exact, and
+`ArgMax`/`ArgMin` keepdims/axis variants plus a falsifiable tie-break probe).
+This brings the machine-verified `CUDA_COVERED_OPS` list length from **125** to
+**131** op names. `ArgMax`, `ArgMin`, and `CumProd` move out of the CPU `ai.onnx`
+gap list, and `BiasGelu`/`FastGelu`/`QuickGelu` are no longer `com.microsoft`
+gaps.
+
+The issue #67 operator-coverage batch 6 adds three standard-domain structural
+operators: `GatherND`, `SpaceToDepth`, and `EyeLike`. All three use
+dtype-agnostic NVRTC byte kernels rather than a vendor library:
+`GatherND` supports Int32/Int64 indices, negative wrapping, tuple tails, and
+`batch_dims`; `SpaceToDepth` rearranges arbitrary fixed-width NCHW tensors; and
+`EyeLike` emits exact zero/one storage for every numeric/bool dtype supported by
+the CPU EP. GPU parity covers batch dimensions, negative indices, multiple
+channels, dtype overrides, diagonal offsets, and empty tensors. This raises the
+machine-verified `CUDA_COVERED_OPS` count from **131** to **134** and the current
+CPU standard-domain parity count from **102 / 141** to **105 / 141**. These ops
+move out of the CPU `ai.onnx` gap list.
 
 ---
 

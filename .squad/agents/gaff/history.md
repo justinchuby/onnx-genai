@@ -152,3 +152,6 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 ## 2026-07-27T15:11:14-07:00 — PR #289 REPL phase 1 re-review
 
 - **Verdict:** 🟢 Approve. Zhora's revision closes the plain-path parser drift (`//`, `/help <arg>`) and the live-renderer newline lifecycle bug. Build, lib tests, fmt, clippy, and crossterm tree passed; Windows could not execute Unix-only piped e2e, so parity was manually traced against `main`.
+
+## 2026-07-28T05-49-08+0000 — Wave 3 update
+Authored PR #321 for #63, landing the Phase-3b live GPU weight-offload slice: VRAM page allocation, H2D copy, binding, and byte-identical device execution for one offloaded weight. #63 remains open for dispatch wiring, multi-page LRU/eviction, #87 prefetch overlap, and #82 routed-expert paging.

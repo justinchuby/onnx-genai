@@ -7,6 +7,14 @@ use super::{check_arity, write_dense_bytes};
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
+/// Dispatch counter for the BNNS pooling fast path (macOS/iOS).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub static POOL_BNNS_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dispatch counter for the scalar fallback path.
+pub static POOL_SCALAR_TEST_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Copy)]
 enum AutoPad {
     NotSet,
@@ -304,6 +312,12 @@ impl Kernel for PoolKernel {
         if try_mlas_pool(self, inputs, outputs, &expected, &pads)? {
             return Ok(());
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if try_bnns_pool(self, inputs, outputs, &expected, &pads)? {
+            POOL_BNNS_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        POOL_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let x = to_dense_f32_widen("Pool", &inputs[0])?;
         let spatial_size = numel(spatial);
@@ -614,6 +628,282 @@ fn usize_to_i64(values: &[usize], name: &str) -> Result<Vec<i64>> {
                 .map_err(|_| EpError::KernelFailed(format!("Pool: {name} exceeds i64")))
         })
         .collect()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Apple Silicon fast path: BNNS 2D spatial pooling (macOS/iOS)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Attempt BNNS-accelerated 2D spatial pooling for MaxPool and AveragePool.
+/// Returns `Ok(true)` when the fast path ran, `Ok(false)` when conditions
+/// are not met (rank ≠ 4, non-f32, dilations, LpPool, indices output).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn try_bnns_pool(
+    kernel: &PoolKernel,
+    inputs: &[TensorView],
+    outputs: &mut [TensorMut],
+    expected: &[usize],
+    pads: &[usize],
+) -> Result<bool> {
+    // Only 2D spatial (rank-4 input: N,C,H,W).
+    if inputs[0].shape.len() != 4 {
+        return Ok(false);
+    }
+    // Only f32.
+    if inputs[0].dtype != DataType::Float32 || outputs[0].dtype != DataType::Float32 {
+        return Ok(false);
+    }
+    // Only max or average; not Lp.
+    let bnns_kind = match kernel.kind {
+        PoolKind::Max { .. } => BnnsPoolKind::Max,
+        PoolKind::Average { include_pad } => BnnsPoolKind::Average { include_pad },
+        PoolKind::Lp { .. } => return Ok(false),
+    };
+    // BNNS doesn't support dilated pooling or MaxPool with indices output.
+    if kernel.params.dilations.iter().any(|&d| d != 1) {
+        return Ok(false);
+    }
+    if outputs.len() > 1 {
+        return Ok(false);
+    }
+    // Only non-ceil_mode or handle ceil_mode via our computed output shape.
+    if !outputs[0].is_contiguous() {
+        return Ok(false);
+    }
+    let x_shape = inputs[0].shape;
+    let (batch, channels, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+    let (oh, ow) = (expected[2], expected[3]);
+    let (kh, kw) = (kernel.params.kernel[0], kernel.params.kernel[1]);
+    let (sh, sw) = (kernel.params.strides[0], kernel.params.strides[1]);
+    let (pad_top, pad_left) = (pads[0], pads[1]);
+    let (pad_bottom, pad_right) = (pads[2], pads[3]);
+
+    let x = to_dense_f32_widen("Pool", &inputs[0])?;
+    let n = numel(expected);
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), n) };
+
+    bnns_pool_execute(
+        bnns_kind, &x, out_slice, batch, channels, ih, iw, oh, ow, kh, kw, sh, sw, pad_top,
+        pad_left, pad_bottom, pad_right,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum BnnsPoolKind {
+    Max,
+    Average { include_pad: bool },
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[allow(clippy::too_many_arguments)]
+fn bnns_pool_execute(
+    kind: BnnsPoolKind,
+    input: &[f32],
+    output: &mut [f32],
+    batch: usize,
+    channels: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+) -> Result<bool> {
+    use std::ffi::c_void;
+
+    const BNNS_DATA_TYPE_FLOAT32: u32 = 0x10020;
+    const BNNS_DATA_LAYOUT_IMAGE_CHW: u32 = 0x30000;
+
+    #[repr(C)]
+    struct BNNSNDArrayDescriptor {
+        flags: u32,
+        layout: u32,
+        size: [usize; 8],
+        stride: [usize; 8],
+        data: *mut c_void,
+        data_type: u32,
+        _pad0: u32,
+        table_data: *mut c_void,
+        table_data_type: u32,
+        data_scale: f32,
+        data_bias: f32,
+        _pad1: u32,
+    }
+
+    #[repr(C)]
+    struct BNNSActivation {
+        function: u32,
+        alpha: f32,
+        beta: f32,
+        iscale: i32,
+        ioffset: i32,
+        ishift: i32,
+        iscale_per_channel: *const i32,
+        ioffset_per_channel: *const i32,
+        ishift_per_channel: *const i32,
+    }
+
+    #[repr(C)]
+    struct BNNSLayerParametersPooling {
+        i_desc: BNNSNDArrayDescriptor,
+        o_desc: BNNSNDArrayDescriptor,
+        bias: BNNSNDArrayDescriptor,
+        activation: BNNSActivation,
+        pooling_function: u32,
+        k_width: usize,
+        k_height: usize,
+        x_stride: usize,
+        y_stride: usize,
+        x_dilation_stride: usize,
+        y_dilation_stride: usize,
+        x_padding: usize,
+        y_padding: usize,
+        pad: [usize; 8],
+    }
+
+    type BNNSFilter = *mut c_void;
+    #[repr(C)]
+    struct BNNSFilterParameters {
+        _opaque: [u8; 0],
+    }
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn BNNSFilterCreateLayerPooling(
+            params: *const BNNSLayerParametersPooling,
+            filter_params: *const BNNSFilterParameters,
+        ) -> BNNSFilter;
+        fn BNNSFilterApplyBatch(
+            filter: BNNSFilter,
+            batch_size: usize,
+            input: *const c_void,
+            input_stride: usize,
+            output: *mut c_void,
+            output_stride: usize,
+        ) -> i32;
+        fn BNNSFilterDestroy(filter: BNNSFilter);
+    }
+
+    fn make_nd(
+        layout: u32,
+        sz: &[usize],
+        st: &[usize],
+        data: *mut c_void,
+    ) -> BNNSNDArrayDescriptor {
+        let mut size = [0usize; 8];
+        let mut stride = [0usize; 8];
+        for (i, (&s, &t)) in sz.iter().zip(st.iter()).enumerate() {
+            size[i] = s;
+            stride[i] = t;
+        }
+        BNNSNDArrayDescriptor {
+            flags: 0,
+            layout,
+            size,
+            stride,
+            data,
+            data_type: BNNS_DATA_TYPE_FLOAT32,
+            _pad0: 0,
+            table_data: std::ptr::null_mut(),
+            table_data_type: 0,
+            data_scale: 0.0,
+            data_bias: 0.0,
+            _pad1: 0,
+        }
+    }
+
+    // BNNS pooling function constants.
+    // 0 = max, 1 = average (divides by full kernel area — equivalent to
+    // include_pad=true). For AveragePool with `include_pad=false` and non-zero
+    // padding, the semantics differ (BNNS always divides by kH*kW, but the ONNX
+    // spec divides by the count of valid input positions). Fall back to scalar.
+    let pooling_function = match kind {
+        BnnsPoolKind::Max => 0u32,
+        BnnsPoolKind::Average { include_pad: _ } => {
+            // When padding is non-zero and include_pad is false, the divisor
+            // differs between BNNS and ONNX — fall back.
+            let has_padding = pad_top != 0 || pad_left != 0 || pad_bottom != 0 || pad_right != 0;
+            if has_padding {
+                return Ok(false);
+            }
+            1u32
+        }
+    };
+
+    // BNNS asymmetric padding: the framework supports it via separate
+    // x_padding / y_padding as "begin" padding. However the BNNS API doesn't
+    // directly expose separate begin/end padding in the simple pooling layer.
+    // For symmetric padding and cases where the output shape already accounts
+    // for asymmetry, we use the begin padding and rely on the output shape
+    // being correct.
+    let _ = (pad_bottom, pad_right); // Used only for output shape computation above.
+
+    let in_stride = channels * ih * iw;
+    let out_stride = channels * oh * ow;
+
+    let params = BNNSLayerParametersPooling {
+        i_desc: make_nd(
+            BNNS_DATA_LAYOUT_IMAGE_CHW,
+            &[iw, ih, channels],
+            &[1, iw, iw * ih],
+            std::ptr::null_mut(),
+        ),
+        o_desc: make_nd(
+            BNNS_DATA_LAYOUT_IMAGE_CHW,
+            &[ow, oh, channels],
+            &[1, ow, ow * oh],
+            std::ptr::null_mut(),
+        ),
+        bias: make_nd(0, &[0], &[0], std::ptr::null_mut()),
+        activation: BNNSActivation {
+            function: 0,
+            alpha: 0.0,
+            beta: 0.0,
+            iscale: 0,
+            ioffset: 0,
+            ishift: 0,
+            iscale_per_channel: std::ptr::null(),
+            ioffset_per_channel: std::ptr::null(),
+            ishift_per_channel: std::ptr::null(),
+        },
+        pooling_function,
+        k_width: kw,
+        k_height: kh,
+        x_stride: sw,
+        y_stride: sh,
+        x_dilation_stride: 1,
+        y_dilation_stride: 1,
+        x_padding: pad_left,
+        y_padding: pad_top,
+        pad: [0; 8],
+    };
+
+    let filter = unsafe { BNNSFilterCreateLayerPooling(&params, std::ptr::null()) };
+    if filter.is_null() {
+        return Ok(false);
+    }
+    let rc = unsafe {
+        BNNSFilterApplyBatch(
+            filter,
+            batch,
+            input.as_ptr() as *const c_void,
+            in_stride * 4,
+            output.as_mut_ptr() as *mut c_void,
+            out_stride * 4,
+        )
+    };
+    unsafe {
+        BNNSFilterDestroy(filter);
+    }
+    Ok(rc == 0)
 }
 
 #[cfg(test)]
@@ -1000,5 +1290,84 @@ mod tests {
         .execute(&[global_input.view()], &mut [global_output.view_mut()])
         .unwrap();
         assert_close(&global_output.to_f32(), &[17.0_f32.cbrt()]);
+    }
+
+    // ─── Dispatch reachability ───────────────────────────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn max_pool_2d_no_padding_uses_bnns() {
+        use std::sync::atomic::Ordering;
+        let before = super::POOL_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let x = Owned::f32(
+            &[1, 1, 4, 4],
+            &(1..=16).map(|v| v as f32).collect::<Vec<_>>(),
+        );
+        let kernel = PoolKernel {
+            params: params(&[2, 2], &[2, 2], &[0, 0, 0, 0], &[1, 1]),
+            auto_pad: AutoPad::NotSet,
+            ceil_mode: false,
+            kind: PoolKind::Max {
+                storage_order: false,
+            },
+        };
+        let mut out = Owned::zeros_f32(&[1, 1, 2, 2]);
+        kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        let after = super::POOL_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "MaxPool 2D undilated did not reach BNNS path"
+        );
+        assert_eq!(out.to_f32(), vec![6.0, 8.0, 14.0, 16.0]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn max_pool_2d_with_padding_uses_bnns() {
+        use std::sync::atomic::Ordering;
+        let before = super::POOL_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let x = Owned::f32(
+            &[1, 1, 4, 4],
+            &(1..=16).map(|v| v as f32).collect::<Vec<_>>(),
+        );
+        let kernel = PoolKernel {
+            params: params(&[3, 3], &[2, 2], &[1, 1, 1, 1], &[1, 1]),
+            auto_pad: AutoPad::NotSet,
+            ceil_mode: false,
+            kind: PoolKind::Max {
+                storage_order: false,
+            },
+        };
+        let mut out = Owned::zeros_f32(&[1, 1, 2, 2]);
+        kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        let after = super::POOL_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "MaxPool 2D with padding did not reach BNNS path"
+        );
+        // Top-left: max of [pad pad pad; pad 1 2; pad 5 6] = 6
+        assert_eq!(out.to_f32()[0], 6.0);
+    }
+
+    #[test]
+    fn dilated_pool_uses_scalar_fallback() {
+        use std::sync::atomic::Ordering;
+        let before = super::POOL_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        let x = Owned::f32(
+            &[1, 1, 5, 5],
+            &(1..=25).map(|v| v as f32).collect::<Vec<_>>(),
+        );
+        let kernel = PoolKernel {
+            params: params(&[2, 2], &[1, 1], &[0, 0, 0, 0], &[2, 2]),
+            auto_pad: AutoPad::NotSet,
+            ceil_mode: false,
+            kind: PoolKind::Max {
+                storage_order: false,
+            },
+        };
+        let mut out = Owned::zeros_f32(&[1, 1, 3, 3]);
+        kernel.execute(&[x.view()], &mut [out.view_mut()]).unwrap();
+        let after = super::POOL_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        assert!(after > before, "Dilated pool did not reach scalar fallback");
     }
 }

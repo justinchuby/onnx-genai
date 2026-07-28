@@ -516,6 +516,10 @@ impl Kernel for UnaryKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+
+    fn can_run_in_place(&self, input_index: usize) -> bool {
+        input_index == 0
+    }
 }
 
 /// Dtype-generic unary map: widen each element to `f32`, apply the (unchanged)
@@ -871,6 +875,13 @@ mod tests {
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         assert_eq!(out.to_f32(), vec![2., 3., 4.]);
+    }
+
+    #[test]
+    fn unary_advertises_safe_in_place_input() {
+        let kernel = UnaryKernel { op: UnOp::Tanh };
+        assert!(kernel.can_run_in_place(0));
+        assert!(!kernel.can_run_in_place(1));
     }
 
     #[test]

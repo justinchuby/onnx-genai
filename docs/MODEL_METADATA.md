@@ -249,6 +249,12 @@ pub enum MetadataWarning {
 }
 ```
 
+This scanning, type validation, and priority resolution is implemented in
+`onnx_std::metadata_hints`. `MetadataHints::from_model` reads the embedded
+`onnx_runtime.*` metadata off a loaded model; `MetadataHints::scan` is the
+source-agnostic entry point that merges hints from any mix of [`HintSource`]s
+through the same validation and priority logic.
+
 ## Multimodal input: the placeholder contract
 
 A vision-language package declares two things, and the runtime derives everything

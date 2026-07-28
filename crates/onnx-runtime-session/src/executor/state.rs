@@ -228,6 +228,23 @@ pub(crate) struct Executor {
     pub(super) decode_view_plan_sig_mismatch_streak: u32,
     /// Latched off after repeated signature mismatches (see above).
     pub(super) decode_view_plan_disabled: bool,
+    /// Master switch for graph-level compute-in-place aliasing.
+    pub(super) compute_in_place_enabled: bool,
+    /// Successful dead-input buffer aliases, retained for parity/safety tests.
+    pub(super) compute_in_place_alias_count: u64,
+    /// Per-plan-node kernel pre-binding (Stage 3). Each slot stores the
+    /// [`KernelKey`] from the most recent successful kernel lookup for that plan
+    /// node. On subsequent dispatch, if the current input shapes match the stored
+    /// key's shapes, the kernel is retrieved via `get_prebound` — a single
+    /// `HashMap::get` with no allocation (the key is already owned). This
+    /// eliminates the 2.15 µs/op dispatch tax (shape-vec allocation + hash) in
+    /// steady-state decode.
+    ///
+    /// Populated lazily: `None` until the first successful dispatch of that node.
+    /// Invalidated (replaced) when shapes change (prefill→decode transition).
+    /// Control-flow and sequence nodes always have `None` (they don't use the
+    /// kernel cache).
+    pub(super) kernel_bindings: Vec<Option<KernelKey>>,
 }
 
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2
@@ -477,6 +494,18 @@ pub(super) fn shape_references_any(shape: &Shape, symbols: &HashSet<SymbolId>) -
 /// construction.
 pub(super) fn decode_memo_env_enabled() -> bool {
     match std::env::var("ONNX_GENAI_DECODE_MEMO") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Whether graph-level compute-in-place aliasing is enabled. Default ON; setting
+/// `ONNX_GENAI_COMPUTE_IN_PLACE=0` retains the fully out-of-place reference path.
+pub(super) fn compute_in_place_env_enabled() -> bool {
+    match std::env::var("ONNX_GENAI_COMPUTE_IN_PLACE") {
         Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off"
