@@ -154,6 +154,19 @@ pub struct RuntimeConfig {
     /// `ONNX_GENAI_METAL_EP_LIB` (`PathBuf`, default: unset): points to the external Metal EP dynamic library.
     /// Also accepts the alias `ONNX_GENAI_MLX_EP_LIBRARY` (set by the Python packages).
     pub metal_ep_lib: Option<PathBuf>,
+    /// `ONNX_GENAI_ORT_LIB` (`PathBuf`, default: unset): points to the exact
+    /// ONNX Runtime shared library file to load before resolving the ORT C API.
+    pub ort_lib: Option<PathBuf>,
+    /// `ONNX_GENAI_ORT_LIB_DIR` (`PathBuf`, default: unset): points to a
+    /// directory containing the ONNX Runtime shared library to load before
+    /// resolving the ORT C API.
+    pub ort_lib_dir: Option<PathBuf>,
+    /// `CONDA_PREFIX` (`PathBuf`, default: unset): active conda environment
+    /// prefix used only for best-effort ORT library auto-discovery.
+    pub conda_prefix: Option<PathBuf>,
+    /// `VIRTUAL_ENV` (`PathBuf`, default: unset): active Python virtual
+    /// environment prefix used only for best-effort ORT library auto-discovery.
+    pub virtual_env: Option<PathBuf>,
     /// `ONNX_GENAI_EP_LIBRARY` (`PathBuf`, default: unset): points to a generic
     /// ORT execution-provider plugin shared library (e.g. the
     /// `onnxruntime-ep-openvino` plugin). Used when `ONNX_GENAI_EP=plugin`.
@@ -285,6 +298,14 @@ impl RuntimeConfig {
             metal_ep_lib: env_path(&lookup, "ONNX_GENAI_METAL_EP_LIB")
                 .filter(|path| !path.as_os_str().is_empty())
                 .or_else(|| env_path(&lookup, "ONNX_GENAI_MLX_EP_LIBRARY"))
+                .filter(|path| !path.as_os_str().is_empty()),
+            ort_lib: env_path(&lookup, "ONNX_GENAI_ORT_LIB")
+                .filter(|path| !path.as_os_str().is_empty()),
+            ort_lib_dir: env_path(&lookup, "ONNX_GENAI_ORT_LIB_DIR")
+                .filter(|path| !path.as_os_str().is_empty()),
+            conda_prefix: env_path(&lookup, "CONDA_PREFIX")
+                .filter(|path| !path.as_os_str().is_empty()),
+            virtual_env: env_path(&lookup, "VIRTUAL_ENV")
                 .filter(|path| !path.as_os_str().is_empty()),
             ep_library: env_path(&lookup, "ONNX_GENAI_EP_LIBRARY")
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -533,6 +554,8 @@ mod tests {
         assert!(!actual.device_kv);
         assert!(!actual.shared_kv_present_binding);
         assert_eq!(actual.metal_ep_lib, None);
+        assert_eq!(actual.ort_lib, None);
+        assert_eq!(actual.ort_lib_dir, None);
         assert!(!actual.profile);
         assert_eq!(actual.trace, None);
         assert_eq!(actual.fim_model_dir, None);
@@ -783,6 +806,10 @@ mod tests {
     fn paths_strings_and_presence_flags_preserve_existing_rules() {
         let actual = config(&[
             ("ONNX_GENAI_METAL_EP_LIB", "/opt/lib/libmlx.dylib"),
+            ("ONNX_GENAI_ORT_LIB", "/opt/ort/lib/libonnxruntime.so.1"),
+            ("ONNX_GENAI_ORT_LIB_DIR", "/opt/ort/lib"),
+            ("CONDA_PREFIX", "/opt/conda/envs/ort"),
+            ("VIRTUAL_ENV", "/opt/venv"),
             ("ONNX_GENAI_TRACE", "trace.json"),
             ("ONNX_GENAI_FIM_MODEL_DIR", ""),
             ("ONNX_GENAI_SPEC_TARGET", "target"),
@@ -797,6 +824,16 @@ mod tests {
             actual.metal_ep_lib,
             Some(PathBuf::from("/opt/lib/libmlx.dylib"))
         );
+        assert_eq!(
+            actual.ort_lib,
+            Some(PathBuf::from("/opt/ort/lib/libonnxruntime.so.1"))
+        );
+        assert_eq!(actual.ort_lib_dir, Some(PathBuf::from("/opt/ort/lib")));
+        assert_eq!(
+            actual.conda_prefix,
+            Some(PathBuf::from("/opt/conda/envs/ort"))
+        );
+        assert_eq!(actual.virtual_env, Some(PathBuf::from("/opt/venv")));
         assert_eq!(actual.trace, Some(PathBuf::from("trace.json")));
         assert_eq!(actual.fim_model_dir, Some(PathBuf::new()));
         assert_eq!(actual.spec_target, Some(PathBuf::from("target")));
@@ -807,8 +844,19 @@ mod tests {
         assert_eq!(actual.mb_target, Some(PathBuf::from("target-only")));
         assert_eq!(actual.mb_prompt, "prompt");
 
-        let empty = config(&[("ONNX_GENAI_METAL_EP_LIB", ""), ("ONNX_GENAI_TRACE", "")]);
+        let empty = config(&[
+            ("ONNX_GENAI_METAL_EP_LIB", ""),
+            ("ONNX_GENAI_ORT_LIB", ""),
+            ("ONNX_GENAI_ORT_LIB_DIR", ""),
+            ("CONDA_PREFIX", ""),
+            ("VIRTUAL_ENV", ""),
+            ("ONNX_GENAI_TRACE", ""),
+        ]);
         assert_eq!(empty.metal_ep_lib, None);
+        assert_eq!(empty.ort_lib, None);
+        assert_eq!(empty.ort_lib_dir, None);
+        assert_eq!(empty.conda_prefix, None);
+        assert_eq!(empty.virtual_env, None);
         assert_eq!(empty.trace, None);
     }
 

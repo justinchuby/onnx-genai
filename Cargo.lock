@@ -2320,6 +2320,8 @@ name = "onnx-genai-ort-sys"
 version = "0.1.0-dev.5"
 dependencies = [
  "bindgen",
+ "libloading 0.8.9",
+ "onnx-genai-runtime-config",
  "sha2",
  "zip",
 ]
