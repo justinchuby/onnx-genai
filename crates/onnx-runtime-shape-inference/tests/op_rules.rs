@@ -279,8 +279,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 165);
-    assert_eq!(registry.entry_count(), 203);
+    assert_eq!(registry.operator_count(), 181);
+    assert_eq!(registry.entry_count(), 219);
 }
 
 #[test]
@@ -4237,4 +4237,327 @@ fn unregistered_op_leaves_output_unresolved() {
     let n = node("SomeExoticOp", 1, 1);
     let outs = run(&n, vec![f32in(vec![c(2), c(3)])], 13);
     assert!(outs[0].type_info.is_none());
+}
+
+// --- Issue #75 catalog extension: ConvTranspose / GridSample / activations /
+//     normalization / generators / Einsum ---------------------------------
+
+fn ints(values: &[i64]) -> Attribute {
+    Attribute::Ints(values.to_vec())
+}
+
+#[test]
+fn conv_transpose_deconvolution_formula_and_channels() {
+    // stride*(input-1) + output_padding + effective_kernel - pads.
+    let mut n = with_attr(node("ConvTranspose", 2, 1), "strides", ints(&[2, 2]));
+    n = with_attr(n, "kernel_shape", ints(&[3, 3]));
+    let out = run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(8), c(4), c(4)]),
+            f32in(vec![c(8), c(16), c(3), c(3)]),
+        ],
+        11,
+    );
+    // channels = W.shape[1] * group(1) = 16; spatial = 2*(4-1)+3 = 9.
+    assert_eq!(out_shape(&out), vec![c(1), c(16), c(9), c(9)]);
+}
+
+#[test]
+fn conv_transpose_kernel_from_weight_and_output_padding() {
+    let n = with_attr(node("ConvTranspose", 2, 1), "output_padding", ints(&[1, 0]));
+    let out = run(
+        &n,
+        vec![
+            f32in(vec![c(1), c(4), c(5), c(5)]),
+            // kernel_shape omitted: taken from W trailing dims [2, 2].
+            f32in(vec![c(4), c(6), c(2), c(2)]),
+        ],
+        11,
+    );
+    // effective_kernel = 2; stride defaults to 1.
+    // dim0 = 1*(5-1)+1(output_padding)+2 = 7; dim1 = 1*(5-1)+0+2 = 6.
+    assert_eq!(out_shape(&out), vec![c(1), c(6), c(7), c(6)]);
+}
+
+#[test]
+fn conv_transpose_output_shape_attr_and_same_pad_and_symbolic() {
+    // Explicit output_shape wins over the formula.
+    let explicit = with_attr(
+        with_attr(node("ConvTranspose", 2, 1), "strides", ints(&[2, 2])),
+        "output_shape",
+        ints(&[10, 12]),
+    );
+    let out = run(
+        &explicit,
+        vec![
+            f32in(vec![c(1), c(3), c(4), c(4)]),
+            f32in(vec![c(3), c(3), c(3), c(3)]),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&out), vec![c(1), c(3), c(10), c(12)]);
+
+    // SAME_UPPER fixes each spatial extent at input*stride.
+    let same = with_attr(
+        with_attr(node("ConvTranspose", 2, 1), "strides", ints(&[2, 3])),
+        "auto_pad",
+        Attribute::String(b"SAME_UPPER".to_vec()),
+    );
+    let out = run(
+        &same,
+        vec![
+            f32in(vec![c(1), c(2), c(4), c(5)]),
+            f32in(vec![c(2), c(2), c(3), c(3)]),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&out), vec![c(1), c(2), c(8), c(15)]);
+
+    // A symbolic spatial input keeps the rank but yields a fresh symbol there.
+    let symbolic = with_attr(node("ConvTranspose", 2, 1), "kernel_shape", ints(&[3, 3]));
+    let out = run(
+        &symbolic,
+        vec![
+            f32in(vec![c(1), c(2), sym(1), c(4)]),
+            f32in(vec![c(2), c(2), c(3), c(3)]),
+        ],
+        11,
+    );
+    let shape = out_shape(&out);
+    assert_symbolic(&shape[2]);
+    assert_eq!(shape[3], c(6)); // 1*(4-1)+3 = 6
+}
+
+#[test]
+fn conv_transpose_is_gated_and_rejects_low_rank() {
+    let n = node("ConvTranspose", 2, 1);
+    assert!(
+        run(
+            &n,
+            vec![
+                f32in(vec![c(1), c(2), c(4), c(4)]),
+                f32in(vec![c(2), c(2), c(3), c(3)])
+            ],
+            0,
+        )[0]
+        .type_info
+        .is_none()
+    );
+    assert!(
+        try_run(
+            &n,
+            vec![f32in(vec![c(1), c(2)]), f32in(vec![c(2), c(2)])],
+            11
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn grid_sample_takes_spatial_from_grid() {
+    let out = run(
+        &node("GridSample", 2, 1),
+        vec![
+            f32in(vec![c(2), c(3), c(8), c(8)]),
+            f32in(vec![c(2), c(10), c(12), c(2)]),
+        ],
+        16,
+    );
+    assert_eq!(out_shape(&out), vec![c(2), c(3), c(10), c(12)]);
+
+    // Symbolic N/C flow through; unresolved grid leaves fresh spatial dims.
+    let out = run(
+        &node("GridSample", 2, 1),
+        vec![f32in(vec![sym(1), c(3), c(8), c(8)])],
+        20,
+    );
+    let shape = out_shape(&out);
+    assert_eq!(shape[0], sym(1));
+    assert_eq!(shape[1], c(3));
+    assert_symbolic(&shape[2]);
+    assert_symbolic(&shape[3]);
+
+    // Gated at opset 16.
+    assert!(
+        run(
+            &node("GridSample", 2, 1),
+            vec![
+                f32in(vec![c(2), c(3), c(8), c(8)]),
+                f32in(vec![c(2), c(4), c(4), c(2)])
+            ],
+            15,
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+#[test]
+fn added_activations_preserve_shape_and_respect_since_version() {
+    for (op, since_version) in [("Shrink", 9), ("Celu", 12), ("HardSwish", 14), ("Mish", 18)] {
+        let input = f32in(vec![sym(2), c(6)]);
+        assert!(
+            run(&node(op, 1, 1), vec![input.clone()], since_version - 1)[0]
+                .type_info
+                .is_none(),
+            "{op} must be gated at {since_version}"
+        );
+        let out = run(&node(op, 1, 1), vec![input], since_version);
+        assert_eq!(out_shape(&out), vec![sym(2), c(6)], "{op}");
+        assert_eq!(out_dtype(&out), DataType::Float32, "{op}");
+    }
+}
+
+#[test]
+fn lrn_mvn_reverse_sequence_are_shape_preserving() {
+    for (op, since_version) in [
+        ("LRN", 1),
+        ("MeanVarianceNormalization", 9),
+        ("ReverseSequence", 10),
+    ] {
+        let n = node(op, if op == "ReverseSequence" { 2 } else { 1 }, 1);
+        let input = tin(DataType::Float32, vec![c(2), sym(3), c(4)]);
+        if since_version > 1 {
+            assert!(
+                run(&n, vec![input.clone()], since_version - 1)[0]
+                    .type_info
+                    .is_none(),
+                "{op} must be gated"
+            );
+        }
+        let out = run(&n, vec![input], since_version);
+        assert_eq!(out_shape(&out), vec![c(2), sym(3), c(4)], "{op}");
+    }
+}
+
+#[test]
+fn random_generators_shape_and_dtype() {
+    // RandomNormal/RandomUniform: shape from attr, dtype override.
+    let n = with_attr(
+        with_attr(node("RandomNormal", 0, 1), "shape", ints(&[2, 3])),
+        "dtype",
+        Attribute::Int(11),
+    );
+    let out = run(&n, vec![], 1);
+    assert_eq!(out_shape(&out), vec![c(2), c(3)]);
+    assert_eq!(out_dtype(&out), DataType::Float64);
+
+    // Default dtype is Float32.
+    let default = with_attr(node("RandomUniform", 0, 1), "shape", ints(&[4]));
+    assert_eq!(out_dtype(&run(&default, vec![], 1)), DataType::Float32);
+
+    // *Like/Bernoulli: mirror input shape, dtype override else input dtype.
+    let like = with_attr(node("RandomNormalLike", 1, 1), "dtype", Attribute::Int(11));
+    let out = run(&like, vec![tin(DataType::Int32, vec![c(3), sym(1)])], 1);
+    assert_eq!(out_shape(&out), vec![c(3), sym(1)]);
+    assert_eq!(out_dtype(&out), DataType::Float64);
+
+    let bernoulli = node("Bernoulli", 1, 1);
+    let out = run(&bernoulli, vec![tin(DataType::Float32, vec![c(5)])], 15);
+    assert_eq!(out_dtype(&out), DataType::Float32);
+    assert!(
+        run(&bernoulli, vec![f32in(vec![c(5)])], 14)[0]
+            .type_info
+            .is_none()
+    );
+}
+
+#[test]
+fn multinomial_batch_by_sample_size() {
+    let n = with_attr(node("Multinomial", 1, 1), "sample_size", Attribute::Int(5));
+    let out = run(&n, vec![f32in(vec![c(4), c(7)])], 7);
+    assert_eq!(out_shape(&out), vec![c(4), c(5)]);
+    assert_eq!(out_dtype(&out), DataType::Int32);
+
+    let as_int64 = with_attr(
+        with_attr(node("Multinomial", 1, 1), "sample_size", Attribute::Int(2)),
+        "dtype",
+        Attribute::Int(7),
+    );
+    let out = run(&as_int64, vec![f32in(vec![sym(1), c(3)])], 7);
+    assert_eq!(out_shape(&out), vec![sym(1), c(2)]);
+    assert_eq!(out_dtype(&out), DataType::Int64);
+
+    // Rank other than [batch, classes] is rejected.
+    assert!(try_run(&node("Multinomial", 1, 1), vec![f32in(vec![c(3)])], 7).is_err());
+}
+
+fn einsum_node(equation: &str, n_in: usize) -> Node {
+    with_attr(
+        node("Einsum", n_in, 1),
+        "equation",
+        Attribute::String(equation.as_bytes().to_vec()),
+    )
+}
+
+#[test]
+fn einsum_matmul_transpose_and_implicit() {
+    // Explicit matmul.
+    let out = run(
+        &einsum_node("ik,kj->ij", 2),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(2), c(4)]);
+
+    // Transpose.
+    let out = run(&einsum_node("ij->ji", 1), vec![f32in(vec![c(2), c(3)])], 12);
+    assert_eq!(out_shape(&out), vec![c(3), c(2)]);
+
+    // Implicit output: once-only labels, alphabetical (i, k).
+    let out = run(
+        &einsum_node("ij,jk", 2),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(2), c(4)]);
+}
+
+#[test]
+fn einsum_ellipsis_broadcasts_batch_dims() {
+    let out = run(
+        &einsum_node("...ij,...jk->...ik", 2),
+        vec![f32in(vec![c(5), c(2), c(3)]), f32in(vec![c(5), c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(5), c(2), c(4)]);
+
+    // A leading 1 broadcasts against a concrete batch extent.
+    let out = run(
+        &einsum_node("...ij,...jk->...ik", 2),
+        vec![f32in(vec![c(1), c(2), c(3)]), f32in(vec![c(6), c(3), c(4)])],
+        12,
+    );
+    assert_eq!(out_shape(&out), vec![c(6), c(2), c(4)]);
+}
+
+#[test]
+fn einsum_symbolic_dims_and_gating() {
+    let out = run(
+        &einsum_node("ik,kj->ij", 2),
+        vec![f32in(vec![sym(1), c(3)]), f32in(vec![c(3), c(4)])],
+        12,
+    );
+    let shape = out_shape(&out);
+    assert_symbolic(&shape[0]);
+    assert_eq!(shape[1], c(4));
+
+    // Gated at opset 12.
+    assert!(
+        run(&einsum_node("ij->ji", 1), vec![f32in(vec![c(2), c(3)])], 11,)[0]
+            .type_info
+            .is_none()
+    );
+
+    // A rank that disagrees with the equation leaves the output unresolved.
+    assert!(
+        run(
+            &einsum_node("ij->ji", 1),
+            vec![f32in(vec![c(2), c(3), c(4)])],
+            12
+        )[0]
+        .type_info
+        .is_none()
+    );
 }

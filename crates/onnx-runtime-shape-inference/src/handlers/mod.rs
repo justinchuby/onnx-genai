@@ -10,7 +10,9 @@ use crate::registry::InferenceRegistry;
 
 mod custom_ops;
 mod data_ops;
+mod einsum;
 mod elementwise;
+mod generator;
 mod linalg;
 mod movement;
 mod norm;
@@ -53,4 +55,6 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     pooling::register(registry);
     selection::register(registry);
     sequence::register(registry);
+    generator::register(registry);
+    einsum::register(registry);
 }
