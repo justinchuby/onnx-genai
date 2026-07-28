@@ -975,20 +975,23 @@ fn arg_reduce_cases(op: &'static str) -> Vec<Case> {
             compare: Compare::ExactBytes,
         });
     }
-    // f16 dtype path (widened to f32 for the comparison, like the CPU oracle).
-    cases.push(Case {
-        label: format!("{op}[Float16,axis-1]"),
-        op,
-        domain: "",
-        opset: 13,
-        inputs: vec![float_input(DataType::Float16, &[2, 4], &values[..8])],
-        outputs: vec![(DataType::Int64, vec![2])],
-        attrs: vec![
-            ("axis", Attribute::Int(-1)),
-            ("keepdims", Attribute::Int(0)),
-        ],
-        compare: Compare::ExactBytes,
-    });
+    // Narrow float dtype paths (widened to f32 for comparison, like the CPU
+    // oracle). Keep both declared CUDA input dtypes exercised.
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        cases.push(Case {
+            label: format!("{op}[{dtype:?},axis-1]"),
+            op,
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(dtype, &[2, 4], &values[..8])],
+            outputs: vec![(DataType::Int64, vec![2])],
+            attrs: vec![
+                ("axis", Attribute::Int(-1)),
+                ("keepdims", Attribute::Int(0)),
+            ],
+            compare: Compare::ExactBytes,
+        });
+    }
     // Tie-break: repeated extremal values along the axis. Default keeps the
     // first index; select_last_index keeps the last — a falsifiable guard on
     // the tie rule (the two cases produce different bytes).
