@@ -351,7 +351,8 @@ impl ExecutionProvider for CpuExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_ep_api::abi::OrtGraphView;
+    use onnx_runtime_ir::{Attribute, FrozenGraph, Graph, NodeId, static_shape};
 
     fn stateful_csa_node(ratio: i64, input_count: usize, output_count: usize) -> Node {
         let mut graph = Graph::new();
@@ -404,6 +405,48 @@ mod tests {
         assert!(ep.initialized);
         ep.shutdown().unwrap();
         assert!(!ep.initialized);
+    }
+
+    #[test]
+    fn graph_view_capabilities_follow_the_cpu_kernel_registry() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = graph.create_value(DataType::Float32, static_shape([2]));
+        let add_out = graph.create_value(DataType::Float32, static_shape([2]));
+        let custom_out = graph.create_value(DataType::Float32, static_shape([2]));
+        let relu_out = graph.create_value(DataType::Float32, static_shape([2]));
+        graph.add_input(input);
+        let add = graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(input), Some(input)],
+            vec![add_out],
+        ));
+        let custom = graph.insert_node(Node::new(
+            NodeId(0),
+            "UnregisteredCustom",
+            vec![Some(add_out)],
+            vec![custom_out],
+        ));
+        let relu = graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(custom_out)],
+            vec![relu_out],
+        ));
+        graph.add_output(relu_out);
+
+        let frozen = FrozenGraph::build(graph).unwrap();
+        let view = frozen.view();
+        let ep = CpuExecutionProvider::new();
+        let claims = OrtGraphView::new(&view).query_capabilities(&ep);
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].node_ids, vec![add]);
+        assert_eq!(claims[1].node_ids, vec![relu]);
+        assert!(ep.registry().supports("Add", "", 17));
+        assert!(!ep.registry().supports("UnregisteredCustom", "", 17));
+        assert!(ep.registry().supports("Relu", "", 17));
+        assert!(!claims.iter().any(|claim| claim.node_ids.contains(&custom)));
     }
 
     #[test]
