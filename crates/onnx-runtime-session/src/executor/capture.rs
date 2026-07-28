@@ -513,6 +513,12 @@ impl Executor {
                 || self.graph.initializers.contains_key(&vid)
                 || self.sequence_values.contains(&vid)
             {
+                // CUDA phase (P5): an overridable optional input is
+                // initializer-backed and so is skipped here today. When device
+                // capture lands, an override fed as a `DeviceIoBinding` must join
+                // the persistent-binding set and its rank/address must enter the
+                // device-graph capture signature, so a rank change re-arms
+                // capture instead of replaying stale geometry.
                 continue;
             }
             self.capture_warm_seeded.insert(vid, shape.clone());

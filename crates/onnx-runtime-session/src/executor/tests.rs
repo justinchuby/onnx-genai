@@ -1145,6 +1145,7 @@ fn cuda_decline_warns_and_falls_back_to_cpu_unless_strict() {
         Arc::new(WeightStore::new()),
         cuda_ep(),
         false,
+        &HashSet::new(),
     )
     .expect("default CUDA decline must use the CPU fallback");
     assert_eq!(exec.device_id().device_type, DeviceType::Cpu);
@@ -1162,6 +1163,7 @@ fn cuda_decline_warns_and_falls_back_to_cpu_unless_strict() {
         Arc::new(WeightStore::new()),
         cuda_ep(),
         true,
+        &HashSet::new(),
     )
     .err()
     .expect("strict CUDA must reject CPU fallback");
@@ -2896,4 +2898,350 @@ fn decode_view_plan_rebuilds_on_source_buffer_move() {
     // or a self-healed reallocation), never left dangling.
     let healed = on.buffers.get(&ymul).expect("ymul rebound").as_ptr() as usize;
     assert!(healed == moved_ptr || healed != 0, "ymul must be backed");
+}
+
+// ===========================================================================
+// Overridable optional input — design §B.3 / Phase-1 (P1) test matrix.
+//
+// These exercise the general "overridable optional input" executor mechanism
+// (an initializer-backed graph input that keeps a declared dynamic dim, carries
+// a concrete default when unfed, and accepts a different-rank override when fed
+// by name). The synthetic graph mirrors a LoRA delta branch but nothing here is
+// LoRA-specific — it is a plain MatMul → MatMul → Add over override inputs.
+// ===========================================================================
+
+/// Little-endian f32 bytes for an inline initializer / tensor.
+fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// Reference `Y = base + (x @ A_t) @ B_t` computed on the host in f64, with the
+/// r=0 (unfed) case collapsing the delta to zero so `Y == base`.
+fn reference_output(
+    m: usize,
+    k: usize,
+    n: usize,
+    r: usize,
+    x: &[f32],
+    base: &[f32],
+    a_t: &[f32],
+    b_t: &[f32],
+) -> Vec<f32> {
+    let mut out = base.to_vec();
+    // rmid[m, r] = x[m, k] @ A_t[k, r]
+    let mut rmid = vec![0.0f64; m * r];
+    for i in 0..m {
+        for j in 0..r {
+            let mut acc = 0.0f64;
+            for p in 0..k {
+                acc += x[i * k + p] as f64 * a_t[p * r + j] as f64;
+            }
+            rmid[i * r + j] = acc;
+        }
+    }
+    // delta[m, n] = rmid[m, r] @ B_t[r, n]
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f64;
+            for p in 0..r {
+                acc += rmid[i * r + p] * b_t[p * n + j] as f64;
+            }
+            out[i * n + j] += acc as f32;
+        }
+    }
+    out
+}
+
+/// Build a small graph exercising two overridable optional inputs feeding a
+/// LoRA-shaped delta branch:
+///
+///   rmid  = MatMul(x, A_t)      // [M, r]
+///   delta = MatMul(rmid, B_t)   // [M, N]
+///   Y     = Add(base, delta)    // [M, N]
+///
+/// `A_t` is declared `[K, sym("lora_r")]` with default `[K, 0]`; `B_t` is
+/// declared `[sym("lora_r"), N]` with default `[0, N]`. `base` is a plain
+/// constant standing in for the untouched base projection's output. Returns the
+/// graph and the explicit override id set (the opt-in classification).
+fn build_override_graph(
+    m: usize,
+    k: usize,
+    n: usize,
+    base: &[f32],
+) -> (Graph, HashSet<ValueId>) {
+    use onnx_runtime_ir::{TensorData, static_shape};
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let r = graph.intern_symbol("lora_r");
+
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([m, k]));
+    graph.add_input(x);
+
+    let base_v = graph.create_named_value("base", DataType::Float32, static_shape([m, n]));
+    graph.set_initializer(
+        base_v,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Float32,
+            vec![m, n],
+            f32_le_bytes(base),
+        )),
+    );
+
+    // A_t: overridable optional input, declared [K, r], default [K, 0].
+    let a_t = graph.create_named_value(
+        "A_t",
+        DataType::Float32,
+        vec![Dim::Static(k), Dim::Symbolic(r)],
+    );
+    graph.add_input(a_t);
+    graph.set_initializer(
+        a_t,
+        WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![k, 0], Vec::new())),
+    );
+
+    // B_t: overridable optional input, declared [r, N], default [0, N].
+    let b_t = graph.create_named_value(
+        "B_t",
+        DataType::Float32,
+        vec![Dim::Symbolic(r), Dim::Static(n)],
+    );
+    graph.add_input(b_t);
+    graph.set_initializer(
+        b_t,
+        WeightRef::Inline(TensorData::from_raw(DataType::Float32, vec![0, n], Vec::new())),
+    );
+
+    let rmid = graph.create_named_value(
+        "rmid",
+        DataType::Float32,
+        vec![Dim::Static(m), Dim::Symbolic(r)],
+    );
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(x), Some(a_t)],
+        vec![rmid],
+    ));
+
+    let delta = graph.create_named_value("delta", DataType::Float32, static_shape([m, n]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(rmid), Some(b_t)],
+        vec![delta],
+    ));
+
+    let y = graph.create_named_value("Y", DataType::Float32, static_shape([m, n]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(base_v), Some(delta)],
+        vec![y],
+    ));
+    graph.add_output(y);
+
+    (graph, HashSet::from([a_t, b_t]))
+}
+
+// unfed → default: with no override fed, the declared symbol resolves from the
+// default shape (r = 0), the delta MatMul is an empty-inner-dim no-op, and Y is
+// bit-identical to the base-only baseline.
+#[test]
+fn optional_override_unfed_falls_back_to_default() {
+    let (m, k, n) = (2, 4, 3);
+    let base = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let (graph, overrides) = build_override_graph(m, k, n, &base);
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+
+    // The override set is registered; A_t/B_t are feedable but NOT required.
+    assert_eq!(exec.optional_overrides.len(), 2);
+    assert!(exec.input_index.contains_key("A_t"));
+    assert!(exec.input_index.contains_key("B_t"));
+    let required: HashSet<ValueId> = exec.required_inputs.iter().copied().collect();
+    let a_t = exec.input_index["A_t"];
+    let b_t = exec.input_index["B_t"];
+    assert!(!required.contains(&a_t), "an override must not be required");
+    assert!(!required.contains(&b_t), "an override must not be required");
+
+    let x = Tensor::from_f32(&[m, k], &[1.0, 0.0, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0]).unwrap();
+    let outputs = exec.run(&[("x", &x)]).unwrap();
+    assert_eq!(outputs[0].to_vec_f32(), base.to_vec());
+}
+
+// host override: feeding real-rank A_t/B_t by name binds the symbol, resizes the
+// owned buffers, and produces Y = base + (x @ A_t) @ B_t.
+#[test]
+fn optional_override_host_feed_binds_and_resizes() {
+    let (m, k, n) = (2, 4, 3);
+    let base = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let (graph, overrides) = build_override_graph(m, k, n, &base);
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+
+    let r = 8usize;
+    let x_vals = [1.0f32, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a_vals: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 1.0).collect();
+    let b_vals: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.3).collect();
+
+    let x = Tensor::from_f32(&[m, k], &x_vals).unwrap();
+    let a_t = Tensor::from_f32(&[k, r], &a_vals).unwrap();
+    let b_t = Tensor::from_f32(&[r, n], &b_vals).unwrap();
+    let outputs = exec
+        .run(&[("x", &x), ("A_t", &a_t), ("B_t", &b_t)])
+        .unwrap();
+
+    let expected = reference_output(m, k, n, r, &x_vals, &base, &a_vals, &b_vals);
+    let got = outputs[0].to_vec_f32();
+    for (g, e) in got.iter().zip(&expected) {
+        assert!((g - e).abs() < 1e-3, "got {got:?} expected {expected:?}");
+    }
+    // The owned override buffer was resized to the fed extent.
+    assert_eq!(exec.buffer_shapes[&exec.input_index["A_t"]], vec![k, r]);
+}
+
+// override → default restoration: a fed run followed by an unfed run must
+// restore the default bytes exactly, leaving no residual adapter state.
+#[test]
+fn optional_override_restores_default_after_feed() {
+    let (m, k, n) = (2, 4, 3);
+    let base = [7.0f32, 8.0, 9.0, 1.0, 2.0, 3.0];
+    let (graph, overrides) = build_override_graph(m, k, n, &base);
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+
+    let r = 8usize;
+    let x_vals = [1.0f32, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a_vals: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.2 - 0.5).collect();
+    let b_vals: Vec<f32> = (0..r * n).map(|i| (i as f32) * 0.05 - 0.1).collect();
+    let x = Tensor::from_f32(&[m, k], &x_vals).unwrap();
+
+    // Fed run: non-trivial delta.
+    let a_t = Tensor::from_f32(&[k, r], &a_vals).unwrap();
+    let b_t = Tensor::from_f32(&[r, n], &b_vals).unwrap();
+    let fed = exec
+        .run(&[("x", &x), ("A_t", &a_t), ("B_t", &b_t)])
+        .unwrap()[0]
+        .to_vec_f32();
+    let fed_expected = reference_output(m, k, n, r, &x_vals, &base, &a_vals, &b_vals);
+    for (g, e) in fed.iter().zip(&fed_expected) {
+        assert!((g - e).abs() < 1e-3);
+    }
+    assert_ne!(fed, base.to_vec(), "the fed run must produce a real delta");
+
+    // Subsequent unfed run: defaults reinstated, delta collapses to zero.
+    let restored = exec.run(&[("x", &x)]).unwrap()[0].to_vec_f32();
+    assert_eq!(
+        restored,
+        base.to_vec(),
+        "an unfed run after a fed run must restore the default (base-only) output"
+    );
+    assert_eq!(exec.buffer_shapes[&exec.input_index["A_t"]], vec![k, 0]);
+}
+
+// rank change: feeding r=8 then r=16 rebinds the declared symbol and resizes the
+// owned buffers each time without error and with correct output.
+#[test]
+fn optional_override_rank_change_rebinds_and_resizes() {
+    let (m, k, n) = (2, 4, 3);
+    let base = [0.0f32; 6];
+    let (graph, overrides) = build_override_graph(m, k, n, &base);
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+
+    let x_vals = [1.0f32, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let x = Tensor::from_f32(&[m, k], &x_vals).unwrap();
+
+    for &r in &[8usize, 16usize] {
+        let a_vals: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.03 - 0.4).collect();
+        let b_vals: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.02 + 0.2).collect();
+        let a_t = Tensor::from_f32(&[k, r], &a_vals).unwrap();
+        let b_t = Tensor::from_f32(&[r, n], &b_vals).unwrap();
+        let got = exec
+            .run(&[("x", &x), ("A_t", &a_t), ("B_t", &b_t)])
+            .unwrap()[0]
+            .to_vec_f32();
+        let expected = reference_output(m, k, n, r, &x_vals, &base, &a_vals, &b_vals);
+        for (g, e) in got.iter().zip(&expected) {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "r={r}: got {got:?} expected {expected:?}"
+            );
+        }
+        assert_eq!(exec.buffer_shapes[&exec.input_index["A_t"]], vec![k, r]);
+    }
+}
+
+// byte-identity: a graph with NO override values built through the override
+// entry point (with an empty set) is indistinguishable from the default build
+// path — same required inputs, no override descriptors, identical output.
+#[test]
+fn optional_override_empty_set_is_byte_identical_to_baseline() {
+    use onnx_runtime_ir::static_shape;
+
+    fn plain_add_graph() -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let a = graph.create_named_value("a", DataType::Float32, static_shape([3]));
+        let b = graph.create_named_value("b", DataType::Float32, static_shape([3]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let sum = graph.create_named_value("sum", DataType::Float32, static_shape([3]));
+        graph.insert_node(Node::new(NodeId(0), "Add", vec![Some(a), Some(b)], vec![sum]));
+        graph.add_output(sum);
+        (graph, a, b)
+    }
+
+    let (g_base, _, _) = plain_add_graph();
+    let mut baseline = Executor::build(
+        g_base,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let (g_over, _, _) = plain_add_graph();
+    let mut through_override = Executor::build_with_overrides(
+        g_over,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+
+    // No overrides classified, and the required-input contract is unchanged.
+    assert!(through_override.optional_overrides.is_empty());
+    assert!(baseline.optional_overrides.is_empty());
+    assert_eq!(
+        baseline.required_inputs.len(),
+        through_override.required_inputs.len()
+    );
+
+    let a = Tensor::from_f32(&[3], &[1.0, 2.0, 3.0]).unwrap();
+    let b = Tensor::from_f32(&[3], &[10.0, 20.0, 30.0]).unwrap();
+    let base_out = baseline.run(&[("a", &a), ("b", &b)]).unwrap()[0].to_vec_f32();
+    let over_out = through_override.run(&[("a", &a), ("b", &b)]).unwrap()[0].to_vec_f32();
+    assert_eq!(base_out, over_out);
+    assert_eq!(base_out, vec![11.0, 22.0, 33.0]);
 }

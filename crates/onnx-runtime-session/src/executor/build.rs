@@ -407,6 +407,35 @@ impl Executor {
             weights,
             ep,
             onnx_genai_runtime_config::runtime_config().require_cuda,
+            &HashSet::new(),
+        )
+    }
+
+    /// Like [`Self::build`], but registers `override_ids` as **overridable
+    /// optional inputs** (design §B.3): each such value must be both a graph
+    /// input and an initializer; it keeps its declared (symbolic) shape, carries
+    /// its initializer bytes as an owned default, and becomes feedable by name at
+    /// run time. `override_ids` is the explicit, opt-in classification — nothing
+    /// is inferred structurally — so a graph with an empty set (the default
+    /// [`Self::build`] path) is byte-for-byte identical to before this class
+    /// existed. The native-LoRA injection pass (P2) is the production producer of
+    /// this set; the executor stays LoRA-agnostic.
+    // P1 defines this executor entry point; the production consumer is the P2
+    // native-LoRA injection pass. Until then it is exercised only by the
+    // executor's own P1 override tests, so silence the not-yet-wired warning.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn build_with_overrides(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        ep: Arc<dyn ExecutionProvider>,
+        override_ids: &HashSet<ValueId>,
+    ) -> Result<Self> {
+        Self::build_with_cuda_requirement(
+            graph,
+            weights,
+            ep,
+            onnx_genai_runtime_config::runtime_config().require_cuda,
+            override_ids,
         )
     }
 
@@ -415,6 +444,7 @@ impl Executor {
         weights: Arc<WeightStore>,
         mut ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
+        override_ids: &HashSet<ValueId>,
     ) -> Result<Self> {
         let execution_provider_fallback_report =
             Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
@@ -433,8 +463,14 @@ impl Executor {
             handles
         };
 
-        let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes) =
-            Self::materialize_initializers(&graph, &weights, ep.as_ref(), &weight_handles)?;
+        let (mut value_shapes, mut value_dtypes, buffers, buffer_shapes, optional_overrides) =
+            Self::materialize_initializers(
+                &graph,
+                &weights,
+                ep.as_ref(),
+                &weight_handles,
+                override_ids,
+            )?;
 
         // 2) Record the loader shape + dtype of every remaining value (graph
         //    inputs and node outputs). No allocation yet — shapes may be
@@ -449,7 +485,8 @@ impl Executor {
         let plan = Self::build_node_plan(&graph, &order, &value_dtypes, has_symbols);
 
         // 4) name → value id and the set of caller-required inputs.
-        let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
+        let (input_index, required_inputs, name_index) =
+            Self::build_name_indexes(&graph, override_ids);
 
         let mut exec = Self {
             graph,
@@ -463,6 +500,7 @@ impl Executor {
             plan,
             input_index,
             required_inputs,
+            optional_overrides,
             has_symbols,
             cache: KernelCache::default(),
             name_index,
@@ -686,16 +724,19 @@ impl Executor {
         weights: &Arc<WeightStore>,
         ep: &dyn ExecutionProvider,
         weight_handles: &HashMap<ValueId, WeightHandle>,
+        override_ids: &HashSet<ValueId>,
     ) -> Result<(
         HashMap<ValueId, Shape>,
         HashMap<ValueId, DataType>,
         HashMap<ValueId, DeviceBuffer>,
         HashMap<ValueId, Vec<usize>>,
+        HashMap<ValueId, OptionalOverride>,
     )> {
         let mut value_shapes: HashMap<ValueId, Shape> = HashMap::new();
         let mut value_dtypes: HashMap<ValueId, DataType> = HashMap::new();
         let mut buffers: HashMap<ValueId, DeviceBuffer> = HashMap::new();
         let mut buffer_shapes: HashMap<ValueId, Vec<usize>> = HashMap::new();
+        let mut optional_overrides: HashMap<ValueId, OptionalOverride> = HashMap::new();
 
         let init_align = TensorLayout::contiguous().alignment;
         let mut initializer_span = trace_span("session.initializer_buffers", "session");
@@ -707,8 +748,17 @@ impl Executor {
         for (&vid, weight) in &graph.initializers {
             let dtype = weight.dtype();
             let dims = weight.dims().to_vec();
+            // An overridable optional input keeps its DECLARED (symbolic) shape
+            // rather than adopting the initializer's concrete dims, so a later
+            // run can bind the override dimension to a different extent. The
+            // concrete dims become its DEFAULT shape instead (stashed below).
+            let is_override = override_ids.contains(&vid);
             value_dtypes.insert(vid, dtype);
-            value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
+            if is_override {
+                value_shapes.insert(vid, graph.value(vid).shape.clone());
+            } else {
+                value_shapes.insert(vid, dims.iter().map(|&d| Dim::Static(d)).collect());
+            }
             if !ep.device_id().is_host_accessible() && weight_handles.contains_key(&vid) {
                 if initializer_span.is_some() {
                     lazy_initializers += 1;
@@ -730,6 +780,12 @@ impl Executor {
             // giving it a producer — a kernel would then write through
             // `as_mut_ptr()` into read-only mmap (SIGSEGV / aliasing UB). In
             // that case fall back to the owned writable copy below.
+            //
+            // An overridable optional input is NEVER borrowed: the per-run
+            // override path resizes and rewrites its buffer, which would be
+            // undefined behaviour against read-only mmap/inline storage. It
+            // always takes the owned-copy path so the default bytes live in a
+            // writable, resizable allocation.
             let producer_less = graph.value(vid).producer.is_none();
             let borrow_align = if matches!(weight, WeightRef::External { .. }) {
                 host_dtype_alignment(dtype)
@@ -738,6 +794,7 @@ impl Executor {
             };
             let buf = if ep.device_id().is_host_accessible()
                 && producer_less
+                && !is_override
                 && !bytes.is_empty()
                 && (bytes.as_ptr() as usize).is_multiple_of(borrow_align)
             {
@@ -767,6 +824,23 @@ impl Executor {
                 ep.copy_from_host(bytes, &mut owned)?;
                 owned
             };
+            if is_override {
+                let name = graph
+                    .value(vid)
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("value#{}", vid.0));
+                optional_overrides.insert(
+                    vid,
+                    OptionalOverride {
+                        name,
+                        dtype,
+                        declared_shape: graph.value(vid).shape.clone(),
+                        default_shape: dims.clone(),
+                        default_bytes: Arc::from(bytes.to_vec().into_boxed_slice()),
+                    },
+                );
+            }
             buffer_shapes.insert(vid, dims);
             buffers.insert(vid, buf);
         }
@@ -781,7 +855,13 @@ impl Executor {
                     .with("buffers", buffers.len() as u64),
             );
         }
-        Ok((value_shapes, value_dtypes, buffers, buffer_shapes))
+        Ok((
+            value_shapes,
+            value_dtypes,
+            buffers,
+            buffer_shapes,
+            optional_overrides,
+        ))
     }
 
     /// Record the loader shape + dtype of every remaining value (graph inputs
@@ -915,8 +995,14 @@ impl Executor {
     /// caller-required inputs (graph inputs that are not pre-filled
     /// initializers), plus the full name → value id map over every named value
     /// (used to resolve a nested subgraph's outer-scope captures by name).
+    ///
+    /// An overridable optional input (a member of `override_ids`, which is a
+    /// graph input that is also an initializer) is registered in `input_index`
+    /// so it is feedable by name, but is kept OUT of `required_inputs` because
+    /// feeding it is optional — when unfed it falls back to its default bytes.
     fn build_name_indexes(
         graph: &Graph,
+        override_ids: &HashSet<ValueId>,
     ) -> (
         HashMap<String, ValueId>,
         Vec<ValueId>,
@@ -926,7 +1012,14 @@ impl Executor {
         let mut required_inputs = Vec::new();
         for &vid in &graph.inputs {
             if graph.initializers.contains_key(&vid) {
-                continue; // pre-filled; not a caller input
+                if override_ids.contains(&vid) {
+                    // Overridable optional input: feedable by name, but not
+                    // required — the default bytes stand in when unfed.
+                    if let Some(name) = &graph.value(vid).name {
+                        input_index.insert(name.clone(), vid);
+                    }
+                }
+                continue; // pre-filled; not a required caller input
             }
             required_inputs.push(vid);
             if let Some(name) = &graph.value(vid).name {
@@ -1382,7 +1475,13 @@ impl Executor {
     ) -> Result<()> {
         let vids: Vec<ValueId> = self.value_shapes.keys().copied().collect();
         for vid in vids {
-            if self.graph.initializers.contains_key(&vid) || excluded.contains(&vid) {
+            // An overridable optional input is an initializer but must still be
+            // sized per run: a fed override resizes it to the override extent and
+            // an unfed run resizes it back to its default shape. Only plain
+            // initializers are size-exempt (their buffer is fixed at build).
+            let plain_initializer = self.graph.initializers.contains_key(&vid)
+                && !self.optional_overrides.contains_key(&vid);
+            if plain_initializer || excluded.contains(&vid) {
                 continue;
             }
             // Sequence-typed values own no tensor buffer (their list lives in
@@ -1448,7 +1547,17 @@ impl Executor {
             let constant_inputs: Vec<bool> = self.plan[i]
                 .inputs
                 .iter()
-                .map(|input| input.is_some_and(|vid| self.graph.initializers.contains_key(&vid)))
+                .map(|input| {
+                    input.is_some_and(|vid| {
+                        // An overridable optional input is initializer-backed but
+                        // NOT constant: its bytes change when an override is fed,
+                        // so a kernel must never precompute against it (e.g. a
+                        // packed/transposed weight would go stale on the next
+                        // override).
+                        self.graph.initializers.contains_key(&vid)
+                            && !self.optional_overrides.contains_key(&vid)
+                    })
+                })
                 .collect();
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);

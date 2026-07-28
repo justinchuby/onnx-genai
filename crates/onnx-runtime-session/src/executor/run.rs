@@ -301,6 +301,36 @@ impl Executor {
                 .expect("input value has a buffer");
             self.ep.copy_from_host(tensor.as_bytes(), buf)?;
         }
+
+        // --- Reinstate defaults for every UNFED overridable optional input ---
+        // A fed override was just bound above; an absent one must be restored to
+        // its default bytes so no adapter state from a prior fed run leaks
+        // forward. Its buffer was already resized to the default shape by the
+        // sizing pass above (its symbol was seeded from `default_shape`), so this
+        // only rewrites the bytes. Gated on a non-empty override set — a graph
+        // without overrides never enters this loop.
+        if !self.optional_overrides.is_empty() {
+            let mut fed: HashSet<ValueId> = inputs
+                .iter()
+                .map(|(name, _)| self.input_index[*name])
+                .collect();
+            fed.extend(external.inputs.keys().copied());
+            // CUDA phase (P5): a device-bound override is reinstated through its
+            // persistent device binding, not this host copy path.
+            let restores: Vec<(ValueId, Arc<[u8]>)> = self
+                .optional_overrides
+                .iter()
+                .filter(|(vid, _)| !fed.contains(vid))
+                .map(|(&vid, over)| (vid, Arc::clone(&over.default_bytes)))
+                .collect();
+            for (vid, default_bytes) in restores {
+                let buf = self
+                    .buffers
+                    .get_mut(&vid)
+                    .expect("overridable optional input has a buffer");
+                self.ep.copy_from_host(&default_bytes, buf)?;
+            }
+        }
         Ok(())
     }
 

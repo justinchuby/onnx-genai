@@ -354,6 +354,11 @@ impl Executor {
 
         let ep = self.ep.clone();
 
+        // An overridable optional input is initializer-backed but is fed a fresh
+        // tensor per run, so it must never be treated as a constant input (a
+        // kernel could otherwise pack/transpose it once and replay stale bytes).
+        let overrides = &self.optional_overrides;
+
         // Bind the mutated fields as disjoint borrows so `self` is never borrowed
         // whole while the kernel (from `cache`) and the buffers/views are held.
         // `cache` is kept as a separate local because the resolved kernel
@@ -396,11 +401,12 @@ impl Executor {
             .iter()
             .map(|input| {
                 input.is_some_and(|vid| {
-                    ctx.graph.initializers.contains_key(&vid)
-                        || ctx
-                            .views_meta
-                            .get(&vid)
-                            .is_some_and(|view| ctx.graph.initializers.contains_key(&view.source))
+                    !overrides.contains_key(&vid)
+                        && (ctx.graph.initializers.contains_key(&vid)
+                            || ctx.views_meta.get(&vid).is_some_and(|view| {
+                                ctx.graph.initializers.contains_key(&view.source)
+                                    && !overrides.contains_key(&view.source)
+                            }))
                 })
             })
             .collect();
