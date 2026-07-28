@@ -155,7 +155,7 @@ fn clip_f32_neon(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
             i += 4;
         }
         while i < n {
-            dst[i] = src[i].max(minimum).min(maximum);
+            dst[i] = clamp_nan_propagating(src[i], minimum, maximum);
             i += 1;
         }
     }
@@ -164,8 +164,17 @@ fn clip_f32_neon(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
 #[cfg(not(target_arch = "aarch64"))]
 fn clip_f32_scalar(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
     for (d, &s) in dst.iter_mut().zip(src.iter()) {
-        *d = s.max(minimum).min(maximum);
+        *d = clamp_nan_propagating(s, minimum, maximum);
     }
+}
+
+/// NaN-propagating clamp matching the old `clip_typed<T>` PartialOrd semantics
+/// and the aarch64 NEON `FMAX`/`FMIN` instruction behaviour. If `x` is NaN,
+/// both comparisons are false and NaN passes through unchanged.
+#[inline(always)]
+fn clamp_nan_propagating(x: f32, minimum: f32, maximum: f32) -> f32 {
+    let x = if x < minimum { minimum } else { x };
+    if x > maximum { maximum } else { x }
 }
 
 #[cfg(feature = "mlas")]
@@ -1083,13 +1092,15 @@ mod tests {
 
     /// Documents the NaN semantics of the fast Clip path.
     ///
-    /// On aarch64: `vmaxq_f32`/`vminq_f32` propagate NaN (same as the old scalar
-    /// `PartialOrd` reference). NaN behaviour is **unchanged** on macOS.
+    /// NaN propagates on all platforms, matching the old `clip_typed<T>` behaviour
+    /// which used `PartialOrd` comparisons (NaN < x and NaN > x are both false,
+    /// so both clamp arms are skipped and NaN passes through).
     ///
-    /// On non-aarch64: the scalar fallback uses `f32::max`/`f32::min` which are
-    /// NaN-suppressing (IEEE 754-2008 `maxNum`/`minNum`). This differs from the
-    /// old `PartialOrd` reference but matches MLAS. ONNX Clip spec does not
-    /// define NaN behaviour, so both are conformant.
+    /// On aarch64 the NEON bulk uses `FMAX`/`FMIN` (NaN-propagating). The scalar
+    /// tail and non-aarch64 fallback use explicit PartialOrd comparisons via
+    /// `clamp_nan_propagating`. This guarantees identical NaN semantics across
+    /// all targets and is a no-behaviour-change from the old path on every
+    /// supported platform.
     #[test]
     fn clip_f32_fast_path_nan_semantics() {
         let before = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
@@ -1110,32 +1121,11 @@ mod tests {
             "fast path did not fire for NaN test: before={before} after={after}"
         );
         let result = y.to_f32();
-        // On aarch64: vmaxq/vminq propagate NaN (unchanged from old PartialOrd reference).
-        // On non-aarch64: f32::max/min suppress NaN to min (matches MLAS).
-        #[cfg(target_arch = "aarch64")]
-        {
-            assert!(
-                result[0].is_nan(),
-                "aarch64: NaN propagates through vmaxq/vminq"
-            );
-            assert_eq!(result[1], 1.0);
-            assert!(
-                result[2].is_nan(),
-                "aarch64: NaN propagates through vmaxq/vminq"
-            );
-            assert!(
-                result[3].is_nan(),
-                "aarch64: -NaN propagates through vmaxq/vminq"
-            );
-            assert_eq!(result[4], 3.0);
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            assert_eq!(result[0], 0.0, "non-aarch64: NaN suppressed to min");
-            assert_eq!(result[1], 1.0);
-            assert_eq!(result[2], 0.0, "non-aarch64: NaN suppressed to min");
-            assert_eq!(result[3], 0.0, "non-aarch64: -NaN suppressed to min");
-            assert_eq!(result[4], 3.0);
-        }
+        // NaN propagates on all platforms — no behaviour change from old path.
+        assert!(result[0].is_nan(), "NaN must propagate (index 0)");
+        assert_eq!(result[1], 1.0);
+        assert!(result[2].is_nan(), "NaN must propagate (index 2)");
+        assert!(result[3].is_nan(), "-NaN must propagate (index 3)");
+        assert_eq!(result[4], 3.0);
     }
 }
