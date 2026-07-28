@@ -233,6 +233,13 @@ struct EngineArgs {
     /// Host RAM ceiling for the warm offload tier, in the same format.
     #[arg(long, value_name = "LIMIT", value_parser = parse_limit)]
     host_ram_limit: Option<onnx_genai::engine::ResourceLimit>,
+
+    /// PEFT LoRA adapter directory to preload and activate for the session
+    /// (native backend only). The adapter's delta is injected at graph-build
+    /// time and applied to every decode step until deactivated. Selecting an
+    /// adapter forces the native decode backend.
+    #[arg(long, value_name = "PATH")]
+    adapter: Option<std::path::PathBuf>,
 }
 
 impl EngineArgs {
@@ -246,6 +253,14 @@ impl EngineArgs {
         }
         if let Some(limit) = self.host_ram_limit {
             config.limits.host_ram_limit = limit;
+        }
+        if let Some(adapter) = self.adapter.as_ref() {
+            config.lora_adapter = Some(adapter.clone());
+            // A LoRA adapter is a native-runtime feature; select the native
+            // backend unless the user explicitly asked for a different one.
+            if matches!(self.backend, EngineDecodeBackend::Auto) {
+                config.decode_backend = EngineDecodeBackend::Native;
+            }
         }
         config
     }

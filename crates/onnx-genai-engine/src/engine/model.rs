@@ -38,6 +38,12 @@ pub struct Engine {
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
+    /// Native-LoRA manager (design §D, **P4**). Owns the decoded PEFT adapter
+    /// for a single-fixed-adapter session and records the active selection.
+    /// `None` when no adapter was configured. Present so engine-level
+    /// activate/deactivate can toggle the injected override buffers.
+    #[cfg(feature = "native-backend")]
+    pub(crate) lora_manager: Option<crate::lora::manager::LoraManager>,
     /// Optional draft model used by the speculative decoding path.
     pub(crate) draft: Option<DraftModel>,
     /// Optional MTP head and target-side projections.

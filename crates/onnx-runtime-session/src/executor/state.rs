@@ -248,6 +248,18 @@ pub(crate) struct Executor {
     pub(super) decode_view_plan_sig_mismatch_streak: u32,
     /// Latched off after repeated signature mismatches (see above).
     pub(super) decode_view_plan_disabled: bool,
+    /// Native-LoRA (design §D) persistent active-adapter feeds: named
+    /// `A_t`/`B_t` overridable-optional-input values bound on **every** run
+    /// while [`Self::overrides_active`] is set, so a single fixed adapter stays
+    /// applied across all decode steps without the caller re-feeding it. Each
+    /// name is validated at install time to be a registered overridable optional
+    /// input. Empty (and inert) for every session without an installed adapter,
+    /// so the non-LoRA run path is byte-identical.
+    pub(super) override_feeds: Vec<(String, Tensor)>,
+    /// Whether [`Self::override_feeds`] are bound this run. Toggled by
+    /// activate/deactivate; when `false` the injected branches fall back to their
+    /// zero-rank defaults (base-only).
+    pub(super) overrides_active: bool,
 }
 
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2

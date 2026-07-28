@@ -1342,6 +1342,43 @@
       ],
       "type": "object"
     },
+    "LoraCapabilities": {
+      "description": "Author-declared LoRA adapter capabilities for a model (design §G).\n\nThis is the metadata contract only — it declares intent and defaults; the\nruntime still discovers and validates each adapter against the actual graph\n(target manifest, §C) before applying it.",
+      "properties": {
+        "available": {
+          "description": "Adapter directories or package-relative paths shipped with the model.\n\nEach entry is a PEFT adapter (an `adapter_config.json` plus its\n`adapter_model.safetensors`). Absent or empty means the model declares no\nbundled adapters.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "default": {
+          "default": null,
+          "description": "The adapter applied by default when a session does not select one, given\nas an entry of [`available`](Self::available). Absent means base-only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supports_hot_swap": {
+          "default": null,
+          "description": "Whether the model supports swapping the active adapter without rebuilding\nthe session. Phase 1 is single-fixed-adapter, so a reader may treat an\nabsent value as `false`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "target_module_policy": {
+          "default": null,
+          "description": "Author policy describing which module types the shipped adapters target\n(for example `\"attention_projections\"` or `\"all_linear\"`). Advisory only:\nthe runtime derives the authoritative target set from the graph.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "MixtureOfExpertsSpec": {
       "description": "Explicit sparse mixture-of-experts structure and graph representation.",
       "properties": {
@@ -3901,6 +3938,17 @@
   ],
   "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
   "properties": {
+    "adapters": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LoraCapabilities"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Author-declared LoRA adapter capabilities (native LoRA design §G).\n\nPurely additive: declares which PEFT adapters ship with the model, an\noptional default, the target-module policy, and hot-swap support. Absent\nmeans the model declares no bundled adapters. The runtime still validates\nevery adapter against the actual graph before applying it."
+    },
     "generation": {
       "anyOf": [
         {

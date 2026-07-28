@@ -541,6 +541,8 @@ impl Executor {
             decode_dispatch_elided_count: 0,
             decode_view_plan_sig_mismatch_streak: 0,
             decode_view_plan_disabled: false,
+            override_feeds: Vec::new(),
+            overrides_active: false,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole

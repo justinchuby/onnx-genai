@@ -29,6 +29,12 @@ impl Engine {
                 EngineDecodeBackend::Native,
             );
         }
+        if config.lora_adapter.is_some() {
+            anyhow::bail!(
+                "a LoRA adapter was configured but the resolved decode backend is {decode_backend:?}; \
+                 native LoRA adapters require the native decode backend (set the backend to native)"
+            );
+        }
 
         // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
         // outputs on some Foundry exports. SessionOptions still honors an explicit
@@ -130,6 +136,8 @@ impl Engine {
             native_session: None,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
+            #[cfg(feature = "native-backend")]
+            lora_manager: None,
             draft,
             mtp,
             eagle3,
@@ -214,6 +222,26 @@ impl Engine {
         let startup_trace = onnx_genai_ort::profile::tracing_enabled()
             .then(crate::runtime_trace::context)
             .flatten();
+        // Single fixed adapter per session (design §D, P4). When an adapter path
+        // is configured, load it through the manager, mark it active, and derive
+        // the format-agnostic spec the injection pass consumes at build time.
+        let mut lora_manager: Option<crate::lora::manager::LoraManager> = None;
+        let lora_spec = if let Some(adapter_path) = config.lora_adapter.as_ref() {
+            let mut manager = crate::lora::manager::LoraManager::with_budget(0);
+            let adapter_id = manager
+                .load(adapter_path)
+                .with_context(|| format!("load LoRA adapter {}", adapter_path.display()))?;
+            let spec = manager
+                .spec(&adapter_id)
+                .context("build LoRA adapter injection spec")?;
+            manager
+                .activate(&adapter_id)
+                .context("activate LoRA adapter")?;
+            lora_manager = Some(manager);
+            Some(spec)
+        } else {
+            None
+        };
         let native_session = {
             let _span = onnx_genai_ort::prof_span!("engine.native_session_load");
             crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
@@ -222,6 +250,7 @@ impl Engine {
                 governor.weight_offload_host_cache(),
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                 config.decode_precision,
+                lora_spec,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
@@ -255,6 +284,7 @@ impl Engine {
             session: None,
             native_session: Some(native_session),
             native_shared_kv_proposer,
+            lora_manager,
             draft: None,
             mtp: None,
             eagle3: None,

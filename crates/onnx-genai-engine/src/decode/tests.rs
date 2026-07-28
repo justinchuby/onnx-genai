@@ -122,6 +122,7 @@ fn empty_metadata() -> InferenceMetadata {
         hardware_requirements: None,
         generation: None,
         tokens: None,
+        adapters: None,
     }
 }
 

@@ -210,6 +210,20 @@ impl NativeDecodeSession {
         self.trace = trace;
     }
 
+    /// Activate or deactivate the session's injected LoRA adapter (design §D,
+    /// **P4**). When active, the injected `A_t`/`B_t` override buffers are fed on
+    /// every decode step so the adapter delta is applied; when inactive the
+    /// overrides fall back to their base-only (zero-rank) defaults, restoring the
+    /// base model bit-for-bit. No-op when no adapter was injected at build time.
+    pub fn set_lora_active(&mut self, active: bool) {
+        self.session.set_lora_active(active);
+    }
+
+    /// Whether the injected LoRA adapter is currently active.
+    pub fn lora_active(&self) -> bool {
+        self.session.lora_active()
+    }
+
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK
     /// captured verify graph and retain the captured graph across `rewind`. No-op
     /// on non-CUDA sessions. Not wired into any live decode path yet; exercised

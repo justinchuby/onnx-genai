@@ -19,9 +19,10 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use onnx_runtime_ir::{DataType, DeviceType, Shape};
+use onnx_runtime_ir::{DataType, DeviceType, Shape, ValueId};
 use onnx_runtime_tracer::{Args, SpanGuard};
 
 pub use epcontext::{
@@ -298,6 +299,12 @@ mod error {
 
         #[error(transparent)]
         ShapeInfer(#[from] onnx_runtime_shape_inference::ShapeInferError),
+
+        #[error(transparent)]
+        Lora(#[from] crate::lora_inject::LoraInjectError),
+
+        #[error("LoRA override input {name:?} is not a registered overridable optional input")]
+        LoraOverrideUnknown { name: String },
     }
 
     impl SessionError {
@@ -456,6 +463,12 @@ pub struct SessionBuilder {
     enable_profiling: bool,
     warmup_shapes: Vec<WarmupShape>,
     decode_precision: DecodePrecision,
+    /// A native-LoRA adapter to inject at graph-build time (design §D, P4). When
+    /// set, [`Self::build`] resolves the target manifest against the model graph,
+    /// injects the delta branches before optimization, and installs the adapter's
+    /// `A_t`/`B_t` feeds on the built session (active by default). `None` leaves
+    /// the graph and run path byte-identical to a non-LoRA session.
+    lora_adapter: Option<lora_inject::LoraAdapterSpec>,
     options: HashMap<String, String>,
 }
 
@@ -509,6 +522,19 @@ impl SessionBuilder {
     /// only takes effect on a GPU fp32-activation quantized decoder.
     pub fn decode_precision(mut self, precision: DecodePrecision) -> Self {
         self.decode_precision = precision;
+        self
+    }
+
+    /// Inject a native-LoRA adapter at graph-build time (design §D, P4). The
+    /// adapter's target manifest is resolved against the model graph, its delta
+    /// branches are injected *before* optimization (so the overridable `A_t`/`B_t`
+    /// inputs exist), and the adapter's factors are installed as the session's
+    /// active override feeds. The single fixed adapter then applies on every
+    /// decode step until [`InferenceSession::set_lora_active`] toggles it off.
+    /// Fails at [`Self::build`] if any targeted module cannot be resolved against
+    /// the graph (fail-loud, design §C).
+    pub fn lora_adapter(mut self, adapter: lora_inject::LoraAdapterSpec) -> Self {
+        self.lora_adapter = Some(adapter);
         self
     }
 
@@ -688,6 +714,38 @@ impl SessionBuilder {
             }
         }
 
+        // Native-LoRA injection (design §B/§C/§D, P4). Runs here — after the
+        // precision rewrite and *before* optimization — so the overridable
+        // `A_t`/`B_t` inputs exist on the graph the executor compiles, and the
+        // optimizer sees (and preserves) the delta branches. The resolved feeds
+        // are installed on the built session below. A `None` adapter leaves the
+        // graph untouched and the override set empty, so the executor builds
+        // byte-identically to a non-LoRA session.
+        let lora_feeds = if let Some(adapter) = &self.lora_adapter {
+            let mut span = trace_span("session.lora_inject", "session");
+            let injection = lora_inject::inject_lora_adapter(&mut graph, adapter)?;
+            let feeds = injection
+                .feeds
+                .into_iter()
+                .map(|feed| {
+                    Tensor::from_raw(feed.data.dtype, feed.data.dims, &feed.data.data)
+                        .map(|tensor| (feed.input_name, tensor))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("adapter", adapter.name.clone())
+                        .with("override_inputs", injection.override_ids.len() as u64)
+                        .with("modules", adapter.modules.len() as u64),
+                );
+            }
+            (injection.override_ids, feeds)
+        } else {
+            (HashSet::new(), Vec::new())
+        };
+        let (lora_override_ids, lora_feeds) = lora_feeds;
+
         // Optimize stage. Off by default; only runs when a level is selected.
         optimize_graph(&mut graph, level)?;
         let ep = {
@@ -707,14 +765,18 @@ impl SessionBuilder {
             ep
         };
 
-        let mut session = InferenceSession::from_parts(
+        let mut session = InferenceSession::from_parts_with_overrides(
             graph,
             weights,
             &model_dir,
             ep_context_config,
             model_metadata,
             ep,
+            lora_override_ids,
         )?;
+        if !lora_feeds.is_empty() {
+            session.install_lora_feeds(lora_feeds)?;
+        }
         if !self.warmup_shapes.is_empty() {
             let mut span = trace_span("session.warmup", "session");
             session.warmup(&self.warmup_shapes)?;
@@ -944,6 +1006,30 @@ impl InferenceSession {
         model_metadata: ModelMetadata,
         ep: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
     ) -> Result<Self> {
+        Self::from_parts_with_overrides(
+            graph,
+            weights,
+            model_dir,
+            ep_context_config,
+            model_metadata,
+            ep,
+            HashSet::new(),
+        )
+    }
+
+    /// Like [`Self::from_parts`], but registers `override_ids` as overridable
+    /// optional inputs (design §B.3, P1) — the value ids the native-LoRA
+    /// injection pass exposed for the adapter's `A_t`/`B_t` factors. An empty set
+    /// is identical to [`Self::from_parts`].
+    fn from_parts_with_overrides(
+        graph: onnx_runtime_ir::Graph,
+        weights: std::sync::Arc<onnx_runtime_loader::WeightStore>,
+        model_dir: &Path,
+        ep_context_config: EpContextDumpConfig,
+        model_metadata: ModelMetadata,
+        ep: std::sync::Arc<dyn onnx_runtime_ep_api::ExecutionProvider>,
+        override_ids: HashSet<ValueId>,
+    ) -> Result<Self> {
         // Establish the canonical-domain invariant for programmatically built
         // graphs (the loader already normalizes at proto-materialization time):
         // the default ONNX domain is `""`, never `"ai.onnx"`. The executor and
@@ -1000,7 +1086,7 @@ impl InferenceSession {
 
         let exec = {
             let mut span = trace_span("session.executor_build", "session");
-            let exec = executor::Executor::build(graph, weights, ep)?;
+            let exec = executor::Executor::build_with_overrides(graph, weights, ep, &override_ids)?;
             if let Some(span) = span.as_mut() {
                 span.set_args(Args::new().with("cache_entries", exec.cache_stats().entries as u64));
             }
@@ -1023,6 +1109,30 @@ impl InferenceSession {
     /// Run inference with named inputs, returning the graph outputs in order.
     pub fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
         self.exec.run(inputs)
+    }
+
+    /// Install (and activate) a native-LoRA adapter's `A_t`/`B_t` feeds (design
+    /// §D, P4). Each name must be an overridable optional input the injection
+    /// pass registered on this session's graph; an unknown name fails loud. Once
+    /// installed the adapter applies on every [`Self::run`] until
+    /// [`Self::set_lora_active`] toggles it off. Normally called for you by
+    /// [`SessionBuilder::lora_adapter`]; exposed for programmatic wiring.
+    pub fn install_lora_feeds(&mut self, feeds: Vec<(String, Tensor)>) -> Result<()> {
+        self.exec.install_override_feeds(feeds)
+    }
+
+    /// Activate (`true`) or deactivate (`false`) the installed native-LoRA
+    /// adapter. Deactivation restores the injected branches' zero-rank defaults,
+    /// so the session decodes base-only; re-activation re-applies the same fixed
+    /// adapter. A no-op when no adapter is installed.
+    pub fn set_lora_active(&mut self, active: bool) {
+        self.exec.set_overrides_active(active);
+    }
+
+    /// Whether an installed native-LoRA adapter is currently applied on the run
+    /// path.
+    pub fn lora_active(&self) -> bool {
+        self.exec.overrides_active()
     }
 
     /// Attach the shared runtime trace context. When enabled, the executor opens

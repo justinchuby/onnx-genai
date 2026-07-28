@@ -7,16 +7,29 @@ impl NativeDecodeSession {
         host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
         io: Option<&ModelIoSpec>,
         decode_precision: DecodePrecision,
+        lora_adapter: Option<onnx_runtime_session::lora_inject::LoraAdapterSpec>,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
+        let has_lora_adapter = lora_adapter.is_some();
         let mut builder = InferenceSession::builder()
             .model(path)
             .device(preference)
             .decode_precision(decode_precision);
+        if let Some(adapter) = lora_adapter {
+            // CUDA phase (P5): native LoRA is CPU-only for Phase 1. Reject a GPU
+            // device up front rather than silently injecting an inert branch.
+            if !matches!(device, NativeDecodeDevice::Cpu) {
+                anyhow::bail!(
+                    "native LoRA adapters are only supported on the CPU device in this phase \
+                     (CUDA is deferred to P5)"
+                );
+            }
+            builder = builder.lora_adapter(adapter);
+        }
         if device == NativeDecodeDevice::Cpu {
             let ep =
                 onnx_runtime_ep_cpu::CpuExecutionProvider::initialized_with_weight_offload_host_cache(
@@ -46,7 +59,13 @@ impl NativeDecodeSession {
             .context("initialize native plugin execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
-        let session = builder.build().context("load native decoder model")?;
+        let mut session = builder.build().context("load native decoder model")?;
+        // Single fixed adapter per session (P4): the adapter was injected at
+        // build time, so activation is a cheap toggle that feeds the override
+        // buffers for every subsequent decode step until deactivated.
+        if has_lora_adapter {
+            session.set_lora_active(true);
+        }
         Self::from_session_with_cuda_kv_max_len_and_io(session, None, io)
     }
 

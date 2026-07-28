@@ -9,6 +9,58 @@ impl Engine {
         self.max_context_for_request(options)
     }
 
+    /// Activate the session's preloaded LoRA adapter (design §D, **P4**). The
+    /// adapter must have been injected at load time (via the configured
+    /// `--adapter` / `EngineConfig::lora_adapter`); this feeds its override
+    /// buffers for every subsequent decode step. Errors when no adapter is
+    /// loaded, or when the native backend is not in use.
+    #[cfg(feature = "native-backend")]
+    pub fn activate_lora_adapter(&mut self) -> anyhow::Result<()> {
+        let active_id = {
+            let manager = self.lora_manager.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("no LoRA adapter is loaded for this session")
+            })?;
+            manager
+                .most_recent()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no LoRA adapter is loaded for this session"))?
+        };
+        if let Some(manager) = self.lora_manager.as_mut() {
+            manager.activate(&active_id).map_err(|error| {
+                anyhow::anyhow!("failed to activate LoRA adapter: {error}")
+            })?;
+        }
+        let session = self
+            .native_session
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("LoRA adapters require the native decode backend"))?;
+        session.set_lora_active(true);
+        Ok(())
+    }
+
+    /// Deactivate the session's LoRA adapter, restoring base-only decoding
+    /// (design §D, **P4**). The decoded adapter stays cached so it can be
+    /// re-activated cheaply. No-op semantics when nothing is loaded.
+    #[cfg(feature = "native-backend")]
+    pub fn deactivate_lora_adapter(&mut self) -> anyhow::Result<()> {
+        if let Some(manager) = self.lora_manager.as_mut() {
+            manager.deactivate();
+        }
+        if let Some(session) = self.native_session.as_mut() {
+            session.set_lora_active(false);
+        }
+        Ok(())
+    }
+
+    /// Whether the session's LoRA adapter is currently applied to decoding.
+    #[cfg(feature = "native-backend")]
+    pub fn lora_adapter_active(&self) -> bool {
+        self.native_session
+            .as_ref()
+            .map(|session| session.lora_active())
+            .unwrap_or(false)
+    }
+
     #[cfg(feature = "native-backend")]
     fn generate_native_with_callback(
         &mut self,

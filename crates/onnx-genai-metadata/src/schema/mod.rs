@@ -31,12 +31,14 @@ where
     })
 }
 
+mod adapters;
 mod generation;
 mod hardware;
 mod model_io;
 mod pipeline;
 mod scheduler;
 
+pub use adapters::*;
 pub use generation::*;
 pub use hardware::*;
 pub use model_io::*;
@@ -131,6 +133,15 @@ pub struct InferenceMetadata {
     /// preprocessing program and a runtime must obtain it elsewhere or fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocessing: Option<PreprocessingSpec>,
+
+    /// Author-declared LoRA adapter capabilities (native LoRA design §G).
+    ///
+    /// Purely additive: declares which PEFT adapters ship with the model, an
+    /// optional default, the target-module policy, and hot-swap support. Absent
+    /// means the model declares no bundled adapters. The runtime still validates
+    /// every adapter against the actual graph before applying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<LoraCapabilities>,
 }
 
 mod schema_vocabulary {

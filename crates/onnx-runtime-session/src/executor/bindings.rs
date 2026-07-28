@@ -155,7 +155,7 @@ impl Executor {
     }
 
     pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
-        self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default())?
+        self.run_scoped_with_active_overrides(inputs, &HashMap::new(), &ExternalBindings::default())?
             .into_iter()
             .map(|output| {
                 output.ok_or_else(|| {
@@ -173,7 +173,12 @@ impl Executor {
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
         let external = self.prepare_external_bindings(bindings)?;
-        self.run_scoped(inputs, &HashMap::new(), &external)?
+        // The in-place CPU KV decode path (`decode_cpu_inplace`) reaches the run
+        // loop here; a session with an active LoRA adapter must therefore bind
+        // its `A_t`/`B_t` feeds on this path too. CUDA phase (P5): a device-bound
+        // override will instead be reinstated through its persistent device
+        // binding, not this host-feed merge.
+        self.run_scoped_with_active_overrides(inputs, &HashMap::new(), &external)?
             .into_iter()
             .map(|output| match output {
                 None => Ok(None),
@@ -184,6 +189,70 @@ impl Executor {
                 }),
             })
             .collect()
+    }
+
+    /// Run at top level, transparently binding the installed native-LoRA adapter
+    /// feeds (design §D) when an adapter is active. Every override feed the caller
+    /// did not already supply for this run is appended to the fed inputs, so a
+    /// single fixed adapter stays applied across all decode steps. When no
+    /// adapter is installed/active this is a zero-overhead pass-through to
+    /// [`Self::run_scoped`], keeping the non-LoRA path byte-identical.
+    fn run_scoped_with_active_overrides(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
+    ) -> Result<Vec<Option<SessionOutput>>> {
+        if !self.overrides_active || self.override_feeds.is_empty() {
+            return self.run_scoped(inputs, outer_scope, external);
+        }
+        // Take the feeds out so the combined slice borrows a local, not `self`,
+        // and `run_scoped` can borrow `self` mutably. Restored before returning.
+        let feeds = std::mem::take(&mut self.override_feeds);
+        let mut combined: Vec<(&str, &Tensor)> = inputs.to_vec();
+        for (name, tensor) in &feeds {
+            let caller_fed = inputs.iter().any(|(n, _)| *n == name.as_str());
+            if !caller_fed {
+                combined.push((name.as_str(), tensor));
+            }
+        }
+        let result = self.run_scoped(&combined, outer_scope, external);
+        self.override_feeds = feeds;
+        result
+    }
+
+    /// Install the native-LoRA adapter feeds (design §D activation): the named
+    /// `A_t`/`B_t` values to bind on every run while active. Each name must be a
+    /// registered overridable optional input (produced by the injection pass);
+    /// an unknown name fails loud. Installing marks the overrides active.
+    pub(crate) fn install_override_feeds(
+        &mut self,
+        feeds: Vec<(String, Tensor)>,
+    ) -> Result<()> {
+        for (name, _) in &feeds {
+            let is_override = self
+                .input_index
+                .get(name)
+                .is_some_and(|vid| self.optional_overrides.contains_key(vid));
+            if !is_override {
+                return Err(SessionError::LoraOverrideUnknown { name: name.clone() });
+            }
+        }
+        self.override_feeds = feeds;
+        self.overrides_active = true;
+        Ok(())
+    }
+
+    /// Toggle whether the installed adapter feeds are bound. `false` restores the
+    /// injected branches' zero-rank defaults (base-only); `true` re-applies the
+    /// installed adapter. A no-op change when no adapter is installed.
+    pub(crate) fn set_overrides_active(&mut self, active: bool) {
+        self.overrides_active = active;
+    }
+
+    /// Whether an installed adapter is currently bound on the run path.
+    pub(crate) fn overrides_active(&self) -> bool {
+        self.overrides_active && !self.override_feeds.is_empty()
     }
 
     pub(crate) fn try_capture_with_device_bindings(

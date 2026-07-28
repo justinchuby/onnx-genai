@@ -179,14 +179,38 @@ pub struct LoraManifest {
     pub entries: Vec<TargetEntry>,
 }
 
+/// One concrete adapter feed produced by the injection: the name of an
+/// overridable optional graph input (`A_t` or `B_t` of a targeted module) paired
+/// with the exact factor bytes to bind when the adapter is *active*. The engine's
+/// `LoraManager` (P4) hands these to the session, which feeds them by name every
+/// run so the delta applies; when the adapter is deactivated the feeds are
+/// dropped and the zero-rank defaults collapse the branch to base-only.
+///
+/// The names are authored here (next to where the override inputs are created)
+/// so the feed side never has to reconstruct the injection's naming convention.
+#[derive(Clone, Debug)]
+pub struct OverrideFeed {
+    /// The overridable optional graph input's name, e.g.
+    /// `lora.<adapter>.layers.0.q_proj.A_t`.
+    pub input_name: String,
+    /// The factor bytes to bind: `A_t = [K, rank]` or `B_t = [rank, N]`.
+    pub data: TensorData,
+}
+
 /// The result of a successful injection: the set of value ids that became
 /// overridable optional inputs (feed into [`Executor::build_with_overrides`]),
-/// plus the manifest that drove the rewrite.
+/// the concrete per-module `A_t`/`B_t` feeds (design §D activation), plus the
+/// manifest that drove the rewrite.
 ///
 /// [`Executor::build_with_overrides`]: crate::executor
 #[derive(Debug)]
 pub struct LoraInjection {
     pub override_ids: HashSet<ValueId>,
+    /// The named `A_t`/`B_t` feeds for every *targeted* module, in the same
+    /// order as `manifest.entries`. Untargeted fused Q/K/V slices are never
+    /// fed (their permanently zero-rank branches stay base-only) and so are
+    /// absent here.
+    pub feeds: Vec<OverrideFeed>,
     pub manifest: LoraManifest,
 }
 
@@ -824,6 +848,7 @@ fn inject_direct(
     spec: &LoraModuleSpec,
     adapter_name: &str,
     override_ids: &mut HashSet<ValueId>,
+    feeds: &mut Vec<OverrideFeed>,
 ) -> Result<(), LoraInjectError> {
     validate_module(spec, entry.k, entry.n, entry.dtype)?;
     let prefix = format!("lora.{adapter_name}.{}", entry.semantic);
@@ -840,8 +865,22 @@ fn inject_direct(
         },
         override_ids,
     );
+    push_module_feeds(&prefix, spec, feeds);
     add_delta_onto_base(graph, &prefix, entry.base_output, scaled);
     Ok(())
+}
+
+/// Record the `A_t`/`B_t` feeds for one targeted module under `prefix`, matching
+/// the input names [`insert_branch`] created (`{prefix}.A_t` / `{prefix}.B_t`).
+fn push_module_feeds(prefix: &str, spec: &LoraModuleSpec, feeds: &mut Vec<OverrideFeed>) {
+    feeds.push(OverrideFeed {
+        input_name: format!("{prefix}.A_t"),
+        data: spec.a_t.clone(),
+    });
+    feeds.push(OverrideFeed {
+        input_name: format!("{prefix}.B_t"),
+        data: spec.b_t.clone(),
+    });
 }
 
 /// Inject a fused `qkv_proj` projection: one delta sub-branch per Q/K/V slice,
@@ -862,24 +901,24 @@ fn inject_fused(
     adapter_name: &str,
     layer_semantic: &str,
     override_ids: &mut HashSet<ValueId>,
+    feeds: &mut Vec<OverrideFeed>,
 ) -> Result<(), LoraInjectError> {
     let mut slice_values = Vec::with_capacity(group.slices.len());
     for (role, _offset, width) in group.slices {
         let prefix = format!("lora.{adapter_name}.{layer_semantic}.{}", role.as_str());
-        let (scale, spec_rank_ok) = match role_specs.get(&role) {
+        let (scale, targeted_spec) = match role_specs.get(&role) {
             Some(spec) => {
                 validate_module(spec, k, width, dtype)?;
-                (spec.scale, true)
+                (spec.scale, Some(*spec))
             }
             // Untargeted slice: a permanently zero-rank branch (scale is
             // irrelevant against the empty delta).
-            None => (1.0, false),
+            None => (1.0, None),
         };
-        let _ = spec_rank_ok;
         let scaled = insert_branch(
             graph,
             &BranchPlan {
-                prefix,
+                prefix: prefix.clone(),
                 k,
                 width,
                 dtype,
@@ -889,6 +928,11 @@ fn inject_fused(
             },
             override_ids,
         );
+        // Only a targeted slice is ever fed; an untargeted slice keeps its
+        // zero-rank default so the fused output stays base-only for that role.
+        if let Some(spec) = targeted_spec {
+            push_module_feeds(&prefix, spec, feeds);
+        }
         slice_values.push(scaled);
     }
 
@@ -926,6 +970,19 @@ pub fn inject(
     manifest: &LoraManifest,
     adapter: &LoraAdapterSpec,
 ) -> Result<HashSet<ValueId>, LoraInjectError> {
+    let mut feeds = Vec::new();
+    inject_collecting_feeds(graph, manifest, adapter, &mut feeds)
+}
+
+/// Inner injection that also records the concrete `A_t`/`B_t` feeds for each
+/// targeted module (design §D activation). [`inject`] discards the feeds (its
+/// callers only need the override ids); [`inject_lora_adapter`] keeps them.
+fn inject_collecting_feeds(
+    graph: &mut Graph,
+    manifest: &LoraManifest,
+    adapter: &LoraAdapterSpec,
+    feeds: &mut Vec<OverrideFeed>,
+) -> Result<HashSet<ValueId>, LoraInjectError> {
     if manifest.entries.len() != adapter.modules.len() {
         return Err(LoraInjectError::SpecCountMismatch {
             entries: manifest.entries.len(),
@@ -950,7 +1007,7 @@ pub fn inject(
     for (entry, spec) in manifest.entries.iter().zip(&adapter.modules) {
         match &entry.placement {
             Placement::Direct => {
-                inject_direct(graph, entry, spec, &adapter.name, &mut override_ids)?;
+                inject_direct(graph, entry, spec, &adapter.name, &mut override_ids, feeds)?;
             }
             Placement::FusedSlice { group, role } => {
                 let layer_semantic = entry
@@ -986,6 +1043,7 @@ pub fn inject(
             &adapter.name,
             &plan.layer_semantic,
             &mut override_ids,
+            feeds,
         )?;
     }
 
@@ -1008,9 +1066,11 @@ pub fn inject_lora_adapter(
         })
         .collect();
     let manifest = build_manifest(graph, &targets)?;
-    let override_ids = inject(graph, &manifest, adapter)?;
+    let mut feeds = Vec::new();
+    let override_ids = inject_collecting_feeds(graph, &manifest, adapter, &mut feeds)?;
     Ok(LoraInjection {
         override_ids,
+        feeds,
         manifest,
     })
 }
