@@ -60,6 +60,7 @@ pub mod check;
 mod codec;
 mod error;
 pub mod json;
+pub mod metadata_hints;
 mod model;
 mod proto_serde;
 pub mod schema;
@@ -69,6 +70,10 @@ pub mod textproto;
 pub mod version;
 
 pub use error::{Error, Result};
+pub use metadata_hints::{
+    HintEntry, HintScope, HintSource, HintValue, MetadataHints, MetadataWarning, ModelHints,
+    NodeHints, PlacementStrength,
+};
 pub use model::{
     DeviceConfigurationProto, IntIntListEntryProto, Model, NodeDeviceConfigurationProto,
     OpaqueProto, ShardedDimProto, ShardingSpecProto, SimpleShardedDimProto, load_model, save_model,

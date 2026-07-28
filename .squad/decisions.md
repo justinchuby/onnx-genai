@@ -10830,3 +10830,144 @@ David's fix commit `adf46ff8` resolves the blocking Windows CI failure.
   at L1152 (health Healthy not Degraded) → the Degraded assertion genuinely bites. Restored, clean.
 - CI: Rust quality + Rust (Windows x86_64) + Rust (Windows ARM64) all GREEN; all other jobs pass.
 PR comment: https://github.com/justinchuby/onnx-genai/pull/308#issuecomment-5099599881
+
+
+Decision archive gate checked at 2026-07-28T05-49-08+0000: active ledger was 858394 bytes; archived 0 dated sections on or before 2026-07-21 to `none (no dated sections on or before cutoff)`.
+
+<!-- scribe-merge-2026-07-28T05-49-08+0000-wave3 -->
+
+<!-- merged from .squad/decisions/inbox/faris-307-cb-bench.md -->
+
+### 2026-07-28: Scheduler-driven continuous-batch benchmark design
+**By:** Faris
+**What:** Benchmark scheduler-driven continuous batching against sequential generation at 1, 2, 4, and 8 physical rows, with two requests per row to include queue admission and backfill. Materialize the committed scatter fixture as `model.onnx` so the model benchmark and its CI smoke check are runnable.
+**Why:** This measures the serving path introduced by #303 under concurrent decode while retaining a deterministic, small CPU fixture and a direct throughput baseline. The pinned-core measurement shows the expected gain at concurrent load (51.01K vs 44.26K tok/s at 2 rows; 75.09K vs 58.35K at 4 rows).
+
+<!-- merged from .squad/decisions/inbox/cole-320-review.md -->
+
+### 2026-07-28: Approve PR #320 continuous-batching benchmark
+**By:** Cole
+**What:** Approve PR #320. The diff is benchmark/fixture/CI-only, compares identical request sets and generated-token counts, and the existing scheduler parity suite proves non-empty token equality against sequential generation.
+**Why:** The parity suite passed and a one-token mutation made its equality assertion fail. The benchmark smoke path loaded the committed scatter ONNX fixture, and a pinned-core concurrency-4 run measured scheduled throughput above sequential throughput (about 75.1K versus 60.8K tokens/s).
+
+<!-- merged from .squad/decisions/inbox/gaff-63-gpu-weight-offload.md -->
+
+### 2026-07-28: Live GPU weight offload — Phase-3b device-binding slice (#63)
+
+**By:** Gaff (CUDA/systems)
+
+**What:** Implemented the smallest complete, correct vertical slice of live GPU
+weight offload (WEIGHT_OFFLOAD Phase 3b): a CUDA `LazyDeviceWeightBinder`
+(`CudaWeightPager`) that allocates a bounded VRAM page for one offloaded
+`pkg.nxrt::BlockQuantizedMoE` weight tensor, copies its canonical compressed
+bytes host→device region-by-region (via a new `MmapRegionSource` seam, never a
+full host expansion), and returns an owned RAII `CudaWeightPage` a kernel reads.
+Proven by a GPU device-execution test: a MatMul weight served through the live
+paging path is **byte-identical** to the resident-upload path, with a mutation
+guard that a corrupted region diverges. Mutation-probed the binder's H2D copy
+(wrong offset) — the byte-identity test fails as required, then reverted.
+
+**Why:** #63 was PARTIAL — CPU host-cache + placement planning existed but live
+VRAM paging/H2D/bind/device-exec were unimplemented stubs
+(`Phase3aHostOnlyBinder` returned `Unsupported`). This lands the real device
+mechanism at the EP seam with correctness proven first (the cardinal rule:
+offload is an optimization, never an output change), leaving clean seams for the
+deferred work.
+
+**Deferred (clean seams left, #63 stays open):** wiring the binder into the
+executor's `BlockQuantizedMoE` dispatch so the fused MoE kernel consumes the
+device page; flipping the CUDA EP's `nxrt` capability (kept `stock` so the
+resident MoE path is unaffected until dispatch wiring lands); multi-page
+LRU/eviction; CPU-wave execution for non-GPU layers; prefetch overlap (#87);
+routed-expert paging (#82). The `MmapRegionSource` trait is the seam the
+executor's weight store will implement to page directly from live mmaps.
+
+<!-- merged from .squad/decisions/inbox/rosenthal-321-review.md -->
+
+# Review: PR #321 — Live GPU weight offload (Phase 3b, issue #63) by Gaff
+
+**Reviewer:** Rosenthal (CUDA/systems)
+**Verdict:** APPROVE
+**Date:** 2026-07-28
+
+## Scope
+Phase-3b vertical slice: live VRAM page alloc + H2D transfer + binding for ONE
+offloaded `pkg.nxrt::BlockQuantizedMoE` weight consumed by a real GPU MatMul
+kernel. Dispatch wiring deferred (issues #82/#87). Files: `ep-api/weight.rs`
+(LazyWeight dtype/shape, `MmapRegionSource` seam, `WeightHandleError::DeviceBinding`),
+`ep-cuda/weight_paging.rs` (`CudaWeightPage` RAII, `CudaWeightPager` binder),
+`tests/weight_offload_gpu.rs`, plus caller updates.
+
+## Findings
+
+### Stream ordering (the critical, subtle check) — NO GAP
+The consuming kernel runs on the EP's dedicated **non-blocking** compute stream
+(`new_stream()` → `CU_STREAM_NON_BLOCKING`, cudarc 0.19.8 core.rs:680). The page
+is filled by `runtime.htod` = `cuMemcpyHtoD_v2` (host-blocking synchronous). Here
+the sync copy is the **producer** and completes on the host *before* the kernel is
+enqueued, so it is correctly ordered — identical to the resident-upload pattern the
+entire EP already relies on and documents (runtime.rs:314-316: "host-blocking
+`*_sync` copies remain correctly serialized against kernel launches"). The known
+`dtod`/`dtoh` footgun is the **opposite** direction (kernel produces → sync copy
+consumes, needing `synchronize()` first); this PR does not reintroduce it, and the
+test's output readback uses `runtime.dtoh` which synchronizes internally. Verified:
+same-direction as the resident reference in the same test, so offload adds no new
+ordering hazard.
+
+### Correctness — PASS
+`offloaded_weight_is_byte_identical_to_resident` compares the OFFLOAD-path kernel
+output (weight paged via `CudaWeightPager`) against an independent RESIDENT-path
+reference (ordinary `htod` upload), byte-for-byte, with fresh output buffers each
+run (not self-vs-self / not a buffer echo), plus an independent CPU-matmul
+cross-check. `MmapRegionSource` copies ONLY the selected region bytes
+(`bytes[offset..offset+len]`), no full host expansion (§9 invariant 5 upheld);
+offset padding (0xAB) proves offset handling. Length mismatch is rejected with
+`DeviceBinding`.
+
+### RAII / leak — PASS
+`CudaWeightPage::drop` frees VRAM exactly once via `free_raw`. The page (owning the
+allocation) is constructed *before* the copy loop, so any early `?` return on copy
+failure drops it → frees the VRAM; no leak, no half-bound weight escapes.
+
+### No regression — PASS
+CUDA capability stays stock (`NXRT_WEIGHT_PAGING_CAPABILITY` constant untouched;
+only the re-export list gained `MmapRegionSource`). Resident `materialize()` path
+unchanged; dispatch wiring deferred. `LazyWeight` gains additive `dtype`/`shape`
+fields; the `block_quantized_moe` signature change is applied to all callers
+(session `build.rs`, api tests). Resident MoE/decode output byte-unaffected.
+
+## Verification performed
+- `cargo fmt --all -- --check` → clean.
+- Clippy on touched files (`weight_paging.rs`, `weight.rs`, `weight_offload_gpu.rs`)
+  → clean. Local `-D warnings` failures are all pre-existing lints in **untouched**
+  kernel/test files under a newer local toolchain (rustc 1.97.0); CI "Rust quality"
+  gate passes.
+- CI checks (`gh pr checks 321`): Rust quality, platform (Linux/Windows/macOS),
+  CUDA compile (Linux/Windows), Miri all green. Kernel micro-benchmarks pending
+  (non-blocking).
+- GPU (pinned `CUDA_VISIBLE_DEVICES=0 taskset -c 1`): both tests pass.
+- **Mutation proof:** corrupted the H2D copy (`mutated[0] ^= 0xFF`) →
+  `offloaded_weight_is_byte_identical_to_resident` FAILS as required (offload output
+  diverges from resident); reverted → green. (Note: a naive skip-1-byte mutation was
+  masked by CUDA allocator reuse of the freed resident buffer; a content-corrupting
+  mutation is the reliable probe.)
+
+<!-- merged from .squad/decisions/inbox/chance-54-model-package.md -->
+
+### 2026-07-28: Land the model-package MVP as a reusable leaf crate
+**By:** Chance
+**What:** Add `onnx-model-package` for ORT 1.x directory manifests, selection, resolution, and validation; adapt `ModelDirectory` so existing engine entry points auto-detect packages while retaining flat-directory behavior.
+**Why:** This keeps package policy independent of ORT/session code and passes resolved model, metadata, configuration, and tokenizer paths into existing loaders. Advanced authoring/inspection CLI, archives, registries, hashes, multi-component pipelines, and compiled-EP compatibility ranking remain deferred.
+
+<!-- merged from .squad/decisions/inbox/ankor-322-review.md -->
+
+### 2026-07-28: PR #322 review — request changes
+**By:** Ankor
+**What:** Block the model-package MVP on path-confinement remediation.
+**Why:** `layout: "installed"` is attacker-controlled and currently permits `/etc/passwd` and `..` references, so an untrusted package can validate arbitrary host paths. An external component directory also permits its implicit `component.json` symlink to resolve outside the package root. Portable direct references correctly reject absolute, parent, and symlink escapes in local probes, but the PR has no durable adversarial coverage.
+**Next:** Holden (Security Engineer), not Chance, should confine every manifest-derived read (including external `component.json`) or introduce an explicit trusted-installed policy, then add absolute/parent/symlink regression tests.
+
+### 2026-07-28: Confine model-package manifest reads after PR #322 security review
+**By:** Scribe, preserving Holden's security fix from the wave-3 manifest
+**What:** Holden repaired PR #322's path-traversal findings by adding `HostTrust` (`Confined` by default, `AllowInstalledLayout` caller opt-in), routing package opens through `open_with_trust`, and enforcing `canonicalize_confined()` symlink-resolving confinement. Manifest-derived paths alone can no longer escape the package root; trusted installed layouts require explicit caller policy.
+**Why:** Ankor's initial review found two traversal vulnerabilities: attacker-controlled `layout: "installed"` could reference arbitrary host paths, and external component directories could use a `component.json` symlink outside the package root. Holden's fix added nine adversarial tests and mutation-proved the confinement, after which Ankor re-approved and PR #322 merged as `cd8e7b34`. Issue #54 remains open for CLI tooling, format registry, advanced EP ranking, hashes/signatures, multi-component packages, archives, and registries.

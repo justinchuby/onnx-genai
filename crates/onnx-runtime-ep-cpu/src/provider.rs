@@ -589,12 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn supports_op_reports_phase1_only() {
+    fn supports_op_reflects_selected_operator_groups() {
         let ep = CpuExecutionProvider::new();
         let mm = Node::new(onnx_runtime_ir::NodeId(0), "MatMul", vec![], vec![]);
         assert!(ep.supports_op(&mm, 17, &[], &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
-        assert!(ep.supports_op(&conv, 17, &[], &[], &[]).is_supported());
+        assert_eq!(
+            ep.supports_op(&conv, 17, &[], &[], &[]).is_supported(),
+            cfg!(feature = "ops-cnn")
+        );
     }
 
     #[test]

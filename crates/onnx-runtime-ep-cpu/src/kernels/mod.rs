@@ -28,7 +28,6 @@ use crate::strided::{elem_offset, next_index, numel};
 
 pub mod activations;
 pub mod add;
-pub mod affine_grid;
 pub mod attention;
 pub mod bitshift;
 pub mod bitwise;
@@ -37,20 +36,12 @@ pub mod block_quantized_matmul;
 pub mod block_quantized_moe;
 pub mod cast;
 pub mod causal_conv;
-pub mod center_crop_pad;
-pub mod col2im;
 pub mod compress;
 pub mod compressed_sparse_attention;
 pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
-#[cfg(feature = "mlas")]
-pub mod conv;
-#[cfg(not(feature = "mlas"))]
-#[path = "conv_ref.rs"]
-pub mod conv;
-pub mod conv_transpose;
 pub mod dropout;
 pub mod elementwise;
 pub mod expand;
@@ -62,7 +53,6 @@ pub mod gather;
 pub mod gather_block_quantized;
 pub mod gelu;
 pub mod gemm;
-pub mod grid_sample;
 pub mod group_query_attention;
 mod half_gemm;
 pub mod hardmax;
@@ -82,12 +72,8 @@ pub mod moe;
 pub mod movement_ops;
 pub mod msft_attention;
 pub mod multi_head_attention;
-#[cfg(feature = "mlas")]
-pub mod nchwc;
-pub mod norm_ops;
 pub mod onehot;
 pub mod pad;
-pub mod pooling;
 pub mod qlinear_matmul;
 pub mod qmoe;
 pub mod quantization;
@@ -95,7 +81,6 @@ pub mod reduce;
 pub mod reduce_ops;
 pub mod relu;
 pub mod reshape;
-pub mod resize;
 pub mod rmsnorm;
 pub mod rotary_embedding;
 pub mod sdpa;
@@ -108,7 +93,6 @@ pub mod simd_sumsq;
 pub mod skip_simplified_layernorm;
 pub mod slice;
 pub mod softmax;
-pub mod space_to_depth;
 pub mod sparse_kv_gather;
 pub mod split;
 pub mod transpose;
@@ -118,6 +102,36 @@ pub mod unsqueeze;
 pub mod varlen_attention;
 pub mod where_op;
 pub mod window;
+
+macro_rules! operator_group_modules {
+    ($feature:literal; $($module:ident),+ $(,)?) => {
+        $(
+            #[cfg(feature = $feature)]
+            pub mod $module;
+        )+
+    };
+}
+
+operator_group_modules!(
+    "ops-cnn";
+    affine_grid,
+    center_crop_pad,
+    col2im,
+    conv_transpose,
+    grid_sample,
+    norm_ops,
+    pooling,
+    resize,
+    space_to_depth,
+);
+
+#[cfg(all(feature = "ops-cnn", feature = "mlas"))]
+pub mod conv;
+#[cfg(all(feature = "ops-cnn", not(feature = "mlas")))]
+#[path = "conv_ref.rs"]
+pub mod conv;
+#[cfg(all(feature = "ops-cnn", feature = "mlas"))]
+pub mod nchwc;
 
 /// The set of ops the CPU EP implements for the Phase-1 BERT-on-CPU milestone.
 pub const PHASE1_OPS: &[&str] = &[
@@ -241,6 +255,133 @@ pub fn is_phase1_op(op_type: &str) -> bool {
     PHASE1_OPS.contains(&op_type)
 }
 
+macro_rules! register_operator_group {
+    ($function:ident, $feature:literal, |$registry:ident| $body:block) => {
+        #[cfg(feature = $feature)]
+        fn $function($registry: &mut OpRegistry) $body
+
+        #[cfg(not(feature = $feature))]
+        fn $function(_: &mut OpRegistry) {}
+    };
+}
+
+register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
+    #[cfg(feature = "mlas")]
+    {
+        registry.register(
+            OpKey::new(nchwc::REORDER_TO_BLOCKED_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcReorderToBlockedFactory),
+        );
+        registry.register(
+            OpKey::new(nchwc::REORDER_TO_NCHW_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcReorderToNchwFactory),
+        );
+        registry.register(
+            OpKey::new(nchwc::NCHWC_CONV_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcConvFactory),
+        );
+        registry.register(
+            OpKey::new(nchwc::NCHWC_MAX_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcPoolFactory::max()),
+        );
+        registry.register(
+            OpKey::new(nchwc::NCHWC_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcPoolFactory::average()),
+        );
+        registry.register(
+            OpKey::new(nchwc::NCHWC_GLOBAL_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
+            Box::new(nchwc::NchwcPoolFactory::global_average()),
+        );
+    }
+    registry.register(
+        OpKey::new("GridSample", "", 16),
+        Box::new(grid_sample::GridSampleFactory { since_version: 16 }),
+    );
+    registry.register(
+        OpKey::new("GridSample", "", 20),
+        Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
+    );
+    registry.register(
+        OpKey::new("Resize", "", 10),
+        Box::new(resize::ResizeFactory { since_version: 10 }),
+    );
+    registry.register(
+        OpKey::new("Resize", "", 11),
+        Box::new(resize::ResizeFactory { since_version: 11 }),
+    );
+    registry.register(
+        OpKey::new("AffineGrid", "", 20),
+        Box::new(affine_grid::AffineGridFactory),
+    );
+    registry.register(
+        OpKey::new("Col2Im", "", 18),
+        Box::new(col2im::Col2ImFactory),
+    );
+    registry.register(
+        OpKey::new("ConvTranspose", "", 1),
+        Box::new(conv_transpose::ConvTransposeFactory),
+    );
+    registry.register(OpKey::new("Conv", "", 1), Box::new(conv::ConvFactory));
+    registry.register(
+        OpKey::new("CenterCropPad", "", 18),
+        Box::new(center_crop_pad::CenterCropPadFactory),
+    );
+    for version in [1, 7, 10, 11, 19] {
+        registry.register(
+            OpKey::new("AveragePool", "", version),
+            Box::new(pooling::AveragePoolFactory),
+        );
+    }
+    for version in [1, 8, 10, 11, 12] {
+        registry.register(
+            OpKey::new("MaxPool", "", version),
+            Box::new(pooling::MaxPoolFactory),
+        );
+    }
+    registry.register(
+        OpKey::new("GlobalAveragePool", "", 1),
+        Box::new(pooling::GlobalAveragePoolFactory),
+    );
+    registry.register(
+        OpKey::new("GlobalMaxPool", "", 1),
+        Box::new(pooling::GlobalMaxPoolFactory),
+    );
+    registry.register(
+        OpKey::new("LpPool", "", 18),
+        Box::new(pooling::LpPoolFactory),
+    );
+    registry.register(
+        OpKey::new("GlobalLpPool", "", 2),
+        Box::new(pooling::GlobalLpPoolFactory),
+    );
+    registry.register(
+        OpKey::new("SpaceToDepth", "", 13),
+        Box::new(space_to_depth::SpaceToDepthFactory),
+    );
+    // BatchNormalization inference semantics are stable since opset 7, when
+    // the legacy `is_test` attribute was removed.
+    registry.register(
+        OpKey::new("BatchNormalization", "", 7),
+        Box::new(norm_ops::BatchNormFactory),
+    );
+    registry.register(
+        OpKey::new("InstanceNormalization", "", 6),
+        Box::new(norm_ops::InstanceNormFactory),
+    );
+    registry.register(
+        OpKey::new("GroupNormalization", "", 18),
+        Box::new(norm_ops::GroupNormFactory { since_version: 18 }),
+    );
+    registry.register(
+        OpKey::new("GroupNormalization", "", 21),
+        Box::new(norm_ops::GroupNormFactory { since_version: 21 }),
+    );
+    registry.register(
+        OpKey::new("PRelu", "", 16),
+        Box::new(norm_ops::PReluFactory),
+    );
+});
+
 /// Build an [`OpRegistry`] populated with every Phase-1 CPU kernel factory.
 ///
 /// The provider consults this to instantiate kernels, and Track D (session) can
@@ -256,6 +397,7 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
+    register_cnn_ops(&mut reg);
     reg.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
     reg.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
@@ -277,36 +419,6 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
         Box::new(varlen_attention::VarlenAttentionFactory),
     );
-    // NCHWc blocked layout ops, emitted only by the CpuNchwcLayoutPropagation
-    // pass (never parsed from a model). They keep the CNN backbone in the MLAS
-    // channels-blocked layout so per-Conv NCHW<->NCHWc reorders are eliminated.
-    #[cfg(feature = "mlas")]
-    {
-        reg.register(
-            OpKey::new(nchwc::REORDER_TO_BLOCKED_OP, nchwc::NCHWC_DOMAIN, 1),
-            Box::new(nchwc::NchwcReorderToBlockedFactory),
-        );
-        reg.register(
-            OpKey::new(nchwc::REORDER_TO_NCHW_OP, nchwc::NCHWC_DOMAIN, 1),
-            Box::new(nchwc::NchwcReorderToNchwFactory),
-        );
-        reg.register(
-            OpKey::new(nchwc::NCHWC_CONV_OP, nchwc::NCHWC_DOMAIN, 1),
-            Box::new(nchwc::NchwcConvFactory),
-        );
-        reg.register(
-            OpKey::new(nchwc::NCHWC_MAX_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
-            Box::new(nchwc::NchwcPoolFactory::max()),
-        );
-        reg.register(
-            OpKey::new(nchwc::NCHWC_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
-            Box::new(nchwc::NchwcPoolFactory::average()),
-        );
-        reg.register(
-            OpKey::new(nchwc::NCHWC_GLOBAL_AVERAGE_POOL_OP, nchwc::NCHWC_DOMAIN, 1),
-            Box::new(nchwc::NchwcPoolFactory::global_average()),
-        );
-    }
     reg.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
@@ -482,28 +594,6 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         Box::new(rmsnorm::RmsNormFactory),
     );
     reg.register(
-        OpKey::new("BatchNormalization", "", 15),
-        Box::new(norm_ops::BatchNormFactory),
-    );
-    reg.register(
-        OpKey::new("InstanceNormalization", "", 6),
-        Box::new(norm_ops::InstanceNormFactory),
-    );
-    // GroupNormalization v18 uses per-group scale/bias. Opset 21 changed the
-    // affine inputs to per-channel, so keep versioned factories for both schemas.
-    reg.register(
-        OpKey::new("GroupNormalization", "", 18),
-        Box::new(norm_ops::GroupNormFactory { since_version: 18 }),
-    );
-    reg.register(
-        OpKey::new("GroupNormalization", "", 21),
-        Box::new(norm_ops::GroupNormFactory { since_version: 21 }),
-    );
-    reg.register(
-        OpKey::new("PRelu", "", 16),
-        Box::new(norm_ops::PReluFactory),
-    );
-    reg.register(
         OpKey::new("LpNormalization", "", 1),
         Box::new(lp_normalization::LpNormalizationFactory),
     );
@@ -610,39 +700,6 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     );
     reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
     reg.register(
-        OpKey::new("GridSample", "", 16),
-        Box::new(grid_sample::GridSampleFactory { since_version: 16 }),
-    );
-    reg.register(
-        OpKey::new("GridSample", "", 20),
-        Box::new(grid_sample::GridSampleFactory { since_version: 20 }),
-    );
-    reg.register(
-        OpKey::new("Resize", "", 10),
-        Box::new(resize::ResizeFactory { since_version: 10 }),
-    );
-    reg.register(
-        OpKey::new("Resize", "", 11),
-        Box::new(resize::ResizeFactory { since_version: 11 }),
-    );
-    reg.register(
-        OpKey::new("AffineGrid", "", 20),
-        Box::new(affine_grid::AffineGridFactory),
-    );
-    reg.register(
-        OpKey::new("Col2Im", "", 18),
-        Box::new(col2im::Col2ImFactory),
-    );
-    reg.register(
-        OpKey::new("ConvTranspose", "", 1),
-        Box::new(conv_transpose::ConvTransposeFactory),
-    );
-    reg.register(OpKey::new("Conv", "", 1), Box::new(conv::ConvFactory));
-    reg.register(
-        OpKey::new("CenterCropPad", "", 18),
-        Box::new(center_crop_pad::CenterCropPadFactory),
-    );
-    reg.register(
         OpKey::new("ConstantOfShape", "", 1),
         Box::new(constant_of_shape::ConstantOfShapeFactory),
     );
@@ -671,67 +728,6 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("QLinearMatMul", "", 10),
         Box::new(qlinear_matmul::QLinearMatMulFactory),
-    );
-    // Spatial pooling. Newer registrations preserve version-specific attributes.
-    reg.register(
-        OpKey::new("AveragePool", "", 1),
-        Box::new(pooling::AveragePoolFactory),
-    );
-    reg.register(
-        OpKey::new("AveragePool", "", 7),
-        Box::new(pooling::AveragePoolFactory),
-    );
-    reg.register(
-        OpKey::new("AveragePool", "", 10),
-        Box::new(pooling::AveragePoolFactory),
-    );
-    reg.register(
-        OpKey::new("AveragePool", "", 11),
-        Box::new(pooling::AveragePoolFactory),
-    );
-    reg.register(
-        OpKey::new("AveragePool", "", 19),
-        Box::new(pooling::AveragePoolFactory),
-    );
-    reg.register(
-        OpKey::new("MaxPool", "", 1),
-        Box::new(pooling::MaxPoolFactory),
-    );
-    reg.register(
-        OpKey::new("MaxPool", "", 8),
-        Box::new(pooling::MaxPoolFactory),
-    );
-    reg.register(
-        OpKey::new("MaxPool", "", 10),
-        Box::new(pooling::MaxPoolFactory),
-    );
-    reg.register(
-        OpKey::new("MaxPool", "", 11),
-        Box::new(pooling::MaxPoolFactory),
-    );
-    reg.register(
-        OpKey::new("MaxPool", "", 12),
-        Box::new(pooling::MaxPoolFactory),
-    );
-    reg.register(
-        OpKey::new("GlobalAveragePool", "", 1),
-        Box::new(pooling::GlobalAveragePoolFactory),
-    );
-    reg.register(
-        OpKey::new("GlobalMaxPool", "", 1),
-        Box::new(pooling::GlobalMaxPoolFactory),
-    );
-    reg.register(
-        OpKey::new("LpPool", "", 18),
-        Box::new(pooling::LpPoolFactory),
-    );
-    reg.register(
-        OpKey::new("GlobalLpPool", "", 2),
-        Box::new(pooling::GlobalLpPoolFactory),
-    );
-    reg.register(
-        OpKey::new("SpaceToDepth", "", 13),
-        Box::new(space_to_depth::SpaceToDepthFactory),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
@@ -1580,6 +1576,28 @@ mod tests {
     use crate::strided::view_in_bounds;
     use testutil::Owned;
 
+    #[cfg(not(feature = "ops-cnn"))]
+    #[test]
+    fn minimal_registry_excludes_deselected_cnn_group() {
+        use onnx_runtime_operator_selection::CPU_OPERATOR_CATALOG;
+
+        let registry = build_cpu_registry();
+        assert!(registry.lookup("MatMul", "ai.onnx", 21).is_some());
+        for entry in CPU_OPERATOR_CATALOG
+            .iter()
+            .filter(|entry| entry.group.feature == "ops-cnn")
+        {
+            assert!(
+                registry
+                    .lookup(entry.op_type, entry.domain, entry.since_version)
+                    .is_none(),
+                "{}::{} should be excluded without ops-cnn",
+                entry.domain,
+                entry.op_type
+            );
+        }
+    }
+
     #[test]
     fn dense_roundtrip_contiguous() {
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
@@ -1618,6 +1636,7 @@ mod tests {
         assert_eq!(backing.to_f32(), vec![1., 3., 5., 2., 4., 6.]);
     }
 
+    #[cfg(feature = "full")]
     #[test]
     fn registry_has_all_phase1_ops() {
         let reg = build_cpu_registry();
@@ -1771,7 +1790,8 @@ mod tests {
         assert!(reg.lookup("RMSNormalization", "", 23).is_some());
         assert!(reg.lookup("RMSNormalization", "", 22).is_none());
         assert!(reg.lookup("BatchNormalization", "", 15).is_some());
-        assert!(reg.lookup("BatchNormalization", "", 14).is_none());
+        assert!(reg.lookup("BatchNormalization", "", 7).is_some());
+        assert!(reg.lookup("BatchNormalization", "", 6).is_none());
         assert!(reg.lookup("InstanceNormalization", "", 6).is_some());
         assert!(reg.lookup("GroupNormalization", "", 18).is_some());
         assert!(reg.lookup("GroupNormalization", "", 21).is_some());
