@@ -78,10 +78,10 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 ## 2026-07-28T00:35:00Z — Per-PR benchmark CI workflow (PR #306)
 
 - Implemented `.github/workflows/benchmark.yml`: separate benchmark workflow running kernel micro-benchmarks and hot-path benchmarks on every PR, posting a comparison comment.
-- Design: benchmarks both PR head and merge-base on the same runner/job; reports % change (reliable); absolute times informational only.
+- Design: benchmarks merge-base FIRST (cold-start), PR SECOND (warm runner). Systematic bias toward PR appearing faster reduces false positives.
 - Workload: ep-cpu kernels (MatMul at M=1 decode + prefill shapes, Add, Gather, ReduceMean × f32/f16/bf16) + genai-bench no_model (tokenization, sampling, KV cache, logit processing, grammar).
-- Thresholds: ⚠️ ≥ 15%, 🔴 ≥ 50% — derived from measured run-to-run variance. Gives ≥7× signal-to-noise margin vs the 350% regression class.
-- Does NOT fail the build (comments only).
-- Guard-break proof: simulated 4.5× M=1 slowdown → script outputs 🔴 at +350%, exits code 1.
-- CI proof: workflow ran green (run 30318985993, 22m20s, macOS arm64 M1 Virtual).
+- **Blocking gate**: ≥30% regression FAILS the check (not advisory). Threshold = 1.5× worst observed CI noise (~20%). Signal-to-noise vs historical 350% regression: 11.7×.
+- ⚠️ ≥15% advisory; 🔴 ≥30% blocks merge.
+- Guard-break proof: simulated 4.5× M=1 slowdown → gate exits 1 at +350%. 25% → passes. 31% → fails.
+- CI proof (base-first ordering): run 30320632489, 21m37s, macOS arm64 M1 Virtual 3-core. Worst noise: +26.5% (below 30% gate). No false positive.
 - Decision filed: `.squad/decisions/inbox/pris-benchmark-ci.md`.
