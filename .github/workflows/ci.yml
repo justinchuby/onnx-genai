@@ -107,6 +107,9 @@ jobs:
       - name: Check dispatch manifest claims have proving counters
         run: python3 scripts/check_dispatch_manifest.py
 
+      - name: Check feature-gated fast paths have fallback coverage
+        run: python3 scripts/check_feature_gate_coverage.py
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.
