@@ -18,9 +18,15 @@ pub const WEIGHT_OFFLOAD_HOST_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_HOST_
 ///
 /// The pipeline overlaps the next routed expert's host-side dequant/admission
 /// (the "transfer" half of issue #87/#63) with the current expert's matmul
-/// (the "compute" half). It is on by default and preserves byte-identical
-/// output and cache statistics; set the variable to `0` to force the legacy
-/// serial route-first loop (used for A/B benchmarking and as an escape hatch).
+/// (the "compute" half). It is on by default and always produces byte-identical
+/// output. To hold the host-memory cap and keep cache statistics identical to
+/// the serial loop, it only engages where no host-cache eviction can occur while
+/// a prefetch is in flight — a disabled host cache (`budget == 0`, pure mmap
+/// streaming) or a fully-resident layer (`budget >= experts * expanded_bytes`).
+/// Under an intermediate (partial-cache) budget it transparently falls back to
+/// the serial route-first loop, which is byte- and stat-identical to the
+/// pre-prefetch baseline. Set the variable to `0` to force the serial loop
+/// unconditionally (used for A/B benchmarking and as an escape hatch).
 pub const WEIGHT_OFFLOAD_PREFETCH_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH";
 
 /// Whether newly created QMoE kernels should pipeline route-first expert

@@ -361,6 +361,47 @@ impl Kernel for QMoEKernel {
 
             let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
             let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
+
+            // Eviction-neutrality guard for the prefetch pipeline.
+            //
+            // The pipeline holds the current expert `n`'s lease (an `Arc`) while
+            // the worker admits expert `n+1`, so entry `n` has
+            // `strong_count >= 2` and is excluded from the eviction candidate set
+            // during that admission. The serial loop has already dropped `n`
+            // before leasing `n+1`, so it *can* evict `n`. Because the host cache
+            // evicts by ascending `(frequency, last_used)`, the just-loaded,
+            // low-frequency expert `n` is frequently exactly the victim serial
+            // picks — yet the pipeline cannot evict it without letting real host
+            // memory exceed the configured budget. The two paths then retain
+            // different experts, diverging hits/misses/evictions/bytes-read and
+            // sometimes reading *more* mmap bytes than serial.
+            //
+            // We therefore engage the pipeline only where it is *provably*
+            // eviction-neutral — where no host-cache eviction can occur while a
+            // prefetch is in flight, so the pinned in-flight expert can never be
+            // a victim:
+            //
+            //   * `budget == 0`: the host cache is disabled; every lease streams
+            //     its expert from mmap in deterministic ascending order, so there
+            //     is no admission/eviction state to perturb; or
+            //   * `budget >= experts * expanded_bytes`: the whole layer's expert
+            //     set fits resident, so the cache admits without ever evicting.
+            //
+            // In both regimes admission/eviction and every counter are
+            // byte-identical to serial, so output *and* cache statistics match
+            // exactly and bytes-read can never regress. Under an intermediate
+            // (partial-cache) budget the pipeline transparently falls back to the
+            // serial route-first loop, which is byte- and stat-identical to the
+            // pre-prefetch baseline.
+            let prefetch_is_eviction_neutral =
+                weight_offload_host_budget(self.host_cache.configured_budget_bytes())
+                    .map(|budget| {
+                        budget == 0
+                            || (experts as u128)
+                                .checked_mul(expanded_bytes as u128)
+                                .is_some_and(|resident| resident <= budget as u128)
+                    })
+                    .unwrap_or(false);
             let compute = |expert: usize,
                            expert_tasks: &[(usize, usize, f32)],
                            weights: &DequantizedExpert,
@@ -382,14 +423,15 @@ impl Kernel for QMoEKernel {
                 )
             };
 
-            if self.prefetch_experts && ordered.len() > 1 {
+            if self.prefetch_experts && ordered.len() > 1 && prefetch_is_eviction_neutral {
                 // Single-ahead prefetch pipeline: a dedicated worker leases
                 // (and, on a miss, dequantizes) expert `n+1` while the main
                 // thread computes expert `n`, overlapping the host-side
                 // transfer with compute. Leases are still issued strictly in
-                // ascending expert order (one request in flight), so cache
-                // admission/eviction and every counter stay byte-identical to
-                // the serial path — only the wall-clock overlaps.
+                // ascending expert order (one request in flight). Combined with
+                // the eviction-neutrality guard above, cache admission/eviction
+                // and every counter stay byte-identical to the serial path —
+                // only the wall-clock overlaps.
                 use std::sync::mpsc;
                 let layer_id = self.layer_id;
                 let bits = self.bits;
@@ -2176,6 +2218,201 @@ mod tests {
         assert!(stats.peak_owned_host_cache_bytes <= one_expert);
     }
 
+    /// Multi-routing / multi-budget sweep proving the prefetch pipeline is
+    /// observationally indistinguishable from the serial route-first loop.
+    ///
+    /// The single-ahead pipeline holds expert `n`'s lease while admitting
+    /// `n+1`; the extra in-flight `Arc` protects entry `n` from eviction, so in
+    /// the partial-cache regime the pipeline and serial retain different experts
+    /// and diverge on hits/misses/evictions/bytes-read. The eviction-neutrality
+    /// guard engages the pipeline only where no eviction can occur while a
+    /// prefetch is in flight (`budget == 0` streaming, or `budget >= experts`
+    /// fully resident) and otherwise falls back to the serial loop, so the two
+    /// paths are byte- and stat-identical everywhere.
+    ///
+    /// The router seeds were mined from a guard-less run and reproduce Gaff's
+    /// cited divergences on this fixture (e.g. seed `0x1000+3·131`/k=1/budget=3×
+    /// read +3072 mmap bytes; seed `0x1000+8·131`/k=2/budget=3× diverged on
+    /// misses). The sweep drives them across the engaged budgets (0× and the
+    /// fully-resident 6×/8×) and the partial budgets that must fall back, and
+    /// asserts for every combination:
+    ///   * byte-identical output,
+    ///   * identical hits/misses/evictions/bytes-read, and
+    ///   * bytes-read is never a regression (`pipe <= serial`).
+    ///
+    /// Removing the guard lets the pipeline engage under a partial budget and
+    /// reintroduces the divergences, failing this test.
+    #[test]
+    fn prefetch_matches_serial_across_routing_and_budget_sweep() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        // Dimensions chosen so the host-side working set exceeds a few-expert
+        // budget, forcing real cross-step admission/eviction (the regime where
+        // an extra in-flight lease can perturb victim selection).
+        const EXPERTS: usize = 6;
+        const HIDDEN: usize = 32;
+        const INTER: usize = 64;
+        const ROWS: usize = 6;
+        const STEPS: usize = 16;
+        let one_expert: u64 = ((INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+
+        // Router seeds whose guard-less single-ahead pipeline diverges from
+        // serial on this fixture (mined offline); includes Gaff's cited
+        // seed=3/k=1 and seed=8/k=2 regimes.
+        let router_seeds: [u64; 8] = [
+            0x1000 + 3 * 131,
+            0x1000 + 7 * 131,
+            0x1000 + 8 * 131,
+            0x1000 + 13 * 131,
+            0x1000 + 27 * 131,
+            0x1000 + 33 * 131,
+            0x1000 + 34 * 131,
+            0x1000 + 39 * 131,
+        ];
+        let ks: [usize; 3] = [1, 2, 3];
+        // 0× engages the streaming pipeline; 1×–4× are partial (serial
+        // fallback); 6× (== EXPERTS) and 8× are fully resident (engaged, no
+        // eviction). All must be indistinguishable from serial.
+        let budget_experts: [u64; 6] = [0, 1, 3, 4, 6, 8];
+
+        let mut saw_partial_eviction = false;
+        let mut saw_engaged_streaming = false;
+        for &seed in &router_seeds {
+            for &k in &ks {
+                let routers = bench_routers(EXPERTS, ROWS, STEPS, seed);
+                for &mult in &budget_experts {
+                    let budget = mult * one_expert;
+                    let (serial_out, serial_stats, _) = run_route_first_bench(
+                        EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, false,
+                    );
+                    let (pipe_out, pipe_stats, _) = run_route_first_bench(
+                        EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, true,
+                    );
+                    let ctx = format!("seed={seed:#x} k={k} budget={mult}x");
+                    assert_eq!(
+                        serial_out, pipe_out,
+                        "output must be byte-identical ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.host_cache_hits, pipe_stats.host_cache_hits,
+                        "hits diverged ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.host_cache_misses, pipe_stats.host_cache_misses,
+                        "misses diverged ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.host_cache_evictions, pipe_stats.host_cache_evictions,
+                        "evictions diverged ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.bytes_read_from_mmap, pipe_stats.bytes_read_from_mmap,
+                        "bytes-read diverged ({ctx})"
+                    );
+                    // The feature's own intent: never read more than serial.
+                    assert!(
+                        pipe_stats.bytes_read_from_mmap <= serial_stats.bytes_read_from_mmap,
+                        "prefetch read more mmap bytes than serial ({ctx})"
+                    );
+                    // The partial budgets (which fall back to serial) must
+                    // actually exercise eviction, else the guard-removal
+                    // mutation would have nothing to diverge on.
+                    if (1..EXPERTS as u64).contains(&mult) && serial_stats.host_cache_evictions > 0
+                    {
+                        saw_partial_eviction = true;
+                    }
+                    // The streaming budget engages the pipeline with real leases.
+                    if mult == 0 && serial_stats.host_cache_misses > 0 {
+                        saw_engaged_streaming = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_partial_eviction,
+            "sweep must exercise eviction in a partial-budget (fallback) regime"
+        );
+        assert!(
+            saw_engaged_streaming,
+            "sweep must exercise the engaged streaming pipeline (budget == 0)"
+        );
+    }
+
+    /// Mutation probe pinned to the exact regimes Gaff cited: seed=3/k=1 (the
+    /// +3072-byte default-on regression) and seed=8/k=2 (evictions/misses
+    /// divergence). It exercises both the engaged pipeline and the fallback,
+    /// and fails if the eviction-neutrality guard is removed.
+    ///
+    /// At the partial budget (3×) these fixtures evict, and the original
+    /// guard-less pipeline diverged from serial; the guard now forces serial
+    /// fallback, so the counters match exactly — deleting the guard re-engages
+    /// the pipeline here and reintroduces the divergence, failing the equality
+    /// assertions. At `budget == 0` the pipeline is engaged (streaming) and is
+    /// asserted byte- and stat-identical, proving the fix does not simply
+    /// disable prefetch.
+    #[test]
+    fn prefetch_guard_holds_stats_in_gaff_divergent_regime() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        const EXPERTS: usize = 6;
+        const HIDDEN: usize = 32;
+        const INTER: usize = 64;
+        const ROWS: usize = 6;
+        const STEPS: usize = 16;
+        let one_expert: u64 = ((INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+
+        // (router seed, k) pairs Gaff's sweep flagged as divergent under the
+        // original guard-less pipeline on this fixture.
+        let cases: [(u64, usize); 2] = [(0x1000 + 3 * 131, 1), (0x1000 + 8 * 131, 2)];
+        let mut fallback_evicted = false;
+        let mut streaming_missed = false;
+        for &(seed, k) in &cases {
+            let routers = bench_routers(EXPERTS, ROWS, STEPS, seed);
+            // 3× is a partial budget: the guard falls back to serial here.
+            // 0× is streaming: the guard engages the pipeline here.
+            for &budget in &[3 * one_expert, 0] {
+                let (serial_out, serial_stats, _) = run_route_first_bench(
+                    EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, false,
+                );
+                let (pipe_out, pipe_stats, _) = run_route_first_bench(
+                    EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, true,
+                );
+                let ctx = format!("seed={seed:#x} k={k} budget={budget}");
+                assert_eq!(
+                    serial_out, pipe_out,
+                    "output must be byte-identical ({ctx})"
+                );
+                assert_eq!(
+                    serial_stats.host_cache_misses, pipe_stats.host_cache_misses,
+                    "miss count must match serial ({ctx})"
+                );
+                assert_eq!(
+                    serial_stats.host_cache_evictions, pipe_stats.host_cache_evictions,
+                    "eviction count must match serial ({ctx})"
+                );
+                assert_eq!(
+                    serial_stats.bytes_read_from_mmap, pipe_stats.bytes_read_from_mmap,
+                    "bytes-read must match serial — no default-on regression ({ctx})"
+                );
+                assert!(
+                    pipe_stats.bytes_read_from_mmap <= serial_stats.bytes_read_from_mmap,
+                    "prefetch must never read more mmap bytes than serial ({ctx})"
+                );
+                if budget > 0 {
+                    fallback_evicted |= serial_stats.host_cache_evictions > 0;
+                } else {
+                    streaming_missed |= serial_stats.host_cache_misses > 0;
+                }
+            }
+        }
+        assert!(
+            fallback_evicted,
+            "the cited partial-budget regimes must evict for the guard-removal probe to bite"
+        );
+        assert!(
+            streaming_missed,
+            "the streaming regime must issue real leases so the engaged path is exercised"
+        );
+    }
+
     /// A/B micro-benchmark. Ignored by default (timing-sensitive); run with:
     /// `cargo test -p onnx-runtime-ep-cpu prefetch_ab_benchmark -- --ignored --nocapture`.
     #[test]
@@ -2189,8 +2426,12 @@ mod tests {
         const STEPS: usize = 64;
         const K: usize = 4;
         let routers = bench_routers(EXPERTS, ROWS, STEPS, 0x5eed_c0de);
-        // Budget ~4 experts: forces admission + eviction, hit-rate < 100%.
-        let budget: u64 = (4 * (INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+        // Streaming host budget (0 = no host cache): every routed expert is
+        // dequantized from mmap each step, so the pipeline overlaps the full
+        // transfer with compute. This is the regime the eviction-neutrality
+        // guard engages (no admission/eviction state to perturb), so the A/B is
+        // both representative of the win and byte-/stat-identical.
+        let budget: u64 = 0;
 
         // Warm both configurations once (JIT of page faults) then time.
         let mut serial = None;
