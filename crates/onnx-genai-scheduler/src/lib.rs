@@ -12,7 +12,8 @@ pub mod policy;
 pub mod pressure;
 
 pub use byte_budget::{
-    BudgetSnapshot, ByteBudget, ByteBudgetError, ReconfigureOutcome as ByteBudgetReconfigureOutcome,
+    BudgetSnapshot, ByteBudget, ByteBudgetError, ByteBudgetReservation,
+    ReconfigureOutcome as ByteBudgetReconfigureOutcome,
 };
 pub use governor::{
     CapacityProvider, CapacityProviders, DerivedBudget, EvictionTier, FixedCapacity,
@@ -335,47 +336,66 @@ impl Scheduler {
     ) -> Result<(Request, u64, Option<ScheduledBudgetCap>), SchedulerAdmissionError> {
         let mut admitted = request.clone();
         let requested_bytes = self.estimated_bytes(request.prompt_tokens, request.max_tokens);
-        match self.try_reserve_bytes(requested_bytes) {
-            Ok(()) => Ok((admitted, requested_bytes, None)),
-            Err(error) => {
-                let available_bytes = error.available;
-                let Some(admitted_max_tokens) =
-                    self.max_tokens_for_available_bytes(request.prompt_tokens, error.available)
-                else {
+
+        let Some(budget) = &self.byte_budget else {
+            return Ok((admitted, requested_bytes, None));
+        };
+        let Some(bytes_per_token) = self.config.bytes_per_token.filter(|&bytes| bytes > 0) else {
+            budget
+                .try_reserve(requested_bytes)
+                .map_err(|error| self.admission_byte_error(request, requested_bytes, error))?;
+            return Ok((admitted, requested_bytes, None));
+        };
+
+        let minimum_required = self.estimated_bytes(request.prompt_tokens, 1);
+        let reservation =
+            match budget.try_reserve_at_most(requested_bytes, minimum_required, bytes_per_token) {
+                Ok(reservation) => reservation,
+                Err(error) => {
                     return Err(self.admission_byte_error(request, requested_bytes, error));
-                };
-                admitted.max_tokens = admitted_max_tokens.min(request.max_tokens);
-                let capped_bytes =
-                    self.estimated_bytes(admitted.prompt_tokens, admitted.max_tokens);
-                match self.try_reserve_bytes(capped_bytes) {
-                    Ok(()) => Ok((
-                        admitted,
-                        capped_bytes,
-                        Some(ScheduledBudgetCap {
-                            requested_max_tokens: request.max_tokens,
-                            admitted_max_tokens: admitted_max_tokens.min(request.max_tokens),
-                            requested_bytes,
-                            admitted_bytes: capped_bytes,
-                            available_bytes,
-                        }),
-                    )),
-                    Err(error) => Err(self.admission_byte_error(request, requested_bytes, error)),
                 }
-            }
+            };
+        if reservation.reserved == requested_bytes {
+            return Ok((admitted, requested_bytes, None));
         }
+
+        let Some(admitted_max_tokens) =
+            self.max_tokens_for_reserved_bytes(request.prompt_tokens, reservation.reserved)
+        else {
+            self.release_bytes(reservation.reserved);
+            return Err(self.admission_byte_error(
+                request,
+                requested_bytes,
+                ByteBudgetError {
+                    requested: requested_bytes,
+                    used: budget.used(),
+                    limit: budget.limit(),
+                    available: reservation.available_before,
+                    shortfall: minimum_required.saturating_sub(reservation.available_before),
+                },
+            ));
+        };
+        admitted.max_tokens = admitted_max_tokens.min(request.max_tokens);
+        Ok((
+            admitted,
+            reservation.reserved,
+            Some(ScheduledBudgetCap {
+                requested_max_tokens: request.max_tokens,
+                admitted_max_tokens: admitted_max_tokens.min(request.max_tokens),
+                requested_bytes,
+                admitted_bytes: reservation.reserved,
+                available_bytes: reservation.available_before,
+            }),
+        ))
     }
 
-    fn max_tokens_for_available_bytes(
-        &self,
-        prompt_tokens: usize,
-        available: u64,
-    ) -> Option<usize> {
+    fn max_tokens_for_reserved_bytes(&self, prompt_tokens: usize, reserved: u64) -> Option<usize> {
         let bytes_per_token = self.config.bytes_per_token?;
         if bytes_per_token == 0 {
             return None;
         }
-        let available_tokens = (available / bytes_per_token) as usize;
-        available_tokens
+        let reserved_tokens = (reserved / bytes_per_token) as usize;
+        reserved_tokens
             .checked_sub(prompt_tokens)
             .filter(|&n| n > 0)
     }
@@ -472,7 +492,6 @@ impl Scheduler {
                         break;
                     }
                     sequence.reserved_bytes = bytes;
-                    sequence.budget_cap = None;
                     decision.swap_in.push(sequence.seq_id);
                     self.running.push(sequence);
                 }
@@ -956,6 +975,38 @@ mod tests {
     }
 
     #[test]
+    fn budget_cap_survives_swap_out_and_swap_in() {
+        let budget = ByteBudget::new(640);
+        let config = SchedulerConfig {
+            max_batch_size: 1,
+            max_total_tokens: 1 << 20,
+            priority_policy: PriorityPolicy::Priority,
+            preemption_policy: PreemptionPolicy::Swap,
+            bytes_per_token: Some(1),
+        };
+        let mut scheduler = Scheduler::with_byte_budget(config, budget.clone());
+
+        scheduler.enqueue_generate_request(10, 512, 3584, Priority::Low);
+        let capped = scheduler.schedule();
+        assert_eq!(capped.prefill, vec![10]);
+        let cap = scheduler.running_budget_cap(10).unwrap();
+        assert_eq!(scheduler.running_max_tokens(10), Some(128));
+        scheduler.advance(10);
+
+        scheduler.enqueue_generate_request(20, 1, 1, Priority::High);
+        let preempt = scheduler.schedule();
+        assert_eq!(preempt.preempt, vec![10]);
+        assert_eq!(preempt.prefill, vec![20]);
+
+        scheduler.complete(20);
+        let resume = scheduler.schedule();
+        assert_eq!(resume.swap_in, vec![10]);
+        assert_eq!(scheduler.running_max_tokens(10), Some(128));
+        assert_eq!(scheduler.running_budget_cap(10), Some(cap));
+        assert_eq!(budget.used(), 640);
+    }
+
+    #[test]
     fn reconfigure_lower_reports_overage_and_blocks_new_admissions() {
         let budget = ByteBudget::new(300);
         let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
@@ -1019,6 +1070,29 @@ mod tests {
     }
 
     #[test]
+    fn capped_reservation_uses_current_shared_budget_atomically() {
+        let budget = ByteBudget::new(640);
+        budget.try_reserve(100).unwrap();
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
+        scheduler.enqueue_generate_request(42, 512, 3584, Priority::Normal);
+
+        let scheduled = scheduler.drive_next_fcfs_result().unwrap().unwrap();
+
+        assert_eq!(scheduled.max_tokens, 28);
+        assert_eq!(
+            scheduled.budget_cap,
+            Some(ScheduledBudgetCap {
+                requested_max_tokens: 3584,
+                admitted_max_tokens: 28,
+                requested_bytes: 4096,
+                admitted_bytes: 540,
+                available_bytes: 540,
+            })
+        );
+        assert_eq!(budget.used(), 640);
+    }
+
+    #[test]
     fn long_multi_turn_session_is_not_rejected_purely_because_ceiling_grew() {
         let budget = ByteBudget::new(1024);
         let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
@@ -1074,6 +1148,27 @@ mod tests {
         assert_eq!(budget.used(), 640);
         scheduler.cancel_request(admitted);
         assert_eq!(scheduler.running_count(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn mismatched_admission_cleanup_clears_admitted_and_original_requests() {
+        let budget = ByteBudget::new(1000);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
+
+        let stale = scheduler.enqueue_generate_request(20, 2, 2, Priority::Normal);
+        let original = scheduler.enqueue_generate_request(7, 512, 3584, Priority::Normal);
+        let scheduled = scheduler.drive_next_fcfs_result().unwrap().unwrap();
+        assert_eq!(scheduled.request_id, stale);
+        assert_eq!(scheduler.running_count(), 1);
+        assert_eq!(scheduler.waiting_count(), 1);
+        assert_eq!(budget.used(), 4);
+
+        scheduler.cancel_request(scheduled.request_id);
+        scheduler.cancel_request(original);
+
+        assert_eq!(scheduler.running_count(), 0);
+        assert_eq!(scheduler.waiting_count(), 0);
         assert_eq!(budget.used(), 0);
     }
 

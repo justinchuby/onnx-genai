@@ -367,7 +367,9 @@ impl Engine {
         };
         if scheduled.request_id != request_id || scheduled.seq_id != session_id {
             self.scheduler.cancel_request(scheduled.request_id);
-            self.scheduler.complete(session_id);
+            if scheduled.request_id != request_id {
+                self.scheduler.cancel_request(request_id);
+            }
             anyhow::bail!(
                 "scheduler admitted request {} for session {}, expected request {} for session {}",
                 scheduled.request_id,
