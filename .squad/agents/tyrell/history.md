@@ -36,3 +36,6 @@ WP-B landed: Progress docs should now treat WP-B as fully landed after WP-B3 `3d
 
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Reviewed PR #304 / #62 and approved bit-identical Tier A/Tier B paged GQA plus zero-present-allocation invariants.
+
+## 2026-07-28T17:40:00+0000
+Approved the final #362 control-flow inference regression-fix cycle.

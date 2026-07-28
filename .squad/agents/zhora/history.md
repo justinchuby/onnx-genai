@@ -128,3 +128,6 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 - Text `onnx-genai generate` now follows the REPL default: compact stats are on only when the shared REPL input-mode detector sees stdin and stdout as terminals, and `--no-stats` opts out.
 - The compact stats line is stderr-only and suppressed by `--profile`; piped stdout remains byte-stable generated text.
 - Image/audio `generate` and `transcribe` keep compact token stats off by default; their non-token throughput belongs in `--profile`.
+
+## 2026-07-28T17:40:00+0000
+#364 merged after the implementation was corrected to use prefetch only in eviction-neutral cache regimes.
