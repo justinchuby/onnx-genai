@@ -174,6 +174,42 @@ fn a_text_only_model_rejects_attachments_by_naming_what_it_accepts() {
 }
 
 #[test]
+fn piped_generate_stdout_is_byte_identical_with_or_without_default_stats() {
+    let base = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+    ]);
+    let no_stats = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+        "--no-stats",
+    ]);
+
+    assert!(base.status.success(), "failed: {}", stderr(&base));
+    assert!(no_stats.status.success(), "failed: {}", stderr(&no_stats));
+    assert_eq!(
+        stdout(&base),
+        stdout(&no_stats),
+        "piped stdout must remain pure generated text"
+    );
+    assert!(
+        !stdout(&base).contains("tok/s") && !stdout(&base).contains("ttft"),
+        "stats must not contaminate piped stdout: {}",
+        stdout(&base)
+    );
+}
+
+#[test]
 fn generate_renders_a_prompt_to_a_png() {
     let out = repository_root().join("target/test-fixtures/cli-render.png");
     let _ = std::fs::remove_file(&out);

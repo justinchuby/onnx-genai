@@ -123,3 +123,8 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 - Made REPL command parsing mode-aware: `Plain` preserves `main` piped behavior for `//...` and `/help <arg>`, while `Tty` keeps the new rich affordances.
 - Fixed the post-generation newline decision to depend on whether the current turn actually used live rendering, not on the reusable renderer lifecycle state.
 - Added lib and e2e regressions; local ONNX Runtime mismatch still prevents model-loading e2e verification.
+
+### 2026-07-27T18:46:09-07:00 — generate default stats stdout/stderr contract
+- Text `onnx-genai generate` now follows the REPL default: compact stats are on only when the shared REPL input-mode detector sees stdin and stdout as terminals, and `--no-stats` opts out.
+- The compact stats line is stderr-only and suppressed by `--profile`; piped stdout remains byte-stable generated text.
+- Image/audio `generate` and `transcribe` keep compact token stats off by default; their non-token throughput belongs in `--profile`.
