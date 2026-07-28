@@ -73,9 +73,11 @@ impl NativeDecodeSession {
         )
     }
 
-    /// Load with an explicit CUDA KV capacity. `None` uses
-    /// `ONNX_GENAI_CUDA_KV_MAX_LEN`, then derives a default from model metadata
-    /// clamped by queried CUDA free memory.
+    /// Load with an explicit CUDA KV capacity. `None` resolves in order:
+    /// `ONNX_GENAI_CUDA_KV_MAX_LEN`, then `model.max_sequence_length` from
+    /// inference metadata, then unbounded growth until the device refuses
+    /// allocation. No free-memory ceiling is derived; the hard maximum comes
+    /// only from an explicit override or the model's declared context limit.
     pub fn load_with_cuda_kv_max_len(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
