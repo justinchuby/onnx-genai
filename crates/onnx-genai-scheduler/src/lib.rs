@@ -194,6 +194,11 @@ impl Scheduler {
         self.byte_budget.as_ref()
     }
 
+    /// Access the scheduler's configuration.
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+
     /// Submit a new request to the scheduler.
     pub fn add_request(
         &mut self,

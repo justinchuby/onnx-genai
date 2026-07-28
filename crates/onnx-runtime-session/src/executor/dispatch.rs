@@ -312,6 +312,7 @@ impl Executor {
         self.refill_input_shapes(pi, resolved);
         let inputs = &self.plan[pi].inputs;
         let outputs = &self.plan[pi].outputs;
+        let inplace_dead_inputs = &self.plan[pi].inplace_dead_inputs;
         let input_dtypes = &self.plan[pi].input_dtypes;
         let output_dtypes = &self.plan[pi].output_dtypes;
         let input_shapes = &self.scratch_input_shapes;
@@ -438,7 +439,38 @@ impl Executor {
         // --- Compute path ----------------------------------------------------
         // Size (allocate or reuse) each output's contiguous buffer, JIT-sizing
         // data-dependent ones.
-        ctx.ensure_output_backings(outputs, &output_shapes, output_dtypes, external)?;
+        let inplace_input =
+            if self.compute_in_place_enabled && outputs.len() == 1 && !has_lazy_inputs {
+                inplace_dead_inputs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, dead)| {
+                        let vid = inputs[index]?;
+                        let info = &in_infos[index];
+                        (*dead
+                            && kernel.can_run_in_place(index)
+                            && !external.inputs.contains_key(&vid)
+                            && !external.outputs.contains_key(&vid)
+                            && !ctx.graph.outputs.contains(&vid)
+                            && !ctx.views_meta.contains_key(&vid)
+                            && !ctx.pinned.contains(&vid)
+                            && !ctx.shared_buffers.contains_key(&vid)
+                            && !self.seq_elem_values.contains_key(&vid)
+                            && info.dtype == output_dtypes[0]
+                            && info.shape == output_shapes[0]
+                            && onnx_runtime_ir::is_contiguous(&info.shape, &info.strides)
+                            && info.byte_offset == 0)
+                            .then_some(vid)
+                    })
+            } else {
+                None
+            };
+        if let Some(input) = inplace_input {
+            ctx.alias_input_as_output(input, outputs[0], &output_shapes[0])?;
+            self.compute_in_place_alias_count += 1;
+        } else {
+            ctx.ensure_output_backings(outputs, &output_shapes, output_dtypes, external)?;
+        }
 
         // Auto-materialization gate: strided (view) inputs feeding a kernel that
         // does not accept them on that slot are gathered into private contiguous
@@ -984,6 +1016,32 @@ struct KernelDispatchContext<'a> {
 }
 
 impl KernelDispatchContext<'_> {
+    /// Transfer a dead, exclusively-owned input allocation to the output value.
+    /// The input views were constructed before this move and retain its raw
+    /// address; the kernel capability contract is what makes simultaneous read
+    /// and write through that identical range safe.
+    fn alias_input_as_output(
+        &mut self,
+        input: ValueId,
+        output: ValueId,
+        output_shape: &[usize],
+    ) -> Result<()> {
+        let buffer = self.buffers.remove(&input).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "missing buffer for in-place input value#{}",
+                input.0
+            ))
+        })?;
+        self.buffer_shapes.remove(&input);
+        if let Some(old) = self.buffers.remove(&output) {
+            self.ep.deallocate(old)?;
+        }
+        self.shared_buffers.remove(&output);
+        self.buffers.insert(output, buffer);
+        self.buffer_shapes.insert(output, output_shape.to_vec());
+        Ok(())
+    }
+
     /// Install the kernel's zero-copy view outputs: bounds-gate each composed
     /// view against its source allocation, drop any buffer the output used to
     /// own, record the alias, and pin the source for the rest of the run.

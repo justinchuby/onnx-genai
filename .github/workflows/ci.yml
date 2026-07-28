@@ -1,13 +1,21 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  CARGO_LLVM_COV_VERSION: "0.8.7"
 
 jobs:
   rust-quality:
@@ -20,10 +28,36 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
+      # without freezing security fixes; the cache key records the resolved rustc release.
+      - name: Install Rust stable toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+      # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
       # Blocking, like the clippy gate below. The sweep this exception was
       # waiting on has landed, so an unformatted tree is now a failure rather
@@ -121,15 +155,55 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
+      # without freezing security fixes; the cache key records the resolved rustc release.
+      - name: Install Rust stable toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
+          rustup default stable
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+      # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="${{ matrix.target || '' }}"
+          if [ -z "$target" ]; then
+            target="$(rustc -Vv | sed -n 's/^host: //p')"
+          fi
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
+      # Installing from crates.io avoids the personally-owned install action;
+      # cargo install costs build minutes on cache misses but keeps provenance in Cargo-style resolution.
+      - name: Install cargo-llvm-cov
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -q "$CARGO_LLVM_COV_VERSION"; then
+            echo "cargo-llvm-cov $CARGO_LLVM_COV_VERSION already installed"
+          else
+            cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
+          fi
 
       # Never replace these explicit packages with bare `cargo test` or
       # `--workspace`: that selects onnx-genai-ort-sys, whose build script
@@ -137,7 +211,42 @@ jobs:
       # after `cargo tree -p <crate> -e normal,dev` confirms no ort-sys,
       # onnx-runtime-ep-cuda, or cudarc dependency. CUDA tests stay compile-only
       # below because GitHub-hosted runners have no GPU.
+      # Rust/LLVM coverage is currently broken on aarch64-pc-windows-msvc
+      # (rust-lang/rust#150123: llvm-profdata reports malformed profraw files),
+      # so that runner keeps executing the same tests without a report until upstream fixes it.
+      - name: Test cross-platform offline crates with coverage
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        run: >-
+          cargo llvm-cov --locked --codecov --output-path codecov-offline.json
+          -p onnx-genai-comfyui-config
+          -p onnx-genai-metadata
+          -p onnx-genai-genai-config
+          -p onnx-genai-kv
+          -p onnx-genai-runtime-config
+          -p onnx-genai-scheduler
+          -p onnx-runtime-protocol-trace
+          -p onnx-runtime-ir
+          -p onnx-runtime-ep-api
+          -p onnx-runtime-ep-cpu
+          -p onnx-runtime-loader
+          -p onnx-runtime-shape-inference
+          -p onnx-runtime-optimizer
+          -p onnx-runtime-quantization
+          -p onnx-runtime-session
+          -p onnx-runtime-tracer
+          -p onnx-genai-preprocess
+          -p onnx-std
+          -p onnx-genai-router
+          -p onnx-runtime-memory
+          -p onnx-runtime-cpuinfo
+          -p onnx-runtime-eager
+          -p onnx-runtime-capi
+          -p onnx-runtime-dlpack
+          -p onnx-runtime-comm
+          -p onnx-std-python
+
       - name: Test cross-platform offline crates
+        if: matrix.target == 'aarch64-pc-windows-msvc'
         run: >-
           cargo test --locked
           -p onnx-genai-comfyui-config
@@ -166,6 +275,15 @@ jobs:
           -p onnx-runtime-dlpack
           -p onnx-runtime-comm
           -p onnx-std-python
+
+      - name: Upload offline coverage to Codecov
+        if: always() && matrix.target != 'aarch64-pc-windows-msvc'
+        uses: codecov/codecov-action@v4
+        with:
+          files: codecov-offline.json
+          flags: offline
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Clippy Windows ARM64 offline crates
         if: matrix.target == 'aarch64-pc-windows-msvc'
@@ -202,9 +320,18 @@ jobs:
 
       # The vendored MLAS feasibility spike is offline, but its build script is
       # intentionally x86_64 Linux-only (GAS assembly and Linux headers).
-      - name: Test Linux-only offline crates
+      - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
-        run: cargo test --locked -p mlas-sys
+        run: cargo llvm-cov --locked --codecov --output-path codecov-mlas.json -p mlas-sys
+
+      - name: Upload MLAS coverage to Codecov
+        if: always() && runner.os == 'Linux'
+        uses: codecov/codecov-action@v4
+        with:
+          files: codecov-mlas.json
+          flags: mlas
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   cli-ort:
     name: CLI ORT coverage (${{ matrix.name }})
@@ -214,8 +341,10 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
+            coverage_flag: cli-ort-linux
           - name: Windows x86_64
             os: windows-latest
+            coverage_flag: cli-ort-windows
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -224,10 +353,36 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
+      # without freezing security fixes; the cache key records the resolved rustc release.
+      - name: Install Rust stable toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
+          rustup default stable
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+      # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
       - name: Install Linux bindgen dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -239,6 +394,16 @@ jobs:
           if (Test-Path (Join-Path $llvm 'libclang.dll')) {
             "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
           }
+      # Installing from crates.io avoids the personally-owned install action;
+      # cargo install costs build minutes on cache misses but keeps provenance in Cargo-style resolution.
+      - name: Install cargo-llvm-cov
+        shell: bash
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -q "$CARGO_LLVM_COV_VERSION"; then
+            echo "cargo-llvm-cov $CARGO_LLVM_COV_VERSION already installed"
+          else
+            cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
+          fi
 
       # The portable lane must stay offline, but the CLI is the user-facing ORT
       # entry point and its REPL contract tests catch token-budget regressions.
@@ -258,71 +423,24 @@ jobs:
           }
           Copy-Item $ort.FullName target\debug\onnxruntime.dll -Force
           Copy-Item $ort.FullName target\debug\deps\onnxruntime.dll -Force
+          # cargo-llvm-cov may use its own target directory; pre-stage the same ORT DLL
+          # there and run coverage with --no-clean so it is not removed before tests.
+          New-Item -ItemType Directory -Force target\llvm-cov-target\debug\deps | Out-Null
+          Copy-Item $ort.FullName target\llvm-cov-target\debug\onnxruntime.dll -Force
+          Copy-Item $ort.FullName target\llvm-cov-target\debug\deps\onnxruntime.dll -Force
           $ort.DirectoryName >> $env:GITHUB_PATH
-      - name: Test onnx-genai-cli
-        run: cargo test --locked -p onnx-genai-cli
-      - name: Clippy onnx-genai-cli
-        run: cargo clippy --locked -p onnx-genai-cli --all-targets -- -D warnings
-
-  coverage:
-    name: Rust coverage
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install Python test dependencies
-        run: python -m pip install --upgrade numpy onnxscript
-      - uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Collect Rust coverage
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov.json
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p mlas-sys
-          -p onnx-runtime-loader
-          -p onnx-std
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-genai-router
-          -p onnx-runtime-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
-
-      - name: Upload coverage to Codecov
+      - name: Test onnx-genai-cli with coverage
+        run: cargo llvm-cov --locked --no-clean --codecov --output-path codecov-cli-ort.json -p onnx-genai-cli
+      - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
         with:
-          files: codecov.json
+          files: codecov-cli-ort.json
+          flags: ${{ matrix.coverage_flag }}
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Clippy onnx-genai-cli
+        run: cargo clippy --locked -p onnx-genai-cli --all-targets -- -D warnings
 
   cuda-compile:
     name: CUDA compile (${{ matrix.name }})
@@ -342,8 +460,36 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Keep CI on Rust stable deliberately: this follows Rust's stability promise
+      # without freezing security fixes; the cache key records the resolved rustc release.
+      - name: Install Rust stable toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+      # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
 
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit,
       # but ep-cuda tests require a CUDA runtime/GPU and must not join the

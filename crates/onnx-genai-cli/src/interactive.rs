@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,10 +14,16 @@ use onnx_genai::{
     GenerateTokenCallback,
 };
 use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
+use reedline::{
+    ColumnarMenu, Completer, DefaultHinter, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
+    MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline,
+    ReedlineEvent, ReedlineMenu, Signal, Span, Suggestion, default_emacs_keybindings,
+};
 
 use super::commands::{
-    ProfileSetting, ReplCommand, ReplLine, available_execution_providers, parse_decode_backend,
-    parse_profile_setting, parse_repl_line, reload, set_trace_recording,
+    ProfileSetting, ReplCommand, ReplLine, available_execution_providers, complete_repl_line,
+    parse_decode_backend, parse_profile_setting, parse_repl_line, reload, render_command_help,
+    render_repl_help, set_trace_recording,
 };
 use super::output::{
     build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
@@ -46,6 +53,187 @@ pub(super) static EXIT_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Guards one-time installation of the Ctrl-C handler.
 static CTRLC_HANDLER: Once = Once::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplInputMode {
+    Plain,
+    Tty,
+}
+
+pub(super) fn repl_input_mode(stdin_is_terminal: bool, stdout_is_terminal: bool) -> ReplInputMode {
+    if stdin_is_terminal && stdout_is_terminal {
+        ReplInputMode::Tty
+    } else {
+        ReplInputMode::Plain
+    }
+}
+
+pub(super) fn initial_repl_show_stats(mode: ReplInputMode, no_stats: bool) -> bool {
+    matches!(mode, ReplInputMode::Tty) && !no_stats
+}
+
+pub(super) fn plain_stream_needs_trailing_newline(used_live_this_turn: bool) -> bool {
+    !used_live_this_turn
+}
+
+struct ReplPrompt;
+
+impl Prompt for ReplPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _edit_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed(">>> ")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("... ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let status = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!(
+            "({status}reverse-search: {}) ",
+            history_search.term
+        ))
+    }
+}
+
+#[derive(Default)]
+struct SlashCompleter;
+
+impl Completer for SlashCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        complete_repl_line(line, pos)
+            .into_iter()
+            .map(|completion| Suggestion {
+                value: completion.replacement,
+                display_override: Some(completion.display),
+                description: completion.description,
+                span: Span::new(completion.start, completion.end),
+                append_whitespace: completion.append_space,
+                ..Suggestion::default()
+            })
+            .collect()
+    }
+}
+
+enum ReplReader {
+    Plain,
+    Tty {
+        editor: Box<Reedline>,
+        prompt: ReplPrompt,
+    },
+}
+
+enum ReplRead {
+    Line(String),
+    Continue,
+    Eof,
+}
+
+impl ReplReader {
+    fn new(mode: ReplInputMode) -> Self {
+        match mode {
+            ReplInputMode::Plain => Self::Plain,
+            ReplInputMode::Tty => Self::Tty {
+                editor: Box::new(build_reedline_editor()),
+                prompt: ReplPrompt,
+            },
+        }
+    }
+
+    fn read_line(&mut self, stdin: &io::Stdin) -> anyhow::Result<ReplRead> {
+        match self {
+            Self::Plain => {
+                print!(">>> ");
+                io::stdout().flush()?;
+
+                let mut line = String::new();
+                if stdin.lock().read_line(&mut line)? == 0 {
+                    eprintln!();
+                    return Ok(ReplRead::Eof);
+                }
+                Ok(ReplRead::Line(
+                    line.trim_end_matches(['\n', '\r']).to_string(),
+                ))
+            }
+            Self::Tty { editor, prompt } => match editor.read_line(prompt) {
+                Ok(Signal::Success(line)) => Ok(ReplRead::Line(line)),
+                Ok(Signal::CtrlD) => {
+                    eprintln!();
+                    Ok(ReplRead::Eof)
+                }
+                Ok(Signal::CtrlC) => {
+                    match interrupt_action(false, false, EXIT_ARMED.load(Ordering::SeqCst)) {
+                        InterruptAction::WarnThenExit => {
+                            EXIT_ARMED.store(true, Ordering::SeqCst);
+                            eprintln!("\n^C  (press Ctrl-C again to exit)");
+                            Ok(ReplRead::Continue)
+                        }
+                        InterruptAction::Exit => std::process::exit(EXIT_INTERRUPTED),
+                        InterruptAction::CancelGeneration => {
+                            unreachable!("idle prompt is not generating")
+                        }
+                    }
+                }
+                Ok(Signal::ExternalBreak(line) | Signal::HostCommand(line)) => {
+                    Ok(ReplRead::Line(line))
+                }
+                Ok(_) => Ok(ReplRead::Continue),
+                Err(error) => Err(anyhow::anyhow!(error)),
+            },
+        }
+    }
+}
+
+fn build_reedline_editor() -> Reedline {
+    let mut keybindings = default_emacs_keybindings();
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu("completion_menu".to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+    let edit_mode = Box::new(Emacs::new(keybindings));
+    let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
+    let history = Box::new(
+        FileBackedHistory::with_file(1000, repl_history_path())
+            .unwrap_or_else(|_| FileBackedHistory::default()),
+    );
+
+    Reedline::create()
+        .with_history(history)
+        .with_completer(Box::new(SlashCompleter))
+        .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_edit_mode(edit_mode)
+        .with_hinter(Box::new(DefaultHinter::default()))
+}
+
+fn repl_history_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ONNX_GENAI_REPL_HISTORY") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".onnx-genai")
+        .join("repl-history.txt")
+}
 
 /// Marker error returned by the streaming callback when a Ctrl-C interrupt has
 /// been requested. It propagates out of `generate_with_callback` as an
@@ -705,6 +893,7 @@ pub(super) fn read_attachment(path: &Path, kind: &str) -> anyhow::Result<Vec<u8>
 pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
     args.cpu.apply()?;
+    let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
     let mut settings = SessionSettings::new(resolve_model_dir(&args.model), &args.engine);
     let load_started = std::time::Instant::now();
     let mut backend = Backend::open(&settings)?;
@@ -718,9 +907,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut trace_verbosity = TraceVerbosity::Full;
     // Where `/profile on` puts a timeline when the user has not named a file.
     let default_trace_path = PathBuf::from("onnx-genai-session.perfetto.json");
-    // Per-turn numbers are opt-in: a line after every reply is noise until a
-    // reader is actually watching throughput or cache behavior.
-    let mut show_stats = false;
+    let mut show_stats = initial_repl_show_stats(input_mode, args.no_stats);
     let sampling_options = args.sampling.to_options();
     let mut session_usage = SessionUsage::default();
     // Inert unless stdout is a terminal, so a piped session is byte-for-byte
@@ -744,25 +931,26 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let mut image_attachments: Vec<PathBuf> = args.attachments.images.clone();
     let mut audio_attachments: Vec<PathBuf> = args.attachments.audio.clone();
     let stdin = io::stdin();
+    let mut reader = ReplReader::new(input_mode);
     loop {
-        print!(">>> ");
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            eprintln!();
-            break;
-        }
+        let line = match reader.read_line(&stdin)? {
+            ReplRead::Line(line) => line,
+            ReplRead::Continue => continue,
+            ReplRead::Eof => break,
+        };
         // The user is still working, so a later Ctrl-C needs two presses again.
         EXIT_ARMED.store(false, Ordering::SeqCst);
-        let line = line.trim_end_matches(['\n', '\r']);
-        let prompt = match parse_repl_line(line) {
+        let prompt = match parse_repl_line(&line, input_mode) {
             ReplLine::Empty => break,
             ReplLine::Prompt(prompt) => Some(prompt),
-            ReplLine::Command(ReplCommand::Help) => {
-                println!(
-                    "/help\n/reset\n/raw\n/stats\n/pages\n/profile [on|off|trace <path>|verbosity <decisions|ops|full>]\n/model [path]\n/session\n/ep [name]\n/backend [auto|ort|native]\n/system <text>\n/image <path> [prompt text]\n/audio <path> [prompt text]"
-                );
+            ReplLine::Command(ReplCommand::Help(command)) => {
+                match command {
+                    Some(command) => match render_command_help(&command) {
+                        Some(help) => println!("{help}"),
+                        None => eprintln!("unknown command: /{command} (try /help)"),
+                    },
+                    None => println!("{}", render_repl_help()),
+                }
                 None
             }
             ReplLine::Command(ReplCommand::Reset) => {
@@ -1106,6 +1294,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             profile.memory = memory;
         }
         let pages_before = backend.page_stats();
+        let used_live_this_turn = show_stats && live.is_active();
         match run_generation_turn(
             &mut backend,
             turn,
@@ -1118,7 +1307,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             show_stats.then_some(&mut live),
         ) {
             Ok(output) => {
-                if !live.is_active() {
+                if plain_stream_needs_trailing_newline(used_live_this_turn) {
                     println!();
                 }
                 // Reasoning models are trained with earlier turns' thinking
