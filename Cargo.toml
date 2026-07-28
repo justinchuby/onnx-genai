@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "xtask",
     "crates/onnx-genai",
     "crates/onnx-genai-preprocess",
     "crates/onnx-genai-metadata",
@@ -28,6 +29,7 @@ members = [
     "crates/onnx-runtime-quantization",
     "crates/onnx-runtime-ep-api",
     "crates/onnx-runtime-ep-cpu",
+    "crates/onnx-runtime-operator-selection",
     "crates/onnx-runtime-ep-cuda",
     "crates/onnx-runtime-eager",
     "crates/onnx-runtime-session",
@@ -143,6 +145,7 @@ onnx-runtime-optimizer = { path = "crates/onnx-runtime-optimizer", version = "=0
 onnx-runtime-quantization = { path = "crates/onnx-runtime-quantization", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-api = { path = "crates/onnx-runtime-ep-api", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cpu = { path = "crates/onnx-runtime-ep-cpu", version = "=0.1.0-dev.5" }
+onnx-runtime-operator-selection = { path = "crates/onnx-runtime-operator-selection", version = "=0.1.0-dev.5" }
 mlas-sys = { path = "crates/mlas-sys", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cuda = { path = "crates/onnx-runtime-ep-cuda", version = "=0.1.0-dev.5" }
 onnx-runtime-eager = { path = "crates/onnx-runtime-eager", version = "=0.1.0-dev.5" }

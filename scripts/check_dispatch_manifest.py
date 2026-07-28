@@ -54,8 +54,11 @@ Known gaps
    test asserts counter increments.
 
 2. The manifest cannot invent claims.  If nobody adds a row for a new
-   optimization, it ships unguarded.  This is a process gap (review-time
-   responsibility), not a tooling gap.  We state it explicitly.
+   optimization, it ships unguarded.  **Mitigated** by the inverse check
+   (added in this version): any _TEST_HITS counter whose name does NOT
+   contain SCALAR/FALLBACK/RESCUE/REF is flagged if it lacks a manifest row.
+   This catches the exact case where PR #324 shipped three optimized paths
+   without manifest rows within an hour of the manifest being created.
 
 3. The ``platform`` field is not validated against actual cfg conditions in
    source.  A row claiming ``aarch64-apple-darwin`` is not verified to be
@@ -66,6 +69,12 @@ Known gaps
    records "minimum_tier" per row independently.  If tier definitions change,
    human review must update rows.  The vocabulary is intentionally minimal
    (tier1/tier2/tier3) to resist churn.
+
+5. Graph-level optimizations (e.g. Conv+BatchNorm fusion) that eliminate an op
+   entirely cannot be expressed as a dispatch tier claim.  They require a
+   separate enforcement mechanism (optimizer-level counters).  The manifest
+   documents these honestly as [[exclusion]] rows rather than misrepresenting
+   them.
 """
 
 from __future__ import annotations
@@ -167,8 +176,8 @@ def check_counter_in_file(
     text = file_path.read_text()
 
     decl_re = re.compile(
-        rf"static\s+{re.escape(counter)}\s*:\s*"
-        rf"(?:std::sync::atomic::)?AtomicUsize"
+        rf"(?:pub(?:\([^)]*\))?\s+)?static\s+{re.escape(counter)}\s*:\s*"
+        rf"(?:std::sync::atomic::)?Atomic(?:Usize|U64)"
     )
     declared = bool(decl_re.search(text))
 
@@ -177,7 +186,7 @@ def check_counter_in_file(
 
     if not declared:
         return False, False, (
-            f"counter `{counter}` not found as `static {counter}: AtomicUsize` "
+            f"counter `{counter}` not found as `static {counter}: Atomic{{Usize,U64}}` "
             f"in {file_path.relative_to(REPO)}"
         )
 
@@ -325,6 +334,79 @@ def main() -> int:
     exclusions = manifest.get("exclusion", [])
     if exclusions:
         print(f"\n  ({len(exclusions)} deliberate exclusion(s) documented)")
+
+    # ─── Inverse check: counters without manifest rows ─────────────────────
+    # A _TEST_HITS counter is a strong signal that someone added a dispatch
+    # branch. If it's an *optimization* counter (not a scalar/fallback/rescue
+    # counter) and has no manifest row, it means the optimization shipped
+    # unguarded. This would have caught all three of PR #324's paths.
+    #
+    # False-positive filter: counters whose names contain SCALAR, FALLBACK,
+    # RESCUE, or REF are proving fallback paths, not claiming optimizations.
+    # Those do not need manifest rows.
+
+    FALLBACK_MARKERS = {"SCALAR", "FALLBACK", "RESCUE", "REF"}
+
+    claimed_counters = {c.get("counter") for c in claims if "counter" in c}
+
+    # Scan kernel directories for all counters
+    scan_dirs = [
+        REPO / "crates" / "onnx-runtime-ep-cpu" / "src" / "kernels",
+        REPO / "crates" / "onnx-runtime-session" / "src" / "executor",
+    ]
+
+    unclaimed: list[str] = []
+    all_counter_re = re.compile(
+        r"^(?:pub(?:\([^)]*\))?\s+)?static\s+(\w+TEST_HITS)\s*:\s*"
+        r"(?:std::sync::atomic::)?Atomic(?:Usize|U64)",
+        re.MULTILINE,
+    )
+
+    for scan_dir in scan_dirs:
+        if not scan_dir.is_dir():
+            continue
+        for rs_file in sorted(scan_dir.rglob("*.rs")):
+            text = rs_file.read_text()
+            for match in all_counter_re.finditer(text):
+                counter_name = match.group(1)
+                # Skip fallback/scalar counters — these are not optimization claims
+                if any(marker in counter_name for marker in FALLBACK_MARKERS):
+                    continue
+                if counter_name not in claimed_counters:
+                    rel = rs_file.relative_to(REPO)
+                    unclaimed.append(
+                        f"  {counter_name} in {rel}"
+                    )
+
+    if unclaimed:
+        print(
+            "\n"
+            "dispatch-manifest lint FAILED: optimization counters exist without "
+            "manifest claims:\n"
+        )
+        for u in unclaimed:
+            print(u)
+        print(
+            f"\n"
+            f"A _TEST_HITS counter that is not SCALAR/FALLBACK/RESCUE/REF\n"
+            f"indicates an optimized dispatch path. Each such path should have\n"
+            f"a [[claim]] row in dispatch_manifest.toml declaring what tier it\n"
+            f"provides on which platform.\n"
+            f"\n"
+            f"Without a manifest row, the optimization is UNGUARDED: removing\n"
+            f"the fast path silently falls to scalar reference with no CI failure.\n"
+            f"\n"
+            f"WHY THIS MATTERS:\n"
+            f"  PR #324 shipped three new optimizations (MaxPool→BNNS, Add→vDSP,\n"
+            f"  BatchNorm opset-7) one hour after the manifest was created. All\n"
+            f"  three had counters but no manifest rows — exactly the condition\n"
+            f"  that let prior defects survive for months.\n"
+            f"\n"
+            f"FIX: Add a [[claim]] row to dispatch_manifest.toml for each counter,\n"
+            f"or if the counter proves a deliberate fallback path, rename it to\n"
+            f"include SCALAR/FALLBACK/RESCUE/REF in the name."
+        )
+        return 1
 
     return 0
 

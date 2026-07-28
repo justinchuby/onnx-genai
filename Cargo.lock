@@ -2493,6 +2493,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-operator-selection",
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
  "onnx-runtime-tracer",
@@ -2547,6 +2548,10 @@ dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.19",
 ]
+
+[[package]]
+name = "onnx-runtime-operator-selection"
+version = "0.1.0-dev.5"
 
 [[package]]
 name = "onnx-runtime-optimizer"
@@ -4145,8 +4150,15 @@ dependencies = [
  "serde",
  "serde_spanned",
  "toml_datetime",
+ "toml_write",
  "winnow",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tower"
@@ -4786,6 +4798,17 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xtask"
+version = "0.1.0-dev.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "onnx-runtime-operator-selection",
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "yoke"
