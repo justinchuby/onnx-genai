@@ -899,10 +899,23 @@ impl Executor {
             });
         }
         let graph_outputs: HashSet<ValueId> = graph.outputs.iter().copied().collect();
+        // Outer values each control-flow node implicitly captures by name from
+        // the enclosing scope (see `control_flow_captures_by_node`). These never
+        // appear in any plan node's formal `inputs`, so liveness must treat the
+        // capturing node as a use site — otherwise an earlier in-place alias
+        // could free a buffer an If/Loop/Scan body still reads at runtime.
+        let captures_by_node = Self::control_flow_captures_by_node(graph);
         let mut last_use = HashMap::new();
         for (pi, node) in plan.iter().enumerate() {
             for vid in node.inputs.iter().flatten() {
                 last_use.insert(*vid, pi);
+            }
+            if let Some(captured) = captures_by_node.get(&node.node_id) {
+                for vid in captured {
+                    // `pi` increases monotonically, so this keeps the maximum
+                    // (latest) use position across formal inputs and captures.
+                    last_use.insert(*vid, pi);
+                }
             }
         }
         for (pi, node) in plan.iter_mut().enumerate() {
@@ -931,7 +944,34 @@ impl Executor {
         plan
     }
 
-    /// Build the name → value id indexes. Returns `(input_index,
+    /// Map each control-flow node to the outer [`ValueId`]s its subgraph bodies
+    /// implicitly capture by name. If/Loop/Scan bodies reference free variables
+    /// from the enclosing scope (resolved at runtime by `prepare_subgraph` via
+    /// [`required_outer_names`] and the name index); those captures never appear
+    /// in the node's formal `inputs`, so callers that reason about value
+    /// liveness must consult this map to avoid freeing a still-captured buffer.
+    fn control_flow_captures_by_node(graph: &Graph) -> HashMap<NodeId, HashSet<ValueId>> {
+        let mut captures_by_node: HashMap<NodeId, HashSet<ValueId>> = HashMap::new();
+        if graph.subgraphs.is_empty() {
+            return captures_by_node;
+        }
+        let name_index: HashMap<&str, ValueId> = graph
+            .values
+            .iter()
+            .filter_map(|(vid, value)| value.name.as_deref().map(|name| (name, vid)))
+            .collect();
+        for ((owner, _attr_key), body) in graph.subgraphs.iter() {
+            let entry = captures_by_node.entry(*owner).or_default();
+            for name in required_outer_names(body) {
+                if let Some(&vid) = name_index.get(name.as_str()) {
+                    entry.insert(vid);
+                }
+            }
+        }
+        captures_by_node.retain(|_, values| !values.is_empty());
+        captures_by_node
+    }
+
     /// required_inputs, name_index)`: the caller-input name map and the set of
     /// caller-required inputs (graph inputs that are not pre-filled
     /// initializers), plus the full name → value id map over every named value

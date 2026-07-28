@@ -197,6 +197,86 @@ fn compute_in_place_refuses_live_and_graph_output_inputs() {
     }
 }
 
+/// An `If` branch body of `branch_out = Identity(h)`, capturing the outer value
+/// `h` by name (a producer-less named value bound from the enclosing scope).
+fn identity_capture_body() -> Graph {
+    let mut body = Graph::new();
+    body.opset_imports.insert(String::new(), 17);
+    let captured = body.create_named_value("h", DataType::Float32, static_shape([4]));
+    let out = body.create_named_value("branch_out", DataType::Float32, static_shape([4]));
+    body.insert_node(Node::new(
+        NodeId(0),
+        "Identity",
+        vec![Some(captured)],
+        vec![out],
+    ));
+    body.add_output(out);
+    body
+}
+
+/// `h = Relu(x); t = Tanh(h); y = If(cond){ Identity(h) }`. The intermediate `h`
+/// has exactly one *formal* consumer (the in-place-eligible `Tanh`, whose output
+/// `t` is dead), but both `If` branches capture `h` by name afterwards. Liveness
+/// that ignores control-flow captures would mark `h` dead at `Tanh` and alias its
+/// buffer away, so the later capture would read freed memory.
+fn inplace_capture_if_graph() -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    graph.add_input(x);
+    let cond = graph.create_named_value("cond", DataType::Bool, static_shape([1]));
+    graph.add_input(cond);
+    let h = graph.create_named_value("h", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(0), "Relu", vec![Some(x)], vec![h]));
+    let t = graph.create_named_value("t", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(1), "Tanh", vec![Some(h)], vec![t]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(NodeId(2), "If", vec![Some(cond)], vec![y]));
+    graph.subgraphs.insert(
+        (NodeId(2), "then_branch".to_string()),
+        identity_capture_body(),
+    );
+    graph.subgraphs.insert(
+        (NodeId(2), "else_branch".to_string()),
+        identity_capture_body(),
+    );
+    graph.add_output(y);
+    graph
+}
+
+/// Regression (issue #85): a value captured by an `If`/`Loop`/`Scan` body must
+/// never be aliased away by an earlier in-place op, even though the capture is
+/// implicit (by name) and absent from every plan node's formal `inputs`. Asserts
+/// the default (enabled) path succeeds, returns `Relu(x)`, and is byte-identical
+/// to the fully out-of-place reference path.
+#[test]
+fn compute_in_place_preserves_control_flow_captures() {
+    let values = Tensor::from_f32(&[4], &[-2.0, -0.5, 0.5, 2.0]).unwrap();
+    let cond = Tensor::from_raw(DataType::Bool, vec![1], &[1]).unwrap();
+    let weights = Arc::new(WeightStore::new());
+    let ep = auto_detect_cpu_ep().unwrap();
+
+    let mut enabled = Executor::build(
+        inplace_capture_if_graph(),
+        Arc::clone(&weights),
+        Arc::clone(&ep),
+    )
+    .unwrap();
+    let enabled_output = enabled.run(&[("x", &values), ("cond", &cond)]).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+
+    let mut disabled = Executor::build(inplace_capture_if_graph(), weights, ep).unwrap();
+    disabled.compute_in_place_enabled = false;
+    let disabled_output = disabled.run(&[("x", &values), ("cond", &cond)]).unwrap()[0]
+        .as_bytes()
+        .to_vec();
+
+    let expected = Tensor::from_f32(&[4], &[0.0, 0.0, 0.5, 2.0]).unwrap();
+    assert_eq!(enabled_output, expected.as_bytes());
+    assert_eq!(enabled_output, disabled_output);
+}
+
 struct CaptureDecliningKernel;
 
 impl Kernel for CaptureDecliningKernel {
