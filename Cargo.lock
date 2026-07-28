@@ -2202,6 +2202,7 @@ dependencies = [
  "libc",
  "onnx-genai",
  "onnx-genai-engine",
+ "onnx-genai-metadata",
  "onnx-genai-server",
  "pyo3",
  "ratatui",
