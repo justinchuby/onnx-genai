@@ -1724,6 +1724,22 @@ impl Kernel for FlashAttentionKernel {
 }
 ```
 
+#### `pkg.nxrt::VarlenAttention` v1 packed contract
+
+The CPU reference path uses token-major packed tensors:
+
+- `query`: `[total_q, q_heads, head_size]` (`float32`)
+- `key`: `[total_kv, kv_heads, head_size]` (`float32`)
+- `value`: `[total_kv, kv_heads, value_head_size]` (`float32`)
+- `cu_seqlens_q`, `cu_seqlens_kv`: `[batch + 1]` (`int32` or `int64`)
+- optional `nonpad_kv_seqlen`: `[batch]`, limiting each allocated packed KV span
+- output: `[total_q, q_heads, value_head_size]`
+
+Attributes are `scale` (optional float), `is_causal` (integer boolean), and
+`softcap` (optional non-negative float). Q heads may be a multiple of KV heads
+for GQA/MQA. Each sequence is dispatched independently through the shared SDPA
+core, so no score or value accumulation crosses a cumulative-length boundary.
+
 ### 13.4 KV Cache Integration
 
 Flash Attention with paged KV cache (from onnx-genai's KV system):

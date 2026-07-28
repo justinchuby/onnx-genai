@@ -279,8 +279,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 164);
-    assert_eq!(registry.entry_count(), 202);
+    assert_eq!(registry.operator_count(), 165);
+    assert_eq!(registry.entry_count(), 203);
 }
 
 #[test]
@@ -2881,6 +2881,24 @@ fn index_share_mirrors_query_and_present_kv() {
         outs[2].type_info.as_ref().unwrap().shape,
         vec![sym(0), c(2), c(8), c(24)]
     );
+}
+
+#[test]
+fn varlen_attention_preserves_packed_query_geometry() {
+    let n = with_domain(node("VarlenAttention", 5, 1), "pkg.nxrt");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(8), c(64)]),
+            f32in(vec![sym(1), c(2), c(64)]),
+            f32in(vec![sym(1), c(2), c(80)]),
+            tin(DataType::Int32, vec![sym(2)]),
+            tin(DataType::Int32, vec![sym(2)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(80)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
 }
 
 #[test]

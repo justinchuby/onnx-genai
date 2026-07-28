@@ -188,6 +188,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "VarlenAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::varlen_attention::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "ScatterND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =

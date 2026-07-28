@@ -66,6 +66,25 @@ pub fn index_share(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `pkg.nxrt::VarlenAttention`: packed token-major attention. The output keeps
+/// query's total-token/head dimensions and uses value's head width.
+pub fn varlen_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    require_outputs(ctx, 1)?;
+    let Some(query) = rank_shape(ctx, 0, 3)? else {
+        return Ok(());
+    };
+    let Some(value) = rank_shape(ctx, 2, 3)? else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    ctx.set_output(
+        0,
+        dtype,
+        vec![query[0].clone(), query[1].clone(), value[2].clone()],
+    );
+    Ok(())
+}
+
 /// Frozen stateful `CompressedSparseAttention` v1 output shapes.
 pub fn compressed_sparse_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(query) = rank_shape(ctx, 0, 4)? else {
@@ -424,6 +443,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
     reg.register("pkg.nxrt", "IndexShare", 1, index_share);
+    reg.register("pkg.nxrt", "VarlenAttention", 1, varlen_attention);
     reg.register(
         "pkg.nxrt",
         "CompressedSparseAttention",
