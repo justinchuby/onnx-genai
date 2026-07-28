@@ -40,6 +40,41 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn looks_like_compact_stats_line(line: &str) -> bool {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix("[ ")
+        .and_then(|line| line.strip_suffix(" ]"))
+    else {
+        return false;
+    };
+    let fields: Vec<&str> = inner.split(" · ").collect();
+    fields
+        .iter()
+        .any(|field| field.strip_suffix(" in").is_some_and(is_usize))
+        && fields
+            .iter()
+            .any(|field| field.strip_suffix(" out").is_some_and(is_usize))
+        && fields.iter().any(|field| field.starts_with("backend "))
+        && fields
+            .iter()
+            .any(|field| field.strip_suffix(" tok/s").is_some_and(is_f64))
+        && fields.iter().any(|field| {
+            field
+                .strip_prefix("ttft ")
+                .and_then(|field| field.strip_suffix(" ms"))
+                .is_some_and(is_f64)
+        })
+}
+
+fn is_usize(text: &str) -> bool {
+    text.parse::<usize>().is_ok()
+}
+
+fn is_f64(text: &str) -> bool {
+    text.parse::<f64>().is_ok()
+}
+
 /// A 4x4 solid-color PNG written to the target directory.
 fn sample_png() -> PathBuf {
     let directory = repository_root().join("target/test-fixtures");
@@ -171,6 +206,42 @@ fn a_text_only_model_rejects_attachments_by_naming_what_it_accepts() {
         "message: {message}"
     );
     assert!(message.contains("How:"), "message: {message}");
+}
+
+#[test]
+fn piped_generate_stdout_is_byte_identical_with_or_without_default_stats() {
+    let base = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+    ]);
+    let no_stats = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+        "--no-stats",
+    ]);
+
+    assert!(base.status.success(), "failed: {}", stderr(&base));
+    assert!(no_stats.status.success(), "failed: {}", stderr(&no_stats));
+    let base_stdout = stdout(&base);
+    let no_stats_stdout = stdout(&no_stats);
+    assert_eq!(
+        base_stdout, no_stats_stdout,
+        "piped stdout must remain pure generated text"
+    );
+    assert!(
+        !base_stdout.lines().any(looks_like_compact_stats_line),
+        "stats line must not contaminate piped stdout: {base_stdout}"
+    );
 }
 
 #[test]

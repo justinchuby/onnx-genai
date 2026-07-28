@@ -36,9 +36,11 @@ run is also cancelled by **Ctrl-C** mid-generation.
 When both stdin and stdout are terminals, the REPL uses a rich line editor:
 arrow-key cursor movement, persistent history, bracketed paste, slash-command
 completion, and multiline input with **Alt+Enter** (plain **Enter** submits).
-Interactive terminal sessions show compact per-turn stats by default; pass
-`--no-stats` to start with them hidden. When stdin or stdout is piped, the REPL
-keeps the original plain `>>> ` line-loop behavior for scripts and tests.
+Interactive terminal text generation shows compact per-turn stats by default;
+pass `--no-stats` to hide them. Stats are enabled only when stdin and stdout are
+terminals, and they are printed to stderr; piped stdout remains byte-stable
+generated text. When stdin or stdout is piped, the REPL also keeps the original
+plain `>>> ` line-loop behavior for scripts and tests.
 
 ### Generation budget and sampling
 
@@ -264,8 +266,10 @@ cargo run -p onnx-genai-cli --bin onnx-genai -- \
 curl localhost:8123/v1/models
 ```
 
-Model loading logs to stderr; append `2>/dev/null` when you only want the
-generated text.
+Model loading logs and default text-generation stats go to stderr; append
+`2>/dev/null` when you only want the generated text. `generate --output-image`,
+`generate --output-audio`, and `transcribe` do not print the compact token stats
+line by default; use `--profile` for their timing and throughput diagnostics.
 
 ### Checking the REPL's live view
 
@@ -284,9 +288,9 @@ dogtok29over,dog
 [ 7 in · 5 out · backend ort · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
 ```
 
-Use `/stats` to toggle the compact line at runtime, or start with
-`--no-stats`. Piping a script into the REPL exercises the byte-stable plain-text
-fallback instead, which is what the tests do:
+Use `/stats` to toggle the compact line at runtime, or start `run` or text
+`generate` with `--no-stats`. Piping a script into the REPL exercises the
+byte-stable plain-text fallback instead, which is what the tests do:
 
 ```bash
 printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \

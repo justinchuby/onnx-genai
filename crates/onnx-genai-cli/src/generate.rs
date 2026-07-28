@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -9,11 +10,13 @@ use onnx_genai_server::multimodal;
 
 use super::commands::resolved_default_providers;
 use super::interactive::{
-    Backend, EXIT_INTERRUPTED, TurnInput, apply_context_sized_max_new_tokens,
-    context_exhaustion_error, context_window_is_full, install_ctrlc_handler, is_interrupt_error,
-    warn_missing_context_limit,
+    Backend, EXIT_INTERRUPTED, ReplInputMode, TurnInput, apply_context_sized_max_new_tokens,
+    context_exhaustion_error, context_window_is_full, initial_repl_show_stats,
+    install_ctrlc_handler, is_interrupt_error, repl_input_mode, warn_missing_context_limit,
 };
-use super::output::{build_turn_prompt, detect_reasoning, load_chat_template, run_generation_turn};
+use super::output::{
+    build_turn_prompt, detect_reasoning, emit_stats_line, load_chat_template, run_generation_turn,
+};
 use super::profile::{self, RunProfile};
 use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
 
@@ -23,6 +26,26 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
     let model_dir = resolve_model_dir(&args.model);
     let mut profile = RunProfile::new(model_dir.display().to_string());
     profile.execution_provider = resolved_default_providers();
+    let output_kind = generate_output_kind(&args)?;
+    let input_mode = repl_input_mode(io::stdin().is_terminal(), io::stdout().is_terminal());
+    let show_stats = initial_generate_show_stats(input_mode, args.no_stats, output_kind);
+    if matches!(output_kind, GenerateOutputKind::Image) {
+        return generate_image(&model_dir, args, profiling, profile);
+    }
+    if matches!(output_kind, GenerateOutputKind::Audio) {
+        return generate_audio(&model_dir, args, profiling, profile);
+    }
+    generate_text(&model_dir, args, profiling, profile, show_stats)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerateOutputKind {
+    Text,
+    Image,
+    Audio,
+}
+
+fn generate_output_kind(args: &GenerateArgs) -> anyhow::Result<GenerateOutputKind> {
     if args.image_output.output_image.is_some() && args.audio_output.output_audio.is_some() {
         anyhow::bail!(
             "What: --output-image and --output-audio were combined. \
@@ -31,14 +54,32 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
         );
     }
     if args.image_output.output_image.is_some() {
-        return generate_image(&model_dir, args, profiling, profile);
+        return Ok(GenerateOutputKind::Image);
     }
     if args.audio_output.output_audio.is_some() {
-        return generate_audio(&model_dir, args, profiling, profile);
+        return Ok(GenerateOutputKind::Audio);
     }
+    Ok(GenerateOutputKind::Text)
+}
+
+fn initial_generate_show_stats(
+    mode: ReplInputMode,
+    no_stats: bool,
+    output_kind: GenerateOutputKind,
+) -> bool {
+    matches!(output_kind, GenerateOutputKind::Text) && initial_repl_show_stats(mode, no_stats)
+}
+
+fn generate_text(
+    model_dir: &Path,
+    args: GenerateArgs,
+    profiling: &ProfileArgs,
+    mut profile: RunProfile,
+    show_stats: bool,
+) -> anyhow::Result<()> {
     let options = args.sampling.to_options();
 
-    let template = load_chat_template(&model_dir, args.sampling.raw);
+    let template = load_chat_template(model_dir, args.sampling.raw);
     let history = vec![ChatMessage::user(args.prompt)];
     let prompt = build_turn_prompt(template.as_ref(), &history)?;
     let mut turn = TurnInput {
@@ -51,7 +92,7 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
     };
 
     let load_started = std::time::Instant::now();
-    let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
+    let mut backend = Backend::load(model_dir, args.engine.to_config())?;
     profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
     let prompt_tokens = backend.prompt_tokens(&turn.prompt).unwrap_or_default();
@@ -98,6 +139,7 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
                 profile.pages = Some(profile::PageActivity::since(before, after));
             }
             profiling.emit(&mut profile)?;
+            emit_stats_line(show_stats, profiling.profile, &mut profile);
             Ok(())
         }
         Err(error) if is_interrupt_error(&error) => {
@@ -242,4 +284,42 @@ fn generate_audio(
     );
     profiling.emit(&mut profile)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_generate_defaults_to_stats_only_on_the_repl_tty_path() {
+        assert!(initial_generate_show_stats(
+            ReplInputMode::Tty,
+            false,
+            GenerateOutputKind::Text
+        ));
+        assert!(!initial_generate_show_stats(
+            ReplInputMode::Plain,
+            false,
+            GenerateOutputKind::Text
+        ));
+        assert!(!initial_generate_show_stats(
+            ReplInputMode::Tty,
+            true,
+            GenerateOutputKind::Text
+        ));
+    }
+
+    #[test]
+    fn non_text_generate_outputs_do_not_default_to_token_stats() {
+        assert!(!initial_generate_show_stats(
+            ReplInputMode::Tty,
+            false,
+            GenerateOutputKind::Image
+        ));
+        assert!(!initial_generate_show_stats(
+            ReplInputMode::Tty,
+            false,
+            GenerateOutputKind::Audio
+        ));
+    }
 }
