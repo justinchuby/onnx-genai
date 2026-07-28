@@ -72,7 +72,7 @@ pub mod version;
 pub use error::{Error, Result};
 pub use metadata_hints::{
     HintEntry, HintScope, HintSource, HintValue, MetadataHints, MetadataWarning, ModelHints,
-    NodeHints, PlacementStrength,
+    NodeHintMap, NodeHints, NodePath, NodePathSegment, PlacementStrength,
 };
 pub use model::{
     DeviceConfigurationProto, IntIntListEntryProto, Model, NodeDeviceConfigurationProto,

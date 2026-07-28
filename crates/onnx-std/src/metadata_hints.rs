@@ -82,6 +82,93 @@ pub enum HintScope {
         /// The node's name (may be empty for an unnamed node).
         node_name: String,
     },
+    /// A node inside one or more graph-valued attributes.
+    NestedNode {
+        /// Collision-proof structural path to the node.
+        path: NodePath,
+    },
+}
+
+/// One typed segment in a nested ONNX node path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NodePathSegment {
+    /// A node at `index` in its containing graph.
+    Node {
+        /// Raw ONNX node name.
+        name: String,
+        /// Node index in the containing graph.
+        index: usize,
+    },
+    /// A graph-valued attribute on the preceding node.
+    Attribute {
+        /// Raw ONNX attribute name.
+        name: String,
+        /// Attribute index on the owner node.
+        index: usize,
+        /// `None` for `GRAPH`; `Some(index)` for an entry in `GRAPHS`.
+        graph_index: Option<usize>,
+    },
+}
+
+/// Structural identity of a node nested in graph-valued attributes.
+///
+/// Names are retained for diagnostics, while typed segments and structural
+/// indices make equality and ordering unambiguous even when names contain `/`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NodePath {
+    segments: Vec<NodePathSegment>,
+}
+
+impl NodePath {
+    /// Start a path at a top-level owner node.
+    pub fn root_node(name: String, index: usize) -> Self {
+        Self {
+            segments: vec![NodePathSegment::Node { name, index }],
+        }
+    }
+
+    /// Append a node in the currently selected subgraph.
+    pub fn with_node(mut self, name: String, index: usize) -> Self {
+        self.segments.push(NodePathSegment::Node { name, index });
+        self
+    }
+
+    /// Append a graph-valued attribute selection.
+    pub fn with_attribute(
+        mut self,
+        name: String,
+        index: usize,
+        graph_index: Option<usize>,
+    ) -> Self {
+        self.segments.push(NodePathSegment::Attribute {
+            name,
+            index,
+            graph_index,
+        });
+        self
+    }
+
+    /// Human-readable path used in diagnostics.
+    pub fn display_name(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                NodePathSegment::Node { name, index } => path_segment(name, "node", *index),
+                NodePathSegment::Attribute {
+                    name,
+                    index,
+                    graph_index,
+                } => {
+                    let name = path_segment(name, "attribute", *index);
+                    match graph_index {
+                        Some(graph_index) => format!("{name}[{graph_index}]"),
+                        None => name,
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
 }
 
 /// A single raw `key = value` metadata entry to be scanned.
@@ -388,10 +475,83 @@ pub struct ModelHints {
 pub struct MetadataHints {
     /// Resolved model-level / graph-level hints.
     pub model: ModelHints,
-    /// Resolved per-node hints, keyed by node name.
-    pub nodes: BTreeMap<String, NodeHints>,
+    /// Resolved per-node hints.
+    pub nodes: NodeHintMap,
     /// Warnings and errors gathered during the scan, in discovery order.
     pub warnings: Vec<MetadataWarning>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NodeIdentity {
+    TopLevel(String),
+    Nested(NodePath),
+}
+
+impl NodeIdentity {
+    fn display_name(&self) -> String {
+        match self {
+            Self::TopLevel(name) => name.clone(),
+            Self::Nested(path) => path.display_name(),
+        }
+    }
+}
+
+/// Resolved node hints keyed by collision-proof node identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeHintMap {
+    entries: BTreeMap<NodeIdentity, NodeHints>,
+}
+
+impl NodeHintMap {
+    /// Look up a top-level node by its raw name.
+    ///
+    /// For compatibility, when no top-level node has this name, a uniquely
+    /// matching nested node may also be found by its human-readable path.
+    pub fn get(&self, name: &str) -> Option<&NodeHints> {
+        self.entries
+            .get(&NodeIdentity::TopLevel(name.to_string()))
+            .or_else(|| {
+                let mut matches = self
+                    .entries
+                    .iter()
+                    .filter(|(identity, _)| identity.display_name() == name)
+                    .map(|(_, hints)| hints);
+                let first = matches.next()?;
+                matches.next().is_none().then_some(first)
+            })
+    }
+
+    /// Look up a nested node by its structural path.
+    pub fn get_path(&self, path: &NodePath) -> Option<&NodeHints> {
+        self.entries.get(&NodeIdentity::Nested(path.clone()))
+    }
+
+    /// Whether a top-level node or unique display path is present.
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// Whether no node hints were resolved.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of structurally distinct nodes with resolved hints.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate over all resolved node hints.
+    pub fn values(&self) -> impl Iterator<Item = &NodeHints> {
+        self.entries.values()
+    }
+
+    fn entry(
+        &mut self,
+        identity: NodeIdentity,
+    ) -> std::collections::btree_map::Entry<'_, NodeIdentity, NodeHints> {
+        self.entries.entry(identity)
+    }
 }
 
 impl MetadataHints {
@@ -440,15 +600,15 @@ struct DevicePlacement {
 #[derive(Default)]
 struct Scanner {
     model: ModelHints,
-    nodes: BTreeMap<String, NodeHints>,
+    nodes: NodeHintMap,
     warnings: Vec<MetadataWarning>,
     /// Highest-priority winner seen so far for each `(node_key, full_key)`.
     /// A `None` node_key denotes model/graph level.
-    winners: BTreeMap<(Option<String>, String), Winner>,
+    winners: BTreeMap<(Option<NodeIdentity>, String), Winner>,
     /// Per-node, per-source device placement. Keeping device and strength
     /// paired by source is what lets a `force` from one source override a
     /// `prefer` from another and lets contradicting forces be detected.
-    device_placements: BTreeMap<String, BTreeMap<HintSource, DevicePlacement>>,
+    device_placements: BTreeMap<NodeIdentity, BTreeMap<HintSource, DevicePlacement>>,
 }
 
 impl Scanner {
@@ -459,9 +619,16 @@ impl Scanner {
         let (registry, node_label, node_key) = match &entry.scope {
             HintScope::Model => (GRAPH_HINTS, String::new(), None),
             HintScope::Graph { graph_name } => (GRAPH_HINTS, graph_name.clone(), None),
-            HintScope::Node { node_name } => {
-                (NODE_HINTS, node_name.clone(), Some(node_name.clone()))
-            }
+            HintScope::Node { node_name } => (
+                NODE_HINTS,
+                node_name.clone(),
+                Some(NodeIdentity::TopLevel(node_name.clone())),
+            ),
+            HintScope::NestedNode { path } => (
+                NODE_HINTS,
+                path.display_name(),
+                Some(NodeIdentity::Nested(path.clone())),
+            ),
         };
 
         let Some(value_type) = lookup(registry, &entry.key) else {
@@ -485,11 +652,11 @@ impl Scanner {
         // Device placement is resolved specially: a `force` overrides a
         // `prefer` regardless of source priority. Device and strength are kept
         // paired per source so each source's intent stays intact until the end.
-        if let HintScope::Node { node_name } = &entry.scope {
+        if let Some(node_identity) = node_key.as_ref() {
             match (entry.key.as_str(), &typed) {
                 ("onnx_runtime.device", HintValue::Text(device)) => {
                     self.device_placements
-                        .entry(node_name.clone())
+                        .entry(node_identity.clone())
                         .or_default()
                         .entry(entry.source)
                         .or_default()
@@ -497,7 +664,7 @@ impl Scanner {
                 }
                 ("onnx_runtime.device.strength", HintValue::Enumerated(token)) => {
                     self.device_placements
-                        .entry(node_name.clone())
+                        .entry(node_identity.clone())
                         .or_default()
                         .entry(entry.source)
                         .or_default()
@@ -513,7 +680,7 @@ impl Scanner {
     /// Keep the highest-priority contribution for a `(node, key)` pair.
     fn record_winner(
         &mut self,
-        node_key: Option<String>,
+        node_key: Option<NodeIdentity>,
         key: String,
         source: HintSource,
         value: HintValue,
@@ -541,7 +708,7 @@ impl Scanner {
     /// device/strength placement, and flag contradicting forces.
     fn settle_device_placement(&mut self) {
         let placements = std::mem::take(&mut self.device_placements);
-        for (node_name, by_source) in placements {
+        for (node_identity, by_source) in placements {
             // One (source, device, strength) contribution per source that named
             // a device. A source that only set a strength contributes nothing.
             let contributions: Vec<(HintSource, String, PlacementStrength)> = by_source
@@ -564,7 +731,7 @@ impl Scanner {
                 && let Some(conflicting) = forced.iter().find(|(_, device, _)| *device != first.1)
             {
                 self.warnings.push(MetadataWarning::ConflictingForce {
-                    node: node_name.clone(),
+                    node: node_identity.display_name(),
                     source_a: first.0,
                     source_b: conflicting.0,
                 });
@@ -582,7 +749,7 @@ impl Scanner {
                 })
                 .map(|(_, device, strength)| (device.clone(), *strength));
             if let Some((device, resolved_strength)) = effective {
-                let node = self.nodes.entry(node_name.clone()).or_default();
+                let node = self.nodes.entry(node_identity.clone()).or_default();
                 node.device = Some(device);
                 node.device_strength = Some(resolved_strength);
             }
@@ -594,13 +761,13 @@ impl Scanner {
         for ((node_key, key), winner) in winners {
             match node_key {
                 None => apply_model_hint(&mut self.model, &key, winner.value),
-                Some(node_name) => {
+                Some(node_identity) => {
                     // Device fields were already settled with strength/force
                     // semantics; skip re-applying the raw winner for them.
                     if key == "onnx_runtime.device" || key == "onnx_runtime.device.strength" {
                         continue;
                     }
-                    let node = self.nodes.entry(node_name).or_default();
+                    let node = self.nodes.entry(node_identity).or_default();
                     apply_node_hint(node, &key, winner.value);
                 }
             }
@@ -678,26 +845,29 @@ fn collect_graph_hint_entries(
     enum Work<'a> {
         Graph {
             graph: &'a GraphProto,
-            path: String,
+            display_path: String,
+            parent_path: Option<NodePath>,
             top_level: bool,
         },
         Node {
             node: &'a NodeProto,
-            path: String,
-            subgraph_prefix: String,
+            identity: NodeIdentity,
+            structural_path: NodePath,
         },
     }
 
     let mut work = vec![Work::Graph {
         graph: root,
-        path: root.name.clone(),
+        display_path: root.name.clone(),
+        parent_path: None,
         top_level: true,
     }];
     while let Some(item) = work.pop() {
         match item {
             Work::Graph {
                 graph,
-                path,
+                display_path,
+                parent_path,
                 top_level,
             } => {
                 entries.extend(
@@ -707,7 +877,7 @@ fn collect_graph_hint_entries(
                         .filter(|entry| entry.key.starts_with(NAMESPACE_PREFIX))
                         .map(|entry| HintEntry {
                             scope: HintScope::Graph {
-                                graph_name: path.clone(),
+                                graph_name: display_path.clone(),
                             },
                             source: HintSource::OnnxMetadata,
                             key: entry.key.clone(),
@@ -715,35 +885,39 @@ fn collect_graph_hint_entries(
                         }),
                 );
                 for (index, node) in graph.node.iter().enumerate().rev() {
-                    let node_name = path_segment(&node.name, "node", index);
-                    let node_path = if top_level {
-                        node.name.clone()
+                    let structural_path = if let Some(parent_path) = &parent_path {
+                        parent_path.clone().with_node(node.name.clone(), index)
                     } else {
-                        qualify(&path, &node_name)
+                        NodePath::root_node(node.name.clone(), index)
                     };
                     work.push(Work::Node {
                         node,
-                        path: node_path,
-                        subgraph_prefix: if top_level {
-                            node_name
+                        identity: if top_level {
+                            NodeIdentity::TopLevel(node.name.clone())
                         } else {
-                            qualify(&path, &node_name)
+                            NodeIdentity::Nested(structural_path.clone())
                         },
+                        structural_path,
                     });
                 }
             }
             Work::Node {
                 node,
-                path,
-                subgraph_prefix,
+                identity,
+                structural_path,
             } => {
                 entries.extend(
                     node.metadata_props
                         .iter()
                         .filter(|entry| entry.key.starts_with(NAMESPACE_PREFIX))
                         .map(|entry| HintEntry {
-                            scope: HintScope::Node {
-                                node_name: path.clone(),
+                            scope: match &identity {
+                                NodeIdentity::TopLevel(node_name) => HintScope::Node {
+                                    node_name: node_name.clone(),
+                                },
+                                NodeIdentity::Nested(path) => {
+                                    HintScope::NestedNode { path: path.clone() }
+                                }
                             },
                             source: HintSource::OnnxMetadata,
                             key: entry.key.clone(),
@@ -753,25 +927,28 @@ fn collect_graph_hint_entries(
 
                 let mut subgraphs = Vec::new();
                 for (attribute_index, attribute) in node.attribute.iter().enumerate() {
-                    let attribute_name =
-                        path_segment(&attribute.name, "attribute", attribute_index);
                     if let Some(graph) = attribute.g.as_ref() {
-                        subgraphs.push((graph, qualify(&subgraph_prefix, &attribute_name)));
+                        let path = structural_path.clone().with_attribute(
+                            attribute.name.clone(),
+                            attribute_index,
+                            None,
+                        );
+                        subgraphs.push((graph, path));
                     }
                     for (graph_index, graph) in attribute.graphs.iter().enumerate() {
-                        subgraphs.push((
-                            graph,
-                            qualify(
-                                &subgraph_prefix,
-                                &format!("{attribute_name}[{graph_index}]"),
-                            ),
-                        ));
+                        let path = structural_path.clone().with_attribute(
+                            attribute.name.clone(),
+                            attribute_index,
+                            Some(graph_index),
+                        );
+                        subgraphs.push((graph, path));
                     }
                 }
-                for (graph, graph_path) in subgraphs.into_iter().rev() {
+                for (graph, parent_path) in subgraphs.into_iter().rev() {
                     work.push(Work::Graph {
                         graph,
-                        path: graph_path,
+                        display_path: parent_path.display_name(),
+                        parent_path: Some(parent_path),
                         top_level: false,
                     });
                 }
@@ -785,14 +962,6 @@ fn path_segment(name: &str, kind: &str, index: usize) -> String {
         format!("<{kind}:{index}>")
     } else {
         name.to_string()
-    }
-}
-
-fn qualify(parent: &str, child: &str) -> String {
-    if parent.is_empty() {
-        child.to_string()
-    } else {
-        format!("{parent}/{child}")
     }
 }
 

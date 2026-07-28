@@ -60,18 +60,25 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
     enum Work {
         Graph {
             graph: ScanGraphProto,
-            path: String,
+            display_path: String,
+            parent_path: Option<onnx_std::NodePath>,
             top_level: bool,
         },
         Node {
             node: ScanNodeProto,
-            path: String,
-            subgraph_prefix: String,
+            identity: ScanNodeIdentity,
+            structural_path: onnx_std::NodePath,
         },
     }
 
+    enum ScanNodeIdentity {
+        TopLevel(String),
+        Nested(onnx_std::NodePath),
+    }
+
     let mut work = vec![Work::Graph {
-        path: root.name.clone(),
+        display_path: root.name.clone(),
+        parent_path: None,
         graph: root,
         top_level: true,
     }];
@@ -79,7 +86,8 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
         match item {
             Work::Graph {
                 graph,
-                path,
+                display_path,
+                parent_path,
                 top_level,
             } => {
                 entries.extend(
@@ -88,7 +96,7 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
                         .into_iter()
                         .map(|entry| onnx_std::HintEntry {
                             scope: onnx_std::HintScope::Graph {
-                                graph_name: path.clone(),
+                                graph_name: display_path.clone(),
                             },
                             source: onnx_std::HintSource::OnnxMetadata,
                             key: entry.key,
@@ -96,34 +104,40 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
                         }),
                 );
                 for (index, node) in graph.node.into_iter().enumerate().rev() {
-                    let node_name = metadata_path_segment(&node.name, "node", index);
-                    let node_path = if top_level {
-                        node.name.clone()
+                    let structural_path = if let Some(parent_path) = &parent_path {
+                        parent_path.clone().with_node(node.name.clone(), index)
                     } else {
-                        qualify_metadata_path(&path, &node_name)
+                        onnx_std::NodePath::root_node(node.name.clone(), index)
                     };
                     work.push(Work::Node {
-                        node,
-                        path: node_path,
-                        subgraph_prefix: if top_level {
-                            node_name
+                        identity: if top_level {
+                            ScanNodeIdentity::TopLevel(node.name.clone())
                         } else {
-                            qualify_metadata_path(&path, &node_name)
+                            ScanNodeIdentity::Nested(structural_path.clone())
                         },
+                        node,
+                        structural_path,
                     });
                 }
             }
             Work::Node {
                 node,
-                path,
-                subgraph_prefix,
+                identity,
+                structural_path,
             } => {
                 entries.extend(
                     node.metadata_props
                         .into_iter()
                         .map(|entry| onnx_std::HintEntry {
-                            scope: onnx_std::HintScope::Node {
-                                node_name: path.clone(),
+                            scope: match &identity {
+                                ScanNodeIdentity::TopLevel(node_name) => {
+                                    onnx_std::HintScope::Node {
+                                        node_name: node_name.clone(),
+                                    }
+                                }
+                                ScanNodeIdentity::Nested(path) => {
+                                    onnx_std::HintScope::NestedNode { path: path.clone() }
+                                }
                             },
                             source: onnx_std::HintSource::OnnxMetadata,
                             key: entry.key,
@@ -133,49 +147,33 @@ fn collect_scan_graph_hint_entries(root: ScanGraphProto, entries: &mut Vec<onnx_
 
                 let mut subgraphs = Vec::new();
                 for (attribute_index, attribute) in node.attribute.into_iter().enumerate() {
-                    let attribute_name =
-                        metadata_path_segment(&attribute.name, "attribute", attribute_index);
                     if let Some(graph) = attribute.g {
-                        subgraphs.push((
-                            *graph,
-                            qualify_metadata_path(&subgraph_prefix, &attribute_name),
-                        ));
+                        let path = structural_path.clone().with_attribute(
+                            attribute.name.clone(),
+                            attribute_index,
+                            None,
+                        );
+                        subgraphs.push((*graph, path));
                     }
                     for (graph_index, graph) in attribute.graphs.into_iter().enumerate() {
-                        subgraphs.push((
-                            graph,
-                            qualify_metadata_path(
-                                &subgraph_prefix,
-                                &format!("{attribute_name}[{graph_index}]"),
-                            ),
-                        ));
+                        let path = structural_path.clone().with_attribute(
+                            attribute.name.clone(),
+                            attribute_index,
+                            Some(graph_index),
+                        );
+                        subgraphs.push((graph, path));
                     }
                 }
-                for (graph, graph_path) in subgraphs.into_iter().rev() {
+                for (graph, parent_path) in subgraphs.into_iter().rev() {
                     work.push(Work::Graph {
                         graph,
-                        path: graph_path,
+                        display_path: parent_path.display_name(),
+                        parent_path: Some(parent_path),
                         top_level: false,
                     });
                 }
             }
         }
-    }
-}
-
-fn metadata_path_segment(name: &str, kind: &str, index: usize) -> String {
-    if name.is_empty() {
-        format!("<{kind}:{index}>")
-    } else {
-        name.to_string()
-    }
-}
-
-fn qualify_metadata_path(parent: &str, child: &str) -> String {
-    if parent.is_empty() {
-        child.to_string()
-    } else {
-        format!("{parent}/{child}")
     }
 }
 
@@ -880,6 +878,73 @@ mod metadata_hint_tests {
                 .get("loop/body/inner")
                 .and_then(|node| node.kernel.as_deref()),
             Some("nested_kernel")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lightweight_scan_keeps_slash_named_top_level_and_nested_nodes_distinct() -> anyhow::Result<()>
+    {
+        let nested_path = onnx_std::NodePath::root_node("owner".to_string(), 1)
+            .with_attribute("body".to_string(), 0, None)
+            .with_node("inner".to_string(), 0);
+        let model = ScanModelProto {
+            graph: Some(ScanGraphProto {
+                node: vec![
+                    ScanNodeProto {
+                        name: "owner/body/inner".to_string(),
+                        metadata_props: vec![ScanStringEntryProto {
+                            key: "onnx_runtime.layer".to_string(),
+                            value: "1".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                    ScanNodeProto {
+                        name: "owner".to_string(),
+                        attribute: vec![ScanAttributeProto {
+                            name: "body".to_string(),
+                            g: Some(Box::new(ScanGraphProto {
+                                node: vec![ScanNodeProto {
+                                    name: "inner".to_string(),
+                                    metadata_props: vec![ScanStringEntryProto {
+                                        key: "onnx_runtime.layer".to_string(),
+                                        value: "2".to_string(),
+                                    }],
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("metadata_hints_collision.onnx");
+        std::fs::write(&path, model.encode_to_vec())?;
+
+        let hints = load_model_metadata_hints(&path)?;
+        std::fs::remove_file(path)?;
+
+        assert_eq!(hints.nodes.len(), 2);
+        assert_eq!(
+            hints
+                .nodes
+                .get("owner/body/inner")
+                .and_then(|node| node.layer),
+            Some(1)
+        );
+        assert_eq!(
+            hints
+                .nodes
+                .get_path(&nested_path)
+                .and_then(|node| node.layer),
+            Some(2)
         );
         Ok(())
     }

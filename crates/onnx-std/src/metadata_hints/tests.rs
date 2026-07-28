@@ -539,6 +539,98 @@ fn top_level_node_identity_is_unchanged_when_subgraphs_are_scanned() {
 }
 
 #[test]
+fn nested_node_identity_does_not_collide_with_slash_named_top_level_node() {
+    let nested_path = NodePath::root_node("owner".to_string(), 1)
+        .with_attribute("body".to_string(), 0, None)
+        .with_node("inner".to_string(), 0);
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![
+            proto_node("owner/body/inner", [("onnx_runtime.layer", "1")]),
+            proto_node_with_graph(
+                "Loop",
+                "owner",
+                "body",
+                GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "2")])],
+                    ..Default::default()
+                },
+            ),
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get("owner/body/inner")
+            .and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&nested_path)
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
+fn graph_and_graphs_paths_that_render_the_same_stay_distinct() {
+    let singular_path = NodePath::root_node("owner".to_string(), 0)
+        .with_attribute("branches[0]".to_string(), 0, None)
+        .with_node("inner".to_string(), 0);
+    let repeated_path = NodePath::root_node("owner".to_string(), 0)
+        .with_attribute("branches".to_string(), 1, Some(0))
+        .with_node("inner".to_string(), 0);
+    let owner = NodeProto {
+        name: "owner".to_string(),
+        attribute: vec![
+            graph_attribute(
+                "branches[0]",
+                GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "10")])],
+                    ..Default::default()
+                },
+            ),
+            AttributeProto {
+                name: "branches".to_string(),
+                r#type: attribute_proto::AttributeType::Graphs as i32,
+                graphs: vec![GraphProto {
+                    node: vec![proto_node("inner", [("onnx_runtime.layer", "20")])],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![owner],
+        ..Default::default()
+    });
+
+    assert_eq!(singular_path.display_name(), repeated_path.display_name());
+    assert_eq!(hints.nodes.len(), 2);
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&singular_path)
+            .and_then(|node| node.layer),
+        Some(10)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get_path(&repeated_path)
+            .and_then(|node| node.layer),
+        Some(20)
+    );
+}
+
+#[test]
 fn from_model_with_no_metadata_is_safe() {
     let model = Model::new(add_graph());
     let hints = MetadataHints::from_model(&model);
