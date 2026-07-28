@@ -519,6 +519,8 @@ pub use capture::{
 pub use kernel_cache::CacheStats;
 pub(crate) use kernel_cache::KernelCache;
 use kernel_cache::*;
+#[cfg(test)]
+pub(crate) use kernel_cache::{PREBIND_FALLBACK_TEST_HITS, PREBIND_FAST_PATH_TEST_HITS};
 mod dynamic_shapes;
 mod geometry;
 use dynamic_shapes::*;
