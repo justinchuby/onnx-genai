@@ -663,35 +663,137 @@ fn model_hint_entries(model: &Model) -> Vec<HintEntry> {
     if let Some(proto) = model.retained_proto()
         && let Some(graph) = proto.graph.as_ref()
     {
-        for entry in &graph.metadata_props {
-            if entry.key.starts_with(NAMESPACE_PREFIX) {
-                entries.push(HintEntry {
-                    scope: HintScope::Graph {
-                        graph_name: graph.name.clone(),
-                    },
-                    source: HintSource::OnnxMetadata,
-                    key: entry.key.clone(),
-                    value: entry.value.clone(),
-                });
-            }
-        }
-        for node in &graph.node {
-            for entry in &node.metadata_props {
-                if entry.key.starts_with(NAMESPACE_PREFIX) {
-                    entries.push(HintEntry {
-                        scope: HintScope::Node {
-                            node_name: node.name.clone(),
+        collect_graph_hint_entries(graph, &mut entries);
+    }
+
+    entries
+}
+
+fn collect_graph_hint_entries(
+    root: &onnx_runtime_loader::proto::onnx::GraphProto,
+    entries: &mut Vec<HintEntry>,
+) {
+    use onnx_runtime_loader::proto::onnx::{GraphProto, NodeProto};
+
+    enum Work<'a> {
+        Graph {
+            graph: &'a GraphProto,
+            path: String,
+            top_level: bool,
+        },
+        Node {
+            node: &'a NodeProto,
+            path: String,
+            subgraph_prefix: String,
+        },
+    }
+
+    let mut work = vec![Work::Graph {
+        graph: root,
+        path: root.name.clone(),
+        top_level: true,
+    }];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Graph {
+                graph,
+                path,
+                top_level,
+            } => {
+                entries.extend(
+                    graph
+                        .metadata_props
+                        .iter()
+                        .filter(|entry| entry.key.starts_with(NAMESPACE_PREFIX))
+                        .map(|entry| HintEntry {
+                            scope: HintScope::Graph {
+                                graph_name: path.clone(),
+                            },
+                            source: HintSource::OnnxMetadata,
+                            key: entry.key.clone(),
+                            value: entry.value.clone(),
+                        }),
+                );
+                for (index, node) in graph.node.iter().enumerate().rev() {
+                    let node_name = path_segment(&node.name, "node", index);
+                    let node_path = if top_level {
+                        node.name.clone()
+                    } else {
+                        qualify(&path, &node_name)
+                    };
+                    work.push(Work::Node {
+                        node,
+                        path: node_path,
+                        subgraph_prefix: if top_level {
+                            node_name
+                        } else {
+                            qualify(&path, &node_name)
                         },
-                        source: HintSource::OnnxMetadata,
-                        key: entry.key.clone(),
-                        value: entry.value.clone(),
+                    });
+                }
+            }
+            Work::Node {
+                node,
+                path,
+                subgraph_prefix,
+            } => {
+                entries.extend(
+                    node.metadata_props
+                        .iter()
+                        .filter(|entry| entry.key.starts_with(NAMESPACE_PREFIX))
+                        .map(|entry| HintEntry {
+                            scope: HintScope::Node {
+                                node_name: path.clone(),
+                            },
+                            source: HintSource::OnnxMetadata,
+                            key: entry.key.clone(),
+                            value: entry.value.clone(),
+                        }),
+                );
+
+                let mut subgraphs = Vec::new();
+                for (attribute_index, attribute) in node.attribute.iter().enumerate() {
+                    let attribute_name =
+                        path_segment(&attribute.name, "attribute", attribute_index);
+                    if let Some(graph) = attribute.g.as_ref() {
+                        subgraphs.push((graph, qualify(&subgraph_prefix, &attribute_name)));
+                    }
+                    for (graph_index, graph) in attribute.graphs.iter().enumerate() {
+                        subgraphs.push((
+                            graph,
+                            qualify(
+                                &subgraph_prefix,
+                                &format!("{attribute_name}[{graph_index}]"),
+                            ),
+                        ));
+                    }
+                }
+                for (graph, graph_path) in subgraphs.into_iter().rev() {
+                    work.push(Work::Graph {
+                        graph,
+                        path: graph_path,
+                        top_level: false,
                     });
                 }
             }
         }
     }
+}
 
-    entries
+fn path_segment(name: &str, kind: &str, index: usize) -> String {
+    if name.is_empty() {
+        format!("<{kind}:{index}>")
+    } else {
+        name.to_string()
+    }
+}
+
+fn qualify(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ use super::*;
 use crate::model::Model;
 use onnx_runtime_ir::{DataType, Graph, Node, NodeId, static_shape};
 use onnx_runtime_loader::ModelMetadata;
+use onnx_runtime_loader::proto::onnx::{AttributeProto, GraphProto, NodeProto, attribute_proto};
 
 /// Build an `onnx_runtime.*` entry attached to a node.
 fn node_entry(node: &str, key: &str, value: &str, source: HintSource) -> HintEntry {
@@ -404,6 +405,140 @@ fn from_model_reads_node_level_metadata_props() {
 }
 
 #[test]
+fn control_flow_subgraph_hints_are_scanned_with_qualified_paths() {
+    for (op_type, owner_name, attribute_name) in [
+        ("Loop", "loop", "body"),
+        ("If", "if", "then_branch"),
+        ("If", "if", "else_branch"),
+        ("Scan", "scan", "body"),
+    ] {
+        let subgraph = GraphProto {
+            metadata_props: vec![string_entry("onnx_runtime.model.architecture", "nested")],
+            node: vec![proto_node("inner", [("onnx_runtime.device", "gpu:1")])],
+            ..Default::default()
+        };
+        let hints = scan_proto_graph(GraphProto {
+            node: vec![proto_node_with_graph(
+                op_type,
+                owner_name,
+                attribute_name,
+                subgraph,
+            )],
+            ..Default::default()
+        });
+
+        assert!(hints.warnings.is_empty(), "{op_type}/{attribute_name}");
+        assert_eq!(hints.model.architecture.as_deref(), Some("nested"));
+        assert_eq!(
+            hints
+                .nodes
+                .get(&format!("{owner_name}/{attribute_name}/inner"))
+                .and_then(|node| node.device.as_deref()),
+            Some("gpu:1"),
+            "{op_type}/{attribute_name}"
+        );
+    }
+}
+
+#[test]
+fn unknown_key_inside_subgraph_warns_with_qualified_node() {
+    let hints = scan_proto_graph(graph_with_nested_node(
+        "loop",
+        "body",
+        proto_node("inner", [("onnx_runtime.devcie", "gpu")]),
+    ));
+
+    assert_eq!(
+        hints.warnings,
+        vec![MetadataWarning::UnknownKey {
+            node: "loop/body/inner".to_string(),
+            key: "onnx_runtime.devcie".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn invalid_value_inside_subgraph_warns_with_qualified_node() {
+    let hints = scan_proto_graph(graph_with_nested_node(
+        "scan",
+        "body",
+        proto_node("inner", [("onnx_runtime.layer", "first")]),
+    ));
+
+    assert_eq!(
+        hints.warnings,
+        vec![MetadataWarning::InvalidValue {
+            node: "scan/body/inner".to_string(),
+            key: "onnx_runtime.layer".to_string(),
+            value: "first".to_string(),
+            expected: "an integer",
+        }]
+    );
+}
+
+#[test]
+fn deeply_nested_graph_attributes_are_scanned() {
+    let leaf = proto_node("leaf", [("onnx_runtime.offloadable", "true")]);
+    let loop_node = proto_node_with_graph(
+        "Loop",
+        "loop",
+        "body",
+        GraphProto {
+            node: vec![leaf],
+            ..Default::default()
+        },
+    );
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![proto_node_with_graph(
+            "If",
+            "if",
+            "then_branch",
+            GraphProto {
+                node: vec![loop_node],
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        hints
+            .nodes
+            .get("if/then_branch/loop/body/leaf")
+            .and_then(|node| node.offloadable),
+        Some(true)
+    );
+}
+
+#[test]
+fn top_level_node_identity_is_unchanged_when_subgraphs_are_scanned() {
+    let mut top = proto_node("shared", [("onnx_runtime.layer", "1")]);
+    top.attribute.push(graph_attribute(
+        "body",
+        GraphProto {
+            node: vec![proto_node("shared", [("onnx_runtime.layer", "2")])],
+            ..Default::default()
+        },
+    ));
+    let hints = scan_proto_graph(GraphProto {
+        node: vec![top],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        hints.nodes.get("shared").and_then(|node| node.layer),
+        Some(1)
+    );
+    assert_eq!(
+        hints
+            .nodes
+            .get("shared/body/shared")
+            .and_then(|node| node.layer),
+        Some(2)
+    );
+}
+
+#[test]
 fn from_model_with_no_metadata_is_safe() {
     let model = Model::new(add_graph());
     let hints = MetadataHints::from_model(&model);
@@ -418,6 +553,62 @@ fn string_entry(
         key: key.to_string(),
         value: value.to_string(),
     }
+}
+
+fn proto_node<const N: usize>(name: &str, metadata: [(&str, &str); N]) -> NodeProto {
+    NodeProto {
+        name: name.to_string(),
+        op_type: "Identity".to_string(),
+        metadata_props: metadata
+            .into_iter()
+            .map(|(key, value)| string_entry(key, value))
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn proto_node_with_graph(
+    op_type: &str,
+    name: &str,
+    attribute_name: &str,
+    graph: GraphProto,
+) -> NodeProto {
+    NodeProto {
+        name: name.to_string(),
+        op_type: op_type.to_string(),
+        attribute: vec![graph_attribute(attribute_name, graph)],
+        ..Default::default()
+    }
+}
+
+fn graph_attribute(name: &str, graph: GraphProto) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: attribute_proto::AttributeType::Graph as i32,
+        g: Some(graph),
+        ..Default::default()
+    }
+}
+
+fn graph_with_nested_node(owner: &str, attribute: &str, node: NodeProto) -> GraphProto {
+    GraphProto {
+        node: vec![proto_node_with_graph(
+            "CustomControlFlow",
+            owner,
+            attribute,
+            GraphProto {
+                node: vec![node],
+                ..Default::default()
+            },
+        )],
+        ..Default::default()
+    }
+}
+
+fn scan_proto_graph(graph: GraphProto) -> MetadataHints {
+    let mut entries = Vec::new();
+    collect_graph_hint_entries(&graph, &mut entries);
+    MetadataHints::scan(entries)
 }
 
 /// Build a tiny `Z = Add(X, Y)` graph with a named node.
