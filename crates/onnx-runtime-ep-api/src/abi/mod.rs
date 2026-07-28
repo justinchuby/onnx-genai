@@ -5,7 +5,7 @@
 //! raw FFI boundary here so the rest of the native runtime can keep using safe
 //! Rust graph data.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 use std::ptr;
@@ -33,6 +33,49 @@ use runtime::{PluginKernelShared, PluginRuntime};
 /// A read-only projection of a [`Graph`] exposed through the ORT C graph API.
 pub struct OrtGraphView<'view, 'graph> {
     view: &'view GraphView<'graph>,
+}
+
+/// Disjoint-set forest used to fuse supported nodes into convex partitions.
+///
+/// Union is deterministic (union by size, lowest index wins ties) so capability
+/// claims stay stable across runs, and `find` avoids path compression so the
+/// structure can be shared behind `&self` and cheaply cloned for trial merges.
+#[derive(Clone)]
+struct UnionFind {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+            size: vec![1; len],
+        }
+    }
+
+    fn find(&self, mut node: usize) -> usize {
+        while self.parent[node] != node {
+            node = self.parent[node];
+        }
+        node
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (root_a, root_b) = (self.find(a), self.find(b));
+        if root_a == root_b {
+            return;
+        }
+        let (root, child) = if self.size[root_a] > self.size[root_b]
+            || (self.size[root_a] == self.size[root_b] && root_a < root_b)
+        {
+            (root_a, root_b)
+        } else {
+            (root_b, root_a)
+        };
+        self.parent[child] = root;
+        self.size[root] += self.size[child];
+    }
 }
 
 /// An EP's claim over a subgraph it wants to compile and run.
@@ -359,9 +402,12 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
 
     /// Ask a native Rust EP which subgraphs it can handle.
     ///
-    /// Supported nodes are projected into deterministic maximal connected
-    /// regions. Unsupported nodes and disconnected components remain separate
-    /// claims, preserving partition boundaries rather than flattening by EP.
+    /// Supported nodes are fused into deterministic, **convex** partitions.
+    /// Adjacent supported nodes are co-partitioned only when the merge keeps
+    /// every claim convex, so no directed path leaves a claim, passes through an
+    /// excluded node, and re-enters it. Unsupported nodes and merges that would
+    /// break convexity split the region into several claims, preserving ORT's
+    /// `GetCapability` schedulability contract rather than flattening by EP.
     pub fn query_capabilities(&self, ep: &dyn ExecutionProvider) -> Vec<SubgraphClaim> {
         let supported: Vec<_> = self
             .view
@@ -379,45 +425,124 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
             return Vec::new();
         }
 
-        let mut membership = vec![false; self.view.nodes().len()];
+        let node_count = self.view.nodes().len();
+        let mut membership = vec![false; node_count];
         for node in supported {
             membership[node.as_usize()] = true;
         }
 
-        let mut visited = vec![false; membership.len()];
-        let mut claims = Vec::new();
-        for seed in self.view.nodes() {
-            if !membership[seed.as_usize()] || visited[seed.as_usize()] {
+        // Fuse adjacent supported nodes, but only when the merge keeps the
+        // partition convex. Two supported nodes may share a claim only if
+        // merging their partitions introduces no directed path that leaves the
+        // claim, passes through an excluded (e.g. unsupported) node, and
+        // re-enters it. Such a non-convex partition would form a dependency
+        // cycle with the excluded node and be unschedulable.
+        let mut partitions = UnionFind::new(node_count);
+        for node in self.view.nodes() {
+            if !membership[node.as_usize()] {
                 continue;
             }
-            let mut stack = vec![seed];
-            visited[seed.as_usize()] = true;
-            let mut component = Vec::new();
-            while let Some(node) = stack.pop() {
-                component.push(node);
-                for input in self.view.node_inputs(node).iter().flatten() {
-                    if let Some(neighbor) = self.view.producer(*input)
-                        && membership[neighbor.as_usize()]
-                        && !visited[neighbor.as_usize()]
+            for &output in self.view.node_outputs(node) {
+                for consumer in self.view.consumers(output) {
+                    let neighbor = consumer.node;
+                    if !membership[neighbor.as_usize()]
+                        || partitions.find(node.as_usize()) == partitions.find(neighbor.as_usize())
                     {
-                        visited[neighbor.as_usize()] = true;
-                        stack.push(neighbor);
+                        continue;
                     }
-                }
-                for &output in self.view.node_outputs(node) {
-                    for consumer in self.view.consumers(output) {
-                        let neighbor = consumer.node;
-                        if membership[neighbor.as_usize()] && !visited[neighbor.as_usize()] {
-                            visited[neighbor.as_usize()] = true;
-                            stack.push(neighbor);
-                        }
+                    if self.merge_preserves_convexity(&partitions, node, neighbor) {
+                        partitions.union(node.as_usize(), neighbor.as_usize());
                     }
                 }
             }
-            component.sort_unstable();
-            claims.push(self.claim_for_component(&component));
         }
-        claims
+
+        // Emit one claim per partition, ordered by first (topological) node and
+        // with deterministic node membership.
+        let mut order = Vec::new();
+        let mut components: HashMap<usize, Vec<NodeIndex>> = HashMap::new();
+        for node in self.view.nodes() {
+            if !membership[node.as_usize()] {
+                continue;
+            }
+            let root = partitions.find(node.as_usize());
+            let component = components.entry(root).or_default();
+            if component.is_empty() {
+                order.push(root);
+            }
+            component.push(node);
+        }
+        order
+            .into_iter()
+            .map(|root| {
+                let mut component = components.remove(&root).expect("root has a component");
+                component.sort_unstable();
+                self.claim_for_component(&component)
+            })
+            .collect()
+    }
+
+    /// Whether fusing the partitions containing `left` and `right` keeps every
+    /// claim convex, i.e. the condensed graph (partition representatives as
+    /// vertices, cross-partition value dependencies as edges) stays acyclic. A
+    /// cycle would mean a directed path leaves the fused claim and returns to
+    /// it, which is unschedulable.
+    fn merge_preserves_convexity(
+        &self,
+        partitions: &UnionFind,
+        left: NodeIndex,
+        right: NodeIndex,
+    ) -> bool {
+        let mut trial = partitions.clone();
+        trial.union(left.as_usize(), right.as_usize());
+        self.condensed_graph_is_acyclic(&trial)
+    }
+
+    /// Kahn's algorithm over the condensed graph whose vertices are the current
+    /// partition representatives and whose edges follow the original graph's
+    /// value dependencies across partitions.
+    fn condensed_graph_is_acyclic(&self, partitions: &UnionFind) -> bool {
+        let mut edges: HashSet<(usize, usize)> = HashSet::new();
+        let mut successors: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut in_degree: HashMap<usize, usize> = HashMap::new();
+
+        for node in self.view.nodes() {
+            in_degree
+                .entry(partitions.find(node.as_usize()))
+                .or_insert(0);
+        }
+        for node in self.view.nodes() {
+            let from = partitions.find(node.as_usize());
+            for &output in self.view.node_outputs(node) {
+                for consumer in self.view.consumers(output) {
+                    let to = partitions.find(consumer.node.as_usize());
+                    if from != to && edges.insert((from, to)) {
+                        successors.entry(from).or_default().push(to);
+                        *in_degree.entry(to).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let mut ready: Vec<usize> = in_degree
+            .iter()
+            .filter(|&(_, &degree)| degree == 0)
+            .map(|(&vertex, _)| vertex)
+            .collect();
+        let mut resolved = 0usize;
+        while let Some(vertex) = ready.pop() {
+            resolved += 1;
+            if let Some(children) = successors.get(&vertex) {
+                for &child in children {
+                    let degree = in_degree.get_mut(&child).expect("edge target is a vertex");
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.push(child);
+                    }
+                }
+            }
+        }
+        resolved == in_degree.len()
     }
 
     fn claim_for_component(&self, nodes: &[NodeIndex]) -> SubgraphClaim {

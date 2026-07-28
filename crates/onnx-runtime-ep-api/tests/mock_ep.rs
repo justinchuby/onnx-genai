@@ -372,3 +372,87 @@ fn graph_view_capability_keeps_contrib_domains_distinct() {
     assert_eq!(native_claims(&canonical_alias, &ep).len(), 1);
     assert!(native_claims(&contrib, &ep).is_empty());
 }
+
+/// Build Leon's convexity reproducer:
+///
+/// * `A = Add(input, input) -> a` (supported)
+/// * `U = Custom(a, a) -> u`     (unsupported)
+/// * `B = Add(a, u) -> b`        (supported, graph output)
+///
+/// `A` and `B` are only undirected-connected through `a`, but any claim holding
+/// both would consume `u` (produced by the excluded `U`) while also producing
+/// `a` (consumed by `U`), forming a dependency cycle `{A,B} -> U -> {A,B}`. A
+/// convex partitioner must therefore keep `A` and `B` in separate claims.
+fn graph_convexity_reproducer() -> FrozenGraph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("ai.onnx".into(), 17);
+
+    let input = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+
+    let a = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(input), Some(input)],
+        vec![a],
+    ));
+
+    let u = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Custom",
+        vec![Some(a), Some(a)],
+        vec![u],
+    ));
+
+    let b = graph.create_value(DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(NodeId(0), "Add", vec![Some(a), Some(u)], vec![b]));
+    graph.add_output(b);
+
+    FrozenGraph::build(graph).unwrap()
+}
+
+#[test]
+fn graph_view_capability_splits_nonconvex_partitions() {
+    let frozen = graph_convexity_reproducer();
+    let ep = MockEp::new();
+    let claims = native_claims(&frozen, &ep);
+
+    // The two supported `Add` nodes must land in separate convex claims; fusing
+    // them would create a scheduling cycle with the excluded `Custom` node.
+    assert_eq!(
+        claims.len(),
+        2,
+        "expected two convex claims, got {claims:?}"
+    );
+    for claim in &claims {
+        assert_eq!(claim.node_ids.len(), 1);
+    }
+
+    // No claim may both consume a value from and produce a value into the same
+    // external node: that is exactly the non-convex cycle this test guards.
+    let graph = frozen.view().graph();
+    for claim in &claims {
+        for &input in &claim.input_values {
+            let Some(producer) = producer_of(graph, input) else {
+                continue;
+            };
+            for &output in &claim.output_values {
+                assert!(
+                    !graph.consumers(output).contains(&producer),
+                    "claim {claim:?} forms a cycle through external node {producer:?}"
+                );
+            }
+        }
+    }
+}
+
+fn producer_of(graph: &Graph, value: onnx_runtime_ir::ValueId) -> Option<NodeId> {
+    graph
+        .topological_order()
+        .unwrap()
+        .into_iter()
+        .find(|&node| graph.node(node).outputs.contains(&value))
+}
