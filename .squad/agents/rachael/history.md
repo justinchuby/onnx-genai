@@ -120,3 +120,13 @@ Pris authored WP-B1 optional-modality metadata schema support and Bryant approve
 
 ### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+
+## 2026-07-27T14:15:00-07:00 — REPL Phase 1 implementation
+
+- Implemented the Phase 1 TTY/plain split for `onnx-genai run`: piped stdin/stdout stays on the byte-stable `read_line` loop, while true TTY sessions use a rich `reedline` editor.
+- Chose `reedline` after verifying it shares `crossterm v0.29.0` with ratatui 0.30.2; it provides multiline Alt+Enter input, cursor movement, persistent file-backed history, bracketed paste, and slash completion.
+- Replaced the hand slash-command parser/help with a declarative registry that also drives command and argument completion; `/fork` and `/rewind` remain out of Phase 1.
+- Made compact stats default-on only for interactive TTY sessions and added `run --no-stats`; non-TTY scripts keep stats opt-in via `/stats`.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Fixed PR #300 / #76 after author lockout: capability projection now rejects non-convex merges with deterministic union-find + Kahn check; merged after Leon approval.

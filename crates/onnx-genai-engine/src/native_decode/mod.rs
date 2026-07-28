@@ -26,6 +26,7 @@ mod cpu;
 mod cuda;
 mod io;
 mod load;
+mod paged_gqa;
 mod proposer;
 mod tensor;
 #[cfg(test)]
@@ -38,6 +39,10 @@ use cuda::DecodeCudaState;
 use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
 use io::*;
+pub use paged_gqa::{
+    GQA_PRESENT_ALLOCATIONS, PagedGqaConfig, flat_gqa_decode_step, gqa_present_allocations,
+    paged_gqa_decode_step,
+};
 pub(crate) use proposer::NativeProposerSession;
 use tensor::*;
 

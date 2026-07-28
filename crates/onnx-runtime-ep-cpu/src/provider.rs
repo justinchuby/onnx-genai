@@ -188,6 +188,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "VarlenAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::varlen_attention::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "ScatterND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
@@ -351,7 +358,8 @@ impl ExecutionProvider for CpuExecutionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_ep_api::abi::OrtGraphView;
+    use onnx_runtime_ir::{Attribute, FrozenGraph, Graph, NodeId, static_shape};
 
     fn stateful_csa_node(ratio: i64, input_count: usize, output_count: usize) -> Node {
         let mut graph = Graph::new();
@@ -404,6 +412,48 @@ mod tests {
         assert!(ep.initialized);
         ep.shutdown().unwrap();
         assert!(!ep.initialized);
+    }
+
+    #[test]
+    fn graph_view_capabilities_follow_the_cpu_kernel_registry() {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let input = graph.create_value(DataType::Float32, static_shape([2]));
+        let add_out = graph.create_value(DataType::Float32, static_shape([2]));
+        let custom_out = graph.create_value(DataType::Float32, static_shape([2]));
+        let relu_out = graph.create_value(DataType::Float32, static_shape([2]));
+        graph.add_input(input);
+        let add = graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(input), Some(input)],
+            vec![add_out],
+        ));
+        let custom = graph.insert_node(Node::new(
+            NodeId(0),
+            "UnregisteredCustom",
+            vec![Some(add_out)],
+            vec![custom_out],
+        ));
+        let relu = graph.insert_node(Node::new(
+            NodeId(0),
+            "Relu",
+            vec![Some(custom_out)],
+            vec![relu_out],
+        ));
+        graph.add_output(relu_out);
+
+        let frozen = FrozenGraph::build(graph).unwrap();
+        let view = frozen.view();
+        let ep = CpuExecutionProvider::new();
+        let claims = OrtGraphView::new(&view).query_capabilities(&ep);
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].node_ids, vec![add]);
+        assert_eq!(claims[1].node_ids, vec![relu]);
+        assert!(ep.registry().supports("Add", "", 17));
+        assert!(!ep.registry().supports("UnregisteredCustom", "", 17));
+        assert!(ep.registry().supports("Relu", "", 17));
+        assert!(!claims.iter().any(|claim| claim.node_ids.contains(&custom)));
     }
 
     #[test]
@@ -486,16 +536,41 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "device")]
     fn deallocate_rejects_cross_device_buffer() {
         let ep = CpuExecutionProvider::new();
         // Fabricate a buffer tagged with a CUDA device to trip invariant #3.
         let boxed = vec![0u8; 8].into_boxed_slice();
         let ptr = Box::into_raw(boxed) as *mut c_void;
         // SAFETY: valid 8-byte host allocation; we only use it to exercise the
-        // device assert. It leaks on the panic path, which is fine in a test.
+        // device assert. The allocation is reclaimed after catching the panic.
         let foreign = unsafe { DeviceBuffer::from_raw_parts(ptr, DeviceId::cuda(0), 8, 8) };
-        let _ = ep.deallocate(foreign); // must panic before freeing
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ep.deallocate(foreign); // must panic before freeing
+        }));
+        let panic = result.expect_err("cross-device deallocate must panic before freeing");
+        let message = if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic.downcast_ref::<&str>() {
+            *message
+        } else {
+            panic!("cross-device deallocate panic used a non-string payload");
+        };
+        assert!(
+            message.contains("cpu_ep: refusing to deallocate a buffer from device"),
+            "unexpected deallocate panic: {message}"
+        );
+        assert!(
+            message.contains("Cuda") || message.contains("cuda"),
+            "cross-device deallocate panic did not identify the foreign CUDA device: {message}"
+        );
+        // SAFETY: `deallocate` panicked before freeing, so `ptr` still names the
+        // original boxed slice allocation.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                ptr as *mut u8,
+                8,
+            )));
+        }
     }
 
     #[test]

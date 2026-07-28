@@ -505,6 +505,33 @@ impl Page {
         }
     }
 
+    /// Borrow one token's contiguous `head_dim` f32 row for `(component, head,
+    /// token_offset)`, or `None` when this component is not stored as F32.
+    ///
+    /// F32 components lay each `(head, token)` row out contiguously in
+    /// [`Page::data`] (see [`Page::write_head_token`]), so a runtime-managed
+    /// (paged) attention reader can attend over the page **in place** — no
+    /// dequantization and no copy. A quantized component has no contiguous f32
+    /// row to borrow and returns `None`, so the caller must fall back to the
+    /// per-element [`Page::value_at_slot`] dequantizing path.
+    pub fn head_token_f32(
+        &self,
+        page_size: usize,
+        head_dim: usize,
+        component: usize,
+        head: usize,
+        token_offset: usize,
+    ) -> Option<&[f32]> {
+        let storage = self.storage_layout[component];
+        if storage.dtype != KvDType::F32 {
+            return None;
+        }
+        let head_len = page_size * head_dim;
+        let within = head * head_len + token_offset * head_dim;
+        let offset = storage.data_offset + within;
+        Some(&self.data[offset..offset + head_dim])
+    }
+
     pub fn has_quantized_storage(&self) -> bool {
         self.storage_layout
             .iter()

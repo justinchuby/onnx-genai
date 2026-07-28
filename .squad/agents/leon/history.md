@@ -149,3 +149,8 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 - 🔴 Rejected Gaff's Route-B revision. Public runner-backed `rewind_session_to` now rejects before session removal/token/KV mutation, but the reject policy was implemented in shared `rewind_target_state_to_len` / `rewind_draft_state_to_len`, accidentally disabling speculative runner rewinds for static-cache/PastPresent generation.
 - Also flagged stale model-backed checkpoint test still expecting `tiny-llm` PastPresent rewind success despite the support matrix marking runner-backed public rewind unsupported. Sapper should revise under Deckard/Batty/Gaff lockout by splitting public API validation from internal speculative rewind policy.
 - Validation: engine build/fmt/clippy passed; server/CLI builds passed; targeted model-free tests passed. Full engine lib suite remained at local ORT mismatch baseline (183 passed, 66 failed, 1 ignored). Conda ORT probe still loaded ORT 1.17/API 17, so model-loading verification remained blocked.
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Reviewed PR #300 / #76, requested changes for non-convex capability claims, then approved Rachael union-find + Kahn convexity fix.
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Approved PR #316 CJK renderer fix and mutation-proof wide-character tests.

@@ -289,11 +289,15 @@ impl DecodeState {
         absolute_current_len: usize,
         target_len: usize,
         has_paged_materialization: bool,
+        runner_policy: crate::kv_bridge::RewindRunnerPolicy,
     ) -> anyhow::Result<()> {
         if !self.use_kv || absolute_current_len == target_len {
             return Ok(());
         }
         if self.has_runner() {
+            if runner_policy == crate::kv_bridge::RewindRunnerPolicy::AllowRunnerRewind {
+                return Ok(());
+            }
             anyhow::bail!(
                 "cannot rewind runner-backed decoder state to token {target_len}; start a fresh session and replay the prefix instead"
             );

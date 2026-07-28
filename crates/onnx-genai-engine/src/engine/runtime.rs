@@ -637,11 +637,15 @@ impl Engine {
             &self.kv_cache,
             session_id,
             state,
-            position,
+            RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
         )?;
         if let (Some(draft_model), Some(draft)) = (&self.draft, &state.draft) {
             let draft_target = position.min(draft.tokens.len());
-            validate_draft_state_rewind_to_len(draft_model, draft, draft_target)?;
+            validate_draft_state_rewind_to_len(
+                draft_model,
+                draft,
+                RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
         }
 
         self.scheduler.complete(session_id);
@@ -657,11 +661,15 @@ impl Engine {
                 &mut self.kv_cache,
                 session_id,
                 &mut state,
-                position,
+                RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
             )?;
             if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
                 let draft_target = position.min(draft.tokens.len());
-                rewind_draft_state_to_len(draft_model, draft, draft_target)?;
+                rewind_draft_state_to_len(
+                    draft_model,
+                    draft,
+                    RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+                )?;
             }
             Ok(())
         })();

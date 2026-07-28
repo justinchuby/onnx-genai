@@ -714,6 +714,73 @@ impl PagedKvCache {
         Ok(sink + (self.len(seq)? - window_start))
     }
 
+    /// Borrow one layer's contiguous f32 K/V row for a single head at absolute
+    /// token `position`, reading it **in place** from the owning page.
+    ///
+    /// This is the runtime-managed (paged) attention read primitive: instead of
+    /// materializing the whole sequence into a fresh `present` buffer every
+    /// decode step, an attention kernel calls this per attended token to borrow
+    /// the persistent page row directly (`num_kv_heads * head_dim` values are
+    /// stored as `[head, head_dim]`, so one head's row is `head_dim` contiguous
+    /// f32). Returns `None` for a quantized layer component (no contiguous f32
+    /// row exists); the caller must then dequantize via
+    /// [`materialize_sequence`](Self::materialize_sequence).
+    ///
+    /// `position` must be a retained, filled token (`retained_start(seq) <=
+    /// position < len(seq)`, or a pinned sink); an evicted or out-of-range
+    /// position is an error.
+    pub fn head_token_row(
+        &self,
+        seq: SequenceId,
+        layer_idx: usize,
+        kind: crate::KvKind,
+        head: usize,
+        position: usize,
+    ) -> Result<Option<&[f32]>, KvError> {
+        if self.page_table.tensor_config.is_none() {
+            return Err(KvError::TensorStorageNotConfigured);
+        }
+        let len = self.len(seq)?;
+        if position >= len {
+            return Err(KvError::InvalidPosition {
+                position,
+                length: len,
+            });
+        }
+        let start = self.retained_start(seq)?;
+        let sink = self.sink_len(seq)?;
+        if position >= sink && position < start {
+            return Err(KvError::PositionEvicted {
+                position,
+                retained_start: start,
+            });
+        }
+        let geom = *self
+            .page_table
+            .layer_configs
+            .get(layer_idx)
+            .ok_or(KvError::SequenceNotFound(seq))?;
+        let page_size = self.page_table.page_size;
+        let buffer_index = self.buffer_index(seq, position)?;
+        let page_index = buffer_index / page_size;
+        let token_offset = buffer_index % page_size;
+        let pages = self
+            .page_table
+            .get_sequence(seq)
+            .ok_or(KvError::SequenceNotFound(seq))?;
+        let page_id = *pages.get(page_index).ok_or(KvError::InvalidPosition {
+            position,
+            length: len,
+        })?;
+        let page = self
+            .page_table
+            .pages
+            .get(&page_id)
+            .ok_or(KvError::PageNotFound(page_id))?;
+        let component = layer_idx * 2 + if kind == crate::KvKind::Key { 0 } else { 1 };
+        Ok(page.head_token_f32(page_size, geom.head_dim, component, head, token_offset))
+    }
+
     /// Validate that `seq` can rewind to `position` without mutating page state.
     pub fn validate_rewind_to(&self, seq: SequenceId, position: usize) -> Result<(), KvError> {
         let retained_start = self.retained_start(seq)?;
@@ -873,7 +940,7 @@ impl KvCacheOps for PagedKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KvDType, PageTensorConfig};
+    use crate::{KvDType, KvKind, PageTensorConfig};
     use onnx_genai_metadata::{
         KvCacheSpec, KvComponentTolerance, KvQuantTolerance, LayerPrecisionOverride,
     };
@@ -2119,5 +2186,85 @@ mod tests {
             cache.preempt_sequence(999),
             Err(KvError::SequenceNotFound(999))
         ));
+    }
+
+    #[test]
+    fn head_token_row_borrows_pages_in_place_across_boundaries() {
+        // config(): 2 layers, 2 kv heads, head_dim 3, page_size 2. Appending 5
+        // tokens spans 3 pages, so this crosses page boundaries.
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 8);
+        let seq = cache.create_sequence();
+        for token in 0..5u32 {
+            let data = layers(token as f32);
+            cache.append_token_kv(seq, &borrowed_layers(&data)).unwrap();
+        }
+
+        // Every (layer, kind, head, position) row must equal the value that was
+        // written, and must match the materialized dense tensors element for
+        // element (the accessor is the zero-copy equivalent of materialize).
+        let materialized = cache.materialize_sequence(seq).unwrap();
+        for layer_idx in 0..2 {
+            let geom = &materialized.layers[layer_idx];
+            for (kind, dense) in [(KvKind::Key, &geom.key), (KvKind::Value, &geom.value)] {
+                for head in 0..geom.num_kv_heads {
+                    for position in 0..5 {
+                        let row = cache
+                            .head_token_row(seq, layer_idx, kind, head, position)
+                            .unwrap()
+                            .expect("f32 cache yields a contiguous row");
+                        let base = (head * 5 + position) * geom.head_dim;
+                        assert_eq!(
+                            row,
+                            &dense[base..base + geom.head_dim],
+                            "layer {layer_idx} {kind:?} head {head} pos {position}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn head_token_row_rejects_out_of_range_and_quantized() {
+        let mut cache = PagedKvCache::new_with_tensor_config(config(), 8);
+        let seq = cache.create_sequence();
+        let data = layers(1.0);
+        cache.append_token_kv(seq, &borrowed_layers(&data)).unwrap();
+
+        // Position at/after the sequence length is out of range.
+        assert!(matches!(
+            cache.head_token_row(seq, 0, KvKind::Key, 0, 1),
+            Err(KvError::InvalidPosition { position: 1, .. })
+        ));
+
+        // A quantized (fp8) component has no contiguous f32 row to borrow.
+        let mut quant = PagedKvCache::new_with_layer_quant_config(
+            2,
+            KvDType::F32,
+            vec![LayerTensorConfig {
+                num_kv_heads: 1,
+                head_dim: 4,
+            }],
+            crate::page_table::KvQuantConfig::homogeneous(KvDType::Fp8E4M3Fn, 1),
+            8,
+        )
+        .unwrap();
+        let qseq = quant.create_sequence();
+        quant
+            .append_token_kv(
+                qseq,
+                &[LayerKv {
+                    key: &[1.0, 2.0, 3.0, 4.0],
+                    value: &[5.0, 6.0, 7.0, 8.0],
+                }],
+            )
+            .unwrap();
+        assert!(
+            quant
+                .head_token_row(qseq, 0, KvKind::Key, 0, 0)
+                .unwrap()
+                .is_none(),
+            "quantized component must report no borrowable f32 row"
+        );
     }
 }

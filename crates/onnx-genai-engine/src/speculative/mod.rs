@@ -17,8 +17,8 @@ use crate::decode_loop::{
 };
 use crate::engine::{Engine, MISSING_ORT_SESSION};
 use crate::kv_bridge::{
-    common_prefix_len, mirror_present_kv_to_pages, rewind_draft_state_to_len,
-    rewind_target_state_to_len, trim_overmaterialized_target_kv,
+    RewindRequest, RewindRunnerPolicy, common_prefix_len, mirror_present_kv_to_pages,
+    rewind_draft_state_to_len, rewind_target_state_to_len, trim_overmaterialized_target_kv,
 };
 use crate::logits::{ProcessorChain, ProcessorContext};
 use crate::processors::{ensure_constrained_finish, select_next_token_with_rng};
@@ -1041,7 +1041,11 @@ impl<'a> DraftModelProposer<'a> {
     ) -> anyhow::Result<()> {
         self.draft_state.tokens = target_tokens[..prefix_len].to_vec();
         if self.draft_state.kv_token_count > prefix_len {
-            rewind_draft_state_to_len(self.draft_model, self.draft_state, prefix_len)?;
+            rewind_draft_state_to_len(
+                self.draft_model,
+                self.draft_state,
+                RewindRequest::new(prefix_len, RewindRunnerPolicy::AllowRunnerRewind),
+            )?;
         }
         Ok(())
     }
@@ -1071,7 +1075,11 @@ impl SpeculativeProposer for DraftModelProposer<'_> {
     fn rewind(&mut self, target_tokens: &[TokenId]) -> anyhow::Result<()> {
         let common_len = common_prefix_len(&self.draft_state.tokens, target_tokens);
         if self.draft_state.kv_token_count > common_len {
-            rewind_draft_state_to_len(self.draft_model, self.draft_state, common_len)?;
+            rewind_draft_state_to_len(
+                self.draft_model,
+                self.draft_state,
+                RewindRequest::new(common_len, RewindRunnerPolicy::AllowRunnerRewind),
+            )?;
         }
         self.draft_state.tokens = target_tokens.to_vec();
         Ok(())
@@ -1782,7 +1790,7 @@ impl Engine {
             &mut self.kv_cache,
             session_id,
             state,
-            rewind_len,
+            RewindRequest::new(rewind_len, RewindRunnerPolicy::AllowRunnerRewind),
         )?;
 
         if let Some(token) = accepted_prefix.replacement {
@@ -1912,6 +1920,7 @@ impl Engine {
                     &mut self.kv_cache,
                     session_id,
                     state,
+                    RewindRunnerPolicy::AllowRunnerRewind,
                 )?;
                 if matches!(speculative_mode, SpeculativeMode::DraftModel) {
                     self.sync_draft_to_target(state)?;

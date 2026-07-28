@@ -4,9 +4,15 @@ Tracks implementation status of `docs/DESIGN.md` (§1–§40). Updated as work l
 
 **Published:** `onnx-genai` v0.1.0 + 8 sub-crates on crates.io; the `onnx-runtime-*` layer (including `onnx-runtime-tracer`) is released as v0.1.0-dev.1. CI (fmt/build/test/**blocking clippy**) + scheduled `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-07-25T01:42:00Z_
+_Last updated: 2026-07-27T21:56:00Z_
 
 **Current `origin/main` implementation HEAD:** `5a8c3dc9`.
+
+## 2026-07-27 — Miri unsafe-crate CI enforcement
+
+- **Miri is now enforced instead of ad-hoc for the tractable unsafe Rust surface.** A dedicated `Miri` workflow now owns the `Miri unsafe-crate soundness` job, separate from general CI. It runs on PR/`main`/`ci/**` changes touching covered crates, Cargo manifests, or `.github/workflows/miri.yml`, plus manual dispatch and a weekly schedule for nightly/toolchain drift.
+- **Covered fully:** `onnx-runtime-memory` and `onnx-runtime-dlpack`. **Covered by targeted Miri subsets:** `onnx-runtime-ep-api` ABI/DeviceBuffer/registry/tensor/weight/mock-EP tests, `onnx-runtime-ep-cpu` allocator/copy/dtype/strided-view tests, `onnx-runtime-session` tensor/sequence/view-bounds/size/prefetch/device-binding tests, and `onnx-runtime-capi` C-handle/status/null/session-option pointer-safety tests. CUDA/native ORT crates remain out of scope because Miri cannot execute those FFI/native-library paths.
+- **Finding fixed while enabling CI:** Miri caught a test-only leak in `onnx-runtime-ep-cpu::provider::tests::deallocate_rejects_cross_device_buffer`; the test now catches the expected panic and reclaims the fabricated allocation, preserving the single-free/cross-device invariant check without leaking under Miri.
 
 ## 2026-07-25 — Valid CUDA-artifact native-vs-ORT large-model sweep
 
@@ -518,7 +524,7 @@ Evidence-based audit of `docs/DESIGN.md` (engine) + `docs/ORT2.md` (nxrt runtime
 
 8. **`KvCacheManager` abstraction — ❌ not realized as designed.** DESIGN §3.2/§decode-loop centre everything on a `KvCacheManager` (page-table mapping + append). **No such type exists** (`grep KvCacheManager crates/` → nothing); the engine composes `PageTable` + `PrefixCache` + `PagedCache` (`onnx-genai-kv`) directly. Functionally the KV path works, but the designed manager seam that the tiered store / budget / governor plug into is absent — which is *why* items 9–11 are hard to add.
 
-9. **Tiered storage §3.2.3 (GPU↔CPU↔SSD) — 🟡 no SSD tier.** GPU↔CPU hot/cold tiering is implemented (`LocalTieredConnector` + `PageTable` LRU offload, `onnx-genai-kv/src/local_tiered.rs`). The **SSD/disk cold tier is a config-only stub** — the code comments state "*This milestone does not implement a real disk spill*"; a mmap/direct-I/O `LocalDisk` backend is unbuilt. §38 distributed connector trait ✅, but the only real backend is local GPU↔CPU.
+9. **Tiered storage §3.2.3 (GPU↔CPU↔SSD) — ✅ disk spill.** `LocalTieredConnector` spills fully cold KV payloads into a managed scratch directory through `KvBackingStore`; `DiskKvBackingStore` byte-round-trips f32 payloads and cleans its files on drop. GPU↔CPU page residency remains managed by `PageTable`; mmap/direct-I/O and compressed disk formats remain future optimizations. §38 distributed connector trait ✅.
 
 10. **MemoryBudget & cross-session eviction §26.4 — 🟡 shared byte-budget primitive and engine-governor wiring landed.** `onnx-genai-scheduler` has admission, priority classes, FCFS/Priority policies, and a real deficit-weighted FairShare policy with configurable class weights, bounded anti-starvation, and idle-credit reset; it also has a per-scheduler `max_total_tokens` KV budget and preempt-evict-to-CPU (`scheduler/src/lib.rs`). The **global cross-session dynamic byte-budget accounting** (bytes, not tokens; shared across sessions/models) now exists as `scheduler::byte_budget::ByteBudget` — a cloneable, thread-safe, dynamically-reconfigurable byte ceiling. `Scheduler::with_byte_budget` gates admission/swap-in on it (bytes derived from a model-supplied `SchedulerConfig.bytes_per_token`, RULES #2), releasing on completion/preemption; over-budget rejections carry the RULES #1 what/why/how shortfall. Two schedulers sharing one handle account against one device ceiling (DESIGN §26.11.3). Engine configuration and guarded live limit updates are now wired; **live eviction on a lowered limit remains pending**.
 

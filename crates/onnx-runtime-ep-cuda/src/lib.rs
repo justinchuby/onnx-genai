@@ -66,6 +66,7 @@ mod optimizer;
 pub mod provider;
 pub mod runtime;
 mod trace;
+pub mod weight_paging;
 
 pub use capture::{require_subgraph_graph_capturable, subgraph_graph_capturable};
 pub use dynamic_library::set_wheel_search_paths;
@@ -86,6 +87,7 @@ pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
 pub use provider::CudaExecutionProvider;
+pub use weight_paging::{CudaWeightPage, CudaWeightPager};
 
 /// Number of additional u32 words required by the CUDA device argmax result buffer.
 pub fn device_argmax_scratch_words(elements: usize) -> usize {

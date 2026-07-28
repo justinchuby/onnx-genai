@@ -11,11 +11,11 @@ pub(crate) use crate::decode_loop::{
     DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
 };
 pub(crate) use crate::kv_bridge::{
-    KvModelInfo, PlacedPayload, attach_pages_to_sequence, chunk_payload_from_exported,
-    common_prefix_len, exported_layers_from_runner, infer_kv_model_info, kv_model_past_is_f32,
-    load_materialized_past, past_kv_from_payloads, rewind_draft_state_to_len,
-    rewind_target_state_to_len, sequence_pages_for_len, validate_draft_state_rewind_to_len,
-    validate_target_state_rewind_to_len,
+    KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
+    chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
+    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past, past_kv_from_payloads,
+    rewind_draft_state_to_len, rewind_target_state_to_len, sequence_pages_for_len,
+    validate_draft_state_rewind_to_len, validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{
@@ -1422,11 +1422,16 @@ mod tests {
     }
 
     #[test]
-    fn tiny_fixture_session_rewind_to_checkpoint_regenerates_same_tokens() -> anyhow::Result<()> {
+    fn tiny_fixture_session_rewind_to_checkpoint_reports_unsupported_runner_state()
+    -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm")
             .canonicalize()?;
         let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(matches!(
+            engine.decode_path,
+            ModelDecodePath::PastPresent { .. }
+        ));
         let session_id = engine.create_session()?;
         let checkpoint = engine.checkpoint_session(session_id)?;
 
@@ -1439,16 +1444,19 @@ mod tests {
         let first_count = engine.session_token_count(session_id)?;
         assert!(first_count > checkpoint.position.get());
 
-        engine.restore_session(checkpoint)?;
+        let error = engine
+            .restore_session(checkpoint)
+            .expect_err("PastPresent runner-backed session rewind is not supported");
+        assert!(
+            error.to_string().contains("runner-backed decoder state"),
+            "unexpected restore error: {error:#}"
+        );
         assert_eq!(
             engine.session_token_count(session_id)?,
-            checkpoint.position.get()
+            first_count,
+            "failed public rewind must leave session unchanged"
         );
-
-        let second = engine.generate_in_session(session_id, request)?;
-        assert_eq!(second.token_ids, first.token_ids);
-        assert_eq!(second.finish_reason, first.finish_reason);
-        assert_eq!(engine.session_token_count(session_id)?, first_count);
+        assert_eq!(first.token_ids.len(), 4);
         engine.close_session(session_id)?;
         Ok(())
     }
