@@ -48,15 +48,29 @@ pub(crate) fn resolve_graph_capture_enabled(
     structural.is_capture_safe()
 }
 
-const DEFAULT_CUDA_KV_MAX_LEN: usize = 4096;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
+    pub max_len_source: String,
     pub device_ptrs: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
     pub graph: CudaGraphDebugStats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CudaDeviceMemorySnapshot {
+    pub(crate) free_bytes: usize,
+    pub(crate) total_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CudaKvCapacity {
+    pub(crate) max_len: usize,
+    pub(crate) source: String,
+    pub(crate) metadata_max_len: Option<usize>,
+    pub(crate) device_memory: Option<CudaDeviceMemorySnapshot>,
+    pub(crate) bytes_per_token: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -80,18 +94,23 @@ enum DecodeCudaGraphPhase {
 
 pub(crate) struct DecodeCudaState {
     logical_len: usize,
+    /// Current physical KV bucket for the native CUDA decode session. The hard
+    /// maximum lives in `capacity.max_len`; this bucket grows on demand via the
+    /// shared `onnx_genai_kv::kv_capacity_bucket` policy. Growth is a capture
+    /// boundary: reallocation invalidates the old graph, then the normal
+    /// warm-up/capture/replay state machine captures the new bucket.
     pub(crate) max_len: usize,
-    bindings: Vec<DeviceIoBinding>,
-    base_binding_count: usize,
-    kv_binding_range: std::ops::Range<usize>,
-    auxiliary_binding_range: std::ops::Range<usize>,
-    input_ids_binding: usize,
-    position_ids_binding: Option<usize>,
+    pub(crate) bindings: Vec<DeviceIoBinding>,
+    pub(crate) base_binding_count: usize,
+    pub(crate) kv_binding_range: std::ops::Range<usize>,
+    pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
+    pub(crate) input_ids_binding: usize,
+    pub(crate) position_ids_binding: Option<usize>,
     logits_binding: usize,
     logits_shape: Vec<usize>,
     logits_dtype: DataType,
     greedy_result: DeviceIoBinding,
-    graph_enabled: bool,
+    pub(crate) graph_enabled: bool,
     /// `true` when the attention-mask binding exposes its *logical* valid length
     /// (not the padded physical capacity) to at least one consumer that is not a
     /// capacity-aware kernel — e.g. GLM-5.2's `indexer` arithmetic branch, which
@@ -104,6 +123,7 @@ pub(crate) struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    capacity: CudaKvCapacity,
     pub(crate) graph_fallback_reason: Option<String>,
     pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
@@ -262,23 +282,24 @@ impl NativeDecodeSession {
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
-        if total_len > state.max_len {
-            bail!(
-                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
-                state.max_len
-            );
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
         }
-        // Single-token decode freezes the mask to physical capacity so the step
-        // is CUDA-graph-capture eligible; multi-token prefill keeps the growing
-        // logical length (prefix-sensitive causal island). A mask whose logical
-        // valid length feeds a non-capacity-aware consumer (see
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        // Single-token decode freezes the mask to the current physical bucket so
+        // the step is CUDA-graph-capture eligible. This is not a fixed-capacity
+        // constraint: when `ensure_capacity` grows the bucket, it invalidates the
+        // old capture and the existing state machine re-captures against the new
+        // buffers, matching ORT shared-buffer growth. Multi-token prefill keeps
+        // the growing logical length (prefix-sensitive causal island). A mask
+        // whose logical valid length feeds a non-capacity-aware consumer (see
         // `decode_mask_expose_len`) cannot be frozen and uses `total_len`.
         let mask_expose = if token_ids.len() == 1 {
             state.decode_mask_expose_len(total_len)
         } else {
             total_len
         };
-        state.extend_mask(past_len, total_len, mask_expose)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
 
         if token_ids.len() == 1 {
             state.write_decode_inputs(token_ids[0], past_len)?;
@@ -387,13 +408,11 @@ impl NativeDecodeSession {
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
-        if total_len > state.max_len {
-            bail!(
-                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
-                state.max_len
-            );
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
         }
-        state.extend_mask(past_len, total_len, total_len)?;
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
         self.run_cuda_eager_rows(
             token_ids,
             past_len,
@@ -416,13 +435,15 @@ impl NativeDecodeSession {
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
-        if total_len > state.max_len {
-            bail!(
-                "CUDA KV capacity exceeded: requested context length {total_len}, configured max_len {} (set ONNX_GENAI_CUDA_KV_MAX_LEN or use load_with_cuda_kv_max_len)",
-                state.max_len
-            );
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
         }
-        state.extend_mask(past_len, total_len, state.decode_mask_expose_len(total_len))?;
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(
+            if grew { 0 } else { past_len },
+            total_len,
+            state.decode_mask_expose_len(total_len),
+        )?;
         state.write_decode_inputs(token_id, past_len)?;
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
@@ -442,6 +463,124 @@ impl NativeDecodeSession {
 }
 
 impl DecodeCudaState {
+    pub(crate) fn kv_bytes_per_token(
+        session: &InferenceSession,
+        present_to_past: &HashMap<String, String>,
+    ) -> anyhow::Result<usize> {
+        let mut bytes = std::mem::size_of::<i64>();
+        for past in present_to_past.values() {
+            let meta = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == *past)
+                .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
+            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
+            {
+                bail!(
+                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
+                    meta.dtype,
+                    meta.shape
+                );
+            }
+            let mut elements_per_token = 1usize;
+            for (axis, dim) in meta.shape.iter().copied().enumerate() {
+                let dim = if axis == 0 || axis == 2 {
+                    1
+                } else if let Dim::Static(value) = dim {
+                    value
+                } else {
+                    bail!(
+                        "cannot infer CUDA KV dimension {axis} for '{past}' shape {:?}",
+                        meta.shape
+                    );
+                };
+                elements_per_token = elements_per_token.checked_mul(dim).with_context(|| {
+                    format!(
+                        "CUDA KV bytes-per-token overflow for '{past}' shape {:?}",
+                        meta.shape
+                    )
+                })?;
+            }
+            bytes = bytes
+                .checked_add(
+                    meta.dtype
+                        .checked_storage_bytes(elements_per_token)
+                        .with_context(|| {
+                            format!(
+                                "CUDA KV bytes-per-token overflow for '{past}' shape {:?}",
+                                meta.shape
+                            )
+                        })?,
+                )
+                .with_context(|| {
+                    format!(
+                        "CUDA KV bytes-per-token overflow for '{past}' shape {:?}",
+                        meta.shape
+                    )
+                })?;
+        }
+        Ok(bytes)
+    }
+
+    fn capacity_exceeded_error(&self, requested: usize) -> String {
+        cuda_kv_capacity_exceeded_message(requested, &self.capacity)
+    }
+
+    fn growth_failed_error(
+        &self,
+        old_capacity: usize,
+        new_capacity: usize,
+        error: anyhow::Error,
+        memory_at_failure: Result<CudaDeviceMemorySnapshot, String>,
+    ) -> anyhow::Error {
+        let memory = memory_at_failure
+            .map(|memory| {
+                format!(
+                    "CUDA free={} bytes, total={} bytes",
+                    memory.free_bytes, memory.total_bytes
+                )
+            })
+            .unwrap_or_else(|err| format!("CUDA free-memory query failed: {err}"));
+        let new_bytes = new_capacity.saturating_mul(self.capacity.bytes_per_token);
+        let transient_bytes = old_capacity
+            .saturating_add(new_capacity)
+            .saturating_mul(self.capacity.bytes_per_token);
+        anyhow::anyhow!(
+            "CUDA KV capacity growth failed while growing from {old_capacity} to {new_capacity} tokens: {error}. \
+             The attempted new KV allocation is approximately {new_bytes} bytes and the transient peak is approximately {transient_bytes} bytes because growth keeps the old bucket live until the new bucket and valid-prefix copy are complete. \
+             {memory}; KV bytes/token: {}. The session state was left unchanged; reset or retry with a shorter prompt/max_new_tokens, set ONNX_GENAI_CUDA_KV_MAX_LEN/load_with_cuda_kv_max_len to an explicit smaller cap, or free VRAM used by other processes.",
+            self.capacity.bytes_per_token
+        )
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        session: &mut InferenceSession,
+        required: usize,
+    ) -> anyhow::Result<bool> {
+        let mut backend = NativeCudaCapacityBackend {
+            state: self,
+            session,
+        };
+        match onnx_genai_kv::ensure_kv_capacity(&mut backend, required)? {
+            onnx_genai_kv::KvCapacityGrowth::Unchanged => Ok(false),
+            onnx_genai_kv::KvCapacityGrowth::Grew {
+                old_capacity,
+                new_capacity,
+                valid_len,
+            } => {
+                tracing::info!(
+                    old_len = old_capacity,
+                    new_len = new_capacity,
+                    valid_len,
+                    hard_max_len = backend.state.capacity.max_len,
+                    "grew native CUDA KV capacity bucket"
+                );
+                Ok(true)
+            }
+        }
+    }
+
     /// Collect the symbolic dimension ids that the native decoder structurally
     /// pins to `1` at decode time. Batch (axis 0 of every input) and query-seq
     /// (the remaining `input_ids` / `position_ids` axes, which are bound to a
@@ -515,9 +654,10 @@ impl DecodeCudaState {
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
-        max_len: usize,
+        capacity: CudaKvCapacity,
         graph_enabled: bool,
     ) -> anyhow::Result<Self> {
+        let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
         let mut mask = session.allocate_device_binding(
             io.attention_mask,
             None::<String>,
@@ -818,6 +958,7 @@ impl DecodeCudaState {
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            capacity,
             graph_fallback_reason: None,
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
@@ -830,19 +971,21 @@ impl DecodeCudaState {
     /// Write the valid `1`s for keys `[start, end)` and set the mask's exposed
     /// logical length. `expose_len` is the last-dim extent the graph's mask
     /// island (and hence the Attention kernel) sees: for a single-token decode
-    /// step it is the fixed physical capacity (`max_len`), which freezes the
+    /// step it is the current physical bucket (`max_len`), which freezes the
     /// island to a shape-static `[1,1,1,max_len]` additive bias (correct for a
     /// single query row — verified: the padding suffix maps to `-inf`, the valid
-    /// prefix to `0`), so the decode step carries no growing logical input and
-    /// stays CUDA-graph-capture eligible. Multi-token prefill passes `end`
-    /// (the growing valid length) because the causal island is prefix-sensitive
-    /// for `q_seq > 1` and must see the exact logical length.
+    /// prefix to `0`). Bucket growth invalidates and re-captures the graph at the
+    /// new bucket, exactly like ORT shared-buffer KV, so capture eligibility does
+    /// not require a session-wide fixed capacity. Multi-token prefill passes
+    /// `end` (the growing valid length) because the causal island is
+    /// prefix-sensitive for `q_seq > 1` and must see the exact logical length.
     /// The last-dim extent to expose for the attention mask on a single-token
-    /// decode step. Frozen to the physical capacity (`max_len`) so the step stays
-    /// CUDA-graph-capture eligible — *unless* the mask binding exposes its logical
-    /// valid length to a non-capacity-aware consumer (`mask_exposes_logical`), in
-    /// which case the true valid length (`total_len`) must be used or the padded
-    /// width leaks into that consumer's arithmetic (see [`Self::mask_exposes_logical`]).
+    /// decode step. Frozen to the current physical bucket (`max_len`) so the step
+    /// stays CUDA-graph-capture eligible — *unless* the mask binding exposes its
+    /// logical valid length to a non-capacity-aware consumer
+    /// (`mask_exposes_logical`), in which case the true valid length (`total_len`)
+    /// must be used or the padded width leaks into that consumer's arithmetic
+    /// (see [`Self::mask_exposes_logical`]).
     fn decode_mask_expose_len(&self, total_len: usize) -> usize {
         if self.mask_exposes_logical {
             total_len
@@ -918,6 +1061,11 @@ impl DecodeCudaState {
                         }
                         self.graph_captures += 1;
                         self.graph_phase = DecodeCudaGraphPhase::Ready;
+                        tracing::debug!(
+                            capacity = self.max_len,
+                            captures = self.graph_captures,
+                            "native CUDA decode graph captured"
+                        );
                     }
                     DeviceGraphCaptureResult::NotCapturable(report) => {
                         self.graph_fallbacks += 1;
@@ -1034,6 +1182,7 @@ impl DecodeCudaState {
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
+            max_len_source: self.capacity.source.clone(),
             device_ptrs,
             kv_transfers: transfers,
             graph: CudaGraphDebugStats {
@@ -1048,7 +1197,147 @@ impl DecodeCudaState {
     }
 }
 
-pub(crate) fn cuda_kv_max_len_from_env() -> anyhow::Result<usize> {
+struct NativeCudaGrownBuffers {
+    replacements: Vec<(usize, DeviceIoBinding)>,
+}
+
+struct NativeCudaCapacityBackend<'a> {
+    state: &'a mut DecodeCudaState,
+    session: &'a mut InferenceSession,
+}
+
+impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
+    type Error = anyhow::Error;
+    type GrownBuffers = NativeCudaGrownBuffers;
+    type GrownMask = DeviceIoBinding;
+
+    fn current_capacity(&self) -> usize {
+        self.state.max_len
+    }
+
+    fn hard_max_capacity(&self) -> usize {
+        self.state.capacity.max_len
+    }
+
+    fn valid_len(&self) -> usize {
+        self.state.logical_len
+    }
+
+    fn capacity_exceeded(&self, required: usize) -> Self::Error {
+        anyhow::anyhow!(self.state.capacity_exceeded_error(required))
+    }
+
+    fn build_grown_buffers(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> anyhow::Result<Self::GrownBuffers> {
+        let old_capacity = self.state.max_len;
+        (|| {
+            native_cuda_device_barrier(self.session)?;
+            let mut replacements = Vec::with_capacity(self.state.kv_binding_range.len());
+            for index in self.state.kv_binding_range.clone() {
+                let old = &self.state.bindings[index];
+                let mut physical_shape = old.physical_shape().to_vec();
+                physical_shape[2] = new_capacity;
+                let mut logical_shape = physical_shape.clone();
+                logical_shape[2] = valid_len;
+                let new_binding = self.session.allocate_device_binding(
+                    old.input_name().to_owned(),
+                    old.output_name().map(str::to_owned),
+                    old.dtype,
+                    physical_shape.clone(),
+                    logical_shape,
+                )?;
+                let dst = new_binding.device_ptr() as usize;
+                let src = old.device_ptr() as usize;
+                let total_bytes =
+                    checked_shape_bytes(&physical_shape, old.dtype).with_context(|| {
+                        format!(
+                            "CUDA KV grow allocation size overflow for '{}' shape {:?}",
+                            old.input_name(),
+                            physical_shape
+                        )
+                    })?;
+                native_cuda_memset_zero(dst, total_bytes)?;
+                copy_kv_prefix_device_to_device(
+                    dst,
+                    src,
+                    old.physical_shape(),
+                    &physical_shape,
+                    2,
+                    valid_len,
+                    old.dtype.checked_storage_bytes(1).with_context(|| {
+                        format!(
+                            "CUDA KV grow copy element size overflow for '{}'",
+                            old.input_name()
+                        )
+                    })?,
+                )?;
+                replacements.push((index, new_binding));
+            }
+            Ok(NativeCudaGrownBuffers { replacements })
+        })()
+        .map_err(|error| {
+            let memory = cuda_device_memory_snapshot(self.session.device_id().index as i32)
+                .map_err(|error| error.to_string());
+            self.state
+                .growth_failed_error(old_capacity, new_capacity, error, memory)
+        })
+    }
+
+    fn build_grown_mask(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> anyhow::Result<Option<Self::GrownMask>> {
+        let old_capacity = self.state.max_len;
+        (|| {
+            let mut new_mask = self.session.allocate_device_binding(
+                self.state.bindings[0].input_name().to_owned(),
+                self.state.bindings[0].output_name().map(str::to_owned),
+                DataType::Int64,
+                vec![1, new_capacity],
+                vec![1, valid_len],
+            )?;
+            native_cuda_memset_zero(
+                new_mask.device_ptr() as usize,
+                new_capacity * std::mem::size_of::<i64>(),
+            )?;
+            new_mask.set_logical_shape(vec![1, valid_len])?;
+            Ok(Some(new_mask))
+        })()
+        .map_err(|error| {
+            let memory = cuda_device_memory_snapshot(self.session.device_id().index as i32)
+                .map_err(|error| error.to_string());
+            self.state
+                .growth_failed_error(old_capacity, new_capacity, error, memory)
+        })
+    }
+
+    fn invalidate_capture(&mut self) -> anyhow::Result<()> {
+        native_cuda_device_barrier(self.session)?;
+        self.state.invalidate_graph(self.session)
+    }
+
+    fn commit_grown_capacity(
+        &mut self,
+        new_capacity: usize,
+        grown_buffers: Self::GrownBuffers,
+        grown_mask: Option<Self::GrownMask>,
+    ) -> anyhow::Result<()> {
+        if let Some(mask) = grown_mask {
+            self.state.bindings[0] = mask;
+        }
+        for (index, binding) in grown_buffers.replacements {
+            self.state.bindings[index] = binding;
+        }
+        self.state.max_len = new_capacity;
+        Ok(())
+    }
+}
+
+pub(crate) fn cuda_kv_max_len_from_env() -> anyhow::Result<Option<usize>> {
     match std::env::var("ONNX_GENAI_CUDA_KV_MAX_LEN") {
         Ok(value) => {
             let parsed = value.trim().parse::<usize>().with_context(|| {
@@ -1057,9 +1346,211 @@ pub(crate) fn cuda_kv_max_len_from_env() -> anyhow::Result<usize> {
             if parsed == 0 {
                 bail!("ONNX_GENAI_CUDA_KV_MAX_LEN must be greater than zero");
             }
-            Ok(parsed)
+            Ok(Some(parsed))
         }
-        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_CUDA_KV_MAX_LEN),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(error).context("read ONNX_GENAI_CUDA_KV_MAX_LEN"),
     }
+}
+
+fn checked_shape_bytes(shape: &[usize], dtype: DataType) -> Option<usize> {
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))?;
+    dtype.checked_storage_bytes(elements)
+}
+
+#[cfg(feature = "cuda")]
+fn native_cuda_device_barrier(session: &InferenceSession) -> anyhow::Result<()> {
+    let _guard = onnx_genai_ort::cuda_rt::DeviceGuard::set(session.device_id().index as i32)?;
+    onnx_genai_ort::cuda_rt::device_synchronize()?;
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn native_cuda_device_barrier(_session: &InferenceSession) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+#[cfg(feature = "cuda")]
+fn native_cuda_memset_zero(dst: usize, bytes: usize) -> anyhow::Result<()> {
+    onnx_genai_ort::cuda_rt::memset_zero(dst, bytes)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+#[cfg(feature = "cuda")]
+fn copy_kv_prefix_device_to_device(
+    dst: usize,
+    src: usize,
+    old_shape: &[usize],
+    new_shape: &[usize],
+    seq_axis: usize,
+    valid_len: usize,
+    elem_size: usize,
+) -> anyhow::Result<()> {
+    if valid_len == 0 {
+        return Ok(());
+    }
+    if old_shape.len() != new_shape.len() || seq_axis >= old_shape.len() {
+        bail!("invalid CUDA KV grow copy shapes {old_shape:?} -> {new_shape:?} on axis {seq_axis}");
+    }
+    let old_cap = old_shape[seq_axis];
+    let new_cap = new_shape[seq_axis];
+    if valid_len > old_cap || valid_len > new_cap {
+        bail!(
+            "invalid CUDA KV grow copy valid prefix {valid_len} for shapes {old_shape:?} -> {new_shape:?}"
+        );
+    }
+    let blocks = old_shape[..seq_axis]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV grow copy block count overflow")?;
+    let inner = old_shape[seq_axis + 1..]
+        .iter()
+        .try_fold(1usize, |product, &dim| product.checked_mul(dim))
+        .context("CUDA KV grow copy inner size overflow")?;
+    let segment_bytes = valid_len
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV grow copy segment size overflow")?;
+    let old_stride = old_cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV grow copy old stride overflow")?;
+    let new_stride = new_cap
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(elem_size))
+        .context("CUDA KV grow copy new stride overflow")?;
+    for block in 0..blocks {
+        let src_offset = block
+            .checked_mul(old_stride)
+            .context("CUDA KV grow copy source offset overflow")?;
+        let dst_offset = block
+            .checked_mul(new_stride)
+            .context("CUDA KV grow copy destination offset overflow")?;
+        onnx_genai_ort::cuda_rt::memcpy_device_to_device(
+            dst + dst_offset,
+            src + src_offset,
+            segment_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn copy_kv_prefix_device_to_device(
+    _dst: usize,
+    _src: usize,
+    _old_shape: &[usize],
+    _new_shape: &[usize],
+    _seq_axis: usize,
+    _valid_len: usize,
+    _elem_size: usize,
+) -> anyhow::Result<()> {
+    bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+pub(crate) fn resolve_cuda_kv_capacity(
+    programmatic_max_len: Option<usize>,
+    env_max_len: Option<usize>,
+    metadata_max_len: Option<usize>,
+    bytes_per_token: usize,
+    device_memory: Option<CudaDeviceMemorySnapshot>,
+) -> anyhow::Result<CudaKvCapacity> {
+    if bytes_per_token == 0 {
+        bail!("CUDA KV bytes per token must be greater than zero");
+    }
+    let (configured, source) = if let Some(max_len) = programmatic_max_len {
+        if let Some(metadata_len) = metadata_max_len
+            && metadata_len < max_len
+        {
+            (
+                metadata_len,
+                format!(
+                    "programmatic load_with_cuda_kv_max_len clamped by model.max_sequence_length ({metadata_len})"
+                ),
+            )
+        } else {
+            (max_len, "programmatic load_with_cuda_kv_max_len".to_owned())
+        }
+    } else if let Some(max_len) = env_max_len {
+        if let Some(metadata_len) = metadata_max_len
+            && metadata_len < max_len
+        {
+            (
+                metadata_len,
+                format!(
+                    "ONNX_GENAI_CUDA_KV_MAX_LEN clamped by model.max_sequence_length ({metadata_len})"
+                ),
+            )
+        } else {
+            (max_len, "ONNX_GENAI_CUDA_KV_MAX_LEN".to_owned())
+        }
+    } else if let Some(max_len) = metadata_max_len {
+        (max_len, "model.max_sequence_length".to_owned())
+    } else {
+        (
+            usize::MAX,
+            "unbounded (model.max_sequence_length unavailable)".to_owned(),
+        )
+    };
+    if configured == 0 {
+        bail!(
+            "derived CUDA KV max length is zero from {source}; free more device memory or set a smaller ONNX_GENAI_CUDA_KV_MAX_LEN/load_with_cuda_kv_max_len value"
+        );
+    }
+    Ok(CudaKvCapacity {
+        max_len: configured,
+        source,
+        metadata_max_len,
+        device_memory,
+        bytes_per_token,
+    })
+}
+
+pub(crate) fn cuda_kv_capacity_exceeded_message(
+    requested: usize,
+    capacity: &CudaKvCapacity,
+) -> String {
+    let metadata = capacity
+        .metadata_max_len
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let memory = capacity
+        .device_memory
+        .map(|memory| {
+            format!(
+                "CUDA free={} bytes, total={} bytes",
+                memory.free_bytes, memory.total_bytes
+            )
+        })
+        .unwrap_or_else(|| "CUDA free-memory query unavailable".to_owned());
+    format!(
+        "CUDA KV capacity exceeded: requested context length {requested}, configured max_len {} (source: {}; model.max_sequence_length: {metadata}; {memory}; KV bytes/token: {}). Increase the limit with ONNX_GENAI_CUDA_KV_MAX_LEN or load_with_cuda_kv_max_len if the device has enough VRAM, or reduce prompt/max_new_tokens.",
+        capacity.max_len, capacity.source, capacity.bytes_per_token
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn cuda_device_memory_snapshot(
+    device_id: i32,
+) -> anyhow::Result<CudaDeviceMemorySnapshot> {
+    let memory = onnx_genai_ort::cuda_rt::device_memory_info(device_id)
+        .context("query CUDA free device memory for native KV capacity")?;
+    Ok(CudaDeviceMemorySnapshot {
+        free_bytes: memory.free_bytes,
+        total_bytes: memory.total_bytes,
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn cuda_device_memory_snapshot(
+    _device_id: i32,
+) -> anyhow::Result<CudaDeviceMemorySnapshot> {
+    bail!("CUDA free-memory query requires the onnx-genai-engine `cuda` feature")
 }

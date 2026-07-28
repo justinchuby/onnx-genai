@@ -4,6 +4,20 @@ use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorDat
 use prost::Message;
 use std::collections::BTreeMap;
 
+#[cfg(feature = "cuda")]
+fn qwen_cuda_smoke_model_dir() -> Option<std::path::PathBuf> {
+    let model_dir = std::env::var_os("ONNX_GENAI_QWEN_CUDA_SMOKE_MODEL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/home/justinchu/qwen2.5-0.5b-int4-onnx"));
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!(
+            "skipping CUDA smoke; target model is not installed (set ONNX_GENAI_QWEN_CUDA_SMOKE_MODEL to its directory)"
+        );
+        return None;
+    }
+    Some(model_dir)
+}
+
 #[test]
 fn tensor_argmax_reads_only_the_final_logits_row_and_keeps_first_tie() {
     let tensor = Tensor::from_f32(&[1, 2, 4], &[100.0, 0.0, 0.0, 0.0, 1.0, 7.0, 7.0, 2.0]).unwrap();
@@ -36,6 +50,103 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
     assert!(resolve_graph_capture_enabled(
         None, false, false, structural
     ));
+}
+
+#[test]
+fn cuda_kv_capacity_uses_metadata_as_default_fact() {
+    let capacity = resolve_cuda_kv_capacity(
+        None,
+        None,
+        Some(4096),
+        10,
+        Some(CudaDeviceMemorySnapshot {
+            free_bytes: 20_000,
+            total_bytes: 40_000,
+        }),
+    )
+    .unwrap();
+    assert_eq!(capacity.max_len, 4096);
+    assert_eq!(capacity.source, "model.max_sequence_length");
+}
+
+#[test]
+fn cuda_kv_capacity_without_metadata_is_unbounded_until_growth_fails() {
+    let capacity = resolve_cuda_kv_capacity(
+        None,
+        None,
+        None,
+        28_680,
+        Some(CudaDeviceMemorySnapshot {
+            free_bytes: 5_925_502_976,
+            total_bytes: 8_585_281_536,
+        }),
+    )
+    .unwrap();
+    assert_eq!(capacity.max_len, usize::MAX);
+    assert_eq!(
+        capacity.source,
+        "unbounded (model.max_sequence_length unavailable)"
+    );
+}
+
+#[test]
+fn cuda_kv_capacity_honors_env_before_metadata() {
+    let capacity = resolve_cuda_kv_capacity(
+        None,
+        Some(8192),
+        Some(16_384),
+        10,
+        Some(CudaDeviceMemorySnapshot {
+            free_bytes: 20_000,
+            total_bytes: 40_000,
+        }),
+    )
+    .unwrap();
+    assert_eq!(capacity.max_len, 8192);
+    assert_eq!(capacity.source, "ONNX_GENAI_CUDA_KV_MAX_LEN");
+}
+
+#[test]
+fn cuda_kv_capacity_metadata_caps_oversized_explicit_override() {
+    let capacity = resolve_cuda_kv_capacity(None, Some(8192), Some(4096), 10, None).unwrap();
+    assert_eq!(capacity.max_len, 4096);
+    assert!(
+        capacity
+            .source
+            .contains("ONNX_GENAI_CUDA_KV_MAX_LEN clamped by model.max_sequence_length"),
+        "{}",
+        capacity.source
+    );
+}
+
+#[test]
+fn cuda_kv_capacity_error_explains_source_and_device_memory() {
+    let capacity = CudaKvCapacity {
+        max_len: 4096,
+        source: "model.max_sequence_length".to_owned(),
+        metadata_max_len: Some(4096),
+        device_memory: Some(CudaDeviceMemorySnapshot {
+            free_bytes: 20_000,
+            total_bytes: 40_000,
+        }),
+        bytes_per_token: 10,
+    };
+    let message = cuda_kv_capacity_exceeded_message(4097, &capacity);
+    assert!(
+        message.contains("requested context length 4097"),
+        "{message}"
+    );
+    assert!(message.contains("configured max_len 4096"), "{message}");
+    assert!(
+        message.contains("source: model.max_sequence_length"),
+        "{message}"
+    );
+    assert!(
+        message.contains("model.max_sequence_length: 4096"),
+        "{message}"
+    );
+    assert!(message.contains("CUDA free=20000 bytes"), "{message}");
+    assert!(message.contains("ONNX_GENAI_CUDA_KV_MAX_LEN"), "{message}");
 }
 
 #[test]
@@ -788,6 +899,7 @@ fn build_cuda_decoder(
         session,
         NativeDecodeCudaOptions {
             kv_max_len: Some(max_len),
+            metadata_max_len: None,
             graph_capture: Some(graph_capture),
         },
     )
@@ -1458,11 +1570,9 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let model_dir = Path::new("/home/justinchu/qwen2.5-0.5b-int4-onnx");
-    if !model_dir.join("model.onnx").is_file() {
-        eprintln!("skipping CUDA smoke; target model is not installed");
+    let Some(model_dir) = qwen_cuda_smoke_model_dir() else {
         return Ok(());
-    }
+    };
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
     let prompt = tokenizer.encode("Hello")?;
     const HORIZON: usize = 64;
@@ -1503,6 +1613,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         NativeDecodeDevice::Cuda { index: Some(0) },
         NativeDecodeCudaOptions {
             kv_max_len: Some(128),
+            metadata_max_len: None,
             graph_capture: Some(false),
         },
     )?;
@@ -1521,6 +1632,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
         NativeDecodeDevice::Cuda { index: Some(0) },
         NativeDecodeCudaOptions {
             kv_max_len: Some(128),
+            metadata_max_len: None,
             graph_capture: Some(true),
         },
     )?;
@@ -1586,11 +1698,9 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
         eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
         return Ok(());
     }
-    let model_dir = Path::new("/home/justinchu/qwen2.5-0.5b-int4-onnx");
-    if !model_dir.join("model.onnx").is_file() {
-        eprintln!("skipping CUDA smoke; target model is not installed");
+    let Some(model_dir) = qwen_cuda_smoke_model_dir() else {
         return Ok(());
-    }
+    };
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
     let prompt = tokenizer.encode("The quick brown fox")?;
 
@@ -1607,6 +1717,7 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
             NativeDecodeDevice::Cuda { index: Some(0) },
             NativeDecodeCudaOptions {
                 kv_max_len: Some(128),
+                metadata_max_len: None,
                 graph_capture: Some(graph),
             },
         )

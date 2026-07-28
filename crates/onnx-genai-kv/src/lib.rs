@@ -52,6 +52,99 @@ pub type SequenceId = u64;
 /// Token identifier.
 pub type TokenId = u32;
 
+/// Round a required sequence length up to the shared KV capacity bucket.
+///
+/// Buckets are powers of two, at least the minimum bucket floor, and clamped to
+/// the caller's hard maximum. `ONNX_GENAI_KV_MIN_BUCKET` can raise or lower the
+/// floor for deployments that want fewer early reallocations or smaller initial
+/// buffers. This is the single capacity policy shared by ORT shared-buffer KV
+/// and native CUDA KV; scheduler/resource planning can consume the same source
+/// instead of reimplementing it.
+pub fn kv_capacity_bucket(len: usize, hard_max: usize) -> usize {
+    const MIN_BUCKET_DEFAULT: usize = 256;
+    if hard_max == 0 {
+        return 0;
+    }
+    let min_bucket = std::env::var("ONNX_GENAI_KV_MIN_BUCKET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MIN_BUCKET_DEFAULT);
+    len.next_power_of_two().max(min_bucket).min(hard_max)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCapacityGrowth {
+    Unchanged,
+    Grew {
+        old_capacity: usize,
+        new_capacity: usize,
+        valid_len: usize,
+    },
+}
+
+pub trait KvCapacityGrowthBackend {
+    type Error;
+    type GrownBuffers;
+    type GrownMask;
+
+    fn current_capacity(&self) -> usize;
+    fn hard_max_capacity(&self) -> usize;
+    fn valid_len(&self) -> usize;
+    fn capacity_exceeded(&self, required: usize) -> Self::Error;
+    fn build_grown_buffers(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> Result<Self::GrownBuffers, Self::Error>;
+    fn build_grown_mask(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> Result<Option<Self::GrownMask>, Self::Error>;
+    fn invalidate_capture(&mut self) -> Result<(), Self::Error>;
+    fn commit_grown_capacity(
+        &mut self,
+        new_capacity: usize,
+        grown_buffers: Self::GrownBuffers,
+        grown_mask: Option<Self::GrownMask>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Shared grow driver for fixed-capacity KV buckets.
+///
+/// Backends provide allocation/copy/capture primitives; this function owns the
+/// policy: reject above the hard maximum, choose the next shared bucket, build
+/// all fallible replacement state before mutating live state, invalidate capture,
+/// then commit atomically.
+pub fn ensure_kv_capacity<B>(backend: &mut B, required: usize) -> Result<KvCapacityGrowth, B::Error>
+where
+    B: KvCapacityGrowthBackend,
+{
+    let hard_max = backend.hard_max_capacity();
+    if required > hard_max {
+        return Err(backend.capacity_exceeded(required));
+    }
+    let old_capacity = backend.current_capacity();
+    if required <= old_capacity {
+        return Ok(KvCapacityGrowth::Unchanged);
+    }
+    let new_capacity = kv_capacity_bucket(required, hard_max);
+    if new_capacity <= old_capacity {
+        return Ok(KvCapacityGrowth::Unchanged);
+    }
+    let valid_len = backend.valid_len();
+    let grown_buffers = backend.build_grown_buffers(new_capacity, valid_len)?;
+    let grown_mask = backend.build_grown_mask(new_capacity, valid_len)?;
+    backend.invalidate_capture()?;
+    backend.commit_grown_capacity(new_capacity, grown_buffers, grown_mask)?;
+    Ok(KvCapacityGrowth::Grew {
+        old_capacity,
+        new_capacity,
+        valid_len,
+    })
+}
+
 /// Device tier for page storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
@@ -135,4 +228,347 @@ pub enum KvError {
     InvalidQuantizationConfig(String),
     #[error("Page {0} not found")]
     PageNotFound(PageId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        KvCapacityGrowth, KvCapacityGrowthBackend, ensure_kv_capacity, kv_capacity_bucket,
+    };
+
+    #[test]
+    fn kv_capacity_bucket_rounds_to_power_of_two_min_256() {
+        let hard = 32_768;
+        assert_eq!(kv_capacity_bucket(0, hard), 256);
+        assert_eq!(kv_capacity_bucket(1, hard), 256);
+        assert_eq!(kv_capacity_bucket(128, hard), 256);
+        assert_eq!(kv_capacity_bucket(256, hard), 256);
+        assert_eq!(kv_capacity_bucket(257, hard), 512);
+        assert_eq!(kv_capacity_bucket(5000, hard), 8192);
+    }
+
+    #[test]
+    fn kv_capacity_bucket_caps_at_hard_max() {
+        assert_eq!(kv_capacity_bucket(20_000, 32_768), 32_768);
+        assert_eq!(kv_capacity_bucket(32_768, 32_768), 32_768);
+        assert_eq!(kv_capacity_bucket(100, 128), 128);
+        assert_eq!(kv_capacity_bucket(100, 0), 0);
+    }
+
+    #[test]
+    fn kv_capacity_bucket_is_monotonic_and_within_bounds() {
+        let hard = 4096;
+        let mut previous = 0;
+        for len in 0..8192 {
+            let bucket = kv_capacity_bucket(len, hard);
+            assert!(
+                bucket >= previous,
+                "len={len} bucket={bucket} previous={previous}"
+            );
+            assert!(bucket <= hard);
+            previous = bucket;
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        current: usize,
+        hard: usize,
+        valid: usize,
+        events: Vec<&'static str>,
+        fail_mask: bool,
+    }
+
+    impl KvCapacityGrowthBackend for RecordingBackend {
+        type Error = &'static str;
+        type GrownBuffers = usize;
+        type GrownMask = usize;
+
+        fn current_capacity(&self) -> usize {
+            self.current
+        }
+
+        fn hard_max_capacity(&self) -> usize {
+            self.hard
+        }
+
+        fn valid_len(&self) -> usize {
+            self.valid
+        }
+
+        fn capacity_exceeded(&self, _required: usize) -> Self::Error {
+            "capacity exceeded"
+        }
+
+        fn build_grown_buffers(
+            &mut self,
+            new_capacity: usize,
+            _valid_len: usize,
+        ) -> Result<Self::GrownBuffers, Self::Error> {
+            self.events.push("buffers");
+            Ok(new_capacity)
+        }
+
+        fn build_grown_mask(
+            &mut self,
+            new_capacity: usize,
+            _valid_len: usize,
+        ) -> Result<Option<Self::GrownMask>, Self::Error> {
+            self.events.push("mask");
+            if self.fail_mask {
+                return Err("mask failed");
+            }
+            Ok(Some(new_capacity))
+        }
+
+        fn invalidate_capture(&mut self) -> Result<(), Self::Error> {
+            self.events.push("invalidate");
+            Ok(())
+        }
+
+        fn commit_grown_capacity(
+            &mut self,
+            new_capacity: usize,
+            _grown_buffers: Self::GrownBuffers,
+            _grown_mask: Option<Self::GrownMask>,
+        ) -> Result<(), Self::Error> {
+            self.events.push("commit");
+            self.current = new_capacity;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ensure_kv_capacity_orders_fallible_work_before_invalidation() {
+        let mut backend = RecordingBackend {
+            current: 256,
+            hard: 4096,
+            valid: 200,
+            ..RecordingBackend::default()
+        };
+        let growth = ensure_kv_capacity(&mut backend, 257).unwrap();
+        assert_eq!(
+            growth,
+            KvCapacityGrowth::Grew {
+                old_capacity: 256,
+                new_capacity: 512,
+                valid_len: 200,
+            }
+        );
+        assert_eq!(backend.events, ["buffers", "mask", "invalidate", "commit"]);
+        assert_eq!(backend.current, 512);
+    }
+
+    #[test]
+    fn ensure_kv_capacity_does_not_invalidate_or_commit_after_prepare_failure() {
+        let mut backend = RecordingBackend {
+            current: 256,
+            hard: 4096,
+            valid: 200,
+            fail_mask: true,
+            ..RecordingBackend::default()
+        };
+        assert_eq!(ensure_kv_capacity(&mut backend, 257), Err("mask failed"));
+        assert_eq!(backend.events, ["buffers", "mask"]);
+        assert_eq!(backend.current, 256);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InjectedFailure {
+        Allocate,
+        PrefixCopy,
+        Mask,
+        InvalidateCapture,
+    }
+
+    struct TransactionalFakeBackend {
+        current: usize,
+        hard: usize,
+        valid: usize,
+        bytes_per_token: usize,
+        buffer_id: usize,
+        capture_generation: usize,
+        capture_valid: bool,
+        events: Vec<&'static str>,
+        fail_at: Option<InjectedFailure>,
+    }
+
+    impl TransactionalFakeBackend {
+        fn new(fail_at: Option<InjectedFailure>) -> Self {
+            Self {
+                current: 256,
+                hard: 4096,
+                valid: 123,
+                bytes_per_token: 32,
+                buffer_id: 7,
+                capture_generation: 11,
+                capture_valid: true,
+                events: Vec::new(),
+                fail_at,
+            }
+        }
+
+        fn translated_growth_error(&self, old: usize, new: usize, raw: &str) -> String {
+            let new_bytes = new * self.bytes_per_token;
+            let transient_peak = (old + new) * self.bytes_per_token;
+            format!(
+                "injected KV capacity growth failed while growing from {old} to {new} tokens: {raw}. \
+                 The attempted new KV allocation is approximately {new_bytes} bytes and the transient peak is approximately {transient_peak} bytes. \
+                 KV bytes/token: {}. The session state was left unchanged; reset or retry with a shorter prompt/max_new_tokens, set an explicit KV max length cap, or free VRAM used by other processes.",
+                self.bytes_per_token
+            )
+        }
+
+        fn assert_unchanged(&self) {
+            assert_eq!(self.current, 256);
+            assert_eq!(self.valid, 123);
+            assert_eq!(self.buffer_id, 7);
+            assert_eq!(self.capture_generation, 11);
+            assert!(self.capture_valid);
+        }
+    }
+
+    impl KvCapacityGrowthBackend for TransactionalFakeBackend {
+        type Error = String;
+        type GrownBuffers = usize;
+        type GrownMask = usize;
+
+        fn current_capacity(&self) -> usize {
+            self.current
+        }
+
+        fn hard_max_capacity(&self) -> usize {
+            self.hard
+        }
+
+        fn valid_len(&self) -> usize {
+            self.valid
+        }
+
+        fn capacity_exceeded(&self, required: usize) -> Self::Error {
+            format!("capacity exceeded at {required}")
+        }
+
+        fn build_grown_buffers(
+            &mut self,
+            new_capacity: usize,
+            _valid_len: usize,
+        ) -> Result<Self::GrownBuffers, Self::Error> {
+            self.events.push("allocate");
+            if self.fail_at == Some(InjectedFailure::Allocate) {
+                return Err(self.translated_growth_error(self.current, new_capacity, "raw OOM"));
+            }
+            self.events.push("prefix-copy");
+            if self.fail_at == Some(InjectedFailure::PrefixCopy) {
+                return Err(self.translated_growth_error(
+                    self.current,
+                    new_capacity,
+                    "raw copy failure",
+                ));
+            }
+            Ok(new_capacity + 1000)
+        }
+
+        fn build_grown_mask(
+            &mut self,
+            new_capacity: usize,
+            _valid_len: usize,
+        ) -> Result<Option<Self::GrownMask>, Self::Error> {
+            self.events.push("mask");
+            if self.fail_at == Some(InjectedFailure::Mask) {
+                return Err(self.translated_growth_error(
+                    self.current,
+                    new_capacity,
+                    "raw mask allocation failure",
+                ));
+            }
+            Ok(Some(new_capacity + 2000))
+        }
+
+        fn invalidate_capture(&mut self) -> Result<(), Self::Error> {
+            self.events.push("invalidate");
+            if self.fail_at == Some(InjectedFailure::InvalidateCapture) {
+                return Err(self.translated_growth_error(
+                    self.current,
+                    self.current * 2,
+                    "raw capture release failure",
+                ));
+            }
+            self.capture_valid = false;
+            Ok(())
+        }
+
+        fn commit_grown_capacity(
+            &mut self,
+            new_capacity: usize,
+            grown_buffers: Self::GrownBuffers,
+            grown_mask: Option<Self::GrownMask>,
+        ) -> Result<(), Self::Error> {
+            self.events.push("commit");
+            assert_eq!(grown_buffers, new_capacity + 1000);
+            assert_eq!(grown_mask, Some(new_capacity + 2000));
+            self.current = new_capacity;
+            self.buffer_id = grown_buffers;
+            self.capture_generation += 1;
+            self.capture_valid = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn injected_allocate_failure_is_actionable_transactional_and_retryable() {
+        let mut backend = TransactionalFakeBackend::new(Some(InjectedFailure::Allocate));
+        let error = ensure_kv_capacity(&mut backend, 257).unwrap_err();
+
+        assert!(error.contains("growing from 256 to 512 tokens"), "{error}");
+        assert!(
+            error.contains("transient peak is approximately 24576 bytes"),
+            "{error}"
+        );
+        assert!(error.contains("KV bytes/token: 32"), "{error}");
+        assert!(
+            error.contains("session state was left unchanged"),
+            "{error}"
+        );
+        assert!(error.contains("shorter prompt/max_new_tokens"), "{error}");
+        assert!(error.contains("free VRAM"), "{error}");
+        assert_eq!(backend.events, ["allocate"]);
+        backend.assert_unchanged();
+
+        backend.fail_at = None;
+        let growth = ensure_kv_capacity(&mut backend, 257).unwrap();
+        assert_eq!(
+            growth,
+            KvCapacityGrowth::Grew {
+                old_capacity: 256,
+                new_capacity: 512,
+                valid_len: 123,
+            }
+        );
+        assert_eq!(backend.current, 512);
+        assert_eq!(backend.buffer_id, 1512);
+        assert_eq!(backend.capture_generation, 12);
+        assert!(backend.capture_valid);
+    }
+
+    #[test]
+    fn injected_mid_sequence_failures_do_not_commit_or_invalidate_capture() {
+        for failure in [
+            InjectedFailure::PrefixCopy,
+            InjectedFailure::Mask,
+            InjectedFailure::InvalidateCapture,
+        ] {
+            let mut backend = TransactionalFakeBackend::new(Some(failure));
+            let error = ensure_kv_capacity(&mut backend, 257).unwrap_err();
+            assert!(
+                error.contains("session state was left unchanged"),
+                "{error}"
+            );
+            backend.assert_unchanged();
+            assert!(!backend.events.contains(&"commit"));
+            if failure != InjectedFailure::InvalidateCapture {
+                assert!(!backend.events.contains(&"invalidate"));
+            }
+        }
+    }
 }

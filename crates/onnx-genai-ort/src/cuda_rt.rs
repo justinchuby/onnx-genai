@@ -42,6 +42,7 @@ type CudaMemsetFn = unsafe extern "C" fn(*mut c_void, i32, usize) -> i32;
 type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
 type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
+type CudaMemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
 
 struct CudaRt {
     // Kept alive so the resolved function pointers remain valid; never called
@@ -52,6 +53,7 @@ struct CudaRt {
     device_synchronize: CudaDeviceSynchronizeFn,
     set_device: CudaSetDeviceFn,
     get_device: CudaGetDeviceFn,
+    mem_get_info: CudaMemGetInfoFn,
 }
 
 // SAFETY: the resolved `cudart` entry points are plain C functions that are
@@ -93,8 +95,23 @@ fn load() -> std::result::Result<CudaRt, String> {
             unsafe { lib.get::<CudaDeviceSynchronizeFn>(b"cudaDeviceSynchronize\0") };
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
         let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
-        match (memcpy, memset, device_synchronize, set_device, get_device) {
-            (Ok(memcpy), Ok(memset), Ok(device_synchronize), Ok(set_device), Ok(get_device)) => {
+        let mem_get_info = unsafe { lib.get::<CudaMemGetInfoFn>(b"cudaMemGetInfo\0") };
+        match (
+            memcpy,
+            memset,
+            device_synchronize,
+            set_device,
+            get_device,
+            mem_get_info,
+        ) {
+            (
+                Ok(memcpy),
+                Ok(memset),
+                Ok(device_synchronize),
+                Ok(set_device),
+                Ok(get_device),
+                Ok(mem_get_info),
+            ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
                 let memcpy = *memcpy;
@@ -102,6 +119,7 @@ fn load() -> std::result::Result<CudaRt, String> {
                 let device_synchronize = *device_synchronize;
                 let set_device = *set_device;
                 let get_device = *get_device;
+                let mem_get_info = *mem_get_info;
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
@@ -109,11 +127,12 @@ fn load() -> std::result::Result<CudaRt, String> {
                     device_synchronize,
                     set_device,
                     get_device,
+                    mem_get_info,
                 });
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice symbol"
+                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
                 );
             }
         }
@@ -136,7 +155,7 @@ fn runtime() -> Result<&'static CudaRt> {
 /// copy is unordered relative to the EP's KV writes (before) and reads (after),
 /// which silently corrupts the cache. Growth is rare (O(log length)), so the
 /// synchronization cost is negligible.
-pub(crate) fn device_synchronize() -> Result<()> {
+pub fn device_synchronize() -> Result<()> {
     let rt = runtime()?;
     // SAFETY: `cudaDeviceSynchronize` takes no arguments and matches the
     // `cudart` ABI.
@@ -147,6 +166,32 @@ pub(crate) fn device_synchronize() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CudaDeviceMemoryInfo {
+    pub free_bytes: usize,
+    pub total_bytes: usize,
+}
+
+/// Query CUDA device memory after making `device_id` current.
+pub fn device_memory_info(device_id: i32) -> Result<CudaDeviceMemoryInfo> {
+    let _guard = DeviceGuard::set(device_id)?;
+    let rt = runtime()?;
+    let mut free_bytes = 0usize;
+    let mut total_bytes = 0usize;
+    // SAFETY: both pointers are valid out-parameters; `cudaMemGetInfo` matches
+    // the cudart ABI and reads the current device selected by `DeviceGuard`.
+    let code = unsafe { (rt.mem_get_info)(&mut free_bytes, &mut total_bytes) };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaMemGetInfo failed with CUDA error code {code}"
+        )));
+    }
+    Ok(CudaDeviceMemoryInfo {
+        free_bytes,
+        total_bytes,
+    })
 }
 
 /// RAII guard that makes `device_id` the calling thread's current CUDA device
@@ -160,14 +205,14 @@ pub(crate) fn device_synchronize() -> Result<()> {
 /// synchronize the wrong device and fail to order the copy against the EP's
 /// stream — the exact race the barriers exist to prevent. Pinning is cheap and
 /// growth is rare (O(log length)).
-pub(crate) struct DeviceGuard {
+pub struct DeviceGuard {
     prev: i32,
     restore: bool,
 }
 
 impl DeviceGuard {
     /// Set the current CUDA device to `device_id`, remembering the previous one.
-    pub(crate) fn set(device_id: i32) -> Result<Self> {
+    pub fn set(device_id: i32) -> Result<Self> {
         let rt = runtime()?;
         let mut prev: i32 = 0;
         // SAFETY: `prev` is a valid out-parameter; `cudaGetDevice` matches the
@@ -218,7 +263,7 @@ impl Drop for DeviceGuard {
 ///
 /// Used to define the tail of a freshly allocated (uninitialized) KV bucket so
 /// positions past the valid length are deterministic zeros.
-pub(crate) fn memset_zero(dst: usize, bytes: usize) -> Result<()> {
+pub fn memset_zero(dst: usize, bytes: usize) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
@@ -255,7 +300,7 @@ pub(crate) fn memset_zero(dst: usize, bytes: usize) -> Result<()> {
 /// Ordering against the *previous* replay's read of these buffers (WAR) is
 /// guaranteed separately: the device sampler fully synchronizes the device at the
 /// end of every captured step before the next step overwrites the inputs.
-pub(crate) fn memcpy_host_to_device(dst: usize, src: &[u8]) -> Result<()> {
+pub fn memcpy_host_to_device(dst: usize, src: &[u8]) -> Result<()> {
     if src.is_empty() {
         return Ok(());
     }
@@ -313,7 +358,7 @@ pub(crate) fn memcpy_device_to_host(dst: &mut [u8], src: usize) -> Result<()> {
 
 /// Copy `bytes` from device address `src` to device address `dst`
 /// (`cudaMemcpyDeviceToDevice`).
-pub(crate) fn memcpy_device_to_device(dst: usize, src: usize, bytes: usize) -> Result<()> {
+pub fn memcpy_device_to_device(dst: usize, src: usize, bytes: usize) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }

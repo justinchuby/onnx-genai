@@ -1372,40 +1372,40 @@ impl<'a> DecodeSession<'a> {
         if self.mode != DecodeKvMode::SharedBuffer {
             return Ok(());
         }
-        let hard_max = self.max_length.ok_or_else(|| {
-            OrtError::InvalidArgument("shared-buffer growth requires max_length".into())
-        })?;
-        if required > hard_max {
-            return Err(OrtError::InvalidArgument(format!(
-                "requested KV capacity {required} exceeds model max_length {hard_max}"
-            )));
-        }
-        if required <= self.kv_capacity {
-            return Ok(());
-        }
-        let new_capacity = kv_capacity_bucket(required, hard_max);
-        if new_capacity <= self.kv_capacity {
-            // Already at the hard cap; no growth is needed.
-            return Ok(());
-        }
-        self.grow_kv_buffers(new_capacity)
+        let _ = onnx_genai_kv::ensure_kv_capacity(self, required)?;
+        Ok(())
+    }
+}
+
+impl onnx_genai_kv::KvCapacityGrowthBackend for DecodeSession<'_> {
+    type Error = OrtError;
+    type GrownBuffers = HashMap<String, Arc<Value>>;
+    type GrownMask = Value;
+
+    fn current_capacity(&self) -> usize {
+        self.kv_capacity
     }
 
-    /// Reallocate the shared KV buffers at `new_capacity`, copying the valid
-    /// prefix `[0, current_len)` across, then resize the captured mask and force
-    /// a graph re-capture so the next captured step rebinds the larger buffers.
-    ///
-    /// CORRECTNESS: the valid KV prefix must survive the reallocation exactly.
-    /// The buffers may be device-resident — where the raw data pointer is NOT
-    /// host-addressable. On CUDA the prefix is relocated with a direct
-    /// device-to-device `cudaMemcpy` on the raw KV device pointers (ORT's
-    /// `CopyTensors` is unusable here: the built-in CUDA EP registers no
-    /// env-level data-transfer, so it fails with "Data transfer implementation
-    /// ... not found (code 9)"). CPU buffers copy directly on the host. Growth
-    /// is rare (O(log length)), so this one-time per-growth cost is amortized
-    /// away.
-    fn grow_kv_buffers(&mut self, new_capacity: usize) -> Result<()> {
-        let valid_len = self.current_len;
+    fn hard_max_capacity(&self) -> usize {
+        self.max_length.unwrap_or(0)
+    }
+
+    fn valid_len(&self) -> usize {
+        self.current_len
+    }
+
+    fn capacity_exceeded(&self, required: usize) -> Self::Error {
+        OrtError::InvalidArgument(format!(
+            "requested KV capacity {required} exceeds model max_length {}",
+            self.hard_max_capacity()
+        ))
+    }
+
+    fn build_grown_buffers(
+        &mut self,
+        new_capacity: usize,
+        valid_len: usize,
+    ) -> Result<Self::GrownBuffers> {
         // Resolve the transfer path once, failing fast (before any allocation)
         // if the buffers live on a device we have no copy primitive for.
         let device = self.grow_device()?;
@@ -1413,55 +1413,80 @@ impl<'a> DecodeSession<'a> {
         // Build the replacement buffers first; only swap them in once every KV
         // tensor has been copied successfully, so a mid-way failure leaves the
         // session's existing state intact.
-        let mut grown = HashMap::with_capacity(self.kv_pairs.len());
-        for pair in &self.kv_pairs {
-            let old = self.current_kv.get(&pair.past).ok_or_else(|| {
-                OrtError::InvalidArgument(format!(
-                    "cannot grow KV: missing shared buffer for '{}'",
-                    pair.past
-                ))
-            })?;
-            let mut new_shape = old.shape().to_vec();
-            new_shape[pair.seq_axis] = i64::try_from(new_capacity)
-                .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
-            let new_value = grow_kv_value(
-                old,
-                &new_shape,
-                pair.seq_axis,
-                valid_len,
-                device,
-                self.kv_allocator.as_ref(),
-            )?;
-            grown.insert(pair.past.clone(), Arc::new(new_value));
-        }
+        let old_capacity = self.kv_capacity;
+        (|| {
+            let mut grown = HashMap::with_capacity(self.kv_pairs.len());
+            for pair in &self.kv_pairs {
+                let old = self.current_kv.get(&pair.past).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "cannot grow KV: missing shared buffer for '{}'",
+                        pair.past
+                    ))
+                })?;
+                let mut new_shape = old.shape().to_vec();
+                new_shape[pair.seq_axis] = i64::try_from(new_capacity)
+                    .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
+                let new_value = grow_kv_value(
+                    old,
+                    &new_shape,
+                    pair.seq_axis,
+                    valid_len,
+                    device,
+                    self.kv_allocator.as_ref(),
+                )?;
+                grown.insert(pair.past.clone(), Arc::new(new_value));
+            }
+            Ok(grown)
+        })()
+        .map_err(|error| self.kv_growth_failed_error(old_capacity, new_capacity, error))
+    }
 
+    fn build_grown_mask(
+        &mut self,
+        new_capacity: usize,
+        _valid_len: usize,
+    ) -> Result<Option<Self::GrownMask>> {
         // The captured attention mask capacity must equal the KV buffer
         // capacity. Build its replacement before mutating the session so a
         // fallible allocation cannot leave the KV and capture state out of sync.
         // Preserve the mask's residency: a device-resident captured mask (the
         // CUDA device-argmax path) must stay on the device allocator so the
         // captured graph keeps reading it in place after re-capture.
-        let grown_mask = if let Some((valid_ones, on_device, mask_device_id)) = self
+        if let Some((valid_ones, on_device, mask_device_id)) = self
             .capture
             .as_ref()
             .map(|cap| (cap.mask_valid_len, cap.inputs_on_device, cap.device_id))
         {
             let mask_len = i64::try_from(new_capacity)
                 .map_err(|_| OrtError::InvalidArgument("KV capacity exceeds i64".into()))?;
-            Some(self.build_grown_capture_mask(
+            self.build_grown_capture_mask(
                 new_capacity,
                 mask_len,
                 valid_ones,
                 on_device,
                 mask_device_id,
-            )?)
+            )
+            .map(Some)
+            .map_err(|error| self.kv_growth_failed_error(self.kv_capacity, new_capacity, error))
         } else {
-            None
-        };
+            Ok(None)
+        }
+    }
 
-        // All fallible work is complete. Release the captured graph while its old
-        // buffers are still alive, then atomically commit the replacement state.
+    fn invalidate_capture(&mut self) -> Result<()> {
+        // The shared grow driver has completed all fallible allocation/copy
+        // work. Release the captured graph while its old buffers are still alive;
+        // commit_grown_capacity atomically swaps in the replacement state.
         self.invalidate_captured_graph();
+        Ok(())
+    }
+
+    fn commit_grown_capacity(
+        &mut self,
+        new_capacity: usize,
+        grown: Self::GrownBuffers,
+        grown_mask: Option<Self::GrownMask>,
+    ) -> Result<()> {
         self.current_kv = grown;
         self.kv_capacity = new_capacity;
         if let (Some(cap), Some(attention_mask)) = (self.capture.as_mut(), grown_mask) {
@@ -1470,13 +1495,86 @@ impl<'a> DecodeSession<'a> {
         }
         Ok(())
     }
+}
+
+impl DecodeSession<'_> {
+    fn kv_growth_bytes_per_token(&self) -> Option<usize> {
+        let mut bytes = if self.capture.is_some() {
+            std::mem::size_of::<i64>()
+        } else {
+            0
+        };
+        for pair in &self.kv_pairs {
+            let value = self.current_kv.get(&pair.past)?;
+            let shape = value.shape();
+            let mut elements = 1usize;
+            for (axis, dim) in shape.iter().copied().enumerate() {
+                if axis == pair.seq_axis {
+                    continue;
+                }
+                let dim = usize::try_from(dim).ok()?;
+                elements = elements.checked_mul(dim)?;
+            }
+            bytes = bytes.checked_add(elements.checked_mul(value.dtype().size_of())?)?;
+        }
+        Some(bytes)
+    }
+
+    fn kv_growth_failed_error(
+        &self,
+        old_capacity: usize,
+        new_capacity: usize,
+        error: OrtError,
+    ) -> OrtError {
+        let bytes_per_token = self.kv_growth_bytes_per_token();
+        let byte_summary = bytes_per_token
+            .map(|bytes_per_token| {
+                let new_bytes = new_capacity.saturating_mul(bytes_per_token);
+                let transient_bytes = old_capacity
+                    .saturating_add(new_capacity)
+                    .saturating_mul(bytes_per_token);
+                format!(
+                    "The attempted new KV allocation is approximately {new_bytes} bytes and the transient peak is approximately {transient_bytes} bytes because growth keeps the old bucket live until the new bucket and valid-prefix copy are complete. KV bytes/token: {bytes_per_token}."
+                )
+            })
+            .unwrap_or_else(|| {
+                "KV bytes/token could not be derived from the current shared buffers.".to_owned()
+            });
+        let memory = self
+            .session
+            .cuda_device_id()
+            .and_then(|device_id| {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda_rt::device_memory_info(device_id)
+                        .ok()
+                        .map(|memory| {
+                            format!(
+                                "CUDA free={} bytes, total={} bytes",
+                                memory.free_bytes, memory.total_bytes
+                            )
+                        })
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = device_id;
+                    None
+                }
+            })
+            .unwrap_or_else(|| "device free-memory query unavailable".to_owned());
+        OrtError::InvalidArgument(format!(
+            "shared-buffer KV capacity growth failed while growing from {old_capacity} to {new_capacity} tokens: {error}. \
+             {byte_summary} {memory}. The session state was left unchanged; reset or retry with a shorter prompt/max_new_tokens, set an explicit KV max length cap, or free VRAM used by other processes."
+        ))
+    }
 
     /// Build a replacement captured attention mask of `capacity` elements
     /// (shape `[1, mask_len]`) with the leading `valid_ones` set to 1 and the
     /// rest zero, preserving the mask's residency: device-resident when
     /// `on_device` (allocated on the retained CUDA allocator and initialized with
     /// host->device fills), host-resident otherwise. Used by
-    /// [`grow_kv_buffers`](Self::grow_kv_buffers) when the KV capacity grows.
+    /// the shared [`onnx_genai_kv::ensure_kv_capacity`] driver when the KV
+    /// capacity grows.
     fn build_grown_capture_mask(
         &self,
         capacity: usize,
