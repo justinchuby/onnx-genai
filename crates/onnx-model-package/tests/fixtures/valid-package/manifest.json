@@ -18,7 +18,8 @@
             "nxrt": "nxrt_info.json"
           },
           "additional_metadata": {
-            "precision": "float32"
+            "precision": "float32",
+            "target": "portable"
           }
         },
         "cpu-fp16": {
@@ -33,7 +34,8 @@
             }
           },
           "additional_metadata": {
-            "precision": "float16"
+            "precision": "float16",
+            "target": "x86_64"
           }
         },
         "cuda-fp16": {
@@ -48,7 +50,8 @@
             }
           },
           "additional_metadata": {
-            "precision": "float16"
+            "precision": "float16",
+            "target": "sm90"
           }
         }
       }

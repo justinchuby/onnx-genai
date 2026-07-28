@@ -482,10 +482,10 @@ The repository already has important pieces:
   awaits a compiled EP.
 - `onnx-std::load_model`/`save_model` share the runtime IR and retain the live
   `WeightStore`.
-- `onnx-genai-engine::Engine::from_dir` currently resolves a flat
-  `ModelDirectory`, loads an ORT-backed session, prefers native inference
-  metadata, falls back to converted `genai_config.json`, and loads
-  `tokenizer.json`.
+- `onnx-genai-engine::Engine::from_dir` resolves either a flat `ModelDirectory`
+  or an ORT model-package directory, loads an ORT-backed session, prefers native
+  inference metadata, falls back to converted `genai_config.json`, and loads
+  the package-resolved `tokenizer.json`.
 - `onnx-genai-genai-config` intentionally models only the GenAI fields needed
   for the metadata compatibility path.
 
@@ -975,6 +975,10 @@ not publisher authenticity.
 - Resolve the open questions below.
 
 ### Phase 1 — directory MVP
+
+The runtime core now parses, validates, selects, resolves, and loads package
+directories while preserving flat-directory loading. The generic format
+registry and `nxrt package` authoring/inspection commands below remain deferred.
 
 - Pure-Rust parse/inspect/validate for ORT package directories.
 - Portable path resolver and `sha256:` shared assets.

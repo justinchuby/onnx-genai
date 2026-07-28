@@ -477,7 +477,7 @@ mod model_package_tests {
         let root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
         let directory = ModelDirectory::load(&root).unwrap();
-        assert_eq!(directory.model_path, root.join("model.onnx.textproto"));
+        assert_eq!(directory.model_path, root.join("model.onnx"));
         assert_eq!(directory.tokenizer_path, root.join("tokenizer.json"));
     }
 }

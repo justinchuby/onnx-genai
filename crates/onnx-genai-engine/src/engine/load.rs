@@ -285,19 +285,29 @@ impl Engine {
 fn package_selection_from_session_options(
     session_options: &SessionOptions,
 ) -> onnx_genai_ort::ModelPackageSelection {
-    let execution_provider = session_options.execution_providers.first().map(|provider| {
-        match provider.selection.name.as_str() {
-            "cpu" => "CPUExecutionProvider".to_string(),
-            "cuda" => "CUDAExecutionProvider".to_string(),
-            "coreml" | "core-ml" | "core_ml" => "CoreMLExecutionProvider".to_string(),
-            "webgpu" | "web-gpu" | "web_gpu" => "WebGpuExecutionProvider".to_string(),
-            "metal" => "MlxExecutionProvider".to_string(),
-            name if name.ends_with("ExecutionProvider") => name.to_string(),
-            name => format!("{name}ExecutionProvider"),
-        }
+    let provider = session_options.execution_providers.first();
+    let execution_provider = provider.map(|provider| match provider.selection.name.as_str() {
+        "cpu" => "CPUExecutionProvider".to_string(),
+        "cuda" => "CUDAExecutionProvider".to_string(),
+        "coreml" | "core-ml" | "core_ml" => "CoreMLExecutionProvider".to_string(),
+        "webgpu" | "web-gpu" | "web_gpu" => "WebGpuExecutionProvider".to_string(),
+        "metal" => "MlxExecutionProvider".to_string(),
+        name if name.ends_with("ExecutionProvider") => name.to_string(),
+        name => format!("{name}ExecutionProvider"),
     });
+    let device = provider.map(|provider| match provider.caps.hardware {
+        onnx_genai_ort::HardwareKind::Cpu => "cpu",
+        onnx_genai_ort::HardwareKind::Gpu => "gpu",
+        onnx_genai_ort::HardwareKind::Npu => "npu",
+        onnx_genai_ort::HardwareKind::Other => "other",
+    });
+    let precision = provider.and_then(|provider| provider.selection.options.get("precision"));
+    let target = provider.and_then(|provider| provider.selection.options.get("target"));
     onnx_genai_ort::ModelPackageSelection {
         execution_provider,
+        device: device.map(str::to_string),
+        precision: precision.cloned(),
+        target: target.cloned(),
         ..Default::default()
     }
 }
@@ -845,4 +855,30 @@ fn load_shared_kv_proposer(
         None
     };
     Ok(shared_kv_proposer)
+}
+
+#[cfg(test)]
+mod package_selection_tests {
+    use super::*;
+
+    #[test]
+    fn package_selection_includes_provider_device_precision_and_target() {
+        let mut execution_provider = onnx_genai_ort::ep_selection("cuda");
+        execution_provider
+            .options
+            .insert("precision".to_string(), "float16".to_string());
+        execution_provider
+            .options
+            .insert("target".to_string(), "sm90".to_string());
+        let options = SessionOptions::with_execution_provider(execution_provider);
+
+        let selection = package_selection_from_session_options(&options);
+        assert_eq!(
+            selection.execution_provider.as_deref(),
+            Some("CUDAExecutionProvider")
+        );
+        assert_eq!(selection.device.as_deref(), Some("gpu"));
+        assert_eq!(selection.precision.as_deref(), Some("float16"));
+        assert_eq!(selection.target.as_deref(), Some("sm90"));
+    }
 }

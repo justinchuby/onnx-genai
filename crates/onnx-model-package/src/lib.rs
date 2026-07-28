@@ -1,4 +1,8 @@
 //! ORT model-package directory parsing, variant selection, and path resolution.
+//!
+//! This crate implements the directory-loading core. Package authoring,
+//! command-line inspection, archive transport, and full execution-provider
+//! compatibility callbacks remain separate follow-up tooling.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -34,6 +38,12 @@ pub enum PackageError {
     UnknownComponent(String),
     #[error("variant '{variant}' was not found in component '{component}'")]
     UnknownVariant { component: String, variant: String },
+    #[error("variant '{variant}' in component '{component}' does not match {request}")]
+    ConflictingSelection {
+        component: String,
+        variant: String,
+        request: String,
+    },
     #[error("no variant in component '{component}' matches {request}")]
     NoMatchingVariant { component: String, request: String },
 }
@@ -146,7 +156,9 @@ pub struct ExecutorInfo {
 pub struct SelectionRequest {
     pub variant: Option<String>,
     pub execution_provider: Option<String>,
+    pub device: Option<String>,
     pub precision: Option<String>,
+    pub target: Option<String>,
 }
 
 impl SelectionRequest {
@@ -246,18 +258,33 @@ impl ModelPackage {
     ) -> Result<SelectedVariant, PackageError> {
         let component = self.load_component(component_name)?;
         let (variant_name, variant) = if let Some(requested_name) = &request.variant {
-            component
+            let (variant_name, variant) = component
                 .variants
                 .get_key_value(requested_name)
                 .ok_or_else(|| PackageError::UnknownVariant {
                     component: component_name.to_string(),
                     variant: requested_name.clone(),
-                })?
+                })?;
+            if variant_match_score(variant, request).is_none() {
+                return Err(PackageError::ConflictingSelection {
+                    component: component_name.to_string(),
+                    variant: requested_name.clone(),
+                    request: describe_request(request),
+                });
+            }
+            (variant_name, variant)
         } else {
             component
                 .variants
                 .iter()
-                .find(|(_, variant)| variant_matches(variant, request))
+                .filter_map(|entry @ (_, variant)| {
+                    variant_match_score(variant, request).map(|score| (entry, score))
+                })
+                .fold(None, |best, candidate| match best {
+                    Some((_, best_score)) if best_score >= candidate.1 => best,
+                    _ => Some(candidate),
+                })
+                .map(|(entry, _)| entry)
                 .ok_or_else(|| PackageError::NoMatchingVariant {
                     component: component_name.to_string(),
                     request: describe_request(request),
@@ -513,8 +540,21 @@ impl ModelPackage {
                 })
             },
         )?;
-        let path = tail.map_or(root.clone(), |tail| root.join(tail));
-        self.canonicalize_confined(&path)
+        let canonical_root = self.canonicalize_confined(&root)?;
+        let path = match tail {
+            Some(tail) => {
+                validate_portable_reference(Path::new(tail))?;
+                canonical_root.join(tail)
+            }
+            None => canonical_root.clone(),
+        };
+        let canonical = self.canonicalize_confined(&path)?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(PackageError::Invalid(format!(
+                "shared-asset reference resolves outside its digest directory: sha256:{reference}"
+            )));
+        }
+        Ok(canonical)
     }
 }
 
@@ -607,21 +647,34 @@ fn ensure_file(path: &Path, field: &str) -> Result<(), PackageError> {
     }
 }
 
-fn variant_matches(variant: &Variant, request: &SelectionRequest) -> bool {
-    let execution_provider_matches = request.execution_provider.as_ref().is_none_or(|requested| {
-        variant
-            .ep
-            .as_ref()
-            .is_some_and(|actual| actual.eq_ignore_ascii_case(requested))
-    });
-    let precision_matches = request.precision.as_ref().is_none_or(|requested| {
-        variant
-            .additional_metadata
-            .get("precision")
-            .and_then(Value::as_str)
-            .is_some_and(|actual| actual.eq_ignore_ascii_case(requested))
-    });
-    execution_provider_matches && precision_matches
+fn variant_match_score(variant: &Variant, request: &SelectionRequest) -> Option<usize> {
+    let attributes = [
+        (request.execution_provider.as_deref(), variant.ep.as_deref()),
+        (request.device.as_deref(), variant.device.as_deref()),
+        (
+            request.precision.as_deref(),
+            variant
+                .additional_metadata
+                .get("precision")
+                .and_then(Value::as_str),
+        ),
+        (
+            request.target.as_deref(),
+            variant
+                .additional_metadata
+                .get("target")
+                .and_then(Value::as_str),
+        ),
+    ];
+    attributes
+        .into_iter()
+        .try_fold(0, |score, (requested, actual)| match (requested, actual) {
+            (Some(requested), Some(actual)) if actual.eq_ignore_ascii_case(requested) => {
+                Some(score + 1)
+            }
+            (Some(_), Some(_)) => None,
+            _ => Some(score),
+        })
 }
 
 fn describe_request(request: &SelectionRequest) -> String {
@@ -629,8 +682,14 @@ fn describe_request(request: &SelectionRequest) -> String {
     if let Some(execution_provider) = &request.execution_provider {
         attributes.push(format!("execution provider '{execution_provider}'"));
     }
+    if let Some(device) = &request.device {
+        attributes.push(format!("device '{device}'"));
+    }
     if let Some(precision) = &request.precision {
         attributes.push(format!("precision '{precision}'"));
+    }
+    if let Some(target) = &request.target {
+        attributes.push(format!("target '{target}'"));
     }
     if attributes.is_empty() {
         "the default selection".to_string()

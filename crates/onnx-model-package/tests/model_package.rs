@@ -50,7 +50,9 @@ fn selection_matches_execution_provider_and_precision_in_manifest_order() {
             "model",
             &SelectionRequest {
                 execution_provider: Some("CPUExecutionProvider".to_string()),
+                device: Some("cpu".to_string()),
                 precision: Some("float16".to_string()),
+                target: Some("x86_64".to_string()),
                 ..Default::default()
             },
         )
@@ -60,6 +62,80 @@ fn selection_matches_execution_provider_and_precision_in_manifest_order() {
         selected.model_path,
         fixture("valid-package").join("cpu-fp16/model.onnx")
     );
+}
+
+#[test]
+fn ambiguous_selection_uses_manifest_order_deterministically() {
+    let package = ModelPackage::open(fixture("valid-package")).unwrap();
+    let selected = package
+        .select(
+            "model",
+            &SelectionRequest::for_execution_provider("CPUExecutionProvider"),
+        )
+        .unwrap();
+    assert_eq!(selected.variant_name, "cpu-fp32");
+}
+
+#[test]
+fn exact_attributes_rank_above_an_earlier_generic_variant() {
+    let root = scratch("selection-specificity");
+    write(
+        &root.join("manifest.json"),
+        r#"{
+  "schema_version": "1.0",
+  "components": {
+    "model": {
+      "component_name": "model",
+      "variants": {
+        "generic": {
+          "variant_directory": "generic",
+          "executor_info": { "nxrt": { "model_file": "model.onnx" } }
+        },
+        "cpu": {
+          "variant_directory": "cpu",
+          "ep": "CPUExecutionProvider",
+          "device": "cpu",
+          "executor_info": { "nxrt": { "model_file": "model.onnx" } }
+        }
+      }
+    }
+  }
+}"#,
+    );
+    write(&root.join("generic/model.onnx"), "generic");
+    write(&root.join("cpu/model.onnx"), "cpu");
+
+    let package = ModelPackage::open(&root).unwrap();
+    let selected = package
+        .select(
+            "model",
+            &SelectionRequest {
+                execution_provider: Some("CPUExecutionProvider".to_string()),
+                device: Some("cpu".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(selected.variant_name, "cpu");
+}
+
+#[test]
+fn named_variant_conflicting_with_requested_attributes_is_rejected() {
+    let package = ModelPackage::open(fixture("valid-package")).unwrap();
+    let error = package
+        .select(
+            "model",
+            &SelectionRequest {
+                variant: Some("cuda-fp16".to_string()),
+                execution_provider: Some("CPUExecutionProvider".to_string()),
+                device: Some("cpu".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, PackageError::ConflictingSelection { .. }));
+    assert!(error.to_string().contains("execution provider"));
+    assert!(error.to_string().contains("device 'cpu'"));
 }
 
 #[test]
@@ -87,6 +163,46 @@ fn resolves_shared_tokenizer_directory() {
                 .join("shared_assets")
                 .join(format!("sha256-{}", "a".repeat(64)))
         )
+    );
+}
+
+#[test]
+fn shared_asset_tail_cannot_escape_its_digest_directory() {
+    let root = scratch("shared-asset-tail-escape");
+    let digest = "a".repeat(64);
+    let manifest = format!(
+        r#"{{
+  "schema_version": "1.0",
+  "components": {{
+    "model": {{
+      "component_name": "model",
+      "variants": {{
+        "cpu": {{
+          "variant_directory": "cpu",
+          "executor_info": {{
+            "nxrt": {{
+              "model_file": "model.onnx",
+              "tokenizer": "sha256:{digest}/../../cpu"
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"#
+    );
+    write(&root.join("manifest.json"), &manifest);
+    write(&root.join("cpu/model.onnx"), "model-bytes");
+    write(&root.join("cpu/tokenizer.json"), "{}");
+    fs::create_dir_all(root.join("shared_assets").join(format!("sha256-{digest}"))).unwrap();
+
+    let package = ModelPackage::open(&root).unwrap();
+    let error = package.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("portable package reference escapes its base"),
+        "{error}"
     );
 }
 
