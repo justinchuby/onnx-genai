@@ -22,7 +22,57 @@ impl Executor {
             let name = self.graph.value(vid).name.as_deref().unwrap_or("<unnamed>");
             self.bind_input_shape(name, vid, value.dtype, &value.shape, &mut bindings)?;
         }
+        self.seed_unfed_override_symbols(inputs, external, &mut bindings)?;
         Ok(bindings)
+    }
+
+    /// Seed the declared symbol(s) of every overridable optional input that was
+    /// NOT fed this run from its concrete default shape, so downstream shapes
+    /// (the intermediate `[M, r]` and the terminal `Add`) resolve against the
+    /// default (e.g. an `r = 0` empty delta) exactly as they resolve against a
+    /// fed override's real extent. A fed override already seeded its symbol
+    /// through [`Self::bind_input_shape`] above, so it is skipped here. No-op
+    /// when the graph has no overrides (the byte-identity gate).
+    fn seed_unfed_override_symbols(
+        &self,
+        inputs: &[(&str, &Tensor)],
+        external: &ExternalBindings,
+        bindings: &mut HashMap<SymbolId, usize>,
+    ) -> Result<()> {
+        if self.optional_overrides.is_empty() {
+            return Ok(());
+        }
+        let mut fed: HashSet<ValueId> = inputs
+            .iter()
+            .filter_map(|(name, _)| self.input_index.get(*name).copied())
+            .collect();
+        fed.extend(external.inputs.keys().copied());
+        for (&vid, over) in &self.optional_overrides {
+            if fed.contains(&vid) {
+                continue; // fed override — its symbol is bound from the fed shape
+            }
+            for (dim, &default) in over.declared_shape.iter().zip(&over.default_shape) {
+                if let Dim::Symbolic(s) = dim {
+                    match bindings.get(s) {
+                        Some(&prev) if prev != default => {
+                            let sym = self
+                                .symbol_name(*s)
+                                .unwrap_or_else(|| format!("symbol#{}", s.0));
+                            return Err(SessionError::SymbolConflict {
+                                symbol: sym,
+                                first: prev,
+                                second: default,
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            bindings.insert(*s, default);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn bind_input_shape(

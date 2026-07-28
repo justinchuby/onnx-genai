@@ -33,8 +33,28 @@ pub(crate) struct Executor {
     pub(super) plan: Vec<NodePlan>,
     /// name → value id for the graph inputs the caller must supply.
     pub(super) input_index: HashMap<String, ValueId>,
-    /// Value ids the caller must supply at `run` (graph inputs minus initializers).
+    /// Value ids the caller must supply at `run`. A graph input falls into
+    /// exactly one of three categories:
+    ///   1. **required input** — a plain graph input (no initializer): the
+    ///      caller MUST feed it. These are the ids stored here.
+    ///   2. **pre-filled initializer** — a graph input that is also an
+    ///      initializer and is NOT an overridable optional input: a constant,
+    ///      never feedable, excluded from both `required_inputs` and
+    ///      `input_index`.
+    ///   3. **overridable optional input** — a value in
+    ///      [`Self::optional_overrides`]: an initializer-backed graph input that
+    ///      carries a concrete default (used when unfed) yet is feedable by name
+    ///      to override that default. It is registered in [`Self::input_index`]
+    ///      (so it can be fed) but stays OUT of `required_inputs` (feeding it is
+    ///      optional). This is the foundation the native-LoRA A/B adapter
+    ///      matrices build on.
     pub(super) required_inputs: Vec<ValueId>,
+    /// Overridable optional inputs, keyed by value id. Empty for every graph
+    /// without an explicitly registered override — the whole overridable-input
+    /// mechanism is gated on membership here, so an un-injected graph builds and
+    /// runs byte-for-byte as it did before this class existed. See
+    /// [`OptionalOverride`].
+    pub(super) optional_overrides: HashMap<ValueId, OptionalOverride>,
     /// Whether any value in the graph carries a symbolic dim. A fully-static
     /// graph is materialized eagerly at build; a symbolic graph defers buffer
     /// allocation and kernel compilation to the first `run` that fixes shapes.
@@ -233,6 +253,55 @@ pub(crate) struct Executor {
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2
 /// view reuse is latched off for the session (Chew defense-in-depth).
 pub(super) const STAGE2_SIG_MISMATCH_LIMIT: u32 = 2;
+
+/// An **overridable optional input**: a single graph value that is
+/// simultaneously
+///   * a graph input feedable by name at run time,
+///   * an initializer carrying a concrete DEFAULT used when the caller does not
+///     feed it, and
+///   * the holder of a DYNAMIC (symbolic) dimension, so an override of a
+///     *different rank/extent* than the default can be fed.
+///
+/// This is the executor foundation the native-LoRA branch (design §B.3) needs:
+/// the A/B adapter matrices default to a zero-rank (empty) delta — an `Add`
+/// no-op — and are overridden at run time with a real-rank adapter. It is a
+/// **general** executor capability, however, and carries nothing LoRA-specific.
+///
+/// A value only becomes an override when it is explicitly registered at build
+/// time (see [`Executor::build_with_overrides`]); membership is never inferred
+/// structurally, because pre-IR-4 ONNX models legally list every initializer as
+/// a graph input and a structural rule would silently reclassify them.
+pub(super) struct OptionalOverride {
+    /// The value's declared name — the key the caller feeds it under. Reserved
+    /// for P2 injection diagnostics and the P5 device path; not read on the CPU
+    /// host-feed path (which routes purely by value id).
+    #[allow(dead_code)]
+    pub(super) name: String,
+    /// Element type. An override must be fed with this exact dtype. The CPU path
+    /// already enforces this through `value_dtypes` in `bind_input_shape`; the
+    /// field is retained for the P5 device binding contract.
+    #[allow(dead_code)]
+    pub(super) dtype: DataType,
+    /// The value's DECLARED shape, kept symbolic in the override dimension
+    /// (e.g. `[K, sym("lora_r")]`). Unlike an ordinary initializer, this shape
+    /// is **not** overwritten with the concrete default dims at build, so a
+    /// later run can bind the symbol to a different override extent.
+    pub(super) declared_shape: Shape,
+    /// The concrete fallback shape (e.g. `[K, 0]`), used to seed the declared
+    /// symbol(s) and size the buffer on any run that does not feed this value.
+    pub(super) default_shape: Vec<usize>,
+    /// Owned default bytes, reinstated into the value's buffer on every unfed
+    /// run so no adapter state from a prior fed run can leak forward. Owned
+    /// (never a borrowed read-only mmap alias) precisely so the per-run override
+    /// path may rewrite and resize the buffer.
+    pub(super) default_bytes: Arc<[u8]>,
+    // CUDA phase (P5): a device override adds an `override_state`
+    // (`None | Host | Device{binding}`) and its identity flows into the
+    // device-graph capture signature so a rank/address change re-arms capture.
+    // The CPU host-feed path derives fed-vs-unfed per run from the run's input
+    // set, so no persistent per-run state is stored here in Phase 1.
+}
+
 
 /// Run-scoped metadata for a zero-copy view value: it owns no buffer but
 /// borrows `source`'s buffer with the given (real, possibly non-contiguous or
