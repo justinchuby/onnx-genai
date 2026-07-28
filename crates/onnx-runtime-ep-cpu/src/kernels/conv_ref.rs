@@ -276,7 +276,12 @@ impl Kernel for ConvKernel {
             // 1D → 2D: insert H=1 at spatial index 0
             x_shape_4d = [self.x_shape[0], self.x_shape[1], 1, self.x_shape[2]];
             w_shape_4d = [self.w_shape[0], self.w_shape[1], 1, self.w_shape[2]];
-            out_shape_4d = [self.output_shape[0], self.output_shape[1], 1, self.output_shape[2]];
+            out_shape_4d = [
+                self.output_shape[0],
+                self.output_shape[1],
+                1,
+                self.output_shape[2],
+            ];
             strides_2d = [1, self.strides[0]];
             dilations_2d = [1, self.dilations[0]];
             pads_2d = [0, self.pads[0], 0, self.pads[1]];
@@ -733,7 +738,17 @@ fn grouped_im2col_gemm_execute(
                 super::matmul::gemm_with_backend(backend, w_group, x_group, o_group, m, k, n)?;
             } else {
                 im2col(
-                    x_group, ic_per_group, ih, iw, kh, kw, strides, dilations, pads, oh, ow,
+                    x_group,
+                    ic_per_group,
+                    ih,
+                    iw,
+                    kh,
+                    kw,
+                    strides,
+                    dilations,
+                    pads,
+                    oh,
+                    ow,
                     &mut col,
                 );
                 super::matmul::gemm_with_backend(backend, w_group, &col, o_group, m, k, n)?;
@@ -1139,7 +1154,10 @@ mod tests {
         let reached = after_im2col > before_im2col || after_bnns > before_bnns;
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let reached = after_im2col > before_im2col;
-        assert!(reached, "1D conv did not reach accelerated path (im2col or BNNS)");
+        assert!(
+            reached,
+            "1D conv did not reach accelerated path (im2col or BNNS)"
+        );
     }
 
     // ─── Numerics parity ────────────────────────────────────────────────

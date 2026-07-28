@@ -250,7 +250,11 @@ static SDPA_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::
 
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
 /// path fires on macOS/iOS.
-#[cfg(all(test, any(target_os = "macos", target_os = "ios"), not(feature = "mlas")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "ios"),
+    not(feature = "mlas")
+))]
 static SDPA_ACCELERATE_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -297,10 +301,7 @@ pub fn sdpa_f32(
     // Accelerate (cblas_sgemm) fast path for macOS/iOS: replaces the NEON
     // scalar dot/axpy loops with AMX-backed GEMMs for QK^T and probs·V,
     // parallelized across (batch, head) tiles via Rayon.
-    #[cfg(all(
-        any(target_os = "macos", target_os = "ios"),
-        not(feature = "mlas")
-    ))]
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), not(feature = "mlas")))]
     {
         let non_empty = t.batch > 0
             && t.num_heads > 0
@@ -1135,10 +1136,7 @@ fn sdpa_f32_fast(
 /// SGEMMs — `logits = alpha · Q · Kᵀ` and `context = probs · V` — with the
 /// `softcap → bias → mask → causal → softmax` epilogue applied per row.
 /// Tiles are parallelized across the crate's shared Rayon pool.
-#[cfg(all(
-    any(target_os = "macos", target_os = "ios"),
-    not(feature = "mlas")
-))]
+#[cfg(all(any(target_os = "macos", target_os = "ios"), not(feature = "mlas")))]
 fn sdpa_f32_accelerate(
     t: &SdpaTensors,
     cfg: &SdpaConfig,
@@ -1154,11 +1152,20 @@ fn sdpa_f32_accelerate(
     #[link(name = "Accelerate", kind = "framework")]
     unsafe extern "C" {
         fn cblas_sgemm(
-            order: i32, trans_a: i32, trans_b: i32,
-            m: i32, n: i32, k: i32,
-            alpha: f32, a: *const f32, lda: i32,
-            b: *const f32, ldb: i32,
-            beta: f32, c: *mut f32, ldc: i32,
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
         );
     }
     const CBLAS_ROW_MAJOR: i32 = 101;
@@ -1210,13 +1217,20 @@ fn sdpa_f32_accelerate(
             let mut logits = vec![0.0f32; q_seq * kv_seq];
             unsafe {
                 cblas_sgemm(
-                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS,
-                    q_seq as i32, kv_seq as i32, head_size as i32,
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_TRANS,
+                    q_seq as i32,
+                    kv_seq as i32,
+                    head_size as i32,
                     alpha,
-                    q_tile.as_ptr(), head_size as i32,
-                    k_tile.as_ptr(), head_size as i32,
+                    q_tile.as_ptr(),
+                    head_size as i32,
+                    k_tile.as_ptr(),
+                    head_size as i32,
                     0.0,
-                    logits.as_mut_ptr(), kv_seq as i32,
+                    logits.as_mut_ptr(),
+                    kv_seq as i32,
                 );
             }
 
@@ -1242,13 +1256,20 @@ fn sdpa_f32_accelerate(
             // context[q_seq, v_head_size] = probs[q_seq, kv_seq] · V[kv_seq, v_head_size]
             unsafe {
                 cblas_sgemm(
-                    CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
-                    q_seq as i32, v_head_size as i32, kv_seq as i32,
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    q_seq as i32,
+                    v_head_size as i32,
+                    kv_seq as i32,
                     1.0,
-                    logits.as_ptr(), kv_seq as i32,
-                    v_tile.as_ptr(), v_head_size as i32,
+                    logits.as_ptr(),
+                    kv_seq as i32,
+                    v_tile.as_ptr(),
+                    v_head_size as i32,
                     0.0,
-                    y_tile.as_mut_ptr(), v_head_size as i32,
+                    y_tile.as_mut_ptr(),
+                    v_head_size as i32,
                 );
             }
         });
