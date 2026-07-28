@@ -7,7 +7,7 @@ on:
     branches:
       - main
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
@@ -19,7 +19,6 @@ permissions:
 
 jobs:
   audit:
-    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

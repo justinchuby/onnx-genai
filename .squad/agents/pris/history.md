@@ -129,8 +129,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Recorded Justin's live `ci:full` verification on PR #340: CI run 30345861354 and audit run 30345861425 started via label.
 - Added CLI-specific cache keys after the main merge exposed a shared-cache collision/incomplete-restore pattern in the Windows CLI lane. Remeasured final-head fast run 30349042835 at 4m33s wall-clock; critical path `Rust (Linux x86_64)` at 4m22s, with Windows CLI at 3m14s. The preceding workflow-code run 30348596658 was 3m51s; current variance is in Linux Rust/quality after the main merge, not the skipped-name fix.
 
-## 2026-07-28T08:01:42-07:00 — Corrected CI fast/slow tier axis
-- Reworked PR CI back to full uninstrumented platform testing: Linux x86_64, Windows x86_64, Windows ARM64, and macOS arm64 offline crate suites all run on every PR, with Linux/Windows CLI ORT and CUDA compile lanes also on PRs.
-- Kept coverage instrumentation tiered instead of platform signal: PRs upload only the Linux offline Codecov flag; main/nightly/`ci:full` add `mlas`, `cli-ort-linux`, `cli-ort-windows`, and Windows offline coverage.
-- Set Codecov carryforward on the flags PRs intentionally omit (`mlas`, `cli-ort-linux`, `cli-ort-windows`) so missing slow-tier uploads do not look like PR coverage regressions against main.
+## 2026-07-28T08:45:38-07:00 — CI tiering rejected; full coverage on PRs
+- Superseded the short-lived corrected-axis plan. Final Justin direction: run coverage everywhere; PR runtime is acceptable.
+- CI now has no fast/slow run-shape distinction: PRs, `main`, nightly, and manual dispatch all run quality checks, audit, coverage-instrumented offline tests on Linux x86_64 / Windows x86_64 / Windows ARM64 / macOS arm64, Linux MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes.
+- Removed `ci:full` labeled triggers because the label would be a no-op, and reset Codecov carryforward to false because PRs upload the same four flags as `main` (`offline`, `mlas`, `cli-ort-linux`, `cli-ort-windows`).
+- Preserved #296/#340 independent hardening: direct `rustup`, GitHub-owned `actions/cache`, arch-aware cache keys, concurrency cancellation, and stable expanded names via always-expanded matrices/no gated matrix jobs.
 - Decision filed: `.squad/decisions/inbox/pris-ci-fast-slow-tiers.md`.
