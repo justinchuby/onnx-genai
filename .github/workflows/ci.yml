@@ -14,6 +14,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_LLVM_COV_VERSION: "0.8.7"
+
 jobs:
   rust-quality:
     name: Rust quality
@@ -35,7 +38,19 @@ jobs:
           rustup default stable
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+<<<<<<< HEAD
       # cargo cache actions are not. Keep the key to OS + rustc release + Cargo.lock.
+=======
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+>>>>>>> origin/main
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -44,9 +59,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+<<<<<<< HEAD
           key: ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-
+=======
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+>>>>>>> origin/main
 
       # Blocking, like the clippy gate below. The sweep this exception was
       # waiting on has landed, so an unformatted tree is now a failure rather
@@ -154,7 +175,22 @@ jobs:
           rustup default stable
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+<<<<<<< HEAD
       # cargo cache actions are not. Keep the key to OS + rustc release + Cargo.lock.
+=======
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="${{ matrix.target || '' }}"
+          if [ -z "$target" ]; then
+            target="$(rustc -Vv | sed -n 's/^host: //p')"
+          fi
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+>>>>>>> origin/main
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -163,9 +199,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+<<<<<<< HEAD
           key: ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-
+=======
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+>>>>>>> origin/main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -177,10 +219,17 @@ jobs:
         if: matrix.target != 'aarch64-pc-windows-msvc'
         shell: bash
         run: |
+<<<<<<< HEAD
           if cargo llvm-cov --version 2>/dev/null | grep -q '0.8.7'; then
             echo 'cargo-llvm-cov 0.8.7 already installed'
           else
             cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+=======
+          if cargo llvm-cov --version 2>/dev/null | grep -q "$CARGO_LLVM_COV_VERSION"; then
+            echo "cargo-llvm-cov $CARGO_LLVM_COV_VERSION already installed"
+          else
+            cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
+>>>>>>> origin/main
           fi
 
       # Never replace these explicit packages with bare `cargo test` or
@@ -341,7 +390,19 @@ jobs:
           rustup default stable
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+<<<<<<< HEAD
       # cargo cache actions are not. Keep the key to OS + rustc release + Cargo.lock.
+=======
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+>>>>>>> origin/main
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -350,9 +411,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+<<<<<<< HEAD
           key: ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-
+=======
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+>>>>>>> origin/main
       - name: Install Linux bindgen dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -369,10 +436,17 @@ jobs:
       - name: Install cargo-llvm-cov
         shell: bash
         run: |
+<<<<<<< HEAD
           if cargo llvm-cov --version 2>/dev/null | grep -q '0.8.7'; then
             echo 'cargo-llvm-cov 0.8.7 already installed'
           else
             cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+=======
+          if cargo llvm-cov --version 2>/dev/null | grep -q "$CARGO_LLVM_COV_VERSION"; then
+            echo "cargo-llvm-cov $CARGO_LLVM_COV_VERSION already installed"
+          else
+            cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --force
+>>>>>>> origin/main
           fi
 
       # The portable lane must stay offline, but the CLI is the user-facing ORT
@@ -440,7 +514,19 @@ jobs:
           rustup default stable
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
       # actions/cache is GitHub-owned, so it is acceptable where personally-owned
+<<<<<<< HEAD
       # cargo cache actions are not. Keep the key to OS + rustc release + Cargo.lock.
+=======
+      # cargo cache actions are not. Include OS, runner arch, actual target triple,
+      # rustc release, cargo tool versions, and Cargo.lock so multi-arch runners
+      # never restore each other's target/ or ~/.cargo/bin artifacts.
+      - name: Resolve cargo cache target
+        id: cache-target
+        shell: bash
+        run: |
+          target="$(rustc -Vv | sed -n 's/^host: //p')"
+          echo "triple=$target" >> "$GITHUB_OUTPUT"
+>>>>>>> origin/main
       - name: Cache cargo artifacts
         uses: actions/cache@v4
         with:
@@ -449,9 +535,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+<<<<<<< HEAD
           key: ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-${{ steps.rust-toolchain.outputs.version }}-
+=======
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
+>>>>>>> origin/main
 
       # CUDA uses dynamic loading, so compile coverage needs no GPU or toolkit,
       # but ep-cuda tests require a CUDA runtime/GPU and must not join the

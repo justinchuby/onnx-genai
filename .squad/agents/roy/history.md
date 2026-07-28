@@ -149,3 +149,21 @@ Scribe note: Roy generic lm_head Transpose-fold + dense fp16 M==1 GEMV fast path
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Approved PR #282 after mutation-proven equivalence for tree speculative decoding core.
+
+## 2026-07-27T14:34:22-07:00 — Rules type-safety standard
+
+- Added a project rule requiring Rust types to enforce invariants: newtypes for transposable primitives, capability values over late hot-path checks, and ownership/borrowing for aliasing.
+
+## 2026-07-27T14:38:08-07:00 — Rules condensation pass
+
+- `RULES.md` was 8,923 bytes on `main`; the new rule initially pushed it to 10,167 bytes, and the condensation pass brought it to 7,149 bytes, smaller than the starting file despite adding a rule.
+- Condensed the new Rust type-safety rule to the core invariants: invalid states, newtypes, capability values, and ownership/borrowing; dropped repeated unsafe/Miri, property-testing, and TLA+ detail.
+- Folded graph-fusion detail into the model/vendor/EP-agnostic rule without changing its force.
+
+## 2026-07-27T14:42:22-07:00 — Rule 2 force restored
+
+- Restored explicit no-hardcoded-architecture enumeration, fusion generalization, and review-blocking consequence in `RULES.md` rule 2 after Justin flagged the condensation as weakening the project identity rule.
+- Removed the stable-ABI wheel rule's stale inbox link; the corresponding abi3 details were found in archived decisions, not active `.squad/decisions.md`.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Reviewed PR #301 / #85, requested changes for control-flow capture liveness, then approved Deckard capture-aware last-use fix.

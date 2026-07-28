@@ -140,3 +140,5 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - Adopted Pris's `ci.yml`/`audit.yml` hardening onto this branch too, removing the remaining personal `dtolnay`, `Swatinem/rust-cache`, and `taiki-e/install-action` uses from the full workflow set.
 - Added/strengthened no-cancel release serialization: `publish.yml` now serializes by workflow rather than ref, and `wheels.yml` gained workflow-level concurrency with `cancel-in-progress: false`.
 - Recorded owner-approved kept-action adjudication: keep PyPA trusted publishing and cibuildwheel, keep Codecov as vendor-owned; recommend immutable SHA pinning as a follow-up PR.
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Authored PR #301 / #85 compute-in-place; Roy found capture-liveness bug, Deckard fixed under author lockout, and the PR merged.

@@ -3,7 +3,9 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout};
+use onnx_runtime_ir::{
+    DataType, DeviceId, DeviceType, Graph, GraphView, Node, NodeId, NodeIndex, Shape, TensorLayout,
+};
 
 use crate::epcontext::EpContext;
 use crate::error::{EpError, Result};
@@ -380,6 +382,40 @@ pub trait ExecutionProvider: Send + Sync {
         input_dtypes: &[DataType],
         layouts: &[TensorLayout],
     ) -> KernelMatch;
+
+    /// Query one node through an immutable structural graph lens.
+    ///
+    /// This compatibility adapter allocates metadata arrays before calling
+    /// [`Self::supports_op`]. EPs can override it with native indexed metadata
+    /// traversal to make capability discovery allocation-free.
+    fn supports_node(&self, view: &GraphView<'_>, node: NodeIndex, opset: u64) -> KernelMatch {
+        let inputs = view.node_inputs(node);
+        let shapes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let input_dtypes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        let layouts = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).layout.clone())
+                    .unwrap_or_else(TensorLayout::contiguous)
+            })
+            .collect::<Vec<_>>();
+        self.supports_op(view.node(node), opset, &shapes, &input_dtypes, &layouts)
+    }
 
     /// Get or create a kernel for `op` specialized to concrete `shapes`.
     ///

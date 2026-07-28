@@ -1,27 +1,21 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::ort::{SessionOptions, profile::TraceVerbosity};
 
-use super::interactive::{Backend, SessionSettings};
+use super::interactive::{Backend, ReplInputMode, SessionSettings};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ReplCommand {
-    Help,
+    Help(Option<String>),
     Reset,
     ToggleRaw,
     ToggleStats,
-    /// Show what the KV page pool is holding.
     Pages,
-    /// Turn the profile report on or off, or report its state.
     Profile(Option<String>),
-    /// Load a different model, or report the current one.
     Model(Option<String>),
-    /// Print a structured summary of the current interactive session.
     Session,
-    /// Switch execution provider, or report the current one.
     ExecutionProvider(Option<String>),
-    /// Switch decode backend, or report the current one.
     DecodeBackend(Option<String>),
     System(Option<String>),
     Image {
@@ -40,6 +34,218 @@ pub(super) enum ReplLine {
     Command(ReplCommand),
     Prompt(String),
     Empty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CommandCategory {
+    Help,
+    Session,
+    ModelRuntime,
+    Diagnostics,
+    Input,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplCommandKind {
+    Help,
+    Reset,
+    Raw,
+    Stats,
+    Pages,
+    Profile,
+    Model,
+    Session,
+    ExecutionProvider,
+    DecodeBackend,
+    System,
+    Image,
+    Audio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompletionSource {
+    None,
+    Files,
+    ExecutionProviders,
+    DecodeBackends,
+    ProfileSettings,
+}
+
+#[derive(Debug)]
+pub(super) struct ReplCommandSpec {
+    pub(super) name: &'static str,
+    pub(super) aliases: &'static [&'static str],
+    pub(super) usage: &'static str,
+    pub(super) summary: &'static str,
+    pub(super) category: CommandCategory,
+    pub(super) completion: CompletionSource,
+    kind: ReplCommandKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ReplCompletion {
+    pub(super) replacement: String,
+    pub(super) display: String,
+    pub(super) description: Option<String>,
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) append_space: bool,
+}
+
+const COMMANDS: &[ReplCommandSpec] = &[
+    ReplCommandSpec {
+        name: "help",
+        aliases: &[],
+        usage: "/help",
+        summary: "Show REPL commands.",
+        category: CommandCategory::Help,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::Help,
+    },
+    ReplCommandSpec {
+        name: "reset",
+        aliases: &[],
+        usage: "/reset",
+        summary: "Clear conversation history and pending attachments.",
+        category: CommandCategory::Session,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::Reset,
+    },
+    ReplCommandSpec {
+        name: "raw",
+        aliases: &[],
+        usage: "/raw",
+        summary: "Toggle raw prompting without the model chat template.",
+        category: CommandCategory::Input,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::Raw,
+    },
+    ReplCommandSpec {
+        name: "stats",
+        aliases: &[],
+        usage: "/stats",
+        summary: "Toggle compact per-turn stats.",
+        category: CommandCategory::Diagnostics,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::Stats,
+    },
+    ReplCommandSpec {
+        name: "pages",
+        aliases: &[],
+        usage: "/pages",
+        summary: "Show the current KV page-pool contents.",
+        category: CommandCategory::Diagnostics,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::Pages,
+    },
+    ReplCommandSpec {
+        name: "profile",
+        aliases: &[],
+        usage: "/profile [on|off|trace <path>|verbosity <decisions|ops|full>]",
+        summary: "Control per-turn profiling and Perfetto trace output.",
+        category: CommandCategory::Diagnostics,
+        completion: CompletionSource::ProfileSettings,
+        kind: ReplCommandKind::Profile,
+    },
+    ReplCommandSpec {
+        name: "model",
+        aliases: &[],
+        usage: "/model [path]",
+        summary: "Reload another model, or print the current session.",
+        category: CommandCategory::ModelRuntime,
+        completion: CompletionSource::Files,
+        kind: ReplCommandKind::Model,
+    },
+    ReplCommandSpec {
+        name: "session",
+        aliases: &[],
+        usage: "/session",
+        summary: "Print a structured summary of the current session.",
+        category: CommandCategory::Session,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::Session,
+    },
+    ReplCommandSpec {
+        name: "ep",
+        aliases: &[],
+        usage: "/ep [name]",
+        summary: "Switch execution provider, or report the current one.",
+        category: CommandCategory::ModelRuntime,
+        completion: CompletionSource::ExecutionProviders,
+        kind: ReplCommandKind::ExecutionProvider,
+    },
+    ReplCommandSpec {
+        name: "backend",
+        aliases: &[],
+        usage: "/backend [auto|ort|native]",
+        summary: "Switch decode backend, or report the current one.",
+        category: CommandCategory::ModelRuntime,
+        completion: CompletionSource::DecodeBackends,
+        kind: ReplCommandKind::DecodeBackend,
+    },
+    ReplCommandSpec {
+        name: "system",
+        aliases: &[],
+        usage: "/system <text>",
+        summary: "Set or clear the system message.",
+        category: CommandCategory::Input,
+        completion: CompletionSource::None,
+        kind: ReplCommandKind::System,
+    },
+    ReplCommandSpec {
+        name: "image",
+        aliases: &[],
+        usage: "/image <path> [prompt text]",
+        summary: "Stage an image attachment for the next turn.",
+        category: CommandCategory::Input,
+        completion: CompletionSource::Files,
+        kind: ReplCommandKind::Image,
+    },
+    ReplCommandSpec {
+        name: "audio",
+        aliases: &[],
+        usage: "/audio <path> [prompt text]",
+        summary: "Stage an audio attachment for the next turn.",
+        category: CommandCategory::Input,
+        completion: CompletionSource::Files,
+        kind: ReplCommandKind::Audio,
+    },
+];
+
+pub(super) fn command_registry() -> &'static [ReplCommandSpec] {
+    COMMANDS
+}
+
+pub(super) fn render_repl_help() -> String {
+    command_registry()
+        .iter()
+        .map(|command| command.usage)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(super) fn render_command_help(command: &str) -> Option<String> {
+    let command = command.trim().trim_start_matches('/');
+    find_command(command).map(|spec| {
+        format!(
+            "{}\n  category: {}\n  {}",
+            spec.usage,
+            spec.category.name(),
+            spec.summary
+        )
+    })
+}
+
+impl CommandCategory {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::Session => "session",
+            Self::ModelRuntime => "model/runtime",
+            Self::Diagnostics => "diagnostics",
+            Self::Input => "input",
+        }
+    }
 }
 
 /// Load a new session, leaving the caller's current one untouched on failure.
@@ -95,15 +301,10 @@ pub(super) fn parse_decode_backend(name: &str) -> Result<EngineDecodeBackend, St
 /// What `/profile <rest>` asked for.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ProfileSetting {
-    /// Report the current state.
     Show,
-    /// Turn the report and the timeline on or off together.
     Toggle(bool),
-    /// Write the timeline here from now on.
     Trace(PathBuf),
-    /// Stop writing a timeline, keeping the report.
     NoTrace,
-    /// Record this much detail.
     Verbosity(TraceVerbosity),
 }
 
@@ -188,9 +389,38 @@ fn argument_of(arguments: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-pub(super) fn parse_repl_line(line: &str) -> ReplLine {
+fn find_command(command: &str) -> Option<&'static ReplCommandSpec> {
+    COMMANDS
+        .iter()
+        .find(|spec| spec.name == command || spec.aliases.contains(&command))
+}
+
+fn parse_attachment(arguments: &str, is_image: bool) -> ReplCommand {
+    let mut attachment_parts = arguments.splitn(2, char::is_whitespace);
+    let path = attachment_parts
+        .next()
+        .filter(|path| !path.is_empty())
+        .map(ToString::to_string);
+    let prompt = attachment_parts
+        .next()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(ToString::to_string);
+    if is_image {
+        ReplCommand::Image { path, prompt }
+    } else {
+        ReplCommand::Audio { path, prompt }
+    }
+}
+
+pub(super) fn parse_repl_line(line: &str, mode: ReplInputMode) -> ReplLine {
     if line.trim().is_empty() {
         return ReplLine::Empty;
+    }
+    if matches!(mode, ReplInputMode::Tty)
+        && let Some(prompt) = line.strip_prefix("//")
+    {
+        return ReplLine::Prompt(format!("/{prompt}"));
     }
     let Some(command_line) = line.strip_prefix('/') else {
         return ReplLine::Prompt(line.to_string());
@@ -199,39 +429,200 @@ pub(super) fn parse_repl_line(line: &str) -> ReplLine {
     let mut parts = command_line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or_default();
     let arguments = parts.next().unwrap_or_default().trim();
-    let attachment_command = |is_image| {
-        let mut attachment_parts = arguments.splitn(2, char::is_whitespace);
-        let path = attachment_parts
-            .next()
-            .filter(|path| !path.is_empty())
-            .map(ToString::to_string);
-        let prompt = attachment_parts
-            .next()
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty())
-            .map(ToString::to_string);
-        if is_image {
-            ReplCommand::Image { path, prompt }
-        } else {
-            ReplCommand::Audio { path, prompt }
-        }
+    let Some(spec) = find_command(command) else {
+        return ReplLine::Command(ReplCommand::Unknown(format!("/{command}")));
     };
-
-    let command = match command {
-        "help" => ReplCommand::Help,
-        "reset" => ReplCommand::Reset,
-        "raw" => ReplCommand::ToggleRaw,
-        "stats" => ReplCommand::ToggleStats,
-        "pages" => ReplCommand::Pages,
-        "profile" => ReplCommand::Profile((!arguments.is_empty()).then(|| arguments.to_string())),
-        "model" => ReplCommand::Model(argument_of(arguments)),
-        "session" => ReplCommand::Session,
-        "ep" => ReplCommand::ExecutionProvider(argument_of(arguments)),
-        "backend" => ReplCommand::DecodeBackend(argument_of(arguments)),
-        "system" => ReplCommand::System((!arguments.is_empty()).then(|| arguments.to_string())),
-        "image" => attachment_command(true),
-        "audio" => attachment_command(false),
-        _ => ReplCommand::Unknown(format!("/{command}")),
+    let command = match spec.kind {
+        ReplCommandKind::Help => ReplCommand::Help(match mode {
+            ReplInputMode::Tty => argument_of(arguments),
+            ReplInputMode::Plain => None,
+        }),
+        ReplCommandKind::Reset => ReplCommand::Reset,
+        ReplCommandKind::Raw => ReplCommand::ToggleRaw,
+        ReplCommandKind::Stats => ReplCommand::ToggleStats,
+        ReplCommandKind::Pages => ReplCommand::Pages,
+        ReplCommandKind::Profile => ReplCommand::Profile(argument_of(arguments)),
+        ReplCommandKind::Model => ReplCommand::Model(argument_of(arguments)),
+        ReplCommandKind::Session => ReplCommand::Session,
+        ReplCommandKind::ExecutionProvider => {
+            ReplCommand::ExecutionProvider(argument_of(arguments))
+        }
+        ReplCommandKind::DecodeBackend => ReplCommand::DecodeBackend(argument_of(arguments)),
+        ReplCommandKind::System => ReplCommand::System(argument_of(arguments)),
+        ReplCommandKind::Image => parse_attachment(arguments, true),
+        ReplCommandKind::Audio => parse_attachment(arguments, false),
     };
     ReplLine::Command(command)
+}
+
+pub(super) fn complete_repl_line(line: &str, pos: usize) -> Vec<ReplCompletion> {
+    let pos = pos.min(line.len());
+    let input = &line[..pos];
+    if !input.starts_with('/') || input.starts_with("//") {
+        return Vec::new();
+    }
+    let without_slash = &input[1..];
+    let Some((command, arguments)) = without_slash.split_once(char::is_whitespace) else {
+        let prefix = without_slash;
+        return COMMANDS
+            .iter()
+            .filter(|spec| spec.name.starts_with(prefix))
+            .map(|spec| ReplCompletion {
+                replacement: format!("/{}", spec.name),
+                display: spec.usage.to_string(),
+                description: Some(spec.summary.to_string()),
+                start: 0,
+                end: pos,
+                append_space: true,
+            })
+            .collect();
+    };
+
+    let Some(spec) = find_command(command) else {
+        return Vec::new();
+    };
+    let arg_start = 1 + command.len() + 1;
+    let prefix = arguments;
+    complete_argument(spec.completion, prefix, arg_start, pos)
+}
+
+fn complete_argument(
+    source: CompletionSource,
+    prefix: &str,
+    start: usize,
+    end: usize,
+) -> Vec<ReplCompletion> {
+    match source {
+        CompletionSource::None => Vec::new(),
+        CompletionSource::Files => complete_paths(prefix, start, end),
+        CompletionSource::ExecutionProviders => complete_fixed(
+            prefix,
+            available_execution_providers()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            start,
+            end,
+        ),
+        CompletionSource::DecodeBackends => complete_fixed(
+            prefix,
+            ["auto", "ort", "native"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            start,
+            end,
+        ),
+        CompletionSource::ProfileSettings => complete_profile(prefix, start, end),
+    }
+}
+
+fn complete_profile(prefix: &str, start: usize, end: usize) -> Vec<ReplCompletion> {
+    let trimmed_start = prefix.len() - prefix.trim_start().len();
+    let trimmed = prefix.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("verbosity")
+        .or_else(|| trimmed.strip_prefix("detail"))
+    {
+        let level_prefix = rest.trim_start();
+        let level_start = end.saturating_sub(level_prefix.len());
+        return complete_fixed(
+            level_prefix,
+            TraceVerbosity::ALL
+                .iter()
+                .map(|level| level.to_string())
+                .collect(),
+            level_start,
+            end,
+        );
+    }
+    if let Some(rest) = trimmed.strip_prefix("trace") {
+        let path_prefix = rest.trim_start();
+        if path_prefix.is_empty() {
+            return complete_fixed(
+                "trace",
+                vec!["trace".to_string()],
+                start + trimmed_start,
+                end,
+            );
+        }
+        let path_start = end.saturating_sub(path_prefix.len());
+        return complete_paths(path_prefix, path_start, end);
+    }
+    complete_fixed(
+        trimmed,
+        ["on", "off", "trace", "verbosity"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        start + trimmed_start,
+        end,
+    )
+}
+
+fn complete_fixed(
+    prefix: &str,
+    values: Vec<String>,
+    start: usize,
+    end: usize,
+) -> Vec<ReplCompletion> {
+    values
+        .into_iter()
+        .filter(|value| value.starts_with(prefix))
+        .map(|value| ReplCompletion {
+            replacement: value.clone(),
+            display: value,
+            description: None,
+            start,
+            end,
+            append_space: true,
+        })
+        .collect()
+}
+
+fn complete_paths(prefix: &str, start: usize, end: usize) -> Vec<ReplCompletion> {
+    let path = Path::new(prefix);
+    let (base_dir, file_prefix) = match path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => (
+            parent.to_path_buf(),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        ),
+        None => (PathBuf::from("."), prefix),
+    };
+    let Ok(entries) = std::fs::read_dir(&base_dir) else {
+        return Vec::new();
+    };
+    let mut completions = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with(file_prefix).then(|| {
+                let mut replacement = match path.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        parent.join(&name).display().to_string()
+                    }
+                    _ => name.clone(),
+                };
+                let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                if is_dir {
+                    replacement.push(std::path::MAIN_SEPARATOR);
+                }
+                ReplCompletion {
+                    replacement: replacement.clone(),
+                    display: replacement,
+                    description: None,
+                    start,
+                    end,
+                    append_space: !is_dir,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    completions.sort_by(|left, right| left.display.cmp(&right.display));
+    completions
 }
