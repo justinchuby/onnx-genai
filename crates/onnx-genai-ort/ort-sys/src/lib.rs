@@ -14,11 +14,14 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 use std::ffi::{CStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
 type OrtGetApiBaseFn = unsafe extern "system" fn() -> *const OrtApiBase;
 #[cfg(not(windows))]
 type OrtGetApiBaseFn = unsafe extern "C" fn() -> *const OrtApiBase;
+
+static REPORT_SELECTION: AtomicBool = AtomicBool::new(true);
 
 struct OrtLibrary {
     _library: libloading::Library,
@@ -103,6 +106,10 @@ pub fn loaded_ort_api_version() -> Option<u32> {
         LoadState::Loaded(loaded) => loaded.api_version,
         LoadState::Failed(_) => None,
     }
+}
+
+pub fn set_ort_selection_report_enabled(enabled: bool) -> bool {
+    REPORT_SELECTION.swap(enabled, Ordering::Relaxed)
 }
 
 fn load_state() -> &'static LoadState {
@@ -197,7 +204,7 @@ fn explicit_selection_error(attempts: String) -> String {
 }
 
 fn report_loaded_library(loaded: &OrtLibrary) {
-    if loaded.report_selection {
+    if loaded.report_selection && REPORT_SELECTION.load(Ordering::Relaxed) {
         eprintln!(
             "onnx-genai: selected ONNX Runtime {} (API {}) from {} ({})",
             loaded.version,
@@ -524,7 +531,7 @@ fn resolved_library_path_from_symbol(symbol: *const ()) -> Option<PathBuf> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 #[link(name = "dl")]
-extern "C" {}
+unsafe extern "C" {}
 
 #[cfg(unix)]
 fn resolved_library_path_from_symbol(symbol: *const ()) -> Option<PathBuf> {

@@ -78,7 +78,10 @@ pub use value::{DataType, Value};
 /// for CLI diagnostics such as `onnx-genai version`.
 #[must_use]
 pub fn onnxruntime_library_report() -> String {
-    match onnx_genai_ort_sys::ort_load_error() {
+    let previous_report_setting = onnx_genai_ort_sys::set_ort_selection_report_enabled(false);
+    let load_error = onnx_genai_ort_sys::ort_load_error();
+    onnx_genai_ort_sys::set_ort_selection_report_enabled(previous_report_setting);
+    match load_error {
         Some(error) => format!("failed to load ({error})"),
         None => {
             let path = onnx_genai_ort_sys::loaded_ort_path()
