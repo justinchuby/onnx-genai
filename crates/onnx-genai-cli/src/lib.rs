@@ -254,7 +254,7 @@ struct EngineArgs {
     /// per request (native backend only, design §J). A single `--adapters`
     /// entry collapses to the same always-on single-adapter fast path as
     /// `--adapter`. Mutually exclusive with `--adapter`.
-    #[arg(long = "adapters", value_name = "NAME=PATH", value_parser = parse_named_adapter)]
+    #[arg(long = "adapters", value_name = "NAME=PATH", value_parser = parse_named_adapter, conflicts_with = "adapter")]
     adapters: Vec<(String, std::path::PathBuf)>,
 }
 
@@ -295,12 +295,16 @@ impl EngineArgs {
             }
         }
         if !self.adapters.is_empty() {
-            // `--adapter` and `--adapters` are mutually exclusive; clap cannot
-            // express this across a scalar and a repeatable arg, so enforce it
-            // here (the engine also rejects both being set).
-            if self.adapter.is_some() {
-                // Leave both set; the engine load fails loud with a clear message.
-            } else if self.adapters.len() == 1 {
+            // `--adapter` and `--adapters` are mutually exclusive; clap rejects
+            // the combination at parse time (`conflicts_with = "adapter"`), so
+            // this arm only runs when `--adapter` is absent. The engine also
+            // rejects both being set (defense in depth) for direct
+            // `EngineArgs`/`EngineConfig` construction that bypasses clap.
+            debug_assert!(
+                self.adapter.is_none(),
+                "clap must reject --adapter together with --adapters before to_config"
+            );
+            if self.adapters.len() == 1 {
                 // A single named adapter collapses to the always-on DIRECT fast
                 // path (the perf gate: never build the pool/segments machinery
                 // for ≤1 adapter).

@@ -170,9 +170,10 @@ impl NativeDecodeSession {
     /// Feed the Phase-2 grouped-LoRA `segments` routing input (design §J) from a
     /// reused byte buffer. Every token row routes to the currently selected
     /// adapter's [`AdapterId`] (or `-1` for base-only). The buffer is cleared and
-    /// refilled in place, so after warmup no per-token heap allocation happens in
-    /// the decode loop (the tensor payload is `tokens * 4` bytes; decode is one
-    /// token → 4 bytes). A no-op when the session has no grouped adapters.
+    /// refilled in place, so the routing payload is not reallocated per step (the
+    /// tensor payload is `tokens * 4` bytes; decode is one token → 4 bytes); the
+    /// `segments` tensor itself still allocates its shape vector and clones the
+    /// input name each step. A no-op when the session has no grouped adapters.
     fn push_lora_segments(
         &mut self,
         tokens: usize,
@@ -181,13 +182,7 @@ impl NativeDecodeSession {
         let Some(state) = self.lora_segments.as_mut() else {
             return Ok(());
         };
-        let route_bytes = state.active_route().to_le_bytes();
-        state.buffer.clear();
-        state.buffer.reserve(tokens * 4);
-        for _ in 0..tokens {
-            state.buffer.extend_from_slice(&route_bytes);
-        }
-        let tensor = Tensor::from_raw(DataType::Int32, vec![tokens], &state.buffer)
+        let tensor = Tensor::from_raw(DataType::Int32, vec![tokens], state.route_bytes(tokens))
             .context("build native grouped-LoRA segments routing tensor")?;
         owned.push((state.input_name.clone(), tensor));
         Ok(())

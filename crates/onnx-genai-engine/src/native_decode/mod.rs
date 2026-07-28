@@ -82,8 +82,11 @@ pub struct NativeDecodeSession {
     /// base-only or single-adapter (DIRECT) session, so the fast path carries no
     /// grouped state. When set it names the `segments` graph input, the loaded
     /// adapter name → id map, the currently selected adapter (per request), and
-    /// a reused `Int32` buffer so building the per-step routing tensor allocates
-    /// nothing in the decode loop.
+    /// a reused `Int32` buffer for the per-step routing tensor payload. The
+    /// routing byte buffer is refilled in place (no per-step payload
+    /// reallocation), but building the `segments` tensor each step still
+    /// allocates its shape vector and clones the input name, so the grouped path
+    /// is not fully allocation-free in the decode loop.
     lora_segments: Option<LoraSegmentsState>,
 }
 
@@ -97,9 +100,11 @@ struct LoraSegmentsState {
     /// (routing id `-1`). Updated per request by [`NativeDecodeSession::select_lora_adapter`].
     active: Option<onnx_runtime_ep_api::AdapterId>,
     /// Reused little-endian `Int32` routing bytes, refilled in place each step so
-    /// building the per-step `segments` tensor allocates nothing in the decode
-    /// loop after warmup (design perf gate). Holds `tokens` repeated copies of
-    /// the active adapter's routing id.
+    /// the routing payload is not reallocated per step (design perf gate). Holds
+    /// `tokens` repeated copies of the active adapter's routing id. Note the
+    /// `segments` tensor built from it still allocates its shape vector and
+    /// clones the input name each step, so the grouped path is not entirely
+    /// allocation-free.
     buffer: Vec<u8>,
 }
 
@@ -110,6 +115,52 @@ impl LoraSegmentsState {
             Some(id) => id.0 as i32,
             None => -1,
         }
+    }
+
+    /// Reset the active route to `name` (or base-only when `None`) for the
+    /// CURRENT request (design §J.4 per-request selection). Fails loud with a
+    /// typed error when `name` is not a loaded adapter — never a silent base
+    /// fallback. Callers reset this on EVERY request at the single per-request
+    /// choke point so no request can inherit a prior request's route.
+    fn select(&mut self, name: Option<&str>) -> anyhow::Result<()> {
+        match name {
+            None => {
+                self.active = None;
+                Ok(())
+            }
+            Some(name) => {
+                let id = self
+                    .adapter_ids
+                    .iter()
+                    .find(|(adapter_name, _)| adapter_name == name)
+                    .map(|(_, id)| *id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown LoRA adapter {name:?}; loaded adapters: [{}]",
+                            self.adapter_ids
+                                .iter()
+                                .map(|(adapter_name, _)| adapter_name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                self.active = Some(id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Refill the reused little-endian `Int32` routing buffer in place with
+    /// `tokens` copies of the active route id and return the payload. Refilling
+    /// in place avoids reallocating the routing payload per step.
+    fn route_bytes(&mut self, tokens: usize) -> &[u8] {
+        let route_bytes = self.active_route().to_le_bytes();
+        self.buffer.clear();
+        self.buffer.reserve(tokens * 4);
+        for _ in 0..tokens {
+            self.buffer.extend_from_slice(&route_bytes);
+        }
+        &self.buffer
     }
 }
 
@@ -287,32 +338,7 @@ impl NativeDecodeSession {
             "native decode session was not built with a multi-adapter grouped-LoRA pool; \
              per-request adapter selection is unavailable",
         )?;
-        match name {
-            None => {
-                state.active = None;
-                Ok(())
-            }
-            Some(name) => {
-                let id = state
-                    .adapter_ids
-                    .iter()
-                    .find(|(adapter_name, _)| adapter_name == name)
-                    .map(|(_, id)| *id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "unknown LoRA adapter {name:?}; loaded adapters: [{}]",
-                            state
-                                .adapter_ids
-                                .iter()
-                                .map(|(adapter_name, _)| adapter_name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })?;
-                state.active = Some(id);
-                Ok(())
-            }
-        }
+        state.select(name)
     }
 
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK

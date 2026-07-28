@@ -1783,3 +1783,59 @@ fn env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
+
+/// Route-bleed regression guard at the routing-state layer (Issue 1, design
+/// §J.4). Drives the REAL grouped-LoRA route state machine — `select` (as
+/// [`NativeDecodeSession::select_lora_adapter`] delegates to it), `active_route`,
+/// and the reused `route_bytes` buffer that `push_lora_segments` feeds — over a
+/// reused-session request SEQUENCE:
+///   1. plain, select adapter A  → route bytes carry A's id,
+///   2. base-only "speculative" request (no adapter) → MUST reset to base (-1),
+///      never inherit A. Simulates the engine choke point calling `select(None)`
+///      on the speculative path; WITHOUT that reset the buffer would still carry
+///      A's id (the route bleed), which this asserts against,
+///   3. plain base-only → still base (-1).
+#[test]
+fn grouped_lora_route_state_does_not_bleed_across_reused_requests() {
+    use onnx_runtime_ep_api::AdapterId;
+
+    let mut state = LoraSegmentsState {
+        input_name: "lora.segments".to_string(),
+        adapter_ids: vec![
+            ("adapter_a".to_string(), AdapterId(0)),
+            ("adapter_b".to_string(), AdapterId(1)),
+        ],
+        active: None,
+        buffer: Vec::new(),
+    };
+
+    // Request 1 — plain, select adapter A: every token row routes to A (id 0).
+    state.select(Some("adapter_a")).expect("select adapter A");
+    assert_eq!(state.active_route(), 0);
+    assert_eq!(state.route_bytes(1), 0i32.to_le_bytes());
+
+    // Request 2 — base-only (e.g. speculative, no adapter). The engine choke
+    // point resets the route to base-only BEFORE the driver runs; the buffer
+    // must then carry -1, NOT the stale adapter A id. This is the route-bleed
+    // regression assertion: it fails if the reset is skipped.
+    let stale_route = state.active_route();
+    assert_eq!(stale_route, 0, "sanity: A is still active until the reset");
+    state.select(None).expect("reset to base-only");
+    assert_eq!(state.active_route(), -1, "base-only request must not inherit A");
+    // The routing payload fed to decode AND verify now carries base (-1), so a
+    // multi-token verify row is base too.
+    assert_eq!(state.route_bytes(3), (-1i32).to_le_bytes().repeat(3));
+
+    // Request 3 — plain base-only: remains base.
+    state.select(None).expect("stay base-only");
+    assert_eq!(state.active_route(), -1);
+
+    // Selecting B still works and an unknown name fails loud (no base fallback).
+    state.select(Some("adapter_b")).expect("select adapter B");
+    assert_eq!(state.active_route(), 1);
+    let error = state.select(Some("missing")).expect_err("unknown must fail loud");
+    assert!(error.to_string().contains("unknown LoRA adapter"), "{error}");
+    // A failed selection leaves the prior route untouched (still B), never a
+    // silent base fallback.
+    assert_eq!(state.active_route(), 1);
+}
