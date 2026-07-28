@@ -4,7 +4,7 @@
 # this tier, proved by this TEST_HITS counter."
 #
 # The CI lint (scripts/check_dispatch_manifest.py) verifies:
-#   1. The counter exists as a `static ...: AtomicUsize` in the declared file.
+#   1. The counter exists as a `static ...: Atomic{Usize,U64}` in the declared file.
 #   2. The counter has a paired test (delegated to check_dispatch_reachability.py).
 #
 # A missing row means "no claimed optimization" — the op may run on scalar
@@ -42,6 +42,15 @@ counter = "GEMV_F16_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
 description = "M=1 decode uses NEON GEMV, not half_gemm"
 # Proves: fp16_m1_decode_reaches_neon_gemv_not_half_gemm
+
+[[claim]]
+op = "MatMul"
+variant = "f16_m1_colmaj"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "GEMV_F16_COLMAJ_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M=1 decode with column-major B uses NEON GEMV col-major path"
 
 [[claim]]
 op = "MatMul"
@@ -104,6 +113,49 @@ file = "crates/onnx-runtime-session/src/executor/kernel_cache.rs"
 description = "Static-shape graphs use pre-bound kernel path, not hash-lookup"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MaxPool — aarch64-apple-darwin (#324)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "MaxPool"
+variant = "2d_undilated"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "POOL_BNNS_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/pooling.rs"
+description = "2D undilated MaxPool dispatches to BNNS pooling on Apple Silicon"
+# Was 77–88% of ResNet-18 runtime on scalar reference; now 0.13 ms via BNNS.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Add — aarch64-apple-darwin (#324)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Add"
+variant = "contiguous_f32"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "ADD_VDSP_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/add.rs"
+description = "Contiguous same-shape f32 Add uses vDSP_vadd"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BatchNormalization — fusion elimination (not a dispatch tier)
+# ═══════════════════════════════════════════════════════════════════════════════
+# BatchNorm's optimization is graph-level: the optimizer's Conv+BN fusion pass
+# eliminates it entirely from the executed graph. This is NOT a dispatch tier —
+# it's "this op should not execute at all for standard CNN models."
+#
+# The manifest's (op, platform) → minimum_tier schema cannot express "op should
+# be fused away" without lying about what tier means. A [[fusion]] table is the
+# honest extension, but today it has no enforcement mechanism (no counter that
+# proves fusion fired). Rather than force BatchNorm into [[claim]] with a fake
+# tier, we document it as a known-good-but-unguarded optimization.
+#
+# When the optimizer gains a FUSION_FIRED_TEST_HITS counter for Conv+BN folding,
+# add a [[fusion]] row here and extend the lint to verify it.
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Deliberate exclusions (not optimized — by design)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -118,3 +170,15 @@ op = "MatMul"
 variant = "bf16_m_ge2"
 platform = "aarch64-apple-darwin"
 reason = "bf16 M>=2 does not use BNNS — BNNS bf16 support is incomplete on current macOS"
+
+[[exclusion]]
+op = "MaxPool"
+variant = "dilated"
+platform = "aarch64-apple-darwin"
+reason = "Dilated pooling deliberately falls to scalar reference — BNNS does not support dilation"
+
+[[exclusion]]
+op = "BatchNormalization"
+variant = "fusion_elimination"
+platform = "all"
+reason = "Optimization is graph-level Conv+BN fusion (elimination), not dispatch tier. Unguarded pending optimizer-level counter."

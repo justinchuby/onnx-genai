@@ -70,3 +70,14 @@ catches `cfg(target_os)` gating errors that the `x86_64-apple-darwin` recipe mis
 - Cross-EP ready: file field can point to any crate; no CPU-specific logic.
 - Would have caught 7/9 historical instances; misses compilation errors (cross-compile script) and un-claimed ops (human judgment).
 - Filed to `.squad/decisions/inbox/resch-dispatch-manifest.md`.
+
+## 2026-07-27T23:13:00-07:00 — Manifest backfill + inverse check
+
+- Backfilled 3 new claims from PR #324: MaxPool→BNNS (tier1), Add→vDSP (tier2), MatMul f16 colmaj→NEON GEMV (tier2).
+- Added 2 new exclusions: dilated MaxPool, BatchNorm fusion elimination.
+- **Inverse check implemented**: any optimization counter (name does NOT contain SCALAR/FALLBACK/RESCUE/REF) without a manifest row now fails CI. This closes the "human must remember to add a row" gap that PR #324 exploited within 1 hour of the manifest shipping.
+- Fixed AtomicU64 blind spot: both `check_dispatch_reachability.py` and `check_dispatch_manifest.py` now match `Atomic{Usize,U64}` and `pub static`. Counter count went from 8→12.
+- BatchNorm judgement: does NOT fit [[claim]] schema — its optimization is graph-level fusion elimination, not dispatch tier. Documented honestly as [[exclusion]] pending optimizer-level counters. This is the tenth instance and a new failure mode (opset registration, not cfg gate).
+- Guard-break proofs: (1) renamed POOL_BNNS_TEST_HITS → lint failed naming MaxPool/aarch64/tier1; (2) added fake counter → inverse check failed naming file and counter.
+- 973 CPU EP tests pass; all 4 lints green; cargo fmt clean.
+- Filed to `.squad/decisions/inbox/resch-manifest-backfill.md`.
