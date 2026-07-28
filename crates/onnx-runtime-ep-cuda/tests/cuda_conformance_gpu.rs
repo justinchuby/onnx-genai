@@ -159,6 +159,159 @@ fn binary_float(
         .collect()
 }
 
+fn quantize_linear_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "QuantizeLinear[u8,scalar]".into(),
+            op: "QuantizeLinear",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[8],
+                    &[-10.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 12.7, 30.0],
+                ),
+                input(DataType::Float32, &[], &[0.1f32]),
+                input(DataType::Uint8, &[], &[128u8]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![8])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "QuantizeLinear[i8,scalar]".into(),
+            op: "QuantizeLinear",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[7],
+                    &[-20.0f32, -2.5, -0.25, 0.0, 0.25, 2.5, 20.0],
+                ),
+                input(DataType::Float32, &[], &[0.25f32]),
+                input(DataType::Int8, &[], &[-3i8]),
+            ],
+            outputs: vec![(DataType::Int8, vec![7])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn dequantize_linear_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "DequantizeLinear[u8,scalar]".into(),
+            op: "DequantizeLinear",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(DataType::Uint8, &[6], &[0u8, 1, 64, 128, 200, 255]),
+                input(DataType::Float32, &[], &[0.125f32]),
+                input(DataType::Uint8, &[], &[128u8]),
+            ],
+            outputs: vec![(DataType::Float32, vec![6])],
+            attrs: vec![],
+            compare: Compare::Float { tol: 0.0 },
+        },
+        Case {
+            label: "DequantizeLinear[i8,scalar]".into(),
+            op: "DequantizeLinear",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(DataType::Int8, &[6], &[-128i8, -10, -3, 0, 64, 127]),
+                input(DataType::Float32, &[], &[0.25f32]),
+                input(DataType::Int8, &[], &[-3i8]),
+            ],
+            outputs: vec![(DataType::Float32, vec![6])],
+            attrs: vec![],
+            compare: Compare::Float { tol: 0.0 },
+        },
+    ]
+}
+
+fn dropout_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "Dropout[f32,inference,data+mask]".into(),
+            op: "Dropout",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(
+                DataType::Float32,
+                &[2, 3],
+                &[1.0f32, -2.5, 0.0, 4.25, f32::NAN, f32::INFINITY],
+            )],
+            outputs: vec![
+                (DataType::Float32, vec![2, 3]),
+                (DataType::Bool, vec![2, 3]),
+            ],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Dropout[i32,inference]".into(),
+            op: "Dropout",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(DataType::Int32, &[4], &[-7i32, 0, 3, 99])],
+            outputs: vec![(DataType::Int32, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn nonzero_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "NonZero[f32,rank2]".into(),
+            op: "NonZero",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(
+                DataType::Float32,
+                &[2, 3],
+                &[0.0f32, -0.0, 2.5, -1.0, 0.0, 3.0],
+            )],
+            outputs: vec![(DataType::Int64, vec![2, 3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "NonZero[f16,rank3]".into(),
+            op: "NonZero",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(
+                DataType::Float16,
+                &[2, 2, 2],
+                &[0.0, 4.0, 0.0, 0.0, -2.0, 0.0, 7.0, 0.0],
+            )],
+            outputs: vec![(DataType::Int64, vec![3, 3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "NonZero[bf16,rank1]".into(),
+            op: "NonZero",
+            domain: "",
+            opset: 13,
+            inputs: vec![float_input(
+                DataType::BFloat16,
+                &[5],
+                &[0.0, -0.0, 1.0, f32::NAN, -2.0],
+            )],
+            outputs: vec![(DataType::Int64, vec![1, 3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
 /// Output shape of a reduction over `axes` (negative allowed) honouring
 /// `keepdims`.
 fn reduce_out_shape(in_shape: &[usize], axes: &[i64], keepdims: bool) -> Vec<usize> {
@@ -1546,6 +1699,13 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     for op in ["HannWindow", "HammingWindow", "BlackmanWindow"] {
         p.push(sweep(op, window_cases(op)));
     }
+
+    // Batch 9 (issue #67): per-tensor quantization, inference Dropout, and
+    // data-dependent coordinate extraction.
+    p.push(sweep("QuantizeLinear", quantize_linear_cases()));
+    p.push(sweep("DequantizeLinear", dequantize_linear_cases()));
+    p.push(sweep("Dropout", dropout_cases()));
+    p.push(sweep("NonZero", nonzero_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.

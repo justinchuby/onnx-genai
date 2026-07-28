@@ -31,11 +31,61 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
         "Mod" => mod_op(node, input_dtypes),
+        "QuantizeLinear" => quantize_linear(node, input_dtypes),
+        "DequantizeLinear" => dequantize_linear(node, input_dtypes),
+        "Dropout" => dropout(node, input_dtypes),
+        "NonZero" => nonzero(node, input_dtypes),
         _ => return None,
     };
     result
         .err()
         .map(|reason| format!("{}: {reason}", node.op_type))
+}
+
+fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, node.inputs.len(), 1, 1)?;
+    if !(2..=3).contains(&node.inputs.len()) {
+        return Err("requires 2 or 3 inputs".into());
+    }
+    require_dtype(input_dtypes, 0, DataType::Float32, "x")?;
+    require_dtype(input_dtypes, 1, DataType::Float32, "scale")?;
+    if input_dtypes.len() == 3 {
+        require_one_of(
+            input_dtypes,
+            2,
+            &[DataType::Int8, DataType::Uint8],
+            "zero_point",
+        )?;
+    }
+    Ok(())
+}
+
+fn dequantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, node.inputs.len(), 1, 1)?;
+    if !(2..=3).contains(&node.inputs.len()) {
+        return Err("requires 2 or 3 inputs".into());
+    }
+    require_one_of(input_dtypes, 0, &[DataType::Int8, DataType::Uint8], "x")?;
+    require_dtype(input_dtypes, 1, DataType::Float32, "scale")?;
+    if input_dtypes.len() == 3 && input_dtypes[2] != input_dtypes[0] {
+        return Err("zero_point dtype must match x".into());
+    }
+    Ok(())
+}
+
+fn dropout(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 2)?;
+    require_fixed_width(input_dtypes, 0, "data")
+}
+
+fn nonzero(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float32, DataType::Float16, DataType::BFloat16],
+        "X",
+    )
 }
 
 fn required_arity(

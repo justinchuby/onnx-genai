@@ -38,6 +38,7 @@ pub mod csa_device_state;
 pub mod cumprod;
 pub mod cumsum;
 pub(crate) mod device_argmax;
+pub mod dropout;
 pub mod elementwise;
 mod flash_attention;
 pub mod fused_gelu;
@@ -57,6 +58,7 @@ pub mod matmul_nbits;
 pub mod mod_op;
 pub mod movement;
 pub mod nary;
+pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
 pub mod packed_varlen_attention;
@@ -67,6 +69,7 @@ pub mod prelu;
 pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
+pub mod quantization;
 pub mod range;
 pub mod reduce;
 pub mod rotary_embedding;
@@ -293,6 +296,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "HannWindow",
     "HammingWindow",
     "BlackmanWindow",
+    "QuantizeLinear",
+    "DequantizeLinear",
+    "Dropout",
+    "NonZero",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -404,6 +411,36 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("Range", "", 11),
         Box::new(range::RangeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for version in [10, 13, 19, 21, 23, 25] {
+        reg.register(
+            OpKey::new("QuantizeLinear", "", version),
+            Box::new(quantization::LinearQuantFactory {
+                op: quantization::LinearQuantOp::Quantize,
+                runtime: runtime.clone(),
+            }),
+        );
+        reg.register(
+            OpKey::new("DequantizeLinear", "", version),
+            Box::new(quantization::LinearQuantFactory {
+                op: quantization::LinearQuantOp::Dequantize,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    for version in [13, 22] {
+        reg.register(
+            OpKey::new("Dropout", "", version),
+            Box::new(dropout::DropoutFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("NonZero", "", 9),
+        Box::new(nonzero::NonZeroFactory {
             runtime: runtime.clone(),
         }),
     );
