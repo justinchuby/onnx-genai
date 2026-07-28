@@ -27,7 +27,7 @@ jobs:
       - name: Install Rust stable toolchain
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked

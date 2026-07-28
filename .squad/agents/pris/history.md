@@ -84,3 +84,7 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #293 Unique data-dependent-extent coverage and recorded durable dispatch coverage/reachability audit lessons.
+
+## 2026-07-27T17:59:12-07:00 — PR #296 review fixes
+- Fixed cargo cache key correctness: keys now include OS, runner architecture, actual target triple, rustc release, cached cargo tool version, and `Cargo.lock`; this prevents `windows-latest` and `windows-11-arm` from sharing `target/` or `~/.cargo/bin` artifacts.
+- Confirmed `audit.yml` does not use clippy or rustfmt and removed those rustup components from the audit toolchain install.

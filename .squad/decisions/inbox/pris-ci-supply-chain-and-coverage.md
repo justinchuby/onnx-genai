@@ -101,3 +101,19 @@ After merging `origin/main` to restore a mergeable PR test merge, I pushed two c
 - Newer run (follow-up push `da81cb3b`) completed successfully: https://github.com/justinchuby/onnx-genai/actions/runs/30314662714
 
 An earlier run from `6edd2d1a` was also cancelled once the PR became mergeable again and the newer PR run entered the same PR-number group: https://github.com/justinchuby/onnx-genai/actions/runs/30314546751
+
+## Cache key correctness — 2026-07-27 review follow-up
+
+Copilot review caught that `runner.os` alone is too coarse for this repo: `windows-latest` and `windows-11-arm` both report `runner.os == 'Windows'`, but their `target/` artifacts and `~/.cargo/bin` binaries are not interchangeable.
+
+Policy recorded: cargo cache keys must include the OS, runner architecture, actual Rust target triple, rustc release, cached cargo-tool version inputs, and `Cargo.lock`. If a job cross-compiles, the key should use the target triple rather than only the runner architecture.
+
+Implemented key shape in `ci.yml`:
+
+```yaml
+${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+```
+
+`steps.cache-target.outputs.triple` resolves from `matrix.target` when the job supplies an explicit target, otherwise from `rustc -Vv` host. This prevents Windows x86_64 and Windows ARM64 from sharing either restore or save keys.
+
+Audit follow-up: confirmed `audit.yml` only runs `cargo install cargo-audit` and `cargo audit`; it does not run clippy or rustfmt, so the `clippy,rustfmt` rustup components were removed from that workflow.
