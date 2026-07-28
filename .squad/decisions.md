@@ -11018,3 +11018,17 @@ Decision archive gate checked at 2026-07-28T07:46:01+00:00: active ledger was 87
 **Why:** Structural byte kernels provide correct dtype-agnostic coverage for indexing and layout operators while reducing heterogeneous fallback. The all-target Clippy warnings were independently verified as identical and pre-existing on `main`; the default-target CI gate remains clean. Issue #67 stays open as a series.
 
 <!-- sources: decisions/inbox/ricks-75-shape-inference.md; decisions/inbox/sapper-67-cuda-coverage.md; wave-5 manifest -->
+
+<!-- scribe-merge-2026-07-28T08-28-52+00-00-joshi-326-wheels-fix -->
+
+## 2026-07-28 — Wheel-publishing repair for #326 (partial)
+
+**By:** Joshi (implementation); Mariette (review); Scribe (reconciliation)
+
+**What:** PR #337 (`5aed2dcf`) repairs `wheels.yml` publishing for Linux x86_64 and Windows AMD64: exclude the virtual Windows API-set DLL `ext-ms-win-dxcore-l1-1-0.dll` from delvewheel, pin the verified `quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1` image with pull retries, and install `clang-devel` for `ort-sys` bindgen. Linux x86_64 and Windows AMD64 build/smoke checks are green; Mariette approved after verifying the upstream tag, commit-SHA run, and unchanged publish gates.
+
+**Why:** Wheel publishing had been broken since 2026-07-21. The image pin/retries address brittle Quay pulls, `clang-devel` supplies libclang required by bindgen, and DXCore is a Windows API-set DLL which must not be vendored.
+
+**Open gap:** #326 remains open: macOS x86_64 extraction of the upstream `onnxruntime-osx-x86_64-1.27.0.tgz` fails because the archive is unavailable/returns an unrecognized format. This needs an ORT version bump or alternate source and is held for Justin; it is separate from the merged Linux/Windows fix.
+
+Decision archive hard gate checked at 2026-07-28T08:28:52+00:00: active ledger was 872849 bytes before this merge. No dated decision sections older than 2026-07-21 were eligible for archival.
