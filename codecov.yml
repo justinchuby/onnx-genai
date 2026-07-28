@@ -16,3 +16,13 @@ ignore:
   - "target/**"
   - "crates/onnx-genai-ort/ort-sys/**"
   - "**/*_generated.rs"
+
+flags:
+  offline:
+    carryforward: false
+  cli-ort-linux:
+    carryforward: false
+  cli-ort-windows:
+    carryforward: false
+  mlas:
+    carryforward: false

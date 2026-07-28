@@ -42,6 +42,11 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.
 - Tightened model-scale GEMV max-relative tolerance from 2.0% to 1.8%, based on Chew's 1.57% measured worst legitimate f32 accumulation-order drift.
 
+## 2026-07-27T14:08:06-07:00 — CI supply-chain hardening and coverage
+- Replaced personally-owned Rust setup/cache/install actions in `ci.yml` and `audit.yml` with direct `rustup`, GitHub-owned `actions/cache@v4`, and direct pinned `cargo install cargo-llvm-cov 0.8.7`.
+- Converted coverage-capable test lanes to upload Codecov flags: `offline`, `mlas`, `cli-ort-linux`, and `cli-ort-windows`; verified final CI green at https://github.com/justinchuby/onnx-genai/actions/runs/30309892830.
+- Confirmed CLI ORT Linux still executes `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer`; Windows CLI ORT stages the DLL into cargo-llvm-cov target paths with `--no-clean`.
+- Documented Windows ARM64 coverage blocker (rust-lang/rust#150123) and release workflow debt in `.squad/decisions/inbox/pris-ci-supply-chain-and-coverage.md`.
 ## 2026-07-27T15:25:00-07:00 — REPL e2e output assertion hardening
 - Fixed the flaky `piped_help_with_an_argument_still_prints_full_help` regression test by comparing stdout-only REPL help listings instead of merged stdout+stderr, which can contain ONNX Runtime/tracing timestamps.
 - Audited `crates/onnx-genai-cli/tests/repl_e2e.rs` and split several command/error assertions so stdout help/session-continuation checks are not coupled to stderr logs.
@@ -65,6 +70,11 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Decision filed: `.squad/decisions/inbox/pris-dispatch-coverage-audit.md`.
 - Commit: `17be7087` (coordinated with Iran's fix in same commit).
 
+## 2026-07-27T16:31:27-07:00 — CI concurrency cancellation
+- Added top-level concurrency cancellation to `ci.yml` using PR-number grouping for pull requests and SHA grouping for push/main runs, preserving post-merge `main` signal while cancelling stale PR coverage runs.
+- Added top-level concurrency cancellation to `audit.yml`, grouped by ref because audit has no pull request trigger.
+- Deliberately exempted release/state-mutating workflows: `publish.yml`, `wheels.yml`, and the squad issue/label workflows.
+- Verified by rapid pushes: run 30314651548 cancelled and run 30314662714 completed successfully.
 ## 2026-07-27T15:17:00-07:00 — Dispatch-reachability CI lint
 
 - Implemented `scripts/check_dispatch_reachability.py`: enforces that every `static ...TEST_HITS` counter has a corresponding `#[test]` reading it.
@@ -78,3 +88,7 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #293 Unique data-dependent-extent coverage and recorded durable dispatch coverage/reachability audit lessons.
+
+## 2026-07-27T17:59:12-07:00 — PR #296 review fixes
+- Fixed cargo cache key correctness: keys now include OS, runner architecture, actual target triple, rustc release, cached cargo tool version, and `Cargo.lock`; this prevents `windows-latest` and `windows-11-arm` from sharing `target/` or `~/.cargo/bin` artifacts.
+- Confirmed `audit.yml` does not use clippy or rustfmt and removed those rustup components from the audit toolchain install.
