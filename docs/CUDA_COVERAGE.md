@@ -168,6 +168,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
 | `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic NCHW spatial-block rearrangement with runtime `blocksize`, including multi-channel and empty-batch tensors (`structural.rs`). |
 | `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
+| `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
+| `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
 
 ## Source-derived coverage audit (2026-07-27)
 
@@ -330,6 +332,15 @@ channels, dtype overrides, diagonal offsets, and empty tensors. This raises the
 machine-verified `CUDA_COVERED_OPS` count from **131** to **134** and the current
 CPU standard-domain parity count from **102 / 141** to **105 / 141**. These ops
 move out of the CPU `ai.onnx` gap list.
+
+The issue #67 operator-coverage batch 7 adds `Pad` and `Range`. `Pad` supports
+all four ONNX modes, negative cropping, subset/negative axes, and arbitrary
+fixed-width element storage. `Range` supports f32/f16/bf16 and Int64 with
+positive or negative deltas. GPU parity covers nonzero constant fill, subset
+axes, cropping, reflect/wrap modes, fractional float steps, narrow float
+storage, and descending Int64 sequences. This raises the machine-verified
+`CUDA_COVERED_OPS` count from **134** to **136** and current CPU standard-domain
+parity from **105 / 141** to **107 / 141**.
 
 ---
 
