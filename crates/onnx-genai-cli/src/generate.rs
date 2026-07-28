@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use onnx_genai::EngineConfig;
 use onnx_genai::engine::PipelineEngine;
 use onnx_genai::ort::{ChatMessage, Tokenizer};
 use onnx_genai::text_to_audio;
@@ -16,7 +15,7 @@ use super::interactive::{
 };
 use super::output::{build_turn_prompt, detect_reasoning, load_chat_template, run_generation_turn};
 use super::profile::{self, RunProfile};
-use super::{GenerateArgs, ProfileArgs, resolve_model_dir};
+use super::{GenerateArgs, ProfileArgs, decode_backend_name, resolve_model_dir};
 
 pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::Result<()> {
     install_ctrlc_handler();
@@ -53,6 +52,7 @@ pub(super) fn generate(args: GenerateArgs, profiling: &ProfileArgs) -> anyhow::R
 
     let load_started = std::time::Instant::now();
     let mut backend = Backend::load(&model_dir, args.engine.to_config())?;
+    profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
     let prompt_tokens = backend.prompt_tokens(&turn.prompt).unwrap_or_default();
     let effective_max_context = backend.effective_max_context(&turn.options);
@@ -123,7 +123,7 @@ fn generate_image(
         .expect("image output path checked by the caller");
     let request = args.image_output.to_request(args.prompt.clone());
     let load_started = std::time::Instant::now();
-    let mut engine = PipelineEngine::from_dir_with_config(model_dir, EngineConfig::default())
+    let mut engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())
         .map_err(|error| {
             anyhow::anyhow!(
                 "What: {} could not be loaded as a diffusion pipeline. \
@@ -133,6 +133,7 @@ fn generate_image(
             )
         })?;
 
+    profile.decode_backend = Some(decode_backend_name(engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
     let render_started = std::time::Instant::now();
     let images = text_to_image::render(model_dir, &mut engine, &request)?;
@@ -212,6 +213,7 @@ fn generate_audio(
     })?;
     let load_started = std::time::Instant::now();
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, args.engine.to_config())?;
+    profile.decode_backend = Some(decode_backend_name(engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
 
     let request = args

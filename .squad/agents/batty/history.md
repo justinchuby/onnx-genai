@@ -73,3 +73,12 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_scale semantics and multi-ControlNet port backing before re-review.
 - 2026-07-27T16:44:54Z — Fixed PR #283 / #50 after Bishop REQUEST-CHANGES: removed invented `conditioning_scale`, bound real mobius `controlnet_cond`, made multi-ControlNet fail loudly, and added contract-pinning tests. Bishop approved; PR merged as 687612f5.
+
+## 2026-07-27T14:08:06-07:00 — CLI backend flag
+
+- Added shared `--backend auto|ort|native` plumbing for `generate` and `run`, reusing the REPL `/backend` parser.
+- `run --backend` now seeds `SessionSettings`, so the initial load and later `/backend` switches use the same reload-bound backend state.
+- Default remains `auto`; explicit `native` reaches `EngineConfig` and fails clearly without native feature support instead of falling back.
+- Gates passed in `backend-flag`: `cargo build -p onnx-genai-cli`, `cargo test -p onnx-genai-cli --lib`, `cargo fmt -p onnx-genai-cli -- --check`, `cargo clippy -p onnx-genai-cli --all-targets -- -D warnings`.
+
+
