@@ -17,8 +17,10 @@ until allocation fails and reports that failure transactionally.
 
 ## Growth
 
-Both ORT shared-buffer KV and native CUDA grow on demand by the shared bucket
-policy instead of pre-allocating the full context. The orchestration lives in
+Both ORT shared-buffer KV and native CUDA pre-allocate at the minimum bucket
+(256 tokens by default, overridden by `ONNX_GENAI_KV_MIN_BUCKET`) and grow on
+demand by the shared bucket policy up to the hard maximum, never pre-allocating
+the full declared context length. The orchestration lives in
 `onnx_genai_kv::ensure_kv_capacity` over the `KvCapacityGrowthBackend` trait:
 reject above the hard maximum, compute the next `kv_capacity_bucket`, build all
 fallible replacement state while the old state remains live, invalidate graph

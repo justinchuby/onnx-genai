@@ -379,13 +379,15 @@ fn resolve_metadata_and_decode_path(
         anyhow::bail!("Unsupported capabilities: {unsupported:?}");
     }
 
-    // Optional factual cap on runtime-owned KV growth. Foundry /
+    // Optional explicit cap on runtime-owned KV growth. Foundry /
     // onnxruntime-genai `genai_config.json` models advertise the model's full
-    // `context_length` (e.g. 32k-131k) as their max sequence length. Shared KV
-    // now grows by buckets instead of pre-allocating that full length, but callers
-    // can still set `ONNX_GENAI_KV_MAX_LEN` as an explicit generation-budget cap,
-    // mirroring the native path's `ONNX_GENAI_CUDA_KV_MAX_LEN`. Unset = model
-    // metadata is the factual ceiling.
+    // `context_length` (e.g. 32k-131k) as their max sequence length. The
+    // shared-buffer decode path pre-allocates at an initial power-of-two bucket
+    // (256 tokens by default, overridden by `ONNX_GENAI_KV_MIN_BUCKET`) and grows
+    // on demand up to the model's declared `max_length`; it does not pre-allocate
+    // the full context. `ONNX_GENAI_KV_MAX_LEN` caps growth below the model
+    // maximum, mirroring the native path's `ONNX_GENAI_CUDA_KV_MAX_LEN`.
+    // Unset = model metadata is the factual ceiling.
     let kv_shared_buffer_cap = shared_buffer_cap_from_env();
     let metadata_max_context = metadata
         .model
