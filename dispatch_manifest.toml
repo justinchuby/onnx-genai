@@ -1,0 +1,120 @@
+# Dispatch Manifest — Claimed Optimizations
+#
+# Each [[claim]] declares: "On this platform, this op dispatches to at least
+# this tier, proved by this TEST_HITS counter."
+#
+# The CI lint (scripts/check_dispatch_manifest.py) verifies:
+#   1. The counter exists as a `static ...: AtomicUsize` in the declared file.
+#   2. The counter has a paired test (delegated to check_dispatch_reachability.py).
+#
+# A missing row means "no claimed optimization" — the op may run on scalar
+# reference without CI complaint. This is intentional: the manifest guards
+# only what we explicitly claim.
+#
+# Adding a row is a commitment: from that point forward, CI blocks any change
+# that removes the counter or breaks the test. Removing a row is a conscious
+# un-claim — legitimate when an optimization is deprecated or superseded.
+#
+# Tier vocabulary (ordered, highest = most optimized):
+#   tier1 — Hardware-accelerated framework (BNNS, AMX, cuBLAS, Metal MPS)
+#   tier2 — Explicit SIMD / optimized library (NEON GEMV, im2col+cblas, AVX2)
+#   tier3 — Scalar reference (always correct, never fast)
+#
+# "minimum_tier" means "the dispatch MUST reach at least this tier." A claim
+# of tier2 is satisfied by tier1 or tier2, but NOT by tier3.
+#
+# ─── Exclusions ──────────────────────────────────────────────────────────────
+# Use [[exclusion]] to document cases we deliberately do NOT optimize.
+# These are not enforced — they exist to prevent someone from adding a claim
+# row for something we intentionally skip, and to distinguish "not yet done"
+# from "decided against."
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MatMul (f16) — aarch64-apple-darwin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "MatMul"
+variant = "f16_m1"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "GEMV_F16_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M=1 decode uses NEON GEMV, not half_gemm"
+# Proves: fp16_m1_decode_reaches_neon_gemv_not_half_gemm
+
+[[claim]]
+op = "MatMul"
+variant = "f16_m_ge2"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "BNNS_F16_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M>=2 prefill uses BNNS/AMX"
+# Proves: fp16_m_ge2_prefill_reaches_bnns_not_half_gemm
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Conv — aarch64-apple-darwin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Conv"
+variant = "standard"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "CONV_BNNS_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "Standard Conv dispatches to BNNS on Apple Silicon"
+# Tier1=BNNS, Tier2=im2col+cblas_sgemm, Tier3=scalar
+
+[[claim]]
+op = "Conv"
+variant = "non_bnns_fallback"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "CONV_IM2COL_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "When BNNS rejects (e.g. unsupported dilation), falls to im2col+GEMM not scalar"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SDPA — aarch64
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "SDPA"
+variant = "default"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "SDPA_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA uses NEON-accelerated dot/axpy on aarch64"
+# Proves: sdpa_dispatcher_reaches_neon_on_aarch64
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kernel dispatch — all platforms
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "KernelDispatch"
+variant = "prebind"
+platform = "all"
+minimum_tier = "tier2"
+counter = "PREBIND_FAST_PATH_TEST_HITS"
+file = "crates/onnx-runtime-session/src/executor/kernel_cache.rs"
+description = "Static-shape graphs use pre-bound kernel path, not hash-lookup"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Deliberate exclusions (not optimized — by design)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[exclusion]]
+op = "Conv"
+variant = "depthwise"
+platform = "aarch64-apple-darwin"
+reason = "Depthwise conv (groups > 1) deliberately on scalar reference pending profiling"
+
+[[exclusion]]
+op = "MatMul"
+variant = "bf16_m_ge2"
+platform = "aarch64-apple-darwin"
+reason = "bf16 M>=2 does not use BNNS — BNNS bf16 support is incomplete on current macOS"
