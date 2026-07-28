@@ -1468,6 +1468,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2302,6 +2304,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
+ "onnx-model-package",
  "onnx-runtime-loader",
  "onnx-runtime-tracer",
  "onnx-std",
@@ -2406,6 +2409,16 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "onnx-model-package"
+version = "0.1.0-dev.5"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

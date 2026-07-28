@@ -34,24 +34,42 @@ pub(crate) fn cap_kv_len(model_max_len: usize, cap: Option<usize>) -> usize {
 /// currently loading model regresses.
 #[cfg(feature = "native-backend")]
 pub(crate) fn genai_config_compat_metadata_from_model_path(
-    model_dir: &Path,
+    genai_config_path: Option<&Path>,
     model_path: &Path,
 ) -> anyhow::Result<Option<InferenceMetadata>> {
     let decoder_graph = decoder_graph_info_from_model_path(model_path);
-    let result = match &decoder_graph {
-        Some(graph) => {
+    let result = match (genai_config_path, &decoder_graph) {
+        (Some(path), Some(graph)) => {
+            onnx_genai_genai_config::inference_metadata_from_path_with_graph(
+                path,
+                graph
+                    .inputs
+                    .iter()
+                    .find(|info| crate::decode::is_kv_input(&info.name))
+                    .map(|info| info.dtype.as_str()),
+                graph,
+            )
+            .map(Some)
+        }
+        (Some(path), None) => {
+            onnx_genai_genai_config::inference_metadata_from_path(path, None).map(Some)
+        }
+        (None, Some(graph)) => {
             let kv_native_dtype = graph
                 .inputs
                 .iter()
                 .find(|info| crate::decode::is_kv_input(&info.name))
                 .map(|info| info.dtype.as_str());
             onnx_genai_genai_config::inference_metadata_from_dir_with_graph(
-                model_dir,
+                model_path.parent().unwrap_or_else(|| Path::new(".")),
                 kv_native_dtype,
                 graph,
             )
         }
-        None => onnx_genai_genai_config::inference_metadata_from_dir(model_dir, None),
+        (None, None) => onnx_genai_genai_config::inference_metadata_from_dir(
+            model_path.parent().unwrap_or_else(|| Path::new(".")),
+            None,
+        ),
     };
     result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
 }
@@ -133,7 +151,7 @@ pub(crate) fn ir_dtype_name(dtype: onnx_runtime_ir::DataType) -> &'static str {
 /// `genai_config.json`. The KV cache native dtype is read from the loaded
 /// session's KV inputs, since it is not present in `genai_config.json`.
 pub(crate) fn genai_config_compat_metadata(
-    model_dir: &Path,
+    genai_config_path: Option<&Path>,
     session: &Session,
 ) -> anyhow::Result<Option<InferenceMetadata>> {
     let kv_native_dtype = session
@@ -157,12 +175,17 @@ pub(crate) fn genai_config_compat_metadata(
     // `kv_outputs` plus recurrent `state_pairs`; uniform dense-KV decoders are
     // unchanged.
     let decoder_graph = session_model_graph_info(session);
-    onnx_genai_genai_config::inference_metadata_from_dir_with_graph(
-        model_dir,
-        kv_native_dtype,
-        &decoder_graph,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
+    let result = if let Some(path) = genai_config_path {
+        onnx_genai_genai_config::inference_metadata_from_path_with_graph(
+            path,
+            kv_native_dtype,
+            &decoder_graph,
+        )
+        .map(Some)
+    } else {
+        Ok(None)
+    };
+    result.map_err(|e| anyhow::anyhow!("Failed to convert genai_config.json: {e}"))
 }
 
 /// Build a [`ModelGraphInfo`] inventory from a loaded session's input/output
