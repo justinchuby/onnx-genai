@@ -653,8 +653,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cli-ort-${{ env.SLOW_TIER }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-cli-ort-${{ env.SLOW_TIER }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
             ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
       - name: Install Linux bindgen dependencies
         if: runner.os == 'Linux'
