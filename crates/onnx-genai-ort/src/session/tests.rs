@@ -84,6 +84,23 @@ fn resolves_cuda_to_nvidia_gpu_capabilities() {
 }
 
 #[test]
+fn cuda_selection_device_id_option_overrides_environment_default() {
+    let mut selection = ep_selection("cuda");
+    selection
+        .options
+        .insert("device_id".to_string(), "3".to_string());
+
+    let resolved = resolve_execution_provider(&selection);
+
+    assert_eq!(resolved.caps.device_id(), Some(3));
+    #[cfg(feature = "cuda")]
+    assert!(matches!(
+        resolved.strategy,
+        ep_compat::AppendStrategy::CudaTyped { device_id: 3 }
+    ));
+}
+
+#[test]
 fn convenience_selection_uses_env_name_normalization() {
     let cuda = ep_selection("CUDA");
     assert_eq!(cuda, EpSelection::new("CUDA"));

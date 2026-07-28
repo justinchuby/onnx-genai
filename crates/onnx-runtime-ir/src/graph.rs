@@ -158,6 +158,12 @@ impl Graph {
         self.unknown_value_shapes.insert(id);
     }
 
+    /// Mark a value's shape as known (e.g. after seeding a control-flow
+    /// subgraph's formal input from the owning node's operand shape).
+    pub fn mark_value_shape_known(&mut self, id: ValueId) {
+        self.unknown_value_shapes.remove(&id);
+    }
+
     // === Symbolic dimensions ===
 
     /// Allocate a fresh symbolic dimension with an optional name (no dedup).

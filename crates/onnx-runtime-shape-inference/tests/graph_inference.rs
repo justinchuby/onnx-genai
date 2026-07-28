@@ -875,3 +875,413 @@ fn bert_toy_fully_resolves() {
     let opset = *opsets.get("").unwrap_or(&0);
     assert!(opset >= 1);
 }
+
+// ===========================================================================
+// Loop / Scan control-flow inference.
+// ===========================================================================
+
+/// A `Loop` body `(iter_num, cond_in, v) -> (cond_out, v_out, scan_out)` that
+/// passes the single loop-carried value straight through and emits it as a scan
+/// output too. The carried formal input `v` is left shape/type-unknown so the
+/// test proves the shape is supplied by *seeding* from the `Loop` operand.
+fn loop_passthrough_body() -> Graph {
+    let mut body = Graph::new();
+    let iter = body.create_named_value("iter", DataType::Int64, Shape::new());
+    body.add_input(iter);
+    let cond_in = body.create_named_value("cond_in", DataType::Bool, Shape::new());
+    body.add_input(cond_in);
+    let v = body.create_named_value("v", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(v);
+    body.mark_value_shape_unknown(v);
+    body.add_input(v);
+
+    let cond_out = body.create_named_value("cond_out", DataType::Bool, Shape::new());
+    body.insert_node(node(0, "Identity", vec![Some(cond_in)], vec![cond_out]));
+    let v_out = body.create_named_value("v_out", DataType::Float32, Shape::new());
+    body.insert_node(node(1, "Identity", vec![Some(v)], vec![v_out]));
+    let scan_out = body.create_named_value("scan_out", DataType::Float32, Shape::new());
+    body.insert_node(node(2, "Identity", vec![Some(v)], vec![scan_out]));
+    body.add_output(cond_out);
+    body.add_output(v_out);
+    body.add_output(scan_out);
+    body
+}
+
+/// Build a single-carried `Loop` with the pass-through body. `trip_count`, when
+/// `Some`, is supplied as a static scalar `M` initializer; when `None`, `M` is a
+/// dynamic input. Returns `(graph, carried_output, scan_output)`.
+fn build_loop(trip_count: Option<i64>, carried_shape: Shape) -> (Graph, ValueId, ValueId) {
+    let mut graph = Graph::new();
+    let m = graph.create_named_value("M", DataType::Int64, Shape::new());
+    match trip_count {
+        Some(value) => graph.set_initializer(
+            m,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int64,
+                vec![],
+                i64_bytes(&[value]),
+            )),
+        ),
+        None => graph.add_input(m),
+    }
+    let cond = graph.create_named_value("cond", DataType::Bool, Shape::new());
+    graph.add_input(cond);
+    let v = graph.create_named_value("v", DataType::Float32, carried_shape);
+    graph.add_input(v);
+
+    let carried_out = graph.create_named_value("carried_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(carried_out);
+    graph.mark_value_shape_unknown(carried_out);
+    let scan = graph.create_named_value("scan", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(scan);
+    graph.mark_value_shape_unknown(scan);
+
+    let loop_node = graph.insert_node(node(
+        0,
+        "Loop",
+        vec![Some(m), Some(cond), Some(v)],
+        vec![carried_out, scan],
+    ));
+    graph
+        .subgraphs
+        .insert((loop_node, "body".into()), loop_passthrough_body());
+    graph.add_output(carried_out);
+    graph.add_output(scan);
+    graph.opset_imports.insert(String::new(), 21);
+    (graph, carried_out, scan)
+}
+
+#[test]
+fn loop_static_trip_count_stacks_scan_output_and_propagates_carried_shape() {
+    let (mut graph, carried_out, scan) = build_loop(Some(5), vec![Dim::Static(2), Dim::Static(3)]);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Loop with static trip count");
+
+    // Loop-carried final keeps the body carried-output shape.
+    assert_eq!(
+        graph.value(carried_out).shape,
+        vec![Dim::Static(2), Dim::Static(3)]
+    );
+    assert_eq!(graph.value(carried_out).dtype, DataType::Float32);
+    // Scan output gains a leading trip-count axis. The trip count is symbolic
+    // even for a static `M`, because `cond` can early-exit; execution computes
+    // the true extent and eager buffer planning must not over-reserve `M` slots.
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "trip count must produce a symbolic leading dim, got {shape:?}"
+    );
+    assert_eq!(shape[1..], [Dim::Static(2), Dim::Static(3)]);
+}
+
+#[test]
+fn loop_dynamic_trip_count_uses_symbolic_leading_scan_dim() {
+    let (mut graph, carried_out, scan) = build_loop(None, vec![Dim::Static(2), Dim::Static(3)]);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Loop with dynamic trip count");
+
+    assert_eq!(
+        graph.value(carried_out).shape,
+        vec![Dim::Static(2), Dim::Static(3)]
+    );
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "unknown trip count must produce a symbolic leading dim, got {shape:?}"
+    );
+    assert_eq!(shape[1..], [Dim::Static(2), Dim::Static(3)]);
+}
+
+#[test]
+fn loop_preserves_symbolic_carried_dimension_through_the_body() {
+    let mut graph = Graph::new();
+    let batch = graph.intern_symbol("batch");
+    let m = graph.create_named_value("M", DataType::Int64, Shape::new());
+    graph.set_initializer(
+        m,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![],
+            i64_bytes(&[4]),
+        )),
+    );
+    let cond = graph.create_named_value("cond", DataType::Bool, Shape::new());
+    graph.add_input(cond);
+    let v = graph.create_named_value(
+        "v",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(3)],
+    );
+    graph.add_input(v);
+    let carried_out = graph.create_named_value("carried_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(carried_out);
+    graph.mark_value_shape_unknown(carried_out);
+    let scan = graph.create_named_value("scan", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(scan);
+    graph.mark_value_shape_unknown(scan);
+    let loop_node = graph.insert_node(node(
+        0,
+        "Loop",
+        vec![Some(m), Some(cond), Some(v)],
+        vec![carried_out, scan],
+    ));
+    graph
+        .subgraphs
+        .insert((loop_node, "body".into()), loop_passthrough_body());
+    graph.add_output(carried_out);
+    graph.add_output(scan);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Loop with symbolic carried dim");
+
+    assert_eq!(
+        graph.value(carried_out).shape,
+        vec![Dim::Symbolic(batch), Dim::Static(3)]
+    );
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "trip count must produce a symbolic leading dim, got {shape:?}"
+    );
+    assert_eq!(shape[1..], [Dim::Symbolic(batch), Dim::Static(3)]);
+}
+
+/// A `Scan` body `(state, scan_slice) -> (state_out, scan_out)` that passes both
+/// through. Both formal inputs are shape/type-unknown, so shapes come only from
+/// seeding (state unchanged; scan slice with its scan axis stripped).
+fn scan_passthrough_body() -> Graph {
+    let mut body = Graph::new();
+    let state = body.create_named_value("state", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(state);
+    body.mark_value_shape_unknown(state);
+    body.add_input(state);
+    let slice = body.create_named_value("slice", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(slice);
+    body.mark_value_shape_unknown(slice);
+    body.add_input(slice);
+
+    let state_out = body.create_named_value("state_out", DataType::Float32, Shape::new());
+    body.insert_node(node(0, "Identity", vec![Some(state)], vec![state_out]));
+    let scan_out = body.create_named_value("scan_out", DataType::Float32, Shape::new());
+    body.insert_node(node(1, "Identity", vec![Some(slice)], vec![scan_out]));
+    body.add_output(state_out);
+    body.add_output(scan_out);
+    body
+}
+
+fn build_scan(
+    opset: u64,
+    state_shape: Shape,
+    scan_shape: Shape,
+    input_axes: Option<Vec<i64>>,
+    output_axes: Option<Vec<i64>>,
+) -> (Graph, ValueId, ValueId) {
+    let mut graph = Graph::new();
+    let state = graph.create_named_value("state_init", DataType::Float32, state_shape);
+    graph.add_input(state);
+    let scan_in = graph.create_named_value("scan_in", DataType::Float32, scan_shape);
+    graph.add_input(scan_in);
+
+    let state_out = graph.create_named_value("state_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(state_out);
+    graph.mark_value_shape_unknown(state_out);
+    let scan_out = graph.create_named_value("scan_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(scan_out);
+    graph.mark_value_shape_unknown(scan_out);
+
+    let mut scan_node = node(
+        0,
+        "Scan",
+        vec![Some(state), Some(scan_in)],
+        vec![state_out, scan_out],
+    );
+    scan_node
+        .attributes
+        .insert("num_scan_inputs".into(), Attribute::Int(1));
+    if let Some(axes) = input_axes {
+        scan_node
+            .attributes
+            .insert("scan_input_axes".into(), Attribute::Ints(axes));
+    }
+    if let Some(axes) = output_axes {
+        scan_node
+            .attributes
+            .insert("scan_output_axes".into(), Attribute::Ints(axes));
+    }
+    let scan_id = graph.insert_node(scan_node);
+    graph
+        .subgraphs
+        .insert((scan_id, "body".into()), scan_passthrough_body());
+    graph.add_output(state_out);
+    graph.add_output(scan_out);
+    graph.opset_imports.insert(String::new(), opset);
+    (graph, state_out, scan_out)
+}
+
+#[test]
+fn scan_strips_input_axis_and_reinserts_output_axis() {
+    let (mut graph, state_out, scan_out) = build_scan(
+        16,
+        vec![Dim::Static(2)],
+        vec![Dim::Static(6), Dim::Static(4)],
+        None,
+        None,
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Scan");
+
+    // Final state keeps its shape; scan output re-gains the sequence axis (6).
+    assert_eq!(graph.value(state_out).shape, vec![Dim::Static(2)]);
+    assert_eq!(
+        graph.value(scan_out).shape,
+        vec![Dim::Static(6), Dim::Static(4)]
+    );
+}
+
+#[test]
+fn scan_honours_non_default_input_and_output_axes() {
+    // Scan axis 1 of a [4, 6] input (sequence length 6); output axis 1.
+    let (mut graph, state_out, scan_out) = build_scan(
+        16,
+        vec![Dim::Static(2)],
+        vec![Dim::Static(4), Dim::Static(6)],
+        Some(vec![1]),
+        Some(vec![1]),
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Scan with custom axes");
+
+    assert_eq!(graph.value(state_out).shape, vec![Dim::Static(2)]);
+    // Per-iteration slice is [4]; the sequence axis (6) is inserted at axis 1.
+    assert_eq!(
+        graph.value(scan_out).shape,
+        vec![Dim::Static(4), Dim::Static(6)]
+    );
+}
+
+#[test]
+fn scan_opset_eight_is_not_modelled_and_leaves_outputs_unresolved() {
+    let (mut graph, state_out, scan_out) = build_scan(
+        8,
+        vec![Dim::Static(2)],
+        vec![Dim::Static(6), Dim::Static(4)],
+        None,
+        None,
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer legacy Scan");
+
+    // The opset-8 form (extra sequence_lens input, different body signature) is
+    // deliberately not inferred: outputs stay unresolved rather than wrong.
+    assert!(report.unresolved.contains(&state_out));
+    assert!(report.unresolved.contains(&scan_out));
+}
+
+#[test]
+fn loop_body_with_nested_if_resolves_through_both_subgraph_levels() {
+    let mut body = Graph::new();
+    let iter = body.create_named_value("iter", DataType::Int64, Shape::new());
+    body.add_input(iter);
+    let cond_in = body.create_named_value("cond_in", DataType::Bool, Shape::new());
+    body.add_input(cond_in);
+    let v = body.create_named_value("v", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(v);
+    body.mark_value_shape_unknown(v);
+    body.add_input(v);
+
+    // Inner If both branches return the captured carried value `v`.
+    let w = body.create_named_value("w", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(w);
+    body.mark_value_shape_unknown(w);
+    let if_node = body.insert_node(node(0, "If", vec![Some(cond_in)], vec![w]));
+    body.subgraphs.insert(
+        (if_node, "then_branch".into()),
+        captured_identity_branch("v"),
+    );
+    body.subgraphs.insert(
+        (if_node, "else_branch".into()),
+        captured_identity_branch("v"),
+    );
+
+    let cond_out = body.create_named_value("cond_out", DataType::Bool, Shape::new());
+    body.insert_node(node(1, "Identity", vec![Some(cond_in)], vec![cond_out]));
+    let v_out = body.create_named_value("v_out", DataType::Float32, Shape::new());
+    body.insert_node(node(2, "Identity", vec![Some(w)], vec![v_out]));
+    let scan_out = body.create_named_value("scan_out", DataType::Float32, Shape::new());
+    body.insert_node(node(3, "Identity", vec![Some(w)], vec![scan_out]));
+    body.add_output(cond_out);
+    body.add_output(v_out);
+    body.add_output(scan_out);
+
+    let mut graph = Graph::new();
+    let m = graph.create_named_value("M", DataType::Int64, Shape::new());
+    graph.set_initializer(
+        m,
+        WeightRef::Inline(TensorData::from_raw(
+            DataType::Int64,
+            vec![],
+            i64_bytes(&[3]),
+        )),
+    );
+    let cond = graph.create_named_value("cond", DataType::Bool, Shape::new());
+    graph.add_input(cond);
+    let v = graph.create_named_value("v", DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]);
+    graph.add_input(v);
+    let carried_out = graph.create_named_value("carried_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(carried_out);
+    graph.mark_value_shape_unknown(carried_out);
+    let scan = graph.create_named_value("scan", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(scan);
+    graph.mark_value_shape_unknown(scan);
+    let loop_node = graph.insert_node(node(
+        0,
+        "Loop",
+        vec![Some(m), Some(cond), Some(v)],
+        vec![carried_out, scan],
+    ));
+    graph.subgraphs.insert((loop_node, "body".into()), body);
+    graph.add_output(carried_out);
+    graph.add_output(scan);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer nested Loop/If");
+
+    assert_eq!(
+        graph.value(carried_out).shape,
+        vec![Dim::Static(2), Dim::Static(3)]
+    );
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "trip count must produce a symbolic leading dim, got {shape:?}"
+    );
+    assert_eq!(shape[1..], [Dim::Static(2), Dim::Static(3)]);
+}

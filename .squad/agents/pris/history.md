@@ -148,3 +148,5 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Replaced `Rust coverage (Windows ARM64)` with uninstrumented `Rust (Windows ARM64)`: same offline crate tests and clippy on Windows ARM64, no cargo-llvm-cov/no Codecov upload.
 - Reason: platform tests are signal; ARM64 coverage of pure-Rust crates is low-information and owned the full-gate critical path. The job previously uploaded the shared `offline` flag, which remains covered by Linux, Windows x86_64, and macOS.
 - Verification after dropping ARM64 coverage: run 30390299025 passed in 18m54s wall-clock. New critical path was `CLI ORT (Windows x86_64)` at 18m50s; uninstrumented `Rust (Windows ARM64)` was 15m12s. Codecov still uploaded all intended flags because ARM64 had shared the `offline` flag, which Linux/Windows x86_64/macOS still upload.
+## 2026-07-28T17:40:00+0000
+#54 model-package and #299 LoRA were confirmed out of scope for this squad; no artifacts retained.

@@ -37,3 +37,6 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Reviewed PR #303 / #59 and approved after byte-identical scheduled-vs-greedy/sequential parity plus mutation probes.
 - 2026-07-28: Pointwise Conv microbench diagnosis was useful, but the initial 5.7-9.8x BNNS headline overstated real impact. Always convert per-layer speedups through Amdahl/model-level measurement before making campaign claims.
+
+## 2026-07-28T17:40:00+0000
+PR #362 merged (5a079029): If/Loop/Scan inference landed; #355 container typing remains deferred.

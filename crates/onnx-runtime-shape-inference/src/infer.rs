@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use onnx_runtime_ir::{
-    DataType, Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef,
+    Attribute, DataType, Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef,
 };
 
 use crate::context::{MergePolicy, NodeIo, SymbolInterner, TypeInfo, TypedShape, merge_shapes};
@@ -104,7 +104,7 @@ impl InferenceRegistry {
                 &mut interner,
             )?;
 
-            if infer_standard_if(
+            if infer_control_flow(
                 graph,
                 &node,
                 &subgraph_results,
@@ -113,6 +113,7 @@ impl InferenceRegistry {
                 &mut interner,
                 remaining_subgraph_nodes,
                 &mut pending_scope_values,
+                effective_version(&node, opset_imports),
             )? {
                 continue;
             }
@@ -219,6 +220,14 @@ impl InferenceRegistry {
                         op: node.op_type.clone(),
                         detail: format!("subgraph attribute `{}` disappeared", key.1),
                     })?;
+            seed_control_flow_body(
+                node,
+                &key.1,
+                subgraph,
+                types,
+                effective_version(node, opset_imports),
+                interner,
+            );
             let result = self.infer_graph_scoped(subgraph, opset_imports, policy, scope)?;
             subgraph_results.insert(key.1, result);
         }
@@ -252,8 +261,32 @@ impl InferenceRegistry {
     }
 }
 
+/// The opset version effective for `node`, mirroring the registry's resolution:
+/// a usable node-local version wins, otherwise the graph import for the node's
+/// domain (defaulting to `1`).
+fn effective_version(node: &Node, opset_imports: &HashMap<String, u64>) -> u64 {
+    if let Some(version) = node.local_opset() {
+        return version;
+    }
+    if node.is_default_domain() {
+        opset_imports.get("").copied().unwrap_or(1)
+    } else {
+        opset_imports.get(&node.domain).copied().unwrap_or(1)
+    }
+}
+
+/// Dispatch the control-flow ops (`If`/`Loop`/`Scan`) that carry subgraph
+/// bodies. Returns `true` when the node was handled here (so the caller skips
+/// the ordinary per-op rule), `false` to fall through to the registry.
+///
+/// All three share the same machinery: [`infer_child_subgraphs`] has already
+/// run each body under lexical outer-scope visibility (and, for `Loop`/`Scan`,
+/// with the body's formal inputs seeded from this node's operands via
+/// [`seed_control_flow_body`]). The per-op functions below only map the inferred
+/// *body outputs* back onto this node's outputs, applying each op's axis
+/// bookkeeping (branch reconciliation, the scan/trip-count axis).
 #[allow(clippy::too_many_arguments)]
-fn infer_standard_if(
+fn infer_control_flow(
     graph: &mut Graph,
     node: &Node,
     subgraph_results: &HashMap<String, ScopedInference>,
@@ -262,34 +295,57 @@ fn infer_standard_if(
     interner: &mut SymbolInterner,
     remaining_subgraph_nodes: usize,
     pending_scope_values: &mut Vec<ValueId>,
+    version: u64,
 ) -> Result<bool, ShapeInferError> {
-    if !is_standard_if(node) {
+    if !node.is_default_domain() {
         return Ok(false);
     }
-
-    if let Some(outputs) = infer_if_outputs(graph, node, subgraph_results, interner)? {
-        for (slot, output) in node.outputs.iter().zip(outputs) {
-            match output {
-                IfOutput::Typed(type_info) => {
-                    types.insert(*slot, type_info);
-                }
-                IfOutput::UnknownRank(element_type) => {
-                    types.remove(slot);
-                    shape_data.remove(slot);
-                    let value = graph.value_mut(*slot);
-                    value.dtype = element_type;
-                    graph.mark_value_type_known(*slot);
-                    graph.mark_value_shape_unknown(*slot);
-                }
-                IfOutput::Unresolved => {}
-            }
+    let outputs = match node.op_type.as_str() {
+        "If" => infer_if_outputs(graph, node, subgraph_results, interner)?,
+        "Loop" => infer_loop_outputs(graph, node, subgraph_results, interner)?,
+        // `Scan`'s opset-8 form carried an extra `sequence_lens` input and a
+        // different body signature; only the stable opset-9+ form is modelled.
+        "Scan" if version >= 9 => {
+            infer_scan_outputs(graph, node, subgraph_results, types, interner)?
         }
+        _ => return Ok(false),
+    };
+
+    if let Some(outputs) = outputs {
+        apply_cf_outputs(graph, node, outputs, types, shape_data);
     }
     if remaining_subgraph_nodes > 0 {
         pending_scope_values.extend(node.outputs.iter().copied());
     }
 
     Ok(true)
+}
+
+/// Write the per-slot [`CfOutput`]s onto the node's outputs, shared by all
+/// control-flow ops.
+fn apply_cf_outputs(
+    graph: &mut Graph,
+    node: &Node,
+    outputs: Vec<CfOutput>,
+    types: &mut HashMap<ValueId, TypeInfo>,
+    shape_data: &mut HashMap<ValueId, ShapeData>,
+) {
+    for (slot, output) in node.outputs.iter().zip(outputs) {
+        match output {
+            CfOutput::Typed(type_info) => {
+                types.insert(*slot, type_info);
+            }
+            CfOutput::UnknownRank(element_type) => {
+                types.remove(slot);
+                shape_data.remove(slot);
+                let value = graph.value_mut(*slot);
+                value.dtype = element_type;
+                graph.mark_value_type_known(*slot);
+                graph.mark_value_shape_unknown(*slot);
+            }
+            CfOutput::Unresolved => {}
+        }
+    }
 }
 
 fn merge_declared_outputs(
@@ -334,7 +390,9 @@ fn is_standard_if(node: &Node) -> bool {
     node.op_type == "If" && node.is_default_domain()
 }
 
-enum IfOutput {
+/// One control-flow node output slot: a fully typed shape, a known dtype whose
+/// shape could not be reconciled (unknown rank), or nothing resolved.
+enum CfOutput {
     Typed(TypeInfo),
     UnknownRank(DataType),
     Unresolved,
@@ -345,7 +403,10 @@ fn infer_if_outputs(
     node: &Node,
     subgraph_results: &HashMap<String, ScopedInference>,
     interner: &mut SymbolInterner,
-) -> Result<Option<Vec<IfOutput>>, ShapeInferError> {
+) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
+    if !is_standard_if(node) {
+        return Ok(None);
+    }
     let then_key = (node.id, "then_branch".to_string());
     let else_key = (node.id, "else_branch".to_string());
     let Some(then_branch) = graph.subgraphs.get(&then_key) else {
@@ -378,7 +439,7 @@ fn infer_if_outputs(
         if !branch_output_is_resolved(then_branch, then_id, &then_resolved)
             || !branch_output_is_resolved(else_branch, else_id, &else_resolved)
         {
-            outputs.push(IfOutput::Unresolved);
+            outputs.push(CfOutput::Unresolved);
             continue;
         }
         let then_value =
@@ -407,7 +468,7 @@ fn infer_if_outputs(
         }
 
         if then_value.shape.len() != else_value.shape.len() {
-            outputs.push(IfOutput::UnknownRank(then_value.dtype));
+            outputs.push(CfOutput::UnknownRank(then_value.dtype));
             continue;
         }
 
@@ -431,15 +492,374 @@ fn infer_if_outputs(
                 _ => interner.fresh_dim(),
             })
             .collect();
-        outputs.push(IfOutput::Typed(TypeInfo::new(then_value.dtype, shape)));
+        outputs.push(CfOutput::Typed(TypeInfo::new(then_value.dtype, shape)));
     }
-    outputs.resize_with(node.outputs.len(), || IfOutput::Unresolved);
+    outputs.resize_with(node.outputs.len(), || CfOutput::Unresolved);
 
     Ok(Some(outputs))
 }
 
 fn branch_output_is_resolved(branch: &Graph, output: ValueId, resolved: &HashSet<ValueId>) -> bool {
     resolved.contains(&output) && branch.try_value(output).is_some()
+}
+
+// ===========================================================================
+// Loop / Scan: shared subgraph-body propagation.
+//
+// Unlike `If` — whose branches read the outer scope purely by name — a `Loop`
+// or `Scan` body has *formal inputs* bound positionally to the owning node's
+// operands (loop-carried dependencies, scan-input slices, the iteration
+// counter). `seed_control_flow_body` writes those operand types onto the body's
+// formal inputs *before* the body is inferred, so the ordinary node rules
+// inside the body see concrete shapes; the `infer_*_outputs` functions then map
+// the inferred body outputs back onto this node's outputs.
+// ===========================================================================
+
+/// Seed a control-flow body's formal inputs from the owning node's operands,
+/// immediately before the body is inferred. A no-op for `If` (its branches take
+/// no formal inputs) and for bodies whose operand types are not yet known.
+fn seed_control_flow_body(
+    node: &Node,
+    attr_name: &str,
+    body: &mut Graph,
+    types: &HashMap<ValueId, TypeInfo>,
+    version: u64,
+    interner: &mut SymbolInterner,
+) {
+    if !node.is_default_domain() || attr_name != "body" {
+        return;
+    }
+    match node.op_type.as_str() {
+        "Loop" => seed_loop_body(node, body, types, interner),
+        "Scan" if version >= 9 => seed_scan_body(node, body, types, interner),
+        _ => {}
+    }
+}
+
+/// The value id of the node's input at slot `i`, if that slot is connected.
+fn node_input(node: &Node, i: usize) -> Option<ValueId> {
+    node.inputs.get(i).copied().flatten()
+}
+
+/// Lower a symbolic shape to IR dims in the owning graph's symbol space.
+fn lower_shape(shape: &[DimExpr], interner: &mut SymbolInterner) -> Vec<Dim> {
+    shape.iter().map(|dim| interner.lower(dim)).collect()
+}
+
+/// Write `dtype`/`shape` onto a body formal input and mark it fully known.
+fn set_body_input(body: &mut Graph, vid: ValueId, dtype: DataType, shape: Vec<Dim>) {
+    if body.try_value(vid).is_none() {
+        return;
+    }
+    let value = body.value_mut(vid);
+    value.dtype = dtype;
+    value.shape = shape;
+    body.mark_value_type_known(vid);
+    body.mark_value_shape_known(vid);
+}
+
+/// Seed a `Loop` body: formal inputs are `(iter_num, cond_in, v_1..v_N)`, bound
+/// to the node's loop-carried operands `(M, cond, v_1..v_N)`.
+fn seed_loop_body(
+    node: &Node,
+    body: &mut Graph,
+    types: &HashMap<ValueId, TypeInfo>,
+    interner: &mut SymbolInterner,
+) {
+    let body_inputs = body.inputs.clone();
+    if let Some(&iter) = body_inputs.first() {
+        set_body_input(body, iter, DataType::Int64, Vec::new());
+    }
+    if let Some(&cond) = body_inputs.get(1) {
+        set_body_input(body, cond, DataType::Bool, Vec::new());
+    }
+    // Loop-carried dependencies: node operand `2 + i` seeds body input `2 + i`.
+    let carried = body_inputs.len().saturating_sub(2);
+    for i in 0..carried {
+        let Some(src) = node_input(node, 2 + i) else {
+            continue;
+        };
+        let Some(type_info) = types.get(&src) else {
+            continue;
+        };
+        let dims = lower_shape(&type_info.shape, interner);
+        set_body_input(body, body_inputs[2 + i], type_info.dtype, dims);
+    }
+}
+
+/// Seed a `Scan` body (opset 9+): the first `N` formal inputs are the loop-state
+/// variables (shape unchanged); the remaining `M = num_scan_inputs` are
+/// per-iteration *slices* of the scan inputs with their scan axis stripped.
+fn seed_scan_body(
+    node: &Node,
+    body: &mut Graph,
+    types: &HashMap<ValueId, TypeInfo>,
+    interner: &mut SymbolInterner,
+) {
+    let body_inputs = body.inputs.clone();
+    let Some(num_scan) = scan_num_scan_inputs(node, body_inputs.len()) else {
+        return;
+    };
+    let num_state = body_inputs.len() - num_scan;
+    let axes = node.attr("scan_input_axes").and_then(Attribute::as_ints);
+
+    for (i, &dst) in body_inputs.iter().enumerate().take(num_state) {
+        let Some(src) = node_input(node, i) else {
+            continue;
+        };
+        let Some(type_info) = types.get(&src) else {
+            continue;
+        };
+        let dims = lower_shape(&type_info.shape, interner);
+        set_body_input(body, dst, type_info.dtype, dims);
+    }
+
+    for j in 0..num_scan {
+        let Some(src) = node_input(node, num_state + j) else {
+            continue;
+        };
+        let Some(type_info) = types.get(&src) else {
+            continue;
+        };
+        let raw_axis = axes.and_then(|axes| axes.get(j).copied()).unwrap_or(0);
+        let Some(axis) = normalize_axis(raw_axis, type_info.rank()) else {
+            continue;
+        };
+        let mut sliced = lower_shape(&type_info.shape, interner);
+        sliced.remove(axis);
+        set_body_input(body, body_inputs[num_state + j], type_info.dtype, sliced);
+    }
+}
+
+/// The `num_scan_inputs` attribute clamped to a plausible range (`0..=total`).
+fn scan_num_scan_inputs(node: &Node, total_inputs: usize) -> Option<usize> {
+    let raw = node.attr("num_scan_inputs")?.as_int()?;
+    let num = usize::try_from(raw).ok()?;
+    (num <= total_inputs).then_some(num)
+}
+
+/// Normalize a possibly-negative axis against `rank`, returning `None` when it
+/// is out of range.
+fn normalize_axis(axis: i64, rank: usize) -> Option<usize> {
+    let rank = i64::try_from(rank).ok()?;
+    let axis = if axis < 0 { axis + rank } else { axis };
+    (0..rank).contains(&axis).then_some(axis as usize)
+}
+
+/// Symbols reaching a body from the owning node, collected from the body's
+/// (already-seeded) formal inputs. A body output that is one of these symbols
+/// is passed straight through to the parent; any other symbol is body-local and
+/// is remapped to a fresh parent symbol (its identity is meaningless outside).
+fn body_parent_symbols(body: &Graph) -> HashSet<SymbolId> {
+    let mut symbols = HashSet::new();
+    for &vid in &body.inputs {
+        if let Some(value) = body.try_value(vid) {
+            for dim in &value.shape {
+                if let Dim::Symbolic(symbol) = dim {
+                    symbols.insert(*symbol);
+                }
+            }
+        }
+    }
+    symbols
+}
+
+/// Map a body output's IR shape into the parent symbol space: static extents are
+/// preserved, parent-origin symbols pass through, and everything else becomes a
+/// fresh parent symbol.
+fn map_body_shape(
+    shape: &[Dim],
+    parent_symbols: &HashSet<SymbolId>,
+    interner: &mut SymbolInterner,
+) -> TypedShape {
+    shape
+        .iter()
+        .map(|dim| match *dim {
+            Dim::Static(extent) => i64::try_from(extent)
+                .map(DimExpr::constant)
+                .unwrap_or_else(|_| interner.fresh_dim()),
+            Dim::Symbolic(symbol) if parent_symbols.contains(&symbol) => DimExpr::symbol(symbol),
+            Dim::Symbolic(_) => interner.fresh_dim(),
+        })
+        .collect()
+}
+
+/// Read a resolved body output as `(dtype, mapped-shape)`, or a dtype-only
+/// [`CfOutput`] when the output's shape could not be resolved.
+fn read_body_output(
+    body: &Graph,
+    output: ValueId,
+    resolved: &HashSet<ValueId>,
+    parent_symbols: &HashSet<SymbolId>,
+    interner: &mut SymbolInterner,
+) -> Result<(DataType, TypedShape), CfOutput> {
+    if !branch_output_is_resolved(body, output, resolved) {
+        return match body.try_value(output) {
+            Some(value) if body.value_type_is_known(output) => {
+                Err(CfOutput::UnknownRank(value.dtype))
+            }
+            _ => Err(CfOutput::Unresolved),
+        };
+    }
+    let value = body.value(output);
+    let shape = map_body_shape(&value.shape, parent_symbols, interner);
+    Ok((value.dtype, shape))
+}
+
+/// Map a `Loop` body's outputs `(cond_out, v_1..v_N, scan_1..scan_K)` onto the
+/// node's outputs `(v_1..v_N, scan_1..scan_K)`.
+///
+/// A loop-carried output takes its body carried-output shape directly; a scan
+/// output gains a prepended trip-count axis.
+///
+/// The trip-count axis is **always symbolic**, even when the `M` operand is a
+/// static constant: the loop may exit early on `cond`, so a static `M` is only
+/// an unsound *upper bound*, not the true iteration count. Emitting it as a
+/// concrete extent would (for a huge `M`) provoke eager buffer over-reservation
+/// downstream; execution computes the real count.
+fn infer_loop_outputs(
+    graph: &Graph,
+    node: &Node,
+    subgraph_results: &HashMap<String, ScopedInference>,
+    interner: &mut SymbolInterner,
+) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
+    let key = (node.id, "body".to_string());
+    let Some(body) = graph.subgraphs.get(&key) else {
+        return Ok(None);
+    };
+    let Some(result) = subgraph_results.get("body") else {
+        return Ok(None);
+    };
+    let resolved: HashSet<_> = result.report.resolved.iter().copied().collect();
+    let parent_symbols = body_parent_symbols(body);
+
+    // Body inputs: iter_num, cond_in, then N carried. Body outputs: cond_out,
+    // then N carried, then K scan outputs. All scan outputs share one iteration
+    // count, so they share one trip-count symbol.
+    let carried = body.inputs.len().saturating_sub(2);
+    let trip_count = interner.fresh_dim();
+
+    let mut outputs = Vec::with_capacity(node.outputs.len());
+    for slot in 0..node.outputs.len() {
+        // Body output 0 is `cond_out`; carried/scan outputs start at index 1.
+        let body_index = slot + 1;
+        let Some(&body_output) = body.outputs.get(body_index) else {
+            outputs.push(CfOutput::Unresolved);
+            continue;
+        };
+        match read_body_output(body, body_output, &resolved, &parent_symbols, interner) {
+            Ok((dtype, mut shape)) => {
+                if slot >= carried {
+                    // A per-iteration scan output stacks along a new leading axis.
+                    shape.insert(0, trip_count.clone());
+                }
+                outputs.push(cf_typed(dtype, shape));
+            }
+            Err(fallback) => outputs.push(fallback),
+        }
+    }
+    Ok(Some(outputs))
+}
+
+/// Build a typed control-flow output, degrading to a dtype-only (unknown-shape)
+/// output when a *fully static* shape would overflow eager buffer sizing.
+///
+/// A control-flow op can stack a per-iteration extent onto a large operand dim;
+/// if every extent is concrete and their byte size overflows, writing it as a
+/// static shape would make eager buffer planning reject the graph at build time
+/// instead of letting execution compute (and, where required, gracefully
+/// reject) the true shape. A shape with any symbolic dim is never eagerly sized,
+/// so it is passed through unchanged.
+fn cf_typed(dtype: DataType, shape: TypedShape) -> CfOutput {
+    let static_dims: Option<Vec<usize>> = shape
+        .iter()
+        .map(|dim| {
+            dim.as_const()
+                .and_then(|extent| usize::try_from(extent).ok())
+        })
+        .collect();
+    if let Some(dims) = static_dims
+        && onnx_runtime_ir::checked_expected_bytes(dtype, &dims).is_none()
+    {
+        return CfOutput::UnknownRank(dtype);
+    }
+    CfOutput::Typed(TypeInfo::new(dtype, shape))
+}
+
+/// Map a `Scan` body's outputs `(state_1..state_N, scan_1..scan_K)` onto the
+/// node's outputs of the same arity.
+///
+/// A final-state output keeps its body shape; a scan output re-inserts the scan
+/// axis (`scan_output_axes[k]`, default 0) sized to the sequence length taken
+/// from the scan inputs.
+fn infer_scan_outputs(
+    graph: &Graph,
+    node: &Node,
+    subgraph_results: &HashMap<String, ScopedInference>,
+    types: &HashMap<ValueId, TypeInfo>,
+    interner: &mut SymbolInterner,
+) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
+    let key = (node.id, "body".to_string());
+    let Some(body) = graph.subgraphs.get(&key) else {
+        return Ok(None);
+    };
+    let Some(result) = subgraph_results.get("body") else {
+        return Ok(None);
+    };
+    let Some(num_scan) = scan_num_scan_inputs(node, body.inputs.len()) else {
+        return Ok(None);
+    };
+    let num_state = body.inputs.len() - num_scan;
+    let resolved: HashSet<_> = result.report.resolved.iter().copied().collect();
+    let parent_symbols = body_parent_symbols(body);
+    let sequence_length = scan_sequence_length(node, types, num_state, interner);
+    let output_axes = node.attr("scan_output_axes").and_then(Attribute::as_ints);
+
+    let mut outputs = Vec::with_capacity(node.outputs.len());
+    for slot in 0..node.outputs.len() {
+        let Some(&body_output) = body.outputs.get(slot) else {
+            outputs.push(CfOutput::Unresolved);
+            continue;
+        };
+        match read_body_output(body, body_output, &resolved, &parent_symbols, interner) {
+            Ok((dtype, mut shape)) => {
+                if slot >= num_state {
+                    // Re-insert the scan axis at its (rank+1) position.
+                    let raw_axis = output_axes
+                        .and_then(|axes| axes.get(slot - num_state).copied())
+                        .unwrap_or(0);
+                    let axis = normalize_axis(raw_axis, shape.len() + 1).unwrap_or(0);
+                    shape.insert(axis, sequence_length.clone());
+                }
+                outputs.push(cf_typed(dtype, shape));
+            }
+            Err(fallback) => outputs.push(fallback),
+        }
+    }
+    Ok(Some(outputs))
+}
+
+/// The `Scan` sequence length: the extent of the first scan input along its scan
+/// axis (`scan_input_axes[0]`, default 0). Falls back to a fresh symbol when the
+/// scan input's type or scan-axis extent is unknown.
+fn scan_sequence_length(
+    node: &Node,
+    types: &HashMap<ValueId, TypeInfo>,
+    num_state: usize,
+    interner: &mut SymbolInterner,
+) -> DimExpr {
+    let length = node_input(node, num_state)
+        .and_then(|vid| types.get(&vid))
+        .and_then(|type_info| {
+            let raw_axis = node
+                .attr("scan_input_axes")
+                .and_then(Attribute::as_ints)
+                .and_then(|axes| axes.first().copied())
+                .unwrap_or(0);
+            let axis = normalize_axis(raw_axis, type_info.rank())?;
+            type_info.shape.get(axis).cloned()
+        });
+    length.unwrap_or_else(|| interner.fresh_dim())
 }
 
 /// Seed every explicitly known value type, including intermediate `value_info`.
