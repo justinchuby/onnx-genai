@@ -59,6 +59,7 @@ pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;
 pub mod gather;
+pub mod grouped_lora;
 pub mod gather_block_quantized;
 pub mod gelu;
 pub mod gemm;
@@ -305,6 +306,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
+    );
+    reg.register(
+        OpKey::new("GroupedLoraDelta", "pkg.nxrt", 1),
+        Box::new(grouped_lora::GroupedLoraDeltaFactory),
     );
     reg.register(
         OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
@@ -1645,8 +1650,8 @@ mod tests {
         // BitwiseAnd,
         // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
-        // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
-        // private/contrib registrations.
+        // SparseKvGather, GroupedLoraDelta, CompressedSparseAttention, and
+        // GroupQueryAttention add private/contrib registrations.
         // CumProd and the three standard window generators add four more
         // default-domain entries beyond the original Phase-1 set.
         // GridSample has separate opset-16 and opset-20 registrations.
@@ -1664,7 +1669,7 @@ mod tests {
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 97 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 98 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
