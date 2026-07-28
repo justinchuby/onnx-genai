@@ -33,6 +33,13 @@ that turn and return to the prompt. At an idle prompt, press **Ctrl-D** or
 **Ctrl-C** (or enter an empty line) to exit. A one-shot `onnx-genai generate`
 run is also cancelled by **Ctrl-C** mid-generation.
 
+When both stdin and stdout are terminals, the REPL uses a rich line editor:
+arrow-key cursor movement, persistent history, bracketed paste, slash-command
+completion, and multiline input with **Alt+Enter** (plain **Enter** submits).
+Interactive terminal sessions show compact per-turn stats by default; pass
+`--no-stats` to start with them hidden. When stdin or stdout is piped, the REPL
+keeps the original plain `>>> ` line-loop behavior for scripts and tests.
+
 ### Generation budget and sampling
 
 When `--max-new-tokens` is omitted, `generate` and `run` follow the model's
@@ -196,24 +203,24 @@ generated text.
 
 ### Checking the REPL's live view
 
-`/stats` renders the reply and its live numbers together, and that path is only
-taken when stdout is a real terminal. It therefore cannot be seen through a pipe
-— run the REPL directly in a terminal and type `/stats`, then a prompt:
+Interactive terminal sessions render the reply and live numbers together by
+default. That path is only taken when stdin and stdout are real terminals, so it
+cannot be seen through a pipe. Run the REPL directly in a terminal and type a
+prompt:
 
 ```bash
 cargo run -p onnx-genai-cli --bin onnx-genai -- run tests/fixtures/tiny-llm --max-new-tokens 5
 ```
 
 ```text
->>> /stats
-per-turn stats enabled
 >>> hello
 dogtok29over,dog
 [ 7 in · 5 out · backend ort · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
 ```
 
-Piping a script into the REPL exercises the plain-text fallback instead, which is
-what the tests do:
+Use `/stats` to toggle the compact line at runtime, or start with
+`--no-stats`. Piping a script into the REPL exercises the byte-stable plain-text
+fallback instead, which is what the tests do:
 
 ```bash
 printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \

@@ -42,6 +42,10 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Guard-break probe skipped the `dot_neon` scalar tail and the new parity test failed (`max_abs=9.221658e-4`, `max_rel=2.034264e0`); restored code passes.
 - Tightened model-scale GEMV max-relative tolerance from 2.0% to 1.8%, based on Chew's 1.57% measured worst legitimate f32 accumulation-order drift.
 
+## 2026-07-27T15:25:00-07:00 — REPL e2e output assertion hardening
+- Fixed the flaky `piped_help_with_an_argument_still_prints_full_help` regression test by comparing stdout-only REPL help listings instead of merged stdout+stderr, which can contain ONNX Runtime/tracing timestamps.
+- Audited `crates/onnx-genai-cli/tests/repl_e2e.rs` and split several command/error assertions so stdout help/session-continuation checks are not coupled to stderr logs.
+- Guard reasoning: a pre-fix plain/piped `/help anything` that prints command-specific help would still differ from bare `/help` on stdout and fail the equality check.
 ## 2026-07-27T14:35:00-07:00 — Dispatch-branch coverage audit (PR #275 blocking bugs)
 
 - **Finding: 12 of 13 reachable dispatch combinations in `matmul.rs` had zero test coverage** while codecov reported PASS. Line coverage (78%) masked the gap.
