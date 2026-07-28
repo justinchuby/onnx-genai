@@ -2,6 +2,299 @@
 
 use super::*;
 
+const MEBIBYTE: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum MetadataDevice {
+    Cpu,
+    Cuda(u32),
+}
+
+/// Load and validate embedded `onnx_runtime.*` hints without materializing the
+/// model's initializer payloads.
+pub(crate) fn load_model_metadata_hints(model_path: &Path) -> anyhow::Result<MetadataHints> {
+    use prost::Message;
+
+    let model = if onnx_runtime_loader::is_textproto_path(model_path) {
+        let bytes = onnx_runtime_loader::read_model_binary(model_path)
+            .map_err(|error| anyhow::anyhow!("Failed to read ONNX metadata hints: {error}"))?;
+        ScanModelProto::decode(bytes.as_slice())
+            .map_err(|error| anyhow::anyhow!("Failed to decode ONNX metadata hints: {error}"))?
+    } else {
+        let file = std::fs::File::open(model_path).with_context(|| {
+            format!(
+                "Failed to open ONNX model '{}' for metadata-hint scanning",
+                model_path.display()
+            )
+        })?;
+        // SAFETY: model packages are immutable while loaded. The minimal protobuf
+        // projection skips initializer bytes, so even large inline models are not
+        // copied merely to inspect metadata.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.with_context(|| {
+            format!(
+                "Failed to memory-map ONNX model '{}' for metadata-hint scanning",
+                model_path.display()
+            )
+        })?;
+        ScanModelProto::decode(&mmap[..])
+            .map_err(|error| anyhow::anyhow!("Failed to decode ONNX metadata hints: {error}"))?
+    };
+
+    let mut entries = model
+        .metadata_props
+        .into_iter()
+        .map(|entry| onnx_std::HintEntry {
+            scope: onnx_std::HintScope::Model,
+            source: onnx_std::HintSource::OnnxMetadata,
+            key: entry.key,
+            value: entry.value,
+        })
+        .collect::<Vec<_>>();
+    if let Some(graph) = model.graph {
+        entries.extend(
+            graph
+                .metadata_props
+                .into_iter()
+                .map(|entry| onnx_std::HintEntry {
+                    scope: onnx_std::HintScope::Graph {
+                        graph_name: graph.name.clone(),
+                    },
+                    source: onnx_std::HintSource::OnnxMetadata,
+                    key: entry.key,
+                    value: entry.value,
+                }),
+        );
+        for node in graph.node {
+            entries.extend(
+                node.metadata_props
+                    .into_iter()
+                    .map(|entry| onnx_std::HintEntry {
+                        scope: onnx_std::HintScope::Node {
+                            node_name: node.name.clone(),
+                        },
+                        source: onnx_std::HintSource::OnnxMetadata,
+                        key: entry.key,
+                        value: entry.value,
+                    }),
+            );
+        }
+    }
+    Ok(MetadataHints::scan(entries))
+}
+
+pub(crate) fn report_metadata_hint_warnings(hints: &MetadataHints) {
+    for warning in &hints.warnings {
+        match warning {
+            MetadataWarning::UnknownKey { node, key } => tracing::warn!(
+                location = node,
+                key,
+                "Ignoring unrecognized ONNX runtime metadata hint"
+            ),
+            MetadataWarning::InvalidValue {
+                node,
+                key,
+                value,
+                expected,
+            } => tracing::warn!(
+                location = node,
+                key,
+                value,
+                expected,
+                "Ignoring malformed ONNX runtime metadata hint"
+            ),
+            MetadataWarning::ConflictingForce {
+                node,
+                source_a,
+                source_b,
+            } => tracing::error!(
+                node,
+                source_a = ?source_a,
+                source_b = ?source_b,
+                "Conflicting forced ONNX runtime placement hints"
+            ),
+        }
+    }
+}
+
+/// Apply model arena suggestions only while the corresponding programmatic
+/// resource limit remains at its default. This preserves the documented source
+/// priority: explicit engine configuration wins over embedded model metadata.
+pub(crate) fn apply_model_memory_hints(
+    config: &mut EngineConfig,
+    hints: &MetadataHints,
+) -> anyhow::Result<()> {
+    let defaults = ResourceLimits::default();
+    if config.limits.vram_limit == defaults.vram_limit
+        && let Some(mebibytes) = hints.model.arena_gpu_mb
+    {
+        config.limits.vram_limit =
+            ResourceLimit::Bytes(metadata_mebibytes_to_bytes("arena_gpu_mb", mebibytes)?);
+    }
+    if config.limits.host_ram_limit == defaults.host_ram_limit
+        && let Some(mebibytes) = hints.model.arena_cpu_mb
+    {
+        config.limits.host_ram_limit =
+            ResourceLimit::Bytes(metadata_mebibytes_to_bytes("arena_cpu_mb", mebibytes)?);
+    }
+    Ok(())
+}
+
+fn metadata_mebibytes_to_bytes(key: &str, value: i64) -> anyhow::Result<u64> {
+    let value = u64::try_from(value).map_err(|_| {
+        anyhow::anyhow!("onnx_runtime.memory.{key} must be a non-negative integer, got {value}")
+    })?;
+    value.checked_mul(MEBIBYTE).ok_or_else(|| {
+        anyhow::anyhow!("onnx_runtime.memory.{key} is too large to represent in bytes: {value}")
+    })
+}
+
+/// Resolve homogeneous model placement into the session's execution-provider
+/// selection. The current engine has one provider per decoder session, so mixed
+/// forced devices fail actionably instead of silently violating a hard hint.
+///
+/// Deferred: per-node heterogeneous placement, colocation groups, kernel
+/// selection, pin/priority, overlap, and prefetch require planner-level consumer
+/// APIs. The validated hints remain available through `Engine::metadata_hints`.
+pub(crate) fn apply_model_placement_hints(
+    options: &mut SessionOptions,
+    hints: &MetadataHints,
+    options_are_programmatic: bool,
+) -> anyhow::Result<()> {
+    let forced = hinted_devices(hints, PlacementStrength::Force)?;
+    if forced.len() > 1 {
+        anyhow::bail!(
+            "ONNX model metadata forces nodes onto multiple devices ({forced:?}), but the decoder session currently supports one execution provider; use a homogeneous placement or remove force"
+        );
+    }
+    let preferred = hinted_devices(hints, PlacementStrength::Prefer)?;
+    let (target, forced_target) = if let Some(target) = forced.first().copied() {
+        (Some(target), true)
+    } else if preferred.len() == 1 {
+        (preferred.first().copied(), false)
+    } else {
+        (None, false)
+    };
+    let Some(target) = target else {
+        return Ok(());
+    };
+
+    if options_are_programmatic {
+        if session_options_match_device(options, target) {
+            return Ok(());
+        }
+        if forced_target {
+            anyhow::bail!(
+                "ONNX model metadata forces placement on {}, but programmatic session options select {}; force hints cannot be overridden",
+                metadata_device_name(target),
+                selected_session_device_name(options)
+            );
+        }
+        return Ok(());
+    }
+
+    let selection = match target {
+        MetadataDevice::Cpu => onnx_genai_ort::ep_selection("cpu"),
+        MetadataDevice::Cuda(index) => {
+            let mut selection = onnx_genai_ort::ep_selection("cuda");
+            selection
+                .options
+                .insert("device_id".to_string(), index.to_string());
+            selection
+        }
+    };
+    let selected = SessionOptions::with_execution_provider(selection);
+    options.execution_providers = selected.execution_providers;
+    options.auto_selected = false;
+    Ok(())
+}
+
+fn hinted_devices(
+    hints: &MetadataHints,
+    strength: PlacementStrength,
+) -> anyhow::Result<std::collections::BTreeSet<MetadataDevice>> {
+    let mut devices = std::collections::BTreeSet::new();
+    for value in hints
+        .nodes
+        .values()
+        .filter(|node| node.device_strength == Some(strength))
+        .filter_map(|node| node.device.as_deref())
+    {
+        match parse_metadata_device(value) {
+            Ok(device) => {
+                devices.insert(device);
+            }
+            Err(error) if strength == PlacementStrength::Prefer => {
+                tracing::warn!(
+                    device = value,
+                    error = %error,
+                    "Ignoring unsupported preferred ONNX runtime device"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(devices)
+}
+
+fn parse_metadata_device(value: &str) -> anyhow::Result<MetadataDevice> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "cpu" || normalized == "cpu:0" {
+        return Ok(MetadataDevice::Cpu);
+    }
+    if normalized == "gpu" || normalized == "cuda" {
+        return Ok(MetadataDevice::Cuda(0));
+    }
+    if let Some(index) = normalized
+        .strip_prefix("gpu:")
+        .or_else(|| normalized.strip_prefix("cuda:"))
+    {
+        return index
+            .parse::<u32>()
+            .map(MetadataDevice::Cuda)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "unsupported onnx_runtime.device value {value:?}; expected cpu, gpu, gpu:<index>, cuda, or cuda:<index>"
+                )
+            });
+    }
+    anyhow::bail!(
+        "unsupported onnx_runtime.device value {value:?}; this engine currently supports cpu and cuda placement"
+    )
+}
+
+fn session_options_match_device(options: &SessionOptions, target: MetadataDevice) -> bool {
+    options
+        .execution_providers
+        .iter()
+        .any(|provider| match target {
+            MetadataDevice::Cpu => provider.caps.is_host(),
+            MetadataDevice::Cuda(index) => {
+                provider.caps.is_gpu()
+                    && provider.caps.is_nvidia()
+                    && provider
+                        .caps
+                        .device_id()
+                        .and_then(|value| u32::try_from(value).ok())
+                        == Some(index)
+            }
+        })
+}
+
+fn selected_session_device_name(options: &SessionOptions) -> String {
+    options
+        .execution_providers
+        .first()
+        .map(|provider| provider.caps.name.clone())
+        .unwrap_or_else(|| "no execution provider".to_string())
+}
+
+fn metadata_device_name(device: MetadataDevice) -> String {
+    match device {
+        MetadataDevice::Cpu => "cpu".to_string(),
+        MetadataDevice::Cuda(index) => format!("cuda:{index}"),
+    }
+}
+
 pub(crate) fn default_inference_metadata() -> InferenceMetadata {
     InferenceMetadata::default()
 }
@@ -278,6 +571,9 @@ struct ScanModelProto {
     /// nodes from every graph field accumulate here.
     #[prost(message, optional, tag = "7")]
     graph: Option<ScanGraphProto>,
+    /// `ModelProto.metadata_props`.
+    #[prost(message, repeated, tag = "14")]
+    metadata_props: Vec<ScanStringEntryProto>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -285,6 +581,12 @@ struct ScanGraphProto {
     /// `GraphProto.node`. `initializer` (tag 5) and every other field is skipped.
     #[prost(message, repeated, tag = "1")]
     node: Vec<ScanNodeProto>,
+    /// `GraphProto.name`.
+    #[prost(string, tag = "2")]
+    name: String,
+    /// `GraphProto.metadata_props`.
+    #[prost(message, repeated, tag = "16")]
+    metadata_props: Vec<ScanStringEntryProto>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -297,6 +599,20 @@ struct ScanNodeProto {
     /// eligibility, which only cares about the top-level graph).
     #[prost(string, tag = "7")]
     domain: String,
+    /// `NodeProto.name`.
+    #[prost(string, tag = "3")]
+    name: String,
+    /// `NodeProto.metadata_props`.
+    #[prost(message, repeated, tag = "9")]
+    metadata_props: Vec<ScanStringEntryProto>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ScanStringEntryProto {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    value: String,
 }
 
 /// Scan for top-level control-flow ops in the ONNX model at `model_path`.
@@ -331,4 +647,230 @@ pub(crate) fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
         matches!(node.domain.as_str(), "" | "ai.onnx")
             && CONTROL_FLOW_OPS.contains(&node.op_type.as_str())
     }))
+}
+
+#[cfg(test)]
+mod metadata_hint_tests {
+    use super::*;
+    use onnx_std::{HintEntry, HintScope, HintSource};
+    use prost::Message;
+
+    fn node_hint(node: &str, key: &str, value: &str) -> HintEntry {
+        HintEntry {
+            scope: HintScope::Node {
+                node_name: node.to_string(),
+            },
+            source: HintSource::OnnxMetadata,
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn model_hint(key: &str, value: &str) -> HintEntry {
+        HintEntry {
+            scope: HintScope::Model,
+            source: HintSource::OnnxMetadata,
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn lightweight_model_scan_reads_all_metadata_scopes() -> anyhow::Result<()> {
+        let model = ScanModelProto {
+            metadata_props: vec![ScanStringEntryProto {
+                key: "onnx_runtime.memory.arena_cpu_mb".to_string(),
+                value: "512".to_string(),
+            }],
+            graph: Some(ScanGraphProto {
+                name: "decoder".to_string(),
+                metadata_props: vec![ScanStringEntryProto {
+                    key: "onnx_runtime.model.num_layers".to_string(),
+                    value: "2".to_string(),
+                }],
+                node: vec![ScanNodeProto {
+                    name: "attention".to_string(),
+                    metadata_props: vec![
+                        ScanStringEntryProto {
+                            key: "onnx_runtime.device".to_string(),
+                            value: "gpu:1".to_string(),
+                        },
+                        ScanStringEntryProto {
+                            key: "onnx_runtime.layer".to_string(),
+                            value: "0".to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                }],
+            }),
+        };
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("metadata_hints_scan.onnx");
+        std::fs::write(&path, model.encode_to_vec())?;
+
+        let hints = load_model_metadata_hints(&path)?;
+        std::fs::remove_file(path)?;
+
+        assert!(hints.warnings.is_empty());
+        assert_eq!(hints.model.arena_cpu_mb, Some(512));
+        assert_eq!(hints.model.num_layers, Some(2));
+        let node = hints.nodes.get("attention").expect("node hints");
+        assert_eq!(node.device.as_deref(), Some("gpu:1"));
+        assert_eq!(node.layer, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn lightweight_model_scan_reports_unknown_and_malformed_values() -> anyhow::Result<()> {
+        let model = ScanModelProto {
+            graph: Some(ScanGraphProto {
+                node: vec![ScanNodeProto {
+                    name: "attention".to_string(),
+                    metadata_props: vec![
+                        ScanStringEntryProto {
+                            key: "onnx_runtime.devcie".to_string(),
+                            value: "gpu".to_string(),
+                        },
+                        ScanStringEntryProto {
+                            key: "onnx_runtime.layer".to_string(),
+                            value: "first".to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("metadata_hints_warnings.onnx");
+        std::fs::write(&path, model.encode_to_vec())?;
+
+        let hints = load_model_metadata_hints(&path)?;
+        std::fs::remove_file(path)?;
+
+        assert!(hints.warnings.iter().any(|warning| matches!(
+            warning,
+            MetadataWarning::UnknownKey { key, .. } if key == "onnx_runtime.devcie"
+        )));
+        assert!(hints.warnings.iter().any(|warning| matches!(
+            warning,
+            MetadataWarning::InvalidValue { key, expected, .. }
+                if key == "onnx_runtime.layer" && *expected == "an integer"
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn model_arena_hints_configure_default_governor_limits() -> anyhow::Result<()> {
+        let hints = MetadataHints::scan([
+            model_hint("onnx_runtime.memory.arena_gpu_mb", "4096"),
+            model_hint("onnx_runtime.memory.arena_cpu_mb", "8192"),
+        ]);
+        let mut config = EngineConfig::default();
+
+        apply_model_memory_hints(&mut config, &hints)?;
+
+        assert_eq!(
+            config.limits.vram_limit,
+            ResourceLimit::Bytes(4096 * MEBIBYTE)
+        );
+        assert_eq!(
+            config.limits.host_ram_limit,
+            ResourceLimit::Bytes(8192 * MEBIBYTE)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn programmatic_memory_limit_has_priority_over_model_hint() -> anyhow::Result<()> {
+        let hints = MetadataHints::scan([model_hint("onnx_runtime.memory.arena_gpu_mb", "4096")]);
+        let mut config = EngineConfig::default();
+        config.limits.vram_limit = ResourceLimit::Bytes(1234);
+
+        apply_model_memory_hints(&mut config, &hints)?;
+
+        assert_eq!(config.limits.vram_limit, ResourceLimit::Bytes(1234));
+        Ok(())
+    }
+
+    #[test]
+    fn forced_model_device_reaches_default_session_options() -> anyhow::Result<()> {
+        let hints = MetadataHints::scan([
+            node_hint("attention", "onnx_runtime.device", "gpu:3"),
+            node_hint("attention", "onnx_runtime.device.strength", "force"),
+        ]);
+        let mut options = SessionOptions::default();
+
+        apply_model_placement_hints(&mut options, &hints, false)?;
+
+        let provider = options.execution_providers.first().expect("provider");
+        assert!(provider.caps.is_gpu());
+        assert!(provider.caps.is_nvidia());
+        assert_eq!(provider.caps.device_id(), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn forced_model_device_cannot_override_programmatic_device() {
+        let hints = MetadataHints::scan([
+            node_hint("attention", "onnx_runtime.device", "gpu"),
+            node_hint("attention", "onnx_runtime.device.strength", "force"),
+        ]);
+        let mut options =
+            SessionOptions::with_execution_provider(onnx_genai_ort::ep_selection("cpu"));
+
+        let error = apply_model_placement_hints(&mut options, &hints, true)
+            .expect_err("forced mismatch must fail")
+            .to_string();
+
+        assert!(
+            error.contains("force hints cannot be overridden"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn programmatic_device_overrides_model_preference() -> anyhow::Result<()> {
+        let hints = MetadataHints::scan([node_hint("attention", "onnx_runtime.device", "gpu")]);
+        let mut options =
+            SessionOptions::with_execution_provider(onnx_genai_ort::ep_selection("cpu"));
+
+        apply_model_placement_hints(&mut options, &hints, true)?;
+
+        assert!(options.execution_providers[0].caps.is_host());
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_preferred_device_is_advisory() -> anyhow::Result<()> {
+        let hints = MetadataHints::scan([node_hint("attention", "onnx_runtime.device", "npu")]);
+        let mut options = SessionOptions::default();
+
+        apply_model_placement_hints(&mut options, &hints, false)?;
+
+        assert!(!options.execution_providers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn heterogeneous_forced_model_devices_fail_actionably() {
+        let hints = MetadataHints::scan([
+            node_hint("cpu_node", "onnx_runtime.device", "cpu"),
+            node_hint("cpu_node", "onnx_runtime.device.strength", "force"),
+            node_hint("gpu_node", "onnx_runtime.device", "gpu"),
+            node_hint("gpu_node", "onnx_runtime.device.strength", "force"),
+        ]);
+
+        let error = apply_model_placement_hints(&mut SessionOptions::default(), &hints, false)
+            .expect_err("heterogeneous force must fail")
+            .to_string();
+
+        assert!(
+            error.contains("currently supports one execution provider"),
+            "{error}"
+        );
+    }
 }
