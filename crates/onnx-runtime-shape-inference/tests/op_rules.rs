@@ -279,8 +279,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 181);
-    assert_eq!(registry.entry_count(), 219);
+    assert_eq!(registry.operator_count(), 187);
+    assert_eq!(registry.entry_count(), 226);
 }
 
 #[test]
@@ -4556,6 +4556,244 @@ fn einsum_symbolic_dims_and_gating() {
             &einsum_node("ij->ji", 1),
             vec![f32in(vec![c(2), c(3), c(4)])],
             12
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+#[test]
+fn det_collapses_trailing_square_matrix_and_gates_since_version() {
+    // Batched input: the trailing [M, M] matrix collapses to a scalar per batch.
+    let out = run(&node("Det", 1, 1), vec![f32in(vec![c(2), c(3), c(3)])], 11);
+    assert_eq!(out_shape(&out), vec![c(2)]);
+    assert_eq!(out_dtype(&out), DataType::Float32);
+
+    // A bare square matrix yields a rank-0 output.
+    let scalar = run(&node("Det", 1, 1), vec![f32in(vec![c(4), c(4)])], 11);
+    assert_eq!(out_shape(&scalar), Vec::<DimExpr>::new());
+
+    // Symbolic batch dims are preserved; only the matrix axes are dropped.
+    let symbolic = run(
+        &node("Det", 1, 1),
+        vec![f32in(vec![sym(1), sym(2), c(5), c(5)])],
+        11,
+    );
+    assert_eq!(out_shape(&symbolic), vec![sym(1), sym(2)]);
+
+    // since_version 11: opset 10 leaves the output unresolved.
+    assert!(
+        run(&node("Det", 1, 1), vec![f32in(vec![c(3), c(3)])], 10)[0]
+            .type_info
+            .is_none()
+    );
+
+    // A rank-1 input has no matrix to reduce.
+    assert!(try_run(&node("Det", 1, 1), vec![f32in(vec![c(3)])], 11).is_err());
+}
+
+#[test]
+fn lp_pool_and_global_lp_pool_reuse_spatial_rules() {
+    // LpPool applies the same windowed spatial formula as AveragePool.
+    let lp = with_attr(
+        node("LpPool", 1, 1),
+        "kernel_shape",
+        Attribute::Ints(vec![2]),
+    );
+    let out = run(&lp, vec![f32in(vec![c(1), c(3), c(8)])], 18);
+    assert_eq!(out_shape(&out), vec![c(1), c(3), c(7)]);
+
+    // A symbolic spatial extent degrades to a fresh symbol but keeps the rank.
+    let symbolic = run(&lp, vec![f32in(vec![c(1), c(3), sym(5)])], 18);
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape[..2], [c(1), c(3)]);
+    assert_symbolic(&shape[2]);
+
+    // kernel_shape is required.
+    assert!(
+        try_run(
+            &node("LpPool", 1, 1),
+            vec![f32in(vec![c(1), c(3), c(8)])],
+            18
+        )
+        .is_err()
+    );
+
+    // GlobalLpPool collapses every spatial dim to 1.
+    let global = run(
+        &node("GlobalLpPool", 1, 1),
+        vec![f32in(vec![c(2), c(3), c(7), c(7)])],
+        1,
+    );
+    assert_eq!(out_shape(&global), vec![c(2), c(3), c(1), c(1)]);
+}
+
+#[test]
+fn max_unpool_uses_transpose_formula_or_explicit_output_shape() {
+    // Transpose formula: stride*(input-1) - pads + kernel.
+    let unpool = with_attr(
+        with_attr(
+            node("MaxUnpool", 2, 1),
+            "kernel_shape",
+            Attribute::Ints(vec![2, 2]),
+        ),
+        "strides",
+        Attribute::Ints(vec![2, 2]),
+    );
+    let out = run(
+        &unpool,
+        vec![
+            f32in(vec![c(1), c(1), c(2), c(2)]),
+            tin(DataType::Int64, vec![c(1), c(1), c(2), c(2)]),
+        ],
+        9,
+    );
+    assert_eq!(out_shape(&out), vec![c(1), c(1), c(4), c(4)]);
+
+    // A symbolic spatial extent degrades to a fresh symbol.
+    let symbolic = run(
+        &unpool,
+        vec![
+            f32in(vec![c(1), c(1), sym(3), c(2)]),
+            tin(DataType::Int64, vec![c(1), c(1), sym(3), c(2)]),
+        ],
+        9,
+    );
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape[..2], [c(1), c(1)]);
+    assert_symbolic(&shape[2]);
+    assert_eq!(shape[3], c(4));
+
+    // The optional output_shape input (slot 2) overrides the formula.
+    let out = run(
+        &node("MaxUnpool", 3, 1),
+        vec![
+            f32in(vec![c(1), c(1), c(2), c(2)]),
+            tin(DataType::Int64, vec![c(1), c(1), c(2), c(2)]),
+            sd_vec(vec![c(1), c(1), c(5), c(5)]),
+        ],
+        11,
+    );
+    assert_eq!(out_shape(&out), vec![c(1), c(1), c(5), c(5)]);
+
+    // since_version 9: opset 8 leaves the output unresolved.
+    assert!(
+        run(
+            &unpool,
+            vec![
+                f32in(vec![c(1), c(1), c(2), c(2)]),
+                tin(DataType::Int64, vec![c(1), c(1), c(2), c(2)])
+            ],
+            8
+        )[0]
+        .type_info
+        .is_none()
+    );
+}
+
+#[test]
+fn col2im_folds_columns_back_into_image() {
+    // data [N, C*prod(block), L], image_shape [4, 4], block_shape [2, 2]:
+    // C = 12 / (2*2) = 3, so output is [1, 3, 4, 4].
+    let out = run(
+        &node("Col2Im", 3, 1),
+        vec![
+            f32in(vec![c(1), c(12), c(9)]),
+            sd_vec(vec![c(4), c(4)]),
+            sd_vec(vec![c(2), c(2)]),
+        ],
+        18,
+    );
+    assert_eq!(out_shape(&out), vec![c(1), c(3), c(4), c(4)]);
+
+    // A symbolic image extent stays symbolic in the output.
+    let symbolic = run(
+        &node("Col2Im", 3, 1),
+        vec![
+            f32in(vec![c(1), c(12), c(9)]),
+            sd_vec(vec![sym(7), c(4)]),
+            sd_vec(vec![c(2), c(2)]),
+        ],
+        18,
+    );
+    let shape = out_shape(&symbolic);
+    assert_eq!(shape[..2], [c(1), c(3)]);
+    assert_symbolic(&shape[2]);
+    assert_eq!(shape[3], c(4));
+
+    // An unknown block volume leaves the channel count symbolic.
+    let unknown_channels = run(
+        &node("Col2Im", 3, 1),
+        vec![
+            f32in(vec![c(1), c(12), c(9)]),
+            sd_vec(vec![c(4), c(4)]),
+            tin(DataType::Int64, vec![c(2)]),
+        ],
+        18,
+    );
+    let shape = out_shape(&unknown_channels);
+    assert_eq!(shape[0], c(1));
+    assert_symbolic(&shape[1]);
+    assert_eq!(shape[2..], [c(4), c(4)]);
+
+    // Rank other than 3 is rejected.
+    assert!(
+        try_run(
+            &node("Col2Im", 3, 1),
+            vec![
+                f32in(vec![c(1), c(12)]),
+                sd_vec(vec![c(4)]),
+                sd_vec(vec![c(2)])
+            ],
+            18,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn center_crop_pad_resizes_selected_axes() {
+    // axes [0, 1]: axes 0 and 1 take the target extents, axis 2 is untouched.
+    let cropped = with_attr(
+        node("CenterCropPad", 2, 1),
+        "axes",
+        Attribute::Ints(vec![0, 1]),
+    );
+    let out = run(
+        &cropped,
+        vec![f32in(vec![c(10), c(8), c(3)]), sd_vec(vec![c(20), c(5)])],
+        18,
+    );
+    assert_eq!(out_shape(&out), vec![c(20), c(5), c(3)]);
+
+    // Omitting axes defaults to every axis.
+    let out = run(
+        &node("CenterCropPad", 2, 1),
+        vec![
+            f32in(vec![c(4), c(5), c(6)]),
+            sd_vec(vec![c(7), c(2), c(9)]),
+        ],
+        18,
+    );
+    assert_eq!(out_shape(&out), vec![c(7), c(2), c(9)]);
+
+    // A symbolic (statically unknown) target extent degrades the targeted axis
+    // to a fresh symbol; untargeted axes are copied through unchanged.
+    let symbolic = run(
+        &cropped,
+        vec![f32in(vec![c(10), c(8), c(3)]), sd_vec(vec![sym(9), c(5)])],
+        18,
+    );
+    let shape = out_shape(&symbolic);
+    assert_symbolic(&shape[0]);
+    assert_eq!(shape[1..], [c(5), c(3)]);
+
+    // since_version 18: opset 17 leaves the output unresolved.
+    assert!(
+        run(
+            &node("CenterCropPad", 2, 1),
+            vec![f32in(vec![c(4), c(5)]), sd_vec(vec![c(2), c(2)])],
+            17,
         )[0]
         .type_info
         .is_none()

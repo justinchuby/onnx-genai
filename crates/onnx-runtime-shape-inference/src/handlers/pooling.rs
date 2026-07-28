@@ -12,6 +12,7 @@ use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
 use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
+use crate::shape_data::ShapeData;
 
 /// Auto-pad handling per the ONNX spec.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -546,14 +547,120 @@ fn int_list(ctx: &InferenceContext, name: &str, len: usize, default: i64) -> Vec
     v
 }
 
+/// One `MaxUnpool` spatial output extent.
+///
+/// `MaxUnpool` is the partial inverse of `MaxPool`, so it applies the transpose
+/// formula `stride*(input-1) - pad_begin - pad_end + kernel` (there is no
+/// dilation or output padding). A symbolic input, a non-positive stride/kernel,
+/// or an out-of-range result degrades to a fresh symbol.
+fn max_unpool_dim(
+    ctx: &mut InferenceContext,
+    input: &DimExpr,
+    kernel: i64,
+    stride: i64,
+    pad_begin: i64,
+    pad_end: i64,
+) -> DimExpr {
+    let Some(d) = input.as_const() else {
+        return ctx.fresh_dim();
+    };
+    if stride <= 0 || kernel <= 0 {
+        return ctx.fresh_dim();
+    }
+    let value =
+        i128::from(stride) * (i128::from(d) - 1) - i128::from(pad_begin) - i128::from(pad_end)
+            + i128::from(kernel);
+    if !(0..=isize::MAX as i128).contains(&value) {
+        return ctx.fresh_dim();
+    }
+    DimExpr::constant(value as i64)
+}
+
+/// `MaxUnpool` (opset 9): scatter `X` `[N, C, D1, …]` back into a larger tensor.
+///
+/// When the optional `output_shape` input (slot 2, a 1-D tensor of the *full*
+/// output dims) resolves to constants it is used verbatim; otherwise the
+/// spatial extents follow the transpose formula from `kernel_shape`, `strides`,
+/// and `pads`. `N`/`C` are always copied from `X`.
+pub fn max_unpool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    if x.len() < 3 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "MaxUnpool".into(),
+            index: 0,
+            rank: x.len(),
+            detail: "expected [N, C, D1, …]".into(),
+        });
+    }
+    let n_spatial = x.len() - 2;
+    // The optional `output_shape` input overrides the computed extents.
+    if ctx.has_input(2) {
+        let dims = ctx.input_shape_data(2).map(ShapeData::as_shape);
+        let out = match dims {
+            Some(dims) if dims.len() == x.len() => {
+                for dim in &dims {
+                    if let Some(extent) = dim.as_const()
+                        && !(0..=isize::MAX as i64).contains(&extent)
+                    {
+                        return Err(ShapeInferError::Invalid {
+                            op: "MaxUnpool".into(),
+                            detail: format!(
+                                "output_shape extent {extent} is outside 0..=isize::MAX"
+                            ),
+                        });
+                    }
+                }
+                dims
+            }
+            // The dims are supplied at runtime but not statically known: keep
+            // the rank (N, C, and one fresh symbol per spatial axis).
+            _ => {
+                let mut out = vec![x[0].clone(), x[1].clone()];
+                out.extend((0..n_spatial).map(|_| ctx.fresh_dim()));
+                out
+            }
+        };
+        ctx.set_output(0, dtype, out);
+        return Ok(());
+    }
+    let kernel = pool_list(ctx, "kernel_shape", n_spatial, 0, true)?;
+    let strides = pool_list(ctx, "strides", n_spatial, 1, false)?;
+    let pads = pool_list(ctx, "pads", n_spatial * 2, 0, false)?;
+    let mut out = vec![x[0].clone(), x[1].clone()];
+    for axis in 0..n_spatial {
+        out.push(max_unpool_dim(
+            ctx,
+            &x[axis + 2],
+            kernel[axis],
+            strides[axis],
+            pads[axis],
+            pads[axis + n_spatial],
+        ));
+    }
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
 /// Register the spatial family.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Conv", 1, conv);
     reg.register("", "ConvTranspose", 1, conv_transpose);
     reg.register("", "MaxPool", 1, pool);
     reg.register("", "AveragePool", 1, pool);
+    // `LpPool` shares `MaxPool`/`AveragePool`'s windowed spatial formula (it
+    // has the same `kernel_shape`/`strides`/`pads`/`auto_pad` attributes, plus
+    // `dilations`/`ceil_mode` from opset 18), so it reuses `pool`.
+    reg.register("", "LpPool", 1, pool);
     reg.register("", "GlobalAveragePool", 1, global_pool);
     reg.register("", "GlobalMaxPool", 1, global_pool);
+    // `GlobalLpPool` collapses every spatial dim to 1, exactly like the other
+    // global pools.
+    reg.register("", "GlobalLpPool", 1, global_pool);
+    reg.register("", "MaxUnpool", 9, max_unpool);
+    reg.register("", "MaxUnpool", 11, max_unpool);
     reg.register("", "Pad", 1, pad);
     reg.register("", "GridSample", 16, grid_sample);
 }
