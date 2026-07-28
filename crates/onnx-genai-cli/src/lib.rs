@@ -48,8 +48,8 @@ use interactive::run_repl;
 use interactive::{
     InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
     context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
-    initial_repl_show_stats, interrupt_action, is_interrupt_error,
-    repl_input_mode, stage_attachment,
+    initial_repl_show_stats, interrupt_action, is_interrupt_error, repl_input_mode,
+    stage_attachment,
 };
 use model_inspection::{list, show, version};
 use onnx_genai::engine::EngineDecodeBackend;
