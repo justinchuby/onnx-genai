@@ -785,6 +785,233 @@ fn hardmax_cases() -> Vec<Case> {
     cases
 }
 
+/// Fused-GELU parity (`com.microsoft` `BiasGelu`/`FastGelu`), one case per
+/// float dtype. `X` is `[2,4]` with a `[4]` bias broadcast over the last dim;
+/// values span negative / zero / positive so both GELU branches are exercised.
+/// The GELU is evaluated in `double` on both sides, so f32 stays within a few
+/// ulp of the CPU oracle.
+fn bias_gelu_cases(op: &'static str) -> Vec<Case> {
+    let x = vec![-3.0f32, -0.7, 0.0, 0.5, 1.2, 2.5, -1.5, 3.0];
+    let bias = vec![0.1f32, -0.2, 0.3, -0.4];
+    FLOAT_DTYPES
+        .into_iter()
+        .map(|dtype| Case {
+            label: format!("{op}[{dtype:?}]"),
+            op,
+            domain: "com.microsoft",
+            opset: 1,
+            inputs: vec![
+                float_input(dtype, &[2, 4], &x),
+                float_input(dtype, &[4], &bias),
+            ],
+            outputs: vec![(dtype, vec![2, 4])],
+            attrs: vec![],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        })
+        .collect()
+}
+
+/// `com.microsoft::FastGelu` parity: the bias-free arity (single input) across
+/// every float dtype, plus an f32 `-inf → 0` guard case.
+fn fast_gelu_no_bias_cases() -> Vec<Case> {
+    let x = vec![-3.0f32, -0.7, 0.0, 0.5, 1.2, 2.5, -1.5, 3.0];
+    let mut cases: Vec<Case> = FLOAT_DTYPES
+        .into_iter()
+        .map(|dtype| Case {
+            label: format!("FastGelu[{dtype:?},no-bias]"),
+            op: "FastGelu",
+            domain: "com.microsoft",
+            opset: 1,
+            inputs: vec![float_input(dtype, &[2, 4], &x)],
+            outputs: vec![(dtype, vec![2, 4])],
+            attrs: vec![],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        })
+        .collect();
+    // The `-inf` element must map to 0 (matches the CPU EP's explicit guard);
+    // if the guard were dropped, `0.5·(-inf)·(1+tanh(-inf))` is NaN and the
+    // float comparison against the CPU's 0 fails.
+    cases.push(Case {
+        label: "FastGelu[Float32,neg-inf-guard]".into(),
+        op: "FastGelu",
+        domain: "com.microsoft",
+        opset: 1,
+        inputs: vec![float_input(
+            DataType::Float32,
+            &[4],
+            &[f32::NEG_INFINITY, -1.0, 0.0, 2.0],
+        )],
+        outputs: vec![(DataType::Float32, vec![4])],
+        attrs: vec![],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    cases
+}
+
+/// `com.microsoft::QuickGelu` parity: `X·sigmoid(alpha·X)`, one case per float
+/// dtype at the default alpha plus an explicit non-default alpha (f32).
+fn quick_gelu_cases() -> Vec<Case> {
+    let x = vec![-4.0f32, -1.0, -0.2, 0.0, 0.3, 1.5, 3.0, 5.0];
+    let mut cases: Vec<Case> = FLOAT_DTYPES
+        .into_iter()
+        .map(|dtype| Case {
+            label: format!("QuickGelu[{dtype:?}]"),
+            op: "QuickGelu",
+            domain: "com.microsoft",
+            opset: 1,
+            inputs: vec![float_input(dtype, &[2, 4], &x)],
+            outputs: vec![(dtype, vec![2, 4])],
+            attrs: vec![],
+            compare: Compare::Float {
+                tol: float_tol(dtype),
+            },
+        })
+        .collect();
+    cases.push(Case {
+        label: "QuickGelu[Float32,alpha=1.5]".into(),
+        op: "QuickGelu",
+        domain: "com.microsoft",
+        opset: 1,
+        inputs: vec![float_input(DataType::Float32, &[2, 4], &x)],
+        outputs: vec![(DataType::Float32, vec![2, 4])],
+        attrs: vec![("alpha", Attribute::Float(1.5))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    cases
+}
+
+/// `CumProd` parity vs the CPU scan: f32 (exclusive/reverse/axis variants,
+/// float-close) and i64 (byte-exact) over multi-dimensional inputs.
+fn cumprod_cases() -> Vec<Case> {
+    let f = |label: &str,
+             shape: &[usize],
+             values: &[f32],
+             axis: i64,
+             attrs: Vec<(&'static str, Attribute)>|
+     -> Case {
+        Case {
+            label: label.to_string(),
+            op: "CumProd",
+            domain: "",
+            opset: 26,
+            inputs: vec![
+                float_input(DataType::Float32, shape, values),
+                input(DataType::Int64, &[], &[axis]),
+            ],
+            outputs: vec![(DataType::Float32, shape.to_vec())],
+            attrs,
+            compare: Compare::Float { tol: 1e-4 },
+        }
+    };
+    let row = vec![1.0f32, 2.0, 3.0, -1.0, 0.5, 4.0];
+    let mut cases = vec![
+        f("CumProd[f32,axis1]", &[2, 3], &row, 1, vec![]),
+        f(
+            "CumProd[f32,axis0,exclusive]",
+            &[2, 3],
+            &row,
+            0,
+            vec![("exclusive", Attribute::Int(1))],
+        ),
+        f(
+            "CumProd[f32,axis-1,reverse]",
+            &[2, 3],
+            &row,
+            -1,
+            vec![("reverse", Attribute::Int(1))],
+        ),
+        f(
+            "CumProd[f32,axis1,3d]",
+            &[2, 2, 2],
+            &[1.0, 2.0, 3.0, 0.5, -2.0, 4.0, 1.5, 2.0],
+            1,
+            vec![],
+        ),
+    ];
+    // Int64 byte-exact scan (includes a zero and a negative factor).
+    let ints = vec![1_i64, 2, 3, -1, 5, 0];
+    cases.push(Case {
+        label: "CumProd[i64,axis1,reverse]".into(),
+        op: "CumProd",
+        domain: "",
+        opset: 26,
+        inputs: vec![
+            input(DataType::Int64, &[2, 3], &ints),
+            input(DataType::Int64, &[], &[1_i64]),
+        ],
+        outputs: vec![(DataType::Int64, vec![2, 3])],
+        attrs: vec![("reverse", Attribute::Int(1))],
+        compare: Compare::ExactBytes,
+    });
+    cases
+}
+
+/// `ArgMax`/`ArgMin` parity vs the CPU oracle (byte-exact Int64 indices) over
+/// keepdims/axis variants, dtypes, and the `select_last_index` tie-break.
+fn arg_reduce_cases(op: &'static str) -> Vec<Case> {
+    let in_shape = vec![2usize, 3, 4];
+    let count: usize = in_shape.iter().product();
+    let values: Vec<f32> = (0..count)
+        .map(|v| ((v * 7 + 3) % 11) as f32 - 5.0)
+        .collect();
+    let mut cases = Vec::new();
+    for (axis, keepdims) in [(1i64, true), (1, false), (-1, false), (0, true)] {
+        let out_shape = reduce_out_shape(&in_shape, &[axis], keepdims);
+        cases.push(Case {
+            label: format!("{op}(axis={axis},keepdims={keepdims})"),
+            op,
+            domain: "",
+            opset: 13,
+            inputs: vec![input(DataType::Float32, &in_shape, &values)],
+            outputs: vec![(DataType::Int64, out_shape)],
+            attrs: vec![
+                ("axis", Attribute::Int(axis)),
+                ("keepdims", Attribute::Int(keepdims as i64)),
+            ],
+            compare: Compare::ExactBytes,
+        });
+    }
+    // f16 dtype path (widened to f32 for the comparison, like the CPU oracle).
+    cases.push(Case {
+        label: format!("{op}[Float16,axis-1]"),
+        op,
+        domain: "",
+        opset: 13,
+        inputs: vec![float_input(DataType::Float16, &[2, 4], &values[..8])],
+        outputs: vec![(DataType::Int64, vec![2])],
+        attrs: vec![
+            ("axis", Attribute::Int(-1)),
+            ("keepdims", Attribute::Int(0)),
+        ],
+        compare: Compare::ExactBytes,
+    });
+    // Tie-break: repeated extremal values along the axis. Default keeps the
+    // first index; select_last_index keeps the last — a falsifiable guard on
+    // the tie rule (the two cases produce different bytes).
+    let tie = vec![3.0f32, 5.0, 5.0, 2.0, 5.0, 5.0, 1.0, 0.0];
+    for select_last in [0i64, 1] {
+        cases.push(Case {
+            label: format!("{op}[tie,select_last={select_last}]"),
+            op,
+            domain: "",
+            opset: 13,
+            inputs: vec![input(DataType::Float32, &[2, 4], &tie)],
+            outputs: vec![(DataType::Int64, vec![2])],
+            attrs: vec![
+                ("axis", Attribute::Int(-1)),
+                ("keepdims", Attribute::Int(0)),
+                ("select_last_index", Attribute::Int(select_last)),
+            ],
+            compare: Compare::ExactBytes,
+        });
+    }
+    cases
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The conformance profile: one entry per CUDA_COVERED_OPS op.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -952,6 +1179,19 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("BitShift", bitshift_cases()));
     p.push(sweep("LogSoftmax", log_softmax_cases()));
     p.push(sweep("Hardmax", hardmax_cases()));
+
+    // Batch 5 (issue #67): fused GELU activations, cumulative product, and the
+    // index reductions ArgMax/ArgMin.
+    p.push(sweep("BiasGelu", bias_gelu_cases("BiasGelu")));
+    p.push(sweep("FastGelu", {
+        let mut c = bias_gelu_cases("FastGelu");
+        c.extend(fast_gelu_no_bias_cases());
+        c
+    }));
+    p.push(sweep("QuickGelu", quick_gelu_cases()));
+    p.push(sweep("CumProd", cumprod_cases()));
+    p.push(sweep("ArgMax", arg_reduce_cases("ArgMax")));
+    p.push(sweep("ArgMin", arg_reduce_cases("ArgMin")));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.
