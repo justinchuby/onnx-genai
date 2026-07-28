@@ -163,3 +163,10 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 
 ## 2026-07-28T17:40:00+0000
 #365 metadata-hints integration merged after the structural identity remediation chain.
+
+## 2026-07-28T13:30:00-07:00 — DeepSeek native+CUDA "repeats thinking, won't stop" investigation
+
+- ⛔ COULD NOT REPRODUCE. Native CUDA EP is unrunnable on this host: cudarc is pinned to the CUDA 13 API set (onnx-runtime-ep-cuda/Cargo.toml:37, cuda-13000 + dynamic-loading) and dlopens cublasLt64_13.dll / cudart64_13.dll, but only CUDA 12 redist exists here (site-packages/nvidia/**); cu13 pip wheels are 0.0.1 stubs; no toolkit/nvcc. GPU present (RTX 4060, driver 591.55) but that alone is insufficient.
+- Ran the strongest reachable differential instead: DeepSeek-R1-Distill-Qwen-1.5B (HF cache), --greedy, budgets 30/600/800, two reasoning prompts, ORT CPU vs native CPU. Result: BYTE-IDENTICAL generated text (bodies compared line-for-line) and BOTH terminate on EOS. No loop, no divergence.
+- This exonerates the shared native decode stack for the symptom: EOS/stop (decode_loop.rs:311), attention mask + position ids (native_decode/cpu.rs:194-203, cuda.rs:854-895), steady-state KV, greedy argmax. Remaining candidates are native-CUDA kernel numerics (untestable here) or the model's default do_sample/temp=0.6 sampling regime (different fix class) — neither confirmed.
+- No production change, no regression test (contingent on a fix; would be manufacturing). Findings + next-engineer plan (needs a CUDA-13 host; dump per-step logits and bisect) in .squad/decisions/inbox/leon-deepseek-repeat.md.
