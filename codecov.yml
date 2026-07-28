@@ -21,8 +21,8 @@ flags:
   offline:
     carryforward: false
   cli-ort-linux:
-    carryforward: false
+    carryforward: true
   cli-ort-windows:
-    carryforward: false
+    carryforward: true
   mlas:
-    carryforward: false
+    carryforward: true

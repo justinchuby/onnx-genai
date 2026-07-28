@@ -1,13 +1,13 @@
-# CI is split into two tiers:
-# - Fast tier: every PR push. Runs formatting/lints, Linux x86_64 offline
-#   crate tests, Linux/Windows x86_64 CLI build/test/e2e, and the Windows
-#   onnx-runtime-loader path-safety tests without coverage instrumentation.
-#   Windows PR coverage is spent where this repo actually sees platform bugs:
-#   CLI, ORT loading, filesystem, terminal, and dynamic linking boundaries.
-# - Slow tier: push to main, nightly schedule, manual dispatch (default), or
-#   adding the `ci:full` label to an open PR. Adds coverage uploads, the full
-#   Windows x86_64 offline-crate suite, Windows ARM64, macOS arm64, and CUDA
-#   compile checks. Audit lives in audit.yml with the same slow-tier triggers.
+# CI is split on instrumentation cost, not platform signal:
+# - PR tier: every PR push. Runs formatting/lints, the full uninstrumented
+#   offline-crate test matrix on Linux x86_64, Windows x86_64, Windows ARM64,
+#   and macOS arm64, the Linux/Windows x86_64 CLI ORT lanes, CUDA compile
+#   checks, and exactly one Linux offline coverage upload.
+# - Full coverage tier: push to main, nightly schedule, manual dispatch
+#   (default), or adding the `ci:full` label to an open PR. Adds the remaining
+#   coverage uploads/flags (mlas, cli-ort-linux, cli-ort-windows) and Windows
+#   x86_64 offline coverage. Audit lives in audit.yml with the same slow-tier
+#   triggers.
 name: CI
 
 on:
@@ -175,6 +175,10 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
+          - name: Windows x86_64
+            os: windows-latest
+          - name: macOS arm64
+            os: macos-latest
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -248,7 +252,7 @@ jobs:
 
   rust-coverage-linux:
     name: Rust coverage (Linux x86_64)
-    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')) || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.tier != 'fast')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.tier != 'fast' }}
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -338,9 +342,10 @@ jobs:
       # The vendored MLAS feasibility spike is offline, but its build script is
       # intentionally x86_64 Linux-only (GAS assembly and Linux headers).
       - name: Test Linux-only offline crates with coverage
+        if: env.SLOW_TIER == 'true'
         run: cargo llvm-cov --locked --codecov --output-path codecov-mlas.json -p mlas-sys
       - name: Upload MLAS coverage to Codecov
-        if: always()
+        if: always() && env.SLOW_TIER == 'true'
         uses: codecov/codecov-action@v4
         with:
           files: codecov-mlas.json
@@ -438,9 +443,8 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  rust-slow-windows-arm64:
-    name: Rust slow platform (Windows ARM64)
-    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')) || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.tier != 'fast')) }}
+  rust-windows-arm64:
+    name: Rust (Windows ARM64)
     runs-on: windows-11-arm
     env:
       CARGO_TERM_COLOR: always
@@ -479,8 +483,8 @@ jobs:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
-      # Windows ARM64 still executes tests, but not coverage, until
-      # rust-lang/rust#150123 stops producing malformed profraw files.
+      # Windows ARM64 executes tests without coverage until rust-lang/rust#150123
+      # stops producing malformed profraw files. Platform signal stays on PRs.
       - name: Test cross-platform offline crates
         run: >-
           cargo test --locked
@@ -541,78 +545,6 @@ jobs:
           -p onnx-runtime-comm
           -p onnx-std-python
           -- -D warnings
-
-  rust-slow-macos-arm64:
-    name: Rust slow platform (macOS arm64)
-    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')) || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.tier != 'fast')) }}
-    runs-on: macos-latest
-    env:
-      CARGO_TERM_COLOR: always
-      RUSTFLAGS: "-D warnings"
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-      - name: Install Rust stable toolchain
-        id: rust-toolchain
-        shell: bash
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
-          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
-      - name: Resolve cargo cache target
-        id: cache-target
-        shell: bash
-        run: |
-          target="$(rustc -Vv | sed -n 's/^host: //p')"
-          echo "triple=$target" >> "$GITHUB_OUTPUT"
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install Python test dependencies
-        run: python -m pip install --upgrade numpy onnxscript
-      # Slow-platform smoke coverage runs tests without coverage instrumentation.
-      - name: Test cross-platform offline crates
-        run: >-
-          cargo test --locked
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
 
   cli-ort:
     name: CLI ORT (${{ matrix.name }})
@@ -734,7 +666,7 @@ jobs:
 
   cuda-compile-linux:
     name: CUDA compile (Linux x86_64)
-    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')) || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.tier != 'fast')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.tier != 'fast' }}
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -792,7 +724,7 @@ jobs:
 
   cuda-compile-windows:
     name: CUDA compile (Windows x86_64)
-    if: ${{ (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full')) || (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.tier != 'fast')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.tier != 'fast' }}
     runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: always

@@ -128,3 +128,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Confirmed `miri.yml` has no matrix/gated job-name issue. Repo-wide scan found analogous conditional matrices only in release/manual workflows (`publish.yml`, `wheels.yml`), not PR CI; left them outside this PR.
 - Recorded Justin's live `ci:full` verification on PR #340: CI run 30345861354 and audit run 30345861425 started via label.
 - Added CLI-specific cache keys after the main merge exposed a shared-cache collision/incomplete-restore pattern in the Windows CLI lane. Remeasured final-head fast run 30349042835 at 4m33s wall-clock; critical path `Rust (Linux x86_64)` at 4m22s, with Windows CLI at 3m14s. The preceding workflow-code run 30348596658 was 3m51s; current variance is in Linux Rust/quality after the main merge, not the skipped-name fix.
+
+## 2026-07-28T08:01:42-07:00 — Corrected CI fast/slow tier axis
+- Reworked PR CI back to full uninstrumented platform testing: Linux x86_64, Windows x86_64, Windows ARM64, and macOS arm64 offline crate suites all run on every PR, with Linux/Windows CLI ORT and CUDA compile lanes also on PRs.
+- Kept coverage instrumentation tiered instead of platform signal: PRs upload only the Linux offline Codecov flag; main/nightly/`ci:full` add `mlas`, `cli-ort-linux`, `cli-ort-windows`, and Windows offline coverage.
+- Set Codecov carryforward on the flags PRs intentionally omit (`mlas`, `cli-ort-linux`, `cli-ort-windows`) so missing slow-tier uploads do not look like PR coverage regressions against main.
+- Decision filed: `.squad/decisions/inbox/pris-ci-fast-slow-tiers.md`.

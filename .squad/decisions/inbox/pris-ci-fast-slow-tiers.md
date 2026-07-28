@@ -1,0 +1,4 @@
+### 2026-07-28: CI tier axis is instrumentation, not platforms
+**By:** Pris
+**What:** PR CI keeps full uninstrumented platform testing on Linux x86_64, Windows x86_64, Windows ARM64, and macOS arm64, plus CUDA compile and CLI ORT lanes. Only coverage instrumentation is tiered: PRs upload the Linux offline coverage flag, while main/nightly/`ci:full` add the remaining coverage flags (`mlas`, `cli-ort-linux`, `cli-ort-windows`) and Windows offline coverage.
+**Why:** The earlier fast/slow split had the axis backwards. This repository's recent defects were platform-specific, so platforms are high-signal pre-merge checks; coverage instrumentation is mostly runtime cost. Keeping platforms on PRs catches Windows cfg/DLL/path issues and Linux-only compile issues before merge while limiting the instrumentation tax.
