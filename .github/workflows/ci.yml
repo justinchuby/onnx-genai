@@ -1,6 +1,9 @@
 # CI is split into two tiers:
-# - Fast tier: every PR push. Runs formatting/lints plus Linux x86_64 and
-#   Windows x86_64 build/test/CLI e2e without coverage instrumentation.
+# - Fast tier: every PR push. Runs formatting/lints, Linux x86_64 offline
+#   crate tests, and Linux/Windows x86_64 CLI build/test/e2e without coverage
+#   instrumentation. Windows PR coverage is spent where this repo actually
+#   sees platform bugs: CLI, ORT loading, filesystem, terminal, and dynamic
+#   linking boundaries.
 # - Slow tier: push to main, nightly schedule, manual dispatch (default), or
 #   adding the `ci:full` label to an open PR. Adds coverage uploads, Windows
 #   ARM64, macOS arm64, and CUDA compile checks. Audit lives in audit.yml with
@@ -155,8 +158,6 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
-          - name: Windows x86_64
-            os: windows-latest
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
