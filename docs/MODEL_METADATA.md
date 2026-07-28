@@ -219,10 +219,11 @@ device-buffer aliasing is a separate capability and fails with an actionable
 error rather than falling back to ORT.
 
 I/O role resolution follows one reusable priority order: an exact `model.io` or
-`speculative.io` declaration, then a unique dtype/shape signal, then the legacy
-terminal-name convention. Structural ambiguity is never guessed. The final
-name-based step exists only for backward compatibility with packages that do
-not yet declare the contract.
+`speculative.io` declaration, then a unique tensor-shape signal. Graph port
+names are never interpreted. When shapes are ambiguous—for example, token IDs,
+attention masks, and position IDs all having rank two, or multiple same-shaped
+KV tensors—the corresponding metadata fields are required and loading fails
+with an error naming the missing field.
 
 Attention representation metadata is interpreted independently of
 `model.attention.type`. In particular, `key_sequence_lengths.scalar_broadcast`

@@ -294,7 +294,9 @@ impl Drop for DecodeSession<'_> {
 }
 
 impl<'a> DecodeSession<'a> {
-    /// Create a decode session and infer KV input/output pairs from graph names.
+    /// Create a decode session using unambiguous tensor shapes.
+    ///
+    /// Models with shape-ambiguous roles must use [`Self::new_with_io`].
     pub fn new(session: &'a Session, options: DecodeSessionOptions) -> Result<Self> {
         Self::new_with_io(session, options, None)
     }
@@ -309,51 +311,101 @@ impl<'a> DecodeSession<'a> {
         let excluded = kv_pairs
             .iter()
             .flat_map(|pair| [pair.past.as_str(), pair.present.as_str()])
+            .chain(
+                [
+                    io.and_then(|io| io.inputs_embeds_input.as_deref()),
+                    io.and_then(|io| io.attention_mask_input.as_deref()),
+                    io.and_then(|io| io.position_ids_input.as_deref()),
+                    io.and_then(|io| io.hidden_output.as_deref()),
+                ]
+                .into_iter()
+                .flatten(),
+            )
             .collect::<HashSet<_>>();
-        let resolve_input =
-            |declared, role, structural: fn(&TensorInfo) -> bool, names: &[&str]| {
-                crate::io_roles::resolve_port(
-                    session.inputs(),
-                    declared,
-                    role,
-                    |tensor| !excluded.contains(tensor.name.as_str()) && structural(tensor),
-                    |name| crate::io_roles::legacy_terminal_name(name, names),
-                )
-                .map_err(OrtError::InvalidArgument)
-                .map(|port| port.map(|port| port.name))
-            };
+        let resolve_input = |declared, role, structural: fn(&TensorInfo) -> bool| {
+            crate::io_roles::resolve_port(session.inputs(), declared, role, |tensor| {
+                !excluded.contains(tensor.name.as_str()) && structural(tensor)
+            })
+            .map_err(OrtError::InvalidArgument)
+            .map(|port| port.map(|port| port.name))
+        };
         let never = |_: &TensorInfo| false;
         let token_input = resolve_input(
             io.and_then(|io| io.token_input.as_deref()),
-            "io.token_input",
-            crate::io_roles::is_integer_sequence,
-            &["input_ids", "decoder_input_ids"],
+            "model.io.token_input",
+            crate::io_roles::is_rank_one_or_two_sequence,
         )?
-        .ok_or_else(|| OrtError::InvalidArgument("cannot resolve token input".into()))?;
+        .ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "cannot resolve token input from tensor shape; declare model.io.token_input".into(),
+            )
+        })?;
         let attention_mask_input = resolve_input(
             io.and_then(|io| io.attention_mask_input.as_deref()),
-            "io.attention_mask_input",
+            "model.io.attention_mask_input",
             never,
-            &["attention_mask"],
         )?;
         let position_ids_input = resolve_input(
             io.and_then(|io| io.position_ids_input.as_deref()),
-            "io.position_ids_input",
+            "model.io.position_ids_input",
             never,
-            &["position_ids"],
         )?;
         let logits_output = crate::io_roles::resolve_port(
             session.outputs(),
             io.and_then(|io| io.logits_output.as_deref()),
-            "io.logits_output",
+            "model.io.logits_output",
             |tensor| {
-                !excluded.contains(tensor.name.as_str()) && crate::io_roles::is_score_output(tensor)
+                !excluded.contains(tensor.name.as_str())
+                    && crate::io_roles::is_rank_one_to_three_output(tensor)
             },
-            |name| crate::io_roles::legacy_terminal_name(name, &["logits"]),
         )
         .map_err(OrtError::InvalidArgument)?
         .map(|port| port.name)
-        .ok_or_else(|| OrtError::InvalidArgument("cannot resolve logits output".into()))?;
+        .ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "cannot resolve logits output from tensor shape; declare model.io.logits_output"
+                    .into(),
+            )
+        })?;
+        let assigned_inputs = [
+            Some(token_input.as_str()),
+            attention_mask_input.as_deref(),
+            position_ids_input.as_deref(),
+            io.and_then(|io| io.inputs_embeds_input.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(kv_pairs.iter().map(|pair| pair.past.as_str()))
+        .collect::<HashSet<_>>();
+        let assigned_outputs = [
+            Some(logits_output.as_str()),
+            io.and_then(|io| io.hidden_output.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(kv_pairs.iter().map(|pair| pair.present.as_str()))
+        .collect::<HashSet<_>>();
+        let unassigned_state_inputs = session
+            .inputs()
+            .iter()
+            .filter(|tensor| {
+                tensor.shape.len() >= 3 && !assigned_inputs.contains(tensor.name.as_str())
+            })
+            .map(|tensor| tensor.name.as_str())
+            .collect::<Vec<_>>();
+        let unassigned_state_outputs = session
+            .outputs()
+            .iter()
+            .filter(|tensor| {
+                tensor.shape.len() >= 3 && !assigned_outputs.contains(tensor.name.as_str())
+            })
+            .map(|tensor| tensor.name.as_str())
+            .collect::<Vec<_>>();
+        if !unassigned_state_inputs.is_empty() || !unassigned_state_outputs.is_empty() {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); declare model.io.kv_inputs and model.io.kv_outputs"
+            )));
+        }
         let share_buffer = options
             .past_present_share_buffer
             .unwrap_or(session.past_present_share_buffer_supported());
@@ -649,7 +701,7 @@ impl<'a> DecodeSession<'a> {
         if self.mode == DecodeKvMode::SharedBuffer {
             let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
             for (name, value) in self.session.output_names().iter().zip(outputs) {
-                if is_logits_output(name) {
+                if name == &self.logits_output {
                     logits = value;
                     break;
                 }
@@ -765,7 +817,7 @@ impl<'a> DecodeSession<'a> {
                     self.binding
                         .bind_output(output, value)
                         .map_err(CapturedStepError::PreRun)?;
-                } else if is_logits_output(output) {
+                } else if output == &self.logits_output {
                     self.binding
                         .bind_output(output, &cap.logits)
                         .map_err(CapturedStepError::PreRun)?;
@@ -861,8 +913,13 @@ impl<'a> DecodeSession<'a> {
             .session
             .outputs()
             .iter()
-            .find(|info| is_logits_output(&info.name))
-            .ok_or_else(|| OrtError::InvalidArgument("model exposes no logits output".into()))?;
+            .find(|info| info.name == self.logits_output)
+            .ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "resolved logits output '{}' is not exposed",
+                    self.logits_output
+                ))
+            })?;
         let vocab = logits_info
             .shape
             .last()
@@ -1245,7 +1302,7 @@ impl<'a> DecodeSession<'a> {
         for (name, value) in self.session.output_names().iter().zip(outputs) {
             if let Some(past_name) = present_to_past.get(name.as_str()) {
                 next_kv.insert((*past_name).to_string(), Arc::new(value));
-            } else if name == &self.logits_output || logits.is_none() {
+            } else if name == &self.logits_output {
                 *logits = Some(value);
             }
         }

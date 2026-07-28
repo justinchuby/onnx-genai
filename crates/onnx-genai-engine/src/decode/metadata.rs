@@ -2,7 +2,6 @@
 //!
 //! Pure code motion from `decode.rs`.
 
-use super::values::{is_kv_input, is_present_output};
 use super::*;
 
 #[cfg(any(test, feature = "native-backend"))]
@@ -100,16 +99,10 @@ pub(crate) fn detect_model_decode_path(
 
     let has_kv_inputs = io
         .and_then(|io| io.kv_inputs.as_ref())
-        .is_some_and(|ports| !ports.is_empty())
-        || (io.is_none() && session.inputs().iter().any(|info| is_kv_input(&info.name)));
+        .is_some_and(|ports| !ports.is_empty());
     let has_present_outputs = io
         .and_then(|io| io.kv_outputs.as_ref())
-        .is_some_and(|ports| !ports.is_empty())
-        || (io.is_none()
-            && session
-                .outputs()
-                .iter()
-                .any(|info| is_present_output(&info.name)));
+        .is_some_and(|ports| !ports.is_empty());
     if has_kv_inputs || has_present_outputs {
         if sliding_window.is_some() {
             // Sliding-window models take the bounded paged past/present path

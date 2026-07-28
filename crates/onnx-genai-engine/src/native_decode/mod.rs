@@ -8,9 +8,6 @@ use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
 use onnx_genai_ort::Tokenizer;
-use onnx_genai_ort::decode_contract::{
-    KvNamingConvention, has_past_prefix, has_present_prefix, matching_past_input,
-};
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
     CaptureDeclineReport, DecodePrecision, DeviceAllocationCounts, DeviceBindingTransferStats,

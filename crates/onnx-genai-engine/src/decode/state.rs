@@ -5,8 +5,7 @@
 use super::resolved_io::ResolvedIo;
 use super::step::stable_session_ref;
 use super::values::{
-    concat_value_axis, is_kv_input, is_present_output, matching_past_input, slice_value_axis,
-    sole_axis_with_extent, validate_fixed_state_budget,
+    concat_value_axis, slice_value_axis, sole_axis_with_extent, validate_fixed_state_budget,
 };
 use super::*;
 
@@ -32,8 +31,7 @@ impl DecodeState {
         Self::new_with_io(session, None)
     }
 
-    /// Construct a decode state, binding KV and per-step ports from an explicit
-    /// metadata `io` block when supplied, else from tensor-name conventions.
+    /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &Session,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
@@ -63,92 +61,23 @@ impl DecodeState {
     }
 
     fn from_resolved(
-        session: &Session,
+        _session: &Session,
         resolved: ResolvedIo,
         positions: Option<PositionProgram>,
     ) -> anyhow::Result<Self> {
-        if resolved.explicit {
-            let kv_inputs = resolved
-                .kv_pairs
-                .iter()
-                .map(|(past, _)| past.clone())
-                .collect::<Vec<_>>();
-            let present_to_past = resolved
-                .kv_pairs
-                .iter()
-                .map(|(past, present)| (present.clone(), past.clone()))
-                .collect::<HashMap<_, _>>();
-            let use_kv = !resolved.kv_pairs.is_empty();
-            return Ok(Self {
-                use_kv,
-                past: HashMap::new(),
-                present_to_past,
-                kv_inputs,
-                io: resolved,
-                loop_state: HashMap::new(),
-                positions,
-                next_positions: None,
-                sliding_window: None,
-                sink_tokens: 0,
-                retained_kv_len: 0,
-                runner: None,
-                #[cfg(test)]
-                test_runner_marker: false,
-            });
-        }
-
-        // TRANSITIONAL: remove in Phase 2 once all packages emit `io`. KV wiring
-        // is inferred from `past`/`present` tensor-name conventions.
-        let kv_inputs = session
-            .inputs()
+        let kv_inputs = resolved
+            .kv_pairs
             .iter()
-            .filter(|info| is_kv_input(&info.name))
-            .map(|info| info.name.clone())
+            .map(|(past, _)| past.clone())
             .collect::<Vec<_>>();
-        let present_outputs = session
-            .outputs()
+        let present_to_past = resolved
+            .kv_pairs
             .iter()
-            .filter(|info| is_present_output(&info.name))
-            .map(|info| info.name.clone())
-            .collect::<Vec<_>>();
-
-        if kv_inputs.is_empty() && present_outputs.is_empty() {
-            return Ok(Self {
-                use_kv: false,
-                past: HashMap::new(),
-                present_to_past: HashMap::new(),
-                kv_inputs,
-                io: resolved,
-                loop_state: HashMap::new(),
-                positions,
-                next_positions: None,
-                sliding_window: None,
-                sink_tokens: 0,
-                retained_kv_len: 0,
-                runner: None,
-                #[cfg(test)]
-                test_runner_marker: false,
-            });
-        }
-
-        let mut present_to_past = HashMap::new();
-        for output in &present_outputs {
-            if let Some(input) = matching_past_input(output, &kv_inputs) {
-                present_to_past.insert(output.clone(), input.clone());
-            }
-        }
-
-        if kv_inputs.is_empty()
-            || present_outputs.is_empty()
-            || present_to_past.len() != present_outputs.len()
-        {
-            anyhow::bail!(
-                "model exposes incomplete KV I/O; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
-            );
-        }
-
+            .map(|(past, present)| (present.clone(), past.clone()))
+            .collect::<HashMap<_, _>>();
+        let use_kv = !resolved.kv_pairs.is_empty();
         Ok(Self {
-            use_kv: true,
+            use_kv,
             past: HashMap::new(),
             present_to_past,
             kv_inputs,
@@ -165,12 +94,8 @@ impl DecodeState {
         })
     }
 
-    pub(crate) fn new_for_path(session: &Session, path: &ModelDecodePath) -> anyhow::Result<Self> {
-        Self::new_for_path_with_io(session, path, None)
-    }
-
-    /// Like [`DecodeState::new_for_path`], binding per-step and KV ports from an
-    /// explicit metadata `io` block when supplied (Legacy / PastPresent paths).
+    /// Create decode state for a selected path, resolving ports from explicit
+    /// metadata or unambiguous tensor shapes.
     pub(crate) fn new_for_path_with_io(
         session: &Session,
         path: &ModelDecodePath,

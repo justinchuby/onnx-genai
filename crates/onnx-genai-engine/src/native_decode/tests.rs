@@ -338,6 +338,43 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
     }
 }
 
+fn tiny_decoder_io() -> ModelIoSpec {
+    ModelIoSpec {
+        sequence_source: Some(SequenceInputKind::TokenIds),
+        kv_ownership: Some(KvOwnership::Owned),
+        token_input: Some("input_ids".into()),
+        inputs_embeds_input: None,
+        attention_mask_input: Some("attention_mask".into()),
+        position_ids_input: Some("position_ids".into()),
+        logits_output: Some("logits".into()),
+        hidden_output: None,
+        kv_inputs: Some(vec![
+            "past_key_values.0.key".into(),
+            "past_key_values.0.value".into(),
+        ]),
+        kv_outputs: Some(vec!["present.0.key".into(), "present.0.value".into()]),
+        encoder_hidden_states_input: None,
+        audio_features_input: None,
+        cross_kv_inputs: None,
+        cross_kv_outputs: None,
+        kv_update: None,
+        state_pairs: None,
+        optional_inputs: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn native_decoder_requires_explicit_ambiguous_io() {
+    let error = match NativeDecodeSession::from_session(tiny_decoder(false)) {
+        Ok(_) => panic!("ambiguous decoder roles must require metadata"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("model.io.token_input"),
+        "{error:#}"
+    );
+}
+
 fn tiny_embedding_target(with_routed_input: bool) -> InferenceSession {
     let mut graph = Graph::new();
     graph.opset_imports.insert(String::new(), 11);
@@ -857,7 +894,12 @@ fn run_capture_safe_decode(
 
 #[test]
 fn native_decode_advances_kv_and_rewinds() {
-    let mut session = NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+    let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(false),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("load decoder");
     let logits = session.decode(&[1, 2, 3], 0).expect("prefill");
     assert_eq!(logits.len(), 3);
     assert_eq!(logits[0].len(), 1);
@@ -876,8 +918,12 @@ fn native_decode_advances_kv_and_rewinds() {
 
 #[test]
 fn native_target_step_preserves_token_driven_binding() {
-    let mut session =
-        NativeDecodeSession::from_session(tiny_decoder(false)).expect("load token target");
+    let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(false),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("load token target");
     assert!(session.step_inputs.iter().any(|binding| {
         binding.name == "input_ids" && binding.source == NativeStepInputSource::TokenIds
     }));
@@ -994,7 +1040,12 @@ fn native_decode_verify_then_rewind_matches_fresh_decode() {
     // committed length, and prove a subsequent decode is bit-identical to a
     // fresh decode from the same committed prefix (no KV corruption). The
     // device-KV bit-identity variant is `native_cuda_verify_rewind_no_kv_corruption`.
-    let mut session = NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+    let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(false),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("load decoder");
     let prompt = [1, 2, 3];
     session.decode(&prompt, 0).expect("prefill");
     let past = session.current_len();
@@ -1019,7 +1070,12 @@ fn native_decode_verify_then_rewind_matches_fresh_decode() {
         .expect("decode after rewind");
 
     // Fresh session decoded over the committed prefix prompt ++ draft[..j].
-    let mut fresh = NativeDecodeSession::from_session(tiny_decoder(false)).expect("fresh decoder");
+    let mut fresh = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(false),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("fresh decoder");
     let mut committed = prompt.to_vec();
     committed.extend_from_slice(&draft[..j]);
     fresh.decode(&committed, 0).expect("fresh prefill");
@@ -1045,7 +1101,12 @@ fn native_decode_verify_then_rewind_matches_fresh_decode() {
 
 #[test]
 fn native_decode_verify_requires_matching_past_and_nonempty_draft() {
-    let mut session = NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+    let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(false),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("load decoder");
     session.decode(&[1, 2], 0).expect("prefill");
     assert!(
         session
@@ -1068,7 +1129,12 @@ fn native_decode_option_c_scaffolding_is_dormant_by_default() {
     // The padded M=maxK capture + retain-graph-on-rewind switches (option (c))
     // must stay dormant. On a CPU session (no CUDA state) the controls are
     // inert no-ops and the capacity stays `None`.
-    let mut session = NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+    let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(false),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("load decoder");
     assert_eq!(session.padded_query_capacity(), None);
     session.set_retain_graph_on_rewind(true);
     session.configure_padded_verify_capture(8);
@@ -1368,7 +1434,12 @@ fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly() -> 
 
 #[test]
 fn native_decode_accepts_last_token_only_logits_and_advances_kv() {
-    let mut session = NativeDecodeSession::from_session(tiny_decoder(true)).expect("load decoder");
+    let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+        tiny_decoder(true),
+        None,
+        Some(&tiny_decoder_io()),
+    )
+    .expect("load decoder");
 
     let logits = session.decode(&[1, 2, 3], 0).expect("prefill");
     assert_eq!(logits, vec![vec![10.0, 20.0]]);
@@ -1727,8 +1798,12 @@ fn tiny_decoder_matches_across_inplace_env_toggle() {
     let run = |value: &str| -> Vec<Vec<f32>> {
         // SAFETY: serialized by `env_lock`; restored below.
         unsafe { std::env::set_var("ONNX_GENAI_CPU_INPLACE_KV", value) };
-        let mut session =
-            NativeDecodeSession::from_session(tiny_decoder(false)).expect("load decoder");
+        let mut session = NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+            tiny_decoder(false),
+            None,
+            Some(&tiny_decoder_io()),
+        )
+        .expect("load decoder");
         let prefill = session.decode(&[1, 2, 3], 0).expect("prefill");
         let step = session.decode(&[4], 3).expect("decode step");
         unsafe { std::env::remove_var("ONNX_GENAI_CPU_INPLACE_KV") };

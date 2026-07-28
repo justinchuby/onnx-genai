@@ -453,6 +453,12 @@ fn load_draft_model(
     let draft = if let Some(draft_model_path) = &config.draft_model {
         let draft_directory = ModelDirectory::load(draft_model_path)
             .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {e}"))?;
+        let draft_io = draft_directory
+            .metadata_path
+            .as_deref()
+            .map(onnx_genai_metadata::load_metadata)
+            .transpose()?
+            .and_then(|metadata| metadata.model.and_then(|model| model.io));
         let draft_session = Session::new(
             environment,
             &draft_directory.model_path,
@@ -490,6 +496,7 @@ fn load_draft_model(
         Some(DraftModel {
             session: Box::new(draft_session),
             decode_path: draft_decode_path,
+            io: draft_io,
             kv_model: draft_kv_model,
             kv_cache: draft_kv_cache,
         })

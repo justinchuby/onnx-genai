@@ -2,25 +2,17 @@
 //!
 //! Pure code motion from `decode.rs`: I/O resolution for the decode step.
 
-use super::values::{ensure_i64, is_token_input_name};
+use super::values::ensure_i64;
 use super::*;
 use onnx_genai_ort::io_roles::{
-    is_embedding_sequence, is_integer_sequence, is_score_output, legacy_terminal_name, resolve_port,
+    is_rank_one_or_two_sequence, is_rank_one_to_three_output, is_rank_three_sequence, resolve_port,
 };
 
 /// Resolved graph I/O port bindings for the decode step.
 ///
-/// Built from an explicit metadata `io` block when a model package declares one
-/// (via [`ModelIoSpec`]), otherwise from unambiguous dtype/shape signals and,
-/// finally, historical tensor-name conventions.
-///
-/// TRANSITIONAL: the convention fallback exists only until every model package
-/// emits an `io` block. Phase 2 removes the fallback, at which point `explicit`
-/// is always `true` and the `is_*` helpers collapse to direct name comparisons.
+/// Built from explicit metadata and otherwise from unambiguous tensor shapes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResolvedIo {
-    /// True when built from an explicit metadata `io` block.
-    pub(super) explicit: bool,
     pub(crate) token_input: Option<String>,
     pub(crate) inputs_embeds_input: Option<String>,
     pub(crate) attention_mask_input: Option<String>,
@@ -324,8 +316,7 @@ pub(super) fn validate_position_shape(info: &TensorInfo, rank: usize) -> anyhow:
 }
 
 impl ResolvedIo {
-    /// Resolve port bindings from an explicit `io` block when present, else fall
-    /// back to tensor-name conventions.
+    /// Resolve port bindings from explicit metadata or unambiguous tensor shape.
     pub(crate) fn resolve_with_positions(
         session: &Session,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
@@ -333,55 +324,58 @@ impl ResolvedIo {
     ) -> anyhow::Result<Self> {
         match io {
             Some(io) => Self::from_spec(session, io, positions),
-            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
             None => {
                 if positions.is_some() {
                     anyhow::bail!(
                         "pipeline.positions requires an explicit decoder io block so its position input can be validated"
                     );
                 }
-                Self::from_structure_or_legacy(session)
+                Self::from_structure(session)
             }
         }
     }
 
-    fn from_structure_or_legacy(session: &Session) -> anyhow::Result<Self> {
-        let input = |role: &str,
-                     structural: fn(&TensorInfo) -> bool,
-                     names: &[&str]|
-         -> anyhow::Result<Option<String>> {
-            resolve_port(session.inputs(), None, role, structural, |name| {
-                legacy_terminal_name(name, names)
-            })
-            .map_err(anyhow::Error::msg)
-            .map(|resolved| resolved.map(|resolved| resolved.name))
-        };
-        let output = |role: &str,
-                      structural: fn(&TensorInfo) -> bool,
-                      names: &[&str]|
-         -> anyhow::Result<Option<String>> {
-            resolve_port(session.outputs(), None, role, structural, |name| {
-                legacy_terminal_name(name, names)
-            })
-            .map_err(anyhow::Error::msg)
-            .map(|resolved| resolved.map(|resolved| resolved.name))
-        };
-        let never = |_: &TensorInfo| false;
+    fn from_structure(session: &Session) -> anyhow::Result<Self> {
+        let input =
+            |role: &str, structural: fn(&TensorInfo) -> bool| -> anyhow::Result<Option<String>> {
+                resolve_port(session.inputs(), None, role, structural)
+                    .map_err(anyhow::Error::msg)
+                    .map(|resolved| resolved.map(|resolved| resolved.name))
+            };
+        let output =
+            |role: &str, structural: fn(&TensorInfo) -> bool| -> anyhow::Result<Option<String>> {
+                resolve_port(session.outputs(), None, role, structural)
+                    .map_err(anyhow::Error::msg)
+                    .map(|resolved| resolved.map(|resolved| resolved.name))
+            };
+        let token_input = input("model.io.token_input", is_rank_one_or_two_sequence)?;
+        let inputs_embeds_input = input("model.io.inputs_embeds_input", is_rank_three_sequence)?;
+        if token_input.is_none() && inputs_embeds_input.is_none() {
+            anyhow::bail!(
+                "cannot resolve the decoder sequence input from tensor shape; declare model.io.sequence_source and its exact model.io.token_input or model.io.inputs_embeds_input"
+            );
+        }
+        let logits_output =
+            output("model.io.logits_output", is_rank_one_to_three_output)?.with_context(|| {
+                "cannot resolve decoder logits from tensor shape; declare model.io.logits_output"
+            })?;
+        if session.inputs().iter().any(|info| {
+            matches!(
+                info.dtype,
+                DataType::Float16 | DataType::BFloat16 | DataType::Float32
+            ) && info.shape.len() >= 3
+                && Some(info.name.as_str()) != inputs_embeds_input.as_deref()
+        }) {
+            anyhow::bail!(
+                "decoder exposes stateful floating-point inputs that cannot be paired unambiguously by shape; declare model.io.kv_inputs and model.io.kv_outputs (or model.io.state_pairs)"
+            );
+        }
         Ok(Self {
-            explicit: false,
-            token_input: input(
-                "token input",
-                is_integer_sequence,
-                &["input_ids", "decoder_input_ids"],
-            )?,
-            inputs_embeds_input: input(
-                "embedding sequence input",
-                is_embedding_sequence,
-                &["inputs_embeds"],
-            )?,
-            attention_mask_input: input("attention mask input", never, &["attention_mask"])?,
-            position_ids_input: input("position ids input", never, &["position_ids"])?,
-            logits_output: output("logits output", is_score_output, &["logits"])?,
+            token_input,
+            inputs_embeds_input,
+            attention_mask_input: None,
+            position_ids_input: None,
+            logits_output: Some(logits_output),
             hidden_output: None,
             kv_pairs: Vec::new(),
             state_pairs: Vec::new(),
@@ -396,6 +390,89 @@ impl ResolvedIo {
     ) -> anyhow::Result<Self> {
         let has_input = |name: &str| session.inputs().iter().any(|info| info.name == name);
         let has_output = |name: &str| session.outputs().iter().any(|info| info.name == name);
+        let occupied_inputs = [
+            io.attention_mask_input.as_deref(),
+            io.position_ids_input.as_deref(),
+            io.encoder_hidden_states_input.as_deref(),
+            io.audio_features_input.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(io.kv_inputs.iter().flatten().map(String::as_str))
+        .chain(io.cross_kv_inputs.iter().flatten().map(String::as_str))
+        .chain(
+            io.state_pairs
+                .iter()
+                .flatten()
+                .map(|pair| pair.input.as_str()),
+        )
+        .chain(io.optional_inputs.keys().map(String::as_str))
+        .collect::<HashSet<_>>();
+        let resolve_input =
+            |declared: Option<&str>, key: &str, structural: fn(&TensorInfo) -> bool| {
+                resolve_port(session.inputs(), declared, key, |tensor| {
+                    !occupied_inputs.contains(tensor.name.as_str()) && structural(tensor)
+                })
+                .map_err(anyhow::Error::msg)
+                .map(|port| port.map(|port| port.name))
+            };
+        let sequence_source = io
+            .sequence_source
+            .unwrap_or(onnx_genai_metadata::SequenceInputKind::TokenIds);
+        let (token_input, inputs_embeds_input) = match sequence_source {
+            onnx_genai_metadata::SequenceInputKind::TokenIds => (
+                Some(
+                    resolve_input(
+                        io.token_input.as_deref(),
+                        "model.io.token_input",
+                        is_rank_one_or_two_sequence,
+                    )?
+                    .context(
+                        "cannot resolve decoder token input from tensor shape; declare model.io.token_input",
+                    )?,
+                ),
+                io.inputs_embeds_input.clone(),
+            ),
+            onnx_genai_metadata::SequenceInputKind::InputsEmbeds => (
+                io.token_input.clone(),
+                Some(
+                    resolve_input(
+                        io.inputs_embeds_input.as_deref(),
+                        "model.io.inputs_embeds_input",
+                        is_rank_three_sequence,
+                    )?
+                    .context(
+                        "cannot resolve decoder embedding input from tensor shape; declare model.io.inputs_embeds_input",
+                    )?,
+                ),
+            ),
+        };
+        let occupied_outputs = io
+            .hidden_output
+            .iter()
+            .map(String::as_str)
+            .chain(io.kv_outputs.iter().flatten().map(String::as_str))
+            .chain(
+                io.state_pairs
+                    .iter()
+                    .flatten()
+                    .map(|pair| pair.output.as_str()),
+            )
+            .collect::<HashSet<_>>();
+        let logits_output = resolve_port(
+            session.outputs(),
+            io.logits_output.as_deref(),
+            "model.io.logits_output",
+            |tensor| {
+                !occupied_outputs.contains(tensor.name.as_str())
+                    && is_rank_one_to_three_output(tensor)
+            },
+        )
+        .map_err(anyhow::Error::msg)?
+        .map(|port| port.name)
+        .context(
+            "cannot resolve decoder logits from tensor shape; declare model.io.logits_output",
+        )?;
 
         for (label, port) in [
             ("io.token_input", &io.token_input),
@@ -478,12 +555,11 @@ impl ResolvedIo {
         let position_ids_input = resolve_position_program(session, io, positions)?;
 
         Ok(Self {
-            explicit: true,
-            token_input: io.token_input.clone(),
-            inputs_embeds_input: io.inputs_embeds_input.clone(),
+            token_input,
+            inputs_embeds_input,
             attention_mask_input: io.attention_mask_input.clone(),
             position_ids_input,
-            logits_output: io.logits_output.clone(),
+            logits_output: Some(logits_output),
             hidden_output: io.hidden_output.clone(),
             kv_pairs,
             state_pairs,
@@ -492,29 +568,17 @@ impl ResolvedIo {
     }
 
     /// Whether `name` is the token-id input for this graph.
-    pub(super) fn is_token_input(&self, name: &str, lower: &str) -> bool {
+    pub(super) fn is_token_input(&self, name: &str) -> bool {
         self.token_input.as_deref() == Some(name)
-            || (!self.explicit && {
-                // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-                is_token_input_name(lower)
-            })
     }
 
     /// Whether `name` is the attention-mask input for this graph.
-    pub(super) fn is_attention_mask_input(&self, name: &str, lower: &str) -> bool {
+    pub(super) fn is_attention_mask_input(&self, name: &str) -> bool {
         self.attention_mask_input.as_deref() == Some(name)
-            || (!self.explicit && {
-                // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-                lower == "attention_mask" || lower.ends_with(".attention_mask")
-            })
     }
 
     /// Whether `name` is the position-ids input for this graph.
-    pub(super) fn is_position_ids_input(&self, name: &str, lower: &str) -> bool {
+    pub(super) fn is_position_ids_input(&self, name: &str) -> bool {
         self.position_ids_input.as_deref() == Some(name)
-            || (!self.explicit && {
-                // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-                lower == "position_ids" || lower.ends_with(".position_ids")
-            })
     }
 }
