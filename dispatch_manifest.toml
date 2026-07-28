@@ -62,6 +62,16 @@ file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
 description = "M>=2 prefill uses BNNS/AMX"
 # Proves: fp16_m_ge2_prefill_reaches_bnns_not_half_gemm
 
+[[claim]]
+op = "MatMul"
+variant = "f32_thin_m"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "THIN_M_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M=2..16 f32 prefill with large B uses column-parallel NEON, not cblas_sgemm"
+# Proves: f32_thin_m_prefill_reaches_neon_col_parallel
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Conv — aarch64-apple-darwin
 # ═══════════════════════════════════════════════════════════════════════════════

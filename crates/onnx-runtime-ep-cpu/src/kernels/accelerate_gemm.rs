@@ -852,6 +852,237 @@ fn neon_dot_f16(a_f16: &[u16], b: &[f32]) -> f32 {
         .sum()
 }
 
+// ─── Thin-M GEMM: column-parallel batched-GEMV for M=2..16, large N ──
+
+/// Minimum K×N element count for the thin-M path to activate. Below this,
+/// B fits in cache and `cblas_sgemm` is faster.
+///
+/// **Fitted constant.** Measured crossover on M1 Max (48 MB SLC) at
+/// K×N ≈ 2–4M elements. We use 4M (16 MB at f32) as the portable floor
+/// because it exceeds the smallest SLC on any Apple Silicon Mac (8 MB on
+/// base M1/M2/M3; source: Notebookcheck, Wikipedia die-shot analyses).
+/// At 16 MB the weight matrix cannot reside in SLC, so every `cblas_sgemm`
+/// panel re-read hits DRAM. The column-parallel NEON path streams B_T once,
+/// which is superior at thin M under these conditions.
+///
+/// The 16 MB figure also exceeds the per-P-cluster L2 (12 MB on M1, 16 MB
+/// on M2/M3), reinforcing that B is DRAM-resident for all parts.
+///
+/// **Bracket:** measured [2M, 4M] on M1 Max; 4M chosen as conservative
+/// upper bound so the path only activates when the streaming advantage is
+/// clear across all SLC sizes.
+pub const THIN_M_LARGE_B_THRESHOLD: usize = 4_000_000;
+
+/// Maximum M for the thin-M GEMM path. Above this, `cblas_sgemm` amortizes
+/// its panel overhead efficiently and matches or beats column-parallel NEON.
+///
+/// **Mechanism (general):** As M grows, arithmetic intensity increases and
+/// the compute-bound regime favors `cblas_sgemm`'s AMX-backed tiling.
+/// **Coefficient (fitted):** Measured on M1 Max — NEON wins by ≥1.2× at
+/// M≤16, break-even at M≈20, cblas wins at M≥24. Bracket: [16, 24].
+const THIN_M_MAX: usize = 16;
+
+/// Column-parallel thin-M GEMM using pre-transposed B_T\[N,K\] row-major.
+///
+/// Computes C\[M,N\] = A\[M,K\] @ B\[K,N\] by treating each output column j as
+/// M independent dot products: C\[i,j\] = dot(A\[i,:\], B_T\[j,:\]).
+///
+/// The column-first loop order ensures that for each group of 4 B_T rows
+/// (12–48 KB depending on K), all M dot products are computed while the data
+/// is L1-hot. Total DRAM traffic is dominated by a single pass of B_T.
+///
+/// Parallelized across Rayon threads (or the persistent SPMD pool when active)
+/// over disjoint column ranges — each thread writes to non-overlapping elements
+/// of `c`, so no reduction or synchronization is needed.
+pub fn neon_thin_m_gemm_col_parallel(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(bt.len(), n * k);
+    debug_assert_eq!(c.len(), m * n);
+
+    let threads = rayon::current_num_threads();
+
+    // Single-threaded fallback for small matrices or single-threaded pools.
+    if threads <= 1 || k * n < 500_000 {
+        neon_thin_m_tile(a, bt, c, m, k, n, 0, n);
+        return;
+    }
+
+    // Parallelize over column strips via Rayon. Each strip owns a disjoint
+    // column range of C: strip t writes c[i*n + j0 .. i*n + j0+jn] for all
+    // rows i, which does not overlap any other strip.
+    use rayon::prelude::*;
+    let chunk = n.div_ceil(threads).max(1);
+    let num_strips = n.div_ceil(chunk);
+    // SAFETY: each task writes to disjoint elements of `c` (non-overlapping
+    // column ranges). The raw pointer send is necessary because `par_chunks_mut`
+    // cannot partition `c` by columns (it's row-major).
+    let c_ptr = c.as_mut_ptr() as usize;
+    (0..num_strips).into_par_iter().for_each(|t| {
+        let j0 = t * chunk;
+        let jn = chunk.min(n - j0);
+        let c_base = c_ptr as *mut f32;
+        // SAFETY: writes only to c[i*n + j0 .. i*n + j0+jn] for i in 0..m,
+        // which is disjoint from any other strip's range.
+        unsafe {
+            neon_thin_m_tile_raw(a, bt, c_base, m, k, n, j0, jn);
+        }
+    });
+}
+
+/// Returns `true` if the thin-M GEMM path should be used for the given shape.
+/// Checks: M in 2..=THIN_M_MAX and K×N exceeds the streaming threshold.
+#[inline]
+pub fn thin_m_gemm_eligible(m: usize, k: usize, n: usize) -> bool {
+    m >= 2 && m <= THIN_M_MAX && k.saturating_mul(n) > THIN_M_LARGE_B_THRESHOLD
+}
+
+/// Compute a tile of C columns [j0..j0+jn] for all M rows, writing into a
+/// contiguous output slice (used for single-threaded path and testing).
+fn neon_thin_m_tile(
+    a: &[f32],
+    bt: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    j0: usize,
+    jn: usize,
+) {
+    // Column-first: process 4 output columns at a time, computing all M rows
+    // per group while B_T data is L1-hot.
+    let mut j = 0;
+    while j + 4 <= jn {
+        let col = j0 + j;
+        for i in 0..m {
+            let a_row = &a[i * k..i * k + k];
+            let s = neon_dot4_bt(a_row, bt, col, k);
+            c[i * n + col] = s[0];
+            c[i * n + col + 1] = s[1];
+            c[i * n + col + 2] = s[2];
+            c[i * n + col + 3] = s[3];
+        }
+        j += 4;
+    }
+    // Remainder columns
+    while j < jn {
+        let col = j0 + j;
+        for i in 0..m {
+            c[i * n + col] = neon_dot(&bt[col * k..(col + 1) * k], &a[i * k..i * k + k]);
+        }
+        j += 1;
+    }
+}
+
+/// Same as `neon_thin_m_tile` but writes via raw pointer (for parallel path).
+///
+/// # Safety
+/// Caller must ensure `c_base[i * n + j0 .. i * n + j0 + jn]` for `i` in
+/// `0..m` are valid, non-overlapping with other concurrent writes.
+unsafe fn neon_thin_m_tile_raw(
+    a: &[f32],
+    bt: &[f32],
+    c_base: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    j0: usize,
+    jn: usize,
+) {
+    let mut j = 0;
+    while j + 4 <= jn {
+        let col = j0 + j;
+        for i in 0..m {
+            let a_row = &a[i * k..i * k + k];
+            let s = neon_dot4_bt(a_row, bt, col, k);
+            unsafe {
+                *c_base.add(i * n + col) = s[0];
+                *c_base.add(i * n + col + 1) = s[1];
+                *c_base.add(i * n + col + 2) = s[2];
+                *c_base.add(i * n + col + 3) = s[3];
+            }
+        }
+        j += 4;
+    }
+    while j < jn {
+        let col = j0 + j;
+        for i in 0..m {
+            let val = neon_dot(&bt[col * k..(col + 1) * k], &a[i * k..i * k + k]);
+            unsafe {
+                *c_base.add(i * n + col) = val;
+            }
+        }
+        j += 1;
+    }
+}
+
+/// Compute 4 dot products simultaneously: dot(x, B_T[col+0]), dot(x, B_T[col+1]),
+/// dot(x, B_T[col+2]), dot(x, B_T[col+3]) — sharing x loads across 4 B_T rows.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn neon_dot4_bt(x: &[f32], bt: &[f32], col: usize, k: usize) -> [f32; 4] {
+    use std::arch::aarch64::*;
+    let r0 = &bt[col * k..];
+    let r1 = &bt[(col + 1) * k..];
+    let r2 = &bt[(col + 2) * k..];
+    let r3 = &bt[(col + 3) * k..];
+    let mut a0 = unsafe { vdupq_n_f32(0.0) };
+    let mut a1 = unsafe { vdupq_n_f32(0.0) };
+    let mut a2 = unsafe { vdupq_n_f32(0.0) };
+    let mut a3 = unsafe { vdupq_n_f32(0.0) };
+    let mut b0 = unsafe { vdupq_n_f32(0.0) };
+    let mut b1 = unsafe { vdupq_n_f32(0.0) };
+    let mut b2 = unsafe { vdupq_n_f32(0.0) };
+    let mut b3 = unsafe { vdupq_n_f32(0.0) };
+    let mut p = 0;
+    while p + 8 <= k {
+        unsafe {
+            let x0 = vld1q_f32(x.as_ptr().add(p));
+            let x1 = vld1q_f32(x.as_ptr().add(p + 4));
+            a0 = vfmaq_f32(a0, vld1q_f32(r0.as_ptr().add(p)), x0);
+            b0 = vfmaq_f32(b0, vld1q_f32(r0.as_ptr().add(p + 4)), x1);
+            a1 = vfmaq_f32(a1, vld1q_f32(r1.as_ptr().add(p)), x0);
+            b1 = vfmaq_f32(b1, vld1q_f32(r1.as_ptr().add(p + 4)), x1);
+            a2 = vfmaq_f32(a2, vld1q_f32(r2.as_ptr().add(p)), x0);
+            b2 = vfmaq_f32(b2, vld1q_f32(r2.as_ptr().add(p + 4)), x1);
+            a3 = vfmaq_f32(a3, vld1q_f32(r3.as_ptr().add(p)), x0);
+            b3 = vfmaq_f32(b3, vld1q_f32(r3.as_ptr().add(p + 4)), x1);
+        }
+        p += 8;
+    }
+    let mut s0 = unsafe { vaddvq_f32(vaddq_f32(a0, b0)) };
+    let mut s1 = unsafe { vaddvq_f32(vaddq_f32(a1, b1)) };
+    let mut s2 = unsafe { vaddvq_f32(vaddq_f32(a2, b2)) };
+    let mut s3 = unsafe { vaddvq_f32(vaddq_f32(a3, b3)) };
+    while p < k {
+        let xv = x[p];
+        s0 += r0[p] * xv;
+        s1 += r1[p] * xv;
+        s2 += r2[p] * xv;
+        s3 += r3[p] * xv;
+        p += 1;
+    }
+    [s0, s1, s2, s3]
+}
+
+/// Scalar fallback for non-aarch64 targets.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn neon_dot4_bt(x: &[f32], bt: &[f32], col: usize, k: usize) -> [f32; 4] {
+    let mut s = [0.0f32; 4];
+    for c in 0..4 {
+        let row = &bt[(col + c) * k..(col + c + 1) * k];
+        s[c] = x.iter().zip(row).map(|(&a, &b)| a * b).sum();
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

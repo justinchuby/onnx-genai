@@ -79,6 +79,16 @@ static GEMV_F16_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 static GEMV_F16_COLMAJ_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter: incremented each time the thin-M GEMM path is reached
+/// (M=2..16, large N×K, f32 on macOS with pre-transposed B).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "ios")
+))]
+static THIN_M_GEMM_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Test-only counter: incremented each time the non-contiguous f16 rescue block
 /// is reached (M≥2, non-contiguous constant B on macOS).
 #[cfg(all(test, any(target_os = "macos", target_os = "ios")))]
@@ -203,6 +213,62 @@ pub unsafe fn precompute_f16_weight_transpose(data_ptr: *const u16, k: usize, n:
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(ptr_key, Arc::new(bt));
+}
+
+/// Pre-compute and cache the f32 transpose of a weight matrix.
+///
+/// Called during model load for weights eligible for the thin-M GEMM path
+/// (K*N > THIN_M_LARGE_B_THRESHOLD). Moves the transpose cost into model load
+/// so that TTFT is not penalized on the first inference after Engine creation.
+///
+/// # Safety
+/// `data_ptr` must point to a valid, aligned, contiguous array of `k * n`
+/// `f32` values that remains live for the duration of this call.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub unsafe fn precompute_f32_weight_transpose(data_ptr: *const f32, k: usize, n: usize) {
+    use accelerate_gemm::THIN_M_LARGE_B_THRESHOLD;
+    if (k as u64) * (n as u64) <= THIN_M_LARGE_B_THRESHOLD as u64 {
+        return;
+    }
+    let ptr_key = data_ptr as usize;
+    if WEIGHT_TRANSPOSE_F32
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&ptr_key)
+    {
+        return;
+    }
+    let numel = k * n;
+    if numel == 0 {
+        return;
+    }
+    let src = unsafe { std::slice::from_raw_parts(data_ptr, numel) };
+    use rayon::prelude::*;
+    let mut bt = vec![0.0f32; n * k];
+    let threads = rayon::current_num_threads();
+    let rows_per_thread = n.div_ceil(threads).max(1);
+    bt.par_chunks_mut(rows_per_thread * k)
+        .enumerate()
+        .for_each(|(t, bt_chunk)| {
+            let j0 = t * rows_per_thread;
+            let j_end = (j0 + rows_per_thread).min(n);
+            let chunk_n = j_end - j0;
+            const TILE: usize = 64;
+            for i0 in (0..k).step_by(TILE) {
+                let ie = (i0 + TILE).min(k);
+                for jj in 0..chunk_n {
+                    let j = j0 + jj;
+                    for i in i0..ie {
+                        bt_chunk[jj * k + i] = src[i * n + j];
+                    }
+                }
+            }
+        });
+    let bt = Arc::new(bt);
+    WEIGHT_TRANSPOSE_F32
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ptr_key, bt);
 }
 
 /// Per-kernel cache for immutable MatMul operands that require materialization.
@@ -1417,6 +1483,32 @@ fn matmul_dense_into_with_backend(
             accelerate_gemm::neon_gemv_parallel(a_dense, b_dense, out, k, n);
         }
         return Ok(());
+    }
+
+    // Thin-M GEMM: column-parallel NEON for M=2..16 with large B (f32 on macOS).
+    //
+    // When B is too large for the SLC and M is small, `cblas_sgemm`'s panel
+    // tiling reads B inefficiently. The column-parallel approach streams B_T
+    // once per thread (each column's data stays L1-hot across M rows),
+    // achieving 2–3× speedup for the lm_head projection [7,768]×[768,50257].
+    //
+    // Requires pre-transposed B (constant weight). Non-constant B falls through
+    // to cblas_sgemm. Does NOT affect the fp16 BNNS path (handled earlier).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if backend == CpuBackend::Accelerate
+        && accelerate_gemm::thin_m_gemm_eligible(m, k, n)
+        && numel(&geom.batch_shape) <= 1
+        && geom.b_promoted_rank == 2
+    {
+        if let Some(bt) = prepack.and_then(|p| p.transposed_b(b_dense, k, n)) {
+            #[cfg(all(test, target_arch = "aarch64"))]
+            THIN_M_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Column-parallel thin-M GEMM: process strips of 4 B_T columns at
+            // a time, computing all M rows per strip while data is L1-hot.
+            // This is ~2.6× faster than cblas_sgemm for these shapes.
+            accelerate_gemm::neon_thin_m_gemm_col_parallel(a_dense, bt, out, m, k, n);
+            return Ok(());
+        }
     }
 
     // A batch product of 1 (e.g. batch_shape = [1] from a [1,1,K] activation
@@ -3261,5 +3353,94 @@ mod tests {
             result.iter().any(|&v| v != 0.0),
             "bf16 non-contiguous B produced all zeros"
         );
+    }
+
+    // ─── Thin-M GEMM dispatch reachability ──────────────────────────
+
+    /// Guard: f32 thin-M prefill (M=2..16, large K×N) on macOS must reach the
+    /// column-parallel NEON path, not fall through to cblas_sgemm.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn f32_thin_m_prefill_reaches_neon_col_parallel() {
+        use std::sync::atomic::Ordering;
+
+        // Use M=7, K=64, N=65536 to trigger the thin-M path (K*N = 4.2M > 4M threshold).
+        let (m, k, n) = (7, 64, 65536);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.001).collect();
+
+        let a = Owned::f32(&[m, k], &a_data);
+        let b = Owned::f32(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+
+        let before = THIN_M_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = THIN_M_GEMM_TEST_HITS.load(Ordering::Relaxed);
+
+        assert!(
+            after > before,
+            "f32 thin-M (M={m}, K={k}, N={n}) did not reach column-parallel NEON — \
+             cblas_sgemm is likely intercepting this shape, which causes a ~2.5× \
+             TTFT regression on large-vocab prefill"
+        );
+    }
+
+    /// Numerics parity: thin-M NEON path produces the same results as cblas_sgemm
+    /// within f32 tolerance.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn f32_thin_m_numerics_match_cblas_reference() {
+        // Shapes covering the lm_head (large N) pattern.
+        let cases = [(7, 64, 65536), (4, 128, 50257), (16, 32, 100000)];
+
+        for (m, k, n) in cases {
+            let a_data: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).sin()).collect();
+            let b_data: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.0071).cos()).collect();
+
+            // Compute via thin-M NEON path (constant B triggers transpose cache).
+            let a = Owned::f32(&[m, k], &a_data);
+            let b = Owned::f32(&[k, n], &b_data);
+            let mut out_neon = Owned::zeros_f32(&[m, n]);
+            let mut kernel = MatMulKernel::default();
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out_neon.view_mut()])
+                .unwrap();
+
+            // Reference: naive f64 accumulation.
+            let mut ref_out = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f64;
+                    for p in 0..k {
+                        sum += a_data[i * k + p] as f64 * b_data[p * n + j] as f64;
+                    }
+                    ref_out[i * n + j] = sum;
+                }
+            }
+
+            let neon_result = out_neon.to_f32();
+            let max_ref: f64 = ref_out.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+            let max_err: f64 = neon_result
+                .iter()
+                .zip(ref_out.iter())
+                .map(|(&a, &b)| (a as f64 - b).abs())
+                .fold(0.0f64, f64::max);
+            let rel_err = if max_ref > 0.0 {
+                max_err / max_ref
+            } else {
+                0.0
+            };
+
+            assert!(
+                rel_err < 1e-5,
+                "thin-M NEON path at [{m},{k}]×[{k},{n}]: relative error {rel_err:.2e} exceeds 1e-5"
+            );
+        }
     }
 }
