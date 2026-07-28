@@ -588,6 +588,55 @@ impl Executor {
                 }
                 transposed_count += 1;
             }
+            // Also pre-compute f32 transposes for weights eligible for the
+            // thin-M GEMM path (large K*N). Same rationale: move the transpose
+            // cost into model load to avoid a TTFT spike on first inference.
+            for node_plan in &exec.plan {
+                let node = exec.graph.node(node_plan.node_id);
+                if node.op_type != "MatMul" && node.op_type != "FusedMatMulBias" {
+                    continue;
+                }
+                let Some(b_vid) = node_plan.inputs.get(1).copied().flatten() else {
+                    continue;
+                };
+                if !exec.graph.initializers.contains_key(&b_vid) {
+                    continue;
+                }
+                if node_plan.input_dtypes.get(1) != Some(&DataType::Float32) {
+                    continue;
+                }
+                let Some(shape) = exec.value_shapes.get(&b_vid) else {
+                    continue;
+                };
+                if shape.len() != 2 {
+                    continue;
+                }
+                let (k, n) = match (shape[0].as_static(), shape[1].as_static()) {
+                    (Some(k), Some(n)) => (k, n),
+                    _ => continue,
+                };
+                let Some(buf) = exec.buffers.get(&b_vid) else {
+                    continue;
+                };
+                debug_assert_eq!(
+                    buf.len(),
+                    k * n * 4,
+                    "precompute_f32_weight_transpose: buffer size {} != expected {} for shape [{k}, {n}]",
+                    buf.len(),
+                    k * n * 4,
+                );
+                let ptr = buf.as_ptr() as *const f32;
+                // SAFETY: `ptr` comes from a materialized DeviceBuffer backed by
+                // the model's mmap. The buffer holds k*n contiguous f32 values
+                // (verified by the initializer dtype + shape checks above) and
+                // outlives this call (model lifetime).
+                unsafe {
+                    onnx_runtime_ep_cpu::kernels::matmul::precompute_f32_weight_transpose(
+                        ptr, k, n,
+                    );
+                }
+                transposed_count += 1;
+            }
             if let Some(span) = _span.as_mut() {
                 span.set_args(Args::new().with("transposed_weights", transposed_count));
             }
