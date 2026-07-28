@@ -754,16 +754,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn disk_offload_forced_spill_restores_interleaved_multi_page_payloads() {
-        let parent = std::env::temp_dir().join(format!(
-            "onnx-genai-kv-disk-tier-test-{}-{}",
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "onnx-genai-kv-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[tokio::test]
+    async fn disk_offload_forced_spill_restores_interleaved_multi_page_payloads() {
+        let parent = unique_temp_path("disk-tier-test");
         let mut config = small_config();
         config.hot_capacity = 1;
         config.disk_backend = Some(DiskTierConfig {
@@ -1135,16 +1139,17 @@ mod tests {
         );
         assert_eq!(conn.health().await, ConnectorHealth::Healthy);
 
-        // A configured-but-missing disk tier degrades health.
+        // An existing file cannot be used as a disk-tier directory on any platform.
+        let unavailable_path = unique_temp_path("unavailable-disk-tier");
+        std::fs::write(&unavailable_path, []).unwrap();
         let mut cfg = small_config();
         cfg.disk_backend = Some(DiskTierConfig {
-            path: std::path::PathBuf::from("/nonexistent/onnx-genai-kv-disk-tier"),
+            path: unavailable_path.clone(),
         });
         let degraded = LocalTieredConnector::new(cfg).unwrap();
-        assert!(matches!(
-            degraded.health().await,
-            ConnectorHealth::Degraded { .. }
-        ));
+        let health = degraded.health().await;
+        std::fs::remove_file(unavailable_path).unwrap();
+        assert!(matches!(health, ConnectorHealth::Degraded { .. }));
     }
 
     #[tokio::test]
