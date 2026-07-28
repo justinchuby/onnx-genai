@@ -2,6 +2,11 @@
 //!
 //! These operators intentionally exclude `ZipMap`: its map-valued output
 //! cannot be represented by the tensor-only [`TypeInfo`] inference model.
+//!
+//! `StringNormalizer` and `TfIdfVectorizer` are catalogued here alongside the
+//! ML transforms, but they are **default-domain** (`ai.onnx`) string ops — not
+//! `ai.onnx.ml` — so they are registered under the empty domain and gate
+//! against the default opset.
 
 use onnx_runtime_ir::{Attribute, DataType};
 
@@ -58,13 +63,9 @@ fn array_feature_extractor(ctx: &mut InferenceContext) -> Result<(), ShapeInferE
     Ok(())
 }
 
-/// Infer a `LabelEncoder` output dtype from its current value/default
-/// attributes. The v1 schema uses `classes_strings`; later schemas use
-/// `values_*` (or tensors at v4).
-fn label_dtype(ctx: &InferenceContext, v1: bool) -> Option<DataType> {
-    if v1 && ctx.node.attr("classes_strings").is_some() {
-        return Some(DataType::String);
-    }
+/// Infer a `LabelEncoder` (v2+) output dtype from its value/default
+/// attributes. The v2/v4 schemas use `values_*` (or tensors at v4).
+fn label_dtype(ctx: &InferenceContext) -> Option<DataType> {
     for (attr, dtype) in [
         ("values_strings", DataType::String),
         ("values_int64s", DataType::Int64),
@@ -92,20 +93,32 @@ fn label_dtype(ctx: &InferenceContext, v1: bool) -> Option<DataType> {
     None
 }
 
+/// `LabelEncoder`-1 maps between int64 and string in either direction. Like
+/// `CategoryMapper`, the direction — and therefore the output dtype — is chosen
+/// by which `default_*` attribute is present: `default_int64` set converts
+/// strings to int64 (int64 output); `default_string` set converts int64 to
+/// strings (string output). `classes_strings` is present in *both* directions,
+/// so it cannot select the output dtype.
 fn label_encoder_v1(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
-    if let (Some(shape), Some(dtype)) = (
-        ctx.input_shape(0).map(<[DimExpr]>::to_vec),
-        label_dtype(ctx, true),
+    let Some(shape) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = match (
+        ctx.node.attr("default_string").is_some(),
+        ctx.node.attr("default_int64").is_some(),
     ) {
-        ctx.set_output(0, dtype, shape);
-    }
+        (true, false) => DataType::String,
+        (false, true) => DataType::Int64,
+        _ => return Ok(()),
+    };
+    ctx.set_output(0, dtype, shape);
     Ok(())
 }
 
 fn label_encoder(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     if let (Some(shape), Some(dtype)) = (
         ctx.input_shape(0).map(<[DimExpr]>::to_vec),
-        label_dtype(ctx, false),
+        label_dtype(ctx),
     ) {
         ctx.set_output(0, dtype, shape);
     }
@@ -182,9 +195,11 @@ fn string_normalizer(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> 
     Ok(())
 }
 
-/// Register tensor-valued `ai.onnx.ml` operators.
+/// Register tensor-valued `ai.onnx.ml` operators, plus the default-domain
+/// (`ai.onnx`) string ops `StringNormalizer` and `TfIdfVectorizer`.
 pub fn register(reg: &mut InferenceRegistry) {
     const ML: &str = "ai.onnx.ml";
+    const DEFAULT: &str = "";
     reg.register(ML, "ArrayFeatureExtractor", 1, array_feature_extractor);
     reg.register(ML, "Binarizer", 1, same_type);
     reg.register(ML, "CategoryMapper", 1, category_mapper);
@@ -194,6 +209,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register(ML, "LabelEncoder", 4, label_encoder);
     reg.register(ML, "Normalizer", 1, float_output);
     reg.register(ML, "Scaler", 1, float_output);
-    reg.register(ML, "StringNormalizer", 10, string_normalizer);
-    reg.register(ML, "TfIdfVectorizer", 9, tf_idf_vectorizer);
+    // Default-domain (`ai.onnx`) string ops: StringNormalizer since v10,
+    // TfIdfVectorizer since v9.
+    reg.register(DEFAULT, "StringNormalizer", 10, string_normalizer);
+    reg.register(DEFAULT, "TfIdfVectorizer", 9, tf_idf_vectorizer);
 }
