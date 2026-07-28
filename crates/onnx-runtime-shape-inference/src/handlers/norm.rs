@@ -297,6 +297,15 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "BatchNormalization", 14, batch_norm);
     reg.register("", "BatchNormalization", 15, batch_norm);
     reg.register("", "InstanceNormalization", 6, instance_norm);
+    // `LRN` (opset 1) and `MeanVarianceNormalization` (opset 9) are both
+    // shape- and dtype-preserving, so they reuse the elementwise same-shape rule.
+    reg.register("", "LRN", 1, super::elementwise::unary);
+    reg.register(
+        "",
+        "MeanVarianceNormalization",
+        9,
+        super::elementwise::unary,
+    );
     // Standard LLM/transformer norm primitives (ai.onnx): both are
     // shape-preserving (output == input X).
     reg.register("", "RMSNormalization", 23, rms_norm);

@@ -106,6 +106,14 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "ScatterND", 16, scatter_nd);
     reg.register("", "ScatterND", 18, scatter_nd);
     reg.register("", "Trilu", 14, trilu);
+    // `ReverseSequence` (opset 10) permutes elements but preserves the input's
+    // shape and dtype, so it reuses the elementwise same-shape rule.
+    reg.register(
+        "",
+        "ReverseSequence",
+        10,
+        crate::handlers::elementwise::unary,
+    );
     reg.register("", "DepthToSpace", 1, depth_to_space);
     reg.register("", "DepthToSpace", 11, depth_to_space);
     reg.register("", "DepthToSpace", 13, depth_to_space);

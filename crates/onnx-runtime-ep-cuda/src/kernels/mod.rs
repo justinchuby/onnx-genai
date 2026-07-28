@@ -74,6 +74,7 @@ pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
+pub mod structural;
 pub mod topk;
 pub mod trilu;
 pub mod unary_predicate;
@@ -280,6 +281,9 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "CumProd",
     "ArgMax",
     "ArgMin",
+    "GatherND",
+    "SpaceToDepth",
+    "EyeLike",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -353,6 +357,24 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("ArgMin", "", 1),
         Box::new(argreduce::ArgReduceFactory {
             op: argreduce::ArgOp::Min,
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("GatherND", "", 11),
+        Box::new(structural::GatherNdFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("SpaceToDepth", "", 13),
+        Box::new(structural::SpaceToDepthFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("EyeLike", "", 9),
+        Box::new(structural::EyeLikeFactory {
             runtime: runtime.clone(),
         }),
     );
