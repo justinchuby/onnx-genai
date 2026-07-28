@@ -92,3 +92,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 ## 2026-07-27T17:59:12-07:00 — PR #296 review fixes
 - Fixed cargo cache key correctness: keys now include OS, runner architecture, actual target triple, rustc release, cached cargo tool version, and `Cargo.lock`; this prevents `windows-latest` and `windows-11-arm` from sharing `target/` or `~/.cargo/bin` artifacts.
 - Confirmed `audit.yml` does not use clippy or rustfmt and removed those rustup components from the audit toolchain install.
+
+## 2026-07-27T20:00:00-07:00 — CI fast/slow tier split
+- Split CI so every PR push runs fast uninstrumented Linux x86_64 + Windows x86_64 Rust tests and CLI ORT e2e, while coverage, Windows ARM64, macOS arm64, CUDA compile, and audit move to slow/full triggers.
+- Added `pull_request` `labeled` handling and created the `ci:full` label so labeling an open PR starts slow/full CI without a new push.
+- Preserved #296 supply-chain/concurrency constraints: direct `rustup`, GitHub-owned `actions/cache`, arch-aware keys, and SHA-keyed non-PR concurrency.
+- Measured fast dispatch run 30324179873 at 7m57s wall-clock; final slow dispatch run 30324584315 passed after rerunning a flaky Windows ARM64 failure, earlier equivalent slow dispatch 30322967863 passed at 15m30s, and audit run 30322969130 passed at 3m08s. Fast remains above the ~4m target because Windows x86_64 Rust tests are the critical path, but Windows correctness stayed on PRs.
