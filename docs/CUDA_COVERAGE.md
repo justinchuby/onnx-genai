@@ -165,6 +165,9 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane cumulative product (f32/i64) honouring `exclusive`/`reverse`, mirroring the `CumSum` scan (`cumprod.rs`). |
 | `ArgMax` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `ArgMin` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
+| `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
+| `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic NCHW spatial-block rearrangement with runtime `blocksize`, including multi-channel and empty-batch tensors (`structural.rs`). |
+| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
 
 ## Source-derived coverage audit (2026-07-27)
 
@@ -315,6 +318,18 @@ This brings the machine-verified `CUDA_COVERED_OPS` list length from **125** to
 **131** op names. `ArgMax`, `ArgMin`, and `CumProd` move out of the CPU `ai.onnx`
 gap list, and `BiasGelu`/`FastGelu`/`QuickGelu` are no longer `com.microsoft`
 gaps.
+
+The issue #67 operator-coverage batch 6 adds three standard-domain structural
+operators: `GatherND`, `SpaceToDepth`, and `EyeLike`. All three use
+dtype-agnostic NVRTC byte kernels rather than a vendor library:
+`GatherND` supports Int32/Int64 indices, negative wrapping, tuple tails, and
+`batch_dims`; `SpaceToDepth` rearranges arbitrary fixed-width NCHW tensors; and
+`EyeLike` emits exact zero/one storage for every numeric/bool dtype supported by
+the CPU EP. GPU parity covers batch dimensions, negative indices, multiple
+channels, dtype overrides, diagonal offsets, and empty tensors. This raises the
+machine-verified `CUDA_COVERED_OPS` count from **131** to **134** and the current
+CPU standard-domain parity count from **102 / 141** to **105 / 141**. These ops
+move out of the CPU `ai.onnx` gap list.
 
 ---
 
