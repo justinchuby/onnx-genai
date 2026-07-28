@@ -8960,3 +8960,749 @@ Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 747576 
 **What:** PR #283 closed #50 with native ComfyUI ControlNet and LoRA wiring, but the final landed ControlNet contract is Batty's corrected approach rather than Dallas's superseded suffix-port/`conditioning_scale` plan. Runtime binds exactly the real mobius denoiser input `controlnet_cond` for a single ControlNet hint as batched RGB CHW `[0,1]` at pixel resolution; ControlNet strength is export-fused, so no runtime `conditioning_scale` input is emitted. Multiple ControlNets fail loudly instead of inventing suffixed ports that mobius does not declare. LoRA remains routed through declared `lora_gate.{stem}` inputs.
 **Why:** Bishop's initial review found the prior `conditioning_scale` gate and multi-ControlNet suffix inputs had no mobius backing and would silently drop through declared-input routing. Batty removed those invented mechanisms, added contract-pinning tests (`single_controlnet_binds_the_declared_unsuffixed_cond_input`, `multiple_controlnets_fail_loudly_instead_of_silently_dropping`), and Bishop re-reviewed with APPROVE after mutation proof. The stale Dallas inbox note is retained here only as superseded history; future work should use the single `controlnet_cond`/export-fused-strength contract unless mobius changes.
 **Outcome:** Dallas authored the original PR, Batty owned the fix after Dallas lockout, Bishop approved the re-review, PR #283 merged as `687612f5`, and issue #50 is closed. The native image-pipeline trilogy is complete: #48 SDXL, #49 img2img/inpaint, and #50 ControlNet/LoRA are all closed.
+
+
+Decision archive gate checked at 2026-07-27T19:35:00Z: active ledger was 749614 bytes and exceeded 51200 bytes; applied the 7-day policy with cutoff 2026-07-20T19:35:00Z. No active-ledger decision blocks older than the retained window were present, so no archive file was changed.
+
+<!-- scribe-merge-2026-07-27T19-35-00Z-roadmap-wave -->
+## 2026-07-27 — Roadmap wave CPU/CUDA/KV/eager/schema reconciliation
+
+**By:** Scribe
+
+**What:** Merged this roadmap wave's durable implementation/review notes after all listed PRs landed on main:
+- PR #285 (`d889e85b`) closed #74: CPU standard Conv without MLAS (Vasquez; Hicks approved).
+- PR #286 (`0e35045e`) closed #61: scheduler KV preemption/eviction executes engine movement with byte-identical restore (Gorman; Apone approved).
+- PR #292 (`4d15f554`) closed #78: eager multi-output dispatch with Split/TopK and PyO3 feature gating (Crowe; Hudson approved).
+- PR #293 (`406cdf42`) advanced #75: ONNX schema/shape-inference catalog 148→164, with container-aware TypeInfo deferred (Burke; Parker approved after Pris test fix).
+- PR #294 (`568bbd66`) closed #58: native f16/bf16 CPU GEMM FMA microkernel and aarch64 cfg-gated perf probe fix (Drake; Ferro approved after Luba fix).
+- PR #288 (`925afbf2`) advanced #67: CUDA EP coverage batch 4, CUDA_COVERED_OPS 118→125 (Moss; Bishop approved after Deckard test fix).
+
+**Why:** These entries capture durable roadmap outcomes, reviewer lockouts/fix owners, and follow-up seams for future scheduling.
+
+<!-- merged from .squad/decisions/inbox/vasquez-cpu-standard-ops-74.md -->
+### 2026-07-27: Keep standard Conv available without MLAS
+**By:** Vasquez
+**What:** Register `ai.onnx::Conv` unconditionally. Use a general pure-Rust 1-D/2-D reference kernel when the optional `mlas` feature is disabled, while retaining the optimized MLAS implementation when enabled.
+**Why:** `Conv` is a required standard operator, and CPU EP capability must not depend on an optional C++/assembly backend. ScatterND, Resize, and QLinearMatMul were already implemented and registered on main.
+
+<!-- merged from .squad/decisions/inbox/hicks-pr285-review.md -->
+# Decision: PR #285 (issue #74) review — Hicks
+
+- **Reviewer:** Hicks (independent, adversarial; not the author)
+- **Author:** Vasquez (locked out of fixes)
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE
+
+## Scope reality vs claim
+PR #285 title lists four ops (Conv, ScatterND, Resize, QLinearMatMul), but the
+actual diff (`origin/main..origin/squad/74-cpu-standard-ops`, single commit
+`9fb3e77a`) only adds **Conv**. ScatterND, Resize, and QLinearMatMul were
+**already registered on `main`** (see kernels/mod.rs lines ~616-668, 897-901).
+The commit message is honest ("register pure-Rust Conv fallback"). The delivered
+change is correctly scoped to Conv; the "all four landed" phrasing is inaccurate
+but there is no silently-wrong code. Not a blocker.
+
+Files changed: `conv_ref.rs` (new, 517 lines), `kernels/mod.rs`, `provider.rs`.
+
+## Conv correctness (the real deliverable)
+- Output-shape formula matches ONNX for NOTSET / VALID / SAME_UPPER / SAME_LOWER;
+  odd-padding split direction correct (SAME_UPPER extra at end, SAME_LOWER extra
+  at begin).
+- Group split correct: output channels partitioned into `group` contiguous
+  blocks; input channels indexed `group*C/group + ic`; weight index matches
+  W=[M, C/group, k...] contiguous layout.
+- Stride/dilation/asymmetric-pad/bounds handling correct; zero-pad via
+  out-of-bounds skip. checked/saturating arithmetic guards overflow.
+- dtype: f32/f16/bf16 widen→compute→narrow; supports strided inputs.
+
+## Independent parity (ORT 1.26, verified by Hicks, not author's numbers)
+- 1D conv (stride2,pad[1,1],bias, 2 in / 3 out ch): ORT == Rust test expected
+  `[11.8,19.2,23.4,27.6,24.0,43.4,54.8,66.2,38.7,70.1,88.7,107.3]` exactly.
+- Group/depthwise-multiplier (group=2, 4 out): ORT == `[1,2,3,4,3,5,7,9,32,62,92,122,43,83,123,163]`.
+- SAME_UPPER == `[6,7]`, SAME_LOWER == `[3,9]` — both match ORT.
+
+## Registry / test-discipline
+`reg.len()` assertion updated `96+mlas(7)` → `97+mlas(6)`: net +1 default-domain
+Conv, mlas total unchanged at 103. provider.rs tests updated (Conv now supported
+without mlas; unknown-op probe renamed to "UnknownOp"). Correct.
+
+## Validation evidence
+- `cargo test -p onnx-runtime-ep-cpu`: **944 passed; 0 failed; 8 ignored** (+ all
+  integration/parity suites green).
+- `cargo fmt --all -- --check`: clean (exit 0).
+- `cargo clippy -p onnx-runtime-ep-cpu --all-targets -- -D warnings`: clean (exit 0).
+
+## Notes / non-blocking
+- No SIMD added (pure scalar loops) — no CI feature-gating concern.
+- Non-standard `activation="Relu"` fusion attr is inert unless explicitly set; harmless.
+- Follow-up (not this PR): if issue #74 intends the other three ops to be
+  (re)audited, track separately — they are unchanged here.
+
+<!-- merged from .squad/decisions/inbox/apone-pr286-review.md -->
+# Decision: PR #286 review (issue #61) — KV preemption/eviction in the engine
+
+- **Reviewer:** Apone (independent, adversarial) — author is Gorman (locked out).
+- **Date:** 2026-07-27
+- **Verdict:** APPROVE
+
+## Summary
+PR wires scheduler `preempt`/`swap_in` decisions to real paged-KV movement via
+`Engine::execute_kv_movement`, `PageTable::evict_sequence_to_cold`,
+`PagedKvCache::preempt_sequence`/`restore_sequence`.
+
+## Evidence
+- Tests: `cargo test -p onnx-genai-kv -p onnx-genai-scheduler -p onnx-genai-engine` — all green
+  (kv 90, engine 241 lib + integration incl. priority_preemption 4/4, scheduler suites). 0 failed.
+- `cargo fmt --all -- --check` clean; `cargo clippy ... -D warnings` clean.
+
+## Mutation probes
+1. Neutered `execute_kv_movement` (unconditional early-return) →
+   `preemption_evicts_kv_and_preserves_output` FAILS at the `hot_evictions` assert (line 167).
+   ⇒ eviction counter genuinely rises from the preemption path, NOT ordinary LRU. Not hollow.
+2. Neutered `restore_sequence` (no-op `Ok(0)`) → KV unit
+   `preempt_then_restore_keeps_kv_bit_identical` FAILS (genuinely gates restore bit-identity),
+   BUT the engine E2E `preemption_evicts_kv_and_preserves_output` STILL PASSES.
+
+## Assessments
+- **Shared-prefix safety:** GENUINE. `evict_sequence_to_cold` guards `ref_count <= 1`; unit test
+  `preempt_leaves_shared_prefix_pages_resident` pins page 0 (retain→ref_count 2) and asserts it
+  stays hot while exclusive pages demote. A peer's shared prefix is never stolen.
+- **Restore correctness:** paged bit-identity across multiple pages is unit-tested and genuinely
+  gated (probe 2). Error path returns `KvError::SequenceNotFound`, wrapped cleanly by the engine.
+- **Deferral honesty:** ACCEPTABLE and documented. Probe 2 shows E2E output-preservation is
+  *trivially true for the ORT runner path* — decode reads the in-place `past` tensors, not the
+  paged mirror, so the E2E "preserves output" assertion would pass even with restore broken.
+  Real ORT GPU memory is NOT yet freed; only the paged tier accounting is. This exactly matches
+  the PR body's stated deferral ("physical cross-device copy of the ORT runner buffer ... deferred
+  to a follow-up"). Correctness invariant (preemption must not change output) is preserved and safe.
+  The "byte-identical output" claim is TRUE and not overstated; restore fidelity is proven by the
+  unit test rather than the E2E test.
+
+## Recommendation (non-blocking, for follow-up owner — NOT Gorman)
+Owner: **Hudson** (or Vasquez). Either (a) implement the deferred physical ORT `past` GPU→CPU
+swap so preemption yields real ORT memory relief, or (b) add a comment on
+`preemption_evicts_kv_and_preserves_output` noting restore fidelity is covered by the KV unit test
+(the E2E assertion is trivially satisfied for the ORT path). Neither blocks this merge.
+
+<!-- merged from .squad/decisions/inbox/crowe-eager-parity-78.md -->
+# Eager multi-output dispatch (#78)
+
+Eager dispatch now has `dispatch_with_outputs(..., output_count, ...)`, which models ONNX's explicit output-slot list and returns materialized leading slots in ONNX order. A one-output `dispatch` wrapper remains for compatibility. Trailing optional slots are omitted by requesting fewer outputs; invalid zero, unsupported extra, and required-output omissions return errors rather than panicking.
+
+The cache key now includes output count and canonicalized attributes because both affect compiled kernel behavior. CPU eager input shape-data is propagated for host scalar/vector control tensors, allowing TopK's runtime `K` and Split's sizes to produce concrete allocation shapes. PyO3's existing feature-gated `nxrt.eager.dispatch` now accepts `outputs=` and exposes all returned tensors.
+
+<!-- merged from .squad/decisions/inbox/hudson-pr292-review.md -->
+# Review decision — PR #292 (issue #78) eager multi-output parity
+
+**Reviewer:** Hudson (independent/adversarial). **Author:** Crowe (locked out of fixes).
+**Date:** 2026-07-27. **Verdict: APPROVE.**
+
+## Findings
+- **Multi-output ordering:** `dispatch_with_outputs` builds an ephemeral node with
+  `output_count` slots; outputs are allocated and returned in ONNX order from
+  shape-inference results. Single-output `dispatch` now delegates with count=1 (DRY,
+  no per-op special-casing).
+- **Output-count edge cases all tested & clean (no panics):** zero →
+  `InvalidOutputCount`; more-than-produced (Relu×2) → `ShapeInference`;
+  fewer-than-produced (TopK×1) → `Kernel(_)`; optional trailing omitted (Dropout×1) OK.
+- **Split parity:** uneven split `[1,2]` on non-zero axis=1, shapes + values
+  hand-verified against row-major oracle. Real CPU `SplitFactory` kernel.
+- **TopK parity:** values AND indices pinned for largest+sorted and smallest+unsorted;
+  hand-verified oracle incl. tie ordering (stable by index). Real CPU `TopKFactory`.
+- **Mutation probe:** corrupted TopK index emit (`d==0 → 99`); the index assertion
+  FAILED as required (`left [1,2,99,1] != right [1,2,0,1]`). Reverted. Index guarantee
+  is genuinely tested.
+- **PyO3 default-build safety:** eager binding change stays behind pre-existing
+  `eager` feature; gating unchanged by this PR; CI Rust jobs (which build the pyo3
+  crate) are green.
+- **cpuinfo/workspace claim:** VALID / pre-existing env. `git submodule status` shows
+  `vendor/cpuinfo` uninitialized (`-` prefix); PR diff does not touch cpuinfo. Not
+  introduced by this PR.
+
+## Validation evidence
+- `cargo test -p onnx-runtime-eager` → 13 + 11 pass, 0 fail.
+- `cargo build -p onnx-runtime-eager` (default) → compiles.
+- `cargo fmt --all -- --check` → clean.
+- `cargo clippy -p onnx-runtime-eager --all-targets -- -D warnings` → clean.
+- `gh pr checks 292` → Rust (Linux/macOS), Rust quality, Rust coverage, CLI ORT,
+  CUDA compile, codecov all PASS; only Windows x86_64/ARM64 pending (queued).
+
+<!-- merged from .squad/decisions/inbox/burke-schema-catalog-75.md -->
+### 2026-07-27: Prioritize kernel-backed tensor schemas before container types
+**By:** Burke
+**What:** Expanded the standard catalog and shape registry with 16 CPU/CUDA-kernel-backed tensor operators, including their active opset boundaries, while deferring sequence/optional and Loop/Scan inference.
+**Why:** These operators were executable but could leave outputs unresolved. The current inference `TypeInfo` represents tensors only, so correct sequence/optional inference requires a container-aware type model rather than pretending containers are tensors.
+
+<!-- merged from .squad/decisions/inbox/parker-pr293-review.md -->
+# Decision — PR #293 (issue #75) review (Parker, independent/adversarial)
+
+**Verdict: REQUEST-CHANGES** (narrow, single test-discipline gap; all shape rules are correct)
+
+**Date:** 2026-07-27T18:20:00Z
+**Author under review:** Burke (locked out from the fix)
+**Reviewer:** Parker (senior compiler/IR engineer)
+**Branch:** squad/75-schema-catalog @ 63acdbe0
+
+## What is correct (verified)
+- **Unique** — data output uses `ctx.fresh_dim()` (data-dependent extent), 3 optional outputs are int64;
+  no-axis: Y=[u], indices=[u], inverse=[product(shape)], counts=[u]; axis: Y keeps rank with selected
+  extent=u, inverse=[shape[axis]]; axis bounds checked. Rule is correct.
+- **Dropout** — output=input, mask=Bool same shape; registered 13 (until 21) and 22. Correct.
+- **PRelu** — routed through bidirectional `binary`. For valid inputs (slope unidirectionally broadcasts
+  to X) this equals X; `broadcast_dim` degrades provably-incompatible concrete dims to a fresh symbol
+  (honest, no fabricated max()). Acceptable; matches practical inference. Minor: not strict
+  propagate-from-first, but no corruption for valid models.
+- **Bitwise*/BitShift** — elementwise broadcasting `binary`, integer dtype passthrough. Correct.
+- **IsInf/IsNaN** — bool dtype override applied (tested). **EyeLike** — rank-2 check + dtype override.
+- **Opset boundaries** — shape-inference `since_version`s mirror the CPU kernel registrations exactly
+  (PRelu 16, Selu 6, ThresholdedRelu 10, Hardmax 13, IsInf 10, IsNaN 9, EyeLike 9, Unique 11,
+  Dropout 13/22, BitShift 11, Bitwise* 18, GroupNorm 18/21, LpNorm 1); boundary negative tests present.
+- **Counts** — registry 164 ops / 203 entries (dynamically computed, pinned by NEW
+  `expanded_registry_catalog_count_is_pinned` test); schema 99/111 (pinned). +16 ops/+19 schema entries
+  machine-confirmed from added YAML. Docs updated consistently.
+- **Deferral honesty** — `TypeInfo` is tensor-only (`dtype` + `shape`); it genuinely cannot represent
+  Sequence/Optional/Map. Deferring sequence/optional + Loop/Scan "pending container-aware TypeInfo" is
+  real and documented. Legitimate.
+
+## Blocking issue (why REQUEST-CHANGES)
+**The Unique data-dependent extent is UNTESTED.** Mutation probe: replaced `let unique_count =
+ctx.fresh_dim();` with `DimExpr::constant(1)` (fabricating a concrete extent — the exact silent-corruption
+the PR claims to prevent). `cargo test -p onnx-runtime-shape-inference` **still passed** (200/200).
+`unique_tracks_axis_and_flattened_inverse_lengths` only asserts `shape.len()==1` and the inverse-length;
+it never asserts Y/indices/counts extent is symbolic/non-constant. The docs explicitly claim "Dynamic
+extents receive stable symbols rather than fabricated constants" — that property has no regression guard.
+Mutation reverted after probing.
+
+## Required fix (small)
+Add assertions to the Unique test that the data-dependent extent is non-constant, e.g.
+`assert!(flat[0].shape[0].as_const().is_none())` for Y (no-axis) and for indices/counts, and for the
+axis case that the selected-axis extent is symbolic. Optionally do the same defensive check for other
+data-dependent ops.
+
+**Fix owner (NOT Burke, locked out): Pris (Quality)**, with Gaff (Code Reviewer) to verify. Test-only
+change; no production code change required.
+
+## Validation evidence
+- `cargo test -p onnx-runtime-shape-inference` → 200 passed; 0 failed (+1 doctest ok)
+- `cargo test -p onnx-std` → all passed (127 + others)
+- `cargo test -p onnx-runtime-loader` → all passed
+- `cargo fmt --all -- --check` → clean (exit 0)
+- `cargo clippy -p onnx-runtime-shape-inference --all-targets -- -D warnings` → clean
+- Machine-counted registry delta: 148/184 → **164/203** (+16 ops / +19 entries), matches claim.
+
+## Minor (non-blocking) nits
+- `prelu.yaml` T omits the integer types PRelu-16 permits (uint32/64, int32/64); float-only kernel, so
+  harmless, but schema is narrower than spec.
+- `is_inf.yaml` T1 lists float16/bfloat16 at since_version 10, which ONNX only added at opset 20.
+
+---
+
+## Re-review (Parker) — 2026-07-27T22:54Z — VERDICT: APPROVE
+
+Pris addressed the block in commit `6710323e` (branch force-pushed after rebase onto main w/ #292).
+
+- **Diff scope confirmed:** three-dot `origin/main...HEAD` shows the Unique handler is byte-identical
+  to what I reviewed (`ctx.fresh_dim()` intact; same 4 `set_output`s). No shape-rule edits. Only
+  additions since last review: `tests/op_rules.rs` symbolic-extent assertions + a new
+  `assert_symbolic` helper (non-const AND is-symbol). Eager/#292 changes in the raw commit-to-commit
+  diff are rebase noise, not part of this PR's three-dot delta.
+- **My independent mutation probe now BITES:** `fresh_dim()` → `constant(1)` →
+  `unique_tracks_axis_and_flattened_inverse_lengths` FAILS ("expected symbolic dim, got …{[]:1}").
+  Reverted → green.
+- **Assertions cover** Y/indices/counts in no-axis mode and selected-axis-extent/indices/counts in
+  axis mode.
+- **Validation:** shape-inference 233 passed (200+17+16); fmt clean; clippy -D warnings clean.
+
+All prior correctness findings stand. Minor schema nits (prelu/is_inf type constraints) remain
+non-blocking. Approving.
+
+<!-- merged from .squad/decisions/inbox/pris-pr293-testfix-75.md -->
+### 2026-07-27: Make Unique's data-dependent extent falsifiable
+**By:** Pris
+**What:** Assert that Unique's data, indices, and counts outputs use a fresh symbolic extent in both flattened and axis modes.
+**Why:** A concrete replacement such as `constant(1)` must fail the test; inverse-indices lengths remain derived from the input shape as required by the schema.
+
+<!-- merged from .squad/decisions/inbox/drake-cpu-half-gemm-58.md -->
+### 2026-07-27: Native CPU f16/bf16 GEMM — FMA inner loop completes issue #58
+
+**By:** Drake (CPU-numerics/SIMD)
+
+**What:**
+Issue #58 asked for a native CPU f16/bf16 GEMM backend (f32 accumulation) to
+replace the old widen-to-f32 path. Investigation found the native path already
+landed via PRs #246 (portable f16/bf16 GEMM), #265 (SIMD tuning), and #278
+(platform naming). `MatMul` no longer widens whole f16/bf16 matrices to f32:
+`try_matmul_half` (`kernels/matmul.rs`) dispatches contiguous f16/bf16 to a
+blocked, register-tiled `half_gemm` that keeps operands in 16-bit storage,
+widens per cache panel (F16C for f16, `(x as u32) << 16` for bf16), and
+accumulates in f32. bf16 additionally has a runtime-gated `avx512_bf16`
+(`_mm512_dpbf16_ps`) kernel in `x86_bf16.rs`.
+
+The remaining gap: the AVX2 and NEON half-GEMM microkernels used separate
+multiply + add, while the sibling f32 `x86_sgemm` (whose `SimdX86` backend is
+already gated on `avx2 && fma`) uses `_mm256_fmadd_ps`. This PR adds an
+`X86Avx2Fma` execution path (runtime `is_x86_feature_detected!("fma")`,
+`#[target_feature(enable = "avx2,fma")]`, `_mm256_fmadd_ps`) that falls back to
+the plain AVX2 mul+add microkernel when FMA is absent, and switches the aarch64
+NEON microkernel to baseline `vfmaq_f32`. f32 accumulation preserved.
+
+**Why:**
+- Directly targets the prefill (M>1) hot path the issue flags. Measured on f16
+  512x4096x4096, single thread, `taskset -c 1`, load-independent paired A/B:
+  **~1.09-1.10x** faster than mul+add (~47 -> ~51.5 GFLOPS), reproducible.
+- CI portability: FMA is runtime-detected with a scalar/plain-AVX2 fallback;
+  no test asserts a specific SIMD kernel without a feature gate. CI runners
+  (AVX2-class, may lack the separate FMA bit) still take the plain AVX2 path.
+- Correctness: extended `runtime_simd_half_gemm_matches_scalar_*` to validate
+  every available accelerated path (plain AVX2 and AVX2+FMA) against the scalar
+  reference; existing widen-to-f32 oracle + transposed-layout tests unchanged.
+
+**Deferred (out of scope, documented in PR):**
+- No x86 AVX512-FP16 dense f16 kernel — the vendored MLAS snapshot ships no
+  such x86 source (`docs/CPU_QUANT_HALF_GEMM_SCOPING.md:122-143`); would be a
+  vendor-acquisition project, not wiring.
+- Larger register tiles / packed-B reuse for half GEMM (matching the f32
+  6x16 microkernel) — separate perf slice.
+
+**Validation:** `cargo test -p onnx-runtime-ep-cpu` green; `cargo test -p
+onnx-runtime-eager` green; `cargo fmt --all -- --check` clean; `cargo clippy -p
+onnx-runtime-ep-cpu --all-targets -- -D warnings` clean.
+
+<!-- merged from .squad/decisions/inbox/ferro-pr294-review.md -->
+# Decision: PR #294 (issue #58) review — Ferro
+
+**Date:** 2026-07-27
+**Reviewer:** Ferro (independent, adversarial; not the author)
+**Author:** Drake — locked out of the fix
+**Branch:** squad/58-cpu-half-gemm (HEAD 4c1addf2)
+**Verdict:** REQUEST-CHANGES
+
+## Summary
+PR adds an AVX2+FMA (`_mm256_fmadd_ps`) half-GEMM microkernel + NEON `vfmaq_f32`,
+runtime-gated on `is_x86_feature_detected!("fma")` with AVX2→scalar fallback.
+The core kernel work is correct, well-gated, and genuinely faster. It is blocked
+by a CI-portability regression the PR itself introduces on aarch64.
+
+## Blocking issue (PR-attributable CI failure)
+`Rust (macOS arm64)` and `Rust (Windows ARM64)` FAIL to compile:
+```
+error[E0599]: no variant ... named `X86Avx2` / `X86Avx2Fma` found for enum `ExecutionPath`
+  --> crates/onnx-runtime-ep-cpu/src/kernels/half_gemm.rs:809-810
+```
+The new `half_gemm_prefill_gflops` perf probe (lines 808-811) names the x86-only
+`ExecutionPath::X86Avx2` / `X86Avx2Fma` variants unconditionally, but those
+variants are `#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]`. On
+aarch64 the whole test binary fails to build → ALL ep-cpu tests fail on ARM,
+including the PR's own NEON `vfmaq_f32` change, which therefore gets ZERO CI
+coverage. Directly contradicts the "CI-portable" claim.
+
+**Fix:** gate `half_gemm_prefill_gflops` (or at least the `paths` array) behind
+`#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]`.
+
+**Fix owner:** Luba (ARM CPU / QNN; owns ARM/Windows-on-ARM cross-compilation),
+with Isidore as backup. NOT Drake (locked out).
+
+## What is GOOD (verified on this AVX2+FMA+F16C+AVX512F host)
+- **Runtime gating correct:** `X86Avx2Fma` selected only when both avx2 AND fma
+  detected; `micro_kernel` dispatches FMA before AVX2 before scalar. Cannot
+  reach `_mm256_fmadd_ps` without fma detected in production dispatch. No SIGILL
+  risk on non-FMA CI. The parity test only pushes `X86Avx2Fma` when fma detected,
+  and asserts the auto-selected path is among the tested set.
+- **FMA-vs-reference parity:** FMA path validated against BOTH the scalar path
+  (<=1e-6) AND the widen-to-f32 oracle (`portable_half_gemm_matches_widened_f32_reference`,
+  <=2e-5) — the trusted reference. Tolerances appropriate for f16/bf16 f32-accum;
+  single-vs-double rounding of FMA stays well within them.
+- **Mutation probe (proves FMA path is exercised):** swapped `_mm256_fmadd_ps`
+  → `_mm256_fmsub_ps`. Parity test FAILED (`F16 X86Avx2Fma 8x16x16 differs from
+  scalar by 0.1517`) AND oracle FAILED (`max f32 accumulation error 1.057`).
+  Reverted. The FMA microkernel is genuinely covered on FMA hosts.
+- **Perf real:** `taskset -c 1`, median of 7, f16 512x4096x4096, 1 thread:
+  avx2 mul+add 40.99 GFLOPS vs avx2+fma 48.77 GFLOPS = **1.19x** (loaded machine;
+  >= PR's claimed ~1.09-1.10x). Real improvement, not a regression.
+- **DRY:** FMA kernel is a faithful structural copy of `micro_kernel_avx2`; only
+  `add(acc, mul(a,b))` → `fmadd(a,b,acc)`. No subtle divergence.
+- Scalar / f32 SGEMM / decode (M==1) paths unchanged.
+
+## Local validation (all green on x86_64 FMA host)
+- `cargo test -p onnx-runtime-ep-cpu` — pass (parity + widen oracle + determinism)
+- `cargo test -p onnx-runtime-eager` — pass (13/11/0)
+- `cargo fmt --all -- --check` — clean
+- `cargo clippy -p onnx-runtime-ep-cpu --all-targets -- -D warnings` — clean
+- CI: x86_64 Linux/Windows, coverage, quality all PASS; **aarch64 (macOS/Windows) FAIL** (blocker above).
+
+Once the aarch64 test-compile gate is fixed and CI is green, this is an easy APPROVE.
+
+---
+
+## RE-REVIEW (2026-07-27T23:05Z) — VERDICT: APPROVE
+
+Luba's fix `ee0b58cc` (force-pushed; Drake locked out) resolves the sole blocker.
+
+- **Delta:** exactly `+1/-0` — `#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]`
+  on the `half_gemm_prefill_gflops` perf probe. No kernel/dispatch/gating/NEON change.
+  The FMA microkernel I mutation-proved is untouched.
+- **No ungated x86 symbol** in all-arch-compiled code: perf-probe variant refs now gated
+  (verified line 789); `detected_simd_paths` refs already inside a `#[cfg(x86)]` block.
+- **CI: all 12 jobs green**, incl. **Rust (macOS arm64) PASS** + **Rust (Windows ARM64) PASS**
+  (both previously FAILED) — run 30312488461. Portability proven.
+- **Local x86:** `cargo test -p onnx-runtime-ep-cpu` 945 passed/0 failed; fmt clean; clippy clean.
+
+Blocker cleared; all prior positives (gating, FMA-vs-reference parity, mutation-proof, ~1.19x perf)
+carry over unchanged. **APPROVE.**
+
+<!-- merged from .squad/decisions/inbox/luba-pr294-aarch64-fix-58.md -->
+### 2026-07-27: Gate x86-only half-GEMM perf probe
+**By:** Luba
+**What:** Restricted `half_gemm_prefill_gflops` to x86/x86_64 because it explicitly benchmarks AVX2 and AVX2+FMA execution paths.
+**Why:** The named enum variants are absent on aarch64; functional parity tests remain architecture-neutral and exercise the NEON path when available.
+
+<!-- merged from .squad/decisions/inbox/moss-cuda-coverage-batch4-67.md -->
+# Decision: CUDA EP operator-coverage batch 4 (issue #67)
+
+- **Author:** Moss (CUDA EP engineer)
+- **Date:** 2026-07-27
+- **PR:** justinchuby/onnx-genai#288 — `squad/67-cuda-coverage-batch4`
+- **Issue:** #67 (Advances, not Closes — ongoing multi-batch effort)
+
+## What
+Added 7 NVRTC-JIT CUDA EP kernels, growing `CUDA_COVERED_OPS` from **118 → 125**
+op names (machine-verified slice length):
+
+- Integer bitwise: `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitwiseNot`
+  (all 8 integer dtypes, NumPy broadcasting).
+- `BitShift` (unsigned u8/u16/u32/u64, `LEFT`/`RIGHT`).
+- `LogSoftmax` (f32/f16/bf16; opset-13 per-axis + legacy opset-≤12 coerce-2D).
+- `Hardmax` (f32/f16/bf16; first-argmax one-hot).
+
+## Key decisions / lessons
+- **CPU EP is the numerical oracle** for every op via the run_cuda-vs-run_cpu
+  conformance harness.
+- **LogSoftmax uses stable shifted-logsumexp** `(x - max) - log(sum(exp(x-max)))`,
+  never naive `log(sum(exp))` (the #266 overflow lesson); a lib test asserts the
+  NVRTC source does not contain the naive form.
+- **BitShift mirrors CPU `checked_shl`/`checked_shr`**: amount `>=` bit-width → 0,
+  replicated exactly including the u32-truncation edge.
+- **Hardmax first-max tie-break** via strict `>`; canonical 0.0/1.0 outputs → the
+  conformance case uses `Compare::ExactBytes` (integer + one-hot ops), `Float{tol}`
+  only for LogSoftmax.
+- Standard ops registered under the **default domain `""`** (no invented domains).
+- Kernels run on the **EP non-default stream**; shared memory sized via runtime
+  device props (`reduction_launch_config`) — no hardcoded SM constants.
+
+## Repo-rule compliance
+- `every_covered_op_has_a_conformance_entry` set-equality guard satisfied (a real
+  parity case per new op).
+- `covered_ops_have_no_duplicates` passes; added
+  `coverage_batch4_ops_are_listed_in_coverage`.
+- `docs/CUDA_COVERAGE.md` prose "113 advertised" is a stale pre-batch-3 figure;
+  corrected the batch-4 paragraph to cite the authoritative slice length
+  (118 → 125).
+
+## Doc-count caveat for future batches
+The `docs/CUDA_COVERAGE.md` audit table (advertised/shared/gap tallies) is
+**stale and cannot be regex-recomputed** — the CUDA registry uses loop-based
+`for … { reg.register(OpKey::new(var, …)) }` registrations, so literal-string
+regex undercounts. Treat the `CUDA_COVERED_OPS` slice length as the source of
+truth, not the prose numbers.
+
+## Next-batch candidates (deferred, tractable)
+Remaining CPU `ai.onnx` gaps worth a future CUDA batch (non-cuDNN, non-heavy):
+`ArgMax`, `ArgMin`, `NonZero`, `Range`, `Pad`, `SpaceToDepth`, `Unique`,
+`QuantizeLinear`. Skip Conv/Resize/heavy kernels unless straightforward.
+
+<!-- merged from .squad/decisions/inbox/bishop-pr288-review.md -->
+# Decision: PR #288 (issue #67) — CUDA op coverage batch 4 — REQUEST-CHANGES
+
+- **Reviewer:** Bishop (independent, adversarial; not the author)
+- **Author:** Moss (locked out of fix)
+- **Date:** 2026-07-27T17:25:00Z
+- **Branch:** squad/67-cuda-coverage-batch4 @ 7c5c0c41
+- **Verdict:** REQUEST-CHANGES (test coverage, not kernel correctness)
+- **Fix owner:** Deckard (CUDA & Perf, Systems Dev) — with Chew (numerics gate) consulting. NOT Moss.
+
+## What is correct (verified)
+- **Op count machine-verified:** `CUDA_COVERED_OPS` = 118 (origin/main) → 125 (PR), +7, no duplicates. Doc corrected.
+- **Kernels are functionally correct:** LogSoftmax uses stable shifted-logsumexp with f32 accumulation for f16/bf16; BitShift guards `amount >= bits → 0` with `(unsigned int)` truncation mirroring CPU `checked_shl/shr(amount as u32)`; Hardmax strict `>` first-argmax; bitwise covers all 8 integer dtypes; BitShift unsigned-only; NumPy broadcasting reuses the reviewed `elementwise` metadata seam.
+- **All suites green on GPU5:** lib 259 passed; conformance 4 passed (incl. set-equality guard + `conformance_sweep_matches_cpu` + no-dup guards); `cargo fmt --check` clean; `cargo clippy --lib -D warnings` clean.
+- **Mutation propagation proven:** Hardmax `>`→`>=` (last-argmax) IS caught by the sweep (tie case diverges). No stale NVRTC cache (in-memory, per-process, keyed on module name but compiled from `src`).
+
+## Why REQUEST-CHANGES — two headline safety claims are NOT exercised by the parity sweep (mutation-proven)
+1. **LogSoftmax numerical stability is untested.** Removing the max-subtraction (naive `x - log(sum(exp(x)))`) **still passes** `conformance_sweep_matches_cpu`. The largest test logit is 81; `exp(81)≈1.6e35` fits in f32 (overflow needs a logit ≳89), so naive == stable here. The stability claim is only protected by a *source-string* unit test, not behavior.
+   - **Fix:** add a LogSoftmax conformance row with logits ≳90 (e.g. 90/100) so a naive f32 path overflows to inf/nan and diverges from the stable CPU oracle.
+2. **BitShift width guard is untested.** Removing the `(amount >= bits) ? 0` guard **still passes** the sweep. The only overshift case is u8 RIGHT by 8 — under C int-promotion `(int)0x10 >> 8 == 0` regardless of the guard, so it can't diverge. The guard is genuinely required for u32<<32, u64<<64, and any small-type shift by ≥32 (all real UB without it). Only protected by a source-string unit test.
+   - **Fix:** add overshift conformance cases that actually diverge without the guard: u32 LEFT/RIGHT by 32 and 40; u64 by 64; u8/u16 by ≥32. Cover amount==width AND amount>width for LEFT and RIGHT.
+
+Both are cheap test-value fixes in `tests/cuda_conformance_gpu.rs`; no kernel change required. Kernels ship correct today, but the PR's two most-emphasized guarantees (#266 logsumexp lesson; CPU checked-shift contract) are currently unfalsifiable by the suite.
+
+## Environmental failures (ignored, pre-existing): conv_gpu/pooling_gpu (cuDNN absent), a fused_attention bf16 test, matmul_gpu 4-D batched, `tests/conv_gpu.rs` --all-targets clippy drift (byte-identical to origin/main).
+
+---
+
+## RE-REVIEW (2026-07-27T23:04Z) — commit 797e4ef (test-only, rebased) — VERDICT: APPROVE
+
+Kernels byte-identical to prior review (0 diff lines in bitwise/hardmax/log_softmax/mod/provider vs 7c5c0c41); only `cuda_conformance_gpu.rs` changed (+221 lines). Both blocking findings resolved and independently re-proven by me on GPU5.
+
+**Fix 1 — LogSoftmax stability: RESOLVED (value-falsifiable).** New `overflow-stability` row per float dtype, logits `[100,0,-100]` → stable output `[0,-100,-200]` (exact in f32/f16/bf16). I neutered the kernel (`row_max = 0.0f`) → `conformance_sweep_matches_cpu` FAILS: `LogSoftmax[Float32,overflow-stability] index 0: got -inf, expected 0`. Restore → PASSES. Exactly the large-magnitude test I asked for.
+
+**Fix 2 — BitShift width guard: RESOLVED (source-contract falsifiable; value-catch is provably impossible on NVIDIA HW).** Deckard's hardware-clamp claim is TRUE and architecturally guaranteed, not GPU5-luck: PTX ISA `shl`/`shr` clamp shift counts ≥ register width to N (zero-fill), NOT modular like x86 (authoritative PTX docs). Small types promote to `int` then narrow, so overshift bits land above the narrow width → 0 either way. I verified:
+- Guard DELETED → value sweep stays GREEN (full overshift battery u32/u64/u16/u8, LEFT/RIGHT, amounts 32/33/40/64/100 all yield 0 unguarded) AND lib test `shift_guard_matches_cpu_checked_shift_contract` FAILS. So guard deletion IS caught.
+- Guard threshold too-low (`>= bits - 1`) → value sweep FAILS on the near-boundary `amount==width-1` rows (max-valid shift wrongly zeroed). So the threshold is value-locked from the low side.
+- I could not exhibit any distinguishing input where an unguarded overshift ≠ 0 — PTX clamp semantics make it impossible. Accepting the source-contract test as the correct resolution.
+
+**Validation (GPU5-pinned):** lib 259 passed; conformance 4 passed; `fmt --check` clean; `clippy --lib -D warnings` clean.
+
+Net: both headline safety guarantees are now falsifiable — one by value diff, one by source contract (because value is physically impossible on NVIDIA GPUs), plus a value-observable near-boundary lock. APPROVE.
+
+<!-- merged from .squad/decisions/inbox/iran-prefill-bnns.md -->
+# Decision: BNNS prefill + first-decode spike elimination
+
+**Author:** Iran (Mac CPU Optimization Engineer)
+**Date:** 2026-07-27
+**Status:** Implemented (PR #275, branch `squad/mac-prefill-bnns`)
+**Commits:** `a855f826`, `58bafd0d`, `f0cbd786`, `aa219b4b`, `9f1e7684`
+
+## Context
+
+Decode was won in PR #227 (native 1.42× vs ORT). Prefill remained 9.6–11.9× worse than ORT (TTFT 1034–1314 ms vs 103–110 ms), making end-to-end performance 0.40–0.45× of ORT. Prefill is compute-bound (arithmetic intensity ≈20 FLOP/byte) — the opposite of decode's bandwidth-bound character.
+
+## Decisions
+
+### 1. Three-regime MatMul dispatch
+
+| M | Path | Bound |
+|---|---|---|
+| M = 1 | NEON GEMV (unchanged) | bandwidth |
+| M ≥ 2, macOS | **BNNS `BNNSMatMul` fp16→f32 via AMX** | compute |
+| M ≥ 2, non-Mac | `half_gemm.rs` NEON | portable fallback |
+
+### 2. Column-major B zero-copy for both BNNS and GEMV
+
+The lm_head vocab projection weight (896×151936, 272 MB) is stored column-major (non-contiguous). Column-major B[K,N] in memory is row-major B^T[N,K]:
+- **BNNS path (M≥2):** `trans_b: true` lets BNNS read the raw mmap'd data directly
+- **GEMV path (M=1):** Raw data IS B_T[N,K], exactly what `neon_gemv_f16_col_parallel` needs — route directly, zero-copy
+
+Without this, the lm_head falls through to f32 densification (544 MB alloc, ~960 ms).
+
+### 3. Global weight-transpose cache with eager pre-transpose
+
+The kernel cache is shape-keyed: prefill M=40 → decode M=1 creates new kernel instances with cold OnceLock caches. 169 kernels would re-transpose ~776 MB.
+
+- Process-global `LazyLock<Mutex<HashMap<usize, Arc<Vec<u16>>>>>` keyed by data pointer
+- Survives kernel-cache shape evictions via Arc sharing
+- Eager pre-transpose during model load: +7ms load time, saves ~30ms on first decode
+- Model load still 14.6× faster than ORT (114ms vs 1671ms)
+
+### 4. BNNS filter cache (thread-local)
+
+`BNNSFilterCreateLayerBroadcastMatMul` costs 3–19 ms cold. A `HashMap<(M,K,N,trans_b), BNNSFilter>` in thread-local storage amortises to zero for subsequent calls. Filters cleaned up via `Drop`.
+
+## Why BNNS
+
+- Standard BLAS has no half-precision GEMM (`sgemm` is f32, `dgemm` is f64)
+- Apple's fp16 matrix path is BNNS, which reaches AMX
+- Measured 2451 GFLOPS at M=128 vs 52 GFLOPS for NEON blocked GEMM (~47×)
+- ORT links no Accelerate — structural advantage they cannot match
+
+## Constraints upheld
+
+1. **No BNNS/Accelerate from Rayon parallel regions** — calls from dispatch level only
+2. **Decode unregressed** — guard test `fp16_m1_decode_reaches_neon_gemv_not_half_gemm` passes; 70.6 tok/s (1.67× ORT)
+3. **Runtime feature detection** — `bnns_matmul_available()` probes at startup
+4. **One implementation** — `half_gemm.rs` remains portable fallback
+5. **Cross-compilation** — clippy clean on both aarch64 and x86_64 with `--all-targets -D warnings`
+
+## Final results
+
+M1 Max 10-core, 64 GB, `qwen2.5-0.5b-f16`, 40-token prompt, 50 gen tokens, load ~12.
+
+| metric | before campaign | after | ORT | vs ORT |
+|---|---:|---:|---:|---:|
+| TTFT | 989 ms | **170 ms** | 109 ms | 1.56× |
+| decode | 57.6 tok/s | **70.6 tok/s** | 42.2 tok/s | **1.67×** |
+| end-to-end | 17.7 tok/s | **57.8 tok/s** | 38.7 tok/s | **1.50×** |
+| model load | 105 ms | 114 ms | 1671 ms | 0.068× |
+| total time | ~2800 ms | **865 ms** | 1293 ms | **1.50×** |
+
+End-to-end arithmetic reconciles: 170 + 49×14.2 = 865 ≈ 865 measured ✓
+
+## Evolution
+
+1. Initial BNNS dispatch: null result (989ms unchanged) — non-contiguous weights bypassed BNNS
+2. Filter cache + contiguous_b_f16: TTFT 989→348ms
+3. trans_b zero-copy: TTFT 348→167ms
+4. Global cache + column-major GEMV: eliminated ~967ms first-decode spike, end-to-end reconciles
+
+## Remaining leads
+
+1. TTFT gap: 170ms vs ORT 109ms (1.56×). BNNS production at 260–346 GFLOPS vs 2451 microbenchmark
+2. Non-GEMM overhead: ~55ms (LayerNorm, SoftMax, RoPE, graph dispatch)
+
+<!-- merged from .squad/decisions/inbox/pris-dispatch-coverage-audit.md -->
+# Decision: Dispatch-Branch Coverage Audit — MatMul Kernel
+
+**Date:** 2026-07-27  
+**Author:** Pris (Tester)  
+**Scope:** `onnx-runtime-ep-cpu::kernels::matmul`  
+**Triggered by:** PR #275 rubber-duck review finding two silent-wrong-answer bugs
+
+## Finding
+
+**12 reachable dispatch combinations had zero test coverage before this audit.**
+
+Line coverage reported 78% and codecov gates passed GREEN — but the entire
+non-contiguous f16 rescue block (lines 823–896), the column-major GEMV M=1
+path (lines 774–796), and the non-constant activation fallthrough were all
+completely unexercised. This is the seventh defect of the form "a path existed
+but was never entered."
+
+## Dispatch-Branch Coverage Matrix
+
+| # | M | dtype | B contiguous | B constant | B layout | BNNS avail | Path | Before | After |
+|---|---|-------|-------------|-----------|----------|-----------|------|--------|-------|
+| 1 | =1 | f16 | contiguous | yes | row-major | yes | GEMV via transposed_b_f16 cache | ✅ | ✅ |
+| 2 | =1 | f16 | non-contig | yes | col-major [1,K] | yes | GEMV zero-copy col-major | ❌ | ✅ |
+| 3 | =1 | f16 | non-contig | **no** | col-major | yes | Fallthrough → f32 widen | ❌ | ✅ |
+| 4 | =1 | f16 | non-contig | yes | other | yes | Fallthrough → f32 widen | ❌ | ✅ (implicit) |
+| 5 | ≥2 | f16 | contiguous | yes | row-major | yes | try_matmul_half → BNNS | ✅ | ✅ |
+| 6 | ≥2 | f16 | contiguous | no | row-major | yes | try_matmul_half → BNNS | ✅ | ✅ |
+| 7 | ≥2 | f16 | non-contig | yes | col-major [1,K] | yes | Rescue → BNNS trans_b | ❌ | ✅ |
+| 8 | ≥2 | f16 | non-contig | yes | non-col-major | yes | Rescue → contiguous_b_f16 → BNNS | ❌ | ✅ |
+| 9 | ≥2 | f16 | non-contig | **no** | col-major | yes | **BUG** → must NOT enter rescue | ❌ | ✅ |
+| 10 | ≥2 | bf16 | contiguous | yes | row-major | — | try_matmul_half → portable half_gemm | ✅ | ✅ |
+| 11 | ≥2 | bf16 | non-contig | yes | col-major | — | Must NOT enter f16 rescue → f32 widen | ❌ | ✅ |
+| 12 | ≥2 | f32 | contiguous | yes | row-major | — | Direct f32 GEMM (Accelerate/generic) | ✅ | ✅ |
+| 13 | ≥2 | f32 | — | — | — | — | Must NOT enter half/rescue | ❌ | ✅ |
+| 14 | ≥2 | f16 | non-contig | yes | col-major | BNNS fails | Rescue → fallback half_gemm_tile | ❌* | ❌* |
+| 15 | ≥2 | f16 | non-contig | yes | non-col | batched | Rescue → bnns_half_dense_into | ❌* | ❌* |
+
+*Rows 14–15 are unreachable on current hardware (BNNS never fails for valid shapes). Marked as acceptable risk.*
+
+**Summary: 12 of 13 reachable combinations were covered (from 7/13 → 12/13).** 
+Region coverage for `matmul.rs`: 79.6% → 88.8% (+9.2pp).
+
+## New Tests Added (8)
+
+All follow the dispatch-reachability pattern (atomic hit counters):
+
+1. `fp16_m1_column_major_b_reaches_colmaj_gemv` — proves #2 enters the right path
+2. `fp16_m1_non_constant_colmaj_b_does_not_reach_gemv` — proves #3 does NOT enter GEMV
+3. `f16_m_ge2_non_constant_non_contiguous_b_does_not_enter_rescue` — **THE BUG GUARD** (proves #9)
+4. `f16_constant_non_contiguous_b_enters_rescue_block` — proves #7 (col-major rescue)
+5. `f16_constant_non_contiguous_non_colmaj_b_enters_rescue` — proves #8 (non-col-major rescue)
+6. `f16_non_constant_non_contiguous_b_produces_correct_result` — value correctness for #9
+7. `f32_m_ge2_does_not_enter_half_or_rescue_paths` — proves #13
+8. `bf16_non_contiguous_does_not_enter_f16_rescue` — proves #11
+
+## Guard-Break Evidence
+
+With the `constant_inputs[1]` guard removed from line 827:
+```
+assertion `left == right` failed: Non-constant non-contiguous B incorrectly
+entered rescue block — this would produce all-zero output (the exact PR #275 bug)
+  left: 0
+ right: 1
+```
+
+With the guard present: all tests pass (945 + 8 new = 945 total, some pre-existing).
+
+## Recommended Enforcement Mechanism
+
+**One rule: every dispatch branch in `kernels/matmul.rs` must ship with a
+reachability test that uses an atomic hit counter.**
+
+Why this over the alternatives considered:
+- **Per-file coverage floor (rejected):** A floor of 85% would have passed
+  even when the bug existed — 78% line coverage masked it because the *lines*
+  were counted via other paths. Coverage floors don't measure the property at
+  issue (which *branch* ran).
+- **Branch/region coverage in CI (helpful but not sufficient):** `cargo llvm-cov`
+  branch coverage reports 0 branches because LLVM doesn't emit branch metadata
+  for Rust match/if-let chains by default. Region coverage would help but
+  requires parsing JSON and setting per-file thresholds — complex to maintain.
+- **Dispatch-reachability pattern (adopted):** A test that increments a counter
+  inside the branch and asserts it was hit proves the exact property: "this
+  combination reached this path." It is:
+  - Cheap to write (3 lines of counter + assert)
+  - Self-documenting (the test name IS the property)
+  - Catches both "wrong path taken" and "path never reached"
+  - Already the team standard (3 existing guards; now 8 more)
+
+**Enforcement:** Add a CI step or PR checklist item: *"Any new dispatch branch
+in `kernels/matmul.rs` requires a `#[test]` with `_TEST_HITS` counter proving
+reachability."* This can be checked mechanically: every `static.*TEST_HITS`
+must have a corresponding test that reads it.
+
+The existing `scripts/check_platform_naming.py` pattern (#278) could be
+extended to scan for unguarded dispatch paths, but the counter-per-branch
+approach is simpler and more robust for within-file coverage.
+
+<!-- merged from .squad/decisions/inbox/pris-dispatch-reachability-lint.md -->
+# Decision: Dispatch-Reachability CI Lint
+
+**Date:** 2026-07-27  
+**Author:** Pris (Tester)  
+**PR:** TBD (squad/pris-dispatch-reachability-lint)  
+**Scope:** `scripts/check_dispatch_reachability.py` + `.github/workflows/ci.yml`
+
+## Rule
+
+Every `static ...TEST_HITS: AtomicUsize` counter in the CPU EP must be read
+(`.load(...)`) inside a `#[test]` function in the same file. CI fails if a
+counter has no test reading it.
+
+## Why
+
+PR #275 shipped two silent-wrong-answer bugs with green codecov (78% line
+coverage). Line coverage cannot detect this class of defect — it measures
+"was this line reached?" not "was this branch reached in this configuration?"
+
+The dispatch-reachability pattern (atomic hit counters) asserts the precise
+property: **this path really executes for the claimed inputs.** This lint
+enforces the pairing so counters cannot exist without tests.
+
+## What it catches
+
+- A counter declared but never tested (lint exit 1, names the counter)
+- A `fetch_add` to a name with no matching `static` declaration (coherence)
+- Commented-out `.load()` calls (stripped before matching)
+
+## What it cannot catch (documented gap)
+
+A dispatch branch that SHOULD have a counter but doesn't. This requires
+human review at PR time. The lint is honest about this: it states the gap
+in its docstring and error output.
+
+This mirrors the design of `scripts/check_platform_naming.py` which catches
+file-level single-arch omissions but explicitly cannot catch within-file gaps.
+
+## False-positive analysis
+
+- **Non-dispatch statics** (e.g. `BNNS_PREFILL_CALLS`): not matched because
+  the regex requires `TEST_HITS` in the name.
+- **Helper functions**: the lint only scans for `static.*TEST_HITS` pattern.
+- **Test-only code**: counters inside `#[cfg(test)]` ARE scanned — they are
+  the mechanism itself.
+- **Comments**: `//` line comments are stripped before `.load()` matching.
+
+No false positives on current main (91 files, 5 counters, all paired).
+
+## BNNS-fail fallback (13th combination)
+
+Re-checked after merge: `bnns_matmul_f16_trans_b` and `bnns_matmul_f16`
+return false only when `BNNSFilterCreateLayerBroadcastMatMul` returns NULL
+or `BNNSFilterApplyTwoInput` returns non-zero. On current Apple Silicon
+hardware with valid positive M/K/N dimensions, neither condition occurs.
+
+Adding a fault-injection hook to the BNNS call would:
+- Add a branch to the hot path (~500ns overhead per prefill)
+- Require `#[cfg(test)]` conditionals in production dispatch
+- Test only that the fallback was *reachable*, not that BNNS actually failed
+
+Decision: leave this documented as acceptable risk. If future hardware or
+OS versions introduce BNNS failures, the `half_gemm_tile` fallback is already
+integration-tested via `matmul_half_dispatch_matches_widened_reference_across_irregular_shapes`.
+
+### Missing manifest note
+The manifest listed the following inbox note(s), but they were not present in `.squad/decisions/inbox/` at merge time: gorman-kv-preemption-61.md, deckard-pr288-testfix-67.md. The durable PR outcome is preserved in the wave summary and reviewer notes above where available.
+
+<!-- scribe-merge-2026-07-27T19-35-00Z-roadmap-wave-end -->

@@ -35,6 +35,11 @@ pub enum EagerError {
     #[error("no execution provider registered for device {0:?}")]
     NoEpForDevice(DeviceId),
 
+    /// The caller requested no output slots. ONNX nodes always have at least
+    /// one materialized output in eager mode.
+    #[error("eager dispatch requires at least one requested output")]
+    InvalidOutputCount,
+
     /// Per-op output shape/dtype inference is missing or could not resolve to a
     /// concrete, allocatable shape (`docs/EAGER.md` §9). The kernel-provided
     /// inference fallback (§9.2) is DEFERRED, so an unresolved output is an

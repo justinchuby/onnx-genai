@@ -1,0 +1,10 @@
+domain: ""
+name: ThresholdedRelu
+since_version: 10
+doc: Zero elements less than or equal to alpha.
+attributes:
+  - { name: alpha, type: float, default: 1.0 }
+inputs: [{ name: X, type_str: T }]
+outputs: [{ name: Y, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

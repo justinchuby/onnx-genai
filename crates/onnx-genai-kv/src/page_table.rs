@@ -1061,6 +1061,50 @@ impl PageTable {
         Ok(victim_id)
     }
 
+    /// Demote every hot page owned exclusively by `seq` to the cold CPU tier.
+    ///
+    /// Unlike [`evict_lru_hot`](Self::evict_lru_hot), which frees the single
+    /// globally-least-recently-used page, this is *sequence-scoped*: it targets
+    /// exactly one sequence's hot residency, which is what a scheduler
+    /// preemption asks for ("evict sequence S"). Pages shared with another live
+    /// sequence or a retained prefix (`ref_count > 1`) are left resident so a
+    /// preemption never steals KV still needed by a running peer.
+    ///
+    /// Only the [`Page::device`] tier tag changes; the page's KV data is left
+    /// untouched, so a later [`promote_to_hot`](Self::promote_to_hot) restores
+    /// byte-identical KV. Returns the number of pages demoted.
+    pub fn evict_sequence_to_cold(&mut self, seq: SequenceId) -> usize {
+        let Some(page_ids) = self.sequences.get(&seq).cloned() else {
+            return 0;
+        };
+        let mut demoted = 0;
+        for page_id in page_ids {
+            if let Some(page) = self.pages.get_mut(&page_id)
+                && page.ref_count <= 1
+                && matches!(page.device, Device::Gpu(_))
+            {
+                page.device = Device::Cpu;
+                demoted += 1;
+            }
+        }
+        self.stats.hot_evictions += demoted as u64;
+        demoted
+    }
+
+    /// Number of pages backing `seq` currently resident on the hot tier.
+    pub fn sequence_hot_pages(&self, seq: SequenceId) -> usize {
+        self.sequences.get(&seq).map_or(0, |page_ids| {
+            page_ids
+                .iter()
+                .filter(|page_id| {
+                    self.pages
+                        .get(page_id)
+                        .is_some_and(|page| matches!(page.device, Device::Gpu(_)))
+                })
+                .count()
+        })
+    }
+
     /// Per-layer KV geometry for `layer`, or `None` when out of range or when
     /// no tensor storage is configured.
     pub fn layer_config(&self, layer: usize) -> Option<LayerTensorConfig> {

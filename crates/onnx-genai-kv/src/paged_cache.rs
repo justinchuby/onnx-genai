@@ -551,6 +551,37 @@ impl PagedKvCache {
         Ok(promoted)
     }
 
+    /// Preempt `seq`: evict all pages it exclusively owns from the hot tier to
+    /// the cold CPU tier, releasing hot residency without dropping any KV.
+    ///
+    /// This is the engine-side execution of a scheduler
+    /// `ScheduleDecision::preempt` entry. Only the device tier changes — the KV
+    /// data stays in place — so [`restore_sequence`](Self::restore_sequence)
+    /// brings back byte-identical KV and a preempted-then-restored sequence
+    /// decodes the same tokens as if it had never been preempted. Returns the
+    /// number of pages demoted.
+    pub fn preempt_sequence(&mut self, seq: SequenceId) -> Result<usize, KvError> {
+        // Validate the sequence exists so a bogus id surfaces as an error
+        // rather than a silent no-op.
+        self.len(seq)?;
+        Ok(self.page_table.evict_sequence_to_cold(seq))
+    }
+
+    /// Restore `seq`: promote every page backing its retained range back to the
+    /// hot tier so decoding can resume. Inverse of
+    /// [`preempt_sequence`](Self::preempt_sequence) and the engine-side
+    /// execution of a scheduler `ScheduleDecision::swap_in` entry. Returns the
+    /// number of pages promoted.
+    pub fn restore_sequence(&mut self, seq: SequenceId) -> Result<usize, KvError> {
+        let start = self.retained_start(seq)?;
+        let end = self.len(seq)?;
+        self.prefetch(seq, start, end)
+    }
+
+    /// Number of pages backing `seq` currently resident on the hot tier.
+    pub fn sequence_hot_pages(&self, seq: SequenceId) -> usize {
+        self.page_table.sequence_hot_pages(seq)
+    }
     fn validate_layers(
         &self,
         layer_configs: &[LayerTensorConfig],
@@ -2009,6 +2040,84 @@ mod tests {
                 position: 2,
                 length: 1
             })
+        ));
+    }
+
+    #[test]
+    fn preempt_then_restore_keeps_kv_bit_identical() {
+        let configs = heterogeneous_layer_configs();
+        // page_size 2 with 5 tokens spans multiple pages, so preemption must
+        // move every backing page — not just the tail.
+        let mut cache =
+            PagedKvCache::new_with_layer_tensor_configs(2, KvDType::F32, configs.clone(), 8);
+        let seq = cache.create_sequence();
+        let tokens = (0..5)
+            .map(|t| hetero_token(&configs, t))
+            .collect::<Vec<_>>();
+        for token in &tokens {
+            cache.append_token_kv(seq, &borrowed_layers(token)).unwrap();
+        }
+        let before = cache.materialize_sequence(seq).unwrap();
+        let page_count = cache.page_table.get_sequence(seq).unwrap().len();
+        assert!(page_count > 1, "test should exercise multiple pages");
+        assert_eq!(cache.sequence_hot_pages(seq), page_count);
+
+        // Preempt: every exclusively-owned page leaves the hot tier.
+        let demoted = cache.preempt_sequence(seq).unwrap();
+        assert_eq!(demoted, page_count);
+        assert_eq!(cache.sequence_hot_pages(seq), 0);
+
+        // KV is fully readable while cold and byte-identical to before.
+        let while_cold = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(while_cold, before);
+
+        // Restore: pages return to the hot tier, KV still byte-identical.
+        let promoted = cache.restore_sequence(seq).unwrap();
+        assert_eq!(promoted, page_count);
+        assert_eq!(cache.sequence_hot_pages(seq), page_count);
+        let after = cache.materialize_sequence(seq).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn preempt_leaves_shared_prefix_pages_resident() {
+        let configs = heterogeneous_layer_configs();
+        let mut cache =
+            PagedKvCache::new_with_layer_tensor_configs(2, KvDType::F32, configs.clone(), 8);
+        let seq = cache.create_sequence();
+        for token in (0..4).map(|t| hetero_token(&configs, t)) {
+            cache
+                .append_token_kv(seq, &borrowed_layers(&token))
+                .unwrap();
+        }
+        // Pin the first page as if it were a retained shared prefix.
+        let shared_page = cache.page_table.get_sequence(seq).unwrap()[0];
+        assert!(cache.page_table.retain(shared_page));
+
+        let hot_before = cache.sequence_hot_pages(seq);
+        let demoted = cache.preempt_sequence(seq).unwrap();
+        // The shared page stays resident; only the exclusively-owned pages move.
+        assert_eq!(demoted, hot_before - 1);
+        assert!(matches!(
+            cache.page_table.pages.get(&shared_page).unwrap().device,
+            Device::Gpu(_)
+        ));
+    }
+
+    #[test]
+    fn preempt_and_restore_are_noops_for_empty_sequence() {
+        let mut cache = PagedKvCache::new(2, 4);
+        let seq = cache.create_sequence();
+        assert_eq!(cache.preempt_sequence(seq).unwrap(), 0);
+        assert_eq!(cache.restore_sequence(seq).unwrap(), 0);
+    }
+
+    #[test]
+    fn preempt_unknown_sequence_errors() {
+        let mut cache = PagedKvCache::new(2, 4);
+        assert!(matches!(
+            cache.preempt_sequence(999),
+            Err(KvError::SequenceNotFound(999))
         ));
     }
 }

@@ -112,6 +112,8 @@ WP-B landed: Deckard's intermediate WP-B3 revision fixed raw membership/default 
 
 - Under Moss's lockout, repaired PR #266 ReduceLogSumExp numerical stability with a dedicated two-pass reduction; Ferro approved and the PR merged.
 
+## 2026-07-27T16:44:54Z — Wave 8 update
+- Took ownership of PR #276 / #87 fix cycle after Ferro REQUEST-CHANGES; must address GPU test build break and WAR-safe driver semantics/docs.
 ## 2026-07-27T12:30:00-07:00 — PR #279 CUDA fallback semantics
 
 - Adjudicated Copilot's CUDA documentation findings against source. `ONNX_GENAI_EP=cuda` without `onnx-genai-ort/cuda` is rejected at ORT session creation, runtime CUDA-provider unavailability is also a hard session error, and `ONNX_GENAI_REQUIRE_CUDA=1` only gates native CUDA node-level fallback to CPU after CUDA is compiled and selected. Corrected CLI/cargo/CAPI/Python docs and comments; verified `cargo tree`, `cargo fmt --check`, and `cargo build -p onnx-genai-cli`.
@@ -129,3 +131,10 @@ Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/
 - Added public engine APIs for persistent-session checkpoints and KV rewind (`checkpoint_session`, `restore_session`, `rewind_session_by`, `rewind_session_to`) using the existing target/draft speculative rewind helpers.
 - Reserved `fork_session` behind an unconstructible public `SessionForkCapability`; current backends return no capability, and the internal path still fail-closes until decoder runner state can be safely cloned/imported without deep-copying or aliasing KV.
 - Documented the API/cost model/invariants/backend matrix in `docs/research/cli/06-fork-rewind-api.md` and added model-free engine unit coverage plus `proptest` randomized fork/rewind/append/remove refcount coverage for paged KV.
+## 2026-07-27T14:56:47-07:00 — PR #287 backend flag lockout revision
+
+- Fixed Batty's rejected CLI backend flag revision: profile output, REPL /session, bare /backend, and /stats now use the loaded engine's resolved backend; auto is only shown as a requested backend when it differs.
+- Kept --backend on transcribe deliberately because speech transcription drives the same autoregressive pipeline decoder; added parser and invalid-backend coverage plus README documentation.
+- Verified cargo build -p onnx-genai-cli, cargo test -p onnx-genai-cli --lib, cargo fmt -p onnx-genai-cli -- --check, cargo clippy -p onnx-genai-cli --all-targets -- -D warnings, and cargo build -p onnx-genai-server.
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- Fixed PR #288 tests after Moss lockout: LogSoftmax overflow-stability is value-falsifiable; BitShift width guard is locked by source-contract test.

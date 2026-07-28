@@ -66,6 +66,16 @@ impl InferenceRegistry {
         chosen
     }
 
+    /// Number of distinct `(domain, operator)` keys in the registry.
+    pub fn operator_count(&self) -> usize {
+        self.handlers.len()
+    }
+
+    /// Number of opset-versioned inference rule entries.
+    pub fn entry_count(&self) -> usize {
+        self.handlers.values().map(Vec::len).sum()
+    }
+
     /// Infer a single node's outputs.
     ///
     /// Returns one [`NodeIo`] per output slot. An unregistered op (or one whose

@@ -41,6 +41,7 @@ mod output;
 mod pages;
 mod profile;
 mod transcribe;
+use commands::parse_decode_backend;
 use generate::generate;
 use interactive::run_repl;
 #[cfg(test)]
@@ -50,6 +51,7 @@ use interactive::{
     stage_attachment,
 };
 use model_inspection::{list, show, version};
+use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
 use onnx_genai::{EngineConfig, GenerateOptions, StopSequence};
@@ -61,12 +63,7 @@ use transcribe::transcribe;
 const CLI_FALLBACK_MAX_NEW_TOKENS: usize = 512;
 
 #[cfg(test)]
-use commands::{
-    ProfileSetting, ReplCommand, ReplLine, parse_decode_backend, parse_profile_setting,
-    parse_repl_line,
-};
-#[cfg(test)]
-use onnx_genai::engine::EngineDecodeBackend;
+use commands::{ProfileSetting, ReplCommand, ReplLine, parse_profile_setting, parse_repl_line};
 #[cfg(test)]
 use onnx_genai::ort::{ChatMessage, profile::TraceVerbosity};
 #[cfg(test)]
@@ -219,6 +216,10 @@ impl SamplingArgs {
 /// Shared engine-tuning flags.
 #[derive(Debug, Args, Default, Clone)]
 struct EngineArgs {
+    /// Decoder backend for text generation.
+    #[arg(long, value_name = "auto|ort|native", value_parser = parse_decode_backend, default_value = "auto")]
+    backend: EngineDecodeBackend,
+
     /// Memory ceiling the engine may use for weights and KV cache: a byte count
     /// (`8GiB`), a fraction of detected capacity (`0.9`), or `auto`.
     ///
@@ -236,7 +237,10 @@ struct EngineArgs {
 
 impl EngineArgs {
     fn to_config(&self) -> EngineConfig {
-        let mut config = EngineConfig::default();
+        let mut config = EngineConfig {
+            decode_backend: self.backend,
+            ..EngineConfig::default()
+        };
         if let Some(limit) = self.vram_limit {
             config.limits.vram_limit = limit;
         }
@@ -244,6 +248,14 @@ impl EngineArgs {
             config.limits.host_ram_limit = limit;
         }
         config
+    }
+}
+
+fn decode_backend_name(backend: EngineDecodeBackend) -> &'static str {
+    match backend {
+        EngineDecodeBackend::Auto => "auto",
+        EngineDecodeBackend::Ort => "ort",
+        EngineDecodeBackend::Native => "native",
     }
 }
 
@@ -907,6 +919,102 @@ mod tests {
     }
 
     #[test]
+    fn backend_is_shared_by_generate_run_and_transcribe() {
+        let generate = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--backend",
+            "native",
+        ])
+        .unwrap();
+        let run = Cli::try_parse_from(["onnx-genai", "run", "./m", "--backend", "ort"]).unwrap();
+        let transcribe =
+            Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "native"])
+                .unwrap();
+
+        match generate.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Native
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+        match run.command {
+            Commands::Run(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Ort);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Ort
+                );
+            }
+            _ => panic!("expected run command"),
+        }
+        match transcribe.command {
+            Commands::Transcribe(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Native);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Native
+                );
+            }
+            _ => panic!("expected transcribe command"),
+        }
+    }
+
+    #[test]
+    fn transcribe_rejects_unknown_backend_loudly() {
+        let error = Cli::try_parse_from(["onnx-genai", "transcribe", "./m", "--backend", "cuda"])
+            .expect_err("cuda is an execution provider, not a decode backend")
+            .to_string();
+
+        assert!(error.contains("auto, ort, or native"), "{error}");
+    }
+
+    #[test]
+    fn backend_defaults_to_auto() {
+        let parsed =
+            Cli::try_parse_from(["onnx-genai", "generate", "./m", "--prompt", "hi"]).unwrap();
+
+        match parsed.command {
+            Commands::Generate(args) => {
+                assert_eq!(args.engine.backend, EngineDecodeBackend::Auto);
+                assert_eq!(
+                    args.engine.to_config().decode_backend,
+                    EngineDecodeBackend::Auto
+                );
+            }
+            _ => panic!("expected generate command"),
+        }
+    }
+
+    #[test]
+    fn backend_reuses_repl_parser_error() {
+        let error = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--backend",
+            "cuda",
+        ])
+        .expect_err("cuda is an execution provider, not a decode backend")
+        .to_string();
+
+        assert!(
+            error.contains("What: \"cuda\" is not a decode backend"),
+            "{error}"
+        );
+        assert!(error.contains("How: use auto, ort, or native."), "{error}");
+    }
+
+    #[test]
     fn sampling_flags_disable_greedy_unless_temperature_is_zero_or_greedy_is_forced() {
         let stochastic = Cli::try_parse_from([
             "onnx-genai",
@@ -1354,6 +1462,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            resolved_decode_backend: EngineDecodeBackend::Ort,
             options: &options,
             history: &history,
             usage: &usage,
@@ -1365,7 +1474,8 @@ mod tests {
             "session\n\
              \x20\x20model: models/tiny\n\
              \x20\x20execution provider: cpu\n\
-             \x20\x20decode backend: auto\n\
+             \x20\x20decode backend: ort\n\
+             \x20\x20requested backend: auto\n\
              \x20\x20sampling: max_new_tokens=32 max_context=auto temperature=0.7 top_p=0.9 top_k=40 greedy=false\n\
              \x20\x20messages: 3 (system: 1, user: 1, assistant: 1)\n\
              \x20\x20completed turns: 1\n\

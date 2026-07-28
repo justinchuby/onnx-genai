@@ -463,6 +463,7 @@ impl Engine {
             }
 
             let decision = self.scheduler.schedule();
+            self.execute_kv_movement(&decision)?;
             let mut runnable = Vec::new();
             for seq in decision
                 .prefill
@@ -500,6 +501,34 @@ impl Engine {
         }
 
         Ok(results)
+    }
+
+    /// Execute the KV-cache movement a scheduler decision calls for.
+    ///
+    /// This is the engine-side counterpart to the scheduler's preemption
+    /// bookkeeping: a `ScheduleDecision::preempt` entry evicts that sequence's
+    /// paged KV off the hot tier (freeing residency for higher-priority work),
+    /// and a `ScheduleDecision::swap_in` entry restores it before the sequence
+    /// runs again. Preemption only re-tags the pages' device tier; the KV data
+    /// is preserved in place, so a preempted-then-restored sequence resumes with
+    /// byte-identical KV and decodes the same tokens as if it had never been
+    /// preempted (see [`PagedKvCache::preempt_sequence`]).
+    ///
+    /// When the scheduler emits neither preemption nor swap-in (the common
+    /// single-sequence / no-pressure path) this is a no-op, keeping normal
+    /// decoding behavior-identical.
+    fn execute_kv_movement(&mut self, decision: &ScheduleDecision) -> anyhow::Result<()> {
+        for seq in &decision.preempt {
+            self.kv_cache
+                .preempt_sequence(*seq)
+                .map_err(|e| anyhow::anyhow!("failed to preempt KV for sequence {seq}: {e}"))?;
+        }
+        for seq in &decision.swap_in {
+            self.kv_cache
+                .restore_sequence(*seq)
+                .map_err(|e| anyhow::anyhow!("failed to restore KV for sequence {seq}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Create a new generation session.

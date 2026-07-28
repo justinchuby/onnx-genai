@@ -36,7 +36,7 @@ pub(crate) use onnx_genai_ort::{
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
     GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
-    ResourceLimits, Scheduler, VramBreakdown,
+    ResourceLimits, ScheduleDecision, Scheduler, VramBreakdown,
 };
 pub(crate) use std::collections::HashMap;
 pub(crate) use std::path::Path;

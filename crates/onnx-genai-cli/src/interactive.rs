@@ -22,7 +22,7 @@ use super::output::{
     build_turn_prompt, detect_reasoning, display_paths, emit_stats_line, load_chat_template,
     run_generation_turn,
 };
-use super::{EngineArgs, ProfileArgs, RunArgs, resolve_model_dir};
+use super::{EngineArgs, ProfileArgs, RunArgs, decode_backend_name, resolve_model_dir};
 use super::{live_turn, pages, profile};
 use profile::RunProfile;
 
@@ -177,11 +177,12 @@ pub(super) struct SessionSettings {
 
 impl SessionSettings {
     pub(super) fn new(model_dir: PathBuf, engine: &EngineArgs) -> Self {
+        let config = engine.to_config();
         Self {
             model_dir,
             execution_provider: None,
-            decode_backend: EngineDecodeBackend::Auto,
-            limits: engine.to_config().limits,
+            decode_backend: config.decode_backend,
+            limits: config.limits,
         }
     }
 
@@ -224,11 +225,7 @@ impl SessionSettings {
     }
 
     pub(super) fn backend_name(&self) -> &'static str {
-        match self.decode_backend {
-            EngineDecodeBackend::Auto => "auto",
-            EngineDecodeBackend::Ort => "ort",
-            EngineDecodeBackend::Native => "native",
-        }
+        decode_backend_name(self.decode_backend)
     }
 }
 
@@ -254,6 +251,7 @@ impl SessionUsage {
 /// diagnostics without echoing conversation content.
 pub(super) struct SessionSummary<'a> {
     pub(super) settings: &'a SessionSettings,
+    pub(super) resolved_decode_backend: EngineDecodeBackend,
     pub(super) options: &'a GenerateOptions,
     pub(super) history: &'a [ChatMessage],
     pub(super) usage: &'a SessionUsage,
@@ -287,8 +285,15 @@ impl fmt::Display for SessionSummary<'_> {
         writeln!(
             formatter,
             "  decode backend: {}",
-            self.settings.backend_name()
+            decode_backend_name(self.resolved_decode_backend)
         )?;
+        if self.settings.decode_backend != self.resolved_decode_backend {
+            writeln!(
+                formatter,
+                "  requested backend: {}",
+                self.settings.backend_name()
+            )?;
+        }
         writeln!(
             formatter,
             "  sampling: max_new_tokens={} max_context={} temperature={} top_p={} top_k={} greedy={}",
@@ -430,6 +435,14 @@ impl Backend {
         match self {
             Self::Text(engine) => Some(engine.page_stats()),
             Self::Pipeline(_) => None,
+        }
+    }
+
+    /// Concrete decoder backend selected for the loaded model.
+    pub(super) fn decode_backend(&self) -> EngineDecodeBackend {
+        match self {
+            Self::Text(engine) => engine.decode_backend(),
+            Self::Pipeline(pipeline) => pipeline.engine.decode_backend(),
         }
     }
 
@@ -868,6 +881,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         "{}",
                         SessionSummary {
                             settings: &settings,
+                            resolved_decode_backend: backend.decode_backend(),
                             options: &sampling_options,
                             history: &history,
                             usage: &session_usage,
@@ -881,6 +895,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     "{}",
                     SessionSummary {
                         settings: &settings,
+                        resolved_decode_backend: backend.decode_backend(),
                         options: &sampling_options,
                         history: &history,
                         usage: &session_usage,
@@ -950,6 +965,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         "{}",
                         SessionSummary {
                             settings: &settings,
+                            resolved_decode_backend: backend.decode_backend(),
                             options: &sampling_options,
                             history: &history,
                             usage: &session_usage,
@@ -1079,7 +1095,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
         profile.execution_provider = settings.resolved_providers();
-        profile.decode_backend = Some(settings.backend_name().to_string());
+        profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = Some(prompt_tokens);
         profile.context = effective_max_context.map(|max_tokens| profile::ContextUsage {

@@ -19,3 +19,6 @@ Approved PR #269 after confirming IsInf, IsNaN, PRelu, CPU IsNaN parity, claim g
 
 ## 2026-07-27T16:44:54Z — Wave 9 update
 Requested changes on PR #276, then approved Deckard's fix cycle for #87 async prefetch overlap.
+
+## 2026-07-27T19:35:00Z — Roadmap wave update
+- Reviewed PR #294, requested changes, then approved after the aarch64 test-build break was fixed.

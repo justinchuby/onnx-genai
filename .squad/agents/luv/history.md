@@ -63,3 +63,8 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-27T10:05:00-07:00 — PR #277 CLI sampling/context review
 - 🟢 Approved Batty's CLI sampling/context fix after checking explicit `--max-new-tokens` preservation, per-turn REPL budget recomputation, finite unknown-context fallback, context arithmetic, sampling/greedy flag semantics, non-TTY stability, and the engine accessor-only API addition.
 - Validation: `cargo build -q -p onnx-genai-cli`, `cargo test -q -p onnx-genai-cli --lib` (72 passed), and `cargo fmt -p onnx-genai-cli -- --check` passed; `cargo clippy -q -p onnx-genai-cli --all-targets -- -D warnings` hit only the known pre-existing `pages.rs:129` manual_checked_ops lint.
+
+## 2026-07-27T14:49:32-07:00 — PR #287 CLI backend flag review
+- 🔴 Rejected Batty's `--backend auto|ort|native` CLI flag because reporting paths use the requested backend (`auto`) rather than the resolved backend actually in use; Deckard should revise under reviewer lockout.
+- Verified CLI build, CLI lib tests (79 passed), fmt, clippy, server build, invalid-value parser error, and text `--backend native` fail-loud behavior on a non-native build.
+- Noted unresolved API-contract question: `--backend` now appears on `transcribe`; document/test it if intentional or split shared args if not.

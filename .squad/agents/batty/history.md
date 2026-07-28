@@ -78,3 +78,11 @@ Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_
 
 - Took over after Leon's rejection under reviewer lockout and made failed rewinds validate before session mutation. Unsupported sliding-window evicted positions and ORT-owned KV without paged materialization now fail without changing logical tokens, `kv_token_count`, decode state, or paged KV.
 - Added model-free regression coverage for both unsupported paths and updated the fork/rewind support matrix to say unsupported rewinds reject cleanly.
+## 2026-07-27T14:08:06-07:00 — CLI backend flag
+
+- Added shared `--backend auto|ort|native` plumbing for `generate` and `run`, reusing the REPL `/backend` parser.
+- `run --backend` now seeds `SessionSettings`, so the initial load and later `/backend` switches use the same reload-bound backend state.
+- Default remains `auto`; explicit `native` reaches `EngineConfig` and fails clearly without native feature support instead of falling back.
+- Gates passed in `backend-flag`: `cargo build -p onnx-genai-cli`, `cargo test -p onnx-genai-cli --lib`, `cargo fmt -p onnx-genai-cli -- --check`, `cargo clippy -p onnx-genai-cli --all-targets -- -D warnings`.
+
+
