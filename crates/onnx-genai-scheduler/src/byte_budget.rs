@@ -43,6 +43,16 @@ pub struct ByteBudgetError {
     pub shortfall: u64,
 }
 
+/// Successful reservation after optionally reducing the requested amount to fit
+/// the currently available budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteBudgetReservation {
+    /// Bytes actually reserved.
+    pub reserved: u64,
+    /// Bytes free before this reservation was taken.
+    pub available_before: u64,
+}
+
 /// Immutable view of the budget at a point in time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetSnapshot {
@@ -115,6 +125,43 @@ impl ByteBudget {
         }
         state.used += bytes;
         Ok(())
+    }
+
+    /// Reserve `requested` bytes, or the largest aligned amount that fits.
+    ///
+    /// The fit calculation and reservation happen while holding the same budget
+    /// lock, so a shared-budget peer cannot consume the computed headroom before
+    /// this reservation is recorded. `minimum` is the smallest useful reservation
+    /// and `unit` is the alignment quantum for partial reservations.
+    pub fn try_reserve_at_most(
+        &self,
+        requested: u64,
+        minimum: u64,
+        unit: u64,
+    ) -> Result<ByteBudgetReservation, ByteBudgetError> {
+        let mut state = self.lock();
+        let available = state.limit.saturating_sub(state.used);
+        let reserved = if requested <= available {
+            requested
+        } else if unit == 0 {
+            0
+        } else {
+            available - (available % unit)
+        };
+        if reserved < minimum {
+            return Err(ByteBudgetError {
+                requested,
+                used: state.used,
+                limit: state.limit,
+                available,
+                shortfall: minimum.saturating_sub(available),
+            });
+        }
+        state.used += reserved;
+        Ok(ByteBudgetReservation {
+            reserved,
+            available_before: available,
+        })
     }
 
     /// Release `bytes` previously reserved via [`ByteBudget::try_reserve`].
@@ -227,6 +274,27 @@ mod tests {
         session_b.try_reserve(300).unwrap();
         assert_eq!(device_budget.used(), 1000);
         assert_eq!(device_budget.available(), 0);
+    }
+
+    #[test]
+    fn reserve_at_most_caps_and_reserves_under_one_lock() {
+        let budget = ByteBudget::new(1000);
+        budget.try_reserve(450).unwrap();
+
+        let reservation = budget.try_reserve_at_most(800, 200, 100).unwrap();
+
+        assert_eq!(
+            reservation,
+            ByteBudgetReservation {
+                reserved: 500,
+                available_before: 550,
+            }
+        );
+        assert_eq!(budget.used(), 950);
+
+        let err = budget.try_reserve_at_most(800, 200, 100).unwrap_err();
+        assert_eq!(err.available, 50);
+        assert_eq!(err.shortfall, 150);
     }
 
     #[test]

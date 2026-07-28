@@ -2,6 +2,20 @@
 
 use super::*;
 
+fn generate_uses_scheduler(backend: EngineDecodeBackend) -> bool {
+    backend != EngineDecodeBackend::Native
+}
+
+fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
+    GenerationBudgetCap {
+        requested_max_new_tokens: cap.requested_max_tokens,
+        admitted_max_new_tokens: cap.admitted_max_tokens,
+        requested_bytes: cap.requested_bytes,
+        admitted_bytes: cap.admitted_bytes,
+        available_bytes: cap.available_bytes,
+    }
+}
+
 impl Engine {
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
@@ -234,7 +248,7 @@ impl Engine {
         request: GenerateRequest,
         callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        if self.decode_backend == EngineDecodeBackend::Native {
+        if !generate_uses_scheduler(self.decode_backend) {
             return self.generate_native_with_callback(request, callback);
         }
         let session_id = self.create_session()?;
@@ -312,7 +326,7 @@ impl Engine {
         session_id: SessionId,
         request: GenerateRequest,
         priority: Priority,
-        custom_sampler: Option<Box<dyn Sampler>>,
+        mut custom_sampler: Option<Box<dyn Sampler>>,
         mut callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
         self.last_speculative_stats = SpeculativeStats::default();
@@ -329,17 +343,33 @@ impl Engine {
             anyhow::bail!("session {session_id} not found");
         }
 
+        let max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+
         let request_id = self.scheduler.enqueue_generate_request(
             session_id,
             prompt_tokens.len(),
             options.max_new_tokens,
             priority,
         );
-        let scheduled = self
-            .scheduler
-            .drive_next_fcfs()
-            .context("scheduler did not admit the session generate request")?;
+        let scheduled = match self.scheduler.drive_next_fcfs_result() {
+            Ok(Some(scheduled)) => scheduled,
+            Ok(None) => {
+                self.scheduler.cancel_request(request_id);
+                anyhow::bail!(
+                    "scheduler had no waiting request after enqueueing request {request_id} for session {session_id}"
+                );
+            }
+            Err(error) => {
+                self.scheduler.cancel_request(request_id);
+                return Err(error.into());
+            }
+        };
         if scheduled.request_id != request_id || scheduled.seq_id != session_id {
+            self.scheduler.cancel_request(scheduled.request_id);
+            if scheduled.request_id != request_id {
+                self.scheduler.cancel_request(request_id);
+            }
             anyhow::bail!(
                 "scheduler admitted request {} for session {}, expected request {} for session {}",
                 scheduled.request_id,
@@ -348,22 +378,22 @@ impl Engine {
                 session_id
             );
         }
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
+        options.max_new_tokens = scheduled.max_tokens;
 
-        let max_context = self.max_context_for_request(&options);
-        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
-
-        let mut state = self
-            .sessions
-            .remove(&session_id)
-            .with_context(|| format!("session {session_id} not found"))?;
-        let prefix_cache_hit_len =
-            self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
-        let mut loop_state =
-            DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
-        let has_custom_sampler = custom_sampler.is_some();
-        loop_state.custom_sampler = custom_sampler;
+        let Some(mut state) = self.sessions.remove(&session_id) else {
+            self.scheduler.complete(session_id);
+            anyhow::bail!("session {session_id} not found");
+        };
 
         let result = (|| -> anyhow::Result<GenerateResult> {
+            let prefix_cache_hit_len =
+                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
+            let mut loop_state =
+                DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
+            let has_custom_sampler = custom_sampler.is_some();
+            loop_state.custom_sampler = custom_sampler.take();
+
             if self.should_use_speculative(&options) && !has_custom_sampler {
                 return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
                     session_id,
@@ -400,11 +430,15 @@ impl Engine {
                 max_context,
                 callback.as_deref_mut(),
             )
-        })();
-        if result.is_ok() && !exceeded_context_limit(state.tokens.len(), max_context) {
-            self.ensure_session_kv_current(session_id, &mut state)?;
-            self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
-        }
+        })()
+        .and_then(|mut result| {
+            if !exceeded_context_limit(state.tokens.len(), max_context) {
+                self.ensure_session_kv_current(session_id, &mut state)?;
+                self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
+            }
+            result.budget_cap = budget_cap;
+            Ok(result)
+        });
         self.sessions.insert(session_id, state);
         self.scheduler.complete(session_id);
         result
@@ -488,6 +522,13 @@ impl Engine {
                 let mut active_request = active.remove(&session_id).with_context(|| {
                     format!("active request for session {session_id} not found")
                 })?;
+                if let Some(max_tokens) = self.scheduler.running_max_tokens(session_id) {
+                    active_request.budget_cap = self
+                        .scheduler
+                        .running_budget_cap(session_id)
+                        .map(generation_budget_cap);
+                    active_request.options.max_new_tokens = max_tokens;
+                }
                 let step_result = self.step_active_generate(&mut active_request)?;
                 generated_steps += 1;
                 if let Some(result) = step_result {
@@ -1116,12 +1157,6 @@ impl Engine {
             );
         }
 
-        self.scheduler.enqueue_generate_request(
-            request.session_id,
-            prompt_tokens.len(),
-            options.max_new_tokens,
-            request.priority,
-        );
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
         let mut state = self
@@ -1132,6 +1167,12 @@ impl Engine {
             self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
         let rng = SamplingRng::new(options.seed);
         let logprobs = options.top_logprobs.map(|_| Vec::new());
+        self.scheduler.enqueue_generate_request(
+            request.session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            request.priority,
+        );
         Ok(ActiveGenerate {
             session_id: request.session_id,
             state,
@@ -1143,6 +1184,7 @@ impl Engine {
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             logprobs,
+            budget_cap: None,
             step: 0,
             rng,
         })
@@ -1188,8 +1230,9 @@ impl Engine {
         active.logprobs = loop_state.logprobs;
         active.step = loop_state.step;
         active.rng = loop_state.rng;
-        if step_result.is_some() {
-            return Ok(step_result);
+        if let Some(mut result) = step_result {
+            result.budget_cap = active.budget_cap;
+            return Ok(Some(result));
         }
         if active.generated_tokens.len() >= active.options.max_new_tokens {
             ensure_constrained_finish(
@@ -1204,7 +1247,10 @@ impl Engine {
                     active.prefix_cache_hit_len,
                     active.logprobs.as_deref(),
                 )
-                .map(Some);
+                .map(|mut result| {
+                    result.budget_cap = active.budget_cap;
+                    Some(result)
+                });
         }
 
         Ok(None)
@@ -1365,6 +1411,7 @@ impl Engine {
             finish_reason,
             prefix_cache_hit_len,
             logprobs: logprobs.map(<[crate::config::TokenLogprob]>::to_vec),
+            budget_cap: None,
         })
     }
 }
@@ -1440,5 +1487,17 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
     fn sampled_fastpath_failed(&mut self) {
         self.state.sampled_fastpath_failed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ort_generate_uses_scheduler_but_native_generate_bypasses_it() {
+        assert!(generate_uses_scheduler(EngineDecodeBackend::Ort));
+        assert!(!generate_uses_scheduler(EngineDecodeBackend::Native));
+        assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
     }
 }

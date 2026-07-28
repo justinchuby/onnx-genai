@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use onnx_genai::GenerateToken;
 use onnx_genai::ort::{ChatMessage, ChatTemplate};
 use onnx_genai::reasoning::{ReasoningMarkers, ReasoningStream};
+use onnx_genai::{GenerateToken, GenerationBudgetCap};
 
 use super::interactive::{Backend, GENERATING, INTERRUPT_REQUESTED, Interrupted, TurnInput};
 use super::{live_turn, profile};
@@ -107,6 +107,13 @@ pub(super) fn emit_stats_line(show_stats: bool, show_profile: bool, profile: &mu
     }
     profile.memory.sample_peak();
     eprintln!("{}", profile.to_stats_line());
+}
+
+fn budget_cap_notice(cap: GenerationBudgetCap) -> String {
+    format!(
+        "notice: scheduler capped --max-new-tokens from {} to {} because the KV byte budget cannot conservatively reserve the requested ceiling; raise --vram-limit or pass an explicit smaller --max-new-tokens to make this bound intentional",
+        cap.requested_max_new_tokens, cap.admitted_max_new_tokens
+    )
 }
 
 fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
@@ -231,12 +238,22 @@ pub(super) fn run_generation_turn(
     }
     GENERATING.store(false, Ordering::SeqCst);
     timings.finish();
+    let budget_cap = result.as_ref().ok().and_then(|result| result.budget_cap);
+    if let Some(cap) = budget_cap {
+        eprintln!("{}", budget_cap_notice(cap));
+    }
     if let Some(profile) = profile {
         profile.timings = timings;
         profile.multimodal_reuse = backend.multimodal_reuse();
         if let Ok(result) = &result {
             profile.finish_reason = Some(format!("{:?}", result.finish_reason));
             profile.prefix_cache_hit = Some(result.prefix_cache_hit_len);
+            if let Some(cap) = budget_cap {
+                profile.budget_cap = Some(profile::BudgetCap {
+                    requested_max_new_tokens: cap.requested_max_new_tokens,
+                    admitted_max_new_tokens: cap.admitted_max_new_tokens,
+                });
+            }
             if let (Some(prompt_tokens), Some(context_limit)) = (prompt_tokens, context_limit) {
                 profile.context = Some(profile::ContextUsage {
                     used_tokens: prompt_tokens + result.token_ids.len(),
@@ -259,7 +276,23 @@ pub(super) fn display_paths(paths: &[PathBuf]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::should_emit_stats_line;
+    use super::*;
+
+    #[test]
+    fn scheduler_budget_cap_notice_names_values_and_levers() {
+        let notice = budget_cap_notice(GenerationBudgetCap {
+            requested_max_new_tokens: 3584,
+            admitted_max_new_tokens: 128,
+            requested_bytes: 4096,
+            admitted_bytes: 640,
+            available_bytes: 640,
+        });
+
+        assert!(notice.contains("scheduler capped --max-new-tokens from 3584 to 128"));
+        assert!(notice.contains("KV byte budget"));
+        assert!(notice.contains("--vram-limit"));
+        assert!(notice.contains("explicit smaller --max-new-tokens"));
+    }
 
     #[test]
     fn profile_text_report_suppresses_the_compact_stats_line() {

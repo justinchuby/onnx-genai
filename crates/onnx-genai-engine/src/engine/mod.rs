@@ -36,7 +36,7 @@ pub(crate) use onnx_genai_ort::{
 pub(crate) use onnx_genai_scheduler::{
     CapacityProvider, CapacityProviders, FixedCapacity, GovernorReconfigureOutcome,
     GovernorSnapshot, ModelKvConfig, Priority, ResourceError, ResourceGovernor, ResourceLimit,
-    ResourceLimits, ScheduleDecision, Scheduler, VramBreakdown,
+    ResourceLimits, ScheduleDecision, ScheduledBudgetCap, Scheduler, VramBreakdown,
 };
 pub(crate) use std::collections::HashMap;
 pub(crate) use std::path::Path;
@@ -45,12 +45,12 @@ pub(crate) use std::sync::Arc;
 pub use crate::config::{
     DryConfig, Eagle3Config, EngineConfig, EngineConfigError, EngineDecodeBackend, FinishReason,
     GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateToken, GenerateTokenCallback, KvConnectorBackend, KvConnectorConfig, LimitParseError,
-    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig,
-    parse_resource_limit,
+    GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
+    KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
+    MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
+    RewindTokenCount, ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability,
+    SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode,
+    TokenLogprob, XtcConfig, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{

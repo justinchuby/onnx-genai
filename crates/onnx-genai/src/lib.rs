@@ -19,8 +19,8 @@ pub use onnx_genai_scheduler as scheduler;
 pub use onnx_genai_engine::{
     CategoricalSampler, Constraint, ConstraintProcessor, DryConfig, Engine, EngineConfig,
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
-    GenerateTokenCallback, GreedySampler, JsonConstraint, LogitProcessor, MirostatConfig,
-    MirostatVersion, ProcessorChain, ProcessorChainBuilder, ProcessorContext, ProcessorSignal,
-    Sampler, SessionId, SpeculativeAcceptContext, SpeculativeProposal, SpeculativeProposer,
-    SpeculativeProposerContext, StopSequence, TokenId, XtcConfig,
+    GenerateTokenCallback, GenerationBudgetCap, GreedySampler, JsonConstraint, LogitProcessor,
+    MirostatConfig, MirostatVersion, ProcessorChain, ProcessorChainBuilder, ProcessorContext,
+    ProcessorSignal, Sampler, SessionId, SpeculativeAcceptContext, SpeculativeProposal,
+    SpeculativeProposer, SpeculativeProposerContext, StopSequence, TokenId, XtcConfig,
 };

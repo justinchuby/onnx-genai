@@ -161,6 +161,7 @@ pub(crate) struct RunProfile {
     pub(crate) timings: TokenTimings,
     pub(crate) prompt_tokens: Option<usize>,
     pub(crate) context: Option<ContextUsage>,
+    pub(crate) budget_cap: Option<BudgetCap>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) prefix_cache_hit: Option<usize>,
     pub(crate) memory: MemoryUsage,
@@ -173,6 +174,12 @@ pub(crate) struct RunProfile {
 pub(crate) struct ContextUsage {
     pub(crate) used_tokens: usize,
     pub(crate) max_tokens: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BudgetCap {
+    pub(crate) requested_max_new_tokens: usize,
+    pub(crate) admitted_max_new_tokens: usize,
 }
 
 /// What a multimodal pipeline avoided recomputing for this generation.
@@ -228,6 +235,13 @@ impl RunProfile {
         }
         if let Some(context) = self.context {
             parts.push(format!("ctx {context}"));
+        }
+        if let Some(cap) = self.budget_cap {
+            parts.push(format!(
+                "max-new capped {} -> {}",
+                format_token_count(cap.requested_max_new_tokens),
+                format_token_count(cap.admitted_max_new_tokens)
+            ));
         }
         if let Some(backend) = &self.decode_backend {
             parts.push(format!("backend {backend}"));
@@ -519,6 +533,13 @@ impl RunProfile {
         if let Some(reason) = &self.finish_reason {
             let _ = writeln!(out, "{:<24} {}", "finish reason", reason);
         }
+        if let Some(cap) = self.budget_cap {
+            let _ = writeln!(
+                out,
+                "{:<24} {} -> {} max_new_tokens (KV budget)",
+                "scheduler cap", cap.requested_max_new_tokens, cap.admitted_max_new_tokens
+            );
+        }
         if let Some(pages) = self.pages.filter(|pages| !pages.is_idle()) {
             let _ = writeln!(out, "kv page activity:");
             let _ = writeln!(out, "{:<24} {:>10}", "  allocated", pages.allocations);
@@ -741,6 +762,12 @@ impl RunProfile {
         }
         if let Some(reason) = &self.finish_reason {
             fields.push(format!("\"finish_reason\":{}", json_string(reason)));
+        }
+        if let Some(cap) = self.budget_cap {
+            fields.push(format!(
+                "\"budget_cap\":{{\"requested_max_new_tokens\":{},\"admitted_max_new_tokens\":{}}}",
+                cap.requested_max_new_tokens, cap.admitted_max_new_tokens
+            ));
         }
         if let Some(pages) = self.pages.filter(|pages| !pages.is_idle()) {
             fields.push(format!(
@@ -1159,5 +1186,26 @@ mod tests {
         assert!(line.contains("backend ort"), "{line}");
         assert!(!line.contains("backend auto"), "{line}");
         assert_eq!(json["decode_backend"], "ort");
+    }
+
+    #[test]
+    fn stats_line_and_reports_expose_scheduler_budget_cap() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.budget_cap = Some(BudgetCap {
+            requested_max_new_tokens: 3584,
+            admitted_max_new_tokens: 128,
+        });
+
+        let line = profile.to_stats_line();
+        let text = profile.to_text();
+        let json: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+
+        assert!(line.contains("max-new capped 3.6k -> 128"), "{line}");
+        assert!(
+            text.contains("scheduler cap") && text.contains("3584 -> 128"),
+            "{text}"
+        );
+        assert_eq!(json["budget_cap"]["requested_max_new_tokens"], 3584);
+        assert_eq!(json["budget_cap"]["admitted_max_new_tokens"], 128);
     }
 }
