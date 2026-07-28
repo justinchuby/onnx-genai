@@ -50,6 +50,7 @@ mod domain;
 mod dtype;
 mod error;
 mod graph;
+mod graph_view;
 mod layout;
 mod node;
 mod shape;
@@ -62,6 +63,7 @@ pub use domain::{AI_ONNX_DOMAIN, is_default_domain, normalize_domain};
 pub use dtype::DataType;
 pub use error::{GraphError, IrError, Result};
 pub use graph::Graph;
+pub use graph_view::{ConsumerUse, FrozenGraph, GraphView, GraphViewCache, NodeIndex, ValueIndex};
 pub use layout::{
     MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides, is_contiguous,
 };

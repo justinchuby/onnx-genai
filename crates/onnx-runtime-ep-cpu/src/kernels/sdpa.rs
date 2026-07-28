@@ -320,10 +320,57 @@ pub fn sdpa_decode_row(
     debug_assert_eq!(k.len(), kv_seq * q.len());
     debug_assert_eq!(v.len(), kv_seq * output.len());
 
+    let head_size = q.len();
+    let v_head_size = output.len();
+    sdpa_decode_row_accessor(
+        q,
+        |ks| {
+            let base = ks * head_size;
+            &k[base..base + head_size]
+        },
+        |ks| {
+            let base = ks * v_head_size;
+            &v[base..base + v_head_size]
+        },
+        lo,
+        hi,
+        scale,
+        softcap,
+        exp,
+        output,
+    );
+}
+
+/// [`sdpa_decode_row`] over a KV window `[lo, hi)` where each key/value row is
+/// supplied by an accessor closure instead of one contiguous per-head buffer.
+///
+/// This is the reuse point for **runtime-managed (paged) KV** attention: a paged
+/// store can attend directly over its pages by returning each token's K/V row in
+/// place, with no per-step concat into a fresh `present` buffer and no output
+/// round-trip. `k_row(ks)` must return this KV head's key row for token `ks`
+/// (length `q.len()`) and `v_row(ks)` its value row (length `output.len()`).
+///
+/// The scoring (`dot_f32`, `scale`, optional `softcap`), the f64-intermediate
+/// softmax, and the `axpy_f32` value reduction are evaluated in exactly the same
+/// operations and order as [`sdpa_decode_row`], so for identical row *values*
+/// the output is **bit-for-bit identical** to the contiguous fresh-present path.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_row_accessor<'a>(
+    q: &[f32],
+    k_row: impl Fn(usize) -> &'a [f32],
+    v_row: impl Fn(usize) -> &'a [f32],
+    lo: usize,
+    hi: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    exp: SoftmaxExp,
+    output: &mut [f32],
+) {
+    debug_assert!(lo <= hi);
+
     let mut scores = vec![0.0f32; hi - lo];
     for (i, ks) in (lo..hi).enumerate() {
-        let k_base = ks * q.len();
-        let mut score = dot_f32(q, &k[k_base..k_base + q.len()]);
+        let mut score = dot_f32(q, k_row(ks));
         score *= scale;
         if let Some(softcap) = softcap {
             score = softcap * (score / softcap).tanh();
@@ -349,8 +396,7 @@ pub fn sdpa_decode_row(
         if probability == 0.0 {
             continue;
         }
-        let v_base = ks * output.len();
-        axpy_f32(output, probability, &v[v_base..v_base + output.len()]);
+        axpy_f32(output, probability, v_row(ks));
     }
 }
 

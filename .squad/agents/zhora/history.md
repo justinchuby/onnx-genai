@@ -117,3 +117,9 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
 Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+
+## 2026-07-27T14:55:00-07:00 — REPL Phase 1 rejection revision
+- Took over PR #289 revision after Gaff's rejection under reviewer lockout.
+- Made REPL command parsing mode-aware: `Plain` preserves `main` piped behavior for `//...` and `/help <arg>`, while `Tty` keeps the new rich affordances.
+- Fixed the post-generation newline decision to depend on whether the current turn actually used live rendering, not on the reusable renderer lifecycle state.
+- Added lib and e2e regressions; local ONNX Runtime mismatch still prevents model-loading e2e verification.

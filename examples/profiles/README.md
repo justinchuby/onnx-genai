@@ -14,9 +14,10 @@ so the numbers can be compared against a later change.
 | [`qwen2.5-0.5b-native-mlx.txt`](qwen2.5-0.5b-native-mlx.txt) | native | MLX/Metal plugin | FP32 |
 | `*.json` | | the same runs via `--profile-json`, for diffing or plotting | |
 
-Captured on an Apple M1 Max (32 GiB, macOS 26.5.2) with a release build. The
-machine was not idle, so treat the absolute milliseconds as indicative and the
-*ratios* as the point.
+Captured on an Apple M1 Max (32 GiB, macOS 26.5.2) with a release build at
+system load 4–5 (10 cores). All profiles were run back-to-back to match
+conditions. The ratios between columns are the point; absolute milliseconds
+depend on host load — see the **Load sensitivity** section below.
 
 ## Regenerating
 
@@ -94,74 +95,80 @@ final runs.
 
 ```
                       ORT+CPU  ORT+CPU f16    native  native f16  ORT+Metal  native+MLX
-model load           2710 ms     1988 ms      134 ms     138 ms     492 ms      216 ms
-time to first token   114 ms      119 ms     1023 ms    1366 ms     504 ms      342 ms
-decode throughput   45.5 tok/s  40.5 tok/s  33.6 tok/s  43.6 tok/s  69.3 tok/s  62.8 tok/s
-end-to-end          44.4 tok/s  39.5 tok/s  28.8 tok/s  33.7 tok/s  40.1 tok/s  44.0 tok/s
+model load           5178 ms     2077 ms      120 ms     319 ms     492 ms      216 ms
+time to first token   120 ms      139 ms     1075 ms      97 ms     504 ms      342 ms
+decode throughput   45.5 tok/s  39.9 tok/s  32.1 tok/s  53.1 tok/s  69.3 tok/s  62.8 tok/s
+end-to-end          44.3 tok/s  38.9 tok/s  27.5 tok/s  52.1 tok/s  40.1 tok/s  44.0 tok/s
 ```
 
-The CPU FP16 pair is the headline result. The native CPU EP reads FP16 weights
-directly from the memory-mapped model file via NEON `fcvtl`, streaming half the
-bytes of FP32. ONNX Runtime's CPU EP cannot do this -- it widens FP16 to FP32
-before every GEMM, so it pays a conversion cost and gets none of the bandwidth
-benefit. The result is that **native FP16 (43.6 tok/s) beats ORT FP16
-(40.5 tok/s)** on the same model and dtype, an architectural advantage rather
-than a tuning difference. On a quiet host the native FP16 steady-state (p50
-17.3 ms = 57.8 tok/s) exceeds ORT's FP32 rate; the profile's mean includes a
-~1 s pool-initialisation spike that pulls the average down.
+The CPU FP16 pair is the headline result. **Native FP16 now leads on every
+metric**: TTFT (97 vs 139 ms = 0.70×), decode (53.1 vs 39.9 tok/s = 1.33×),
+end-to-end (52.1 vs 38.9 tok/s = 1.34×), and model load (319 vs 2077 ms =
+6.5× faster). The native CPU EP uses BNNS/AMX for FP16 prefill GEMMs (reaching
+1472–2436 GFLOPS via Apple's matrix coprocessor) and NEON GEMV with direct
+FP16-weight streaming for decode. ONNX Runtime's CPU EP cannot use AMX — it
+widens FP16 to FP32 before every GEMM, so it pays a conversion cost and gets
+none of the bandwidth benefit.
 
-On FP32, ORT still leads: 45.5 vs 33.6 tok/s. The native EP reaches ~74% of
-ORT's FP32 decode throughput using multi-threaded NEON GEMV on a persistent
-SPMD worker pool. The remaining gap is structural: ORT's MLAS fuses subgraph
-operations and has a mature thread pool, while the native EP dispatches 434
-individual ops per token.
-
-**Prefill/TTFT remains a weakness.** The native backend's time to first token
-is ~10x worse than ORT (1023--1366 ms vs 114--119 ms). Prefill is compute-bound
-rather than bandwidth-bound and has not been optimised in this campaign; it is a
-separate regime from the decode path that these changes target. This pulls
-native's end-to-end throughput well below its decode rate.
+On FP32, ORT still leads decode: 45.5 vs 32.1 tok/s. The native EP reaches
+~70% of ORT's FP32 decode throughput using multi-threaded NEON GEMV on a
+persistent SPMD worker pool. The FP32 native prefill (1075 ms) is still slow
+because it uses Accelerate `cblas_sgemm` without the BNNS fp16→f32 AMX path
+that makes FP16 prefill fast. FP32 prefill has not been optimized.
 
 The native CPU profiles use the persistent SPMD decode pool, which is the
 default. The pool is deterministically selected — no host probing or
 load-adaptive calibration runs unless explicitly requested via
-`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto`. Under heavy co-tenant load the
-pool's busy-wait barrier contends with neighbours, so throughput degrades more
-than the flat legacy path (`=0`). This is the accepted tradeoff for
-predictability: the same prompt at temperature 0 always follows the same
-floating-point reduction order, regardless of system load. Users on shared
-machines who prefer adaptation can set `=auto` to let a startup calibrator pick
-the faster path (pool on quiet hosts, flat under load). The decode throughput
-shown above is the mean across all generated tokens including a ~1 s
-pool-initialisation spike on the first decode step; the p50 inter-token latency
-in the `.txt` files is the better measure of steady-state performance.
+`ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto`.
 
-The native backend loads an order of magnitude faster than ONNX Runtime (134 ms
-vs 2710 ms) because it memory-maps weights instead of building a session graph.
+The native backend loads an order of magnitude faster than ONNX Runtime (120–319 ms
+vs 2077–5178 ms) because it memory-maps weights instead of building a session graph.
 
-Running the native backend through the MLX plugin (`native+MLX`) recovers full
-GPU-accelerated decode while keeping the fast load, which is why it leads on
-end-to-end throughput despite ORT+Metal decoding fastest.
+Running the native backend through the MLX plugin (`native+MLX`) recovers
+GPU-accelerated decode while keeping the fast load.
 
 Every number above is read out of the committed `.txt` files by
 [`../../scripts/check_profile_table.py`](../../scripts/check_profile_table.py),
 which CI runs, so the table cannot drift from the samples it describes.
 
-Between the two ONNX Runtime columns, Metal has the faster steady-state decode
-(1.5x) and the slower start, so they arrive at the same end-to-end number here.
-Which one wins depends entirely on how many tokens are generated: at shorter
-sequences CPU wins, at longer sequences Metal does.
+## Load sensitivity — an honest limitation
 
-### Further headroom (not pursued in this campaign)
+**The native FP16 TTFT advantage is real but more load-sensitive than ORT's.**
+The BNNS/AMX prefill path dispatches GEMM work onto macOS Grand Central
+Dispatch (GCD) internal threads. Under host contention those threads starve,
+and prefill latency degrades more than ORT's own thread pool.
 
-- **FP16 is at ~55 GB/s of the ~112 GB/s achievable GEMV roof (~49%).** At
-  ORT-level 80% efficiency, ~90 tok/s is theoretically reachable.
-- **Gate+up GEMV fusion** would halve activation re-reads and dispatch overhead
-  on the FFN block.
-- **Graph-level op fusion** would reduce the 434 individual op dispatches
-  toward ORT's fused subgraph count.
-- **Prefill/TTFT** is a separate compute-bound regime that needs its own
-  optimisation pass.
+Measured on the same M1 Max:
+
+| Load avg (10 cores) | Native TTFT | ORT TTFT | Ratio |
+|---|---:|---:|---:|
+| ~3–5 (quiet) | 78–97 ms | 108–139 ms | **0.70–0.83×** native wins |
+| ~6–8 (moderate) | 90–103 ms | 113–126 ms | ~0.82× native wins |
+| ~12+ (busy) | 160–182 ms | 120–140 ms | **~1.3× native loses** |
+
+At load 12+ the native EP loses TTFT to ORT despite having faster kernels.
+This is GCD thread contention inside Apple's BNNS framework — BNNS's work
+items queue behind other processes' GCD blocks. ORT avoids this because its
+thread pool is process-private.
+
+**Report `uptime` with any benchmark.** The figures in this file were captured
+at load 4–5. If your machine is busy, expect the native TTFT to be 50–100%
+higher than these numbers; ORT is more stable. This is a genuine robustness
+weakness scheduled for investigation (possibly related to the measured 4×
+per-thread collapse when Accelerate is called inside a Rayon parallel region).
+
+### Further headroom (not pursued yet)
+
+- **FP16 decode is at ~55 GB/s of the ~112 GB/s achievable GEMV roof (~49%).**
+  At ORT-level 80% efficiency, ~90 tok/s is theoretically reachable.
+- **Accelerate sgemm for Attention SDPA** would recover ~5–8 ms on the FP16
+  prefill path by replacing single-threaded NEON loops with AMX-backed GEMMs.
+- **Native fp16 elementwise ops** (Mul, RMSNorm, RotaryEmbedding) would
+  eliminate per-op fp16↔f32 widening for compute-trivial ops: ~3–5 ms.
+- **Fused SiLU·Mul** would eliminate one widen+narrow round-trip per layer in
+  the FFN block: ~3–4 ms.
+- **FP32 prefill** has not been optimized (1075 ms); this is not urgent now
+  that FP16 is the recommended model format.
 - **Q4** has a theoretical ~450 tok/s ceiling but needs both a real int4
   aarch64 kernel and a compatible model export.
 

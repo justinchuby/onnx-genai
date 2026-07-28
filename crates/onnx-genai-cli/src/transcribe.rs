@@ -14,7 +14,9 @@ use onnx_genai_server::multimodal;
 use super::commands::resolved_default_providers;
 use super::interactive::{GENERATING, INTERRUPT_REQUESTED, Interrupted, install_ctrlc_handler};
 use super::profile::RunProfile;
-use super::{ProfileArgs, TranscribeArgs, TranscriptFormat, resolve_model_dir};
+use super::{
+    ProfileArgs, TranscribeArgs, TranscriptFormat, decode_backend_name, resolve_model_dir,
+};
 
 struct Transcript {
     index: usize,
@@ -185,6 +187,8 @@ pub(super) fn transcribe(args: TranscribeArgs, profiling: &ProfileArgs) -> anyho
     profile.execution_provider = resolved_default_providers();
     let load_started = std::time::Instant::now();
     let mut transcriber = Transcriber::load(&model_dir, &args)?;
+    profile.decode_backend =
+        Some(decode_backend_name(transcriber.engine.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
 
     let window = transcriber.window_seconds();
