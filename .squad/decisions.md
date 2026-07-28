@@ -11060,3 +11060,30 @@ Decision archive hard gate checked at 2026-07-28T09:10:28+00:00: active ledger w
 **Deferred:** `DFT`, `STFT`, `MelWeightMatrix`, `AffineGrid`, and loss operators remain later tensor-rule work. Sequence/Optional/Map propagation needs an SSA `Value`/`TypeInfo` container element-type model change, so #75 remains open.
 
 <!-- sources: decisions/inbox/luv-67-cuda-batch7.md; decisions/inbox/coco-75-shape-inference-b2.md; wave-7 manifest -->
+
+<!-- scribe-archive-2026-07-28T10-04-25+0000-wave8 -->
+Decision archive hard gate checked at 2026-07-28T10:04:25+0000: active ledger was 876732 bytes and exceeded 51200 bytes. Applied the seven-day policy (dated sections before 2026-07-21); no eligible dated decision sections remained after prior reconciliation, so archived 0 entries and created no archive file.
+
+<!-- scribe-merge-2026-07-28T10-04-25+0000-jones-67-cuda-batch8 -->
+## 2026-07-28 — CUDA operator coverage batch 8
+
+### Issue #67 — CUDA `ScatterND` and window functions (PR #341, `6aca9a9d`)
+**By:** Jones (implementation); Clemens (independent review, **APPROVE**)
+
+**What:** Added CUDA kernels for `ScatterND`, `HannWindow`, `HammingWindow`, and `BlackmanWindow`, increasing `CUDA_COVERED_OPS` from 136 to 140. Standard CPU parity advanced to 111/141.
+
+**Why:** A deterministic single-thread `ScatterND` kernel preserves CPU duplicate-index reduction semantics. A shared dtype-parametric NVRTC window implementation covers f16/bf16/f32/f64 without cuDNN and avoids maintaining three duplicate implementations.
+
+**Verification:** GPU7 conformance passed 190/190 cases; the coverage-of-coverage gate passed; a `ScatterND` mutation probe failed as expected. #67 remains open for further coverage.
+
+<!-- scribe-merge-2026-07-28T10-04-25+0000-branson-75-shape-inference-b3 -->
+### Issue #75 — Shape-inference catalog batch 3 (PR #343, `9aea50f9`)
+**By:** Branson (implementation); Morse (independent review, **APPROVE**)
+
+**What:** Added rules for `DFT`, `STFT`, `MelWeightMatrix`, `HannWindow`, `HammingWindow`, `BlackmanWindow`, `AffineGrid`, `NegativeLogLikelihoodLoss`, and `SoftmaxCrossEntropyLoss`. The registry advanced from 187 to 196 operators and from 226 to 236 versioned registrations.
+
+**Why:** Signal, window, grid, and loss operators have well-defined output-shape math. Rules preserve known rank/dimensions while unresolved shape data becomes fresh symbols; DFT registrations distinguish opset-17 attribute-axis and opset-20 input-axis forms.
+
+**Verification:** Format, warnings-denied Clippy, and all 229 shape-inference tests passed; an STFT frame-count mutation probe failed as expected. Sequence/Optional/Map container operators remain deferred pending an SSA `Value`/`TypeInfo` container type-model change. #75 remains open for later batches.
+
+<!-- sources: decisions/inbox/jones-67-cuda-batch8.md; decisions/inbox/branson-75-shape-inference-b3.md; wave-8 manifest -->
