@@ -81,6 +81,14 @@ pub fn broadcast_apply<T: Copy>(
     Ok(())
 }
 
+/// Dispatch counter for the vDSP contiguous f32 fast path (macOS/iOS).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub static ADD_VDSP_TEST_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dispatch counter for the scalar fallback path.
+pub static ADD_SCALAR_TEST_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Kernel for AddKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Add", inputs, outputs, 2, 2, 1)?;
@@ -89,6 +97,12 @@ impl Kernel for AddKernel {
         if add_contiguous_f32(inputs, &mut outputs[0])? {
             return Ok(());
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if add_vdsp_f32(inputs, &mut outputs[0])? {
+            ADD_VDSP_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        ADD_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         dispatch_arith!(inputs[0].dtype, "Add", T => add_typed::<T>(inputs, outputs))
     }
 
@@ -144,6 +158,73 @@ fn add_typed<T: NumericElem>(inputs: &[TensorView], outputs: &mut [TensorMut]) -
     })?;
     let out: Vec<T> = acc.into_iter().map(T::from_acc).collect();
     write_dense::<T>(&mut outputs[0], &out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Apple Silicon fast path: vDSP_vadd for contiguous f32 same-shape tensors
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Contiguous f32 same-shape elementwise Add using Accelerate's vDSP_vadd.
+/// Returns `Ok(true)` when the fast path ran, `Ok(false)` when conditions
+/// are not met and the caller should fall through.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn add_vdsp_f32(inputs: &[TensorView], output: &mut TensorMut) -> Result<bool> {
+    use crate::dtype::to_dense_f32_widen;
+
+    if inputs[0].dtype != DataType::Float32
+        || inputs[1].dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || inputs[0].shape != inputs[1].shape
+        || inputs[0].shape != output.shape
+        || !inputs[0].is_contiguous()
+        || !inputs[1].is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Ok(false);
+    }
+    // Alias check: output must not overlap either input.
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if inputs.iter().any(|input| {
+        let start = input.data_ptr::<u8>() as usize;
+        let end = start.saturating_add(input.byte_size());
+        output_start < end && start < output_end
+    }) {
+        return Ok(false);
+    }
+    let left = to_dense_f32_widen("Add", &inputs[0])?;
+    let right = to_dense_f32_widen("Add", &inputs[1])?;
+    let n = output.numel();
+    // SAFETY: validated contiguous Float32 output with numel matching both inputs.
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
+    // SAFETY: vDSP_vadd reads `n` floats from each source (stride 1) and writes
+    // `n` floats to the output. All three pointers are valid for `n` f32s.
+    unsafe {
+        vDSP_vadd(
+            left.as_ptr(),
+            1,
+            right.as_ptr(),
+            1,
+            out_slice.as_mut_ptr(),
+            1,
+            n as u64,
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn vDSP_vadd(
+        __A: *const f32,
+        __IA: i64,
+        __B: *const f32,
+        __IB: i64,
+        __C: *mut f32,
+        __IC: i64,
+        __N: u64,
+    );
 }
 
 /// Guard that a secondary operand carries the same dtype the dispatch selected.
@@ -286,5 +367,43 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap_err();
         assert!(format!("{err}").contains("share one dtype"));
+    }
+
+    // ─── Dispatch reachability ───────────────────────────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn add_contiguous_f32_same_shape_uses_vdsp() {
+        use std::sync::atomic::Ordering;
+        let before = super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[2, 3], &[10., 20., 30., 40., 50., 60.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = super::ADD_VDSP_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "Contiguous f32 same-shape Add did not reach vDSP path"
+        );
+        assert_eq!(out.to_f32(), vec![11., 22., 33., 44., 55., 66.]);
+    }
+
+    #[test]
+    fn add_broadcast_uses_scalar_fallback() {
+        use std::sync::atomic::Ordering;
+        let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[3], &[10., 20., 30.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "Broadcasting Add did not reach scalar fallback"
+        );
     }
 }

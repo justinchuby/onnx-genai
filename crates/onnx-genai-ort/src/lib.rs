@@ -60,6 +60,7 @@ pub use onnx_genai_metadata::{
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
 };
 pub use onnx_genai_runtime_config::EpSelection;
+pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{
     CudaAttentionMode, EpCapabilities, HardwareKind, ResolvedEp, RunPhaseError, Session,
     SessionOptions, TensorInfo, available_execution_providers, capability, ep_selection,
@@ -71,3 +72,29 @@ pub use shared_kv_proposer::{
 };
 pub use tokenizer::Tokenizer;
 pub use value::{DataType, Value};
+
+/// Human-readable report of the ONNX Runtime shared library selected for this process.
+///
+/// Calling this resolves ORT if it has not already been loaded, so it is suitable
+/// for CLI diagnostics such as `onnx-genai version`.
+#[must_use]
+pub fn onnxruntime_library_report() -> String {
+    let previous_report_setting = onnx_genai_ort_sys::set_ort_selection_report_enabled(false);
+    let load_error = onnx_genai_ort_sys::ort_load_error();
+    onnx_genai_ort_sys::set_ort_selection_report_enabled(previous_report_setting);
+    match load_error {
+        Some(error) => format!("failed to load ({error})"),
+        None => {
+            let path = onnx_genai_ort_sys::loaded_ort_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown path>".to_owned());
+            let version = onnx_genai_ort_sys::loaded_ort_version()
+                .unwrap_or_else(|| "unknown version".to_owned());
+            let api = onnx_genai_ort_sys::loaded_ort_api_version()
+                .map_or_else(|| "unknown".to_owned(), |api| api.to_string());
+            let reason = onnx_genai_ort_sys::loaded_ort_reason()
+                .unwrap_or_else(|| "dynamic loader default search path".to_owned());
+            format!("{version} (API {api}) from {path} ({reason})")
+        }
+    }
+}

@@ -7,7 +7,7 @@ use crate::handlers::checked_axis;
 use crate::shape_data::ShapeData;
 
 use super::concat_slice::vector_length;
-use super::{const_ints, validate_vector_input};
+use super::{checked_extent, const_ints, validate_vector_input};
 
 /// `Transpose`: permute dimensions by `perm` (default: reverse).
 pub fn transpose(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
@@ -406,4 +406,114 @@ fn bidirectional_broadcast(
         output.push(ctx.broadcast_dim(&a, &b)?);
     }
     Ok(output)
+}
+
+/// `Col2Im` (opset 18): rearrange column blocks back into a multi-dimensional
+/// image — the inverse of an im2col unfold.
+///
+/// The data input has shape `[N, C * prod(block_shape), L]`. The `image_shape`
+/// input (slot 1) gives the spatial extents of the reconstructed image and the
+/// `block_shape` input (slot 2) gives the sliding-block extents. The output is
+/// `[N, C, *image_shape]`, where `C = data.shape[1] / prod(block_shape)`.
+/// Unknown operands degrade to fresh symbols rather than fabricated extents.
+pub fn col2im(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(data) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    if data.len() != 3 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "Col2Im".into(),
+            index: 0,
+            rank: data.len(),
+            detail: "expected [N, C * prod(block_shape), L]".into(),
+        });
+    }
+    validate_vector_input(ctx, 1, "Col2Im")?;
+    validate_vector_input(ctx, 2, "Col2Im")?;
+
+    // Channels: divide the folded second dimension by the block volume. When
+    // the block shape is not statically known, the channel count is unknown.
+    let channels = match const_ints(ctx, 2) {
+        Some(blocks) => {
+            let volume = blocks
+                .iter()
+                .copied()
+                .try_fold(1i64, |acc, b| acc.checked_mul(b));
+            match volume {
+                Some(volume) if volume > 0 => data[1]
+                    .checked_div(&DimExpr::constant(volume))
+                    .unwrap_or_else(|| ctx.fresh_dim()),
+                _ => ctx.fresh_dim(),
+            }
+        }
+        None => ctx.fresh_dim(),
+    };
+
+    // The spatial extents are exactly the `image_shape` values; a symbolic
+    // element stays symbolic. Without shape-data the spatial rank is unknown,
+    // so the output is left unresolved.
+    let Some(image) = ctx.input_shape_data(1).map(ShapeData::as_shape) else {
+        return Ok(());
+    };
+    let mut out = vec![data[0].clone(), channels];
+    for dim in image {
+        if let Some(extent) = dim.as_const() {
+            out.push(DimExpr::constant(checked_extent(
+                "Col2Im",
+                i128::from(extent),
+            )?));
+        } else {
+            out.push(dim);
+        }
+    }
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
+/// `CenterCropPad` (opset 18): center-crop or center-pad `input_data` so that
+/// the extents along `axes` match the `shape` input, leaving every other axis
+/// untouched.
+///
+/// The output has the input's rank. Each targeted axis takes its extent from
+/// the corresponding `shape` element (symbolic when the value is not statically
+/// known); untargeted axes are copied through. When `axes` is omitted it
+/// defaults to every axis of the input.
+pub fn center_crop_pad(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(input) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    let rank = input.len();
+    validate_vector_input(ctx, 1, "CenterCropPad")?;
+
+    let axes: Vec<usize> = match ctx.node.attr("axes").and_then(Attribute::as_ints) {
+        Some(raw) => raw
+            .iter()
+            .map(|&axis| {
+                checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+                    op: "CenterCropPad".into(),
+                    detail: format!("axis {axis} is out of range for rank {rank}"),
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        None => (0..rank).collect(),
+    };
+
+    let mut out = input;
+    // The target extents come from the `shape` input; when a value is not
+    // statically known the corresponding axis degrades to a fresh symbol.
+    let target = ctx.input_shape_data(1).map(ShapeData::as_shape);
+    for (i, &axis) in axes.iter().enumerate() {
+        let dim = match target.as_ref().and_then(|t| t.get(i)) {
+            Some(dim) if dim.as_const().is_some() => {
+                let extent = dim.as_const().unwrap();
+                DimExpr::constant(checked_extent("CenterCropPad", i128::from(extent))?)
+            }
+            _ => ctx.fresh_dim(),
+        };
+        out[axis] = dim;
+    }
+    ctx.set_output(0, dtype, out);
+    Ok(())
 }

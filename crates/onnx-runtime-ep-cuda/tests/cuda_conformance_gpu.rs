@@ -1015,6 +1015,342 @@ fn arg_reduce_cases(op: &'static str) -> Vec<Case> {
     cases
 }
 
+fn gather_nd_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "GatherND[i64-indices,negative-index]".into(),
+            op: "GatherND",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[2, 3, 2],
+                    &(0..12).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[3, 2], &[0_i64, 1, 1, -1, -1, 0]),
+            ],
+            outputs: vec![(DataType::Float32, vec![3, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "GatherND[i32-indices,batch-dims]".into(),
+            op: "GatherND",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(
+                    DataType::Int64,
+                    &[2, 2, 3],
+                    &(0_i64..12).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int32, &[2, 2, 1], &[0_i32, 1, 1, 0]),
+            ],
+            outputs: vec![(DataType::Int64, vec![2, 2, 3])],
+            attrs: vec![("batch_dims", Attribute::Int(1))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn space_to_depth_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "SpaceToDepth[f32,multiple-channels]".into(),
+            op: "SpaceToDepth",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(
+                DataType::Float32,
+                &[1, 2, 4, 4],
+                &(0..32).map(|value| value as f32).collect::<Vec<_>>(),
+            )],
+            outputs: vec![(DataType::Float32, vec![1, 8, 2, 2])],
+            attrs: vec![("blocksize", Attribute::Int(2))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "SpaceToDepth[i64,empty-batch]".into(),
+            op: "SpaceToDepth",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(DataType::Int64, &[0, 1, 2, 2], &[] as &[i64])],
+            outputs: vec![(DataType::Int64, vec![0, 4, 1, 1])],
+            attrs: vec![("blocksize", Attribute::Int(2))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn eye_like_cases() -> Vec<Case> {
+    let mut cases = vec![Case {
+        label: "EyeLike[f32,negative-offset]".into(),
+        op: "EyeLike",
+        domain: "",
+        opset: 9,
+        inputs: vec![input(DataType::Float32, &[4, 3], &[7.0_f32; 12])],
+        outputs: vec![(DataType::Float32, vec![4, 3])],
+        attrs: vec![("k", Attribute::Int(-1))],
+        compare: Compare::ExactBytes,
+    }];
+    for dtype in [
+        DataType::Bool,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Uint64,
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Float32,
+        DataType::Float64,
+    ] {
+        cases.push(Case {
+            label: format!("EyeLike[{dtype:?}-override,positive-offset]"),
+            op: "EyeLike",
+            domain: "",
+            opset: 9,
+            inputs: vec![input(DataType::Float32, &[3, 4], &[9.0_f32; 12])],
+            outputs: vec![(dtype, vec![3, 4])],
+            attrs: vec![
+                ("k", Attribute::Int(1)),
+                ("dtype", Attribute::Int(dtype as i64)),
+            ],
+            compare: Compare::ExactBytes,
+        });
+    }
+    cases.push(Case {
+        label: "EyeLike[bool-override,empty-rows]".into(),
+        op: "EyeLike",
+        domain: "",
+        opset: 9,
+        inputs: vec![input(DataType::Float32, &[0, 3], &[] as &[f32])],
+        outputs: vec![(DataType::Bool, vec![0, 3])],
+        attrs: vec![("dtype", Attribute::Int(DataType::Bool as i64))],
+        compare: Compare::ExactBytes,
+    });
+    cases
+}
+
+fn pad_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "Pad[f32,constant,broadcast-axes]".into(),
+            op: "Pad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Float32, &[2, 2], &[1.0_f32, 2.0, 3.0, 4.0]),
+                input(DataType::Int64, &[2], &[1_i64, 2]),
+                input(DataType::Float32, &[], &[9.0_f32]),
+                input(DataType::Int64, &[1], &[-1_i64]),
+            ],
+            outputs: vec![(DataType::Float32, vec![2, 5])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Pad[i64,negative-crop]".into(),
+            op: "Pad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int64, &[5], &[10_i64, 20, 30, 40, 50]),
+                input(DataType::Int64, &[2], &[-1_i64, -1]),
+            ],
+            outputs: vec![(DataType::Int64, vec![3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Pad[f16,reflect]".into(),
+            op: "Pad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(DataType::Float16, &[4], &[1.0, 2.0, 3.0, 4.0]),
+                input(DataType::Int64, &[2], &[2_i64, 2]),
+            ],
+            outputs: vec![(DataType::Float16, vec![8])],
+            attrs: vec![("mode", Attribute::String("reflect".into()))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Pad[bf16,wrap]".into(),
+            op: "Pad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(DataType::BFloat16, &[3], &[1.0, -2.0, 3.5]),
+                input(DataType::Int64, &[2], &[2_i64, 1]),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![6])],
+            attrs: vec![("mode", Attribute::String("wrap".into()))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Pad[uint8,edge]".into(),
+            op: "Pad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Uint8, &[3], &[2_u8, 4, 8]),
+                input(DataType::Int64, &[2], &[2_i64, 1]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![6])],
+            attrs: vec![("mode", Attribute::String("edge".into()))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn range_cases() -> Vec<Case> {
+    let mut cases = vec![
+        Case {
+            label: "Range[i64,negative-delta]".into(),
+            op: "Range",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Int64, &[], &[5_i64]),
+                input(DataType::Int64, &[], &[-2_i64]),
+                input(DataType::Int64, &[], &[-2_i64]),
+            ],
+            outputs: vec![(DataType::Int64, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Range[f32,fractional]".into(),
+            op: "Range",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(DataType::Float32, &[], &[-0.5_f32]),
+                input(DataType::Float32, &[], &[1.0_f32]),
+                input(DataType::Float32, &[], &[0.25_f32]),
+            ],
+            outputs: vec![(DataType::Float32, vec![6])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ];
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        cases.push(Case {
+            label: format!("Range[{dtype:?},fractional]"),
+            op: "Range",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(dtype, &[], &[-1.0]),
+                float_input(dtype, &[], &[1.0]),
+                float_input(dtype, &[], &[0.5]),
+            ],
+            outputs: vec![(dtype, vec![4])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        });
+    }
+    cases
+}
+
+fn scatter_nd_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "ScatterND[f32,slice-update,negative-index]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[3, 3],
+                    &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                ),
+                input(DataType::Int64, &[2, 1], &[-1_i64, 0]),
+                input(
+                    DataType::Float32,
+                    &[2, 3],
+                    &[10.0_f32, 11.0, 12.0, 20.0, 21.0, 22.0],
+                ),
+            ],
+            outputs: vec![(DataType::Float32, vec![3, 3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "ScatterND[f16,duplicate-index,add]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 16,
+            inputs: vec![
+                float_input(DataType::Float16, &[3], &[10.0, 20.0, 30.0]),
+                input(DataType::Int64, &[3, 1], &[1_i64, 1, -3]),
+                float_input(DataType::Float16, &[3], &[2.0, 3.0, 4.0]),
+            ],
+            outputs: vec![(DataType::Float16, vec![3])],
+            attrs: vec![("reduction", Attribute::String(b"add".to_vec()))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "ScatterND[bf16,duplicate-index,max]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(DataType::BFloat16, &[3], &[10.0, 20.0, 30.0]),
+                input(DataType::Int64, &[3, 1], &[1_i64, 1, -3]),
+                float_input(DataType::BFloat16, &[3], &[12.0, 25.0, 40.0]),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![3])],
+            attrs: vec![("reduction", Attribute::String(b"max".to_vec()))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "ScatterND[i64,slice-update,mul]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int64, &[2, 2], &[2_i64, 3, 4, 5]),
+                input(DataType::Int64, &[2, 1], &[0_i64, -1]),
+                input(DataType::Int64, &[2, 2], &[10_i64, 20, 2, 3]),
+            ],
+            outputs: vec![(DataType::Int64, vec![2, 2])],
+            attrs: vec![("reduction", Attribute::String(b"mul".to_vec()))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn window_cases(op: &'static str) -> Vec<Case> {
+    [
+        (DataType::Float32, true, 1e-6),
+        (DataType::Float16, false, 3e-3),
+        (DataType::BFloat16, true, 3e-2),
+        (DataType::Float64, false, 1e-6),
+    ]
+    .into_iter()
+    .map(|(dtype, periodic, tol)| Case {
+        label: format!("{op}[{dtype:?},periodic={periodic}]"),
+        op,
+        domain: "",
+        opset: 17,
+        inputs: vec![input(DataType::Int64, &[], &[7_i64])],
+        outputs: vec![(dtype, vec![7])],
+        attrs: vec![
+            ("periodic", Attribute::Int(i64::from(periodic))),
+            ("output_datatype", Attribute::Int(dtype as i64)),
+        ],
+        compare: Compare::Float { tol },
+    })
+    .collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The conformance profile: one entry per CUDA_COVERED_OPS op.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1195,6 +1531,21 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("CumProd", cumprod_cases()));
     p.push(sweep("ArgMax", arg_reduce_cases("ArgMax")));
     p.push(sweep("ArgMin", arg_reduce_cases("ArgMin")));
+
+    // Batch 6 (issue #67): model-shaping/indexing structural operators.
+    p.push(sweep("GatherND", gather_nd_cases()));
+    p.push(sweep("SpaceToDepth", space_to_depth_cases()));
+    p.push(sweep("EyeLike", eye_like_cases()));
+
+    // Batch 7 (issue #67): general padding/cropping and sequence construction.
+    p.push(sweep("Pad", pad_cases()));
+    p.push(sweep("Range", range_cases()));
+
+    // Batch 8 (issue #67): indexed updates and signal-processing windows.
+    p.push(sweep("ScatterND", scatter_nd_cases()));
+    for op in ["HannWindow", "HammingWindow", "BlackmanWindow"] {
+        p.push(sweep(op, window_cases(op)));
+    }
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.

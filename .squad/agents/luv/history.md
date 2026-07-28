@@ -68,3 +68,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 - 🔴 Rejected Batty's `--backend auto|ort|native` CLI flag because reporting paths use the requested backend (`auto`) rather than the resolved backend actually in use; Deckard should revise under reviewer lockout.
 - Verified CLI build, CLI lib tests (79 passed), fmt, clippy, server build, invalid-value parser error, and text `--backend native` fail-loud behavior on a non-native build.
 - Noted unresolved API-contract question: `--backend` now appears on `transcribe`; document/test it if intentional or split shared args if not.
+
+## 2026-07-28T09-10-28+00-00 — CUDA coverage batch 7 merged
+- PR #338 (`c59383db`) added CUDA `Pad` and `Range`, moving CUDA coverage 134→136 and standard CPU parity 105→107/141. Freysa approved after 174/174 H200 GPU 2 parity cases, coverage validation, content-corrupting mutation proof, and clean default-target Clippy. #67 remains open; ScatterND, quantization, and cuDNN work are deferred.

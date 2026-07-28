@@ -4,14 +4,14 @@ on:
   schedule:
     - cron: "0 6 * * 1"
   push:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "**/Cargo.toml"
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true
 
 permissions:
@@ -19,6 +19,7 @@ permissions:
 
 jobs:
   audit:
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -17,6 +17,10 @@ static CONV_BNNS_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::
 static CONV_IM2COL_GEMM_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(target_arch = "aarch64")]
+static CONV_NEON_DEPTHWISE_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 static CONV_SCALAR_REF_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -266,22 +270,57 @@ impl Kernel for ConvKernel {
             .map(|value| to_dense_f32_widen(OP, value))
             .transpose()?;
 
-        let is_rank4 = self.x_shape.len() == 4;
-        let is_group1 = self.group == 1;
+        // Promote rank-3 (1D conv) shapes to rank-4 by inserting H=1 so the
+        // BNNS and im2col+GEMM tiers handle them without a separate code path.
+        // Data layout is unchanged: [N, C, W] → [N, C, 1, W] is a logical
+        // reshape with no memory movement.
+        let (x_shape_4d, w_shape_4d, out_shape_4d, strides_2d, dilations_2d, pads_2d);
+        let (eff_x_shape, eff_w_shape, eff_out_shape, eff_strides, eff_dilations, eff_pads);
+        if self.x_shape.len() == 3 {
+            // 1D → 2D: insert H=1 at spatial index 0
+            x_shape_4d = [self.x_shape[0], self.x_shape[1], 1, self.x_shape[2]];
+            w_shape_4d = [self.w_shape[0], self.w_shape[1], 1, self.w_shape[2]];
+            out_shape_4d = [
+                self.output_shape[0],
+                self.output_shape[1],
+                1,
+                self.output_shape[2],
+            ];
+            strides_2d = [1, self.strides[0]];
+            dilations_2d = [1, self.dilations[0]];
+            pads_2d = [0, self.pads[0], 0, self.pads[1]];
+            eff_x_shape = x_shape_4d.as_slice();
+            eff_w_shape = w_shape_4d.as_slice();
+            eff_out_shape = out_shape_4d.as_slice();
+            eff_strides = strides_2d.as_slice();
+            eff_dilations = dilations_2d.as_slice();
+            eff_pads = pads_2d.as_slice();
+        } else {
+            eff_x_shape = &self.x_shape;
+            eff_w_shape = &self.w_shape;
+            eff_out_shape = &self.output_shape;
+            eff_strides = &self.strides;
+            eff_dilations = &self.dilations;
+            eff_pads = &self.pads;
+        }
 
-        let output = if is_rank4 && is_group1 {
-            // Try Tier 1 (BNNS) for undilated, symmetric-padding convolutions.
+        let is_rank4 = eff_x_shape.len() == 4;
+
+        let output = if is_rank4 {
+            // Try Tier 1 (BNNS) for undilated convolutions (supports groups).
             #[cfg(any(target_os = "macos", target_os = "ios"))]
-            if self.dilations.iter().all(|&d| d == 1)
+            if self.group == 1
+                && eff_dilations.iter().all(|&d| d == 1)
                 && let Some(result) = bnns::bnns_conv_execute(
                     &x,
                     &weights,
                     bias.as_deref(),
-                    &self.x_shape,
-                    &self.w_shape,
-                    &self.output_shape,
-                    &self.strides,
-                    &self.pads,
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    eff_strides,
+                    eff_pads,
+                    1,
                     self.relu,
                 )
             {
@@ -291,22 +330,68 @@ impl Kernel for ConvKernel {
                 return Ok(());
             }
 
-            // Tier 2: im2col + GEMM.
+            // Tier 2a: Direct NEON depthwise convolution (aarch64 only).
+            // Depthwise proper: groups == in_channels == out_channels, ic_per_group == 1.
+            // This eliminates the im2col buffer entirely — depthwise is memory-bound
+            // (M=1, K=kernel_size per group), so the im2col expansion costs more in
+            // memory traffic than it saves in arithmetic density.
+            #[cfg(target_arch = "aarch64")]
+            if self.group > 1
+                && eff_w_shape[1] == 1
+                && self.group == eff_x_shape[1]
+                && eff_w_shape[0] == eff_x_shape[1]
+            {
+                CONV_NEON_DEPTHWISE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let result = neon_depthwise::depthwise_conv_execute(
+                    &x,
+                    &weights,
+                    bias.as_deref(),
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    eff_strides,
+                    eff_dilations,
+                    eff_pads,
+                    self.relu,
+                );
+                write_dense_f32_narrow(OP, &mut outputs[0], &result)?;
+                record_conv_metrics(inputs, outputs, self);
+                return Ok(());
+            }
+
+            // Tier 2b: im2col + GEMM.
             CONV_IM2COL_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            im2col_gemm_execute(
-                &x,
-                &weights,
-                bias.as_deref(),
-                &self.x_shape,
-                &self.w_shape,
-                &self.output_shape,
-                &self.strides,
-                &self.dilations,
-                &self.pads,
-                self.relu,
-            )?
+            if self.group == 1 {
+                im2col_gemm_execute(
+                    &x,
+                    &weights,
+                    bias.as_deref(),
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    eff_strides,
+                    eff_dilations,
+                    eff_pads,
+                    self.relu,
+                )?
+            } else {
+                grouped_im2col_gemm_execute(
+                    &x,
+                    &weights,
+                    bias.as_deref(),
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    self.group,
+                    eff_strides,
+                    eff_dilations,
+                    eff_pads,
+                    self.relu,
+                )?
+            }
         } else {
-            // Tier 3: scalar reference for rank-3, grouped, or other cases.
+            // Tier 3: scalar reference for non-spatial convolutions (should not reach here
+            // after the rank-3→rank-4 promotion above, but kept as a safety net).
             CONV_SCALAR_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             scalar_ref_execute(
                 &x,
@@ -461,6 +546,7 @@ mod bnns {
         out_shape: &[usize],
         strides: &[usize],
         pads: &[usize],
+        groups: usize,
         relu: bool,
     ) -> Option<Vec<f32>> {
         // Require symmetric padding.
@@ -469,6 +555,9 @@ mod bnns {
         }
         let (batch, ic, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
         let (oc, kh, kw) = (w_shape[0], w_shape[2], w_shape[3]);
+        // w_shape[1] = input_channels_per_group (ONNX Conv weight layout: [O, I/groups, kH, kW])
+        let ic_per_group = w_shape[1];
+        let oc_per_group = oc / groups;
         let (oh, ow) = (out_shape[2], out_shape[3]);
         let in_stride = ic * ih * iw;
         let out_stride = oc * oh * ow;
@@ -483,8 +572,8 @@ mod bnns {
             ),
             w_desc: make_nd(
                 BNNS_DATA_LAYOUT_CONV_WEIGHTS_OIHW,
-                &[kw, kh, ic, oc],
-                &[1, kw, kw * kh, kw * kh * ic],
+                &[kw, kh, ic_per_group, oc_per_group],
+                &[1, kw, kw * kh, kw * kh * ic_per_group],
                 w_copy.as_mut_ptr() as *mut c_void,
             ),
             o_desc: make_nd(
@@ -511,7 +600,7 @@ mod bnns {
             y_dilation_stride: 1,
             x_padding: pads[1],
             y_padding: pads[0],
-            groups: 1,
+            groups,
             pad: [0; 4],
         };
         let filter = unsafe { BNNSFilterCreateLayerConvolution(&params, std::ptr::null()) };
@@ -558,6 +647,9 @@ fn im2col_gemm_execute(
     let m = oc;
     let k = ic * kh * kw;
     let n = oh * ow;
+    if n == 0 || m == 0 {
+        return Ok(vec![]);
+    }
     let is_1x1 = kh == 1
         && kw == 1
         && strides.iter().all(|&s| s == 1)
@@ -632,9 +724,396 @@ fn im2col(
     }
 }
 
+/// Grouped im2col + GEMM: for each group, performs im2col on the group's input
+/// channels and applies GEMM with the group's weight slice.
+fn grouped_im2col_gemm_execute(
+    x: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    x_shape: &[usize],
+    w_shape: &[usize],
+    out_shape: &[usize],
+    group: usize,
+    strides: &[usize],
+    dilations: &[usize],
+    pads: &[usize],
+    relu: bool,
+) -> Result<Vec<f32>> {
+    let (batch, ic, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+    let (oc, kh, kw) = (w_shape[0], w_shape[2], w_shape[3]);
+    let (oh, ow) = (out_shape[2], out_shape[3]);
+    let ic_per_group = ic / group;
+    let oc_per_group = oc / group;
+    // Per-group GEMM: M = oc_per_group, K = ic_per_group * kH * kW, N = oH * oW
+    let m = oc_per_group;
+    let k = ic_per_group * kh * kw;
+    let n = oh * ow;
+    if n == 0 || m == 0 {
+        return Ok(vec![]);
+    }
+    let backend = crate::backend::CpuBackend::auto_detect();
+    let mut output = vec![0.0f32; batch * oc * n];
+    let mut col = vec![0.0f32; k * n];
+    for b in 0..batch {
+        for g in 0..group {
+            let x_offset = b * ic * ih * iw + g * ic_per_group * ih * iw;
+            let x_group = &x[x_offset..][..ic_per_group * ih * iw];
+            let w_offset = g * oc_per_group * k;
+            let w_group = &weights[w_offset..][..oc_per_group * k];
+            let o_offset = b * oc * n + g * oc_per_group * n;
+            let o_group = &mut output[o_offset..][..oc_per_group * n];
+            let is_1x1 = kh == 1
+                && kw == 1
+                && strides.iter().all(|&s| s == 1)
+                && dilations.iter().all(|&d| d == 1)
+                && pads.iter().all(|&p| p == 0);
+            if is_1x1 {
+                super::matmul::gemm_with_backend(backend, w_group, x_group, o_group, m, k, n)?;
+            } else {
+                im2col(
+                    x_group,
+                    ic_per_group,
+                    ih,
+                    iw,
+                    kh,
+                    kw,
+                    strides,
+                    dilations,
+                    pads,
+                    oh,
+                    ow,
+                    &mut col,
+                );
+                super::matmul::gemm_with_backend(backend, w_group, &col, o_group, m, k, n)?;
+            }
+            if let Some(bias) = bias {
+                for oc_idx in 0..m {
+                    let bv = bias[g * oc_per_group + oc_idx];
+                    for s in 0..n {
+                        o_group[oc_idx * n + s] += bv;
+                    }
+                }
+            }
+            if relu {
+                for v in o_group.iter_mut() {
+                    *v = v.max(0.0);
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tier 3: Scalar reference
+// Tier 2a: Direct NEON depthwise convolution (aarch64)
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// Depthwise convolution is memory-bound (M=1, K=kernel_size per group).
+// im2col expands the input by ~kernel_size× in memory with almost no
+// arithmetic density to show for it. A direct kernel reads input once,
+// accumulates with NEON, and writes output — roughly 18× less memory
+// traffic for 3×3.
+//
+// Specialized inner loops for 3×3 stride-1 and 3×3 stride-2 cover
+// the overwhelming majority of MobileNet/EfficientNet depthwise layers.
+// A general fallback handles all other shapes.
+
+#[cfg(target_arch = "aarch64")]
+mod neon_depthwise {
+    use std::arch::aarch64::*;
+
+    /// Entry point: direct depthwise convolution.
+    /// Requires: groups == in_channels == out_channels, w_shape[1] == 1.
+    pub fn depthwise_conv_execute(
+        x: &[f32],
+        weights: &[f32],
+        bias: Option<&[f32]>,
+        x_shape: &[usize],
+        w_shape: &[usize],
+        out_shape: &[usize],
+        strides: &[usize],
+        dilations: &[usize],
+        pads: &[usize],
+        relu: bool,
+    ) -> Vec<f32> {
+        let (batch, c, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+        let (kh, kw) = (w_shape[2], w_shape[3]);
+        let (oh, ow) = (out_shape[2], out_shape[3]);
+        let (sh, sw) = (strides[0], strides[1]);
+        let (dh, dw) = (dilations[0], dilations[1]);
+        let (pt, pl, pb, pr) = (pads[0], pads[1], pads[2], pads[3]);
+        let _ = (pb, pr); // used implicitly through output geometry
+
+        let mut output = vec![0.0f32; batch * c * oh * ow];
+
+        for b in 0..batch {
+            let x_batch = &x[b * c * ih * iw..][..c * ih * iw];
+            let o_batch = &mut output[b * c * oh * ow..][..c * oh * ow];
+
+            // Dispatch to specialized kernels when possible.
+            if kh == 3 && kw == 3 && dh == 1 && dw == 1 {
+                if sh == 1 && sw == 1 {
+                    depthwise_3x3_s1(x_batch, weights, bias, c, ih, iw, oh, ow, pt, pl, o_batch);
+                } else if sh == 2 && sw == 2 {
+                    depthwise_3x3_s2(x_batch, weights, bias, c, ih, iw, oh, ow, pt, pl, o_batch);
+                } else {
+                    depthwise_general(
+                        x_batch, weights, bias, c, ih, iw, kh, kw, oh, ow, sh, sw, dh, dw, pt, pl,
+                        o_batch,
+                    );
+                }
+            } else {
+                depthwise_general(
+                    x_batch, weights, bias, c, ih, iw, kh, kw, oh, ow, sh, sw, dh, dw, pt, pl,
+                    o_batch,
+                );
+            }
+
+            if relu {
+                apply_relu_neon(o_batch);
+            }
+        }
+
+        output
+    }
+
+    /// Apply ReLU in-place using NEON.
+    fn apply_relu_neon(data: &mut [f32]) {
+        let len = data.len();
+        let chunks = len / 4;
+        let remainder = len % 4;
+        unsafe {
+            let zero = vdupq_n_f32(0.0);
+            let ptr = data.as_mut_ptr();
+            for i in 0..chunks {
+                let v = vld1q_f32(ptr.add(i * 4));
+                vst1q_f32(ptr.add(i * 4), vmaxq_f32(v, zero));
+            }
+            for i in (chunks * 4)..(chunks * 4 + remainder) {
+                let p = ptr.add(i);
+                *p = (*p).max(0.0);
+            }
+        }
+    }
+
+    /// Specialized 3×3 depthwise, stride 1, undilated.
+    ///
+    /// Splits each output row into three regions:
+    /// - Left boundary (scalar): output cols where the leftmost kernel column
+    ///   would access a negative (padded) input column.
+    /// - Interior (NEON, chunks of 4): output cols where all 9 kernel positions
+    ///   have guaranteed in-bounds column accesses, enabling raw pointer loads.
+    /// - Right boundary (scalar): output cols where the rightmost kernel column
+    ///   exceeds the input width, plus any NEON tail.
+    fn depthwise_3x3_s1(
+        x: &[f32],
+        weights: &[f32],
+        bias: Option<&[f32]>,
+        c: usize,
+        ih: usize,
+        iw: usize,
+        oh: usize,
+        ow: usize,
+        pt: usize,
+        pl: usize,
+        output: &mut [f32],
+    ) {
+        // For a NEON chunk of 4 outputs starting at o_w, the input accesses are:
+        //   kc=0: col = o_w - pl       .. o_w+3 - pl
+        //   kc=2: col = o_w - pl + 2   .. o_w+3 - pl + 2 = o_w + 5 - pl
+        // All valid when: o_w >= pl AND o_w + 5 - pl < iw, i.e. o_w < iw + pl - 5
+        // Also need chunk to fit: o_w + 4 <= ow, i.e. o_w < ow - 3
+        let neon_start = pl;
+        let neon_limit = (iw + pl).saturating_sub(5).min(ow.saturating_sub(3));
+
+        for ch in 0..c {
+            let x_ch = &x[ch * ih * iw..][..ih * iw];
+            let w_ch = &weights[ch * 9..][..9];
+            let o_ch = &mut output[ch * oh * ow..][..oh * ow];
+            let bv = bias.map_or(0.0, |b| b[ch]);
+
+            let w: [f32; 9] = [
+                w_ch[0], w_ch[1], w_ch[2], w_ch[3], w_ch[4], w_ch[5], w_ch[6], w_ch[7], w_ch[8],
+            ];
+
+            for o_h in 0..oh {
+                let i_h_base = o_h.wrapping_sub(pt);
+                let row_out = o_h * ow;
+
+                // Left boundary (scalar).
+                for o_w in 0..neon_start.min(ow) {
+                    o_ch[row_out + o_w] = scalar_3x3_pixel(x_ch, &w, bv, ih, iw, i_h_base, o_w, pl);
+                }
+
+                // Interior: NEON chunks of 4 with guaranteed in-bounds loads.
+                let mut o_w = neon_start;
+                if neon_start < neon_limit {
+                    unsafe {
+                        let bias_v = vdupq_n_f32(bv);
+                        while o_w < neon_limit {
+                            let i_w_base = o_w - pl; // safe: o_w >= pl
+                            let mut acc = bias_v;
+
+                            for kr in 0..3usize {
+                                let i_h = i_h_base.wrapping_add(kr);
+                                if i_h >= ih {
+                                    continue;
+                                }
+                                let row_ptr = x_ch.as_ptr().add(i_h * iw + i_w_base);
+                                let v0 = vld1q_f32(row_ptr);
+                                let v1 = vld1q_f32(row_ptr.add(1));
+                                let v2 = vld1q_f32(row_ptr.add(2));
+                                acc = vfmaq_f32(acc, v0, vdupq_n_f32(w[kr * 3]));
+                                acc = vfmaq_f32(acc, v1, vdupq_n_f32(w[kr * 3 + 1]));
+                                acc = vfmaq_f32(acc, v2, vdupq_n_f32(w[kr * 3 + 2]));
+                            }
+
+                            vst1q_f32(o_ch.as_mut_ptr().add(row_out + o_w), acc);
+                            o_w += 4;
+                        }
+                    }
+                }
+
+                // Right boundary + NEON tail (scalar).
+                for o_w in o_w..ow {
+                    o_ch[row_out + o_w] = scalar_3x3_pixel(x_ch, &w, bv, ih, iw, i_h_base, o_w, pl);
+                }
+            }
+        }
+    }
+
+    /// Scalar computation for a single output pixel of a 3×3 depthwise conv.
+    #[inline(always)]
+    fn scalar_3x3_pixel(
+        x_ch: &[f32],
+        w: &[f32; 9],
+        bv: f32,
+        ih: usize,
+        iw: usize,
+        i_h_base: usize,
+        o_w: usize,
+        pl: usize,
+    ) -> f32 {
+        let mut sum = bv;
+        for kr in 0..3usize {
+            let i_h = i_h_base.wrapping_add(kr);
+            if i_h >= ih {
+                continue;
+            }
+            for kc in 0..3usize {
+                let i_w = o_w.wrapping_sub(pl).wrapping_add(kc);
+                if i_w < iw {
+                    sum += x_ch[i_h * iw + i_w] * w[kr * 3 + kc];
+                }
+            }
+        }
+        sum
+    }
+
+    /// Specialized 3×3 depthwise, stride 2, undilated.
+    fn depthwise_3x3_s2(
+        x: &[f32],
+        weights: &[f32],
+        bias: Option<&[f32]>,
+        c: usize,
+        ih: usize,
+        iw: usize,
+        oh: usize,
+        ow: usize,
+        pt: usize,
+        pl: usize,
+        output: &mut [f32],
+    ) {
+        for ch in 0..c {
+            let x_ch = &x[ch * ih * iw..][..ih * iw];
+            let w_ch = &weights[ch * 9..][..9];
+            let o_ch = &mut output[ch * oh * ow..][..oh * ow];
+            let bv = bias.map_or(0.0, |b| b[ch]);
+
+            let w: [f32; 9] = [
+                w_ch[0], w_ch[1], w_ch[2], w_ch[3], w_ch[4], w_ch[5], w_ch[6], w_ch[7], w_ch[8],
+            ];
+
+            for o_h in 0..oh {
+                let i_h_base = (o_h * 2).wrapping_sub(pt);
+
+                // For stride-2, consecutive output pixels read from input
+                // positions 2 apart, so we can't trivially use contiguous
+                // NEON loads. Use scalar with per-element accumulation.
+                // This is still faster than im2col because there is no
+                // buffer allocation.
+                for o_w in 0..ow {
+                    let i_w_base = (o_w * 2).wrapping_sub(pl);
+                    let mut sum = bv;
+                    for kr in 0..3usize {
+                        let i_h = i_h_base.wrapping_add(kr);
+                        if i_h >= ih {
+                            continue;
+                        }
+                        for kc in 0..3usize {
+                            let i_w = i_w_base.wrapping_add(kc);
+                            if i_w < iw {
+                                sum += x_ch[i_h * iw + i_w] * w[kr * 3 + kc];
+                            }
+                        }
+                    }
+                    o_ch[o_h * ow + o_w] = sum;
+                }
+            }
+        }
+    }
+
+    /// General depthwise convolution — handles arbitrary kernel sizes, strides,
+    /// and dilations. No im2col buffer.
+    fn depthwise_general(
+        x: &[f32],
+        weights: &[f32],
+        bias: Option<&[f32]>,
+        c: usize,
+        ih: usize,
+        iw: usize,
+        kh: usize,
+        kw: usize,
+        oh: usize,
+        ow: usize,
+        sh: usize,
+        sw: usize,
+        dh: usize,
+        dw: usize,
+        pt: usize,
+        pl: usize,
+        output: &mut [f32],
+    ) {
+        let ks = kh * kw;
+        for ch in 0..c {
+            let x_ch = &x[ch * ih * iw..][..ih * iw];
+            let w_ch = &weights[ch * ks..][..ks];
+            let o_ch = &mut output[ch * oh * ow..][..oh * ow];
+            let bv = bias.map_or(0.0, |b| b[ch]);
+
+            for o_h in 0..oh {
+                let i_h_base = (o_h * sh).wrapping_sub(pt);
+                for o_w in 0..ow {
+                    let i_w_base = (o_w * sw).wrapping_sub(pl);
+                    let mut sum = bv;
+                    for kr in 0..kh {
+                        let i_h = i_h_base.wrapping_add(kr * dh);
+                        if i_h >= ih {
+                            continue;
+                        }
+                        for kc in 0..kw {
+                            let i_w = i_w_base.wrapping_add(kc * dw);
+                            if i_w < iw {
+                                sum += x_ch[i_h * iw + i_w] * w_ch[kr * kw + kc];
+                            }
+                        }
+                    }
+                    o_ch[o_h * ow + o_w] = sum;
+                }
+            }
+        }
+    }
+}
 
 fn scalar_ref_execute(
     x: &[f32],
@@ -936,8 +1415,57 @@ mod tests {
     }
 
     #[test]
-    fn scalar_ref_handles_grouped_conv() {
-        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+    fn grouped_conv_reaches_im2col_gemm() {
+        // True depthwise: groups == in_channels == out_channels, 3x3 kernel.
+        // On aarch64, this now reaches the direct NEON path instead of im2col.
+        #[cfg(target_arch = "aarch64")]
+        let before = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(target_arch = "aarch64"))]
+        let before = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        let ic = 32usize;
+        let h = 14usize;
+        let w = 14usize;
+        let input: Vec<f32> = (0..ic * h * w)
+            .map(|i: usize| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let weight: Vec<f32> = (0..ic * 9)
+            .map(|i: usize| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..ic).map(|i| i as f32 * 0.01).collect();
+        let _ = run(
+            &[1, ic, h, w],
+            &input,
+            &[ic, 1, 3, 3],
+            &weight,
+            Some(&bias),
+            &[1, ic, h, w],
+            &[
+                ("group", Attribute::Int(ic as i64)),
+                ("pads", Attribute::Ints(vec![1, 1, 1, 1])),
+            ],
+        );
+        #[cfg(target_arch = "aarch64")]
+        {
+            let after = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+            assert!(
+                after > before,
+                "Depthwise conv (groups={ic}) did not reach NEON depthwise path"
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let after = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+            assert!(
+                after > before,
+                "Depthwise conv (groups={ic}) did not reach im2col+GEMM path"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn grouped_conv_reaches_im2col_gemm_non_apple() {
+        let before = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
         let _ = run(
             &[1, 2, 2, 2],
             &[1., 2., 3., 4., 10., 20., 30., 40.],
@@ -947,16 +1475,110 @@ mod tests {
             &[1, 4, 2, 2],
             &[("group", Attribute::Int(2))],
         );
-        let after = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+        let after = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
-            "Grouped conv did not reach scalar reference path"
+            "Grouped conv did not reach im2col+GEMM path"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn depthwise_conv_reaches_neon_direct() {
+        let before = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        let ic = 16usize;
+        let input: Vec<f32> = (0..ic * 7 * 7)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let weight: Vec<f32> = (0..ic * 9)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..ic).map(|i| i as f32 * 0.01).collect();
+        let _ = run(
+            &[1, ic, 7, 7],
+            &input,
+            &[ic, 1, 3, 3],
+            &weight,
+            Some(&bias),
+            &[1, ic, 7, 7],
+            &[
+                ("group", Attribute::Int(ic as i64)),
+                ("pads", Attribute::Ints(vec![1, 1, 1, 1])),
+            ],
+        );
+        let after = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "Depthwise conv did not reach NEON direct path on aarch64"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn depthwise_conv_5x5_reaches_neon_direct() {
+        // Non-3×3 depthwise should also hit the NEON general path.
+        let before = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        let ic = 24usize;
+        let input: Vec<f32> = (0..ic * 14 * 14)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let weight: Vec<f32> = (0..ic * 25)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..ic).map(|i| i as f32 * 0.01).collect();
+        let _ = run(
+            &[1, ic, 14, 14],
+            &input,
+            &[ic, 1, 5, 5],
+            &weight,
+            Some(&bias),
+            &[1, ic, 10, 10],
+            &[("group", Attribute::Int(ic as i64))],
+        );
+        let after = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "5×5 depthwise conv did not reach NEON direct path on aarch64"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn depthwise_1d_promoted_reaches_neon_direct() {
+        // 1D depthwise should be promoted to 2D and then hit the NEON path.
+        let before = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        let ic = 32usize;
+        let input: Vec<f32> = (0..ic * 64)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let weight: Vec<f32> = (0..ic * 3)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let _ = run(
+            &[1, ic, 64],
+            &input,
+            &[ic, 1, 3],
+            &weight,
+            None,
+            &[1, ic, 64],
+            &[
+                ("group", Attribute::Int(ic as i64)),
+                ("pads", Attribute::Ints(vec![1, 1])),
+            ],
+        );
+        let after = super::CONV_NEON_DEPTHWISE_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "1D depthwise conv did not reach NEON direct path on aarch64"
         );
     }
 
     #[test]
-    fn scalar_ref_handles_1d_conv() {
-        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+    fn conv_1d_reaches_im2col_or_bnns() {
+        // 1D convs are promoted to 2D and dispatch through the accelerated path
+        let before_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
         let x = (1..=16).map(|v| v as f32).collect::<Vec<_>>();
         let w = (1..=18).map(|v| v as f32 * 0.1).collect::<Vec<_>>();
         let _ = run(
@@ -971,8 +1593,122 @@ mod tests {
                 ("pads", Attribute::Ints(vec![1, 1])),
             ],
         );
+        let after_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let reached = after_im2col > before_im2col || after_bnns > before_bnns;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let reached = after_im2col > before_im2col;
+        assert!(
+            reached,
+            "1D conv did not reach accelerated path (im2col or BNNS)"
+        );
+    }
+
+    // ─── Scalar reference reachability and exclusion ────────────────────
+
+    #[test]
+    fn scalar_ref_fires_for_non_rank4_safety_net() {
+        // Construct a ConvKernel directly with a 5D shape to force the scalar
+        // reference path. This bypasses the factory (which rejects rank != 3|4)
+        // and proves the counter is live. The scalar reference handles arbitrary
+        // spatial rank correctly.
+        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+
+        // 3D convolution: [N=1, C=1, D=2, H=2, W=2], kernel [1, 1, 1, 1, 1]
+        let kernel = super::ConvKernel {
+            x_shape: vec![1, 1, 2, 2, 2],
+            w_shape: vec![1, 1, 1, 1, 1],
+            output_shape: vec![1, 1, 2, 2, 2],
+            group: 1,
+            strides: vec![1, 1, 1],
+            dilations: vec![1, 1, 1],
+            pads: vec![0, 0, 0, 0, 0, 0],
+            relu: false,
+        };
+        let x = Owned::f32(&[1, 1, 2, 2, 2], &[1., 2., 3., 4., 5., 6., 7., 8.]);
+        let w = Owned::f32(&[1, 1, 1, 1, 1], &[2.0]);
+        let mut output = Owned::zeros_f32(&[1, 1, 2, 2, 2]);
+        kernel
+            .execute(&[x.view(), w.view()], &mut [output.view_mut()])
+            .unwrap();
+
         let after = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
-        assert!(after > before, "1D conv did not reach scalar ref path");
+        assert!(
+            after > before,
+            "5D conv did not reach scalar reference path"
+        );
+        // Verify correctness: 1x1x1 kernel with weight=2 is a pointwise multiply
+        assert_eq!(output.to_f32(), vec![2., 4., 6., 8., 10., 12., 14., 16.]);
+    }
+
+    #[test]
+    fn scalar_ref_excluded_for_standard_2d_conv() {
+        // A standard rank-4 conv MUST NOT fall to the scalar reference —
+        // it should be served by BNNS (macOS) or im2col+GEMM. We verify by
+        // checking that im2col or BNNS incremented their counter instead.
+        let before_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let input = vec![1.0; 3 * 8 * 8];
+        let weight = vec![0.01; 16 * 3 * 3 * 3];
+        let bias = vec![0.0; 16];
+        let _ = run(
+            &[1, 3, 8, 8],
+            &input,
+            &[16, 3, 3, 3],
+            &weight,
+            Some(&bias),
+            &[1, 16, 6, 6],
+            &[],
+        );
+        let after_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let reached_fast = after_im2col > before_im2col || after_bnns > before_bnns;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let reached_fast = after_im2col > before_im2col;
+        assert!(
+            reached_fast,
+            "Standard 2D conv fell to scalar reference — a faster tier should have handled it"
+        );
+    }
+
+    #[test]
+    fn scalar_ref_excluded_for_1d_conv() {
+        // Rank-3 (1D) convs are promoted to rank-4 and must NOT fall to scalar ref.
+        // This is the exact bug that made Whisper's Conv path 643× slower.
+        // Verify by checking that a fast tier fired.
+        let before_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        let x = (1..=16).map(|v| v as f32).collect::<Vec<_>>();
+        let w = (1..=18).map(|v| v as f32 * 0.1).collect::<Vec<_>>();
+        let _ = run(
+            &[1, 2, 8],
+            &x,
+            &[3, 2, 3],
+            &w,
+            Some(&[0.5, -0.5, 1.0]),
+            &[1, 3, 4],
+            &[
+                ("strides", Attribute::Ints(vec![2])),
+                ("pads", Attribute::Ints(vec![1, 1])),
+            ],
+        );
+        let after_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let reached_fast = after_im2col > before_im2col || after_bnns > before_bnns;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let reached_fast = after_im2col > before_im2col;
+        assert!(
+            reached_fast,
+            "1D conv fell to scalar reference — rank-3 promotion should route to im2col/BNNS"
+        );
     }
 
     // ─── Numerics parity ────────────────────────────────────────────────
@@ -1052,6 +1788,82 @@ mod tests {
         );
     }
 
+    fn parity_check_grouped(
+        x_shape: &[usize],
+        w_shape: &[usize],
+        group: usize,
+        strides: &[usize],
+        dilations: &[usize],
+        pads: &[usize],
+    ) {
+        let x_count: usize = x_shape.iter().product();
+        let w_count: usize = w_shape.iter().product();
+        let x: Vec<f32> = (0..x_count)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let w: Vec<f32> = (0..w_count)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..w_shape[0])
+            .map(|i| (i as f32 - w_shape[0] as f32 / 2.0) * 0.1)
+            .collect();
+        let spatial_rank = x_shape.len() - 2;
+        let mut output_shape = vec![x_shape[0], w_shape[0]];
+        for axis in 0..spatial_rank {
+            let effective = dilations[axis] * (w_shape[2 + axis] - 1) + 1;
+            let padded = x_shape[2 + axis] + pads[axis] + pads[axis + spatial_rank];
+            let out_dim = if padded >= effective {
+                (padded - effective) / strides[axis] + 1
+            } else {
+                0
+            };
+            output_shape.push(out_dim);
+        }
+        let reference = super::scalar_ref_execute(
+            &x,
+            &w,
+            Some(&bias),
+            x_shape,
+            w_shape,
+            &output_shape,
+            group,
+            strides,
+            dilations,
+            pads,
+            false,
+        );
+        let mut attrs: Vec<(&str, Attribute)> = vec![("group", Attribute::Int(group as i64))];
+        if strides.iter().any(|&s| s != 1) {
+            attrs.push((
+                "strides",
+                Attribute::Ints(strides.iter().map(|&s| s as i64).collect()),
+            ));
+        }
+        if dilations.iter().any(|&d| d != 1) {
+            attrs.push((
+                "dilations",
+                Attribute::Ints(dilations.iter().map(|&d| d as i64).collect()),
+            ));
+        }
+        if pads.iter().any(|&p| p != 0) {
+            attrs.push((
+                "pads",
+                Attribute::Ints(pads.iter().map(|&p| p as i64).collect()),
+            ));
+        }
+        let tiered = run(x_shape, &x, w_shape, &w, Some(&bias), &output_shape, &attrs);
+        assert_eq!(reference.len(), tiered.len());
+        let max_diff = reference
+            .iter()
+            .zip(tiered.iter())
+            .map(|(r, t)| (r - t).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "grouped parity: max_diff={max_diff} (x={x_shape:?}, w={w_shape:?}, group={group})"
+        );
+    }
+
     #[test]
     fn conv_parity_3x3_stride1_pad1() {
         parity_check(
@@ -1118,6 +1930,285 @@ mod tests {
         );
     }
 
+    // ─── Depthwise / grouped conv parity tests ──────────────────────────
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride1() {
+        // True depthwise: groups == in_channels == out_channels
+        parity_check_grouped(
+            &[1, 32, 28, 28],
+            &[32, 1, 3, 3],
+            32,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride2() {
+        parity_check_grouped(
+            &[1, 64, 56, 56],
+            &[64, 1, 3, 3],
+            64,
+            &[2, 2],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_asymmetric_padding() {
+        parity_check_grouped(
+            &[1, 32, 7, 7],
+            &[32, 1, 3, 3],
+            32,
+            &[2, 2],
+            &[1, 1],
+            &[1, 1, 0, 0],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_non_vector_width_channels() {
+        // 13 channels — not a multiple of any SIMD vector width
+        parity_check_grouped(
+            &[1, 13, 14, 14],
+            &[13, 1, 3, 3],
+            13,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_dilation() {
+        parity_check_grouped(
+            &[1, 32, 28, 28],
+            &[32, 1, 3, 3],
+            32,
+            &[1, 1],
+            &[2, 2],
+            &[2, 2, 2, 2],
+        );
+    }
+
+    #[test]
+    fn conv_parity_grouped_not_depthwise() {
+        // groups < in_channels (grouped but not depthwise): groups=4, in=16, out=32
+        parity_check_grouped(
+            &[1, 16, 14, 14],
+            &[32, 4, 3, 3],
+            4,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_channel_multiplier() {
+        // Channel multiplier: groups=16, in=16, out=32 (multiplier=2)
+        parity_check_grouped(
+            &[1, 16, 14, 14],
+            &[32, 1, 3, 3],
+            16,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_5x5_mobilenet_style() {
+        // EfficientNet uses 5x5 depthwise
+        parity_check_grouped(
+            &[1, 48, 28, 28],
+            &[48, 1, 5, 5],
+            48,
+            &[1, 1],
+            &[1, 1],
+            &[2, 2, 2, 2],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_1pixel_spatial() {
+        // 1-pixel spatial dim — edge case for NEON tail handling
+        parity_check_grouped(
+            &[1, 8, 1, 1],
+            &[8, 1, 1, 1],
+            8,
+            &[1, 1],
+            &[1, 1],
+            &[0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride1_single_channel() {
+        // Single channel — minimum case for depthwise
+        parity_check_grouped(
+            &[1, 1, 7, 7],
+            &[1, 1, 3, 3],
+            1,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride1_odd_channels() {
+        // 7 channels — not a multiple of 4 (NEON vector width)
+        parity_check_grouped(
+            &[1, 7, 11, 11],
+            &[7, 1, 3, 3],
+            7,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride2_narrow() {
+        // 3-pixel width input with stride 2 — boundary case
+        parity_check_grouped(
+            &[1, 16, 3, 3],
+            &[16, 1, 3, 3],
+            16,
+            &[2, 2],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_batch2() {
+        // Multi-batch
+        parity_check_grouped(
+            &[2, 32, 14, 14],
+            &[32, 1, 3, 3],
+            32,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    // ─── Rank-3 (1D) Conv parity tests ─────────────────────────────────
+    // The rank-3→rank-4 promotion is brand-new surface; a dimension-indexing
+    // bug there yields plausible output, not a crash.
+
+    fn parity_check_1d(
+        x_shape: &[usize],
+        w_shape: &[usize],
+        group: usize,
+        strides: &[usize],
+        dilations: &[usize],
+        pads: &[usize],
+    ) {
+        assert_eq!(x_shape.len(), 3);
+        assert_eq!(w_shape.len(), 3);
+        let x_count: usize = x_shape.iter().product();
+        let w_count: usize = w_shape.iter().product();
+        let x: Vec<f32> = (0..x_count)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let w: Vec<f32> = (0..w_count)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..w_shape[0])
+            .map(|i| (i as f32 - w_shape[0] as f32 / 2.0) * 0.1)
+            .collect();
+        let effective = dilations[0] * (w_shape[2] - 1) + 1;
+        let padded = x_shape[2] + pads[0] + pads[1];
+        let out_w = if padded >= effective {
+            (padded - effective) / strides[0] + 1
+        } else {
+            0
+        };
+        let output_shape = vec![x_shape[0], w_shape[0], out_w];
+        let reference = super::scalar_ref_execute(
+            &x,
+            &w,
+            Some(&bias),
+            x_shape,
+            w_shape,
+            &output_shape,
+            group,
+            strides,
+            dilations,
+            pads,
+            false,
+        );
+        let mut attrs: Vec<(&str, Attribute)> = vec![];
+        if group > 1 {
+            attrs.push(("group", Attribute::Int(group as i64)));
+        }
+        if strides.iter().any(|&s| s != 1) {
+            attrs.push((
+                "strides",
+                Attribute::Ints(strides.iter().map(|&s| s as i64).collect()),
+            ));
+        }
+        if dilations.iter().any(|&d| d != 1) {
+            attrs.push((
+                "dilations",
+                Attribute::Ints(dilations.iter().map(|&d| d as i64).collect()),
+            ));
+        }
+        if pads.iter().any(|&p| p != 0) {
+            attrs.push((
+                "pads",
+                Attribute::Ints(pads.iter().map(|&p| p as i64).collect()),
+            ));
+        }
+        let tiered = run(x_shape, &x, w_shape, &w, Some(&bias), &output_shape, &attrs);
+        assert_eq!(reference.len(), tiered.len());
+        let max_diff = reference
+            .iter()
+            .zip(tiered.iter())
+            .map(|(r, t)| (r - t).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "rank-3 parity: max_diff={max_diff} (x={x_shape:?}, w={w_shape:?}, group={group})"
+        );
+    }
+
+    #[test]
+    fn conv_parity_rank3_group1_stride1() {
+        // Whisper-style: 80 mel channels, kernel 3, stride 1
+        parity_check_1d(&[1, 80, 3000], &[512, 80, 3], 1, &[1], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_group1_stride2() {
+        // Whisper first conv: stride 2, pad 1
+        parity_check_1d(&[1, 80, 3000], &[512, 80, 3], 1, &[2], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_depthwise() {
+        // 1D depthwise: groups == in_channels
+        parity_check_1d(&[1, 32, 64], &[32, 1, 3], 32, &[1], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_grouped() {
+        // 1D grouped: groups=4, ic=16, oc=32
+        parity_check_1d(&[1, 16, 32], &[32, 4, 3], 4, &[1], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_dilated() {
+        // 1D dilated, no groups
+        parity_check_1d(&[1, 16, 64], &[32, 16, 3], 1, &[1], &[2], &[2, 2]);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn conv_parity_bnns_vs_scalar_ref() {
@@ -1157,6 +2248,7 @@ mod tests {
             &output_shape,
             &strides,
             &pads,
+            1,
             false,
         );
         let bnns_out = bnns_result.expect("BNNS should accept this config");

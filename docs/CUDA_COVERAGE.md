@@ -165,6 +165,13 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `CumProd` (v26) | `` | ✅ | **NVRTC-custom** | Deterministic per-lane cumulative product (f32/i64) honouring `exclusive`/`reverse`, mirroring the `CumSum` scan (`cumprod.rs`). |
 | `ArgMax` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
 | `ArgMin` | `` | ✅ | **NVRTC-custom** | Per-lane axis reduction to Int64 indices (f32/f16/bf16 widened to f32), honouring `keepdims` and `select_last_index`; first-index tie-break matched to the CPU EP (`argreduce.rs`). |
+| `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
+| `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic NCHW spatial-block rearrangement with runtime `blocksize`, including multi-channel and empty-batch tensors (`structural.rs`). |
+| `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
+| `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
+| `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
+| `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
+| `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
 
 ## Source-derived coverage audit (2026-07-27)
 
@@ -315,6 +322,37 @@ This brings the machine-verified `CUDA_COVERED_OPS` list length from **125** to
 **131** op names. `ArgMax`, `ArgMin`, and `CumProd` move out of the CPU `ai.onnx`
 gap list, and `BiasGelu`/`FastGelu`/`QuickGelu` are no longer `com.microsoft`
 gaps.
+
+The issue #67 operator-coverage batch 6 adds three standard-domain structural
+operators: `GatherND`, `SpaceToDepth`, and `EyeLike`. All three use
+dtype-agnostic NVRTC byte kernels rather than a vendor library:
+`GatherND` supports Int32/Int64 indices, negative wrapping, tuple tails, and
+`batch_dims`; `SpaceToDepth` rearranges arbitrary fixed-width NCHW tensors; and
+`EyeLike` emits exact zero/one storage for every numeric/bool dtype supported by
+the CPU EP. GPU parity covers batch dimensions, negative indices, multiple
+channels, dtype overrides, diagonal offsets, and empty tensors. This raises the
+machine-verified `CUDA_COVERED_OPS` count from **131** to **134** and the current
+CPU standard-domain parity count from **102 / 141** to **105 / 141**. These ops
+move out of the CPU `ai.onnx` gap list.
+
+The issue #67 operator-coverage batch 7 adds `Pad` and `Range`. `Pad` supports
+all four ONNX modes, negative cropping, subset/negative axes, and arbitrary
+fixed-width element storage. `Range` supports f32/f16/bf16 and Int64 with
+positive or negative deltas. GPU parity covers nonzero constant fill, subset
+axes, cropping, reflect/wrap modes, fractional float steps, narrow float
+storage, and descending Int64 sequences. This raises the machine-verified
+`CUDA_COVERED_OPS` count from **134** to **136** and current CPU standard-domain
+parity from **105 / 141** to **107 / 141**.
+
+The issue #67 operator-coverage batch 8 adds `ScatterND`, `HannWindow`,
+`HammingWindow`, and `BlackmanWindow`. `ScatterND` performs deterministic,
+ordered slice updates with negative-index wrapping and all opset-18 reductions
+for f32/f16/bf16/Int64 data. The three window operators share one generalized
+NVRTC implementation and support periodic/symmetric generation in
+f16/bf16/f32/f64. GPU parity covers slice updates, duplicate indices,
+`add`/`mul`/`max`, negative indices, every supported window dtype, and both
+periodic modes. This raises `CUDA_COVERED_OPS` from **136** to **140** and CPU
+standard-domain parity from **107 / 141** to **111 / 141**.
 
 ---
 

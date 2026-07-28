@@ -524,6 +524,10 @@ struct GenerateArgs {
     #[arg(long)]
     stream: bool,
 
+    /// Do not show compact per-turn stats by default in an interactive terminal.
+    #[arg(long)]
+    no_stats: bool,
+
     /// Prompt text.
     #[arg(long, short = 'p')]
     prompt: String,
@@ -1125,6 +1129,24 @@ mod tests {
         match parsed_command_line.command {
             Commands::Run(args) => assert!(args.no_stats),
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn generate_accepts_no_stats_opt_out() {
+        let parsed_command_line = Cli::try_parse_from([
+            "onnx-genai",
+            "generate",
+            "./m",
+            "--prompt",
+            "hi",
+            "--no-stats",
+        ])
+        .unwrap();
+
+        match parsed_command_line.command {
+            Commands::Generate(args) => assert!(args.no_stats),
+            _ => panic!("expected generate command"),
         }
     }
 

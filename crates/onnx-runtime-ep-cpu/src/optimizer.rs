@@ -75,10 +75,10 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     // Always-on NCHWc layout propagation: keeps CNN backbones in the MLAS
     // channels-blocked layout end-to-end so per-Conv NCHW<->NCHWc reorders are
     // eliminated (mirrors ORT's NchwcTransformer). Runs after BN/Relu folding so
-    // interior activations are already fused where possible. Gated on `mlas`:
-    // the NCHWc kernels are MLAS-backed and unregistered without the feature, so
-    // without MLAS plain Conv kernels run instead.
-    #[cfg(feature = "mlas")]
+    // interior activations are already fused where possible. Gated on both
+    // `mlas` and `ops-cnn`: the MLAS-backed NCHWc/Conv kernels live in the CNN
+    // operator group, so without either feature plain Conv kernels run instead.
+    #[cfg(all(feature = "mlas", feature = "ops-cnn"))]
     passes.push(Box::new(crate::nchwc_layout::NchwcLayoutPropagation::new()));
     passes
 }
@@ -1393,6 +1393,16 @@ mod tests {
     use super::{CpuSiluFusion, MICROSOFT_DOMAIN, MatMulNBitsBiasFusion};
     use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, Node, NodeId, ValueId, static_shape};
     use onnx_runtime_optimizer::{OptimizationPass, PassContext};
+
+    #[cfg(not(feature = "ops-cnn"))]
+    #[test]
+    fn optimization_registry_excludes_nchwc_without_cnn_ops() {
+        assert!(
+            !super::cpu_optimization_passes()
+                .iter()
+                .any(|pass| pass.name() == "CpuNchwcLayoutPropagation")
+        );
+    }
 
     #[test]
     fn fused_initializer_capacity_rejects_overflow_and_isize_excess() {

@@ -19,3 +19,6 @@ Rejected Batty's initial `onnx_rs` binding for lossy paths, an `exists()` prefli
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Freysa's raw-protobuf admission rejection was resolved in the final WP-B3 path.
+
+## 2026-07-28T09-10-28+00-00 — PR #338 review
+- Approved Luv's #67 CUDA `Pad`/`Range` batch after H200 GPU 2 passed 174/174 parity cases, the coverage gate passed, a content-corrupting mutation probe failed as expected, and default-target warnings-denied Clippy was clean. PR #338 merged as `c59383db`.

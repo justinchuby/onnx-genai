@@ -1,19 +1,30 @@
 # Team Focus — now
 
-**Current focus:** Roadmap CUDA/CPU parity, scheduler coverage, model packaging, and performance. Native image-pipeline trilogy is complete.
+**Current focus:** Roadmap CUDA/CPU parity, scheduler coverage, model packaging, performance, and MoE core delivery. Wave 8 added CUDA `ScatterND`/window kernels and nine shape-inference rules.
 
-**MERGED this wave:** PR #312 closed #65 (heterogeneous CPU/CUDA partition); PR #308 closed #60 (disk-backed KV offload); PR #311 advanced #67 (CUDA op coverage batch 5); PR #309 advanced #86 (varlen packed attention); PR #313 landed decode-garble triage/prevention guard; PR #316 fixed #289 (CJK/wide-char renderer width).
+**DONE THIS SESSION:** 18 PRs merged, including PR #341 (`6aca9a9d`) for #67 and PR #343 (`9aea50f9`) for #75.
 
-**CLOSED this wave:** #65, #60.
+**GAP REGISTER:**
+- #326: macOS x86_64 ORT archive extraction is held for Justin; Linux x86_64 and Windows AMD64 CPU wheel publishing is fixed by PR #337 (`5aed2dcf`).
+- #75: Sequence/Optional shape-inference needs an SSA type-model change for container element-type propagation.
+- #80/#82/#83: GLM/DeepSeek MoE core, including routed-expert paging, and Mobius PRs #404/#423/#430 are BLOCKED on Justin.
 
-**ADVANCED / STILL OPEN:** #67 remains open for CUDA op coverage batch 6; #86 remains open for exporter/CUDA/f16 deferred work.
+**ADVANCED / STILL OPEN:**
+- #63 live GPU weight offload remains open for dispatch wiring, multi-page LRU/eviction, prefetch overlap #87, and routed-expert paging #82.
+- #54 ORT model-package remains open for CLI tooling, format registry, advanced EP ranking, hashes/signatures, multi-component packages, archives, and registries.
+- #67 CUDA parity remains advanced and open at **111/141 CPU parity (140 CUDA ops)**; further batches are planned.
+- #86 remains advanced and open.
+- #75 shape inference remains partially advanced and open at **196 registered operators** (236 versioned entries); container propagation is deferred pending the SSA type-model change.
+- #55 remains open for scheduler/consumer wiring and `execution_hints.json`/YAML/builder merging.
+- #73 remains open for full module gating of remaining operator groups beyond CNN/pooling/spatial.
+- #80/#82/#83 GLM/DeepSeek MoE core remains advanced and open; Mobius PRs #404/#423/#430 are blocked on Justin.
 
-**REGRESSION RESOLUTION:** Decode was fine: real fused decode graphs fire compute-in-place aliasing #301 zero times, native==ORT byte-identical, and repeated sentences are natural greedy output. #289 was a CLI renderer bug: `live_turn.rs` used `chars().count()` rather than Unicode display width, causing CJK wrapping/spacing errors; fixed in PR #316.
+**REMAINING roadmap candidates:** #82 routed-expert paging; #87 compute-transfer overlap / weight-paging prefetch; #72 Windows/macOS CI wheels; #222 graph rewriter; #231 metadata; #69 CUDA conformance profiles + GPU CI.
 
-**REMAINING UNBLOCKED roadmap candidates:** #63 live GPU weight offload; #82 routed-expert paging; #54 ORT model-package MVP; #55 model metadata hints; #72 Windows/macOS CI wheels; #73 minimal operator builds; #67 batch 6; #307 perf-test continuous batching; #299 LoRA loading; #222 graph rewriter; #231 metadata.
-
-**BLOCKED on Justin:** Mobius #404/#423/#430 (GLM/DeepSeek E2E + Foundry-Local benchmark).
+**BLOCKED on Justin:** Mobius #404/#423/#430 (GLM/DeepSeek MoE core E2E + Foundry-Local CUDA-vs-ORT benchmark — the core deliverable).
 
 **ON HOLD:** #106 while Justin researches.
 
-**Updated:** 2026-07-28T04-08-08+0000
+**Other squad open PRs, not ours to merge:** #314, #315, #317, #318, #291, #99.
+
+**Updated:** 2026-07-28T10:04:25+0000

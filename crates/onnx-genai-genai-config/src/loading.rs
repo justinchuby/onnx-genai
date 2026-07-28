@@ -33,6 +33,14 @@ pub fn inference_metadata_from_dir(
     Ok(Some(config.to_inference_metadata(kv_native_dtype)?))
 }
 
+/// Compatibility metadata from an explicitly resolved configuration path.
+pub fn inference_metadata_from_path(
+    path: &Path,
+    kv_native_dtype: Option<&str>,
+) -> Result<InferenceMetadata, GenAiConfigError> {
+    load(path)?.to_inference_metadata(kv_native_dtype)
+}
+
 /// Like [`inference_metadata_from_dir`], but derives the single-decoder KV/state
 /// topology from the decoder's actual ONNX graph inventory (`decoder_graph`)
 /// rather than expanding KV name patterns over a uniform per-layer count.
@@ -53,6 +61,15 @@ pub fn inference_metadata_from_dir_with_graph(
         kv_native_dtype,
         decoder_graph,
     )?))
+}
+
+/// Graph-aware compatibility metadata from an explicitly resolved configuration path.
+pub fn inference_metadata_from_path_with_graph(
+    path: &Path,
+    kv_native_dtype: Option<&str>,
+    decoder_graph: &ModelGraphInfo,
+) -> Result<InferenceMetadata, GenAiConfigError> {
+    load(path)?.to_inference_metadata_with_graph(kv_native_dtype, decoder_graph)
 }
 
 /// Strict compatibility conversion for an existing multimodal ORT-GenAI package.

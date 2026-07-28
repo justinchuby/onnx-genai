@@ -149,3 +149,16 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 - **Non-blocking concerns:** C1 = add TODO for intrinsic migration; C2 = tighten test error thresholds (2% → 1e-4).
 - Filed to `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
 
+
+## 2026-07-28T00:40:00-07:00 — PR #334 Grouped/Depthwise Conv Review
+
+- **REJECT** (formatting) for Deckard's depthwise conv im2col+GEMM PR.
+- `cargo fmt --all -- --check` fails with 3 violations — same class as #324.
+- **Numerics: SOUND.** Grouped im2col indexing is correct across all 8 parity tests (true depthwise, grouped-not-depthwise, channel multiplier, non-SIMD-width channels, stride>1, dilation, asymmetric padding). Guard-break test detects off-by-one immediately.
+- **BNNS claim independently verified:** Probed `BNNSFilterCreateLayerConvolution` directly via FFI. With `groups > 1`, BNNS either returns NULL (oc_per_group in descriptor) or accepts but only writes group 0's output (full oc mode). The deprecated API is genuinely broken for groups > 1. Guard is justified.
+- **Fall-through:** No #275 pattern. Both paths produce fully-populated output vectors.
+- **Non-grouped path untouched** (byte-identical except defensive n==0 guard).
+- **Reachability:** Counter `CONV_IM2COL_GEMM_TEST_HITS` covers both branches, manifest claim present, test genuinely forces grouped path.
+- **12× gap judgement:** im2col is structurally wrong for depthwise (memory-bound, K=9, M=1). Direct NEON kernel would be 4–8× faster (eliminates im2col buffer entirely). This PR is a correct intermediate step. Schedule NEON depthwise follow-up targeting 2–3× ORT.
+- **Revision agent:** Iran.
+- Filed to `.squad/decisions/inbox/chew-pr334-review.md`.

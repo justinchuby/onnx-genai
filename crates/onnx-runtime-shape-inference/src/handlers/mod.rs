@@ -10,13 +10,17 @@ use crate::registry::InferenceRegistry;
 
 mod custom_ops;
 mod data_ops;
+mod einsum;
 mod elementwise;
+mod generator;
 mod linalg;
+mod loss;
 mod movement;
 mod norm;
 mod pooling;
 mod selection;
 mod sequence;
+mod signal;
 
 /// Normalise an ONNX axis (which may be negative) into `0..rank`.
 ///
@@ -53,4 +57,8 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     pooling::register(registry);
     selection::register(registry);
     sequence::register(registry);
+    generator::register(registry);
+    einsum::register(registry);
+    signal::register(registry);
+    loss::register(registry);
 }
