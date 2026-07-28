@@ -582,9 +582,10 @@ impl Engine {
                 seq: draft_model.kv_cache.create_sequence(),
                 tokens: Vec::new(),
                 kv_token_count: 0,
-                decode_state: DecodeState::new_for_path(
+                decode_state: DecodeState::new_for_path_with_io(
                     &draft_model.session,
                     &draft_model.decode_path,
+                    draft_model.io.as_ref(),
                 )?,
             })
         } else {
@@ -785,8 +786,11 @@ impl Engine {
             draft.seq = draft_model.kv_cache.create_sequence();
             draft.tokens.clear();
             draft.kv_token_count = 0;
-            draft.decode_state =
-                DecodeState::new_for_path(&draft_model.session, &draft_model.decode_path)?;
+            draft.decode_state = DecodeState::new_for_path_with_io(
+                &draft_model.session,
+                &draft_model.decode_path,
+                draft_model.io.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -796,8 +800,7 @@ impl Engine {
             .session
             .as_deref()
             .context("ORT decoder session is unavailable")?;
-        // Bind ports from an explicit `model.io` block when the package declares
-        // one; otherwise DecodeState falls back to tensor-name conventions.
+        // Bind ports from explicit metadata or unambiguous tensor shapes.
         let io = self
             .metadata
             .model

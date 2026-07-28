@@ -8,22 +8,13 @@ use super::metadata::{
     sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
-use super::values::{is_token_input_name, slice_value_axis, zero_state_value};
+use super::values::{slice_value_axis, zero_state_value};
 use onnx_genai_genai_config::GenAiConfig;
 use onnx_genai_metadata::{
     AttentionConfig, InferenceMetadata, KvCacheSpec, ModelCapabilities, RuntimeConfigurable,
     RuntimeKvConfig,
 };
 use onnx_genai_ort::{DataType, DecodeKvMode, TensorInfo, Value};
-
-#[test]
-fn recognizes_causal_and_seq2seq_token_input_names() {
-    assert!(is_token_input_name("input_ids"));
-    assert!(is_token_input_name("decoder_input_ids"));
-    assert!(is_token_input_name("model.input_ids"));
-    assert!(is_token_input_name("model.decoder_input_ids"));
-    assert!(!is_token_input_name("encoder_input_ids"));
-}
 
 #[test]
 fn is_group_query_attention_recognizes_variants() {

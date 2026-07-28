@@ -1,0 +1,5 @@
+model:
+  max_sequence_length: 16
+  io:
+    token_input: input_ids
+    logits_output: logits

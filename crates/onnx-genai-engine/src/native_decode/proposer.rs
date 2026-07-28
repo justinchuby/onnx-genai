@@ -64,16 +64,6 @@ impl NativeProposerSession {
         session: InferenceSession,
         io: Option<&ModelIoSpec>,
     ) -> anyhow::Result<Self> {
-        let input_names = session
-            .inputs()
-            .iter()
-            .map(|meta| meta.name.clone())
-            .collect::<Vec<_>>();
-        let output_names = session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.clone())
-            .collect::<Vec<_>>();
         let role_inputs = role_tensor_info(session.inputs());
         let role_outputs = role_tensor_info(session.outputs());
         let sequence_source = io
@@ -84,14 +74,14 @@ impl NativeProposerSession {
                 &role_inputs,
                 io.and_then(|io| io.token_input.as_deref()),
                 StructuralRole::IntegerSequence,
-                &["input_ids", "decoder_input_ids"],
+                "speculative.io",
                 "token_input",
             )?,
             SequenceInputKind::InputsEmbeds => declared_or_detected_input(
                 &role_inputs,
                 io.and_then(|io| io.inputs_embeds_input.as_deref()),
                 StructuralRole::EmbeddingSequence,
-                &["inputs_embeds"],
+                "speculative.io",
                 "inputs_embeds_input",
             )?,
         };
@@ -99,33 +89,33 @@ impl NativeProposerSession {
             &role_inputs,
             io.and_then(|io| io.attention_mask_input.as_deref()),
             StructuralRole::None,
-            &["attention_mask"],
+            "speculative.io",
             "attention_mask_input",
         )?;
         let position_ids = optional_declared_or_detected_input(
             &role_inputs,
             io.and_then(|io| io.position_ids_input.as_deref()),
             StructuralRole::None,
-            &["position_ids"],
+            "speculative.io",
             "position_ids_input",
         )?;
         let logits_output = optional_declared_or_detected_output(
             &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
             StructuralRole::ScoreOutput,
-            &["logits"],
+            "speculative.io",
             "logits_output",
         )?;
         let projected_state_output = optional_declared_or_detected_output(
             &role_outputs,
             io.and_then(|io| io.hidden_output.as_deref()),
             StructuralRole::None,
-            &["projected_state"],
+            "speculative.io",
             "hidden_output",
         )?;
         if logits_output.is_none() && projected_state_output.is_none() {
             bail!(
-                "native proposer metadata must declare at least one semantic output role: io.logits_output or io.hidden_output"
+                "native proposer metadata must declare at least one semantic output role: speculative.io.logits_output or speculative.io.hidden_output"
             );
         }
 
@@ -142,19 +132,7 @@ impl NativeProposerSession {
                             "native proposer metadata must declare io.kv_inputs and io.kv_outputs together for owned KV"
                         ),
                     },
-                    None => {
-                        let inputs = input_names
-                            .iter()
-                            .filter(|name| is_past_name(name))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let outputs = output_names
-                            .iter()
-                            .filter(|name| is_present_name(name))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        (inputs, outputs)
-                    }
+                    None => (Vec::new(), Vec::new()),
                 };
                 if inputs.len() != outputs.len() {
                     bail!(
@@ -163,22 +141,12 @@ impl NativeProposerSession {
                         outputs.len()
                     );
                 }
-                let pairs = if io.is_some() {
-                    outputs.into_iter().zip(inputs.iter().cloned()).collect()
-                } else {
-                    outputs
-                            .into_iter()
-                            .map(|output| {
-                                matching_past_name(&output, &inputs)
-                                    .map(|input| (output.clone(), input))
-                                    .with_context(|| {
-                                        format!(
-                                            "native proposer present output '{output}' has no matching past input"
-                                        )
-                                    })
-                            })
-                            .collect::<anyhow::Result<Vec<_>>>()?
-                };
+                if inputs.is_empty() != outputs.is_empty() {
+                    bail!(
+                        "native proposer owned KV requires speculative.io.kv_inputs and speculative.io.kv_outputs"
+                    );
+                }
+                let pairs = outputs.into_iter().zip(inputs.iter().cloned()).collect();
                 (inputs, pairs)
             }
             KvOwnership::Shared => {

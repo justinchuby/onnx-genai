@@ -12,30 +12,16 @@ pub(crate) fn extract_next_token_logits_with_io(
     extract_next_token_logits_from_outputs(session, &outputs, logits_output)
 }
 
-/// Locate the logits output index, preferring an explicitly declared name from
-/// the resolved `io` binding and falling back to tensor-name conventions.
+/// Locate the logits output selected by the resolved I/O contract.
 fn logits_output_index(session: &Session, logits_output: Option<&str>) -> anyhow::Result<usize> {
-    if let Some(declared) = logits_output {
-        return session
-            .output_names()
-            .iter()
-            .position(|name| name == declared)
-            .with_context(|| {
-                format!("declared logits output '{declared}' is not exposed by the graph")
-            });
-    }
-    // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+    let declared = logits_output.context(
+        "decoder logits role is unresolved; declare model.io.logits_output when output shapes are ambiguous",
+    )?;
     session
         .output_names()
         .iter()
-        .position(|name| name == "logits")
-        .or_else(|| {
-            session
-                .output_names()
-                .iter()
-                .position(|name| name.to_ascii_lowercase().contains("logits"))
-        })
-        .context("model did not expose a logits output")
+        .position(|name| name == declared)
+        .with_context(|| format!("declared logits output '{declared}' is not exposed by the graph"))
 }
 
 pub(super) fn extract_next_token_logits_from_outputs(

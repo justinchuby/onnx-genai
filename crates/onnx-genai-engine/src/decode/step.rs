@@ -161,18 +161,17 @@ pub(crate) fn run_decode_step_with_extra(
 
     let mut owned_inputs: Vec<(String, Value)> = Vec::new();
     for info in session.inputs() {
-        let lower = info.name.to_ascii_lowercase();
-        if decode_state.io.is_token_input(&info.name, &lower) {
+        if decode_state.io.is_token_input(&info.name) {
             owned_inputs.push((
                 info.name.clone(),
                 build_int_input(&input_ids, &[1, seq_len as i64], info)?,
             ));
-        } else if decode_state.io.is_attention_mask_input(&info.name, &lower) {
+        } else if decode_state.io.is_attention_mask_input(&info.name) {
             owned_inputs.push((
                 info.name.clone(),
                 build_int_input(&attention_mask, &[1, total_len as i64], info)?,
             ));
-        } else if decode_state.io.is_position_ids_input(&info.name, &lower) {
+        } else if decode_state.io.is_position_ids_input(&info.name) {
             if position_step.is_none() {
                 position_step = Some(build_position_step(
                     info,
@@ -217,10 +216,9 @@ pub(crate) fn run_decode_step_with_extra(
             );
         } else {
             anyhow::bail!(
-                "unsupported model input '{}' with shape {:?}; supported inputs are token IDs, attention masks, declared position programs, KV cache, fixed loop state, and pipeline-routed extra inputs (explicit io: {}, declared state inputs: {:?})",
+                "unsupported model input '{}' with shape {:?}; declare its semantic role in model.io or route it through pipeline metadata (declared state inputs: {:?})",
                 info.name,
                 info.shape,
-                decode_state.io.explicit,
                 decode_state
                     .io
                     .state_pairs

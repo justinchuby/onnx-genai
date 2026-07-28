@@ -1,6 +1,6 @@
 use super::*;
 use onnx_genai_ort::io_roles::{
-    is_embedding_sequence, is_integer_sequence, is_score_output, legacy_terminal_name, resolve_port,
+    is_rank_one_or_two_sequence, is_rank_one_to_three_output, is_rank_three_sequence, resolve_port,
 };
 
 pub(crate) fn role_tensor_info(
@@ -40,9 +40,9 @@ pub(crate) enum StructuralRole {
 
 fn structurally_matches(role: StructuralRole, info: &onnx_genai_ort::TensorInfo) -> bool {
     match role {
-        StructuralRole::IntegerSequence => is_integer_sequence(info),
-        StructuralRole::EmbeddingSequence => is_embedding_sequence(info),
-        StructuralRole::ScoreOutput => is_score_output(info),
+        StructuralRole::IntegerSequence => is_rank_one_or_two_sequence(info),
+        StructuralRole::EmbeddingSequence => is_rank_three_sequence(info),
+        StructuralRole::ScoreOutput => is_rank_one_to_three_output(info),
         StructuralRole::None => false,
     }
 }
@@ -51,21 +51,20 @@ pub(crate) fn declared_or_detected_input(
     inputs: &[onnx_genai_ort::TensorInfo],
     declared: Option<&str>,
     structural_role: StructuralRole,
-    candidates: &[&str],
+    metadata_scope: &str,
     field: &str,
 ) -> anyhow::Result<String> {
     resolve_port(
         inputs,
         declared,
-        &format!("native graph metadata io.{field}"),
+        &format!("{metadata_scope}.{field}"),
         |info| structurally_matches(structural_role, info),
-        |name| legacy_terminal_name(name, candidates),
     )
     .map_err(anyhow::Error::msg)?
     .map(|resolved| resolved.name)
     .with_context(|| {
         format!(
-            "native graph cannot resolve io.{field}; declare the exact port in metadata or export an unambiguous typed tensor (legacy names: {candidates:?})"
+            "native graph cannot resolve {metadata_scope}.{field} from tensor shape; declare the exact graph port in {metadata_scope}.{field}"
         )
     })
 }
@@ -74,15 +73,14 @@ pub(crate) fn optional_declared_or_detected_input(
     inputs: &[onnx_genai_ort::TensorInfo],
     declared: Option<&str>,
     structural_role: StructuralRole,
-    candidates: &[&str],
+    metadata_scope: &str,
     field: &str,
 ) -> anyhow::Result<Option<String>> {
     resolve_port(
         inputs,
         declared,
-        &format!("native graph metadata io.{field}"),
+        &format!("{metadata_scope}.{field}"),
         |info| structurally_matches(structural_role, info),
-        |name| legacy_terminal_name(name, candidates),
     )
     .map_err(anyhow::Error::msg)
     .map(|resolved| resolved.map(|resolved| resolved.name))
@@ -92,21 +90,20 @@ pub(crate) fn declared_or_detected_output(
     outputs: &[onnx_genai_ort::TensorInfo],
     declared: Option<&str>,
     structural_role: StructuralRole,
-    candidates: &[&str],
+    metadata_scope: &str,
     field: &str,
 ) -> anyhow::Result<String> {
     resolve_port(
         outputs,
         declared,
-        &format!("native graph metadata io.{field}"),
+        &format!("{metadata_scope}.{field}"),
         |info| structurally_matches(structural_role, info),
-        |name| legacy_terminal_name(name, candidates),
     )
     .map_err(anyhow::Error::msg)?
     .map(|resolved| resolved.name)
     .with_context(|| {
         format!(
-            "native graph cannot resolve io.{field}; declare the exact port in metadata or export an unambiguous typed tensor (legacy names: {candidates:?})"
+            "native graph cannot resolve {metadata_scope}.{field} from tensor shape; declare the exact graph port in {metadata_scope}.{field}"
         )
     })
 }
@@ -115,28 +112,15 @@ pub(crate) fn optional_declared_or_detected_output(
     outputs: &[onnx_genai_ort::TensorInfo],
     declared: Option<&str>,
     structural_role: StructuralRole,
-    candidates: &[&str],
+    metadata_scope: &str,
     field: &str,
 ) -> anyhow::Result<Option<String>> {
     resolve_port(
         outputs,
         declared,
-        &format!("native graph metadata io.{field}"),
+        &format!("{metadata_scope}.{field}"),
         |info| structurally_matches(structural_role, info),
-        |name| legacy_terminal_name(name, candidates),
     )
     .map_err(anyhow::Error::msg)
     .map(|resolved| resolved.map(|resolved| resolved.name))
-}
-
-pub(crate) fn is_past_name(name: &str) -> bool {
-    has_past_prefix(name, KvNamingConvention::Dotted)
-}
-
-pub(crate) fn is_present_name(name: &str) -> bool {
-    has_present_prefix(name, KvNamingConvention::Dotted)
-}
-
-pub(crate) fn matching_past_name(output: &str, inputs: &[String]) -> Option<String> {
-    matching_past_input(output, inputs, KvNamingConvention::Dotted).cloned()
 }

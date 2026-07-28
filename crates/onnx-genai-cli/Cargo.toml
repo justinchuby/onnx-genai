@@ -77,6 +77,7 @@ libc = "0.2"
 # The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
 image = { workspace = true, features = ["png"] }
 onnx-genai = { workspace = true }
+onnx-genai-metadata = { workspace = true }
 serde_json = { workspace = true }
 
 [dependencies.pyo3]

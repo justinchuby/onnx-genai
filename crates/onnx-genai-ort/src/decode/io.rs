@@ -29,23 +29,7 @@ pub(super) fn infer_kv_pairs(
             )),
         };
     }
-    let input_names = session.input_names();
-    let mut pairs = Vec::new();
-    for output in session.outputs() {
-        if !name_contains_present_key_value(&output.name) {
-            continue;
-        }
-        let Some(suffix) = kv_suffix(&output.name, KvNamingConvention::Dotted) else {
-            continue;
-        };
-        let Some(past_name) = input_names.iter().find(|input| {
-            kv_suffix(input, KvNamingConvention::Dotted).as_deref() == Some(suffix.as_str())
-        }) else {
-            continue;
-        };
-        pairs.push(kv_pair(session, past_name, &output.name)?);
-    }
-    Ok(pairs)
+    Ok(Vec::new())
 }
 
 fn kv_pair(session: &Session, past_name: &str, present_name: &str) -> Result<KvPair> {

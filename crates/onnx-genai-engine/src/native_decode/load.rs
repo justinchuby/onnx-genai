@@ -192,7 +192,7 @@ impl NativeDecodeSession {
                 &role_inputs,
                 io.and_then(|io| io.token_input.as_deref()),
                 StructuralRole::IntegerSequence,
-                &["input_ids", "decoder_input_ids"],
+                "model.io",
                 "token_input",
             )?)
         } else {
@@ -202,7 +202,7 @@ impl NativeDecodeSession {
                         &role_inputs,
                         Some(name),
                         StructuralRole::IntegerSequence,
-                        &["input_ids", "decoder_input_ids"],
+                        "model.io",
                         "token_input",
                     )
                 })
@@ -213,7 +213,7 @@ impl NativeDecodeSession {
                 &role_inputs,
                 io.and_then(|io| io.inputs_embeds_input.as_deref()),
                 StructuralRole::EmbeddingSequence,
-                &["inputs_embeds"],
+                "model.io",
                 "inputs_embeds_input",
             )?)
         } else {
@@ -223,7 +223,7 @@ impl NativeDecodeSession {
                         &role_inputs,
                         Some(name),
                         StructuralRole::EmbeddingSequence,
-                        &["inputs_embeds"],
+                        "model.io",
                         "inputs_embeds_input",
                     )
                 })
@@ -233,28 +233,28 @@ impl NativeDecodeSession {
             &role_inputs,
             io.and_then(|io| io.attention_mask_input.as_deref()),
             StructuralRole::None,
-            &["attention_mask"],
+            "model.io",
             "attention_mask_input",
         )?;
         let position_ids = optional_declared_or_detected_input(
             &role_inputs,
             io.and_then(|io| io.position_ids_input.as_deref()),
             StructuralRole::None,
-            &["position_ids"],
+            "model.io",
             "position_ids_input",
         )?;
         let logits = declared_or_detected_output(
             &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
             StructuralRole::ScoreOutput,
-            &["logits"],
+            "model.io",
             "logits_output",
         )?;
         let hidden_output = optional_declared_or_detected_output(
             &role_outputs,
             io.and_then(|io| io.hidden_output.as_deref()),
             StructuralRole::None,
-            &[],
+            "model.io",
             "hidden_output",
         )?;
         let kv_ownership = io
@@ -270,21 +270,10 @@ impl NativeDecodeSession {
                 (Some(inputs), Some(outputs)) => (inputs.clone(), outputs.clone()),
                 (None, None) => (Vec::new(), Vec::new()),
                 _ => bail!(
-                    "native target decoder metadata must declare io.kv_inputs and io.kv_outputs together"
+                    "native target decoder metadata must declare model.io.kv_inputs and model.io.kv_outputs together"
                 ),
             },
-            None => (
-                input_names
-                    .iter()
-                    .filter(|name| is_past_name(name))
-                    .cloned()
-                    .collect(),
-                output_names
-                    .iter()
-                    .filter(|name| is_present_name(name))
-                    .cloned()
-                    .collect(),
-            ),
+            None => (Vec::new(), Vec::new()),
         };
 
         // Fixed loop-carried recurrent states (hybrid linear-attention
@@ -311,32 +300,21 @@ impl NativeDecodeSession {
 
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
-                "native decode requires decoder-with-past I/O; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
+                "native decode requires explicit decoder state; declare model.io.kv_inputs and model.io.kv_outputs (or model.io.state_pairs)"
             );
         }
 
         let mut present_to_past = HashMap::new();
-        if io.is_some() {
-            // KV pairs pair positionally; state pairs carry explicit names.
-            let kv_pair_count = kv_inputs.len() - state_pairs.len();
-            present_to_past.extend(
-                present_outputs
-                    .iter()
-                    .take(kv_pair_count)
-                    .cloned()
-                    .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
-            );
-            present_to_past.extend(state_pairs.iter().cloned());
-        } else {
-            for output in &present_outputs {
-                let Some(input) = matching_past_name(output, &kv_inputs) else {
-                    bail!(
-                        "native decoder present output '{output}' has no matching past input; inputs: {kv_inputs:?}"
-                    );
-                };
-                present_to_past.insert(output.clone(), input);
-            }
-        }
+        // KV lists pair positionally; state pairs carry explicit names.
+        let kv_pair_count = kv_inputs.len() - state_pairs.len();
+        present_to_past.extend(
+            present_outputs
+                .iter()
+                .take(kv_pair_count)
+                .cloned()
+                .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
+        );
+        present_to_past.extend(state_pairs.iter().cloned());
         if present_to_past.len() != kv_inputs.len() {
             bail!(
                 "native decoder has incomplete past/present pairs; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
