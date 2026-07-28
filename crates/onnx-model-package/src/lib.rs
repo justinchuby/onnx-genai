@@ -38,15 +38,38 @@ pub enum PackageError {
     NoMatchingVariant { component: String, request: String },
 }
 
-/// ORT package layout policy.
+/// ORT package layout policy declared inside the (untrusted) manifest.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PackageLayout {
     /// All references must remain under the package root or a shared asset.
     #[default]
     Portable,
-    /// References may use absolute paths or parent traversal.
+    /// References may use absolute paths or parent traversal, but only when the
+    /// embedding application has separately opted in via
+    /// [`HostTrust::AllowInstalledLayout`]. The manifest declaring this layout
+    /// is never, on its own, sufficient to escape the package root.
     Installed,
+}
+
+/// Caller-supplied trust policy governing whether an `installed`-layout package
+/// may resolve references outside the package root.
+///
+/// Packages are untrusted input (see `docs/MODEL_PACKAGE.md` §7), so the
+/// manifest's own `layout` field must never be able to grant itself
+/// filesystem-escape privileges. Confinement is therefore always enforced
+/// unless the embedding application explicitly passes
+/// [`HostTrust::AllowInstalledLayout`], which it should only do for packages it
+/// has itself installed into a trusted location.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostTrust {
+    /// Always confine every reference to the package root, regardless of the
+    /// manifest `layout`. The safe default for downloaded/untrusted packages.
+    #[default]
+    Confined,
+    /// Permit `installed`-layout manifests to use absolute paths and `..`.
+    /// Only pass this for packages the host itself trusts.
+    AllowInstalledLayout,
 }
 
 /// An ORT 1.x package manifest.
@@ -163,11 +186,26 @@ pub struct SelectedVariant {
 pub struct ModelPackage {
     root: PathBuf,
     manifest: Manifest,
+    trust: HostTrust,
 }
 
 impl ModelPackage {
-    /// Open and structurally validate a package directory.
+    /// Open and structurally validate a package directory, confining every
+    /// reference to the package root regardless of the manifest `layout`.
+    ///
+    /// This is the safe entry point for untrusted (e.g. downloaded) packages.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, PackageError> {
+        Self::open_with_trust(root, HostTrust::Confined)
+    }
+
+    /// Open a package with an explicit caller-supplied trust policy.
+    ///
+    /// Pass [`HostTrust::AllowInstalledLayout`] only for packages the embedding
+    /// application itself trusts; with it, `installed`-layout manifests may
+    /// resolve absolute paths and `..` outside the package root. The default
+    /// [`HostTrust::Confined`] (used by [`ModelPackage::open`]) never permits
+    /// such escapes, even when the manifest declares `"layout": "installed"`.
+    pub fn open_with_trust(root: impl AsRef<Path>, trust: HostTrust) -> Result<Self, PackageError> {
         let root = root.as_ref();
         if !root.is_dir() {
             return Err(PackageError::Invalid(format!(
@@ -187,7 +225,11 @@ impl ModelPackage {
             path: root.to_path_buf(),
             source,
         })?;
-        Ok(Self { root, manifest })
+        Ok(Self {
+            root,
+            manifest,
+            trust,
+        })
     }
 
     /// Return the parsed package manifest.
@@ -258,7 +300,11 @@ impl ModelPackage {
             ComponentReference::External(reference) => {
                 let mut path = self.resolve_path(&self.root, reference, true)?;
                 if path.is_dir() {
-                    path = path.join(COMPONENT_FILE);
+                    // The implicit `component.json` under an external component
+                    // directory must pass the same confinement check as any
+                    // other reference; a symlinked component.json could
+                    // otherwise escape the package root.
+                    path = self.canonicalize_confined(&path.join(COMPONENT_FILE))?;
                 }
                 read_json(&path)
             }
@@ -375,6 +421,36 @@ impl ModelPackage {
             .transpose()
     }
 
+    /// Whether references must be confined to the package root. Confinement is
+    /// always enforced unless the manifest declares the `installed` layout AND
+    /// the caller explicitly opted in via [`HostTrust::AllowInstalledLayout`].
+    fn confinement_enforced(&self) -> bool {
+        !(self.manifest.layout == PackageLayout::Installed
+            && self.trust == HostTrust::AllowInstalledLayout)
+    }
+
+    /// Canonicalize an existing path (resolving symlinks) and, when confinement
+    /// is enforced, reject it if the real path escapes the package root.
+    fn canonicalize_confined(&self, path: &Path) -> Result<PathBuf, PackageError> {
+        if !path.exists() {
+            return Err(PackageError::Invalid(format!(
+                "referenced path does not exist: {}",
+                path.display()
+            )));
+        }
+        let canonical = path.canonicalize().map_err(|source| PackageError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if self.confinement_enforced() && !canonical.starts_with(&self.root) {
+            return Err(PackageError::Invalid(format!(
+                "package reference resolves outside package root: {}",
+                path.display()
+            )));
+        }
+        Ok(canonical)
+    }
+
     fn resolve_path(
         &self,
         base: &Path,
@@ -385,7 +461,7 @@ impl ModelPackage {
             self.resolve_shared_asset(asset_reference)?
         } else {
             let reference_path = Path::new(reference);
-            if self.manifest.layout == PackageLayout::Portable {
+            if self.confinement_enforced() {
                 validate_portable_reference(reference_path)?;
             }
             if reference_path.is_absolute() {
@@ -395,24 +471,7 @@ impl ModelPackage {
             }
         };
         if must_exist {
-            if !path.exists() {
-                return Err(PackageError::Invalid(format!(
-                    "referenced path does not exist: {}",
-                    path.display()
-                )));
-            }
-            let canonical = path.canonicalize().map_err(|source| PackageError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if self.manifest.layout == PackageLayout::Portable && !canonical.starts_with(&self.root)
-            {
-                return Err(PackageError::Invalid(format!(
-                    "portable package reference resolves outside package root: {}",
-                    path.display()
-                )));
-            }
-            return Ok(canonical);
+            return self.canonicalize_confined(&path);
         }
         Ok(path)
     }
@@ -444,7 +503,7 @@ impl ModelPackage {
             },
             |reference| {
                 let path = Path::new(reference);
-                if self.manifest.layout == PackageLayout::Portable {
+                if self.confinement_enforced() {
                     validate_portable_reference(path)?;
                 }
                 Ok(if path.is_absolute() {
@@ -455,23 +514,7 @@ impl ModelPackage {
             },
         )?;
         let path = tail.map_or(root.clone(), |tail| root.join(tail));
-        if !path.exists() {
-            return Err(PackageError::Invalid(format!(
-                "shared asset does not exist: {}",
-                path.display()
-            )));
-        }
-        let canonical = path.canonicalize().map_err(|source| PackageError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if self.manifest.layout == PackageLayout::Portable && !canonical.starts_with(&self.root) {
-            return Err(PackageError::Invalid(format!(
-                "portable shared asset resolves outside package root: {}",
-                path.display()
-            )));
-        }
-        Ok(canonical)
+        self.canonicalize_confined(&path)
     }
 }
 
