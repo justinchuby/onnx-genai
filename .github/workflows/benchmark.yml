@@ -73,6 +73,9 @@ jobs:
       - name: Benchmark PR head (genai-bench no_model)
         run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
 
+      - name: Smoke-check PR model benchmarks
+        run: cargo bench -p onnx-genai-bench --features bench-ort --bench model -- --test
+
       - name: Save PR criterion results
         run: cp -R target/criterion pr-criterion
 
