@@ -1,4 +1,5 @@
-//! CUDA indexed element movement: `GatherElements` and `ScatterElements`.
+//! CUDA indexed element movement: `GatherElements`, `ScatterElements`, and
+//! `ScatterND`.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -7,12 +8,14 @@ use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{Attribute, DataType, Node, compute_contiguous_strides};
 
+use super::movement::PersistentMetadata;
 use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
 pub const SCATTER_CAPTURE_ERROR_INDEX: u32 = 256;
 pub const GATHER_ELEMENTS_CAPTURE_ERROR_INDEX: u32 = 1_024;
+pub const SCATTER_ND_CAPTURE_ERROR_INDEX: u32 = 8_192;
 const SOURCE: &str = r#"
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
 #define NXRT_HAS_CUDA_HALF_HEADERS 1
@@ -187,6 +190,128 @@ DEFINE_SCATTER_FLOAT(__half, f16, long long, i64)
 DEFINE_SCATTER_FLOAT(__nv_bfloat16, bf16, int, i32)
 DEFINE_SCATTER_FLOAT(__nv_bfloat16, bf16, long long, i64)
 #endif
+
+__device__ bool scatter_nd_offset(
+    const long long* indices, unsigned long long tuple,
+    const unsigned long long* meta, int data_rank, int index_depth,
+    unsigned long long* data_offset) {
+  const unsigned long long* data_strides = meta;
+  const unsigned long long* data_dims = meta + data_rank;
+  *data_offset = 0;
+  for (int dimension = 0; dimension < index_depth; ++dimension) {
+    const long long raw = indices[tuple * index_depth + dimension];
+    unsigned long long coordinate;
+    if (raw >= 0) {
+      coordinate = (unsigned long long)raw;
+      if (coordinate >= data_dims[dimension]) return false;
+    } else {
+      const unsigned long long magnitude = 0ull - (unsigned long long)raw;
+      if (magnitude > data_dims[dimension]) return false;
+      coordinate = data_dims[dimension] - magnitude;
+    }
+    *data_offset += coordinate * data_strides[dimension];
+  }
+  return true;
+}
+
+template <typename Data>
+__device__ void scatter_nd_float_impl(
+    Data* output, const long long* indices, const Data* updates,
+    const unsigned long long* meta, int data_rank, int index_depth,
+    unsigned long long tuples, unsigned long long slice_length, int reduction,
+    unsigned int* capture_error) {
+  if (blockIdx.x || threadIdx.x) return;
+  for (unsigned long long tuple = 0; tuple < tuples; ++tuple) {
+    unsigned long long destination;
+    if (!scatter_nd_offset(
+            indices, tuple, meta, data_rank, index_depth, &destination)) {
+      if (capture_error) atomicOr(capture_error, 8192u);
+      continue;
+    }
+    for (unsigned long long element = 0; element < slice_length; ++element) {
+      const unsigned long long output_index = destination + element;
+      const unsigned long long update_index = tuple * slice_length + element;
+      if (reduction == 0) {
+        output[output_index] = updates[update_index];
+        continue;
+      }
+      const float current = scatter_load<Data>(output[output_index]);
+      const float update = scatter_load<Data>(updates[update_index]);
+      if (reduction == 1)
+        output[output_index] = scatter_store<Data>(current + update);
+      else if (reduction == 2)
+        output[output_index] = scatter_store<Data>(current * update);
+      else if (reduction == 3) {
+        const float value = (isnan(current) || isnan(update))
+            ? __int_as_float(0x7fc00000) : fmaxf(current, update);
+        output[output_index] = scatter_store<Data>(value);
+      } else {
+        const float value = (isnan(current) || isnan(update))
+            ? __int_as_float(0x7fc00000) : fminf(current, update);
+        output[output_index] = scatter_store<Data>(value);
+      }
+    }
+  }
+}
+
+__device__ void scatter_nd_i64_impl(
+    long long* output, const long long* indices, const long long* updates,
+    const unsigned long long* meta, int data_rank, int index_depth,
+    unsigned long long tuples, unsigned long long slice_length, int reduction,
+    unsigned int* capture_error) {
+  if (blockIdx.x || threadIdx.x) return;
+  for (unsigned long long tuple = 0; tuple < tuples; ++tuple) {
+    unsigned long long destination;
+    if (!scatter_nd_offset(
+            indices, tuple, meta, data_rank, index_depth, &destination)) {
+      if (capture_error) atomicOr(capture_error, 8192u);
+      continue;
+    }
+    for (unsigned long long element = 0; element < slice_length; ++element) {
+      const unsigned long long output_index = destination + element;
+      const long long update = updates[tuple * slice_length + element];
+      if (reduction == 0) output[output_index] = update;
+      else if (reduction == 1)
+        output[output_index] =
+            (long long)((unsigned long long)output[output_index] +
+                        (unsigned long long)update);
+      else if (reduction == 2)
+        output[output_index] =
+            (long long)((unsigned long long)output[output_index] *
+                        (unsigned long long)update);
+      else if (reduction == 3)
+        output[output_index] =
+            output[output_index] > update ? output[output_index] : update;
+      else
+        output[output_index] =
+            output[output_index] < update ? output[output_index] : update;
+    }
+  }
+}
+
+#define DEFINE_SCATTER_ND_FLOAT(DATA, SUFFIX) \
+extern "C" __global__ void scatter_nd_##SUFFIX( \
+    DATA* output, const long long* indices, const DATA* updates, \
+    const unsigned long long* meta, int data_rank, int index_depth, \
+    unsigned long long tuples, unsigned long long slice_length, int reduction, \
+    unsigned int* capture_error) { \
+  scatter_nd_float_impl(output, indices, updates, meta, data_rank, index_depth, \
+                        tuples, slice_length, reduction, capture_error); \
+}
+
+DEFINE_SCATTER_ND_FLOAT(float, f32)
+extern "C" __global__ void scatter_nd_i64(
+    long long* output, const long long* indices, const long long* updates,
+    const unsigned long long* meta, int data_rank, int index_depth,
+    unsigned long long tuples, unsigned long long slice_length, int reduction,
+    unsigned int* capture_error) {
+  scatter_nd_i64_impl(output, indices, updates, meta, data_rank, index_depth,
+                      tuples, slice_length, reduction, capture_error);
+}
+#ifdef NXRT_HAS_CUDA_HALF_HEADERS
+DEFINE_SCATTER_ND_FLOAT(__half, f16)
+DEFINE_SCATTER_ND_FLOAT(__nv_bfloat16, bf16)
+#endif
 "#;
 
 fn axis(op: &str, raw: i64, rank: usize) -> Result<usize> {
@@ -237,6 +362,34 @@ fn validate_indices(
         if !in_range {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep {op}: index {value} out of range"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_nd_indices(
+    runtime: &CudaRuntime,
+    indices: &TensorView,
+    data_shape: &[usize],
+    index_depth: usize,
+) -> Result<()> {
+    let mut bytes = vec![0_u8; indices.dtype.storage_bytes(indices.numel())];
+    if !bytes.is_empty() {
+        unsafe { runtime.dtoh(&mut bytes, cuptr(indices.data_ptr::<u8>() as *const c_void))? };
+    }
+    for (linear, raw) in bytes.chunks_exact(8).enumerate() {
+        let value = i64::from_ne_bytes(raw.try_into().unwrap());
+        let dimension = linear % index_depth;
+        let size = data_shape[dimension];
+        let in_range = if value >= 0 {
+            (value as u64) < size as u64
+        } else {
+            value.unsigned_abs() <= size as u64
+        };
+        if !in_range {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ScatterND: index {value} out of range at tuple dimension {dimension}"
             )));
         }
     }
@@ -341,6 +494,14 @@ struct ScatterCaptureSignature {
     indices_dtype: DataType,
     data_shape: Vec<usize>,
     indices_shape: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScatterNdCaptureSignature {
+    data_dtype: DataType,
+    data_shape: Vec<usize>,
+    indices_shape: Vec<usize>,
+    updates_shape: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,36 +748,238 @@ enum Reduction {
     Min = 4,
 }
 
+fn parse_reduction(node: &Node, op: &str) -> Result<Reduction> {
+    match node.attr("reduction") {
+        None => Ok(Reduction::None),
+        Some(attribute) => match attribute.as_str() {
+            Some("none") => Ok(Reduction::None),
+            Some("add") => Ok(Reduction::Add),
+            Some("mul") => Ok(Reduction::Mul),
+            Some("max") => Ok(Reduction::Max),
+            Some("min") => Ok(Reduction::Min),
+            Some(value) => Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: unsupported reduction {value:?}"
+            ))),
+            None => Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: reduction must be a string"
+            ))),
+        },
+    }
+}
+
 pub struct ScatterElementsFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
+pub struct ScatterNdFactory {
+    pub runtime: Arc<CudaRuntime>,
+}
+
+impl KernelFactory for ScatterNdFactory {
+    fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(ScatterNdKernel {
+            runtime: self.runtime.clone(),
+            reduction: parse_reduction(node, "ScatterND")?,
+            metadata: Mutex::new(PersistentMetadata::new(self.runtime.clone())),
+            warmed_signature: Mutex::new(None),
+        }))
+    }
+}
+
+struct ScatterNdKernel {
+    runtime: Arc<CudaRuntime>,
+    reduction: Reduction,
+    metadata: Mutex<PersistentMetadata>,
+    warmed_signature: Mutex<Option<ScatterNdCaptureSignature>>,
+}
+
+impl Kernel for ScatterNdKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        if inputs.len() != 3 || outputs.len() != 1 {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ScatterND: expected 3 inputs and 1 output".into(),
+            ));
+        }
+        require_dense("ScatterND", inputs, outputs)?;
+        let data = &inputs[0];
+        let indices = &inputs[1];
+        let updates = &inputs[2];
+        let output = &mut outputs[0];
+        if indices.dtype != DataType::Int64 {
+            return Err(not_implemented(format!(
+                "ScatterND supports Int64 indices, got {:?}",
+                indices.dtype
+            )));
+        }
+        if !matches!(
+            data.dtype,
+            DataType::Float16 | DataType::Float32 | DataType::BFloat16 | DataType::Int64
+        ) {
+            return Err(not_implemented(format!(
+                "ScatterND supports Float16, Float32, BFloat16, and Int64 data, got {:?}",
+                data.dtype
+            )));
+        }
+        if updates.dtype != data.dtype || output.dtype != data.dtype || output.shape != data.shape {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ScatterND: data, updates, and output must match".into(),
+            ));
+        }
+        if indices.shape.is_empty() {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ScatterND: indices must have rank at least 1".into(),
+            ));
+        }
+        let index_depth = *indices.shape.last().expect("rank checked above");
+        if index_depth > data.shape.len() {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ScatterND: index tuple length {index_depth} exceeds data rank {}",
+                data.shape.len()
+            )));
+        }
+        let mut expected_updates_shape = indices.shape[..indices.shape.len() - 1].to_vec();
+        expected_updates_shape.extend_from_slice(&data.shape[index_depth..]);
+        if updates.shape != expected_updates_shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep ScatterND: updates shape {:?} must be {expected_updates_shape:?}",
+                updates.shape
+            )));
+        }
+        if matches!(data.dtype, DataType::Float16 | DataType::BFloat16) {
+            self.runtime.require_nvrtc_half_headers("ScatterND")?;
+        }
+
+        let capturing = self.runtime.is_capturing()?;
+        let signature = ScatterNdCaptureSignature {
+            data_dtype: data.dtype,
+            data_shape: data.shape.to_vec(),
+            indices_shape: indices.shape.to_vec(),
+            updates_shape: updates.shape.to_vec(),
+        };
+        let mut warmed_signature = self.warmed_signature.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep ScatterND: capture signature lock was poisoned".into())
+        })?;
+        if capturing && warmed_signature.as_ref() != Some(&signature) {
+            return Err(EpError::KernelFailed(
+                "cuda_ep ScatterND: shape or dtype changed during CUDA graph capture; warm the exact signature first".into(),
+            ));
+        }
+        if !capturing && index_depth != 0 {
+            validate_nd_indices(&self.runtime, indices, data.shape, index_depth)?;
+        }
+        unsafe {
+            self.runtime.dtod_async(
+                cuptr(data.data_ptr::<u8>() as *const c_void),
+                cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+                data.dtype.storage_bytes(data.numel()),
+            )?
+        };
+        let tuples = indices.shape[..indices.shape.len() - 1]
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+            .ok_or_else(|| {
+                EpError::KernelFailed("cuda_ep ScatterND: tuple count overflow".into())
+            })?;
+        let slice_length = data.shape[index_depth..]
+            .iter()
+            .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
+            .ok_or_else(|| {
+                EpError::KernelFailed("cuda_ep ScatterND: slice length overflow".into())
+            })?;
+        if tuples == 0 || slice_length == 0 {
+            if !capturing {
+                *warmed_signature = Some(signature);
+            }
+            return Ok(());
+        }
+
+        let mut metadata_values = compute_contiguous_strides(data.shape)
+            .into_iter()
+            .map(|value| value as u64)
+            .collect::<Vec<_>>();
+        metadata_values.extend(data.shape.iter().map(|&value| value as u64));
+        let metadata_ptr = self
+            .metadata
+            .lock()
+            .map_err(|_| {
+                EpError::KernelFailed("cuda_ep ScatterND: metadata lock was poisoned".into())
+            })?
+            .prepare(&metadata_values, "ScatterND")?;
+        let entry = match data.dtype {
+            DataType::Float16 => "scatter_nd_f16",
+            DataType::Float32 => "scatter_nd_f32",
+            DataType::BFloat16 => "scatter_nd_bf16",
+            DataType::Int64 => "scatter_nd_i64",
+            _ => unreachable!("validated above"),
+        };
+        let function = self
+            .runtime
+            .nvrtc_function("indexing_ops_v3", SOURCE, entry)?;
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let indices_ptr = cuptr(indices.data_ptr::<u8>() as *const c_void);
+        let updates_ptr = cuptr(updates.data_ptr::<u8>() as *const c_void);
+        let data_rank = i32::try_from(data.shape.len())
+            .map_err(|_| EpError::KernelFailed("cuda_ep ScatterND: rank exceeds i32".into()))?;
+        let index_depth = i32::try_from(index_depth).map_err(|_| {
+            EpError::KernelFailed("cuda_ep ScatterND: index depth exceeds i32".into())
+        })?;
+        let tuples = tuples as u64;
+        let slice_length = slice_length as u64;
+        let reduction = self.reduction as i32;
+        let capture_error = if capturing {
+            self.runtime.capture_error_ptr()
+        } else {
+            0
+        };
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&output_ptr)
+            .arg(&indices_ptr)
+            .arg(&updates_ptr)
+            .arg(&metadata_ptr)
+            .arg(&data_rank)
+            .arg(&index_depth)
+            .arg(&tuples)
+            .arg(&slice_length)
+            .arg(&reduction)
+            .arg(&capture_error);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
+        if !capturing {
+            *warmed_signature = Some(signature);
+        }
+        Ok(())
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        false
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        match self.warmed_signature.lock() {
+            Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
+            Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "ScatterND must warm its exact shape/dtype signature before capture",
+            ),
+            Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
+                "ScatterND capture signature lock was poisoned",
+            ),
+        }
+    }
+}
+
 impl KernelFactory for ScatterElementsFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let reduction = match node.attr("reduction") {
-            None => Reduction::None,
-            Some(attribute) => match attribute.as_str() {
-                Some("none") => Reduction::None,
-                Some("add") => Reduction::Add,
-                Some("mul") => Reduction::Mul,
-                Some("max") => Reduction::Max,
-                Some("min") => Reduction::Min,
-                Some(value) => {
-                    return Err(EpError::KernelFailed(format!(
-                        "cuda_ep ScatterElements: unsupported reduction {value:?}"
-                    )));
-                }
-                None => {
-                    return Err(EpError::KernelFailed(
-                        "cuda_ep ScatterElements: reduction must be a string".into(),
-                    ));
-                }
-            },
-        };
         Ok(Box::new(ScatterElementsKernel {
             runtime: self.runtime.clone(),
             axis: node.attr("axis").and_then(Attribute::as_int).unwrap_or(0),
-            reduction,
+            reduction: parse_reduction(node, "ScatterElements")?,
             metadata: Mutex::new(ScatterMetadataCache::new(self.runtime.clone())),
             warmed_signature: Mutex::new(None),
         }))

@@ -82,6 +82,7 @@ pub mod trilu;
 pub mod unary_predicate;
 pub mod varlen_attention;
 pub mod where_op;
+pub mod window;
 
 use activations::ActivationFactory;
 use elementwise::{BinaryFactory, BinaryOp, StandardGeluFactory, UnaryFactory, UnaryOp};
@@ -288,6 +289,10 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "EyeLike",
     "Pad",
     "Range",
+    "ScatterND",
+    "HannWindow",
+    "HammingWindow",
+    "BlackmanWindow",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -334,6 +339,14 @@ pub fn build_cuda_registry_with_metrics(
         reg.register(
             OpKey::new("ScatterElements", "", opset),
             Box::new(indexing::ScatterElementsFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    for opset in [11, 16, 18] {
+        reg.register(
+            OpKey::new("ScatterND", "", opset),
+            Box::new(indexing::ScatterNdFactory {
                 runtime: runtime.clone(),
             }),
         );
@@ -394,6 +407,19 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    for (op_type, kind) in [
+        ("HannWindow", window::WindowKind::Hann),
+        ("HammingWindow", window::WindowKind::Hamming),
+        ("BlackmanWindow", window::WindowKind::Blackman),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 17),
+            Box::new(window::WindowFactory {
+                kind,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("TopK", "", 10),
         Box::new(topk::TopKFactory {

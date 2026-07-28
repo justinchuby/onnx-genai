@@ -1258,6 +1258,99 @@ fn range_cases() -> Vec<Case> {
     cases
 }
 
+fn scatter_nd_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "ScatterND[f32,slice-update,negative-index]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[3, 3],
+                    &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                ),
+                input(DataType::Int64, &[2, 1], &[-1_i64, 0]),
+                input(
+                    DataType::Float32,
+                    &[2, 3],
+                    &[10.0_f32, 11.0, 12.0, 20.0, 21.0, 22.0],
+                ),
+            ],
+            outputs: vec![(DataType::Float32, vec![3, 3])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "ScatterND[f16,duplicate-index,add]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 16,
+            inputs: vec![
+                float_input(DataType::Float16, &[3], &[10.0, 20.0, 30.0]),
+                input(DataType::Int64, &[3, 1], &[1_i64, 1, -3]),
+                float_input(DataType::Float16, &[3], &[2.0, 3.0, 4.0]),
+            ],
+            outputs: vec![(DataType::Float16, vec![3])],
+            attrs: vec![("reduction", Attribute::String(b"add".to_vec()))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "ScatterND[bf16,duplicate-index,max]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(DataType::BFloat16, &[3], &[10.0, 20.0, 30.0]),
+                input(DataType::Int64, &[3, 1], &[1_i64, 1, -3]),
+                float_input(DataType::BFloat16, &[3], &[12.0, 25.0, 40.0]),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![3])],
+            attrs: vec![("reduction", Attribute::String(b"max".to_vec()))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "ScatterND[i64,slice-update,mul]".into(),
+            op: "ScatterND",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int64, &[2, 2], &[2_i64, 3, 4, 5]),
+                input(DataType::Int64, &[2, 1], &[0_i64, -1]),
+                input(DataType::Int64, &[2, 2], &[10_i64, 20, 2, 3]),
+            ],
+            outputs: vec![(DataType::Int64, vec![2, 2])],
+            attrs: vec![("reduction", Attribute::String(b"mul".to_vec()))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn window_cases(op: &'static str) -> Vec<Case> {
+    [
+        (DataType::Float32, true, 1e-6),
+        (DataType::Float16, false, 3e-3),
+        (DataType::BFloat16, true, 3e-2),
+        (DataType::Float64, false, 1e-6),
+    ]
+    .into_iter()
+    .map(|(dtype, periodic, tol)| Case {
+        label: format!("{op}[{dtype:?},periodic={periodic}]"),
+        op,
+        domain: "",
+        opset: 17,
+        inputs: vec![input(DataType::Int64, &[], &[7_i64])],
+        outputs: vec![(dtype, vec![7])],
+        attrs: vec![
+            ("periodic", Attribute::Int(i64::from(periodic))),
+            ("output_datatype", Attribute::Int(dtype as i64)),
+        ],
+        compare: Compare::Float { tol },
+    })
+    .collect()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The conformance profile: one entry per CUDA_COVERED_OPS op.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1447,6 +1540,12 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // Batch 7 (issue #67): general padding/cropping and sequence construction.
     p.push(sweep("Pad", pad_cases()));
     p.push(sweep("Range", range_cases()));
+
+    // Batch 8 (issue #67): indexed updates and signal-processing windows.
+    p.push(sweep("ScatterND", scatter_nd_cases()));
+    for op in ["HannWindow", "HammingWindow", "BlackmanWindow"] {
+        p.push(sweep(op, window_cases(op)));
+    }
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.

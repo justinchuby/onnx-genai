@@ -95,6 +95,10 @@ pub fn decode_floats(bytes: &[u8], dtype: DataType) -> Vec<f32> {
             .chunks_exact(2)
             .map(|c| bf16::from_bits(u16::from_ne_bytes(c.try_into().unwrap())).to_f32())
             .collect(),
+        DataType::Float64 => bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_ne_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
         other => panic!("unsupported float dtype {other:?}"),
     }
 }
