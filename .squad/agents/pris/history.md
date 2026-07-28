@@ -121,3 +121,10 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Measured repeat fast run 30342667705 at 3m45s wall-clock; critical path `Rust (Linux x86_64)` at 3m40s, Windows CLI at 3m26s, loader path-safety step 12s. First run on the commit was 7m31s from Windows cache/build variance, with loader step 34s.
 ## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - CI supply-chain and coverage hardening note was merged into decisions.
+
+## 2026-07-28T02:18:00-07:00 — Stable names for skipped slow CI jobs
+- Fixed unexpanded skipped check names caused by job-level `if:` conditions on matrix jobs: GitHub skips before matrix expansion, producing raw `${{ matrix.name }}` in fast-tier skipped checks.
+- Replaced the slow-tier matrices in `ci.yml` with explicit per-platform jobs so skipped checks are named `Rust coverage (Linux x86_64)`, `Rust coverage (Windows x86_64)`, `Rust slow platform (...)`, and `CUDA compile (...)`.
+- Confirmed `miri.yml` has no matrix/gated job-name issue. Repo-wide scan found analogous conditional matrices only in release/manual workflows (`publish.yml`, `wheels.yml`), not PR CI; left them outside this PR.
+- Recorded Justin's live `ci:full` verification on PR #340: CI run 30345861354 and audit run 30345861425 started via label.
+- Added CLI-specific cache keys after the main merge exposed a shared-cache collision/incomplete-restore pattern in the Windows CLI lane. Remeasured fast run 30348596658 at 3m51s warm-cache wall-clock; critical path `CLI ORT (Windows x86_64)` at 3m45s.
