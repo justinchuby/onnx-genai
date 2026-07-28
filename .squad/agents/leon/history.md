@@ -154,3 +154,9 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 
 ## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - Approved PR #316 CJK renderer fix and mutation-proof wide-character tests.
+
+## 2026-07-28T03:11:03-07:00 — PR #291 Sapper policy-split fourth review
+
+- 🟢 Approved Sapper's revision. `RewindRunnerPolicy` now keeps public `Engine::rewind_session_to` on `RejectRunnerRewind` while speculative draft alignment, draft rewind, target accept/reject rewind, and overmaterialized cleanup use `AllowRunnerRewind`.
+- Verified public runner-backed rewind rejects before scheduler/session/token/KV/runner mutation; policy-boundary tests would fail if allow/reject were flipped. Support matrix now matches the public API contract, with prepared/infallible runner rewind recorded as follow-up.
+- Validation: engine build/fmt/clippy passed; server/CLI builds passed; full engine lib suite now runs locally with ORT 1.27/API 27 (252 passed, 0 failed, 1 ignored); targeted failed-rewind/speculative/checkpoint tests passed.
