@@ -80,7 +80,19 @@ fn clip_contiguous_f32_fast(
     }
 
     let len = numel(inputs[0].shape);
-    // SAFETY: validated contiguous Float32 views — `len` elements are accessible.
+    // Overlap guard: if input and output alias, fall back to the generic path
+    // which allocates a separate buffer. This crate previously shipped a rescue
+    // block that silently returned zeros on aliasing — no appetite for that class.
+    let input_start = inputs[0].data_ptr::<u8>() as usize;
+    let input_end = input_start.saturating_add(inputs[0].byte_size());
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if output_start < input_end && input_start < output_end {
+        return Ok(false);
+    }
+
+    // SAFETY: validated contiguous Float32 views — `len` elements are accessible,
+    // and the overlap check above proves the ranges are disjoint.
     let src = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<f32>(), len) };
     let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), len) };
 
@@ -1066,6 +1078,64 @@ mod tests {
                 out, expected,
                 "mismatch at index {i}: src={src}, got={out}, expected={expected}"
             );
+        }
+    }
+
+    /// Documents the NaN semantics of the fast Clip path.
+    ///
+    /// On aarch64: `vmaxq_f32`/`vminq_f32` propagate NaN (same as the old scalar
+    /// `PartialOrd` reference). NaN behaviour is **unchanged** on macOS.
+    ///
+    /// On non-aarch64: the scalar fallback uses `f32::max`/`f32::min` which are
+    /// NaN-suppressing (IEEE 754-2008 `maxNum`/`minNum`). This differs from the
+    /// old `PartialOrd` reference but matches MLAS. ONNX Clip spec does not
+    /// define NaN behaviour, so both are conformant.
+    #[test]
+    fn clip_f32_fast_path_nan_semantics() {
+        let before = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let data = [f32::NAN, 1.0, f32::NAN, -f32::NAN, 3.0];
+        let x = Owned::f32(&[5], &data);
+        let lo = Owned::f32(&[], &[0.0]);
+        let hi = Owned::f32(&[], &[6.0]);
+        let mut y = Owned::zeros_f32(&[5]);
+        ClipKernel {
+            min: None,
+            max: None,
+        }
+        .execute(&[x.view(), lo.view(), hi.view()], &mut [y.view_mut()])
+        .unwrap();
+        let after = CLIP_F32_FAST_TEST_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after > before,
+            "fast path did not fire for NaN test: before={before} after={after}"
+        );
+        let result = y.to_f32();
+        // On aarch64: vmaxq/vminq propagate NaN (unchanged from old PartialOrd reference).
+        // On non-aarch64: f32::max/min suppress NaN to min (matches MLAS).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(
+                result[0].is_nan(),
+                "aarch64: NaN propagates through vmaxq/vminq"
+            );
+            assert_eq!(result[1], 1.0);
+            assert!(
+                result[2].is_nan(),
+                "aarch64: NaN propagates through vmaxq/vminq"
+            );
+            assert!(
+                result[3].is_nan(),
+                "aarch64: -NaN propagates through vmaxq/vminq"
+            );
+            assert_eq!(result[4], 3.0);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert_eq!(result[0], 0.0, "non-aarch64: NaN suppressed to min");
+            assert_eq!(result[1], 1.0);
+            assert_eq!(result[2], 0.0, "non-aarch64: NaN suppressed to min");
+            assert_eq!(result[3], 0.0, "non-aarch64: -NaN suppressed to min");
+            assert_eq!(result[4], 3.0);
         }
     }
 }
