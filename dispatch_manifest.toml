@@ -170,12 +170,21 @@ description = "Contiguous same-shape f32 Add uses vDSP_vadd"
 
 [[claim]]
 op = "Conv"
-variant = "grouped_depthwise"
+variant = "depthwise_neon_direct"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "CONV_NEON_DEPTHWISE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "Depthwise Conv (groups==IC==OC) uses direct NEON kernel, no im2col buffer"
+
+[[claim]]
+op = "Conv"
+variant = "grouped_not_depthwise"
 platform = "all"
 minimum_tier = "tier2"
 counter = "CONV_IM2COL_GEMM_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
-description = "Grouped/depthwise Conv dispatches to im2col+GEMM (BNNS legacy API rejects groups>1)"
+description = "Grouped-but-not-depthwise Conv dispatches to im2col+GEMM"
 
 [[exclusion]]
 op = "MatMul"
