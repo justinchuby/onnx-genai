@@ -79,6 +79,11 @@ image = { workspace = true, features = ["png"] }
 onnx-genai = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# PTY-driven e2e tests: openpty/dup to verify TTY-only rendering branches.
+# nix is already in the dependency tree via ctrlc; no version bump needed.
+nix = { version = "0.31", default-features = false }
+
 [dependencies.pyo3]
 version = "0.29"
 # `abi3-py310` builds against the limited API (a single cp310-abi3 module usable
