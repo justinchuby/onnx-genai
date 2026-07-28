@@ -56,6 +56,48 @@ pub struct Request {
 pub struct ScheduledRequest {
     pub request_id: u64,
     pub seq_id: SequenceId,
+    /// The admitted generation ceiling. This can be lower than the requested
+    /// ceiling when the shared byte budget can conservatively guarantee a
+    /// smaller run but not the caller's larger safety ceiling.
+    pub max_tokens: usize,
+}
+
+/// Why a queued request could not be admitted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SchedulerAdmissionError {
+    #[error(
+        "scheduler admission failed: running batch is full (running {running} sequences, \
+         max_batch_size {max_batch_size}); wait for a running request to finish or raise \
+         SchedulerConfig::max_batch_size"
+    )]
+    BatchFull {
+        running: usize,
+        max_batch_size: usize,
+    },
+    #[error(
+        "scheduler admission failed: KV byte budget cannot reserve even one generated token for \
+         request {request_id} on sequence {seq_id}: requested {requested} B for the full ceiling \
+         ({prompt_tokens} prompt + {max_tokens} max_new_tokens at {bytes_per_token} B/token), \
+         minimum required {minimum_required} B ({prompt_tokens} prompt + 1 generated token), but \
+         only {available} B free (used {used} B of {limit} B limit, shortfall {shortfall} B; \
+         running {running}/{max_batch_size} sequences); raise --vram-limit, reduce concurrent \
+         requests, shorten the prompt, or lower --max-new-tokens"
+    )]
+    ByteBudget {
+        request_id: u64,
+        seq_id: SequenceId,
+        prompt_tokens: usize,
+        max_tokens: usize,
+        bytes_per_token: u64,
+        requested: u64,
+        minimum_required: u64,
+        used: u64,
+        limit: u64,
+        available: u64,
+        shortfall: u64,
+        running: usize,
+        max_batch_size: usize,
+    },
 }
 
 /// A sequence currently in the running batch.
@@ -241,16 +283,104 @@ impl Scheduler {
     /// This is intentionally single-request for the first session integration;
     /// full continuous batching will replace this with batch formation.
     pub fn drive_next_fcfs(&mut self) -> Option<ScheduledRequest> {
-        if self.running.len() >= self.config.max_batch_size || self.waiting.is_empty() {
-            return None;
+        self.drive_next_fcfs_result().ok().flatten()
+    }
+
+    /// Admit one queued request using FCFS and report why admission failed.
+    pub fn drive_next_fcfs_result(
+        &mut self,
+    ) -> Result<Option<ScheduledRequest>, SchedulerAdmissionError> {
+        if self.running.len() >= self.config.max_batch_size {
+            return Err(SchedulerAdmissionError::BatchFull {
+                running: self.running.len(),
+                max_batch_size: self.config.max_batch_size,
+            });
+        }
+        if self.waiting.is_empty() {
+            return Ok(None);
+        }
+        let request = self.waiting.remove(0);
+        let (request, bytes) = match self.reserve_or_cap_request(&request) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.waiting.insert(0, request);
+                return Err(error);
+            }
+        };
+        self.push_admitted_request(request.clone(), bytes);
+        Ok(Some(ScheduledRequest {
+            request_id: request.id,
+            seq_id: request.seq_id,
+            max_tokens: request.max_tokens,
+        }))
+    }
+
+    fn reserve_or_cap_request(
+        &self,
+        request: &Request,
+    ) -> Result<(Request, u64), SchedulerAdmissionError> {
+        let mut admitted = request.clone();
+        let requested_bytes = self.estimated_bytes(request.prompt_tokens, request.max_tokens);
+        match self.try_reserve_bytes(requested_bytes) {
+            Ok(()) => return Ok((admitted, requested_bytes)),
+            Err(error) => {
+                let Some(admitted_max_tokens) =
+                    self.max_tokens_for_available_bytes(request.prompt_tokens, error.available)
+                else {
+                    return Err(self.admission_byte_error(request, requested_bytes, error));
+                };
+                admitted.max_tokens = admitted_max_tokens.min(request.max_tokens);
+            }
         }
 
-        let request = self.waiting.remove(0);
-        let bytes = self.estimated_bytes(request.prompt_tokens, request.max_tokens);
-        if !self.try_reserve_bytes(bytes) {
-            self.waiting.insert(0, request);
+        let capped_bytes = self.estimated_bytes(admitted.prompt_tokens, admitted.max_tokens);
+        match self.try_reserve_bytes(capped_bytes) {
+            Ok(()) => Ok((admitted, capped_bytes)),
+            Err(error) => Err(self.admission_byte_error(request, requested_bytes, error)),
+        }
+    }
+
+    fn max_tokens_for_available_bytes(
+        &self,
+        prompt_tokens: usize,
+        available: u64,
+    ) -> Option<usize> {
+        let bytes_per_token = self.config.bytes_per_token?;
+        if bytes_per_token == 0 {
             return None;
         }
+        let available_tokens = (available / bytes_per_token) as usize;
+        available_tokens
+            .checked_sub(prompt_tokens)
+            .filter(|&n| n > 0)
+    }
+
+    fn admission_byte_error(
+        &self,
+        request: &Request,
+        requested_bytes: u64,
+        error: ByteBudgetError,
+    ) -> SchedulerAdmissionError {
+        let minimum_required = self.estimated_bytes(request.prompt_tokens, 1);
+        SchedulerAdmissionError::ByteBudget {
+            request_id: request.id,
+            seq_id: request.seq_id,
+            prompt_tokens: request.prompt_tokens,
+            max_tokens: request.max_tokens,
+            bytes_per_token: self.config.bytes_per_token.unwrap_or(0),
+            requested: requested_bytes,
+            minimum_required,
+            used: error.used,
+            limit: error.limit,
+            available: error.available,
+            shortfall: minimum_required.saturating_sub(error.available),
+            running: self.running.len(),
+            max_batch_size: self.config.max_batch_size,
+        }
+    }
+
+    fn push_admitted_request(&mut self, request: Request, bytes: u64) -> SequenceId {
+        let seq_id = request.seq_id;
         self.running.push(RunningSequence {
             seq_id: request.seq_id,
             request_id: request.id,
@@ -261,10 +391,7 @@ impl Scheduler {
             arrived_at: request.arrived_at,
             reserved_bytes: bytes,
         });
-        Some(ScheduledRequest {
-            request_id: request.id,
-            seq_id: request.seq_id,
-        })
+        seq_id
     }
 
     /// Called each iteration to decide what to run.
@@ -296,26 +423,20 @@ impl Scheduler {
             };
             match candidate {
                 Candidate::Waiting(request) => {
-                    let bytes = self.estimated_bytes(request.prompt_tokens, request.max_tokens);
-                    if !self.try_reserve_bytes(bytes) {
-                        self.waiting.push(request);
-                        break;
-                    }
-                    decision.prefill.push(request.seq_id);
-                    self.running.push(RunningSequence {
-                        seq_id: request.seq_id,
-                        request_id: request.id,
-                        prompt_tokens: request.prompt_tokens,
-                        generated_tokens: 0,
-                        max_tokens: request.max_tokens,
-                        priority: request.priority,
-                        arrived_at: request.arrived_at,
-                        reserved_bytes: bytes,
-                    });
+                    let (request, bytes) = match self.reserve_or_cap_request(&request) {
+                        Ok(admitted) => admitted,
+                        Err(_) => {
+                            self.waiting.push(request);
+                            break;
+                        }
+                    };
+                    let seq_id = request.seq_id;
+                    self.push_admitted_request(request, bytes);
+                    decision.prefill.push(seq_id);
                 }
                 Candidate::Swapped(mut sequence) => {
                     let bytes = self.estimated_bytes(sequence.prompt_tokens, sequence.max_tokens);
-                    if !self.try_reserve_bytes(bytes) {
+                    if self.try_reserve_bytes(bytes).is_err() {
                         self.swapped.push(sequence);
                         break;
                     }
@@ -354,6 +475,23 @@ impl Scheduler {
         self.swapped.retain(|s| s.seq_id != seq_id);
     }
 
+    /// Cancel a queued or running request and release any hot-tier reservation it
+    /// owns. Engine callers use this when admission was attempted for a
+    /// synchronous request but the request cannot proceed.
+    pub fn cancel_request(&mut self, request_id: u64) {
+        self.waiting.retain(|request| request.id != request_id);
+        if let Some(pos) = self
+            .running
+            .iter()
+            .position(|sequence| sequence.request_id == request_id)
+        {
+            let sequence = self.running.remove(pos);
+            self.release_bytes(sequence.reserved_bytes);
+        }
+        self.swapped
+            .retain(|sequence| sequence.request_id != request_id);
+    }
+
     /// Number of waiting requests.
     pub fn waiting_count(&self) -> usize {
         self.waiting.len()
@@ -367,6 +505,14 @@ impl Scheduler {
     /// Number of preempted requests waiting to resume.
     pub fn swapped_count(&self) -> usize {
         self.swapped.len()
+    }
+
+    /// Admitted generation ceiling for a running sequence.
+    pub fn running_max_tokens(&self, seq_id: SequenceId) -> Option<usize> {
+        self.running
+            .iter()
+            .find(|sequence| sequence.seq_id == seq_id)
+            .map(|sequence| sequence.max_tokens)
     }
 
     fn apply_preemption(&mut self, decision: &mut ScheduleDecision) {
@@ -413,12 +559,12 @@ impl Scheduler {
         }
     }
 
-    /// Reserve `bytes` against the shared budget. Returns `true` when there is no
-    /// budget (accounting disabled) or the reservation succeeds.
-    fn try_reserve_bytes(&self, bytes: u64) -> bool {
+    /// Reserve `bytes` against the shared budget. Returns `Ok(())` when there is
+    /// no budget (accounting disabled) or the reservation succeeds.
+    fn try_reserve_bytes(&self, bytes: u64) -> Result<(), ByteBudgetError> {
         match &self.byte_budget {
-            Some(budget) => budget.try_reserve(bytes).is_ok(),
-            None => true,
+            Some(budget) => budget.try_reserve(bytes),
+            None => Ok(()),
         }
     }
 
@@ -428,7 +574,6 @@ impl Scheduler {
             budget.release(bytes);
         }
     }
-
     fn has_capacity_for_candidate(&self) -> bool {
         self.running.len() < self.config.max_batch_size
             && self.running_token_budget() < self.config.max_total_tokens
@@ -677,8 +822,9 @@ mod tests {
     #[test]
     fn byte_budget_gates_admission_below_token_and_batch_budget() {
         // 10 bytes/token, footprint = (prompt 4 + max 6) * 10 = 100 B each.
-        // Budget of 250 B admits only 2 of 3 otherwise-eligible sequences.
-        let budget = ByteBudget::new(250);
+        // Budget of 240 B admits only 2 of 3: the remaining 40 B cannot
+        // conservatively cover even prompt + one generated token for seq 3.
+        let budget = ByteBudget::new(240);
         let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
         scheduler.enqueue_generate_request(1, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(2, 4, 6, Priority::Normal);
@@ -694,7 +840,7 @@ mod tests {
 
     #[test]
     fn completion_releases_bytes_and_admits_waiting_sequence() {
-        let budget = ByteBudget::new(250);
+        let budget = ByteBudget::new(240);
         let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(10), budget.clone());
         scheduler.enqueue_generate_request(1, 4, 6, Priority::Normal);
         scheduler.enqueue_generate_request(2, 4, 6, Priority::Normal);
@@ -714,7 +860,7 @@ mod tests {
     #[test]
     fn shared_budget_is_accounted_across_two_schedulers() {
         // One device budget shared by two sessions/models (DESIGN §26.11.3).
-        let device_budget = ByteBudget::new(250);
+        let device_budget = ByteBudget::new(240);
         let mut session_a =
             Scheduler::with_byte_budget(byte_budget_config(10), device_budget.clone());
         let mut session_b =
@@ -726,7 +872,7 @@ mod tests {
         assert_eq!(a_decision.prefill, vec![1, 2]);
         assert_eq!(device_budget.used(), 200);
 
-        // Only 50 B remain device-wide, so session B cannot admit its 100 B request.
+        // Only 40 B remain device-wide, so session B cannot admit prompt + one token.
         session_b.enqueue_generate_request(3, 4, 6, Priority::Normal);
         let b_decision = session_b.schedule();
         assert!(b_decision.prefill.is_empty());
@@ -803,5 +949,115 @@ mod tests {
         let decision = scheduler.schedule();
         assert_eq!(decision.prefill, vec![1, 2]);
         assert!(scheduler.byte_budget().is_none());
+    }
+
+    #[test]
+    fn full_context_ceiling_is_capped_to_budget_preserving_conservative_reservation() {
+        let budget = ByteBudget::new(640);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
+        scheduler.enqueue_generate_request(42, 512, 3584, Priority::Normal);
+
+        let scheduled = scheduler.drive_next_fcfs_result().unwrap().unwrap();
+
+        assert_eq!(scheduled.seq_id, 42);
+        assert_eq!(scheduled.max_tokens, 128);
+        assert_eq!(scheduler.running_max_tokens(42), Some(128));
+        assert_eq!(budget.used(), 640);
+        assert_eq!(scheduler.waiting_count(), 0);
+    }
+
+    #[test]
+    fn long_multi_turn_session_is_not_rejected_purely_because_ceiling_grew() {
+        let budget = ByteBudget::new(1024);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
+
+        for (prompt_tokens, expected_max_tokens) in [(128, 896), (300, 724), (600, 424)] {
+            scheduler.enqueue_generate_request(
+                7,
+                prompt_tokens,
+                4096 - prompt_tokens,
+                Priority::Normal,
+            );
+            let scheduled = scheduler.drive_next_fcfs_result().unwrap().unwrap();
+            assert_eq!(scheduled.seq_id, 7);
+            assert_eq!(scheduled.max_tokens, expected_max_tokens);
+            assert_eq!(budget.used(), 1024);
+            scheduler.complete(7);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_turns_release_capped_reservations_without_leaking() {
+        let budget = ByteBudget::new(640);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
+
+        for _ in 0..5 {
+            scheduler.enqueue_generate_request(7, 512, 3584, Priority::Normal);
+            let scheduled = scheduler.drive_next_fcfs_result().unwrap().unwrap();
+            assert_eq!(scheduled.max_tokens, 128);
+            assert_eq!(scheduler.running_count(), 1);
+            scheduler.complete(7);
+            assert_eq!(scheduler.running_count(), 0);
+            assert_eq!(scheduler.waiting_count(), 0);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn cancel_request_clears_failed_or_running_turn_state() {
+        let budget = ByteBudget::new(500);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget.clone());
+
+        let failed = scheduler.enqueue_generate_request(7, 512, 3584, Priority::Normal);
+        assert!(scheduler.drive_next_fcfs_result().is_err());
+        assert_eq!(scheduler.waiting_count(), 1);
+        scheduler.cancel_request(failed);
+        assert_eq!(scheduler.waiting_count(), 0);
+        assert_eq!(budget.used(), 0);
+
+        budget.reconfigure(640);
+        let admitted = scheduler.enqueue_generate_request(8, 512, 3584, Priority::Normal);
+        scheduler.drive_next_fcfs_result().unwrap().unwrap();
+        assert_eq!(budget.used(), 640);
+        scheduler.cancel_request(admitted);
+        assert_eq!(scheduler.running_count(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn admission_failure_names_cause_and_actionable_budget_numbers() {
+        let budget = ByteBudget::new(500);
+        let mut scheduler = Scheduler::with_byte_budget(byte_budget_config(1), budget);
+        scheduler.enqueue_generate_request(9, 512, 3584, Priority::Normal);
+
+        let err = scheduler.drive_next_fcfs_result().unwrap_err();
+        let text = err.to_string();
+
+        assert!(text.contains("KV byte budget"), "{text}");
+        assert!(text.contains("requested 4096 B"), "{text}");
+        assert!(text.contains("minimum required 513 B"), "{text}");
+        assert!(text.contains("only 500 B free"), "{text}");
+        assert!(text.contains("shortfall 13 B"), "{text}");
+        assert!(text.contains("running 0/32 sequences"), "{text}");
+        assert!(text.contains("raise --vram-limit"), "{text}");
+        assert!(text.contains("lower --max-new-tokens"), "{text}");
+    }
+
+    #[test]
+    fn batch_full_failure_names_running_count_and_limit() {
+        let mut cfg = byte_budget_config(1);
+        cfg.max_batch_size = 1;
+        let mut scheduler = Scheduler::with_byte_budget(cfg, ByteBudget::new(10_000));
+        scheduler.enqueue_generate_request(1, 4, 6, Priority::Normal);
+        scheduler.drive_next_fcfs_result().unwrap().unwrap();
+        scheduler.enqueue_generate_request(2, 4, 6, Priority::Normal);
+
+        let err = scheduler.drive_next_fcfs_result().unwrap_err();
+        let text = err.to_string();
+
+        assert!(text.contains("running batch is full"), "{text}");
+        assert!(text.contains("running 1 sequences"), "{text}");
+        assert!(text.contains("max_batch_size 1"), "{text}");
     }
 }
