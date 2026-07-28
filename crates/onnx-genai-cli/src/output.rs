@@ -102,11 +102,15 @@ fn runtime_trace_events() -> Vec<serde_json::Value> {
 /// Suppressed while `--profile` is on, which already prints every one of these
 /// numbers and more; printing both would just repeat the turn twice.
 pub(super) fn emit_stats_line(show_stats: bool, show_profile: bool, profile: &mut RunProfile) {
-    if !show_stats || show_profile {
+    if !should_emit_stats_line(show_stats, show_profile) {
         return;
     }
     profile.memory.sample_peak();
     eprintln!("{}", profile.to_stats_line());
+}
+
+fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
+    show_stats && !show_profile
 }
 
 /// Build the prompt string sent to the engine for the current turn.
@@ -251,4 +255,16 @@ pub(super) fn display_paths(paths: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_emit_stats_line;
+
+    #[test]
+    fn profile_text_report_suppresses_the_compact_stats_line() {
+        assert!(should_emit_stats_line(true, false));
+        assert!(!should_emit_stats_line(true, true));
+        assert!(!should_emit_stats_line(false, false));
+    }
 }

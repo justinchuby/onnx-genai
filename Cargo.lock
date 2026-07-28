@@ -1468,6 +1468,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -2206,6 +2208,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -2301,6 +2304,7 @@ dependencies = [
  "onnx-genai-metadata",
  "onnx-genai-ort-sys",
  "onnx-genai-runtime-config",
+ "onnx-model-package",
  "onnx-runtime-loader",
  "onnx-runtime-tracer",
  "onnx-std",
@@ -2316,6 +2320,8 @@ name = "onnx-genai-ort-sys"
 version = "0.1.0-dev.5"
 dependencies = [
  "bindgen",
+ "libloading 0.8.9",
+ "onnx-genai-runtime-config",
  "sha2",
  "zip",
 ]
@@ -2408,6 +2414,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-model-package"
+version = "0.1.0-dev.5"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "onnx-runtime-capi"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2479,6 +2495,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
+ "onnx-runtime-operator-selection",
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
  "onnx-runtime-tracer",
@@ -2533,6 +2550,10 @@ dependencies = [
  "onnx-runtime-ir",
  "thiserror 2.0.19",
 ]
+
+[[package]]
+name = "onnx-runtime-operator-selection"
+version = "0.1.0-dev.5"
 
 [[package]]
 name = "onnx-runtime-optimizer"
@@ -4131,8 +4152,15 @@ dependencies = [
  "serde",
  "serde_spanned",
  "toml_datetime",
+ "toml_write",
  "winnow",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tower"
@@ -4772,6 +4800,17 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xtask"
+version = "0.1.0-dev.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "onnx-runtime-operator-selection",
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "yoke"

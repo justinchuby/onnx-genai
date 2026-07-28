@@ -104,6 +104,9 @@ jobs:
       - name: Check dispatch branches have reachability tests
         run: python3 scripts/check_dispatch_reachability.py
 
+      - name: Check dispatch manifest claims have proving counters
+        run: python3 scripts/check_dispatch_manifest.py
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.
@@ -139,6 +142,12 @@ jobs:
           -p onnx-runtime-comm
           -p onnx-std-python
           -- -D warnings
+
+      # x86_64-apple-darwin changes target_arch but leaves target_os="macos",
+      # so cfg(target_os) errors are invisible.  This step uses a genuine Linux
+      # target that exercises BOTH dimensions.  PR #317 proved the gap.
+      - name: Cross-target compile check (catches os-gating errors)
+        run: bash scripts/check_cross_compile.sh
 
       # onnx-genai-engine's native decode path only compiles when this feature
       # is on. Without this step a refactor can leave it uncompilable while

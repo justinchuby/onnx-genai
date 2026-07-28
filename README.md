@@ -114,11 +114,12 @@ entire process must be confined.
 `onnx-genai run <model>` starts an interactive REPL. In a terminal it uses a
 rich line editor with cursor movement, persistent history, bracketed paste,
 slash-command completion, and multiline input via Alt+Enter (Enter submits).
-Interactive terminal sessions show compact per-turn stats by default; pass
-`--no-stats` to start with them hidden. If stdin or stdout is piped, the REPL
-keeps the original plain `>>> ` line loop for script compatibility. One Ctrl-C
-stops the current generation; two in a row exit. Slash commands control the
-session:
+Interactive terminal text generation shows compact per-turn stats by default;
+pass `--no-stats` to hide them. Stats are enabled only when stdin and stdout are
+terminals, and they are printed to stderr; piped stdout remains byte-stable
+generated text. If stdin or stdout is piped, the REPL keeps the original plain
+`>>> ` line loop for script compatibility. One Ctrl-C stops the current
+generation; two in a row exit. Slash commands control the session:
 
 ```text
 >>> /help
@@ -156,8 +157,10 @@ the command says so rather than printing a report that is quietly missing its
 most detailed section.
 
 `/stats` toggles per-turn numbers, for watching throughput and cache behavior
-without the full `--profile` report. While a reply streams, the numbers update
-live beneath it; when the turn ends they settle into one line:
+without the full `--profile` report. `generate` uses the same compact line for
+terminal text generation unless `--no-stats` is passed. While a REPL reply
+streams, the numbers update live beneath it; when the turn ends they settle into
+one line:
 
 ```text
 [ 613 in · 64 out · 41.2 tok/s · ttft 116 ms · 598 reused · encoder 1/1 · rss 2.5 GiB ]
@@ -166,9 +169,9 @@ live beneath it; when the turn ends they settle into one line:
 The live view is drawn with [ratatui](https://ratatui.rs) into an *inline*
 viewport rather than an alternate screen, so finished lines spill into the
 terminal's own scrollback and the conversation stays selectable, copyable, and
-present after the session ends. It is used only on a terminal and only once
-`/stats` is on: a piped session, and any session that did not ask for numbers,
-gets exactly the plain streaming output it got before.
+present after the session ends. Compact stats are used only on a terminal and go
+to stderr for `generate`: a piped session, or one started with `--no-stats`, gets
+exactly the plain streaming output it got before.
 
 ### Image and audio input
 

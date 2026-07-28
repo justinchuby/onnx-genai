@@ -1,6 +1,6 @@
 //! Linear-algebra rules: `MatMul` (NumPy semantics) and `Gemm`.
 
-use onnx_runtime_ir::Attribute;
+use onnx_runtime_ir::{Attribute, DataType};
 
 use crate::context::InferenceContext;
 use crate::dim_expr::DimExpr;
@@ -700,10 +700,36 @@ pub fn gemm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
 }
 
 /// Register the linear-algebra family.
+/// `Det` (opset 11): the determinant of the innermost 2-D square matrices.
+///
+/// An input of shape `[*, M, M]` produces `[*]` — the trailing two axes (the
+/// square matrix) collapse to a single scalar determinant per batch element.
+/// A scalar matrix input `[M, M]` yields a rank-0 output. The dtype is
+/// preserved (floating point per the ONNX schema).
+pub fn det(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    if x.len() < 2 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "Det".into(),
+            index: 0,
+            rank: x.len(),
+            detail: "expected [*, M, M]".into(),
+        });
+    }
+    let out = x[..x.len() - 2].to_vec();
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
+/// Register the linear-algebra family.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MatMul", 1, matmul);
     reg.register("", "QLinearMatMul", 10, qlinear_matmul);
     reg.register("", "Gemm", 1, gemm);
+    reg.register("", "Det", 11, det);
     reg.register("pkg.nxrt", "BlockQuantizedMatMul", 1, quantized_matmul);
     reg.register("com.microsoft", "MatMulNBits", 1, quantized_matmul);
     // com.microsoft fused matmul honors transA/transB/transBatch attributes.

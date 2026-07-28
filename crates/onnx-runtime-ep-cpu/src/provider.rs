@@ -188,6 +188,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "VarlenAttention"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::varlen_attention::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "ScatterND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
@@ -529,16 +536,41 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "device")]
     fn deallocate_rejects_cross_device_buffer() {
         let ep = CpuExecutionProvider::new();
         // Fabricate a buffer tagged with a CUDA device to trip invariant #3.
         let boxed = vec![0u8; 8].into_boxed_slice();
         let ptr = Box::into_raw(boxed) as *mut c_void;
         // SAFETY: valid 8-byte host allocation; we only use it to exercise the
-        // device assert. It leaks on the panic path, which is fine in a test.
+        // device assert. The allocation is reclaimed after catching the panic.
         let foreign = unsafe { DeviceBuffer::from_raw_parts(ptr, DeviceId::cuda(0), 8, 8) };
-        let _ = ep.deallocate(foreign); // must panic before freeing
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = ep.deallocate(foreign); // must panic before freeing
+        }));
+        let panic = result.expect_err("cross-device deallocate must panic before freeing");
+        let message = if let Some(message) = panic.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic.downcast_ref::<&str>() {
+            *message
+        } else {
+            panic!("cross-device deallocate panic used a non-string payload");
+        };
+        assert!(
+            message.contains("cpu_ep: refusing to deallocate a buffer from device"),
+            "unexpected deallocate panic: {message}"
+        );
+        assert!(
+            message.contains("Cuda") || message.contains("cuda"),
+            "cross-device deallocate panic did not identify the foreign CUDA device: {message}"
+        );
+        // SAFETY: `deallocate` panicked before freeing, so `ptr` still names the
+        // original boxed slice allocation.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                ptr as *mut u8,
+                8,
+            )));
+        }
     }
 
     #[test]
@@ -557,12 +589,15 @@ mod tests {
     }
 
     #[test]
-    fn supports_op_reports_phase1_only() {
+    fn supports_op_reflects_selected_operator_groups() {
         let ep = CpuExecutionProvider::new();
         let mm = Node::new(onnx_runtime_ir::NodeId(0), "MatMul", vec![], vec![]);
         assert!(ep.supports_op(&mm, 17, &[], &[], &[]).is_supported());
         let conv = Node::new(onnx_runtime_ir::NodeId(1), "Conv", vec![], vec![]);
-        assert!(ep.supports_op(&conv, 17, &[], &[], &[]).is_supported());
+        assert_eq!(
+            ep.supports_op(&conv, 17, &[], &[], &[]).is_supported(),
+            cfg!(feature = "ops-cnn")
+        );
     }
 
     #[test]

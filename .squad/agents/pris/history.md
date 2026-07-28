@@ -89,6 +89,16 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #293 Unique data-dependent-extent coverage and recorded durable dispatch coverage/reachability audit lessons.
 
+## 2026-07-28T00:35:00Z — Per-PR benchmark CI workflow (PR #306)
+
+- Implemented `.github/workflows/benchmark.yml`: separate benchmark workflow running kernel micro-benchmarks and hot-path benchmarks on every PR, posting a comparison comment.
+- Design: benchmarks merge-base FIRST (cold-start), PR SECOND (warm runner). Systematic bias toward PR appearing faster reduces false positives.
+- Workload: ep-cpu kernels (MatMul at M=1 decode + prefill shapes, Add, Gather, ReduceMean × f32/f16/bf16) + genai-bench no_model (tokenization, sampling, KV cache, logit processing, grammar).
+- **Informational only** (per Justin's direction): does NOT block CI. Visual flags ⚠️ ≥15%, 🔴 ≥30% calibrated against measured runner noise (~27% worst-case).
+- Real regression gates stay in `profile_native.rs` (throughput floors + dispatch-reachability tests on real hardware).
+- Regression-detection proof: simulated 4.5× M=1 slowdown → six 🔴 lines at +350%, header "🔴 Benchmark Regression Detected". Unmissable for reviewer.
+- CI proof: runs green on PR (22m on macOS arm64 M1 Virtual 3-core). Comment updated in place on re-push.
+- Decision filed: `.squad/decisions/inbox/pris-benchmark-ci.md`.
 ## 2026-07-27T17:59:12-07:00 — PR #296 review fixes
 - Fixed cargo cache key correctness: keys now include OS, runner architecture, actual target triple, rustc release, cached cargo tool version, and `Cargo.lock`; this prevents `windows-latest` and `windows-11-arm` from sharing `target/` or `~/.cargo/bin` artifacts.
 - Confirmed `audit.yml` does not use clippy or rustfmt and removed those rustup components from the audit toolchain install.
@@ -109,3 +119,5 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Added `cargo test --locked -p onnx-runtime-loader pathsafe` to the fast Windows CLI lane so `rejects_rooted_path` continues to run before merge. This is the narrow exception to the pure-Rust-offline-on-Linux rule because Windows path semantics are the behavior under test.
 - Rechecked the Windows cfg audit: no other meaningful `#[cfg(windows)]` tests in the offline crate suite; remaining hits are Windows-specific implementation code in tracer/decode affinity or ORT/CUDA code outside the offline crate set.
 - Measured repeat fast run 30342667705 at 3m45s wall-clock; critical path `Rust (Linux x86_64)` at 3m40s, Windows CLI at 3m26s, loader path-safety step 12s. First run on the commit was 7m31s from Windows cache/build variance, with loader step 34s.
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- CI supply-chain and coverage hardening note was merged into decisions.

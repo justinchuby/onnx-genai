@@ -59,6 +59,7 @@ skip = "*-musllinux_*"
 test-command = 'python -c "import nxrt"'
 
 [tool.cibuildwheel.linux]
-# Linux wheel builds run inside a manylinux container, so provision Rust.
-before-all = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+# Linux wheel builds run inside a manylinux container, so provision bindgen's
+# libclang dependency and Rust.
+before-all = "dnf install -y clang-devel && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }

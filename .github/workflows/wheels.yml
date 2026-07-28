@@ -15,6 +15,10 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -44,6 +48,11 @@ jobs:
       CIBW_ARCHS: ${{ matrix.archs }}
       # maturin adds this Cargo feature to [tool.maturin].features (abi3-py310).
       CIBW_CONFIG_SETTINGS: ${{ matrix.cibw_config_settings }}
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
+      # DXCore is a Windows API set resolved by the OS loader, not a DLL to vendor.
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+        delvewheel repair --exclude ext-ms-win-dxcore-l1-1-0.dll
+        -w {dest_dir} -v {wheel}
 
     steps:
       - uses: actions/checkout@v5
@@ -52,7 +61,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep wheel publishing on Rust stable deliberately: this follows Rust's
+      # stability promise without freezing security fixes.
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Pull manylinux image with retries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          image="$CIBW_MANYLINUX_X86_64_IMAGE"
+          for attempt in 1 2 3; do
+            docker pull "$image" && exit 0
+            echo "manylinux image pull attempt $attempt failed"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Build and smoke-test CPU wheel
         uses: pypa/cibuildwheel@v4.1.0
@@ -93,7 +120,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep wheel publishing on Rust stable deliberately: this follows Rust's
+      # stability promise without freezing security fixes.
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       # The CUDA EP dynamically loads CUDA, so compilation needs no GPU. Release
       # promotion still requires CUDA-enabled self-hosted runners to verify the

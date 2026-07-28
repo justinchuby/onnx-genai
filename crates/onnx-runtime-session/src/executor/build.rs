@@ -376,7 +376,7 @@ pub(super) fn build_lazy_weight_handles(
         let shape = weight.dims().to_vec();
         let weight = weight.clone();
         let store = Arc::clone(weights);
-        let lazy = LazyWeight::block_quantized_moe(vec![region], move || {
+        let lazy = LazyWeight::block_quantized_moe(dtype, shape.clone(), vec![region], move || {
             let bytes = store.bytes(&weight).ok_or_else(|| {
                 onnx_runtime_ep_api::WeightHandleError::InvalidResident(
                     "external weight bytes are no longer available".into(),
@@ -451,6 +451,7 @@ impl Executor {
         // 4) name → value id and the set of caller-required inputs.
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
 
+        let plan_len = plan.len();
         let mut exec = Self {
             graph,
             weights,
@@ -505,6 +506,7 @@ impl Executor {
             decode_view_plan_disabled: false,
             compute_in_place_enabled: compute_in_place_env_enabled(),
             compute_in_place_alias_count: 0,
+            kernel_bindings: vec![None; plan_len],
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -1513,7 +1515,7 @@ impl Executor {
                 .collect();
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
-            self.cache.get_or_create(
+            let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
                 &input_shapes,
@@ -1522,6 +1524,9 @@ impl Executor {
                 opset,
                 self.ep.as_ref(),
             )?;
+            // Pre-populate the kernel binding so the first decode step already
+            // hits the zero-alloc fast path for static-shape graphs.
+            self.kernel_bindings[i] = Some(key);
         }
         if let Some(span) = span.as_mut() {
             span.set_args(

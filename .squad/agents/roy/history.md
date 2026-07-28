@@ -167,3 +167,17 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Reviewed PR #301 / #85, requested changes for control-flow capture liveness, then approved Deckard capture-aware last-use fix.
+
+## 2026-07-27T20:42:16-07:00 — Integration stress design
+
+- Authored `docs/research/testing/00-integration-stress-design.md` for Justin's request to stress-test real multi-turn backend mechanisms.
+- Centered the design on invariants rather than exact stochastic output: termination, non-empty committed turns, reasoning progress, repetition bounds, token/history/KV consistency, scheduler liveness, sampling observability, feature-state coherence, and reproducible failure packets.
+- Recommended phase 1 as a committed tiny reasoning fixture plus per-PR CPU ORT REPL stress; CUDA DeepSeek/native and ORT CUDA shared-GQA failures require self-hosted/manual GPU lanes.
+- Dropped decision inbox note `.squad/decisions/inbox/roy-stress-test-design.md`.
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Approved PR #313 decode-garble triage and byte-identity/fires regression guard; repeated-sentence output classified as natural greedy behavior.
+
+## 2026-07-27T23:31:47-07:00 — Integration stress fixture audit
+
+- Corrected `docs/research/testing/00-integration-stress-design.md` after PR #330 review: replaced stale fixture tier claims with an on-disk inventory of every `tests/fixtures/` directory, including `.onnx` vs `.onnx.textproto` formats and stress-harness suitability.
+- Verified concrete references for `repl_e2e.rs`, `cli-ort`, bench binaries, and the Qwen/GLM env-var tests; clarified that current Qwen real-model env vars are native-CUDA locks, not CPU ORT fixtures.

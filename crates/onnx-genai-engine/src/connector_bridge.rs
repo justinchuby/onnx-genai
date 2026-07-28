@@ -453,8 +453,8 @@ fn location_load_ms(location: &KvCacheLocation) -> Option<f64> {
 mod tests {
     use super::*;
     use onnx_genai_kv::{
-        ConnectorCapabilities, ConnectorHealth, ConnectorResult, Device, FetchedKv, KvLayerPayload,
-        KvPayloadDtype, LocalTieredConfig, LocalTieredConnector,
+        ConnectorCapabilities, ConnectorHealth, ConnectorResult, Device, DiskTierConfig, FetchedKv,
+        KvLayerPayload, KvPayloadDtype, LocalTieredConfig, LocalTieredConnector,
     };
     use std::sync::Mutex;
 
@@ -690,6 +690,60 @@ mod tests {
         assert_eq!(outcome.chunks[0].payload.num_tokens, 4);
         assert_eq!(outcome.chunks[1].start, 8);
         assert_eq!(bridge.stats().fetched_tokens, 8);
+    }
+
+    #[test]
+    fn disk_offloaded_fetch_extension_matches_resident_decode_input() {
+        let tokens: Vec<TokenId> = (0..12).collect();
+        let resident_connector = Arc::new(
+            LocalTieredConnector::new(LocalTieredConfig {
+                chunk_size: 4,
+                page_size: 4,
+                ..LocalTieredConfig::default()
+            })
+            .unwrap(),
+        );
+        let mut resident = bridge_over(resident_connector, 4);
+        resident.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        let expected = resident.fetch_extension(&tokens, 0, tokens.len(), Device::Gpu(0));
+
+        let parent = std::env::temp_dir().join(format!(
+            "onnx-genai-engine-disk-kv-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk_connector = Arc::new(
+            LocalTieredConnector::new(LocalTieredConfig {
+                chunk_size: 4,
+                page_size: 4,
+                hot_capacity: 1,
+                disk_backend: Some(DiskTierConfig {
+                    path: parent.clone(),
+                }),
+                ..LocalTieredConfig::default()
+            })
+            .unwrap(),
+        );
+        let disk_for_assert = Arc::clone(&disk_connector);
+        let mut disk = bridge_over(disk_connector, 4);
+        disk.store_prefix_with(&tokens, tokens.len(), |_, n| Ok(fake_payload(n)));
+        assert!(disk_for_assert.spill_count().unwrap() >= 2);
+        let actual = disk.fetch_extension(&tokens, 0, tokens.len(), Device::Gpu(0));
+
+        // Fetched payloads are the exact K/V input used by continuation decode.
+        assert_eq!(actual.chunks.len(), expected.chunks.len());
+        for (actual, expected) in actual.chunks.iter().zip(&expected.chunks) {
+            assert_eq!(actual.start, expected.start);
+            assert_eq!(actual.num_tokens, expected.num_tokens);
+            assert_eq!(actual.payload, expected.payload);
+        }
+        drop(disk);
+        drop(disk_for_assert);
+        assert!(std::fs::read_dir(&parent).unwrap().next().is_none());
+        std::fs::remove_dir(parent).unwrap();
     }
 
     #[test]

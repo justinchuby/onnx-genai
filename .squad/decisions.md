@@ -11,6 +11,7 @@ Decision archive gate rechecked after inbox merge at 2026-07-27T04:35:00-07:00: 
 <!-- scribe-merge-2026-07-27T04-35-00-07-00-pr227-lessons -->
 
 Decision archive gate checked at 2026-07-27T16:44:54Z: active ledger was 734629 bytes; archived 0 dated entries older than 2026-07-20 to `.squad/decisions/archive/2026-07-27T16-44-54Z-wave9-older-than-7-days.md`.
+Decision archive gate checked at 2026-07-28T04-08-08+0000: active ledger was 826313 bytes; archived 7 dated sections on or before 2026-07-21 to `.squad/decisions/archive/2026-07-28T04-08-08+0000-older-than-7-days.md`.
 
 ## 2026-07-27 — PR #227 roofline and benchmark lessons
 
@@ -1470,241 +1471,6 @@ The three measured M=8 node times were 1079.810, 583.353, and 582.688 ms, demons
 This confirms that the earlier 31.9% “prefill/reset” bucket is genuine M=8 model compute, not benchmark reset/allocation. The native M=8 prefill is roughly 0.58-1.08 seconds versus 63.5 ms for the 32-thread ORT wrapper first forward and about 102 ms for OGA prompt append/prefill. Lowering `NXRT_SQNBIT_PREFILL_MIN` to route M=8 through MLAS did not improve end-to-end throughput (8.43 versus 8.57 tok/s).
 
 **Decision:** assign dedicated CPU prefill optimization work if TTFT or short-request throughput matters. It will not improve steady M=1 decode, but the measured M=8 compute is a real product bottleneck and is overwhelmingly `MatMulNBits`, not harness overhead.
-## 2026-07-21 — VLM WP2/WP3, opset-24 CUDA, ScatterElements, and DS-1
-
-### Land VLM WP0 metadata contract and source-compatible hotfix
-**By:** Sapper; hotfix by Rachael; reviewed by Luv 🟢  
-**What:** Land architecture-neutral typed multimodal metadata as commit `0f6ffbd`, then make additive WP0 fields `Default`-derived in hotfix `1b66d0f` so downstream literal construction sites keep building.  
-**Why:** VLM routing must be metadata-driven rather than model-flavored, and optional multimodal fields must be source-compatible as the contract grows.
-
-### Land native CUDA opset-24 ConstantOfShape, Gelu, and OneHot
-**By:** Batty; reviewed by Pris 🟢  
-**What:** Land commit `ea4036d` with generic native CUDA handlers for standard-domain ConstantOfShape, Gelu, and OneHot, preserving opset-aware semantics including negative-index behavior.  
-**Why:** Opset-24 Gemma/DeepSeek-style graphs should stay native instead of falling back because construction, activation, or indexing handlers are missing.
-
-### Replace VLM every-step model bindings with a generic Kahn executor
-**By:** Sapper; reviewed by Luv 🟢  
-**What:** Land VLM WP3 as commit `3aec9f3`, replacing model-flavored `EmbedsStepBinding` with a metadata-driven every-step executor that topologically schedules declared inputs, outputs, and dependencies using Kahn sorting.  
-**Why:** Autoregressive VLM step execution must follow the declared metadata graph, not hard-coded architecture names.
-
-### Land DS-1 generic runtime shape propagation with bounded materialization
-**By:** Deckard; revision by Holden; rereview by Pris 🟢  
-**What:** Land commit `1584fb3` for DeepSeek-V2 dynamic `Slice -> Unsqueeze` shape propagation, reusing the opset-aware shape-inference registry and permitting host materialization only after dtype, rank, and element-cap gates pass.  
-**Why:** Runtime output sizing should reuse the same generic ONNX shape rules as kernels while preventing unbounded host copies from hostile or accidental shapes.
-
-### Broaden native CUDA ScatterElements dtype coverage portably
-**By:** Deckard; reviewed by Chew 🟢  
-**What:** Land commit `5b01a01` covering fp16/bf16/fp32/int64 data with int32/int64 indices. Serial single-threaded reduction avoids half atomics, remains SM-portable, and is CUDA-graph capture-safe.  
-**Why:** Valid ONNX ScatterElements graphs should not decline native placement solely because a supported data/index dtype pairing was absent.
-
-### Land VLM WP2 native image processor after numerics and allocation fixes
-**By:** Leon; revision by Sapper; final review Pris 🟢  
-**What:** Land commit `5c48ba5` for generic metadata-declared image preprocessing. The accepted path preserves bit-exact `f32::from(v) / 255.0` Divide semantics (not reciprocal multiply; 126/256 bytes otherwise differ by 1 ULP), uses `try_reserve_exact` bounded allocations, rejects degenerate dimensions, and pins patch-size-2 HF fixtures by SHA.  
-**Why:** VLM processors need multi-output metadata-declared preprocessing without legacy numerical drift or unbounded metadata-derived allocation.
-
-### Preserve review lockouts from this segment
-**By:** Scribe  
-**What:** Record active lockout history: WP2 had Chew 🔴, locking Leon+Chew out until Sapper revised and Pris approved; WP4 had Gaff 🔴, locking Zhora+Gaff out while Batty revises; DS-1 had Gaff 🔴, after which Holden revised and Pris approved.  
-**Why:** Rejected artifacts and reviewers stay locked out for their correction cycle, while accepted third-agent revisions become the authoritative artifacts.
-
-### Treat CUDA 13 NVRTC on H200 as current-good
-**By:** Scribe  
-**What:** The CUDA crate pins `cudarc` `cuda-13000` with dynamic loading, and NVRTC 13 builds and runs GPU tests successfully on H200.  
-**Why:** The older belief that this host requires CUDA 12.6 NVRTC is stale and should not guide future debugging or setup.
-
-### Additional inbox decisions folded and deduped
-**By:** Scribe  
-**What:** Processed non-preserved decision inbox artifacts, deduping items already represented above or in the active ledger. Folded summaries:  
-- `batty-clippy-hygiene.md` — 2026-07-21: Clear engine and ORT clippy warnings; By: Batty; What: Cleared all `cargo clippy --all-targets --features cuda -- -D warnings` diagnostics in `onnx-genai-engine` and `onnx-genai-ort` without changing public APIs or runtime logic..
-- `brigitte-wp3-argmax-expose.md` — 2026-07-21: Expose and verify ORT multi-row device argmax; By: Brigitte; What: Added `DeviceSampler::argmax_rows(&self, DataType, usize, usize, usize) -> Result<Vec<u32>>`, implemented by `CudaSampler` through its existing `pub(crate) CudaSampler::argmax_rows` entry point. Coverage is f32, f16, an….
-- `chew-flash-tc-adjudication.md` — Chew — Adjudication: `flash_attention_f16_tc` numerics dispute (Holden vs Deckard).
-- `deckard-ep-transparency.md` — Decision: Production per-op executor spans + kernel-variant & capture-rejection reasons (native EP).
-- `deckard-flash-tc-fix.md` — Deckard — flash_attention_f16_tc wmma parity investigation + permanent gate.
-- `fenster-fixture-fix.md` — 2026-07-21: Treat binary/textproto twins as one model; By: Fenster; What: Chose Option A. `ModelDirectory` now collapses `<name>.onnx.textproto` when the same-stem `<name>.onnx` exists and prefers the binary; distinct model names remain ambiguous..
-- `gaff-clippy-review.md` — 2026-07-21: Clippy hygiene review (Batty 2a0555b); By: Gaff; What: Approved commit `2a0555b` as pure Clippy hygiene. The six-file diff contains iterator idioms, redundant-clone removal in CUDA sampler tests, a let-chain, `then_some`, literal digit regrouping, a rustdoc blank line, and….
-- `holden-attn-cliff-investigation.md` — Holden — Attention "cliff at ~pos 30" investigation (native CUDA, Qwen2.5-0.5B-int4).
-- `holden-wp1-verify-review.md` — Review: WP1 — Native M=K verify + rewind primitive (option b) + (c)-ready guard.
-- `hudson-fixture-fix-review.md` — 2026-07-21: loader same-stem fix review; By: Hudson; What: Binary/textproto twins are correctly treated as one logical model, with the binary preferred..
-- `hudson-wp3-argmax-review.md` — Hudson review — WP3-prep multi-row device argmax.
-- `joshi-rmsnorm-generic.md` — 2026-07-21: Select fp16 SkipRMSNorm warp half4 by structural capability; By: Joshi; What: Generalized `skip_rmsnorm_f16_warp_896` into `skip_rmsnorm_f16_warp_half4`. The kernel now receives and uses runtime `norm_size`, iterates `norm_size / (32 lanes * 4 halves)` half4 chunks per lane, divides the sum of sq….
-- `kowalski-wave4-profile.md` — 2026-07-21: Wave-4 stacked CUDA profile; By: Kowalski; What: Treat wave-4 native CUDA fp16 decode as approximately 759 tok/s at 256 tokens and 789 tok/s at 1024 tokens, with about 227 launches/token, zero CUDA-graph fallbacks, and coherent decode..
-- `pris-fusion-genericity-review.md` — Review: Fusion-genericity remediation (wt-fusion-generic @ 19b3b91).
-- `pris-opset24-review.md` — Kernel Review — Native CUDA opset-24 op handlers.
-- `pris-rmsnorm-review.md` — 2026-07-21: RMSNorm genericity review (Joshi 53d55e1); By: Pris; What: Reviewed branch `wt-rmsnorm-generic` @ 53d55e1, which replaces the.
-- `ripley-wp2-native-driver.md` — WP2 — Native speculative driver (host-argmax accept).
-- `sapper-fusion-genericity.md` — Decision: CUDA wave-4 fusions gate on structure + capability, not Qwen dims.
-- `sebastian-multimodel-bench.md` — 2026-07-21: H200 native CUDA multi-model benchmark; By: Sebastian; What: Current `main` (`035ad9f`) measured Qwen2.5-0.5B int4 at **771.40 tok/s median** (766.49/773.62/771.40), 1 prompt token, 256 output tokens, 5 warmups per independent process, CUDA graph + device KV + strict CUDA, and ze….
-- `solveig-wp1-verify-primitive.md` — Decision: WP1 — Native M=K verify + rewind primitive (option b) + (c)-ready guard.
-- `wallace-ep-transparency-review.md` — 2026-07-21: EP transparency backbone review; By: Wallace; What: Deckard's per-op executor span backbone (`exec_plan_node`) is a genuine LIVE span, and the re-instrumented kernels attach kernel-variant + capture-status reasons to it in the real native decode path — my original dead-w….
-- `wallace-wp2-driver-review.md` — WP2 native speculative driver — review.  
-**Why:** The inbox should hold only living research artifacts; segment decisions belong in the active ledger.
-## 2026-07-21 — CUDA graph M4 end-to-end validation
-
-### Real Qwen2.5 int4 decode captures with zero fallbacks
-**By:** Rachael; reviewed by Chew; smoke correction by Pris 🟢  
-**What:** Seed unresolved persistent external input/output physical shapes only during capture, keeping eager shape resolution and binding-signature invalidation intact. Constant/Shape metadata reuse and capture-safe integer Sub, ReduceSum, and Gather complete the real Qwen graph while device-side GQA/Reduce/Gather guards still latch errors before token consumption. After Chew caught stale fallback assertions, Pris updated the H200 smoke to require one capture, 62 replays, zero fallbacks, and no fallback reason. Landed as `dda3b25`, `13c094a`, and `42b71f7`.  
-**Why:** Qwen2.5-0.5B int4 now captures end to end with token-exact graph ON/OFF parity and zero fallbacks: 70.33 versus 19.99 tok/s at 256 tokens (+251.8%), and 24.25 versus 11.73 tok/s at 1024 tokens (+106.7%). This validates the complete M4 capture-safety track on the real model.
-## 2026-07-21 — Perf campaign reconciliation
-
-### H200 native CUDA decode target and profiling baseline
-**By:** Ana and Rachael  
-**What:** Use ORT GenAI H200 Qwen2.5-0.5B int4 steady-state decode as the performance target: **657.34 tok/s** at 256 tokens (667.43 tok/s at 1024). Native progressed from about **73 → 145 → 192 → 201 tok/s**, but f32 Sq=1 GQA remained dominant: 70.5% of GPU time over 256-token decode and 82.7% over 16-token decode.  
-**Why:** GEMV/argmax work is valuable but insufficient alone; the next high-leverage path is replacing serial f32 decode attention and then wiring/validating fp16 flash decode.
-
-### Retile MatMulNBits decode GEMV and approve the result
-**By:** Royb; reviewed by Wallace 🟢  
-**What:** Retile the M=1 accuracy-level-4 symmetric block-32 CUDA MatMulNBits path, quantizing the f32 activation once with matching warp absmax/round/clamp/scale semantics. Wallace approved Roy's `5dbcbbb` retile.  
-**Why:** This moved native decode from roughly 145 tok/s to about 192 tok/s while preserving numerics, but still leaves a large gap to Ana's 657 tok/s ORT target.
-
-### Keep device-side greedy argmax after Batty's rebase repair
-**By:** Mariette and Batty; reviewed by Joi 🟢  
-**What:** Add allocation-free CUDA f32 greedy argmax with lowest-index tie behavior matching the host sampler. Joi rejected Mariette's rebased `c12e74f` because `DecodeCudaState::run_one_token` was called without the new `TraceContext`; Batty fixed the call and Joi approved `cdf62a0`.  
-**Why:** The fixed path builds and measured about **200.97 tok/s**, removing the host argmax bottleneck without changing token selection.
-
-### Land fp16 flash-decode as kernel-only first, then dormant dispatch wiring
-**By:** Sebastian; reviewed by Bryant and Holden 🟢  
-**What:** Add a capture-safe fp16 flash-decode GQA attention kernel as kernel-only commit `9c6f36b`, approved by Bryant. Wire it through a dormant fp16 dispatch branch at `521438e`, approved by Holden, gated by `q.dtype == Float16` and supported `(q_seq, dim)` while leaving the f32 path first and unchanged.  
-**Why:** Split landing keeps the kernel independently reviewed and lets dispatch be enabled safely only for supported fp16 decode shapes.
-
-### Direct fp16 activation × int4 GEMV remains a separate optimization track
-**By:** Royb  
-**What:** Prototype direct fp16-activation × int4 MatMulNBits GEMV on `wt-fp16-matmul` (`6a1daa2`) to avoid the int8 quantization pass.  
-**Why:** This is distinct from fp16 flash attention and should be validated as a separate GEMV optimization before promotion.
-
-### Sequence zero-copy design needs a second Deckard revision
-**By:** Zhora and Deckard; reviewed by Luv 🔴  
-**What:** Zhora's zero-copy Sequence tensors use shared allocation views with dtype/shape/layout/offset metadata. Luv rejected `ddae7d0`; Deckard closed the original public-output/runtime blockers with `SessionOutput::{Tensor, Sequence}` and related fixes, but Luv's re-review still rejected `cf8888b`.  
-**Why:** The direction is acceptable, but remaining correctness/review blockers mean the Sequence zero-copy change is not approved yet.
-
-### Runtime string tensors must use a dedicated host storage variant
-**By:** Batty  
-**What:** Represent runtime strings with `TensorStorage::{Raw, Strings(Vec<String>)}` or equivalent, expose safe `StringTensorView`/`StringTensorMut`, and never cast byte/device storage to `String`.  
-**Why:** String tensors are host-owned structured values, not raw numeric buffers; exhaustive storage keeps executor behavior type-safe.
-
-### PressureProtocol scaffold/fix path and current rejection state
-**By:** Sapper, Roy, Deckard, and Pris; reviewed by Holden and Freysa 🔴/🟢 mixed  
-**What:** Sapper/Roy added HostGovernor pressure envelopes and replay extension points; Holden rejected the first scaffold until actor ordering was scoped by `(HostId, ActorId)`, which Deckard fixed. Freysa rejected Sapper's HostGovernor revision, locking Sapper out and assigning the fix to Batty; Roy repaired release integrity by retaining authoritative allocations in `Claimed` and enforcing deterministic scheduling. Freysa's 2026-07-21 re-review still rejected `3207c25` because the branch/diff was not review-clean. Pris strengthened forged-release and cancellation synchronization regression tests.  
-**Why:** Credit integrity and deterministic admission are the right design constraints, but the pressure implementation is not approved until reviewed from a clean branch with the fixed protocol evidence.
-
-### Graph-capture transparency requires structured reasons across three axes
-**By:** Coordinator and Gaff; reviewed by Chew  
-**What:** All EPs must surface structured trace reasons for kernel non-selection and graph-capture non-capturability; transparency has three axes: op claim, kernel-variant selection, and capture support. Gaff added `CaptureSupport::{Supported, Unsupported { reason }}` and default compatibility adapters; Chew reviewed the structured reason-carrying design.  
-**Why:** Silent bool declines make performance debugging impossible; traces must explain both variant choice and capture segmentation/fallback.
-
-### Decouple CUDA EP claim from segmented graph capture
-**By:** Coordinator and Tyrell  
-**What:** CUDA EP should claim/run supported subgraphs even when only maximal segments are capturable, interleaving captured runs with eager CUDA runs for non-capturable nodes.  
-**Why:** Capturability is an execution scheduling property, not an EP ownership property; partial segmented capture preserves CUDA placement without all-or-nothing fallback.
-
-### Cross-platform support must include Windows ARM64
-**By:** Coordinator; audit by Deckard  
-**What:** Treat `aarch64-pc-windows-msvc` as a required target alongside Windows x64, macOS x86_64/arm64, and Linux x64. Deckard also flagged truthful CUDA selection, OS-aware library discovery, updated CUDA-12 CUDART candidates, pip/Conda NVIDIA discovery, and preventing Python from advertising CUDA while executing CPU.  
-**Why:** Packaging and runtime probing must match the documented support matrix and actual execution provider behavior.
-
-### Publishability of onnx-rs remains required
-**By:** Leon  
-**What:** Keep `onnx-rs` publishable to crates.io with package metadata and publish workflow coverage.  
-**Why:** It is the ONNX standard-library crate for Rust in this workspace and must remain releasable.
-
-### Capture-safe Sq=1 GQA decode kernel approved as prior f32 stepping stone
-**By:** Sebastian; reviewed by Bryant 🟢  
-**What:** Bryant approved `b6ada01`, a capture-safe warp-parallel Sq=1 GQA decode attention kernel for supported `head_dim <= 128` with zero CUDA-graph fallback.  
-**Why:** This was a correct f32 decode-attention stepping stone before the later fp16 flash-decode path.
-## 2026-07-21 — fp16 decode, transparent fallback, cross-platform loading, and trace cost
-
-### Land coherent end-to-end fp16 native CUDA decode
-**By:** Sebastian; component work by Mariette, Leon, and Roy; reviewed by Bryant, Wallace, and Holden 🟢  
-**What:** Thread fp16 activations, KV, logits/argmax, normalization, RoPE, attention, and direct fp16×int4 MatMulNBits through native decode while retaining dtype-gated f32 paths. Leon fixed the rejected fp16 LayerNorm shared-memory reuse race before Bryant approved the normalization/RoPE path. Landed as `c8741ba`.  
-**Why:** H200 Qwen2.5-0.5B int4 reached about **344 tok/s** with coherent tokens, CUDA graph capture, and zero fallbacks, up from the approximately **200 tok/s** f32 path; f32 remained unregressed near 200 tok/s.
-
-### Make CUDA-to-CPU fallback observable and optionally strict
-**By:** Deckard; reviewed by Batty 🟢  
-**What:** Retain a structured `ExecutionProviderFallbackReport`, emit an initialization warning when CUDA declines force whole-session CPU execution, and make `ONNX_GENAI_REQUIRE_CUDA=1` reject that fallback. Landed as `3a8eebe`.  
-**Why:** Device selection must not silently advertise CUDA while executing on CPU; callers now receive node/op/reason detail and can opt into strict CUDA-only behavior.
-
-### Use OS-aware CUDA and CUPTI dynamic-library discovery
-**By:** Leon and Roy; reviewed by Pris 🟢  
-**What:** Select CUDA driver/runtime/library and CUPTI candidates by operating system, including Windows DLL names and pip/Conda layouts. Treat Windows ARM64 as gracefully unavailable before probing x64-only NVIDIA libraries. Landed as `2466016` and `8cd36c3`.  
-**Why:** Cross-platform probing must fail normally rather than panic or attempt incompatible binaries. CUPTI discovery remains local to the tracer to avoid an inverted dependency on the CUDA EP.
-
-### Emit per-op CPU bytes/FLOPs only for active trace spans
-**By:** Rachael, Gaff, and Deckard; reviewed by Zhora 🟢  
-**What:** Annotate major CPU kernel spans with logical tensor bytes and documented FLOP estimates, lazily computing metrics only when a span is active. Keep tracing optional and propagate the `tracing` feature through `bench-native` and `native-backend`. Landed as `61f4d2c`.  
-**Why:** Profiles gain arithmetic-intensity and bandwidth inputs without imposing tensor scans, formula work, JSON allocation, or tracer dependencies on default non-tracing builds.
-## 2026-07-21 — CI hardening and native CUDA decode wave 1–2
-
-### Cover every offline crate and make warnings blocking on all portable targets
-**By:** Batty and Gaff; Windows ARM64 revision by Deckard; reviewed by Hudson 🟢  
-**What:** Classify all 38 workspace members by default normal+dev dependencies, explicitly test and cover all 27 pure-offline crates, and enforce blocking rustc and Clippy warnings (`RUSTFLAGS="-D warnings"` and `-- -D warnings`) rather than advisory lanes. The portable matrix retains Linux x64, Windows x64, and macOS ARM64 and adds native Windows ARM64 on `windows-11-arm`/`aarch64-pc-windows-msvc`, with the same 26-crate portable test set and an ARM64 Clippy gate; `mlas-sys` remains Linux-only, while native-ORT and CUDA crates stay outside offline execution. Formatting remains advisory pending the repository-wide sweep.  
-**Why:** CI now covers the full offline workspace without triggering ORT downloads, and warnings fail builds across supported portable targets. The final 27-crate Linux lane passed 1,921 tests with 0 failures and 8 ignored; Hudson approved after Deckard closed the initially missing Windows ARM64 gate.
-
-### Keep the measured wave-1 decode optimizations capture-safe
-**By:** Leon, Tyrell, Deckard, Sebastian, and Roy  
-**What:** Use persistent two-pass multi-block greedy argmax; segment CUDA graphs into maximal capturable runs around eager CUDA seams while retaining whole-subgraph EP ownership; abort/drain failed mid-segment capture before reset; use true multi-CTA split-K fp16 flash decode; and retain Roy's coalesced direct fp16×int4 GEMV retile. All paths preserve fixed device addresses, token semantics, and zero-fallback graph replay.  
-**Why:** These changes removed launch/occupancy and GEMV bottlenecks without regressing correctness: argmax reached about 368 tok/s, split-K attention about 398 tok/s at 256 tokens (about 390 at 1024), and the GEMV retile about 423 tok/s. Segmented capture now recovers cleanly from invalidated streams instead of wedging later inference.
-
-### Fuse the single-token GQA preparation chain
-**By:** Rachael; reviewed by Holden 🟢  
-**What:** For eligible `Sq=Sk=1` aliased fixed-capacity decode, fuse QKV split, query relayout, K/V append, and Q/K RoPE into one kernel and write attention output directly in BSH layout. Keep metadata preparation separate to preserve the capture poison/latch protocol; all other shapes retain the unfused path.  
-**Why:** Prep launches fell 75% (192→48 per token), bit-exact fused/unfused and capture tests passed, and H200 throughput rose from about 557 to 615 tok/s with zero fallbacks.
-
-### Use warp-shuffle fp16 skip-RMSNorm
-**By:** Sapper; reviewed by Wallace 🟢  
-**What:** Replace the fp16 shared-memory reduction tree with a single-warp packed-half2/half4 shuffle reduction, specializing hidden size 896 while retaining a tail-safe generic fp16 path; f32 kernels remain unchanged.  
-**Why:** The hot kernel fell from about 6.20 to 5.07 µs/call and stacked decode reached about 579–583 tok/s with identical tokens, full CUDA tests passing, and zero graph fallbacks.
-
-### Specialize the fp16 down-projection GEMV and accept the stacked ORT win
-**By:** Luv; reviewed by Pris 🟢  
-**What:** Route only `K=4864, N=896, block_size=32` with fp16 scales to a 256-thread, eight-column K-parallel GEMV that stages the activation in permuted half2 shared memory; all other shapes retain the general kernel.  
-**Why:** The down-projection kernel fell from about 10.24 to 7.28 µs/call with parity within fp16 tolerance and identical greedy tokens. Stacked with GQA fusion and RMSNorm, native H200 decode reached **663–672 tok/s**, beating the **657 tok/s ORT GenAI** reference with zero fallbacks.
-
-### Require SM-portable correctness and performance for every CUDA EP kernel
-**By:** Coordinator directive; validated in wave-2 reviews by Holden, Wallace, and Pris  
-**What:** Every `onnx-runtime-ep-cuda` kernel must remain correct and performant across supported NVIDIA SM architectures, not merely `sm_90`. Dispatch must derive the live architecture dynamically, avoid unguarded SM90-only features, keep resource use within portable limits, and preserve capable fallbacks or variants where architecture-specific tuning is necessary.  
-**Why:** H200 wins are not acceptable if they break or materially strand devices such as RTX 4060 (`sm_89`). Wave-2 kernels use broadly available primitives and do not raise the minimum architecture.
-## 2026-07-21 — Native CUDA decode wave 3 and CUDA CI
-
-### Use 16-way split-K for long-context fp16 GQA decode
-**By:** Sebastian; reviewed by Holden 🟢
-**What:** Raise fp16 flash-decode `MAX_SPLITS` from 8 to 16, retaining device-side capture-safe split selection, deterministic fixed-order merging, and the single-stream shared-scratch invariant. Landed as `3b972bf`.
-**Why:** Independent H200 review measured 1024-token decode improving from about 647 to 693 tok/s (+7.1%) while 256-token throughput remained flat, with identical greedy tokens, zero graph fallbacks, bounded 2.03 MiB scratch, and no SM90-only dependency.
-
-### Fuse SwiGLU SiLU and multiply in one CUDA kernel
-**By:** Mariette; reviewed by Pris 🟢
-**What:** Fuse eligible equal-shape, single-consumer `Mul(Silu(gate), up)` patterns into one capture-safe f32/f16/bf16 pointwise kernel, preserving separate fallback paths and kernel-variant trace reasons. Landed as `12e48b8`.
-**Why:** The fusion halves activation launches from 48 to 24 per token and improved authoritative 256-token H200 decode from about 673 to 689 tok/s, with identical tokens, zero graph fallbacks, full CUDA parity, and portable primitives suitable for sm_89.
-
-### Record the stacked wave-3 performance baseline
-**By:** Kowalski
-**What:** Treat the fresh shared-H200 re-profile as the current wave-3 baseline: median throughput about 691 tok/s at 256 tokens and 712 tok/s at 1024 tokens, with zero CUDA graph fallbacks. Recorded in `docs/PROGRESS.md` by `f42ca3f`.
-**Why:** The stacked GQA split and SwiGLU fusion gains reproduce together, remain coherent, and place native CUDA decode above the 657 tok/s ORT GenAI reference at 256 tokens.
-
-### Gate CUDA EP Clippy warnings in CI
-**By:** Gaff; reviewed by Wallace 🟢
-**What:** Clear all 21 existing `onnx-runtime-ep-cuda` Clippy warnings without adding allows, remove no-op explicit drops of non-owning `TensorMut` views, and add `cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings` to the `cuda-compile` job. Landed as `22ec87e`.
-**Why:** CUDA EP warnings are now blocking in CI. Review verified the lint rewrites and drop removals preserve behavior and ownership, with builds, tests, Clippy, YAML parsing, and a zero-fallback performance sanity run passing.
-## 2026-07-21 — Native CUDA decode wave 4
-
-### Fold batch-1 GQA metadata into fused decode preparation
-**By:** Luv; reviewed by Holden 🟢  
-**What:** For eligible batch-1, `Sq=Sk=1`, fixed-capacity aliased-device-KV decode, derive GQA metadata inside each fused prep CTA and have block 0 write the attention arrays; unsupported shapes retain the separate metadata kernel. Landed as `bd30e6c`.  
-**Why:** The change preserves latch-first poison propagation, all bounds/error bits, sentinel/no-write behavior, capture safety, and SM portability while removing 24 launches/token. Independent H200 review measured roughly 691→710 tok/s at 256 tokens with exact tokens and zero fallbacks.
-
-### Fuse MatMulNBits-adjacent QKV bias and paired gate/up SwiGLU
-**By:** Rachael; reviewed by Pris 🟢  
-**What:** Fold eligible QKV bias Adds into the MatMulNBits epilogue with exact two-op fp16 rounding, and collapse the validated Qwen 0.5B gate/up projections plus SwiGLU into one paired capture-safe kernel. Strict initializer, shape, dtype, consumer, and graph-output gates preserve unfused fallback. Landed as `102fee9`.  
-**Why:** GPU bit-exact tests and end-to-end greedy tokens match the two-op baseline, with zero graph fallbacks and portable primitives. Stacked on the GQA metadata fold, H200 reached about **759 tok/s at 256 tokens** and **789 tok/s at 1024 tokens**, saving about 72 launches/token.
-
-### Drop the CUDA replay binding-cache prototype — DEAD END
-**By:** Deckard  
-**What:** Do not merge or re-attempt commit `14a1d8f`, which cached validated device-I/O metadata and raw external addresses for CUDA-graph replay.  
-**Why:** Two paired H200 measurements showed only **+0.23%** (+1.60 tok/s), below the 0.5% noise threshold, while the exact-identity/raw-address predicate adds correctness sensitivity on the replay hot path. Revisit only with materially stronger isolated evidence and a safer design.
-
-### Keep Ana wave-3 roofline as the current roofline of record
-**By:** Scribe  
-**What:** Preserve `.squad/decisions/inbox/ana-wave3-roofline-691.md` as the current roofline artifact: wave 4 achieved about **759 tok/s**, within its **750–790 tok/s** ceiling.  
-**Why:** The artifact remains the authoritative lever ranking and ceiling analysis after wave-4 validation.
-<!-- scribe-merge-2026-07-22T22-15-00Z-generality-batch -->
 ## 2026-07-22 — CPU EP generality and portability batch
 <!-- merged from .squad/decisions/inbox/coordinator-generality-directive.md -->
 ### 2026-07-22T21:25:00Z: Directive — cross-OS + cross-processor generality is mandatory
@@ -10184,3 +9950,1085 @@ consult `control_flow_captures_by_node` (or otherwise account for `If`/`Loop`/
 <!-- scribe-merge-2026-07-27T02-00-00Z-roadmap-59-62-76-85-end -->
 
 Decision archive gate checked at 2026-07-27T02:00:00Z: active ledger exceeded 50KB; archived 0 dated entries older than 2026-07-20. Recent 2026-07-21..2026-07-27 entries remain active.
+
+<!-- scribe-merge-2026-07-28T04-08-08+0000-wave2-regression -->
+## 2026-07-28 — Wave 2 regressions, roadmap, and CI decisions
+
+**By:** Scribe
+
+**What:** Merged 17 decision inbox notes from the wave ending 2026-07-28T04-08-08+0000; skipped 0 duplicate notes. Notes containing `split` or `iran` were intentionally left in the inbox.
+
+**Why:** Preserve author/reviewer findings from merged PRs #308, #309, #311, #312, #313, #316 and ancillary CI/supply-chain notes while clearing the local inbox.
+
+<!-- merged from .squad/decisions/inbox/bryant-pr311-review-67.md sha256:c90cf968935ca56e2a3187d9116219ca225b347dc1c2c9140aca9b287d8636c8 -->
+
+# Bryant — Independent adversarial CUDA review of PR #311 (issue #67, batch 5)
+
+- **Reviewer:** Bryant (independent adversarial CUDA reviewer; NOT the author)
+- **PR:** #311 `feat(ep-cuda): CUDA operator coverage batch 5 (#67)` — author Janek
+- **Branch:** `squad/67-cuda-coverage-b5` @ `c44b1a2c`
+- **Worktree:** `/home/justinchu/wt-bryant-311` (left in place, tree clean)
+- **GPU:** GPUs 1–7 were busy (99%, ~17 GB each); **GPU 0 was idle** (0 MiB) so tests
+  ran with `CUDA_VISIBLE_DEVICES=0 taskset -c 1` (instructed GPU 6 was occupied).
+- **VERDICT: REQUEST-CHANGES** — one narrow, verified test-coverage gap.
+
+## Scope reviewed
+6 ops, `CUDA_COVERED_OPS` 125→131: BiasGelu/FastGelu/QuickGelu (com.microsoft, f32/f16/bf16),
+CumProd (ai.onnx v26, f32/i64), ArgMax/ArgMin (ai.onnx, f32/f16/bf16→i64).
+New files: `fused_gelu.rs`, `cumprod.rs`, `argreduce.rs`.
+
+## What passed (strong evidence)
+- **Math parity vs CPU oracle — verified by reading the CPU source, not just trusting the PR:**
+  - GELU: CUDA `fused_gelu_scalar` matches `ep-cpu/kernels/gelu.rs` `exact_gelu`/`tanh_gelu`
+    bit-for-bit — f64 accumulation, same constants (`0.7071067811865476`, `0.7978845608028654`,
+    `0.044715`), and the `-inf→0` guard. QuickGelu matches `contrib_fused.rs:168-189`
+    (NEG_INF→0, identical branchless sigmoid).
+  - CumProd i64: CUDA uses `unsigned long long` wrapping multiply; CPU uses `i64::wrapping_mul`
+    (`ep-cpu/dtype.rs:89`). Two's-complement wrapping mul is byte-identical → overflow parity holds.
+  - ArgMax/ArgMin tie-break + `select_last_index` + NaN-never-wins matches `selection.rs`.
+- **GPU conformance:** `conformance_sweep_matches_cpu` = **144 inline CUDA-vs-CPU cases pass**;
+  all 4 conformance tests green; **264 lib tests pass**.
+- **Off-GPU guards pass:** `every_covered_op_has_a_conformance_entry`,
+  `profile_has_no_duplicate_entries`, `dedicated_suites_exist_and_name_their_op`.
+  `CUDA_COVERED_OPS` = 131, no duplicates, all 6 new ops present + registered (mod.rs:339-353,607-616).
+- **Falsifiability — all probes bite (2 author's re-run + 2 my own):**
+  1. Remove FastGelu `-inf` guard → `FastGelu[Float32,neg-inf-guard]` fails (`got NaN, expected 0`).
+  2. Drop `select_last` tie term → `ArgMax[tie,select_last=1]` bytes differ.
+  3. Perturb tanh coeff `0.044715→0.05` → `FastGelu[Float32]` parity fails (`-0.004045 vs -0.004967`).
+  4. (mine) Neuter CumProd `reverse` → `CumProd[f32,axis-1,reverse]` fails (`got 1, expected 6`).
+  All restored; tree clean.
+- **Rust quality gate:** `cargo fmt --all --check` clean. `cargo clippy` on the **lib**
+  (all 3 new kernels + mod.rs) and the **conformance test target** = clean with `-D warnings`.
+- **CI:** all green — CUDA compile (Linux/Windows), Rust (Linux/Windows x86_64, **Windows ARM64,
+  macOS arm64**), Rust quality, CLI ORT coverage. aarch64 compile unaffected.
+
+## Blocking finding
+- **bf16 ArgMax/ArgMin declared but exercised by ZERO conformance cases.** The PR body and
+  `CUDA_COVERED_OPS` claim `f32/f16/bf16→i64`, and `argreduce.rs` defines the bf16 kernel
+  (`DEFINE_ARG_REDUCE(__nv_bfloat16, bf16)`), but `arg_reduce_cases()`
+  (`cuda_conformance_gpu.rs:955-1013`) only builds **f32** (4 axis variants + 2 tie) and **one
+  f16** case — no `BFloat16`. GELU ops DO cover bf16; only arg-reduce misses it. This is exactly
+  the "claimed-but-untested dtype" class the suite's own docstring says it exists to prevent, and
+  the op-level coverage guard is not dtype-granular enough to catch it.
+  - I verified the bf16 kernel actually **works** (added a temporary bf16 ArgMax+ArgMin case →
+    sweep went 144→146, all pass), so this is a **test-completeness gap, not a latent bug**.
+  - **Fix (trivial):** add a `BFloat16` case to `arg_reduce_cases` mirroring the existing f16 case.
+
+## Non-blocking notes
+- QuickGelu/BiasGelu `-inf` guard is only conformance-tested for FastGelu/f32; the guard is
+  dtype-independent so risk is low, but a bf16/f16 `-inf` case would harden it.
+- Pre-existing clippy debt (NOT this PR): `tests/normalization_fp16_gpu.rs:233` (type_complexity)
+  and `tests/pointwise_gpu.rs:136` (too_many_arguments) fail `clippy --all-targets --features cuda`.
+  Both files are untouched by #311 and present on `origin/main`; CI's clippy doesn't compile GPU
+  test targets so it stays green. Worth a separate cleanup.
+
+<!-- merged from .squad/decisions/inbox/daniels-pr311-bf16fix-67.md sha256:d2141c0b352ea2f10281adf280341cfd4d0c38c85a6712b1bfdd5aaf13e2a850 -->
+
+### 2026-07-28: Exercise declared bf16 ArgMax/ArgMin CUDA coverage
+**By:** Daniels
+**What:** Extend the table-driven ArgMax/ArgMin conformance cases so both Float16 and BFloat16 inputs run the same axis-reduction oracle and produce byte-exact Int64 indices.
+**Why:** The CUDA kernels already declare and implement bf16, but the conformance profile previously exercised only f32/f16. Keeping declared narrow-float dtypes in one table prevents coverage drift and raises the GPU parity sweep from 144 to 146 cases.
+
+<!-- merged from .squad/decisions/inbox/daniels-varlen-packed-attention-86.md sha256:ceaa6e2f3ac280b153907d19f1eaa7297990dac612d6e4055af7b4ba44aabfa1 -->
+
+### 2026-07-27: Freeze CPU packed attention as `pkg.nxrt::VarlenAttention` v1
+**By:** Daniels
+**What:** Add a token-major f32 packed attention op using separate Q and KV cumulative offsets, optional per-sequence `nonpad_kv_seqlen`, GQA/MQA head broadcast, causal masking, and the shared scalar SDPA core. Graph/exporter replacement of padded Attention-24 nodes and static-cache prefill integration remain follow-up work.
+**Why:** Separate Q/KV offsets cover prefill and external-cache cases without cross-sequence score materialization. The scalar SDPA entry preserves byte-identical numerics against a padded masked oracle, while the explicit `nonpad_kv_seqlen` limit prevents allocated KV tails from contributing.
+
+<!-- merged from .squad/decisions/inbox/david-pr308-winfix-60.md sha256:2e558732bfc0208998c7b21df7804b573f429bd2e5759522d4ad80f9520896d0 -->
+
+### 2026-07-28: Use an existing file to test unavailable disk tiers
+**By:** David
+**What:** PR #308's health test now creates a uniquely named temporary file and configures that file path as the disk-tier directory, then asserts `ConnectorHealth::Degraded`.
+**Why:** An existing file is never a directory, and `create_dir_all` on it fails portably on Windows, macOS, and Linux. This avoids Unix-only assumptions while genuinely exercising the unavailable-tier branch; Windows x86_64, Windows ARM64, and Rust quality CI passed.
+
+<!-- merged from .squad/decisions/inbox/holden-miri-in-ci.md sha256:73b55f54b86f6d86e81d45cc2f920846ce21860f0dbabb897a78ad3d82e5323f -->
+
+# Holden decision: Miri in CI for tractable unsafe crates
+
+Date: 2026-07-27
+Branch: `ci/miri-unsafe-crates`
+
+## Tractable-crate analysis
+
+Checked with `cargo tree -p <crate> -e normal,dev` for `ort-sys`, `onnx-runtime-ep-cuda`, `cudarc`, and `mlas-sys`:
+
+- `onnx-runtime-memory`: no hits; included with full `cargo +nightly miri test`.
+- `onnx-runtime-dlpack`: no hits; included with full `cargo +nightly miri test`.
+- `onnx-runtime-ep-api`: pulls `onnx-genai-ort-sys`; included targeted pure Rust ABI/DeviceBuffer/registry/tensor/weight/mock-EP tests. Excluded Linux-only legacy plugin-loader tests because they compile and dlopen C fixtures via native process/FFI calls.
+- `onnx-runtime-ep-cpu`: pulls `onnx-genai-ort-sys` through `onnx-runtime-ep-api`; full tests also include OS affinity and Rayon-heavy execution that Miri cannot reliably interpret. Included targeted pure-unsafe subsets: `strided::tests`, `provider::tests`, and `dtype::tests`.
+- `onnx-runtime-session`: pulls `onnx-genai-ort-sys` through EP crates and has a dev-only `cudarc` dependency for CUDA WAR tests. Included targeted pure session ownership/bounds subsets: tensor, sequence, executor view-bounds/checked-size, prefetch, and device-binding tests.
+- `onnx-runtime-capi`: pulls `onnx-genai-ort-sys` through session. Included C status/null/handle/pointer/session-option tests; excluded full end-to-end roundtrip from the Miri lane because it enters Rayon/crossbeam worker internals rather than the C ABI pointer-safety surface.
+- `onnx-runtime-ep-cuda`: excluded; direct CUDA/cudarc/native driver path.
+- `onnx-genai-ort`: excluded; direct native ONNX Runtime FFI.
+- `onnx-genai-engine`: excluded; pulls native ORT through `onnx-genai-ort`; CUDA/native backend coverage remains compile/test coverage outside Miri.
+
+## Flags and borrow model
+
+The CI job keeps Miri's default Stacked Borrows model. I deliberately did not switch to Tree Borrows: the project wants strict raw-pointer ownership checking for `DeviceBuffer`, DLPack, strided views, and C handles. The only Miri flag used is `-Zmiri-disable-isolation`, and only for ep-api/session/C API tests that create temporary registry, model, or sidecar files.
+
+## Cost and scheduling
+
+Miri now lives in `.github/workflows/miri.yml` instead of the general CI workflow. That scopes the weekly `schedule` trigger to Miri only, keeps nightly-toolchain failures from being read as general CI failures, and reflects that Miri has a different cadence/owner/toolchain. The workflow runs per-PR and on `main`/`ci/**` pushes when Cargo, `.github/workflows/miri.yml`, or one of the covered crate paths changes; it also runs weekly to catch nightly Miri/toolchain drift even when code is quiet. Its concurrency group matches CI: PRs group by pull-request number, pushes group by SHA, and schedule/workflow_dispatch are separated by the final boolean so a scheduled run cannot share a group with PR or push runs. The measured Linux lane is about seven minutes, so per-PR path-limited execution is cheap enough and is the primary signal; weekly is only a drift backstop. The job prints `MIRI_TIMING <lane>: <seconds>` per lane for durable per-crate timing from GitHub logs.
+
+Local Windows smoke timings before CI were: `onnx-runtime-memory` 166s, `onnx-runtime-dlpack` 33s, `onnx-runtime-ep-api` 155s, `onnx-runtime-ep-cpu strided` about 6s interpreted time, `provider` about 140s interpreted time, and `dtype` about 6s interpreted time. Linux CI timings are authoritative and should be read from `MIRI_TIMING` lines.
+
+## Findings
+
+Miri found one small, unambiguous issue while enabling the lane: `onnx-runtime-ep-cpu::provider::tests::deallocate_rejects_cross_device_buffer` intentionally panicked before freeing a fabricated allocation. That was test-only, but it would make Miri red and could hide real leaks, so the test now catches the expected cross-device panic payload and reconstructs/drops the boxed slice, so unrelated panics no longer satisfy the invariant test. No production soundness defect was found in the covered local smoke run.
+
+## Coverage
+
+Do not upload Codecov coverage from this Miri job. Miri is an interpreter-based soundness checker; coverage instrumentation and Miri are not a useful or reliable composition, and treating Miri as a coverage contributor would misrepresent the coverage signal. The regular test/coverage lanes remain responsible for Codecov upload.
+
+<!-- merged from .squad/decisions/inbox/holden-release-workflow-supply-chain.md sha256:6386d3d294033c653d4661549b250a0144c6cb22cdd17957deb66d62bbfc4cdc -->
+
+### 2026-07-27: Harden release workflow action provenance
+**By:** Holden
+**What:** Workflows now avoid the personally-owned actions found in inventory. `publish.yml` replaced four `dtolnay/rust-toolchain@stable` steps and `wheels.yml` replaced two with direct `rustup toolchain install stable --profile minimal` plus `rustup default stable`, matching Pris's `ci/harden-and-coverage` pattern. This branch also adopted Pris's `ci.yml`/`audit.yml` hardening so the remaining `dtolnay`, `Swatinem/rust-cache`, and `taiki-e/install-action` uses are gone here too. `publish.yml` and `wheels.yml` now serialize release runs at workflow scope with `cancel-in-progress: false`.
+**Why:** Release workflows hold crates.io/PyPI publishing authority, so personally-owned setup actions are higher-risk there than in ordinary CI. The direct release `rustup` replacement preserves the previous effective toolchain state for every affected release job: all six original `dtolnay` uses had no `components`, `targets`, or `target` inputs, so they installed stable/minimal host toolchains only; the replacement does the same. Linux cibuildwheel containers still use their existing `pyproject.toml` `before-all` Rust installation, so container toolchain provisioning did not change. Justin explicitly ruled that PyPA is trusted (`pypa是可信组织 action可以留`), so `pypa/gh-action-pypi-publish` and `pypa/cibuildwheel` are deliberately kept as owner-approved choices, not oversights. The substantive reason remains important: `gh-action-pypi-publish` is PyPI's sanctioned trusted-publishing/OIDC path, and replacing it with raw `twine` would reintroduce long-lived credentials and worsen the posture. `codecov/codecov-action` is vendor-owned and is the upload endpoint, so it is acceptable to keep. Follow-up recommendation: pin all retained `pypa/*`, `actions/*`, and `codecov/*` action references to immutable commit SHAs with an update process; tag pins such as `release/v1`, `v4.1.0`, `v5`, and `v4` are mutable. Do this as a dedicated follow-up PR rather than mixing broad SHA churn into this provenance/mechanism change.
+
+<!-- merged from .squad/decisions/inbox/janek-cuda-coverage-b5-67.md sha256:f02fff904c53449e7640f37efd1c28afda3f617bd2d1b8d77a721b11907f7300 -->
+
+# Decision: CUDA EP operator coverage — batch 5 (#67)
+
+- **Author:** Janek (CUDA kernel engineer)
+- **Date:** 2026-07-27
+- **Issue:** #67 — Finish CUDA EP operator coverage parity
+- **Branch:** `squad/67-cuda-coverage-b5`
+
+## What
+
+Added 6 CUDA EP kernels, bringing `CUDA_COVERED_OPS` from **125 → 131**:
+
+| Op | Domain | Dtypes | Kernel file |
+|----|--------|--------|-------------|
+| `BiasGelu` | `com.microsoft` | f32/f16/bf16 | `kernels/fused_gelu.rs` |
+| `FastGelu` | `com.microsoft` | f32/f16/bf16 | `kernels/fused_gelu.rs` |
+| `QuickGelu` | `com.microsoft` | f32/f16/bf16 | `kernels/fused_gelu.rs` |
+| `CumProd` | `ai.onnx` (v26) | f32/i64 | `kernels/cumprod.rs` |
+| `ArgMax` | `ai.onnx` | f32/f16/bf16 → i64 | `kernels/argreduce.rs` |
+| `ArgMin` | `ai.onnx` | f32/f16/bf16 → i64 | `kernels/argreduce.rs` |
+
+## Why these ops
+
+Coherent, well-defined, GPU-testable batch that avoids cuDNN (absent on this
+host): the three `com.microsoft` fused GELUs unblock BERT/GPT-style contrib
+models; `ArgMax`/`ArgMin` unblock classification/greedy heads; `CumProd`
+complements the existing `CumSum` scan. All are NVRTC-custom, matched to the CPU
+EP for numeric parity.
+
+## Correctness decisions
+
+- **Fused GELU** evaluates the exact/tanh GELU in `double` (like the CPU EP's
+  f64 path in `contrib_fused.rs`), widening f16/bf16 to f32 first. Bias
+  broadcasts over the last dimension (`i % width`). The `-inf → 0` guard is
+  replicated (NVRTC has no `INFINITY`, so `isinf(v) && v < 0` is used).
+- **CumProd** is a near-copy of the deterministic per-lane `CumSum` kernel with a
+  multiplicative accumulator (identity 1) — kept as a separate file rather than
+  refactoring `cumsum.rs` to avoid risk to the tested scan.
+- **ArgMax/ArgMin** reproduce the CPU scan exactly: keep `best`, update on strict
+  improvement, or on an exact tie when `select_last_index=1`. NaN never wins
+  (`>`/`<`/`==` all false), matching the CPU oracle. Output is Int64; `keepdims`
+  controls the declared output shape.
+
+## Verification
+
+- GPU conformance sweep on GPU 6 (`cuda_conformance_gpu`): **144 inline
+  CUDA-vs-CPU parity cases pass** (was fewer pre-batch); all 4 conformance tests
+  green.
+- Full ep-cuda suite on GPU 6: all green **except** the known cuDNN-absent
+  `conv_gpu`/`pooling_gpu` tests (environmental, ignored per issue scope).
+- Off-GPU coverage-of-coverage guards
+  (`every_covered_op_has_a_conformance_entry`, `profile_has_no_duplicate_entries`,
+  `dedicated_suites_exist_and_name_their_op`) pass.
+- **Mutation probes (falsifiable oracles):**
+  - Removing the `FastGelu` `-inf` guard → `FastGelu[Float32,neg-inf-guard]`
+    fails (`got NaN, expected 0`). Restored.
+  - Dropping the `select_last_index` term in `ArgMax` → `ArgMax[tie,select_last=1]`
+    bytes differ from the CPU oracle. Restored.
+- `cargo fmt --all -- --check` clean; `cargo clippy` clean for the new files
+  (pre-existing ep-cuda lints in untouched files remain and are outside CI's
+  clippy scope — CI clippy excludes `onnx-runtime-ep-cuda`).
+- `scripts/check_profile_table.py`, `check_platform_naming.py`, and
+  `check_dispatch_reachability.py` all pass.
+
+## Follow-ups (not in this batch)
+
+Remaining CPU `ai.onnx` gaps still open for future batches include `Range`,
+`EyeLike`, `GatherND`, `ScatterND`, `Pad`, `SpaceToDepth`, `NonZero`,
+`Compress`, quantize/dequantize, and the cuDNN-gated pooling/norm ops.
+
+<!-- merged from .squad/decisions/inbox/leon-316-review.md sha256:a85f38c16e10ac9ff3a922b2177a4187271db31d27341306726f01cb1f56cc01 -->
+
+# Decision: PR #316 review (Leon, Reviewer)
+
+**Subject:** PR #316 by Ledward — fix #289 CJK/wide-char row-width miscount in the REPL inline live renderer.
+**Verdict:** APPROVE
+**Date:** 2026-07-28
+
+## Scope confirmed rendering-only
+Diff touches only:
+- `Cargo.lock` — adds `unicode-width 0.2.2` to `onnx-genai-cli`.
+- `crates/onnx-genai-cli/Cargo.toml` — direct dep `unicode-width = "0.2.2"` + rationale comment.
+- `crates/onnx-genai-cli/src/live_turn.rs` — `wrapped_rows` width measure swapped from
+  `segment.text.chars().count()` to `UnicodeWidthStr::width(...)`, plus 3 tests.
+
+No decode/model/tensor logic touched. The plain-pipe (non-TTY) path is unchanged (not in the diff).
+
+## Correctness (the critical check) — PASS
+ratatui 0.30 wraps text (`Paragraph` + `Wrap`) in `ratatui-widgets 0.3.2` `reflow.rs::WordWrapper`
+via `grapheme.symbol.cell_width()`, which resolves in `ratatui-core 0.1.2`
+`buffer/cell_width.rs` `impl CellWidth for str` to plain `self.width()` =
+`unicode_width::UnicodeWidthStr::width` — **NOT** `width_cjk()`.
+Ledward used plain `UnicodeWidthStr::width`. Definition matches ratatui exactly.
+
+## Single shared unicode-width instance — PASS
+`cargo tree -p onnx-genai-cli -i unicode-width@0.2.2` → one 0.2.2 shared by ratatui-core,
+ratatui-widgets, reedline, and onnx-genai-cli. The transitive `unicode-width 0.1.14` is confined
+to a **build-dependency** chain (miette → prost-reflect → protox), never in the render path. No
+runtime duplication/divergence. No lockfile version bump of the render-path crate.
+
+## Mutation proof (gate) — PASS
+In a worktree at PR head, reverted `wrapped_rows` to `chars().count()`, `touch`ed the file, reran
+`cargo test -p onnx-genai-cli --lib`: exactly the 3 new tests FAILED
+(`wide_characters_occupy_two_columns_each`, `mixed_ascii_and_wide_text_sums_display_width_across_segments`,
+`a_combining_mark_adds_no_width`), all 87 other tests — including the ASCII wrap test
+`a_wrapped_row_count_spans_the_segments_of_one_line` — PASSED. Restored. Tests genuinely gate the fix.
+
+## Quality gates — PASS
+- `cargo test -p onnx-genai-cli --lib`: 90/90.
+- `cargo fmt -p onnx-genai-cli -- --check`: clean.
+- `cargo clippy -p onnx-genai-cli -- -D warnings`: clean.
+- (Full workspace build not attempted — pre-existing environmental vendor/cpuinfo MLAS breakage.)
+
+## CI — green where it matters
+Rust quality, Rust (Linux x86_64), Rust (macOS arm64), CUDA compile (Linux + Windows), Miri, audit,
+codecov all PASS. Rust (Windows x86_64 / ARM64), CLI ORT (Windows), Kernel micro-benchmarks PENDING
+(Windows/bench lag — noted, not blocking).
+
+## Non-blocking notes (no action required)
+1. `wrapped_rows` sums total display width then `div_ceil(width)` — a column-fill model, whereas
+   ratatui does word-wrapping (never splits a word), so ratatui can render *more* rows than this
+   estimate. Pre-existing approximation, unchanged by this PR; the width-measure fix strictly
+   improves alignment for CJK.
+2. ratatui's `cell_width` adds +1 per halfwidth katakana dakuten/handakuten (U+FF9E/U+FF9F) that
+   plain whole-string `width()` reports as 0 — an extreme edge that could undercount by one cell in
+   that pathological case only. Negligible, pre-existing class of approximation, not a regression.
+
+Neither note blocks; both are strictly better than the previous scalar-count behavior.
+
+<!-- merged from .squad/decisions/inbox/lope-pr312-review-65.md sha256:95f8758fc0a55820de369d3b097addba50cbbd27d40f29e1f30468c6954e765f -->
+
+# Lope — Independent Adversarial Review: PR #312 (issue #65)
+
+**Verdict: APPROVE**
+
+Heterogeneous CPU/CUDA graph partition + execution. Author: Shaw (commit 8a3cd243).
+Reviewed on fresh worktree `origin/squad/65-heterogeneous-partition`.
+
+## Scope
+`crates/onnx-runtime-session/src/hetero.rs` (+623) & `hetero/tests.rs` (+368),
+`lib.rs` `pub mod hetero;` (additive). +992/-0, no existing code touched.
+
+## Verified findings (evidence)
+
+1. **Byte-identical parity is real & non-vacuous.** Mixed test compares hetero
+   output vs single-EP reference via `as_bytes()` (f32 bits), tests.rs:152-161,
+   with a one-bit-flip oracle self-check (tests.rs:242-251).
+
+2. **Mutation probes (independently reproduced, cargo `touch` gotcha handled):**
+   - PROBE 1 — replace `values.insert(*parent_value, tensor)` in `execute`
+     (hetero.rs:603) with a no-op → **all 4 execution tests FAIL**
+     (fan_out, fully_accel, mixed, pure_cpu); restore → 8/8 green.
+   - PROBE 2 (my own) — iterate `plan.partitions.iter().rev()` in `execute`
+     (hetero.rs:569) → the 2 multi-partition tests FAIL, single-partition tests
+     correctly unaffected (reversing a 1-element list is a no-op). Confirms
+     topological execution order is load-bearing. Restore → 8/8 green,
+     `git status` clean.
+
+3. **Convexity reuse is correct (not a re-derivation).** `provider_partitions`
+   (hetero.rs:262-296) wraps each provider in `AssignedOracle` (a node-id gated
+   capability oracle, hetero.rs:121-185) and runs the landed #76
+   `OrtGraphView::query_capabilities` (union-find + Kahn convexity,
+   ep-api/src/abi/mod.rs:411). `AssignedOracle` gates `supports_op` by `op.id`;
+   `insert_node` sets `node.id` to the slot key (ir/graph.rs:434), so gating keys
+   match placement keys. Because each provider's claim treats other providers'
+   nodes as excluded, convexity is computed against the whole graph — this
+   prevents the non-convex/unschedulable partition bug #300 fixed and rules out a
+   cross-partition cycle (a claim consuming from AND producing into the same
+   external node splits). `order_partitions` (hetero.rs:300-372) adds a
+   defense-in-depth Kahn cycle guard returning `Err` if a cycle survives.
+
+4. **Transfer insertion minimal & correct.** `plan_transfers` (hetero.rs:374-408)
+   dedups by `(value, to-device)` — fan-out to N consumers on one device = 1
+   transfer (test fan_out_boundary_transfer_is_deduplicated asserts exactly 1
+   `y→CPU`). No missing-transfer risk in execution: `execute` host-stages EVERY
+   boundary value through a `HashMap<ValueId,Tensor>` regardless of the transfer
+   list, so correctness is independent of the (descriptive, Phase-1) transfer
+   plan. Initializers are re-attached locally in `extract_subgraph`
+   (hetero.rs:494) — never need staging.
+
+5. **Unsupported-op fails before execution.** `assign_nodes` (hetero.rs:227-258)
+   returns `SessionError::unsupported_op` naming the first unrunnable node;
+   test node_unsupported_by_all_providers_fails_before_execution asserts the
+   error names `Sqrt`.
+
+6. **Determinism/topo order.** Nodes sorted by NodeId; ready-set is a `BTreeMap`
+   keyed `(min_rank, ep, first_node)`; transfers sorted. Tests
+   placement_is_deterministic_across_runs + topological_order_preserved pass.
+
+7. **No regression to default Executor path.** `execute` reuses
+   `Executor::build`/`run` per partition (hetero.rs:597-599) — no forked
+   buffer-planning. `hetero` is additive; the main-branch compute-in-place decode
+   regression lives in Executor internals this PR does not touch.
+
+## CI / local validation
+- `gh pr checks 312`: **all green** (Rust Linux/Win/macOS/ARM64, CUDA compile
+  Linux+Win, Rust quality gate, coverage, codecov).
+- Local: `cargo test -p onnx-runtime-session -p onnx-runtime-ep-api
+  -p onnx-runtime-ep-cpu` → all pass (hetero 8/8, ep-cpu 947, etc).
+- `cargo fmt --all -- --check` → clean. `cargo clippy -p onnx-runtime-session
+  -p onnx-runtime-ep-api -p onnx-runtime-ep-cpu --all-targets -- -D warnings`
+  → clean.
+
+## Deferred scope — honestly documented
+Value residency, async copies/fences, shape-keyed placement, CUDA-graph capture,
+multi-GPU D2D, real GPU e2e — all listed in module docs (hetero.rs:34-40) and PR
+body. Not silently claimed. AcceleratorEp mock (DeviceType::Mlx, host-backed)
+exercises transfer planning on CPU; real CUDA path GPU-gated.
+
+## Nits (non-blocking)
+- Fan-out dedup tested at N=2; logic (HashSet) generalizes to N=3 — no fix needed.
+- `execute` ignores `plan.transfers` (host-stages everything) by design for
+  Phase 1; correctness holds. Worth a code comment for future maintainers but not
+  a blocker.
+
+Reviewer: Lope (independent adversarial). Worktree left in place at
+/home/justinchu/wt-lope-312.
+
+<!-- merged from .squad/decisions/inbox/nabil-mlx-logging.md sha256:d9114fc3f526ef2c878ecaf41fe8c1708636c4cb3e09c8fee2c148cd5aa64eea -->
+
+# Decision: MLX EP logging — `log` facade, not `tracing`
+
+**Date:** 2026-07-27
+**Author:** Nabil (ORT Plugin EP Engineer — Metal)
+**PR:** https://github.com/justinchuby/onnxruntime-mlx/pull/9
+**Status:** Proposed (PR open, not merged)
+
+## Context
+
+The `onnxruntime-mlx` plugin EP (a Rust `cdylib` loaded into ORT) had 12 raw
+`eprintln!` sites with no structured logging. A stale build was polluting
+profile captures with per-subgraph prints on every decode step.
+
+## Decision
+
+Use the **`log` crate** (facade only) with a minimal 90-line in-crate logger,
+rather than the `tracing` ecosystem used by onnx-genai.
+
+## Rationale
+
+| Concern | `log` | `tracing` |
+|---------|-------|-----------|
+| Plugin isolation | ✅ facade-only; dylib owns its statics | ⚠️ subscriber model adds complexity in a shared-process context |
+| Host conflict risk | None — `set_boxed_logger` is private to the dylib's copy | The subscriber global could interfere if the host also uses tracing |
+| Dependency weight | ~0 transitive deps | 5–10 transitive deps (tracing-core, tracing-subscriber, etc.) |
+| Benefit of subscriber | N/A — host cannot install a subscriber into the plugin anyway | None — the plugin is the only consumer of its own log output |
+
+The sibling onnx-genai repo uses `tracing` because it's an *application* that
+benefits from span-based structured logging and async instrumentation. A plugin
+dylib has fundamentally different constraints: it must be minimal, must not
+conflict with the host, and has no subscriber to route events to.
+
+## Levels
+
+- Default: **Warn** (panics + user-visible failures only)
+- `ONNXRUNTIME_EP_MLX_VERBOSE=1`: Info
+- `ONNXRUNTIME_EP_MLX_TRACE=<path>`: Debug
+- `RUST_LOG=onnxruntime_ep_mlx=<level>`: explicit override
+
+## Implications
+
+- Future `eprintln!` additions to the MLX EP crate should use `log::*!` macros
+  at the appropriate level.
+- The `[rust-mlx-ep]` prefix is now added by the logger, not by each call site.
+- The session summary and slowest-ops table are **deliberate user-facing features**
+  (not stray debugging) — gated at `info!` behind `VERBOSE=1` or `TRACE=`.
+
+<!-- merged from .squad/decisions/inbox/oram-pr309-review-86.md sha256:7c36dad68cd732700d052d2b09c13e68d3b10f8a6ac6038b29c98d7e3d2091d0 -->
+
+# Oram — Independent Adversarial Review: PR #309 (issue #86)
+
+**Subject:** `pkg.nxrt::VarlenAttention` v1 CPU f32 packed/varlen kernel + Attention-24 `nonpad_kv_seqlen`
+**Verdict:** APPROVE
+**Reviewer:** Oram (independent; not the author). Fresh worktree `/home/justinchu/wt-oram-309` @ 5b6c5350.
+
+## Correctness invariant — PASS
+Packed output is byte-identical to a padded+masked reference that attends each
+sequence independently. The oracle is **genuinely non-circular**: the padded
+reference (`padded_reference`, tests L410-490) builds a `[batch, heads, max_q, dim]`
+rectangle and masks padding + causality via `RaggedPaddedBias` (explicit -inf),
+whereas the packed kernel loops per sequence with `batch=1`, truncated `kv_seq`,
+and a `CausalOffset` bias (kernel L211-260). They share only the trusted numeric
+core `sdpa_f32_scalar` — which is required for bit-exact parity and is legitimate,
+not the packed path acting as its own oracle. Masked -inf entries contribute
+exact 0.0 to the softmax sum, so per-sequence truncation and full-rectangle-masking
+yield identical bits. Both causal (byte test) and non-causal (leakage test) packed
+paths get a byte-identical assertion.
+
+## Independent mutation probes (all confirmed the tests are load-bearing)
+1. **Causal offset off-by-one** (`kv_len - q_len` → `+1`, L254): byte oracle FAILED —
+   `bit mismatch at output 0: 0.49150017 vs 0.77870107`. Restored.
+2. **Widen KV window across packed boundary** (`kv_end` → `(cu_kv[s+1]+1).min(total_kv)`,
+   L213): leakage test `packed_boundaries_prevent_cross_sequence_attention` FAILED —
+   seq-0 output poisoned `2482.5916 vs 0.9056443`. Confirms boundary is the only thing
+   preventing cross-sequence leakage; test is not hollow. Restored.
+3. **Ignore nonpad_kv_seqlen** (force `None`, L216): byte oracle FAILED —
+   `0.49150017 vs 0.77870107`. Confirms KV truncation to real length is load-bearing.
+   Restored. (PR also embeds this as an in-test `ignoring_nonpad` mutation, L577-589.)
+
+## Checklist evidence
+- **Cross-seq leakage (3):** poisons neighbor v=±10000, asserts seq-0 unaffected; mutation `leaked_cu` moves boundary — verified sensitive.
+- **Causal within seq (4):** covered by causal byte oracle over ragged/GQA cases.
+- **nonpad_kv_seqlen (5):** truncation validated + negative/overflow rejected (kernel L216-229); poisoned tails prove effect.
+- **GQA/MQA (6):** q4/kv2 and q2/kv1 in byte oracle; `q_heads % kv_heads == 0` enforced (L148). Head mapping is delegated to sdpa core (kernel only forwards counts).
+- **Shape inference (7):** `[query[0], query[1], value[2]]`, dtype from input 0; registry counts pinned 165/203 (op_rules.rs) and ep-cpu registry +98 (mod.rs) — all updated.
+- **CI (8):** `gh pr checks 309` all GREEN incl. Rust quality (fmt+clippy), macOS arm64, Windows ARM64, CUDA compile. Locally reproduced: `cargo test -p onnx-runtime-ep-cpu` 949+ pass; `-p onnx-runtime-shape-inference` pass; `cargo fmt --all --check` clean; `cargo clippy -p onnx-runtime-ep-cpu -p onnx-runtime-shape-inference --all-targets -D warnings` clean.
+- **Deferred scope (9):** exporter rewrite, static-cache packed driver, CUDA, f16/bf16, benchmark honestly documented as deferred.
+
+## Non-blocking notes (v1 reference kernel; not merge-blockers)
+- `softcap != None` and default `scale=None` (1/sqrt) paths have no dedicated test (tests always `Some(0.5)`, `softcap: None`).
+- `unsupported_reason` claim-time validation has no direct unit test in the diff.
+- Trace-metric `kv_len` uses `.max(0)` clamp while the execute loop errors on negative — cosmetic inconsistency, metrics-only, no correctness impact.
+
+**Bottom line:** The critical varlen failure modes (cross-sequence leakage, within-sequence
+causality, KV truncation) each have a sensitive, independent, byte-identical test that I
+verified fails under injected bugs. Ship it.
+
+<!-- merged from .squad/decisions/inbox/pris-ci-supply-chain-and-coverage.md sha256:d3df2bda205146bf5bf49c3be61176cfb07e7d0ddb8a4f85090189bc06a54d23 -->
+
+# CI supply-chain hardening and coverage policy
+
+Date: 2026-07-27
+Owner: Pris
+Requested by: Justin Chu
+Run: https://github.com/justinchuby/onnx-genai/actions/runs/30309892830
+Commit verified: fb1f301eb8df7b2ce25de078babb3bbdafd8a0e9
+
+## Policy recorded
+
+- Be wary of personally-owned third-party GitHub Actions. Prefer commands we own directly when GitHub-hosted runners already provide the substrate.
+- Every coverage-capable test lane should produce a coverage report and upload it to Codecov with a lane-specific flag. Upload failures remain non-blocking; test/coverage execution failures remain blocking.
+
+## Replacements in scope
+
+Changed `.github/workflows/ci.yml` and `.github/workflows/audit.yml` only.
+
+- Replaced `dtolnay/rust-toolchain@stable` with direct `rustup toolchain install stable --profile minimal --component ...` plus `rustup default stable`.
+  - Stable is deliberate: it follows Rust's stability promise without freezing security fixes. The cache key records the resolved `rustc` release.
+- Replaced `Swatinem/rust-cache@v2` with `actions/cache@v4` over `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, and `target`.
+  - `actions/cache` is GitHub-owned, which is acceptable under the new supply-chain rule.
+- Replaced `taiki-e/install-action@cargo-llvm-cov` with direct `cargo install cargo-llvm-cov --version 0.8.7 --locked --force`, guarded by an installed-version check.
+  - Recommendation implemented: install from crates.io instead of a personal install action. This costs build minutes on cache misses, but keeps the binary provenance in Cargo's registry/checksum path and avoids ad-hoc binary checksum plumbing in CI.
+
+## Coverage flags added
+
+- `offline` for the portable offline crate tests on Linux, Windows x86_64, and macOS.
+- `mlas` for the Linux-only `mlas-sys` test.
+- `cli-ort-linux` for CLI ORT Linux tests.
+- `cli-ort-windows` for CLI ORT Windows tests.
+
+`codecov.yml` now declares those flags with `carryforward: false`.
+
+## Verification
+
+Final CI run is green: https://github.com/justinchuby/onnx-genai/actions/runs/30309892830
+
+- `a_turn_that_stops_inside_the_reasoning_says_it_has_no_answer` executed in `CLI ORT coverage (Linux x86_64)` and passed.
+- Codecov uploads were queued for `offline`, `mlas`, `cli-ort-linux`, and `cli-ort-windows`.
+- Windows CLI ORT coverage explicitly stages `onnxruntime.dll` into both `target\\debug` and `target\\llvm-cov-target\\debug` paths and runs `cargo llvm-cov --no-clean` so coverage target layout does not lose the DLL.
+
+## Measured time cost
+
+Baseline: main CI run https://github.com/justinchuby/onnx-genai/actions/runs/30307881431
+Final run: https://github.com/justinchuby/onnx-genai/actions/runs/30309892830
+
+| Lane | Baseline | Final | Delta |
+|---|---:|---:|---:|
+| Rust quality | 2m12s | 2m42s | +0m30s |
+| CUDA compile Linux | 0m42s | 0m28s | -0m14s |
+| CUDA compile Windows | 2m31s | 1m37s | -0m54s |
+| Rust Linux x86_64 | 3m32s | 6m15s | +2m43s |
+| Rust Windows x86_64 | 5m21s | 10m21s | +5m00s |
+| Rust macOS arm64 | 2m43s | 4m25s | +1m42s |
+| Rust Windows ARM64 | 6m40s | 9m51s | +3m11s |
+| CLI ORT Linux x86_64 | 1m22s | 5m47s | +4m25s |
+| CLI ORT Windows x86_64 | 3m10s | 12m16s | +9m06s |
+
+The largest added costs are the CLI ORT coverage lanes, especially Windows, where instrumentation plus ORT rebuild/staging is significant. The final critical path increased from about 6m40s to about 12m16s.
+
+## Known exception
+
+`aarch64-pc-windows-msvc` coverage is blocked by an upstream Rust/LLVM issue: `llvm-profdata` reports malformed `.profraw` files with `symbol name is empty` and cannot merge profiles (rust-lang/rust#150123). The Windows ARM64 runner still executes the same offline tests and clippy gate, but coverage upload is disabled there until upstream fixes coverage instrumentation.
+
+## Remaining release workflow debt
+
+Out of scope for this change, still present and should get a dedicated release-workflow review:
+
+- `.github/workflows/publish.yml` uses `dtolnay/rust-toolchain@stable` at four call sites.
+- `.github/workflows/wheels.yml` uses `dtolnay/rust-toolchain@stable` at two call sites.
+
+## Concurrency policy — 2026-07-27
+
+Justin directed CI to cancel superseded runs so rapid PR pushes do not keep burning full coverage minutes after a newer commit exists.
+
+### Applied
+
+- `.github/workflows/ci.yml` now uses:
+  - `group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}`
+  - `cancel-in-progress: true`
+  - Why this key: pull request events group by PR number, so newer pushes to PR #296 cancel older PR runs. Push events to `main` group by commit SHA, so post-merge `main` runs are not cancelled by later commits and keep their health signal. The workflow-dispatch boolean separates manual runs from normal PR/push groups.
+- `.github/workflows/audit.yml` now uses:
+  - `group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' }}`
+  - `cancel-in-progress: true`
+  - Why this key: audit has no `pull_request` trigger, so grouping by ref cancels stale branch audits when Cargo manifests/lockfiles change repeatedly. The latest completed audit is the useful signal.
+
+### Exempted / unchanged
+
+- `.github/workflows/publish.yml`: already serializes by tag/ref with `cancel-in-progress: false`; left unchanged. Cancelling release publication can leave crates or wheels half-published.
+- `.github/workflows/wheels.yml`: left unchanged because it has tag and manual publish paths (`publish-cpu` uses PyPI trusted publishing). Treat it like release infrastructure; cancelling mid-publish is riskier than wasted minutes.
+- `.github/workflows/squad-heartbeat.yml`: left unchanged because it mutates issues/comments/assignments; cancellation mid-run can leave partial GitHub state.
+- `.github/workflows/squad-issue-assign.yml`: left unchanged because it comments on and assigns issues; cancellation/retry can duplicate or partially apply state.
+- `.github/workflows/squad-triage.yml`: left unchanged because it comments/labels issues; cancellation can leave partial triage state.
+- `.github/workflows/sync-squad-labels.yml`: left unchanged because it creates/updates many labels; although mostly idempotent, cancellation can leave a partially synced label set until a later run.
+
+### Verification
+
+After merging `origin/main` to restore a mergeable PR test merge, I pushed two commits in quick succession:
+
+- Superseded run (merge push `da7418b2`) was cancelled: https://github.com/justinchuby/onnx-genai/actions/runs/30314651548
+- Newer run (follow-up push `da81cb3b`) completed successfully: https://github.com/justinchuby/onnx-genai/actions/runs/30314662714
+
+An earlier run from `6edd2d1a` was also cancelled once the PR became mergeable again and the newer PR run entered the same PR-number group: https://github.com/justinchuby/onnx-genai/actions/runs/30314546751
+
+## Cache key correctness — 2026-07-27 review follow-up
+
+Copilot review caught that `runner.os` alone is too coarse for this repo: `windows-latest` and `windows-11-arm` both report `runner.os == 'Windows'`, but their `target/` artifacts and `~/.cargo/bin` binaries are not interchangeable.
+
+Policy recorded: cargo cache keys must include the OS, runner architecture, actual Rust target triple, rustc release, cached cargo-tool version inputs, and `Cargo.lock`. If a job cross-compiles, the key should use the target triple rather than only the runner architecture.
+
+Implemented key shape in `ci.yml`:
+
+```yaml
+${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-target.outputs.triple }}-rust-${{ steps.rust-toolchain.outputs.version }}-cargo-tools-${{ env.CARGO_LLVM_COV_VERSION }}-${{ hashFiles('Cargo.lock') }}
+```
+
+`steps.cache-target.outputs.triple` resolves from `matrix.target` when the job supplies an explicit target, otherwise from `rustc -Vv` host. This prevents Windows x86_64 and Windows ARM64 from sharing either restore or save keys.
+
+Audit follow-up: confirmed `audit.yml` only runs `cargo install cargo-audit` and `cargo audit`; it does not run clippy or rustfmt, so the `clippy,rustfmt` rustup components were removed from that workflow.
+
+<!-- merged from .squad/decisions/inbox/roy-313-review.md sha256:b48bcd071042629b9e70a9ceef03f3e0815dbed3fd87bdf649cd14e0cf73820b -->
+
+# Decision: PR #313 review (Roy, Reviewer)
+
+**Verdict: APPROVE**
+
+PR #313 (author Vickers/justinchuby, branch `squad/regr-decode-garble`) adds a
+single regression-prevention test — no production behavior change.
+
+## What was verified
+- **Test-only diff**: single file `crates/onnx-runtime-session/src/executor/tests.rs`,
+  +117/-0. No `src` logic touched. Not a red flag.
+- **Test quality**: `decode_shaped_residual_graph` is genuinely decode-shaped —
+  3 residual layers (`prev` read twice: feeds both `Tanh` and the residual `Add`,
+  so it stays live across the activation) + a long-lived carry `k = Relu(x)`
+  produced first / consumed last (KV/cache stand-in) + a pure activation tail
+  that legitimately fires compute-in-place. The byte-identity assertion compares
+  the enabled path against a **disabled reference** (compute-in-place OFF), not
+  self-vs-self. Asserts alias count `>= 3` (enabled) and `== 0` (disabled) so the
+  guard is not vacuous.
+- **Mutation proof (independently reproduced)**: flipped last-use→first-use in the
+  liveness pass (`last_use.insert` → `entry().or_insert`) in
+  `crates/onnx-runtime-session/src/executor/build.rs`. After `touch` to defeat the
+  stale-mtime gotcha and rebuild: the NEW test **FAILED** on the byte-identity
+  assertion, while `compute_in_place_chain_is_byte_identical_and_fires` and
+  `compute_in_place_preserves_control_flow_captures` still **PASSED**. Reverted
+  cleanly; 94 lib tests green again. (Pre-existing `refuses_live` test also catches
+  this mutation — expected; the new test adds real-model-shaped multi-hazard
+  coverage beyond the single-op cases.)
+- **Local quality gates**: `cargo test -p onnx-runtime-session --lib` → 94 passed;
+  `cargo fmt -p onnx-runtime-session -- --check` clean; `cargo clippy -p
+  onnx-runtime-session --all-targets -- -D warnings` clean.
+- **CI**: all checks green including Rust quality, Rust (Windows x86_64/ARM64,
+  macOS, Linux), CLI ORT coverage (Windows/Linux), CUDA compile, codecov.
+
+## Rationale
+Closes the coverage gap that let #301 ship without a real-decode-shaped parity
+check. The exoneration narrative (compute-in-place fires 0× on real fused decode
+graphs; env toggle no-op; ON/OFF/ORT byte-identical; garble = small-model greedy
+behavior + separate #289 REPL renderer bug) is consistent with a test-only guard
+that adds protection without changing behavior. Mutation gate independently passes.
+
+<!-- merged from .squad/decisions/inbox/shaw-heterogeneous-partition-65.md sha256:0d7f5bfbe645c7c928498612c5fbf14e5c5ddbaf8716b3b09eba0403a7e60072 -->
+
+# Decision: Heterogeneous CPU/CUDA graph partition and execution (#65)
+
+- **Author:** Shaw (runtime/executor architect)
+- **Date:** 2026-07-27
+- **Issue:** #65 — Implement heterogeneous CPU/CUDA graph partition and execution
+- **Branch:** `squad/65-heterogeneous-partition`
+
+## What
+
+New module `crates/onnx-runtime-session/src/hetero.rs` (+ `hetero/tests.rs`) that
+places a graph's nodes across an ordered set of execution providers, partitions
+them into convex same-provider claims, plans the minimal cross-device transfers
+at partition boundaries, and executes the graph heterogeneously with output that
+is **byte-identical** to single-provider execution.
+
+Public API:
+
+- `ProviderPlacement { ep, provider }` — a provider in priority order (front = highest).
+- `Partition { ep, device, nodes, inputs, outputs }` — one convex same-provider run.
+- `Transfer { value, from, to }` — a cross-device materialization at a boundary.
+- `HeterogeneousPlan { partitions, transfers, node_placement }`.
+- `plan(graph, providers) -> HeterogeneousPlan` — assign → partition → order → transfers.
+- `execute(plan, graph, weights, providers, inputs) -> Vec<Tensor>` — realize the plan.
+
+## Why this design (reuse, not rebuild)
+
+- **Placement** picks the highest-priority provider whose `supports_op` accepts
+  each node; a node no provider supports fails *before* execution
+  (`SessionError::unsupported_op`), mirroring `reject_unsupported_operators`.
+- **Partitioning reuses #76 verbatim.** Each provider is wrapped in an
+  `AssignedOracle` — a capability gate that reports support only for the nodes
+  that provider exclusively owns — and the landed
+  `OrtGraphView::query_capabilities` (union-find + Kahn convexity) is run over
+  it. This yields deterministic, convex claims per provider with **no
+  re-derivation** of the partitioning/convexity logic. Overlapping support
+  (e.g. both CPU and CUDA run `Add`) collapses to a single assignment.
+- **Ordering** is a Kahn topological sort of the partition DAG keyed by
+  `(min member topo-rank, ep, first node)` for determinism.
+- **Transfers** are deduplicated by `(value, to-device)`, so a value that fans
+  out to several partitions on the same destination device is transferred once,
+  and a transfer is only recorded when the source and destination devices differ.
+- **Execution reuses the existing `Executor`.** Each partition is extracted as a
+  standalone subgraph (values remapped, initializers re-attached, boundary
+  inputs become named graph inputs, partition outputs become graph outputs) and
+  run through the existing `Executor`. Intermediate tensors flow through a host
+  `HashMap<ValueId, Tensor>` — the correctness-first *synchronous host-staged
+  transfer* phase from `docs/HETEROGENEOUS_PLACEMENT.md` §5.2. Every
+  cross-partition value is materialized on the host between partitions, a
+  faithful (if unoptimized) realization of the planned transfer edges.
+
+## Correctness invariant & mutation proof
+
+The guarantee: a graph executed heterogeneously is **byte-identical**
+(`f32::to_bits` / raw-byte equality) to the same graph on one reference provider.
+Partition/placement/transfer-insertion is an execution-planning optimization,
+not an output change.
+
+Proven mutation-resistant two ways:
+
+1. **In-test probes** (`mixed_multiple_partition_boundaries`): reversing the
+   partition order → `Err` (topological order is load-bearing); clearing a
+   producer partition's outputs (drop a boundary transfer) → `Err`; restore →
+   byte-identical again; and a one-bit-flip oracle self-check confirms the
+   comparator actually detects a difference.
+2. **Source-level probe** (manual): replacing the output-recording
+   `values.insert(*parent_value, tensor)` in `execute` with a no-op made all four
+   execution tests (`pure_cpu`, `fully_accelerator`, `mixed`, `fan_out`) FAIL;
+   restoring returned all 8 to green. The tests are not vacuous.
+
+## Tests (8, all green)
+
+`pure_cpu_single_partition`, `fully_accelerator_single_partition`,
+`mixed_multiple_partition_boundaries`, `fan_out_boundary_transfer_is_deduplicated`,
+`topological_order_preserved`, `empty_graph_has_no_partitions`,
+`node_unsupported_by_all_providers_fails_before_execution`,
+`placement_is_deterministic_across_runs`.
+
+A CPU-backed `AcceleratorEp` mock reports `DeviceType::Mlx` with a restricted op
+set, so partition/placement/transfer-insertion is fully unit-testable on CPU
+while still exercising a genuine second device for transfer planning. Real GPU
+execution is gated behind the existing ep-cuda GPU-only pattern (CI compiles
+CUDA, runs it only on a GPU); this slice is CPU-verified.
+
+## CI note
+
+Workspace-wide build fails only on the uninitialized `vendor/cpuinfo`
+submodule — pre-existing/environmental (red on `origin/main` too), not caused by
+this PR. Per-crate `cargo test`/`fmt`/`clippy -D warnings` on the touched crates
+(`onnx-runtime-session`, `onnx-runtime-ep-api`, `onnx-runtime-ep-cpu`) are green.
+
+### Gotcha logged for the team
+
+The `mv`/`cp`-restore of a mutation-probe backup can give the restored file an
+**older mtime**, so cargo's incremental fingerprint reuses the stale (mutated)
+object and tests keep failing on already-correct source. Always `touch` the
+restored file (or `cargo clean -p <crate>`) after a probe-restore before
+re-running.
+
+## Deferred scope (documented, not silently claimed)
+
+- Value residency: keeping a tensor on-device across partition boundaries
+  (this slice round-trips every boundary value through host memory).
+- Asynchronous copies / fences / stream overlap (transfers are synchronous).
+- Shape-keyed placement (`M=1` decode on CUDA vs `M>1` prefill on CPU).
+- Partition-level CUDA-graph capture and multi-GPU peer (D2D) copies.
+- Real end-to-end CUDA execution validation (CPU-only in CI; GPU path gated).
+
+<!-- merged from .squad/decisions/inbox/tennessee-disk-backed-kv-60.md sha256:c380f0a4cfba1f5623074b65b3aed114b81ace499aa95557c736e6985cb863dc -->
+
+### 2026-07-27: Disk KV backing-store boundary
+**By:** Tennessee
+**What:** `LocalTieredConnector` now spills fully cold payloads through the public `KvBackingStore` trait, using `DiskKvBackingStore` by default when `DiskTierConfig` is set; an in-memory implementation remains available for embedding/tests.
+**Why:** Keeping the existing `PageTable` residency and prefix indexes intact avoids rebuilding paging, while dropping the payload after a durable write makes the configured cold tier real and restores bit-exact f32 K/V at fetch time. Each disk store owns a unique scratch subdirectory and deletes it on drop.
+
+<!-- merged from .squad/decisions/inbox/vickers-decode-garble-regression.md sha256:128428ab9b6ead723df3dfebf45899da3c85d1f2df4c0f9a7a3294791172db01 -->
+
+# Decision — "native/CUDA decode garble" regression: compute-in-place (#301) EXONERATED
+
+- **Author:** Vickers (debugging)
+- **Date:** 2026-07-28
+- **Requested by:** Justin
+- **Branch / PR:** `squad/regr-decode-garble` (see PR)
+- **Issue context:** #85 (compute-in-place), #301, plus suspects #303/#286/#289
+- **Verdict:** The reported "both native AND CUDA decode is corrupted" regression is **NOT** caused
+  by graph-level compute-in-place aliasing (#301). The prime hypothesis is disproven by direct
+  measurement. **Do not disable compute-in-place — it is inert on real decode graphs.**
+
+## What was reported
+CLI text generation "corrupted" on both `native` (CPU) and CUDA backends: repeated
+sentences/phrases, garbled/"oversized" characters, and whitespace inserted between rendered
+characters. ORT presumed unaffected. Prime hypothesis: PR #301's default-on compute-in-place
+aliasing corrupts a still-live buffer on real multi-layer decode graphs.
+
+## What I measured (definitive bisect: `ONNX_GENAI_COMPUTE_IN_PLACE` on/off)
+Real models, greedy/deterministic, `onnx-genai generate --greedy --raw`:
+
+| Backend | Model | ON (default) vs OFF | vs ORT | Output quality |
+|---|---|---|---|---|
+| native CPU | qwen3-0.6b (cpu-int4) | **byte-identical** (2 prompts, 60 & 80 tok) | **byte-identical** | coherent |
+| CUDA | qwen2.5-0.5b-instruct | **byte-identical** | n/a | coherent |
+
+Then I **instrumented the alias site** (`dispatch.rs`, `compute_in_place_alias_count`) and ran a
+real decode on each model:
+
+- **qwen3-0.6b CPU decode: 0 aliases.**
+- **qwen2.5-0.5b CUDA decode: 0 aliases.**
+
+Compute-in-place **never fires** on these real decode graphs — its eligibility predicate
+(`dispatch.rs:443-467`: dead/last-use + `can_run_in_place` + not-external/pinned/shared/view/output
++ dtype/shape/contiguous/offset guards) admits **nothing** on a fused transformer decode graph. So
+it is mechanically incapable of corrupting output here, and toggling the env var is a **no-op**.
+
+Per the task's own decision tree: *"If the flag does NOT change the output, then #301 is NOT the
+(only) cause."* The flag does not change output → **#301 is exonerated.**
+
+## What the symptoms actually are
+- **Repeated sentences/phrases:** natural greedy behavior of a small model on a raw (non-chat)
+  prompt — reproduced **identically** on native ON, native OFF, **and ORT**. Not a regression.
+- **Garbled/"oversized" characters + whitespace-between-characters:** these are **terminal-render
+  artifacts**, not numeric decode corruption (native decode is byte-identical to ORT and coherent).
+  The only new rendering code in this session's merges is the **#289 rich REPL editor / ratatui
+  inline live renderer** (`crates/onnx-genai-cli/src/live_turn.rs`), which is TTY-gated (does not
+  affect `generate` or piped `run`). This is a **SEPARATE bug that a second agent should own.**
+  - Concrete suspect for a second agent: `live_turn.rs::wrapped_rows` budgets rows with
+    `segment.text.chars().count()` (scalar char count) while ratatui lays out with **display
+    width** (wide/CJK/emoji = 2 cells). A width mismatch there (and/or the `insert_before` spill vs
+    `draw` interaction) is the kind of defect that yields "extra whitespace / oversized glyphs".
+    I could not fully repro in this environment because the reedline editor requires cursor-position
+    replies that a plain pty does not emulate (`ESC[6n` → "cursor position could not be read"). Needs
+    a real TTY repro.
+
+## Decision
+1. **Keep `ONNX_GENAI_COMPUTE_IN_PLACE` default ON.** Flipping it to opt-in would be a no-op fix
+   under a **false narrative** (it never fires on these models), and would risk the team closing the
+   real (rendering) bug as "fixed" while users still see garbled REPL output. The opt-out env var
+   already exists as an escape hatch. This is deliberately **not** shipping a default-off change.
+2. **Harden the #301 class anyway** with an always-run, mutation-proof session test on a *real,
+   multi-layer decode-shaped graph* (residual reuse + long-lived KV/cache carry) — the shape the
+   existing single-op unit tests could not exercise together. Test:
+   `compute_in_place_multilayer_decode_residual_is_byte_identical_and_fires`
+   (`crates/onnx-runtime-session/src/executor/tests.rs`). It asserts the enabled path (a) actually
+   aliases (≥3, non-vacuous) and (b) is byte-identical to the out-of-place reference.
+   **Mutation result:** with a liveness hole injected (record first-use instead of last-use, so a
+   residual/carry input is aliased away) the new test **FAILS** — while the pre-existing
+   `compute_in_place_chain_*` and `_control_flow_captures` tests still PASS, demonstrating exactly
+   the coverage gap this adds. Restored; all 94 lib tests green, fmt + clippy(-D warnings) clean.
+
+## Follow-ups (open)
+- **[owner: a CLI/render agent]** Reproduce and fix the #289 REPL render artifacts
+  (oversized/whitespace-between-characters) in a **real TTY**; start at `live_turn.rs`
+  (`wrapped_rows` width accounting + ratatui inline viewport).
+- **[optional, perf]** #301 provides **zero** measured aliasing on real qwen decode graphs; if the
+  optimization is meant to help decode, its eligibility predicate needs revisiting (separately).
+
+## Files
+- `crates/onnx-runtime-session/src/executor/tests.rs` (+ new test; only file changed)
+- No production code changed. Instrumentation used during investigation was temporary and reverted.
+
+<!-- merged from .squad/decisions/inbox/walter-pr308-review-60.md sha256:8016e389227259c4e1ba6aec126e358a5bfd363a07dc689c10160de1dc2a4fc8 -->
+
+# Walter — Independent Review of PR #308 (issue #60: real disk-backed KV offload)
+
+**Verdict: REQUEST-CHANGES**
+**Reviewer:** Walter (adversarial, independent; not author Tennessee)
+**Worktree:** /home/justinchu/wt-walter-308 @ origin/squad/60-disk-backed-kv (62beba4f)
+**Date:** 2026-07-28
+
+## Summary
+Adds `KvBackingStore` trait + `InMemoryKvBackingStore` + `DiskKvBackingStore`; `LocalTieredConnector`
+spills fully-cold chunk payloads to a unique scratch dir and restores them bit-exactly, cleaning up on drop.
+The offload correctness is well-tested and holds locally, BUT the PR's own new test breaks Windows CI.
+
+## Blocking issue (why REQUEST-CHANGES)
+`Rust (Windows x86_64)` AND `Rust (Windows ARM64)` CI jobs both FAIL:
+- `local_tiered::tests::capabilities_and_health_are_reported` panics at local_tiered.rs:1144
+  `assertion failed: matches!(degraded.health().await, ConnectorHealth::Degraded { .. })`.
+- Cause: test hardcodes Unix path `/nonexistent/onnx-genai-kv-disk-tier` (local_tiered.rs:1140).
+  `health()` (local_tiered.rs:668-679) reports Degraded only when `disk.path.is_dir()` is false.
+  On Windows that path is creatable under the current drive, so `create_dir_all` succeeds and
+  `health()` returns Healthy. Classic filesystem-path portability assumption breaking Windows/aarch64.
+- Fix: make the "unavailable" path uncreatable cross-platform (child dir under a regular-file path via
+  env::temp_dir()), or drive degraded-health off a construction-time failure flag, not an is_dir() probe.
+
+## Verified correct (evidence)
+- Local: `cargo test -p onnx-genai-kv` 94 pass; engine bridge test pass; `cargo fmt --all -- --check` clean;
+  `cargo clippy -p onnx-genai-kv -p onnx-genai-engine --all-targets -- -D warnings` clean.
+- Mutation A (corrupt 1 byte on write, `to_bits() ^ 1`): round-trip test AND forced-spill test both FAILED
+  → bit-exact round-trip is genuinely asserted (uses f32::to_bits; NaN 0x7fc00001 and -0.0 covered). Restored.
+- Mutation B (disable spill body `if false && all_cold`): forced-spill FAILED "must write real spill files"
+  (spill_count, local_tiered.rs:807) and engine test FAILED on spill_count()>=2 (connector_bridge.rs:733)
+  → a real spill is exercised, not silently passing in RAM. Restored; git status clean.
+- Decode equivalence: connector_bridge disk_offloaded_fetch_extension_matches_resident_decode_input asserts
+  offloaded fetch == resident fetch (the exact decode-input K/V).
+- Multi-sequence: files keyed by KvCacheKey (Hash+Eq), sequential {n}.kv names → no path collision across seqs.
+- Drop: `let _ = fs::remove_dir_all(scratch_dir)` — no panic; tests assert parent dir empty after drop;
+  unique child dir per store (pid+nanos+atomic), caller parent untouched.
+- Extras: write rejects malformed payload (is_well_formed); read validates magic/dtype/trailing bytes;
+  no new Cargo dependency (pure std::fs); only F32 dtype, handled exhaustively.
+
+## Required change
+Fix the hardcoded `/nonexistent` Unix path so the two Windows Rust jobs go green. Then this is an approve.
+
+PR comment: https://github.com/justinchuby/onnx-genai/pull/308#issuecomment-5099351466
+
+---
+
+## Re-review update — VERDICT: APPROVE (2026-07-28)
+David's fix commit `adf46ff8` resolves the blocking Windows CI failure.
+- Test now uses a temp FILE as the disk-tier dir path (`std::fs::write(&unavailable_path, [])`), so
+  `is_dir()==false` on Unix AND Windows → `health()` returns Degraded portably. `create_dir_all` on a
+  file path also fails, so no stray dir is created.
+- No leak: health captured, then `remove_file` before the assert (runs even if assert would panic).
+- Local: capabilities_and_health test passes.
+- Mutation probe: replaced temp-file with a real dir (+touch to defeat cargo stale-mtime) → test FAILED
+  at L1152 (health Healthy not Degraded) → the Degraded assertion genuinely bites. Restored, clean.
+- CI: Rust quality + Rust (Windows x86_64) + Rust (Windows ARM64) all GREEN; all other jobs pass.
+PR comment: https://github.com/justinchuby/onnx-genai/pull/308#issuecomment-5099599881
+
+
+Decision archive gate checked at 2026-07-28T05-49-08+0000: active ledger was 858394 bytes; archived 0 dated sections on or before 2026-07-21 to `none (no dated sections on or before cutoff)`.
+
+<!-- scribe-merge-2026-07-28T05-49-08+0000-wave3 -->
+
+<!-- merged from .squad/decisions/inbox/faris-307-cb-bench.md -->
+
+### 2026-07-28: Scheduler-driven continuous-batch benchmark design
+**By:** Faris
+**What:** Benchmark scheduler-driven continuous batching against sequential generation at 1, 2, 4, and 8 physical rows, with two requests per row to include queue admission and backfill. Materialize the committed scatter fixture as `model.onnx` so the model benchmark and its CI smoke check are runnable.
+**Why:** This measures the serving path introduced by #303 under concurrent decode while retaining a deterministic, small CPU fixture and a direct throughput baseline. The pinned-core measurement shows the expected gain at concurrent load (51.01K vs 44.26K tok/s at 2 rows; 75.09K vs 58.35K at 4 rows).
+
+<!-- merged from .squad/decisions/inbox/cole-320-review.md -->
+
+### 2026-07-28: Approve PR #320 continuous-batching benchmark
+**By:** Cole
+**What:** Approve PR #320. The diff is benchmark/fixture/CI-only, compares identical request sets and generated-token counts, and the existing scheduler parity suite proves non-empty token equality against sequential generation.
+**Why:** The parity suite passed and a one-token mutation made its equality assertion fail. The benchmark smoke path loaded the committed scatter ONNX fixture, and a pinned-core concurrency-4 run measured scheduled throughput above sequential throughput (about 75.1K versus 60.8K tokens/s).
+
+<!-- merged from .squad/decisions/inbox/gaff-63-gpu-weight-offload.md -->
+
+### 2026-07-28: Live GPU weight offload — Phase-3b device-binding slice (#63)
+
+**By:** Gaff (CUDA/systems)
+
+**What:** Implemented the smallest complete, correct vertical slice of live GPU
+weight offload (WEIGHT_OFFLOAD Phase 3b): a CUDA `LazyDeviceWeightBinder`
+(`CudaWeightPager`) that allocates a bounded VRAM page for one offloaded
+`pkg.nxrt::BlockQuantizedMoE` weight tensor, copies its canonical compressed
+bytes host→device region-by-region (via a new `MmapRegionSource` seam, never a
+full host expansion), and returns an owned RAII `CudaWeightPage` a kernel reads.
+Proven by a GPU device-execution test: a MatMul weight served through the live
+paging path is **byte-identical** to the resident-upload path, with a mutation
+guard that a corrupted region diverges. Mutation-probed the binder's H2D copy
+(wrong offset) — the byte-identity test fails as required, then reverted.
+
+**Why:** #63 was PARTIAL — CPU host-cache + placement planning existed but live
+VRAM paging/H2D/bind/device-exec were unimplemented stubs
+(`Phase3aHostOnlyBinder` returned `Unsupported`). This lands the real device
+mechanism at the EP seam with correctness proven first (the cardinal rule:
+offload is an optimization, never an output change), leaving clean seams for the
+deferred work.
+
+**Deferred (clean seams left, #63 stays open):** wiring the binder into the
+executor's `BlockQuantizedMoE` dispatch so the fused MoE kernel consumes the
+device page; flipping the CUDA EP's `nxrt` capability (kept `stock` so the
+resident MoE path is unaffected until dispatch wiring lands); multi-page
+LRU/eviction; CPU-wave execution for non-GPU layers; prefetch overlap (#87);
+routed-expert paging (#82). The `MmapRegionSource` trait is the seam the
+executor's weight store will implement to page directly from live mmaps.
+
+<!-- merged from .squad/decisions/inbox/rosenthal-321-review.md -->
+
+# Review: PR #321 — Live GPU weight offload (Phase 3b, issue #63) by Gaff
+
+**Reviewer:** Rosenthal (CUDA/systems)
+**Verdict:** APPROVE
+**Date:** 2026-07-28
+
+## Scope
+Phase-3b vertical slice: live VRAM page alloc + H2D transfer + binding for ONE
+offloaded `pkg.nxrt::BlockQuantizedMoE` weight consumed by a real GPU MatMul
+kernel. Dispatch wiring deferred (issues #82/#87). Files: `ep-api/weight.rs`
+(LazyWeight dtype/shape, `MmapRegionSource` seam, `WeightHandleError::DeviceBinding`),
+`ep-cuda/weight_paging.rs` (`CudaWeightPage` RAII, `CudaWeightPager` binder),
+`tests/weight_offload_gpu.rs`, plus caller updates.
+
+## Findings
+
+### Stream ordering (the critical, subtle check) — NO GAP
+The consuming kernel runs on the EP's dedicated **non-blocking** compute stream
+(`new_stream()` → `CU_STREAM_NON_BLOCKING`, cudarc 0.19.8 core.rs:680). The page
+is filled by `runtime.htod` = `cuMemcpyHtoD_v2` (host-blocking synchronous). Here
+the sync copy is the **producer** and completes on the host *before* the kernel is
+enqueued, so it is correctly ordered — identical to the resident-upload pattern the
+entire EP already relies on and documents (runtime.rs:314-316: "host-blocking
+`*_sync` copies remain correctly serialized against kernel launches"). The known
+`dtod`/`dtoh` footgun is the **opposite** direction (kernel produces → sync copy
+consumes, needing `synchronize()` first); this PR does not reintroduce it, and the
+test's output readback uses `runtime.dtoh` which synchronizes internally. Verified:
+same-direction as the resident reference in the same test, so offload adds no new
+ordering hazard.
+
+### Correctness — PASS
+`offloaded_weight_is_byte_identical_to_resident` compares the OFFLOAD-path kernel
+output (weight paged via `CudaWeightPager`) against an independent RESIDENT-path
+reference (ordinary `htod` upload), byte-for-byte, with fresh output buffers each
+run (not self-vs-self / not a buffer echo), plus an independent CPU-matmul
+cross-check. `MmapRegionSource` copies ONLY the selected region bytes
+(`bytes[offset..offset+len]`), no full host expansion (§9 invariant 5 upheld);
+offset padding (0xAB) proves offset handling. Length mismatch is rejected with
+`DeviceBinding`.
+
+### RAII / leak — PASS
+`CudaWeightPage::drop` frees VRAM exactly once via `free_raw`. The page (owning the
+allocation) is constructed *before* the copy loop, so any early `?` return on copy
+failure drops it → frees the VRAM; no leak, no half-bound weight escapes.
+
+### No regression — PASS
+CUDA capability stays stock (`NXRT_WEIGHT_PAGING_CAPABILITY` constant untouched;
+only the re-export list gained `MmapRegionSource`). Resident `materialize()` path
+unchanged; dispatch wiring deferred. `LazyWeight` gains additive `dtype`/`shape`
+fields; the `block_quantized_moe` signature change is applied to all callers
+(session `build.rs`, api tests). Resident MoE/decode output byte-unaffected.
+
+## Verification performed
+- `cargo fmt --all -- --check` → clean.
+- Clippy on touched files (`weight_paging.rs`, `weight.rs`, `weight_offload_gpu.rs`)
+  → clean. Local `-D warnings` failures are all pre-existing lints in **untouched**
+  kernel/test files under a newer local toolchain (rustc 1.97.0); CI "Rust quality"
+  gate passes.
+- CI checks (`gh pr checks 321`): Rust quality, platform (Linux/Windows/macOS),
+  CUDA compile (Linux/Windows), Miri all green. Kernel micro-benchmarks pending
+  (non-blocking).
+- GPU (pinned `CUDA_VISIBLE_DEVICES=0 taskset -c 1`): both tests pass.
+- **Mutation proof:** corrupted the H2D copy (`mutated[0] ^= 0xFF`) →
+  `offloaded_weight_is_byte_identical_to_resident` FAILS as required (offload output
+  diverges from resident); reverted → green. (Note: a naive skip-1-byte mutation was
+  masked by CUDA allocator reuse of the freed resident buffer; a content-corrupting
+  mutation is the reliable probe.)
+
+<!-- merged from .squad/decisions/inbox/chance-54-model-package.md -->
+
+### 2026-07-28: Land the model-package MVP as a reusable leaf crate
+**By:** Chance
+**What:** Add `onnx-model-package` for ORT 1.x directory manifests, selection, resolution, and validation; adapt `ModelDirectory` so existing engine entry points auto-detect packages while retaining flat-directory behavior.
+**Why:** This keeps package policy independent of ORT/session code and passes resolved model, metadata, configuration, and tokenizer paths into existing loaders. Advanced authoring/inspection CLI, archives, registries, hashes, multi-component pipelines, and compiled-EP compatibility ranking remain deferred.
+
+<!-- merged from .squad/decisions/inbox/ankor-322-review.md -->
+
+### 2026-07-28: PR #322 review — request changes
+**By:** Ankor
+**What:** Block the model-package MVP on path-confinement remediation.
+**Why:** `layout: "installed"` is attacker-controlled and currently permits `/etc/passwd` and `..` references, so an untrusted package can validate arbitrary host paths. An external component directory also permits its implicit `component.json` symlink to resolve outside the package root. Portable direct references correctly reject absolute, parent, and symlink escapes in local probes, but the PR has no durable adversarial coverage.
+**Next:** Holden (Security Engineer), not Chance, should confine every manifest-derived read (including external `component.json`) or introduce an explicit trusted-installed policy, then add absolute/parent/symlink regression tests.
+
+### 2026-07-28: Confine model-package manifest reads after PR #322 security review
+**By:** Scribe, preserving Holden's security fix from the wave-3 manifest
+**What:** Holden repaired PR #322's path-traversal findings by adding `HostTrust` (`Confined` by default, `AllowInstalledLayout` caller opt-in), routing package opens through `open_with_trust`, and enforcing `canonicalize_confined()` symlink-resolving confinement. Manifest-derived paths alone can no longer escape the package root; trusted installed layouts require explicit caller policy.
+**Why:** Ankor's initial review found two traversal vulnerabilities: attacker-controlled `layout: "installed"` could reference arbitrary host paths, and external component directories could use a `component.json` symlink outside the package root. Holden's fix added nine adversarial tests and mutation-proved the confinement, after which Ankor re-approved and PR #322 merged as `cd8e7b34`. Issue #54 remains open for CLI tooling, format registry, advanced EP ranking, hashes/signatures, multi-component packages, archives, and registries.
+
+
+<!-- scribe-archive-2026-07-28T06-44-16+0000-wave4 -->
+Decision archive gate checked at 2026-07-28T06-44-16+0000: active ledger was 868508 bytes and exceeded 51200 bytes. Applied the 7-day policy (entries on or before 2026-07-21); no eligible dated decision sections remained after the prior reconciliation, so archived 0 entries and created no archive file.
+
+
+<!-- scribe-merge-2026-07-28T06-44-16+0000-millburn-55-metadata-hints -->
+## 2026-07-28 — Incremental `onnx_runtime.*` metadata-hints subsystem
+
+**By:** Millburn; reviewed by Ravel (**APPROVE**).
+
+**What:** PR #329 (`7876a7ad`) added the typed `onnx_runtime.*` metadata-hints subsystem in `crates/onnx-std/src/metadata_hints.rs`, including validation, precedence, provenance, and warnings for recognized runtime metadata.
+
+**Why:** It establishes a safe metadata contract for runtime consumers while retaining forward-compatible warning behavior for unsupported or malformed hints. Issue #55 remains open for scheduler/consumer wiring and `execution_hints.json`/YAML/builder merging.
+
+
+<!-- scribe-merge-2026-07-28T06-44-16+0000-fifield-73-minimal-builds -->
+## 2026-07-28 — Incremental model-driven minimal operator builds
+
+**By:** Fifield; reviewed by Holloway (**APPROVE**).
+
+**What:** PR #327 (`64d99919`) keeps `full` default-on, fully gates the representative CPU `ops-cnn` group, and drives minimal builds from a shared operator catalog plus deterministic manifests. The `onnx-runtime-ep-cpu` and `onnx-runtime-operator-selection` catalog machinery retains unchanged default builds and mutation-proof minimal exclusions.
+
+**Why:** This provides a usable, testable minimal-build path without destabilizing the default registry or forcing a risky one-PR split of every kernel dependency. Issue #73 remains open for full gating of the remaining operator groups beyond CNN/pooling/spatial.
+
+<!-- scribe-merge-2026-07-28T07-46-01+00-00-wave5 -->
+## 2026-07-28 — Wave 5 shape-inference and CUDA parity reconciliation
+
+Decision archive gate checked at 2026-07-28T07:46:01+00:00: active ledger was 870368 bytes and exceeded 51200 bytes. Reviewed dated decision-entry headings against the seven-day cutoff (before 2026-07-21); none were eligible for archival. Historical date references were retained in their current entries.
+
+### Issue #75 — shape-inference catalog batch (PR #333, `6ba382b6`)
+**By:** Ricks (implementation); Karine (independent specification review)
+
+**What:** Added 16 standard tensor operators: `ConvTranspose`, `GridSample`, `Einsum`, `Celu`, `Shrink`, `Mish`, `HardSwish`, `LRN`, `MeanVarianceNormalization`, `ReverseSequence`, `RandomNormal`, `RandomUniform`, `RandomNormalLike`, `RandomUniformLike`, `Bernoulli`, and `Multinomial`. The registry advanced from 165 to 181 operators and from 203 to 219 versioned registrations. Karine approved after verifying specification math and running a mutation probe.
+
+**Why:** The additions close common tensor-op shape-inference gaps while retaining symbolic-dimension correctness and existing range-based version registration.
+
+**Deferred:** Sequence (8 operators), Optional (3), Map, Loop, Scan, recurrent, and ONNX-ML families remain outside #75. `Value` and `TypeInfo` currently carry only tensor dtype and shape, so container element-type propagation requires a separate SSA IR type-model change. Create/track this follow-up under #75, particularly for Sequence and Optional.
+
+### Issue #67 — CUDA operator coverage batch (PR #331, `52b1fc59`)
+**By:** Sapper (implementation); Hallett (independent review)
+
+**What:** Added CUDA coverage for `GatherND`, `SpaceToDepth`, and `EyeLike`, increasing `CUDA_COVERED_OPS` from 131 to 134 and standard CPU-parity coverage from 105/141. The batch was tested on an H200 across 165 parity cases. Hallett approved after coverage-of-coverage validation, a GPU4 parity rerun, and a content-corrupting mutation probe.
+
+**Why:** Structural byte kernels provide correct dtype-agnostic coverage for indexing and layout operators while reducing heterogeneous fallback. The all-target Clippy warnings were independently verified as identical and pre-existing on `main`; the default-target CI gate remains clean. Issue #67 stays open as a series.
+
+<!-- sources: decisions/inbox/ricks-75-shape-inference.md; decisions/inbox/sapper-67-cuda-coverage.md; wave-5 manifest -->
+
+<!-- scribe-merge-2026-07-28T08-28-52+00-00-joshi-326-wheels-fix -->
+
+## 2026-07-28 — Wheel-publishing repair for #326 (partial)
+
+**By:** Joshi (implementation); Mariette (review); Scribe (reconciliation)
+
+**What:** PR #337 (`5aed2dcf`) repairs `wheels.yml` publishing for Linux x86_64 and Windows AMD64: exclude the virtual Windows API-set DLL `ext-ms-win-dxcore-l1-1-0.dll` from delvewheel, pin the verified `quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1` image with pull retries, and install `clang-devel` for `ort-sys` bindgen. Linux x86_64 and Windows AMD64 build/smoke checks are green; Mariette approved after verifying the upstream tag, commit-SHA run, and unchanged publish gates.
+
+**Why:** Wheel publishing had been broken since 2026-07-21. The image pin/retries address brittle Quay pulls, `clang-devel` supplies libclang required by bindgen, and DXCore is a Windows API-set DLL which must not be vendored.
+
+**Open gap:** #326 remains open: macOS x86_64 extraction of the upstream `onnxruntime-osx-x86_64-1.27.0.tgz` fails because the archive is unavailable/returns an unrecognized format. This needs an ORT version bump or alternate source and is held for Justin; it is separate from the merged Linux/Windows fix.
+
+Decision archive hard gate checked at 2026-07-28T08:28:52+00:00: active ledger was 872849 bytes before this merge. No dated decision sections older than 2026-07-21 were eligible for archival.

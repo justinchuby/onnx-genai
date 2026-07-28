@@ -203,6 +203,12 @@ pub fn register(reg: &mut InferenceRegistry) {
     }
     reg.register("", "Selu", 6, unary);
     reg.register("", "ThresholdedRelu", 10, unary);
+    // Additional shape- and dtype-preserving activations, gated at their
+    // `since_version`: `Shrink` (9), `Celu` (12), `HardSwish` (14), `Mish` (18).
+    reg.register("", "Shrink", 9, unary);
+    reg.register("", "Celu", 12, unary);
+    reg.register("", "HardSwish", 14, unary);
+    reg.register("", "Mish", 18, unary);
     reg.register("", "Hardmax", 13, unary);
     reg.register("", "LpNormalization", 1, unary);
     reg.register("", "GroupNormalization", 18, unary);

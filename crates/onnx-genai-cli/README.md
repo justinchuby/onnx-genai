@@ -36,9 +36,11 @@ run is also cancelled by **Ctrl-C** mid-generation.
 When both stdin and stdout are terminals, the REPL uses a rich line editor:
 arrow-key cursor movement, persistent history, bracketed paste, slash-command
 completion, and multiline input with **Alt+Enter** (plain **Enter** submits).
-Interactive terminal sessions show compact per-turn stats by default; pass
-`--no-stats` to start with them hidden. When stdin or stdout is piped, the REPL
-keeps the original plain `>>> ` line-loop behavior for scripts and tests.
+Interactive terminal text generation shows compact per-turn stats by default;
+pass `--no-stats` to hide them. Stats are enabled only when stdin and stdout are
+terminals, and they are printed to stderr; piped stdout remains byte-stable
+generated text. When stdin or stdout is piped, the REPL also keeps the original
+plain `>>> ` line-loop behavior for scripts and tests.
 
 ### Generation budget and sampling
 
@@ -87,6 +89,72 @@ resource-constrained host or when debugging — set `ONNX_GENAI_DECODE_MEMO=0`
 unset, keeps it on.
 
 ## Runtime selection
+
+### Selecting the ONNX Runtime library
+
+There are two separate resolution steps:
+
+- **Build time (`ort-sys/build.rs`)** finds headers and a link/development
+  install in this order: `ORT_LIB_DIR`, `ORT_ROOT`, `pkg-config`, then a
+  SHA-256-pinned ORT 1.27.0 download into Cargo's `OUT_DIR`.
+- **Run time** chooses the shared library the process actually loads in this
+  order: `ONNX_GENAI_ORT_LIB` (exact file), `ONNX_GENAI_ORT_LIB_DIR`
+  (containing directory), active `CONDA_PREFIX`, active `VIRTUAL_ENV`, the
+  pinned `ort-sys` download under `target/.../ort-prebuilt/lib`, then the
+  platform dynamic-loader default search path.
+
+Native `cargo run` / binary builds can honor the runtime variables because
+`ort-sys` resolves `OrtGetApiBase` with `libloading` before the first ORT API
+call instead of link-loading `onnxruntime` into the final binary. If that ever
+changes back to a normal import-library link, runtime variables cannot override
+the OS loader; put the desired directory first in `PATH` (Windows),
+`LD_LIBRARY_PATH` (Linux), or `DYLD_LIBRARY_PATH` (macOS) before process start.
+
+Ask the tool what it actually loaded:
+
+```bash
+onnx-genai version
+cargo run -p onnx-genai-cli --bin onnx-genai -- version
+```
+
+The output includes the ORT path, ORT version, API version, and why that library
+was selected. Any explicit or auto-discovered selection also prints the same
+line on first ORT use. API mismatches name the loaded library path, loaded API
+version, required API version, and concrete fixes.
+
+Examples only — adapt paths to your machine:
+
+```powershell
+# Windows PowerShell, conda or venv with a pip onnxruntime wheel.
+$prefix = if ($env:CONDA_PREFIX) { $env:CONDA_PREFIX } else { $env:VIRTUAL_ENV }
+$env:ONNX_GENAI_ORT_LIB_DIR = "$prefix\Lib\site-packages\onnxruntime\capi"
+$env:PATH = "$env:ONNX_GENAI_ORT_LIB_DIR;$env:PATH"
+onnx-genai version
+```
+
+```bash
+# Linux/macOS shell, pip onnxruntime inside the active Python environment.
+export ONNX_GENAI_ORT_LIB_DIR="$(python - <<'PY'
+import pathlib, onnxruntime
+print(pathlib.Path(onnxruntime.__file__).resolve().parent / "capi")
+PY
+)"
+export LD_LIBRARY_PATH="$ONNX_GENAI_ORT_LIB_DIR:${LD_LIBRARY_PATH:-}"  # Linux
+export DYLD_LIBRARY_PATH="$ONNX_GENAI_ORT_LIB_DIR:${DYLD_LIBRARY_PATH:-}"  # macOS
+onnx-genai version
+```
+
+```bash
+# System package or from-source ORT install.
+export ONNX_GENAI_ORT_LIB=/opt/onnxruntime/lib/libonnxruntime.so.1
+onnx-genai version
+```
+
+```bash
+# From-source build using the pinned ort-sys download: leave ORT vars unset.
+unset ONNX_GENAI_ORT_LIB ONNX_GENAI_ORT_LIB_DIR
+cargo run -p onnx-genai-cli --bin onnx-genai -- version
+```
 
 CUDA has two independent switches:
 
@@ -198,8 +266,10 @@ cargo run -p onnx-genai-cli --bin onnx-genai -- \
 curl localhost:8123/v1/models
 ```
 
-Model loading logs to stderr; append `2>/dev/null` when you only want the
-generated text.
+Model loading logs and default text-generation stats go to stderr; append
+`2>/dev/null` when you only want the generated text. `generate --output-image`,
+`generate --output-audio`, and `transcribe` do not print the compact token stats
+line by default; use `--profile` for their timing and throughput diagnostics.
 
 ### Checking the REPL's live view
 
@@ -218,9 +288,9 @@ dogtok29over,dog
 [ 7 in · 5 out · backend ort · 2.0 tok/s · ttft 1 ms · rss 50.6 MiB ]
 ```
 
-Use `/stats` to toggle the compact line at runtime, or start with
-`--no-stats`. Piping a script into the REPL exercises the byte-stable plain-text
-fallback instead, which is what the tests do:
+Use `/stats` to toggle the compact line at runtime, or start `run` or text
+`generate` with `--no-stats`. Piping a script into the REPL exercises the
+byte-stable plain-text fallback instead, which is what the tests do:
 
 ```bash
 printf '/stats\nhello\n\n' | cargo run -p onnx-genai-cli --bin onnx-genai -- \

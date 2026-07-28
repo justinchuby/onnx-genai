@@ -519,7 +519,7 @@ fn gemm_packed(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn gemm_with_backend(
+pub(crate) fn gemm_with_backend(
     backend: CpuBackend,
     a: &[f32],
     b: &[f32],
