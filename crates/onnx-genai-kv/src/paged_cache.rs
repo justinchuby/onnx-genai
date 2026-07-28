@@ -52,6 +52,7 @@ pub struct MaterializedKv {
 }
 
 /// Paged KV cache manager.
+#[derive(Clone)]
 pub struct PagedKvCache {
     pub page_table: PageTable,
     next_seq_id: SequenceId,
@@ -779,16 +780,12 @@ impl PagedKvCache {
         let component = layer_idx * 2 + if kind == crate::KvKind::Key { 0 } else { 1 };
         Ok(page.head_token_f32(page_size, geom.head_dim, component, head, token_offset))
     }
-}
 
-impl KvCacheOps for PagedKvCache {
-    fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<(), KvError> {
+    /// Validate that `seq` can rewind to `position` without mutating page state.
+    pub fn validate_rewind_to(&self, seq: SequenceId, position: usize) -> Result<(), KvError> {
         let retained_start = self.retained_start(seq)?;
         let sink = self.sink_len(seq)?;
         let length = self.len(seq)?;
-        // Positions in the pinned sink prefix [0, sink) are physically retained
-        // and are valid rewind targets. Only the evicted gap
-        // [sink, retained_start) must be rejected.
         if position < retained_start && (sink == 0 || position >= sink) {
             return Err(KvError::PositionEvicted {
                 position,
@@ -798,6 +795,17 @@ impl KvCacheOps for PagedKvCache {
         if position > length {
             return Err(KvError::InvalidPosition { position, length });
         }
+        self.page_table
+            .get_sequence(seq)
+            .ok_or(KvError::SequenceNotFound(seq))?;
+        Ok(())
+    }
+}
+
+impl KvCacheOps for PagedKvCache {
+    fn rewind_to(&mut self, seq: SequenceId, position: usize) -> Result<(), KvError> {
+        self.validate_rewind_to(seq, position)?;
+        let sink = self.sink_len(seq)?;
 
         let page_size = self.page_table.page_size;
         let retained_position = self.buffer_index(seq, position)?;

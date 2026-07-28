@@ -11,9 +11,11 @@ pub(crate) use crate::decode_loop::{
     DecodeLoopBackend, DecodeLoopState, exceeded_context_limit, run_decode_loop, step_decode_loop,
 };
 pub(crate) use crate::kv_bridge::{
-    KvModelInfo, PlacedPayload, attach_pages_to_sequence, chunk_payload_from_exported,
-    common_prefix_len, exported_layers_from_runner, infer_kv_model_info, kv_model_past_is_f32,
-    load_materialized_past, past_kv_from_payloads, sequence_pages_for_len,
+    KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
+    chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
+    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past, past_kv_from_payloads,
+    rewind_draft_state_to_len, rewind_target_state_to_len, sequence_pages_for_len,
+    validate_draft_state_rewind_to_len, validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{
@@ -46,7 +48,8 @@ pub use crate::config::{
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
     KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
     MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    ScheduledGenerateArrival, SessionId, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode,
+    RewindTokenCount, ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability,
+    SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode,
     TokenLogprob, XtcConfig, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
@@ -80,6 +83,8 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
 
     #[test]
     fn cap_kv_len_uncapped_returns_model_max() {
@@ -94,6 +99,322 @@ mod tests {
     #[test]
     fn cap_kv_len_ignores_cap_larger_than_model_max() {
         assert_eq!(cap_kv_len(512, Some(40_960)), 512);
+    }
+
+    #[test]
+    fn paged_kv_fork_shares_prefix_then_diverges_copy_on_write() -> anyhow::Result<()> {
+        let mut cache = PagedKvCache::new(4, 8);
+        let parent = cache.create_sequence();
+        cache.append(parent, 6)?;
+        let parent_pages = cache.page_table.get_sequence(parent).unwrap().to_vec();
+
+        let child = cache.fork(parent, 6)?;
+        let child_pages = cache.page_table.get_sequence(child).unwrap().to_vec();
+
+        assert_eq!(child_pages, parent_pages);
+        for page_id in &parent_pages {
+            assert_eq!(cache.page_table.pages[page_id].ref_count, 2);
+        }
+
+        cache.append(child, 1)?;
+        let diverged_child_pages = cache.page_table.get_sequence(child).unwrap().to_vec();
+        assert_eq!(cache.len(parent)?, 6);
+        assert_eq!(cache.len(child)?, 7);
+        assert_eq!(diverged_child_pages[0], parent_pages[0]);
+        assert_ne!(diverged_child_pages[1], parent_pages[1]);
+        assert_eq!(cache.page_table.pages[&parent_pages[0]].ref_count, 2);
+        assert_eq!(cache.page_table.pages[&parent_pages[1]].ref_count, 1);
+        assert_eq!(
+            cache.page_table.pages[&diverged_child_pages[1]].ref_count,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_prefix_pages_survive_rewind_and_divergent_write() -> anyhow::Result<()> {
+        let mut cache = PagedKvCache::new(4, 8);
+        let mut prefixes = PrefixCache::new();
+        let seq = cache.create_sequence();
+        let tokens = vec![10, 11, 12, 13, 14, 15];
+        cache.append(seq, tokens.len())?;
+        let cached_pages = cache.page_table.get_sequence(seq).unwrap().to_vec();
+        prefixes.insert_pages(&tokens, &cached_pages, &mut cache.page_table);
+
+        cache.rewind_to(seq, 2)?;
+        cache.append(seq, 1)?;
+
+        let matched = prefixes.lookup_shared(&tokens, &mut cache.page_table);
+        assert_eq!(matched.matched_tokens, tokens.len());
+        assert_eq!(matched.page_ids, cached_pages);
+        for page_id in &matched.page_ids {
+            assert!(
+                cache
+                    .page_table
+                    .pages
+                    .get(page_id)
+                    .is_some_and(|page| page.ref_count > 0),
+                "cached prefix referenced reclaimed page {page_id}"
+            );
+        }
+        prefixes.release_shared(&tokens, matched.matched_tokens, &mut cache.page_table);
+        Ok(())
+    }
+
+    fn model_free_rewind_test_engine(
+        kv_cache: PagedKvCache,
+        sessions: HashMap<SessionId, EngineSession>,
+    ) -> anyhow::Result<Engine> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&fixture)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let governor = EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig {
+                page_size_bytes: 1,
+                tokens_per_page: 1,
+            },
+            0,
+        )?;
+
+        Ok(Engine {
+            decode_backend: EngineDecodeBackend::Ort,
+            metadata: InferenceMetadata::default(),
+            kv_cache,
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::Legacy,
+            scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
+            governor,
+            sessions,
+            session: None,
+            #[cfg(feature = "native-backend")]
+            native_session: None,
+            #[cfg(feature = "native-backend")]
+            native_shared_kv_proposer: None,
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        })
+    }
+
+    #[test]
+    fn failed_rewind_of_windowed_evicted_position_leaves_session_unchanged() -> anyhow::Result<()> {
+        let mut kv_cache = PagedKvCache::new(4, 8);
+        let session_id = kv_cache.create_sequence();
+        kv_cache.append(session_id, 5)?;
+        let original_kv_len = kv_cache.len(session_id)?;
+        let state = EngineSession {
+            tokens: vec![10, 11, 12, 13, 14],
+            kv_token_count: 5,
+            decode_state: DecodeState::for_test_windowed(2, 2),
+            draft: None,
+            sampled_fastpath_failed: false,
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(session_id, state);
+        let mut engine = model_free_rewind_test_engine(kv_cache, sessions)?;
+
+        let error = engine
+            .rewind_session_to(session_id, SessionPosition::new(2))
+            .expect_err("evicted sliding-window rewind must fail");
+
+        assert!(
+            error.to_string().contains("were evicted"),
+            "unexpected error: {error:#}"
+        );
+        let state = engine.sessions.get(&session_id).expect("session remains");
+        assert_eq!(state.tokens, [10, 11, 12, 13, 14]);
+        assert_eq!(state.kv_token_count, 5);
+        assert_eq!(engine.kv_cache.len(session_id)?, original_kv_len);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_rewind_of_ort_owned_kv_leaves_session_unchanged() -> anyhow::Result<()> {
+        let mut kv_cache = PagedKvCache::new(4, 8);
+        let session_id = kv_cache.create_sequence();
+        kv_cache.append(session_id, 3)?;
+        let original_kv_len = kv_cache.len(session_id)?;
+        let state = EngineSession {
+            tokens: vec![20, 21, 22],
+            kv_token_count: 3,
+            decode_state: DecodeState::for_test_with_past(HashMap::new()),
+            draft: None,
+            sampled_fastpath_failed: false,
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(session_id, state);
+        let mut engine = model_free_rewind_test_engine(kv_cache, sessions)?;
+
+        let error = engine
+            .rewind_session_to(session_id, SessionPosition::new(1))
+            .expect_err("ORT-owned KV without paged materialization must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without paged KV materialization"),
+            "unexpected error: {error:#}"
+        );
+        let state = engine.sessions.get(&session_id).expect("session remains");
+        assert_eq!(state.tokens, [20, 21, 22]);
+        assert_eq!(state.kv_token_count, 3);
+        assert_eq!(engine.kv_cache.len(session_id)?, original_kv_len);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_rewind_of_runner_backed_state_leaves_session_unchanged() -> anyhow::Result<()> {
+        let mut kv_cache = PagedKvCache::new(4, 8);
+        let session_id = kv_cache.create_sequence();
+        kv_cache.append(session_id, 4)?;
+        let original_kv_len = kv_cache.len(session_id)?;
+        let original_pages = kv_cache
+            .page_table
+            .get_sequence(session_id)
+            .expect("sequence exists")
+            .to_vec();
+        let state = EngineSession {
+            tokens: vec![30, 31, 32, 33],
+            kv_token_count: 4,
+            decode_state: DecodeState::for_test_runner_backed(),
+            draft: None,
+            sampled_fastpath_failed: false,
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert(session_id, state);
+        let mut engine = model_free_rewind_test_engine(kv_cache, sessions)?;
+
+        let error = engine
+            .rewind_session_to(session_id, SessionPosition::new(2))
+            .expect_err("runner-backed rewind must fail closed");
+
+        assert!(
+            error.to_string().contains("runner-backed decoder state"),
+            "unexpected error: {error:#}"
+        );
+        let state = engine.sessions.get(&session_id).expect("session remains");
+        assert_eq!(state.tokens, [30, 31, 32, 33]);
+        assert_eq!(state.kv_token_count, 4);
+        assert_eq!(engine.kv_cache.len(session_id)?, original_kv_len);
+        assert_eq!(
+            engine
+                .kv_cache
+                .page_table
+                .get_sequence(session_id)
+                .expect("sequence remains"),
+            original_pages.as_slice()
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Clone)]
+    enum KvOp {
+        Append { session: usize, tokens: usize },
+        Rewind { session: usize, position: usize },
+        Fork { session: usize, position: usize },
+        Remove { session: usize },
+    }
+
+    fn kv_op_strategy() -> impl Strategy<Value = KvOp> {
+        prop_oneof![
+            (0usize..32, 1usize..=3).prop_map(|(session, tokens)| KvOp::Append { session, tokens }),
+            (0usize..32, 0usize..96)
+                .prop_map(|(session, position)| KvOp::Rewind { session, position }),
+            (0usize..32, 0usize..96)
+                .prop_map(|(session, position)| KvOp::Fork { session, position }),
+            (0usize..32).prop_map(|session| KvOp::Remove { session }),
+        ]
+    }
+
+    fn assert_live_sequence_refcounts_match_pages(
+        cache: &PagedKvCache,
+        live: &[(SessionId, usize)],
+    ) {
+        let mut expected_refs = HashMap::new();
+        for &(seq, expected_len) in live {
+            assert_eq!(cache.len(seq).unwrap(), expected_len);
+            for &page_id in cache.page_table.get_sequence(seq).unwrap() {
+                *expected_refs.entry(page_id).or_insert(0u32) += 1;
+            }
+        }
+
+        for (&page_id, &expected_ref_count) in &expected_refs {
+            let page = cache
+                .page_table
+                .pages
+                .get(&page_id)
+                .unwrap_or_else(|| panic!("live sequence references missing page {page_id}"));
+            assert_eq!(
+                page.ref_count, expected_ref_count,
+                "page {page_id} refcount must match live sequence references"
+            );
+        }
+
+        for (&page_id, page) in &cache.page_table.pages {
+            let expected = expected_refs.get(&page_id).copied().unwrap_or(0);
+            assert_eq!(
+                page.ref_count, expected,
+                "page {page_id} has a refcount without matching live references"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn paged_kv_refcounts_match_live_sequences_for_random_fork_rewind_interleavings(
+            ops in prop::collection::vec(kv_op_strategy(), 1..80)
+        ) {
+            let mut cache = PagedKvCache::new(4, 256);
+            let root = cache.create_sequence();
+            let mut live = vec![(root, 0usize)];
+
+            for op in ops {
+                match op {
+                    KvOp::Append { session, tokens } => {
+                        let index = session % live.len();
+                        let (seq, len) = &mut live[index];
+                        cache.append(*seq, tokens).unwrap();
+                        *len += tokens;
+                    }
+                    KvOp::Rewind { session, position } => {
+                        let index = session % live.len();
+                        let (seq, len) = &mut live[index];
+                        let target = position % (*len + 1);
+                        cache.rewind_to(*seq, target).unwrap();
+                        *len = target;
+                    }
+                    KvOp::Fork { session, position } => {
+                        let index = session % live.len();
+                        let (source, source_len) = live[index];
+                        let target = position % (source_len + 1);
+                        let child = cache.fork(source, target).unwrap();
+                        live.push((child, target));
+                    }
+                    KvOp::Remove { session } => {
+                        if live.len() > 1 {
+                            let index = session % live.len();
+                            let (seq, _) = live.swap_remove(index);
+                            cache.remove(seq).unwrap();
+                        }
+                    }
+                }
+                assert_live_sequence_refcounts_match_pages(&cache, &live);
+            }
+        }
     }
 
     fn test_model_path(label: &str) -> std::path::PathBuf {
@@ -1097,6 +1418,73 @@ mod tests {
         assert!(engine.sessions[&session_id].kv_token_count > 0);
         engine.close_session(session_id)?;
         assert!(engine.sessions.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_session_rewind_to_checkpoint_reports_unsupported_runner_state()
+    -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(matches!(
+            engine.decode_path,
+            ModelDecodePath::PastPresent { .. }
+        ));
+        let session_id = engine.create_session()?;
+        let checkpoint = engine.checkpoint_session(session_id)?;
+
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![2, 4, 3]));
+        request.options.max_new_tokens = 4;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+
+        let first = engine.generate_in_session(session_id, request.clone())?;
+        let first_count = engine.session_token_count(session_id)?;
+        assert!(first_count > checkpoint.position.get());
+
+        let error = engine
+            .restore_session(checkpoint)
+            .expect_err("PastPresent runner-backed session rewind is not supported");
+        assert!(
+            error.to_string().contains("runner-backed decoder state"),
+            "unexpected restore error: {error:#}"
+        );
+        assert_eq!(
+            engine.session_token_count(session_id)?,
+            first_count,
+            "failed public rewind must leave session unchanged"
+        );
+        assert_eq!(first.token_ids.len(), 4);
+        engine.close_session(session_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tiny_fixture_session_fork_fails_closed_until_runner_state_supported() -> anyhow::Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let session_id = engine.create_session()?;
+        assert!(engine.session_fork_capability().is_none());
+
+        let error = engine
+            .fork_session(
+                &SessionForkCapability { _private: () },
+                session_id,
+                SessionPosition::new(0),
+            )
+            .expect_err("fork must fail closed until decode state can be cloned safely");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session fork is not yet enabled"),
+            "unexpected fork error: {error}"
+        );
+        engine.close_session(session_id)?;
         Ok(())
     }
 

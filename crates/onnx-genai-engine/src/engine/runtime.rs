@@ -601,6 +601,163 @@ impl Engine {
         Ok(id)
     }
 
+    /// Checkpoint the current logical token boundary for a persistent session.
+    ///
+    /// The returned checkpoint is intentionally small: restoring a session uses
+    /// the same rewind machinery as speculative decoding and keeps prefix-cache
+    /// page ownership intact. Checkpoints are invalid after the session is
+    /// closed or reset.
+    pub fn checkpoint_session(&self, session_id: SessionId) -> anyhow::Result<SessionCheckpoint> {
+        self.require_ort_backend("session checkpoints")?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        Ok(SessionCheckpoint {
+            session_id,
+            position: SessionPosition::new(state.tokens.len()),
+        })
+    }
+
+    /// Restore a persistent session to a previously checkpointed token boundary.
+    pub fn restore_session(&mut self, checkpoint: SessionCheckpoint) -> anyhow::Result<()> {
+        self.rewind_session_to(checkpoint.session_id, checkpoint.position)
+    }
+
+    /// Rewind a persistent session by `tokens` logical tokens.
+    ///
+    /// This mutates only the named session. Cached prefixes remain valid because
+    /// they own their page-table references independently of session ownership;
+    /// pages that are no longer referenced by the session or a prefix cache entry
+    /// are released by the underlying paged KV cache.
+    pub fn rewind_session_by(
+        &mut self,
+        session_id: SessionId,
+        tokens: RewindTokenCount,
+    ) -> anyhow::Result<SessionPosition> {
+        self.require_ort_backend("session rewind")?;
+        let tokens = tokens.get();
+        let current = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?
+            .tokens
+            .len();
+        let target = current.checked_sub(tokens).with_context(|| {
+            format!("cannot rewind session {session_id} by {tokens} tokens from length {current}")
+        })?;
+        let target = SessionPosition::new(target);
+        self.rewind_session_to(session_id, target)?;
+        Ok(target)
+    }
+
+    /// Rewind a persistent session to an absolute logical token position.
+    ///
+    /// Rewind reuses the same KV truncation path as speculative decoding, after
+    /// validating the requested target against the logical length and backend KV
+    /// support so rejected rewinds leave the session untouched.
+    pub fn rewind_session_to(
+        &mut self,
+        session_id: SessionId,
+        position: SessionPosition,
+    ) -> anyhow::Result<()> {
+        self.require_ort_backend("session rewind")?;
+        let position = position.get();
+        let state = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        let current = state.tokens.len();
+        if position > current {
+            anyhow::bail!(
+                "cannot rewind session {session_id} to token {position}; current length is {current}"
+            );
+        }
+        validate_target_state_rewind_to_len(
+            self.kv_model.as_ref(),
+            &self.kv_cache,
+            session_id,
+            state,
+            RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
+        )?;
+        if let (Some(draft_model), Some(draft)) = (&self.draft, &state.draft) {
+            let draft_target = position.min(draft.tokens.len());
+            validate_draft_state_rewind_to_len(
+                draft_model,
+                draft,
+                RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
+        }
+
+        self.scheduler.complete(session_id);
+        let mut state = self
+            .sessions
+            .remove(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        let result = (|| {
+            let session = self.session.as_deref().context(MISSING_ORT_SESSION)?;
+            rewind_target_state_to_len(
+                session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                &mut state,
+                RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
+            if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
+                let draft_target = position.min(draft.tokens.len());
+                rewind_draft_state_to_len(
+                    draft_model,
+                    draft,
+                    RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+                )?;
+            }
+            Ok(())
+        })();
+        self.sessions.insert(session_id, state);
+        result
+    }
+
+    /// Capability for session fork, if the selected backend supports safe CoW
+    /// fork at the engine level.
+    ///
+    /// Current ORT decode runners do not expose clone/import semantics strong
+    /// enough to fork without deep-copying or aliasing mutable KV, so this
+    /// returns `None` today. A future supported backend should return `Some` and
+    /// route fork through [`Engine::fork_session`].
+    pub fn session_fork_capability(&self) -> Option<SessionForkCapability> {
+        None
+    }
+
+    /// Fork a persistent session at a logical token boundary.
+    ///
+    /// Callers can obtain `capability` only from
+    /// [`Engine::session_fork_capability`], which is `None` for all current
+    /// backends. Keeping the capability token in the signature prevents
+    /// unsupported engines from being asked to fork through the typed API.
+    pub fn fork_session(
+        &mut self,
+        _capability: &SessionForkCapability,
+        source: SessionId,
+        position: SessionPosition,
+    ) -> anyhow::Result<SessionId> {
+        self.require_ort_backend("session fork")?;
+        let state = self
+            .sessions
+            .get(&source)
+            .with_context(|| format!("session {source} not found"))?;
+        let position = position.get();
+        let current = state.tokens.len();
+        if position > current {
+            anyhow::bail!(
+                "cannot fork session {source} at token {position}; current length is {current}"
+            );
+        }
+        anyhow::bail!(
+            "session fork is not yet enabled: safe CoW fork requires cloneable/importable decoder state aligned with paged KV; current ORT runner/static-cache paths would require deep-copying or unsafe KV aliasing"
+        )
+    }
+
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
         self.require_ort_backend("persistent sessions")?;

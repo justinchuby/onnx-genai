@@ -146,5 +146,11 @@ WP-B landed: Sapper's WP-B3 v3 admission fix landed at `3d84b9b`, making raw `Gr
 
 - Prepared Mobius PRs #404/#423/#430 for Justin review without merging. #404 replacement branch `sapper/404-rebase` at `fa30534` resolves conflicts and review comments; #423 `squad/hythe-deepseek-moe-phase1` at `40846bb` and #430 `test/l4-l5-golden-new-models` at `d1d235e` have current review fixes, Ruff clean, and focused tests passing.
 
+## 2026-07-27T21:45:00-07:00 — Runtime fork rewind policy split
+
+- Revised PR #291 runner-backed rewind handling so the unsupported-runner policy is explicit and limited to the public session rewind API.
+- Internal speculative target rejection and draft realignment validation now use the allow-runner policy; public `restore_session`/`rewind_session_to` keep fail-closed ordering before session removal or token/KV mutation.
+- Updated the stale tiny PastPresent checkpoint test to expect the clean unsupported error and added model-free regression coverage for the speculative runner rewind policy boundary.
+- 2026-07-28T00:55-07:00 follow-up: replaced the raw `(len, policy)` tail with `RewindRequest` to avoid an 8-argument helper and fixed remaining kv_bridge test call sites. Full engine lib tests now pass locally after staging the pinned ORT DLL beside the test binary.
 ## 2026-07-28T07:46:01+00:00 — Wave 5
 - PR #331 (`52b1fc59`) merged: added CUDA GatherND, SpaceToDepth, and EyeLike; #67 remains open for later coverage batches. Hallett independently approved the GPU parity and mutation-probe evidence.

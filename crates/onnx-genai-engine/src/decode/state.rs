@@ -23,6 +23,8 @@ pub(crate) struct DecodeState {
     pub(super) sink_tokens: usize,
     pub(super) retained_kv_len: usize,
     pub(super) runner: Option<DecodeRunner>,
+    #[cfg(test)]
+    pub(super) test_runner_marker: bool,
 }
 
 impl DecodeState {
@@ -90,6 +92,8 @@ impl DecodeState {
                 sink_tokens: 0,
                 retained_kv_len: 0,
                 runner: None,
+                #[cfg(test)]
+                test_runner_marker: false,
             });
         }
 
@@ -122,6 +126,8 @@ impl DecodeState {
                 sink_tokens: 0,
                 retained_kv_len: 0,
                 runner: None,
+                #[cfg(test)]
+                test_runner_marker: false,
             });
         }
 
@@ -154,6 +160,8 @@ impl DecodeState {
             sink_tokens: 0,
             retained_kv_len: 0,
             runner: None,
+            #[cfg(test)]
+            test_runner_marker: false,
         })
     }
 
@@ -208,6 +216,8 @@ impl DecodeState {
                         stable_session_ref(session),
                         StaticCacheDecodeOptions { batch_size: 1 },
                     )?)),
+                    #[cfg(test)]
+                    test_runner_marker: false,
                 })
             }
             ModelDecodePath::PastPresent {
@@ -244,7 +254,17 @@ impl DecodeState {
     }
 
     pub(crate) fn has_runner(&self) -> bool {
-        self.runner.is_some()
+        self.runner.is_some() || self.has_test_runner_marker()
+    }
+
+    #[cfg(test)]
+    fn has_test_runner_marker(&self) -> bool {
+        self.test_runner_marker
+    }
+
+    #[cfg(not(test))]
+    fn has_test_runner_marker(&self) -> bool {
+        false
     }
 
     pub(crate) fn is_windowed(&self) -> bool {
@@ -262,6 +282,62 @@ impl DecodeState {
 
     pub(crate) fn uses_token_prefix_cache(&self) -> bool {
         self.has_runner() || self.is_windowed()
+    }
+
+    pub(crate) fn validate_rewind_to_len(
+        &self,
+        absolute_current_len: usize,
+        target_len: usize,
+        has_paged_materialization: bool,
+        runner_policy: crate::kv_bridge::RewindRunnerPolicy,
+    ) -> anyhow::Result<()> {
+        if !self.use_kv || absolute_current_len == target_len {
+            return Ok(());
+        }
+        if self.has_runner() {
+            if runner_policy == crate::kv_bridge::RewindRunnerPolicy::AllowRunnerRewind {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "cannot rewind runner-backed decoder state to token {target_len}; start a fresh session and replay the prefix instead"
+            );
+        }
+        if self.is_windowed() {
+            return self.validate_windowed_rewind(absolute_current_len, target_len);
+        }
+        if !has_paged_materialization {
+            anyhow::bail!("cannot rewind ORT KV tensors without paged KV materialization");
+        }
+        Ok(())
+    }
+
+    fn validate_windowed_rewind(
+        &self,
+        absolute_current_len: usize,
+        target_len: usize,
+    ) -> anyhow::Result<()> {
+        let _window_size = self
+            .sliding_window
+            .context("windowed rewind requires sliding-window state")?;
+        if self.sink_tokens == 0 {
+            let retained_start = absolute_current_len.saturating_sub(self.retained_kv_len);
+            if target_len < retained_start {
+                anyhow::bail!(
+                    "cannot rewind sliding-window KV to absolute position {target_len}; positions before {retained_start} were evicted"
+                );
+            }
+            return Ok(());
+        }
+
+        let sink = self.sink_tokens.min(self.retained_kv_len);
+        let window_len = self.retained_kv_len - sink;
+        let window_abs_start = absolute_current_len.saturating_sub(window_len);
+        if target_len >= window_abs_start || target_len <= sink {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "cannot rewind sliding-window KV to absolute position {target_len}; positions in the evicted gap [{sink}, {window_abs_start}) are unavailable"
+        );
     }
 
     pub(crate) fn retained_kv_len(&self, absolute_past_len: usize) -> usize {
@@ -325,6 +401,45 @@ impl DecodeState {
             sink_tokens: 0,
             retained_kv_len: 0,
             runner: None,
+            test_runner_marker: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_windowed(sliding_window: usize, retained_kv_len: usize) -> Self {
+        Self {
+            use_kv: true,
+            past: HashMap::new(),
+            present_to_past: HashMap::new(),
+            kv_inputs: Vec::new(),
+            io: ResolvedIo::default(),
+            loop_state: HashMap::new(),
+            positions: None,
+            next_positions: None,
+            sliding_window: Some(sliding_window),
+            sink_tokens: 0,
+            retained_kv_len,
+            runner: None,
+            test_runner_marker: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_runner_backed() -> Self {
+        Self {
+            use_kv: true,
+            past: HashMap::new(),
+            present_to_past: HashMap::new(),
+            kv_inputs: Vec::new(),
+            io: ResolvedIo::default(),
+            loop_state: HashMap::new(),
+            positions: None,
+            next_positions: None,
+            sliding_window: None,
+            sink_tokens: 0,
+            retained_kv_len: 0,
+            runner: None,
+            test_runner_marker: true,
         }
     }
 

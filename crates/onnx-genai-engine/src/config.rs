@@ -402,6 +402,66 @@ pub enum SpeculativeMode {
 /// Identifier for a persistent generation session.
 pub type SessionId = SequenceId;
 
+/// Absolute logical token position within a persistent session.
+///
+/// Newtyping token positions keeps APIs from accepting an arbitrary `usize`
+/// where a session boundary is required. Use [`SessionPosition::new`] at the
+/// boundary where a caller intentionally converts from a raw count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SessionPosition(usize);
+
+impl SessionPosition {
+    /// Construct an absolute logical token position.
+    pub const fn new(position: usize) -> Self {
+        Self(position)
+    }
+
+    /// Raw zero-based token boundary.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Relative logical-token rewind distance for a persistent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RewindTokenCount(usize);
+
+impl RewindTokenCount {
+    /// Construct a rewind distance.
+    pub const fn new(tokens: usize) -> Self {
+        Self(tokens)
+    }
+
+    /// Raw token count to rewind.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Opaque checkpoint for a persistent generation session.
+///
+/// The checkpoint records the logical token boundary that can later be passed to
+/// [`Engine::restore_session`](crate::Engine::restore_session). It is only valid
+/// for the session that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCheckpoint {
+    /// Session whose logical token stream was checkpointed.
+    pub session_id: SessionId,
+    /// Logical token position retained by the checkpoint.
+    pub position: SessionPosition,
+}
+
+/// Capability token required to request a session fork.
+///
+/// Engines return this token only for decode configurations that can fork
+/// without deep-copying KV or aliasing mutable decoder state. Current backends
+/// return `None`, so unsupported engines cannot be asked to fork through the
+/// typed API.
+#[derive(Debug, Clone)]
+pub struct SessionForkCapability {
+    pub(crate) _private: (),
+}
+
 /// Distributed KV connector backend selection (DESIGN §38, K3).
 ///
 /// Model-agnostic by construction: a backend carries only its own generic

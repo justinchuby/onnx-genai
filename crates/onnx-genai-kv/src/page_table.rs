@@ -613,6 +613,7 @@ pub struct SequenceUsage {
     pub shared: usize,
 }
 
+#[derive(Clone)]
 pub struct PageTable {
     /// Logical sequence → ordered list of page IDs.
     pub sequences: HashMap<SequenceId, Vec<PageId>>,

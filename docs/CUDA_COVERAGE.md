@@ -354,6 +354,15 @@ f16/bf16/f32/f64. GPU parity covers slice updates, duplicate indices,
 periodic modes. This raises `CUDA_COVERED_OPS` from **136** to **140** and CPU
 standard-domain parity from **107 / 141** to **111 / 141**.
 
+The issue #67 operator-coverage batch 9 adds per-tensor `QuantizeLinear` and
+`DequantizeLinear` (f32 with scalar scale and optional scalar i8/u8 zero point),
+deterministic inference-mode `Dropout` (identity data plus optional all-true
+mask), and `NonZero` coordinate extraction for f32/f16/bf16. Inline GPU parity
+covers signed and unsigned quantization, saturation and ties-to-even rounding,
+multi-output Dropout, multiple ranks, narrow float storage, signed zero, and
+NaN. This raises `CUDA_COVERED_OPS` from **140** to **144** and CPU
+standard-domain parity from **111 / 141** to **115 / 141**.
+
 ---
 
 ## Custom-kernel candidates (with WHY)

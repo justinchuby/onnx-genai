@@ -41,7 +41,8 @@ pub use engine::{
     GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
     GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig,
     MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
-    PrioritizedGenerateRequest, PrioritizedGenerateResult, ScheduledGenerateArrival, SessionId,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
     SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, XtcConfig,
     parse_resource_limit,
 };
