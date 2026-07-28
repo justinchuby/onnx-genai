@@ -73,7 +73,7 @@ platform = "aarch64-apple-darwin"
 minimum_tier = "tier1"
 counter = "CONV_BNNS_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
-description = "Standard Conv (including 1D promoted to 2D) dispatches to BNNS on Apple Silicon"
+description = "Standard Conv (kernel > 1x1, including 1D promoted to 2D) dispatches to BNNS on Apple Silicon"
 # Tier1=BNNS, Tier2=im2col+cblas_sgemm, Tier3=scalar
 
 [[claim]]
@@ -84,6 +84,15 @@ minimum_tier = "tier2"
 counter = "CONV_IM2COL_GEMM_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
 description = "When BNNS rejects (e.g. unsupported dilation), falls to im2col+GEMM not scalar"
+
+[[claim]]
+op = "Conv"
+variant = "pointwise_1x1_gemm"
+platform = "all"
+minimum_tier = "tier2"
+counter = "CONV_POINTWISE_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "1x1 pointwise Conv with weight > L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SDPA — aarch64
