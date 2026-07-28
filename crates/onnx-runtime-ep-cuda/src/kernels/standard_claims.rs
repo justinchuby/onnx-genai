@@ -16,6 +16,8 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "Gather" => gather(node, input_dtypes),
         "GatherElements" => gather_elements(node, input_dtypes),
         "ScatterElements" => scatter_elements(node, input_dtypes),
+        "ScatterND" => scatter_nd(node, input_dtypes),
+        "HannWindow" | "HammingWindow" | "BlackmanWindow" => window(node, input_dtypes),
         "Where" => where_op(node, input_dtypes),
         "Expand" => expand(node, input_dtypes),
         "ConstantOfShape" => constant_of_shape(node, input_dtypes),
@@ -326,6 +328,10 @@ fn scatter_elements(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
         "indices",
     )?;
     require_dtype(input_dtypes, 2, input_dtypes[0], "updates")?;
+    scatter_reduction(node)
+}
+
+fn scatter_reduction(node: &Node) -> Result<(), String> {
     match node.attr("reduction") {
         None => Ok(()),
         Some(attribute)
@@ -340,6 +346,48 @@ fn scatter_elements(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
             Err("attribute 'reduction' must be one of 'none', 'add', 'mul', 'max', or 'min'".into())
         }
     }
+}
+
+fn scatter_nd(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 3, 1, 1)?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[
+            DataType::Float16,
+            DataType::Float32,
+            DataType::BFloat16,
+            DataType::Int64,
+        ],
+        "data",
+    )?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "indices")?;
+    require_dtype(input_dtypes, 2, input_dtypes[0], "updates")?;
+    scatter_reduction(node)
+}
+
+fn window(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_dtype(input_dtypes, 0, DataType::Int64, "size")?;
+    bool_attribute(node, "periodic")?;
+    if let Some(attribute) = node.attr("output_datatype") {
+        let value = attribute
+            .as_int()
+            .ok_or_else(|| "attribute 'output_datatype' must be an integer".to_string())?;
+        let value = i32::try_from(value)
+            .map_err(|_| format!("attribute 'output_datatype' value {value} is invalid"))?;
+        let dtype = DataType::from_onnx(value)
+            .ok_or_else(|| format!("attribute 'output_datatype' value {value} is invalid"))?;
+        if !matches!(
+            dtype,
+            DataType::Float16 | DataType::BFloat16 | DataType::Float32 | DataType::Float64
+        ) {
+            return Err(format!(
+                "attribute 'output_datatype' selects unsupported {dtype:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn where_op(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {

@@ -60,12 +60,14 @@ pub mod nary;
 pub mod normalization;
 pub mod onehot;
 pub mod packed_varlen_attention;
+pub mod pad;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;
 pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
+pub mod range;
 pub mod reduce;
 pub mod rotary_embedding;
 pub mod shape;
@@ -80,6 +82,7 @@ pub mod trilu;
 pub mod unary_predicate;
 pub mod varlen_attention;
 pub mod where_op;
+pub mod window;
 
 use activations::ActivationFactory;
 use elementwise::{BinaryFactory, BinaryOp, StandardGeluFactory, UnaryFactory, UnaryOp};
@@ -121,7 +124,7 @@ use pointwise::{
 /// * **Comparison** — `Equal`, `Greater`, `Less`, `GreaterOrEqual`,
 ///   `LessOrEqual` (f32/i32/i64 operands → bool, broadcasting; `Equal` also
 ///   accepts bool operands).
-/// * **Movement/construction** — `Concat`, `Expand`, `Reshape`, `Slice`, `Split`,
+/// * **Movement/construction** — `Concat`, `Expand`, `Pad`, `Range`, `Reshape`, `Slice`, `Split`,
 ///   `Squeeze`, `Tile`, `Transpose`, `Unsqueeze`, `Identity`, `Flatten`, plus
 ///   broadcasting `Where` and triangular-mask `Trilu`.
 /// * **Metadata** — `Shape`, `Size` (host-computed Int64, uploaded to device).
@@ -284,6 +287,12 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "GatherND",
     "SpaceToDepth",
     "EyeLike",
+    "Pad",
+    "Range",
+    "ScatterND",
+    "HannWindow",
+    "HammingWindow",
+    "BlackmanWindow",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -334,6 +343,14 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    for opset in [11, 16, 18] {
+        reg.register(
+            OpKey::new("ScatterND", "", opset),
+            Box::new(indexing::ScatterNdFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("CumSum", "", 11),
         Box::new(cumsum::CumSumFactory {
@@ -378,6 +395,31 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("Pad", "", 1),
+        Box::new(pad::PadFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Range", "", 11),
+        Box::new(range::RangeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for (op_type, kind) in [
+        ("HannWindow", window::WindowKind::Hann),
+        ("HammingWindow", window::WindowKind::Hamming),
+        ("BlackmanWindow", window::WindowKind::Blackman),
+    ] {
+        reg.register(
+            OpKey::new(op_type, "", 17),
+            Box::new(window::WindowFactory {
+                kind,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
     reg.register(
         OpKey::new("TopK", "", 10),
         Box::new(topk::TopKFactory {

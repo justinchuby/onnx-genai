@@ -102,7 +102,7 @@ fn runtime_trace_events() -> Vec<serde_json::Value> {
 /// Suppressed while `--profile` is on, which already prints every one of these
 /// numbers and more; printing both would just repeat the turn twice.
 pub(super) fn emit_stats_line(show_stats: bool, show_profile: bool, profile: &mut RunProfile) {
-    if !show_stats || show_profile {
+    if !should_emit_stats_line(show_stats, show_profile) {
         return;
     }
     profile.memory.sample_peak();
@@ -114,6 +114,10 @@ fn budget_cap_notice(cap: GenerationBudgetCap) -> String {
         "notice: scheduler capped --max-new-tokens from {} to {} because the KV byte budget cannot conservatively reserve the requested ceiling; raise --vram-limit or pass an explicit smaller --max-new-tokens to make this bound intentional",
         cap.requested_max_new_tokens, cap.admitted_max_new_tokens
     )
+}
+
+fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
+    show_stats && !show_profile
 }
 
 /// Build the prompt string sent to the engine for the current turn.
@@ -288,5 +292,12 @@ mod tests {
         assert!(notice.contains("KV byte budget"));
         assert!(notice.contains("--vram-limit"));
         assert!(notice.contains("explicit smaller --max-new-tokens"));
+    }
+
+    #[test]
+    fn profile_text_report_suppresses_the_compact_stats_line() {
+        assert!(should_emit_stats_line(true, false));
+        assert!(!should_emit_stats_line(true, true));
+        assert!(!should_emit_stats_line(false, false));
     }
 }

@@ -16,3 +16,6 @@ Applied CUDA coverage documentation correction for the merged kernel slice.
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Coco's initial WP-B3 admission work was superseded by raw-protobuf authority fixes that completed the epic.
+
+## 2026-07-28T09-10-28+00-00 — Shape-inference catalog batch 2 merged
+- PR #339 (`b1f9d3bb`) added Det, LpPool, GlobalLpPool, MaxUnpool, Col2Im, and CenterCropPad; registry 181→187 operators and 219→226 versioned entries. Chew approved after specification review and mutation probing. #75 remains open; signal/loss operators and SSA container types are deferred.

@@ -248,6 +248,16 @@ pub struct QkCapture<'a> {
 #[cfg(all(test, target_arch = "aarch64"))]
 static SDPA_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
+/// path fires on macOS/iOS.
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "ios"),
+    not(feature = "mlas")
+))]
+static SDPA_ACCELERATE_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Run scaled-dot-product attention over `t`, writing the context into `y`
 /// (`[batch, num_heads, q_seq, v_head_size]`, `BNSH`).
 ///
@@ -285,6 +295,22 @@ pub fn sdpa_f32(
             && t.v_head_size > 0;
         if qk.is_none() && non_empty {
             sdpa_f32_fast(t, cfg, bias, mask, y);
+            return;
+        }
+    }
+    // Accelerate (cblas_sgemm) fast path for macOS/iOS: replaces the NEON
+    // scalar dot/axpy loops with AMX-backed GEMMs for QK^T and probs·V,
+    // parallelized across (batch, head) tiles via Rayon.
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), not(feature = "mlas")))]
+    {
+        let non_empty = t.batch > 0
+            && t.num_heads > 0
+            && t.q_seq > 0
+            && t.kv_seq > 0
+            && t.head_size > 0
+            && t.v_head_size > 0;
+        if qk.is_none() && non_empty {
+            sdpa_f32_accelerate(t, cfg, bias, mask, y);
             return;
         }
     }
@@ -1103,6 +1129,152 @@ fn sdpa_f32_fast(
         });
 }
 
+/// Accelerate (cblas_sgemm) fast path for SDPA on macOS/iOS.
+///
+/// Mirrors [`sdpa_f32_fast`] (MLAS path) but uses Apple's Accelerate framework
+/// which reaches the AMX coprocessor. Per `(batch, head)` tile it runs two
+/// SGEMMs — `logits = alpha · Q · Kᵀ` and `context = probs · V` — with the
+/// `softcap → bias → mask → causal → softmax` epilogue applied per row.
+/// Tiles are parallelized across the crate's shared Rayon pool.
+#[cfg(all(any(target_os = "macos", target_os = "ios"), not(feature = "mlas")))]
+fn sdpa_f32_accelerate(
+    t: &SdpaTensors,
+    cfg: &SdpaConfig,
+    bias: &dyn AttnBias,
+    mask: &dyn KeyMask,
+    y: &mut [f32],
+) {
+    use rayon::prelude::*;
+
+    #[cfg(test)]
+    SDPA_ACCELERATE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+    const CBLAS_ROW_MAJOR: i32 = 101;
+    const CBLAS_NO_TRANS: i32 = 111;
+    const CBLAS_TRANS: i32 = 112;
+
+    let SdpaTensors {
+        q,
+        k,
+        v,
+        batch,
+        num_heads,
+        num_kv_heads,
+        q_seq,
+        kv_seq,
+        head_size,
+        v_head_size,
+    } = *t;
+
+    debug_assert_eq!(q.len(), batch * num_heads * q_seq * head_size);
+    debug_assert_eq!(k.len(), batch * num_kv_heads * kv_seq * head_size);
+    debug_assert_eq!(v.len(), batch * num_kv_heads * kv_seq * v_head_size);
+    debug_assert_eq!(y.len(), batch * num_heads * q_seq * v_head_size);
+    debug_assert!(num_kv_heads > 0 && num_heads.is_multiple_of(num_kv_heads));
+
+    let heads_per_kv = num_heads / num_kv_heads;
+
+    let alpha = match cfg.scale {
+        ScaleMode::PostDot(s) => s,
+        ScaleMode::SplitSqrt(s) => s,
+    };
+
+    let tile_v = q_seq * v_head_size;
+    y.par_chunks_mut(tile_v)
+        .enumerate()
+        .for_each(|(bh, y_tile)| {
+            let b = bh / num_heads;
+            let n = bh % num_heads;
+            let kv_n = n / heads_per_kv;
+
+            let q_off = ((b * num_heads + n) * q_seq) * head_size;
+            let k_off = ((b * num_kv_heads + kv_n) * kv_seq) * head_size;
+            let v_off = ((b * num_kv_heads + kv_n) * kv_seq) * v_head_size;
+            let q_tile = &q[q_off..q_off + q_seq * head_size];
+            let k_tile = &k[k_off..k_off + kv_seq * head_size];
+            let v_tile = &v[v_off..v_off + kv_seq * v_head_size];
+
+            // logits[q_seq, kv_seq] = alpha · Q[q_seq, head_size] · K[kv_seq, head_size]ᵀ
+            let mut logits = vec![0.0f32; q_seq * kv_seq];
+            unsafe {
+                cblas_sgemm(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_TRANS,
+                    q_seq as i32,
+                    kv_seq as i32,
+                    head_size as i32,
+                    alpha,
+                    q_tile.as_ptr(),
+                    head_size as i32,
+                    k_tile.as_ptr(),
+                    head_size as i32,
+                    0.0,
+                    logits.as_mut_ptr(),
+                    kv_seq as i32,
+                );
+            }
+
+            // Per-row epilogue: softcap → bias → mask → causal → softmax.
+            for i in 0..q_seq {
+                let row = &mut logits[i * kv_seq..i * kv_seq + kv_seq];
+                for (j, s) in row.iter_mut().enumerate() {
+                    let mut val = *s;
+                    if let Some(softcap) = cfg.softcap {
+                        val = softcap * (val / softcap).tanh();
+                    }
+                    val += bias.at(b, n, i, j);
+                    val += mask.at(b, i, j);
+                    if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+                        val = cfg.causal_fill;
+                    }
+                    *s = val;
+                }
+
+                softmax_in_place(row, SoftmaxExp::F32);
+            }
+
+            // context[q_seq, v_head_size] = probs[q_seq, kv_seq] · V[kv_seq, v_head_size]
+            unsafe {
+                cblas_sgemm(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    q_seq as i32,
+                    v_head_size as i32,
+                    kv_seq as i32,
+                    1.0,
+                    logits.as_ptr(),
+                    kv_seq as i32,
+                    v_tile.as_ptr(),
+                    v_head_size as i32,
+                    0.0,
+                    y_tile.as_mut_ptr(),
+                    v_head_size as i32,
+                );
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1766,15 +1938,132 @@ mod tests {
             past_seq: 0,
             causal_fill: f32::NEG_INFINITY,
         };
+        // On macOS/iOS without MLAS, the Accelerate path fires instead of NEON.
+        // On other aarch64 (Linux), the NEON path fires.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let before = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+
         let mut y = vec![f32::NAN; batch * num_heads * q_seq * dv];
         sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut y, None);
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let after = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
-            "sdpa_f32 dispatcher did not execute sdpa_f32_neon on aarch64"
+            "sdpa_f32 dispatcher did not execute accelerated path on aarch64"
         );
         assert!(y.iter().all(|value| value.is_finite()));
+    }
+
+    /// Accelerate vs scalar parity at Whisper's encoder shape: 6 heads attend
+    /// over 1500 frames with head_size=64. This exercises the threaded GEMM
+    /// path at a scale far beyond LLM decode (M=1) or prefill (M~40).
+    /// The Accelerate path parallelizes across (batch, head) tiles via Rayon,
+    /// which alters accumulation order. We verify determinism across runs and
+    /// check tolerance against the f64 reference.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        not(feature = "mlas"),
+        target_arch = "aarch64"
+    ))]
+    #[test]
+    fn sdpa_accelerate_vs_scalar_parity_matrix() {
+        use std::sync::atomic::Ordering;
+
+        let (batch, num_heads, num_kv_heads, q_seq, kv_seq, dh, dv) = (
+            1usize, 6usize, 6usize, 1500usize, 1500usize, 64usize, 64usize,
+        );
+        let q = deterministic_values(batch * num_heads * q_seq * dh, 0x1500_A1CE, 0.5);
+        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0x1500_B0B0, 0.5);
+        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0x1500_CAFE, 0.75);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dv,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+
+        // Verify the Accelerate path is reached.
+        let before = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
+        let mut accelerate_out = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut accelerate_out, None);
+        let after = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "sdpa_f32 did not reach the Accelerate path for Whisper shape"
+        );
+
+        // Determinism: run again and confirm bit-exact (no thread-ordering drift).
+        let mut accelerate_out2 = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut accelerate_out2, None);
+        assert_eq!(
+            accelerate_out
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            accelerate_out2
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            "Accelerate SDPA is non-deterministic across runs at Whisper shape"
+        );
+
+        // Tolerance vs f64 reference — the Accelerate path uses GEMM (different
+        // accumulation order from sequential scalar), so we compare against the
+        // f64 oracle rather than insisting on scalar agreement.
+        let f64_ref = sdpa_f64_reference(&tensors, &cfg, &NoBias, &NoMask);
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&got, &expected) in accelerate_out.iter().zip(f64_ref.iter()) {
+            assert!(got.is_finite(), "Accelerate produced non-finite output");
+            let abs_err = (got - expected).abs();
+            max_abs = max_abs.max(abs_err);
+            max_rel = max_rel.max(abs_err / expected.abs().max(1e-6));
+        }
+        // At 1500x1500 with 64-dim heads, accumulation differences are larger
+        // than decode shapes. The bounds catch real defects (dropped tiles,
+        // transposed operands, wrong softmax normalization) while accommodating
+        // GEMM vs sequential accumulation order differences. The relative bound
+        // is loose because near-zero output values (where softmax concentrates
+        // probability elsewhere) inflate the metric.
+        assert!(
+            max_abs <= 2e-3,
+            "Accelerate vs f64 max_abs={max_abs:e} (Whisper 1500-frame shape)"
+        );
+        assert!(
+            max_rel <= 5e-2,
+            "Accelerate vs f64 max_rel={max_rel:e} (Whisper 1500-frame shape)"
+        );
+
+        // Also verify against scalar reference with a looser tolerance (both are
+        // valid float orderings, but neither is authoritative over the other).
+        let mut scalar_out = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32_scalar(&tensors, &cfg, &NoBias, &NoMask, &mut scalar_out, None);
+        let mut max_scalar_abs = 0.0f32;
+        for (&accel, &scalar) in accelerate_out.iter().zip(scalar_out.iter()) {
+            max_scalar_abs = max_scalar_abs.max((accel - scalar).abs());
+        }
+        assert!(
+            max_scalar_abs <= 5e-3,
+            "Accelerate vs scalar max_abs={max_scalar_abs:e} (Whisper 1500-frame shape)"
+        );
     }
 
     /// Deterministic pseudo-random f32 fill in `[-1, 1)` for parity fixtures.

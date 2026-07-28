@@ -10995,3 +10995,95 @@ Decision archive gate checked at 2026-07-28T06-44-16+0000: active ledger was 868
 **What:** PR #327 (`64d99919`) keeps `full` default-on, fully gates the representative CPU `ops-cnn` group, and drives minimal builds from a shared operator catalog plus deterministic manifests. The `onnx-runtime-ep-cpu` and `onnx-runtime-operator-selection` catalog machinery retains unchanged default builds and mutation-proof minimal exclusions.
 
 **Why:** This provides a usable, testable minimal-build path without destabilizing the default registry or forcing a risky one-PR split of every kernel dependency. Issue #73 remains open for full gating of the remaining operator groups beyond CNN/pooling/spatial.
+
+<!-- scribe-merge-2026-07-28T07-46-01+00-00-wave5 -->
+## 2026-07-28 — Wave 5 shape-inference and CUDA parity reconciliation
+
+Decision archive gate checked at 2026-07-28T07:46:01+00:00: active ledger was 870368 bytes and exceeded 51200 bytes. Reviewed dated decision-entry headings against the seven-day cutoff (before 2026-07-21); none were eligible for archival. Historical date references were retained in their current entries.
+
+### Issue #75 — shape-inference catalog batch (PR #333, `6ba382b6`)
+**By:** Ricks (implementation); Karine (independent specification review)
+
+**What:** Added 16 standard tensor operators: `ConvTranspose`, `GridSample`, `Einsum`, `Celu`, `Shrink`, `Mish`, `HardSwish`, `LRN`, `MeanVarianceNormalization`, `ReverseSequence`, `RandomNormal`, `RandomUniform`, `RandomNormalLike`, `RandomUniformLike`, `Bernoulli`, and `Multinomial`. The registry advanced from 165 to 181 operators and from 203 to 219 versioned registrations. Karine approved after verifying specification math and running a mutation probe.
+
+**Why:** The additions close common tensor-op shape-inference gaps while retaining symbolic-dimension correctness and existing range-based version registration.
+
+**Deferred:** Sequence (8 operators), Optional (3), Map, Loop, Scan, recurrent, and ONNX-ML families remain outside #75. `Value` and `TypeInfo` currently carry only tensor dtype and shape, so container element-type propagation requires a separate SSA IR type-model change. Create/track this follow-up under #75, particularly for Sequence and Optional.
+
+### Issue #67 — CUDA operator coverage batch (PR #331, `52b1fc59`)
+**By:** Sapper (implementation); Hallett (independent review)
+
+**What:** Added CUDA coverage for `GatherND`, `SpaceToDepth`, and `EyeLike`, increasing `CUDA_COVERED_OPS` from 131 to 134 and standard CPU-parity coverage from 105/141. The batch was tested on an H200 across 165 parity cases. Hallett approved after coverage-of-coverage validation, a GPU4 parity rerun, and a content-corrupting mutation probe.
+
+**Why:** Structural byte kernels provide correct dtype-agnostic coverage for indexing and layout operators while reducing heterogeneous fallback. The all-target Clippy warnings were independently verified as identical and pre-existing on `main`; the default-target CI gate remains clean. Issue #67 stays open as a series.
+
+<!-- sources: decisions/inbox/ricks-75-shape-inference.md; decisions/inbox/sapper-67-cuda-coverage.md; wave-5 manifest -->
+
+<!-- scribe-merge-2026-07-28T08-28-52+00-00-joshi-326-wheels-fix -->
+
+## 2026-07-28 — Wheel-publishing repair for #326 (partial)
+
+**By:** Joshi (implementation); Mariette (review); Scribe (reconciliation)
+
+**What:** PR #337 (`5aed2dcf`) repairs `wheels.yml` publishing for Linux x86_64 and Windows AMD64: exclude the virtual Windows API-set DLL `ext-ms-win-dxcore-l1-1-0.dll` from delvewheel, pin the verified `quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1` image with pull retries, and install `clang-devel` for `ort-sys` bindgen. Linux x86_64 and Windows AMD64 build/smoke checks are green; Mariette approved after verifying the upstream tag, commit-SHA run, and unchanged publish gates.
+
+**Why:** Wheel publishing had been broken since 2026-07-21. The image pin/retries address brittle Quay pulls, `clang-devel` supplies libclang required by bindgen, and DXCore is a Windows API-set DLL which must not be vendored.
+
+**Open gap:** #326 remains open: macOS x86_64 extraction of the upstream `onnxruntime-osx-x86_64-1.27.0.tgz` fails because the archive is unavailable/returns an unrecognized format. This needs an ORT version bump or alternate source and is held for Justin; it is separate from the merged Linux/Windows fix.
+
+Decision archive hard gate checked at 2026-07-28T08:28:52+00:00: active ledger was 872849 bytes before this merge. No dated decision sections older than 2026-07-21 were eligible for archival.
+
+
+<!-- scribe-archive-2026-07-28T09-10-28+00-00-wave7 -->
+Decision archive hard gate checked at 2026-07-28T09:10:28+00:00: active ledger was 874273 bytes and exceeded 51200 bytes. Applied the seven-day policy (dated sections before 2026-07-21); no eligible dated decision sections remained after prior reconciliation, so archived 0 entries and created no archive file.
+
+<!-- scribe-merge-2026-07-28T09-10-28+00-00-luv-67-cuda-batch7 -->
+## 2026-07-28 — CUDA operator coverage batch 7
+
+### Issue #67 — CUDA `Pad` and `Range` (PR #338, `c59383db`)
+**By:** Luv (implementation); Freysa (independent review)
+
+**What:** Added standard-domain CUDA EP coverage for `Pad` and `Range`, increasing `CUDA_COVERED_OPS` from 134 to 136 and standard CPU-parity coverage from 105/141 to 107/141. `Pad` covers constant, reflect, edge, wrap, negative cropping, and subset axes. `Range` covers f32/f16/bf16/Int64 positive and negative sequences.
+
+**Verification:** Freysa approved after the H200 GPU 2 parity suite passed all 174 cases, the coverage gate passed, a content-corrupting mutation probe failed as expected, and default-target warnings-denied Clippy was clean.
+
+**Deferred:** `ScatterND`, quantization operators, and cuDNN-dependent work remain separate follow-ups; deterministic duplicate-index reductions and scale/zero-point broadcasting need focused treatment. #67 remains open as a coverage series.
+
+<!-- scribe-merge-2026-07-28T09-10-28+00-00-coco-75-shape-inference-b2 -->
+### Issue #75 — Shape-inference catalog batch 2 (PR #339, `b1f9d3bb`)
+**By:** Coco (implementation); Chew (independent specification review)
+
+**What:** Added six standard tensor rules: `Det`, `LpPool`, `GlobalLpPool`, `MaxUnpool`, `Col2Im`, and `CenterCropPad`. The registry advances from 181 to 187 operators and from 219 to 226 versioned registrations. Rules preserve symbolic-dimension behavior and use version-gated registration.
+
+**Verification:** Chew approved after spec-verifying all six rules and confirming a mutation probe. Coco's targeted format, warnings-denied Clippy, and shape-inference test suite passed.
+
+**Deferred:** `DFT`, `STFT`, `MelWeightMatrix`, `AffineGrid`, and loss operators remain later tensor-rule work. Sequence/Optional/Map propagation needs an SSA `Value`/`TypeInfo` container element-type model change, so #75 remains open.
+
+<!-- sources: decisions/inbox/luv-67-cuda-batch7.md; decisions/inbox/coco-75-shape-inference-b2.md; wave-7 manifest -->
+
+<!-- scribe-archive-2026-07-28T10-04-25+0000-wave8 -->
+Decision archive hard gate checked at 2026-07-28T10:04:25+0000: active ledger was 876732 bytes and exceeded 51200 bytes. Applied the seven-day policy (dated sections before 2026-07-21); no eligible dated decision sections remained after prior reconciliation, so archived 0 entries and created no archive file.
+
+<!-- scribe-merge-2026-07-28T10-04-25+0000-jones-67-cuda-batch8 -->
+## 2026-07-28 — CUDA operator coverage batch 8
+
+### Issue #67 — CUDA `ScatterND` and window functions (PR #341, `6aca9a9d`)
+**By:** Jones (implementation); Clemens (independent review, **APPROVE**)
+
+**What:** Added CUDA kernels for `ScatterND`, `HannWindow`, `HammingWindow`, and `BlackmanWindow`, increasing `CUDA_COVERED_OPS` from 136 to 140. Standard CPU parity advanced to 111/141.
+
+**Why:** A deterministic single-thread `ScatterND` kernel preserves CPU duplicate-index reduction semantics. A shared dtype-parametric NVRTC window implementation covers f16/bf16/f32/f64 without cuDNN and avoids maintaining three duplicate implementations.
+
+**Verification:** GPU7 conformance passed 190/190 cases; the coverage-of-coverage gate passed; a `ScatterND` mutation probe failed as expected. #67 remains open for further coverage.
+
+<!-- scribe-merge-2026-07-28T10-04-25+0000-branson-75-shape-inference-b3 -->
+### Issue #75 — Shape-inference catalog batch 3 (PR #343, `9aea50f9`)
+**By:** Branson (implementation); Morse (independent review, **APPROVE**)
+
+**What:** Added rules for `DFT`, `STFT`, `MelWeightMatrix`, `HannWindow`, `HammingWindow`, `BlackmanWindow`, `AffineGrid`, `NegativeLogLikelihoodLoss`, and `SoftmaxCrossEntropyLoss`. The registry advanced from 187 to 196 operators and from 226 to 236 versioned registrations.
+
+**Why:** Signal, window, grid, and loss operators have well-defined output-shape math. Rules preserve known rank/dimensions while unresolved shape data becomes fresh symbols; DFT registrations distinguish opset-17 attribute-axis and opset-20 input-axis forms.
+
+**Verification:** Format, warnings-denied Clippy, and all 229 shape-inference tests passed; an STFT frame-count mutation probe failed as expected. Sequence/Optional/Map container operators remain deferred pending an SSA `Value`/`TypeInfo` container type-model change. #75 remains open for later batches.
+
+<!-- sources: decisions/inbox/jones-67-cuda-batch8.md; decisions/inbox/branson-75-shape-inference-b3.md; wave-8 manifest -->

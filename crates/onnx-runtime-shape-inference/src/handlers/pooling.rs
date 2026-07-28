@@ -12,6 +12,7 @@ use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
 use crate::handlers::checked_axis;
 use crate::registry::InferenceRegistry;
+use crate::shape_data::ShapeData;
 
 /// Auto-pad handling per the ONNX spec.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,8 @@ struct SpatialParams {
     pad_end: i64,
     auto: AutoPad,
     ceil_mode: bool,
+    /// Extra `ConvTranspose` trailing padding; ignored by the forward formula.
+    output_padding: i64,
 }
 
 /// Compute one spatial output extent.
@@ -125,6 +128,7 @@ fn conv_pool(
             pad_end: *pads.get(d + n_spatial).unwrap_or(&0),
             auto,
             ceil_mode,
+            output_padding: 0,
         };
         let dim = spatial_out(ctx, &x[d + 2], &params);
         out.push(dim);
@@ -543,14 +547,298 @@ fn int_list(ctx: &InferenceContext, name: &str, len: usize, default: i64) -> Vec
     v
 }
 
+/// One `MaxUnpool` spatial output extent.
+///
+/// `MaxUnpool` is the partial inverse of `MaxPool`, so it applies the transpose
+/// formula `stride*(input-1) - pad_begin - pad_end + kernel` (there is no
+/// dilation or output padding). A symbolic input, a non-positive stride/kernel,
+/// or an out-of-range result degrades to a fresh symbol.
+fn max_unpool_dim(
+    ctx: &mut InferenceContext,
+    input: &DimExpr,
+    kernel: i64,
+    stride: i64,
+    pad_begin: i64,
+    pad_end: i64,
+) -> DimExpr {
+    let Some(d) = input.as_const() else {
+        return ctx.fresh_dim();
+    };
+    if stride <= 0 || kernel <= 0 {
+        return ctx.fresh_dim();
+    }
+    let value =
+        i128::from(stride) * (i128::from(d) - 1) - i128::from(pad_begin) - i128::from(pad_end)
+            + i128::from(kernel);
+    if !(0..=isize::MAX as i128).contains(&value) {
+        return ctx.fresh_dim();
+    }
+    DimExpr::constant(value as i64)
+}
+
+/// `MaxUnpool` (opset 9): scatter `X` `[N, C, D1, …]` back into a larger tensor.
+///
+/// When the optional `output_shape` input (slot 2, a 1-D tensor of the *full*
+/// output dims) resolves to constants it is used verbatim; otherwise the
+/// spatial extents follow the transpose formula from `kernel_shape`, `strides`,
+/// and `pads`. `N`/`C` are always copied from `X`.
+pub fn max_unpool(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    if x.len() < 3 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "MaxUnpool".into(),
+            index: 0,
+            rank: x.len(),
+            detail: "expected [N, C, D1, …]".into(),
+        });
+    }
+    let n_spatial = x.len() - 2;
+    // The optional `output_shape` input overrides the computed extents.
+    if ctx.has_input(2) {
+        let dims = ctx.input_shape_data(2).map(ShapeData::as_shape);
+        let out = match dims {
+            Some(dims) if dims.len() == x.len() => {
+                for dim in &dims {
+                    if let Some(extent) = dim.as_const()
+                        && !(0..=isize::MAX as i64).contains(&extent)
+                    {
+                        return Err(ShapeInferError::Invalid {
+                            op: "MaxUnpool".into(),
+                            detail: format!(
+                                "output_shape extent {extent} is outside 0..=isize::MAX"
+                            ),
+                        });
+                    }
+                }
+                dims
+            }
+            // The dims are supplied at runtime but not statically known: keep
+            // the rank (N, C, and one fresh symbol per spatial axis).
+            _ => {
+                let mut out = vec![x[0].clone(), x[1].clone()];
+                out.extend((0..n_spatial).map(|_| ctx.fresh_dim()));
+                out
+            }
+        };
+        ctx.set_output(0, dtype, out);
+        return Ok(());
+    }
+    let kernel = pool_list(ctx, "kernel_shape", n_spatial, 0, true)?;
+    let strides = pool_list(ctx, "strides", n_spatial, 1, false)?;
+    let pads = pool_list(ctx, "pads", n_spatial * 2, 0, false)?;
+    let mut out = vec![x[0].clone(), x[1].clone()];
+    for axis in 0..n_spatial {
+        out.push(max_unpool_dim(
+            ctx,
+            &x[axis + 2],
+            kernel[axis],
+            strides[axis],
+            pads[axis],
+            pads[axis + n_spatial],
+        ));
+    }
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
 /// Register the spatial family.
 pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Conv", 1, conv);
+    reg.register("", "ConvTranspose", 1, conv_transpose);
     reg.register("", "MaxPool", 1, pool);
     reg.register("", "AveragePool", 1, pool);
+    // `LpPool` shares `MaxPool`/`AveragePool`'s windowed spatial formula (it
+    // has the same `kernel_shape`/`strides`/`pads`/`auto_pad` attributes, plus
+    // `dilations`/`ceil_mode` from opset 18), so it reuses `pool`.
+    reg.register("", "LpPool", 1, pool);
     reg.register("", "GlobalAveragePool", 1, global_pool);
     reg.register("", "GlobalMaxPool", 1, global_pool);
+    // `GlobalLpPool` collapses every spatial dim to 1, exactly like the other
+    // global pools.
+    reg.register("", "GlobalLpPool", 1, global_pool);
+    reg.register("", "MaxUnpool", 9, max_unpool);
+    reg.register("", "MaxUnpool", 11, max_unpool);
     reg.register("", "Pad", 1, pad);
+    reg.register("", "GridSample", 16, grid_sample);
+    reg.register("", "AffineGrid", 20, affine_grid);
+}
+
+/// One `ConvTranspose` spatial output extent.
+///
+/// With an explicit (non-auto) pad the deconvolution formula is
+/// `stride*(input-1) + output_padding + effective_kernel - pad_begin - pad_end`.
+/// Under `SAME_UPPER`/`SAME_LOWER` the spec fixes the extent at `input*stride`.
+/// A symbolic input, a non-positive stride, or an overflowing/out-of-range
+/// result degrades to a fresh symbol — an honest "unknown" rather than a
+/// fabricated extent.
+fn conv_transpose_dim(ctx: &mut InferenceContext, input: &DimExpr, p: &SpatialParams) -> DimExpr {
+    let Some(d) = input.as_const() else {
+        return ctx.fresh_dim();
+    };
+    if p.stride <= 0 {
+        return ctx.fresh_dim();
+    }
+    let value = match p.auto {
+        AutoPad::SameUpper | AutoPad::SameLower => i128::from(d) * i128::from(p.stride),
+        AutoPad::Valid | AutoPad::NotSet => {
+            let effective_kernel = i128::from(p.dilation) * (i128::from(p.kernel) - 1) + 1;
+            i128::from(p.stride) * (i128::from(d) - 1)
+                + i128::from(p.output_padding)
+                + effective_kernel
+                - i128::from(p.pad_begin)
+                - i128::from(p.pad_end)
+        }
+    };
+    if !(0..=isize::MAX as i128).contains(&value) {
+        return ctx.fresh_dim();
+    }
+    DimExpr::constant(value as i64)
+}
+
+/// `ConvTranspose` (opset 1): the transpose (fractionally-strided) convolution.
+///
+/// Output channels are `W.shape[1] * group`; each spatial extent follows the
+/// deconvolution formula, or the explicit `output_shape` attribute when given.
+pub fn conv_transpose(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    if x.len() < 3 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "ConvTranspose".into(),
+            index: 0,
+            rank: x.len(),
+            detail: "expected [N, C, D1, …]".into(),
+        });
+    }
+    let n_spatial = x.len() - 2;
+    let group = ctx
+        .node
+        .attr("group")
+        .and_then(Attribute::as_int)
+        .unwrap_or(1)
+        .max(1);
+    // Output channels come from `W`'s second dimension (M / group) times group.
+    let channels = match ctx.input_shape(1) {
+        Some(w) if w.len() >= 2 => w[1].mul(&DimExpr::constant(group)),
+        _ => ctx.fresh_dim(),
+    };
+    let kernel: Vec<i64> = match ctx.node.attr("kernel_shape").and_then(Attribute::as_ints) {
+        Some(k) => k.to_vec(),
+        None => match ctx.input_shape(1) {
+            Some(w) if w.len() == n_spatial + 2 => {
+                w[2..].iter().map(|d| d.as_const().unwrap_or(1)).collect()
+            }
+            _ => vec![1; n_spatial],
+        },
+    };
+    let strides = int_list(ctx, "strides", n_spatial, 1);
+    let dilations = int_list(ctx, "dilations", n_spatial, 1);
+    let pads = int_list(ctx, "pads", n_spatial * 2, 0);
+    let output_padding = int_list(ctx, "output_padding", n_spatial, 0);
+    let output_shape = ctx
+        .node
+        .attr("output_shape")
+        .and_then(Attribute::as_ints)
+        .map(<[i64]>::to_vec);
+    let auto = auto_pad(ctx);
+
+    let mut out = Vec::with_capacity(x.len());
+    out.push(x[0].clone());
+    out.push(channels);
+    for d in 0..n_spatial {
+        let dim = if let Some(shape) = &output_shape {
+            match shape.get(d).copied() {
+                Some(value) if value >= 0 => DimExpr::constant(value),
+                _ => ctx.fresh_dim(),
+            }
+        } else {
+            let params = SpatialParams {
+                kernel: *kernel.get(d).unwrap_or(&1),
+                stride: *strides.get(d).unwrap_or(&1),
+                dilation: *dilations.get(d).unwrap_or(&1),
+                pad_begin: *pads.get(d).unwrap_or(&0),
+                pad_end: *pads.get(d + n_spatial).unwrap_or(&0),
+                auto,
+                ceil_mode: false,
+                output_padding: *output_padding.get(d).unwrap_or(&0),
+            };
+            conv_transpose_dim(ctx, &x[d + 2], &params)
+        };
+        out.push(dim);
+    }
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
+/// `GridSample` (opset 16): sample `X` `[N, C, D1, …]` at the locations in
+/// `grid` `[N, D1_out, …, spatial]`. The output keeps `N`/`C` from `X` and takes
+/// each spatial extent from the matching `grid` dimension.
+pub fn grid_sample(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_shape(0).map(<[DimExpr]>::to_vec) else {
+        return Ok(());
+    };
+    if x.len() < 3 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "GridSample".into(),
+            index: 0,
+            rank: x.len(),
+            detail: "expected [N, C, D1, …]".into(),
+        });
+    }
+    let dtype = ctx.input_dtype(0).unwrap_or(DataType::Float32);
+    let n_spatial = x.len() - 2;
+    let mut out = vec![x[0].clone(), x[1].clone()];
+    match ctx.input_shape(1) {
+        Some(grid) if grid.len() == n_spatial + 2 => {
+            out.extend(grid[1..=n_spatial].iter().cloned());
+        }
+        _ => out.extend((0..n_spatial).map(|_| ctx.fresh_dim())),
+    }
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
+/// `AffineGrid` (opset 20): generate a sampling grid from a batch of affine
+/// matrices `theta` and a target output `size`. For 2-D (`size = [N, C, H, W]`)
+/// the grid is `[N, H, W, 2]`; for 3-D (`size = [N, C, D, H, W]`) it is
+/// `[N, D, H, W, 3]`. The extents come from the resolved `size` vector, so the
+/// rule needs `size`'s shape-data; the element type follows `theta`.
+pub fn affine_grid(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(dtype) = ctx.input_dtype(0) else {
+        return Ok(());
+    };
+    let Some(size) = ctx
+        .input_shape_data(1)
+        .filter(|data| !data.is_scalar())
+        .map(|data| data.elems.clone())
+    else {
+        return Ok(());
+    };
+    let out = match size.len() {
+        // 2-D: size = [N, C, H, W]  ->  grid = [N, H, W, 2].
+        4 => vec![
+            size[0].clone(),
+            size[2].clone(),
+            size[3].clone(),
+            DimExpr::constant(2),
+        ],
+        // 3-D: size = [N, C, D, H, W]  ->  grid = [N, D, H, W, 3].
+        5 => vec![
+            size[0].clone(),
+            size[2].clone(),
+            size[3].clone(),
+            size[4].clone(),
+            DimExpr::constant(3),
+        ],
+        _ => return Ok(()),
+    };
+    ctx.set_output(0, dtype, out);
+    Ok(())
 }
 
 /// `GlobalAveragePool`/`GlobalMaxPool`: spatial dims collapse to 1.
