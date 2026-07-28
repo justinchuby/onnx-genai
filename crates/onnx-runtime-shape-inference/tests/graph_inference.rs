@@ -967,11 +967,15 @@ fn loop_static_trip_count_stacks_scan_output_and_propagates_carried_shape() {
         vec![Dim::Static(2), Dim::Static(3)]
     );
     assert_eq!(graph.value(carried_out).dtype, DataType::Float32);
-    // Scan output gains a leading trip-count axis (= static M).
-    assert_eq!(
-        graph.value(scan).shape,
-        vec![Dim::Static(5), Dim::Static(2), Dim::Static(3)]
+    // Scan output gains a leading trip-count axis. The trip count is symbolic
+    // even for a static `M`, because `cond` can early-exit; execution computes
+    // the true extent and eager buffer planning must not over-reserve `M` slots.
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "trip count must produce a symbolic leading dim, got {shape:?}"
     );
+    assert_eq!(shape[1..], [Dim::Static(2), Dim::Static(3)]);
 }
 
 #[test]
@@ -1046,10 +1050,12 @@ fn loop_preserves_symbolic_carried_dimension_through_the_body() {
         graph.value(carried_out).shape,
         vec![Dim::Symbolic(batch), Dim::Static(3)]
     );
-    assert_eq!(
-        graph.value(scan).shape,
-        vec![Dim::Static(4), Dim::Symbolic(batch), Dim::Static(3)]
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "trip count must produce a symbolic leading dim, got {shape:?}"
     );
+    assert_eq!(shape[1..], [Dim::Symbolic(batch), Dim::Static(3)]);
 }
 
 /// A `Scan` body `(state, scan_slice) -> (state_out, scan_out)` that passes both
@@ -1272,8 +1278,10 @@ fn loop_body_with_nested_if_resolves_through_both_subgraph_levels() {
         graph.value(carried_out).shape,
         vec![Dim::Static(2), Dim::Static(3)]
     );
-    assert_eq!(
-        graph.value(scan).shape,
-        vec![Dim::Static(3), Dim::Static(2), Dim::Static(3)]
+    let shape = &graph.value(scan).shape;
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "trip count must produce a symbolic leading dim, got {shape:?}"
     );
+    assert_eq!(shape[1..], [Dim::Static(2), Dim::Static(3)]);
 }

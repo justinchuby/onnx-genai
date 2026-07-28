@@ -302,7 +302,7 @@ fn infer_control_flow(
     }
     let outputs = match node.op_type.as_str() {
         "If" => infer_if_outputs(graph, node, subgraph_results, interner)?,
-        "Loop" => infer_loop_outputs(graph, node, subgraph_results, shape_data, interner)?,
+        "Loop" => infer_loop_outputs(graph, node, subgraph_results, interner)?,
         // `Scan`'s opset-8 form carried an extra `sequence_lens` input and a
         // different body signature; only the stable opset-9+ form is modelled.
         "Scan" if version >= 9 => {
@@ -710,13 +710,17 @@ fn read_body_output(
 /// node's outputs `(v_1..v_N, scan_1..scan_K)`.
 ///
 /// A loop-carried output takes its body carried-output shape directly; a scan
-/// output gains a prepended trip-count axis (the static `M` operand when known,
-/// otherwise a fresh symbol — the loop may exit early on `cond`).
+/// output gains a prepended trip-count axis.
+///
+/// The trip-count axis is **always symbolic**, even when the `M` operand is a
+/// static constant: the loop may exit early on `cond`, so a static `M` is only
+/// an unsound *upper bound*, not the true iteration count. Emitting it as a
+/// concrete extent would (for a huge `M`) provoke eager buffer over-reservation
+/// downstream; execution computes the real count.
 fn infer_loop_outputs(
     graph: &Graph,
     node: &Node,
     subgraph_results: &HashMap<String, ScopedInference>,
-    shape_data: &HashMap<ValueId, ShapeData>,
     interner: &mut SymbolInterner,
 ) -> Result<Option<Vec<CfOutput>>, ShapeInferError> {
     let key = (node.id, "body".to_string());
@@ -730,9 +734,10 @@ fn infer_loop_outputs(
     let parent_symbols = body_parent_symbols(body);
 
     // Body inputs: iter_num, cond_in, then N carried. Body outputs: cond_out,
-    // then N carried, then K scan outputs.
+    // then N carried, then K scan outputs. All scan outputs share one iteration
+    // count, so they share one trip-count symbol.
     let carried = body.inputs.len().saturating_sub(2);
-    let trip_count = loop_trip_count(node, shape_data, interner);
+    let trip_count = interner.fresh_dim();
 
     let mut outputs = Vec::with_capacity(node.outputs.len());
     for slot in 0..node.outputs.len() {
@@ -748,7 +753,7 @@ fn infer_loop_outputs(
                     // A per-iteration scan output stacks along a new leading axis.
                     shape.insert(0, trip_count.clone());
                 }
-                outputs.push(CfOutput::Typed(TypeInfo::new(dtype, shape)));
+                outputs.push(cf_typed(dtype, shape));
             }
             Err(fallback) => outputs.push(fallback),
         }
@@ -756,21 +761,29 @@ fn infer_loop_outputs(
     Ok(Some(outputs))
 }
 
-/// The `Loop` trip-count dimension: the static scalar `M` operand when known,
-/// otherwise a fresh symbol.
-fn loop_trip_count(
-    node: &Node,
-    shape_data: &HashMap<ValueId, ShapeData>,
-    interner: &mut SymbolInterner,
-) -> DimExpr {
-    node_input(node, 0)
-        .and_then(|vid| shape_data.get(&vid))
-        .filter(|data| data.is_scalar())
-        .and_then(|data| data.elems.first())
-        .and_then(DimExpr::as_const)
-        .and_then(|value| (value >= 0).then_some(value))
-        .map(DimExpr::constant)
-        .unwrap_or_else(|| interner.fresh_dim())
+/// Build a typed control-flow output, degrading to a dtype-only (unknown-shape)
+/// output when a *fully static* shape would overflow eager buffer sizing.
+///
+/// A control-flow op can stack a per-iteration extent onto a large operand dim;
+/// if every extent is concrete and their byte size overflows, writing it as a
+/// static shape would make eager buffer planning reject the graph at build time
+/// instead of letting execution compute (and, where required, gracefully
+/// reject) the true shape. A shape with any symbolic dim is never eagerly sized,
+/// so it is passed through unchanged.
+fn cf_typed(dtype: DataType, shape: TypedShape) -> CfOutput {
+    let static_dims: Option<Vec<usize>> = shape
+        .iter()
+        .map(|dim| {
+            dim.as_const()
+                .and_then(|extent| usize::try_from(extent).ok())
+        })
+        .collect();
+    if let Some(dims) = static_dims
+        && onnx_runtime_ir::checked_expected_bytes(dtype, &dims).is_none()
+    {
+        return CfOutput::UnknownRank(dtype);
+    }
+    CfOutput::Typed(TypeInfo::new(dtype, shape))
 }
 
 /// Map a `Scan` body's outputs `(state_1..state_N, scan_1..scan_K)` onto the
@@ -818,7 +831,7 @@ fn infer_scan_outputs(
                     let axis = normalize_axis(raw_axis, shape.len() + 1).unwrap_or(0);
                     shape.insert(axis, sequence_length.clone());
                 }
-                outputs.push(CfOutput::Typed(TypeInfo::new(dtype, shape)));
+                outputs.push(cf_typed(dtype, shape));
             }
             Err(fallback) => outputs.push(fallback),
         }
