@@ -4,13 +4,15 @@
 
 use super::values::{ensure_i64, is_token_input_name};
 use super::*;
+use onnx_genai_ort::io_roles::{
+    is_embedding_sequence, is_integer_sequence, is_score_output, legacy_terminal_name, resolve_port,
+};
 
 /// Resolved graph I/O port bindings for the decode step.
 ///
 /// Built from an explicit metadata `io` block when a model package declares one
-/// (via [`ModelIoSpec`]), or derived from historical tensor-name conventions
-/// otherwise. When [`ResolvedIo::explicit`] is `false`, the scalar port fields
-/// are `None` and the decode step falls back to tensor-name conventions.
+/// (via [`ModelIoSpec`]), otherwise from unambiguous dtype/shape signals and,
+/// finally, historical tensor-name conventions.
 ///
 /// TRANSITIONAL: the convention fallback exists only until every model package
 /// emits an `io` block. Phase 2 removes the fallback, at which point `explicit`
@@ -338,9 +340,53 @@ impl ResolvedIo {
                         "pipeline.positions requires an explicit decoder io block so its position input can be validated"
                     );
                 }
-                Ok(Self::default())
+                Self::from_structure_or_legacy(session)
             }
         }
+    }
+
+    fn from_structure_or_legacy(session: &Session) -> anyhow::Result<Self> {
+        let input = |role: &str,
+                     structural: fn(&TensorInfo) -> bool,
+                     names: &[&str]|
+         -> anyhow::Result<Option<String>> {
+            resolve_port(session.inputs(), None, role, structural, |name| {
+                legacy_terminal_name(name, names)
+            })
+            .map_err(anyhow::Error::msg)
+            .map(|resolved| resolved.map(|resolved| resolved.name))
+        };
+        let output = |role: &str,
+                      structural: fn(&TensorInfo) -> bool,
+                      names: &[&str]|
+         -> anyhow::Result<Option<String>> {
+            resolve_port(session.outputs(), None, role, structural, |name| {
+                legacy_terminal_name(name, names)
+            })
+            .map_err(anyhow::Error::msg)
+            .map(|resolved| resolved.map(|resolved| resolved.name))
+        };
+        let never = |_: &TensorInfo| false;
+        Ok(Self {
+            explicit: false,
+            token_input: input(
+                "token input",
+                is_integer_sequence,
+                &["input_ids", "decoder_input_ids"],
+            )?,
+            inputs_embeds_input: input(
+                "embedding sequence input",
+                is_embedding_sequence,
+                &["inputs_embeds"],
+            )?,
+            attention_mask_input: input("attention mask input", never, &["attention_mask"])?,
+            position_ids_input: input("position ids input", never, &["position_ids"])?,
+            logits_output: output("logits output", is_score_output, &["logits"])?,
+            hidden_output: None,
+            kv_pairs: Vec::new(),
+            state_pairs: Vec::new(),
+            cross_kv_pairs: Vec::new(),
+        })
     }
 
     fn from_spec(
@@ -447,31 +493,28 @@ impl ResolvedIo {
 
     /// Whether `name` is the token-id input for this graph.
     pub(super) fn is_token_input(&self, name: &str, lower: &str) -> bool {
-        if self.explicit {
-            self.token_input.as_deref() == Some(name)
-        } else {
-            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-            is_token_input_name(lower)
-        }
+        self.token_input.as_deref() == Some(name)
+            || (!self.explicit && {
+                // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+                is_token_input_name(lower)
+            })
     }
 
     /// Whether `name` is the attention-mask input for this graph.
     pub(super) fn is_attention_mask_input(&self, name: &str, lower: &str) -> bool {
-        if self.explicit {
-            self.attention_mask_input.as_deref() == Some(name)
-        } else {
-            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-            lower == "attention_mask" || lower.ends_with(".attention_mask")
-        }
+        self.attention_mask_input.as_deref() == Some(name)
+            || (!self.explicit && {
+                // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+                lower == "attention_mask" || lower.ends_with(".attention_mask")
+            })
     }
 
     /// Whether `name` is the position-ids input for this graph.
     pub(super) fn is_position_ids_input(&self, name: &str, lower: &str) -> bool {
-        if self.explicit {
-            self.position_ids_input.as_deref() == Some(name)
-        } else {
-            // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
-            lower == "position_ids" || lower.ends_with(".position_ids")
-        }
+        self.position_ids_input.as_deref() == Some(name)
+            || (!self.explicit && {
+                // TRANSITIONAL: remove in Phase 2 once all packages emit `io`.
+                lower == "position_ids" || lower.ends_with(".position_ids")
+            })
     }
 }

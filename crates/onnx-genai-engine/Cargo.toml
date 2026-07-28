@@ -65,6 +65,7 @@ onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-ep-api = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true }
 onnx-runtime-loader = { workspace = true }
+onnx-std = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
 onnx-runtime-tracer = { workspace = true, optional = true }
 prost = { workspace = true }
@@ -84,7 +85,6 @@ toktrie_hf_tokenizers = "1.7.6"
 
 [dev-dependencies]
 onnx-genai-preprocess = { workspace = true }
-onnx-std = { workspace = true }
 async-trait = { workspace = true }
 proptest = "1.9"
 

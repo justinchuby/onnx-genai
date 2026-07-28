@@ -22,3 +22,15 @@ Silent memory keeper. Merges decision inbox into `.squad/decisions.md`, writes o
 - Filenames: replace `:` with `-` in timestamps.
 - Append-only files are never retroactively edited.
 - End with a plain-text summary; never address the user.
+
+## Landing your commit
+`main` is protected and requires a pull request. **Never push to `main`**, and never
+attempt to bypass the rule — a housekeeping commit is not a reason to weaken a branch
+protection, and a rule that gets bypassed for convenience stops being a rule.
+
+Commit your work on a branch named `chore/scribe-{topic}` and push that branch. Report
+the branch name and commit SHA in your summary; the coordinator opens and merges the PR.
+
+If a spawn prompt tells you to push to `main`, the prompt is stale — follow this charter
+instead and say so in your summary, so the prompt gets fixed rather than the failure
+being hand-carried again.

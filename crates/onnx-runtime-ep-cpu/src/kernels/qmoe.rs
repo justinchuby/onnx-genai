@@ -38,6 +38,7 @@ use super::{
 };
 use crate::weight_offload::{
     WeightOffloadMode, checked_host_budget, metrics, weight_offload_host_budget,
+    weight_offload_prefetch_default,
 };
 
 /// Factory for the ORT contrib `QMoE` operator.
@@ -51,6 +52,10 @@ impl QMoEFactory {
     }
 }
 
+/// One routed expert and its `(row, contribution_slot, route_weight)` tasks,
+/// as materialised for the route-first offload loop.
+type RoutedExpert = (usize, Vec<(usize, usize, f32)>);
+
 /// Route-grouped, per-active-expert dequantizing integer QMoE kernel.
 pub struct QMoEKernel {
     layer_id: u32,
@@ -59,6 +64,7 @@ pub struct QMoEKernel {
     block_size: usize,
     weight_offload: WeightOffloadMode,
     host_cache: WeightOffloadHostCache,
+    prefetch_experts: bool,
 }
 
 impl KernelFactory for QMoEFactory {
@@ -94,6 +100,7 @@ impl KernelFactory for QMoEFactory {
             block_size: block_size as usize,
             weight_offload: WeightOffloadMode::from_env(),
             host_cache: self.host_cache.clone(),
+            prefetch_experts: weight_offload_prefetch_default(),
         }))
     }
 }
@@ -352,38 +359,60 @@ impl Kernel for QMoEKernel {
                 .map_err(error)?;
             metrics().record_routes(self.layer_id, &token_counts);
 
-            for (expert, expert_tasks) in tasks {
-                let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
-                let key = ExpertCacheKey::new(
-                    self.layer_id,
-                    expert,
-                    self.bits,
-                    self.block_size,
-                    &fc1,
-                    &fc2,
-                    fc3.as_ref(),
-                );
-                let weights = self.host_cache.lease(key, expanded_bytes, || {
-                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), true)
-                })?;
-                if weights.read_from_mmap {
-                    let mut bytes_read = fc1
-                        .expert_source_bytes(expert)?
-                        .checked_add(fc2.expert_source_bytes(expert)?)
-                        .ok_or_else(|| error("selected expert byte count overflow"))?;
-                    if let Some(source) = &fc3 {
-                        bytes_read = bytes_read
-                            .checked_add(source.expert_source_bytes(expert)?)
-                            .ok_or_else(|| error("selected expert byte count overflow"))?;
-                    }
-                    metrics().record_bytes_read(bytes_read).map_err(error)?;
-                }
+            let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
+            let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
+
+            // Eviction-neutrality guard for the prefetch pipeline.
+            //
+            // The pipeline holds the current expert `n`'s lease (an `Arc`) while
+            // the worker admits expert `n+1`, so entry `n` has
+            // `strong_count >= 2` and is excluded from the eviction candidate set
+            // during that admission. The serial loop has already dropped `n`
+            // before leasing `n+1`, so it *can* evict `n`. Because the host cache
+            // evicts by ascending `(frequency, last_used)`, the just-loaded,
+            // low-frequency expert `n` is frequently exactly the victim serial
+            // picks — yet the pipeline cannot evict it without letting real host
+            // memory exceed the configured budget. The two paths then retain
+            // different experts, diverging hits/misses/evictions/bytes-read and
+            // sometimes reading *more* mmap bytes than serial.
+            //
+            // We therefore engage the pipeline only where it is *provably*
+            // eviction-neutral — where no host-cache eviction can occur while a
+            // prefetch is in flight, so the pinned in-flight expert can never be
+            // a victim:
+            //
+            //   * `budget == 0`: the host cache is disabled; every lease streams
+            //     its expert from mmap in deterministic ascending order, so there
+            //     is no admission/eviction state to perturb; or
+            //   * `budget >= experts * expanded_bytes`: the whole layer's expert
+            //     set fits resident, so the cache admits without ever evicting.
+            //
+            // In both regimes admission/eviction and every counter are
+            // byte-identical to serial, so output *and* cache statistics match
+            // exactly and bytes-read can never regress. Under an intermediate
+            // (partial-cache) budget the pipeline transparently falls back to the
+            // serial route-first loop, which is byte- and stat-identical to the
+            // pre-prefetch baseline.
+            let prefetch_is_eviction_neutral =
+                weight_offload_host_budget(self.host_cache.configured_budget_bytes())
+                    .map(|budget| {
+                        budget == 0
+                            || (experts as u128)
+                                .checked_mul(expanded_bytes as u128)
+                                .is_some_and(|resident| resident <= budget as u128)
+                    })
+                    .unwrap_or(false);
+            let compute = |expert: usize,
+                           expert_tasks: &[(usize, usize, f32)],
+                           weights: &DequantizedExpert,
+                           contributions: &mut [f32]|
+             -> Result<()> {
                 write_grouped_contributions(
-                    &mut contributions,
+                    contributions,
                     &x,
-                    &expert_tasks,
+                    expert_tasks,
                     expert,
-                    &weights,
+                    weights,
                     fc1_bias.as_deref(),
                     fc2_bias.as_deref(),
                     fc3_bias.as_deref(),
@@ -391,7 +420,81 @@ impl Kernel for QMoEKernel {
                     hidden,
                     inter,
                     &self.attributes,
-                )?;
+                )
+            };
+
+            if self.prefetch_experts && ordered.len() > 1 && prefetch_is_eviction_neutral {
+                // Single-ahead prefetch pipeline: a dedicated worker leases
+                // (and, on a miss, dequantizes) expert `n+1` while the main
+                // thread computes expert `n`, overlapping the host-side
+                // transfer with compute. Leases are still issued strictly in
+                // ascending expert order (one request in flight). Combined with
+                // the eviction-neutrality guard above, cache admission/eviction
+                // and every counter stay byte-identical to the serial path —
+                // only the wall-clock overlaps.
+                use std::sync::mpsc;
+                let layer_id = self.layer_id;
+                let bits = self.bits;
+                let block_size = self.block_size;
+                let host_cache = &self.host_cache;
+                let fc1_ref = &fc1;
+                let fc2_ref = &fc2;
+                let fc3_ref = fc3.as_ref();
+                let ordered_ref = &ordered;
+                std::thread::scope(|scope| -> Result<()> {
+                    let (req_tx, req_rx) = mpsc::channel::<usize>();
+                    let (res_tx, res_rx) = mpsc::channel::<Result<Arc<DequantizedExpert>>>();
+                    scope.spawn(move || {
+                        while let Ok(index) = req_rx.recv() {
+                            let expert = ordered_ref[index].0;
+                            let leased = lease_route_first_expert(
+                                host_cache,
+                                layer_id,
+                                bits,
+                                block_size,
+                                expert,
+                                expanded_bytes,
+                                fc1_ref,
+                                fc2_ref,
+                                fc3_ref,
+                            );
+                            if res_tx.send(leased).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    req_tx
+                        .send(0)
+                        .map_err(|_| error("route-first prefetch worker unavailable"))?;
+                    for index in 0..ordered_ref.len() {
+                        let weights = res_rx
+                            .recv()
+                            .map_err(|_| error("route-first prefetch worker stopped"))??;
+                        if index + 1 < ordered_ref.len() {
+                            req_tx
+                                .send(index + 1)
+                                .map_err(|_| error("route-first prefetch worker unavailable"))?;
+                        }
+                        let (expert, expert_tasks) = &ordered_ref[index];
+                        compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                    }
+                    Ok(())
+                })?;
+            } else {
+                for (expert, expert_tasks) in &ordered {
+                    let weights = lease_route_first_expert(
+                        &self.host_cache,
+                        self.layer_id,
+                        self.bits,
+                        self.block_size,
+                        *expert,
+                        expanded_bytes,
+                        &fc1,
+                        &fc2,
+                        fc3.as_ref(),
+                    )?;
+                    compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                }
             }
         } else {
             for (expert, expert_tasks) in tasks {
@@ -914,6 +1017,37 @@ pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostC
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lease_route_first_expert(
+    host_cache: &WeightOffloadHostCache,
+    layer_id: u32,
+    bits: usize,
+    block_size: usize,
+    expert: usize,
+    expanded_bytes: usize,
+    fc1: &QuantizedExperts<'_>,
+    fc2: &QuantizedExperts<'_>,
+    fc3: Option<&QuantizedExperts<'_>>,
+) -> Result<Arc<DequantizedExpert>> {
+    let key = ExpertCacheKey::new(layer_id, expert, bits, block_size, fc1, fc2, fc3);
+    let lease = host_cache.lease(key, expanded_bytes, || {
+        DequantizedExpert::load(expert, fc1, fc2, fc3, true)
+    })?;
+    if lease.read_from_mmap {
+        let mut bytes_read = fc1
+            .expert_source_bytes(expert)?
+            .checked_add(fc2.expert_source_bytes(expert)?)
+            .ok_or_else(|| error("selected expert byte count overflow"))?;
+        if let Some(source) = fc3 {
+            bytes_read = bytes_read
+                .checked_add(source.expert_source_bytes(expert)?)
+                .ok_or_else(|| error("selected expert byte count overflow"))?;
+        }
+        metrics().record_bytes_read(bytes_read).map_err(error)?;
+    }
+    Ok(lease.weights)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_grouped_contributions(
     contributions: &mut [f32],
     input: &[f32],
@@ -1329,7 +1463,7 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
-    use crate::weight_offload::{WeightOffloadMode, metrics};
+    use crate::weight_offload::{WeightOffloadMode, WeightOffloadStats, metrics};
     use onnx_runtime_ep_api::{DevicePtr, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, DeviceId, Graph, NodeId, WeightRef, static_shape};
     use onnx_runtime_loader::{Model, Pageability, WeightStore, load_model_with_weights};
@@ -1603,6 +1737,18 @@ mod tests {
         routers: &[&[f32]],
         k: usize,
     ) -> MmapRun {
+        run_mmap_qmoe_sequence_prefetch(enabled, interleaved, input, routers, k, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_mmap_qmoe_sequence_prefetch(
+        enabled: bool,
+        interleaved: bool,
+        input: &[f32],
+        routers: &[&[f32]],
+        k: usize,
+        prefetch_experts: bool,
+    ) -> MmapRun {
         const EXPERTS: usize = 4;
         const ROWS: usize = 4;
         const HIDDEN: usize = 16;
@@ -1759,6 +1905,7 @@ mod tests {
             block_size: BLOCK,
             weight_offload: WeightOffloadMode { enabled },
             host_cache: default_weight_offload_host_cache().clone(),
+            prefetch_experts,
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
         let mut final_output = None;
@@ -1817,6 +1964,529 @@ mod tests {
         }
     }
 
+    /// Configurable mmap-backed route-first QMoE workload used for A/B
+    /// prefetch benchmarking. Unlike [`run_mmap_qmoe_sequence_prefetch`] (fixed
+    /// 4×16 fixture dims), this builds arbitrarily sized expert-major weights so
+    /// the host-side dequant cost is large enough to observe compute/transfer
+    /// overlap. Returns the final output, a stats snapshot, and the wall-clock
+    /// elapsed across all decode steps.
+    #[allow(clippy::too_many_arguments)]
+    fn run_route_first_bench(
+        experts: usize,
+        hidden: usize,
+        inter: usize,
+        bits: usize,
+        block: usize,
+        rows: usize,
+        k: usize,
+        host_cache_budget: u64,
+        routers: &[Vec<f32>],
+        prefetch_experts: bool,
+    ) -> (Vec<f32>, WeightOffloadStats, std::time::Duration) {
+        let pack_size = 8 / bits;
+        let packed_fc1 = hidden / pack_size;
+        let packed_fc2 = inter / pack_size;
+        let blocks_fc1 = hidden / block;
+        let blocks_fc2 = inter / block;
+
+        let fc1 = quantize(experts, inter, hidden, bits, block, false);
+        let fc2 = quantize(experts, hidden, inter, bits, block, false);
+
+        let mut external = vec![0u8; 4];
+        let fc1_packed_offset = external.len();
+        external.extend_from_slice(&fc1.packed);
+        let fc1_scales_offset = external.len();
+        append_f32_bytes(&mut external, &fc1.scales);
+        let fc2_packed_offset = external.len();
+        external.extend_from_slice(&fc2.packed);
+        let fc2_scales_offset = external.len();
+        append_f32_bytes(&mut external, &fc2.scales);
+
+        let path = test_external_path();
+        std::fs::create_dir_all(path.parent().expect("external parent"))
+            .expect("create external parent");
+        std::fs::write(&path, &external).expect("write external weights");
+
+        let fc1_packed_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc1_packed_offset,
+            length: fc1.packed.len(),
+            dtype: DataType::Uint8,
+            dims: vec![experts, inter, packed_fc1],
+        };
+        let fc1_scales_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc1_scales_offset,
+            length: fc1.scales.len() * 4,
+            dtype: DataType::Float32,
+            dims: vec![experts, inter, blocks_fc1],
+        };
+        let fc2_packed_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc2_packed_offset,
+            length: fc2.packed.len(),
+            dtype: DataType::Uint8,
+            dims: vec![experts, hidden, packed_fc2],
+        };
+        let fc2_scales_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc2_scales_offset,
+            length: fc2.scales.len() * 4,
+            dtype: DataType::Float32,
+            dims: vec![experts, hidden, blocks_fc2],
+        };
+
+        let layout =
+            |rows_per_expert, storage_elements_per_row, blocks_per_row| ExpertTensorLayout {
+                version: 1,
+                experts,
+                rows_per_expert,
+                storage_elements_per_row,
+                order: ExpertStorageOrder::ExpertMajor,
+                quantization: Some(ExpertQuantization {
+                    bits,
+                    block_size: block,
+                    blocks_per_row,
+                }),
+            };
+        let catalogs = [
+            WeightRegionCatalog::classify(&fc1_packed_ref, layout(inter, packed_fc1, blocks_fc1)),
+            WeightRegionCatalog::classify(&fc1_scales_ref, layout(inter, blocks_fc1, blocks_fc1)),
+            WeightRegionCatalog::classify(&fc2_packed_ref, layout(hidden, packed_fc2, blocks_fc2)),
+            WeightRegionCatalog::classify(&fc2_scales_ref, layout(hidden, blocks_fc2, blocks_fc2)),
+        ];
+        assert!(
+            catalogs
+                .iter()
+                .all(|catalog| catalog.pageability() == &Pageability::Pageable),
+            "benchmark weights must be pageable to exercise route-first offload"
+        );
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).expect("map external weights");
+        let fc1_packed_shape = [experts, inter, packed_fc1];
+        let fc1_scale_shape = [experts, inter, blocks_fc1];
+        let fc2_packed_shape = [experts, hidden, packed_fc2];
+        let fc2_scale_shape = [experts, hidden, blocks_fc2];
+        let fc1_packed_strides = [(inter * packed_fc1) as i64, packed_fc1 as i64, 1];
+        let fc1_scale_strides = [(inter * blocks_fc1) as i64, blocks_fc1 as i64, 1];
+        let fc2_packed_strides = [(hidden * packed_fc2) as i64, packed_fc2 as i64, 1];
+        let fc2_scale_strides = [(hidden * blocks_fc2) as i64, blocks_fc2 as i64, 1];
+
+        let (graph, node) = model_node(
+            "QMoE",
+            &[
+                Some((DataType::Float32, &[rows, hidden][..])),
+                Some((DataType::Float32, &[rows, experts])),
+                Some((DataType::Uint8, &[experts, inter, packed_fc1])),
+                Some((DataType::Float32, &[experts, inter, blocks_fc1])),
+                None,
+                Some((DataType::Uint8, &[experts, hidden, packed_fc2])),
+                Some((DataType::Float32, &[experts, hidden, blocks_fc2])),
+            ],
+            &[rows, hidden],
+            &attributes(bits, block, k, false),
+        );
+        let attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
+        let kernel = QMoEKernel {
+            layer_id: graph.node(node).id.0,
+            attributes,
+            bits,
+            block_size: block,
+            weight_offload: WeightOffloadMode { enabled: true },
+            host_cache: default_weight_offload_host_cache().clone(),
+            prefetch_experts,
+        };
+
+        reset_offload_test_state(host_cache_budget);
+        let input = pseudo_random_values(rows * hidden, 0xa5a5_1234);
+        let x = Owned::f32(&[rows, hidden], &input);
+        let mut final_output = None;
+        let start = std::time::Instant::now();
+        for router_values in routers {
+            let router = Owned::f32(&[rows, experts], router_values);
+            let mut output = Owned::zeros_f32(&[rows, hidden]);
+            kernel
+                .execute(
+                    &[
+                        x.view(),
+                        router.view(),
+                        mapped_tensor_view(
+                            &store,
+                            &fc1_packed_ref,
+                            &fc1_packed_shape,
+                            &fc1_packed_strides,
+                            DataType::Uint8,
+                        ),
+                        mapped_tensor_view(
+                            &store,
+                            &fc1_scales_ref,
+                            &fc1_scale_shape,
+                            &fc1_scale_strides,
+                            DataType::Float32,
+                        ),
+                        TensorView::absent(DataType::Float32),
+                        mapped_tensor_view(
+                            &store,
+                            &fc2_packed_ref,
+                            &fc2_packed_shape,
+                            &fc2_packed_strides,
+                            DataType::Uint8,
+                        ),
+                        mapped_tensor_view(
+                            &store,
+                            &fc2_scales_ref,
+                            &fc2_scale_shape,
+                            &fc2_scale_strides,
+                            DataType::Float32,
+                        ),
+                    ],
+                    &mut [output.view_mut()],
+                )
+                .expect("run mmap QMoE");
+            final_output = Some(output.to_f32());
+        }
+        let elapsed = start.elapsed();
+        let stats = crate::weight_offload_stats();
+        drop(store);
+        std::fs::remove_file(path).expect("remove external weights");
+        (
+            final_output.expect("at least one execution"),
+            stats,
+            elapsed,
+        )
+    }
+
+    fn bench_routers(experts: usize, rows: usize, steps: usize, seed: u64) -> Vec<Vec<f32>> {
+        (0..steps)
+            .map(|step| pseudo_random_values(rows * experts, seed.wrapping_add(step as u64 * 97)))
+            .collect()
+    }
+
+    #[test]
+    fn prefetch_pipeline_is_byte_and_stat_identical_to_serial() {
+        let _guard = hold_metrics_test_lock();
+        const EXPERTS: usize = 8;
+        const HIDDEN: usize = 64;
+        const INTER: usize = 128;
+        const ROWS: usize = 6;
+        let routers = bench_routers(EXPERTS, ROWS, 6, 0xbead_1111);
+        let budget: u64 = (3 * (INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+        let (serial_out, serial_stats, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 2, budget, &routers, false,
+        );
+        let (pipe_out, pipe_stats, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 2, budget, &routers, true,
+        );
+        assert_eq!(serial_out, pipe_out, "prefetch must be byte-identical");
+        assert_eq!(serial_stats.host_cache_hits, pipe_stats.host_cache_hits);
+        assert_eq!(serial_stats.host_cache_misses, pipe_stats.host_cache_misses);
+        assert_eq!(
+            serial_stats.host_cache_evictions,
+            pipe_stats.host_cache_evictions
+        );
+        assert_eq!(
+            serial_stats.bytes_read_from_mmap,
+            pipe_stats.bytes_read_from_mmap
+        );
+        assert!(
+            serial_stats.host_cache_misses > 0 && serial_stats.host_cache_evictions > 0,
+            "workload must force real admission and eviction (misses={}, evictions={})",
+            serial_stats.host_cache_misses,
+            serial_stats.host_cache_evictions
+        );
+    }
+
+    #[test]
+    fn prefetch_pipeline_survives_cache_smaller_than_working_set() {
+        let _guard = hold_metrics_test_lock();
+        const EXPERTS: usize = 6;
+        const HIDDEN: usize = 32;
+        const INTER: usize = 64;
+        const ROWS: usize = 6;
+        // Budget for a single expert forces eviction whenever >1 expert is hot.
+        let one_expert: u64 = ((INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+        let routers = bench_routers(EXPERTS, ROWS, 8, 0xfeed_2222);
+        let (serial_out, _, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 3, one_expert, &routers, false,
+        );
+        let (pipe_out, stats, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 3, one_expert, &routers, true,
+        );
+        assert_eq!(serial_out, pipe_out);
+        assert!(stats.owned_host_cache_bytes <= one_expert);
+        assert!(stats.peak_owned_host_cache_bytes <= one_expert);
+    }
+
+    /// Multi-routing / multi-budget sweep proving the prefetch pipeline is
+    /// observationally indistinguishable from the serial route-first loop.
+    ///
+    /// The single-ahead pipeline holds expert `n`'s lease while admitting
+    /// `n+1`; the extra in-flight `Arc` protects entry `n` from eviction, so in
+    /// the partial-cache regime the pipeline and serial retain different experts
+    /// and diverge on hits/misses/evictions/bytes-read. The eviction-neutrality
+    /// guard engages the pipeline only where no eviction can occur while a
+    /// prefetch is in flight (`budget == 0` streaming, or `budget >= experts`
+    /// fully resident) and otherwise falls back to the serial loop, so the two
+    /// paths are byte- and stat-identical everywhere.
+    ///
+    /// The router seeds were mined from a guard-less run and reproduce Gaff's
+    /// cited divergences on this fixture (e.g. seed `0x1000+3·131`/k=1/budget=3×
+    /// read +3072 mmap bytes; seed `0x1000+8·131`/k=2/budget=3× diverged on
+    /// misses). The sweep drives them across the engaged budgets (0× and the
+    /// fully-resident 6×/8×) and the partial budgets that must fall back, and
+    /// asserts for every combination:
+    ///   * byte-identical output,
+    ///   * identical hits/misses/evictions/bytes-read, and
+    ///   * bytes-read is never a regression (`pipe <= serial`).
+    ///
+    /// Removing the guard lets the pipeline engage under a partial budget and
+    /// reintroduces the divergences, failing this test.
+    #[test]
+    fn prefetch_matches_serial_across_routing_and_budget_sweep() {
+        let _guard = hold_metrics_test_lock();
+        // Dimensions chosen so the host-side working set exceeds a few-expert
+        // budget, forcing real cross-step admission/eviction (the regime where
+        // an extra in-flight lease can perturb victim selection).
+        const EXPERTS: usize = 6;
+        const HIDDEN: usize = 32;
+        const INTER: usize = 64;
+        const ROWS: usize = 6;
+        const STEPS: usize = 16;
+        let one_expert: u64 = ((INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+
+        // Router seeds whose guard-less single-ahead pipeline diverges from
+        // serial on this fixture (mined offline); includes Gaff's cited
+        // seed=3/k=1 and seed=8/k=2 regimes.
+        let router_seeds: [u64; 8] = [
+            0x1000 + 3 * 131,
+            0x1000 + 7 * 131,
+            0x1000 + 8 * 131,
+            0x1000 + 13 * 131,
+            0x1000 + 27 * 131,
+            0x1000 + 33 * 131,
+            0x1000 + 34 * 131,
+            0x1000 + 39 * 131,
+        ];
+        let ks: [usize; 3] = [1, 2, 3];
+        // 0× engages the streaming pipeline; 1×–4× are partial (serial
+        // fallback); 6× (== EXPERTS) and 8× are fully resident (engaged, no
+        // eviction). All must be indistinguishable from serial.
+        let budget_experts: [u64; 6] = [0, 1, 3, 4, 6, 8];
+
+        let mut saw_partial_eviction = false;
+        let mut saw_engaged_streaming = false;
+        for &seed in &router_seeds {
+            for &k in &ks {
+                let routers = bench_routers(EXPERTS, ROWS, STEPS, seed);
+                for &mult in &budget_experts {
+                    let budget = mult * one_expert;
+                    let (serial_out, serial_stats, _) = run_route_first_bench(
+                        EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, false,
+                    );
+                    let (pipe_out, pipe_stats, _) = run_route_first_bench(
+                        EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, true,
+                    );
+                    let ctx = format!("seed={seed:#x} k={k} budget={mult}x");
+                    assert_eq!(
+                        serial_out, pipe_out,
+                        "output must be byte-identical ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.host_cache_hits, pipe_stats.host_cache_hits,
+                        "hits diverged ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.host_cache_misses, pipe_stats.host_cache_misses,
+                        "misses diverged ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.host_cache_evictions, pipe_stats.host_cache_evictions,
+                        "evictions diverged ({ctx})"
+                    );
+                    assert_eq!(
+                        serial_stats.bytes_read_from_mmap, pipe_stats.bytes_read_from_mmap,
+                        "bytes-read diverged ({ctx})"
+                    );
+                    // The feature's own intent: never read more than serial.
+                    assert!(
+                        pipe_stats.bytes_read_from_mmap <= serial_stats.bytes_read_from_mmap,
+                        "prefetch read more mmap bytes than serial ({ctx})"
+                    );
+                    // The partial budgets (which fall back to serial) must
+                    // actually exercise eviction, else the guard-removal
+                    // mutation would have nothing to diverge on.
+                    if (1..EXPERTS as u64).contains(&mult) && serial_stats.host_cache_evictions > 0
+                    {
+                        saw_partial_eviction = true;
+                    }
+                    // The streaming budget engages the pipeline with real leases.
+                    if mult == 0 && serial_stats.host_cache_misses > 0 {
+                        saw_engaged_streaming = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_partial_eviction,
+            "sweep must exercise eviction in a partial-budget (fallback) regime"
+        );
+        assert!(
+            saw_engaged_streaming,
+            "sweep must exercise the engaged streaming pipeline (budget == 0)"
+        );
+    }
+
+    /// Mutation probe pinned to the exact regimes Gaff cited: seed=3/k=1 (the
+    /// +3072-byte default-on regression) and seed=8/k=2 (evictions/misses
+    /// divergence). It exercises both the engaged pipeline and the fallback,
+    /// and fails if the eviction-neutrality guard is removed.
+    ///
+    /// At the partial budget (3×) these fixtures evict, and the original
+    /// guard-less pipeline diverged from serial; the guard now forces serial
+    /// fallback, so the counters match exactly — deleting the guard re-engages
+    /// the pipeline here and reintroduces the divergence, failing the equality
+    /// assertions. At `budget == 0` the pipeline is engaged (streaming) and is
+    /// asserted byte- and stat-identical, proving the fix does not simply
+    /// disable prefetch.
+    #[test]
+    fn prefetch_guard_holds_stats_in_gaff_divergent_regime() {
+        let _guard = hold_metrics_test_lock();
+        const EXPERTS: usize = 6;
+        const HIDDEN: usize = 32;
+        const INTER: usize = 64;
+        const ROWS: usize = 6;
+        const STEPS: usize = 16;
+        let one_expert: u64 = ((INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+
+        // (router seed, k) pairs Gaff's sweep flagged as divergent under the
+        // original guard-less pipeline on this fixture.
+        let cases: [(u64, usize); 2] = [(0x1000 + 3 * 131, 1), (0x1000 + 8 * 131, 2)];
+        let mut fallback_evicted = false;
+        let mut streaming_missed = false;
+        for &(seed, k) in &cases {
+            let routers = bench_routers(EXPERTS, ROWS, STEPS, seed);
+            // 3× is a partial budget: the guard falls back to serial here.
+            // 0× is streaming: the guard engages the pipeline here.
+            for &budget in &[3 * one_expert, 0] {
+                let (serial_out, serial_stats, _) = run_route_first_bench(
+                    EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, false,
+                );
+                let (pipe_out, pipe_stats, _) = run_route_first_bench(
+                    EXPERTS, HIDDEN, INTER, 4, 16, ROWS, k, budget, &routers, true,
+                );
+                let ctx = format!("seed={seed:#x} k={k} budget={budget}");
+                assert_eq!(
+                    serial_out, pipe_out,
+                    "output must be byte-identical ({ctx})"
+                );
+                assert_eq!(
+                    serial_stats.host_cache_misses, pipe_stats.host_cache_misses,
+                    "miss count must match serial ({ctx})"
+                );
+                assert_eq!(
+                    serial_stats.host_cache_evictions, pipe_stats.host_cache_evictions,
+                    "eviction count must match serial ({ctx})"
+                );
+                assert_eq!(
+                    serial_stats.bytes_read_from_mmap, pipe_stats.bytes_read_from_mmap,
+                    "bytes-read must match serial — no default-on regression ({ctx})"
+                );
+                assert!(
+                    pipe_stats.bytes_read_from_mmap <= serial_stats.bytes_read_from_mmap,
+                    "prefetch must never read more mmap bytes than serial ({ctx})"
+                );
+                if budget > 0 {
+                    fallback_evicted |= serial_stats.host_cache_evictions > 0;
+                } else {
+                    streaming_missed |= serial_stats.host_cache_misses > 0;
+                }
+            }
+        }
+        assert!(
+            fallback_evicted,
+            "the cited partial-budget regimes must evict for the guard-removal probe to bite"
+        );
+        assert!(
+            streaming_missed,
+            "the streaming regime must issue real leases so the engaged path is exercised"
+        );
+    }
+
+    /// A/B micro-benchmark. Ignored by default (timing-sensitive); run with:
+    /// `cargo test -p onnx-runtime-ep-cpu prefetch_ab_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored --nocapture"]
+    fn prefetch_ab_benchmark() {
+        let _guard = hold_metrics_test_lock();
+        const EXPERTS: usize = 16;
+        const HIDDEN: usize = 256;
+        const INTER: usize = 512;
+        const ROWS: usize = 8;
+        const STEPS: usize = 64;
+        const K: usize = 4;
+        let routers = bench_routers(EXPERTS, ROWS, STEPS, 0x5eed_c0de);
+        // Streaming host budget (0 = no host cache): every routed expert is
+        // dequantized from mmap each step, so the pipeline overlaps the full
+        // transfer with compute. This is the regime the eviction-neutrality
+        // guard engages (no admission/eviction state to perturb), so the A/B is
+        // both representative of the win and byte-/stat-identical.
+        let budget: u64 = 0;
+
+        // Warm both configurations once (JIT of page faults) then time.
+        let mut serial = None;
+        let mut pipe = None;
+        for _ in 0..3 {
+            serial = Some(run_route_first_bench(
+                EXPERTS, HIDDEN, INTER, 4, 32, ROWS, K, budget, &routers, false,
+            ));
+            pipe = Some(run_route_first_bench(
+                EXPERTS, HIDDEN, INTER, 4, 32, ROWS, K, budget, &routers, true,
+            ));
+        }
+        let (serial_out, serial_stats, serial_elapsed) = serial.unwrap();
+        let (pipe_out, pipe_stats, pipe_elapsed) = pipe.unwrap();
+        assert_eq!(serial_out, pipe_out, "A/B outputs must be byte-identical");
+
+        let tokens = (ROWS * STEPS) as f64;
+        let serial_tps = tokens / serial_elapsed.as_secs_f64();
+        let pipe_tps = tokens / pipe_elapsed.as_secs_f64();
+        let hit_rate = |s: &WeightOffloadStats| {
+            let total = s.host_cache_hits + s.host_cache_misses;
+            if total == 0 {
+                0.0
+            } else {
+                s.host_cache_hits as f64 / total as f64
+            }
+        };
+        println!(
+            "=== route-first QMoE prefetch A/B (experts={EXPERTS} hidden={HIDDEN} inter={INTER} rows={ROWS} steps={STEPS} k={K}) ==="
+        );
+        println!(
+            "BEFORE (serial):    {:>8.1} tok/s | {:>7.2} ms | hits={} misses={} evictions={} hit-rate={:.1}%",
+            serial_tps,
+            serial_elapsed.as_secs_f64() * 1e3,
+            serial_stats.host_cache_hits,
+            serial_stats.host_cache_misses,
+            serial_stats.host_cache_evictions,
+            hit_rate(&serial_stats) * 100.0
+        );
+        println!(
+            "AFTER  (prefetch):  {:>8.1} tok/s | {:>7.2} ms | hits={} misses={} evictions={} hit-rate={:.1}%",
+            pipe_tps,
+            pipe_elapsed.as_secs_f64() * 1e3,
+            pipe_stats.host_cache_hits,
+            pipe_stats.host_cache_misses,
+            pipe_stats.host_cache_evictions,
+            hit_rate(&pipe_stats) * 100.0
+        );
+        println!(
+            "speedup: {:.2}x ({:+.1}%)",
+            pipe_tps / serial_tps,
+            (pipe_tps / serial_tps - 1.0) * 100.0
+        );
+    }
+
     fn pseudo_random_values(len: usize, seed: u64) -> Vec<f32> {
         let mut state = seed;
         (0..len)
@@ -1832,6 +2502,24 @@ mod tests {
     fn metrics_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Serialize the offload tests on the shared process-global metrics, and do
+    /// so *robustly against poisoning*.
+    ///
+    /// These tests all mutate the same process-wide `metrics()` singleton, so
+    /// they must run one at a time. If any one of them panics (a genuine
+    /// assertion failure) while holding this mutex, the standard library marks
+    /// the mutex poisoned; every subsequent `lock().expect(...)` then panics
+    /// with `PoisonError` instead of running. That amplifies a single real
+    /// failure into a cascade of unrelated "failures" that hides the true
+    /// culprit. We therefore recover the guard from a poisoned mutex: the
+    /// offending test still reports its own failure, but the remaining tests
+    /// continue to run and report honestly (one failure stays one failure).
+    fn hold_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        metrics_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn reset_offload_test_state(host_cache_budget: u64) {
@@ -2024,7 +2712,7 @@ mod tests {
 
     #[test]
     fn route_first_mmap_matches_full_dequant_on_pseudorandom_inputs() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x1234_5678);
         let router = pseudo_random_values(4 * 4, 0x9876_5432);
         reset_offload_test_state(0);
@@ -2037,7 +2725,7 @@ mod tests {
 
     #[test]
     fn route_first_preserves_exact_accumulation_order_for_top_k() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x0a11_ce55);
         let router = pseudo_random_values(4 * 4, 0x5151_5151);
         let baseline = run_mmap_qmoe_with_k(false, false, &input, &router, 3);
@@ -2048,7 +2736,7 @@ mod tests {
 
     #[test]
     fn route_first_reads_only_unique_selected_expert_ranges() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0xfeed_beef);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, // expert 1
@@ -2074,9 +2762,44 @@ mod tests {
         assert_eq!(layer.unique_experts, 2);
     }
 
+    /// Route-first dequantized-expert residency must stay *bounded* — the point
+    /// of the #364 offload design is that we never resident every selected
+    /// expert at once, even when all of them are routed to.
+    ///
+    /// The peak residency depends on which path runs:
+    ///
+    ///   * The serial route-first loop holds exactly the working set: one
+    ///     dequantized expert is materialized, computed, and dropped before the
+    ///     next is leased, so the peak is deterministically `WORKING_SET`.
+    ///   * The single-ahead prefetch pipeline (engaged at `budget == 0`) holds
+    ///     the current expert's lease while the worker leases and dequantizes
+    ///     the next one, so residency may transiently reach
+    ///     `WORKING_SET + IN_FLIGHT_PREFETCH_DEPTH`. Whether it actually does is
+    ///     a *timing* question: if the prefetch overlaps compute the peak is 2,
+    ///     otherwise it stays 1. Under coverage instrumentation the overlap is
+    ///     far more likely, which is exactly why a fragile `== 1` assertion
+    ///     flaked in CI while passing locally.
+    ///
+    /// We therefore assert the honest invariant — residency is bounded to the
+    /// working set plus at most one in-flight prefetch, and never grows to hold
+    /// all selected experts — instead of an exact peak that is nondeterministic
+    /// by design.
     #[test]
     fn route_first_bounds_dequantized_residency_when_all_experts_are_selected() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        /// Route-first computes one expert at a time, so the working set is a
+        /// single dequantized expert.
+        const WORKING_SET: u64 = 1;
+        /// The prefetch pipeline keeps a single lease in flight (single-ahead),
+        /// so it can add at most one more resident expert on top of the working
+        /// set.
+        const IN_FLIGHT_PREFETCH_DEPTH: u64 = 1;
+        /// Upper bound on concurrent dequantized-expert residency for the
+        /// route-first path, whether or not the prefetch overlaps compute.
+        const RESIDENCY_BOUND: u64 = WORKING_SET + IN_FLIGHT_PREFETCH_DEPTH;
+        /// Every one of the four experts is routed to by this fixture.
+        const SELECTED_EXPERTS: u64 = 4;
+
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x1234);
         let router = vec![
             9.0, 0.0, 0.0, 0.0, // expert 0
@@ -2085,17 +2808,45 @@ mod tests {
             0.0, 0.0, 0.0, 9.0, // expert 3
         ];
         let baseline = run_mmap_qmoe(false, false, &input, &router);
+
+        // Serial route-first (prefetch disabled): with no prefetch ever in
+        // flight the peak is deterministically the working set. This pins the
+        // lower edge of the bound and proves the accounting itself is correct.
+        reset_offload_test_state(0);
+        let serial = run_mmap_qmoe_sequence_prefetch(true, false, &input, &[&router], 1, false);
+        let serial_stats = crate::weight_offload_stats();
+        assert_close(&serial.output, &baseline.output);
+        assert_eq!(serial_stats.unique_experts_per_batch, 4);
+        assert_eq!(serial_stats.peak_dequantized_experts, WORKING_SET);
+
+        // Single-ahead prefetch pipeline (engaged at `budget == 0`): residency
+        // may reach `WORKING_SET + IN_FLIGHT_PREFETCH_DEPTH` when the prefetch
+        // overlaps compute, but must never exceed it and must never resident
+        // every selected expert. Asserting the bound — not an exact peak — is
+        // stable regardless of scheduling, which is what makes this test
+        // deterministic under coverage-instrumented timing.
         reset_offload_test_state(0);
         let route_first = run_mmap_qmoe(true, false, &input, &router);
         let stats = crate::weight_offload_stats();
         assert_close(&route_first.output, &baseline.output);
         assert_eq!(stats.unique_experts_per_batch, 4);
-        assert_eq!(stats.peak_dequantized_experts, 1);
+        assert!(
+            (WORKING_SET..=RESIDENCY_BOUND).contains(&stats.peak_dequantized_experts),
+            "route-first peak dequantized residency {} escaped the expected \
+             bound {WORKING_SET}..={RESIDENCY_BOUND}",
+            stats.peak_dequantized_experts,
+        );
+        assert!(
+            stats.peak_dequantized_experts < SELECTED_EXPERTS,
+            "route-first must bound residency, not resident all {SELECTED_EXPERTS} \
+             selected experts at once (peak was {})",
+            stats.peak_dequantized_experts,
+        );
     }
 
     #[test]
     fn interleaved_expert_layout_falls_back_without_error() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x55aa);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
@@ -2110,7 +2861,7 @@ mod tests {
 
     #[test]
     fn flag_off_preserves_legacy_path_and_counters() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 7);
         let router = pseudo_random_values(4 * 4, 11);
         reset_offload_test_state(0);
@@ -2126,7 +2877,7 @@ mod tests {
 
     #[test]
     fn zero_byte_host_cache_matches_phase1_direct_mmap() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x0bad_f00d);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
@@ -2149,7 +2900,7 @@ mod tests {
     #[test]
     fn host_cache_enforces_expanded_byte_cap_for_oversubscribed_working_set() {
         const EXPANDED_EXPERT_BYTES: u64 = 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0xcafe_babe);
         let router = vec![
             9.0, 0.0, 0.0, 0.0, // expert 0
@@ -2177,7 +2928,7 @@ mod tests {
     #[test]
     fn repeated_routing_working_set_converges_to_host_cache_hits() {
         const TWO_EXPANDED_EXPERTS: u64 = 2 * 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x1234_abcd);
         let router = vec![
             0.0, 5.0, 1.0, 2.0, 1.0, 4.0, 0.0, 3.0, 0.0, 1.0, 2.0, 6.0, 2.0, 1.0, 0.0, 7.0,
@@ -2204,7 +2955,7 @@ mod tests {
     #[test]
     fn one_off_rare_route_does_not_evict_pinned_hot_expert() {
         const EXPANDED_EXPERT_BYTES: u64 = 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0x55aa_aa55);
         let hot = vec![
             0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0,
@@ -2232,7 +2983,7 @@ mod tests {
     #[test]
     fn cached_and_uncached_routes_and_logits_are_bit_identical() {
         const TWO_EXPANDED_EXPERTS: u64 = 2 * 2 * 16 * 16 * 4;
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         let input = pseudo_random_values(4 * 16, 0xdec0_de01);
         let router = pseudo_random_values(4 * 4, 0xface_feed);
         reset_offload_test_state(0);
@@ -2245,7 +2996,7 @@ mod tests {
 
     #[test]
     fn two_engine_cache_partitions_respect_independent_budgets() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         metrics().reset();
         let engine_a = WeightOffloadHostCache::new(4).unwrap();
         let engine_b = WeightOffloadHostCache::new(8).unwrap();
@@ -2275,7 +3026,7 @@ mod tests {
 
     #[test]
     fn process_metrics_aggregate_live_cache_residency_and_release_on_drop() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         metrics().reset();
         let engine_a = WeightOffloadHostCache::new(4).unwrap();
         let engine_b = WeightOffloadHostCache::new(8).unwrap();
@@ -2318,7 +3069,7 @@ mod tests {
 
     #[test]
     fn admission_history_skips_uncacheable_keys_and_expires_churn() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         metrics().reset();
         let mut cache = HostExpertCache::default();
         let weights = || DequantizedExpert {
@@ -2358,7 +3109,7 @@ mod tests {
 
     #[test]
     fn active_host_cache_lease_blocks_eviction_until_drop() {
-        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        let _guard = hold_metrics_test_lock();
         reset_offload_test_state(4);
         let weights = |value| DequantizedExpert {
             fc1: vec![value],

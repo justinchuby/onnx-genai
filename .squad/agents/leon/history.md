@@ -209,3 +209,5 @@ Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. F
 - Documented the Windows/WDDM finding: exhausting reported free memory does not reliably produce CUDA allocator failure because the GPU memory manager can page/virtualize.
 - Added model-free injected-failure coverage at the shared `KvCapacityGrowthBackend` seam. Allocation failure now asserts the translated actionable error and proves the fake session's buffer id, logical length, capture generation, and capture-valid state remain unchanged before a successful retry.
 - Added mid-sequence injected failures for prefix-copy, mask allocation, and capture invalidation; all prove no commit and unchanged session state. Native/ORT commit phases remain effectively infallible assignments after all fallible work has completed.
+## 2026-07-28T17:40:00+0000
+#365 metadata-hints integration merged after the structural identity remediation chain.

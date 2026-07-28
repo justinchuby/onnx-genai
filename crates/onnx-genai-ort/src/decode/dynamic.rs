@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 /// Prompt and prefill runs use CUDA-graph annotation id `-1` (no capture) so
 /// only the fixed-shape decode step is captured and replayed. Each
@@ -66,6 +67,10 @@ pub struct DecodeSession<'a> {
     session: &'a Session,
     binding: IoBinding,
     kv_pairs: Vec<KvPair>,
+    token_input: String,
+    attention_mask_input: Option<String>,
+    position_ids_input: Option<String>,
+    logits_output: String,
     current_kv: HashMap<String, Arc<Value>>,
     current_len: usize,
     mode: DecodeKvMode,
@@ -291,7 +296,64 @@ impl Drop for DecodeSession<'_> {
 impl<'a> DecodeSession<'a> {
     /// Create a decode session and infer KV input/output pairs from graph names.
     pub fn new(session: &'a Session, options: DecodeSessionOptions) -> Result<Self> {
-        let kv_pairs = infer_kv_pairs(session)?;
+        Self::new_with_io(session, options, None)
+    }
+
+    /// Create a decode session using declarative graph-port roles when present.
+    pub fn new_with_io(
+        session: &'a Session,
+        options: DecodeSessionOptions,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> Result<Self> {
+        let kv_pairs = infer_kv_pairs(session, io)?;
+        let excluded = kv_pairs
+            .iter()
+            .flat_map(|pair| [pair.past.as_str(), pair.present.as_str()])
+            .collect::<HashSet<_>>();
+        let resolve_input =
+            |declared, role, structural: fn(&TensorInfo) -> bool, names: &[&str]| {
+                crate::io_roles::resolve_port(
+                    session.inputs(),
+                    declared,
+                    role,
+                    |tensor| !excluded.contains(tensor.name.as_str()) && structural(tensor),
+                    |name| crate::io_roles::legacy_terminal_name(name, names),
+                )
+                .map_err(OrtError::InvalidArgument)
+                .map(|port| port.map(|port| port.name))
+            };
+        let never = |_: &TensorInfo| false;
+        let token_input = resolve_input(
+            io.and_then(|io| io.token_input.as_deref()),
+            "io.token_input",
+            crate::io_roles::is_integer_sequence,
+            &["input_ids", "decoder_input_ids"],
+        )?
+        .ok_or_else(|| OrtError::InvalidArgument("cannot resolve token input".into()))?;
+        let attention_mask_input = resolve_input(
+            io.and_then(|io| io.attention_mask_input.as_deref()),
+            "io.attention_mask_input",
+            never,
+            &["attention_mask"],
+        )?;
+        let position_ids_input = resolve_input(
+            io.and_then(|io| io.position_ids_input.as_deref()),
+            "io.position_ids_input",
+            never,
+            &["position_ids"],
+        )?;
+        let logits_output = crate::io_roles::resolve_port(
+            session.outputs(),
+            io.and_then(|io| io.logits_output.as_deref()),
+            "io.logits_output",
+            |tensor| {
+                !excluded.contains(tensor.name.as_str()) && crate::io_roles::is_score_output(tensor)
+            },
+            |name| crate::io_roles::legacy_terminal_name(name, &["logits"]),
+        )
+        .map_err(OrtError::InvalidArgument)?
+        .map(|port| port.name)
+        .ok_or_else(|| OrtError::InvalidArgument("cannot resolve logits output".into()))?;
         let share_buffer = options
             .past_present_share_buffer
             .unwrap_or(session.past_present_share_buffer_supported());
@@ -304,6 +366,10 @@ impl<'a> DecodeSession<'a> {
             session,
             binding: IoBinding::new(session)?,
             kv_pairs,
+            token_input,
+            attention_mask_input,
+            position_ids_input,
+            logits_output,
             current_kv: HashMap::new(),
             current_len: 0,
             mode,
@@ -1136,12 +1202,11 @@ impl<'a> DecodeSession<'a> {
         position_ids: &Value,
     ) -> Result<()> {
         for input in self.session.inputs() {
-            let lower = input.name.to_ascii_lowercase();
-            if lower == "input_ids" || lower.ends_with(".input_ids") {
+            if input.name == self.token_input {
                 self.binding.bind_input(&input.name, input_ids)?;
-            } else if lower == "attention_mask" || lower.ends_with(".attention_mask") {
+            } else if self.attention_mask_input.as_deref() == Some(input.name.as_str()) {
                 self.binding.bind_input(&input.name, attention_mask)?;
-            } else if lower == "position_ids" || lower.ends_with(".position_ids") {
+            } else if self.position_ids_input.as_deref() == Some(input.name.as_str()) {
                 self.binding.bind_input(&input.name, position_ids)?;
             }
         }
@@ -1163,7 +1228,7 @@ impl<'a> DecodeSession<'a> {
     fn rotate_outputs(&mut self, outputs: Vec<Value>, logits: &mut Option<Value>) -> Result<()> {
         if self.mode == DecodeKvMode::SharedBuffer {
             for (name, value) in self.session.output_names().iter().zip(outputs) {
-                if is_logits_output(name) {
+                if name == &self.logits_output {
                     *logits = Some(value);
                     break;
                 }
@@ -1180,7 +1245,7 @@ impl<'a> DecodeSession<'a> {
         for (name, value) in self.session.output_names().iter().zip(outputs) {
             if let Some(past_name) = present_to_past.get(name.as_str()) {
                 next_kv.insert((*past_name).to_string(), Arc::new(value));
-            } else if is_logits_output(name) || logits.is_none() {
+            } else if name == &self.logits_output || logits.is_none() {
                 *logits = Some(value);
             }
         }

@@ -13,3 +13,6 @@
 - For PR #291, owned the runner-backed rewind boundary after Leon's deeper rejection; runner-backed static-cache/shared-buffer rewind now rejects during validation until a transactional prepared rewind exists.
 - Authored PR #321 for issue #63, landing Phase-3b live GPU weight-offload allocation, H2D copy, binding, and byte-identical one-weight device execution.
 - Recent consolidated decisions remain authoritative in `.squad/decisions.md`; this history was summarized by Scribe because it exceeded the 15KB threshold.
+
+## 2026-07-28T17:40:00+0000
+Reviewed #364: blocked the partial-cache stat divergence, then approved the guarded fix.

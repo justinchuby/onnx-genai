@@ -39,6 +39,8 @@ mod values;
 mod tests;
 
 pub(crate) use logits::{extract_logits_sequence_with_io, extract_next_token_logits_with_io};
+#[cfg(feature = "native-backend")]
+pub(crate) use metadata::{KeySequenceLengthsPolicy, key_sequence_lengths_policy};
 pub(crate) use metadata::{
     detect_model_decode_path, shared_kv_buffer_len_from_metadata, sink_tokens_from_metadata,
     sliding_window_from_metadata,

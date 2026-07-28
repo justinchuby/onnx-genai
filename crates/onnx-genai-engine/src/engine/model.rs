@@ -13,6 +13,8 @@ pub struct Engine {
     pub(crate) decode_backend: EngineDecodeBackend,
     /// Model inference metadata.
     pub(crate) metadata: InferenceMetadata,
+    /// Validated execution hints embedded in the ONNX graph.
+    pub(crate) metadata_hints: MetadataHints,
     /// KV cache manager.
     pub(crate) kv_cache: PagedKvCache,
     /// Shared-prefix cache for reusing paged KV across sessions.

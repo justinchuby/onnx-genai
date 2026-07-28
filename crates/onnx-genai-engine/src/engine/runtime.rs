@@ -859,6 +859,11 @@ impl Engine {
         &self.metadata
     }
 
+    /// Validated `onnx_runtime.*` hints consumed while loading the model.
+    pub fn metadata_hints(&self) -> &MetadataHints {
+        &self.metadata_hints
+    }
+
     /// Resolved decoder execution backend.
     pub fn decode_backend(&self) -> EngineDecodeBackend {
         self.decode_backend

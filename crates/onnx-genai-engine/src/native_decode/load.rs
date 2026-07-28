@@ -21,6 +21,7 @@ impl NativeDecodeSession {
         host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
         io: Option<&ModelIoSpec>,
         metadata_max_len: Option<usize>,
+        key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
         decode_precision: DecodePrecision,
     ) -> anyhow::Result<Self> {
         let preference = match device {
@@ -62,6 +63,7 @@ impl NativeDecodeSession {
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
+        Self::validate_key_sequence_lengths_contract(&session, key_sequence_lengths_policy)?;
         Self::from_session_with_cuda_options_and_io(
             session,
             NativeDecodeCudaOptions {
@@ -71,6 +73,38 @@ impl NativeDecodeSession {
             },
             io,
         )
+    }
+
+    fn validate_key_sequence_lengths_contract(
+        session: &InferenceSession,
+        policy: crate::decode::KeySequenceLengthsPolicy,
+    ) -> anyhow::Result<()> {
+        for (_, node) in session.graph().nodes.iter() {
+            // This registry is semantic, not name inference: each supported attention
+            // schema declares the input position carrying key-sequence lengths.
+            // Add future attention schemas here when their native kernel lands.
+            let key_sequence_lengths_index = match (node.domain.as_str(), node.op_type.as_str()) {
+                ("com.microsoft", "GroupQueryAttention") => 5,
+                _ => continue,
+            };
+            let Some(value_id) = node
+                .inputs
+                .get(key_sequence_lengths_index)
+                .and_then(|input| *input)
+            else {
+                continue;
+            };
+            let value = session.graph().value(value_id);
+            if value.shape.is_empty()
+                && policy == crate::decode::KeySequenceLengthsPolicy::Canonical
+            {
+                bail!(
+                    "attention key-sequence lengths input '{}' is scalar, but metadata does not declare model.attention.key_sequence_lengths.scalar_broadcast: unit_batch; the default contract requires contiguous int32 [batch_size]",
+                    value.name.as_deref().unwrap_or("<anonymous>")
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Load with an explicit CUDA KV capacity. `None` resolves in order:
@@ -180,14 +214,17 @@ impl NativeDecodeSession {
             .iter()
             .map(|meta| meta.name.clone())
             .collect::<Vec<_>>();
+        let role_inputs = role_tensor_info(session.inputs());
+        let role_outputs = role_tensor_info(session.outputs());
 
         let sequence_source = io
             .and_then(|io| io.sequence_source)
             .unwrap_or(SequenceInputKind::TokenIds);
         let token_input = if sequence_source == SequenceInputKind::TokenIds {
             Some(declared_or_detected_input(
-                &input_names,
+                &role_inputs,
                 io.and_then(|io| io.token_input.as_deref()),
+                StructuralRole::IntegerSequence,
                 &["input_ids", "decoder_input_ids"],
                 "token_input",
             )?)
@@ -195,8 +232,9 @@ impl NativeDecodeSession {
             io.and_then(|io| io.token_input.as_deref())
                 .map(|name| {
                     declared_or_detected_input(
-                        &input_names,
+                        &role_inputs,
                         Some(name),
+                        StructuralRole::IntegerSequence,
                         &["input_ids", "decoder_input_ids"],
                         "token_input",
                     )
@@ -205,8 +243,9 @@ impl NativeDecodeSession {
         };
         let inputs_embeds_input = if sequence_source == SequenceInputKind::InputsEmbeds {
             Some(declared_or_detected_input(
-                &input_names,
+                &role_inputs,
                 io.and_then(|io| io.inputs_embeds_input.as_deref()),
+                StructuralRole::EmbeddingSequence,
                 &["inputs_embeds"],
                 "inputs_embeds_input",
             )?)
@@ -214,8 +253,9 @@ impl NativeDecodeSession {
             io.and_then(|io| io.inputs_embeds_input.as_deref())
                 .map(|name| {
                     declared_or_detected_input(
-                        &input_names,
+                        &role_inputs,
                         Some(name),
+                        StructuralRole::EmbeddingSequence,
                         &["inputs_embeds"],
                         "inputs_embeds_input",
                     )
@@ -223,26 +263,30 @@ impl NativeDecodeSession {
                 .transpose()?
         };
         let attention_mask = optional_declared_or_detected_input(
-            &input_names,
+            &role_inputs,
             io.and_then(|io| io.attention_mask_input.as_deref()),
+            StructuralRole::None,
             &["attention_mask"],
             "attention_mask_input",
         )?;
         let position_ids = optional_declared_or_detected_input(
-            &input_names,
+            &role_inputs,
             io.and_then(|io| io.position_ids_input.as_deref()),
+            StructuralRole::None,
             &["position_ids"],
             "position_ids_input",
         )?;
         let logits = declared_or_detected_output(
-            &output_names,
+            &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
+            StructuralRole::ScoreOutput,
             &["logits"],
             "logits_output",
         )?;
         let hidden_output = optional_declared_or_detected_output(
-            &output_names,
+            &role_outputs,
             io.and_then(|io| io.hidden_output.as_deref()),
+            StructuralRole::None,
             &[],
             "hidden_output",
         )?;

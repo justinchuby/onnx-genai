@@ -71,3 +71,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 
 ### 2026-07-22T14:59:36+0000 — WP-B landed
 WP-B landed: Wallace's WP-B4 approve-with-notes review was resolved by Joshi's BF16 regression coverage.
+
+## 2026-07-28T17:40:00+0000
+Approved PR #365 after four rounds, including recursive scanning and uniform structural identity.
