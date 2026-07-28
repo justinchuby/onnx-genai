@@ -23,6 +23,7 @@ native-backend = [
     "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-session",
     "dep:onnx-runtime-tracer",
+    "dep:onnx-runtime-ep-api",
 ]
 mlas = [
     "native-backend",

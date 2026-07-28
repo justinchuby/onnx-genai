@@ -333,6 +333,18 @@ impl LoraWeightPool {
         Ok(())
     }
 
+    /// The resident (aligned) byte cost of admitting a factor pair whose raw
+    /// factor byte lengths are `a_bytes` and `b_bytes`. This is exactly what
+    /// [`admit`](Self::admit) charges against the pool, exposed so a control-plane
+    /// budget (the engine's `ByteBudget`) can reserve the identical amount before
+    /// admission (design §J.2 control plane).
+    pub fn page_pair_resident_bytes(a_bytes: usize, b_bytes: usize) -> u64 {
+        fn aligned(bytes: usize) -> u64 {
+            (bytes.div_ceil(LORA_PAGE_ALIGNMENT).max(1) * LORA_PAGE_ALIGNMENT) as u64
+        }
+        aligned(a_bytes) + aligned(b_bytes)
+    }
+
     /// Evict a specific pair, releasing its bytes. Returns whether it was present.
     pub fn evict(&mut self, adapter: AdapterId, module: LoraModuleId) -> bool {
         if let Some(page) = self.pages.remove(&(adapter, module)) {
