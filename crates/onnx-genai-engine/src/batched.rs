@@ -619,13 +619,19 @@ impl Engine {
             } => {
                 let max_len = max_len
                     .context("shared-buffer continuous batching requires a known max_len")?;
+                let io = self
+                    .metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.io.as_ref());
                 Box::new(
-                    BatchedSharedBufferDecodeSession::new(
+                    BatchedSharedBufferDecodeSession::new_with_io(
                         session,
                         SharedBufferBatchOptions {
                             batch_size,
                             max_len,
                         },
+                        io,
                     )
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to create continuous shared-buffer session: {e}")

@@ -58,10 +58,6 @@ pub(super) fn empty_past_value(info: &TensorInfo) -> Result<Value> {
     Value::empty(&shape, info.dtype)
 }
 
-pub(super) fn is_logits_output(name: &str) -> bool {
-    name.to_ascii_lowercase().contains("logits")
-}
-
 /// Copy a device-resident `logits [1, 1, vocab]` row back into a host CPU
 /// [`Value`] of the same dtype, for the non-greedy path that still consumes the
 /// full vocabulary. This mirrors ORT's implicit device->host logits copy that
