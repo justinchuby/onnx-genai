@@ -1,8 +1,9 @@
 # Model-Driven Minimal Builds
 
-> **Status: strategy only; not yet implemented.** The commands, features, and
-> generated files below define the intended interface. Default builds must
-> continue to include the full operator set until each phase lands.
+> **Status: first usable CPU workflow implemented.** Default builds still include
+> the full operator set. `cargo xtask operator-manifest` and
+> `cargo xtask minimal-build` accept explicit operator lists; direct `.onnx`
+> analysis and exact per-operator code generation remain future work.
 
 ## 1. Goal and scope
 
@@ -26,7 +27,7 @@ sequence.
   [`OpRegistry`](../crates/onnx-runtime-ep-cpu/src/kernels/mod.rs) in
   `build_cpu_registry()`. It currently covers approximately 113 operators (112
   unique names and 114 domain/name keys). The kernel modules and registration
-  statements are compiled unconditionally today.
+  statements were previously compiled unconditionally.
 - The native CUDA EP follows the same registry-oriented architecture, although
   its current coverage differs. Therefore native-EP operator stripping is under
   this project's control; it no longer inherently requires an upstream ORT
@@ -41,7 +42,11 @@ sequence.
   graph pipeline. A required-op collector is therefore a small addition, not a
   new model parser.
 
-There is no supported minimal-build workflow or per-op gating today.
+The CPU EP now has default-on operator capability features and a shared operator
+catalog. The `ops-cnn` group is fully compile-time gated as the representative
+implementation: its modules and registry factories are absent unless selected.
+Other declared groups currently classify manifest requirements but remain
+compiled while their module dependencies are separated in follow-up work.
 
 ## 3. Design requirements
 
@@ -151,44 +156,42 @@ optimization, not the minimal-build mechanism.
 
 ## 5. Intended user workflows
 
-These commands describe the planned interface and do not work yet.
+The implemented interface accepts explicit operator requirements. Requirements
+use `OpType@opset` for the standard domain or `domain::OpType@opset`.
 
-### 5.1 One model
+### 5.1 One operator profile
 
 ```console
 cargo xtask minimal-build \
-  --ep cpu \
-  --model models/phi.onnx \
+  --operator MatMul@21 \
+  --operator Softmax@21 \
+  --operator com.microsoft::GroupQueryAttention@1 \
   --output target/minimal/phi
 ```
 
-The command validates the model, writes
+The command validates every requirement against the shared CPU catalog, writes
 `target/minimal/phi/operator-selection.toml`, builds with `full` disabled, and
-places the release artifact beside the manifest. The output reports selected
-operator count and artifact size.
+uses the manifest's sorted Cargo feature set. Build artifacts are placed under
+`target/minimal/phi/cargo-target`. The output reports selected operator count.
 
-### 5.2 A group of models
+### 5.2 A checked-in operator list or manifest
 
 ```console
+cargo xtask operator-manifest \
+  --operators-file deploy/service-operators.txt \
+  --output deploy/service-ops.toml
+
 cargo xtask minimal-build \
-  --ep cpu \
-  --model models/embed.onnx \
-  --model models/reranker.onnx \
-  --model models/generator.onnx \
+  --manifest deploy/service-ops.toml \
   --output target/minimal/service
 ```
 
-The analyzer takes the union of all required operator keys and emits one
-reproducible service profile. A checked-in manifest may later be rebuilt with:
+The generator deduplicates and sorts requirements, takes their group union, and
+emits one reproducible service profile. List files are newline-delimited and may
+contain blank lines or `#` comments. Model paths and content hashes will be added
+with direct `.onnx` analysis.
 
-```console
-cargo xtask minimal-build --manifest deploy/service-ops.toml
-```
-
-Paths in checked-in manifests should be accompanied by content hashes so model
-replacement cannot silently reuse a stale operator set.
-
-### 5.3 Loading a model outside the selected set
+### 5.3 Future: loading a model outside the selected set
 
 Session creation must compare the model's requirements with the embedded build
 manifest before kernel compilation. A missing operator uses the existing
@@ -240,10 +243,10 @@ size to native-EP full-versus-minimal artifacts.
 - Minimal builds are explicit and reproducible; no model inspection occurs
   implicitly during an ordinary `cargo build`.
 - Operator groups—not 113 public flags—are the supported manual interface.
-- Maintain one operator catalog as the source of truth for registry generation,
-  feature groups, analyzer validation, and coverage tests. CI should verify that
-  every registry entry is catalogued and every selected key resolves to a
-  factory.
+- Maintain one operator catalog as the source of truth for feature groups,
+  analyzer validation, and coverage tests. The representative gated group uses
+  it for exclusion assertions; future registry generation should make it the
+  source of factory registrations as well.
 - Group tests compile representative profiles, not the power set. Model-driven
   tests build a small fixture and verify both successful loading and the exact
   stripped-op diagnostic.
@@ -253,22 +256,22 @@ size to native-EP full-versus-minimal artifacts.
 
 ## 8. Phasing
 
-All phases are **NOT YET IMPLEMENTED**.
+Phase 1 is partially implemented and Phase 2 has an operator-list-driven slice.
 
 ### Phase 1 — operator-group Cargo features (small)
 
-- Add the group features above and default `full`.
-- Gate both `pub mod` declarations and matching `build_cpu_registry()`
-  registrations in `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs`.
-- Introduce the operator catalog and test `full`, `ops-transformer`, and
-  `ops-cnn` representative combinations.
-- Preserve current default registry coverage and error behavior.
+- [x] Add the group features above and default `full`.
+- [x] Fully gate the representative `ops-cnn` modules and registry entries.
+- [x] Introduce a shared operator catalog and full/minimal registry tests.
+- [x] Preserve current default registry coverage and error behavior.
+- [ ] Extend full compile-time gating to the remaining groups.
 
 ### Phase 2 — model-driven analyzer and codegen
 
 - Add recursive required-op collection to `onnx-std`, reusing its schema/checker
   graph traversal and shape pipeline.
-- Add the deterministic selection manifest and `cargo xtask minimal-build`.
+- [x] Add deterministic operator-list manifests and `cargo xtask minimal-build`.
+- [ ] Accept `.onnx` models and add model hashes/opset imports.
 - Generate the registry root, compute optimizer/fusion closure, embed the build
   profile, and implement the actionable stripped-op load error.
 - Support one-model and union-of-models workflows.
