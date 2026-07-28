@@ -170,6 +170,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
 | `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
 | `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
+| `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
+| `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
 
 ## Source-derived coverage audit (2026-07-27)
 
@@ -341,6 +343,16 @@ axes, cropping, reflect/wrap modes, fractional float steps, narrow float
 storage, and descending Int64 sequences. This raises the machine-verified
 `CUDA_COVERED_OPS` count from **134** to **136** and current CPU standard-domain
 parity from **105 / 141** to **107 / 141**.
+
+The issue #67 operator-coverage batch 8 adds `ScatterND`, `HannWindow`,
+`HammingWindow`, and `BlackmanWindow`. `ScatterND` performs deterministic,
+ordered slice updates with negative-index wrapping and all opset-18 reductions
+for f32/f16/bf16/Int64 data. The three window operators share one generalized
+NVRTC implementation and support periodic/symmetric generation in
+f16/bf16/f32/f64. GPU parity covers slice updates, duplicate indices,
+`add`/`mul`/`max`, negative indices, every supported window dtype, and both
+periodic modes. This raises `CUDA_COVERED_OPS` from **136** to **140** and CPU
+standard-domain parity from **107 / 141** to **111 / 141**.
 
 ---
 
