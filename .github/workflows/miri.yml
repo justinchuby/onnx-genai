@@ -31,6 +31,8 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Match CI: PRs group by PR number, pushes by SHA; schedule/manual get a
+  # separate suffix so scheduled drift checks cannot cancel or be cancelled by PRs.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
   cancel-in-progress: true
 
