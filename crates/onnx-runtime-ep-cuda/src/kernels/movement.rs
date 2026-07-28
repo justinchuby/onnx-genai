@@ -255,14 +255,14 @@ fn launch_metadata(
 }
 
 #[derive(Debug)]
-struct PersistentMetadata {
+pub(super) struct PersistentMetadata {
     runtime: Arc<CudaRuntime>,
     values: Option<Vec<u64>>,
     ptr: CUdeviceptr,
 }
 
 impl PersistentMetadata {
-    fn new(runtime: Arc<CudaRuntime>) -> Self {
+    pub(super) fn new(runtime: Arc<CudaRuntime>) -> Self {
         Self {
             runtime,
             values: None,
@@ -270,7 +270,7 @@ impl PersistentMetadata {
         }
     }
 
-    fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
+    pub(super) fn prepare(&mut self, values: &[u64], op: &str) -> Result<CUdeviceptr> {
         if self.values.as_deref() == Some(values) {
             return Ok(self.ptr);
         }

@@ -1015,6 +1015,127 @@ fn arg_reduce_cases(op: &'static str) -> Vec<Case> {
     cases
 }
 
+fn gather_nd_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "GatherND[i64-indices,negative-index]".into(),
+            op: "GatherND",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(
+                    DataType::Float32,
+                    &[2, 3, 2],
+                    &(0..12).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[3, 2], &[0_i64, 1, 1, -1, -1, 0]),
+            ],
+            outputs: vec![(DataType::Float32, vec![3, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "GatherND[i32-indices,batch-dims]".into(),
+            op: "GatherND",
+            domain: "",
+            opset: 13,
+            inputs: vec![
+                input(
+                    DataType::Int64,
+                    &[2, 2, 3],
+                    &(0_i64..12).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int32, &[2, 2, 1], &[0_i32, 1, 1, 0]),
+            ],
+            outputs: vec![(DataType::Int64, vec![2, 2, 3])],
+            attrs: vec![("batch_dims", Attribute::Int(1))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn space_to_depth_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "SpaceToDepth[f32,multiple-channels]".into(),
+            op: "SpaceToDepth",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(
+                DataType::Float32,
+                &[1, 2, 4, 4],
+                &(0..32).map(|value| value as f32).collect::<Vec<_>>(),
+            )],
+            outputs: vec![(DataType::Float32, vec![1, 8, 2, 2])],
+            attrs: vec![("blocksize", Attribute::Int(2))],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "SpaceToDepth[i64,empty-batch]".into(),
+            op: "SpaceToDepth",
+            domain: "",
+            opset: 13,
+            inputs: vec![input(DataType::Int64, &[0, 1, 2, 2], &[] as &[i64])],
+            outputs: vec![(DataType::Int64, vec![0, 4, 1, 1])],
+            attrs: vec![("blocksize", Attribute::Int(2))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn eye_like_cases() -> Vec<Case> {
+    let mut cases = vec![Case {
+        label: "EyeLike[f32,negative-offset]".into(),
+        op: "EyeLike",
+        domain: "",
+        opset: 9,
+        inputs: vec![input(DataType::Float32, &[4, 3], &[7.0_f32; 12])],
+        outputs: vec![(DataType::Float32, vec![4, 3])],
+        attrs: vec![("k", Attribute::Int(-1))],
+        compare: Compare::ExactBytes,
+    }];
+    for dtype in [
+        DataType::Bool,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Uint64,
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Float32,
+        DataType::Float64,
+    ] {
+        cases.push(Case {
+            label: format!("EyeLike[{dtype:?}-override,positive-offset]"),
+            op: "EyeLike",
+            domain: "",
+            opset: 9,
+            inputs: vec![input(DataType::Float32, &[3, 4], &[9.0_f32; 12])],
+            outputs: vec![(dtype, vec![3, 4])],
+            attrs: vec![
+                ("k", Attribute::Int(1)),
+                ("dtype", Attribute::Int(dtype as i64)),
+            ],
+            compare: Compare::ExactBytes,
+        });
+    }
+    cases.push(Case {
+        label: "EyeLike[bool-override,empty-rows]".into(),
+        op: "EyeLike",
+        domain: "",
+        opset: 9,
+        inputs: vec![input(DataType::Float32, &[0, 3], &[] as &[f32])],
+        outputs: vec![(DataType::Bool, vec![0, 3])],
+        attrs: vec![("dtype", Attribute::Int(DataType::Bool as i64))],
+        compare: Compare::ExactBytes,
+    });
+    cases
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The conformance profile: one entry per CUDA_COVERED_OPS op.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1195,6 +1316,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("CumProd", cumprod_cases()));
     p.push(sweep("ArgMax", arg_reduce_cases("ArgMax")));
     p.push(sweep("ArgMin", arg_reduce_cases("ArgMin")));
+
+    // Batch 6 (issue #67): model-shaping/indexing structural operators.
+    p.push(sweep("GatherND", gather_nd_cases()));
+    p.push(sweep("SpaceToDepth", space_to_depth_cases()));
+    p.push(sweep("EyeLike", eye_like_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
     // GEMM / quantized-matmul family.
