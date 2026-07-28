@@ -37,28 +37,69 @@ Use pairwise/default sweeps, not a full Cartesian product. Each scenario chooses
 
 Recommended scenario names:
 
-1. `ci_tiny_reasoning_pressure_cpu_ort`: tiny reasoning fixture, ORT CPU, 8-12 turns, low context, greedy + one stochastic seed.
-2. `ci_tiny_plain_multiturn_cpu_native`: tiny plain LLM, native CPU if built, 8-12 turns, stats/profile consistency.
-3. `ci_tiny_vlm_prefix_cpu_ort`: existing tiny VLM, repeated image follow-up, encoder/prefix cache invariants.
-4. `nightly_qmoe_scheduler_pressure`: `tiny-glm52-qmoe-indexshare` or `GLM_TINY_QMOE_E2E_DIR`, multi-turn plus small KV budget.
-5. `nightly_real_reasoning_cpu_ort`: `ONNX_GENAI_QWEN3_0_6B_FOUNDRY_DIR` or equivalent, 20-50 turns, repetition/reasoning invariants.
-6. `self_hosted_cuda_deepseek_reasoning`: DeepSeek R1 Distill Qwen 1.5B on native CUDA and ORT CUDA, reproducing Justin's two observed failures.
+1. `ci_tiny_reasoning_pressure_cpu_ort`: **new fixture to create**, not currently on disk: a tiny reasoning LLM with `<think>` behavior, ORT CPU, 8-12 turns, low context, greedy + one stochastic seed.
+2. `ci_tiny_plain_multiturn_cpu_ort`: `tests/fixtures/tiny-llm` (`model.onnx.textproto`, tokenizer, manifest), 8-12 turns, `/stats` and history consistency. Existing `crates/onnx-genai-cli/tests/repl_e2e.rs` already uses this fixture.
+3. `ci_tiny_plain_multiturn_native`: use an exact native fixture, not a wildcard: `tiny-native-engine` / `tiny-native-sub4-engine` / `tiny-native-cuda-engine` are textproto fixtures; `tiny-native-scalar-gqa` is serialized `model.onnx`. Pick the one the engine-level harness can load for the feature under test.
+4. `ci_tiny_vlm_prefix_cpu_ort`: `tests/fixtures/tiny-vlm-image-input` (`decoder.onnx.textproto` + `encoder.onnx.textproto`), repeated image follow-up, encoder/prefix cache invariants. Existing `crates/onnx-genai-cli/tests/repl_e2e.rs` already exercises this shape.
+5. `nightly_qmoe_scheduler_pressure`: committed `tests/fixtures/tiny-glm52-qmoe-indexshare` (`model.onnx` + external data) or `GLM_TINY_QMOE_E2E_DIR`, multi-turn plus small KV budget.
+6. `nightly_real_reasoning_native_cuda`: `ONNX_GENAI_QWEN3_0_6B_FOUNDRY_DIR` and `QWEN3_0_6B_CUDA_E2E_DIR` are confirmed native-CUDA test env vars today; they are not CPU ORT fixtures. Add a CPU/ORT real-reasoning env var only when such a test exists.
+7. `self_hosted_cuda_deepseek_reasoning`: DeepSeek R1 Distill Qwen 1.5B on native CUDA and ORT CUDA, reproducing Justin's two observed failures. No committed fixture or env-var test exists for this exact model today.
 
 ## Model fixture tiers
 
-| Tier | Fixtures / env vars | Use |
-|---|---|---|
-| Tier 0 committed tiny | `tests/fixtures/tiny-llm`, `tiny-vlm-image-input`, `tiny-llm-sharedbuffer`, `tiny-native-*` | Per-PR invariant plumbing and CLI/history/stats checks. |
-| Tier 0.5 new tiny reasoning | Add a committed tiny reasoning fixture that emits `<think>`, can close or fail to close reasoning, and has a deliberately small context window. | Highest-value addition. It would have caught the fixed token-budget/empty-turn bugs in CI and would turn repeating reasoning into a generic invariant failure. |
-| Tier 1 committed specialized | `tiny-glm52-qmoe-indexshare`, `tiny-gemma4-vlm`, MTP/Eagle/speculative fixtures | Nightly/slow CI for MoE, VLM, speculative, and index-sharing state. |
-| Tier 2 env-gated real | `QWEN3_0_6B_CUDA_E2E_DIR`, `GLM_TINY_QMOE_E2E_DIR`, `ONNX_GENAI_QWEN3_0_6B_FOUNDRY_DIR` | Nightly where models exist; local/self-hosted for GPU. These must fail loudly when a job promises the model. |
-| Tier 3 manual repro | DeepSeek R1 Distill Qwen 1.5B and other large/reasoning models | Manual or self-hosted soak; not GitHub-hosted CI. |
+This inventory was checked against `tests/fixtures/` and the crate tree on 2026-07-27. There are no crate-local `fixtures/` directories outside `tests/fixtures/`; crate-level tests consume the repository fixtures and env-var model directories.
 
-I agree the tiny reasoning fixture is the first fixture to add. It gives CI a cheap proxy for the exact failure class: reasoning delimiters, hidden/visible answer split, max-token truncation, context pressure, and repetition/progress detection.
+| Tier | Fixtures / env vars | Confirmed format | Use |
+|---|---|---|---|
+| Tier 0 Phase-1-ready text | `tests/fixtures/tiny-llm` | `model.onnx.textproto`, `tokenizer.json`, `manifest.json`; **no `model.onnx`** | Per-PR CLI REPL/history/stats invariant plumbing. Existing `crates/onnx-genai-cli/tests/repl_e2e.rs` uses it, so it is usable by that harness, but implementers must not assume serialized ONNX. |
+| Tier 0 Phase-1-ready VLM | `tests/fixtures/tiny-vlm-image-input` | `decoder.onnx.textproto`, `encoder.onnx.textproto`, `inference_metadata.yaml`, `tokenizer.json` | Per-PR repeated-image/encoder-cache REPL stress. Existing `crates/onnx-genai-cli/tests/repl_e2e.rs` uses it. |
+| Tier 0 serialized ONNX text/state | `tiny-llm-scatter`, `tiny-llm-sharedbuffer` | `tiny-llm-scatter` has both `model.onnx` and `model.onnx.textproto`; `tiny-llm-sharedbuffer` has `model.onnx` + `model.onnx.data` | Use when a proposed stress harness needs serialized ONNX instead of textproto, especially scatter/shared-buffer state. |
+| Tier 0 native-backend fixtures | Exact names: `tiny-native-engine`, `tiny-native-cuda-engine`, `tiny-native-sub4-engine`, `tiny-native-scalar-gqa` | First three are `model.onnx.textproto`; `tiny-native-scalar-gqa` is `model.onnx` + metadata | Native engine stress candidates. Do not cite `tiny-native-*` as if all have the same format. |
+| Tier 0.5 missing high-value fixture | Tiny reasoning LLM | **Does not exist today** | Work to create first: emits/handles `<think>`, can close or fail to close reasoning, and has deliberately small context. |
+| Tier 1 committed specialized | `tiny-glm52-qmoe-indexshare`, `tiny-gemma4-vlm`, `tiny-mtp-full`, `tiny-eagle3`, `tiny-qwen35-mtp`, `tiny-multiaxis-state-decoder` | Mixed: QMoE is serialized `model.onnx` + data; most others are textproto graphs plus tokenizer/manifest/metadata | Slow/nightly fixtures for MoE/QMoE, VLM, speculative/MTP/Eagle, and stateful decoder behavior. |
+| Tier 1 other modality fixtures | `tiny-codec`, `tiny-diffusion`, `tiny-dit-diffusion`, `tiny-masked-diffusion`, `tiny-tts*`, `tiny-txt2img`, `tiny-vlm-multibinding`, `tiny-whisper*` | Mostly `.onnx.textproto` component graphs plus `inference_metadata.yaml`; some include tokenizer/audio/run fixtures | Useful for future pipeline/modality stress, but not Phase 1 text/reasoning stress. |
+| Tier 2 confirmed env-gated real/native tests | `QWEN3_0_6B_CUDA_E2E_DIR`, `ONNX_GENAI_QWEN3_0_6B_FOUNDRY_DIR`, `GLM_TINY_QMOE_E2E_DIR` | Test code requires `model.onnx`, metadata, tokenizer, and for Qwen/GLM often external data; Qwen env vars are under `#[cfg(all(feature = "cuda", feature = "native-backend"))]` | Nightly/self-hosted when provisioned. Current tests skip when absent; a CI job that promises one must invert that into a loud provisioning failure. |
+| Tier 3 missing manual repro fixture | DeepSeek R1 Distill Qwen 1.5B | **Not present as a committed fixture or named env-var test** | Manual/self-hosted CUDA/ORT repro for Justin's exact failures. |
+
+### Confirmed fixture inventory
+
+| Fixture | Format on disk | Exercises | Usable by proposed stress? |
+|---|---|---|---|
+| `tiny-codec` | `encoder.onnx.textproto`, `vocoder.onnx.textproto` | Audio codec pipeline | Later modality/pipeline stress; not Phase 1. |
+| `tiny-diffusion` | textproto denoiser/VAE graphs | Diffusion pipeline | Later modality stress. |
+| `tiny-dit-diffusion` | textproto denoiser | DiT diffusion | Later modality stress. |
+| `tiny-eagle3` | `model.onnx.textproto`, manifest | Eagle/speculative-style model fixture | Slow speculative stress candidate. |
+| `tiny-gemma4-assistant` | `model.onnx.textproto`, tokenizer, manifest | Gemma-style assistant decoder | Slow text/model-family coverage. |
+| `tiny-gemma4-assistant-mixed` | `model.onnx.textproto`, tokenizer, manifest | Mixed Gemma assistant variant | Slow text/model-family coverage. |
+| `tiny-gemma4-vlm` | textproto vision/embedding/decoder graphs, tokenizer, metadata | VLM pipeline | Slow VLM stress candidate. |
+| `tiny-glm52-qmoe-indexshare` | `model.onnx`, `model.onnx.data`, tokenizer, metadata, generator | GLM 5.2 QMoE + IndexShare | Yes for scheduler/QMoE stress; already used by engine tests. |
+| `tiny-llm` | `model.onnx.textproto`, tokenizer, manifest | Plain tiny LLM | Yes for Phase 1 REPL; no serialized `model.onnx`. |
+| `tiny-llm-explicit-io` | `model.onnx.textproto`, tokenizer, metadata | Explicit I/O LLM metadata | Engine/metadata stress candidate. |
+| `tiny-llm-scatter` | `model.onnx`, `model.onnx.textproto`, tokenizer, manifest | Scatter/static-cache LLM variant | Yes when serialized ONNX is required. |
+| `tiny-llm-sharedbuffer` | `model.onnx`, `model.onnx.data`, tokenizer, manifest | Shared-buffer LLM state | Yes for shared-buffer/KV-adjacent stress. |
+| `tiny-masked-diffusion` | `lm.onnx.textproto`, metadata | Masked diffusion | Later modality stress. |
+| `tiny-mtp-full` | `model.onnx.textproto`, tokenizer, manifest, embeddings | MTP | Slow speculative/MTP stress candidate. |
+| `tiny-multiaxis-state-decoder` | textproto decoder/embedding, tokenizer, metadata | Multi-axis state decoder | Engine state stress candidate. |
+| `tiny-native-cuda-engine` | `model.onnx.textproto`, tokenizer | Native CUDA-oriented engine fixture | Self-hosted/native feature candidate; textproto format. |
+| `tiny-native-engine` | `model.onnx.textproto`, tokenizer | Native engine fixture | Native feature candidate; textproto format. |
+| `tiny-native-scalar-gqa` | `model.onnx`, tokenizer, metadata | Native scalar GQA | Native GQA/KV stress candidate with serialized ONNX. |
+| `tiny-native-sub4-engine` | `model.onnx.textproto`, tokenizer | Native sub-4-bit fixture | Native quant stress candidate; textproto format. |
+| `tiny-qwen35-mtp` | `model.onnx.textproto`, manifest | Qwen MTP | Slow speculative/model-family stress candidate. |
+| `tiny-tts` | textproto decoder/vocoder, tokenizer, metadata | TTS | Later audio/pipeline stress. |
+| `tiny-tts-nested` | textproto nested TTS graphs, tokenizer, metadata | Nested autoregressive TTS | Later nested-pipeline stress. |
+| `tiny-tts-nested-preembed` | textproto nested TTS/pre-embed graphs, tokenizer, metadata | Nested TTS pre-embedding | Later nested-pipeline stress. |
+| `tiny-tts-nested-prefill` | textproto nested TTS/prefill graphs, tokenizer, metadata | Nested TTS prefill | Later nested-pipeline stress. |
+| `tiny-txt2img` | textproto text encoder/denoiser/VAE, tokenizer, metadata | Text-to-image | Later modality stress. |
+| `tiny-vlm-image-input` | textproto encoder/decoder, tokenizer, metadata | VLM image input | Yes for Phase 1 VLM/prefix stress. |
+| `tiny-vlm-multibinding` | textproto embedding/decoder, tokenizer, metadata | VLM multi-binding | Slow VLM binding stress candidate. |
+| `tiny-whisper` | textproto encoder/decoder, tokenizer, `tiny.wav`, metadata | Whisper/audio transcription | Later audio stress. |
+| `tiny-whisper-cross-kv` | textproto encoder/decoder, tokenizer, `tiny.wav`, metadata | Whisper cross-KV | Later cross-KV/audio stress. |
+
+I still recommend the tiny reasoning fixture as the first new fixture. The existing `tiny-llm` is usable by `repl_e2e.rs`, but it is not a reasoning fixture and it is not serialized `model.onnx`. The tiny reasoning fixture gives CI a cheap proxy for reasoning delimiters, hidden/visible answer split, max-token truncation, context pressure, and repetition/progress detection.
 
 ## Where it runs
 
-- **Per-PR fast CI:** CPU-only, committed fixtures only. Use `repl_e2e.rs` for CLI session behavior and a small engine harness for state/KV invariants. The `cli-ort` Linux/Windows lane must continue to fail loudly if ORT is missing; do not silently skip the promised ORT tests.
+- **Per-PR fast CI:** CPU-only, committed fixtures only. Use `crates/onnx-genai-cli/tests/repl_e2e.rs` for CLI session behavior and a small engine harness for state/KV invariants. The `cli-ort` Linux/Windows lane must continue to fail loudly if ORT is missing; do not silently skip the promised ORT tests.
 - **Per-PR slow CI / required before merge for risky changes:** longer tiny-fixture runs, stochastic flag distribution smoke, native CPU when the feature set is compiled, and feature overlays for prefix caching/speculative/rewind.
 - **Nightly:** env-var real-model tests on machines that actually provision the model directories. If a nightly lane advertises `ONNX_GENAI_QWEN3_0_6B_FOUNDRY_DIR`, absence is a job failure, not a skip.
 - **Self-hosted/manual GPU:** CUDA native/ORT and Metal. GitHub runners do not provide CUDA GPUs, so the DeepSeek native CUDA repetition bug and ORT CUDA shared-GQA admission failure cannot be fully covered in hosted CI.
@@ -68,10 +109,22 @@ I agree the tiny reasoning fixture is the first fixture to add. It gives CI a ch
 
 Build on existing machinery instead of parallel tools:
 
-- Extend `repl_e2e.rs` for user-visible CLI invariants: turn commit/drop behavior, `/session`, `/stats`, `/profile`, `/backend`, `/ep`, and error text.
+- Extend confirmed harness `crates/onnx-genai-cli/tests/repl_e2e.rs` for user-visible CLI invariants: turn commit/drop behavior, `/session`, `/stats`, `/profile`, `/backend`, `/ep`, and error text.
 - Add an engine-level stress harness for invariants that need direct state: KV valid length, scheduler admission, prefix/speculative/rewind counters, and token positions.
-- Reuse bench crate binaries (`profile_native`, `compare`) for backend identity, profile JSON shape, and native-vs-ORT diagnostics. Do not make benchmark throughput the pass/fail criterion except for explicit perf jobs.
+- Reuse confirmed bench crate binaries (`crates/onnx-genai-bench/src/bin/profile_native.rs`, `compare.rs`) for backend identity, profile JSON shape, and native-vs-ORT diagnostics. `profile_native` is gated by the bench crate `bench-native` feature. Do not make benchmark throughput the pass/fail criterion except for explicit perf jobs.
 - Treat profile/stats JSON as the artifact schema. If a needed field is missing, add it once and make all stress tests consume the same schema.
+
+Confirmed concrete references:
+
+| Reference | Confirmed location / status |
+|---|---|
+| CLI REPL harness | `crates/onnx-genai-cli/tests/repl_e2e.rs` exists and currently uses `tiny-llm` and `tiny-vlm-image-input`. |
+| `cli-ort` CI lane | `.github/workflows/ci.yml` defines `cli-ort` for Linux x86_64 and Windows x86_64 and builds/tests `onnx-genai-cli`. |
+| Bench binaries | `crates/onnx-genai-bench/src/bin/profile_native.rs` and `compare.rs` exist; `profile_native` requires the `bench-native` feature in `crates/onnx-genai-bench/Cargo.toml`. |
+| `QWEN3_0_6B_CUDA_E2E_DIR` | Used by `crates/onnx-genai-engine/tests/qwen3_0_6b_native_cuda_e2e.rs`; CUDA + native-backend gated; expects `model.onnx`, `model.onnx.data`, metadata, tokenizer. |
+| `ONNX_GENAI_QWEN3_0_6B_FOUNDRY_DIR` | Used by `crates/onnx-genai-engine/tests/qwen3_0_6b_foundry_native_cuda_lock.rs`; CUDA + native-backend gated Foundry native-CUDA golden lock. |
+| `GLM_TINY_QMOE_E2E_DIR` | Used by `glm_tiny_qmoe_e2e.rs` and `glm_tiny_qmoe_native_cuda_e2e.rs`; can override the committed `tiny-glm52-qmoe-indexshare` fixture for GLM/QMoE tests. |
+
 
 ## Failure diagnosis and reproducibility
 
@@ -91,8 +144,8 @@ Determinism rule: every stochastic scenario has an explicit seed and records the
 |---|---|---|
 | Every PR | 2-3 CPU tiny scenarios: reasoning pressure, plain multi-turn stats, VLM prefix reuse. Linux + Windows ORT for CLI contracts. | Seconds to a few minutes. |
 | Slow PR tier | Tiny MoE/QMoE, speculative, rewind/fork, stochastic flag smoke, 20-50 turns. | Optional/required by label or touched crates. |
-| Nightly | Real CPU/ORT reasoning model, env-gated QMoE, longer context pressure, 50-100 turns, distribution checks across seeds. | Tens of minutes. |
-| Self-hosted GPU nightly | CUDA native/ORT DeepSeek/Qwen, real KV-byte budgets, Metal when hardware exists. | Hardware-dependent. |
+| Nightly | Env-gated QMoE, longer context pressure, 50-100 turns, distribution checks across seeds. Real CPU/ORT reasoning joins only after a confirmed CPU/ORT fixture/env-var test exists. | Tens of minutes. |
+| Self-hosted GPU nightly | CUDA native/ORT DeepSeek/Qwen, confirmed native-CUDA Qwen env-var tests, real KV-byte budgets, Metal when hardware exists. | Hardware-dependent. |
 | Manual soak | 100+ turns, large models, new EPs/features, pre-release validation. | Not a merge gate. |
 
 ## Today's defects mapped to proposed tests
@@ -110,7 +163,7 @@ Determinism rule: every stochastic scenario has an explicit seed and records the
 ### Phase 1 — highest-value slice
 
 1. Add the tiny reasoning fixture.
-2. Add per-PR CPU ORT stress in `repl_e2e.rs`: 8-12 turns, low context/max tokens, `/stats` enabled, assertions for termination, non-empty committed turns, message/token consistency, and no excessive reasoning repetition.
+2. Add per-PR CPU ORT stress in `crates/onnx-genai-cli/tests/repl_e2e.rs`: 8-12 turns, low context/max tokens, `/stats` enabled, assertions for termination, non-empty committed turns, message/token consistency, and no excessive reasoning repetition.
 3. Add a small stochastic flag observability test against a tiny fixture.
 4. Make artifacts mandatory on invariant failure.
 

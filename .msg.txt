@@ -1,0 +1,24 @@
+docs(testing): correct the fixture inventory against what is on disk
+
+Copilot's review flagged the Tier 0 fixture list as stale. Checking it
+turned up a mixed result rather than a straightforward one: tiny-llm is
+indeed textproto-only and not the .onnx the document implied, but the
+tiny-native-* directories do exist, contrary to the review.
+
+Both claims were worth checking rather than accepting. The document now
+lists every tests/fixtures entry with its actual format, notes that no
+crate-local fixture directories exist outside that tree, and cites only
+references that were confirmed -- the env-var-gated real-model tests,
+repl_e2e.rs, the cli-ort lane, and the bench binaries.
+
+This matters more here than in most documents because the design is meant
+to be executed against in waves. Someone picking up Phase 1 starts from
+the fixture list, and pointing them at a fixture that does not exist, or
+whose format they assume wrongly, wastes exactly the time the design is
+meant to save.
+
+Phase 1 remains achievable; the tiny reasoning fixture it depends on was
+already listed as work to create rather than as something already present.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+Copilot-Session: 023d5a3f-c551-4aa8-afbe-a329af15fbdd

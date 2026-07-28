@@ -176,3 +176,8 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 - Dropped decision inbox note `.squad/decisions/inbox/roy-stress-test-design.md`.
 ## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - Approved PR #313 decode-garble triage and byte-identity/fires regression guard; repeated-sentence output classified as natural greedy behavior.
+
+## 2026-07-27T23:31:47-07:00 — Integration stress fixture audit
+
+- Corrected `docs/research/testing/00-integration-stress-design.md` after PR #330 review: replaced stale fixture tier claims with an on-disk inventory of every `tests/fixtures/` directory, including `.onnx` vs `.onnx.textproto` formats and stress-harness suitability.
+- Verified concrete references for `repl_e2e.rs`, `cli-ort`, bench binaries, and the Qwen/GLM env-var tests; clarified that current Qwen real-model env vars are native-CUDA locks, not CPU ORT fixtures.
