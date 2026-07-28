@@ -266,22 +266,52 @@ impl Kernel for ConvKernel {
             .map(|value| to_dense_f32_widen(OP, value))
             .transpose()?;
 
-        let is_rank4 = self.x_shape.len() == 4;
-        let is_group1 = self.group == 1;
+        // Promote rank-3 (1D conv) shapes to rank-4 by inserting H=1 so the
+        // BNNS and im2col+GEMM tiers handle them without a separate code path.
+        // Data layout is unchanged: [N, C, W] → [N, C, 1, W] is a logical
+        // reshape with no memory movement.
+        let (x_shape_4d, w_shape_4d, out_shape_4d, strides_2d, dilations_2d, pads_2d);
+        let (eff_x_shape, eff_w_shape, eff_out_shape, eff_strides, eff_dilations, eff_pads);
+        if self.x_shape.len() == 3 {
+            // 1D → 2D: insert H=1 at spatial index 0
+            x_shape_4d = [self.x_shape[0], self.x_shape[1], 1, self.x_shape[2]];
+            w_shape_4d = [self.w_shape[0], self.w_shape[1], 1, self.w_shape[2]];
+            out_shape_4d = [self.output_shape[0], self.output_shape[1], 1, self.output_shape[2]];
+            strides_2d = [1, self.strides[0]];
+            dilations_2d = [1, self.dilations[0]];
+            pads_2d = [0, self.pads[0], 0, self.pads[1]];
+            eff_x_shape = x_shape_4d.as_slice();
+            eff_w_shape = w_shape_4d.as_slice();
+            eff_out_shape = out_shape_4d.as_slice();
+            eff_strides = strides_2d.as_slice();
+            eff_dilations = dilations_2d.as_slice();
+            eff_pads = pads_2d.as_slice();
+        } else {
+            eff_x_shape = &self.x_shape;
+            eff_w_shape = &self.w_shape;
+            eff_out_shape = &self.output_shape;
+            eff_strides = &self.strides;
+            eff_dilations = &self.dilations;
+            eff_pads = &self.pads;
+        }
 
-        let output = if is_rank4 && is_group1 {
-            // Try Tier 1 (BNNS) for undilated, symmetric-padding convolutions.
+        let is_rank4 = eff_x_shape.len() == 4;
+
+        let output = if is_rank4 {
+            // Try Tier 1 (BNNS) for undilated convolutions (supports groups).
             #[cfg(any(target_os = "macos", target_os = "ios"))]
-            if self.dilations.iter().all(|&d| d == 1)
+            if self.group == 1
+                && eff_dilations.iter().all(|&d| d == 1)
                 && let Some(result) = bnns::bnns_conv_execute(
                     &x,
                     &weights,
                     bias.as_deref(),
-                    &self.x_shape,
-                    &self.w_shape,
-                    &self.output_shape,
-                    &self.strides,
-                    &self.pads,
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    eff_strides,
+                    eff_pads,
+                    1,
                     self.relu,
                 )
             {
@@ -293,20 +323,37 @@ impl Kernel for ConvKernel {
 
             // Tier 2: im2col + GEMM.
             CONV_IM2COL_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            im2col_gemm_execute(
-                &x,
-                &weights,
-                bias.as_deref(),
-                &self.x_shape,
-                &self.w_shape,
-                &self.output_shape,
-                &self.strides,
-                &self.dilations,
-                &self.pads,
-                self.relu,
-            )?
+            if self.group == 1 {
+                im2col_gemm_execute(
+                    &x,
+                    &weights,
+                    bias.as_deref(),
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    eff_strides,
+                    eff_dilations,
+                    eff_pads,
+                    self.relu,
+                )?
+            } else {
+                grouped_im2col_gemm_execute(
+                    &x,
+                    &weights,
+                    bias.as_deref(),
+                    eff_x_shape,
+                    eff_w_shape,
+                    eff_out_shape,
+                    self.group,
+                    eff_strides,
+                    eff_dilations,
+                    eff_pads,
+                    self.relu,
+                )?
+            }
         } else {
-            // Tier 3: scalar reference for rank-3, grouped, or other cases.
+            // Tier 3: scalar reference for non-spatial convolutions (should not reach here
+            // after the rank-3→rank-4 promotion above, but kept as a safety net).
             CONV_SCALAR_REF_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             scalar_ref_execute(
                 &x,
@@ -461,6 +508,7 @@ mod bnns {
         out_shape: &[usize],
         strides: &[usize],
         pads: &[usize],
+        groups: usize,
         relu: bool,
     ) -> Option<Vec<f32>> {
         // Require symmetric padding.
@@ -469,6 +517,9 @@ mod bnns {
         }
         let (batch, ic, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
         let (oc, kh, kw) = (w_shape[0], w_shape[2], w_shape[3]);
+        // w_shape[1] = input_channels_per_group (ONNX Conv weight layout: [O, I/groups, kH, kW])
+        let ic_per_group = w_shape[1];
+        let oc_per_group = oc / groups;
         let (oh, ow) = (out_shape[2], out_shape[3]);
         let in_stride = ic * ih * iw;
         let out_stride = oc * oh * ow;
@@ -483,8 +534,8 @@ mod bnns {
             ),
             w_desc: make_nd(
                 BNNS_DATA_LAYOUT_CONV_WEIGHTS_OIHW,
-                &[kw, kh, ic, oc],
-                &[1, kw, kw * kh, kw * kh * ic],
+                &[kw, kh, ic_per_group, oc_per_group],
+                &[1, kw, kw * kh, kw * kh * ic_per_group],
                 w_copy.as_mut_ptr() as *mut c_void,
             ),
             o_desc: make_nd(
@@ -511,7 +562,7 @@ mod bnns {
             y_dilation_stride: 1,
             x_padding: pads[1],
             y_padding: pads[0],
-            groups: 1,
+            groups,
             pad: [0; 4],
         };
         let filter = unsafe { BNNSFilterCreateLayerConvolution(&params, std::ptr::null()) };
@@ -558,6 +609,9 @@ fn im2col_gemm_execute(
     let m = oc;
     let k = ic * kh * kw;
     let n = oh * ow;
+    if n == 0 || m == 0 {
+        return Ok(vec![]);
+    }
     let is_1x1 = kh == 1
         && kw == 1
         && strides.iter().all(|&s| s == 1)
@@ -630,6 +684,76 @@ fn im2col(
             }
         }
     }
+}
+
+/// Grouped im2col + GEMM: for each group, performs im2col on the group's input
+/// channels and applies GEMM with the group's weight slice.
+fn grouped_im2col_gemm_execute(
+    x: &[f32],
+    weights: &[f32],
+    bias: Option<&[f32]>,
+    x_shape: &[usize],
+    w_shape: &[usize],
+    out_shape: &[usize],
+    group: usize,
+    strides: &[usize],
+    dilations: &[usize],
+    pads: &[usize],
+    relu: bool,
+) -> Result<Vec<f32>> {
+    let (batch, ic, ih, iw) = (x_shape[0], x_shape[1], x_shape[2], x_shape[3]);
+    let (oc, kh, kw) = (w_shape[0], w_shape[2], w_shape[3]);
+    let (oh, ow) = (out_shape[2], out_shape[3]);
+    let ic_per_group = ic / group;
+    let oc_per_group = oc / group;
+    // Per-group GEMM: M = oc_per_group, K = ic_per_group * kH * kW, N = oH * oW
+    let m = oc_per_group;
+    let k = ic_per_group * kh * kw;
+    let n = oh * ow;
+    if n == 0 || m == 0 {
+        return Ok(vec![]);
+    }
+    let backend = crate::backend::CpuBackend::auto_detect();
+    let mut output = vec![0.0f32; batch * oc * n];
+    let mut col = vec![0.0f32; k * n];
+    for b in 0..batch {
+        for g in 0..group {
+            let x_offset = b * ic * ih * iw + g * ic_per_group * ih * iw;
+            let x_group = &x[x_offset..][..ic_per_group * ih * iw];
+            let w_offset = g * oc_per_group * k;
+            let w_group = &weights[w_offset..][..oc_per_group * k];
+            let o_offset = b * oc * n + g * oc_per_group * n;
+            let o_group = &mut output[o_offset..][..oc_per_group * n];
+            let is_1x1 = kh == 1
+                && kw == 1
+                && strides.iter().all(|&s| s == 1)
+                && dilations.iter().all(|&d| d == 1)
+                && pads.iter().all(|&p| p == 0);
+            if is_1x1 {
+                super::matmul::gemm_with_backend(backend, w_group, x_group, o_group, m, k, n)?;
+            } else {
+                im2col(
+                    x_group, ic_per_group, ih, iw, kh, kw, strides, dilations, pads, oh, ow,
+                    &mut col,
+                );
+                super::matmul::gemm_with_backend(backend, w_group, &col, o_group, m, k, n)?;
+            }
+            if let Some(bias) = bias {
+                for oc_idx in 0..m {
+                    let bv = bias[g * oc_per_group + oc_idx];
+                    for s in 0..n {
+                        o_group[oc_idx * n + s] += bv;
+                    }
+                }
+            }
+            if relu {
+                for v in o_group.iter_mut() {
+                    *v = v.max(0.0);
+                }
+            }
+        }
+    }
+    Ok(output)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -936,8 +1060,42 @@ mod tests {
     }
 
     #[test]
-    fn scalar_ref_handles_grouped_conv() {
-        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+    fn grouped_conv_reaches_im2col_gemm() {
+        let before = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        // True depthwise: groups == in_channels == out_channels, 3x3 kernel
+        let ic = 32usize;
+        let h = 14usize;
+        let w = 14usize;
+        let input: Vec<f32> = (0..ic * h * w)
+            .map(|i: usize| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let weight: Vec<f32> = (0..ic * 9)
+            .map(|i: usize| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..ic).map(|i| i as f32 * 0.01).collect();
+        let _ = run(
+            &[1, ic, h, w],
+            &input,
+            &[ic, 1, 3, 3],
+            &weight,
+            Some(&bias),
+            &[1, ic, h, w],
+            &[
+                ("group", Attribute::Int(ic as i64)),
+                ("pads", Attribute::Ints(vec![1, 1, 1, 1])),
+            ],
+        );
+        let after = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "Depthwise conv (groups={ic}) did not reach im2col+GEMM path"
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn grouped_conv_reaches_im2col_gemm_non_apple() {
+        let before = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
         let _ = run(
             &[1, 2, 2, 2],
             &[1., 2., 3., 4., 10., 20., 30., 40.],
@@ -947,16 +1105,19 @@ mod tests {
             &[1, 4, 2, 2],
             &[("group", Attribute::Int(2))],
         );
-        let after = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+        let after = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
-            "Grouped conv did not reach scalar reference path"
+            "Grouped conv did not reach im2col+GEMM path"
         );
     }
 
     #[test]
-    fn scalar_ref_handles_1d_conv() {
-        let before = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
+    fn conv_1d_reaches_im2col_or_bnns() {
+        // 1D convs are promoted to 2D and dispatch through the accelerated path
+        let before_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
         let x = (1..=16).map(|v| v as f32).collect::<Vec<_>>();
         let w = (1..=18).map(|v| v as f32 * 0.1).collect::<Vec<_>>();
         let _ = run(
@@ -971,8 +1132,14 @@ mod tests {
                 ("pads", Attribute::Ints(vec![1, 1])),
             ],
         );
-        let after = super::CONV_SCALAR_REF_TEST_HITS.load(Ordering::Relaxed);
-        assert!(after > before, "1D conv did not reach scalar ref path");
+        let after_im2col = super::CONV_IM2COL_GEMM_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let after_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let reached = after_im2col > before_im2col || after_bnns > before_bnns;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let reached = after_im2col > before_im2col;
+        assert!(reached, "1D conv did not reach accelerated path (im2col or BNNS)");
     }
 
     // ─── Numerics parity ────────────────────────────────────────────────
@@ -1052,6 +1219,82 @@ mod tests {
         );
     }
 
+    fn parity_check_grouped(
+        x_shape: &[usize],
+        w_shape: &[usize],
+        group: usize,
+        strides: &[usize],
+        dilations: &[usize],
+        pads: &[usize],
+    ) {
+        let x_count: usize = x_shape.iter().product();
+        let w_count: usize = w_shape.iter().product();
+        let x: Vec<f32> = (0..x_count)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let w: Vec<f32> = (0..w_count)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..w_shape[0])
+            .map(|i| (i as f32 - w_shape[0] as f32 / 2.0) * 0.1)
+            .collect();
+        let spatial_rank = x_shape.len() - 2;
+        let mut output_shape = vec![x_shape[0], w_shape[0]];
+        for axis in 0..spatial_rank {
+            let effective = dilations[axis] * (w_shape[2 + axis] - 1) + 1;
+            let padded = x_shape[2 + axis] + pads[axis] + pads[axis + spatial_rank];
+            let out_dim = if padded >= effective {
+                (padded - effective) / strides[axis] + 1
+            } else {
+                0
+            };
+            output_shape.push(out_dim);
+        }
+        let reference = super::scalar_ref_execute(
+            &x,
+            &w,
+            Some(&bias),
+            x_shape,
+            w_shape,
+            &output_shape,
+            group,
+            strides,
+            dilations,
+            pads,
+            false,
+        );
+        let mut attrs: Vec<(&str, Attribute)> = vec![("group", Attribute::Int(group as i64))];
+        if strides.iter().any(|&s| s != 1) {
+            attrs.push((
+                "strides",
+                Attribute::Ints(strides.iter().map(|&s| s as i64).collect()),
+            ));
+        }
+        if dilations.iter().any(|&d| d != 1) {
+            attrs.push((
+                "dilations",
+                Attribute::Ints(dilations.iter().map(|&d| d as i64).collect()),
+            ));
+        }
+        if pads.iter().any(|&p| p != 0) {
+            attrs.push((
+                "pads",
+                Attribute::Ints(pads.iter().map(|&p| p as i64).collect()),
+            ));
+        }
+        let tiered = run(x_shape, &x, w_shape, &w, Some(&bias), &output_shape, &attrs);
+        assert_eq!(reference.len(), tiered.len());
+        let max_diff = reference
+            .iter()
+            .zip(tiered.iter())
+            .map(|(r, t)| (r - t).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "grouped parity: max_diff={max_diff} (x={x_shape:?}, w={w_shape:?}, group={group})"
+        );
+    }
+
     #[test]
     fn conv_parity_3x3_stride1_pad1() {
         parity_check(
@@ -1118,6 +1361,109 @@ mod tests {
         );
     }
 
+    // ─── Depthwise / grouped conv parity tests ──────────────────────────
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride1() {
+        // True depthwise: groups == in_channels == out_channels
+        parity_check_grouped(
+            &[1, 32, 28, 28],
+            &[32, 1, 3, 3],
+            32,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_3x3_stride2() {
+        parity_check_grouped(
+            &[1, 64, 56, 56],
+            &[64, 1, 3, 3],
+            64,
+            &[2, 2],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_asymmetric_padding() {
+        parity_check_grouped(
+            &[1, 32, 7, 7],
+            &[32, 1, 3, 3],
+            32,
+            &[2, 2],
+            &[1, 1],
+            &[1, 1, 0, 0],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_non_vector_width_channels() {
+        // 13 channels — not a multiple of any SIMD vector width
+        parity_check_grouped(
+            &[1, 13, 14, 14],
+            &[13, 1, 3, 3],
+            13,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_dilation() {
+        parity_check_grouped(
+            &[1, 32, 28, 28],
+            &[32, 1, 3, 3],
+            32,
+            &[1, 1],
+            &[2, 2],
+            &[2, 2, 2, 2],
+        );
+    }
+
+    #[test]
+    fn conv_parity_grouped_not_depthwise() {
+        // groups < in_channels (grouped but not depthwise): groups=4, in=16, out=32
+        parity_check_grouped(
+            &[1, 16, 14, 14],
+            &[32, 4, 3, 3],
+            4,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_channel_multiplier() {
+        // Channel multiplier: groups=16, in=16, out=32 (multiplier=2)
+        parity_check_grouped(
+            &[1, 16, 14, 14],
+            &[32, 1, 3, 3],
+            16,
+            &[1, 1],
+            &[1, 1],
+            &[1, 1, 1, 1],
+        );
+    }
+
+    #[test]
+    fn conv_parity_depthwise_5x5_mobilenet_style() {
+        // EfficientNet uses 5x5 depthwise
+        parity_check_grouped(
+            &[1, 48, 28, 28],
+            &[48, 1, 5, 5],
+            48,
+            &[1, 1],
+            &[1, 1],
+            &[2, 2, 2, 2],
+        );
+    }
+
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn conv_parity_bnns_vs_scalar_ref() {
@@ -1157,6 +1503,7 @@ mod tests {
             &output_shape,
             &strides,
             &pads,
+            1,
             false,
         );
         let bnns_out = bnns_result.expect("BNNS should accept this config");
