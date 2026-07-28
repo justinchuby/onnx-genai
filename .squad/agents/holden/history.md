@@ -137,5 +137,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 ## 2026-07-27T17:03:14-07:00 — Release workflow supply-chain hardening
 
 - Converted release workflow Rust setup away from personally-owned `dtolnay/rust-toolchain`: 4 uses in `publish.yml`, 2 uses in `wheels.yml`, each replaced with direct stable/minimal `rustup` commands matching Pris's CI pattern.
+- Adopted Pris's `ci.yml`/`audit.yml` hardening onto this branch too, removing the remaining personal `dtolnay`, `Swatinem/rust-cache`, and `taiki-e/install-action` uses from the full workflow set.
 - Added/strengthened no-cancel release serialization: `publish.yml` now serializes by workflow rather than ref, and `wheels.yml` gained workflow-level concurrency with `cancel-in-progress: false`.
-- Recorded kept-action adjudication: keep PyPA trusted publishing, PyPA cibuildwheel, and Codecov for now; recommend immutable SHA pinning as follow-up.
+- Recorded owner-approved kept-action adjudication: keep PyPA trusted publishing and cibuildwheel, keep Codecov as vendor-owned; recommend immutable SHA pinning as a follow-up PR.
