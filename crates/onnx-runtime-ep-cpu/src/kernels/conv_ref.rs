@@ -268,12 +268,11 @@ impl Kernel for ConvKernel {
 
         let is_rank4 = self.x_shape.len() == 4;
         let is_group1 = self.group == 1;
-        let is_undilated = self.dilations.iter().all(|&d| d == 1);
 
         let output = if is_rank4 && is_group1 {
             // Try Tier 1 (BNNS) for undilated, symmetric-padding convolutions.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
-            if is_undilated
+            if self.dilations.iter().all(|&d| d == 1)
                 && let Some(result) = bnns::bnns_conv_execute(
                     &x,
                     &weights,

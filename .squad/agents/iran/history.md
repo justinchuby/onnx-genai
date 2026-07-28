@@ -19,3 +19,11 @@
 - Every SIMD/fast dispatch path needs reachability and parity guards before claims ship.
 - Future non-contiguous weights should check algebraic layout identities such as column-major-as-transpose before copying.
 - Do not chase dispatch count alone; measure where time is actually concentrated under controlled load.
+
+## 2026-07-27: Conv Three-Tier Dispatch (#317)
+- Diagnosed 643× ResNet-18 gap: `conv_ref.rs` scalar loop was only path on macOS due to `mlas` feature gate being x86-64-Linux-only.
+- Assessed BNNSGraph: requires `.mlmodelc`, cannot do per-op dispatch. No migration target exists.
+- Implemented Tier 1 (BNNS Filter Conv, AMX, 877–1458 GFLOPS), Tier 2 (im2col + cblas_sgemm, ~300 GFLOPS), Tier 3 (scalar ref).
+- Result: ResNet-18 8792ms → 93ms (94× faster), now 0.15× ORT (from 0.0016×). Whisper-tiny unchanged (MatMul-bound). Decode unregressed.
+- Remaining ResNet-18 gap (6.7×) is non-Conv ops (BatchNorm, Pool, Add on scalar paths).
+- BNNS Filter API deprecated but no replacement for per-op use. `cblas_sgemm` is durable fallback.
