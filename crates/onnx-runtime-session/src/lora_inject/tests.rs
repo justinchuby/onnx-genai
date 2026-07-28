@@ -1030,6 +1030,30 @@ fn run_phase1_direct(
 // §E golden parity: the grouped GroupedLoraDelta op, run as a pool-of-one with
 // every row routed to adapter 0, is bit-parity with the Phase-1 4-node subgraph.
 #[test]
+fn grouped_injection_drop_removes_registry_entry() {
+    let (m, k, n, r) = (2, 4, 3, 2);
+    let w = vec![0.0f32; k * n];
+    let a = vec![0.0f32; k * r];
+    let b = vec![0.0f32; r * n];
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, 1.0, &a, &b, k, n)],
+    };
+    let pool_id = {
+        let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped");
+        assert!(LoraPoolRegistry::global().get(injection.pool_id).is_some());
+        injection.pool_id
+    };
+    assert!(LoraPoolRegistry::global().get(pool_id).is_none());
+}
+
+#[test]
 fn grouped_single_adapter_matches_phase1_subgraph() {
     let (m, k, n, r) = (2, 4, 3, 2);
     let scale = 0.5f32;

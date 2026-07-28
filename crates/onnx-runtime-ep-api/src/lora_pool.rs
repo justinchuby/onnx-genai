@@ -10,7 +10,7 @@
 //!
 //! ## What lives here vs. what lives above
 //!
-//! Byte accounting and LRU eviction are self-contained in this type. The design
+//! Byte accounting and build-time LRU eviction are self-contained in this type. The design
 //! §J.2 sketches the pool as owning a `scheduler::ByteBudget`, but that type
 //! lives in `onnx-genai-scheduler`, a *higher* layer than this foundational EP
 //! contract crate. Importing it here would invert the dependency graph
@@ -208,16 +208,21 @@ pub struct LoraPagePair<'a> {
 
 /// The host-side paged adapter weight pool (design §J.2).
 ///
-/// Admission (`admit`) and eviction happen at adapter-load time under `&mut
-/// self`; the kernel holds an `Arc<LoraWeightPool>` and only ever calls the
-/// `&self` read accessors, so the decode hot path is lock-free and
-/// allocation-free with respect to adapter weights.
+/// Admission (`admit`), recency updates (`touch`), and eviction happen only while
+/// building the pool under `&mut self`. Once wrapped in `Arc<LoraWeightPool>`,
+/// residency is fixed and kernels only call `&self` read accessors. Live eviction
+/// would require a deliberate interior-mutability and reader-lifetime design.
 pub struct LoraWeightPool {
     capacity_bytes: u64,
     used_bytes: u64,
     next_recency: u64,
     pages: HashMap<(AdapterId, LoraModuleId), AdapterModulePages>,
+    residency_owner: Option<Box<dyn LoraPoolResidencyOwner>>,
 }
+
+trait LoraPoolResidencyOwner: Send + Sync {}
+
+impl<T: Send + Sync> LoraPoolResidencyOwner for T {}
 
 impl LoraWeightPool {
     /// Create an empty pool with an absolute byte ceiling.
@@ -227,7 +232,19 @@ impl LoraWeightPool {
             used_bytes: 0,
             next_recency: 0,
             pages: HashMap::new(),
+            residency_owner: None,
         }
+    }
+
+    /// Attach an owner whose resources remain live until the final
+    /// `Arc<LoraWeightPool>` is dropped.
+    pub fn with_residency_owner<T>(mut self, owner: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        assert!(self.residency_owner.is_none(), "pool already has a residency owner");
+        self.residency_owner = Some(Box::new(owner));
+        self
     }
 
     /// The active byte ceiling.
@@ -258,10 +275,10 @@ impl LoraWeightPool {
     /// Admit one `(adapter, module)` factor pair, copying the already-transposed
     /// `A_t = [K, rank]` and `B_t = [rank, N]` bytes into fresh aligned pages.
     ///
-    /// Evicts least-recently-used pages (never the pair being admitted) until the
-    /// pair fits, then errors with [`LoraPoolError::CapacityExceeded`] only if the
-    /// single pair is larger than the whole pool ceiling. Fails loud on any
-    /// shape/byte or rank disagreement rather than storing a corrupt page.
+    /// During mutable pool construction, evicts least-recently-used pages (never
+    /// the pair being admitted) until the pair fits. Once shared through `Arc`,
+    /// this build-time eviction path is no longer available. Fails loud on any
+    /// capacity, shape/byte, or rank disagreement.
     #[allow(clippy::too_many_arguments)]
     pub fn admit(
         &mut self,
@@ -345,7 +362,8 @@ impl LoraWeightPool {
         aligned(a_bytes) + aligned(b_bytes)
     }
 
-    /// Evict a specific pair, releasing its bytes. Returns whether it was present.
+    /// Evict a pair during mutable pool construction, releasing its bytes. This
+    /// is not a live data-plane eviction API after `Arc` wrapping.
     pub fn evict(&mut self, adapter: AdapterId, module: LoraModuleId) -> bool {
         if let Some(page) = self.pages.remove(&(adapter, module)) {
             self.used_bytes = self.used_bytes.saturating_sub(page.resident_bytes);
@@ -385,8 +403,8 @@ impl LoraWeightPool {
         })
     }
 
-    /// Mark a pair most-recently-used (a load-time / admission-time control-plane
-    /// operation — never called on the read hot path).
+    /// Mark a pair most-recently-used during mutable pool construction. Recency
+    /// only affects later build-time admissions; it is never mutated live.
     pub fn touch(&mut self, adapter: AdapterId, module: LoraModuleId) {
         let recency = self.next_recency;
         if let Some(page) = self.pages.get_mut(&(adapter, module)) {
@@ -460,10 +478,32 @@ fn validate_factor(
 // `weight.rs`) as the seam a *paging* EP (CUDA, P2g) will use to bind the pool on
 // device.
 
-/// A registration token; drop it (or call [`LoraPoolRegistry::unregister`]) to
-/// release the pool from the process registry.
+/// A copyable identifier baked into grouped LoRA operator attributes.
+///
+/// This identifier has no drop behavior. Registry lifetime is managed by
+/// [`LoraPoolRegistry::unregister`] or an owned [`LoraPoolRegistration`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LoraPoolId(pub u64);
+
+/// Owned registry entry. Dropping it unregisters its pool exactly once.
+pub struct LoraPoolRegistration {
+    registry: LoraPoolRegistry,
+    pool_id: Option<LoraPoolId>,
+}
+
+impl LoraPoolRegistration {
+    pub fn pool_id(&self) -> LoraPoolId {
+        self.pool_id.expect("live registration has a pool identifier")
+    }
+}
+
+impl Drop for LoraPoolRegistration {
+    fn drop(&mut self) {
+        if let Some(pool_id) = self.pool_id.take() {
+            self.registry.unregister(pool_id);
+        }
+    }
+}
 
 /// Process-wide registry mapping a `pool_id` to a shared pool. Cloneable handle;
 /// all clones observe the same registry.
@@ -492,6 +532,15 @@ impl LoraPoolRegistry {
         state.next_id += 1;
         state.pools.insert(id, pool);
         LoraPoolId(id)
+    }
+
+    /// Register a pool and return an owned entry that unregisters on drop.
+    pub fn register_owned(&self, pool: Arc<LoraWeightPool>) -> LoraPoolRegistration {
+        let pool_id = self.register(pool);
+        LoraPoolRegistration {
+            registry: self.clone(),
+            pool_id: Some(pool_id),
+        }
     }
 
     /// Look up a pool by id.
@@ -640,5 +689,16 @@ mod tests {
         assert!(Arc::ptr_eq(&registry.get(id).unwrap(), &pool));
         assert!(registry.unregister(id).is_some());
         assert!(registry.get(id).is_none());
+    }
+
+    #[test]
+    fn owned_registration_drop_is_safe_after_external_unregister() {
+        let registry = LoraPoolRegistry::default();
+        let registration =
+            registry.register_owned(Arc::new(LoraWeightPool::with_capacity_bytes(1 << 20)));
+        let pool_id = registration.pool_id();
+        assert!(registry.unregister(pool_id).is_some());
+        drop(registration);
+        assert!(registry.get(pool_id).is_none());
     }
 }

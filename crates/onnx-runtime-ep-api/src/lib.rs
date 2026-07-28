@@ -58,7 +58,8 @@ pub use provider::{
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use lora_pool::{
     AdapterId, LoraFactorInput, LoraFactorKind, LoraFactorView, LoraModuleId, LoraPagePair,
-    LoraPoolError, LoraPoolId, LoraPoolRegistry, LoraWeightPool, LORA_PAGE_ALIGNMENT,
+    LoraPoolError, LoraPoolId, LoraPoolRegistration, LoraPoolRegistry, LoraWeightPool,
+    LORA_PAGE_ALIGNMENT,
 };
 pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,

@@ -43,7 +43,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use onnx_runtime_ep_api::{
-    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolId, LoraPoolRegistry, LoraWeightPool,
+    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolId, LoraPoolRegistration,
+    LoraPoolRegistry, LoraWeightPool,
 };
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
@@ -1119,16 +1120,16 @@ pub struct GroupedLoraInjection {
     /// initializer, so the executor treats it as a required runtime input that
     /// is never a graph constant (never prepacked).
     pub segments_input: String,
-    /// The id under which the populated pool is registered in the process
-    /// [`LoraPoolRegistry`]; baked into every emitted op's `pool_id` attribute.
+    /// The copyable identifier baked into every emitted op's `pool_id` attribute.
+    /// It does not own the registry entry; dropping this injection releases it.
     pub pool_id: LoraPoolId,
-    /// The populated, registered pool. Holding this handle keeps the pool
-    /// resident; dropping the registry entry (see [`LoraPoolRegistry::unregister`])
-    /// releases it.
+    /// The populated pool. Its registry entry is owned by this injection's
+    /// private registration and is removed when the injection is dropped.
     pub pool: Arc<LoraWeightPool>,
     /// The adapter id every row routes to for the single-adapter unify case.
     pub adapter_id: AdapterId,
     pub manifest: LoraManifest,
+    _registration: LoraPoolRegistration,
 }
 
 /// Round a byte count up to the pool's page alignment so a computed capacity is
@@ -1415,7 +1416,8 @@ pub fn inject_grouped(
     }
 
     let pool = Arc::new(pool);
-    let pool_id = LoraPoolRegistry::global().register(Arc::clone(&pool));
+    let registration = LoraPoolRegistry::global().register_owned(Arc::clone(&pool));
+    let pool_id = registration.pool_id();
 
     // --- Create the single shared non-constant `segments` routing input. ---
     let tokens_symbol = graph.create_symbol(Some("lora.segments.tokens".to_string()));
@@ -1503,6 +1505,7 @@ pub fn inject_grouped(
         pool,
         adapter_id: SINGLE_ADAPTER_ID,
         manifest: manifest.clone(),
+        _registration: registration,
     })
 }
 

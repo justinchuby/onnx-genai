@@ -14,17 +14,16 @@
 //! with an effectively unbounded ceiling so it never self-evicts; every admission
 //! first reserves the exact resident byte cost from the shared budget (failing
 //! loud, cross-session, if the machine-wide ceiling is hit) and every eviction
-//! releases it. Because the same [`ByteBudget`] handle can be shared with the KV
-//! subsystem, adapter memory and KV memory account against one device-wide
-//! ceiling.
+//! releases it. Remaining reservations are owned by the populated data-plane
+//! pool and returned when its final `Arc` is dropped.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use onnx_genai_scheduler::byte_budget::{ByteBudget, ByteBudgetError};
 use onnx_runtime_ep_api::{
-    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolError, LoraPoolId, LoraPoolRegistry,
-    LoraWeightPool,
+    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolError, LoraPoolRegistration,
+    LoraPoolRegistry, LoraWeightPool,
 };
 
 /// A failure admitting an adapter factor pair through the budgeted pool.
@@ -38,11 +37,45 @@ pub enum BudgetedLoraPoolError {
     Pool(#[from] LoraPoolError),
 }
 
+struct BudgetReservation {
+    budget: ByteBudget,
+    reserved_bytes: u64,
+}
+
+impl BudgetReservation {
+    fn new(budget: ByteBudget) -> Self {
+        Self { budget, reserved_bytes: 0 }
+    }
+
+    fn reserve(&mut self, bytes: u64) -> Result<(), ByteBudgetError> {
+        self.budget.try_reserve(bytes)?;
+        self.reserved_bytes += bytes;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.reserved_bytes = self
+            .reserved_bytes
+            .checked_sub(bytes)
+            .expect("LoRA budget release must not exceed its reservation");
+        self.budget.release(bytes);
+    }
+}
+
+impl Drop for BudgetReservation {
+    fn drop(&mut self) {
+        let reserved_bytes = std::mem::take(&mut self.reserved_bytes);
+        if reserved_bytes != 0 {
+            self.budget.release(reserved_bytes);
+        }
+    }
+}
+
 /// The control-plane wrapper: an ep-api [`LoraWeightPool`] whose residency is
 /// governed by a shared [`ByteBudget`].
 pub struct BudgetedLoraPool {
     pool: LoraWeightPool,
-    budget: ByteBudget,
+    reservation: BudgetReservation,
     /// Bytes reserved from the budget per resident key, so eviction releases the
     /// exact amount admission charged.
     reserved: HashMap<(AdapterId, LoraModuleId), u64>,
@@ -56,14 +89,14 @@ impl BudgetedLoraPool {
     pub fn new(budget: ByteBudget) -> Self {
         Self {
             pool: LoraWeightPool::with_capacity_bytes(u64::MAX),
-            budget,
+            reservation: BudgetReservation::new(budget),
             reserved: HashMap::new(),
         }
     }
 
     /// Bytes currently reserved from the shared budget by this pool's pages.
     pub fn reserved_bytes(&self) -> u64 {
-        self.reserved.values().copied().sum()
+        self.reservation.reserved_bytes
     }
 
     /// Number of resident `(adapter, module)` pairs.
@@ -90,21 +123,24 @@ impl BudgetedLoraPool {
     ) -> Result<(), BudgetedLoraPoolError> {
         let cost = LoraWeightPool::page_pair_resident_bytes(a_t.bytes.len(), b_t.bytes.len());
 
-        // A re-admission of the same key releases its old reservation first so the
-        // budget nets only the delta (a hot-swap of the same slot).
-        if let Some(previous) = self.reserved.remove(&(adapter, module)) {
-            self.budget.release(previous);
+        let previous = self.reserved.get(&(adapter, module)).copied().unwrap_or(0);
+        let additional = cost.saturating_sub(previous);
+        if additional != 0 {
+            self.reservation.reserve(additional)?;
         }
 
-        self.budget.try_reserve(cost)?;
         match self.pool.admit(adapter, module, a_t, b_t, scale) {
             Ok(()) => {
+                if previous > cost {
+                    self.reservation.release(previous - cost);
+                }
                 self.reserved.insert((adapter, module), cost);
                 Ok(())
             }
             Err(error) => {
-                // Roll the reservation back so a shape/rank rejection never leaks.
-                self.budget.release(cost);
+                if additional != 0 {
+                    self.reservation.release(additional);
+                }
                 Err(error.into())
             }
         }
@@ -115,20 +151,20 @@ impl BudgetedLoraPool {
     pub fn evict(&mut self, adapter: AdapterId, module: LoraModuleId) -> bool {
         let present = self.pool.evict(adapter, module);
         if let Some(bytes) = self.reserved.remove(&(adapter, module)) {
-            self.budget.release(bytes);
+            self.reservation.release(bytes);
         }
         present
     }
 
     /// Freeze the populated data-plane pool into a shared handle and register it
     /// in the process [`LoraPoolRegistry`], returning the `pool_id` to bake into
-    /// the emitted `GroupedLoraDelta` ops. Consumes `self`, handing ownership of
-    /// the pages to the registry; the reservations stay live for the lifetime of
-    /// the returned `Arc` (release them by unregistering and dropping it).
-    pub fn register(self) -> (LoraPoolId, Arc<LoraWeightPool>) {
-        let pool = Arc::new(self.pool);
-        let id = LoraPoolRegistry::global().register(Arc::clone(&pool));
-        (id, pool)
+    /// the emitted `GroupedLoraDelta` ops. The registration unregisters on drop;
+    /// reservations remain attached until every pool `Arc` is gone.
+    pub fn register(self) -> (LoraPoolRegistration, Arc<LoraWeightPool>) {
+        let Self { pool, reservation, reserved: _ } = self;
+        let pool = Arc::new(pool.with_residency_owner(reservation));
+        let registration = LoraPoolRegistry::global().register_owned(Arc::clone(&pool));
+        (registration, pool)
     }
 }
 
@@ -210,5 +246,59 @@ mod tests {
             .expect_err("rank mismatch must fail");
         assert!(matches!(error, BudgetedLoraPoolError::Pool(_)));
         assert_eq!(budget.snapshot().used, 0, "data-plane rejection releases the reservation");
+    }
+
+    #[test]
+    fn registered_pool_drop_restores_exact_prior_budget_availability() {
+        let budget = ByteBudget::new(4096);
+        budget.try_reserve(256).expect("baseline reservation");
+        let available_before = budget.available();
+        let mut pool = BudgetedLoraPool::new(budget.clone());
+        let a = vec![0u8; 8];
+        let b = vec![0u8; 12];
+        for module in 0..2 {
+            pool.admit(
+                AdapterId(0),
+                LoraModuleId(module),
+                factor(2, 1, &a),
+                factor(1, 3, &b),
+                1.0,
+            )
+            .expect("admit fits");
+        }
+
+        let (registration, resident_pool) = pool.register();
+        let pool_id = registration.pool_id();
+        assert_eq!(budget.available(), available_before - 256);
+        assert!(LoraPoolRegistry::global().get(pool_id).is_some());
+        drop(registration);
+        assert!(LoraPoolRegistry::global().get(pool_id).is_none());
+        assert_eq!(budget.available(), available_before - 256);
+        drop(resident_pool);
+        assert_eq!(budget.available(), available_before);
+        assert_eq!(budget.used(), 256);
+    }
+
+    #[test]
+    fn eviction_then_pool_drop_does_not_double_release_budget() {
+        let budget = ByteBudget::new(4096);
+        budget.try_reserve(256).expect("baseline reservation");
+        let available_before = budget.available();
+        {
+            let mut pool = BudgetedLoraPool::new(budget.clone());
+            let a = vec![0u8; 8];
+            let b = vec![0u8; 12];
+            pool.admit(
+                AdapterId(0),
+                LoraModuleId(0),
+                factor(2, 1, &a),
+                factor(1, 3, &b),
+                1.0,
+            )
+            .expect("admit fits");
+            assert!(pool.evict(AdapterId(0), LoraModuleId(0)));
+        }
+        assert_eq!(budget.available(), available_before);
+        assert_eq!(budget.used(), 256);
     }
 }
