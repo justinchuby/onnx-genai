@@ -131,6 +131,44 @@ Every number above is read out of the committed `.txt` files by
 [`../../scripts/check_profile_table.py`](../../scripts/check_profile_table.py),
 which CI runs, so the table cannot drift from the samples it describes.
 
+## Cold-start vs steady-state framing
+
+**TTFT alone is not a fair cold-start metric between these two runtimes.**
+ORT pre-packs weights during model load (quantization layout transforms,
+graph optimisation, session construction). This makes ORT's model load ~5×
+slower than native's, while making its TTFT look better — the work that
+native does on first inference, ORT has already done during load.
+
+The honest cold-start metric is **time to first token from process start**:
+model load + TTFT. This is what a user waiting for the first word actually
+experiences. TTFT alone is the honest metric only for a warm, already-loaded
+process serving many requests (e.g. a long-running server).
+
+Measured on TinyStories-33M, Apple M1 Max, load 3–5, three interleaved runs:
+
+| Metric | native | ORT | Ratio |
+|---|---:|---:|---|
+| model load | 29.0 ms | 146.9 ms | native 5.1× faster |
+| TTFT | 26.2 ms | 3.4 ms | native 7.7× slower |
+| **time to first token from process start** | **55.2 ms** | **150.3 ms** | **native 2.7× faster** |
+
+Both framings are true; they answer different questions:
+
+- **"How fast does the user see the first word after launching?"** →
+  time-to-first-token from process start. Native wins 2.7×.
+- **"How fast does an already-loaded server respond?"** →
+  TTFT alone. ORT wins ~4–8× on this model because it front-loaded
+  the work into model load.
+
+The mechanism is weight pre-packing: ORT's session builder transposes,
+pads, and tiles weight matrices into SIMD-friendly layouts at load time.
+Native loads weights via memory-map with no transform, so the equivalent
+work (if any) is deferred to inference.
+
+The `compare` binary reports all three numbers — model load, TTFT, and
+their sum — so readers can choose the framing that matches their
+deployment scenario.
+
 ## Load sensitivity — an honest limitation
 
 **The native FP16 TTFT advantage is real but more load-sensitive than ORT's.**
