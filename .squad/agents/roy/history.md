@@ -167,3 +167,6 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Reviewed PR #301 / #85, requested changes for control-flow capture liveness, then approved Deckard capture-aware last-use fix.
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Approved PR #313 decode-garble triage and byte-identity/fires regression guard; repeated-sentence output classified as natural greedy behavior.

@@ -60,6 +60,7 @@ pub use onnx_genai_metadata::{
     SpeculatorProposerKind, SpeculatorProposerStatus, SpeculatorVerifier, detect_speculator,
 };
 pub use onnx_genai_runtime_config::EpSelection;
+pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{
     CudaAttentionMode, EpCapabilities, HardwareKind, ResolvedEp, RunPhaseError, Session,
     SessionOptions, TensorInfo, available_execution_providers, capability, ep_selection,

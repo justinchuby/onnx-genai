@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "package_name": "tiny-llm-scatter-package",
+  "layout": "portable",
+  "components": {
+    "model": {
+      "component_name": "model",
+      "variants": {
+        "cpu": {
+          "variant_directory": "cpu",
+          "ep": "CPUExecutionProvider",
+          "device": "cpu",
+          "executor_info": {
+            "nxrt": "nxrt_info.json"
+          },
+          "additional_metadata": {
+            "precision": "float32"
+          }
+        }
+      }
+    }
+  }
+}

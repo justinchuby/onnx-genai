@@ -232,6 +232,19 @@ pub(crate) struct Executor {
     pub(super) compute_in_place_enabled: bool,
     /// Successful dead-input buffer aliases, retained for parity/safety tests.
     pub(super) compute_in_place_alias_count: u64,
+    /// Per-plan-node kernel pre-binding (Stage 3). Each slot stores the
+    /// [`KernelKey`] from the most recent successful kernel lookup for that plan
+    /// node. On subsequent dispatch, if the current input shapes match the stored
+    /// key's shapes, the kernel is retrieved via `get_prebound` — a single
+    /// `HashMap::get` with no allocation (the key is already owned). This
+    /// eliminates the 2.15 µs/op dispatch tax (shape-vec allocation + hash) in
+    /// steady-state decode.
+    ///
+    /// Populated lazily: `None` until the first successful dispatch of that node.
+    /// Invalidated (replaced) when shapes change (prefill→decode transition).
+    /// Control-flow and sequence nodes always have `None` (they don't use the
+    /// kernel cache).
+    pub(super) kernel_bindings: Vec<Option<KernelKey>>,
 }
 
 /// After this many consecutive buffer-identity signature mismatches, F5 Stage 2

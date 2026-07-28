@@ -31,3 +31,15 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 ## 2026-07-18T04-55-00Z — Scribe session update
 
 - On lockout reassignment, fixed CUDA standard Attention claim validation (`8eb23f1`) so `Undefined` optional mask/past/nonpad slots mean absent while supplied tensors retain strict type and compatibility checks.
+
+## 2026-07-27T18:20:00-07:00 — MLX EP logging framework
+
+- Replaced all 12 `eprintln!`/`eprint!` sites in `onnxruntime-mlx/rust/` with the `log` crate facade + minimal in-crate stderr logger.
+- Chose `log` over `tracing` because the plugin is a cdylib with its own statics; the subscriber model has no benefit and adds weight.
+- Default: **Warn** only (panics + capture failures). Info via `VERBOSE=1`, Debug via `TRACE=<path>`.
+- Verified: build clean (`-D warnings`), 1106 tests pass, stderr is empty by default.
+- PR: https://github.com/justinchuby/onnxruntime-mlx/pull/9 (not merged)
+- Decision: `.squad/decisions/inbox/nabil-mlx-logging.md`
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- MLX logging decision note was merged into decisions for future backend logging work.
