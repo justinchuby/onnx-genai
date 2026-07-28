@@ -136,3 +136,8 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Preserved #296/#340 independent hardening: direct `rustup`, GitHub-owned `actions/cache`, arch-aware cache keys, concurrency cancellation, and stable expanded names via always-expanded matrices/no gated matrix jobs.
 - Decision filed: `.squad/decisions/inbox/pris-ci-fast-slow-tiers.md`.
 - Verification: manual CI dispatch 30379369830 on `ci/platforms-on-pr` passed in 27m26s wall-clock with critical path `Rust coverage (Windows ARM64)` at 27m22s; audit dispatch 30377173441 passed in 3m18s. Earlier dispatch 30377171127 proved Windows ARM64 report merging still fails with malformed profraw/no profile can be merged, so the final workflow uses `cargo llvm-cov --no-report` on that target while keeping instrumentation.
+
+## 2026-07-28T10:10:34-07:00 — Added parallel Linux fast CI
+- Added separate `.github/workflows/fast-ci.yml` with one clearly named check, `Fast (Linux x86_64)`, running uninstrumented Linux fmt/build/test/clippy for early PR feedback. It runs in parallel with the full coverage gate; passing it alone is not merge-ready.
+- Kept full CI unchanged in scope: coverage-instrumented full matrix plus CLI ORT, CUDA, audit, no `ci:full`, and Codecov carryforward disabled.
+- Split the full Rust coverage job cache so `~/.cargo/registry`/`~/.cargo/git` can share the same registry key shape as fast CI while `target` is keyed separately with a `coverage` marker; fast `target` uses a distinct `fast` marker to avoid instrumented/uninstrumented artifact contamination.
