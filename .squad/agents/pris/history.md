@@ -104,3 +104,8 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Kept the full Windows x86_64 offline-crate suite in slow CI via the Windows `Rust coverage` job.
 - Audited offline crates for Windows-specific cfg tests before moving broad Windows tests out of fast PR CI; found `onnx-runtime-loader::pathsafe::tests::rejects_rooted_path` as the meaningful Windows-only test that now relies on slow CI, plus Windows-specific implementation code in tracer and CPU decode affinity.
 - Remeasured final-SHA fast dispatch run 30334227247 at 4m33s wall-clock; critical path was `CLI ORT (Windows x86_64)` at 4m21s. The preceding same-workflow run 30333847821 was 3m59s with `Rust (Linux x86_64)` at 3m55s and Windows CLI at 2m51s; the first refined run was 8m09s due a Windows cache-save post step. Conclusion: the split reaches the target with warm caches, but Windows CLI variance can still exceed 4m.
+
+## 2026-07-28T01:18:00-07:00 — Windows path-safety exception in fast CI
+- Added `cargo test --locked -p onnx-runtime-loader pathsafe` to the fast Windows CLI lane so `rejects_rooted_path` continues to run before merge. This is the narrow exception to the pure-Rust-offline-on-Linux rule because Windows path semantics are the behavior under test.
+- Rechecked the Windows cfg audit: no other meaningful `#[cfg(windows)]` tests in the offline crate suite; remaining hits are Windows-specific implementation code in tracer/decode affinity or ORT/CUDA code outside the offline crate set.
+- Measured repeat fast run 30342667705 at 3m45s wall-clock; critical path `Rust (Linux x86_64)` at 3m40s, Windows CLI at 3m26s, loader path-safety step 12s. First run on the commit was 7m31s from Windows cache/build variance, with loader step 34s.
