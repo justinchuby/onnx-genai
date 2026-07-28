@@ -14,6 +14,20 @@ pub mod weight_handle;
 pub const WEIGHT_OFFLOAD_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD";
 /// Optional override for the Resource Governor's owned warm-host cache budget.
 pub const WEIGHT_OFFLOAD_HOST_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_HOST_BYTES";
+/// Opt-out switch for the route-first single-ahead expert prefetch pipeline.
+///
+/// The pipeline overlaps the next routed expert's host-side dequant/admission
+/// (the "transfer" half of issue #87/#63) with the current expert's matmul
+/// (the "compute" half). It is on by default and preserves byte-identical
+/// output and cache statistics; set the variable to `0` to force the legacy
+/// serial route-first loop (used for A/B benchmarking and as an escape hatch).
+pub const WEIGHT_OFFLOAD_PREFETCH_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH";
+
+/// Whether newly created QMoE kernels should pipeline route-first expert
+/// prefetch. Defaults to `true`; `ONNX_GENAI_WEIGHT_OFFLOAD_PREFETCH=0` disables.
+pub(crate) fn weight_offload_prefetch_default() -> bool {
+    std::env::var_os(WEIGHT_OFFLOAD_PREFETCH_ENV).is_none_or(|value| value != "0")
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WeightOffloadMode {

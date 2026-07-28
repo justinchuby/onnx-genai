@@ -38,6 +38,7 @@ use super::{
 };
 use crate::weight_offload::{
     WeightOffloadMode, checked_host_budget, metrics, weight_offload_host_budget,
+    weight_offload_prefetch_default,
 };
 
 /// Factory for the ORT contrib `QMoE` operator.
@@ -51,6 +52,10 @@ impl QMoEFactory {
     }
 }
 
+/// One routed expert and its `(row, contribution_slot, route_weight)` tasks,
+/// as materialised for the route-first offload loop.
+type RoutedExpert = (usize, Vec<(usize, usize, f32)>);
+
 /// Route-grouped, per-active-expert dequantizing integer QMoE kernel.
 pub struct QMoEKernel {
     layer_id: u32,
@@ -59,6 +64,7 @@ pub struct QMoEKernel {
     block_size: usize,
     weight_offload: WeightOffloadMode,
     host_cache: WeightOffloadHostCache,
+    prefetch_experts: bool,
 }
 
 impl KernelFactory for QMoEFactory {
@@ -94,6 +100,7 @@ impl KernelFactory for QMoEFactory {
             block_size: block_size as usize,
             weight_offload: WeightOffloadMode::from_env(),
             host_cache: self.host_cache.clone(),
+            prefetch_experts: weight_offload_prefetch_default(),
         }))
     }
 }
@@ -352,38 +359,19 @@ impl Kernel for QMoEKernel {
                 .map_err(error)?;
             metrics().record_routes(self.layer_id, &token_counts);
 
-            for (expert, expert_tasks) in tasks {
-                let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
-                let key = ExpertCacheKey::new(
-                    self.layer_id,
-                    expert,
-                    self.bits,
-                    self.block_size,
-                    &fc1,
-                    &fc2,
-                    fc3.as_ref(),
-                );
-                let weights = self.host_cache.lease(key, expanded_bytes, || {
-                    DequantizedExpert::load(expert, &fc1, &fc2, fc3.as_ref(), true)
-                })?;
-                if weights.read_from_mmap {
-                    let mut bytes_read = fc1
-                        .expert_source_bytes(expert)?
-                        .checked_add(fc2.expert_source_bytes(expert)?)
-                        .ok_or_else(|| error("selected expert byte count overflow"))?;
-                    if let Some(source) = &fc3 {
-                        bytes_read = bytes_read
-                            .checked_add(source.expert_source_bytes(expert)?)
-                            .ok_or_else(|| error("selected expert byte count overflow"))?;
-                    }
-                    metrics().record_bytes_read(bytes_read).map_err(error)?;
-                }
+            let expanded_bytes = DequantizedExpert::expanded_bytes(&fc1, &fc2, fc3.as_ref())?;
+            let ordered: Vec<RoutedExpert> = tasks.into_iter().collect();
+            let compute = |expert: usize,
+                           expert_tasks: &[(usize, usize, f32)],
+                           weights: &DequantizedExpert,
+                           contributions: &mut [f32]|
+             -> Result<()> {
                 write_grouped_contributions(
-                    &mut contributions,
+                    contributions,
                     &x,
-                    &expert_tasks,
+                    expert_tasks,
                     expert,
-                    &weights,
+                    weights,
                     fc1_bias.as_deref(),
                     fc2_bias.as_deref(),
                     fc3_bias.as_deref(),
@@ -391,7 +379,80 @@ impl Kernel for QMoEKernel {
                     hidden,
                     inter,
                     &self.attributes,
-                )?;
+                )
+            };
+
+            if self.prefetch_experts && ordered.len() > 1 {
+                // Single-ahead prefetch pipeline: a dedicated worker leases
+                // (and, on a miss, dequantizes) expert `n+1` while the main
+                // thread computes expert `n`, overlapping the host-side
+                // transfer with compute. Leases are still issued strictly in
+                // ascending expert order (one request in flight), so cache
+                // admission/eviction and every counter stay byte-identical to
+                // the serial path — only the wall-clock overlaps.
+                use std::sync::mpsc;
+                let layer_id = self.layer_id;
+                let bits = self.bits;
+                let block_size = self.block_size;
+                let host_cache = &self.host_cache;
+                let fc1_ref = &fc1;
+                let fc2_ref = &fc2;
+                let fc3_ref = fc3.as_ref();
+                let ordered_ref = &ordered;
+                std::thread::scope(|scope| -> Result<()> {
+                    let (req_tx, req_rx) = mpsc::channel::<usize>();
+                    let (res_tx, res_rx) = mpsc::channel::<Result<Arc<DequantizedExpert>>>();
+                    scope.spawn(move || {
+                        while let Ok(index) = req_rx.recv() {
+                            let expert = ordered_ref[index].0;
+                            let leased = lease_route_first_expert(
+                                host_cache,
+                                layer_id,
+                                bits,
+                                block_size,
+                                expert,
+                                expanded_bytes,
+                                fc1_ref,
+                                fc2_ref,
+                                fc3_ref,
+                            );
+                            if res_tx.send(leased).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    req_tx
+                        .send(0)
+                        .map_err(|_| error("route-first prefetch worker unavailable"))?;
+                    for index in 0..ordered_ref.len() {
+                        let weights = res_rx
+                            .recv()
+                            .map_err(|_| error("route-first prefetch worker stopped"))??;
+                        if index + 1 < ordered_ref.len() {
+                            req_tx
+                                .send(index + 1)
+                                .map_err(|_| error("route-first prefetch worker unavailable"))?;
+                        }
+                        let (expert, expert_tasks) = &ordered_ref[index];
+                        compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                    }
+                    Ok(())
+                })?;
+            } else {
+                for (expert, expert_tasks) in &ordered {
+                    let weights = lease_route_first_expert(
+                        &self.host_cache,
+                        self.layer_id,
+                        self.bits,
+                        self.block_size,
+                        *expert,
+                        expanded_bytes,
+                        &fc1,
+                        &fc2,
+                        fc3.as_ref(),
+                    )?;
+                    compute(*expert, expert_tasks, &weights, &mut contributions)?;
+                }
             }
         } else {
             for (expert, expert_tasks) in tasks {
@@ -914,6 +975,37 @@ pub(crate) fn default_weight_offload_host_cache() -> &'static WeightOffloadHostC
 }
 
 #[allow(clippy::too_many_arguments)]
+fn lease_route_first_expert(
+    host_cache: &WeightOffloadHostCache,
+    layer_id: u32,
+    bits: usize,
+    block_size: usize,
+    expert: usize,
+    expanded_bytes: usize,
+    fc1: &QuantizedExperts<'_>,
+    fc2: &QuantizedExperts<'_>,
+    fc3: Option<&QuantizedExperts<'_>>,
+) -> Result<Arc<DequantizedExpert>> {
+    let key = ExpertCacheKey::new(layer_id, expert, bits, block_size, fc1, fc2, fc3);
+    let lease = host_cache.lease(key, expanded_bytes, || {
+        DequantizedExpert::load(expert, fc1, fc2, fc3, true)
+    })?;
+    if lease.read_from_mmap {
+        let mut bytes_read = fc1
+            .expert_source_bytes(expert)?
+            .checked_add(fc2.expert_source_bytes(expert)?)
+            .ok_or_else(|| error("selected expert byte count overflow"))?;
+        if let Some(source) = fc3 {
+            bytes_read = bytes_read
+                .checked_add(source.expert_source_bytes(expert)?)
+                .ok_or_else(|| error("selected expert byte count overflow"))?;
+        }
+        metrics().record_bytes_read(bytes_read).map_err(error)?;
+    }
+    Ok(lease.weights)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_grouped_contributions(
     contributions: &mut [f32],
     input: &[f32],
@@ -1329,7 +1421,7 @@ mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
-    use crate::weight_offload::{WeightOffloadMode, metrics};
+    use crate::weight_offload::{WeightOffloadMode, WeightOffloadStats, metrics};
     use onnx_runtime_ep_api::{DevicePtr, ExecutionProvider};
     use onnx_runtime_ir::{Attribute, DeviceId, Graph, NodeId, WeightRef, static_shape};
     use onnx_runtime_loader::{Model, Pageability, WeightStore, load_model_with_weights};
@@ -1603,6 +1695,18 @@ mod tests {
         routers: &[&[f32]],
         k: usize,
     ) -> MmapRun {
+        run_mmap_qmoe_sequence_prefetch(enabled, interleaved, input, routers, k, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_mmap_qmoe_sequence_prefetch(
+        enabled: bool,
+        interleaved: bool,
+        input: &[f32],
+        routers: &[&[f32]],
+        k: usize,
+        prefetch_experts: bool,
+    ) -> MmapRun {
         const EXPERTS: usize = 4;
         const ROWS: usize = 4;
         const HIDDEN: usize = 16;
@@ -1759,6 +1863,7 @@ mod tests {
             block_size: BLOCK,
             weight_offload: WeightOffloadMode { enabled },
             host_cache: default_weight_offload_host_cache().clone(),
+            prefetch_experts,
         };
         let x = Owned::f32(&[ROWS, HIDDEN], input);
         let mut final_output = None;
@@ -1815,6 +1920,330 @@ mod tests {
                 .all(|catalog| catalog.pageability() == &Pageability::Pageable),
             selected_source_bytes,
         }
+    }
+
+    /// Configurable mmap-backed route-first QMoE workload used for A/B
+    /// prefetch benchmarking. Unlike [`run_mmap_qmoe_sequence_prefetch`] (fixed
+    /// 4×16 fixture dims), this builds arbitrarily sized expert-major weights so
+    /// the host-side dequant cost is large enough to observe compute/transfer
+    /// overlap. Returns the final output, a stats snapshot, and the wall-clock
+    /// elapsed across all decode steps.
+    #[allow(clippy::too_many_arguments)]
+    fn run_route_first_bench(
+        experts: usize,
+        hidden: usize,
+        inter: usize,
+        bits: usize,
+        block: usize,
+        rows: usize,
+        k: usize,
+        host_cache_budget: u64,
+        routers: &[Vec<f32>],
+        prefetch_experts: bool,
+    ) -> (Vec<f32>, WeightOffloadStats, std::time::Duration) {
+        let pack_size = 8 / bits;
+        let packed_fc1 = hidden / pack_size;
+        let packed_fc2 = inter / pack_size;
+        let blocks_fc1 = hidden / block;
+        let blocks_fc2 = inter / block;
+
+        let fc1 = quantize(experts, inter, hidden, bits, block, false);
+        let fc2 = quantize(experts, hidden, inter, bits, block, false);
+
+        let mut external = vec![0u8; 4];
+        let fc1_packed_offset = external.len();
+        external.extend_from_slice(&fc1.packed);
+        let fc1_scales_offset = external.len();
+        append_f32_bytes(&mut external, &fc1.scales);
+        let fc2_packed_offset = external.len();
+        external.extend_from_slice(&fc2.packed);
+        let fc2_scales_offset = external.len();
+        append_f32_bytes(&mut external, &fc2.scales);
+
+        let path = test_external_path();
+        std::fs::create_dir_all(path.parent().expect("external parent"))
+            .expect("create external parent");
+        std::fs::write(&path, &external).expect("write external weights");
+
+        let fc1_packed_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc1_packed_offset,
+            length: fc1.packed.len(),
+            dtype: DataType::Uint8,
+            dims: vec![experts, inter, packed_fc1],
+        };
+        let fc1_scales_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc1_scales_offset,
+            length: fc1.scales.len() * 4,
+            dtype: DataType::Float32,
+            dims: vec![experts, inter, blocks_fc1],
+        };
+        let fc2_packed_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc2_packed_offset,
+            length: fc2.packed.len(),
+            dtype: DataType::Uint8,
+            dims: vec![experts, hidden, packed_fc2],
+        };
+        let fc2_scales_ref = WeightRef::External {
+            path: path.clone(),
+            offset: fc2_scales_offset,
+            length: fc2.scales.len() * 4,
+            dtype: DataType::Float32,
+            dims: vec![experts, hidden, blocks_fc2],
+        };
+
+        let layout =
+            |rows_per_expert, storage_elements_per_row, blocks_per_row| ExpertTensorLayout {
+                version: 1,
+                experts,
+                rows_per_expert,
+                storage_elements_per_row,
+                order: ExpertStorageOrder::ExpertMajor,
+                quantization: Some(ExpertQuantization {
+                    bits,
+                    block_size: block,
+                    blocks_per_row,
+                }),
+            };
+        let catalogs = [
+            WeightRegionCatalog::classify(&fc1_packed_ref, layout(inter, packed_fc1, blocks_fc1)),
+            WeightRegionCatalog::classify(&fc1_scales_ref, layout(inter, blocks_fc1, blocks_fc1)),
+            WeightRegionCatalog::classify(&fc2_packed_ref, layout(hidden, packed_fc2, blocks_fc2)),
+            WeightRegionCatalog::classify(&fc2_scales_ref, layout(hidden, blocks_fc2, blocks_fc2)),
+        ];
+        assert!(
+            catalogs
+                .iter()
+                .all(|catalog| catalog.pageability() == &Pageability::Pageable),
+            "benchmark weights must be pageable to exercise route-first offload"
+        );
+
+        let mut store = WeightStore::new();
+        store.map_external(&path).expect("map external weights");
+        let fc1_packed_shape = [experts, inter, packed_fc1];
+        let fc1_scale_shape = [experts, inter, blocks_fc1];
+        let fc2_packed_shape = [experts, hidden, packed_fc2];
+        let fc2_scale_shape = [experts, hidden, blocks_fc2];
+        let fc1_packed_strides = [(inter * packed_fc1) as i64, packed_fc1 as i64, 1];
+        let fc1_scale_strides = [(inter * blocks_fc1) as i64, blocks_fc1 as i64, 1];
+        let fc2_packed_strides = [(hidden * packed_fc2) as i64, packed_fc2 as i64, 1];
+        let fc2_scale_strides = [(hidden * blocks_fc2) as i64, blocks_fc2 as i64, 1];
+
+        let (graph, node) = model_node(
+            "QMoE",
+            &[
+                Some((DataType::Float32, &[rows, hidden][..])),
+                Some((DataType::Float32, &[rows, experts])),
+                Some((DataType::Uint8, &[experts, inter, packed_fc1])),
+                Some((DataType::Float32, &[experts, inter, blocks_fc1])),
+                None,
+                Some((DataType::Uint8, &[experts, hidden, packed_fc2])),
+                Some((DataType::Float32, &[experts, hidden, blocks_fc2])),
+            ],
+            &[rows, hidden],
+            &attributes(bits, block, k, false),
+        );
+        let attributes = MoeAttributes::from_node(graph.node(node)).expect("attributes");
+        let kernel = QMoEKernel {
+            layer_id: graph.node(node).id.0,
+            attributes,
+            bits,
+            block_size: block,
+            weight_offload: WeightOffloadMode { enabled: true },
+            host_cache: default_weight_offload_host_cache().clone(),
+            prefetch_experts,
+        };
+
+        reset_offload_test_state(host_cache_budget);
+        let input = pseudo_random_values(rows * hidden, 0xa5a5_1234);
+        let x = Owned::f32(&[rows, hidden], &input);
+        let mut final_output = None;
+        let start = std::time::Instant::now();
+        for router_values in routers {
+            let router = Owned::f32(&[rows, experts], router_values);
+            let mut output = Owned::zeros_f32(&[rows, hidden]);
+            kernel
+                .execute(
+                    &[
+                        x.view(),
+                        router.view(),
+                        mapped_tensor_view(
+                            &store,
+                            &fc1_packed_ref,
+                            &fc1_packed_shape,
+                            &fc1_packed_strides,
+                            DataType::Uint8,
+                        ),
+                        mapped_tensor_view(
+                            &store,
+                            &fc1_scales_ref,
+                            &fc1_scale_shape,
+                            &fc1_scale_strides,
+                            DataType::Float32,
+                        ),
+                        TensorView::absent(DataType::Float32),
+                        mapped_tensor_view(
+                            &store,
+                            &fc2_packed_ref,
+                            &fc2_packed_shape,
+                            &fc2_packed_strides,
+                            DataType::Uint8,
+                        ),
+                        mapped_tensor_view(
+                            &store,
+                            &fc2_scales_ref,
+                            &fc2_scale_shape,
+                            &fc2_scale_strides,
+                            DataType::Float32,
+                        ),
+                    ],
+                    &mut [output.view_mut()],
+                )
+                .expect("run mmap QMoE");
+            final_output = Some(output.to_f32());
+        }
+        let elapsed = start.elapsed();
+        let stats = crate::weight_offload_stats();
+        drop(store);
+        std::fs::remove_file(path).expect("remove external weights");
+        (
+            final_output.expect("at least one execution"),
+            stats,
+            elapsed,
+        )
+    }
+
+    fn bench_routers(experts: usize, rows: usize, steps: usize, seed: u64) -> Vec<Vec<f32>> {
+        (0..steps)
+            .map(|step| pseudo_random_values(rows * experts, seed.wrapping_add(step as u64 * 97)))
+            .collect()
+    }
+
+    #[test]
+    fn prefetch_pipeline_is_byte_and_stat_identical_to_serial() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        const EXPERTS: usize = 8;
+        const HIDDEN: usize = 64;
+        const INTER: usize = 128;
+        const ROWS: usize = 6;
+        let routers = bench_routers(EXPERTS, ROWS, 6, 0xbead_1111);
+        let budget: u64 = (3 * (INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+        let (serial_out, serial_stats, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 2, budget, &routers, false,
+        );
+        let (pipe_out, pipe_stats, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 2, budget, &routers, true,
+        );
+        assert_eq!(serial_out, pipe_out, "prefetch must be byte-identical");
+        assert_eq!(serial_stats.host_cache_hits, pipe_stats.host_cache_hits);
+        assert_eq!(serial_stats.host_cache_misses, pipe_stats.host_cache_misses);
+        assert_eq!(
+            serial_stats.host_cache_evictions,
+            pipe_stats.host_cache_evictions
+        );
+        assert_eq!(
+            serial_stats.bytes_read_from_mmap,
+            pipe_stats.bytes_read_from_mmap
+        );
+        assert!(
+            serial_stats.host_cache_misses > 0 && serial_stats.host_cache_evictions > 0,
+            "workload must force real admission and eviction (misses={}, evictions={})",
+            serial_stats.host_cache_misses,
+            serial_stats.host_cache_evictions
+        );
+    }
+
+    #[test]
+    fn prefetch_pipeline_survives_cache_smaller_than_working_set() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        const EXPERTS: usize = 6;
+        const HIDDEN: usize = 32;
+        const INTER: usize = 64;
+        const ROWS: usize = 6;
+        // Budget for a single expert forces eviction whenever >1 expert is hot.
+        let one_expert: u64 = ((INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+        let routers = bench_routers(EXPERTS, ROWS, 8, 0xfeed_2222);
+        let (serial_out, _, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 3, one_expert, &routers, false,
+        );
+        let (pipe_out, stats, _) = run_route_first_bench(
+            EXPERTS, HIDDEN, INTER, 4, 16, ROWS, 3, one_expert, &routers, true,
+        );
+        assert_eq!(serial_out, pipe_out);
+        assert!(stats.owned_host_cache_bytes <= one_expert);
+        assert!(stats.peak_owned_host_cache_bytes <= one_expert);
+    }
+
+    /// A/B micro-benchmark. Ignored by default (timing-sensitive); run with:
+    /// `cargo test -p onnx-runtime-ep-cpu prefetch_ab_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark; run explicitly with --ignored --nocapture"]
+    fn prefetch_ab_benchmark() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        const EXPERTS: usize = 16;
+        const HIDDEN: usize = 256;
+        const INTER: usize = 512;
+        const ROWS: usize = 8;
+        const STEPS: usize = 64;
+        const K: usize = 4;
+        let routers = bench_routers(EXPERTS, ROWS, STEPS, 0x5eed_c0de);
+        // Budget ~4 experts: forces admission + eviction, hit-rate < 100%.
+        let budget: u64 = (4 * (INTER * HIDDEN + HIDDEN * INTER) * 4) as u64;
+
+        // Warm both configurations once (JIT of page faults) then time.
+        let mut serial = None;
+        let mut pipe = None;
+        for _ in 0..3 {
+            serial = Some(run_route_first_bench(
+                EXPERTS, HIDDEN, INTER, 4, 32, ROWS, K, budget, &routers, false,
+            ));
+            pipe = Some(run_route_first_bench(
+                EXPERTS, HIDDEN, INTER, 4, 32, ROWS, K, budget, &routers, true,
+            ));
+        }
+        let (serial_out, serial_stats, serial_elapsed) = serial.unwrap();
+        let (pipe_out, pipe_stats, pipe_elapsed) = pipe.unwrap();
+        assert_eq!(serial_out, pipe_out, "A/B outputs must be byte-identical");
+
+        let tokens = (ROWS * STEPS) as f64;
+        let serial_tps = tokens / serial_elapsed.as_secs_f64();
+        let pipe_tps = tokens / pipe_elapsed.as_secs_f64();
+        let hit_rate = |s: &WeightOffloadStats| {
+            let total = s.host_cache_hits + s.host_cache_misses;
+            if total == 0 {
+                0.0
+            } else {
+                s.host_cache_hits as f64 / total as f64
+            }
+        };
+        println!(
+            "=== route-first QMoE prefetch A/B (experts={EXPERTS} hidden={HIDDEN} inter={INTER} rows={ROWS} steps={STEPS} k={K}) ==="
+        );
+        println!(
+            "BEFORE (serial):    {:>8.1} tok/s | {:>7.2} ms | hits={} misses={} evictions={} hit-rate={:.1}%",
+            serial_tps,
+            serial_elapsed.as_secs_f64() * 1e3,
+            serial_stats.host_cache_hits,
+            serial_stats.host_cache_misses,
+            serial_stats.host_cache_evictions,
+            hit_rate(&serial_stats) * 100.0
+        );
+        println!(
+            "AFTER  (prefetch):  {:>8.1} tok/s | {:>7.2} ms | hits={} misses={} evictions={} hit-rate={:.1}%",
+            pipe_tps,
+            pipe_elapsed.as_secs_f64() * 1e3,
+            pipe_stats.host_cache_hits,
+            pipe_stats.host_cache_misses,
+            pipe_stats.host_cache_evictions,
+            hit_rate(&pipe_stats) * 100.0
+        );
+        println!(
+            "speedup: {:.2}x ({:+.1}%)",
+            pipe_tps / serial_tps,
+            (pipe_tps / serial_tps - 1.0) * 100.0
+        );
     }
 
     fn pseudo_random_values(len: usize, seed: u64) -> Vec<f32> {
