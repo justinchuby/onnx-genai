@@ -1959,6 +1959,113 @@ mod tests {
         assert!(y.iter().all(|value| value.is_finite()));
     }
 
+    /// Accelerate vs scalar parity at Whisper's encoder shape: 6 heads attend
+    /// over 1500 frames with head_size=64. This exercises the threaded GEMM
+    /// path at a scale far beyond LLM decode (M=1) or prefill (M~40).
+    /// The Accelerate path parallelizes across (batch, head) tiles via Rayon,
+    /// which alters accumulation order. We verify determinism across runs and
+    /// check tolerance against the f64 reference.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        not(feature = "mlas"),
+        target_arch = "aarch64"
+    ))]
+    #[test]
+    fn sdpa_accelerate_vs_scalar_parity_matrix() {
+        use std::sync::atomic::Ordering;
+
+        let (batch, num_heads, num_kv_heads, q_seq, kv_seq, dh, dv) = (
+            1usize, 6usize, 6usize, 1500usize, 1500usize, 64usize, 64usize,
+        );
+        let q = deterministic_values(batch * num_heads * q_seq * dh, 0x1500_A1CE, 0.5);
+        let k = deterministic_values(batch * num_kv_heads * kv_seq * dh, 0x1500_B0B0, 0.5);
+        let v = deterministic_values(batch * num_kv_heads * kv_seq * dv, 0x1500_CAFE, 0.75);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads,
+            num_kv_heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dv,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+
+        // Verify the Accelerate path is reached.
+        let before = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
+        let mut accelerate_out = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut accelerate_out, None);
+        let after = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "sdpa_f32 did not reach the Accelerate path for Whisper shape"
+        );
+
+        // Determinism: run again and confirm bit-exact (no thread-ordering drift).
+        let mut accelerate_out2 = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut accelerate_out2, None);
+        assert_eq!(
+            accelerate_out
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            accelerate_out2
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            "Accelerate SDPA is non-deterministic across runs at Whisper shape"
+        );
+
+        // Tolerance vs f64 reference — the Accelerate path uses GEMM (different
+        // accumulation order from sequential scalar), so we compare against the
+        // f64 oracle rather than insisting on scalar agreement.
+        let f64_ref = sdpa_f64_reference(&tensors, &cfg, &NoBias, &NoMask);
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (&got, &expected) in accelerate_out.iter().zip(f64_ref.iter()) {
+            assert!(got.is_finite(), "Accelerate produced non-finite output");
+            let abs_err = (got - expected).abs();
+            max_abs = max_abs.max(abs_err);
+            max_rel = max_rel.max(abs_err / expected.abs().max(1e-6));
+        }
+        // At 1500x1500 with 64-dim heads, accumulation differences are larger
+        // than decode shapes. The bounds catch real defects (dropped tiles,
+        // transposed operands, wrong softmax normalization) while accommodating
+        // GEMM vs sequential accumulation order differences. The relative bound
+        // is loose because near-zero output values (where softmax concentrates
+        // probability elsewhere) inflate the metric.
+        assert!(
+            max_abs <= 2e-3,
+            "Accelerate vs f64 max_abs={max_abs:e} (Whisper 1500-frame shape)"
+        );
+        assert!(
+            max_rel <= 5e-2,
+            "Accelerate vs f64 max_rel={max_rel:e} (Whisper 1500-frame shape)"
+        );
+
+        // Also verify against scalar reference with a looser tolerance (both are
+        // valid float orderings, but neither is authoritative over the other).
+        let mut scalar_out = vec![f32::NAN; batch * num_heads * q_seq * dv];
+        sdpa_f32_scalar(&tensors, &cfg, &NoBias, &NoMask, &mut scalar_out, None);
+        let mut max_scalar_abs = 0.0f32;
+        for (&accel, &scalar) in accelerate_out.iter().zip(scalar_out.iter()) {
+            max_scalar_abs = max_scalar_abs.max((accel - scalar).abs());
+        }
+        assert!(
+            max_scalar_abs <= 5e-3,
+            "Accelerate vs scalar max_abs={max_scalar_abs:e} (Whisper 1500-frame shape)"
+        );
+    }
+
     /// Deterministic pseudo-random f32 fill in `[-1, 1)` for parity fixtures.
     #[cfg(feature = "mlas")]
     fn fill(n: usize, seed: u64) -> Vec<f32> {

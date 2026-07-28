@@ -1482,6 +1482,117 @@ mod tests {
         );
     }
 
+    // ─── Rank-3 (1D) Conv parity tests ─────────────────────────────────
+    // The rank-3→rank-4 promotion is brand-new surface; a dimension-indexing
+    // bug there yields plausible output, not a crash.
+
+    fn parity_check_1d(
+        x_shape: &[usize],
+        w_shape: &[usize],
+        group: usize,
+        strides: &[usize],
+        dilations: &[usize],
+        pads: &[usize],
+    ) {
+        assert_eq!(x_shape.len(), 3);
+        assert_eq!(w_shape.len(), 3);
+        let x_count: usize = x_shape.iter().product();
+        let w_count: usize = w_shape.iter().product();
+        let x: Vec<f32> = (0..x_count)
+            .map(|i| ((i.wrapping_mul(37) % 257) as f32 - 128.0) / 128.0)
+            .collect();
+        let w: Vec<f32> = (0..w_count)
+            .map(|i| ((i.wrapping_mul(53) % 131) as f32 - 65.0) / 65.0)
+            .collect();
+        let bias: Vec<f32> = (0..w_shape[0])
+            .map(|i| (i as f32 - w_shape[0] as f32 / 2.0) * 0.1)
+            .collect();
+        let effective = dilations[0] * (w_shape[2] - 1) + 1;
+        let padded = x_shape[2] + pads[0] + pads[1];
+        let out_w = if padded >= effective {
+            (padded - effective) / strides[0] + 1
+        } else {
+            0
+        };
+        let output_shape = vec![x_shape[0], w_shape[0], out_w];
+        let reference = super::scalar_ref_execute(
+            &x,
+            &w,
+            Some(&bias),
+            x_shape,
+            w_shape,
+            &output_shape,
+            group,
+            strides,
+            dilations,
+            pads,
+            false,
+        );
+        let mut attrs: Vec<(&str, Attribute)> = vec![];
+        if group > 1 {
+            attrs.push(("group", Attribute::Int(group as i64)));
+        }
+        if strides.iter().any(|&s| s != 1) {
+            attrs.push((
+                "strides",
+                Attribute::Ints(strides.iter().map(|&s| s as i64).collect()),
+            ));
+        }
+        if dilations.iter().any(|&d| d != 1) {
+            attrs.push((
+                "dilations",
+                Attribute::Ints(dilations.iter().map(|&d| d as i64).collect()),
+            ));
+        }
+        if pads.iter().any(|&p| p != 0) {
+            attrs.push((
+                "pads",
+                Attribute::Ints(pads.iter().map(|&p| p as i64).collect()),
+            ));
+        }
+        let tiered = run(x_shape, &x, w_shape, &w, Some(&bias), &output_shape, &attrs);
+        assert_eq!(reference.len(), tiered.len());
+        let max_diff = reference
+            .iter()
+            .zip(tiered.iter())
+            .map(|(r, t)| (r - t).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "rank-3 parity: max_diff={max_diff} (x={x_shape:?}, w={w_shape:?}, group={group})"
+        );
+    }
+
+    #[test]
+    fn conv_parity_rank3_group1_stride1() {
+        // Whisper-style: 80 mel channels, kernel 3, stride 1
+        parity_check_1d(&[1, 80, 3000], &[512, 80, 3], 1, &[1], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_group1_stride2() {
+        // Whisper first conv: stride 2, pad 1
+        parity_check_1d(&[1, 80, 3000], &[512, 80, 3], 1, &[2], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_depthwise() {
+        // 1D depthwise: groups == in_channels
+        parity_check_1d(&[1, 32, 64], &[32, 1, 3], 32, &[1], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_grouped() {
+        // 1D grouped: groups=4, ic=16, oc=32
+        parity_check_1d(&[1, 16, 32], &[32, 4, 3], 4, &[1], &[1], &[1, 1]);
+    }
+
+    #[test]
+    fn conv_parity_rank3_dilated() {
+        // 1D dilated, no groups
+        parity_check_1d(&[1, 16, 64], &[32, 16, 3], 1, &[1], &[2], &[2, 2]);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn conv_parity_bnns_vs_scalar_ref() {
