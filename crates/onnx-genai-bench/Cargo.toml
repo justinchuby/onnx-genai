@@ -16,7 +16,6 @@ bench-native = [
     "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-ep-cuda",
     "dep:onnx-runtime-ir",
-    "dep:onnx-runtime-loader",
     "dep:onnx-runtime-session",
     "dep:onnx-runtime-tracer",
 ]
@@ -47,7 +46,8 @@ onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { workspace = true, optional = true }
 onnx-runtime-ir = { workspace = true, optional = true }
-onnx-runtime-loader = { workspace = true, optional = true }
+onnx-runtime-loader = { workspace = true }
+prost = { workspace = true }
 onnx-runtime-session = { workspace = true, optional = true }
 onnx-runtime-tracer = { workspace = true, optional = true }
 serde_json = { workspace = true }

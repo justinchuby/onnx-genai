@@ -10,6 +10,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
+use onnx_runtime_loader::proto;
+use prost::Message;
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 use tokio::{
@@ -333,11 +335,19 @@ struct DirectSummary {
 #[derive(Clone, Debug)]
 struct DirectRoofline {
     measured_bandwidth_gbps: f64,
-    model_weight_bytes: u64,
+    /// Bytes actually streamed from memory per decode token: total model weights
+    /// minus embedding tables (which are accessed via single-row Gather lookups,
+    /// not full matrix reads).
+    decode_weight_bytes: u64,
+    /// Total file-level bytes (model.onnx + model.onnx.data) for reference.
+    total_file_bytes: u64,
     ceiling_tokens_per_second: f64,
     threads: usize,
     bytes_per_thread: usize,
     repetitions: usize,
+    /// If the decode working set fits within the Apple SLC (system level cache),
+    /// a DRAM bandwidth ceiling is not the binding constraint.
+    cache_resident: bool,
 }
 
 #[tokio::main]
@@ -695,8 +705,8 @@ fn measure_direct_roofline(model_dir: &Path) -> Result<Option<DirectRoofline>> {
     if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
         return Ok(None);
     }
-    let model_weight_bytes = model_weight_bytes(model_dir)?;
-    if model_weight_bytes == 0 {
+    let (decode_bytes, total_file_bytes) = decode_weight_bytes(model_dir)?;
+    if decode_bytes == 0 {
         bail!(
             "cannot compute roofline fraction: no model weight bytes found under {}",
             model_dir.display()
@@ -713,18 +723,91 @@ fn measure_direct_roofline(model_dir: &Path) -> Result<Option<DirectRoofline>> {
     if !measured_bandwidth_gbps.is_finite() || measured_bandwidth_gbps <= 0.0 {
         bail!("measured invalid Apple-Silicon memory bandwidth: {measured_bandwidth_gbps}");
     }
+
+    // Detect whether the working set fits in the Apple SLC. The M1/M2/M3/M4
+    // family has a system-level cache of 16–48 MB depending on die variant.
+    // Query `hw.perflevel0.l2cachesize` (per-cluster L2) and multiply by the
+    // number of P-clusters as a conservative SLC proxy; true SLC size is not
+    // published via sysctl but is ≥ the sum of P-cluster L2 caches.
+    let slc_bytes = estimate_apple_slc_bytes();
+    let cache_resident = decode_bytes < slc_bytes as u64;
+
     Ok(Some(DirectRoofline {
         measured_bandwidth_gbps,
-        model_weight_bytes,
-        ceiling_tokens_per_second: measured_bandwidth_gbps * 1_000_000_000.0
-            / model_weight_bytes as f64,
+        decode_weight_bytes: decode_bytes,
+        total_file_bytes,
+        ceiling_tokens_per_second: measured_bandwidth_gbps * 1_000_000_000.0 / decode_bytes as f64,
         threads,
         bytes_per_thread,
         repetitions,
+        cache_resident,
     }))
 }
 
-fn model_weight_bytes(model_dir: &Path) -> Result<u64> {
+/// Estimate the Apple Silicon system-level cache capacity in bytes.
+/// Uses the performance-cluster L2 size as a conservative lower bound.
+fn estimate_apple_slc_bytes() -> usize {
+    // hw.perflevel0.l2cachesize gives the P-cluster L2 size (e.g., 12 MiB on
+    // M1 Pro/Max, 16 MiB on M2/M3). The actual SLC is larger (32–48 MiB on Max
+    // variants) but there is no public sysctl. Using L2 is conservative.
+    let l2 = sysctl_usize("hw.perflevel0.l2cachesize").unwrap_or(16 * 1024 * 1024);
+    // On Max/Ultra, the SLC is roughly 4× the P-cluster L2. On base/Pro it's
+    // roughly 2×. Use 2× as the conservative multiplier.
+    l2 * 2
+}
+
+/// Compute bytes actually streamed from main memory during a single decode
+/// token. This excludes embedding/positional tables accessed via Gather (which
+/// read only a single row per token, not the full matrix).
+///
+/// Returns `(decode_bytes, total_file_bytes)`.
+fn decode_weight_bytes(model_dir: &Path) -> Result<(u64, u64)> {
+    let model_onnx_path = model_dir.join("model.onnx");
+    let total_file_bytes = total_model_file_bytes(model_dir)?;
+
+    // Parse just the protobuf graph (no external data loaded)
+    let model_bytes = fs::read(&model_onnx_path)
+        .with_context(|| format!("read {}", model_onnx_path.display()))?;
+    let model_proto = proto::onnx::ModelProto::decode(model_bytes.as_slice())
+        .with_context(|| "parse model.onnx protobuf")?;
+
+    let graph = model_proto
+        .graph
+        .as_ref()
+        .with_context(|| "model.onnx has no graph")?;
+
+    // Identify initializer names consumed by Gather nodes (embedding lookups).
+    let mut gather_data_inputs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for node in &graph.node {
+        if node.op_type == "Gather" && !node.input.is_empty() {
+            gather_data_inputs.insert(&node.input[0]);
+        }
+    }
+
+    // Sum initializer bytes, treating Gather-accessed tensors as 1-row lookups.
+    let mut decode_bytes: u64 = 0;
+    for init in &graph.initializer {
+        let tensor_bytes = initializer_byte_size(init);
+        if gather_data_inputs.contains(init.name.as_str()) {
+            // During decode, a Gather reads exactly one row.
+            let row_bytes = if init.dims.len() >= 2 {
+                let last_dim = *init.dims.last().unwrap() as u64;
+                last_dim * elem_byte_size(init.data_type)
+            } else {
+                // Scalar or 1-D: accessed in full
+                tensor_bytes
+            };
+            decode_bytes += row_bytes;
+        } else {
+            decode_bytes += tensor_bytes;
+        }
+    }
+
+    Ok((decode_bytes, total_file_bytes))
+}
+
+/// Total bytes of model.onnx + model.onnx.data* (the previous file-level sum).
+fn total_model_file_bytes(model_dir: &Path) -> Result<u64> {
     let mut bytes = 0_u64;
     for entry in fs::read_dir(model_dir).with_context(|| format!("read {}", model_dir.display()))? {
         let entry = entry?;
@@ -738,6 +821,55 @@ fn model_weight_bytes(model_dir: &Path) -> Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+/// Byte size of an ONNX TensorProto initializer, using external_data length if
+/// present, otherwise computing from dims × element size.
+fn initializer_byte_size(tensor: &proto::onnx::TensorProto) -> u64 {
+    // Check external_data for an explicit length field
+    for entry in &tensor.external_data {
+        if entry.key == "length" {
+            if let Ok(len) = entry.value.parse::<u64>() {
+                return len;
+            }
+        }
+    }
+    // Fallback: compute from dims × element size
+    if tensor.dims.is_empty() {
+        return tensor.raw_data.len() as u64;
+    }
+    let num_elements: u64 = tensor.dims.iter().map(|&d| d as u64).product();
+    num_elements * elem_byte_size(tensor.data_type)
+}
+
+/// Byte size per element for an ONNX data type.
+fn elem_byte_size(data_type: i32) -> u64 {
+    // https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3#L484
+    match data_type {
+        1 => 4,   // FLOAT
+        2 => 1,   // UINT8
+        3 => 1,   // INT8
+        4 => 2,   // UINT16
+        5 => 2,   // INT16
+        6 => 4,   // INT32
+        7 => 8,   // INT64
+        8 => 0,   // STRING (not applicable for weights)
+        9 => 1,   // BOOL
+        10 => 2,  // FLOAT16
+        11 => 8,  // DOUBLE
+        12 => 4,  // UINT32
+        13 => 8,  // UINT64
+        14 => 8,  // COMPLEX64
+        15 => 16, // COMPLEX128
+        16 => 2,  // BFLOAT16
+        17 => 1,  // FLOAT8E4M3FN
+        18 => 1,  // FLOAT8E4M3FNUZ
+        19 => 1,  // FLOAT8E5M2
+        20 => 1,  // FLOAT8E5M2FNUZ
+        21 => 4,  // UINT4 (packed, but 4 bits → round up)
+        22 => 4,  // INT4 (packed)
+        _ => 4,   // Unknown, assume 4
+    }
 }
 
 fn sysctl_usize(name: &str) -> Option<usize> {
@@ -904,14 +1036,30 @@ fn render_direct_report(
         );
         metadata_row(
             &mut report,
-            "model weight bytes",
-            roofline.model_weight_bytes.to_string(),
+            "decode weight bytes",
+            format!(
+                "{} (of {} total file bytes; excludes embedding tables accessed via Gather)",
+                roofline.decode_weight_bytes, roofline.total_file_bytes
+            ),
         );
-        metadata_row(
-            &mut report,
-            "decode roofline ceiling",
-            format!("{:.2} tok/s", roofline.ceiling_tokens_per_second),
-        );
+        if roofline.cache_resident {
+            metadata_row(
+                &mut report,
+                "decode roofline ceiling",
+                format!(
+                    "{:.2} tok/s ⚠️ NOT BINDING — working set ({:.1} MiB) fits in SLC; \
+                     actual throughput may exceed this DRAM-derived bound",
+                    roofline.ceiling_tokens_per_second,
+                    roofline.decode_weight_bytes as f64 / (1024.0 * 1024.0)
+                ),
+            );
+        } else {
+            metadata_row(
+                &mut report,
+                "decode roofline ceiling",
+                format!("{:.2} tok/s", roofline.ceiling_tokens_per_second),
+            );
+        }
     } else {
         metadata_row(
             &mut report,
@@ -925,14 +1073,19 @@ fn render_direct_report(
     for summary in summaries {
         let roofline_cell = roofline
             .map(|roofline| {
-                percent_spread_cell(
+                let cell = percent_spread_cell(
                     distribution_scale(
                         summary.decode_tokens_per_second,
-                        roofline.model_weight_bytes as f64
+                        roofline.decode_weight_bytes as f64
                             / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
                     ),
                     2,
-                )
+                );
+                if roofline.cache_resident {
+                    format!("{cell} ⚠️")
+                } else {
+                    cell
+                }
             })
             .unwrap_or_else(|| "N/A".to_string());
         report.push_str(&format!(
@@ -947,6 +1100,24 @@ fn render_direct_report(
             spread_cell(summary.total_ms, 1),
             spread_cell(summary.generated_tokens, 0),
         ));
+    }
+    // Emit a warning if any backend exceeds the roofline ceiling — this indicates
+    // the bandwidth probe is not representative (e.g., depressed by host load while
+    // the model benefits from temporal cache locality between tokens).
+    if let Some(roofline) = roofline {
+        let any_exceeds = summaries.iter().any(|s| {
+            let seconds_per_token = roofline.decode_weight_bytes as f64
+                / (roofline.measured_bandwidth_gbps * 1_000_000_000.0);
+            s.decode_tokens_per_second.median * seconds_per_token > 1.0
+        });
+        if any_exceeds && !roofline.cache_resident {
+            report.push_str(
+                "\n> ⚠️ One or more backends exceed the roofline ceiling. This typically \
+                 means the bandwidth probe was depressed by host load while the model \
+                 benefited from inter-token temporal locality in cache. Re-run on a quiet \
+                 host for an accurate ceiling.\n",
+            );
+        }
     }
     if let Some(ratios) = direct_ratios(summaries) {
         report.push('\n');
@@ -1040,8 +1211,10 @@ fn direct_json_report(
 fn direct_roofline_json(roofline: &DirectRoofline) -> Value {
     json!({
         "measured_bandwidth_gbps": roofline.measured_bandwidth_gbps,
-        "model_weight_bytes": roofline.model_weight_bytes,
+        "decode_weight_bytes": roofline.decode_weight_bytes,
+        "total_file_bytes": roofline.total_file_bytes,
         "ceiling_tokens_per_second": roofline.ceiling_tokens_per_second,
+        "cache_resident": roofline.cache_resident,
         "threads": roofline.threads,
         "bytes_per_thread": roofline.bytes_per_thread,
         "repetitions": roofline.repetitions,
@@ -1057,7 +1230,7 @@ fn direct_summary_json(summary: &DirectSummary, roofline: Option<&DirectRoofline
         "decode_tokens_per_second": distribution_json(summary.decode_tokens_per_second),
         "decode_roofline_fraction": roofline.map(|roofline| distribution_json(distribution_scale(
             summary.decode_tokens_per_second,
-            roofline.model_weight_bytes as f64 / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
+            roofline.decode_weight_bytes as f64 / (roofline.measured_bandwidth_gbps * 1_000_000_000.0),
         ))),
         "end_to_end_tokens_per_second": distribution_json(summary.end_to_end_tokens_per_second),
         "total_ms": distribution_json(summary.total_ms),

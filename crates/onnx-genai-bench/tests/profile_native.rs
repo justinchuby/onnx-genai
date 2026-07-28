@@ -7,8 +7,13 @@ use std::{path::PathBuf, process::Command};
 // Campaign achieved ~33.6 tok/s (mean) on the M1 Max measurement rig.
 // Under heavy host load, the median of 5 runs drops to ~20 tok/s.
 // The pre-campaign baseline was 3.83 tok/s.
+//
+// Roofline fraction is computed against decode-relevant weight bytes (excluding
+// embedding tables accessed via Gather lookups). This raises the ceiling ~39%
+// versus the prior file-size-based accounting, proportionally lowering fractions.
+// Strictness-preserving derivation: 0.35 × (1/1.3865) = 0.2524 → rounded to 0.25.
 const NATIVE_CPU_DECODE_FLOOR_TOK_PER_S: f64 = 18.0;
-const NATIVE_CPU_DECODE_FLOOR_ROOFLINE_FRACTION: f64 = 0.35;
+const NATIVE_CPU_DECODE_FLOOR_ROOFLINE_FRACTION: f64 = 0.25;
 
 // ── FP16 floors (`models/qwen2.5-0.5b-f16`) ──────────────────────────────────
 //
@@ -16,11 +21,16 @@ const NATIVE_CPU_DECODE_FLOOR_ROOFLINE_FRACTION: f64 = 0.35;
 // [59.24, 60.67]. Under heavy load the 5-run median drops to ~35 tok/s.
 // The half_gemm regression dropped it to 13.37 tok/s.
 //
+// Roofline fraction is computed against decode-relevant weight bytes (excluding
+// embedding tables accessed via Gather lookups). This raises the ceiling ~39%
+// versus the prior file-size-based accounting, proportionally lowering fractions.
+// Strictness-preserving derivation: 0.25 × (1/1.3889) = 0.1800 → kept at 0.18.
+//
 // The absolute floor protects against catastrophic regressions; the dispatch
 // test (fp16_m1_decode_reaches_neon_gemv_not_half_gemm in matmul.rs) is the
 // sharper guard for the specific GEMV bypass pattern.
 const NATIVE_CPU_DECODE_FLOOR_F16_TOK_PER_S: f64 = 28.0;
-const NATIVE_CPU_DECODE_FLOOR_F16_ROOFLINE_FRACTION: f64 = 0.25;
+const NATIVE_CPU_DECODE_FLOOR_F16_ROOFLINE_FRACTION: f64 = 0.18;
 
 fn sysctl_value(name: &str) -> Option<String> {
     let output = Command::new("sysctl").args(["-n", name]).output().ok()?;

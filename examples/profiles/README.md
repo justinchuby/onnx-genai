@@ -91,6 +91,25 @@ fraction, so a lower-bandwidth M1 Air result remains interpretable instead of
 being compared directly to this M1 Max. Keep the machine idle and cool between
 final runs.
 
+### Roofline ceiling semantics
+
+The decode roofline ceiling represents the maximum decode throughput achievable
+if the only bottleneck is streaming model weights from DRAM at the measured
+bandwidth. The denominator is **decode weight bytes**: the subset of model
+weights that are fully read during each decode step. This specifically excludes
+embedding tables (token embeddings, positional embeddings, rotary caches)
+accessed via Gather lookups, which read only a single row per token rather than
+the full matrix.
+
+For the FP32 `qwen2.5-0.5b` model, decode weight bytes are ~1.43 GiB of the
+~1.98 GiB total (the 544 MiB token embedding table is excluded). A roofline
+fraction of e.g. 45% means the backend achieves 45% of the theoretical maximum
+set by DRAM bandwidth alone.
+
+If the reported ceiling is exceeded (fraction > 100%), this indicates either
+(a) the bandwidth measurement was taken under host load and is pessimistic, or
+(b) the working set fits partially in cache. The tool warns in both cases.
+
 ## What the samples show
 
 ```
