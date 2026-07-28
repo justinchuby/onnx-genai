@@ -11087,3 +11087,34 @@ Decision archive hard gate checked at 2026-07-28T10:04:25+0000: active ledger wa
 **Verification:** Format, warnings-denied Clippy, and all 229 shape-inference tests passed; an STFT frame-count mutation probe failed as expected. Sequence/Optional/Map container operators remain deferred pending an SSA `Value`/`TypeInfo` container type-model change. #75 remains open for later batches.
 
 <!-- sources: decisions/inbox/jones-67-cuda-batch8.md; decisions/inbox/branson-75-shape-inference-b3.md; wave-8 manifest -->
+
+<!-- scribe-archive-2026-07-28T11-20-06+0000-wave9 -->
+Decision archive hard gate checked at 2026-07-28T11:20:06+0000: active ledger was 879192 bytes and exceeded 51200 bytes. Applied the seven-day policy (dated sections before 2026-07-21); no eligible dated decision sections remained, so archived 0 entries and created no archive file.
+
+<!-- scribe-merge-2026-07-28T11-20-06+0000-wave9 -->
+## 2026-07-28 — Wave 9 minimal-build, CUDA, and shape-inference reconciliation
+
+### Issue #73 — NCHWc minimal-build configuration (PR #344, `9ae360f0`)
+**By:** Lambert; reviewed by Parker (**APPROVE**).
+
+**What:** `NchwcLayoutPropagation` is now gated on both `mlas` and `ops-cnn`, rather than `mlas` alone.
+
+**Why:** NCHWc layout propagation depends on NCHWc/Conv kernels in the CNN operator group. An MLAS-only build previously failed with E0433 and advertised a transformation whose supporting kernels were absent. Parker reproduced the old failure and confirmed the regression guard catches it.
+
+### Issue #67 — CUDA operator coverage batch 9 (PR #348, `bd89c97d`)
+**By:** Kane; reviewed by Brett (**APPROVE**).
+
+**What:** Added CUDA coverage for `QuantizeLinear`, `DequantizeLinear`, `Dropout`, and `NonZero`, increasing `CUDA_COVERED_OPS` from 140 to 144.
+
+**Why:** The implementations preserve constrained executable semantics: per-tensor quantization rejects non-scalar parameters as unsupported, round-half-even behavior is retained, inference `Dropout` is identity, and `NonZero` returns int64 `[rank, NNZ]` coordinates in row-major order. Brett verified a quantization-pair mutation probe and GPU5 conformance (199/199).
+
+### Issue #75 — Shape-inference catalog batch 4 and strict-lockout revision (PR #346, `f53ed934`; revision `c20ec211`)
+**By:** Bryant (original implementation); Rachael (independent revision after lockout); reviewed by Holden (**REQUEST-CHANGES → APPROVE**).
+
+**What:** Batch 4 added shape rules for `ArrayFeatureExtractor`, `Binarizer`, `CategoryMapper`, `Imputer`, `LabelEncoder`, `Normalizer`, `Scaler`, `StringNormalizer`, and `TfIdfVectorizer`, advancing the registry from 196/236 to 205 operators/247 versioned entries.
+
+**Correction and process:** Holden rejected Bryant's initial revision for two correctness defects: `StringNormalizer` and `TfIdfVectorizer` were wrongly registered under `ai.onnx.ml` instead of the default `ai.onnx` domain, and `LabelEncoder-1` inferred dtype from `classes_strings` rather than the active `default_*` attribute. Under strict reviewer lockout, Bryant did not revise the change. Rachael independently fixed the default-domain registrations (StringNormalizer since v10; TfIdfVectorizer since v9) and made `LabelEncoder-1` mirror `CategoryMapper`'s `default_int64`/`default_string` dtype selection. Holden re-reviewed and approved. This is a successful strict-lockout cycle: reject, independent ownership transfer, correction, and re-approval.
+
+**Deferred:** `ZipMap` and other container-valued operators remain blocked by the tensor-only `TypeInfo` model.
+
+<!-- sources: decisions/inbox/lambert-nchwc-cfg.md; decisions/inbox/kane-67-b9.md; decisions/inbox/bryant-75-b4.md; decisions/inbox/rachael-75-b4-fix.md; wave-9 manifest -->

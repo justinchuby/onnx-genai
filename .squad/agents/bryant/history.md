@@ -85,3 +85,6 @@ WP-B landed: Bryant approved WP-B3 v3 after raw-shape authority, loader-unchange
 
 ## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - Reviewed PR #311, requested changes, then re-approved Daniels' BF16 CUDA fix; #67 advanced to next batch.
+## 2026-07-28T11:20:06+0000 — #75 batch 4 lockout outcome
+- Authored PR #346 (`f53ed934`) adding the batch-4 catalog, advancing shape inference to 205 operators / 247 versioned entries.
+- Holden requested changes for two domain/dtype correctness defects. Strict reviewer lockout transferred revision ownership to Rachael; her independent `c20ec211` correction was re-approved by Holden.

@@ -13,3 +13,7 @@
 
 ## 2026-07-28T05-49-08+0000 — Wave 3 update
 Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-resolving canonicalize_confined confinement. Nine adversarial tests were mutation-proven; manifest-only packages can no longer escape package root.
+
+## 2026-07-28T11:20:06+0000 — #75 strict-lockout review cycle
+- Requested changes on PR #346 for incorrect default-domain registration and LabelEncoder-1 dtype selection.
+- Re-approved after Rachael, not the locked-out original author Bryant, independently corrected both defects in `c20ec211`.

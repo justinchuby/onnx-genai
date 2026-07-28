@@ -130,3 +130,6 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 
 ## 2026-07-27T02:00:00Z — Roadmap wave update
 - Fixed PR #300 / #76 after author lockout: capability projection now rejects non-convex merges with deterministic union-find + Kahn check; merged after Leon approval.
+## 2026-07-28T11:20:06+0000 — Independent #75 lockout revision
+- Took ownership of PR #346's revision after Holden requested changes and Bryant was locked out.
+- `c20ec211` corrected StringNormalizer/TfIdfVectorizer default-domain registration and LabelEncoder-1 default-attribute dtype selection; Holden re-approved.
