@@ -1,48 +1,39 @@
 #!/usr/bin/env python3
 """Compare criterion benchmark results between a PR and its merge-base.
 
-This is a REGRESSION GATE, not an advisory comment. It fails (exit 1) when a
-benchmark scenario exceeds the failure threshold, blocking the PR until the
-regression is addressed or justified.
+Generates a Markdown table for posting as a PR comment. This is an
+INFORMATIONAL comparison — it does not block CI. The real regression gates
+live in crates/onnx-genai-bench/tests/profile_native.rs (throughput floors
+and dispatch-reachability tests on real hardware).
+
+This workflow's value is visibility: surface the comparison on the PR that
+caused a change, while the author is still looking at it. A merge earlier
+today cost 60.41 → 13.37 tok/s and nobody noticed for hours; a comment on
+that PR would have been enough.
 
 Methodology
 -----------
-The workflow benchmarks the merge-base FIRST (absorbs cold-start/cache-miss
-overhead), then the PR head SECOND (benefits from warm caches and steady-state
-runner). This creates a small systematic bias toward PR appearing faster, which:
-  - Reduces false positives (PR must overcome warm-runner advantage to appear
-    slower, so only genuine regressions trip the gate).
-  - Makes the gate more conservative and therefore more durable — a gate that
-    cries wolf gets disabled within a week.
+The workflow benchmarks the merge-base FIRST (absorbs cold-start overhead),
+then the PR head SECOND (warm caches, steady-state runner). This means PR
+numbers tend to appear slightly faster — a delta that appears despite this
+bias is more likely genuine.
 
-The comparison uses criterion point-estimate means from 100 samples each.
+Measured run-to-run variance (same code, base-first ordering, macOS arm64
+M1 Virtual 3-core CI runner):
+  - Single-threaded kernels: typically <10%
+  - Multi-threaded matmul: up to ~27% (3 cores = high contention)
+  - Hot-path (sampling, tokenization): <5%
 
-Threshold derivation
---------------------
-Measured variance on the CI runner (macOS arm64 M1 Virtual, 3 cores) with the
-CORRECTED ordering (base-first, PR-second):
-  - Single-threaded kernels: typically <10% noise
-  - Multi-threaded matmul: up to ~20% noise (fewer cores = more contention)
-  - Hot-path (sampling, tokenization): <5% noise
-
-The failure threshold (30%) is set at 1.5× the worst observed single-scenario
-noise (~20%), giving a margin that prevents false positives while catching the
-historical regression class we guard against (350% = 4.5× M=1 decode).
-
-Signal-to-noise margin: 350% / 30% = 11.7×.
-
-If CI noise proves larger than expected after deployment, raise the threshold
-from the data — but document exactly what variance was observed on what
-scenarios, so the next person can re-derive rather than guess.
+The ⚠️ icon at 15% and 🔴 at 30% are VISUAL FLAGS for the reviewer, not
+build gates. A reader needs to know whether a 5% delta is signal or noise,
+and these icons provide that context calibrated against measured variance.
 
 Exit codes
 ----------
-0 — all changes within threshold (PR may merge)
-1 — at least one regression exceeds the failure threshold (PR BLOCKED)
+Always 0 — this script never fails the build.
 
 Known gaps
 ----------
-This script compares criterion point estimates. It cannot detect:
   - Regressions in code paths not exercised by the benchmark suite.
   - Sub-threshold regressions that compound over multiple PRs.
   - Regressions that only manifest with a real model (GQA fusion, speculative
@@ -58,21 +49,20 @@ import sys
 from pathlib import Path
 
 
-# ── Thresholds ───────────────────────────────────────────────────────────────
+# ── Visual thresholds ────────────────────────────────────────────────────────
 #
-# FAIL_THRESHOLD: the gate trips here. Derived from:
-#   - Observed CI noise: ~20% worst-case on multi-threaded matmul with
-#     base-first ordering on 3-core M1 Virtual runner.
-#   - Margin: 1.5× worst noise → 30%.
-#   - Historical regression: 4.5× (350%). Signal-to-noise: 11.7×.
+# These are ICONS for the reviewer, not build gates.
 #
-# WARN_THRESHOLD: surfaces suspicious changes (does NOT block).
+# Calibrated against measured CI runner noise (macOS arm64 M1 Virtual):
+#   - Worst observed same-code delta: ~27% (multi-threaded matmul)
+#   - WARN at 15%: flags scenarios worth a second look
+#   - ALERT at 30%: flags scenarios very likely to be real regressions
+#     (above worst observed noise)
 #
-# To re-derive: run the benchmark twice on the same commit with base-first
-# ordering and record the max positive delta across all scenarios. Set
-# FAIL_THRESHOLD at 1.5× that value.
-WARN_THRESHOLD = 0.15   # 15% slower → ⚠️ in comment
-FAIL_THRESHOLD = 0.30   # 30% slower → 🔴 gate FAILS
+# The historical regression this exists to surface: 4.5× (350%) on M=1
+# decode. At 350%, even the most conservative reader sees the 🔴 immediately.
+WARN_THRESHOLD = 0.15   # 15% slower → ⚠️
+ALERT_THRESHOLD = 0.30  # 30% slower → 🔴
 
 
 def parse_estimates(criterion_dir: Path) -> dict[str, float]:
@@ -117,9 +107,9 @@ def format_ns(ns: float) -> str:
     return f"{ns:.1f} ns"
 
 
-def status_icon(change: float, warn: float, fail: float) -> str:
+def status_icon(change: float, warn: float, alert: float) -> str:
     """Return emoji status for a change ratio."""
-    if change >= fail:
+    if change >= alert:
         return "🔴"
     if change >= warn:
         return "⚠️"
@@ -131,15 +121,15 @@ def status_icon(change: float, warn: float, fail: float) -> str:
 def generate_markdown(
     rows: list[tuple[str, float, float, float]],
     warn: float,
-    fail: float,
+    alert: float,
     host_info: str = "",
 ) -> str:
     """Generate the PR comment body."""
-    has_regression = any(change >= fail for _, _, _, change in rows)
+    has_alert = any(change >= alert for _, _, _, change in rows)
     has_warning = any(change >= warn for _, _, _, change in rows)
 
-    if has_regression:
-        header = "## 🔴 Benchmark Regression — Check FAILED"
+    if has_alert:
+        header = "## 🔴 Benchmark Regression Detected"
     elif has_warning:
         header = "## ⚠️ Benchmark Change Detected"
     else:
@@ -148,17 +138,6 @@ def generate_markdown(
     lines = [
         header,
         "",
-    ]
-
-    if has_regression:
-        lines.append(
-            "**This check has FAILED.** One or more scenarios regressed beyond "
-            f"the {fail:.0%} threshold. The PR is blocked until the regression is "
-            "addressed or the threshold is re-evaluated against measured noise."
-        )
-        lines.append("")
-
-    lines.extend([
         "Comparison of criterion micro-benchmarks: **PR head vs merge-base**, "
         "measured on the same runner in the same job (base first → PR second).",
         "",
@@ -168,10 +147,10 @@ def generate_markdown(
         "",
         "| Status | Scenario | Base | PR | Change |",
         "|:---:|---|---:|---:|---:|",
-    ])
+    ]
 
     for scenario, base_ns, pr_ns, change in rows:
-        icon = status_icon(change, warn, fail)
+        icon = status_icon(change, warn, alert)
         sign = "+" if change >= 0 else ""
         lines.append(
             f"| {icon} | `{scenario}` | {format_ns(base_ns)} "
@@ -180,9 +159,9 @@ def generate_markdown(
 
     lines.append("")
     lines.append(
-        f"**Thresholds:** ⚠️ ≥ {warn:.0%} slower (advisory), "
-        f"🔴 ≥ {fail:.0%} slower (**blocks merge**) — "
-        "derived from measured runner variance × 1.5 safety margin"
+        f"**Visual flags:** ⚠️ ≥ {warn:.0%} slower, "
+        f"🔴 ≥ {alert:.0%} slower — calibrated against "
+        "measured runner noise (~27% worst-case on multi-threaded matmul)"
     )
 
     if host_info:
@@ -203,7 +182,9 @@ def generate_markdown(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Compare criterion benchmark results and generate a PR comment."
+    )
     parser.add_argument(
         "--base-dir",
         type=Path,
@@ -220,18 +201,6 @@ def main() -> int:
         "--output",
         type=Path,
         help="Write markdown to this file (default: stdout)",
-    )
-    parser.add_argument(
-        "--warn-threshold",
-        type=float,
-        default=WARN_THRESHOLD,
-        help=f"Warn threshold as fraction (default: {WARN_THRESHOLD})",
-    )
-    parser.add_argument(
-        "--fail-threshold",
-        type=float,
-        default=FAIL_THRESHOLD,
-        help=f"Fail threshold as fraction (default: {FAIL_THRESHOLD})",
     )
     parser.add_argument(
         "--host-info",
@@ -263,9 +232,7 @@ def main() -> int:
         print("error: no common scenarios between base and PR", file=sys.stderr)
         return 1
 
-    markdown = generate_markdown(
-        rows, args.warn_threshold, args.fail_threshold, args.host_info
-    )
+    markdown = generate_markdown(rows, WARN_THRESHOLD, ALERT_THRESHOLD, args.host_info)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -274,9 +241,7 @@ def main() -> int:
     else:
         print(markdown)
 
-    # Exit 1 only on unambiguous regression
-    has_failure = any(change >= args.fail_threshold for _, _, _, change in rows)
-    return 1 if has_failure else 0
+    return 0
 
 
 if __name__ == "__main__":

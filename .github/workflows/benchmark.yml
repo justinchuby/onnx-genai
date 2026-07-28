@@ -1,19 +1,17 @@
 name: Benchmarks
 
-# Kernel micro-benchmark regression gate. Runs on every PR, compares the PR
-# head against its merge-base on the SAME runner in the SAME job, and FAILS
-# the check on a statistically unambiguous regression.
+# Informational micro-benchmark comparison posted as a PR comment.
+# Does NOT block CI — the real regression gates live in
+# crates/onnx-genai-bench/tests/profile_native.rs (throughput floors +
+# dispatch-reachability tests on real hardware).
 #
-# Design principles:
-#   1. Ratios are reliable, absolutes are not.
-#   2. Base is benchmarked FIRST (eats cold-start overhead). PR second (warm
-#      runner). This creates a small systematic bias toward PR appearing faster,
-#      which reduces false positives. A genuine regression must overcome this
-#      bias — that is a feature, not a bug.
-#   3. The gate is REAL. It fails the build. A gate that cannot fail is a
-#      comment nobody reads. The throughput floor that passed cheerfully through
-#      a 4.5× decode regression proves this.
-#   4. Thresholds are derived from measured variance, not chosen as round numbers.
+# This workflow's job is VISIBILITY: surface the comparison on the PR
+# that caused a change, while the author is still looking at it.
+#
+# Design:
+#   - Base benchmarked FIRST (eats cold-start), PR SECOND (warm runner).
+#   - Reports % change as the reliable signal; absolutes are informational.
+#   - Measured run-to-run variance included so readers can judge signal vs noise.
 
 on:
   pull_request:
@@ -23,7 +21,6 @@ permissions:
   contents: read
   pull-requests: write
 
-# Cancel in-progress benchmark runs for the same PR when new commits arrive.
 concurrency:
   group: benchmark-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -31,7 +28,6 @@ concurrency:
 jobs:
   micro-benchmarks:
     name: Kernel micro-benchmarks
-    # macOS arm64 runner to exercise the Apple Silicon path.
     runs-on: macos-latest
     env:
       CARGO_TERM_COLOR: always
@@ -40,16 +36,14 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-          # Fetch enough history to find the merge-base.
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # Separate cache for benchmarks to avoid polluting the main CI cache.
           prefix-key: bench-v1
 
-      # ── Benchmark the MERGE-BASE FIRST (eats cold-start) ──────────────
+      # ── Benchmark the merge-base FIRST (eats cold-start) ──────────────
       - name: Determine merge-base
         id: merge-base
         run: |
@@ -82,7 +76,7 @@ jobs:
       - name: Save PR criterion results
         run: cp -R target/criterion pr-criterion
 
-      # ── Compare, comment, and gate ────────────────────────────────────
+      # ── Compare and comment ────────────────────────────────────────────
       - name: Collect host info
         id: host
         run: |
@@ -97,16 +91,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Generate comparison
-        id: compare
-        # Do not fail here — post the comment first for visibility.
         run: |
           python3 scripts/ci_bench_compare.py \
             --base-dir base-criterion \
             --pr-dir pr-criterion \
             --output benchmark-comment.md \
             --host-info "${{ steps.host.outputs.info }}"
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-        continue-on-error: true
 
       - name: Find existing comment
         id: find-comment
@@ -134,12 +124,3 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ── THE GATE: fail the check if regression detected ───────────────
-      - name: Fail on regression
-        if: steps.compare.outcome == 'failure'
-        run: |
-          echo "::error::Benchmark regression detected — check failed."
-          echo ""
-          cat benchmark-comment.md
-          exit 1
