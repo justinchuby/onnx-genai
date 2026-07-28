@@ -239,13 +239,14 @@ impl DecodeState {
                     && state.io.state_pairs.is_empty()
                     && state.positions.is_none()
                 {
-                    state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new(
+                    state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new_with_io(
                         stable_session_ref(session),
                         DecodeSessionOptions {
                             batch_size: 1,
                             max_length: *max_len,
                             past_present_share_buffer: Some(*shared_buffer),
                         },
+                        io,
                     )?));
                 }
                 Ok(state)
