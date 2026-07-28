@@ -74,3 +74,14 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #293 Unique data-dependent-extent coverage and recorded durable dispatch coverage/reachability audit lessons.
+
+## 2026-07-28T00:35:00Z — Per-PR benchmark CI workflow (PR #306)
+
+- Implemented `.github/workflows/benchmark.yml`: separate benchmark workflow running kernel micro-benchmarks and hot-path benchmarks on every PR, posting a comparison comment.
+- Design: benchmarks both PR head and merge-base on the same runner/job; reports % change (reliable); absolute times informational only.
+- Workload: ep-cpu kernels (MatMul at M=1 decode + prefill shapes, Add, Gather, ReduceMean × f32/f16/bf16) + genai-bench no_model (tokenization, sampling, KV cache, logit processing, grammar).
+- Thresholds: ⚠️ ≥ 15%, 🔴 ≥ 50% — derived from measured run-to-run variance. Gives ≥7× signal-to-noise margin vs the 350% regression class.
+- Does NOT fail the build (comments only).
+- Guard-break proof: simulated 4.5× M=1 slowdown → script outputs 🔴 at +350%, exits code 1.
+- CI proof: workflow ran green (run 30318985993, 22m20s, macOS arm64 M1 Virtual).
+- Decision filed: `.squad/decisions/inbox/pris-benchmark-ci.md`.
