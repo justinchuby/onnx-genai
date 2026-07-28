@@ -240,3 +240,16 @@ minimum_tier = "tier1"
 counter = "CLIP_F32_FAST_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/selection.rs"
 description = "Contiguous f32 Clip uses zero-copy NEON SIMD clamp (aarch64) or scalar loop, avoiding allocating to_dense"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Relu — all platforms (#360 audit item)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Relu"
+variant = "contiguous_f32"
+platform = "all"
+minimum_tier = "tier2"
+counter = "RELU_F32_FAST_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/relu.rs"
+description = "Contiguous f32 Relu uses zero-copy NEON SIMD max(x,0) (aarch64) or scalar loop, avoiding allocating to_dense"
