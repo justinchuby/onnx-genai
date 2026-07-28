@@ -3168,3 +3168,147 @@ fn decode_view_plan_rebuilds_on_source_buffer_move() {
     let healed = on.buffers.get(&ymul).expect("ymul rebound").as_ptr() as usize;
     assert!(healed == moved_ptr || healed != 0, "ymul must be backed");
 }
+
+// ============================================================================
+// Kernel pre-binding (Stage 3): reachability proof
+// ============================================================================
+
+/// Proves the kernel pre-binding fast path is taken during steady-state dispatch
+/// for a static-shape graph. The TEST_HITS counter increments on the pre-bound
+/// path; a non-zero delta after two runs proves the path fires.
+#[test]
+fn kernel_prebinding_fast_path_fires_on_static_graph() {
+    use super::PREBIND_FAST_PATH_TEST_HITS;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.create_named_value("a", DataType::Float32, static_shape([4]));
+    let b = graph.create_named_value("b", DataType::Float32, static_shape([4]));
+    graph.add_input(a);
+    graph.add_input(b);
+    let sum = graph.create_named_value("sum", DataType::Float32, static_shape([4]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(a), Some(b)],
+        vec![sum],
+    ));
+    graph.add_output(sum);
+
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let a_val = Tensor::from_f32(&[4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let b_val = Tensor::from_f32(&[4], &[10.0, 20.0, 30.0, 40.0]).unwrap();
+
+    // First run populates the binding (build already pre-compiled for static graphs).
+    let before = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+    executor
+        .run(&[("a", &a_val), ("b", &b_val)])
+        .expect("first run");
+    let after_first = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+
+    // The static-shape build pre-populates kernel_bindings, so the very first
+    // run should already hit the fast path.
+    assert!(
+        after_first > before,
+        "pre-bound fast path must fire on the first run of a static-shape graph \
+         (before={before}, after={after_first})"
+    );
+
+    // Second run: same shapes, so fast path fires again.
+    executor
+        .run(&[("a", &a_val), ("b", &b_val)])
+        .expect("second run");
+    let after_second = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+    assert!(
+        after_second > after_first,
+        "pre-bound fast path must fire on subsequent runs with stable shapes \
+         (after_first={after_first}, after_second={after_second})"
+    );
+
+    // Verify correctness too.
+    let out = executor.run(&[("a", &a_val), ("b", &b_val)]).unwrap();
+    assert_eq!(out[0].to_vec_f32(), vec![11.0, 22.0, 33.0, 44.0]);
+}
+
+/// Proves the fallback path fires when shapes change (e.g. prefill→decode), and
+/// that the pre-binding is updated so subsequent calls with the new shape hit
+/// the fast path.
+#[test]
+fn kernel_prebinding_fallback_fires_on_shape_change() {
+    use super::{PREBIND_FALLBACK_TEST_HITS, PREBIND_FAST_PATH_TEST_HITS};
+    #[allow(unused_imports)]
+    use onnx_runtime_ir::SymbolId;
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    // Dynamic first dim (simulates sequence length changes).
+    let seq_sym = graph.intern_symbol("seq");
+    let shape_a: Shape = vec![Dim::Symbolic(seq_sym), Dim::Static(4)];
+    let shape_sum: Shape = vec![Dim::Symbolic(seq_sym), Dim::Static(4)];
+
+    let a = graph.create_named_value("a", DataType::Float32, shape_a.clone());
+    let b = graph.create_named_value("b", DataType::Float32, shape_a.clone());
+    graph.add_input(a);
+    graph.add_input(b);
+    let sum = graph.create_named_value("sum", DataType::Float32, shape_sum);
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "Add",
+        vec![Some(a), Some(b)],
+        vec![sum],
+    ));
+    graph.add_output(sum);
+
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    // Run 1: seq=3 (populates binding).
+    let a1 = Tensor::from_f32(&[3, 4], &[1.0; 12]).unwrap();
+    let b1 = Tensor::from_f32(&[3, 4], &[2.0; 12]).unwrap();
+    executor.run(&[("a", &a1), ("b", &b1)]).expect("run seq=3");
+
+    // Run 2: same seq=3 → fast path.
+    let fast_before = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+    executor
+        .run(&[("a", &a1), ("b", &b1)])
+        .expect("run seq=3 again");
+    let fast_after = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+    assert!(
+        fast_after > fast_before,
+        "fast path must fire on same-shape repeat"
+    );
+
+    // Run 3: seq=1 → shape change → fallback fires, binding updated.
+    let a2 = Tensor::from_f32(&[1, 4], &[5.0, 6.0, 7.0, 8.0]).unwrap();
+    let b2 = Tensor::from_f32(&[1, 4], &[1.0, 1.0, 1.0, 1.0]).unwrap();
+    let fallback_before = PREBIND_FALLBACK_TEST_HITS.load(Ordering::Relaxed);
+    let out = executor.run(&[("a", &a2), ("b", &b2)]).expect("run seq=1");
+    let fallback_after = PREBIND_FALLBACK_TEST_HITS.load(Ordering::Relaxed);
+    assert!(
+        fallback_after > fallback_before,
+        "fallback path must fire on shape change"
+    );
+    assert_eq!(out[0].to_vec_f32(), vec![6.0, 7.0, 8.0, 9.0]);
+
+    // Run 4: seq=1 again → fast path fires (binding was updated).
+    let fast_before2 = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+    executor
+        .run(&[("a", &a2), ("b", &b2)])
+        .expect("run seq=1 again");
+    let fast_after2 = PREBIND_FAST_PATH_TEST_HITS.load(Ordering::Relaxed);
+    assert!(
+        fast_after2 > fast_before2,
+        "after shape change, the updated binding must serve the fast path"
+    );
+}
