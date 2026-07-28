@@ -98,12 +98,17 @@ and `:643-651` describe `adapters/`, `support.lora`, and
 ## A. Adapter wire format
 
 ### Prior art (ORT GenAI `.onnx_adapter`)
-ORT GenAI ships adapters as a flatbuffer container of named LoRA tensors, keyed
-by the PEFT convention `<module>.lora_A.weight` / `<module>.lora_B.weight`, with
-rank and `alpha` carried alongside (`scale = alpha / rank`). We **borrow** the
-logical contract (naming scheme, A/B factorization, rank/alpha semantics and the
-"name == graph-input name" matching rule) but **do not** depend on their
-flatbuffer schema or reader.
+ORT GenAI delegates adapter loading to ONNX Runtime's version-1 FlatBuffers
+container (`adapter_schema.fbs`, file identifier `TORT`). The container carries
+format/adapter/model versions and named tensor parameters, but **does not carry
+rank, alpha, or scale metadata**. Parameter names equal graph-input names. The
+current ORT GenAI model builder emits names such as
+`model.layers.0.attn.q_proj.lora_A.MatMul.weight`, stores A/B already in
+`[K,r]`/`[r,N]` orientation, and multiplies B by the PEFT scale before export.
+Our interoperable reader therefore derives rank from the paired dimensions and
+records `scale = 1` (`alpha = rank`) without rescaling the already-scaled B
+tensor. Arbitrary graph-input naming and graphs that apply scale separately are
+not inferable from the container alone and are rejected rather than guessed.
 
 ### Recommendation: direct PEFT/safetensors ingestion (primary)
 Load stock PEFT adapters directly — `adapter_config.json`

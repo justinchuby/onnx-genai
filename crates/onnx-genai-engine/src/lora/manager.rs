@@ -1,18 +1,18 @@
 //! Native-LoRA runtime manager (design `docs/NATIVE_LORA_DESIGN.md` §D, **P4**).
 //!
-//! The [`LoraManager`] is the engine-side owner of decoded PEFT adapters. It:
+//! The [`LoraManager`] is the engine-side owner of decoded adapters. It:
 //!
-//! 1. loads a PEFT adapter directory through the P2a loader
-//!    ([`super::format::load_peft_adapter`]), which transposes each `A`/`B`
-//!    factor at load into the ONNX-`MatMul` orientation;
+//! 1. loads a PEFT adapter directory or ONNX Runtime `.onnx_adapter` file
+//!    through the format-detecting loader ([`super::format::load_adapter`]),
+//!    which normalizes each `A`/`B` factor into the ONNX-`MatMul` orientation;
 //! 2. keeps a small, byte-budgeted **LRU** of decoded adapters (the transposed
 //!    `A_t`/`B_t` host bytes), evicting the least-recently-used inactive adapter
 //!    when the budget is exceeded — mirroring the KV cache's byte-budget pattern;
 //! 3. translates a decoded adapter into the session crate's format-agnostic
-//!    [`LoraAdapterSpec`] (the **PEFT → spec bridge**), which is what the
-//!    injection pass consumes. This is the single place that couples PEFT
-//!    semantic module names to the session's injection input, keeping the session
-//!    crate free of any PEFT specifics (the dependency direction is
+//!    [`LoraAdapterSpec`] (the **loaded-adapter → spec bridge**), which is what
+//!    the injection pass consumes. This is the single place that couples semantic
+//!    module names to the session's injection input, keeping the session crate
+//!    free of any on-disk adapter format specifics (the dependency direction is
 //!    engine → session).
 //!
 //! # Phase-1 selection model — single fixed adapter per session
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_runtime_session::lora_inject::{LoraAdapterSpec, LoraModuleSpec};
 
-use super::format::{AdapterLoadError, LoadedAdapter, load_peft_adapter};
+use super::format::{AdapterLoadError, LoadedAdapter, load_adapter};
 
 /// A stable identifier for a loaded adapter. Derived from the adapter's on-disk
 /// name so re-loading the same directory resolves to the same id.
@@ -104,12 +104,12 @@ impl LoraManager {
         }
     }
 
-    /// Load (or re-touch) a PEFT adapter directory and cache it. Returns its id.
+    /// Load (or re-touch) a supported adapter and cache it. Returns its id.
     /// A single adapter larger than a non-zero budget is rejected rather than
     /// silently blowing the budget.
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<AdapterId, LoraManagerError> {
         let path: PathBuf = path.as_ref().to_path_buf();
-        let adapter = load_peft_adapter(&path)?;
+        let adapter = load_adapter(&path)?;
         let id = AdapterId(adapter.name.clone());
 
         // Already cached: move it to most-recently-used and return.
@@ -216,11 +216,11 @@ impl LoraManager {
     }
 }
 
-/// Translate a decoded PEFT [`LoadedAdapter`] (P2a) into the session crate's
+/// Translate a decoded [`LoadedAdapter`] (P2a) into the session crate's
 /// format-agnostic [`LoraAdapterSpec`] (the input to the injection pass). This is
-/// the **PEFT → spec bridge**: it maps each transposed `A_t = [K, r]` / `B_t =
+/// the **loaded-adapter → spec bridge**: it maps each normalized `A_t = [K, r]` / `B_t =
 /// [r, N]` factor and its semantic module name onto a [`LoraModuleSpec`], so the
-/// session crate never sees a PEFT-specific type. Modules are emitted in the
+/// session crate never sees a format-specific type. Modules are emitted in the
 /// loader's stable (`module_key`-sorted) order.
 pub fn adapter_spec_from_loaded(adapter: &LoadedAdapter) -> LoraAdapterSpec {
     LoraAdapterSpec {
@@ -259,7 +259,10 @@ mod tests {
     use std::fs;
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
     }
 
     /// Write a minimal single-module PEFT adapter into a named subdirectory of a
@@ -298,7 +301,7 @@ mod tests {
     #[test]
     fn bridge_maps_every_module_to_matmul_ready_spec() {
         let (_root, directory) = write_adapter("adapterA", 2, 4, 6);
-        let adapter = load_peft_adapter(&directory).unwrap();
+        let adapter = load_adapter(&directory).unwrap();
         let spec = adapter_spec_from_loaded(&adapter);
         assert_eq!(spec.name, "adapterA");
         assert_eq!(spec.modules.len(), 1);
@@ -344,7 +347,7 @@ mod tests {
         let (_root_a, dir_a) = write_adapter("adapterA", 1, 2, 2);
         let (_root_b, dir_b) = write_adapter("adapterB", 1, 2, 2);
         let (_root_c, dir_c) = write_adapter("adapterC", 1, 2, 2);
-        let one = load_peft_adapter(&dir_a).unwrap();
+        let one = load_adapter(&dir_a).unwrap();
         let per_adapter = adapter_bytes(&one);
         // Budget fits exactly two adapters.
         let mut manager = LoraManager::with_budget(per_adapter * 2);
