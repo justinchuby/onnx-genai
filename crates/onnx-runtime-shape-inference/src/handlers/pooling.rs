@@ -663,6 +663,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "MaxUnpool", 11, max_unpool);
     reg.register("", "Pad", 1, pad);
     reg.register("", "GridSample", 16, grid_sample);
+    reg.register("", "AffineGrid", 20, affine_grid);
 }
 
 /// One `ConvTranspose` spatial output extent.
@@ -798,6 +799,44 @@ pub fn grid_sample(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         }
         _ => out.extend((0..n_spatial).map(|_| ctx.fresh_dim())),
     }
+    ctx.set_output(0, dtype, out);
+    Ok(())
+}
+
+/// `AffineGrid` (opset 20): generate a sampling grid from a batch of affine
+/// matrices `theta` and a target output `size`. For 2-D (`size = [N, C, H, W]`)
+/// the grid is `[N, H, W, 2]`; for 3-D (`size = [N, C, D, H, W]`) it is
+/// `[N, D, H, W, 3]`. The extents come from the resolved `size` vector, so the
+/// rule needs `size`'s shape-data; the element type follows `theta`.
+pub fn affine_grid(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(dtype) = ctx.input_dtype(0) else {
+        return Ok(());
+    };
+    let Some(size) = ctx
+        .input_shape_data(1)
+        .filter(|data| !data.is_scalar())
+        .map(|data| data.elems.clone())
+    else {
+        return Ok(());
+    };
+    let out = match size.len() {
+        // 2-D: size = [N, C, H, W]  ->  grid = [N, H, W, 2].
+        4 => vec![
+            size[0].clone(),
+            size[2].clone(),
+            size[3].clone(),
+            DimExpr::constant(2),
+        ],
+        // 3-D: size = [N, C, D, H, W]  ->  grid = [N, D, H, W, 3].
+        5 => vec![
+            size[0].clone(),
+            size[2].clone(),
+            size[3].clone(),
+            size[4].clone(),
+            DimExpr::constant(3),
+        ],
+        _ => return Ok(()),
+    };
     ctx.set_output(0, dtype, out);
     Ok(())
 }
