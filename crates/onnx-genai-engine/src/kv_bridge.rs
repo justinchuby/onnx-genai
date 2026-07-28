@@ -1406,7 +1406,7 @@ mod tests {
     fn windowed_past_present_keeps_absolute_positions_with_bounded_past() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let path = detect_model_decode_path(&session, None, None, Some(2), 0)?;
+        let path = detect_model_decode_path(&session, None, None, None, Some(2), 0)?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -1430,7 +1430,7 @@ mod tests {
         // paged sliding-window path (shared_buffer: false), since the append-only
         // single shared buffer cannot express windowed eviction.
         assert!(matches!(
-            detect_model_decode_path(&session, Some(16), Some(16), Some(2), 0)?,
+            detect_model_decode_path(&session, None, Some(16), Some(16), Some(2), 0)?,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,

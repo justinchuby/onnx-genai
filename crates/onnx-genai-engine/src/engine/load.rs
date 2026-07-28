@@ -250,6 +250,7 @@ impl Engine {
                 native_device.clone(),
                 governor.weight_offload_host_cache(),
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                crate::decode::key_sequence_lengths_policy(&metadata),
                 config.decode_precision,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
@@ -401,6 +402,7 @@ fn resolve_metadata_and_decode_path(
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
             session,
+            metadata.model.as_ref().and_then(|model| model.io.as_ref()),
             metadata_max_context,
             shared_kv_max_len,
             sliding_window,
@@ -469,7 +471,7 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
+            detect_model_decode_path(&draft_session, None, metadata_max_context, None, None, 0)?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             config.page_size,

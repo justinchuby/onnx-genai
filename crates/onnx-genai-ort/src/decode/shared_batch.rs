@@ -58,7 +58,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
                 "shared-buffer batch requires max_len > 0".into(),
             ));
         }
-        let kv_pairs = infer_kv_pairs(session)?;
+        let kv_pairs = infer_kv_pairs(session, None)?;
         if kv_pairs.is_empty() {
             return Err(OrtError::InvalidArgument(
                 "model exposes no past/present KV pairs for shared-buffer batching".into(),

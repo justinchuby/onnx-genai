@@ -3,8 +3,9 @@
 //! Pure code motion from `decode.rs`.
 
 use super::metadata::{
-    decode_kv_mode_from_shared_buffer_len, is_group_query_attention, is_share_buffer_kv_dtype,
-    shared_kv_buffer_len_from_metadata, sliding_window_from_metadata,
+    KeySequenceLengthsPolicy, decode_kv_mode_from_shared_buffer_len, is_group_query_attention,
+    is_share_buffer_kv_dtype, key_sequence_lengths_policy, shared_kv_buffer_len_from_metadata,
+    sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
 use super::values::{is_token_input_name, slice_value_axis, zero_state_value};
@@ -167,6 +168,44 @@ fn shared_kv_from_gqa_fp16_native_dtype() {
         ..empty_metadata()
     };
     assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(4096));
+}
+
+#[test]
+fn declared_shared_buffer_is_attention_type_agnostic() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+model:
+  max_sequence_length: 1024
+  attention:
+    type: multi_head_attention
+  io:
+    kv_update: shared_buffer
+kv_cache:
+  native_dtype: float32
+"#,
+    )
+    .expect("valid declarative shared-buffer metadata");
+    assert_eq!(shared_kv_buffer_len_from_metadata(&metadata), Some(1024));
+}
+
+#[test]
+fn key_sequence_lengths_policy_is_generic_and_strict_by_default() {
+    let absent: InferenceMetadata =
+        serde_yaml::from_str("model:\n  attention:\n    type: future_attention\n")
+            .expect("valid attention metadata");
+    assert_eq!(
+        key_sequence_lengths_policy(&absent),
+        KeySequenceLengthsPolicy::Canonical
+    );
+
+    let present: InferenceMetadata = serde_yaml::from_str(
+        "model:\n  attention:\n    type: future_attention\n    key_sequence_lengths:\n      scalar_broadcast: unit_batch\n",
+    )
+    .expect("valid generalized attention metadata");
+    assert_eq!(
+        key_sequence_lengths_policy(&present),
+        KeySequenceLengthsPolicy::UnitBatchScalar
+    );
 }
 
 #[test]

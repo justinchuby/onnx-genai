@@ -7,7 +7,28 @@ pub(super) struct KvPair {
     pub(super) input: TensorInfo,
     pub(super) seq_axis: usize,
 }
-pub(super) fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
+pub(super) fn infer_kv_pairs(
+    session: &Session,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> Result<Vec<KvPair>> {
+    if let Some(io) = io {
+        return match (&io.kv_inputs, &io.kv_outputs) {
+            (Some(inputs), Some(outputs)) if inputs.len() == outputs.len() => inputs
+                .iter()
+                .zip(outputs)
+                .map(|(past, present)| kv_pair(session, past, present))
+                .collect(),
+            (Some(inputs), Some(outputs)) => Err(OrtError::InvalidArgument(format!(
+                "io.kv_inputs ({}) and io.kv_outputs ({}) must have equal length",
+                inputs.len(),
+                outputs.len()
+            ))),
+            (None, None) => Ok(Vec::new()),
+            _ => Err(OrtError::InvalidArgument(
+                "io.kv_inputs and io.kv_outputs must be declared together".into(),
+            )),
+        };
+    }
     let input_names = session.input_names();
     let mut pairs = Vec::new();
     for output in session.outputs() {
@@ -22,38 +43,51 @@ pub(super) fn infer_kv_pairs(session: &Session) -> Result<Vec<KvPair>> {
         }) else {
             continue;
         };
-        let input = session
-            .inputs()
-            .iter()
-            .find(|input| input.name == *past_name)
-            .cloned()
-            .ok_or_else(|| {
-                OrtError::InvalidArgument("past name came from session inputs".into())
-            })?;
-        if !matches!(
-            input.dtype,
-            DataType::Float32 | DataType::Float16 | DataType::BFloat16
-        ) {
-            return Err(OrtError::InvalidArgument(format!(
-                "KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
-                input.name, input.dtype
-            )));
-        }
-        if input.shape.len() < 3 {
-            return Err(OrtError::InvalidArgument(format!(
-                "KV input '{}' has unsupported shape {:?}",
-                input.name, input.shape
-            )));
-        }
-        let seq_axis = input.shape.len() - 2;
-        pairs.push(KvPair {
-            past: past_name.clone(),
-            present: output.name.clone(),
-            input,
-            seq_axis,
-        });
+        pairs.push(kv_pair(session, past_name, &output.name)?);
     }
     Ok(pairs)
+}
+
+fn kv_pair(session: &Session, past_name: &str, present_name: &str) -> Result<KvPair> {
+    let input = session
+        .inputs()
+        .iter()
+        .find(|input| input.name == past_name)
+        .cloned()
+        .ok_or_else(|| {
+            OrtError::InvalidArgument(format!("declared KV input '{past_name}' is not exposed"))
+        })?;
+    if !session
+        .outputs()
+        .iter()
+        .any(|output| output.name == present_name)
+    {
+        return Err(OrtError::InvalidArgument(format!(
+            "declared KV output '{present_name}' is not exposed"
+        )));
+    }
+    if !matches!(
+        input.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        return Err(OrtError::InvalidArgument(format!(
+            "KV input '{}' must be Float32, Float16, or BFloat16, got {:?}",
+            input.name, input.dtype
+        )));
+    }
+    if input.shape.len() < 3 {
+        return Err(OrtError::InvalidArgument(format!(
+            "KV input '{}' has unsupported shape {:?}",
+            input.name, input.shape
+        )));
+    }
+    let seq_axis = input.shape.len() - 2;
+    Ok(KvPair {
+        past: past_name.to_string(),
+        present: present_name.to_string(),
+        input,
+        seq_axis,
+    })
 }
 
 pub(super) fn detect_static_cache(

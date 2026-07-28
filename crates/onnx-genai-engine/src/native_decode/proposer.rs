@@ -74,44 +74,52 @@ impl NativeProposerSession {
             .iter()
             .map(|meta| meta.name.clone())
             .collect::<Vec<_>>();
+        let role_inputs = role_tensor_info(session.inputs());
+        let role_outputs = role_tensor_info(session.outputs());
         let sequence_source = io
             .and_then(|io| io.sequence_source)
             .unwrap_or(SequenceInputKind::TokenIds);
         let sequence_input = match sequence_source {
             SequenceInputKind::TokenIds => declared_or_detected_input(
-                &input_names,
+                &role_inputs,
                 io.and_then(|io| io.token_input.as_deref()),
+                StructuralRole::IntegerSequence,
                 &["input_ids", "decoder_input_ids"],
                 "token_input",
             )?,
             SequenceInputKind::InputsEmbeds => declared_or_detected_input(
-                &input_names,
+                &role_inputs,
                 io.and_then(|io| io.inputs_embeds_input.as_deref()),
+                StructuralRole::EmbeddingSequence,
                 &["inputs_embeds"],
                 "inputs_embeds_input",
             )?,
         };
         let attention_mask = optional_declared_or_detected_input(
-            &input_names,
+            &role_inputs,
             io.and_then(|io| io.attention_mask_input.as_deref()),
+            StructuralRole::None,
             &["attention_mask"],
             "attention_mask_input",
         )?;
         let position_ids = optional_declared_or_detected_input(
-            &input_names,
+            &role_inputs,
             io.and_then(|io| io.position_ids_input.as_deref()),
+            StructuralRole::None,
             &["position_ids"],
             "position_ids_input",
         )?;
         let logits_output = optional_declared_or_detected_output(
-            &output_names,
+            &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
+            StructuralRole::ScoreOutput,
             &["logits"],
             "logits_output",
         )?;
         let projected_state_output = optional_declared_or_detected_output(
-            &output_names,
+            &role_outputs,
             io.and_then(|io| io.hidden_output.as_deref()),
+            StructuralRole::None,
             &["projected_state"],
             "hidden_output",
         )?;
