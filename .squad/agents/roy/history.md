@@ -164,3 +164,9 @@ Approved PR #282 after mutation-proven equivalence for tree speculative decoding
 
 - Restored explicit no-hardcoded-architecture enumeration, fusion generalization, and review-blocking consequence in `RULES.md` rule 2 after Justin flagged the condensation as weakening the project identity rule.
 - Removed the stable-ABI wheel rule's stale inbox link; the corresponding abi3 details were found in archived decisions, not active `.squad/decisions.md`.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Reviewed PR #301 / #85, requested changes for control-flow capture liveness, then approved Deckard capture-aware last-use fix.
+
+## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
+- Approved PR #313 decode-garble triage and byte-identity/fires regression guard; repeated-sentence output classified as natural greedy behavior.

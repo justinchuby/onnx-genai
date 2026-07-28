@@ -133,3 +133,15 @@ Fixed PR #276 after Ferro rejection: build break plus driver-enforced WAR fence/
 - Verified cargo build -p onnx-genai-cli, cargo test -p onnx-genai-cli --lib, cargo fmt -p onnx-genai-cli -- --check, cargo clippy -p onnx-genai-cli --all-targets -- -D warnings, and cargo build -p onnx-genai-server.
 ## 2026-07-27T19:35:00Z — Roadmap wave update
 - Fixed PR #288 tests after Moss lockout: LogSoftmax overflow-stability is value-falsifiable; BitShift width guard is locked by source-contract test.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Fixed PR #301 / #85 after author lockout: executor liveness now treats If/Loop/Scan free-variable captures as use sites; merged after Roy approval.
+
+## 2026-07-27T20:15:00Z — Kernel pre-binding (Stage 3)
+- Implemented per-plan-node kernel pre-binding to eliminate the 2.15 µs/op dispatch tax (Vec<Vec<usize>> allocation per op per token).
+- Added `kernel_bindings: Vec<Option<KernelKey>>` on Executor, `get_prebound` zero-alloc fast path on KernelCache.
+- Static-shape graphs pre-populate bindings at build; symbolic graphs populate on first dispatch.
+- Shape changes (prefill→decode) detected via `matches_shapes` (slice comparison, no alloc) and fall through to `get_or_create`.
+- Reachability: PREBIND_FAST_PATH_TEST_HITS + PREBIND_FALLBACK_TEST_HITS counters with paired tests.
+- All session tests pass (211+), both clippy targets clean, format clean, dispatch/platform lints pass.
+- Decision: `.squad/decisions/inbox/deckard-kernel-prebinding.md`.

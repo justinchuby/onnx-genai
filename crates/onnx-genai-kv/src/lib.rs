@@ -21,6 +21,7 @@
 //! per-layer attention patterns (§40.3) needing per-layer KV buffers, and
 //! feeding discontinuous `position_ids` into a contiguous ORT graph (§40.8).
 
+pub mod backing_store;
 pub mod connector;
 pub mod fp8;
 pub mod local_tiered;
@@ -29,6 +30,7 @@ pub mod paged_cache;
 pub mod prefix_cache;
 pub mod tiered;
 
+pub use backing_store::{DiskKvBackingStore, InMemoryKvBackingStore, KvBackingStore};
 pub use connector::{
     CachePriority, CompressionFormat, ConnectorCapabilities, ConnectorError, ConnectorHealth,
     ConnectorResult, DEFAULT_CHUNK_SIZE, FetchedKv, KvCacheConnector, KvCacheKey, KvCacheLocation,

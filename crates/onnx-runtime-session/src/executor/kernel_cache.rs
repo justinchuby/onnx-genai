@@ -1,5 +1,16 @@
 use super::*;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global counters for kernel pre-binding path reachability.
+/// Incremented on the pre-bound fast path; read by tests to prove the path fires.
+#[cfg(test)]
+pub(crate) static PREBIND_FAST_PATH_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static PREBIND_FALLBACK_TEST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Cache key for a compiled kernel (§11.1). Keyed by the concrete node and its
 /// **resolved** (concrete) input shapes: attributes are fixed per node, so this
 /// is correct, and the shape component makes it *shape-keyed* — a re-run with
@@ -12,6 +23,21 @@ pub(super) struct KernelKey {
     pub(super) shapes: Vec<Vec<usize>>,
 }
 
+impl KernelKey {
+    /// Check whether the cached key matches the current input shapes **without
+    /// allocating**. The caller's `input_shapes` is a `&[Vec<usize>]` (the reused
+    /// scratch), so this comparison is a flat slice-of-slices equality.
+    #[inline]
+    pub(super) fn matches_shapes(&self, input_shapes: &[Vec<usize>]) -> bool {
+        self.shapes.len() == input_shapes.len()
+            && self
+                .shapes
+                .iter()
+                .zip(input_shapes.iter())
+                .all(|(a, b)| a.as_slice() == b.as_slice())
+    }
+}
+
 /// Observable kernel-cache statistics (§11.1) — enough to prove reuse in tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -21,6 +47,8 @@ pub struct CacheStats {
     pub hits: u64,
     /// Lookups that compiled a new kernel.
     pub misses: u64,
+    /// Lookups served via the pre-bound fast path (zero-alloc).
+    pub prebind_hits: u64,
 }
 
 /// Shape-keyed kernel cache (§11.1). Owns the compiled kernels for the session.
@@ -29,6 +57,7 @@ pub(crate) struct KernelCache {
     pub(super) entries: HashMap<KernelKey, Box<dyn onnx_runtime_ep_api::Kernel>>,
     pub(super) hits: u64,
     pub(super) misses: u64,
+    pub(super) prebind_hits: AtomicU64,
 }
 
 impl KernelCache {
@@ -37,13 +66,38 @@ impl KernelCache {
             entries: self.entries.len(),
             hits: self.hits,
             misses: self.misses,
+            prebind_hits: self.prebind_hits.load(Ordering::Relaxed),
         }
     }
 
+    /// Zero-allocation kernel lookup via a pre-stored binding key.
+    ///
+    /// Returns `Some` when `binding` shapes match the current `input_shapes`
+    /// and the compiled kernel is present in the cache. Returns `None` on any
+    /// mismatch — caller falls through to `get_or_create`. This is the
+    /// **pre-bound fast path**: during steady-state decode (fixed shapes), it
+    /// replaces the per-token HashMap-key allocation with a single
+    /// pointer chase + slice comparison.
+    #[inline]
+    pub(super) fn get_prebound<'a>(
+        &'a self,
+        binding: &KernelKey,
+        input_shapes: &[Vec<usize>],
+    ) -> Option<&'a dyn onnx_runtime_ep_api::Kernel> {
+        if !binding.matches_shapes(input_shapes) {
+            return None;
+        }
+        let kernel = self.entries.get(binding)?.as_ref();
+        self.prebind_hits.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        PREBIND_FAST_PATH_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(kernel)
+    }
+
     /// Return the cached kernel for `(node, resolved_input_shapes)`, verifying
-    /// EP support and compiling+inserting it on a miss. The EP support check
-    /// lives on the miss path so a re-planned shape is re-validated exactly
-    /// once per distinct shape.
+    /// EP support and compiling+inserting it on a miss. Also returns the
+    /// [`KernelKey`] so the caller can store it as a pre-binding for future
+    /// zero-alloc lookups.
     // Each argument is an independent part of the kernel-cache key or the EP
     // contract; bundling them into a context struct is tracked separately
     // (Dallas #5, kernel-dispatch decomposition).
@@ -57,7 +111,7 @@ impl KernelCache {
         constant_inputs: &[bool],
         opset: u64,
         ep: &dyn ExecutionProvider,
-    ) -> Result<&dyn onnx_runtime_ep_api::Kernel> {
+    ) -> Result<(&dyn onnx_runtime_ep_api::Kernel, KernelKey)> {
         let key = KernelKey {
             node: node_id.0,
             shapes: input_shapes.to_vec(),
@@ -108,6 +162,9 @@ impl KernelCache {
             self.entries.insert(key.clone(), kernel);
             self.misses += 1;
         }
-        Ok(self.entries.get(&key).expect("just inserted").as_ref())
+        #[cfg(test)]
+        PREBIND_FALLBACK_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let kernel_ref = self.entries.get(&key).expect("just inserted").as_ref();
+        Ok((kernel_ref, key))
     }
 }

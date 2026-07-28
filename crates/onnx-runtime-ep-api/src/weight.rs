@@ -121,7 +121,12 @@ where
 #[derive(Clone)]
 pub struct LazyWeight {
     pub boundary: LazyWeightBoundary,
-    /// Validated external mmap ranges that back this initializer.
+    /// Canonical element type of the backing tensor.
+    pub dtype: DataType,
+    /// Canonical shape of the backing tensor.
+    pub shape: Vec<usize>,
+    /// Validated external mmap ranges that back this initializer, in binding
+    /// order. Their lengths sum to the canonical byte size of the tensor.
     pub regions: Vec<ExternalMmapRegion>,
     resident_materializer: Arc<dyn ResidentWeightMaterializer>,
 }
@@ -131,6 +136,8 @@ impl std::fmt::Debug for LazyWeight {
         formatter
             .debug_struct("LazyWeight")
             .field("boundary", &self.boundary)
+            .field("dtype", &self.dtype)
+            .field("shape", &self.shape)
             .field("regions", &self.regions)
             .field("resident_materializer", &"<deferred>")
             .finish()
@@ -139,6 +146,8 @@ impl std::fmt::Debug for LazyWeight {
 
 impl LazyWeight {
     pub fn block_quantized_moe<M>(
+        dtype: DataType,
+        shape: Vec<usize>,
         regions: Vec<ExternalMmapRegion>,
         resident_materializer: M,
     ) -> Result<Self, WeightHandleError>
@@ -150,9 +159,16 @@ impl LazyWeight {
         }
         Ok(Self {
             boundary: LazyWeightBoundary::BlockQuantizedMoe,
+            dtype,
+            shape,
             regions,
             resident_materializer: Arc::new(resident_materializer),
         })
+    }
+
+    /// Total canonical byte size of the backing tensor, summed across regions.
+    pub fn region_bytes_len(&self) -> usize {
+        self.regions.iter().map(|region| region.len).sum()
     }
 
     /// Materialize the unchanged stock-EP resident behavior.
@@ -226,6 +242,17 @@ pub trait LazyDeviceWeightBinder {
     ) -> Result<Self::Binding, WeightHandleError>;
 }
 
+/// Resolves the live host bytes backing a validated external mmap region.
+///
+/// A paging-capable device binder uses this to copy only the selected region
+/// bytes host→device, rather than materializing the whole resident tensor on the
+/// host first (WEIGHT_OFFLOAD §9 invariant 5: never allocate an unbudgeted full
+/// expansion). The executor's weight store owns the live mappings and implements
+/// this; the returned slice must stay valid for the duration of the copy.
+pub trait MmapRegionSource {
+    fn region_bytes(&self, region: &ExternalMmapRegion) -> Result<&[u8], WeightHandleError>;
+}
+
 /// CPU-only Phase-3a binder: callers must use the host materialization route.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Phase3aHostOnlyBinder;
@@ -251,6 +278,8 @@ pub enum WeightHandleError {
     MissingRegions,
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("device weight binding failed: {0}")]
+    DeviceBinding(String),
 }
 
 #[cfg(test)]
@@ -273,7 +302,10 @@ mod tests {
 
     fn lazy() -> WeightHandle {
         WeightHandle::Lazy(
-            LazyWeight::block_quantized_moe(vec![region()], || Ok(resident())).unwrap(),
+            LazyWeight::block_quantized_moe(DataType::Uint8, vec![4], vec![region()], || {
+                Ok(resident())
+            })
+            .unwrap(),
         )
     }
 
@@ -293,7 +325,7 @@ mod tests {
         let materializations = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&materializations);
         let lazy = WeightHandle::Lazy(
-            LazyWeight::block_quantized_moe(vec![region()], move || {
+            LazyWeight::block_quantized_moe(DataType::Uint8, vec![4], vec![region()], move || {
                 counter.fetch_add(1, Ordering::Relaxed);
                 Ok(resident())
             })

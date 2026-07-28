@@ -1,17 +1,19 @@
 # Team Focus — now
 
-**Current focus:** Roadmap CUDA/CPU parity, scheduler coverage, and performance. Native image-pipeline trilogy is complete.
+**Current focus:** Roadmap CUDA/CPU parity, scheduler coverage, model packaging, and performance. Native image-pipeline trilogy is complete.
 
-**MERGED this wave:** PR #285 closed #74 (CPU standard Conv without MLAS); PR #286 closed #61 (engine-executed KV preemption/eviction); PR #292 closed #78 (eager multi-output dispatch); PR #294 closed #58 (native f16/bf16 CPU GEMM FMA microkernel). PR #293 advanced #75 (ONNX schema/shape-inference catalog 148→164; containers deferred). PR #288 advanced #67 (CUDA EP coverage batch 4; CUDA_COVERED_OPS 118→125).
+**MERGED this wave:** PR #312 closed #65 (heterogeneous CPU/CUDA partition); PR #308 closed #60 (disk-backed KV offload); PR #311 advanced #67 (CUDA op coverage batch 5); PR #309 advanced #86 (varlen packed attention); PR #313 landed decode-garble triage/prevention guard; PR #316 fixed #289 (CJK/wide-char renderer width).
 
-**CLOSED this wave:** #74, #61, #78, #58.
+**CLOSED this wave:** #65, #60.
 
-**ADVANCED this wave:** #75, #67.
+**ADVANCED / STILL OPEN:** #67 remains open for CUDA op coverage batch 6; #86 remains open for exporter/CUDA/f16 deferred work.
 
-**REMAINING UNBLOCKED roadmap candidates:** #59 continuous batching; #62 paged GQA KV; #63 live GPU weight offload; #65 heterogeneous CPU/CUDA partition; #60 disk-backed KV offload; #85 compute-in-place; #76 GraphView/lens EP projection; #82 routed-expert paging; #67 more CUDA op coverage; #75 remaining containers (sequence/optional/Loop/Scan).
+**REGRESSION RESOLUTION:** Decode was fine: real fused decode graphs fire compute-in-place aliasing #301 zero times, native==ORT byte-identical, and repeated sentences are natural greedy output. #289 was a CLI renderer bug: `live_turn.rs` used `chars().count()` rather than Unicode display width, causing CJK wrapping/spacing errors; fixed in PR #316.
 
-**BLOCKED on Justin:** Mobius #404/#423/#430 (GLM/DeepSeek E2E + CUDA-vs-ORT benchmark).
+**REMAINING UNBLOCKED roadmap candidates:** #63 live GPU weight offload; #82 routed-expert paging; #54 ORT model-package MVP; #55 model metadata hints; #72 Windows/macOS CI wheels; #73 minimal operator builds; #67 batch 6; #307 perf-test continuous batching; #299 LoRA loading; #222 graph rewriter; #231 metadata.
+
+**BLOCKED on Justin:** Mobius #404/#423/#430 (GLM/DeepSeek E2E + Foundry-Local benchmark).
 
 **ON HOLD:** #106 while Justin researches.
 
-**Updated:** 2026-07-27T19:35:00Z
+**Updated:** 2026-07-28T04-08-08+0000

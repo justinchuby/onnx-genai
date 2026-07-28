@@ -38,6 +38,7 @@ use ratatui::layout::Rect;
 use ratatui::prelude::{CrosstermBackend, Line, Span, Style};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthStr;
 
 /// Rows the live view occupies, including the status line.
 ///
@@ -260,12 +261,17 @@ impl Active {
 }
 
 /// Rows `lines` occupy once wrapped to `width`.
+///
+/// Extent is measured by Unicode display width, not scalar count: ratatui's
+/// `Paragraph` wraps by terminal cells (via `unicode-width`), where CJK/wide
+/// characters take two columns and combining marks take none. Counting `chars`
+/// undercounts wide text and desynchronizes this row math from the real layout.
 fn wrapped_rows(lines: &[Vec<Segment>], width: usize) -> usize {
     lines
         .iter()
         .map(|line| {
             line.iter()
-                .map(|segment| segment.text.chars().count())
+                .map(|segment| UnicodeWidthStr::width(segment.text.as_str()))
                 .sum::<usize>()
                 .div_ceil(width)
                 .max(1)
@@ -346,6 +352,48 @@ mod tests {
             },
         ];
         assert_eq!(wrapped_rows(&[mixed], 20), 2);
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_columns_each() {
+        // Each CJK ideograph renders in two terminal cells, so 15 of them are 30
+        // columns wide and wrap to two rows in a 20-column terminal. Counting
+        // scalar values instead would see 15 <= 20 and wrongly report one row —
+        // the miscount behind the garbled Chinese REPL output.
+        let cjk = "字".repeat(15);
+        assert_eq!(wrapped_rows(&[line(&cjk)], 20), 2);
+        // Exactly fills two rows: 20 ideographs == 40 columns == 2 * 20.
+        assert_eq!(wrapped_rows(&[line(&"字".repeat(20))], 20), 2);
+        // 21 ideographs == 42 columns spills into a third row.
+        assert_eq!(wrapped_rows(&[line(&"字".repeat(21))], 20), 3);
+    }
+
+    #[test]
+    fn mixed_ascii_and_wide_text_sums_display_width_across_segments() {
+        // "abc" (3 columns) + 10 ideographs (20 columns) == 23 columns, which
+        // wraps to two rows at width 20. Char counting would see 13 and report
+        // one row. The wide run is a separate segment to prove the width sums
+        // correctly across a styling split.
+        let mixed = vec![
+            Segment {
+                text: "abc".to_string(),
+                reasoning: false,
+            },
+            Segment {
+                text: "文".repeat(10),
+                reasoning: true,
+            },
+        ];
+        assert_eq!(wrapped_rows(&[mixed], 20), 2);
+    }
+
+    #[test]
+    fn a_combining_mark_adds_no_width() {
+        // "e" + U+0301 (combining acute) is one column, not two: zero-width
+        // marks must not inflate the row math. This documents the general
+        // display-width fix rather than a CJK special case.
+        let combined = "e\u{0301}".repeat(20);
+        assert_eq!(wrapped_rows(&[line(&combined)], 20), 1);
     }
 
     #[test]

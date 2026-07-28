@@ -43,6 +43,7 @@ pub use tensor::{DeviceBindingTransferStats, DeviceIoBinding, Tensor, cpu_alloca
 mod epcontext;
 mod executor;
 mod fp16_decode;
+pub mod hetero;
 mod plugin_provider;
 pub mod sequence;
 mod tensor;

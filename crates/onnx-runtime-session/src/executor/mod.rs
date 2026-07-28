@@ -320,6 +320,9 @@ pub(crate) struct NodePlan {
     pub input_dtypes: Vec<DataType>,
     /// Element types of the outputs.
     pub output_dtypes: Vec<DataType>,
+    /// Inputs consumed for the final time by this node and therefore eligible for
+    /// a kernel-authorized in-place overwrite after additional runtime guards.
+    pub inplace_dead_inputs: Vec<bool>,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.
@@ -516,6 +519,8 @@ pub use capture::{
 pub use kernel_cache::CacheStats;
 pub(crate) use kernel_cache::KernelCache;
 use kernel_cache::*;
+#[cfg(test)]
+pub(crate) use kernel_cache::{PREBIND_FALLBACK_TEST_HITS, PREBIND_FAST_PATH_TEST_HITS};
 mod dynamic_shapes;
 mod geometry;
 use dynamic_shapes::*;

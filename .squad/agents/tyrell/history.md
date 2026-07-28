@@ -33,3 +33,6 @@ CI now covers all 27 offline crates with warnings-as-errors and native Windows A
 WP-B landed: Progress docs should now treat WP-B as fully landed after WP-B3 `3d84b9b` plus clippy `6f217a4`.
 
 2026-07-22T22:15:00Z — Landed `122b31a` cross-OS decode affinity and safe multi-NUMA auto-enable; Gaff approved after N1/N2 fixes, with Windows multigroup validation remaining non-blocking.
+
+## 2026-07-27T02:00:00Z — Roadmap wave update
+- Reviewed PR #304 / #62 and approved bit-identical Tier A/Tier B paged GQA plus zero-present-allocation invariants.
