@@ -48,15 +48,12 @@ use crate::connector::{
     KvStoreEntry,
 };
 use crate::fp8::Fp8Format;
-use crate::{Device, PageId, PageTable, PrefixCache, TokenId};
+use crate::{Device, DiskKvBackingStore, KvBackingStore, PageId, PageTable, PrefixCache, TokenId};
 
 /// Optional cold-cold disk tier configuration.
 ///
-/// **This milestone does not implement a real disk spill.** The type exists so
-/// the connector can be *configured* with a disk tier and report health for it;
-/// a memory-mapped / direct-I/O `LocalDisk` backend is a future extension (see
-/// the module docs and DESIGN §38.5.1). The connector never fabricates
-/// [`KvCacheLocation::LocalDisk`] results.
+/// Payloads are written below this directory once all pages for a chunk have
+/// left the GPU tier. Each connector owns and removes a unique scratch child.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskTierConfig {
     /// Directory the disk tier would spill pages into.
@@ -80,7 +77,7 @@ pub struct LocalTieredConfig {
     /// Compression format applied to stored KV. Only `None` and `Fp8` are
     /// implemented; other formats are rejected at construction.
     pub compression: CompressionFormat,
-    /// Optional disk tier. `None` by default (see [`DiskTierConfig`]).
+    /// Optional disk tier. Cold chunk payloads spill here when configured.
     pub disk_backend: Option<DiskTierConfig>,
     /// Accounting estimate: bytes occupied by one page.
     pub bytes_per_page: usize,
@@ -114,11 +111,8 @@ struct ChunkEntry {
     size_bytes: usize,
     /// Deterministic prefix-cache path for this key.
     path: Vec<TokenId>,
-    /// The real KV host bytes for this chunk, retained so `fetch` can return
-    /// them for cross-session/cross-node reuse (DESIGN §38, K4). In this runtime
-    /// both tiers are host RAM, so the page-table bookkeeping above tracks
-    /// tiering/eviction while these bytes are the authoritative KV.
-    payload: KvPayload,
+    /// Resident payload, or `None` after a successful cold-tier spill.
+    payload: Option<KvPayload>,
 }
 
 impl ChunkEntry {
@@ -140,6 +134,7 @@ struct Interior {
     prefix_cache: PrefixCache,
     chunks: HashMap<KvCacheKey, ChunkEntry>,
     pinned: HashSet<KvCacheKey>,
+    backing_store: Option<Box<dyn KvBackingStore>>,
 }
 
 /// Default single-node tiered KV connector (DESIGN §38.5.1).
@@ -169,6 +164,12 @@ impl LocalTieredConnector {
             }
         };
         let page_table = PageTable::new(config.page_size.max(1), config.hot_capacity);
+        let backing_store = match &config.disk_backend {
+            Some(disk) => DiskKvBackingStore::new(&disk.path)
+                .ok()
+                .map(|store| Box::new(store) as Box<dyn KvBackingStore>),
+            None => None,
+        };
         Ok(Self {
             config,
             fp8_format,
@@ -177,8 +178,37 @@ impl LocalTieredConnector {
                 prefix_cache: PrefixCache::new(),
                 chunks: HashMap::new(),
                 pinned: HashSet::new(),
+                backing_store,
             }),
         })
+    }
+
+    /// Build a connector with a caller-provided cold backing store.
+    ///
+    /// This is useful for embedding applications and tests that need a custom
+    /// durable tier. It replaces any disk tier selected by `config`.
+    pub fn with_backing_store(
+        config: LocalTieredConfig,
+        backing_store: Box<dyn KvBackingStore>,
+    ) -> ConnectorResult<Self> {
+        let connector = Self::new(config)?;
+        connector
+            .inner
+            .lock()
+            .map_err(poisoned_lock_error)?
+            .backing_store = Some(backing_store);
+        Ok(connector)
+    }
+
+    /// Number of payload writes performed by the cold backing store.
+    pub fn spill_count(&self) -> ConnectorResult<u64> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(poisoned_lock_error)?
+            .backing_store
+            .as_ref()
+            .map_or(0, |store| store.spill_count()))
     }
 
     /// Convenience constructor using [`LocalTieredConfig::default`].
@@ -272,6 +302,26 @@ impl Interior {
         }
     }
 
+    /// Persist fully cold payloads and release their host-RAM copies.
+    fn spill_cold_payloads(&mut self) -> ConnectorResult<()> {
+        let Some(store) = self.backing_store.as_mut() else {
+            return Ok(());
+        };
+        for (key, entry) in &mut self.chunks {
+            let all_cold = entry.page_ids.iter().all(|page_id| {
+                !matches!(
+                    self.page_table.pages.get(page_id).map(|page| page.device),
+                    Some(Device::Gpu(_))
+                )
+            });
+            if all_cold && let Some(payload) = entry.payload.as_ref() {
+                store.write(key, payload).map_err(ConnectorError::Backend)?;
+                entry.payload = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Free a chunk's pages and drop it from every index.
     fn drop_chunk(&mut self, key: &KvCacheKey) -> bool {
         let Some(entry) = self.chunks.remove(key) else {
@@ -279,6 +329,9 @@ impl Interior {
         };
         self.pinned.remove(key);
         self.prefix_cache.remove(&entry.path);
+        if let Some(store) = self.backing_store.as_mut() {
+            store.remove(key);
+        }
         for pid in entry.page_ids {
             self.page_table.free(pid);
         }
@@ -336,9 +389,17 @@ impl Interior {
                     )
                 })
                 .count();
-            KvCacheLocation::LocalCpu {
-                estimated_load_ms: pages_needing_upload as f64 * cpu_load_ms_per_page,
-                size_bytes: entry.size_bytes,
+            let estimated_load_ms = pages_needing_upload as f64 * cpu_load_ms_per_page;
+            if entry.payload.is_none() {
+                KvCacheLocation::LocalDisk {
+                    estimated_load_ms,
+                    size_bytes: entry.size_bytes,
+                }
+            } else {
+                KvCacheLocation::LocalCpu {
+                    estimated_load_ms,
+                    size_bytes: entry.size_bytes,
+                }
             }
         }
     }
@@ -480,10 +541,11 @@ impl KvCacheConnector for LocalTieredConnector {
                 stored_at: Instant::now(),
                 size_bytes,
                 path,
-                payload: entry.kv_data,
+                payload: Some(entry.kv_data),
             },
         );
 
+        inner.spill_cold_payloads()?;
         let budget = self.config.max_cached_pages;
         inner.evict_to_budget(budget);
         Ok(())
@@ -501,6 +563,15 @@ impl KvCacheConnector for LocalTieredConnector {
         }
         let Some(entry) = inner.chunks.get(key).cloned() else {
             return Err(ConnectorError::NotFound);
+        };
+        let payload = match entry.payload {
+            Some(payload) => payload,
+            None => inner
+                .backing_store
+                .as_mut()
+                .ok_or_else(|| ConnectorError::Backend("cold payload has no backing store".into()))?
+                .read(key)
+                .map_err(ConnectorError::Backend)?,
         };
         if let Device::Gpu(_) = target {
             let priority = entry.priority;
@@ -528,7 +599,7 @@ impl KvCacheConnector for LocalTieredConnector {
         Ok(FetchedKv {
             key: key.clone(),
             pages: entry.page_ids,
-            payload: entry.payload,
+            payload,
             transfer_time: start.elapsed(),
         })
     }
@@ -563,6 +634,7 @@ impl KvCacheConnector for LocalTieredConnector {
                     page.device = Device::Gpu(0);
                 }
             }
+            let _ = inner.spill_cold_payloads();
         }
     }
 
@@ -680,6 +752,91 @@ mod tests {
             bytes_per_page: 1024,
             cpu_load_ms_per_page: 1.0,
         }
+    }
+
+    #[tokio::test]
+    async fn disk_offload_forced_spill_restores_interleaved_multi_page_payloads() {
+        let parent = std::env::temp_dir().join(format!(
+            "onnx-genai-kv-disk-tier-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = small_config();
+        config.hot_capacity = 1;
+        config.disk_backend = Some(DiskTierConfig {
+            path: parent.clone(),
+        });
+
+        let first = key("sequence-a", 0, 0xA1, 8); // two pages
+        let second = key("sequence-b", 0, 0xB2, 4);
+        let third = key("sequence-a", 1, 0xA3, 4);
+        let expected_first = payload_for(&first, 2, 4);
+        let expected_second = payload_for(&second, 2, 4);
+        let expected_third = payload_for(&third, 2, 4);
+
+        {
+            let conn = LocalTieredConnector::new(config).unwrap();
+            conn.store(KvStoreEntry {
+                key: first.clone(),
+                kv_data: expected_first.clone(),
+                priority: CachePriority::Session,
+                ttl: None,
+            })
+            .await
+            .unwrap();
+            conn.store(KvStoreEntry {
+                key: second.clone(),
+                kv_data: expected_second.clone(),
+                priority: CachePriority::Session,
+                ttl: None,
+            })
+            .await
+            .unwrap();
+            conn.store(KvStoreEntry {
+                key: third.clone(),
+                kv_data: expected_third.clone(),
+                priority: CachePriority::Session,
+                ttl: None,
+            })
+            .await
+            .unwrap();
+
+            assert!(
+                conn.spill_count().unwrap() >= 2,
+                "must write real spill files"
+            );
+            assert!(matches!(
+                conn.lookup(&first).await.unwrap(),
+                KvCacheLocation::LocalDisk { .. }
+            ));
+            assert!(matches!(
+                conn.lookup(&second).await.unwrap(),
+                KvCacheLocation::LocalDisk { .. }
+            ));
+
+            // These are the exact bytes the decode path consumes; equality here
+            // catches skipped/reordered/replaced disk reloads.
+            assert_eq!(
+                conn.fetch(&first, Device::Gpu(0)).await.unwrap().payload,
+                expected_first
+            );
+            assert_eq!(
+                conn.fetch(&second, Device::Gpu(0)).await.unwrap().payload,
+                expected_second
+            );
+            assert_eq!(
+                conn.fetch(&third, Device::Gpu(0)).await.unwrap().payload,
+                expected_third
+            );
+        }
+        assert!(
+            std::fs::read_dir(&parent).unwrap().next().is_none(),
+            "connector drop must remove all scratch files"
+        );
+        std::fs::remove_dir(parent).unwrap();
     }
 
     #[tokio::test]
