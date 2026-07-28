@@ -80,8 +80,8 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Implemented `.github/workflows/benchmark.yml`: separate benchmark workflow running kernel micro-benchmarks and hot-path benchmarks on every PR, posting a comparison comment.
 - Design: benchmarks merge-base FIRST (cold-start), PR SECOND (warm runner). Systematic bias toward PR appearing faster reduces false positives.
 - Workload: ep-cpu kernels (MatMul at M=1 decode + prefill shapes, Add, Gather, ReduceMean × f32/f16/bf16) + genai-bench no_model (tokenization, sampling, KV cache, logit processing, grammar).
-- **Blocking gate**: ≥30% regression FAILS the check (not advisory). Threshold = 1.5× worst observed CI noise (~20%). Signal-to-noise vs historical 350% regression: 11.7×.
-- ⚠️ ≥15% advisory; 🔴 ≥30% blocks merge.
-- Guard-break proof: simulated 4.5× M=1 slowdown → gate exits 1 at +350%. 25% → passes. 31% → fails.
-- CI proof (base-first ordering): run 30320632489, 21m37s, macOS arm64 M1 Virtual 3-core. Worst noise: +26.5% (below 30% gate). No false positive.
+- **Informational only** (per Justin's direction): does NOT block CI. Visual flags ⚠️ ≥15%, 🔴 ≥30% calibrated against measured runner noise (~27% worst-case).
+- Real regression gates stay in `profile_native.rs` (throughput floors + dispatch-reachability tests on real hardware).
+- Regression-detection proof: simulated 4.5× M=1 slowdown → six 🔴 lines at +350%, header "🔴 Benchmark Regression Detected". Unmissable for reviewer.
+- CI proof: runs green on PR (22m on macOS arm64 M1 Virtual 3-core). Comment updated in place on re-push.
 - Decision filed: `.squad/decisions/inbox/pris-benchmark-ci.md`.
