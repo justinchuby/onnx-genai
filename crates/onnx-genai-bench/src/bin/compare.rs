@@ -322,6 +322,8 @@ struct DirectSummary {
     backend: DirectBackend,
     model_load_ms: Distribution,
     ttft_ms: Distribution,
+    /// Time to first token from process start: model_load + TTFT.
+    process_start_to_first_token_ms: Distribution,
     decode_tokens_per_second: Distribution,
     end_to_end_tokens_per_second: Distribution,
     total_ms: Distribution,
@@ -812,6 +814,12 @@ fn summarize_direct_samples(
                         .map(|sample| millis(sample.ttft))
                         .collect(),
                 ),
+                process_start_to_first_token_ms: Distribution::from_values(
+                    backend_samples
+                        .iter()
+                        .map(|sample| millis(sample.model_load) + millis(sample.ttft))
+                        .collect(),
+                ),
                 decode_tokens_per_second: Distribution::from_values(
                     backend_samples
                         .iter()
@@ -912,8 +920,8 @@ fn render_direct_report(
         );
     }
     report.push('\n');
-    report.push_str("| backend | model load ms | TTFT ms | decode tok/s | decode roofline % | end-to-end tok/s | total ms | output tokens |\n");
-    report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    report.push_str("| backend | model load ms | TTFT ms | process start → first token ms | decode tok/s | decode roofline % | end-to-end tok/s | total ms | output tokens |\n");
+    report.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for summary in summaries {
         let roofline_cell = roofline
             .map(|roofline| {
@@ -928,10 +936,11 @@ fn render_direct_report(
             })
             .unwrap_or_else(|| "N/A".to_string());
         report.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             summary.backend.label(),
             spread_cell(summary.model_load_ms, 1),
             spread_cell(summary.ttft_ms, 1),
+            spread_cell(summary.process_start_to_first_token_ms, 1),
             spread_cell(summary.decode_tokens_per_second, 2),
             roofline_cell,
             spread_cell(summary.end_to_end_tokens_per_second, 2),
@@ -952,6 +961,10 @@ fn render_direct_report(
         ));
         report.push_str(&format!("| TTFT ms | {:.3}x |\n", ratios.ttft_ms));
         report.push_str(&format!(
+            "| process start → first token ms | {:.3}x |\n",
+            ratios.process_start_to_first_token_ms
+        ));
+        report.push_str(&format!(
             "| model load ms | {:.3}x |\n",
             ratios.model_load_ms
         ));
@@ -963,6 +976,7 @@ fn render_direct_report(
 struct DirectRatios {
     model_load_ms: f64,
     ttft_ms: f64,
+    process_start_to_first_token_ms: f64,
     decode_tokens_per_second: f64,
     end_to_end_tokens_per_second: f64,
 }
@@ -977,6 +991,8 @@ fn direct_ratios(summaries: &[DirectSummary]) -> Option<DirectRatios> {
     Some(DirectRatios {
         model_load_ms: native.model_load_ms.median / ort.model_load_ms.median,
         ttft_ms: native.ttft_ms.median / ort.ttft_ms.median,
+        process_start_to_first_token_ms: native.process_start_to_first_token_ms.median
+            / ort.process_start_to_first_token_ms.median,
         decode_tokens_per_second: native.decode_tokens_per_second.median
             / ort.decode_tokens_per_second.median,
         end_to_end_tokens_per_second: native.end_to_end_tokens_per_second.median
@@ -1013,6 +1029,7 @@ fn direct_json_report(
         "ratios": direct_ratios(summaries).map(|ratios| json!({
             "native_over_ort_model_load_ms": ratios.model_load_ms,
             "native_over_ort_ttft_ms": ratios.ttft_ms,
+            "native_over_ort_process_start_to_first_token_ms": ratios.process_start_to_first_token_ms,
             "native_over_ort_decode_tokens_per_second": ratios.decode_tokens_per_second,
             "native_over_ort_end_to_end_tokens_per_second": ratios.end_to_end_tokens_per_second,
         })),
@@ -1036,6 +1053,7 @@ fn direct_summary_json(summary: &DirectSummary, roofline: Option<&DirectRoofline
         "backend": summary.backend.as_str(),
         "model_load_ms": distribution_json(summary.model_load_ms),
         "ttft_ms": distribution_json(summary.ttft_ms),
+        "process_start_to_first_token_ms": distribution_json(summary.process_start_to_first_token_ms),
         "decode_tokens_per_second": distribution_json(summary.decode_tokens_per_second),
         "decode_roofline_fraction": roofline.map(|roofline| distribution_json(distribution_scale(
             summary.decode_tokens_per_second,
