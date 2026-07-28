@@ -103,5 +103,28 @@ Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a c
 - Fixed cargo cache key correctness: keys now include OS, runner architecture, actual target triple, rustc release, cached cargo tool version, and `Cargo.lock`; this prevents `windows-latest` and `windows-11-arm` from sharing `target/` or `~/.cargo/bin` artifacts.
 - Confirmed `audit.yml` does not use clippy or rustfmt and removed those rustup components from the audit toolchain install.
 
+## 2026-07-27T20:00:00-07:00 — CI fast/slow tier split
+- Split CI so every PR push runs fast uninstrumented Linux x86_64 + Windows x86_64 Rust tests and CLI ORT e2e, while coverage, Windows ARM64, macOS arm64, CUDA compile, and audit move to slow/full triggers.
+- Added `pull_request` `labeled` handling and created the `ci:full` label so labeling an open PR starts slow/full CI without a new push.
+- Preserved #296 supply-chain/concurrency constraints: direct `rustup`, GitHub-owned `actions/cache`, arch-aware keys, and SHA-keyed non-PR concurrency.
+- Measured fast dispatch run 30324179873 at 7m57s wall-clock; final slow dispatch run 30324584315 passed after rerunning a flaky Windows ARM64 failure, earlier equivalent slow dispatch 30322967863 passed at 15m30s, and audit run 30322969130 passed at 3m08s. Fast remains above the ~4m target because Windows x86_64 Rust tests are the critical path, but Windows correctness stayed on PRs.
+
+## 2026-07-27T22:56:00-07:00 — CI tier refinement: Windows CLI-only fast path
+- Refined fast CI so the broad offline-crate suite runs per PR only on Linux x86_64; Windows x86_64 stays per PR only for the CLI ORT lane (build/test/e2e/clippy), where Windows platform differences have actually bitten: CLI contracts, ORT DLL loading, filesystem/terminal/dynamic-linking boundaries.
+- Kept the full Windows x86_64 offline-crate suite in slow CI via the Windows `Rust coverage` job.
+- Audited offline crates for Windows-specific cfg tests before moving broad Windows tests out of fast PR CI; found `onnx-runtime-loader::pathsafe::tests::rejects_rooted_path` as the meaningful Windows-only test that now relies on slow CI, plus Windows-specific implementation code in tracer and CPU decode affinity.
+- Remeasured final-SHA fast dispatch run 30334227247 at 4m33s wall-clock; critical path was `CLI ORT (Windows x86_64)` at 4m21s. The preceding same-workflow run 30333847821 was 3m59s with `Rust (Linux x86_64)` at 3m55s and Windows CLI at 2m51s; the first refined run was 8m09s due a Windows cache-save post step. Conclusion: the split reaches the target with warm caches, but Windows CLI variance can still exceed 4m.
+
+## 2026-07-28T01:18:00-07:00 — Windows path-safety exception in fast CI
+- Added `cargo test --locked -p onnx-runtime-loader pathsafe` to the fast Windows CLI lane so `rejects_rooted_path` continues to run before merge. This is the narrow exception to the pure-Rust-offline-on-Linux rule because Windows path semantics are the behavior under test.
+- Rechecked the Windows cfg audit: no other meaningful `#[cfg(windows)]` tests in the offline crate suite; remaining hits are Windows-specific implementation code in tracer/decode affinity or ORT/CUDA code outside the offline crate set.
+- Measured repeat fast run 30342667705 at 3m45s wall-clock; critical path `Rust (Linux x86_64)` at 3m40s, Windows CLI at 3m26s, loader path-safety step 12s. First run on the commit was 7m31s from Windows cache/build variance, with loader step 34s.
 ## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
 - CI supply-chain and coverage hardening note was merged into decisions.
+
+## 2026-07-28T02:18:00-07:00 — Stable names for skipped slow CI jobs
+- Fixed unexpanded skipped check names caused by job-level `if:` conditions on matrix jobs: GitHub skips before matrix expansion, producing raw `${{ matrix.name }}` in fast-tier skipped checks.
+- Replaced the slow-tier matrices in `ci.yml` with explicit per-platform jobs so skipped checks are named `Rust coverage (Linux x86_64)`, `Rust coverage (Windows x86_64)`, `Rust slow platform (...)`, and `CUDA compile (...)`.
+- Confirmed `miri.yml` has no matrix/gated job-name issue. Repo-wide scan found analogous conditional matrices only in release/manual workflows (`publish.yml`, `wheels.yml`), not PR CI; left them outside this PR.
+- Recorded Justin's live `ci:full` verification on PR #340: CI run 30345861354 and audit run 30345861425 started via label.
+- Added CLI-specific cache keys after the main merge exposed a shared-cache collision/incomplete-restore pattern in the Windows CLI lane. Remeasured final-head fast run 30349042835 at 4m33s wall-clock; critical path `Rust (Linux x86_64)` at 4m22s, with Windows CLI at 3m14s. The preceding workflow-code run 30348596658 was 3m51s; current variance is in Linux Rust/quality after the main merge, not the skipped-name fix.
