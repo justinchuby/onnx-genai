@@ -133,41 +133,116 @@ decode throughput   45.5 tok/s  39.9 tok/s  32.1 tok/s  53.1 tok/s  69.3 tok/s  
 end-to-end          44.3 tok/s  38.9 tok/s  27.5 tok/s  52.1 tok/s  40.1 tok/s  44.0 tok/s
 ```
 
-The CPU FP16 pair is the headline result. **Native FP16 now leads on every
-metric**: TTFT (97 vs 139 ms = 0.70×), decode (53.1 vs 39.9 tok/s = 1.33×),
-end-to-end (52.1 vs 38.9 tok/s = 1.34×), and model load (319 vs 2077 ms =
-6.5× faster). The native CPU EP uses BNNS/AMX for FP16 prefill GEMMs (reaching
+These single-provider profiles were captured at **load 4–5** (10-core M1 Max).
+The CPU FP16 native/ORT comparison in this table (1.33× decode) is
+**systematically pessimistic** because native decode degrades more under
+contention than ORT — see **Load sensitivity** below. For the definitive
+head-to-head comparison at controlled load, see the next section.
+
+Every number above is read out of the committed `.txt` files by
+[`../../scripts/check_profile_table.py`](../../scripts/check_profile_table.py),
+which CI runs, so the table cannot drift from the samples it describes.
+
+## Head-to-head comparison (native CPU vs ORT CPU)
+
+These are the definitive performance claims, measured with the `compare` binary
+(interleaved native/ORT runs, warmups discarded, statistical medians). Each
+table reports host load at measurement time. The compare methodology is
+documented above under "One-command native CPU vs ORT CPU comparison".
+
+### qwen2.5-0.5b-f16 — the headline model
+
+Measured 2026-07-28 on Apple M1 Max (32 GiB, macOS 26.5.2).
+Load 2.5–3.7 (quiet host), 3 measured pairs, commit `679837e1`.
+
+| Metric | native | ORT | Ratio | Load |
+|---|---:|---:|---|---|
+| model load ms | 277.6 | 1744.8 | **6.3× faster** | 3.7 |
+| TTFT ms | 90.4 | 111.6 | 1.23× faster | 3.7 |
+| process start → first token ms | 370.2 | 1856.4 | **5.01× faster** | 3.7 |
+| decode tok/s | 73.02 | 42.56 | **1.72×** | 3.7 |
+| decode roofline % | 42.6% | 24.8% | — | 3.7 |
+| end-to-end tok/s | 65.28 | 38.80 | **1.68×** | 3.7 |
+
+Decode roofline ceiling: 171.6 tok/s (DRAM-bound, SLC covers only 7% of decode
+set). Measured bandwidth: 122.8 GB/s.
+
+**Key takeaway:** Native FP16 decode is **1.72×** ORT's throughput at low load.
+This is the primary CPU inference benchmark; all optimised dispatch paths (NEON
+depthwise #342, pointwise Conv→GEMM #347, inline NEON SDPA #349, thin-M GEMM
+#353) contribute to this figure.
+
+### TinyStories-33M (FP32) — small-model honesty check
+
+Measured 2026-07-28. Load 2.5–2.6 (quiet host), 5 measured pairs, commit `679837e1`.
+
+| Metric | native | ORT | Ratio | Load |
+|---|---:|---:|---|---|
+| model load ms | 44.2 | 144.5 | 3.3× faster | 2.6 |
+| TTFT ms | 16.3 | 5.7 | **2.86× slower** | 2.6 |
+| process start → first token ms | 60.8 | 150.2 | **2.47× faster** | 2.6 |
+| decode tok/s | 297.4 | 327.0 | **0.91× (ORT wins)** | 2.6 |
+| decode roofline % | 65.2%* | 71.7%* | — | 2.6 |
+| end-to-end tok/s | 258.6 | 315.6 | **0.82× (ORT wins)** | 2.6 |
+
+Decode roofline ceiling: 456.3 tok/s ⚠️ **NOT BINDING** — decode set (255 MiB)
+is partially cache-resident (SLC covers ~19%); roofline% marked with `*` is
+not a meaningful efficiency metric for this model (#354).
+
+**What's behind:** On this small FP32 model, ORT still wins decode by ~9% and
+end-to-end by ~18%. Native TTFT is 2.86× slower because native defers all
+weight preparation to first inference while ORT front-loads it into model load.
+The cold-start metric (process start → first token) still favours native
+2.47× because the 3.3× model-load advantage dominates.
+
+### Previously published figures (load 4–5)
+
+The table in "What the samples show" above was measured at load 4–5 and
+reported native FP16 decode at 53.1 tok/s (1.33× ORT). That measurement is
+genuine but reflects contended conditions. The native EP's NEON GEMV decode
+path is more load-sensitive than ORT's private thread pool — see **Load
+sensitivity** below for quantified evidence. The prior figure was neither wrong
+nor misleading for the conditions stated; the low-load figure (73.0 tok/s,
+1.72×) is what the hardware delivers when not competing for resources.
+
+### Vision and audio models
+
+ResNet-18 is not present locally. MobileNetV2 and Whisper (encoder, graph-only)
+are present but cannot be benchmarked with the generative `compare` tool. No
+previous published figures exist for these models in this file. When a
+non-generative inference benchmark harness is available, these models should be
+measured and added.
+
+## Explanation of the FP16 results
+
+The native CPU EP uses BNNS/AMX for FP16 prefill GEMMs (reaching
 1472–2436 GFLOPS via Apple's matrix coprocessor) and NEON GEMV with direct
 FP16-weight streaming for decode. ONNX Runtime's CPU EP cannot use AMX — it
 widens FP16 to FP32 before every GEMM, so it pays a conversion cost and gets
 none of the bandwidth benefit.
 
-On FP32, ORT still leads decode: 45.5 vs 32.1 tok/s. The native EP reaches
-~70% of ORT's FP32 decode throughput using multi-threaded NEON GEMV on a
-persistent SPMD worker pool. The FP32 native prefill (1075 ms) is still slow
-because it uses Accelerate `cblas_sgemm` without the BNNS fp16→f32 AMX path
-that makes FP16 prefill fast. FP32 prefill has not been optimized.
+On FP32, ORT still leads decode on the large model: 42.6 vs 73.0 tok/s
+favours native on FP16, but on TinyStories-33M FP32 the relationship inverts
+(native 297.4 vs ORT 327.0 tok/s). The native EP reaches ~91% of ORT's FP32
+decode throughput on small cache-resident models using multi-threaded NEON GEMV
+on a persistent SPMD worker pool.
 
 The native CPU profiles use the persistent SPMD decode pool, which is the
 default. The pool is deterministically selected — no host probing or
 load-adaptive calibration runs unless explicitly requested via
 `ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL=auto`.
 
-The native backend loads an order of magnitude faster than ONNX Runtime (120–319 ms
-vs 2077–5178 ms) because it memory-maps weights instead of building a session graph.
+The native backend loads an order of magnitude faster than ONNX Runtime (44–278 ms
+vs 145–1745 ms) because it memory-maps weights instead of building a session graph.
 
 Running the native backend through the MLX plugin (`native+MLX`) recovers
 GPU-accelerated decode while keeping the fast load.
-
-Every number above is read out of the committed `.txt` files by
-[`../../scripts/check_profile_table.py`](../../scripts/check_profile_table.py),
-which CI runs, so the table cannot drift from the samples it describes.
 
 ## Cold-start vs steady-state framing
 
 **TTFT alone is not a fair cold-start metric between these two runtimes.**
 ORT pre-packs weights during model load (quantization layout transforms,
-graph optimisation, session construction). This makes ORT's model load ~5×
+graph optimisation, session construction). This makes ORT's model load ~5–6×
 slower than native's, while making its TTFT look better — the work that
 native does on first inference, ORT has already done during load.
 
@@ -176,20 +251,21 @@ model load + TTFT. This is what a user waiting for the first word actually
 experiences. TTFT alone is the honest metric only for a warm, already-loaded
 process serving many requests (e.g. a long-running server).
 
-Measured on TinyStories-33M, Apple M1 Max, load 3–5, three interleaved runs:
+Measured on TinyStories-33M, Apple M1 Max, **load 2.5–2.6**, 5 interleaved
+pairs (2026-07-28):
 
-| Metric | native | ORT | Ratio |
-|---|---:|---:|---|
-| model load | 29.0 ms | 146.9 ms | native 5.1× faster |
-| TTFT | 26.2 ms | 3.4 ms | native 7.7× slower |
-| **time to first token from process start** | **55.2 ms** | **150.3 ms** | **native 2.7× faster** |
+| Metric | native | ORT | Ratio | Load |
+|---|---:|---:|---|---|
+| model load | 44.2 ms | 144.5 ms | native 3.3× faster | 2.6 |
+| TTFT | 16.3 ms | 5.7 ms | **native 2.86× slower** | 2.6 |
+| **process start → first token** | **60.8 ms** | **150.2 ms** | **native 2.47× faster** | 2.6 |
 
 Both framings are true; they answer different questions:
 
 - **"How fast does the user see the first word after launching?"** →
-  time-to-first-token from process start. Native wins 2.7×.
+  time-to-first-token from process start. Native wins 2.47×.
 - **"How fast does an already-loaded server respond?"** →
-  TTFT alone. ORT wins ~4–8× on this model because it front-loaded
+  TTFT alone. ORT wins ~2.9× on this model because it front-loaded
   the work into model load.
 
 The mechanism is weight pre-packing: ORT's session builder transposes,
@@ -229,16 +305,19 @@ per-thread collapse when Accelerate is called inside a Rayon parallel region).
 
 ### Further headroom (not pursued yet)
 
-- **FP16 decode is at ~55 GB/s of the ~112 GB/s achievable GEMV roof (~49%).**
-  At ORT-level 80% efficiency, ~90 tok/s is theoretically reachable.
-- **Accelerate sgemm for Attention SDPA** would recover ~5–8 ms on the FP16
-  prefill path by replacing single-threaded NEON loops with AMX-backed GEMMs.
+- **FP16 decode is at ~73 tok/s of the ~172 tok/s achievable GEMV roof (~43%).**
+  At ORT-level 80% efficiency, ~137 tok/s is theoretically reachable. The gap
+  is partly dispatch overhead and partly NEON GEMV thread coordination.
+- **Accelerate sgemm for Attention SDPA** — partially addressed by inline NEON
+  SDPA decode (#349), which removed the scalar fallback. Further gains possible
+  from AMX-backed SDPA GEMMs for prefill.
 - **Native fp16 elementwise ops** (Mul, RMSNorm, RotaryEmbedding) would
   eliminate per-op fp16↔f32 widening for compute-trivial ops: ~3–5 ms.
 - **Fused SiLU·Mul** would eliminate one widen+narrow round-trip per layer in
   the FFN block: ~3–4 ms.
-- **FP32 prefill** has not been optimized (1075 ms); this is not urgent now
-  that FP16 is the recommended model format.
+- **Small-model decode deficit** (TinyStories-33M: 0.91× ORT) — the decode
+  working set is partially cache-resident; ORT's pre-packed layouts and mature
+  GEMV achieve higher cache efficiency. This is an open gap.
 - **Q4** has a theoretical ~450 tok/s ceiling but needs both a real int4
   aarch64 kernel and a compatible model export.
 
