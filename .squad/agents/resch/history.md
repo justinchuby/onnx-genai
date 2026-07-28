@@ -58,3 +58,15 @@ catches `cfg(target_os)` gating errors that the `x86_64-apple-darwin` recipe mis
 - Wired into `.github/workflows/ci.yml` quality job.
 - Known gaps: can't check ep-cpu from macOS; can't catch runtime dispatch; Windows cfg via portable matrix.
 - Filed to `.squad/decisions/inbox/resch-cross-compile-check.md`.
+
+## 2026-07-27T22:05:00-07:00 — Dispatch manifest lint (Phase 1–2 of structural fix)
+
+- Created `dispatch_manifest.toml` — declarative table of (op, variant, platform) → minimum tier + proving counter.
+- Created `scripts/check_dispatch_manifest.py` — CI lint that validates every manifest claim has its counter in the declared file.
+- Seeded 6 claims: MatMul f16 M=1 (GEMV), MatMul f16 M≥2 (BNNS), Conv standard (BNNS), Conv fallback (im2col+GEMM), SDPA (NEON), KernelDispatch (prebind).
+- Documented 2 deliberate exclusions: depthwise Conv, bf16 M≥2.
+- Guard-break proof: renamed CONV_BNNS_TEST_HITS → lint correctly failed with targeted error message naming op, platform, tier, counter.
+- Zero runtime cost: manifest is CI-only; counters remain #[cfg(test)].
+- Cross-EP ready: file field can point to any crate; no CPU-specific logic.
+- Would have caught 7/9 historical instances; misses compilation errors (cross-compile script) and un-claimed ops (human judgment).
+- Filed to `.squad/decisions/inbox/resch-dispatch-manifest.md`.
