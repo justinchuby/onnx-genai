@@ -1,9 +1,9 @@
 # CI is split into two tiers:
 # - Fast tier: every PR push. Runs formatting/lints, Linux x86_64 offline
-#   crate tests, and Linux/Windows x86_64 CLI build/test/e2e without coverage
-#   instrumentation. Windows PR coverage is spent where this repo actually
-#   sees platform bugs: CLI, ORT loading, filesystem, terminal, and dynamic
-#   linking boundaries.
+#   crate tests, Linux/Windows x86_64 CLI build/test/e2e, and the Windows
+#   onnx-runtime-loader path-safety tests without coverage instrumentation.
+#   Windows PR coverage is spent where this repo actually sees platform bugs:
+#   CLI, ORT loading, filesystem, terminal, and dynamic linking boundaries.
 # - Slow tier: push to main, nightly schedule, manual dispatch (default), or
 #   adding the `ci:full` label to an open PR. Adds coverage uploads, the full
 #   Windows x86_64 offline-crate suite, Windows ARM64, macOS arm64, and CUDA
@@ -534,6 +534,9 @@ jobs:
       # entry point and its REPL contract tests catch token-budget regressions.
       # Keep this isolated so the native ORT download is intentional, pinned by
       # ort-sys checksums, and paid only by the crate that needs it.
+      - name: Test Windows loader path safety
+        if: env.SLOW_TIER != 'true' && runner.os == 'Windows'
+        run: cargo test --locked -p onnx-runtime-loader pathsafe
       - name: Build onnx-genai-cli
         run: cargo build --locked -p onnx-genai-cli
       - name: Expose downloaded ORT on Windows
