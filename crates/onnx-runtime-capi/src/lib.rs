@@ -129,6 +129,7 @@ fn map_session_error(err: &SessionError) -> OrtErrorCode {
         | E::RankMismatch { .. }
         | E::RuntimeBroadcastIncompatible { .. }
         | E::LoraOverrideUnknown { .. } => OrtErrorCode::InvalidArgument,
+        E::UnknownLoraAdapter { .. } => OrtErrorCode::InvalidArgument,
         E::NoModelSource => OrtErrorCode::NoModel,
         E::UnsupportedOp { .. } => OrtErrorCode::NotImplemented,
         E::Ep(_) | E::ExecutionProviderUnavailable(_) => OrtErrorCode::EpFail,
