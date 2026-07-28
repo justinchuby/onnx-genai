@@ -287,3 +287,21 @@ Phase 1 landed in #289. Remaining phases cover session/runtime interaction — `
 `/rewind` — which depend on runtime APIs tracked in
 `docs/research/cli/04-runtime-capability-inventory.md` and `06-fork-rewind-api.md`.
 Fork is reserved behind a type gate and **not yet enabled on any backend**.
+
+## 2026-07-28 — Declarative, name-agnostic model I/O and shared-KV contracts
+
+**PR #373 / issue #231 (Melina; reviewed by Richter; merged `61d3bdac`).** Decoder and
+proposer ports resolve first from exact `model.io` / `speculative.io` declarations, then
+from unique dtype/shape signals; legacy terminal-name matching remains compatibility-only.
+Declared KV lists pair positionally. Attention representation permissions are independent of
+attention implementation, and `io.kv_update: shared_buffer` declares operator-agnostic
+shared-buffer KV updates. Strict attention sequence-length validation rejects incompatible
+contracts early.
+
+## 2026-07-28 — Honest route-first QMoE residency tests under coverage
+
+**PR #378 (Nandez; reviewed by Kuato; merged `ac75e146`).** Coverage-mode route-first QMoE
+offload assertions now reflect the scheduler contract: serial execution peaks at one resident
+expert; prefetch peaks in `[1, 2]` and remains below selected experts. The shared
+`hold_metrics_test_lock` helper is poison-recovering across 20 call sites, preventing a
+previous test panic from cascading into phantom residency regressions on unrelated PRs.
