@@ -867,12 +867,15 @@ discovery (Phase 1's `build_manifest`) becomes the **fail-loud fallback**.
 
 `pkg.nxrt::GroupedLoraDelta` is registered by the native CUDA EP and mirrors the
 CPU operator contract. The CUDA kernel reads `x` and the per-row Int32/Int64
-`segments` route, groups rows by adapter on the host, lazily copies each referenced
-64-byte-aligned factor page into a persistent device allocation, and launches one
-dense `X_group @ A_t @ B_t` computation per adapter before scattering directly
-into `delta`. Base-only rows (`segments < 0`) remain zero. Float32, Float16, and
-BFloat16 activations/factors are supported; **both dot products accumulate in
-fp32**, and narrowing occurs only at the final output store.
+`segments` route, groups rows by adapter on the host, concatenates every group’s
+row indices into one persistent device table with a single upload, and launches
+one dense `X_group @ A_t @ B_t` computation per adapter using its table offset
+before scattering directly into `delta`. This avoids cross-stream reuse of a
+shared row table while groups are in flight. Referenced 64-byte-aligned factor
+pages are copied lazily into persistent device allocations. Base-only rows
+(`segments < 0`) remain zero. Float32, Float16, and BFloat16
+activations/factors are supported; **both dot products accumulate in fp32**, and
+narrowing occurs only at the final output store.
 
 The mixed route `[A,B,base,A]` is numerically verified on an NVIDIA H200 against
 both the CPU `GroupedLoraDelta` kernel and an independent closed-form reference.
@@ -1038,11 +1041,12 @@ than the previous misleading "session was not loaded with a grouped pool" error.
   delta, A ≠ B, and an unknown name fails loud). The single-adapter
   `engine_lora_path_applies_and_reverts_adapter_delta` still passes unchanged.
 * **CUDA grouped LoRA (§J.7).** The native CUDA registry claims
-  `pkg.nxrt::GroupedLoraDelta`; referenced factor pages are persistent on device,
-  mixed adapters and base-only rows execute on CUDA with fp32 accumulation, and
-  the `[A,B,base,A]` GPU parity test matches the CPU op and closed-form reference.
-  CUDA-graph capture intentionally splits at this eager seam until device-side
-  grouping and fixed capture-safe page tables land.
+  `pkg.nxrt::GroupedLoraDelta`; referenced factor pages and the concatenated
+  per-run row table are device-resident, mixed adapters and base-only rows execute
+  on CUDA with fp32 accumulation, and GPU parity plus a repeated large
+  three-adapter routing stress test verify correct, stable routing. CUDA-graph
+  capture intentionally splits at this eager seam until device-side grouping and
+  fixed capture-safe page tables land.
 
 **Deferred (honestly not done in this pass).**
 

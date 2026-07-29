@@ -110,6 +110,7 @@ __device__ void grouped_lora_delta(
     const unsigned char* factor_a,
     const unsigned char* factor_b,
     Value* output,
+    unsigned long long row_offset,
     unsigned long long group_rows,
     int input_width,
     int output_width,
@@ -126,7 +127,7 @@ __device__ void grouped_lora_delta(
          element += (unsigned long long)gridDim.x * blockDim.x) {
         const unsigned long long group_row = element / output_width;
         const int output_column = (int)(element % output_width);
-        const int input_row = rows[group_row];
+        const int input_row = rows[row_offset + group_row];
         float output_accumulator = 0.0f;
         for (int rank_column = 0; rank_column < rank; ++rank_column) {
             float intermediate_accumulator = 0.0f;
@@ -154,34 +155,36 @@ __device__ void grouped_lora_delta(
 extern "C" __global__ void grouped_lora_delta_float32(
     const float* input, const int* rows,
     const unsigned char* factor_a, const unsigned char* factor_b, float* output,
-    unsigned long long group_rows, int input_width, int output_width, int rank,
+    unsigned long long row_offset, unsigned long long group_rows, int input_width,
+    int output_width, int rank,
     int factor_a_data_type, int factor_b_data_type, float scale)
 {
     grouped_lora_delta(
-        input, rows, factor_a, factor_b, output, group_rows, input_width,
+        input, rows, factor_a, factor_b, output, row_offset, group_rows, input_width,
         output_width, rank, factor_a_data_type, factor_b_data_type, scale);
 }
 
 extern "C" __global__ void grouped_lora_delta_float16(
     const __half* input, const int* rows,
     const unsigned char* factor_a, const unsigned char* factor_b, __half* output,
-    unsigned long long group_rows, int input_width, int output_width, int rank,
+    unsigned long long row_offset, unsigned long long group_rows, int input_width,
+    int output_width, int rank,
     int factor_a_data_type, int factor_b_data_type, float scale)
 {
     grouped_lora_delta(
-        input, rows, factor_a, factor_b, output, group_rows, input_width,
+        input, rows, factor_a, factor_b, output, row_offset, group_rows, input_width,
         output_width, rank, factor_a_data_type, factor_b_data_type, scale);
 }
 
 extern "C" __global__ void grouped_lora_delta_bfloat16(
     const __nv_bfloat16* input, const int* rows,
     const unsigned char* factor_a, const unsigned char* factor_b,
-    __nv_bfloat16* output, unsigned long long group_rows, int input_width,
-    int output_width, int rank, int factor_a_data_type, int factor_b_data_type,
-    float scale)
+    __nv_bfloat16* output, unsigned long long row_offset,
+    unsigned long long group_rows, int input_width, int output_width, int rank,
+    int factor_a_data_type, int factor_b_data_type, float scale)
 {
     grouped_lora_delta(
-        input, rows, factor_a, factor_b, output, group_rows, input_width,
+        input, rows, factor_a, factor_b, output, row_offset, group_rows, input_width,
         output_width, rank, factor_a_data_type, factor_b_data_type, scale);
 }
 "#;
@@ -324,9 +327,37 @@ impl Kernel for GroupedLoraDeltaKernel {
         for (adapter, _) in &grouped_rows {
             self.ensure_device_factor_pair(*adapter, &mut device_state)?;
         }
+        let total_rows = grouped_rows
+            .iter()
+            .try_fold(0_usize, |total, (_, adapter_rows)| {
+                total
+                    .checked_add(adapter_rows.len())
+                    .ok_or_else(|| error("total adapter row count overflow"))
+            })?;
+        let mut concatenated_rows = Vec::new();
+        concatenated_rows
+            .try_reserve_exact(total_rows)
+            .map_err(|_| error("unable to allocate concatenated adapter row table"))?;
+        for (_, adapter_rows) in &grouped_rows {
+            concatenated_rows.extend_from_slice(adapter_rows);
+        }
+        if !concatenated_rows.is_empty() {
+            self.upload_rows(&concatenated_rows, &mut device_state)?;
+        }
         self.zero_output(output)?;
-        for (adapter, rows) in grouped_rows {
-            self.launch_group(input, output, adapter, &rows, &mut device_state)?;
+        let mut row_offset = 0_usize;
+        for (adapter, adapter_rows) in grouped_rows {
+            self.launch_group(
+                input,
+                output,
+                adapter,
+                &adapter_rows,
+                row_offset,
+                &mut device_state,
+            )?;
+            row_offset = row_offset
+                .checked_add(adapter_rows.len())
+                .ok_or_else(|| error("total adapter row count overflow"))?;
         }
         self.runtime.synchronize()
     }
@@ -486,17 +517,7 @@ impl GroupedLoraDeltaKernel {
         .map_err(|failure| driver_err("launch GroupedLoraDelta zero fill", failure))
     }
 
-    fn launch_group(
-        &self,
-        input: &TensorView,
-        output: &mut TensorMut,
-        adapter: AdapterId,
-        rows: &[i32],
-        device_state: &mut DeviceState,
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
+    fn upload_rows(&self, rows: &[i32], device_state: &mut DeviceState) -> Result<()> {
         let row_bytes = std::mem::size_of_val(rows);
         if device_state.row_capacity < row_bytes {
             let replacement = self.runtime.alloc_raw(row_bytes)?;
@@ -512,8 +533,20 @@ impl GroupedLoraDeltaKernel {
             std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), row_bytes)
         };
         // SAFETY: the persistent row allocation covers `row_bytes`.
-        unsafe {
-            self.runtime.htod(row_bytes, device_state.row_pointer)?;
+        unsafe { self.runtime.htod(row_bytes, device_state.row_pointer) }
+    }
+
+    fn launch_group(
+        &self,
+        input: &TensorView,
+        output: &mut TensorMut,
+        adapter: AdapterId,
+        adapter_rows: &[i32],
+        row_offset: usize,
+        device_state: &mut DeviceState,
+    ) -> Result<()> {
+        if adapter_rows.is_empty() {
+            return Ok(());
         }
 
         let factor_pair = device_state
@@ -529,8 +562,10 @@ impl GroupedLoraDeltaKernel {
         let function = self.runtime.nvrtc_function(MODULE, SOURCE, entry)?;
         let input_pointer = cuptr(input.data_ptr::<u8>() as *const c_void);
         let output_pointer = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
-        let group_rows =
-            u64::try_from(rows.len()).map_err(|_| error("adapter group size exceeds u64"))?;
+        let row_offset =
+            u64::try_from(row_offset).map_err(|_| error("adapter row offset exceeds u64"))?;
+        let group_rows = u64::try_from(adapter_rows.len())
+            .map_err(|_| error("adapter group size exceeds u64"))?;
         let input_width =
             i32::try_from(self.input_width).map_err(|_| error("K exceeds CUDA Int32 indexing"))?;
         let output_width =
@@ -547,6 +582,7 @@ impl GroupedLoraDeltaKernel {
             .arg(&factor_pair.factor_a_pointer)
             .arg(&factor_pair.factor_b_pointer)
             .arg(&output_pointer)
+            .arg(&row_offset)
             .arg(&group_rows)
             .arg(&input_width)
             .arg(&output_width)
@@ -907,6 +943,147 @@ mod tests {
                 (cuda_value - expected).abs() < 1e-5,
                 "CUDA/closed-form mismatch at {index}: CUDA={cuda_value}, expected={expected}"
             );
+        }
+        execution_provider.deallocate(input_buffer).unwrap();
+        execution_provider.deallocate(segment_buffer).unwrap();
+        execution_provider.deallocate(output_buffer).unwrap();
+    }
+
+    #[test]
+    fn large_interleaved_adapter_groups_route_stably_on_device() {
+        let execution_provider = CudaExecutionProvider::initialized(0)
+            .expect("CUDA device required for routing stress test");
+        let input_width = 256;
+        let output_width = 256;
+        let rank = 8;
+        let rows_per_adapter = 4_096;
+        let adapter_count = 3;
+        let total_rows = rows_per_adapter * adapter_count;
+        let mut pool = LoraWeightPool::with_capacity_bytes(1 << 20);
+        let factor_a = vec![1.0_f32; input_width * rank];
+        for adapter_index in 0..adapter_count {
+            let multiplier = (adapter_index + 1) as f32;
+            let factor_b = vec![multiplier / rank as f32; rank * output_width];
+            pool.admit(
+                AdapterId(adapter_index as u64),
+                LoraModuleId(0),
+                LoraFactorInput {
+                    dtype: DataType::Float32,
+                    rows: input_width,
+                    cols: rank,
+                    bytes: bytes_of(&factor_a),
+                },
+                LoraFactorInput {
+                    dtype: DataType::Float32,
+                    rows: rank,
+                    cols: output_width,
+                    bytes: bytes_of(&factor_b),
+                },
+                1.0,
+            )
+            .unwrap();
+        }
+        let registration = LoraPoolRegistry::global().register_owned(Arc::new(pool));
+        let cuda_kernel = GroupedLoraDeltaFactory {
+            runtime: execution_provider.runtime().clone(),
+        }
+        .create(
+            &node(registration.pool_id(), input_width, output_width),
+            &[],
+        )
+        .unwrap();
+
+        let input = vec![1.0_f32; total_rows * input_width];
+        let segments: Vec<i32> = (0..total_rows)
+            .map(|row| (row % adapter_count) as i32)
+            .collect();
+        let input_shape = [total_rows, input_width];
+        let output_shape = [total_rows, output_width];
+        let segment_shape = [total_rows];
+        let input_strides = compute_contiguous_strides(&input_shape);
+        let output_strides = compute_contiguous_strides(&output_shape);
+        let segment_strides = compute_contiguous_strides(&segment_shape);
+        let input_buffer = execution_provider
+            .allocate(std::mem::size_of_val(input.as_slice()), 256)
+            .unwrap();
+        let segment_buffer = execution_provider
+            .allocate(std::mem::size_of_val(segments.as_slice()), 256)
+            .unwrap();
+        let mut output_buffer = execution_provider
+            .allocate(
+                output_shape.iter().product::<usize>() * std::mem::size_of::<f32>(),
+                256,
+            )
+            .unwrap();
+        unsafe {
+            execution_provider
+                .runtime()
+                .htod(bytes_of(&input), cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            execution_provider
+                .runtime()
+                .htod(bytes_of(&segments), cuptr(segment_buffer.as_ptr()))
+                .unwrap();
+        }
+
+        let mut stable_output = None;
+        for iteration in 0..12 {
+            let cuda_inputs = [
+                TensorView::new(
+                    DevicePtr(input_buffer.as_ptr()),
+                    DataType::Float32,
+                    &input_shape,
+                    &input_strides,
+                    execution_provider.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(segment_buffer.as_ptr()),
+                    DataType::Int32,
+                    &segment_shape,
+                    &segment_strides,
+                    execution_provider.device_id(),
+                ),
+            ];
+            let cuda_output = TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                execution_provider.device_id(),
+            );
+            cuda_kernel
+                .execute(&cuda_inputs, &mut [cuda_output])
+                .unwrap();
+            let mut output_bytes =
+                vec![0_u8; output_shape.iter().product::<usize>() * std::mem::size_of::<f32>()];
+            unsafe {
+                execution_provider
+                    .runtime()
+                    .dtoh(&mut output_bytes, cuptr(output_buffer.as_ptr()))
+                    .unwrap();
+            }
+            let output_values: Vec<f32> = output_bytes
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+                .collect();
+            for (row, adapter_identifier) in segments.iter().copied().enumerate() {
+                let expected = input_width as f32 * (adapter_identifier + 1) as f32;
+                for output_value in &output_values[row * output_width..(row + 1) * output_width] {
+                    assert_eq!(
+                        output_value.to_bits(),
+                        expected.to_bits(),
+                        "incorrect adapter routing at iteration {iteration}, row {row}"
+                    );
+                }
+            }
+            if let Some(previous_output) = &stable_output {
+                assert_eq!(
+                    output_values, *previous_output,
+                    "routing output changed at iteration {iteration}"
+                );
+            } else {
+                stable_output = Some(output_values);
+            }
         }
         execution_provider.deallocate(input_buffer).unwrap();
         execution_provider.deallocate(segment_buffer).unwrap();
