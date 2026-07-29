@@ -2,7 +2,7 @@
 
 use crate::decode::{
     DecodeState, apply_paged_sliding_window, clone_value, extract_next_token_logits_with_io,
-    is_present_output, run_decode_step_with_extra,
+    run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -1130,6 +1130,10 @@ struct NestedAutoregressivePlan {
     outer_hidden_output: String,
     /// Inner decoder input port that receives the seed / threaded embedding.
     inner_embeds_input: String,
+    /// Inner decoder OUTPUT port carrying the per-code embedding threaded into
+    /// the next inner step's `inputs_embeds` seed. Declared explicitly via
+    /// `pipeline.strategy.inner_embedding_output`; never inferred by tensor name.
+    inner_embedding_output: String,
     /// Prompt-phase components (`prompt_only`), run once before the outer loop.
     prompt_components: Vec<String>,
     /// Post-decode components (`final_only`, e.g. a vocoder), run once after the
@@ -1433,10 +1437,18 @@ impl PipelinePlan {
         let outer_hidden_output = outer_hidden_output.to_string();
         let inner_embeds_input = inner_embeds_input.to_string();
 
-        // The inner decoder threads its own per-code embedding on later steps;
-        // its exact output port is resolved from the loaded session in the driver
-        // (the sole non-logits, non-KV output), since sessions are not available
-        // at plan-build time.
+        // The inner decoder threads its own per-code embedding on later steps.
+        // The exact output port is declared explicitly (it is shape-indistinguish-
+        // able from other float outputs); a missing declaration is an actionable
+        // error rather than a tensor-name guess.
+        let inner_embedding_output = nested.inner_embedding_output.clone().context(
+            "nested_autoregressive strategy is missing \
+                 'inner_embedding_output' (the inner decoder output port threaded \
+                 across inner steps)",
+        )?;
+        if inner_embedding_output.is_empty() {
+            anyhow::bail!("nested_autoregressive 'inner_embedding_output' must not be empty");
+        }
 
         // Optional pre-embedder driving the outer talker via `inputs_embeds`
         // (materialized codec-sum embedder) instead of `input_ids`. When set it
@@ -1568,6 +1580,7 @@ impl PipelinePlan {
             max_frames,
             outer_hidden_output,
             inner_embeds_input,
+            inner_embedding_output,
             prompt_components,
             post_decode_components,
             pre_embedder,
@@ -2015,6 +2028,76 @@ mod tests {
         }
     }
 
+    /// A minimal `nested_autoregressive` (multi-decoder TTS) spec with the
+    /// required outer→inner per-frame hidden binding. `inner_embedding_output`
+    /// is threaded through so both the missing and declared cases can be tested.
+    fn nested_autoregressive_spec(inner_embedding_output: Option<String>) -> PipelineSpec {
+        PipelineSpec {
+            models: BTreeMap::from([
+                ("talker".to_string(), component("decoder")),
+                ("code_predictor".to_string(), component("decoder")),
+            ]),
+            dataflow: vec![DataflowEdge {
+                from: "talker.last_hidden_state".to_string(),
+                to: "code_predictor.inputs_embeds".to_string(),
+                dtype: None,
+                device_transfer: None,
+            }],
+            strategy: PipelineStrategy {
+                kind: PipelineStrategyKind::NestedAutoregressive,
+                outer: Some("talker".to_string()),
+                inner: Some("code_predictor".to_string()),
+                num_code_groups: Some(4),
+                max_tokens: Some(8),
+                inner_embedding_output,
+                ..PipelineStrategy::default()
+            },
+            ..PipelineSpec::default()
+        }
+    }
+
+    #[test]
+    fn nested_autoregressive_requires_explicit_inner_embedding_output() {
+        let error = PipelinePlan::from_spec(
+            &nested_autoregressive_spec(None),
+            &SchedulerRegistry::builtin(),
+        )
+        .expect_err("a nested_autoregressive plan without the inner-embedding contract must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("inner_embedding_output"),
+            "the error must name the missing key: {message}"
+        );
+    }
+
+    #[test]
+    fn nested_autoregressive_rejects_empty_inner_embedding_output() {
+        let error = PipelinePlan::from_spec(
+            &nested_autoregressive_spec(Some(String::new())),
+            &SchedulerRegistry::builtin(),
+        )
+        .expect_err("an empty inner_embedding_output must fail");
+        assert!(
+            error.to_string().contains("inner_embedding_output"),
+            "the error must name the offending key: {error}"
+        );
+    }
+
+    #[test]
+    fn nested_autoregressive_carries_declared_inner_embedding_output() -> anyhow::Result<()> {
+        let plan = PipelinePlan::from_spec(
+            &nested_autoregressive_spec(Some("code_embeds".to_string())),
+            &SchedulerRegistry::builtin(),
+        )?;
+        match plan {
+            PipelinePlan::NestedAutoregressive(nested) => {
+                assert_eq!(nested.inner_embedding_output, "code_embeds");
+            }
+            other => panic!("expected a nested_autoregressive plan, got {other:?}"),
+        }
+        Ok(())
+    }
+
     #[cfg(not(feature = "native-backend"))]
     #[test]
     fn explicit_native_backend_without_feature_reports_actionable_build_error() {
@@ -2130,6 +2213,7 @@ pipeline:
                 inner: None,
                 num_code_groups: None,
                 pre_embedder: None,
+                inner_embedding_output: None,
                 prefill_embedder: None,
                 stages: vec![
                     PipelineStrategyStage {
@@ -2157,6 +2241,7 @@ pipeline:
                             inner: None,
                             num_code_groups: None,
                             pre_embedder: None,
+                            inner_embedding_output: None,
                             prefill_embedder: None,
                             stages: vec![],
                         }),
@@ -2187,6 +2272,7 @@ pipeline:
                             inner: None,
                             num_code_groups: None,
                             pre_embedder: None,
+                            inner_embedding_output: None,
                             prefill_embedder: None,
                             stages: vec![],
                         }),
@@ -2252,6 +2338,7 @@ pipeline:
             inner: None,
             num_code_groups: None,
             pre_embedder: None,
+            inner_embedding_output: None,
             prefill_embedder: None,
             stages: vec![],
         }

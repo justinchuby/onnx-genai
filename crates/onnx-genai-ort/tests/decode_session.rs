@@ -240,7 +240,7 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
         deterministic_session_options(),
     )
     .expect("session");
-    let signature = StaticCacheDecodeSession::detect(&session)
+    let signature = StaticCacheDecodeSession::detect(&session, None)
         .expect("detect")
         .expect("static-cache signature");
     assert_eq!(signature.layers, 1);
@@ -249,7 +249,7 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
     assert!(!signature.has_position_ids);
 
     let mut decode =
-        StaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 1 })
+        StaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 1 }, None)
             .expect("static decode session");
     let initial_buffers = decode.buffer_infos().expect("initial buffers");
     assert_eq!(initial_buffers.len(), 2);
@@ -332,9 +332,12 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
         .max()
         .expect("traces");
 
-    let mut batched =
-        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 3 })
-            .expect("batched static decode session");
+    let mut batched = BatchedStaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 3 },
+        None,
+    )
+    .expect("batched static decode session");
     let initial_buffers = batched.buffer_infos().expect("initial buffers");
     assert_eq!(initial_buffers.len(), 2);
     assert!(
@@ -427,9 +430,12 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
         .map(|prompt| static_cache_greedy_trace(&session, prompt, 2))
         .collect::<Vec<_>>();
 
-    let mut batched =
-        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
-            .expect("batched static decode session");
+    let mut batched = BatchedStaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 4 },
+        None,
+    )
+    .expect("batched static decode session");
 
     for prompt_index in 0..2 {
         let ids = prompts
@@ -457,9 +463,12 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
             BatchedStaticCacheDecodeSession::row_logits(&full_logits, row, 0).expect("row logits");
         assert_batched_matches_individual(&row_logits, &expected[row].logits[2]);
     }
-    let mut full_reference =
-        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
-            .expect("full reference");
+    let mut full_reference = BatchedStaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 4 },
+        None,
+    )
+    .expect("full reference");
     for prompt_index in 0..2 {
         let ids = prompts
             .iter()
@@ -546,7 +555,7 @@ struct StaticTrace {
 
 fn static_cache_greedy_trace(session: &Session, prompt: &[i64], generated: usize) -> StaticTrace {
     let mut decode =
-        StaticCacheDecodeSession::new(session, StaticCacheDecodeOptions { batch_size: 1 })
+        StaticCacheDecodeSession::new(session, StaticCacheDecodeOptions { batch_size: 1 }, None)
             .expect("static decode session");
     let mut input_tokens = Vec::new();
     let mut logits = Vec::new();

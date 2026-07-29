@@ -140,6 +140,7 @@ impl DecodeState {
                     runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
                         stable_session_ref(session),
                         StaticCacheDecodeOptions { batch_size: 1 },
+                        io,
                     )?)),
                     #[cfg(test)]
                     test_runner_marker: false,

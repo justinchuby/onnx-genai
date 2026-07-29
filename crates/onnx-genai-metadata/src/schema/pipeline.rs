@@ -478,10 +478,10 @@ pub struct PipelineComponentSpec {
 
     /// Explicit graph I/O port bindings for this pipeline component.
     ///
-    /// When present, the runtime binds decode-step ports from the declared
-    /// names instead of inferring them from tensor-name conventions. When
-    /// absent, the runtime falls back to the historical name conventions (a
-    /// temporary, transitional behavior).
+    /// The runtime binds decode-step ports from the declared names. A port that
+    /// is not declared is resolved ONLY from an unambiguous io-shape signal;
+    /// when the shape is ambiguous the runtime fails with an actionable error
+    /// naming the key to declare, and never guesses from a tensor name.
     #[serde(default)]
     pub io: Option<ModelIoSpec>,
 }
@@ -677,6 +677,18 @@ pub struct PipelineStrategy {
     #[schemars(range(min = 1))]
     #[serde(default)]
     pub num_code_groups: Option<usize>,
+
+    /// Inner decoder output port threaded across inner steps for a
+    /// `nested_autoregressive` stage.
+    ///
+    /// Each inner step consumes the previous step's per-code embedding as its
+    /// `inputs_embeds` seed; this names the inner decoder OUTPUT port that
+    /// produces that embedding. It is declared explicitly because the port is
+    /// shape-indistinguishable from other float outputs — the runtime must not
+    /// infer it by tensor name. Absent on a nested stage ⇒ actionable error
+    /// naming `pipeline.strategy.inner_embedding_output`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_embedding_output: Option<String>,
 
     /// Optional pre-embedder component driving the outer decoder (talker) of a
     /// `nested_autoregressive` stage through `inputs_embeds` instead of

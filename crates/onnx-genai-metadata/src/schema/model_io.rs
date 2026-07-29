@@ -23,10 +23,11 @@ pub struct ModelCapabilities {
 
     /// Explicit graph I/O port bindings for the single-decoder LLM path.
     ///
-    /// When present, the runtime binds decode-step inputs and outputs from the
-    /// declared names instead of inferring them from tensor-name conventions.
-    /// When absent, the runtime falls back to the historical name conventions
-    /// (a temporary, transitional behavior).
+    /// The runtime binds decode-step inputs and outputs from the declared names.
+    /// A port that is not declared is resolved ONLY from an unambiguous io-shape
+    /// signal; when the shape is ambiguous the runtime fails with an actionable
+    /// error naming the exact key to declare, and never guesses from a tensor
+    /// name.
     #[serde(default)]
     pub io: Option<ModelIoSpec>,
 
@@ -42,10 +43,10 @@ pub struct ModelCapabilities {
 /// Explicit binding of the graph ports the decode step reads and writes.
 ///
 /// Every field is optional so a model package can declare only the ports its
-/// graph exposes. Any port left unset is resolved from an unambiguous
-/// dtype/shape signal where possible, then falls back to the runtime's
-/// historical name convention for compatibility. A declared port is always
-/// authoritative.
+/// graph exposes. A port left unset is resolved ONLY from an unambiguous
+/// dtype/shape signal; when the shape cannot disambiguate the port, the runtime
+/// fails with an actionable error naming the key to declare rather than
+/// interpreting a tensor name. A declared port is always authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct ModelIoSpec {
     /// Which declared sequence port drives autoregressive execution.
@@ -167,6 +168,62 @@ pub struct ModelIoSpec {
     /// the real ONNX input port name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub optional_inputs: BTreeMap<String, OptionalInputSpec>,
+
+    /// Explicit port binding for a fixed-buffer TensorScatter static KV cache.
+    ///
+    /// A static-cache decoder scatters each step's K/V into pre-allocated,
+    /// fixed-length buffers via an integer write-index vector and a non-pad
+    /// sequence-length vector, rather than growing/appending a cache. These
+    /// control ports are integer vectors and are therefore SHAPE-indistinguish-
+    /// able from one another, so shape cannot disambiguate them: the ABI must be
+    /// declared explicitly. When present, this spec is authoritative and the
+    /// runtime binds exactly these ports; when absent, a graph is treated as a
+    /// static-cache model only if it exposes the ports by name (a transitional
+    /// fallback that emits nothing new and is slated for removal once exporters
+    /// emit this spec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_cache: Option<StaticCacheIoSpec>,
+}
+
+/// Explicit port ABI for a fixed-buffer TensorScatter static KV cache.
+///
+/// Describes GRAPH STRUCTURE, never a model family. The four per-layer cache
+/// lists pair positionally per layer and must all have the same length: index
+/// `i` in each list is layer `i`'s key/value input and updated key/value output.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct StaticCacheIoSpec {
+    /// Input port carrying the per-token scatter write positions
+    /// (`int` vector). Shape-indistinguishable from other integer control
+    /// inputs, so it must be named explicitly.
+    #[schemars(length(min = 1))]
+    pub write_indices_input: String,
+
+    /// Input port carrying the non-pad KV sequence length (`int` vector).
+    /// Shape-indistinguishable from `write_indices_input`, so it too must be
+    /// named explicitly.
+    #[schemars(length(min = 1))]
+    pub kv_sequence_length_input: String,
+
+    /// Per-layer static key-cache buffer inputs, positional per layer. Length
+    /// must equal `value_cache_inputs`, `key_cache_outputs`, and
+    /// `value_cache_outputs`.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub key_cache_inputs: Vec<String>,
+
+    /// Per-layer static value-cache buffer inputs, paired positionally with
+    /// `key_cache_inputs`.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub value_cache_inputs: Vec<String>,
+
+    /// Per-layer updated key-cache outputs, paired positionally with
+    /// `key_cache_inputs`.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub key_cache_outputs: Vec<String>,
+
+    /// Per-layer updated value-cache outputs, paired positionally with
+    /// `value_cache_inputs`.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub value_cache_outputs: Vec<String>,
 }
 
 /// Presence and absent-value contract for one optional graph input.

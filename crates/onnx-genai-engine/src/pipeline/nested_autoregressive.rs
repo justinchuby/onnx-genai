@@ -119,7 +119,6 @@ impl PipelineEngine {
         let pre_embed = self.resolve_pre_embedder(&plan, &present, outer_session)?;
         let prefill = self.resolve_prefill(&plan, &present, pre_embed.as_ref(), &tensors)?;
         let inner_embed_output = resolve_inner_embedding_output(inner_session, &plan)?;
-
         let mut outer_state = DecodeState::new(outer_session)?;
         let mut codes: Vec<i64> = Vec::with_capacity(plan.max_frames * plan.num_code_groups);
         // The outer loop feeds the full prompt on frame 0 (prefill), then the
@@ -347,29 +346,29 @@ impl PipelineEngine {
     }
 }
 
-/// The inner decoder's per-code embedding output: its sole output that is
-/// neither logits nor a present-KV tensor. Threaded into the next inner step's
-/// seed input.
+/// The inner decoder's per-code embedding output, declared explicitly on the
+/// plan and threaded into the next inner step's seed input. Validated to be an
+/// actual graph output so a misconfigured contract fails with a clear error
+/// rather than a silent binding failure.
 fn resolve_inner_embedding_output(
     inner_session: &Session,
     plan: &NestedAutoregressivePlan,
 ) -> anyhow::Result<String> {
-    let inner_embed_output = inner_session
+    let declared = plan.inner_embedding_output.clone();
+    if inner_session
         .output_names()
         .iter()
-        .find(|name| {
-            let lower = name.to_ascii_lowercase();
-            !lower.contains("logits") && !is_present_output(name)
-        })
-        .cloned()
-        .with_context(|| {
-            format!(
-                "nested inner decoder '{}' must expose a per-code embedding output (a \
-                     non-logits, non-KV output) to thread across inner steps",
-                plan.inner
-            )
-        })?;
-    Ok(inner_embed_output)
+        .any(|name| name == &declared)
+    {
+        Ok(declared)
+    } else {
+        anyhow::bail!(
+            "nested inner decoder '{}' does not expose the declared \
+             pipeline.strategy.inner_embedding_output '{}'",
+            plan.inner,
+            declared
+        )
+    }
 }
 
 /// The talker's per-frame result: its argmax token (code group 0 in
