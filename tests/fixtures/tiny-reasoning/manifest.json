@@ -1,0 +1,19 @@
+{
+  "generator": "tests/fixtures/tiny-reasoning/generate_tiny_reasoning.py",
+  "derived_from": "tests/fixtures/tiny-llm",
+  "description": "Tiny reasoning LLM: tiny-llm's graph + a <think> chat template + declared do_sample. Degenerates under greedy (reasoning never closes) so CI can assert the reasoning-progress invariant on CPU.",
+  "reasoning_open_delimiter": "<think>",
+  "reasoning_close_delimiter": "</think>",
+  "closes_under_greedy": false,
+  "generation_defaults": {
+    "do_sample": true,
+    "temperature": 0.6,
+    "top_k": 20
+  },
+  "files": {
+    "model.onnx.textproto": 76915,
+    "tokenizer.json": 2161,
+    "tokenizer_config.json": 158,
+    "inference_metadata.yaml": 617
+  }
+}
