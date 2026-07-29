@@ -484,6 +484,12 @@ pub struct SessionBuilder {
     /// Authoritative metadata-declared LoRA target manifest. When absent, target
     /// resolution falls back to graph discovery.
     lora_target_manifest: Option<onnx_genai_metadata::LoraTargetManifest>,
+    /// Optional control-plane pool sink for the grouped multi-adapter path
+    /// (design §J.2). `None` uses the default budget-free pool; the engine sets a
+    /// `ByteBudget`-governed sink so grouped adapter residency is reserved from
+    /// the shared device budget and an over-budget set fails loud at build. Only
+    /// consulted when `lora_adapters` drives the grouped path.
+    lora_pool_sink: Option<Box<dyn onnx_runtime_ep_api::LoraPoolSink>>,
     options: HashMap<String, String>,
 }
 
@@ -573,6 +579,19 @@ impl SessionBuilder {
         manifest: onnx_genai_metadata::LoraTargetManifest,
     ) -> Self {
         self.lora_target_manifest = Some(manifest);
+        self
+    }
+
+    /// Set the control-plane pool sink for the grouped multi-adapter path (design
+    /// §J.2). The engine supplies a `ByteBudget`-governed sink so grouped adapter
+    /// residency is reserved from the shared device budget before admission and
+    /// an over-budget set fails loud at [`Self::build`]. No effect on the
+    /// single/none DIRECT fast path.
+    pub fn lora_pool_sink(
+        mut self,
+        sink: Box<dyn onnx_runtime_ep_api::LoraPoolSink>,
+    ) -> Self {
+        self.lora_pool_sink = Some(sink);
         self
     }
 
@@ -674,7 +693,7 @@ impl SessionBuilder {
     /// Device selection keeps CPU as the default and selects CUDA only when
     /// explicitly requested in a CUDA-enabled build. "Compile" resolves a
     /// kernel per node into the shape-keyed cache.
-    pub fn build(self) -> Result<InferenceSession> {
+    pub fn build(mut self) -> Result<InferenceSession> {
         let (level, ep_context_config) = Self::parse_options(&self.options)?;
 
         // Memory limits and profiling remain reserved builder intents.
@@ -772,6 +791,7 @@ impl SessionBuilder {
             None
         } else {
             let mut span = trace_span("session.lora_inject_grouped", "session");
+            let pool_sink = self.lora_pool_sink.take();
             let adapters: Vec<(onnx_runtime_ep_api::AdapterId, &lora_inject::LoraAdapterSpec)> =
                 self.lora_adapters
                     .iter()
@@ -784,6 +804,7 @@ impl SessionBuilder {
                 &mut graph,
                 &adapters,
                 self.lora_target_manifest.as_ref(),
+                pool_sink,
             )?;
             if let Some(span) = span.as_mut() {
                 span.set_args(

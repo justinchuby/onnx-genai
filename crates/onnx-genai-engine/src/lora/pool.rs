@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use onnx_genai_scheduler::byte_budget::{ByteBudget, ByteBudgetError};
 use onnx_runtime_ep_api::{
-    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolError, LoraPoolRegistration,
-    LoraPoolRegistry, LoraWeightPool,
+    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolAdmitError, LoraPoolError,
+    LoraPoolRegistration, LoraPoolRegistry, LoraPoolSink, LoraWeightPool,
 };
 
 /// A failure admitting an adapter factor pair through the budgeted pool.
@@ -165,6 +165,46 @@ impl BudgetedLoraPool {
         let pool = Arc::new(pool.with_residency_owner(reservation));
         let registration = LoraPoolRegistry::global().register_owned(Arc::clone(&pool));
         (registration, pool)
+    }
+}
+
+/// Route grouped-adapter admission through the shared [`ByteBudget`]: this is the
+/// production wiring that makes the control plane authoritative (design §J.2).
+/// The grouped-injection pass in `onnx-runtime-session` admits every adapter's
+/// factor pages through this sink, so each pair's resident bytes are reserved
+/// from the same device-wide budget the KV cache uses *before* it lands, and an
+/// over-budget adapter set fails loud (a typed [`LoraPoolAdmitError::Budget`])
+/// instead of silently over-committing memory. On [`Self::finish`] the remaining
+/// reservation is attached to the pool as its residency owner, so it is released
+/// exactly once when the last pool `Arc` drops (preserving the RAII release).
+impl LoraPoolSink for BudgetedLoraPool {
+    fn admit(
+        &mut self,
+        adapter: AdapterId,
+        module: LoraModuleId,
+        a_t: LoraFactorInput<'_>,
+        b_t: LoraFactorInput<'_>,
+        scale: f32,
+    ) -> Result<(), LoraPoolAdmitError> {
+        // Disambiguate to the inherent budget-reserving admission (which reserves
+        // the shared bytes before the data-plane admit and rolls back on either
+        // failure), then translate its typed rejection into the vendor-neutral
+        // sink error the injection pass propagates.
+        BudgetedLoraPool::admit(self, adapter, module, a_t, b_t, scale).map_err(|error| match error
+        {
+            BudgetedLoraPoolError::Pool(pool) => LoraPoolAdmitError::Pool(pool),
+            BudgetedLoraPoolError::Budget(budget) => LoraPoolAdmitError::Budget {
+                requested: budget.requested,
+                used: budget.used,
+                limit: budget.limit,
+                available: budget.available,
+                shortfall: budget.shortfall,
+            },
+        })
+    }
+
+    fn finish(self: Box<Self>) -> (LoraPoolRegistration, Arc<LoraWeightPool>) {
+        (*self).register()
     }
 }
 

@@ -298,6 +298,11 @@ impl Engine {
                     .adapters
                     .as_ref()
                     .and_then(|adapters| adapters.target_manifest.clone()),
+                // Share the engine's cross-session byte budget (the same instance
+                // the scheduler/KV subsystem uses) so grouped LoRA adapter
+                // residency is counted against — and boundable by — the device
+                // ceiling (design §J.2 control plane).
+                Some(governor.byte_budget()),
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };

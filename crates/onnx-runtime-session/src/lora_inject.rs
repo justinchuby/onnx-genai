@@ -42,8 +42,8 @@ use std::sync::Arc;
 
 use onnx_genai_metadata::{LoraTargetDescriptor, LoraTargetManifest};
 use onnx_runtime_ep_api::{
-    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolId, LoraPoolRegistration,
-    LoraPoolRegistry, LoraWeightPool,
+    AdapterId, LoraFactorInput, LoraModuleId, LoraPoolAdmitError, LoraPoolId, LoraPoolRegistration,
+    LoraPoolSink, LoraWeightPool, LoraWeightPoolSink,
 };
 use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, NodeId, Shape, TensorData, ValueId, WeightRef,
@@ -311,6 +311,20 @@ pub enum LoraInjectError {
         module: String,
         #[source]
         source: onnx_runtime_ep_api::LoraPoolError,
+    },
+
+    #[error(
+        "LoRA module {module:?}: the grouped adapter set does not fit the shared device byte \
+         budget: requested {requested} B but only {available} B free (used {used} B of {limit} B \
+         ceiling); free at least {shortfall} B or raise the budget"
+    )]
+    PoolBudgetExceeded {
+        module: String,
+        requested: u64,
+        used: u64,
+        limit: u64,
+        available: u64,
+        shortfall: u64,
     },
 
     #[error(
@@ -1457,6 +1471,30 @@ fn factor_input(data: &TensorData) -> LoraFactorInput<'_> {
     }
 }
 
+/// Translate a control-plane [`LoraPoolSink`] admission failure into the typed
+/// injection error for `module`: a data-plane rejection stays a
+/// [`LoraInjectError::PoolAdmission`], a shared-budget rejection becomes a
+/// fail-loud [`LoraInjectError::PoolBudgetExceeded`].
+fn map_pool_admit_error(module: String, source: LoraPoolAdmitError) -> LoraInjectError {
+    match source {
+        LoraPoolAdmitError::Pool(source) => LoraInjectError::PoolAdmission { module, source },
+        LoraPoolAdmitError::Budget {
+            requested,
+            used,
+            limit,
+            available,
+            shortfall,
+        } => LoraInjectError::PoolBudgetExceeded {
+            module,
+            requested,
+            used,
+            limit,
+            available,
+            shortfall,
+        },
+    }
+}
+
 /// Emit one `GroupedLoraDelta` op reading `(activation, segments)` and producing
 /// a `[.., width]` delta shaped from `base_output`, returning the delta value.
 /// The op carries the `pkg.nxrt` domain and the five integer attributes the CPU
@@ -1535,7 +1573,7 @@ pub fn inject_grouped(
     manifest: &LoraManifest,
     adapter: &LoraAdapterSpec,
 ) -> Result<GroupedLoraInjection, LoraInjectError> {
-    inject_grouped_multi(graph, manifest, &[(SINGLE_ADAPTER_ID, adapter)])
+    inject_grouped_multi(graph, manifest, &[(SINGLE_ADAPTER_ID, adapter)], None)
 }
 
 /// Inject many adapters as one shared set of Phase-2
@@ -1565,10 +1603,19 @@ pub fn inject_grouped(
 ///    onto the base output by the reused Phase-1 `Add`) and one op per Q/K/V
 ///    slice of a fused `qkv_proj` (concatenated in `[Q, K, V]` order and added
 ///    once).
+///
+/// The factor pages are admitted through a control-plane [`LoraPoolSink`]. When
+/// `sink` is `None` a default budget-free [`LoraWeightPoolSink`] sized to hold
+/// every adapter is used, so the single-adapter (pool-of-one) path and tests are
+/// unchanged. The engine passes a `ByteBudget`-governed sink so grouped adapter
+/// residency is reserved from the shared device budget before admission and an
+/// over-budget set fails loud ([`LoraInjectError::PoolBudgetExceeded`]) rather
+/// than silently over-committing memory (design §J.2 control plane).
 pub fn inject_grouped_multi(
     graph: &mut Graph,
     manifest: &LoraManifest,
     adapters: &[(AdapterId, &LoraAdapterSpec)],
+    sink: Option<Box<dyn LoraPoolSink>>,
 ) -> Result<GroupedLoraInjection, LoraInjectError> {
     if adapters.is_empty() {
         return Err(LoraInjectError::EmptyAdapterSet);
@@ -1666,9 +1713,12 @@ pub fn inject_grouped_multi(
     }
 
     // --- Build the pool: assign module ids and admit every adapter's page. ---
-    // Capacity holds every adapter's factors (aligned page bytes plus a small
-    // slack), so nothing is evicted at load time; the real byte budget governs
-    // admission one layer up in the engine (design §J.2 control plane).
+    // The default (budget-free) sink's pool holds every adapter's factors
+    // (aligned page bytes plus a small slack) so nothing is evicted at load
+    // time. When the engine supplies a `ByteBudget`-governed sink, the shared
+    // device budget is authoritative: each pair's resident bytes are reserved
+    // from it before admission and the capacity below is unused (design §J.2
+    // control plane).
     let mut capacity: u64 = 0;
     let account = |cap: &mut u64, data: &TensorData| {
         *cap = cap.saturating_add(aligned_page_bytes(data.data.len()));
@@ -1698,7 +1748,8 @@ pub fn inject_grouped_multi(
     capacity = capacity
         .saturating_add(64 * (2 * manifest.entries.len() as u64 + 8) * adapters.len() as u64);
 
-    let mut pool = LoraWeightPool::with_capacity_bytes(capacity);
+    let mut sink =
+        sink.unwrap_or_else(|| Box::new(LoraWeightPoolSink::with_capacity_bytes(capacity)));
     let mut next_module_id: u32 = 0;
     let mut plans: Vec<GroupedOpPlan> = Vec::new();
 
@@ -1709,17 +1760,14 @@ pub fn inject_grouped_multi(
         let mut max_rank = 0usize;
         for (adapter_id, adapter) in adapters {
             let spec = &adapter.modules[d.entry_index];
-            pool.admit(
+            sink.admit(
                 *adapter_id,
                 LoraModuleId(module_id),
                 factor_input(&spec.a_t),
                 factor_input(&spec.b_t),
                 spec.scale,
             )
-            .map_err(|source| LoraInjectError::PoolAdmission {
-                module: spec.module_name.clone(),
-                source,
-            })?;
+            .map_err(|source| map_pool_admit_error(spec.module_name.clone(), source))?;
             max_rank = max_rank.max(spec.rank);
         }
         plans.push(GroupedOpPlan {
@@ -1746,17 +1794,14 @@ pub fn inject_grouped_multi(
                     for (adapter_id, adapter) in adapters {
                         let spec = &adapter.modules[entry_index];
                         validate_module(spec, f.k, width, f.dtype)?;
-                        pool.admit(
+                        sink.admit(
                             *adapter_id,
                             LoraModuleId(module_id),
                             factor_input(&spec.a_t),
                             factor_input(&spec.b_t),
                             spec.scale,
                         )
-                        .map_err(|source| LoraInjectError::PoolAdmission {
-                            module: spec.module_name.clone(),
-                            source,
-                        })?;
+                        .map_err(|source| map_pool_admit_error(spec.module_name.clone(), source))?;
                         max_rank = max_rank.max(spec.rank);
                     }
                     max_rank
@@ -1778,14 +1823,16 @@ pub fn inject_grouped_multi(
                             cols: width,
                             bytes: &[],
                         };
-                        pool.admit(*adapter_id, LoraModuleId(module_id), a0, b0, 1.0)
-                            .map_err(|source| LoraInjectError::PoolAdmission {
-                                module: format!(
-                                    "{}.{} (untargeted)",
-                                    f.layer_semantic,
-                                    role.as_str()
-                                ),
-                                source,
+                        sink.admit(*adapter_id, LoraModuleId(module_id), a0, b0, 1.0)
+                            .map_err(|source| {
+                                map_pool_admit_error(
+                                    format!(
+                                        "{}.{} (untargeted)",
+                                        f.layer_semantic,
+                                        role.as_str()
+                                    ),
+                                    source,
+                                )
                             })?;
                     }
                     1
@@ -1805,8 +1852,10 @@ pub fn inject_grouped_multi(
         }
     }
 
-    let pool = Arc::new(pool);
-    let registration = LoraPoolRegistry::global().register_owned(Arc::clone(&pool));
+    // Freeze the populated pool (attaching any budget reservation as its
+    // residency owner) and register it; the reservation releases exactly once
+    // when the last pool `Arc` drops.
+    let (registration, pool) = sink.finish();
     let pool_id = registration.pool_id();
 
     // --- Create the single shared non-constant `segments` routing input. ---
@@ -1944,10 +1993,15 @@ pub fn inject_grouped_lora_adapter(
 /// from the first adapter's targets; every adapter must target an identical
 /// module set, or injection fails loud
 /// ([`LoraInjectError::AdapterModuleSetMismatch`]).
+///
+/// `sink` is the control-plane pool sink (see [`inject_grouped_multi`]): `None`
+/// uses the default budget-free pool; the engine passes a `ByteBudget`-governed
+/// sink so grouped adapter residency is charged against the shared device budget.
 pub fn inject_grouped_lora_adapters(
     graph: &mut Graph,
     adapters: &[(AdapterId, &LoraAdapterSpec)],
     declared_manifest: Option<&LoraTargetManifest>,
+    sink: Option<Box<dyn LoraPoolSink>>,
 ) -> Result<GroupedLoraInjection, LoraInjectError> {
     let (_, first) = adapters.first().ok_or(LoraInjectError::EmptyAdapterSet)?;
     let targets: Vec<LoraTarget> = first
@@ -1959,7 +2013,7 @@ pub fn inject_grouped_lora_adapters(
         })
         .collect();
     let manifest = build_manifest(graph, &targets, declared_manifest)?;
-    inject_grouped_multi(graph, &manifest, adapters)
+    inject_grouped_multi(graph, &manifest, adapters, sink)
 }
 
 #[cfg(test)]

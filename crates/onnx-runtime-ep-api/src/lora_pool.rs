@@ -566,6 +566,113 @@ impl LoraPoolRegistry {
     }
 }
 
+/// Admission failure for a control-plane [`LoraPoolSink`]: either the data-plane
+/// [`LoraWeightPool`] rejected the factor pair (shape / rank / capacity), or a
+/// byte budget layered above the pool rejected the reservation for the pair's
+/// resident bytes.
+///
+/// The `Budget` variant intentionally mirrors the scheduler's `ByteBudgetError`
+/// field-for-field (RULES #1 what/why/how) without this leaf crate depending on
+/// the scheduler: the engine's `ByteBudget`-governed sink translates its typed
+/// rejection into this vendor-neutral shape.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LoraPoolAdmitError {
+    /// The data-plane pool rejected the factor pair.
+    #[error(transparent)]
+    Pool(#[from] LoraPoolError),
+    /// A shared byte budget above the pool rejected the residency reservation.
+    #[error(
+        "shared byte budget rejected grouped LoRA adapter residency: requested {requested} B but \
+         only {available} B free (used {used} B of {limit} B device ceiling); free at least \
+         {shortfall} B by preempting a session or raise the budget"
+    )]
+    Budget {
+        /// Resident bytes the rejected admission asked for.
+        requested: u64,
+        /// Bytes already reserved across the shared budget at rejection time.
+        used: u64,
+        /// The active byte ceiling.
+        limit: u64,
+        /// Bytes free at rejection time (`limit - used`).
+        available: u64,
+        /// Bytes that must be freed (or added to the limit) to admit the pair.
+        shortfall: u64,
+    },
+}
+
+/// Control-plane admission sink for building one grouped-LoRA
+/// [`LoraWeightPool`] (design §J.2 control plane).
+///
+/// The grouped-injection pass admits every adapter's factor pages through a sink
+/// and then finalizes it into a registered, shared pool. Two implementations
+/// exist:
+///
+/// * [`LoraWeightPoolSink`] — the default, budget-free sink: a plain
+///   capacity-bounded pool. Used by the single-adapter (pool-of-one) path and by
+///   tests, so their behavior is byte-for-byte unchanged.
+/// * The engine's `BudgetedLoraPool` — reserves each pair's resident bytes from
+///   the shared cross-session `ByteBudget` (the same ceiling the KV cache
+///   accounts against) *before* admitting it, and attaches the reservation to
+///   the finished pool so it is released exactly once when the last `Arc` drops.
+///   An over-budget adapter set fails loud here instead of silently
+///   over-committing device memory.
+pub trait LoraPoolSink: Send {
+    /// Admit one `(adapter, module)` factor pair, reserving its resident bytes
+    /// against any governing budget first. On budget or data-plane rejection
+    /// nothing is admitted and no bytes leak.
+    fn admit(
+        &mut self,
+        adapter: AdapterId,
+        module: LoraModuleId,
+        a_t: LoraFactorInput<'_>,
+        b_t: LoraFactorInput<'_>,
+        scale: f32,
+    ) -> Result<(), LoraPoolAdmitError>;
+
+    /// Freeze the populated pool into a shared handle, register it in the process
+    /// [`LoraPoolRegistry`], and hand back the registration (whose `pool_id` the
+    /// emitted ops bake in) plus the shared pool. Any residency reservation is
+    /// attached to the pool so it releases exactly once on final `Arc` drop.
+    fn finish(self: Box<Self>) -> (LoraPoolRegistration, Arc<LoraWeightPool>);
+}
+
+/// The default budget-free [`LoraPoolSink`]: a plain capacity-bounded
+/// [`LoraWeightPool`]. Residency is bounded only by the pool's own byte ceiling,
+/// with no cross-session budget accounting.
+pub struct LoraWeightPoolSink {
+    pool: LoraWeightPool,
+}
+
+impl LoraWeightPoolSink {
+    /// A sink over a fresh pool with the given absolute byte ceiling.
+    pub fn with_capacity_bytes(capacity_bytes: u64) -> Self {
+        Self {
+            pool: LoraWeightPool::with_capacity_bytes(capacity_bytes),
+        }
+    }
+}
+
+impl LoraPoolSink for LoraWeightPoolSink {
+    fn admit(
+        &mut self,
+        adapter: AdapterId,
+        module: LoraModuleId,
+        a_t: LoraFactorInput<'_>,
+        b_t: LoraFactorInput<'_>,
+        scale: f32,
+    ) -> Result<(), LoraPoolAdmitError> {
+        self.pool
+            .admit(adapter, module, a_t, b_t, scale)
+            .map_err(LoraPoolAdmitError::from)
+    }
+
+    fn finish(self: Box<Self>) -> (LoraPoolRegistration, Arc<LoraWeightPool>) {
+        let pool = Arc::new(self.pool);
+        let registration = LoraPoolRegistry::global().register_owned(Arc::clone(&pool));
+        (registration, pool)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@ impl NativeDecodeSession {
         lora_adapter: Option<onnx_runtime_session::lora_inject::LoraAdapterSpec>,
         lora_adapters: Vec<onnx_runtime_session::lora_inject::LoraAdapterSpec>,
         lora_target_manifest: Option<onnx_genai_metadata::LoraTargetManifest>,
+        lora_byte_budget: Option<onnx_genai_scheduler::ByteBudget>,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -38,6 +39,17 @@ impl NativeDecodeSession {
             // Phase-2 multi-adapter grouped path (design §J): all adapters share
             // one paged pool, selected per request through the `segments` input.
             builder = builder.lora_adapters(lora_adapters);
+            // Wire the shared cross-session byte budget (the same instance the
+            // KV/device subsystem accounts against) so grouped adapter residency
+            // is reserved from it before admission and an over-budget set fails
+            // loud instead of over-committing device memory (design §J.2 control
+            // plane). Without a budget the pool falls back to its own capacity
+            // ceiling (unbounded by the device budget).
+            if let Some(budget) = lora_byte_budget {
+                builder = builder.lora_pool_sink(Box::new(
+                    crate::lora::pool::BudgetedLoraPool::new(budget),
+                ));
+            }
         }
         if let Some(manifest) = lora_target_manifest {
             builder = builder.lora_target_manifest(manifest);

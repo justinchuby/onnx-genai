@@ -1325,6 +1325,7 @@ fn grouped_two_adapters_route_per_row() {
         &mut graph,
         &manifest,
         &[(AdapterId(0), &adapter_a), (AdapterId(1), &adapter_b)],
+        None,
     )
     .expect("inject_grouped_multi");
     let pool_id = injection.pool_id;
@@ -1408,6 +1409,7 @@ fn grouped_multi_adapter_module_mismatch_fails_loud() {
         &mut graph,
         &manifest,
         &[(AdapterId(0), &adapter_a), (AdapterId(1), &adapter_b)],
+        None,
     );
     assert!(matches!(
         error,
