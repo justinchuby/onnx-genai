@@ -470,3 +470,13 @@ Do not delete a worktree before Scribe has merged its decision inbox. `.squad/de
 5. Safe to delete the worktree.
 
 Merging and deleting the inbox files produces no git diff (expected, not a failure). The loss that occurred here: Rachael, Zhora, Leon wrote inbox files in separate worktrees, those worktrees were deleted before Scribe ran, and inbox files were lost. The substance survived in merged `history.md` files and PR descriptions, but the durable-rule fragments did not make it to this ledger — they had to be manually recovered from context.
+
+### 2026-07-29: stream parsed tool calls as OpenAI deltas
+**By:** McClane
+**What:** Emit one metadata delta followed by an arguments delta for every parsed tool call, then finish with `tool_calls`.
+**Why:** Clients can assemble tool invocations incrementally without receiving a monolithic completed tool-call object, while retaining full-output parsing for Qwen, Llama, and Mistral safety.
+
+### 2026-07-29: CUDA operator parity batch 10
+**By:** Ernie
+**What:** Added CUDA kernels and CPU-parity coverage for AffineGrid, BatchNormalization, Compress, DynamicQuantizeLinear, GlobalAveragePool, GlobalLpPool, GlobalMaxPool, and LpNormalization. Deferred CenterCropPad, Col2Im, ConvTranspose, GridSample, GroupNormalization, InstanceNormalization, LpPool, NonMaxSuppression, QLinearMatMul, Resize, Unique, and com.microsoft FusedAttention.
+**Why:** The selected operators form a reviewable low-risk batch around fixed-width transforms, channel-wise normalization, and block reductions. Heavy geometry, convolution, detection, and data-dependent operators need dedicated follow-up waves.
