@@ -1614,13 +1614,13 @@ mod tests {
             completed_turns: 1,
         };
         let sampling_overrides = SamplingOverrides::default();
+        let mut sampling = options;
+        sampling.resolve_sampling_defaults(None, &sampling_overrides);
 
         let summary = interactive::SessionSummary {
             settings: &settings,
             resolved_decode_backend: EngineDecodeBackend::Ort,
-            options: &options,
-            generation_defaults: None,
-            sampling_overrides: &sampling_overrides,
+            sampling,
             history: &history,
             usage: &usage,
         }
@@ -1666,13 +1666,13 @@ mod tests {
         };
         let usage = interactive::SessionUsage::default();
         let sampling_overrides = SamplingOverrides::default();
+        let mut sampling = options;
+        sampling.resolve_sampling_defaults(Some(&defaults), &sampling_overrides);
 
         let summary = interactive::SessionSummary {
             settings: &settings,
             resolved_decode_backend: EngineDecodeBackend::Ort,
-            options: &options,
-            generation_defaults: Some(&defaults),
-            sampling_overrides: &sampling_overrides,
+            sampling,
             history: &[],
             usage: &usage,
         }
