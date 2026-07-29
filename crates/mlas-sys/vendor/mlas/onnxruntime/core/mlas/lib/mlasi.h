@@ -1898,7 +1898,7 @@ MlasTryBatchParallel(
 
 
 #if defined(BUILD_MLAS_NO_ONNXRUNTIME)
-// nxrt-mlas-mt: implemented in vendor/shim.cpp â€” reports the Rayon-backed
+// nxrt-mlas-mt: implemented in vendor/shim.cpp — reports the Rayon-backed
 // degree of parallelism (or 1 when no backend is registered).
 extern "C" int MlasStandaloneMaxThreads();
 #endif

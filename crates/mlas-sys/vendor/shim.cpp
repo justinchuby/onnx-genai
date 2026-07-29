@@ -175,13 +175,6 @@ extern "C" void mlas_sgemm_pack_b(
 
 extern "C" int mlas_qnbit_gemm_available(size_t bits, size_t blk_len, int comp_type)
 {
-#if defined(MLAS_TARGET_ARM64) && defined(_WIN32)
-    // The standalone Windows ARM64 CompInt8 path access-violates outside ORT's
-    // full runtime wiring; keep the safe CompFp32 QNBit path available.
-    if (static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type) == SQNBIT_CompInt8) {
-        return 0;
-    }
-#endif
     return MlasIsQNBitGemmAvailable(
                bits, blk_len, static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type))
                ? 1
@@ -209,9 +202,35 @@ extern "C" void mlas_qnbit_gemm_pack_b(
     int has_zp,
     const void* quant_b_zero_point)
 {
+    const auto ct = static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type);
+    if (bits == 8 && ct == SQNBIT_CompInt8) {
+        // ORT's MatMulNBits pre-pack path calls MLAS once per pre-packable
+        // input. The SQ8 ARM64 packer accumulates state across those calls:
+        // first quantized B bytes, then scales/zero-points. Expose a single
+        // Rust-friendly call by replaying that sequence into the same buffer.
+        MlasQNBitGemmPackQuantBData(
+            n, k, bits, blk_len, ct,
+            quant_b_data,
+            packed_b,
+            nullptr,
+            false,
+            nullptr,
+            /*ThreadPool=*/nullptr,
+            /*BackendKernelSelectorConfig=*/nullptr);
+        MlasQNBitGemmPackQuantBData(
+            n, k, bits, blk_len, ct,
+            nullptr,
+            packed_b,
+            quant_b_scale,
+            has_zp != 0,
+            quant_b_zero_point,
+            /*ThreadPool=*/nullptr,
+            /*BackendKernelSelectorConfig=*/nullptr);
+        return;
+    }
+
     MlasQNBitGemmPackQuantBData(
-        n, k, bits, blk_len,
-        static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type),
+        n, k, bits, blk_len, ct,
         quant_b_data,
         packed_b,
         quant_b_scale,
@@ -260,9 +279,13 @@ extern "C" void mlas_qnbit_gemm(
     if (ct == SQNBIT_CompInt8) {
         // The int8-compute path derives PackedQuantBData / QuantBScale /
         // QuantBBlkSum from the combined workspace produced by
-        // MlasQNBitGemmPackQuantBData (which baked scale + zero point into the
-        // block sums), so only the workspace pointer is needed here.
+        // MlasQNBitGemmPackQuantBData. The KleidiAI packed ARM64 path also
+        // reads PackedQuantBData directly (and stores zero-point correction
+        // after it), so provide both views over the same packed buffer.
         params.QuantBDataWorkspace = packed_b;
+        params.PackedQuantBData = static_cast<const std::byte*>(packed_b);
+        params.QuantBScale = quant_b_scale;
+        params.QuantBZeroPoint = has_zp != 0 ? quant_b_zero_point : nullptr;
     } else {
         // The fp32-compute path repacks only the quantized nibbles; scales and
         // (optional) zero points are consumed at compute time in their original

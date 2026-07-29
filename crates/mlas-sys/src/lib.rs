@@ -791,8 +791,8 @@ pub fn sgemm(
 }
 
 /// Blocked n-bit quantized GEMM compute type, mirroring MLAS's
-/// `MLAS_QNBIT_GEMM_COMPUTE_TYPE`. Only the two x86 float-input variants used
-/// by the CPU `MatMulNBits` decode path are exposed.
+/// `MLAS_QNBIT_GEMM_COMPUTE_TYPE`. These are the two float-input variants used
+/// by the CPU `MatMulNBits` decode path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SQNBitComputeType {
     /// fp32 activation, fp32 accumulate (`SQNBIT_CompFp32`).
@@ -1450,6 +1450,42 @@ mod tests {
         (packed, scales, asymmetric.then_some(zps), dequant)
     }
 
+    /// Quantize a row-major `N x K` f32 weight to ONNX `MatMulNBits` uint8
+    /// blocks, returning `(packed_b, scales, zero_points, dequantized_nk)`.
+    /// `packed_b` is `[N, k_blocks, block_size]`; scales and zero points are
+    /// both `[N, k_blocks]`.
+    fn quantize_int8(
+        weights_nk: &[f32],
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> (Vec<u8>, Vec<f32>, Vec<u8>, Vec<f32>) {
+        let blocks = k.div_ceil(block_size);
+        let mut packed = vec![0u8; n * blocks * block_size];
+        let mut scales = vec![0.0f32; n * blocks];
+        let mut zps = vec![0u8; n * blocks];
+        let mut dequant = vec![0.0f32; n * k];
+        for row in 0..n {
+            for block in 0..blocks {
+                let start = block * block_size;
+                let end = (start + block_size).min(k);
+                let values = &weights_nk[row * k + start..row * k + end];
+                let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let scale = ((max - min) / 255.0).max(1e-6);
+                let zp = (-min / scale).round().clamp(0.0, 255.0) as u8;
+                scales[row * blocks + block] = scale;
+                zps[row * blocks + block] = zp;
+                for (offset, &value) in values.iter().enumerate() {
+                    let q = (value / scale + zp as f32).round().clamp(0.0, 255.0) as u8;
+                    packed[(row * blocks + block) * block_size + offset] = q;
+                    dequant[row * k + start + offset] = (q as f32 - zp as f32) * scale;
+                }
+            }
+        }
+        (packed, scales, zps, dequant)
+    }
+
     fn ref_gemm_nk(
         a: &[f32],
         w_nk: &[f32],
@@ -1510,13 +1546,48 @@ mod tests {
         let mut c = vec![0.0f32; m * n];
         sqnbit_gemm(&packed, m, &a, bias.as_deref(), &mut c, true);
         let expected = ref_gemm_nk(&a, &dequant, m, k, n, bias.as_deref());
+        let tol = match comp {
+            SQNBitComputeType::Fp32 => 2e-2,
+            // CompInt8 quantizes activations and the ARM64 KleidiAI path stores
+            // qsi4 scales as bf16 in the packed RHS, so it is intentionally
+            // approximate compared with the f32-dequant oracle.
+            SQNBitComputeType::Int8 => 8e-2,
+        };
         assert_close(
             &c,
             &expected,
-            2e-2,
+            tol,
             &format!(
                 "sqnbit {comp:?} m{m} n{n} k{k} blk{block_size} asym{asymmetric} bias{with_bias}"
             ),
+        );
+    }
+
+    fn check_sqnbit_bits8_block128_with_zp(comp: SQNBitComputeType, m: usize) {
+        let (n, k, block_size) = (96usize, 256usize, 128usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.019 + 0.13).sin()) * 1.7)
+            .collect();
+        let (packed_b, scales, zps, dequant) = quantize_int8(&weights, n, k, block_size);
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.007 + 0.31).cos()) * 0.7)
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin()).collect();
+
+        let packed = SQNBitPackedB::new(n, k, 8, block_size, comp, &packed_b, &scales, Some(&zps));
+        if packed.is_none() {
+            eprintln!("SQNBit bits=8 blk=128 comp={comp:?} unavailable on host; skipping");
+            return;
+        }
+        let packed = packed.unwrap();
+        let mut c = vec![0.0f32; m * n];
+        sqnbit_gemm(&packed, m, &a, Some(&bias), &mut c, true);
+        let expected = ref_gemm_nk(&a, &dequant, m, k, n, Some(&bias));
+        assert_close(
+            &c,
+            &expected,
+            3e-2,
+            &format!("sqnbit bits8 {comp:?} block128 zp m{m}"),
         );
     }
 
@@ -1535,6 +1606,14 @@ mod tests {
             }
         }
         check_sqnbit(SQNBitComputeType::Fp32, 4, 128, 512, 32, false, true);
+    }
+
+    #[test]
+    fn sqnbit_bits4_and_bits8_block128_with_zero_points_round_trip() {
+        for comp in [SQNBitComputeType::Fp32, SQNBitComputeType::Int8] {
+            check_sqnbit(comp, 3, 96, 256, 128, true, true);
+        }
+        check_sqnbit_bits8_block128_with_zp(SQNBitComputeType::Int8, 3);
     }
 
     /// N-sharding parity: splitting the weight into contiguous output-column
@@ -1806,16 +1885,15 @@ mod tests {
         // under the AVX512F check at :547); AVX512F alone falls back to the
         // Avx2/Avx2vnni dispatch, i.e. the broken kernel. Mirror that exact gate
         // so the skip condition matches production's `host_has_mlas_sqnbit_avx512`.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let host_has_avx512 = std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512dq")
             && std::arch::is_x86_feature_detected!("avx512vl");
-        #[cfg(not(target_arch = "x86_64"))]
-        let host_has_avx512 = false;
         for &blk in &[32usize, 64, 128] {
             for &m in &[1usize, 8] {
                 for &asym in &[false, true] {
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                     if m == 1 && asym && !host_has_avx512 {
                         eprintln!(
                             "skipping MLAS-broken AVX2 M=1 asymmetric CompInt8 blk{blk} \
