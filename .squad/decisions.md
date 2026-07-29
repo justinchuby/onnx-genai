@@ -1,11 +1,12 @@
 # Decisions — live standing directives
 
-Last compacted: 2026-07-29T21:19:00Z
+Last compacted: 2026-07-29T23:30:00Z
 
 Full historical ledger archived to `.squad/decisions-archive/2026-07.md`:
 - "Full decisions snapshot archived by size gate — 2026-07-28T11:30:55Z"
 - "Post-rebase decisions archived by size gate — 2026-07-28T11:35:49Z"
-- "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" (this run)
+- "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" (first run)
+- "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z" (merge resolution)
 
 Older archives: `.squad/decisions/archive/`.
 
@@ -22,6 +23,14 @@ pointers to archived history.
 Size compaction of a shared append-only file is not rebase-safe: concurrent appends can
 silently reinflate the file without a conflict while leaving the compacted header intact.
 A compaction PR must be re-run against tip immediately before merge if main advanced.
+
+**Concurrent Scribe runs are a structural hazard.** Two Scribe runs merged the same file
+in the same window on 2026-07-29, producing divergent copies that git had to reconcile.
+The root fix is to assemble decisions.md from the inbox rather than hand-merge it: if the
+live file is only ever written by appending inbox drops, two runs produce no divergence
+in overlapping content — each run's drops are distinct files. Until that is built,
+the coordination rule is: Scribe checks `git log origin/main..HEAD` before committing;
+if main has moved, rebase or merge first, then apply the compaction on top.
 
 ## Performance claim discipline
 
@@ -85,6 +94,13 @@ non-contiguous weights, rescue block returning zeros, Conv macOS scalar/BNNS tie
 non-Conv CNN scalar paths, and 1x1 Conv's GEMM bypass existing but being intercepted by
 BNNS Conv.
 
+**Manifest lint reliability (PR #414):** A dispatch-manifest lint whose increment regex
+does not handle rustfmt-wrapped counter increments is blind to those increments. A lint
+without a `--self-test` mode that passes before the lint itself runs proves nothing when
+it goes silent — a real dead branch looks the same as a rustfmt-wrapped live one. Wire a
+self-test into CI before the lint check; the self-test must exercise both wrapped and
+single-line increment patterns plus genuine dead-counter cases.
+
 ## Minimal-build and shape-inference rules
 
 - Graph/layout transforms must be gated on both their infrastructure feature and the
@@ -132,8 +148,9 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   snapshot archived by size gate — 2026-07-28T11:30:55Z".
 - Post-rebase additions: `.squad/decisions-archive/2026-07.md` → "Post-rebase decisions
   archived by size gate — 2026-07-28T11:35:49Z".
-- Narrative entries compacted 2026-07-29: `.squad/decisions-archive/2026-07.md` →
-  "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z".
+- Narrative entries compacted 2026-07-29 (two runs): `.squad/decisions-archive/2026-07.md`
+  → "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" and
+  "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z".
 - Prior active-ledger archives: `.squad/decisions/archive/`.
 - Mac CPU EP load-bearing topics in the archive: PR #227 roofline lessons, load-adaptive
   opt-in, Apple Silicon portability directive, BNNS prefill/deprecation notes,
@@ -141,11 +158,13 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   Conv correction, Iran SDPA model-ratio correction, and negative-result GEMV notes.
 - Wave 8/9 topics in the archive: CUDA coverage batches 8/9, shape-inference catalog
   batches 3/4, NCHWc minimal-build gating, and strict reviewer-lockout correction cycle.
-- 2026-07-29 narrative (archived): Mac CPU EP campaign summary (PRs #342/#345/#347/#349),
-  wheels.yml PR #401 full root-cause, DFT/Perch PR #357, KV Phase 1, BNNS batch>1 fix,
-  declarative I/O PR #373, QMoE PR #378, decode ports PRs #380/#382, recurrent shape
-  PR #386, JSON schema PR #388, tool-call parser PR #390, DeepSeek investigation,
-  Fact-Checker KV verdict, Pris CI timing data, Luv round-3 review counts, tool/CUDA drops.
+- 2026-07-29 narrative (archived): Mac CPU EP campaign summary, wheels.yml PR #401,
+  DFT/Perch PR #357, KV Phase 1, BNNS batch>1 fix, declarative I/O PR #373, QMoE PR #378,
+  decode ports PRs #380/#382, recurrent PR #386, JSON schema PR #388, tool-call parser
+  PR #390, DeepSeek investigation, Fact-Checker KV verdict, Pris CI timing data, Luv
+  round-3 review counts, tool/CUDA drops, Doug CUDA benchmark (pre-SiLU-fix), Cohaagen
+  #377 verbose, Matthias static-cache implementation, Johnny PackedVarlenAttention,
+  Pris multiturn corrected measurements.
 
 ## CLI charter — standing directives
 
@@ -190,15 +209,25 @@ retains tests/clippy but not llvm-cov coverage (duplicates x64/macOS while ownin
 CI critical path — up to 26 min). Platform execution is the signal; instrumentation is
 the cost. Current critical path: `CLI ORT (Windows x86_64)` at ~18m50s.
 
-## Native backend multi-turn: session-persistent KV is the structural gap
+## Native backend multi-turn: session-persistent KV closes the structural gap for headline models
 
-**By:** Pris (benchmarked 2026-07-28); fixed by Deckard (squad/session-kv-phase1)
+**By:** Pris (benchmarked 2026-07-28; corrected with session API 2026-07-29, PR #408)
 
-Without persistent KV each turn re-prefills the entire conversation O(context). ORT
-prefills only new tokens O(new_tokens); at turn 10, TinyStories-33M ORT is 2.1× faster,
-Qwen2.5-0.5B ORT 1.18× faster. Pre-packing does not address this structural gap.
-Phase 1 landed: incremental prefill with prefix-match rewind, single-session limit.
-Batch>1 native crash fixed separately (Resch, squad/fix-batch-segfault).
+Without persistent KV each turn re-prefills the entire conversation O(context). Phase 1
+landed (Deckard, squad/session-kv-phase1); the multiturn benchmark was then wired to the
+session API. **Corrected results with KV reuse (Pris, M1 Max):**
+
+- **Qwen2.5-0.5B-f16 (session):** Native wins at every turn — 1.13x faster over 10
+  turns; native TTFT 60 ms vs ORT 150 ms. Roy's Phase 1 hypothesis confirmed for the
+  headline model.
+- **TinyStories-33M (session):** Break-even at turn 1–4; ORT 1.5–1.7x faster overall.
+  Native TTFT faster (21 ms vs 27 ms ORT), but decode throughput is 2x slower — that is
+  now the bottleneck, not prefill.
+- **Stateless (old path, --native-stateless):** Qwen break-even at turn 8, ORT 1.18x;
+  TinyStories break-even at turn 3, ORT 2.2x. These are the pre-Phase-1 numbers.
+
+Batch>1 native crash fixed separately (Resch, squad/fix-batch-segfault). Pre-packing
+deferred — re-evaluate after decode throughput gap is addressed.
 
 ## 2026-07-29 — Verification steps that warn instead of fail are not verification
 
@@ -306,7 +335,7 @@ Merging and deleting the inbox files produces no git diff (expected, not a failu
 
 ## 2026-07-29 — All inference/pipeline metadata must be explicit; name guessing is forbidden
 
-**By:** Justin Chu directive #377; Cohaagen, Benny, Melina (PRs #380, #382, #377/`squad/377-explicit-metadata`)
+**By:** Justin Chu directive #377; Cohaagen, Benny, Melina, Matthias (PRs #380, #382, #377/`squad/377-explicit-metadata`, #412)
 
 ALL inference/pipeline metadata except io-SHAPE must be EXPLICIT and GENERAL. Name
 guessing/historical-name fallback must be replaced by explicit metadata plus a clear ERROR
@@ -314,9 +343,16 @@ naming the missing key. Only io-SHAPE may disambiguate. Do not re-propose deferr
 
 **Active schema fields (Benny/mobius: emit these names verbatim):**
 - `pipeline.strategy.inner_embedding_output: Option<String>` — nested-AR inner decoder embedding output port. Absent ⇒ ERROR.
-- `model.io.static_cache: Option<StaticCacheIoSpec>` — `write_indices_input`, `kv_sequence_length_input`, per-layer `key/value_cache_inputs/outputs` (equal-length, positional). Inconsistent ⇒ ERROR.
+- `model.io.static_cache: Option<StaticCacheIoSpec>` — `write_indices_input`, `kv_sequence_length_input`, per-layer `key/value_cache_inputs/outputs` (equal-length, positional). Inconsistent ⇒ ERROR. **Must be declared; convention-based binding removed (Matthias, PR #412).**
 - Encoder prompt-input role: from `model.encoder.inputs.audio_features` vs `.input_ids`; no port-name string matching.
 - Paged-KV bridge geometry: from `model.io.kv_inputs`/`kv_outputs` only; no metadata ⇒ `Ok(None)`.
+
+**Matthias (PR #412):** `detect_static_cache_by_convention` removed from
+`crates/onnx-genai-ort/src/decode/io.rs`. A TensorScatter static-cache graph without a
+declared `model.io.static_cache` block now fails closed with an error naming the missing
+key — never silently binds by hardcoded `write_indices`/`nonpad_kv_seqlen`/`key_cache.{i}`
+port names. `StaticCacheAbi::classify` stays authoritative and name-agnostic. In-repo
+static-cache fixtures now declare the block explicitly.
 
 **Remaining name path (off-limits scope):** `decode_contract.rs` `KvNamingConvention` — only for #99 speculative proposers; do not remove from this workstream.
 

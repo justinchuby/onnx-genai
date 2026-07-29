@@ -17,9 +17,13 @@ static CONV_BNNS_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::
 static CONV_IM2COL_GEMM_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Counts pointwise 1×1 convolutions that deliberately bypassed BNNS. Only
+/// meaningful where BNNS exists, so it is gated to the same platforms as the
+/// bypass itself — an ungated counter would compile-warn elsewhere and, worse,
+/// would count a "bypass" on platforms that never had BNNS to bypass.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 static CONV_POINTWISE_GEMM_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-
 #[cfg(target_arch = "aarch64")]
 static CONV_NEON_DEPTHWISE_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -310,41 +314,11 @@ impl Kernel for ConvKernel {
         let is_rank4 = eff_x_shape.len() == 4;
 
         let output = if is_rank4 {
-            // Try Tier 1 (BNNS) for undilated convolutions.
-            //
-            // Skip BNNS for 1×1 pointwise kernels when the weight tensor exceeds L1
-            // and the spatial reuse factor is too low to amortize the overhead.
-            //
-            // Mechanism: BNNS copies the full weight tensor (OC × IC × 4 bytes) and
-            // creates/destroys a filter on every call. Each weight element is reused
-            // N times (once per spatial position). When N/IC < REUSE_MIN, the copy
-            // overhead exceeds BNNS's compute advantage.
-            //
-            // L1 threshold: Apple Silicon E-cores have 64KB L1 data cache; P-cores
-            // have 128KB (M1–M4). We size to the smaller E-core L1 deliberately so
-            // the guard is conservative and portable across all core types and parts.
-            // Below this size the weight copy is cache-local and ~free regardless of
-            // which core runs it, so BNNS overhead is negligible.
-            //
-            // Reuse threshold (BNNS_REUSE_MIN = 6): empirically fitted on M1 Max
-            // over shapes from 24→144 @ 14×14 to 2048→512 @ 7×7. The mechanism
-            // (BNNS per-call setup amortized by compute) is general across Apple
-            // Silicon; the coefficient 6 is not — it is the observed minimum N/IC
-            // ratio at which BNNS's AMX kernel recovers its copy/pack overhead in
-            // our measurements. Validated on 15 shapes spanning MobileNetV2 and
-            // ResNet with interleaved A/B at loads 5–53, corroborated 3×. The
-            // guard correctly classifies all tested shapes: no regressions where
-            // BNNS is kept, no missed wins where GEMM is routed.
+            // Try Tier 1 (BNNS) for undilated convolutions, unless the pointwise
+            // guard below says BNNS would lose. See skip_bnns_for_pointwise_1x1.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             {
-                const APPLE_SILICON_L1_F32: usize = 16_384; // E-core 64KB / 4
-                const BNNS_REUSE_MIN: usize = 6; // fitted; see comment above
-                let is_1x1 = eff_w_shape[2..].iter().all(|&k| k == 1);
-                let weight_elems = eff_w_shape[0] * eff_w_shape[1];
-                let spatial_size = eff_out_shape[2..].iter().product::<usize>();
-                let skip_bnns = is_1x1
-                    && weight_elems > APPLE_SILICON_L1_F32
-                    && spatial_size <= eff_w_shape[1] * BNNS_REUSE_MIN;
+                let skip_bnns = skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape);
 
                 if self.group == 1
                     && eff_dilations.iter().all(|&d| d == 1)
@@ -401,15 +375,17 @@ impl Kernel for ConvKernel {
             // Tier 2b: im2col + GEMM.
             CONV_IM2COL_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Track pointwise 1×1 convolutions that bypassed BNNS and reached
-            // the direct GEMM fast path due to low spatial reuse.
-            {
-                let is_1x1_pw = eff_w_shape[2..].iter().all(|&k| k == 1);
-                let weight_elems = eff_w_shape[0] * eff_w_shape[1];
-                let spatial = eff_out_shape[2..].iter().product::<usize>();
-                if is_1x1_pw && weight_elems > 16_384 && spatial <= eff_w_shape[1] * 6 {
-                    CONV_POINTWISE_GEMM_TEST_HITS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+            // the direct GEMM fast path due to low spatial reuse. The predicate
+            // is the *same function* the dispatch used above — re-deriving it
+            // here let the counter and the dispatch drift apart silently, which
+            // would make the manifest claim prove the wrong thing.
+            //
+            // Gated to the same platforms as the BNNS attempt: where BNNS does
+            // not exist there is nothing to bypass, and counting there would
+            // report a bypass that never happened.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if skip_bnns_for_pointwise_1x1(eff_w_shape, eff_out_shape) {
+                CONV_POINTWISE_GEMM_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if self.group == 1 {
                 im2col_gemm_execute(
@@ -466,6 +442,44 @@ impl Kernel for ConvKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+}
+
+/// Should a 1×1 pointwise Conv bypass BNNS and go straight to im2col+GEMM?
+///
+/// This is the single source of truth for the decision. It exists as a function
+/// because the dispatch site and the instrumentation counter previously
+/// re-derived it independently, with the counter using bare literals (`16_384`,
+/// `6`) against the dispatch's named constants. Two copies of a predicate drift,
+/// and when they drift the counter proves a claim the code no longer makes.
+///
+/// Mechanism: BNNS copies the full weight tensor (OC × IC × 4 bytes) and
+/// creates/destroys a filter on every call. Each weight element is reused N
+/// times (once per spatial position). When N/IC < BNNS_REUSE_MIN, that copy
+/// overhead exceeds BNNS's compute advantage.
+///
+/// L1 threshold: Apple Silicon E-cores have 64 KB L1 data cache; P-cores have
+/// 128 KB (M1–M4). We deliberately size to the smaller E-core L1 so the guard is
+/// conservative and portable across core types and parts — the work may land on
+/// either. Below this size the weight copy is cache-local and ~free regardless
+/// of which core runs it, so BNNS overhead is negligible.
+///
+/// Reuse threshold (BNNS_REUSE_MIN = 6) is **fitted, not derived**. It is the
+/// observed minimum N/IC ratio at which BNNS's AMX kernel recovers its
+/// copy/pack overhead on M1 Max, measured over shapes from 24→144 @ 14×14 to
+/// 2048→512 @ 7×7 — 15 shapes spanning MobileNetV2 and ResNet, interleaved A/B
+/// at loads 5–53, corroborated 3×. The *mechanism* generalizes across Apple
+/// Silicon; the *coefficient* is an M1 Max measurement. Do not "correct" it to
+/// a value implied by a datasheet: it is empirical.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn skip_bnns_for_pointwise_1x1(w_shape: &[usize], out_shape: &[usize]) -> bool {
+    const APPLE_SILICON_L1_F32: usize = 16_384; // E-core 64 KB / 4 bytes per f32
+    const BNNS_REUSE_MIN: usize = 6; // fitted on M1 Max; see doc comment
+
+    let is_1x1 = w_shape[2..].iter().all(|&k| k == 1);
+    let weight_elems = w_shape[0] * w_shape[1];
+    let spatial_size = out_shape[2..].iter().product::<usize>();
+
+    is_1x1 && weight_elems > APPLE_SILICON_L1_F32 && spatial_size <= w_shape[1] * BNNS_REUSE_MIN
 }
 
 fn record_conv_metrics(inputs: &[TensorView], outputs: &mut [TensorMut], kernel: &ConvKernel) {
@@ -1765,10 +1779,13 @@ mod tests {
     // ─── Pointwise 1×1 dispatch and parity ────────────────────────────
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn pointwise_1x1_reaches_gemm_not_bnns() {
         // 1×1 pointwise Conv at small spatial sizes with large weights must route
         // to im2col+GEMM (direct GEMM for 1×1), NOT to BNNS.
-        // Guard: weight_elems > L1 (16384) AND spatial ≤ IC × 6.
+        // Guard: weight_elems > E-core L1 (16384 f32) AND spatial ≤ IC × 6.
+        // Apple-only: on other platforms there is no BNNS to avoid, so the
+        // assertion would be vacuous.
         let before = super::CONV_POINTWISE_GEMM_TEST_HITS.load(Ordering::Relaxed);
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let before_bnns = super::CONV_BNNS_TEST_HITS.load(Ordering::Relaxed);
