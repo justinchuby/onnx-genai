@@ -260,7 +260,7 @@ impl<'a> ContinuousBatchManager<'a> {
             .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {e}"))?;
         let rng = SamplingRng::for_row(pending.options.seed, row_index);
         let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
-        let mut row = ContinuousBatchRow {
+        let row = ContinuousBatchRow {
             handle: pending.handle,
             physical_row: row_index,
             context_tokens: pending.prompt_tokens,
@@ -270,7 +270,6 @@ impl<'a> ContinuousBatchManager<'a> {
             state: loop_state,
             pending_logits: None,
         };
-        prefill_continuous_row(&mut *self.decode, &mut row)?;
         self.rows[row_index] = Some(row);
         Ok(())
     }
@@ -369,30 +368,35 @@ impl<'a> ContinuousBatchManager<'a> {
         if advancing_rows.len() == active_rows.len() {
             let mut input_ids = vec![0_i64; active_rows.len()];
             let mut position_ids = vec![0_i64; active_rows.len()];
+            let mut completes_context = vec![false; active_rows.len()];
             for (active_index, &logical_row) in active_rows.iter().enumerate() {
                 let row = self.rows[logical_row]
                     .as_ref()
                     .context("active continuous row is not assigned")?;
-                let token = *row
-                    .context_tokens
-                    .last()
-                    .context("continuous row has empty context")?;
-                input_ids[active_index] = i64::from(token);
-                position_ids[active_index] = self
+                let row_len = self
                     .decode
                     .row_len(logical_row)
-                    .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
-                    as i64;
+                    .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?;
+                let token = *row.context_tokens.get(row_len).with_context(|| {
+                    format!(
+                        "continuous row {logical_row} has no token to advance at offset {row_len}"
+                    )
+                })?;
+                input_ids[active_index] = i64::from(token);
+                position_ids[active_index] = row_len as i64;
+                completes_context[active_index] = row_len + 1 == row.context_tokens.len();
             }
             let logits = self
                 .decode
                 .step_active(&input_ids, &position_ids)
                 .map_err(|e| anyhow::anyhow!("Continuous active static-cache step failed: {e}"))?;
             for (active_index, logical_row) in active_rows.into_iter().enumerate() {
-                let row = self.rows[logical_row]
-                    .as_mut()
-                    .context("active continuous row is not assigned")?;
-                row.pending_logits = Some(row_logits(&logits, active_index, 0)?);
+                if completes_context[active_index] {
+                    let row = self.rows[logical_row]
+                        .as_mut()
+                        .context("active continuous row is not assigned")?;
+                    row.pending_logits = Some(row_logits(&logits, active_index, 0)?);
+                }
             }
             return Ok(());
         }
@@ -400,19 +404,23 @@ impl<'a> ContinuousBatchManager<'a> {
         let mut input_ids = vec![0_i64; self.max_batch()];
         let mut position_ids = vec![0_i64; self.max_batch()];
         let mut advance_rows = vec![false; self.max_batch()];
+        let mut completes_context = vec![false; self.max_batch()];
         for row in self.rows.iter().flatten() {
             if row.pending_logits.is_none() {
-                let token = *row
-                    .context_tokens
-                    .last()
-                    .context("continuous row has empty context")?;
-                input_ids[row.physical_row] = i64::from(token);
-                position_ids[row.physical_row] = self
+                let row_len = self
                     .decode
                     .row_len(row.physical_row)
-                    .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
-                    as i64;
+                    .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?;
+                let token = *row.context_tokens.get(row_len).with_context(|| {
+                    format!(
+                        "continuous row {} has no token to advance at offset {row_len}",
+                        row.physical_row
+                    )
+                })?;
+                input_ids[row.physical_row] = i64::from(token);
+                position_ids[row.physical_row] = row_len as i64;
                 advance_rows[row.physical_row] = true;
+                completes_context[row.physical_row] = row_len + 1 == row.context_tokens.len();
             }
         }
         let logits = self
@@ -420,7 +428,7 @@ impl<'a> ContinuousBatchManager<'a> {
             .step_select(&input_ids, &position_ids, &advance_rows)
             .map_err(|e| anyhow::anyhow!("Continuous static-cache decode step failed: {e}"))?;
         for row in self.rows.iter_mut().flatten() {
-            if advance_rows[row.physical_row] {
+            if advance_rows[row.physical_row] && completes_context[row.physical_row] {
                 row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
             }
         }
@@ -835,28 +843,6 @@ impl Engine {
             None => configured,
         }
     }
-}
-
-fn prefill_continuous_row(
-    decode: &mut dyn BatchedDecodeSession<'_>,
-    row: &mut ContinuousBatchRow,
-) -> anyhow::Result<()> {
-    for offset in 0..row.context_tokens.len() {
-        let mut input_ids = vec![0_i64; decode.batch_size()];
-        let mut position_ids = vec![0_i64; decode.batch_size()];
-        let mut advance_rows = vec![false; decode.batch_size()];
-        input_ids[row.physical_row] = i64::from(row.context_tokens[offset]);
-        position_ids[row.physical_row] = decode
-            .row_len(row.physical_row)
-            .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
-            as i64;
-        advance_rows[row.physical_row] = true;
-        let logits = decode
-            .step_select(&input_ids, &position_ids, &advance_rows)
-            .map_err(|e| anyhow::anyhow!("Continuous static-cache prefill failed: {e}"))?;
-        row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
-    }
-    Ok(())
 }
 
 fn collect_finished_events(
