@@ -312,7 +312,7 @@ impl Executor {
         if !self.optional_overrides.is_empty() {
             let mut fed: HashSet<ValueId> = inputs
                 .iter()
-                .map(|(name, _)| self.input_index[*name])
+                .filter_map(|(name, _)| self.input_index.get(*name).copied())
                 .collect();
             fed.extend(external.inputs.keys().copied());
             // CUDA phase (P5): a device-bound override is reinstated through its

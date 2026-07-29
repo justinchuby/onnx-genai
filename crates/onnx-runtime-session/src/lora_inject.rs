@@ -291,13 +291,14 @@ pub enum LoraInjectError {
     },
 
     #[error(
-        "LoRA module {module:?}: adapter factor dtype {adapter:?} does not match the base \
-         activation dtype {activation:?}; the delta branch runs in the activation dtype"
+        "LoRA module {module:?}: adapter factor dtype {adapter:?} does not match the expected \
+         dtype {expected:?}; the A and B factors and the base activation must share one dtype \
+         because the delta branch runs in the activation dtype"
     )]
     DtypeMismatch {
         module: String,
         adapter: DataType,
-        activation: DataType,
+        expected: DataType,
     },
 
     #[error("internal: manifest has {entries} entries but the adapter spec has {modules} modules")]
@@ -995,14 +996,14 @@ fn validate_module(
         return Err(LoraInjectError::DtypeMismatch {
             module: spec.module_name.clone(),
             adapter: spec.a_t.dtype,
-            activation: spec.b_t.dtype,
+            expected: spec.b_t.dtype,
         });
     }
     if spec.a_t.dtype != dtype {
         return Err(LoraInjectError::DtypeMismatch {
             module: spec.module_name.clone(),
             adapter: spec.a_t.dtype,
-            activation: dtype,
+            expected: dtype,
         });
     }
     let a_rank = *spec.a_t.dims.get(1).unwrap_or(&usize::MAX);

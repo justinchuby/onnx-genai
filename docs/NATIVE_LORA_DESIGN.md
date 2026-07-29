@@ -947,11 +947,13 @@ know):**
 
 ### J.9 What is wired end-to-end today (multi-adapter reachability)
 
-*Status as of 2026-07-28 (branch `feat/native-lora-p2`, PR #374).* The grouped
+*Status as of 2026-07-29 (branch `feat/native-lora-p2`, PR #374).* The grouped
 subsystem (§J.1 op, §J.2 pool, §J.6 declared-manifest resolution) was fully
-built and unit-tested but had **zero production callers**. This section records
-what is now reachable end-to-end versus what remains deferred. Nothing here
-re-litigates §J.1–§J.8; it only states the current wiring.
+built and unit-tested but had **zero production callers** (notably the
+`BudgetedLoraPool` control plane); this revision wires the shared byte budget
+into grouped admission (see "Shared byte-budget governance" below). This section
+records what is now reachable end-to-end versus what remains deferred. Nothing
+here re-litigates §J.1–§J.8; it only states the current wiring.
 
 **User-facing surface (CPU, native backend).**
 
@@ -993,6 +995,32 @@ comes **only** from `segments`. All adapters in one grouped session must target
 an identical module set (same module name + layer index per position), enforced
 fail-loud via `AdapterModuleSetMismatch`; this is an honest constraint for this
 pass, not a silent truncation.
+
+**Shared byte-budget governance (now wired).** Grouped-adapter admission is
+routed through `BudgetedLoraPool` (engine `lora/pool.rs`) via a `LoraPoolSink`
+control-plane trait (`onnx-runtime-ep-api`). Before the data-plane
+`LoraWeightPool` admits each `(adapter, module)` factor pair, the pool reserves
+that pair's page-aligned resident bytes from the **shared** `ByteBudget` — the
+same instance the KV/device subsystem uses (`EngineResourceGovernor::byte_budget`,
+threaded from `engine/load.rs` through `NativeDecodeSession` into the session
+builder). An over-budget adapter set fails loud with a typed
+`LoraInjectError::PoolBudgetExceeded { requested, used, limit, available,
+shortfall }` instead of over-committing device memory. The reservation is
+attached to the finished pool as its residency owner, so it releases exactly
+once on session drop (preserving the RAII release). The ≤1-adapter DIRECT fast
+path never builds the pool, so it is not budgeted (and stays byte-for-byte
+Phase-1). NOTE: this is admission-time reservation + fail-loud only; the §J.2
+LRU **eviction/paging** of cold pages under budget pressure remains deferred
+(P2a). Regression coverage: engine `tests/lora_grouped_budget.rs`
+(over-budget admission fails loud and leaks nothing; a successful load reserves
+and then releases the shared budget to the exact prior level on drop).
+
+**Collapsed single adapter + `--select-adapter`.** When a single `--adapters
+NAME=PATH` collapses to the DIRECT fast path, the selectable `NAME` is retained
+(`EngineConfig.lora_adapter_name`). A request `--select-adapter NAME` for that
+same adapter is a **no-op** (it is already applied to every token); any other
+name fails loud with a message that NAMES the actually-loaded adapter, rather
+than the previous misleading "session was not loaded with a grouped pool" error.
 
 **Wired (reachable + tested).**
 
