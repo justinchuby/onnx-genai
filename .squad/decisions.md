@@ -320,3 +320,7 @@ to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate success
 ## 2026-07-29 — Shared-buffer decode must thread declared KV pairs
 
 **PR #382 / issue #377 continuation (Benny; reviewed by Lori; regression test by Leon; merged `85b9ba15`).** ORT batched shared-buffer and static-cache decode adapters no longer guess exporter I/O names; they consume declared KV pairs. The repair also restores those pairs when constructing `BatchedSharedBufferDecodeSession`, fixing the latent #380 regression where passing `None` made construction always fail. A CPU engine-level continuous-batch test using `tiny-llm-sharedbuffer` now compares sequential generation and fails at construction if declared `model.io.kv_inputs` / `kv_outputs` stop reaching the session. This is deliberately CPU coverage because the previous CUDA-only E2E auto-skips without CUDA.
+
+## 2026-07-29 — Recurrent shape geometry shares an opset-aware contract
+
+**PR #386 / issue #355 slice (Hauser; reviewed by Helm; merged `39c28b44`).** RNN, GRU, and LSTM shape inference share `recurrent()`, which propagates symbolic sequence and batch dimensions, derives direction count and hidden size, and emits only declared Y/Y_h/Y_c outputs (including LSTM Y_c). Registrations at opsets 1 and 14 enforce the layout boundary: pre-14 ignores a stray `layout`, while 14+ honors it. Missing or insufficient shape information remains permissive rather than panicking. Helm independently checked ONNX axis order for both layouts and ran the recurrent suite (238 tests) plus clean clippy.
