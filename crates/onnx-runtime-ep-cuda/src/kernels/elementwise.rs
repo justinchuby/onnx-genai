@@ -210,6 +210,20 @@ extern "C" __global__ void silu_mul_f16(
         }
     }
 }
+
+__device__ float op_decomposed_silu_f16(float x) {
+    const float sigmoid_h = __half2float(__float2half_rn(op_sigmoid(x)));
+    return __half2float(__float2half_rn(__fmul_rn(x, sigmoid_h)));
+}
+
+extern "C" __global__ void decomposed_silu_mul_f16(
+    const __half* a, const __half* b, __half* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        const float silu_h = op_decomposed_silu_f16(__half2float(a[i]));
+        y[i] = __float2half_rn(__fmul_rn(silu_h, __half2float(b[i])));
+    }
+}
 #endif
 "#;
 
@@ -348,11 +362,17 @@ pub(crate) fn launch_silu_mul_f16_raw(
     up: CUdeviceptr,
     output: CUdeviceptr,
     n: usize,
+    decomposed: bool,
 ) -> Result<()> {
     runtime.require_nvrtc_half_headers("SiluMul fp16")?;
     let n_u64 = u64::try_from(n)
         .map_err(|_| EpError::KernelFailed(format!("cuda_ep SiluMul: {n} elements exceed u64")))?;
-    let func = runtime.nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, "silu_mul_f16")?;
+    let entry = if decomposed {
+        "decomposed_silu_mul_f16"
+    } else {
+        "silu_mul_f16"
+    };
+    let func = runtime.nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, entry)?;
     let mut builder = runtime.stream().launch_builder(&func);
     builder.arg(&gate).arg(&up).arg(&output).arg(&n_u64);
     // SAFETY: callers provide three live fp16 allocations covering `n`
@@ -366,7 +386,7 @@ pub(crate) fn launch_silu_mul_f16_raw(
         })
     }
     .map(|_| ())
-    .map_err(|e| driver_err("launch silu_mul_f16", e))
+    .map_err(|e| driver_err(&format!("launch {entry}"), e))
 }
 
 /// Reject a strided (non-contiguous) view with a "materialise first" error.
@@ -567,6 +587,10 @@ impl KernelFactory for BinaryFactory {
         {
             return Ok(Box::new(SiluMulKernel {
                 runtime: self.runtime.clone(),
+                decomposed: node
+                    .attr(crate::optimizer::DECOMPOSED_SILU_ATTR)
+                    .and_then(Attribute::as_int)
+                    == Some(1),
                 last_capture_safe_signature: Mutex::new(None),
             }));
         }
@@ -831,6 +855,7 @@ impl Kernel for BinaryKernel {
 #[derive(Debug)]
 struct SiluMulKernel {
     runtime: Arc<CudaRuntime>,
+    decomposed: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
 }
 
@@ -886,7 +911,17 @@ impl SiluMulKernel {
             current_signature.as_ref(),
         )?;
 
-        let entry = format!("silu_mul_{}", dtype.suffix());
+        if self.decomposed && dtype != FloatDtype::F16 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {OP}: decomposed SiLU fusion requires float16, got {:?}",
+                gate.dtype
+            )));
+        }
+        let entry = if self.decomposed {
+            "decomposed_silu_mul_f16".to_string()
+        } else {
+            format!("silu_mul_{}", dtype.suffix())
+        };
         let func = self
             .runtime
             .nvrtc_function(POINTWISE_MODULE, POINTWISE_SRC, &entry)?;
@@ -1150,6 +1185,7 @@ mod tests {
         )];
         SiluMulKernel {
             runtime: runtime.clone(),
+            decomposed: false,
             last_capture_safe_signature: Mutex::new(None),
         }
         .execute(&inputs, &mut outputs)
