@@ -151,109 +151,167 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
 
 <!-- History before 2026-07-28T11:35:49Z was archived by size. Keep this file small. -->
 
-## 2026-07-28T17:40:00+0000 — control flow, metadata, and QMoE offload wave
+## 2026-07-29 — Verification steps that warn instead of fail are not verification
 
-- PR #362 (`5a079029`) completed #355's tensor control-flow work: `If`, `Loop`, and
-  `Scan` infer child graphs after formal body inputs are seeded from their owning
-  node; Loop scan dimensions stay symbolic because a constant trip count is only
-  an early-exit upper bound. Fully-static control-flow results whose byte size
-  overflows degrade to dtype-only rather than triggering eager-planning overflow.
-  Sequence, Optional, and Map propagation remains deliberately unresolved until
-  the tensor-only SSA `TypeInfo` gains a container-aware representation.
-- The cache roofline ceiling is informational when SLC covers at least 10% of a
-  model's decode set (`cache_assisted`); retain the DRAM ceiling only for larger
-  working sets and never report an unexplained roofline percentage above 100%.
-- PR #364 (`3b08c025`) established route-first CPU QMoE's one-ahead prefetch
-  strategy. It may engage only in eviction-neutral regimes: mmap streaming
-  (`budget == 0`) or a fully resident layer. Partial-cache budgets execute the
-  serial path. This preserves output, cache statistics, and `pipe_bytes <=
-  serial` while retaining a measured 36–47% streaming throughput gain. Unifying
-  this host path with GPU prefetch awaits Phase-3b live device binding; Granite's
-  unfused MatMul MoE cannot currently engage it.
-- PR #365 (`83f4c293`) made `onnx_runtime.*` metadata effective at engine load,
-  with explicit programmatic settings retaining priority. Metadata collection
-  recursively scans GRAPH/GRAPHS attributes. Every scanned node now uses a
-  uniform structural `NodePath` identity (including anonymous and duplicate-name
-  top-level nodes); names are diagnostic labels only. External name-addressed
-  hints resolve to a unique structural node or remain in a separate external-name
-  keyspace, so they cannot collide.
-- Large-model smoke status is a blocker, not an offload regression: the 27B
-  native path hits the Unsqueeze rank bug, ORT lacks
-  `past_key_values.*.recurrent_state`, and the needed Mobius #432 mapping remains
-  unmerged; all H200 capacity was occupied externally. Granite MoE runs on ORT
-  CUDA but exports unfused MatMuls, while the fused fixture verifies route-first
-  CPU paging independently.
-## 2026-07-28T13:50:00Z — MobileNetV2 remaining gap: Clip dispatch-miss (defect #14)
+**By:** Scribe (recording Holden's diagnosis)  
+**Blocks:** PR #401 (wheels.yml hardening)  
+**Durable rule:** A verification step that warns instead of failing is not verification.
 
-Per-op profiling on MobileNetV2-12: Clip dominated at 76.8% of runtime. Fixed with
-`clip_contiguous_f32_fast()` — NEON-accelerated zero-copy path. Per-op: 34ms → 0.86ms
-(39.5x). Amdahl projected 3.93x; measured 3.75–3.91x model speedup. Residual gap (11.5ms
-vs ORT 6.3ms) is Conv-dominated, no single lever remaining. **PR #359.**
+Evidence: the ORT `osx-x86_64` download was the only asset without a pinned checksum, so its integrity check emitted a warning and the build continued with a 9-byte HTML-ish error body. Combined with `curl` exiting 0 on a 404, three "successful" steps produced a corrupt input before `tar` finally objected. The archive format was never validated until the terminal step.
 
-## 2026-07-28 — NEON fast path for Relu (MLAS gate audit item #2)
+**Related:** `curl` needs `-f` (or an explicit status check via `-w %{http_code}`) or an HTTP error body will be treated as a downloaded file and exit code 0.
 
-Relu was second HIGH-priority violation: only fast path behind `cfg(feature="mlas")`.
-ResNet-18: Relu 0.43 ms (5.17%) before → 0.094 ms (1.17%) after. Per-op: 4.6×. Model:
-1.044× (within Amdahl projection). Added `clip_contiguous_f32_fast()` pattern. Manifest
-row for `(Relu, contiguous_f32, all, tier2)` with `RELU_F32_FAST_TEST_HITS` counter.
+## 2026-07-29 — wheels.yml: drop unpublishable macOS x86_64 wheel; harden ORT download errors
 
-## 2026-07-28 — Standing Directive: Hardware-Rationale Accuracy in Dispatch Comments
+**Author:** Holden (release/CI-hardening). Branch `fix/wheels-macos-x86`, merged as **PR #401**.
 
-Source comments justifying dispatch thresholds with hardware figures must: (1) cite
-verified figure from specs/teardown/on-device; (2) state if constant is derived or fitted;
-(3) if fitted, state measured bracket and confirmed platforms. Wrong rationale is worse
-than no rationale — prevents future engineers from silently breaking working dispatch.
+### Context
 
-## 2026-07-28 — Thin-M GEMM bypass for f32 prefill on Apple Silicon
+Issue #326 ("wheels.yml failing every run since 2026-07-21, including on a release tag") was closed by PR #337, which fixed the Windows DXCore API-set DLL exclusion and the manylinux image pin. But wheels.yml stayed red: three of four CPU jobs passed and **CPU wheel (macOS x86_64) still failed**, so a broken release pipeline was closed as fixed for over a week (through tag `v0.1.0-dev.3`).
 
-For small M (2-16) with large B (K×N > 4M), cblas only achieves ~25 GB/s; bypass to
-NEON column-parallel path for constant (pre-transposed) weights. M crossover at 16 measured
-on M1 Max, bracket [16,24]. TinyStories-33M TTFT: 17.7ms → 13.3ms (-25%). f32 weight
-transposes precomputed at model load. Counter: `THIN_M_GEMM_TEST_HITS`. **PR #351.**
+Failure signature from `onnx-genai-ort-sys`'s build script:
+```
+tar: Error opening archive: Unrecognized archive format
+Failed to extract ORT archive
+```
 
-## 2026-07-28 — report time-to-first-token from process start
+### What was actually downloaded (verified, not assumed)
 
-`compare.rs` now reports process start → first token ms (model_load + TTFT) as derived
-column. TTFT alone favors runtimes that front-load work into model load (ORT pre-packs).
-Cold-start metric: native 55–57.5ms, ORT 150–165.5ms (2.6–2.7×). Updated
-`examples/profiles/README.md` with mechanism explanation.
+The build script downloads `onnxruntime-{os}-{ORT_VERSION}.{ext}` from ORT's GitHub releases. For Intel macOS that resolves to `https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-x86_64-1.27.0.tgz`.
 
-## 2026-07-28 — Republish profile figures with load context
+Reproduced with the same `curl -L -o` the build script uses:
+- **HTTP status: 404**, `Content-Type: text/plain`, **9 bytes** on disk, body = `Not Found`.
+- `curl` exits **0** on a 404 without `-f`, so the build script's success check passed.
+- **No SHA-256 checksum is pinned** for `onnxruntime-osx-x86_64-1.27.0.tgz` (all four other platforms have one), so `verify_archive_checksum` only warned and returned.
+- `tar` then received the 9-byte "Not Found" text → "Unrecognized archive format".
 
-Measurements at load 2.5–3.7 show: qwen2.5-0.5b-f16: 1.72× decode, 1.68× e2e, 5.01×
-cold-start. TinyStories-33M: 0.91× decode (ORT wins), 0.82× e2e (ORT wins), 2.47×
-cold-start. Verified against Justin's independent measurement (< 2% agreement). Every
-number carries host load context. Unflattering numbers preserved in README.
+### Is the artifact still published upstream? No.
 
-## 2026-07-28T00:00:00Z — probe the stream you are writing to
+GitHub release assets, macOS only:
+| ORT version | osx-arm64 | osx-x86_64 | osx-universal2 |
+|---|---|---|---|
+| 1.18.0 | ✅ | ✅ | ✅ |
+| 1.20.0 | ✅ | ✅ | ✅ |
+| 1.22.0 | ✅ | ✅ | ✅ |
+| **1.27.0** | ✅ | ❌ 404 | ❌ 404 |
 
-`emit_stats_line` in PR #372: stats written to stderr but probed stdout TTY status, inverting
-decision under redirection. **Durable rule:** probe the stream you are writing to. Stats on
-stderr → test `stderr().is_terminal()`. Never cross-probe. Extracted `stats_text()` for pure
-testable logic; added `stats_format_follows_stderr_not_stdout` unit test covering all 4 cases.
+Upstream ONNX Runtime stopped shipping `osx-x86_64` (and `universal2`) prebuilts after the 1.22.x series. We pin **ORT 1.27.0** because it must match `ORT_API_VERSION` 27 used by the bindgen headers (`ort-sys/build.rs:16-19`), so we cannot downgrade to recover an Intel binary. The absent checksum was itself the early warning that whoever pinned checksums couldn't fetch that asset.
 
-## 2026-07-28 — Feature Gate Coverage Lint
+### Decision
 
-Added `scripts/check_feature_gate_coverage.py` — sixth CI layer targeting blind spot:
-cfg-gated performance paths whose fallback is unmonitored. Audit findings: CRITICAL (Clip),
-HIGH (Relu), MEDIUM (GlobalPool) — double-copy allocations on macOS. No other feature flags
-guard kernel performance paths. Script catches missing *instrumentation* on fallback paths,
-not missing optimizations — manifest then makes tier visible for human review.
+**Drop the `macOS x86_64` entry from the `cpu-wheels` matrix in `.github/workflows/wheels.yml`.**
 
-## 2026-07-28 — Roofline ceiling: cache-assisted threshold for small models
+Rationale: the artifact genuinely no longer exists upstream, and building ORT from source for an EOL Intel-macOS target (GitHub's `macos-15-intel` is the final hosted Intel line) is not justified. A job that can never pass trains everyone to ignore a red pipeline — exactly how #326 stayed "fixed but broken" for a week. Documented the gap in `crates/onnx-runtime-python/README.md` (new "Supported wheel platforms" note) so Intel-Mac users know the wheel is intentionally absent and can build from source via `ORT_ROOT`.
 
-TinyStories-33M (107M params, 267.8 MB decode set) exceeds 100% because SLC (48 MiB = 18%
-coverage) provides inter-token reuse lift. Broadened check from "cache_resident" (entire model
-fits) to "cache_assisted" (SLC ≥ 10% of decode set). Roofline ceiling marked informational
-for cache-assisted models. No change to floor constants. **PR #354.**
+### Error-message quality hardening
 
-## 2026-07-28T04:30:00-07:00 — CLI improvement track durable lessons
+`"Failed to extract ORT archive"` named neither the URL, the HTTP status, the file size, nor the first bytes — it cost real triage time. `ort-sys/build.rs` now:
+- Captures curl's HTTP status via `-w %{http_code}` and **fails on any non-200**, with a message naming the URL, status, byte size, first bytes, and the likely cause (upstream not publishing that asset for this platform).
+- Validates archive magic bytes (gzip `1f 8b` / zip `PK`) before invoking tar/zip, so a 200-with-error-page is caught with an actionable message.
+- The tar-extract failure now reports the URL, size, and first bytes and points at `ORT_ROOT` as the escape hatch.
+- Added `--retry 3 --retry-delay 2` to the download for CI flakiness.
 
-- Recurring verification defects are a durable review pattern: do not accept code that merely appears to verify, preserve, or clean up its claim. Empty-turn handling, flaky tests, speculative rewind placement, benchmark caps, cache keys, broad assertions, and stale fixture inventories were each caught by different review/automation layers; keep redundant review layers in place.
-- Bugs live where automation cannot reach. The CLI track widened automation coverage as first-class product work: CLI CI, cross-platform contract tests, visible ORT-library reporting, and Miri in CI all closed places where defects had been invisible.
-- PR #315 proved observability pays for itself: `cargo test -p onnx-genai-engine --lib` moved from 178 passed / 64 failed to 253 passed / 0 failed once agents could select a working ORT and see which ORT library was actually loaded.
-- Silent behavior is a bug class to eliminate. Ignored `--temperature`, silent CUDA fallback, empty turns on context exhaustion, requested-vs-resolved backend reporting, and invisible budget caps were fixed by making behavior observable, not just internally correct.
-- Coordinator merge and diagnosis discipline: distinguish allocator growth from scheduler worst-case reservation, and verify merges by building or equivalent validation; conflict markers and scratch files can survive if git output is trusted without inspection.
+### Verification
+
+`workflow_dispatch` on `fix/wheels-macos-x86`; per-job results recorded in the PR / run link. **PR #401 merged.**
+
+## 2026-07-29 — DFT kernel for Perch bioacoustics model
+
+**Author:** Deckard  
+**Status:** Implemented  
+**Verified:** PR #357
+
+### Summary
+
+Implemented the ONNX DFT operator (opset 17+) with a vDSP Accelerate fast path for power-of-two lengths on macOS/iOS, plus a Cooley–Tukey radix-2 fallback for all platforms. Verified end-to-end on the Perch v2 bioacoustics model from HuggingFace.
+
+### Key findings
+
+- Opset registration: DFT at `since_version: 17` correctly covers all models at opset ≥ 17 (including Perch at opset 18). Verified via `DFT_VDSP_TEST_HITS` counter increments (1000 during Perch inference).
+- Attribution (M1 Max): DFT is 0.80% (9.3ms) of total model time (~1171ms). Amdahl projection: even reducing it to zero yields only 1.008× speedup — negligible.
+- Numerics: vDSP f32 vs double-precision naive DFT max absolute error < 1e-2 (N=1024); radix-2 fallback within 1e-4 absolute tolerance.
+
+### Decision
+
+No further DFT optimization is warranted for Perch. The vDSP path is already hardware-optimal for the power-of-two case. The real Perch bottlenecks are elementwise ops (Add/Mul/Div/Neg/Exp = 66%) which benefit from the SIMD vectorization work in `onnx-genai-dense-elem`.
+
+## 2026-07-29 — Session-persistent KV cache — Phase 1 implementation
+
+**Author:** Deckard  
+**Status:** Implemented  
+**PR:** squad/session-kv-phase1
+
+### Decision
+
+Implemented Roy's Phase 1 design: remove the unconditional `reset()` from the native decode session's multi-turn path and add incremental prefill so a continued conversation only prefills new tokens.
+
+### Key design choices
+
+**Cache invalidation:** The API computes `common_prefix_len(session_tokens, new_prompt_tokens)` on every call. If the new prompt diverges from the cached history, the KV is rewound to the divergence point via the existing `rewind()` machinery. Default behavior is safe: the stateless `generate()` path still resets unconditionally.
+
+**resume_from capping:** `resume_from = min(prefix_len, native.current_len())` — because the session token history includes the last generated token which was sampled but never fed through the model.
+
+**Weight-transpose cache interaction:** Phase 1 does not change model/executor lifetime. Global weight-transpose caches (#353) are keyed by data pointer and cleared on `Executor::drop`. One `InferenceSession` per `Engine` lifetime is preserved, so the interaction is nil.
+
+**Single-session limitation (Phase 1):** Only one native session is supported. Attempting to create a second fails explicitly. The stateless `generate()` path remains unchanged.
+
+### Verification
+
+1. `native_session_incremental_matches_stateless` — token-identical output.
+2. `native_session_rewind_produces_correct_output` — divergent prefix correctness.
+3. `native_session_creation_guards` — API safety rails.
+4. `NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS` counter + dispatch_manifest.toml row.
+
+## 2026-07-29 — Stream parsed tool calls as OpenAI deltas
+
+**By:** McClane
+
+**What:** Emit one metadata delta followed by an arguments delta for every parsed tool call, then finish with `tool_calls`.
+
+**Why:** Clients can assemble tool invocations incrementally without receiving a monolithic completed tool-call object, while retaining full-output parsing for Qwen, Llama, and Mistral safety.
+
+## 2026-07-28 — Fix BNNS batch>1 SIGSEGV in Conv/Pool kernels
+
+**Author:** Resch  
+**Status:** Implemented  
+**PR:** squad/fix-batch-segfault
+
+### Root cause
+
+`BNNSFilterApplyBatch` with `batch_size > 1` causes a SIGSEGV inside `libBNNS.dylib` for convolution filters created via `BNNSFilterCreateLayerConvolution`. The crash is inside Apple's framework code (frame #0 in libBNNS.dylib, confirmed via AddressSanitizer). The single-image `BNNSFilterApply` works correctly.
+
+The bug was introduced when BNNS Conv was added (PR #324 / #317) — it exercised only batch=1 shapes. The batch dimension was correctly threaded through buffer allocation and stride calculations, but the BNNS framework itself crashes when the deprecated `BNNSFilterCreateLayerConvolution` + `BNNSFilterApplyBatch` combination receives batch>1.
+
+### Fix
+
+Replace `BNNSFilterApplyBatch` with a per-image loop using `BNNSFilterApply`:
+- Conv: `bnns_conv_execute` in `conv_ref.rs`
+- Pool: `bnns_pool_execute` in `pooling.rs` (same class, prophylactic fix)
+
+BNNS still uses its internal thread pool per `BNNSFilterApply` call, so the AMX compute advantage is preserved. The overhead is one extra function call per image — negligible relative to the convolution work.
+
+### Batch>1 performance (MobileNetV2, native)
+
+Measured at load 2.7–3.0:
+| batch | median ms | throughput (samples/s) | scaling |
+|------:|----------:|----------------------:|--------:|
+| 1 | 11.5 | 86.7 | 1.00× |
+| 2 | 22.7 | 88.1 | 1.02× |
+| 4 | 45.1 | 88.7 | 1.02× |
+| 8 | 89.2 | 89.7 | 1.04× |
+| 16 | 178.1 | 89.8 | 1.04× |
+
+Native batch scaling is ~1.0× (linear cost, no amortization). ORT gets 1.9× because its internal NCHWc path and thread pool amortize overhead. Our per-image BNNS dispatch preserves scaling but cannot achieve that overhead amortization without the newer `BNNSGraph` API (which supports batch natively). This is a future optimization axis, not a regression — before this fix, batch>1 simply crashed.
+
+### Standing lesson
+
+`BNNSFilterApplyBatch` is unreliable for `BNNSFilterCreateLayerConvolution` filters. Use per-image `BNNSFilterApply` until migration to `BNNSGraph` (which supersedes the deprecated per-layer API and supports batch natively).
+
+## 2026-07-28 and earlier — archived by size gate
+
+Detailed narrative entries from 2026-07-28T17:40:00+0000 through 2026-07-28T04:30:00-07:00 (Holden wheels summary: PR #347, PR #349, Wave 8/9 consolidation), plus extended Pris CI tiering/ARM64/multi-turn benchmark entries (lines 310–531 of previous compaction) have been moved to `.squad/decisions-archive/2026-07.md` → "Narrative entries compacted by size gate — 2026-07-29". 
+
+These remain available for detailed reference. Summaries: control-flow/QMoE wave work, MobileNetV2 Clip/Relu dispatch, Cache roofline for small models, CLI improvement track lessons, CI tiering/full coverage decision, ARM64 coverage removal, multi-turn and batch benchmark deficits. All foundational context is preserved in the archive.
 
 ## CLI charter — standing directives
 
@@ -346,33 +404,20 @@ ORT shared-buffer KV allocation: `kv_capacity_bucket(0, max_length)` at `dynamic
 
 **By:** Pris
 
-CI has two parallel PR signals: a Linux-only uninstrumented `Fast (Linux x86_64)` job in `ci.yml` for early feedback, and the full coverage gate. PRs, `main` pushes, nightly schedules, and manual dispatch still run the full signal: quality checks, security audit, coverage-instrumented offline crate tests across Linux x86_64 / Windows x86_64 / macOS arm64, uninstrumented Windows ARM64 offline crate tests, Linux-only MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes. Rule: run tests on every platform; instrument for coverage only where the coverage is informative. The fast lane is deliberately duplicated work, has no `needs`, and does not gate or serialize the full lane; passing it alone is not merge-ready. The `ci:full` label trigger was removed because it became a no-op. Codecov carryforward remains disabled because PRs upload the same four flags as `main`.
-
-Rationale: Tiering was tried to reduce PR cost. The first split had the axis wrong: platforms are signal in this repo, while instrumentation is cost. Justin decided the coverage runtime is acceptable and requested a Linux-only no-coverage fast lane for fail-fast ergonomics, so the final choice is to pay the full cost rather than risk reintroducing blind spots.
+CI has two parallel PR signals: a Linux-only uninstrumented `Fast (Linux x86_64)` job in `ci.yml` for early feedback, and the full coverage gate. PRs, `main` pushes, nightly schedules, and manual dispatch still run the full signal. Rule: run tests on every platform; instrument for coverage only where the coverage is informative. Detailed entry archived.
 
 ### 2026-07-28: Windows ARM64 coverage removal
 
 **By:** Pris
 
-Removed the `Rust coverage (Windows ARM64)` job and replaced it with `Rust (Windows ARM64)` uninstrumented tests. Windows ARM64 platform execution catches real platform bugs, but coverage for these pure-Rust crates duplicates x64/macOS coverage while owning the full-gate critical path (18-26m). Uninstrumented ARM64 tests retain the platform signal without coverage overhead. Full CI now passes in 18m54s with new critical path: `CLI ORT (Windows x86_64)` at 18m50s. No Codecov flag disappears; ARM64 had only contributed to the shared `offline` flag.
+Removed the `Rust coverage (Windows ARM64)` job and replaced it with `Rust (Windows ARM64)` uninstrumented tests. Windows ARM64 platform execution catches real platform bugs, but coverage for pure-Rust crates duplicates x64/macOS while owning the critical path. Uninstrumented ARM64 tests retain signal without overhead. Detailed entry archived.
 
 ### 2026-07-28: Multi-turn and batch benchmarks reveal structural native deficit
 
 **Author:** Pris  
-**Affects:** Iran, Deckard (native backend architecture)
+**Root cause:** Native backend has no session-persistent KV cache; each turn re-prefills entire conversation. ORT preserves KV, prefilling only new tokens.
 
-**Root cause: Native backend has no session-persistent KV cache.** Each turn re-prefills the entire conversation (O(context_length)). ORT preserves KV, so each turn prefills only new tokens (O(new_tokens)).
-
-**Multi-turn findings (Apple M1 Max, load 1.5–3.6):**
-- TinyStories-33M: ORT breaks even at turn 2; ORT 2.1× faster over 10 turns.
-- Qwen2.5-0.5B: ORT breaks even at turn 8; ORT 1.18× faster over 10 turns.
-- At turns 3–10, native TTFT is 3.1–3.4× slower than ORT per prefill (no KV reuse).
-
-**Batch vision (MobileNetV2):**
-- Batch=1: native 0.50× ORT (11.6 ms vs 5.8 ms).
-- Batch>1: native crashes (segfault) — correctness bug.
-
-**Should we pre-pack?** No — pre-packing would not address the O(context_length) vs O(new_tokens) structural disadvantage. Session-persistent KV is the priority; pre-packing is deferred until after persistent KV lands. Weight transpose caches ARE correctly reused across turns (168 stable Qwen entries, 25 stable TinyStories entries), so the deficit is not cache reuse.
+**Findings (Apple M1 Max):** TinyStories-33M ORT 2.1× faster over 10 turns; Qwen2.5-0.5B ORT 1.18× faster. Batch vision: native crashes at batch>1 (segfault bug). **Decision:** Session-persistent KV is priority #1; pre-packing deferred post-KV. Detailed measurements and projections archived.
 
 ## 2026-07-29 — Probe the stream you are writing to
 

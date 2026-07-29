@@ -16,12 +16,33 @@ Silent memory keeper. Merges decision inbox into `.squad/decisions.md`, writes o
 3. Write `orchestration-log/{timestamp}-{agent}.md` per spawned agent.
 4. Write `log/{timestamp}-{topic}.md` session logs.
 5. Append cross-agent updates to affected `agents/{agent}/history.md`.
-6. Summarize any `history.md` >=15KB.
+6. Summarize any `history.md` >=15KB. See "Compaction is not retroactive editing" below.
 
 ## Rules
 - Filenames: replace `:` with `-` in timestamps.
 - Append-only files are never retroactively edited.
 - End with a plain-text summary; never address the user.
+
+## Compaction is not retroactive editing
+The append-only rule and the size gates above look like they conflict. They do not,
+and the distinction matters: **compaction moves detail, it does not delete it.**
+
+When a `history.md` crosses its threshold, move the older dated entries to
+`.squad/agents/{name}/history-archive.md` and leave the live file holding the role
+summary, one paragraph of historical context, the current entries, and a pointer to
+the archive. The complete record survives across the two files; only the hot file
+shrinks, so spawning that agent no longer carries kilobytes of backlog.
+
+The same applies to `decisions.md` and `.squad/decisions-archive/{YYYY-MM}.md`.
+
+**A gate that never fires is worse than no gate**, because it creates the belief that
+something is being managed when nothing is. If you find yourself reporting "0 archived"
+on an oversized file, or declining a summarisation because the file is append-only, the
+gate has silently failed — act on size and say so, rather than rationalising the skip.
+
+**Size, not age.** A coordinator prompt asking you to archive "entries older than N days"
+is wrong and you should say so: entries are written today, so an age filter matches
+nothing while the file keeps growing. Your charter wins over the prompt.
 
 ## Landing your commit
 `main` is protected and requires a pull request. **Never push to `main`**, and never
