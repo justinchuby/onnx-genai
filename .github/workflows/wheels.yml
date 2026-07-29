@@ -35,12 +35,15 @@ jobs:
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
-          # No macOS x86_64 (Intel) wheel: upstream ONNX Runtime stopped
-          # publishing an osx-x86_64 prebuilt after 1.22.x (v1.27.0 ships only
-          # osx-arm64). We pin ORT 1.27.0 to match ORT_API_VERSION 27, so we
-          # cannot downgrade to recover an Intel binary. A matrix entry here
-          # could only ever 404 and fail, so it is dropped rather than left red.
-          # See .squad/decisions.md and the README wheels note.
+          # macOS is Apple Silicon (arm64) ONLY, deliberately — not an oversight.
+          # The macOS x86_64 (Intel) matrix entry was removed 2026-07-29: we no
+          # longer ship an Intel-Mac wheel. ONNX Runtime is pinned to 1.27.0 (for
+          # ORT_API_VERSION 27) and upstream publishes no osx-x86_64 prebuilt at
+          # that version, so an Intel row could only ever fail the build. Do NOT
+          # re-add an x86_64 / macos-13 / macos-15-intel row without first sourcing
+          # an Intel-macOS ONNX Runtime; a job that can never pass just trains
+          # everyone to ignore a red pipeline.
+          # See .squad/decisions.md and crates/onnx-runtime-python/README.md.
           # macos-14 is the GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
             os: macos-14
