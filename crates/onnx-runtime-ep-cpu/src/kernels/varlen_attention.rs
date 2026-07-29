@@ -18,9 +18,25 @@ const OP: &str = "VarlenAttention";
 pub struct VarlenAttentionFactory;
 
 pub struct VarlenAttentionKernel {
-    scale: Option<f32>,
-    is_causal: bool,
-    softcap: Option<f32>,
+    pub(super) scale: Option<f32>,
+    pub(super) is_causal: bool,
+    pub(super) softcap: Option<f32>,
+}
+
+pub(super) struct PackedAttentionSpec<'a> {
+    pub query: &'a [f32],
+    pub key: &'a [f32],
+    pub value: &'a [f32],
+    pub cu_seqlens_q: &'a [usize],
+    pub cu_seqlens_kv: &'a [usize],
+    pub nonpad_kv_seqlen: Option<&'a [i64]>,
+    pub num_heads: usize,
+    pub kv_num_heads: usize,
+    pub head_size: usize,
+    pub value_head_size: usize,
+    pub scale: f32,
+    pub is_causal: bool,
+    pub softcap: Option<f32>,
 }
 
 impl KernelFactory for VarlenAttentionFactory {
@@ -184,7 +200,6 @@ impl Kernel for VarlenAttentionKernel {
         let q = to_dense_f32_widen(OP, &inputs[0])?;
         let k = to_dense_f32_widen(OP, &inputs[1])?;
         let v = to_dense_f32_widen(OP, &inputs[2])?;
-        let mut output = vec![0.0; total_q * q_heads * value_dim];
         let scale = self
             .scale
             .unwrap_or_else(|| 1.0 / (head_size as f32).sqrt());
@@ -208,61 +223,111 @@ impl Kernel for VarlenAttentionKernel {
                 .saturating_add(score_elements.saturating_mul(4))
         });
 
-        for sequence in 0..batch {
-            let (q_start, q_end) = (cu_q[sequence], cu_q[sequence + 1]);
-            let (kv_start, kv_end) = (cu_kv[sequence], cu_kv[sequence + 1]);
-            let q_len = q_end - q_start;
-            let allocated_kv = kv_end - kv_start;
-            let kv_len = match &nonpad {
-                Some(lengths) => usize::try_from(lengths[sequence]).map_err(|_| {
-                    error(format!(
-                        "nonpad_kv_seqlen[{sequence}] must be non-negative, got {}",
-                        lengths[sequence]
-                    ))
-                })?,
-                None => allocated_kv,
-            };
-            if kv_len > allocated_kv {
-                return Err(error(format!(
-                    "nonpad_kv_seqlen[{sequence}]={kv_len} exceeds packed KV span {allocated_kv}"
-                )));
-            }
-
-            let q_bhsd = token_major_to_bhsd(&q, q_start, q_len, q_heads, head_size);
-            let k_bhsd = token_major_to_bhsd(&k, kv_start, kv_len, kv_heads, head_size);
-            let v_bhsd = token_major_to_bhsd(&v, kv_start, kv_len, kv_heads, value_dim);
-            let tensors = SdpaTensors {
-                q: &q_bhsd,
-                k: &k_bhsd,
-                v: &v_bhsd,
-                batch: 1,
-                num_heads: q_heads,
-                num_kv_heads: kv_heads,
-                q_seq: q_len,
-                kv_seq: kv_len,
-                head_size,
-                v_head_size: value_dim,
-            };
-            let config = SdpaConfig {
-                scale: ScaleMode::SplitSqrt(scale),
-                softcap: self.softcap,
-                causal: false,
-                past_seq: 0,
-                causal_fill: f32::NEG_INFINITY,
-            };
-            let causal = CausalOffset {
-                offset: kv_len as i64 - q_len as i64,
-            };
-            let bias: &dyn AttnBias = if self.is_causal { &causal } else { &NoBias };
-            let mut y_bhsd = vec![0.0; q_heads * q_len * value_dim];
-            sdpa_f32_scalar(&tensors, &config, bias, &NoMask, &mut y_bhsd, None);
-            bhsd_to_token_major(&y_bhsd, &mut output, q_start, q_len, q_heads, value_dim);
-        }
+        let output = compute_packed_attention(PackedAttentionSpec {
+            query: &q,
+            key: &k,
+            value: &v,
+            cu_seqlens_q: &cu_q,
+            cu_seqlens_kv: &cu_kv,
+            nonpad_kv_seqlen: nonpad.as_deref(),
+            num_heads: q_heads,
+            kv_num_heads: kv_heads,
+            head_size,
+            value_head_size: value_dim,
+            scale,
+            is_causal: self.is_causal,
+            softcap: self.softcap,
+        })?;
         write_dense_f32_narrow(OP, &mut outputs[0], &output)
     }
 }
 
-fn offsets(view: &TensorView, name: &str, total: usize) -> Result<Vec<usize>> {
+pub(super) fn compute_packed_attention(spec: PackedAttentionSpec<'_>) -> Result<Vec<f32>> {
+    let total_q = spec.cu_seqlens_q.last().copied().unwrap_or(0);
+    let batch = spec.cu_seqlens_q.len() - 1;
+    let mut output = vec![0.0; total_q * spec.num_heads * spec.value_head_size];
+    for sequence in 0..batch {
+        let (q_start, q_end) = (spec.cu_seqlens_q[sequence], spec.cu_seqlens_q[sequence + 1]);
+        let (kv_start, kv_end) = (
+            spec.cu_seqlens_kv[sequence],
+            spec.cu_seqlens_kv[sequence + 1],
+        );
+        let query_length = q_end - q_start;
+        let allocated_kv_length = kv_end - kv_start;
+        let kv_length = match spec.nonpad_kv_seqlen {
+            Some(lengths) => usize::try_from(lengths[sequence]).map_err(|_| {
+                error(format!(
+                    "nonpad_kv_seqlen[{sequence}] must be non-negative, got {}",
+                    lengths[sequence]
+                ))
+            })?,
+            None => allocated_kv_length,
+        };
+        if kv_length > allocated_kv_length {
+            return Err(error(format!(
+                "nonpad_kv_seqlen[{sequence}]={kv_length} exceeds packed KV span {allocated_kv_length}"
+            )));
+        }
+
+        let query_bhsd = token_major_to_bhsd(
+            spec.query,
+            q_start,
+            query_length,
+            spec.num_heads,
+            spec.head_size,
+        );
+        let key_bhsd = token_major_to_bhsd(
+            spec.key,
+            kv_start,
+            kv_length,
+            spec.kv_num_heads,
+            spec.head_size,
+        );
+        let value_bhsd = token_major_to_bhsd(
+            spec.value,
+            kv_start,
+            kv_length,
+            spec.kv_num_heads,
+            spec.value_head_size,
+        );
+        let tensors = SdpaTensors {
+            q: &query_bhsd,
+            k: &key_bhsd,
+            v: &value_bhsd,
+            batch: 1,
+            num_heads: spec.num_heads,
+            num_kv_heads: spec.kv_num_heads,
+            q_seq: query_length,
+            kv_seq: kv_length,
+            head_size: spec.head_size,
+            v_head_size: spec.value_head_size,
+        };
+        let config = SdpaConfig {
+            scale: ScaleMode::SplitSqrt(spec.scale),
+            softcap: spec.softcap,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let causal = CausalOffset {
+            offset: kv_length as i64 - query_length as i64,
+        };
+        let bias: &dyn AttnBias = if spec.is_causal { &causal } else { &NoBias };
+        let mut output_bhsd = vec![0.0; spec.num_heads * query_length * spec.value_head_size];
+        sdpa_f32_scalar(&tensors, &config, bias, &NoMask, &mut output_bhsd, None);
+        bhsd_to_token_major(
+            &output_bhsd,
+            &mut output,
+            q_start,
+            query_length,
+            spec.num_heads,
+            spec.value_head_size,
+        );
+    }
+    Ok(output)
+}
+
+pub(super) fn offsets(view: &TensorView, name: &str, total: usize) -> Result<Vec<usize>> {
     if view.shape.len() != 1 {
         return Err(error(format!(
             "{name} must be rank 1, got {:?}",
