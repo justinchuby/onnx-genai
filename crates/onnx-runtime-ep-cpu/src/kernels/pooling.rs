@@ -781,14 +781,7 @@ fn bnns_pool_execute(
             params: *const BNNSLayerParametersPooling,
             filter_params: *const BNNSFilterParameters,
         ) -> BNNSFilter;
-        fn BNNSFilterApplyBatch(
-            filter: BNNSFilter,
-            batch_size: usize,
-            input: *const c_void,
-            input_stride: usize,
-            output: *mut c_void,
-            output_stride: usize,
-        ) -> i32;
+        fn BNNSFilterApply(filter: BNNSFilter, input: *const c_void, output: *mut c_void) -> i32;
         fn BNNSFilterDestroy(filter: BNNSFilter);
     }
 
@@ -890,20 +883,27 @@ fn bnns_pool_execute(
     if filter.is_null() {
         return Ok(false);
     }
-    let rc = unsafe {
-        BNNSFilterApplyBatch(
-            filter,
-            batch,
-            input.as_ptr() as *const c_void,
-            in_stride * 4,
-            output.as_mut_ptr() as *mut c_void,
-            out_stride * 4,
-        )
-    };
+    // Apply per-image. BNNSFilterApplyBatch with batch>1 crashes (SIGSEGV
+    // inside libBNNS) for convolution filters and may be unsafe for pooling
+    // as well. The single-image BNNSFilterApply avoids this.
+    let mut ok = true;
+    for b in 0..batch {
+        let rc = unsafe {
+            BNNSFilterApply(
+                filter,
+                input.as_ptr().add(b * in_stride) as *const c_void,
+                output.as_mut_ptr().add(b * out_stride) as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            ok = false;
+            break;
+        }
+    }
     unsafe {
         BNNSFilterDestroy(filter);
     }
-    Ok(rc == 0)
+    Ok(ok)
 }
 
 #[cfg(test)]
