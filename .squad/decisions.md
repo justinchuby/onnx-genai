@@ -332,3 +332,141 @@ to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate success
 ## 2026-07-29 — Tool-call parser handles Qwen, Llama, and Mistral formats
 
 **PR #390 / issue #183 follow-up (Stevens; reviewed by Edgemar; merged `0e62150e`).** `parse_tool_calls` recognizes Qwen/Hermes `<tool_call>` objects, Llama 3 `<|python_tag|>` objects, and Mistral `[TOOL_CALLS]` arrays. A serde `StreamDeserializer::byte_offset()` prefix scanner consumes consecutive complete top-level Llama JSON values (including semicolons inside strings) without naive splitting and terminates safely on malformed input or model terminators. One converter prefers `arguments`, falls back to `parameters`, and assigns sequential IDs. Edgemar independently ran eight parser tests and clean clippy; the roughly 49 local `tests.rs` failures are pre-existing missing-weights-fixture failures.
+
+## 2026-07-28 — Fact-Checker Verdict: ORT shared-buffer KV allocation strategy
+
+**Requested by:** Justin Chu (@justinchuby)  
+**Blocks:** PR #367 (`fix/cuda-kv-capacity`)
+
+**Verdict: ✅ PR #367's wording is correct. `main`'s wording is stale.**
+
+ORT shared-buffer KV allocation: `kv_capacity_bucket(0, max_length)` at `dynamic.rs:386` allocates the **minimum bucket (256)** via and grows lazily by `ensure_kv_capacity`, not by pre-allocating the full context. `main`'s comment describing pre-allocation is stale — it predates the bucketing policy. PR #367's wording is verified by code tracing and passing tests `kv_capacity_bucket_rounds_to_power_of_two_min_256` and `ensure_kv_capacity_orders_fallible_work_before_invalidation`.
+
+### 2026-07-28: CI tiering rejected; run full coverage on PRs
+
+**By:** Pris
+
+CI has two parallel PR signals: a Linux-only uninstrumented `Fast (Linux x86_64)` job in `ci.yml` for early feedback, and the full coverage gate. PRs, `main` pushes, nightly schedules, and manual dispatch still run the full signal: quality checks, security audit, coverage-instrumented offline crate tests across Linux x86_64 / Windows x86_64 / macOS arm64, uninstrumented Windows ARM64 offline crate tests, Linux-only MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes. Rule: run tests on every platform; instrument for coverage only where the coverage is informative. The fast lane is deliberately duplicated work, has no `needs`, and does not gate or serialize the full lane; passing it alone is not merge-ready. The `ci:full` label trigger was removed because it became a no-op. Codecov carryforward remains disabled because PRs upload the same four flags as `main`.
+
+Rationale: Tiering was tried to reduce PR cost. The first split had the axis wrong: platforms are signal in this repo, while instrumentation is cost. Justin decided the coverage runtime is acceptable and requested a Linux-only no-coverage fast lane for fail-fast ergonomics, so the final choice is to pay the full cost rather than risk reintroducing blind spots.
+
+### 2026-07-28: Windows ARM64 coverage removal
+
+**By:** Pris
+
+Removed the `Rust coverage (Windows ARM64)` job and replaced it with `Rust (Windows ARM64)` uninstrumented tests. Windows ARM64 platform execution catches real platform bugs, but coverage for these pure-Rust crates duplicates x64/macOS coverage while owning the full-gate critical path (18-26m). Uninstrumented ARM64 tests retain the platform signal without coverage overhead. Full CI now passes in 18m54s with new critical path: `CLI ORT (Windows x86_64)` at 18m50s. No Codecov flag disappears; ARM64 had only contributed to the shared `offline` flag.
+
+### 2026-07-28: Multi-turn and batch benchmarks reveal structural native deficit
+
+**Author:** Pris  
+**Affects:** Iran, Deckard (native backend architecture)
+
+**Root cause: Native backend has no session-persistent KV cache.** Each turn re-prefills the entire conversation (O(context_length)). ORT preserves KV, so each turn prefills only new tokens (O(new_tokens)).
+
+**Multi-turn findings (Apple M1 Max, load 1.5–3.6):**
+- TinyStories-33M: ORT breaks even at turn 2; ORT 2.1× faster over 10 turns.
+- Qwen2.5-0.5B: ORT breaks even at turn 8; ORT 1.18× faster over 10 turns.
+- At turns 3–10, native TTFT is 3.1–3.4× slower than ORT per prefill (no KV reuse).
+
+**Batch vision (MobileNetV2):**
+- Batch=1: native 0.50× ORT (11.6 ms vs 5.8 ms).
+- Batch>1: native crashes (segfault) — correctness bug.
+
+**Should we pre-pack?** No — pre-packing would not address the O(context_length) vs O(new_tokens) structural disadvantage. Session-persistent KV is the priority; pre-packing is deferred until after persistent KV lands. Weight transpose caches ARE correctly reused across turns (168 stable Qwen entries, 25 stable TinyStories entries), so the deficit is not cache reuse.
+
+## 2026-07-29 — Probe the stream you are writing to
+
+**By:** Rachael  
+**Blocks:** PR #372 (REPL stats display)
+
+`emit_stats_line` chose its format from `io::stdout().is_terminal()` while writing to stderr. This inverts under redirection: `> out.txt` in a terminal gives the cramped one-line form intended for log files; `2> stats.log` puts terminal-oriented layout into a file. **Rule:** always probe the destination stream, never a convenient nearby one. Stats to stderr → test `stderr().is_terminal()`, not stdout.
+
+**Durable pattern:** Extract testable pure functions. `stats_text()` and `needs_trailing_newline()` had to become named pure functions before their branches could be unit-tested; inlining had hidden both defects in the production path.
+
+## 2026-07-29 — Run the gate command CI runs, verbatim
+
+**By:** Rachael  
+**Blocks:** PR #372 (formatting)
+
+A package-scoped `cargo fmt --check` passed locally while the entire workspace was unformatted. CI's `cargo fmt --all --check` caught it in 37 seconds. **Rule:** use the exact gate command that CI uses, not a convenient subset. Local validation with a narrower scope is structurally untrustable.
+
+## 2026-07-29 — Terminal behaviour requires PTY-driven tests; piped I/O cannot cover it
+
+**By:** Rachael  
+**Blocks:** PR #372 (PTY harness)
+
+Two `#[cfg(unix)]` PTY tests written on Windows compiled to **zero tests** on Windows and were reported alongside a green 168-test suite. Ran under WSL: did not compile (`nix` missing `term`/`fs` features), could hang the runner forever, failed `clippy -D warnings`. **Rule:** A `cfg`-gated test is unverified until it runs on a platform where the gate admits it. Do not assume compilation equals verification. Piped-stdio tests structurally cannot cover PTY-specific behavior (control sequences, window size events, terminal probe responses).
+
+## 2026-07-29 — Type-ahead is not lost during generation on Unix or Windows
+
+**By:** Zhora  
+**Closes:** Issue #298 (type-ahead swallowed)  
+**Verified:** PR #393
+
+**Investigation scope:** user keystrokes during decode on Unix (`ratatui` + `crossterm 0.29`) and Windows (`ratatui` + native conhost/ConPTY).
+
+**Findings:**
+- crossterm 0.29 routes `cursor::position()` keystrokes to `skipped_events` and drains them back; ratatui 0.30's inline viewport reads stdin only at init/resize.
+- Windows `ReadConsoleInputW` is unaffected by `ENABLE_LINE_INPUT`; `SetConsoleMode` does not flush the queue; there is no `FlushConsoleInputBuffer` in the Windows API.
+- Tested against ~19s real stream with type-ahead injected pasted, delayed, and character-by-character.
+
+**Verdict:** ConPTY does not echo type-ahead during generation at all, so no REPL repaint can overwrite it. This is a terminal characteristic, not a backend bug. **Do not re-open as a native-backend issue.**
+
+**Still unverified (native conhost):** In a native terminal (not IDE or ConPTY), start a long stream, type `/help` mid-stream, watch for appear-then-vanish, then press Enter at next prompt. If help renders, keystrokes were safe (cosmetic echo overpaint); if nothing, it is real loss.
+
+## 2026-07-29 — PTY-harness hazards that present as swallowed input
+
+**By:** Zhora  
+**Blocks:** PR #393 (timeout and drain fixes)
+
+A **0×0 window** makes `ratatui::insert_before_no_scrolling_regions()` infinite-loop. Feeding `\n` where a terminal sends `\r` means the line never completes. Both present as a hang or lost input and send the next investigator down the wrong path (looking for a keystroke loss instead of a terminal setup defect). Fixed in PR #393 and documented for future harness work.
+
+## 2026-07-29 — Prefer an idle timeout to a total one when the child is silent before first output
+
+**By:** Zhora  
+**Blocks:** PR #393 (drain timeout)
+
+A 30s total drain budget lost ~48s to a cold model load on a slow machine; it was not a safety net, it was a coin flip. Now 120s idle — justified at ~2.5× the measured worst case — with a failure message stating it timed out waiting for bytes, **not** a trailing-newline defect. An empty read can never masquerade as an assertion failure; this distinction prevents phantom failures during CI variance.
+
+## 2026-07-29 — The DeepSeek "repeats thinking, won't stop" report is not a backend bug
+
+**By:** Leon  
+**Blocks:** PRs #367, #385, #392, #395  
+**Verdict:** ✅ Verified not native-backend issue
+
+Native CUDA and ORT fall into **identical verbatim repetition loop**, diverging only at one `,`/`.` tie-break at character position 325 (fp16 GPU vs fp32 CPU). It is **greedy-decoding degeneration**. The `CUDA KV capacity exceeded (4097 > 4096)` error was a **downstream symptom** — the loop grew KV into the native path's cap; ORT had no cap and looped silently.
+
+**Root cause** was a model that ships `do_sample: true, temperature: 0.6` but the CLI was forcing greedy override (next durable rule below).
+
+## 2026-07-29 — Model-declared generation defaults are canonical; our constants are fallback, not override
+
+**By:** Leon  
+**Blocks:** PRs #385, #392  
+**Closed:** Issues #290, #296 (silent temperature/do_sample override)
+
+We parsed model `do_sample`, `temperature`, `top_p`, `top_k` and then discarded them, forcing greedy — on models that ship explicit values precisely because greedy degenerates (e.g., DeepSeek, Qwen).
+
+**Precedence is now strict:** explicit caller flag > model-declared value > greedy fallback. Enforcement is in the engine so CLI, server, and Python all inherit it without duplication.
+
+## 2026-07-29 — The CUDA driver API ships with the display driver, not the toolkit
+
+**By:** Leon  
+**Clears:** PR #395 misconception
+
+`nvcuda.dll` is present whenever the GPU driver is installed. Both `cust` (the EP loader) and `cudarc` fall back `*_13` → `*_12` cleanly. An earlier conclusion that native CUDA was unrunnable here was inferred from a `Cargo.toml` pin and was wrong.
+
+**Durable rule:** An inferred capability claim that turns out to be wrong costs more than the investigation it prevented. Never suppress an inferred bad fact without verifying it directly against a fresh environment.
+
+## 2026-07-29 — Standing Operational Rule: Worktree lifecycle and decision merging
+
+**By:** Justin Chu (recorded by Scribe)
+
+Do not delete a worktree before Scribe has merged its decision inbox. `.squad/decisions/inbox/` is gitignored and per-worktree, so removing a worktree destroys any unmerged decision drops in it. Coordination workflow:
+
+1. Agent writes decision to `.squad/decisions/inbox/{agent}-{slug}.md` (in-worktree, gitignored).
+2. PR lands; worktree remains temporarily.
+3. Scribe runs (either same session or next): merges inbox → `.squad/decisions.md`, deletes merged files.
+4. Scribe commits and pushes.
+5. Safe to delete the worktree.
+
+Merging and deleting the inbox files produces no git diff (expected, not a failure). The loss that occurred here: Rachael, Zhora, Leon wrote inbox files in separate worktrees, those worktrees were deleted before Scribe ran, and inbox files were lost. The substance survived in merged `history.md` files and PR descriptions, but the durable-rule fragments did not make it to this ledger — they had to be manually recovered from context.
