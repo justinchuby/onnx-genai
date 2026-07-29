@@ -83,6 +83,14 @@ name = "profile_vision"
 required-features = ["bench-native"]
 
 [[bin]]
+name = "multiturn"
+required-features = ["bench-native"]
+
+[[bin]]
+name = "batch_vision"
+required-features = ["bench-native"]
+
+[[bin]]
 name = "bench_generic"
 required-features = ["mlas"]
 
