@@ -160,11 +160,18 @@ const GEMV_F16_DOWN_BLOCK_SIZE: usize = 32;
 const GEMV_F16_DOWN_THREADS: u32 = 256;
 const GEMV_F16_DOWN_COLUMNS_PER_BLOCK: usize = 8;
 const GATE_UP_SWIGLU_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu";
+const GATE_UP_DECOMPOSED_SWIGLU_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu";
 const GATE_UP_SWIGLU_RMSNORM_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm";
+const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm";
 /// Asymmetric-zero-point specializations of the paired gate/up SwiGLU entries
 /// (see [`GEMV_F16_SCALES_F16_ZP_ENTRY`] for the `HasZp` specialization scheme).
 const GATE_UP_SWIGLU_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_zp";
+const GATE_UP_DECOMPOSED_SWIGLU_ZP_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_zp";
 const GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY: &str = "matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp";
+const GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY: &str =
+    "matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_zp";
 const GATE_UP_SWIGLU_THREADS: u32 = 256;
 
 const DEQUANT_SRC: &str = r#"
@@ -2397,9 +2404,23 @@ __device__ __forceinline__ float gate_up_silu_f32(float x)
         const float denominator = __fadd_rn(1.0f, (float)exp((double)-x));
         return __fdiv_rn(x, denominator);
     }
+
     const float e = (float)exp((double)x);
     const float numerator = __fmul_rn(x, e);
     return __fdiv_rn(numerator, __fadd_rn(1.0f, e));
+}
+
+__device__ __forceinline__ float gate_up_decomposed_silu_f32(float x)
+{
+    float sigmoid;
+    if (x >= 0.0f) {
+        sigmoid = 1.0f / (1.0f + (float)exp((double)-x));
+    } else {
+        const float e = (float)exp((double)x);
+        sigmoid = e / (1.0f + e);
+    }
+    const float sigmoid_h = __half2float(__float2half_rn(sigmoid));
+    return __half2float(__float2half_rn(__fmul_rn(x, sigmoid_h)));
 }
 
 // Paired gate/up projection + SwiGLU. One warp computes column `column` of BOTH
@@ -2411,7 +2432,7 @@ __device__ __forceinline__ float gate_up_silu_f32(float x)
 // (`fp16(gate_acc)`, `fp16(up_acc)`, then `fp16(silu(gate_h)*up_h)`) so greedy
 // decoding stays byte-identical. Register-only + warp shuffles: no shared
 // memory, so it is portable to sm_53+ and safe on small SMs (no >48KB opt-in).
-template <bool HasZp>
+template <bool HasZp, bool Decomposed>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -2539,8 +2560,10 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_tpl(
         // standalone silu_mul_f16 kernel fed by the two GEMV outputs.
         const float gate_h = __half2float(__float2half(gate_value));
         const float up_h = __half2float(__float2half(up_value));
-        output[column] =
-            __float2half_rn(__fmul_rn(gate_up_silu_f32(gate_h), up_h));
+        const float silu_h = Decomposed
+            ? gate_up_decomposed_silu_f32(gate_h)
+            : gate_up_silu_f32(gate_h);
+        output[column] = __float2half_rn(__fmul_rn(silu_h, up_h));
     }
 }
 
@@ -2559,7 +2582,25 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu(
     const int blob_size,
     const int zp_row_bytes)
 {
-    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<false>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
+    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<false, false>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<false, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_zp(
@@ -2577,7 +2618,25 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_zp(
     const int blob_size,
     const int zp_row_bytes)
 {
-    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
+    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<true, false>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_zp(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_tpl<true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, output, k, n, k_blocks, blob_size, zp_row_bytes);
 }
 
 // Paired gate/up projection + SwiGLU with a fused RMS-normalization prologue.
@@ -2591,7 +2650,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_zp(
 // `SkipSimplifiedLayerNormalization` through the paired kernel. Every arithmetic
 // step mirrors the standalone norm followed by the two-op gate/up SwiGLU, so
 // greedy tokens stay bit-for-bit identical.
-template <bool HasZp>
+template <bool HasZp, bool Decomposed>
 __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed_gate,
@@ -2804,8 +2863,10 @@ __device__ __forceinline__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl
     if (lane == 0 && column < n) {
         const float gate_h = __half2float(__float2half(gate_value));
         const float up_h = __half2float(__float2half(up_value));
-        output[column] =
-            __float2half_rn(__fmul_rn(gate_up_silu_f32(gate_h), up_h));
+        const float silu_h = Decomposed
+            ? gate_up_decomposed_silu_f32(gate_h)
+            : gate_up_silu_f32(gate_h);
+        output[column] = __float2half_rn(__fmul_rn(silu_h, up_h));
     }
 }
 
@@ -2827,7 +2888,28 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm(
     const int gamma_is_half,
     const float epsilon)
 {
-    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, false>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<false, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
 extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
@@ -2848,7 +2930,28 @@ extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_zp(
     const int gamma_is_half,
     const float epsilon)
 {
-    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<true, false>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_gate_up_decomposed_swiglu_rmsnorm_zp(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed_gate,
+    const __half* __restrict__ scales_gate,
+    const unsigned char* __restrict__ packed_up,
+    const __half* __restrict__ scales_up,
+    const unsigned char* __restrict__ zero_points_gate,
+    const unsigned char* __restrict__ zero_points_up,
+    const void* __restrict__ gamma,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int gamma_is_half,
+    const float epsilon)
+{
+    matmul_nbits_gemv_f16_gate_up_swiglu_rmsnorm_tpl<true, true>(activation, packed_gate, scales_gate, packed_up, scales_up, zero_points_gate, zero_points_up, gamma, output, k, n, k_blocks, blob_size, zp_row_bytes, gamma_is_half, epsilon);
 }
 
 // Down projection specialization: a 256-thread CTA (8 warps) computes `COLS`
@@ -3462,6 +3565,10 @@ impl KernelFactory for MatMulNBitsFactory {
                 .attr(crate::optimizer::GATE_UP_SWIGLU_FUSION_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
                 == Some(1),
+            decomposed_silu: node
+                .attr(crate::optimizer::DECOMPOSED_SILU_ATTR)
+                .and_then(onnx_runtime_ir::Attribute::as_int)
+                == Some(1),
             rmsnorm_prologue: node
                 .attr(crate::optimizer::MATMUL_NBITS_RMSNORM_PROLOGUE_ATTR)
                 .and_then(onnx_runtime_ir::Attribute::as_int)
@@ -3528,6 +3635,7 @@ pub struct MatMulNBitsKernel {
     /// `[x, W_gate, scales_gate, W_up, scales_up]` and the kernel writes
     /// `silu(gate) * up` directly (see [`GATE_UP_SWIGLU_ENTRY`]).
     gate_up_swiglu: bool,
+    decomposed_silu: bool,
     /// Set on a general fp16 GEMV whose input activation must be RMS-normalized
     /// in-kernel before the int4 dot, produced by
     /// [`crate::optimizer::CudaSkipRmsNormMatMulFusion`]. The `gamma` weight is
@@ -4876,6 +4984,7 @@ impl MatMulNBitsKernel {
                 output_ptr,
                 output_ptr,
                 output.numel(),
+                self.decomposed_silu,
             )
         })();
 
@@ -4905,10 +5014,11 @@ impl MatMulNBitsKernel {
             .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU GEMV")?;
         // Symmetric weights launch the `HasZp == false` entry, whose PTX drops the
         // per-block zero-point load entirely; only asymmetric weights pay for it.
-        let entry = if zp_gate.is_some() || zp_up.is_some() {
-            GATE_UP_SWIGLU_ZP_ENTRY
-        } else {
-            GATE_UP_SWIGLU_ENTRY
+        let entry = match (self.decomposed_silu, zp_gate.is_some() || zp_up.is_some()) {
+            (true, true) => GATE_UP_DECOMPOSED_SWIGLU_ZP_ENTRY,
+            (true, false) => GATE_UP_DECOMPOSED_SWIGLU_ENTRY,
+            (false, true) => GATE_UP_SWIGLU_ZP_ENTRY,
+            (false, false) => GATE_UP_SWIGLU_ENTRY,
         };
         let function = self
             .runtime
@@ -4988,10 +5098,11 @@ impl MatMulNBitsKernel {
     ) -> Result<()> {
         self.runtime
             .require_nvrtc_half_headers("MatMulNBits fp16 gate/up SwiGLU RMS-norm GEMV")?;
-        let entry = if zp_gate.is_some() || zp_up.is_some() {
-            GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY
-        } else {
-            GATE_UP_SWIGLU_RMSNORM_ENTRY
+        let entry = match (self.decomposed_silu, zp_gate.is_some() || zp_up.is_some()) {
+            (true, true) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ZP_ENTRY,
+            (true, false) => GATE_UP_DECOMPOSED_SWIGLU_RMSNORM_ENTRY,
+            (false, true) => GATE_UP_SWIGLU_RMSNORM_ZP_ENTRY,
+            (false, false) => GATE_UP_SWIGLU_RMSNORM_ENTRY,
         };
         let function = self
             .runtime
@@ -6582,6 +6693,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
@@ -6860,6 +6972,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
@@ -7010,6 +7123,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 accuracy4_workspace: None,
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
+                decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
@@ -7753,6 +7867,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
@@ -8010,6 +8125,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
@@ -8278,6 +8394,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             accuracy4_workspace: None,
             fold_bias_post_round: false,
             gate_up_swiglu: false,
+            decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
@@ -8292,6 +8409,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             accuracy4_workspace: None,
             fold_bias_post_round: true,
             gate_up_swiglu: false,
+            decomposed_silu: false,
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
@@ -8549,6 +8667,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 accuracy4_workspace: None,
                 fold_bias_post_round: false,
                 gate_up_swiglu: false,
+                decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
@@ -8966,6 +9085,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 accuracy4_workspace: None,
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
+                decomposed_silu: false,
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
@@ -8980,6 +9100,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 accuracy4_workspace: None,
                 fold_bias_post_round: false,
                 gate_up_swiglu: true,
+                decomposed_silu: false,
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
@@ -9429,6 +9550,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 accuracy4_workspace: None,
                 fold_bias_post_round: fold,
                 gate_up_swiglu: false,
+                decomposed_silu: false,
                 rmsnorm_prologue: rmsnorm,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
