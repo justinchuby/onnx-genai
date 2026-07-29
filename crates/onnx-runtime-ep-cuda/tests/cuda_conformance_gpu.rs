@@ -1708,6 +1708,25 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     p.push(sweep("NonZero", nonzero_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
+    // Batch 10 (issue #67): normalization, global reductions, quantization, and
+    // low-complexity data transforms.
+    for op in [
+        "AffineGrid",
+        "BatchNormalization",
+        "Compress",
+        "DynamicQuantizeLinear",
+        "GlobalAveragePool",
+        "GlobalLpPool",
+        "GlobalMaxPool",
+        "LpNormalization",
+    ] {
+        p.push(dedicated(
+            op,
+            "cuda_parity_batch10_gpu.rs",
+            "issue #67 CUDA coverage batch 10 CPU parity",
+        ));
+    }
+
     // GEMM / quantized-matmul family.
     p.push(dedicated(
         "MatMul",
