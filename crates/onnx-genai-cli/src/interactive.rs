@@ -796,6 +796,7 @@ pub(super) fn drop_exhausted_repl_turn(
 }
 
 fn reasoning_incomplete_note(
+    span_closed: bool,
     finish_reason: Option<&str>,
     turn_max_new_tokens: usize,
     max_new_tokens_was_explicit: bool,
@@ -810,8 +811,16 @@ fn reasoning_incomplete_note(
         "If the context window is exhausted, use /reset to clear conversation history or shorten the prompt."
             .to_string()
     };
+    // Two shapes reach here, and the diagnostic must name which so the user is
+    // not told the decode "stopped inside" its reasoning when the span actually
+    // closed. Both drop the turn for the same reason: no answer to keep.
+    let cause = if span_closed {
+        "generation closed its reasoning but produced no answer before stopping"
+    } else {
+        "generation stopped inside the model's reasoning"
+    };
     format!(
-        "note: generation stopped inside the model's reasoning (finish reason: {finish_reason}). No answer was produced, so this turn is not kept. {next_step}"
+        "note: {cause} (finish reason: {finish_reason}). No answer was produced, so this turn is not kept. {next_step}"
     )
 }
 
@@ -1337,14 +1346,21 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 let reply = match reasoning.as_ref() {
                     Some(config) => {
                         let split = config.markers.split(&output, config.opened_by_template);
-                        if !split.complete {
-                            // The decode budget ran out mid-thought, so there is
-                            // no answer. Drop the whole exchange rather than
-                            // record an empty assistant turn, which would teach
-                            // the model that questions go unanswered.
+                        // Drop the exchange when there is no answer to keep. Two
+                        // cases qualify: the decode budget ran out mid-thought so
+                        // the span never closed (`!complete`), or the span closed
+                        // with only whitespace after it (`answer` empty). Both
+                        // would otherwise record an empty assistant turn, which
+                        // teaches the model that questions go unanswered and
+                        // poisons later turns' context. Emptiness was historically
+                        // guarded only on the unclosed path; the closed-but-empty
+                        // case (e.g. a decode that stops exactly on `</think>`) is
+                        // the same defect and is guarded here too.
+                        if !split.complete || split.answer.trim().is_empty() {
                             eprintln!(
                                 "{}",
                                 reasoning_incomplete_note(
+                                    split.complete,
                                     profile.finish_reason.as_deref(),
                                     turn_max_new_tokens,
                                     args.sampling.max_new_tokens.is_some(),
