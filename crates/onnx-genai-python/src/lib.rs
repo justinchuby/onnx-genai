@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use onnx_genai_engine::{
     Engine as RustEngine, EngineConfig, FinishReason, GenerateOptions, GenerateRequest,
-    GenerateResult as RustGenerateResult, GenerateToken, StopSequence,
+    GenerateResult as RustGenerateResult, GenerateToken, SamplingOverrides, StopSequence,
 };
 use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -65,11 +65,44 @@ impl GenerateResult {
     }
 }
 
+/// The caller's *explicit* sampling selections, for
+/// [`GenerateOptions::resolve_sampling_defaults`].
+///
+/// Each argument is `None` when the Python caller omitted the keyword, so the
+/// model's declared `do_sample`/`temperature`/`top_p`/`top_k` can drive that
+/// control (and the runtime greedy fallback applies only when the model is also
+/// silent). An explicit `temperature=0` forces greedy; any other explicit
+/// sampling control requests sampling.
+fn sampling_overrides(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: Option<u64>,
+) -> SamplingOverrides {
+    let forces_greedy = temperature == Some(0.0);
+    let requests_sampling = seed.is_some()
+        || temperature.is_some_and(|value| value > 0.0)
+        || top_p.is_some()
+        || top_k.is_some_and(|value| value > 0);
+    let greedy = if forces_greedy {
+        Some(true)
+    } else if requests_sampling {
+        Some(false)
+    } else {
+        None
+    };
+    SamplingOverrides {
+        greedy,
+        temperature,
+        top_p,
+        top_k,
+    }
+}
+
 fn build_options(
     max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    top_k: usize,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
     seed: Option<u64>,
     stop: Option<Vec<String>>,
 ) -> PyResult<GenerateOptions> {
@@ -78,49 +111,58 @@ fn build_options(
             "max_tokens must be greater than zero; choose the maximum number of new tokens",
         ));
     }
-    if !temperature.is_finite() || temperature < 0.0 {
+    if let Some(temperature) = temperature
+        && (!temperature.is_finite() || temperature < 0.0)
+    {
         return Err(PyValueError::new_err(
             "temperature must be finite and non-negative; use 0 for greedy decoding",
         ));
     }
-    if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) {
+    if let Some(top_p) = top_p
+        && (!top_p.is_finite() || !(0.0..=1.0).contains(&top_p))
+    {
         return Err(PyValueError::new_err(
             "top_p must be finite and between 0 and 1 inclusive",
         ));
     }
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = max_tokens;
-    options.temperature = temperature;
-    options.top_p = top_p;
-    options.top_k = top_k;
-    options.seed = seed;
-    options.greedy = temperature == 0.0;
-    options.stop_sequences = stop
-        .unwrap_or_default()
-        .into_iter()
-        .map(StopSequence::Text)
-        .collect();
-    Ok(options)
+    // Sampling controls (temperature/top_p/top_k/greedy) are intentionally left
+    // at their defaults here and resolved later against the model's declared
+    // generation defaults in `resolve_sampling_defaults`, once the engine (and
+    // therefore its metadata) is available.
+    Ok(GenerateOptions {
+        max_new_tokens: max_tokens,
+        seed,
+        stop_sequences: stop
+            .unwrap_or_default()
+            .into_iter()
+            .map(StopSequence::Text)
+            .collect(),
+        ..GenerateOptions::default()
+    })
 }
 
 fn request(
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    top_k: usize,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
     seed: Option<u64>,
     stop: Option<Vec<String>>,
-) -> PyResult<GenerateRequest> {
+) -> PyResult<(GenerateRequest, SamplingOverrides)> {
     if prompt.is_empty() {
         return Err(PyValueError::new_err(
             "prompt must not be empty; pass text containing at least one model token",
         ));
     }
-    Ok(GenerateRequest {
-        prompt: prompt.into(),
-        options: build_options(max_tokens, temperature, top_p, top_k, seed, stop)?,
-    })
+    let overrides = sampling_overrides(temperature, top_p, top_k, seed);
+    Ok((
+        GenerateRequest {
+            prompt: prompt.into(),
+            options: build_options(max_tokens, temperature, top_p, seed, stop)?,
+        },
+        overrides,
+    ))
 }
 
 fn generation_error(err: impl std::fmt::Display) -> PyErr {
@@ -204,21 +246,29 @@ impl Engine {
         })
     }
 
-    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (prompt, *, max_tokens=128, temperature=None, top_p=None, top_k=None, seed=None, stop=None))]
     fn generate(
         &self,
         py: Python<'_>,
         prompt: &str,
         max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<usize>,
         seed: Option<u64>,
         stop: Option<Vec<String>>,
     ) -> PyResult<GenerateResult> {
-        let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
+        let (mut request, overrides) =
+            request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
             let mut engine = try_lock_engine(&self.inner)?;
+            // Honor the model's declared sampling regime (e.g. a reasoning model
+            // that ships do_sample=true); explicit keyword arguments still win.
+            let declared = engine.metadata().generation.clone();
+            request
+                .options
+                .resolve_sampling_defaults(declared.as_ref(), &overrides);
             engine
                 .generate(request)
                 .map(GenerateResult::from)
@@ -226,16 +276,17 @@ impl Engine {
         })
     }
 
-    #[pyo3(signature = (prompt, callback, *, max_tokens=128, temperature=1.0, top_p=1.0, top_k=0, seed=None, stop=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (prompt, callback, *, max_tokens=128, temperature=None, top_p=None, top_k=None, seed=None, stop=None))]
     fn generate_stream(
         &self,
         py: Python<'_>,
         prompt: &str,
         callback: Py<PyAny>,
         max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<usize>,
         seed: Option<u64>,
         stop: Option<Vec<String>>,
     ) -> PyResult<GenerateResult> {
@@ -244,7 +295,8 @@ impl Engine {
                 "callback must be callable and accept (text, token_id, finish_reason)",
             ));
         }
-        let request = request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
+        let (mut request, overrides) =
+            request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
             let mut callback_error: Option<PyErr> = None;
             let mut callback_fn = |token: GenerateToken| {
@@ -273,6 +325,12 @@ impl Engine {
             // invocations. Re-entry is safe because every method uses try_lock
             // and therefore fails immediately instead of waiting on this mutex.
             let mut engine = try_lock_engine(&self.inner)?;
+            // Honor the model's declared sampling regime (e.g. a reasoning model
+            // that ships do_sample=true); explicit keyword arguments still win.
+            let declared = engine.metadata().generation.clone();
+            request
+                .options
+                .resolve_sampling_defaults(declared.as_ref(), &overrides);
             let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
             let result = engine.generate_with_callback(request, Some(callback_fn));
             if let Some(err) = callback_error {
@@ -310,18 +368,74 @@ fn _onnx_genai(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{ENGINE_IN_USE, Engine, build_options, try_lock_engine};
+    use super::{ENGINE_IN_USE, Engine, build_options, sampling_overrides, try_lock_engine};
+    use onnx_genai_engine::{GenerateOptions, GenerationDefaults};
 
     #[test]
-    fn generation_options_match_python_arguments() {
-        let options = build_options(17, 0.7, 0.9, 12, Some(42), Some(vec!["stop".into()])).unwrap();
+    fn build_options_carries_non_sampling_arguments() {
+        let options = build_options(
+            17,
+            Some(0.7),
+            Some(0.9),
+            Some(42),
+            Some(vec!["stop".into()]),
+        )
+        .unwrap();
         assert_eq!(options.max_new_tokens, 17);
-        assert_eq!(options.temperature, 0.7);
-        assert_eq!(options.top_p, 0.9);
-        assert_eq!(options.top_k, 12);
         assert_eq!(options.seed, Some(42));
-        assert!(!options.greedy);
         assert_eq!(options.stop_sequences.len(), 1);
+        // Sampling controls are deferred to resolve_sampling_defaults, so the
+        // base options keep their defaults here.
+        assert_eq!(options.temperature, GenerateOptions::default().temperature);
+        assert!(options.greedy);
+    }
+
+    #[test]
+    fn explicit_kwargs_map_to_sampling_overrides() {
+        // Explicit sampling controls request sampling and are carried through.
+        let overrides = sampling_overrides(Some(0.7), Some(0.9), Some(12), Some(42));
+        assert_eq!(overrides.greedy, Some(false));
+        assert_eq!(overrides.temperature, Some(0.7));
+        assert_eq!(overrides.top_p, Some(0.9));
+        assert_eq!(overrides.top_k, Some(12));
+
+        // An explicit temperature of 0 forces greedy.
+        assert_eq!(
+            sampling_overrides(Some(0.0), None, None, None).greedy,
+            Some(true)
+        );
+
+        // A fully-silent call defers the greedy decision to the model.
+        assert_eq!(sampling_overrides(None, None, None, None).greedy, None);
+    }
+
+    #[test]
+    fn silent_call_honors_model_declared_sampling() {
+        // A caller that passes no sampling kwargs adopts the model's declared
+        // do_sample/temperature instead of the greedy fallback.
+        let mut options = build_options(8, None, None, None, None).unwrap();
+        assert!(options.greedy, "default before resolution is greedy");
+        let declared = GenerationDefaults {
+            do_sample: Some(true),
+            temperature: Some(0.6),
+            top_k: None,
+            top_p: None,
+            repetition_penalty: None,
+            num_beams: None,
+            num_return_sequences: None,
+            min_length: None,
+            max_length: None,
+            length_penalty: None,
+            no_repeat_ngram_size: None,
+            diversity_penalty: None,
+            early_stopping: None,
+        };
+        options.resolve_sampling_defaults(
+            Some(&declared),
+            &sampling_overrides(None, None, None, None),
+        );
+        assert!(!options.greedy, "model do_sample=true must disable greedy");
+        assert_eq!(options.temperature, 0.6);
     }
 
     #[test]

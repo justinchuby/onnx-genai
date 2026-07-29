@@ -39,3 +39,29 @@ past/present aliasing, exact real-model comparison settings, and reviewer lockou
 - Revert verification proved the test catches the latent #380 regression previously hidden
   because the equivalent CUDA E2E auto-skips without CUDA. The repair and test merged in
   `85b9ba15`.
+
+## 2026-07-28T18:00:00-0700 — PR #385 re-scoped onto #392 (server + Python sampling wiring)
+
+- #392 merged the engine + CLI half of the model-sampling-defaults work to `main`
+  (`resolve_sampling_defaults`, `Option`-typed `SamplingOverrides`, CLI wiring). Confirmed #392
+  preserved the strict precedence (explicit override > model-declared > greedy fallback) and the
+  three-state `Option` typing — no design regression to raise.
+- Reset the branch onto `origin/main` and re-applied ONLY the delta #392 left missing (the two
+  Copilot findings): server + Python wiring, the misnamed-test fix, and a resolver-level
+  temperature-0 → greedy guard. Dropped everything already on `main`. Final diff: 7 files,
+  +414/-49, single commit `b78d8bec`.
+- Resolution stays at each front end's request-construction boundary (CLI already via #392;
+  server via `ModelHandle::generation_defaults` in `prepare_generate_request`/`prepare_completion`;
+  Python via `engine.metadata().generation`). Not the engine, because `GenerateOptions` erases
+  explicit-vs-unspecified (RULES rule 5). Pipelines + audio pass `None` (no-op).
+- Finding 2: renamed `explicit_temperature_zero_forces_greedy` →
+  `explicit_greedy_override_is_applied_and_keeps_its_temperature`; the resolver now owns the
+  `temperature == 0` → greedy mapping for every consumer (new test
+  `resolved_temperature_zero_forces_greedy_without_explicit_greedy`). `temperature: Some(0.0)`
+  without greedy = deterministic argmax; sampler never zero-divides (`TemperatureProcessor` only
+  inserted when `temperature > 0.0 && != 1.0`).
+- Behaviour change: server/Python callers that don't override sampling now decode stochastically
+  against `do_sample: true` models, matching the CLI. No greedy-assuming test broke.
+- Gates green: fmt --all clean; clippy -D warnings on engine/server/python/cli; engine lib 274,
+  server sampling tests + 116 pass (1 pre-existing `vision.onnx`-fixture failure, identical on
+  clean main), python 5, cli lib 103.

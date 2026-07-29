@@ -59,6 +59,7 @@ pub use native_decode::{
     NativeDecodeSession,
 };
 pub use onnx_genai_kv::{CachePriority, KvDType, LocalTieredConfig};
+pub use onnx_genai_metadata::GenerationDefaults;
 pub use onnx_genai_scheduler::{
     GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
 };
