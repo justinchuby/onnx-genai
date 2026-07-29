@@ -6,6 +6,8 @@ use crate::{
     models_config::ModelSpec,
     routes::{CompletionGeneration, collect_generation_result, prepare_completion},
     sse::StopBoundaryBuffer,
+    sse::{content_chunk, done_chunk, tool_call_delta_chunks},
+    types::{ChatMessageToolCall, ChatMessageToolCallFunction},
 };
 use axum::{
     body::{Body, to_bytes},
@@ -13,7 +15,7 @@ use axum::{
 };
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
@@ -62,6 +64,98 @@ fn sse_json_events(body: &[u8]) -> Vec<Value> {
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()
+}
+
+fn sse_events_from_chunks(
+    chunks: impl IntoIterator<Item = crate::sse::ChatCompletionChunk>,
+) -> Vec<Value> {
+    let body = chunks
+        .into_iter()
+        .map(|chunk| format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()))
+        .collect::<String>();
+    sse_json_events(body.as_bytes())
+}
+
+fn test_tool_call(id: &str, name: &str, arguments: &str) -> ChatMessageToolCall {
+    ChatMessageToolCall {
+        id: id.to_string(),
+        kind: "function".to_string(),
+        function: ChatMessageToolCallFunction {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    }
+}
+
+#[test]
+fn tool_call_stream_deltas_emit_metadata_arguments_and_distinct_indices() {
+    let calls = vec![
+        test_tool_call("call_weather", "weather", r#"{"city":"Paris"}"#),
+        test_tool_call("call_time", "time", r#"{"timezone":"UTC"}"#),
+    ];
+    let mut chunks = tool_call_delta_chunks("chatcmpl-test", 1, "test", calls.clone());
+    chunks.push(done_chunk("chatcmpl-test", 1, "test", "tool_calls"));
+    let events = sse_events_from_chunks(chunks);
+
+    let tool_deltas = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+        .map(|calls| &calls[0])
+        .collect::<Vec<_>>();
+    let metadata = tool_deltas
+        .iter()
+        .filter(|call| call["function"]["name"].is_string())
+        .collect::<Vec<_>>();
+    assert_eq!(metadata.len(), calls.len());
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(metadata[index]["index"], index);
+        assert_eq!(metadata[index]["id"], call.id);
+        assert_eq!(metadata[index]["type"], "function");
+        assert_eq!(metadata[index]["function"]["name"], call.function.name);
+        assert_eq!(metadata[index]["function"]["arguments"], "");
+    }
+
+    let mut arguments_by_index = BTreeMap::new();
+    for call in tool_deltas
+        .iter()
+        .filter(|call| call["function"]["name"].is_null())
+    {
+        let index = call["index"].as_u64().unwrap() as usize;
+        arguments_by_index
+            .entry(index)
+            .or_insert_with(String::new)
+            .push_str(call["function"]["arguments"].as_str().unwrap());
+        assert!(call.get("id").is_none());
+        assert!(call.get("type").is_none());
+    }
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(arguments_by_index[&index], call.function.arguments);
+    }
+    assert_eq!(
+        events.last().unwrap()["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+}
+
+#[test]
+fn content_only_stream_deltas_remain_content_with_stop_finish_reason() {
+    let events = sse_events_from_chunks([
+        content_chunk(
+            "chatcmpl-test",
+            1,
+            "test",
+            "normal content".to_string(),
+            None,
+        ),
+        done_chunk("chatcmpl-test", 1, "test", "stop"),
+    ]);
+
+    assert_eq!(
+        events[0]["choices"][0]["delta"]["content"],
+        "normal content"
+    );
+    assert!(events[0]["choices"][0]["delta"]["tool_calls"].is_null());
+    assert_eq!(events[1]["choices"][0]["finish_reason"], "stop");
 }
 
 fn tiny_png_data_uri() -> String {

@@ -5,9 +5,7 @@ use axum::response::sse::Event;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::types::{
-    ChatLogprobs, ChatMessageToolCall, ChatMessageToolCallFunction, CompletionLogprobs,
-};
+use crate::types::{ChatLogprobs, ChatMessageToolCall, CompletionLogprobs};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct CompletionChunk {
@@ -56,10 +54,20 @@ pub(crate) struct Delta {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ChunkToolCall {
     index: usize,
-    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     #[serde(rename = "type")]
-    kind: String,
-    function: ChatMessageToolCallFunction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    function: ChunkToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ChunkToolCallFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<String>,
 }
 #[derive(Debug)]
 pub(crate) struct StopBoundaryBuffer {
@@ -227,11 +235,55 @@ pub(crate) fn content_chunk(
     }
 }
 
-pub(crate) fn tool_calls_chunk(
+pub(crate) fn tool_call_delta_chunks(
     id: &str,
     created: u64,
     model: &str,
     tool_calls: Vec<ChatMessageToolCall>,
+) -> Vec<ChatCompletionChunk> {
+    tool_calls
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, call)| {
+            [
+                tool_call_delta_chunk(
+                    id,
+                    created,
+                    model,
+                    ChunkToolCall {
+                        index,
+                        id: Some(call.id),
+                        kind: Some(call.kind),
+                        function: ChunkToolCallFunction {
+                            name: Some(call.function.name),
+                            arguments: Some(String::new()),
+                        },
+                    },
+                ),
+                tool_call_delta_chunk(
+                    id,
+                    created,
+                    model,
+                    ChunkToolCall {
+                        index,
+                        id: None,
+                        kind: None,
+                        function: ChunkToolCallFunction {
+                            name: None,
+                            arguments: Some(call.function.arguments),
+                        },
+                    },
+                ),
+            ]
+        })
+        .collect()
+}
+
+fn tool_call_delta_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    tool_call: ChunkToolCall,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
@@ -243,18 +295,7 @@ pub(crate) fn tool_calls_chunk(
             delta: Delta {
                 role: None,
                 content: None,
-                tool_calls: Some(
-                    tool_calls
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, call)| ChunkToolCall {
-                            index,
-                            id: call.id,
-                            kind: call.kind,
-                            function: call.function,
-                        })
-                        .collect(),
-                ),
+                tool_calls: Some(vec![tool_call]),
             },
             logprobs: None,
             finish_reason: None,

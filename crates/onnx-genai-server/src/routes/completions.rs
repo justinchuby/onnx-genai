@@ -659,10 +659,7 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     } else {
-                        send_stream_chunk(&tx, tool_calls_chunk(&id, created, &model, tool_calls))
-                            .await?;
-                        send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
-                            .await?;
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if buffer_for_tool_detection {
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
@@ -688,10 +685,7 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     } else {
-                        send_stream_chunk(&tx, tool_calls_chunk(&id, created, &model, tool_calls))
-                            .await?;
-                        send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
-                            .await?;
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if wants_constrained_json {
                     if !result.text.is_empty() {
@@ -1967,6 +1961,18 @@ fn finish_reason_label(reason: &FinishReason) -> &'static str {
         FinishReason::MaxTokens | FinishReason::Length => "length",
         FinishReason::EosToken | FinishReason::StopSequence { .. } => "stop",
     }
+}
+
+async fn send_tool_call_deltas(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str),
+    tool_calls: Vec<ChatMessageToolCall>,
+) -> anyhow::Result<()> {
+    let (id, created, model) = response;
+    for chunk in tool_call_delta_chunks(id, created, model, tool_calls) {
+        send_stream_chunk(tx, chunk).await?;
+    }
+    send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
 }
 
 fn completion_id() -> String {
