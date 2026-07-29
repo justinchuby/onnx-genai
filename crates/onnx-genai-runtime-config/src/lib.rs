@@ -154,6 +154,50 @@ pub struct RuntimeConfig {
     /// `ONNX_GENAI_METAL_EP_LIB` (`PathBuf`, default: unset): points to the external Metal EP dynamic library.
     /// Also accepts the alias `ONNX_GENAI_MLX_EP_LIBRARY` (set by the Python packages).
     pub metal_ep_lib: Option<PathBuf>,
+    /// `ONNX_GENAI_QNN_EP_LIB` (`PathBuf`, default: unset): points to the
+    /// Qualcomm QNN ORT plugin library (`onnxruntime_providers_qnn.dll`).
+    pub qnn_ep_lib: Option<PathBuf>,
+    /// `ONNX_GENAI_QNN_BACKEND_PATH` (`PathBuf`, default: unset): points to the
+    /// QNN backend library, usually `QnnHtp.dll` for NPU/HTP execution.
+    pub qnn_backend_path: Option<PathBuf>,
+    /// `ONNX_GENAI_QNN_BACKEND_TYPE` (`String`, default: unset): QNN backend
+    /// type (`htp`, `gpu`, `cpu`, `saver`, `ir`). Used only when no backend path
+    /// is configured.
+    pub qnn_backend_type: Option<String>,
+    /// `ONNX_GENAI_QNN_PERFORMANCE_MODE` (`String`, default: unset): QNN HTP
+    /// performance mode provider option.
+    pub qnn_performance_mode: Option<String>,
+    /// `ONNX_GENAI_QNN_VTCM_MB` (`String`, default: unset): QNN VTCM size
+    /// provider option.
+    pub qnn_vtcm_mb: Option<String>,
+    /// `ONNX_GENAI_QNN_HTP_ARCH` (`String`, default: unset): QNN HTP
+    /// architecture provider option.
+    pub qnn_htp_arch: Option<String>,
+    /// `ONNX_GENAI_QNN_SOC_MODEL` (`String`, default: unset): QNN SoC model
+    /// provider option.
+    pub qnn_soc_model: Option<String>,
+    /// `ONNX_GENAI_QNN_DEVICE_ID` (`String`, default: unset): QNN device id
+    /// provider option.
+    pub qnn_device_id: Option<String>,
+    /// `ONNX_GENAI_QNN_DEVICE` (`String`, default: unset): optional ORT hardware
+    /// device class for the QNN plugin. Defaults to `NPU` in the ORT layer.
+    pub qnn_device: Option<String>,
+    /// `ONNX_GENAI_QNN_DISABLE_CPU_FALLBACK` (`bool`, default: false): when QNN
+    /// is selected, adds `session.disable_cpu_ep_fallback=1`.
+    pub qnn_disable_cpu_fallback: bool,
+    /// `ONNX_GENAI_QNN_CONTEXT_ENABLE` (`bool`, default: false): when QNN is
+    /// selected, adds `ep.context_enable=1`.
+    pub qnn_context_enable: bool,
+    /// `ONNX_GENAI_QNN_CONTEXT_FILE` (`PathBuf`, default: unset): when QNN is
+    /// selected, adds `ep.context_file_path`.
+    pub qnn_context_file: Option<PathBuf>,
+    /// `ONNX_GENAI_QNN_CONTEXT_EMBED` (`String`, default: unset): when QNN is
+    /// selected, adds `ep.context_embed_mode`.
+    pub qnn_context_embed: Option<String>,
+    /// `ONNX_GENAI_ORT_SESSION_OPTIONS` (`Vec<(String,String)>`, default:
+    /// empty): generic ORT session config entries, parsed from `key=value,...`
+    /// and applied via `AddSessionConfigEntry`.
+    pub session_config_entries: Vec<(String, String)>,
     /// `ONNX_GENAI_ORT_LIB` (`PathBuf`, default: unset): points to the exact
     /// ONNX Runtime shared library file to load before resolving the ORT C API.
     pub ort_lib: Option<PathBuf>,
@@ -299,6 +343,29 @@ impl RuntimeConfig {
                 .filter(|path| !path.as_os_str().is_empty())
                 .or_else(|| env_path(&lookup, "ONNX_GENAI_MLX_EP_LIBRARY"))
                 .filter(|path| !path.as_os_str().is_empty()),
+            qnn_ep_lib: env_path(&lookup, "ONNX_GENAI_QNN_EP_LIB")
+                .filter(|path| !path.as_os_str().is_empty()),
+            qnn_backend_path: env_path(&lookup, "ONNX_GENAI_QNN_BACKEND_PATH")
+                .filter(|path| !path.as_os_str().is_empty()),
+            qnn_backend_type: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_BACKEND_TYPE"),
+            qnn_performance_mode: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_PERFORMANCE_MODE"),
+            qnn_vtcm_mb: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_VTCM_MB"),
+            qnn_htp_arch: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_HTP_ARCH"),
+            qnn_soc_model: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_SOC_MODEL"),
+            qnn_device_id: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_DEVICE_ID"),
+            qnn_device: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_DEVICE"),
+            qnn_disable_cpu_fallback: env_bool(
+                &lookup,
+                "ONNX_GENAI_QNN_DISABLE_CPU_FALLBACK",
+                false,
+            ),
+            qnn_context_enable: env_bool(&lookup, "ONNX_GENAI_QNN_CONTEXT_ENABLE", false),
+            qnn_context_file: env_utf8_path(&lookup, "ONNX_GENAI_QNN_CONTEXT_FILE")
+                .filter(|path| !path.as_os_str().is_empty()),
+            qnn_context_embed: env_non_empty_string(&lookup, "ONNX_GENAI_QNN_CONTEXT_EMBED"),
+            session_config_entries: env_string(&lookup, "ONNX_GENAI_ORT_SESSION_OPTIONS")
+                .map(|value| parse_key_value_list(&value))
+                .unwrap_or_default(),
             ort_lib: env_path(&lookup, "ONNX_GENAI_ORT_LIB")
                 .filter(|path| !path.as_os_str().is_empty()),
             ort_lib_dir: env_path(&lookup, "ONNX_GENAI_ORT_LIB_DIR")
@@ -402,6 +469,15 @@ where
     F: Fn(&str) -> Option<OsString>,
 {
     lookup(name).and_then(|value| value.into_string().ok())
+}
+
+fn env_non_empty_string<F>(lookup: &F, name: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env_string(lookup, name)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// Normalize an execution-provider name consistently for env and API callers.
@@ -554,6 +630,20 @@ mod tests {
         assert!(!actual.device_kv);
         assert!(!actual.shared_kv_present_binding);
         assert_eq!(actual.metal_ep_lib, None);
+        assert_eq!(actual.qnn_ep_lib, None);
+        assert_eq!(actual.qnn_backend_path, None);
+        assert_eq!(actual.qnn_backend_type, None);
+        assert_eq!(actual.qnn_performance_mode, None);
+        assert_eq!(actual.qnn_vtcm_mb, None);
+        assert_eq!(actual.qnn_htp_arch, None);
+        assert_eq!(actual.qnn_soc_model, None);
+        assert_eq!(actual.qnn_device_id, None);
+        assert_eq!(actual.qnn_device, None);
+        assert!(!actual.qnn_disable_cpu_fallback);
+        assert!(!actual.qnn_context_enable);
+        assert_eq!(actual.qnn_context_file, None);
+        assert_eq!(actual.qnn_context_embed, None);
+        assert!(actual.session_config_entries.is_empty());
         assert_eq!(actual.ort_lib, None);
         assert_eq!(actual.ort_lib_dir, None);
         assert!(!actual.profile);
@@ -764,6 +854,58 @@ mod tests {
         assert!(actual.ep_options.is_empty());
         assert_eq!(actual.ep_device, None);
         assert_eq!(actual.plugin_fusion_min_net_score, 0);
+    }
+
+    #[test]
+    fn qnn_env_vars_parse_as_paths_options_and_session_entries() {
+        let actual = config(&[
+            (
+                "ONNX_GENAI_QNN_EP_LIB",
+                "C:\\qnn\\onnxruntime_providers_qnn.dll",
+            ),
+            ("ONNX_GENAI_QNN_BACKEND_PATH", "C:\\qnn\\QnnHtp.dll"),
+            ("ONNX_GENAI_QNN_BACKEND_TYPE", " htp "),
+            ("ONNX_GENAI_QNN_PERFORMANCE_MODE", " burst "),
+            ("ONNX_GENAI_QNN_VTCM_MB", "8"),
+            ("ONNX_GENAI_QNN_HTP_ARCH", "73"),
+            ("ONNX_GENAI_QNN_SOC_MODEL", "60"),
+            ("ONNX_GENAI_QNN_DEVICE_ID", "0"),
+            ("ONNX_GENAI_QNN_DEVICE", " NPU "),
+            ("ONNX_GENAI_QNN_DISABLE_CPU_FALLBACK", "1"),
+            ("ONNX_GENAI_QNN_CONTEXT_ENABLE", "true"),
+            ("ONNX_GENAI_QNN_CONTEXT_FILE", "ctx.onnx"),
+            ("ONNX_GENAI_QNN_CONTEXT_EMBED", " 1 "),
+            (
+                "ONNX_GENAI_ORT_SESSION_OPTIONS",
+                "session.disable_cpu_ep_fallback=1, ep.context_enable=1, =skip",
+            ),
+        ]);
+        assert_eq!(
+            actual.qnn_ep_lib,
+            Some(PathBuf::from("C:\\qnn\\onnxruntime_providers_qnn.dll"))
+        );
+        assert_eq!(
+            actual.qnn_backend_path,
+            Some(PathBuf::from("C:\\qnn\\QnnHtp.dll"))
+        );
+        assert_eq!(actual.qnn_backend_type.as_deref(), Some("htp"));
+        assert_eq!(actual.qnn_performance_mode.as_deref(), Some("burst"));
+        assert_eq!(actual.qnn_vtcm_mb.as_deref(), Some("8"));
+        assert_eq!(actual.qnn_htp_arch.as_deref(), Some("73"));
+        assert_eq!(actual.qnn_soc_model.as_deref(), Some("60"));
+        assert_eq!(actual.qnn_device_id.as_deref(), Some("0"));
+        assert_eq!(actual.qnn_device.as_deref(), Some("NPU"));
+        assert!(actual.qnn_disable_cpu_fallback);
+        assert!(actual.qnn_context_enable);
+        assert_eq!(actual.qnn_context_file, Some(PathBuf::from("ctx.onnx")));
+        assert_eq!(actual.qnn_context_embed.as_deref(), Some("1"));
+        assert_eq!(
+            actual.session_config_entries,
+            vec![
+                ("session.disable_cpu_ep_fallback".to_owned(), "1".to_owned()),
+                ("ep.context_enable".to_owned(), "1".to_owned()),
+            ]
+        );
     }
 
     #[test]

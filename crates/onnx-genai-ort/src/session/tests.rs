@@ -34,6 +34,10 @@ fn fixed_capacity_present_binding_uses_capabilities_or_opt_in() {
         false
     ));
     assert!(!fixed_capacity_present_binding_supported(
+        &[resolve("qnn")],
+        false
+    ));
+    assert!(!fixed_capacity_present_binding_supported(
         &[resolve("some-unknown-ep")],
         false
     ));
@@ -58,6 +62,58 @@ fn resolves_cpu_to_host_defaults() {
         resolved.strategy,
         ep_compat::AppendStrategy::HostDefault
     ));
+}
+
+#[test]
+fn resolves_qnn_to_conservative_plugin_npu() {
+    let resolved = resolve_execution_provider(&ep_selection("qnn"));
+    assert_eq!(resolved.caps.name, "qnn");
+    assert_eq!(resolved.caps.hardware, HardwareKind::Npu);
+    assert!(
+        !resolved
+            .caps
+            .has(capability::FIXED_CAPACITY_PRESENT_BINDING)
+    );
+    assert!(!resolved.caps.has(capability::DEVICE_KV));
+    assert!(!resolved.caps.has(capability::GRAPH_CAPTURE));
+    assert!(resolved.is_strict());
+    match &resolved.strategy {
+        ep_compat::AppendStrategy::PluginLibrary {
+            lib,
+            registration_name,
+            options,
+            device,
+        } => {
+            let expected_plugin = if cfg!(windows) {
+                "onnxruntime_providers_qnn.dll"
+            } else if cfg!(target_os = "macos") {
+                "libonnxruntime_providers_qnn.dylib"
+            } else {
+                "libonnxruntime_providers_qnn.so"
+            };
+            let expected_backend = if cfg!(windows) {
+                "QnnHtp.dll"
+            } else if cfg!(target_os = "macos") {
+                "libQnnHtp.dylib"
+            } else {
+                "libQnnHtp.so"
+            };
+            assert_eq!(
+                lib.file_name().and_then(|name| name.to_str()),
+                Some(expected_plugin)
+            );
+            assert_eq!(registration_name, "onnxruntime_qnn_ep");
+            assert_eq!(device.as_deref(), Some("NPU"));
+            assert_eq!(
+                options
+                    .iter()
+                    .find(|(key, _)| key == "backend_path")
+                    .map(|(_, value)| value.as_str()),
+                Some(expected_backend)
+            );
+        }
+        other => panic!("expected QNN PluginLibrary, got {other:?}"),
+    }
 }
 
 #[test]
@@ -199,6 +255,10 @@ fn strict_providers_include_cuda_and_plugins() {
     let metal = SessionOptions::with_execution_provider(ep_selection("metal"));
     assert!(requested_non_cpu_provider(&metal));
     assert!(requested_strict_provider(&metal));
+
+    let qnn = SessionOptions::with_execution_provider(ep_selection("qnn"));
+    assert!(requested_non_cpu_provider(&qnn));
+    assert!(requested_strict_provider(&qnn));
 
     let webgpu = SessionOptions::with_execution_provider(ep_selection("webgpu"));
     assert!(requested_non_cpu_provider(&webgpu));
