@@ -1490,6 +1490,143 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
     }
 }
 
+// ─── Native Session KV (Phase 1: single-session incremental prefill) ────────
+
+#[cfg(feature = "native-backend")]
+impl Engine {
+    /// Create a persistent native session for incremental KV reuse across turns.
+    ///
+    /// The native backend supports exactly one session at a time (Phase 1).
+    /// The stateless `generate()` API remains unchanged — calling it still resets.
+    pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
+        if self.decode_backend != EngineDecodeBackend::Native {
+            anyhow::bail!("create_native_session requires the native decode backend");
+        }
+        if self.native_session_state.is_some() {
+            anyhow::bail!(
+                "a native session already exists; close it before creating a new one (Phase 1 supports one session)"
+            );
+        }
+        let native = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        // Ensure clean slate.
+        native.reset()?;
+        self.native_session_state = Some(NativeSessionState { tokens: Vec::new() });
+        // Return a fixed session id for the single-session Phase 1.
+        Ok(SessionId::from(0u64))
+    }
+
+    /// Close the native session, releasing its KV state.
+    pub fn close_native_session(&mut self, _session_id: SessionId) -> anyhow::Result<()> {
+        if self.native_session_state.is_none() {
+            anyhow::bail!("no native session to close");
+        }
+        if let Some(native) = self.native_session.as_mut() {
+            native.reset()?;
+        }
+        self.native_session_state = None;
+        Ok(())
+    }
+
+    /// Generate in a persistent native session. Only new tokens since the last
+    /// turn are prefilled; prior KV state is reused.
+    ///
+    /// **Prefix-mismatch safety:** If the new prompt doesn't extend the existing
+    /// session token history, the KV cache is rewound to the longest common
+    /// prefix. This handles regeneration, history edits, and branching correctly.
+    pub fn generate_native_in_session(
+        &mut self,
+        _session_id: SessionId,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_native_in_session_with_callback(_session_id, request, None)
+    }
+
+    /// Generate in a persistent native session with streaming callback.
+    pub fn generate_native_in_session_with_callback(
+        &mut self,
+        _session_id: SessionId,
+        request: GenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.native_session_state.is_none() {
+            anyhow::bail!("no native session exists; call create_native_session first");
+        }
+
+        request.options.validate()?;
+        let mut options = request.options;
+        if options.eos_token_id.is_none() {
+            options.eos_token_id = self.tokenizer.eos_token_id();
+        }
+        let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        options.max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+
+        // Compute the common prefix between session history and new prompt.
+        // Cap at current_len: state.tokens may include the final generated token
+        // that was sampled but not yet fed back through the model.
+        let prefix_len = common_prefix_len(
+            &self.native_session_state.as_ref().unwrap().tokens,
+            &prompt_tokens,
+        );
+
+        let native = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+
+        let resume_from = prefix_len.min(native.current_len());
+
+        let result = native.generate_incremental_with_callback(
+            &prompt_tokens,
+            resume_from,
+            &options,
+            &chain,
+            &self.tokenizer,
+            callback,
+        )?;
+
+        // Update session token history: rewind to prefix, then append new prompt + generated.
+        let state = self.native_session_state.as_mut().unwrap();
+        state.tokens.truncate(prefix_len);
+        state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
+        state.tokens.extend_from_slice(&result.token_ids);
+
+        Ok(result)
+    }
+
+    /// Rewind the native session KV cache by discarding tokens from the end.
+    pub fn rewind_native_session(
+        &mut self,
+        _session_id: SessionId,
+        token_count: RewindTokenCount,
+    ) -> anyhow::Result<SessionPosition> {
+        let state = self
+            .native_session_state
+            .as_mut()
+            .context("no native session exists")?;
+        let current = state.tokens.len();
+        let target = current.checked_sub(token_count.get()).with_context(|| {
+            format!(
+                "cannot rewind native session by {} from length {current}",
+                token_count.get()
+            )
+        })?;
+        state.tokens.truncate(target);
+        let native = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        native.rewind(target)?;
+        Ok(SessionPosition::new(target))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

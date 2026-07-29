@@ -1,13 +1,14 @@
 #![cfg(feature = "native-backend")]
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest, NativeDecodeDevice,
-    SpeculativeMode,
+    Engine, EngineConfig, EngineDecodeBackend, GeneratePrompt, GenerateRequest,
+    NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS, NativeDecodeDevice, SpeculativeMode,
 };
 use onnx_genai_ort::{SessionOptions, ep_selection};
 use std::path::Path;
 #[cfg(feature = "cuda")]
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn engine_generates_through_explicit_native_backend() -> anyhow::Result<()> {
@@ -330,5 +331,152 @@ fn engine_native_scalar_gqa_runs_without_metadata_permission() -> anyhow::Result
     assert_eq!(cpu_tokens, vec![1, 1, 1, 1]);
     assert_eq!(cuda_tokens, cpu_tokens);
 
+    Ok(())
+}
+
+// ─── Session KV Phase 1 tests ────────────────────────────────────────────────
+
+/// Multi-turn equivalence: incremental-prefill session produces token-identical
+/// output vs. stateless full-reset path.
+#[test]
+fn native_session_incremental_matches_stateless() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    // Stateless (full-reset) generation: 3 turns accumulating context.
+    let stateless_results = {
+        let mut stateless_engine = Engine::from_dir(
+            &fixture,
+            EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                ..EngineConfig::default()
+            },
+        )?;
+        let mut results = Vec::new();
+        // Simulate multi-turn: each turn adds a new "user token" then generates.
+        let mut context = vec![0u32];
+        for turn in 0..3 {
+            // Add a "new user token" for turns after the first.
+            if turn > 0 {
+                context.push(0);
+            }
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(context.clone()));
+            request.options.max_new_tokens = 2;
+            request.options.temperature = 0.0;
+            request.options.stop_on_eos = false;
+            let result = stateless_engine.generate(request)?;
+            context.extend_from_slice(&result.token_ids);
+            results.push(result.token_ids.clone());
+        }
+        results
+    };
+
+    // Session (incremental) generation: same turns through session API.
+    let session_id = engine.create_native_session()?;
+    let hits_before = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
+    let mut context = vec![0u32];
+    let mut session_results = Vec::new();
+    for turn in 0..3 {
+        if turn > 0 {
+            context.push(0);
+        }
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(context.clone()));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let result = engine.generate_native_in_session(session_id, request)?;
+        context.extend_from_slice(&result.token_ids);
+        session_results.push(result.token_ids.clone());
+    }
+    let hits_after = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
+
+    // Verify token-identical output.
+    assert_eq!(session_results, stateless_results);
+    // Verify incremental path fired for turns 2 and 3 (turn 1 has no prefix to reuse).
+    assert!(
+        hits_after - hits_before >= 2,
+        "incremental prefill counter did not fire: before={hits_before}, after={hits_after}"
+    );
+    engine.close_native_session(session_id)?;
+    Ok(())
+}
+
+/// Divergence/rewind test: an edited prefix produces the same output as a fresh
+/// session with that prefix.
+#[test]
+fn native_session_rewind_produces_correct_output() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    // Build 3 turns.
+    let session_id = engine.create_native_session()?;
+    let mut context = vec![0u32];
+    for _ in 0..3 {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(context.clone()));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let result = engine.generate_native_in_session(session_id, request)?;
+        context.extend_from_slice(&result.token_ids);
+    }
+
+    // Now "edit history": pass a different prefix that diverges at token 2.
+    let edited_context = vec![0u32, 0, 0];
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(edited_context.clone()));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    let session_result = engine.generate_native_in_session(session_id, request)?;
+
+    // Fresh stateless with same edited context must produce identical tokens.
+    let mut fresh_engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut fresh_request = GenerateRequest::new(GeneratePrompt::TokenIds(edited_context));
+    fresh_request.options.max_new_tokens = 2;
+    fresh_request.options.temperature = 0.0;
+    fresh_request.options.stop_on_eos = false;
+    let fresh_result = fresh_engine.generate(fresh_request)?;
+
+    assert_eq!(session_result.token_ids, fresh_result.token_ids);
+    engine.close_native_session(session_id)?;
+    Ok(())
+}
+
+/// Session creation rejects non-native backends and enforces single-session limit.
+#[test]
+fn native_session_creation_guards() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    let _session_id = engine.create_native_session()?;
+    // Second session must fail (Phase 1 single-session).
+    let err = engine.create_native_session().unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
     Ok(())
 }

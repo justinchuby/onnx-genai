@@ -35,6 +35,9 @@ pub struct Engine {
     /// by the server's fallback driver in this first milestone.
     #[cfg(feature = "native-backend")]
     pub(crate) native_session: Option<crate::native_decode::NativeDecodeSession>,
+    /// Persistent native session state for incremental KV reuse across turns.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_session_state: Option<NativeSessionState>,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
@@ -79,6 +82,15 @@ pub struct Engine {
 // an execution provider introduced thread-affine handles or a field gained
 // unsynchronized shared mutation.
 unsafe impl Send for Engine {}
+
+/// Per-conversation state for native session-persistent KV reuse.
+/// The authoritative token history lives here; the `NativeDecodeSession`'s
+/// `current_len` represents the *KV-materialized* position.
+#[cfg(feature = "native-backend")]
+pub(crate) struct NativeSessionState {
+    /// Full token history of this session (prompt + generated tokens from all turns).
+    pub(crate) tokens: Vec<TokenId>,
+}
 
 pub(crate) struct MtpModel {
     pub(crate) config: MtpConfig,

@@ -253,3 +253,16 @@ minimum_tier = "tier2"
 counter = "RELU_F32_FAST_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/relu.rs"
 description = "Contiguous f32 Relu uses zero-copy NEON SIMD max(x,0) (aarch64) or scalar loop, avoiding allocating to_dense"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Native Session KV — incremental prefill (Phase 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "NativeDecodeSession"
+variant = "incremental_prefill"
+platform = "all"
+minimum_tier = "tier2"
+counter = "NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS"
+file = "crates/onnx-genai-engine/src/native_decode/mod.rs"
+description = "Multi-turn session reuses KV cache and prefills only new tokens instead of full context reset"
