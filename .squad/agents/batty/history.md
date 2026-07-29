@@ -93,3 +93,26 @@ Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_
 - Kept error reporting actionable for true rejection: batch-full vs KV-budget cause, requested/minimum/available/used/limit/shortfall bytes, running/max batch counts, and concrete mitigation hints.
 - Added model-free scheduler tests for full-context ceiling capping, long multi-turn ceiling growth, repeated-turn accounting non-leakage, and error text; added an engine unit test locking that ORT generate uses the scheduler while native generate bypasses it.
 - Follow-up review fixes: `budget_cap` remains attached to a sequence across swap-out/swap-in; capped reservation now computes and reserves the adjusted byte amount atomically under the shared `ByteBudget` lock; mismatched scheduler admission cleanup cancels both the admitted request and the originally enqueued request.
+
+## 2026-07-29T12:30:00Z — tiny-reasoning-fixture round 2 + empty-answer fix (PRs #410, #411)
+
+### Round 2 (PR #410 → locked out)
+Authored round-2 replacement test: statistical token-stream assertion. Luv ran it alone:
+15/15 failures with the fix intact; one green in full parallel suite was a fluke; the
+supporting "8/8 distinct outputs" was a stderr-timestamp artifact — test compared stdout
+only. Luv issued REJECT; Batty locked out of `test/tiny-reasoning-fixture`.
+
+### Empty-answer fix (shipped in PR #411)
+Diagnosed and fixed: `quick --greedy --max-new-tokens 3` stopped on `</think>` and
+committed an empty assistant turn. Commit path was unconditional on non-emptiness while
+`manifest.json` asserted the invariant. Fix: closed path now drops whitespace-only answers
+with a diagnostic distinct from "stopped inside reasoning". Also corrected the generator
+description string that had diverged from `manifest.json` (found during merge-conflict
+resolution — regenerating would have silently reverted the manifest correction).
+
+Durable rules: "A committed turn with an empty answer poisons context exactly as an
+unclosed one does." / "A checked-in fixture must be reproducible from its generator."
+(`.squad/decisions.md`, reconstructed rules section, 2026-07-29)
+
+Inbox drop `batty-reasoning-fixture-revision.md` was lost when the worktree was deleted
+before Scribe ran; content reconstructed into `.squad/decisions.md`.

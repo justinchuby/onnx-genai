@@ -20,3 +20,41 @@ Older detailed work (2026-07-14 through 2026-07-28) archived in `history-archive
 - Reset branch onto `origin/main`, re-applied only the delta #392 left missing: server + Python wiring, misnamed-test fix, resolver-level temperature-0 → greedy guard. Final diff: 7 files, +414/-49, single commit `b78d8bec`.
 - Server/Python callers now decode stochastically against `do_sample: true` models, matching CLI. No greedy-assuming test broke.
 - Gates green: engine lib 274, server sampling 116 pass (1 pre-existing fixture failure)
+
+## 2026-07-29T12:30:00Z — tiny-reasoning-fixture rounds 2–3 (PR #411)
+
+### Round 2 (replaced Batty after Gaff REJECT)
+Authored statistical token-stream replacement. Luv ran it alone: 15/15 failures with
+fix intact; one green in parallel suite was a fluke. Luv issued REJECT.
+
+### Round 3 — resolved-policy surface (approved `f8ed4fb4`)
+Surfaced sampling policy generation actually resolved into `--stats`/`--profile`.
+`SamplingPolicy` captured from `turn_options` after `resolve_session_sampling`; same
+struct moved into `TurnInput.options` (`:1352`) — no separate display-side resolution.
+Two resolution sites unified: one helper called by both `/session` and every turn,
+reading live backend on demand. No cache; no staleness across `/reload`/`/ep`/`/backend`.
+`interactive.rs:1342-1347` + `generate.rs:122-127`.
+
+Luv approved at `f8ed4fb4`. Mutation: both new tests FAIL 3/3; suite 42+2/44.
+Mutated stats line `greedy=true temperature=1 top_k=0` — matches #385/#392 class.
+
+### Delta (`88fa86b5`)
+Moved capture inside `run_generation_turn` (`output.rs:206-211`). `turn` bound
+immutably; moved into `backend.generate(turn, …)` at line 278 — no window between
+capture and use. Divergence structurally impossible. Luv delta-approved after
+mutation 3/3 red, isolation 10/10 green, full suite 44/44.
+
+Also contributed to:
+- Fixture `manifest.json`/generator string consistency fix (Batty's bug).
+- Empty-answer invariant correction (manifest now accurately describes "drop
+  whitespace-only" rather than asserting strict non-emptiness).
+
+Durable rules:
+- "Instrument the boundary you care about."
+- "Two independent resolution sites for one policy is the defect, not an inconvenience."
+- "Close a gap by construction rather than by comment where you can."
+- "A checked-in fixture must be reproducible from its generator."
+(`.squad/decisions.md`, reconstructed rules section, 2026-07-29)
+
+Inbox drop `leon-reasoning-fixture-round3.md` was lost when the worktree was deleted
+before Scribe ran; content reconstructed into `.squad/decisions.md`.
