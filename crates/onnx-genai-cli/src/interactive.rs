@@ -1334,17 +1334,6 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             warned_missing_context_limit = true;
         }
         let turn_max_new_tokens = turn_options.max_new_tokens;
-        // Capture the sampling policy from the *resolved* per-turn options — the
-        // exact struct handed to the decode loop below — so `--stats`/`--profile`
-        // report what generation actually did. Reading it here, not re-resolving
-        // it for display, is what keeps the reported policy from disagreeing with
-        // the decode loop (the `/session`-summary defect, #385/#392).
-        let sampling_policy = profile::SamplingPolicy {
-            greedy: turn_options.greedy,
-            temperature: turn_options.temperature,
-            top_p: turn_options.top_p,
-            top_k: turn_options.top_k,
-        };
         let turn = TurnInput {
             prompt: rendered,
             images: staged_images,
@@ -1356,7 +1345,6 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
         profile.execution_provider = settings.resolved_providers();
-        profile.sampling_policy = Some(sampling_policy);
         profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = Some(prompt_tokens);

@@ -584,11 +584,17 @@ fn sampling_reaches_the_decode_loop_not_only_the_session_summary() {
     // ~99% collapse onto the greedy stream) -- a 5-run "at least one differs"
     // assertion is a ~95% false-fail, not a regression detector.
     //
-    // Instead observe the policy the *decode loop actually used*. The REPL now
-    // surfaces the resolved per-turn `GenerateOptions` -- the exact struct handed
-    // to generation, read after `resolve_sampling_defaults`, not re-resolved for
-    // display -- in the `--stats` line on stderr. This is deterministic: one run
-    // each way, no token-stream sampling.
+    // Instead observe the policy the *decode loop actually used*. `run_generation_turn`
+    // captures the sampling policy from the `turn.options` it moves into
+    // `backend.generate`, and surfaces it in the `--stats` line on stderr. This is
+    // deterministic: one run each way, no token-stream sampling.
+    //
+    // SCOPE: this pins the policy *handed to* the decode loop (greedy/temperature/
+    // top_p/top_k the resolver produced), not the engine sampler's *behaviour*
+    // under it. An engine-internal regression that ignores an honoured top_k or
+    // temperature is out of reach here -- and inherently so on this fixture, whose
+    // near-deterministic tokens cannot witness sampling (that is exactly why the
+    // token-stream approach failed). This test's job is the resolution boundary.
     //
     // tiny-reasoning declares do_sample=true, temperature=0.6, top_k=20, so with
     // no sampling flag the decode loop must run stochastically at those declared

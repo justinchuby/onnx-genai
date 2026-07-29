@@ -192,6 +192,23 @@ pub(super) fn run_generation_turn(
 
     let prompt_tokens = turn.prompt_tokens;
     let context_limit = turn.context_limit;
+    // Capture the sampling policy from `turn.options` here — the exact struct
+    // moved into `backend.generate(turn, ...)` below. This is deliberately the
+    // *only* capture site, and it reads the value at the point of use: there is
+    // no separate resolved variable and no window between capture and use, so a
+    // refactor cannot slip a re-resolution in between and leave stats reporting a
+    // policy generation did not run with. The fields are `Copy`, so reading them
+    // does not move `turn`. WARNING: this must read from `turn.options`, not a
+    // value re-resolved for display — re-resolving is the #385/#392 defect this
+    // instrument exists to catch, and it would make the sampling-policy test
+    // green while pointing at the wrong thing. (It observes the policy handed to
+    // the decode loop, not the engine sampler's behaviour under it.)
+    let sampling_policy = profile::SamplingPolicy {
+        greedy: turn.options.greedy,
+        temperature: turn.options.temperature,
+        top_p: turn.options.top_p,
+        top_k: turn.options.top_k,
+    };
     let mut output = String::new();
     let mut timings = profile::TokenTimings::default();
     timings.start();
@@ -296,6 +313,7 @@ pub(super) fn run_generation_turn(
     if let Some(profile) = profile {
         profile.timings = timings;
         profile.multimodal_reuse = backend.multimodal_reuse();
+        profile.sampling_policy = Some(sampling_policy);
         if let Ok(result) = &result {
             profile.finish_reason = Some(format!("{:?}", result.finish_reason));
             profile.prefix_cache_hit = Some(result.prefix_cache_hit_len);
