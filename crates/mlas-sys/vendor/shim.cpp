@@ -175,6 +175,13 @@ extern "C" void mlas_sgemm_pack_b(
 
 extern "C" int mlas_qnbit_gemm_available(size_t bits, size_t blk_len, int comp_type)
 {
+#if defined(MLAS_TARGET_ARM64) && defined(_WIN32)
+    // The standalone Windows ARM64 CompInt8 path access-violates outside ORT's
+    // full runtime wiring; keep the safe CompFp32 QNBit path available.
+    if (static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type) == SQNBIT_CompInt8) {
+        return 0;
+    }
+#endif
     return MlasIsQNBitGemmAvailable(
                bits, blk_len, static_cast<MLAS_QNBIT_GEMM_COMPUTE_TYPE>(comp_type))
                ? 1

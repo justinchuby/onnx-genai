@@ -11,15 +11,17 @@ SGEMM standalone and calling it over FFI. See `docs/MLAS_SYS_SPIKE.md`.
 - Copied paths (from the upstream repo root):
   - `onnxruntime/core/mlas/inc/`  → `mlas/onnxruntime/core/mlas/inc/`
   - `onnxruntime/core/mlas/lib/`  → `mlas/onnxruntime/core/mlas/lib/`
-    (only the x86-64 + generic subset; ARM/POWER/WASM/RISC-V/LoongArch/s390x
-    kernel sources were dropped, along with the Windows MASM `amd64/` tree and
-    the two uncompiled TUs `cast.cpp`/`convolve.cpp` whose external includes
-    — GSL `narrow`, `SafeInt.hpp` — we do not satisfy standalone)
+    (x86-64 + generic subset, plus the Windows ARM64 NEON/QNBit sources needed
+    by the aarch64 build; POWER/WASM/RISC-V/LoongArch/s390x kernels remain
+    dropped, along with the Windows MASM `amd64/` tree and the uncompiled TUs
+    whose external includes we do not satisfy standalone)
   - `onnxruntime/core/platform/env_var.h` → `mlas/onnxruntime/core/platform/env_var.h`
     (self-contained; needed by `qkv_quant_kernel_avx512vnni.cpp`)
 
-The `x86_64/` directory holds the GAS/Linux (`.S`) assembly kernels. Windows
-would use the MASM `.asm` variants (not vendored here) — see the spike doc.
+The `x86_64/` directory holds the GAS/Linux (`.S`) assembly kernels. The
+`arm64/` directory holds the Windows ARM64 (`.asm`) kernels; `build.rs`
+preprocesses them with `cl.exe /P` before invoking `armasm64.exe`, mirroring
+upstream CMake.
 
 ## License
 
@@ -59,8 +61,8 @@ section in sync with the patched files.
 ## How it is built
 
 `build.rs` compiles the subset with the `cc` crate (no cmake), grouping sources
-by ISA exactly as `cmake/onnxruntime_mlas.cmake` does for the `X86_64` branch,
-with `-DBUILD_MLAS_NO_ONNXRUNTIME` (MLAS's standalone CPUID/threading shim).
-The vendored MLAS sources are otherwise unmodified from upstream; the few TUs
-that rely on headers ORT supplies transitively are handled with compiler
-`-include` flags in `build.rs`.
+by ISA from `cmake/onnxruntime_mlas.cmake` for x86-64 and Windows ARM64, with
+`-DBUILD_MLAS_NO_ONNXRUNTIME` (MLAS's standalone CPUID/threading shim). The
+vendored MLAS sources are otherwise unmodified from upstream; the few TUs that
+rely on headers ORT supplies transitively are handled with compiler force-include
+flags in `build.rs`.

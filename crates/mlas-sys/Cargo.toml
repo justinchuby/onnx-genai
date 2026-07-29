@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/justinchuby/onnx-genai"
-description = "FFI bindings to a vendored subset of ONNX Runtime's MLAS SGEMM kernels (opt-in, x86-64 Linux)."
+description = "FFI bindings to a vendored subset of ONNX Runtime's MLAS kernels."
 
 # Kept out of `default-members` (see root Cargo.toml) so the opt-in vendored
 # C++/asm build cannot affect the default `cargo build`/`cargo test`.

@@ -26,6 +26,7 @@ struct Paths {
     root: PathBuf,
     lib: PathBuf,
     asm: PathBuf,
+    arm64_asm: PathBuf,
     includes: Vec<PathBuf>,
 }
 
@@ -34,6 +35,9 @@ fn main() {
     let vendor = root.join("vendor/mlas/onnxruntime");
     let lib = vendor.join("core/mlas/lib");
     let asm = lib.join("x86_64");
+    let arm64_asm = lib.join("arm64");
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     println!("cargo:rerun-if-changed=vendor/shim.cpp");
     println!("cargo:rerun-if-changed=vendor/mlas");
@@ -49,6 +53,7 @@ fn main() {
         root,
         lib,
         asm,
+        arm64_asm,
         includes,
     };
 
@@ -62,7 +67,6 @@ fn main() {
         "dgemm.cpp",
         "qgemm.cpp",
         "qgemm_kernel_default.cpp",
-        "qgemm_kernel_avx2.cpp",
         "qnbitgemm.cpp",
         "qlutgemm.cpp",
         "qkv_quant.cpp",
@@ -91,9 +95,77 @@ fn main() {
     .iter()
     .map(|f| p.lib.join(f))
     .collect();
+    if target_arch == "aarch64" {
+        generic.extend(
+            [
+                "activate_fp16.cpp",
+                "pooling_fp16.cpp",
+                "halfgemm.cpp",
+                "qdwconv_kernelsize.cpp",
+                "halfgemm_kernel_neon.cpp",
+                "qgemm_kernel_neon.cpp",
+                "qgemm_kernel_udot.cpp",
+                "qgemm_kernel_sdot.cpp",
+                "qnbitgemm_kernel_neon.cpp",
+                "sqnbitgemm_kernel_neon_fp32.cpp",
+                "sqnbitgemm_kernel_neon_int8.cpp",
+                "sqnbitgemm_kernel_avx512_2bit.cpp",
+                "sqnbitgemm_kernel_neon_int8_2bit.cpp",
+                "cast_kernel_neon.cpp",
+                "hqnbitgemm_kernel_neon_fp16.cpp",
+                "hqnbitgemm_kernel_neon_fp16_8bit.cpp",
+                "rotary_embedding_kernel_neon.cpp",
+                "rotary_embedding_kernel_neon_fp16.cpp",
+                "qkv_quant_kernel_neon.cpp",
+                "hgemm_kernel_neon.cpp",
+                "halfgemm_kernel_neon_fp16.cpp",
+                "softmax_kernel_neon.cpp",
+                "softmax_kernel_neon_fp16.cpp",
+                "eltwise_kernel_neon.cpp",
+                "eltwise_kernel_neon_fp16.cpp",
+                "sqnbitgemm_kernel_neon_int8_i8mm.cpp",
+            ]
+            .iter()
+            .map(|f| p.lib.join(f)),
+        );
+    } else {
+        generic.push(p.lib.join("qgemm_kernel_avx2.cpp"));
+    }
     generic.push(p.root.join("vendor/shim.cpp"));
     generic.push(p.root.join("vendor/probe.cpp"));
     p.compile_cpp("mlas_generic", &[], &generic);
+
+    if target_arch == "aarch64" {
+        if target_env == "msvc" {
+            p.compile_msvc_arm64_asm(
+                "mlas_arm64_asm",
+                &[
+                    "ConvSymS8KernelDot.asm",
+                    "ConvSymS8KernelDotLd64.asm",
+                    "ConvSymU8KernelDot.asm",
+                    "ConvSymS8KernelNeon.asm",
+                    "ConvSymU8KernelNeon.asm",
+                    "DepthwiseQConvSymS8KernelNeon.asm",
+                    "DepthwiseQConvSymU8KernelNeon.asm",
+                    "DepthwiseQConvKernelSize9Neon.asm",
+                    "HalfGemmKernelNeon.asm",
+                    "QgemmU8X8KernelNeon.asm",
+                    "QgemmS8S8KernelNeon.asm",
+                    "QgemmU8X8KernelUdot.asm",
+                    "QgemmS8S8KernelSdot.asm",
+                    "SgemmKernelNeon.asm",
+                    "SgemvKernelNeon.asm",
+                    "SymQgemmS8KernelNeon.asm",
+                    "SymQgemmS8KernelSdot.asm",
+                    "SymQgemmS8KernelSdotLd64.asm",
+                ],
+            );
+        }
+        if target_env != "msvc" {
+            println!("cargo:rustc-link-lib=stdc++");
+        }
+        return;
+    }
 
     p.compile_cpp(
         "mlas_sse2_cpp",
@@ -273,7 +345,9 @@ fn main() {
         &["QgemmU8S8KernelAmxCommon.S", "QgemmU8S8KernelAmx.S"],
     );
 
-    println!("cargo:rustc-link-lib=stdc++");
+    if target_env != "msvc" {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 }
 
 impl Paths {
@@ -282,6 +356,7 @@ impl Paths {
         b.cpp(true);
         b.std("c++17");
         b.define("BUILD_MLAS_NO_ONNXRUNTIME", None);
+        b.define("_USE_MATH_DEFINES", None);
         // Full (non-minimal) build: keeps platform.cpp's AVX-512 kernel
         // selection block enabled (it is gated behind !ORT_MINIMAL_BUILD),
         // which is exactly the SGEMM parity we are validating.
@@ -297,8 +372,14 @@ impl Paths {
     fn compile_cpp(&self, name: &str, flags: &[&str], files: &[PathBuf]) {
         let mut b = self.base();
         // Headers ORT normally supplies transitively across its include graph.
-        for h in ["cstring", "cstdlib", "cstdint", "unistd.h"] {
-            b.flag("-include").flag(h);
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            for h in ["cstring", "cstdlib", "cstdint"] {
+                b.flag(&format!("/FI{h}"));
+            }
+        } else {
+            for h in ["cstring", "cstdlib", "cstdint", "unistd.h"] {
+                b.flag("-include").flag(h);
+            }
         }
         for f in flags {
             b.flag(f);
@@ -316,9 +397,73 @@ impl Paths {
             b.flag(f);
         }
         for f in files {
-            let path = self.asm.join(f);
+            let path = if f.ends_with(".asm") {
+                self.arm64_asm.join(f)
+            } else {
+                self.asm.join(f)
+            };
             assert!(path.exists(), "missing vendored asm: {}", path.display());
             b.file(path);
+        }
+        b.compile(name);
+    }
+
+    fn compile_msvc_arm64_asm(&self, name: &str, files: &[&str]) {
+        use std::process::Command;
+
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
+        let compiler = self.base().get_compiler();
+        let cl = compiler.path();
+        let armasm64 = cl
+            .parent()
+            .expect("MSVC cl.exe has a parent directory")
+            .join("armasm64.exe");
+
+        let mut objects = Vec::new();
+        for f in files {
+            let src = self.arm64_asm.join(f);
+            assert!(src.exists(), "missing vendored asm: {}", src.display());
+            let stem = src
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("asm file stem");
+            let preprocessed = out_dir.join(format!("{stem}.i"));
+            let obj = out_dir.join(format!("{stem}.obj"));
+
+            let mut cl_cmd = compiler.to_command();
+            cl_cmd.arg("/nologo").arg("/P").arg(&src);
+            cl_cmd.arg(format!("/Fi{}", preprocessed.display()));
+            cl_cmd.arg("/DBUILD_MLAS_NO_ONNXRUNTIME");
+            cl_cmd.arg("/D_USE_MATH_DEFINES");
+            cl_cmd.arg("/DNDEBUG");
+            for inc in &self.includes {
+                cl_cmd.arg(format!("/I{}", inc.display()));
+            }
+            let status = cl_cmd.status().expect("run cl.exe to preprocess ARM64 asm");
+            assert!(
+                status.success(),
+                "cl.exe failed to preprocess {}",
+                src.display()
+            );
+
+            let mut asm_cmd = Command::new(&armasm64);
+            for (key, value) in compiler.env() {
+                asm_cmd.env(key, value);
+            }
+            asm_cmd.arg("-nologo").arg(&preprocessed).arg(&obj);
+            let status = asm_cmd.status().expect("run armasm64.exe");
+            assert!(
+                status.success(),
+                "armasm64.exe failed for {}",
+                src.display()
+            );
+
+            objects.push(obj);
+        }
+
+        let mut b = self.base();
+        for obj in objects {
+            b.object(obj);
         }
         b.compile(name);
     }
