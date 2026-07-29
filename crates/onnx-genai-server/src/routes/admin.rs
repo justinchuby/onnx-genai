@@ -352,14 +352,13 @@ pub(crate) async fn admin_warmup_model(
     let duration = tokio::task::spawn_blocking(move || registry.warmup(&warmup_id))
         .await
         .map_err(|_| ApiError::internal("model warmup task panicked"))?
-        .map_err(|err| {
-            if err
-                .downcast_ref::<crate::registry::RegistryError>()
-                .is_some()
-            {
-                map_registry_error(crate::registry::RegistryError)
-            } else {
+        .map_err(|err| match err {
+            crate::registry::WarmupError::Registry(err) => map_registry_error(err),
+            crate::registry::WarmupError::NotLoaded => {
                 ApiError::not_found(format!("model '{id}' is not loaded"))
+            }
+            crate::registry::WarmupError::Failed(err) => {
+                ApiError::internal(format!("failed to warm model '{id}': {err}"))
             }
         })?;
     Ok(Json(AdminWarmupResponse {

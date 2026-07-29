@@ -195,6 +195,33 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
+#[derive(Debug)]
+pub(crate) enum WarmupError {
+    Registry(RegistryError),
+    NotLoaded,
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for WarmupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => error.fmt(formatter),
+            Self::NotLoaded => formatter.write_str("model is not loaded"),
+            Self::Failed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for WarmupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(error) => Some(error),
+            Self::NotLoaded => None,
+            Self::Failed(error) => error.source(),
+        }
+    }
+}
+
 /// Registry of models, providing runtime load / unload / lazy-load with LRU
 /// eviction.
 ///
@@ -410,6 +437,7 @@ impl ModelRegistry {
             tokio::task::spawn_blocking(move || registry.warmup(&warmup_id))
                 .await
                 .context("model warmup task panicked")?
+                .map_err(anyhow::Error::new)
                 .with_context(|| format!("failed to warm model '{id}'"))?;
         }
         Ok(handle)
@@ -417,10 +445,12 @@ impl ModelRegistry {
 
     /// Warm a currently loaded model. Unknown and unloaded models return an
     /// error; a successfully warmed model returns a zero duration on repeats.
-    pub(crate) fn warmup(&self, id: &str) -> anyhow::Result<Duration> {
-        self.get_loaded(id)?
-            .ok_or_else(|| anyhow::anyhow!("model '{id}' is not loaded"))?
+    pub(crate) fn warmup(&self, id: &str) -> Result<Duration, WarmupError> {
+        self.get_loaded(id)
+            .map_err(WarmupError::Registry)?
+            .ok_or(WarmupError::NotLoaded)?
             .warmup()
+            .map_err(WarmupError::Failed)
     }
 
     /// Unload a model: drop its handle from `models`/`order` but keep the spec in

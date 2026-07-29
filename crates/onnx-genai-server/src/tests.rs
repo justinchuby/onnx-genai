@@ -2408,6 +2408,35 @@ async fn admin_warmup_unknown_model_returns_404() {
 }
 
 #[tokio::test]
+async fn admin_warmup_loaded_model_generation_failure_returns_500() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        max_queue_depth: 1,
+        ..ServerConfig::default()
+    });
+    let handle = state.registry.resolve("model-a").unwrap().unwrap();
+    let _occupied = handle
+        .engine
+        .generation_capacity
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-a/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 async fn configured_warmup_runs_when_an_eager_model_loads() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load_from_specs(
