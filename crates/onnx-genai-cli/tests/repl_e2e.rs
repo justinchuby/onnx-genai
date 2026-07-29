@@ -573,39 +573,107 @@ fn greedy_reasoning_is_reproducible_across_runs() {
 
 #[test]
 fn sampling_reaches_the_decode_loop_not_only_the_session_summary() {
-    // Finding 1 (Gaff): the `/session` summary resolves the sampling policy
-    // independently of generation, so a test keyed only on that summary passes
-    // even when generation silently reverts to greedy -- the exact #385/#392
-    // "declared defaults parsed then discarded, greedy forced" defect. This test
-    // instead observes what generation *did*, not what the summary *says*.
+    // Finding 1 (Gaff, then Luv): the `/session` summary resolves the sampling
+    // policy in `SessionSummary::fmt`, *independently* of generation. A test
+    // keyed only on that summary passes even when generation silently reverts to
+    // greedy -- the exact #385/#392 "declared defaults parsed then discarded,
+    // greedy forced" defect. It cannot be caught by observing the token stream
+    // either: at the fixture's declared temperature 0.6 / top_k 20 the decode
+    // distribution is so peaked that sampling is effectively greedy, so the
+    // emitted tokens almost never witness that sampling occurred (measured
+    // ~99% collapse onto the greedy stream) -- a 5-run "at least one differs"
+    // assertion is a ~95% false-fail, not a regression detector.
     //
-    // Greedy decoding is deterministic, so the greedy reply is a fixed token
-    // stream. tiny-reasoning declares do_sample=true, so with no sampling flag
-    // generation must sample and produce a stream that is *not* that fixed greedy
-    // stream. If the declared default were ignored and generation forced greedy,
-    // every no-flag reply would be byte-identical to the greedy reply. Removing
-    // the per-turn `resolve_sampling_defaults` call in `interactive.rs` collapses
-    // the no-flag runs onto `greedy` and turns this red.
-    let greedy = stdout_text(&repl(
+    // Instead observe the policy the *decode loop actually used*. The REPL now
+    // surfaces the resolved per-turn `GenerateOptions` -- the exact struct handed
+    // to generation, read after `resolve_sampling_defaults`, not re-resolved for
+    // display -- in the `--stats` line on stderr. This is deterministic: one run
+    // each way, no token-stream sampling.
+    //
+    // tiny-reasoning declares do_sample=true, temperature=0.6, top_k=20, so with
+    // no sampling flag the decode loop must run stochastically at those declared
+    // values. Commenting out the per-turn `resolve_sampling_defaults` call in
+    // `interactive.rs` collapses the resolved policy to the runtime greedy
+    // fallback (greedy=true, temperature=1, top_k=0) and turns every assertion
+    // below red -- while the `/session`-keyed tests stay green, proving those
+    // never witnessed generation.
+    let sampled = stderr_text(&repl(
         &reasoning_model(),
-        &["--greedy", "--max-new-tokens", "16"],
-        "world\n\n",
+        &["--max-new-tokens", "8"],
+        "/stats\nquick\n\n",
     ));
-    // Sampling varies run to run, so across a handful of no-flag runs at least
-    // one must differ from the fixed greedy stream. Under a silent-force-greedy
-    // regression every run collapses onto `greedy` and none differ.
-    let generation_sampled = (0..5).any(|_| {
-        stdout_text(&repl(
-            &reasoning_model(),
-            &["--max-new-tokens", "16"],
-            "world\n\n",
-        )) != greedy
-    });
     assert!(
-        generation_sampled,
+        sampled.contains("sampling greedy=false"),
         "the model's declared do_sample must reach the decode loop, not just the \
-         /session summary: every no-flag reply was byte-identical to the greedy \
-         stream {greedy:?}, so generation was silently forced greedy"
+         /session summary; the stats line did not report a stochastic policy: {sampled}"
+    );
+    assert!(
+        sampled.contains("temperature=0.6"),
+        "the decode loop must use the model's declared temperature, not the runtime \
+         default; a regression that ignores declared temperature is invisible otherwise: {sampled}"
+    );
+    assert!(
+        sampled.contains("top_k=20"),
+        "the decode loop must use the model's declared top_k, not the runtime \
+         default; a regression that ignores declared top_k is invisible otherwise: {sampled}"
+    );
+
+    // The other end of the precedence chain, same instrument: an explicit
+    // --greedy must force the deterministic policy onto the decode loop, and the
+    // stats line must report that -- so the summary and generation cannot silently
+    // diverge in either direction.
+    let greedy = stderr_text(&repl(
+        &reasoning_model(),
+        &["--greedy", "--max-new-tokens", "8"],
+        "/stats\nquick\n\n",
+    ));
+    assert!(
+        greedy.contains("sampling greedy=true"),
+        "an explicit --greedy must force the decode loop greedy, and the stats line \
+         must report it: {greedy}"
+    );
+}
+
+#[test]
+fn the_session_summary_reports_the_same_policy_generation_used() {
+    // Unification guard (Gaff Finding 1, Luv (b)): the `/session` summary and the
+    // decode loop resolve the sampling policy through one shared helper
+    // (`resolve_session_sampling`) reading the live backend, so the summary is
+    // structurally unable to report a policy generation did not use. Batty's
+    // earlier ticket to defer this rested on the (false) premise that the
+    // token-stream test already removed the harm; it never worked, so the
+    // divergence was live and is closed here rather than ticketed.
+    //
+    // Observe both surfaces in one no-flag session: the `--stats` line (stderr)
+    // reports what the turn used; the `/session` summary (stdout) reports what it
+    // will use. Both must show the identical resolved policy -- greedy=false at
+    // the declared temperature 0.6 / top_k 20.
+    let output = repl(
+        &reasoning_model(),
+        &["--max-new-tokens", "8"],
+        "/stats\nquick\n/session\n\n",
+    );
+    let stats = stderr_text(&output);
+    let summary = stdout_text(&output);
+
+    assert!(
+        stats.contains("sampling greedy=false")
+            && stats.contains("temperature=0.6")
+            && stats.contains("top_k=20"),
+        "the turn's --stats line must report the resolved policy generation used: {stats}"
+    );
+    // The `/session` summary line resolves through the same helper, so it must
+    // report the same three values.
+    let summary_line = summary
+        .lines()
+        .find(|line| line.trim_start().starts_with("sampling:"))
+        .unwrap_or_default();
+    assert!(
+        summary_line.contains("greedy=false")
+            && summary_line.contains("temperature=0.6")
+            && summary_line.contains("top_k=20"),
+        "the /session summary must report the same resolved policy the turn used, not a \
+         second independent resolution: {summary}"
     );
 }
 
@@ -788,7 +856,14 @@ fn the_declared_stochastic_regime_still_terminates_without_hanging() {
     let empty_close_drops = combined
         .matches("closed its reasoning but produced no answer")
         .count();
-    let admission_drops = combined.matches("context window is full").count();
+    // Match the admission-drop message specifically. The literal
+    // `context window is full (` (with the trailing `(` before the token count)
+    // is unique to `full_repl_context_message`; the finite-fallback warning in
+    // `warn_missing_context_limit` also contains "context window is full" but is
+    // followed by " without", so the `(` disambiguates the two even if that
+    // warning ever fires (it does not for this fixture, which declares
+    // max_sequence_length).
+    let admission_drops = combined.matches("context window is full (").count();
     assert_eq!(
         completed + reasoning_drops + empty_close_drops + admission_drops,
         REASONING_TURNS.len(),

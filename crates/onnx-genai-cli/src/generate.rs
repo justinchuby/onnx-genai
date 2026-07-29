@@ -119,6 +119,14 @@ fn generate_text(
     turn.prompt_tokens = Some(prompt_tokens);
     turn.context_limit = effective_max_context;
     profile.prompt_tokens = Some(prompt_tokens);
+    // Surface the resolved decode-loop policy — read from the same `turn.options`
+    // handed to generation below, not re-resolved for display.
+    profile.sampling_policy = Some(profile::SamplingPolicy {
+        greedy: turn.options.greedy,
+        temperature: turn.options.temperature,
+        top_p: turn.options.top_p,
+        top_k: turn.options.top_k,
+    });
     profile.context = effective_max_context.map(|max_tokens| profile::ContextUsage {
         used_tokens: prompt_tokens,
         max_tokens,

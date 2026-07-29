@@ -437,17 +437,38 @@ impl SessionUsage {
 pub(super) struct SessionSummary<'a> {
     pub(super) settings: &'a SessionSettings,
     pub(super) resolved_decode_backend: EngineDecodeBackend,
-    pub(super) options: &'a GenerateOptions,
-    pub(super) generation_defaults: Option<&'a GenerationDefaults>,
-    pub(super) sampling_overrides: &'a SamplingOverrides,
+    /// The sampling policy resolved for the current backend — the *same* value a
+    /// generated turn uses, produced by [`resolve_session_sampling`]. Held
+    /// resolved (not as base options + defaults + overrides) so the summary
+    /// cannot resolve it a second, independent way and silently disagree with
+    /// what generation does (#385/#392).
+    pub(super) sampling: GenerateOptions,
     pub(super) history: &'a [ChatMessage],
     pub(super) usage: &'a SessionUsage,
 }
 
+/// Resolve the sampling policy for the live backend.
+///
+/// The single resolution site shared by the `/session` summary and every
+/// generated turn, so the two cannot disagree about greedy/temperature/top_p/
+/// top_k. It reads the backend's declared defaults and the session's explicit
+/// overrides on demand, so there is nothing to cache and nothing to go stale
+/// across a `/reload`, `/ep`, or `/backend`: the next call reads whichever
+/// backend is live. `max_new_tokens`/`max_context` are left untouched (context
+/// sizing happens separately, per turn).
+pub(super) fn resolve_session_sampling(
+    base: &GenerateOptions,
+    backend: &Backend,
+    overrides: &SamplingOverrides,
+) -> GenerateOptions {
+    let mut resolved = base.clone();
+    resolved.resolve_sampling_defaults(backend.generation_defaults(), overrides);
+    resolved
+}
+
 impl fmt::Display for SessionSummary<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut options = self.options.clone();
-        options.resolve_sampling_defaults(self.generation_defaults, self.sampling_overrides);
+        let options = &self.sampling;
         let system_messages = self
             .history
             .iter()
@@ -1094,9 +1115,11 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         SessionSummary {
                             settings: &settings,
                             resolved_decode_backend: backend.decode_backend(),
-                            options: &sampling_options,
-                            generation_defaults: backend.generation_defaults(),
-                            sampling_overrides: &sampling_overrides,
+                            sampling: resolve_session_sampling(
+                                &sampling_options,
+                                &backend,
+                                &sampling_overrides
+                            ),
                             history: &history,
                             usage: &session_usage,
                         }
@@ -1110,9 +1133,11 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     SessionSummary {
                         settings: &settings,
                         resolved_decode_backend: backend.decode_backend(),
-                        options: &sampling_options,
-                        generation_defaults: backend.generation_defaults(),
-                        sampling_overrides: &sampling_overrides,
+                        sampling: resolve_session_sampling(
+                            &sampling_options,
+                            &backend,
+                            &sampling_overrides
+                        ),
                         history: &history,
                         usage: &session_usage,
                     }
@@ -1182,9 +1207,11 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         SessionSummary {
                             settings: &settings,
                             resolved_decode_backend: backend.decode_backend(),
-                            options: &sampling_options,
-                            generation_defaults: backend.generation_defaults(),
-                            sampling_overrides: &sampling_overrides,
+                            sampling: resolve_session_sampling(
+                                &sampling_options,
+                                &backend,
+                                &sampling_overrides
+                            ),
                             history: &history,
                             usage: &session_usage,
                         }
@@ -1280,11 +1307,12 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             println!("(sending {})", display_paths(&staged_images));
         }
         let rendered = build_turn_prompt(template.as_ref(), &history)?;
-        let mut turn_options = sampling_options.clone();
-        // Resolve against the *current* backend each turn so the model's
-        // declared sampling regime is honored, and stays correct across a
-        // `/reload` that swaps in a model with different declared defaults.
-        turn_options.resolve_sampling_defaults(backend.generation_defaults(), &sampling_overrides);
+        // Resolve against the *current* backend each turn through the same helper
+        // the `/session` summary uses, so the model's declared sampling regime is
+        // honored, stays correct across a `/reload` that swaps in different
+        // declared defaults, and can never disagree with what `/session` reports.
+        let mut turn_options =
+            resolve_session_sampling(&sampling_options, &backend, &sampling_overrides);
         let prompt_tokens = backend.prompt_tokens(&rendered).unwrap_or_default();
         let effective_max_context = backend.effective_max_context(&turn_options);
         if let Some(message) =
@@ -1306,6 +1334,17 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             warned_missing_context_limit = true;
         }
         let turn_max_new_tokens = turn_options.max_new_tokens;
+        // Capture the sampling policy from the *resolved* per-turn options — the
+        // exact struct handed to the decode loop below — so `--stats`/`--profile`
+        // report what generation actually did. Reading it here, not re-resolving
+        // it for display, is what keeps the reported policy from disagreeing with
+        // the decode loop (the `/session`-summary defect, #385/#392).
+        let sampling_policy = profile::SamplingPolicy {
+            greedy: turn_options.greedy,
+            temperature: turn_options.temperature,
+            top_p: turn_options.top_p,
+            top_k: turn_options.top_k,
+        };
         let turn = TurnInput {
             prompt: rendered,
             images: staged_images,
@@ -1317,6 +1356,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
         profile.execution_provider = settings.resolved_providers();
+        profile.sampling_policy = Some(sampling_policy);
         profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = Some(prompt_tokens);

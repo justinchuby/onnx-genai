@@ -163,6 +163,8 @@ pub(crate) struct RunProfile {
     pub(crate) context: Option<ContextUsage>,
     pub(crate) budget_cap: Option<BudgetCap>,
     pub(crate) finish_reason: Option<String>,
+    /// The sampling policy the decode loop actually used this turn.
+    pub(crate) sampling_policy: Option<SamplingPolicy>,
     pub(crate) prefix_cache_hit: Option<usize>,
     pub(crate) memory: MemoryUsage,
     pub(crate) pages: Option<PageActivity>,
@@ -180,6 +182,33 @@ pub(crate) struct ContextUsage {
 pub(crate) struct BudgetCap {
     pub(crate) requested_max_new_tokens: usize,
     pub(crate) admitted_max_new_tokens: usize,
+}
+
+/// The sampling policy the decode loop actually used for a turn.
+///
+/// This is captured from the `GenerateOptions` *after*
+/// [`resolve_sampling_defaults`](onnx_genai::config::GenerateOptions::resolve_sampling_defaults)
+/// — the exact struct handed to generation — so surfacing it reports what
+/// generation did rather than resolving the policy a second time (which is the
+/// `/session`-summary defect this exists to catch: a display-side resolution
+/// that can silently disagree with the decode loop, #385/#392).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SamplingPolicy {
+    pub(crate) greedy: bool,
+    pub(crate) temperature: f32,
+    pub(crate) top_p: f32,
+    pub(crate) top_k: usize,
+}
+
+impl SamplingPolicy {
+    /// Compact, machine-parseable rendering for the `--stats` / `--profile`
+    /// output. Pure ASCII, so its display width equals its scalar count.
+    pub(crate) fn to_stats_part(self) -> String {
+        format!(
+            "sampling greedy={} temperature={} top_p={} top_k={}",
+            self.greedy, self.temperature, self.top_p, self.top_k
+        )
+    }
 }
 
 /// What a multimodal pipeline avoided recomputing for this generation.
@@ -232,6 +261,9 @@ impl RunProfile {
         }
         if self.timings.tokens() > 0 {
             parts.push(format!("{} out", self.timings.tokens()));
+        }
+        if let Some(policy) = &self.sampling_policy {
+            parts.push(policy.to_stats_part());
         }
         if let Some(hit) = self.prefix_cache_hit {
             if let Some(prompt_tokens) = self.prompt_tokens.filter(|tokens| *tokens > 0) {
@@ -317,6 +349,9 @@ impl RunProfile {
         }
         if self.timings.tokens() > 0 {
             headline.push(format!("{} out", self.timings.tokens()));
+        }
+        if let Some(policy) = &self.sampling_policy {
+            headline.push(policy.to_stats_part());
         }
         if let Some(backend) = &self.decode_backend {
             headline.push(format!("backend {backend}"));
@@ -697,6 +732,21 @@ impl RunProfile {
         }
         if let Some(reason) = &self.finish_reason {
             let _ = writeln!(out, "{:<24} {}", "finish reason", reason);
+        }
+        if let Some(policy) = &self.sampling_policy {
+            let _ = writeln!(
+                out,
+                "{:<24} {}",
+                "sampling policy",
+                if policy.greedy {
+                    "greedy".to_string()
+                } else {
+                    format!(
+                        "temperature {} / top_p {} / top_k {}",
+                        policy.temperature, policy.top_p, policy.top_k
+                    )
+                }
+            );
         }
         if let Some(cap) = self.budget_cap {
             let _ = writeln!(
