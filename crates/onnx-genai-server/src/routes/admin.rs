@@ -341,6 +341,34 @@ pub(crate) async fn admin_load_model(
     Ok(Json(AdminLoadResponse { id, loaded: true }))
 }
 
+/// `POST /v1/admin/models/{id}/warm` — run a small generation to initialize a
+/// loaded model's lazy runtime allocations. Repeated calls are idempotent.
+pub(crate) async fn admin_warmup_model(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<AdminWarmupResponse>, ApiError> {
+    let registry = state.registry.clone();
+    let warmup_id = id.clone();
+    let duration = tokio::task::spawn_blocking(move || registry.warmup(&warmup_id))
+        .await
+        .map_err(|_| ApiError::internal("model warmup task panicked"))?
+        .map_err(|err| {
+            if err
+                .downcast_ref::<crate::registry::RegistryError>()
+                .is_some()
+            {
+                map_registry_error(crate::registry::RegistryError)
+            } else {
+                ApiError::not_found(format!("model '{id}' is not loaded"))
+            }
+        })?;
+    Ok(Json(AdminWarmupResponse {
+        id,
+        warmed: true,
+        duration_ms: duration.as_millis(),
+    }))
+}
+
 /// `DELETE /v1/admin/models/{id}` — unload a loaded model.  The spec is kept
 /// available so the model can be lazily reloaded on a later request.  404 if the
 /// model is not currently loaded.

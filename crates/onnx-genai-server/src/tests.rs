@@ -1120,6 +1120,7 @@ async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preproces
             id: "compat-vlm".to_owned(),
             path: model_dir,
             eager: true,
+            warmup: false,
         },
         &ServerConfig::default(),
     )
@@ -2055,11 +2056,13 @@ fn two_model_state() -> AppState {
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
+            warmup: false,
         },
         ModelSpec {
             id: "model-b".to_string(),
             path: path.clone(),
             eager: true,
+            warmup: false,
         },
     ];
     AppState::load_from_specs(specs, ServerConfig::default()).expect("load two tiny-llm fixtures")
@@ -2263,11 +2266,13 @@ fn lazy_state(config: ServerConfig) -> AppState {
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
+            warmup: false,
         },
         ModelSpec {
             id: "model-b".to_string(),
             path: path.clone(),
             eager: false,
+            warmup: false,
         },
     ];
     AppState::load_from_specs(specs, config).expect("load lazy two-model state")
@@ -2343,6 +2348,79 @@ async fn admin_load_then_route_to_lazy_model() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_warmup_loaded_model_returns_success_and_is_idempotent() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+
+    let first_response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-a/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = json_body(first_response).await;
+    assert_eq!(first_body["id"], "model-a");
+    assert_eq!(first_body["warmed"], true);
+    assert!(first_body["duration_ms"].is_number());
+
+    let second_response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-a/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = json_body(second_response).await;
+    assert_eq!(second_body["duration_ms"], 0);
+}
+
+#[tokio::test]
+async fn admin_warmup_unknown_model_returns_404() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/no-such-model/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn configured_warmup_runs_when_an_eager_model_loads() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_from_specs(
+        vec![ModelSpec {
+            id: "model-a".to_string(),
+            path,
+            eager: true,
+            warmup: true,
+        }],
+        ServerConfig::default(),
+    )
+    .expect("load and warm tiny model");
+    assert!(state.registry.is_warmed_for_test("model-a"));
 }
 
 #[tokio::test]
@@ -2534,6 +2612,7 @@ async fn admin_endpoints_return_404_when_gate_is_off() {
     for (method, uri) in [
         ("GET", "/v1/admin/models"),
         ("POST", "/v1/admin/models/model-b/load"),
+        ("POST", "/v1/admin/models/model-a/warm"),
         ("DELETE", "/v1/admin/models/model-a"),
         ("POST", "/v1/admin/resources/vram-limit"),
     ] {

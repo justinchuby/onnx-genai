@@ -90,6 +90,10 @@ pub fn app(state: AppState) -> Router {
         router = router
             .route("/v1/admin/models", get(routes::admin_list_models))
             .route("/v1/admin/models/{id}/load", post(routes::admin_load_model))
+            .route(
+                "/v1/admin/models/{id}/warm",
+                post(routes::admin_warmup_model),
+            )
             .route("/v1/admin/models/{id}", delete(routes::admin_unload_model))
             .route(
                 "/v1/admin/resources/vram-limit",
