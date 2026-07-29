@@ -1,0 +1,4 @@
+### 2026-07-29: Möbius emits explicit inference I/O metadata
+**By:** Benny
+**What:** Möbius PR onnxruntime/mobius#434 augments decoder, multimodal, speech-to-text, and nested-autoregressive TTS metadata from actual exported graph ports. It emits `model.io.static_cache`, positional `kv_inputs`/`kv_outputs`, `token_input`, `inputs_embeds_input`, `logits_output`, `sequence_source`, `kv_ownership`, encoder `audio_features_input` or `token_input`, and nested `inner_embedding_output`. Synthetic graph tests cover dynamic KV, TensorScatter static cache, encoder roles, and Qwen3-TTS; a large-weight real-export smoke test remains outstanding.
+**Why:** onnx-genai issue #377 and PR #412 remove runtime tensor-name guessing. Exported packages must carry authoritative graph-role metadata so decode, paged KV, static cache, nested autoregression, and encoder prompt binding remain name-agnostic.
