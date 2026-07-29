@@ -415,26 +415,14 @@ fn two_ctrl_c_presses_are_needed_to_exit_an_idle_prompt() {
     );
 }
 
-/// A copy of the tiny text model whose chat template declares reasoning
-/// delimiters, the way a reasoning model's template does.
+/// The committed tiny reasoning fixture, whose chat template opens a `<think>`
+/// reasoning span after the generation prompt the way a real reasoning model's
+/// template does. Its tiny vocabulary has no token that decodes to the closing
+/// `</think>`, so the span never closes and the model degenerates under greedy
+/// decoding -- the whole reason this fixture exists. See
+/// `tests/fixtures/tiny-reasoning/generate_tiny_reasoning.py`.
 fn reasoning_model() -> PathBuf {
-    let source = fixture("tiny-llm");
-    let dir = repository_root().join("target/test-fixtures/tiny-llm-reasoning");
-    std::fs::create_dir_all(&dir).unwrap();
-    for entry in std::fs::read_dir(&source).unwrap().flatten() {
-        let name = entry.file_name();
-        if name != "tokenizer_config.json" {
-            let _ = std::fs::copy(entry.path(), dir.join(&name));
-        }
-    }
-    // The template opens the span after the generation prompt, which is how
-    // reasoning templates are written: the model only ever emits the close.
-    std::fs::write(
-        dir.join("tokenizer_config.json"),
-        r#"{"chat_template":"{% for m in messages %}<|{{ m.role }}|>\n{{ m.content }}\n{% endfor %}{% if add_generation_prompt %}<|assistant|>\n<think>\n{% endif %}"}"#,
-    )
-    .unwrap();
-    dir
+    fixture("tiny-reasoning")
 }
 
 #[test]
@@ -470,9 +458,228 @@ fn a_model_without_reasoning_delimiters_reports_nothing_about_them() {
         "hello\n\n",
     ));
 
+    // Key on the actual reasoning diagnostic the runtime would emit, not the
+    // bare word "reasoning": the captured output also carries the absolute model
+    // path, so a checkout or worktree directory that happens to contain
+    // "reasoning" must not be mistaken for the model reporting a reasoning span.
     assert!(
-        !output.contains("reasoning"),
-        "a plain model must not mention reasoning: {output}"
+        !output.contains("the model's reasoning"),
+        "a plain model must not report a reasoning stop: {output}"
+    );
+}
+
+/// Ten distinct in-vocabulary prompts, keeping the reasoning session in the
+/// design's 8-12 turn band (docs/research/testing/00-integration-stress-design.md,
+/// scenario `ci_tiny_reasoning_pressure_cpu_ort`).
+///
+/// These are the *degenerate* prompts: on each of them the greedy attractor
+/// never reaches the renamed close token (id 22), so the reasoning span stays
+/// open and every turn is dropped. The "quick"/"fox"/"dog" family is
+/// deliberately excluded because those *do* close (see the positive test);
+/// mixing them in would break the "every turn drops" contract these prompts
+/// pin. The exact words still do not matter to the assertions, which key on
+/// properties (a drop note, a resource stop, empty history) not tokens.
+const REASONING_TURNS: &[&str] = &[
+    "hello", "world", "the", "brown", "jumps", "over", "lazy", ".", ",", "tok16",
+];
+
+/// Build a `run` script that sends every reasoning turn then asks for `/session`.
+fn reasoning_session_script() -> String {
+    let mut script = REASONING_TURNS.join("\n");
+    script.push_str("\n/session\n\n");
+    script
+}
+
+#[test]
+fn greedy_reasoning_degenerates_and_no_turn_is_ever_committed() {
+    // The user-visible defect this pins ("DeepSeek repeats its thinking and
+    // won't stop"): a reasoning model decoded greedily stays inside its thinking,
+    // never reaches an answer, and hits the token/context budget. Here a context
+    // stop stands in, on CPU, for the CUDA KV-capacity stop the full model hit.
+    // The REPL must drop every such exchange (reasoning-progress invariant) and
+    // never commit an empty assistant turn (non-empty-committed invariant), while
+    // still admitting the next turn after each drop (admission liveness).
+    let output = text(&repl(
+        &reasoning_model(),
+        &["--greedy", "--max-new-tokens", "16"],
+        &reasoning_session_script(),
+    ));
+
+    let drops = output
+        .matches("stopped inside the model's reasoning")
+        .count();
+    assert_eq!(
+        drops,
+        REASONING_TURNS.len(),
+        "every greedy reasoning turn must be dropped, got {drops}: {output}"
+    );
+    assert!(
+        output.contains("this turn is not kept"),
+        "the dropped exchange must be reported to the user: {output}"
+    );
+    // A classified resource stop, not a silent success: the decode ran out of
+    // budget while still inside the reasoning span.
+    assert!(
+        output.contains("finish reason: Length"),
+        "the drop must be a classified resource stop: {output}"
+    );
+    // Non-empty committed turns: nothing empty was kept, so history stays clean
+    // and every later turn was still admitted (all ten ran to produce ten drops).
+    assert!(
+        output.contains("messages: 0 (system: 0, user: 0, assistant: 0)"),
+        "no unclosed reasoning turn may be committed to history: {output}"
+    );
+}
+
+#[test]
+fn greedy_reasoning_is_reproducible_across_runs() {
+    // Sampling-observability invariant, greedy half: a fixed (greedy) policy is
+    // stable, so the same prompt yields byte-identical output on every run.
+    let run = || {
+        stdout_text(&repl(
+            &reasoning_model(),
+            &["--greedy", "--max-new-tokens", "16"],
+            "hello\n\n",
+        ))
+    };
+    let first = run();
+    let second = run();
+    assert!(
+        first.contains(">>>"),
+        "the run must have produced a reply prompt: {first}"
+    );
+    assert_eq!(
+        first, second,
+        "greedy decoding must be deterministic across runs"
+    );
+}
+
+#[test]
+fn a_model_declaring_do_sample_is_not_forced_into_greedy() {
+    // #385/#392: the runtime's greedy fallback must not override a default the
+    // model actually published. tiny-reasoning declares `do_sample: true`, so
+    // with no sampling flag the resolved policy is stochastic at the declared
+    // temperature -- precisely the regime a reasoning model ships to avoid the
+    // greedy loop above.
+    let output = text(&repl(&reasoning_model(), &[], "/session\n\n"));
+    assert!(
+        output.contains("greedy=false"),
+        "a declared do_sample=true must resolve to stochastic decoding: {output}"
+    );
+    assert!(
+        output.contains("temperature=0.6"),
+        "the model's declared temperature must be honored: {output}"
+    );
+}
+
+#[test]
+fn an_explicit_greedy_flag_overrides_the_models_declared_do_sample() {
+    // The other end of the precedence chain: an explicit caller flag wins over
+    // the model's declared default. This is the only supported way to force the
+    // degenerate greedy regime onto a model that declares it samples.
+    let output = text(&repl(&reasoning_model(), &["--greedy"], "/session\n\n"));
+    assert!(
+        output.contains("greedy=true"),
+        "an explicit --greedy must win over the model's declared do_sample: {output}"
+    );
+}
+
+#[test]
+fn temperature_zero_forces_greedy_even_when_the_model_declares_do_sample() {
+    // Resolved temperature 0 has no stochastic meaning, so it collapses to greedy
+    // regardless of the declared do_sample -- pinned end to end through the CLI.
+    let output = text(&repl(
+        &reasoning_model(),
+        &["--temperature", "0"],
+        "/session\n\n",
+    ));
+    assert!(
+        output.contains("greedy=true"),
+        "temperature 0 must resolve to greedy: {output}"
+    );
+}
+
+#[test]
+fn a_reasoning_turn_that_closes_its_span_commits_a_non_empty_answer() {
+    // The positive half of the reasoning-progress invariant, and the reason the
+    // fixture has a *reachable* close: a turn whose generated text closes the
+    // </think> span with visible answer text after it must be committed, not
+    // dropped. Without this a regression that drops *every* turn would pass
+    // against a fixture that can only ever drop -- it could not tell "correctly
+    // dropped" from "commit path broken". "quick" is the deterministic greedy
+    // prompt whose attractor reaches the renamed close token followed by a real
+    // word, so the span closes with a non-empty answer.
+    let output = text(&repl(
+        &reasoning_model(),
+        &["--greedy", "--max-new-tokens", "8"],
+        "quick\n/session\n\n",
+    ));
+
+    // The span actually closed: the close delimiter was emitted, and the turn
+    // was not reported as stopping inside the reasoning.
+    assert!(
+        output.contains("</think>"),
+        "the reasoning span must close for this prompt: {output}"
+    );
+    assert!(
+        !output.contains("stopped inside the model's reasoning"),
+        "a closed reasoning turn must not be dropped: {output}"
+    );
+    // The committed answer is non-empty: there is visible text after the close
+    // delimiter. Keyed on the *presence* of answer text, not its token identity,
+    // so regenerating the fixture (which can move the answer word) never breaks
+    // this. The runtime does not itself guard a closed-but-empty answer (see the
+    // decision record), so this asserts the property directly.
+    let answer = output
+        .rsplit_once("</think>")
+        .map(|(_, tail)| tail.lines().next().unwrap_or("").trim())
+        .unwrap_or("");
+    assert!(
+        !answer.is_empty(),
+        "the committed answer after the close must be non-empty: {output}"
+    );
+    // /session shows history incrementing: exactly the user turn and its
+    // committed assistant answer, and one completed turn.
+    assert!(
+        output.contains("messages: 2 (system: 0, user: 1, assistant: 1)"),
+        "the committed turn must increment history to one user + one assistant: {output}"
+    );
+    assert!(
+        output.contains("completed turns: 1"),
+        "the closed turn must count as one completed turn: {output}"
+    );
+}
+
+#[test]
+fn the_declared_stochastic_regime_still_terminates_without_hanging() {
+    // The design asks for greedy plus a stochastic path. Under the model's
+    // declared do_sample the generated tokens differ run to run, so -- unlike the
+    // greedy tests -- the per-turn outcome (drop vs close) is not fixed: sampling
+    // can reach the close token on prompts greedy would not. What is invariant is
+    // termination: the stochastic regime must be the one in force, and every turn
+    // must run to a classified stop and reach the /session prompt rather than
+    // hanging inside an unbounded reasoning loop. Asserting a fixed drop count
+    // here would be flaky for exactly the reason the sampling matters, so this
+    // pins termination and policy, not an outcome tally.
+    let output = repl(
+        &reasoning_model(),
+        &["--max-new-tokens", "16"],
+        &reasoning_session_script(),
+    );
+    let combined = text(&output);
+    assert!(
+        output.status.success(),
+        "the stochastic session must terminate cleanly, not hang: {combined}"
+    );
+    assert!(
+        combined.contains("greedy=false"),
+        "the declared regime must be stochastic: {combined}"
+    );
+    // Reaching the /session summary proves all ten turns ran to a stop and the
+    // REPL stayed live through them (no unbounded loop swallowed the session).
+    assert!(
+        combined.contains("messages:") && combined.contains("completed turns:"),
+        "the session must run every turn through to the /session summary: {combined}"
     );
 }
 
