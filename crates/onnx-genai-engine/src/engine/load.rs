@@ -145,6 +145,8 @@ impl Engine {
             native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             lora_manager: None,
+            #[cfg(feature = "native-backend")]
+            lora_single_adapter_name: None,
             draft,
             mtp,
             eagle3,
@@ -337,6 +339,7 @@ impl Engine {
             native_session: Some(native_session),
             native_shared_kv_proposer,
             lora_manager,
+            lora_single_adapter_name: config.lora_adapter_name.clone(),
             draft: None,
             mtp: None,
             eagle3: None,

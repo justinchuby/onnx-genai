@@ -504,6 +504,13 @@ pub struct EngineConfig {
     /// single/none DIRECT fast path. Only the native backend consumes this, and
     /// it is mutually exclusive with [`Self::lora_adapter`].
     pub lora_adapters: Vec<(String, PathBuf)>,
+    /// User-facing name of a single `--adapters NAME=PATH` that collapsed onto
+    /// the DIRECT single-adapter fast path. Carries the selectable identifier
+    /// (which [`Self::lora_adapter`] alone discards, being only a path) so a
+    /// `--select-adapter NAME` request for the already-applied adapter is a
+    /// no-op rather than a misleading "not a grouped pool" error. `None` for
+    /// base-only, grouped, or path-only (`--adapter`) sessions.
+    pub lora_adapter_name: Option<String>,
     /// Number of GPU pages for KV cache.
     pub num_gpu_pages: usize,
     /// Tokens per KV page.
@@ -549,6 +556,7 @@ impl Default for EngineConfig {
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
             lora_adapter: None,
             lora_adapters: Vec::new(),
+            lora_adapter_name: None,
             num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),

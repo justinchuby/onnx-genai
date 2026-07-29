@@ -44,6 +44,15 @@ pub struct Engine {
     /// activate/deactivate can toggle the injected override buffers.
     #[cfg(feature = "native-backend")]
     pub(crate) lora_manager: Option<crate::lora::manager::LoraManager>,
+    /// Selectable name of the single LoRA adapter that collapsed to the DIRECT
+    /// fast path (design §D/§J). When exactly one `--adapters NAME=PATH` is
+    /// configured it loads on the always-on single-adapter path but keeps its
+    /// user-facing NAME here, so a `--select-adapter NAME` request for that same
+    /// adapter resolves to a no-op (already applied) instead of failing as if no
+    /// adapter were loaded. `None` for base-only or grouped multi-adapter
+    /// sessions.
+    #[cfg(feature = "native-backend")]
+    pub(crate) lora_single_adapter_name: Option<String>,
     /// Optional draft model used by the speculative decoding path.
     pub(crate) draft: Option<DraftModel>,
     /// Optional MTP head and target-side projections.

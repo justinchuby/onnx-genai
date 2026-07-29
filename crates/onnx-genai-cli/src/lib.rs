@@ -307,8 +307,11 @@ impl EngineArgs {
             if self.adapters.len() == 1 {
                 // A single named adapter collapses to the always-on DIRECT fast
                 // path (the perf gate: never build the pool/segments machinery
-                // for ≤1 adapter).
+                // for ≤1 adapter). Preserve the user-facing NAME so a
+                // `--select-adapter NAME` request for this same adapter is a
+                // no-op instead of erroring as if nothing were loaded.
                 config.lora_adapter = Some(self.adapters[0].1.clone());
+                config.lora_adapter_name = Some(self.adapters[0].0.clone());
             } else {
                 config.lora_adapters = self.adapters.clone();
             }

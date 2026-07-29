@@ -27,11 +27,12 @@ enum RequestLoraRoute<'a> {
 /// both the plain and speculative entry points share, so neither can proceed on
 /// a stale route.
 #[cfg(feature = "native-backend")]
-fn resolve_request_lora_route(
+fn resolve_request_lora_route<'a>(
     has_grouped_lora: bool,
     is_speculative: bool,
-    adapter: Option<&str>,
-) -> anyhow::Result<RequestLoraRoute<'_>> {
+    adapter: Option<&'a str>,
+    single_adapter_name: Option<&str>,
+) -> anyhow::Result<RequestLoraRoute<'a>> {
     // Per-request adapter selection is wired for the plain decode path;
     // combining it with native speculation is deferred (§J), so reject rather
     // than silently ignoring the requested adapter.
@@ -46,11 +47,26 @@ fn resolve_request_lora_route(
         // so a base-only request (plain OR speculative) can never inherit a
         // prior request's adapter. This is the route-bleed fix.
         Ok(RequestLoraRoute::Select(adapter))
-    } else if adapter.is_some() {
-        anyhow::bail!(
-            "a per-request LoRA adapter was requested, but this session was not loaded with a \
-             multi-adapter grouped-LoRA pool (configure EngineConfig::lora_adapters)"
-        );
+    } else if let Some(requested) = adapter {
+        // No grouped pool, but the session may have loaded exactly one adapter
+        // that collapsed to the always-on DIRECT fast path. In that case the
+        // adapter is already applied to every token, so selecting it by name is
+        // a no-op rather than an error. Any other name is genuinely unknown and
+        // fails loud, naming the adapter that WAS loaded so the message is
+        // actionable.
+        match single_adapter_name {
+            Some(loaded) if loaded == requested => Ok(RequestLoraRoute::NoGroupedPool),
+            Some(loaded) => anyhow::bail!(
+                "requested LoRA adapter {requested:?}, but this session loaded a single adapter \
+                 {loaded:?} on the DIRECT fast path; select {loaded:?} (already applied) or load \
+                 a multi-adapter set (EngineConfig::lora_adapters) to switch adapters per request"
+            ),
+            None => anyhow::bail!(
+                "a per-request LoRA adapter {requested:?} was requested, but this session was not \
+                 loaded with a multi-adapter grouped-LoRA pool (configure \
+                 EngineConfig::lora_adapters)"
+            ),
+        }
     } else {
         Ok(RequestLoraRoute::NoGroupedPool)
     }
@@ -152,6 +168,7 @@ impl Engine {
         // selected for THIS request. A no-op for base-only / single-adapter
         // (DIRECT) sessions, keeping the ≤1-adapter fast path byte-for-byte.
         {
+            let single_adapter_name = self.lora_single_adapter_name.clone();
             let native_session = self
                 .native_session
                 .as_mut()
@@ -160,6 +177,7 @@ impl Engine {
                 native_session.has_grouped_lora(),
                 speculation_plan.is_some(),
                 options.adapter.as_deref(),
+                single_adapter_name.as_deref(),
             )? {
                 RequestLoraRoute::Select(adapter) => {
                     // Route every token of THIS request to the resolved adapter
@@ -1442,25 +1460,25 @@ mod lora_route_tests {
     fn grouped_speculative_base_only_resets_route_to_base() {
         // Request A: plain, explicit adapter → route to A.
         assert_eq!(
-            resolve_request_lora_route(true, false, Some("adapter_a")).unwrap(),
+            resolve_request_lora_route(true, false, Some("adapter_a"), None).unwrap(),
             RequestLoraRoute::Select(Some("adapter_a")),
         );
         // Request B: SPECULATIVE, no adapter → MUST reset to base-only, not
         // inherit A. This is the route-bleed regression guard.
         assert_eq!(
-            resolve_request_lora_route(true, true, None).unwrap(),
+            resolve_request_lora_route(true, true, None, None).unwrap(),
             RequestLoraRoute::Select(None),
         );
         // Request C: plain, no adapter → base-only.
         assert_eq!(
-            resolve_request_lora_route(true, false, None).unwrap(),
+            resolve_request_lora_route(true, false, None, None).unwrap(),
             RequestLoraRoute::Select(None),
         );
     }
 
     #[test]
     fn grouped_speculative_with_explicit_adapter_fails_loud() {
-        let error = resolve_request_lora_route(true, true, Some("adapter_a"))
+        let error = resolve_request_lora_route(true, true, Some("adapter_a"), None)
             .expect_err("speculative + explicit adapter must fail loud");
         assert!(
             error.to_string().contains("speculative"),
@@ -1470,11 +1488,36 @@ mod lora_route_tests {
 
     #[test]
     fn non_grouped_adapter_request_fails_loud() {
-        let error = resolve_request_lora_route(false, false, Some("adapter_a"))
+        let error = resolve_request_lora_route(false, false, Some("adapter_a"), None)
             .expect_err("adapter request without a grouped pool must fail loud");
         assert!(
             error.to_string().contains("multi-adapter grouped-LoRA pool"),
             "unexpected error: {error}"
+        );
+    }
+
+    // A single `--adapters NAME=PATH` collapses to the DIRECT fast path but keeps
+    // its selectable NAME. Selecting that same name must be a no-op (already
+    // applied), not an error.
+    #[test]
+    fn collapsed_single_adapter_matching_select_is_noop() {
+        assert_eq!(
+            resolve_request_lora_route(false, false, Some("writer"), Some("writer")).unwrap(),
+            RequestLoraRoute::NoGroupedPool,
+        );
+    }
+
+    // Selecting a DIFFERENT name on a collapsed single-adapter session fails
+    // loud, and the message NAMES the adapter that was actually loaded.
+    #[test]
+    fn collapsed_single_adapter_mismatched_select_names_loaded_adapter() {
+        let error = resolve_request_lora_route(false, false, Some("coder"), Some("writer"))
+            .expect_err("selecting an unloaded adapter must fail loud");
+        let message = error.to_string();
+        assert!(message.contains("coder"), "unexpected error: {message}");
+        assert!(
+            message.contains("writer"),
+            "error must name the loaded adapter: {message}"
         );
     }
 
@@ -1483,11 +1526,11 @@ mod lora_route_tests {
         // ≤1-adapter / base-only sessions carry no grouped route state, so the
         // fast path is left untouched.
         assert_eq!(
-            resolve_request_lora_route(false, false, None).unwrap(),
+            resolve_request_lora_route(false, false, None, None).unwrap(),
             RequestLoraRoute::NoGroupedPool,
         );
         assert_eq!(
-            resolve_request_lora_route(false, true, None).unwrap(),
+            resolve_request_lora_route(false, true, None, None).unwrap(),
             RequestLoraRoute::NoGroupedPool,
         );
     }
