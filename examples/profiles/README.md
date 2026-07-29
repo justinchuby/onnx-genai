@@ -277,63 +277,76 @@ The `compare` binary reports all three numbers — model load, TTFT, and
 their sum — so readers can choose the framing that matches their
 deployment scenario.
 
-## Multi-turn sessions — where our cold-start advantage disappears
+## Multi-turn sessions — session-persistent KV changes the picture
 
-**The cold-start advantage is valid only for single-shot use.** In real
-multi-turn chat (model loaded once, N sequential turns with growing context),
-the picture reverses because:
+PR #397 added session-persistent KV to the native backend via
+`create_native_session` + `generate_native_in_session`. The `multiturn`
+benchmark now uses this session API for native (matching ORT's `create_session`
++ `generate_in_session`). Pass `--native-stateless` to measure the old
+full-re-prefill path.
 
-1. Native re-prefills the **entire conversation** each turn (no persistent KV
-   cache across turns). TTFT grows O(context_length).
-2. ORT maintains a persistent KV session — each turn prefills only the new
-   tokens. ORT TTFT stays ~constant.
+Measured 2026-07-29 on Apple M1 Max (32 GiB, macOS 26.5.2), interleaved A/B,
+3 repetitions, greedy decode with 30 tokens/turn, load 3.6–5.3.
 
-Measured 2026-07-28 on Apple M1 Max (32 GiB, macOS 26.5.2), interleaved A/B,
-3 repetitions, greedy decode with 30 tokens/turn.
-**All numbers below taken under exclusive bench lock at load 1.5–3.6.**
+### Qwen2.5-0.5B-FP16 — native session wins at every turn
 
-### TinyStories-33M (FP32)
+| Metric | Session (KV reuse) | Stateless (re-prefill) |
+|---|---|---|
+| **Break-even turn** | **none (native wins all 10)** | **8** |
+| Native steady-state TTFT | 60 ms (2.5× faster than ORT's 150 ms) | 458 ms (3.0× slower) |
+| Native steady-state decode | 941 ms (1.2× slower than ORT's 782 ms) | 946 ms (1.2× slower) |
+| Over 10 turns | **native 1.13× faster** | ORT 1.18× faster |
+| Native TTFT growth | 0.7× (flat — session KV active) | 8.7× (O(context)) |
+| ORT TTFT growth | 1.2× (flat) | 1.2× (flat) |
 
-| Metric | Value |
-|---|---|
-| **Break-even turn** | **2** |
-| ORT load penalty | 158 ms (4.5× slower than native) |
-| ORT per-turn advantage (steady-state) | 198 ms/turn faster |
-| Native steady-state TTFT | 93 ms (3.4× slower than ORT's 28 ms) |
-| Native steady-state decode | 236 ms (2.3× slower than ORT's 103 ms) |
-| Over 10 turns | **ORT 2.1× faster overall** |
-| Native TTFT growth | 23 ms → 148 ms (6.5× across 10 turns) |
-| ORT TTFT growth | 12 ms → 30 ms (flat — only new-token prefill) |
+Corroborated with second run at load 4.5–5.8: no break-even, native 1.12×
+faster overall, steady-state TTFT 59.5 ms vs ORT 152 ms.
 
-Corroborated with second run at load 1.7–3.6: break-even turn 1, ORT 2.3×
-faster overall, steady-state TTFT ratio 3.8×.
+**Session-persistent KV eliminated the Qwen multi-turn deficit.** Native
+TTFT is 2.5× faster than ORT's (60 ms vs 150 ms). The remaining gap is
+decode: native is 1.2× slower per turn. But native's 5.6–6.1× load advantage
+means the break-even for ORT's per-turn decode edge would require ~22 turns.
 
-### Qwen2.5-0.5B-FP16
+### TinyStories-33M (FP32) — ORT still wins on decode
 
-| Metric | Value |
-|---|---|
-| **Break-even turn** | **8** |
-| ORT load penalty | 1494 ms (6.2× slower than native) |
-| ORT per-turn advantage (steady-state) | 465 ms/turn faster |
-| Native steady-state TTFT | 463 ms (3.1× slower than ORT's 150 ms) |
-| Native steady-state decode | 922 ms (1.2× slower than ORT's 770 ms) |
-| Over 10 turns | **ORT 1.18× faster overall** |
-| Native TTFT growth | 92 ms → 743 ms (8.1× across 10 turns) |
-| ORT TTFT growth | 129 ms → 150 ms (flat) |
+| Metric | Session (KV reuse) | Stateless (re-prefill) |
+|---|---|---|
+| **Break-even turn** | **1–4** | **3** |
+| Native steady-state TTFT | 21–23 ms (0.8× ORT's 27 ms — native wins) | 96 ms (3.4× slower) |
+| Native steady-state decode | 203–211 ms (1.9–2.0× slower than ORT's 103–105 ms) | 257 ms (2.5× slower) |
+| Over 10 turns | **ORT 1.5–1.7× faster** | ORT 2.2× faster |
+| Native TTFT growth | 1.3× (nearly flat) | 6.9× |
+| ORT TTFT growth | 3.2× | 3.1× |
 
-### Why this reverses the published conclusion
+Session-persistent KV helped native TTFT (now faster than ORT), but ORT still
+wins overall because native decode is ~2× slower on this small FP32 model.
+The decode gap is the bottleneck — not prefill.
 
-PR #351 established native's cold-start advantage: 2.47–4.63× faster from
-process start to first token. **That holds for one-shot invocations only.**
-For any session longer than 3–8 turns, ORT is cumulatively faster because
-its per-turn cost is dramatically lower.
+**Why ORT TTFT grows 3.2× on TinyStories:** ORT's session incremental path
+still shows TTFT growth because the assistant-response tokens from prior turns
+are added to the session's KV in the incremental prompt. This is expected
+behaviour — the overhead comes from the growing session state, not re-prefill.
 
-**Root cause is NOT pre-packing amortisation.** It is the absence of
-session-persistent KV in the native backend. ORT's `create_session` +
-`generate_in_session` maintains KV state, so each turn processes only new
-tokens. Native has no equivalent — it re-prefills the entire growing
-conversation each turn. Pre-packing the weights would not help; the fix is
-architectural (persistent KV sessions for the native backend).
+### Session vs stateless — what the session API buys
+
+| Model | Metric | Session | Stateless | Improvement |
+|---|---|---:|---:|---|
+| Qwen-0.5B-f16 | steady TTFT | 60 ms | 458 ms | **7.6× faster** |
+| Qwen-0.5B-f16 | 10-turn total | 9.5 s | 12.9 s | **1.36× faster** |
+| TinyStories-33M | steady TTFT | 21 ms | 96 ms | **4.6× faster** |
+| TinyStories-33M | 10-turn total | 2.1 s | 3.2 s | **1.5× faster** |
+
+### What native still needs to win TinyStories at every turn count
+
+Native TTFT already beats ORT (21 ms vs 27 ms). The gap is decode:
+
+| Model | Per-decode target | Current | Reduction needed |
+|---|---|---|---|
+| TinyStories-33M | ≤ 105 ms | 203 ms | 48% |
+
+The decode deficit on small FP32 models is the remaining competitive gap.
+ORT's pre-packed GEMV layouts achieve higher cache efficiency on cache-resident
+models — this is a kernel-level gap, not architectural.
 
 ### Cache-survival finding
 
@@ -344,18 +357,6 @@ turns:
   then stable across repetitions — not rebuilt per turn)
 
 Caches survive because the Engine and its model mmap persist across turns.
-This is NOT the cause of the multi-turn deficit.
-
-### What native needs to be competitive at every turn count
-
-| Model | Per-prefill target | Per-decode target |
-|---|---|---|
-| TinyStories-33M | ≤ 28 ms (currently 93 ms, −70%) | ≤ 103 ms (currently 236 ms, −56%) |
-| Qwen2.5-0.5B-f16 | ≤ 150 ms (currently 463 ms, −68%) | ≤ 770 ms (currently 922 ms, −16%) |
-
-These reductions are unreachable by kernel speedup alone — the O(context)
-re-prefill makes it structurally impossible to match ORT's O(new_tokens)
-prefill. **Session-persistent KV is the prerequisite.**
 
 ## Batch inference — vision models
 
