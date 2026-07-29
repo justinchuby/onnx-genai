@@ -98,6 +98,58 @@ pub(super) fn intra_op_threads_from_env() -> Option<i32> {
     }
 }
 
+/// Effective ORT intra-op thread count for session creation.
+///
+/// Precedence is: explicit API > `ONNX_GENAI_INTRA_OP_THREADS` > platform
+/// CPU default > ORT's own default (0).
+pub(super) fn effective_intra_op_threads(options: &SessionOptions) -> i32 {
+    if options.intra_op_num_threads > 0 {
+        return options.intra_op_num_threads;
+    }
+    intra_op_threads_from_env()
+        .or_else(|| default_cpu_ort_intra_op_threads(options))
+        .unwrap_or(0)
+}
+
+fn default_cpu_ort_intra_op_threads(options: &SessionOptions) -> Option<i32> {
+    if !options
+        .execution_providers
+        .iter()
+        .all(|ep| ep.caps.is_host())
+    {
+        return None;
+    }
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|available| default_cpu_ort_intra_op_threads_for_available(available.get()))
+}
+
+pub(super) fn default_cpu_ort_intra_op_threads_for_available(available: usize) -> Option<i32> {
+    default_cpu_ort_intra_op_threads_for_available_on(
+        available,
+        cfg!(all(target_os = "windows", target_arch = "aarch64")),
+    )
+}
+
+pub(super) fn default_cpu_ort_intra_op_threads_for_available_on(
+    available: usize,
+    windows_arm64: bool,
+) -> Option<i32> {
+    if !windows_arm64 {
+        return None;
+    }
+
+    // Match ONNX Runtime GenAI's default policy in src/models/model.cpp:
+    // SetIntraOpNumThreads(min(max(1, hardware_concurrency() / 2), 16)).
+    // That avoids all-core ORT CPU decode on Windows ARM64 Snapdragon parts,
+    // where int4 decode is memory-bandwidth-bound rather than core-count-bound.
+    //
+    // TODO: refine with a cache-cluster cap once onnx-runtime-cpuinfo exposes
+    // all cache records; its current wrapper only records the first L2/L3 entry,
+    // so cluster detection is unreliable.
+    Some(((available / 2).clamp(1, 16)) as i32)
+}
+
 /// Whether to disable WebGPU validation. Default true (safe overhead
 /// reduction); set `ONNX_GENAI_WEBGPU_VALIDATION=1` to keep validation on.
 pub(super) fn webgpu_disable_validation_from_env() -> bool {

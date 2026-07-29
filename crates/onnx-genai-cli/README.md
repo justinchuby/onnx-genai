@@ -77,6 +77,11 @@ peak-throughput automatic default is unchanged. This controls native decode
 workers; use an OS cpuset/taskset as well when the entire process, including
 prefill or ONNX Runtime work, must be hard-confined.
 
+For the ONNX Runtime CPU backend, use `ONNX_GENAI_INTRA_OP_THREADS=N` to
+override ORT intra-op parallelism. On Windows ARM64, the automatic ORT CPU
+default matches onnxruntime-genai: half of logical CPUs, capped at 16. Other
+platforms leave ORT's own default unchanged.
+
 ### Decode-plan memo (default on)
 
 On the native CPU decode path, a steady-state decode-plan memo caches the
