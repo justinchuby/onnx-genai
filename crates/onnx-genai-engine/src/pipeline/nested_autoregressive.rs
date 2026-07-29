@@ -119,7 +119,7 @@ impl PipelineEngine {
         let pre_embed = self.resolve_pre_embedder(&plan, &present, outer_session)?;
         let prefill = self.resolve_prefill(&plan, &present, pre_embed.as_ref(), &tensors)?;
         let inner_embed_output = resolve_inner_embedding_output(inner_session, &plan)?;
-        let mut outer_state = DecodeState::new(outer_session)?;
+        let mut outer_state = DecodeState::new_with_io(outer_session, plan.outer_io.as_ref())?;
         let mut codes: Vec<i64> = Vec::with_capacity(plan.max_frames * plan.num_code_groups);
         // The outer loop feeds the full prompt on frame 0 (prefill), then the
         // previous frame's outer argmax token on each subsequent frame.
@@ -462,14 +462,9 @@ fn run_outer_talker_step(
         outputs
     };
 
-    let outer_logits = named_output(outer_session, &outer_outputs, "logits", true)?;
+    let outer_logits = named_output(outer_session, &outer_outputs, &plan.outer_logits_output)?;
     let outer_token = argmax_last_row(outer_logits)?;
-    let hidden = named_output(
-        outer_session,
-        &outer_outputs,
-        &plan.outer_hidden_output,
-        false,
-    )?;
+    let hidden = named_output(outer_session, &outer_outputs, &plan.outer_hidden_output)?;
     let seed = last_position_hidden(hidden)?;
     Ok(OuterStepOutcome { outer_token, seed })
 }
@@ -485,7 +480,7 @@ fn run_inner_code_loop(
     seed: Value,
     codes: &mut Vec<i64>,
 ) -> anyhow::Result<Vec<i64>> {
-    let mut inner_state = DecodeState::new(inner_session)?;
+    let mut inner_state = DecodeState::new_with_io(inner_session, plan.inner_io.as_ref())?;
     let mut inner_embeds = seed;
     let mut frame_inner_codes: Vec<i64> = Vec::with_capacity(plan.num_code_groups);
     for step in 0..plan.num_code_groups {
@@ -497,7 +492,7 @@ fn run_inner_code_loop(
 
         let inner_outputs =
             run_decode_step_with_extra(inner_session, &mut inner_state, &[0], step, &step_extras)?;
-        let inner_logits = named_output(inner_session, &inner_outputs, "logits", true)?;
+        let inner_logits = named_output(inner_session, &inner_outputs, &plan.inner_logits_output)?;
         let inner_code = argmax_last_row(inner_logits)?;
         codes.push(inner_code);
         frame_inner_codes.push(inner_code);
@@ -506,7 +501,6 @@ fn run_inner_code_loop(
             inner_session,
             &inner_outputs,
             inner_embed_output,
-            false,
         )?)?;
     }
     Ok(frame_inner_codes)
@@ -544,30 +538,18 @@ fn publish_generation_result(
 
 /// Locate a named session output by index and return a reference to its value.
 ///
-/// With `contains == false` the name must match exactly; with `contains == true`
-/// an exact match is preferred but a case-insensitive substring match (e.g. a
-/// prefixed `logits`) is accepted as a fallback, mirroring the decode helpers.
+/// The `name` must match a declared output port EXACTLY. Every nested-AR output
+/// (logits, hidden, per-code embedding) is bound from an explicit metadata port
+/// name, so no substring or case-insensitive fallback is consulted.
 fn named_output<'a>(
     session: &Session,
     outputs: &'a [Value],
     name: &str,
-    contains: bool,
 ) -> anyhow::Result<&'a Value> {
     let index = session
         .output_names()
         .iter()
         .position(|out| out == name)
-        .or_else(|| {
-            if contains {
-                let needle = name.to_ascii_lowercase();
-                session
-                    .output_names()
-                    .iter()
-                    .position(|out| out.to_ascii_lowercase().contains(&needle))
-            } else {
-                None
-            }
-        })
         .with_context(|| format!("model did not expose output '{name}'"))?;
     outputs
         .get(index)

@@ -27,10 +27,6 @@ pub(crate) struct DecodeState {
 }
 
 impl DecodeState {
-    pub(crate) fn new(session: &Session) -> anyhow::Result<Self> {
-        Self::new_with_io(session, None)
-    }
-
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &Session,
