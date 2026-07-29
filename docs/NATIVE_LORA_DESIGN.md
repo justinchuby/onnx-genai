@@ -863,31 +863,31 @@ discovery (Phase 1's `build_manifest`) becomes the **fail-loud fallback**.
   the recommended long-term source of truth (it removes the per-export structural
   guessing risk entirely for linear-attention and future layouts).
 
-### J.7 CUDA sub-phase (clearly scoped later)
+### J.7 CUDA sub-phase (wired dense grouped path)
 
-Deferred, unchanged prerequisites from Phase 1 (§F P5, §I items 3–4), **all
-verified blocking today**:
+`pkg.nxrt::GroupedLoraDelta` is registered by the native CUDA EP and mirrors the
+CPU operator contract. The CUDA kernel reads `x` and the per-row Int32/Int64
+`segments` route, groups rows by adapter on the host, concatenates every group’s
+row indices into one persistent device table with a single upload, and launches
+one dense `X_group @ A_t @ B_t` computation per adapter using its table offset
+before scattering directly into `delta`. This avoids cross-stream reuse of a
+shared row table while groups are in flight. Referenced 64-byte-aligned factor
+pages are copied lazily into persistent device allocations. Base-only rows
+(`segments < 0`) remain zero. Float32, Float16, and BFloat16
+activations/factors are supported; **both dot products accumulate in fp32**, and
+narrowing occurs only at the final output store.
 
-- **Capture-safe `k==0` / null-page zero-fill.** CUDA `MatMul` misses the
-  capture-safe GEMV when `k==0` and the fallback neither zero-fills nor captures
-  (`ep-cuda/src/kernels/matmul.rs`, GEMV gated on `plan.k > 0`). The pool's null
-  page (base-only rows) needs a capture-safe zero delta — either a fixed-rank
-  zero-padded page with `scale=0`, or a `k==0` fast path added first.
-- **Persistent device bindings + adapter pool on device.** Native CUDA rejects
-  `Routed` step inputs (`native_decode/load.rs:353-365`); the pool handle and
-  `segments` must be **direct `DecodeCudaState` bindings**, and the pool arena
-  must live in **device** memory (a mirror of §J.2 on-device, paged by the same
-  LRU/`ByteBudget`).
-- **Capture invalidation on adapter-set change.** The device-graph replay
-  signature is pointer+shape, not contents (`state.rs:562-606`,
-  `bindings.rs:245-257`), so **same-shape** content swaps (a fixed-capacity pool)
-  are capture-safe, but any change to the **set of resident pages / their
-  addresses / `segments` shape** must invalidate and re-arm capture. Fixed device
-  pool capacity (zero-padded ranks, stable addresses) is the simplest capture-safe
-  design; a page swap keeps addresses and only rewrites contents.
+The mixed route `[A,B,base,A]` is numerically verified on an NVIDIA H200 against
+both the CPU `GroupedLoraDelta` kernel and an independent closed-form reference.
+The CUDA implementation is deliberately an eager CUDA-graph seam: dynamic
+`segments` are copied to the host for grouping, and factor pages may be bound on
+first use. `capture_support()` therefore rejects capture with an actionable
+reason rather than risking stale routes or changing page pointers inside a
+captured graph.
 
-CUDA is **P2g+**, gated on the CPU subsystem (P2a–P2f) landing and on real
-multi-tenant GPU demand.
+Still deferred within P2g+: device-side grouping/BGMV/SGMV, capture-safe fixed
+page tables and same-shape route updates, asynchronous page prefetch/eviction,
+and removal of the small per-run `segments` device-to-host transfer.
 
 ### J.8 Phased plan (P2a…P2g)
 
@@ -1040,6 +1040,13 @@ than the previous misleading "session was not loaded with a grouped pool" error.
   adapter A vs B vs base per run and asserts each output equals that adapter's
   delta, A ≠ B, and an unknown name fails loud). The single-adapter
   `engine_lora_path_applies_and_reverts_adapter_delta` still passes unchanged.
+* **CUDA grouped LoRA (§J.7).** The native CUDA registry claims
+  `pkg.nxrt::GroupedLoraDelta`; referenced factor pages and the concatenated
+  per-run row table are device-resident, mixed adapters and base-only rows execute
+  on CUDA with fp32 accumulation, and GPU parity plus a repeated large
+  three-adapter routing stress test verify correct, stable routing. CUDA-graph
+  capture intentionally splits at this eager seam until device-side grouping and
+  fixed capture-safe page tables land.
 
 **Deferred (honestly not done in this pass).**
 
@@ -1050,7 +1057,5 @@ than the previous misleading "session was not loaded with a grouped pool" error.
   backend delivers **per-request-grouped** selection (one adapter per generate
   call), which is end-to-end reachable and tested; the batched backend still
   routes a whole batch to base. This is the remaining step to the full §J vision.
-* **CUDA** grouped LoRA (§J.7): the grouped path is CPU-only and fails loud if a
-  grouped pool meets a CUDA execution provider.
 * **Speculative decoding + grouped adapter** combined: rejected fail-loud (the
   draft/verify paths do not yet thread the route).
