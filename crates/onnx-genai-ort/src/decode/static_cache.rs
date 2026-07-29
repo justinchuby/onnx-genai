@@ -1,7 +1,6 @@
 use super::*;
 
 pub(super) struct StaticCachePair {
-    pub(super) index: usize,
     pub(super) key_input: TensorInfo,
     pub(super) value_input: TensorInfo,
     pub(super) key_output: String,

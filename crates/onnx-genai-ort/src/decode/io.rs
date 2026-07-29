@@ -78,10 +78,10 @@ fn kv_pair(session: &Session, past_name: &str, present_name: &str) -> Result<KvP
 ///
 /// The `write_indices`/`kv_sequence_length` scatter control inputs are integer
 /// vectors and therefore SHAPE-indistinguishable, so their names come only from
-/// explicit `model.io.static_cache` metadata (or the transitional hardcoded
-/// fallback when a graph declares none). The token/position ports come from the
-/// ordinary `model.io` roles. Nothing is interpreted from a graph port name
-/// once metadata is declared.
+/// explicit `model.io.static_cache` metadata. The token/position ports come from
+/// the ordinary `model.io` roles. Nothing is ever interpreted from a graph port
+/// name: a static-cache graph without `model.io.static_cache` is rejected rather
+/// than name-guessed.
 #[derive(Debug, Clone)]
 pub(super) struct StaticCacheAbi {
     pub(super) token_input: String,
@@ -127,7 +127,7 @@ pub(super) fn detect_static_cache(
     if let Some(spec) = io.and_then(|io| io.static_cache.as_ref()) {
         return detect_static_cache_from_spec(session, io, spec).map(Some);
     }
-    detect_static_cache_by_convention(session, io)
+    reject_undeclared_static_cache(session)
 }
 
 /// Resolve the static-cache ABI from explicit `model.io.static_cache` metadata.
@@ -157,7 +157,6 @@ fn detect_static_cache_from_spec(
         require_declared_output(session, &spec.value_cache_outputs[index])?;
         accumulate_static_cache_layer(&mut geometry, index, &key_input, &value_input)?;
         pairs.push(StaticCachePair {
-            index,
             key_input,
             value_input,
             key_output: spec.key_cache_outputs[index].clone(),
@@ -182,73 +181,36 @@ fn detect_static_cache_from_spec(
     Ok((signature, pairs, abi))
 }
 
-/// Transitional no-metadata fallback: recognize the historical hardcoded
-/// scatter-ABI port names. Retained only until exporters emit
-/// `model.io.static_cache`; it never guesses generation-critical roles by shape.
-fn detect_static_cache_by_convention(
+/// Fail-closed guard for the no-metadata path.
+///
+/// The TensorScatter static-cache scatter ABI is driven by SHAPE-indistinguish-
+/// able integer control ports (`write_indices` / `kv_sequence_length`), so it can
+/// only be bound from explicit `model.io.static_cache` metadata — never guessed
+/// from graph port names. When a graph exposes the historical scatter control
+/// ports but declares no `static_cache` spec, we refuse to interpret those names
+/// and instead return an actionable error naming the exact key to declare. Graphs
+/// that expose no static-cache scatter ABI return `Ok(None)` so the ordinary KV
+/// path handles them.
+fn reject_undeclared_static_cache(
     session: &Session,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
 ) -> Result<Option<(StaticCacheSignature, Vec<StaticCachePair>, StaticCacheAbi)>> {
-    let has_write_indices = session
+    let looks_like_static_cache = session
         .input_names()
         .iter()
-        .any(|name| name == "write_indices");
-    let has_nonpad = session
-        .input_names()
-        .iter()
-        .any(|name| name == "nonpad_kv_seqlen");
-    if !has_write_indices || !has_nonpad {
+        .any(|name| name == "write_indices" || name == "nonpad_kv_seqlen");
+    if !looks_like_static_cache {
         return Ok(None);
     }
-
-    let mut indices = session
-        .inputs()
-        .iter()
-        .filter_map(|input| static_cache_suffix(&input.name, "key_cache."))
-        .collect::<Vec<_>>();
-    indices.sort_unstable();
-    indices.dedup();
-    if indices.is_empty() {
-        return Ok(None);
-    }
-
-    let mut pairs = Vec::with_capacity(indices.len());
-    let mut geometry = None;
-    for index in indices {
-        let key_name = format!("key_cache.{index}");
-        let value_name = format!("value_cache.{index}");
-        let key_output = format!("updated_key_cache.{index}");
-        let value_output = format!("updated_value_cache.{index}");
-        let key_input = declared_input(session, &key_name)?;
-        let value_input = declared_input(session, &value_name)?;
-        require_declared_output(session, &key_output)?;
-        require_declared_output(session, &value_output)?;
-        accumulate_static_cache_layer(&mut geometry, index, &key_input, &value_input)?;
-        pairs.push(StaticCachePair {
-            index,
-            key_input,
-            value_input,
-            key_output,
-            value_output,
-        });
-    }
-    pairs.sort_by_key(|pair| pair.index);
-    let (max_len, kv_dim, dtype) =
-        geometry.ok_or_else(|| OrtError::InvalidArgument("non-empty static cache pairs".into()))?;
-    let abi = StaticCacheAbi {
-        token_input: token_input_name(session, io),
-        position_ids_input: position_ids_input_name(session, io),
-        write_indices_input: "write_indices".to_string(),
-        kv_sequence_length_input: "nonpad_kv_seqlen".to_string(),
-    };
-    let signature = StaticCacheSignature {
-        layers: pairs.len(),
-        max_len,
-        kv_dim,
-        dtype,
-        has_position_ids: abi.position_ids_input.is_some(),
-    };
-    Ok(Some((signature, pairs, abi)))
+    Err(OrtError::InvalidArgument(
+        "graph exposes a TensorScatter static-cache scatter ABI but declares no \
+         `model.io.static_cache`; its integer scatter control ports \
+         (write_indices / kv_sequence_length) are shape-indistinguishable and \
+         cannot be bound by port name. Declare `model.io.static_cache` with \
+         write_indices_input, kv_sequence_length_input, and the positionally \
+         paired key_cache_inputs / value_cache_inputs / key_cache_outputs / \
+         value_cache_outputs."
+            .into(),
+    ))
 }
 
 /// Resolve the token-sequence input: explicit `model.io.token_input`, else the
@@ -352,10 +314,6 @@ fn accumulate_static_cache_layer(
         }
     }
     Ok(())
-}
-
-fn static_cache_suffix(name: &str, prefix: &str) -> Option<usize> {
-    name.strip_prefix(prefix)?.parse().ok()
 }
 
 fn validate_static_cache_tensor(info: &TensorInfo) -> Result<()> {

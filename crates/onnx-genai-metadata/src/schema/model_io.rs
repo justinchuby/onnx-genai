@@ -177,10 +177,9 @@ pub struct ModelIoSpec {
     /// control ports are integer vectors and are therefore SHAPE-indistinguish-
     /// able from one another, so shape cannot disambiguate them: the ABI must be
     /// declared explicitly. When present, this spec is authoritative and the
-    /// runtime binds exactly these ports; when absent, a graph is treated as a
-    /// static-cache model only if it exposes the ports by name (a transitional
-    /// fallback that emits nothing new and is slated for removal once exporters
-    /// emit this spec).
+    /// runtime binds exactly these ports. When absent, a graph that exposes the
+    /// scatter ABI is REJECTED with an actionable error naming this key rather
+    /// than having its integer control ports guessed by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_cache: Option<StaticCacheIoSpec>,
 }
