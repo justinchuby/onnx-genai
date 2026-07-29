@@ -194,6 +194,7 @@ impl AppState {
             id: model_id,
             path: model_dir.to_path_buf(),
             eager: true,
+            warmup: false,
         };
         let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
         Ok(Self {
