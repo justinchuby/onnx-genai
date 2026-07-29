@@ -134,6 +134,12 @@ pub enum AdapterLoadError {
     },
     #[error("tensor geometry for {key:?} overflows the platform address space")]
     GeometryOverflow { key: String },
+    #[error(
+        "ONNX Runtime adapter parameter {key:?} carries LoRA scale/alpha metadata ({token:?}), \
+         which contradicts the assumption that the exporter pre-scales the B factor \
+         (scale = 1.0); refusing to load rather than silently mis-scale the delta"
+    )]
+    UnexpectedScaleParameter { key: String, token: &'static str },
 }
 
 #[derive(Debug, Deserialize)]
@@ -241,6 +247,27 @@ pub fn load_adapter(path: impl AsRef<Path>) -> Result<LoadedAdapter, AdapterLoad
 /// `[K, rank]` and `[rank, N]` orientation and multiplies the B factor by the
 /// PEFT scale before export. Therefore these tensors are retained as-is and the
 /// format-agnostic representation records `scale = 1` and `alpha = rank`.
+///
+/// This is not an assumption of convenience — it is the documented ORT
+/// convention, confirmed from two authoritative sources:
+///   * The adapter FlatBuffer schema
+///     (`onnxruntime/lora/adapter_format/adapter_schema.fbs`) has **no**
+///     alpha / scale / rank field. A `Parameter` is only
+///     `{name, dims, data_type, raw_data}` and an `Adapter` is
+///     `{format_version, adapter_version, model_version, parameters}`; there is
+///     nowhere in the container to carry a scale, so the scale must already be
+///     folded into the weights.
+///   * Olive's `extract_adapters.py` simply relocates the `lora_A` / `lora_B`
+///     initializers out of the ONNX model into the adapter file (matching the
+///     `lora_A -> MatMul` / `lora_B -> MatMul` pattern) and applies no scaling,
+///     i.e. whatever scale the PEFT→ONNX export baked in stays baked in.
+///
+/// Because the container cannot carry a scale, we keep `scale = 1.0`. As a
+/// guard against a future export that violates this convention,
+/// [`parse_onnx_parameter_name`] fails loud (via
+/// [`AdapterLoadError::UnexpectedScaleParameter`]) if it ever encounters a
+/// parameter that advertises a scale/alpha, rather than silently skipping it
+/// and mis-scaling the delta.
 pub fn load_onnx_adapter(path: impl AsRef<Path>) -> Result<LoadedAdapter, AdapterLoadError> {
     let path = path.as_ref();
     let bytes = fs::read(path).map_err(|source| AdapterLoadError::Read {
@@ -651,6 +678,23 @@ fn parse_onnx_parameter_name(key: &str) -> Result<Option<ParsedKey>, AdapterLoad
         .iter()
         .position(|component| matches!(*component, "lora_A" | "lora_B"));
     let Some(factor_position) = factor_position else {
+        // A non-factor parameter is normally metadata we can ignore, but if it
+        // advertises a per-adapter LoRA scale/alpha we must NOT silently skip
+        // it: our loader assumes the exporter has already baked the PEFT scale
+        // into the B factor (scale = 1.0). A scale-bearing parameter would mean
+        // that assumption is false for this container, so fail loud rather than
+        // apply a silently wrong delta.
+        for component in &components {
+            let lowered = component.to_ascii_lowercase();
+            for token in ["alpha", "scaling", "scale", "lora_rank"] {
+                if lowered.contains(token) {
+                    return Err(AdapterLoadError::UnexpectedScaleParameter {
+                        key: key.to_owned(),
+                        token,
+                    });
+                }
+            }
+        }
         return Ok(None);
     };
     let factor = if components[factor_position] == "lora_A" {
@@ -1194,6 +1238,124 @@ mod tests {
             tensor_f32_values(&module.b_transposed),
             [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
         );
+    }
+
+    /// Row-major matmul of `a` [rows, inner] by `b` [inner, cols] -> [rows, cols].
+    fn matmul(a: &[f32], rows: usize, inner: usize, b: &[f32], cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                let mut acc = 0.0f32;
+                for k in 0..inner {
+                    acc += a[r * inner + k] * b[k * cols + c];
+                }
+                out[r * cols + c] = acc;
+            }
+        }
+        out
+    }
+
+    /// Golden test with a NON-TRIVIAL alpha (alpha != rank).
+    ///
+    /// The ORT `.onnx_adapter` container cannot carry a scale, so ORT bakes the
+    /// PEFT scale (`alpha / rank`) into the B factor at export time and we load
+    /// `scale = 1.0`. This test pins that contract numerically: it exports an
+    /// adapter whose intended alpha is 16 at rank 2 (PEFT scale = 8.0) by
+    /// pre-scaling B by 8.0, then asserts that applying the loaded delta
+    /// (`scale * (A @ B_stored)`) reproduces the intended `(alpha / rank) *
+    /// (A @ B_raw)` delta. A future non-pre-scaled export that instead relied on
+    /// the loader to apply `alpha / rank` would leave `scale = 1.0` and produce a
+    /// delta 8x too small, failing this assertion instead of silently
+    /// mis-scaling.
+    #[test]
+    fn lora_onnx_adapter_prescaled_b_reproduces_nontrivial_alpha_delta() {
+        let rank = 2usize;
+        let k = 3usize;
+        let n = 2usize;
+        let intended_alpha = 16.0f32;
+        let peft_scale = intended_alpha / rank as f32; // 8.0
+
+        // A is stored [K, rank]; B is stored [rank, N].
+        let a_values = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]; // [3, 2]
+        let b_raw = [1.0, 2.0, 3.0, 4.0]; // [2, 2], unscaled PEFT B
+        let b_prescaled: Vec<f32> = b_raw.iter().map(|value| value * peft_scale).collect();
+
+        let (_directory, path) = write_onnx_adapter(vec![
+            (
+                "model.layers.0.attn.q_proj.lora_A.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![k as i64, rank as i64],
+                f32_bytes(&a_values),
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_B.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![rank as i64, n as i64],
+                f32_bytes(&b_prescaled),
+            ),
+        ]);
+
+        let adapter = load_adapter(&path).unwrap();
+        let module = adapter.modules.values().next().unwrap();
+
+        assert_eq!(module.rank, rank);
+        assert_eq!(module.alpha, rank as f32, "alpha mirrors rank; no scale field");
+        assert_eq!(
+            module.scale, 1.0,
+            "ORT bakes the scale into B, so the loader must record scale = 1.0"
+        );
+
+        let a_loaded = tensor_f32_values(&module.a_transposed);
+        let b_loaded = tensor_f32_values(&module.b_transposed);
+
+        // Effective delta actually applied at inference: scale * (A @ B_stored).
+        let effective: Vec<f32> = matmul(&a_loaded, k, rank, &b_loaded, n)
+            .into_iter()
+            .map(|value| value * module.scale)
+            .collect();
+
+        // Intended PEFT delta with the non-trivial alpha: (alpha / rank) * (A @ B_raw).
+        let expected: Vec<f32> = matmul(&a_values, k, rank, &b_raw, n)
+            .into_iter()
+            .map(|value| value * peft_scale)
+            .collect();
+
+        assert_eq!(
+            effective, expected,
+            "pre-scaled B + scale=1.0 must reproduce the intended alpha/rank-scaled delta"
+        );
+    }
+
+    /// A parameter that advertises a per-adapter scale/alpha must fail loud
+    /// rather than be silently skipped, because our loader assumes the exporter
+    /// pre-scaled B (`scale = 1.0`); a scale-bearing container would violate that.
+    #[test]
+    fn lora_onnx_adapter_scale_parameter_fails_loud() {
+        let (_directory, path) = write_onnx_adapter(vec![
+            (
+                "model.layers.0.attn.q_proj.lora_A.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![2, 1],
+                f32_bytes(&[1.0, 2.0]),
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_B.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![1, 2],
+                f32_bytes(&[3.0, 4.0]),
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_alpha",
+                TensorDataType::FLOAT,
+                vec![1],
+                f32_bytes(&[16.0]),
+            ),
+        ]);
+
+        assert!(matches!(
+            load_adapter(&path).unwrap_err(),
+            AdapterLoadError::UnexpectedScaleParameter { token: "alpha", .. }
+        ));
     }
 
     #[test]
