@@ -295,7 +295,6 @@ struct PackedN16SdotWeight {
     values: Vec<i8>,
     scales: Vec<f32>,
     zero_point_offsets: Vec<i16>,
-    centered_group_sums_32: Vec<i16>,
 }
 
 #[cfg(test)]
@@ -2507,7 +2506,6 @@ fn numa_place_n16_sdot(weight: PackedN16SdotWeight, n: usize) -> PackedN16SdotWe
             values: numa.place_rows(&weight.values, n.div_ceil(N16_SDOT_OUTPUTS)),
             scales: numa.place_rows(&weight.scales, n),
             zero_point_offsets: numa.place_rows(&weight.zero_point_offsets, n),
-            centered_group_sums_32: numa.place_rows(&weight.centered_group_sums_32, n),
         };
     }
     if let Some(spmd) = spmd_decode_active() {
@@ -2515,7 +2513,6 @@ fn numa_place_n16_sdot(weight: PackedN16SdotWeight, n: usize) -> PackedN16SdotWe
             values: spmd.place_rows(&weight.values, n.div_ceil(N16_SDOT_OUTPUTS)),
             scales: spmd.place_rows(&weight.scales, n),
             zero_point_offsets: spmd.place_rows(&weight.zero_point_offsets, n),
-            centered_group_sums_32: spmd.place_rows(&weight.centered_group_sums_32, n),
         };
     }
     weight
@@ -3139,12 +3136,10 @@ fn prepack_n16_sdot_from_bytes(
     let groups_per_block = block_size / N16_SDOT_K_GROUP;
     let tile_count = n.div_ceil(N16_SDOT_OUTPUTS);
     let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
-    let k_groups_32 = k.div_ceil(32);
     let zero_point_row_size = (k_blocks * bits).div_ceil(8);
     let midpoint = 1i16 << (bits - 1);
     let mut values = vec![0i8; tile_count * tile_stride];
     let mut zero_point_offsets = vec![0i16; n * k_blocks];
-    let mut centered_group_sums_32 = vec![0i16; n * k_groups_32];
 
     for output in 0..n {
         let tile = output / N16_SDOT_OUTPUTS;
@@ -3174,9 +3169,6 @@ fn prepack_n16_sdot_from_bytes(
                     } else {
                         0
                     };
-                    if depth < k {
-                        centered_group_sums_32[output * k_groups_32 + depth / 32] += centered;
-                    }
                     let index = tile * tile_stride
                         + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
                         + lane * N16_SDOT_K_GROUP
@@ -3191,7 +3183,6 @@ fn prepack_n16_sdot_from_bytes(
         values,
         scales,
         zero_point_offsets,
-        centered_group_sums_32,
     }
 }
 
@@ -3231,36 +3222,70 @@ fn n16_sdot_matmul_m1(
     #[cfg(test)]
     N16_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    #[cfg(target_arch = "aarch64")]
-    if matches!(dot_kernel, DotKernel::NeonDot) {
-        // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
-        // detection; the prepack layout is validated by the debug assertions.
-        unsafe {
-            n16_sdot_matmul_m1_neon_dot(
-                &activation,
-                &activation_scales,
-                &activation_sums,
-                weight,
-                result,
-                n,
-                k_blocks,
-                groups_per_block,
-            );
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        #[cfg(target_arch = "aarch64")]
+        if matches!(dot_kernel, DotKernel::NeonDot) {
+            // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
+            // detection; the prepack layout is validated by the debug assertions.
+            unsafe {
+                n16_sdot_matmul_m1_neon_dot(
+                    &activation,
+                    &activation_scales,
+                    &activation_sums,
+                    weight,
+                    output_start,
+                    outputs,
+                    n,
+                    k_blocks,
+                    groups_per_block,
+                );
+            }
+            return;
         }
+
+        let _ = dot_kernel;
+        n16_sdot_matmul_m1_scalar(
+            &activation,
+            &activation_scales,
+            &activation_sums,
+            weight,
+            output_start,
+            outputs,
+            k_blocks,
+            groups_per_block,
+        );
+    };
+    parallel_n16_output_rows(result, padded_k, compute);
+}
+
+fn parallel_n16_output_rows<F>(result: &mut [f32], k: usize, compute: F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    if let Some(spmd) = spmd_decode_active() {
+        spmd.dispatch_output_rows_indexed(result, N16_SDOT_OUTPUTS, &|_, start, outputs| {
+            compute(start, outputs)
+        });
         return;
     }
-
-    let _ = dot_kernel;
-    n16_sdot_matmul_m1_scalar(
-        &activation,
-        &activation_scales,
-        &activation_sums,
-        weight,
-        result,
-        n,
-        k_blocks,
-        groups_per_block,
-    );
+    if let Some(numa) = numa_decode_active() {
+        numa.dispatch_output_rows(result, k, &compute);
+        return;
+    }
+    let chunk = output_chunk_len(result.len(), k);
+    let chunk = if chunk < result.len() {
+        chunk.div_ceil(N16_SDOT_OUTPUTS) * N16_SDOT_OUTPUTS
+    } else {
+        chunk
+    };
+    if chunk < result.len() {
+        result
+            .par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(chunk_index, outputs)| compute(chunk_index * chunk, outputs));
+    } else {
+        compute(0, result);
+    }
 }
 
 fn activation_signed_block_sums(activation: &[i8], k_blocks: usize, block_size: usize) -> Vec<i32> {
@@ -3282,39 +3307,54 @@ fn n16_sdot_matmul_m1_scalar(
     activation_scales: &[f32],
     activation_sums: &[i32],
     weight: &PackedN16SdotWeight,
+    output_start: usize,
     result: &mut [f32],
-    n: usize,
     k_blocks: usize,
     groups_per_block: usize,
 ) {
-    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
-    let tile_count = n.div_ceil(N16_SDOT_OUTPUTS);
-    for tile in 0..tile_count {
-        let output_start = tile * N16_SDOT_OUTPUTS;
-        let output_end = (output_start + N16_SDOT_OUTPUTS).min(n);
-        for (lane, output_value) in result[output_start..output_end].iter_mut().enumerate() {
-            let output = output_start + lane;
-            let mut total = 0.0f32;
-            for block in 0..k_blocks {
-                let mut dot = weight.zero_point_offsets[output * k_blocks + block] as i32
-                    * activation_sums[block];
-                for group in 0..groups_per_block {
-                    let base = tile * tile_stride
-                        + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
-                        + lane * N16_SDOT_K_GROUP;
-                    let activation_base =
-                        block * groups_per_block * N16_SDOT_K_GROUP + group * N16_SDOT_K_GROUP;
-                    for kk in 0..N16_SDOT_K_GROUP {
-                        dot += weight.values[base + kk] as i32
-                            * activation[activation_base + kk] as i32;
-                    }
-                }
-                total += dot as f32
-                    * (weight.scales[output * k_blocks + block] * activation_scales[block]);
-            }
-            *output_value = total;
-        }
+    for (offset, output_value) in result.iter_mut().enumerate() {
+        let output = output_start + offset;
+        *output_value = n16_sdot_int4_output_scalar(
+            activation,
+            activation_scales,
+            activation_sums,
+            weight,
+            output,
+            k_blocks,
+            groups_per_block,
+        );
     }
+}
+
+fn n16_sdot_int4_output_scalar(
+    activation: &[i8],
+    activation_scales: &[f32],
+    activation_sums: &[i32],
+    weight: &PackedN16SdotWeight,
+    output: usize,
+    k_blocks: usize,
+    groups_per_block: usize,
+) -> f32 {
+    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let tile = output / N16_SDOT_OUTPUTS;
+    let lane = output % N16_SDOT_OUTPUTS;
+    let mut total = 0.0f32;
+    for block in 0..k_blocks {
+        let mut dot =
+            weight.zero_point_offsets[output * k_blocks + block] as i32 * activation_sums[block];
+        for group in 0..groups_per_block {
+            let base = tile * tile_stride
+                + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
+                + lane * N16_SDOT_K_GROUP;
+            let activation_base =
+                block * groups_per_block * N16_SDOT_K_GROUP + group * N16_SDOT_K_GROUP;
+            for kk in 0..N16_SDOT_K_GROUP {
+                dot += weight.values[base + kk] as i32 * activation[activation_base + kk] as i32;
+            }
+        }
+        total += dot as f32 * (weight.scales[output * k_blocks + block] * activation_scales[block]);
+    }
+    total
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -3334,7 +3374,6 @@ fn n16_sdot_u8_i16_matmul_m1(
     debug_assert_eq!(activation.len(), k);
     debug_assert_eq!(weight.scales.len(), n * k_blocks);
     debug_assert_eq!(weight.zero_point_offsets.len(), n * k_blocks);
-    debug_assert_eq!(weight.centered_group_sums_32.len(), n * k_groups_32);
     debug_assert_eq!(result.len(), n);
 
     let mut quantized = vec![0i16; k];
@@ -3359,36 +3398,40 @@ fn n16_sdot_u8_i16_matmul_m1(
     #[cfg(test)]
     N16_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    #[cfg(target_arch = "aarch64")]
-    if matches!(dot_kernel, DotKernel::NeonDot) {
-        // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
-        // detection; block/group sizes are fixed by the guards above.
-        unsafe {
-            n16_sdot_u8_i16_matmul_m1_neon_dot(
-                &quantized,
-                &group_scales,
-                &group_sums,
-                &block_activation_sums,
-                weight,
-                result,
-                n,
-                k_blocks,
-            );
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        #[cfg(target_arch = "aarch64")]
+        if matches!(dot_kernel, DotKernel::NeonDot) {
+            // SAFETY: `DotKernel::NeonDot` is selected only after runtime dotprod
+            // detection; block/group sizes are fixed by the guards above.
+            unsafe {
+                n16_sdot_u8_i16_matmul_m1_neon_dot(
+                    &quantized,
+                    &group_scales,
+                    &group_sums,
+                    &block_activation_sums,
+                    weight,
+                    output_start,
+                    outputs,
+                    n,
+                    k_blocks,
+                );
+            }
+            return;
         }
-        return;
-    }
 
-    let _ = dot_kernel;
-    n16_sdot_u8_i16_matmul_m1_scalar(
-        &quantized,
-        &group_scales,
-        &group_sums,
-        &block_activation_sums,
-        weight,
-        result,
-        n,
-        k_blocks,
-    );
+        let _ = dot_kernel;
+        n16_sdot_u8_i16_matmul_m1_scalar(
+            &quantized,
+            &group_scales,
+            &group_sums,
+            &block_activation_sums,
+            weight,
+            output_start,
+            outputs,
+            k_blocks,
+        );
+    };
+    parallel_n16_output_rows(result, k, compute);
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -3398,51 +3441,68 @@ fn n16_sdot_u8_i16_matmul_m1_scalar(
     group_sums: &[i32],
     block_activation_sums: &[f32],
     weight: &PackedN16SdotWeight,
+    output_start: usize,
     result: &mut [f32],
-    n: usize,
     k_blocks: usize,
 ) {
+    for (offset, output_value) in result.iter_mut().enumerate() {
+        let output = output_start + offset;
+        *output_value = n16_sdot_bits8_output_scalar(
+            activation,
+            group_scales,
+            group_sums,
+            block_activation_sums,
+            weight,
+            output,
+            k_blocks,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn n16_sdot_bits8_output_scalar(
+    activation: &[i16],
+    group_scales: &[f32],
+    group_sums: &[i32],
+    block_activation_sums: &[f32],
+    weight: &PackedN16SdotWeight,
+    output: usize,
+    k_blocks: usize,
+) -> f32 {
     let groups_per_block = 4usize;
     let groups_per_block_4 = 32 / N16_SDOT_K_GROUP;
     let tile_stride = k_blocks * 128 / N16_SDOT_K_GROUP * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
-    let tile_count = n.div_ceil(N16_SDOT_OUTPUTS);
-    for tile in 0..tile_count {
-        let output_start = tile * N16_SDOT_OUTPUTS;
-        let output_end = (output_start + N16_SDOT_OUTPUTS).min(n);
-        for (lane, output_value) in result[output_start..output_end].iter_mut().enumerate() {
-            let output = output_start + lane;
-            let mut total = 0.0f32;
-            for (block, &block_sum) in block_activation_sums.iter().enumerate().take(k_blocks) {
-                let mut product = 0.0f32;
-                for group_in_block in 0..groups_per_block {
-                    let group = block * groups_per_block + group_in_block;
-                    let mut centered_dot = 0i32;
-                    for sub in 0..groups_per_block_4 {
-                        let group4 = group_in_block * groups_per_block_4 + sub;
-                        let base = tile * tile_stride
-                            + (block * 128 / N16_SDOT_K_GROUP + group4)
-                                * N16_SDOT_OUTPUTS
-                                * N16_SDOT_K_GROUP
-                            + lane * N16_SDOT_K_GROUP;
-                        let activation_base = group * 32 + sub * N16_SDOT_K_GROUP;
-                        for kk in 0..N16_SDOT_K_GROUP {
-                            if activation_base + kk < activation.len() {
-                                centered_dot += weight.values[base + kk] as i32
-                                    * activation[activation_base + kk] as i32;
-                            }
-                        }
+    let tile = output / N16_SDOT_OUTPUTS;
+    let lane = output % N16_SDOT_OUTPUTS;
+    let mut total = 0.0f32;
+    for (block, &block_sum) in block_activation_sums.iter().enumerate().take(k_blocks) {
+        let mut product = 0.0f32;
+        for group_in_block in 0..groups_per_block {
+            let group = block * groups_per_block + group_in_block;
+            let mut centered_dot = 0i32;
+            for sub in 0..groups_per_block_4 {
+                let group4 = group_in_block * groups_per_block_4 + sub;
+                let base = tile * tile_stride
+                    + (block * 128 / N16_SDOT_K_GROUP + group4)
+                        * N16_SDOT_OUTPUTS
+                        * N16_SDOT_K_GROUP
+                    + lane * N16_SDOT_K_GROUP;
+                let activation_base = group * 32 + sub * N16_SDOT_K_GROUP;
+                for kk in 0..N16_SDOT_K_GROUP {
+                    if activation_base + kk < activation.len() {
+                        centered_dot += weight.values[base + kk] as i32
+                            * activation[activation_base + kk] as i32;
                     }
-                    let q_dot = centered_dot + 128 * group_sums[group];
-                    product += group_scales[group] * q_dot as f32;
                 }
-                let scale = weight.scales[output * k_blocks + block];
-                let zero_point =
-                    128i32 - weight.zero_point_offsets[output * k_blocks + block] as i32;
-                total += scale * product - scale * zero_point as f32 * block_sum;
             }
-            *output_value = total;
+            let q_dot = centered_dot + 128 * group_sums[group];
+            product += group_scales[group] * q_dot as f32;
         }
+        let scale = weight.scales[output * k_blocks + block];
+        let zero_point = 128i32 - weight.zero_point_offsets[output * k_blocks + block] as i32;
+        total += scale * product - scale * zero_point as f32 * block_sum;
     }
+    total
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3453,67 +3513,101 @@ unsafe fn n16_sdot_matmul_m1_neon_dot(
     activation_scales: &[f32],
     activation_sums: &[i32],
     weight: &PackedN16SdotWeight,
+    output_start: usize,
     result: &mut [f32],
     n: usize,
     k_blocks: usize,
     groups_per_block: usize,
 ) {
-    use std::arch::aarch64::*;
-
-    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
-    let tile_count = n.div_ceil(N16_SDOT_OUTPUTS);
-    for tile in 0..tile_count {
-        let output_start = tile * N16_SDOT_OUTPUTS;
-        for quad in 0..4 {
-            let mut acc_f32 = vdupq_n_f32(0.0);
-            for block in 0..k_blocks {
-                let mut acc_i32 = vdupq_n_s32(0);
-                for group in 0..groups_per_block {
-                    let activation_base =
-                        block * groups_per_block * N16_SDOT_K_GROUP + group * N16_SDOT_K_GROUP;
-                    let word = u32::from_le_bytes([
-                        activation[activation_base] as u8,
-                        activation[activation_base + 1] as u8,
-                        activation[activation_base + 2] as u8,
-                        activation[activation_base + 3] as u8,
-                    ]);
-                    let act = vreinterpretq_s8_u32(vdupq_n_u32(word));
-                    let weight_base = tile * tile_stride
-                        + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
-                        + quad * 4 * N16_SDOT_K_GROUP;
-                    let weights = unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base)) };
-                    acc_i32 = unsafe { sdot_i8x16(acc_i32, act, weights) };
-                }
-                let mut correction = [0i32; 4];
-                let mut scale = [0.0f32; 4];
-                for lane in 0..4 {
-                    let output = output_start + quad * 4 + lane;
-                    if output < n {
-                        correction[lane] = weight.zero_point_offsets[output * k_blocks + block]
-                            as i32
-                            * activation_sums[block];
-                        scale[lane] = weight.scales[output * k_blocks + block];
-                    }
-                }
-                let corr = unsafe { vld1q_s32(correction.as_ptr()) };
-                let block_i32 = vaddq_s32(acc_i32, corr);
-                let block_f32 = vcvtq_f32_s32(block_i32);
-                let scales = vmulq_n_f32(
-                    unsafe { vld1q_f32(scale.as_ptr()) },
-                    activation_scales[block],
-                );
-                acc_f32 = vaddq_f32(acc_f32, vmulq_f32(block_f32, scales));
-            }
-            let mut out = [0.0f32; 4];
-            unsafe { vst1q_f32(out.as_mut_ptr(), acc_f32) };
-            for (lane, &value) in out.iter().enumerate() {
-                let output = output_start + quad * 4 + lane;
-                if output < n {
-                    result[output] = value;
-                }
-            }
+    let mut offset = 0usize;
+    while offset < result.len() {
+        let output = output_start + offset;
+        if output.is_multiple_of(4) && output + 4 <= n && offset + 4 <= result.len() {
+            let out = unsafe {
+                n16_sdot_int4_quad_neon(
+                    activation,
+                    activation_scales,
+                    activation_sums,
+                    weight,
+                    output,
+                    k_blocks,
+                    groups_per_block,
+                )
+            };
+            result[offset..offset + 4].copy_from_slice(&out);
+            offset += 4;
+        } else {
+            result[offset] = n16_sdot_int4_output_scalar(
+                activation,
+                activation_scales,
+                activation_sums,
+                weight,
+                output,
+                k_blocks,
+                groups_per_block,
+            );
+            offset += 1;
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn n16_sdot_int4_quad_neon(
+    activation: &[i8],
+    activation_scales: &[f32],
+    activation_sums: &[i32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    k_blocks: usize,
+    groups_per_block: usize,
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+
+    debug_assert!(output_start.is_multiple_of(4));
+    let tile_stride = k_blocks * groups_per_block * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
+    let tile = output_start / N16_SDOT_OUTPUTS;
+    let quad = (output_start % N16_SDOT_OUTPUTS) / 4;
+    let mut acc_f32 = vdupq_n_f32(0.0);
+    for block in 0..k_blocks {
+        let mut acc_i32 = vdupq_n_s32(0);
+        for group in 0..groups_per_block {
+            let activation_base =
+                block * groups_per_block * N16_SDOT_K_GROUP + group * N16_SDOT_K_GROUP;
+            let word = u32::from_le_bytes([
+                activation[activation_base] as u8,
+                activation[activation_base + 1] as u8,
+                activation[activation_base + 2] as u8,
+                activation[activation_base + 3] as u8,
+            ]);
+            let act = vreinterpretq_s8_u32(vdupq_n_u32(word));
+            let weight_base = tile * tile_stride
+                + (block * groups_per_block + group) * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP
+                + quad * 4 * N16_SDOT_K_GROUP;
+            let weights = unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base)) };
+            acc_i32 = unsafe { sdot_i8x16(acc_i32, act, weights) };
+        }
+        let mut correction = [0i32; 4];
+        let mut scale = [0.0f32; 4];
+        for lane in 0..4 {
+            let output = output_start + lane;
+            correction[lane] = weight.zero_point_offsets[output * k_blocks + block] as i32
+                * activation_sums[block];
+            scale[lane] = weight.scales[output * k_blocks + block];
+        }
+        let corr = unsafe { vld1q_s32(correction.as_ptr()) };
+        let block_i32 = vaddq_s32(acc_i32, corr);
+        let block_f32 = vcvtq_f32_s32(block_i32);
+        let scales = vmulq_n_f32(
+            unsafe { vld1q_f32(scale.as_ptr()) },
+            activation_scales[block],
+        );
+        acc_f32 = vaddq_f32(acc_f32, vmulq_f32(block_f32, scales));
+    }
+    let mut out = [0.0f32; 4];
+    unsafe { vst1q_f32(out.as_mut_ptr(), acc_f32) };
+    out
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3525,110 +3619,131 @@ unsafe fn n16_sdot_u8_i16_matmul_m1_neon_dot(
     group_sums: &[i32],
     block_activation_sums: &[f32],
     weight: &PackedN16SdotWeight,
+    output_start: usize,
     result: &mut [f32],
     n: usize,
     k_blocks: usize,
 ) {
+    let mut offset = 0usize;
+    while offset < result.len() {
+        let output = output_start + offset;
+        if output.is_multiple_of(4) && output + 4 <= n && offset + 4 <= result.len() {
+            let out = unsafe {
+                n16_sdot_bits8_quad_neon(
+                    activation,
+                    group_scales,
+                    group_sums,
+                    block_activation_sums,
+                    weight,
+                    output,
+                    k_blocks,
+                )
+            };
+            result[offset..offset + 4].copy_from_slice(&out);
+            offset += 4;
+        } else {
+            result[offset] = n16_sdot_bits8_output_scalar(
+                activation,
+                group_scales,
+                group_sums,
+                block_activation_sums,
+                weight,
+                output,
+                k_blocks,
+            );
+            offset += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn n16_sdot_bits8_quad_neon(
+    activation: &[i16],
+    group_scales: &[f32],
+    group_sums: &[i32],
+    block_activation_sums: &[f32],
+    weight: &PackedN16SdotWeight,
+    output_start: usize,
+    k_blocks: usize,
+) -> [f32; 4] {
     use std::arch::aarch64::*;
 
+    debug_assert!(output_start.is_multiple_of(4));
     let groups_per_block = 4usize;
     let groups_per_block_4 = 32 / N16_SDOT_K_GROUP;
     let tile_stride = k_blocks * 128 / N16_SDOT_K_GROUP * N16_SDOT_OUTPUTS * N16_SDOT_K_GROUP;
-    let tile_count = n.div_ceil(N16_SDOT_OUTPUTS);
-    for tile in 0..tile_count {
-        let output_start = tile * N16_SDOT_OUTPUTS;
-        for quad in 0..4 {
-            let mut total = vdupq_n_f32(0.0);
-            for block in 0..k_blocks {
-                let mut product = vdupq_n_f32(0.0);
-                for group_in_block in 0..groups_per_block {
-                    let group = block * groups_per_block + group_in_block;
-                    let mut acc_hi = vdupq_n_s32(0);
-                    let mut acc_lo = vdupq_n_s32(0);
-                    for sub in 0..groups_per_block_4 {
-                        let group4 = group_in_block * groups_per_block_4 + sub;
-                        let activation_base = group * 32 + sub * N16_SDOT_K_GROUP;
-                        let mut hi_bytes = [0i8; 4];
-                        let mut lo_bytes = [0i8; 4];
-                        for kk in 0..N16_SDOT_K_GROUP {
-                            let value = activation.get(activation_base + kk).copied().unwrap_or(0);
-                            let hi = value.div_euclid(256) as i8;
-                            let lo_center = (value - i16::from(hi) * 256 - 128) as i8;
-                            hi_bytes[kk] = hi;
-                            lo_bytes[kk] = lo_center;
-                        }
-                        let hi_word = u32::from_le_bytes([
-                            hi_bytes[0] as u8,
-                            hi_bytes[1] as u8,
-                            hi_bytes[2] as u8,
-                            hi_bytes[3] as u8,
-                        ]);
-                        let lo_word = u32::from_le_bytes([
-                            lo_bytes[0] as u8,
-                            lo_bytes[1] as u8,
-                            lo_bytes[2] as u8,
-                            lo_bytes[3] as u8,
-                        ]);
-                        let hi_vec = vreinterpretq_s8_u32(vdupq_n_u32(hi_word));
-                        let lo_vec = vreinterpretq_s8_u32(vdupq_n_u32(lo_word));
-                        let weight_base = tile * tile_stride
-                            + (block * 128 / N16_SDOT_K_GROUP + group4)
-                                * N16_SDOT_OUTPUTS
-                                * N16_SDOT_K_GROUP
-                            + quad * 4 * N16_SDOT_K_GROUP;
-                        let weights = unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base)) };
-                        acc_hi = unsafe { sdot_i8x16(acc_hi, hi_vec, weights) };
-                        acc_lo = unsafe { sdot_i8x16(acc_lo, lo_vec, weights) };
-                    }
-                    let mut centered_sums = [0i32; 4];
-                    for lane in 0..4 {
-                        let output = output_start + quad * 4 + lane;
-                        if output < n {
-                            centered_sums[lane] = weight.centered_group_sums_32
-                                [output * group_scales.len() + group]
-                                as i32;
-                        }
-                    }
-                    let centered = unsafe { vld1q_s32(centered_sums.as_ptr()) };
-                    let q_dot = vaddq_s32(
-                        vaddq_s32(acc_lo, vmulq_n_s32(acc_hi, 256)),
-                        vaddq_s32(
-                            vmulq_n_s32(centered, 128),
-                            vdupq_n_s32(128 * group_sums[group]),
-                        ),
-                    );
-                    product = vaddq_f32(
-                        product,
-                        vmulq_n_f32(vcvtq_f32_s32(q_dot), group_scales[group]),
-                    );
+    let tile = output_start / N16_SDOT_OUTPUTS;
+    let quad = (output_start % N16_SDOT_OUTPUTS) / 4;
+    let mut total = vdupq_n_f32(0.0);
+    for block in 0..k_blocks {
+        let mut product = vdupq_n_f32(0.0);
+        for group_in_block in 0..groups_per_block {
+            let group = block * groups_per_block + group_in_block;
+            let mut acc_hi = vdupq_n_s32(0);
+            let mut acc_lo = vdupq_n_s32(0);
+            for sub in 0..groups_per_block_4 {
+                let group4 = group_in_block * groups_per_block_4 + sub;
+                let activation_base = group * 32 + sub * N16_SDOT_K_GROUP;
+                let mut hi_bytes = [0i8; 4];
+                let mut lo_bytes = [0i8; 4];
+                for kk in 0..N16_SDOT_K_GROUP {
+                    let value = activation.get(activation_base + kk).copied().unwrap_or(0);
+                    let hi = value.div_euclid(256) as i8;
+                    let lo_center = (value - i16::from(hi) * 256 - 128) as i8;
+                    hi_bytes[kk] = hi;
+                    lo_bytes[kk] = lo_center;
                 }
-                let mut scales = [0.0f32; 4];
-                let mut zero_points = [0.0f32; 4];
-                for lane in 0..4 {
-                    let output = output_start + quad * 4 + lane;
-                    if output < n {
-                        scales[lane] = weight.scales[output * k_blocks + block];
-                        zero_points[lane] = (128i32
-                            - weight.zero_point_offsets[output * k_blocks + block] as i32)
-                            as f32;
-                    }
-                }
-                let scale_vec = unsafe { vld1q_f32(scales.as_ptr()) };
-                let zp_vec = unsafe { vld1q_f32(zero_points.as_ptr()) };
-                let block_sum = vdupq_n_f32(block_activation_sums[block]);
-                let contribution = vsubq_f32(product, vmulq_f32(zp_vec, block_sum));
-                total = vaddq_f32(total, vmulq_f32(scale_vec, contribution));
+                let hi_word = u32::from_le_bytes([
+                    hi_bytes[0] as u8,
+                    hi_bytes[1] as u8,
+                    hi_bytes[2] as u8,
+                    hi_bytes[3] as u8,
+                ]);
+                let lo_word = u32::from_le_bytes([
+                    lo_bytes[0] as u8,
+                    lo_bytes[1] as u8,
+                    lo_bytes[2] as u8,
+                    lo_bytes[3] as u8,
+                ]);
+                let hi_vec = vreinterpretq_s8_u32(vdupq_n_u32(hi_word));
+                let lo_vec = vreinterpretq_s8_u32(vdupq_n_u32(lo_word));
+                let weight_base = tile * tile_stride
+                    + (block * 128 / N16_SDOT_K_GROUP + group4)
+                        * N16_SDOT_OUTPUTS
+                        * N16_SDOT_K_GROUP
+                    + quad * 4 * N16_SDOT_K_GROUP;
+                let weights = unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base)) };
+                acc_hi = unsafe { sdot_i8x16(acc_hi, hi_vec, weights) };
+                acc_lo = unsafe { sdot_i8x16(acc_lo, lo_vec, weights) };
             }
-            let mut out = [0.0f32; 4];
-            unsafe { vst1q_f32(out.as_mut_ptr(), total) };
-            for (lane, &value) in out.iter().enumerate() {
-                let output = output_start + quad * 4 + lane;
-                if output < n {
-                    result[output] = value;
-                }
-            }
+            let q_dot = vaddq_s32(
+                vaddq_s32(acc_lo, vmulq_n_s32(acc_hi, 256)),
+                vdupq_n_s32(128 * group_sums[group]),
+            );
+            product = vaddq_f32(
+                product,
+                vmulq_n_f32(vcvtq_f32_s32(q_dot), group_scales[group]),
+            );
         }
+        let mut scales = [0.0f32; 4];
+        let mut zero_points = [0.0f32; 4];
+        for lane in 0..4 {
+            let output = output_start + lane;
+            scales[lane] = weight.scales[output * k_blocks + block];
+            zero_points[lane] =
+                (128i32 - weight.zero_point_offsets[output * k_blocks + block] as i32) as f32;
+        }
+        let scale_vec = unsafe { vld1q_f32(scales.as_ptr()) };
+        let zp_vec = unsafe { vld1q_f32(zero_points.as_ptr()) };
+        let block_sum = vdupq_n_f32(block_activation_sums[block]);
+        let contribution = vsubq_f32(product, vmulq_f32(zp_vec, block_sum));
+        total = vaddq_f32(total, vmulq_f32(scale_vec, contribution));
     }
+    let mut out = [0.0f32; 4];
+    unsafe { vst1q_f32(out.as_mut_ptr(), total) };
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
