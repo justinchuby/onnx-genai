@@ -1,213 +1,41 @@
 # Leon — History
 
 ## Role and invariants
-Engine/KV/runtime-buffer implementer. Runtime owns KV; model geometry comes from `inference_metadata.yaml`, not ORT-GenAI configuration. Preserve device-buffer ownership, past/present aliasing contracts, exact real-model comparison settings, and reviewer lockouts.
 
-## Summary through 2026-07-14T20:05:00Z
-
-### Engine and KV
-Implemented attention-sink SWA, SharedKv generalization, connector engine wiring, and real KV byte materialization. Prefix lookup initially remained metric-only until K4 added symmetric f32 payload extraction/injection. Prefix-dependent hashing now proves equal keys imply equal prefixes. Follow-ups remain for multi-layer fixtures, graceful recompute fallback, and heterogeneous connector payloads.
-
-### Gemma4 speculative execution
-Migrated engine paths to per-layer KV geometry and helped deliver real heterogeneous Gemma4 E2B execution. Corrected proposer inputs to `embed(last_token) + last_hidden`, raising acceptance from 25% to 70.6% with token identity preserved. Performance remains below greedy and is a separate tuning concern.
-
-### Loader dtype and fusion hardening
-Closed silent Float32 fallbacks with `UnsupportedDataType` and fail-closed decoding across all real dtype sites; Holden approved. Added strict LayerNorm operand-order guards and adversarial coverage; Gaff approved.
-
-### EPContext and encoder
-Rejected encoder v1 for generic-layer EPContext literals violating the model-agnostic rule; Deckard's v2 passed. Revised EPContext writer sidecar naming after Batty's rejection, but introduced an over-broad duplicate-identity rejection; Leon is locked out of that writer artifact and Gaff's v3 is final. Later unified external-path guarding and explicit C API mapping were approved.
-
-### Product/API and packaging
-Renamed the full C ABI from `ort2_*` to `nxrt_*` with no compatibility aliases. Broke the shape-inference/loader publication cycle by making the loader dev-dependency path-only in the packaged manifest; Roy approved.
-
-### Recent validation
-Loader opset-import validation for file, from-parts, and nested-subgraph paths merged in `00cda89`; the executor's sentinel failure path is now an unreachable invariant. Holden's final review was green.
-
-- 2026-07-15 — Added Windows oneDNN wheel bundling in `ef89a95`; CI verification is pending.
-
-- 2026-07-16T00:00:01Z — Re-profiled native CPU decode after MatMulNBits threading and landed allocation-free, same-shape contiguous-f32 `Mul` (`347060f`). The guarded non-aliased fast path reduced Mul 3.12→0.25 ms and decode 40.5→44.2 tok/s; Holden 🟡 approved (independent +6.35%).
-
-- 2026-07-16T00:00:00Z — Streamlined M=1 GQA decode to write contiguous f32 attention and present K/V outputs directly (`1fdd1ec`), preserving the generic prefill/strided/non-f32 path. GQA fell 0.865→0.690 ms/step and decode rose 54.38→58.44 tok/s (+7.5%) with exact eight-token output; Sebastian cleared the change and 413 CPU EP tests pass.
-
-- 2026-07-16T00:00:00Z — Repaired the rejected CUDA executor control-flow paths in `5c0f05f` under Deckard's lockout. Non-host SequenceAt values now synchronously upload to correctly stamped CUDA buffers; Scan retains host staging and relies on child-executor H2D. Added CUDA SequenceAt/Scan versus CPU parity coverage; Holden cleared the repair, with exact Qwen tokens, session 112/112, and CUDA EP 117/117.
-
-## 2026-07-16T15:39:27Z — Scribe session update
-
-- 🟢 Reviewed BlockQuantizedMatMul: hand-verified MXFP4 0xD7→12.0/-6.0 and IQ4_NL decoding; unsupported IQ formats fail closed and 420 CPU tests pass.
-
-## 2026-07-16T18:11:48+0000 — IQ-family CPU decode reviews
-
-- 🟢 Cleared Bryant's IQ2_XS/IQ2_S/IQ3_XXS and IQ1_S/IQ1_M implementations after upstream llama.cpp grid, layout, fingerprint, and hand-trace audits.
-- CPU `BlockQuantizedMatMul` now covers the complete supported IQ family.
-
-## 2026-07-16T19:05:18+0000 — BlockQuantizedMatMul prefill review
-
-- 🟢 Cleared Joi's `5010261`: all ten formats matched scalar decode bits, selected MXFP4/IQ4_NL/IQ4_XS AVX2 paths were independently checked, and generic GEMM retained K accumulation order.
-- Default and oneDNN CPU EP suites each passed 430 tests; M=64 generic matmul gains measured 32–35×.
-
-## 2026-07-16T19:27:57+0000 — CUDA IQ super-block GEMV wave
-
-- 🟢 Cleared Roy's shared `onnx-runtime-quantization` extraction: all seven moved grids/sign tables are byte-identical (IQ1S FNV-1a `0x6703ed863501ae2e`); CPU decode and Joi's AVX2 paths are unchanged, and the standalone crate builds/tests cleanly.
-
-## 2026-07-16T19-27-57+0000 — Scribe session update
-
-- 🟢 Cleared Sapper's `67c1e3b` quantized-matmul shape rules: domains, `N`, symbolic dimensions, dtype preservation, error handling, and 2D/3D coverage are correct (93 unit tests + one doc-test).
-
-## 2026-07-16T23:30:00+0000 — GAFF loader foundation review
-
-- 🟢 Cleared Sapper's `2a9e5b1`: formal subgraph I/O is ordered and typed, recursive scopes isolate inline initializers, and UNDEFINED graph attributes retain populated graph fields.
-- The Loop load regression and all 101 loader tests passed; existing validation already permits If/Loop/Scan.
-
-## 2026-07-16T23:58:29+0000 — Comparison/logical inference review
-
-- 🟢 Cleared Chew's `d06d1e7`: all comparison/logical output dtypes are Bool, broadcast/unary shapes hold, and bitwise operators were untouched; 115 tests passed.
-
-
-## 2026-07-17T00:58:13Z — GAFF Loop remediation
-
-- Under Sapper's lockout, repaired the rejected Loop design: removed the untrusted eager scan reservation and validated every loop-carried output against its initial dtype and full shape.
-- Holden 🟢 re-approved the huge-`M` early-exit and second-iteration shape-change regressions; 121 session tests passed and final commit `f6e8ba6` merged. `Scan` is now the remaining control-flow work.
-
-## 2026-07-14T00:00:00Z — Scan hardening and normalization inference
-
-- Repaired Scan stack-shape arithmetic against zero-masked overflow (Holden 🟢) and added BatchNormalization/InstanceNormalization shape inference (Bryant 🟢).
-
-## 2026-07-17T07:19:39Z — WEIGHT_OFFLOAD Phase 1 landed
-
-- Delivered `f601cad`: `WeightRegionCatalog`, route-first mmap QMoE expert selection, and opt-in `ONNX_GENAI_WEIGHT_OFFLOAD=1`; default behavior remains unchanged.
-- Chew's corrective `a77eed0` and Nabil 🟢 approval closed the landing; large-model exact-logit/throughput validation remains deferred.
-
-- 2026-07-18 Scribe: Initial Reshape/Split validation and coverage work was superseded by the reviewed correction.
-
-## 2026-07-18T01:20:34Z — CUDA SparseKvGather D==0 fix landed
-- Fixed validation ordering in `c2180c9`; three D==0 parity tests passed 12/12, Gorman re-approved, and CUDA SparseKvGather landed.
-
-- 2026-07-18: CUDA CSA claim gate was corrected to mirror CPU ratio-specific contracts and parity tests, then superseded by Deckard's shared attention_bias validation; final CSA approval landed.
-- 2026-07-18T05:55:00Z — Added CPU CSA `supports_op` claim validation via unified factory dry-run on lockout reassignment (`2a08ef9`); Deckard approved.
-- 2026-07-19: Fixed PR #30 device sampling parity/safety; continuing PR #32 rebase, build, and review-comment fixes.
-- 2026-07-19T07:55:00Z: PR #32's EP-capabilities refactor merged at `9683a08` after the rebase and three review fixes.
-
-## 2026-07-19T07:42:20Z — Mobius-head E2E harness landed
-
-- Landed `3d47ea9`: pinned GLM-5.2 and DeepSeek-V4-Flash manifest plus ignored, environment-gated real-engine E2E smoke. Gaff approved; absent artifacts skip cleanly and no download path was added.
-
-- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
-
-## 2026-07-21T05:40:00Z — fp16 decode and cross-platform reconciliation
-
-- Landed OS-aware CUDA dynamic-library candidates and graceful Windows ARM64 unavailability (`2466016`); Pris approved after the CUPTI gap was completed separately.
-
-
-## 2026-07-21 — Wave-2 and CI milestone
-CI now covers all 27 offline crates with warnings-as-errors and native Windows ARM64. Capture-safe native fp16 CUDA decode wave 2 stacked GQA prep fusion, warp-shuffle RMSNorm, and specialized down-projection GEMV on wave 1, reaching 663–672 tok/s on H200 versus ORT GenAI at 657, with zero fallbacks. All CUDA EP kernel work must remain correct and fast across supported SM architectures, not only sm_90.
-- 2026-07-21T23:55Z — VLM WP2 native image processor landed via Sapper revision after Chew rejection; living VLM scope artifact preserved in inbox.
-
-- 2026-07-22T00:00:00Z — Reviewed Batty CUDA-graph auto-enable 🟢 GREEN: 7/7 criteria passed, no model-name gating, correct env/metadata precedence, and capture-safety fallback intact.
-
-## 2026-07-24T15:10:00Z — Phi decode-correctness lock
-
-Authored the Phi-4-mini bit-exact native-CUDA-versus-ORT 64-token decode lock. Following Holden's review, Pris environment-gated and generalized shared `common/decode_lock.rs`; Leon co-owns this Qwen/Phi helper with Batty and Pris.
-
-## 2026-07-26T19:45:52Z — Scribe update
-
-- Spawned as leon-10 on `test/attention-default-domain-capture` for PR #193 default-domain Attention capture-path regression and revert-check; outcome pending.
-
-## 2026-07-26T20:00:00Z — Scribe update
-
-- 2026-07-26T20:00:00Z — Delivered PR #201 capture regression coverage for default-domain Attention staged-KV copy-back under CUDA graph capture; merged to main at `88e48eca`.
-## 2026-07-26T22:38:02+00:00 — #88 RoPE capture DoD dispatched
-
-- Dispatched on `test/rope-capture-dod` to add the standalone-RoPE graph record/replay or unfused-model zero-fallback token-parity DoD regression for issue #88. Status at Scribe handoff: in progress.
-## 2026-07-26T22:38:02+00:00 — #88 RoPE capture DoD merged
-
-- PR #208 (`test(cuda): cover standalone RoPE graph capture`) merged to main as `5eb0d8db`, closing #88. Chew independently approved with guard-break evidence; Resch's `63e0ef26` fmt-gate repair kept main green for the merge.
-
-
-## 2026-07-27T13:12:20+00:00 — Roadmap wave-5
-
-- PR #267 for #86 merged: pkg.nxrt::VarlenAttention consumes Attention-24 nonpad_kv_seqlen. Bishop required bf16 coverage; Batty supplied the lockout revision.
-
-## 2026-07-27T12:20:00-07:00 — CLI context exhaustion guard
-
-- Repaired PR #277 lockout defect in `fix/cli-sampling-and-context`: CLI now rejects `prompt_tokens >= effective_max_context` before decode, so exhausted turns do not append empty assistant history.
-- Added equality/greater-than boundary unit coverage and preserved the one-token-room healthy path; clippy is clean with the known `pages.rs:129` lint allowed.
-
-## 2026-07-27T15:30:00-07:00 — PR #291 fork/rewind review
-
-- 🔴 Rejected Deckard's runtime fork/rewind PR. Public rewind reuses speculative helpers, but failed/rejected rewinds truncate logical tokens before backend KV/runner rewind succeeds, then reinsert the partially mutated session; this can leave tokens, kv_token_count, KV pages, and decode cursor inconsistent.
-- Prefix-cache page retention and fork capability gating looked sound; support matrix is not acceptable until unsupported/rejected rewind paths are transactional. Batty should own revision under Deckard lockout.
-- Validation: engine build/fmt/clippy passed; server/CLI builds passed; model-free new KV tests passed. Full engine lib suite failed locally from known ORT API/null-pointer environment mismatch (180 passed, 66 failed, 1 ignored).
-
-## 2026-07-27T17:13:01-07:00 — PR #291 Batty revision re-review
-
-- 🔴 Rejected Batty's transaction-boundary revision. Unsupported sliding-window and ORT-owned-KV paths are now clean and model-free regressions pass, but runner-backed rewind still truncates logical tokens and rewinds paged KV before fallible ORT runner rewind can finish.
-- Verified paged materialized rewind uses an independent deep `PagedKvCache` clone before materialization; support matrix remains too strong for static-cache/shared-buffer rows until runner rewind is transactional. Gaff should own next revision under Deckard/Batty lockout.
-- Validation: engine build/fmt/clippy passed; server/CLI builds passed; targeted model-free tests passed. Full engine lib suite remained at known local ORT mismatch baseline (182 passed, 66 failed, 1 ignored).
-
-## 2026-07-27T20:54:14-07:00 — PR #291 Gaff Route-B third review
-
-- 🔴 Rejected Gaff's Route-B revision. Public runner-backed `rewind_session_to` now rejects before session removal/token/KV mutation, but the reject policy was implemented in shared `rewind_target_state_to_len` / `rewind_draft_state_to_len`, accidentally disabling speculative runner rewinds for static-cache/PastPresent generation.
-- Also flagged stale model-backed checkpoint test still expecting `tiny-llm` PastPresent rewind success despite the support matrix marking runner-backed public rewind unsupported. Sapper should revise under Deckard/Batty/Gaff lockout by splitting public API validation from internal speculative rewind policy.
-- Validation: engine build/fmt/clippy passed; server/CLI builds passed; targeted model-free tests passed. Full engine lib suite remained at local ORT mismatch baseline (183 passed, 66 failed, 1 ignored). Conda ORT probe still loaded ORT 1.17/API 17, so model-loading verification remained blocked.
-## 2026-07-27T02:00:00Z — Roadmap wave update
-- Reviewed PR #300 / #76, requested changes for non-convex capability claims, then approved Rachael union-find + Kahn convexity fix.
-
-## 2026-07-28T04-08-08+0000 — Wave 2 regression/roadmap update
-- Approved PR #316 CJK renderer fix and mutation-proof wide-character tests.
-
-## 2026-07-28T03:11:03-07:00 — PR #291 Sapper policy-split fourth review
-
-- 🟢 Approved Sapper's revision. `RewindRunnerPolicy` now keeps public `Engine::rewind_session_to` on `RejectRunnerRewind` while speculative draft alignment, draft rewind, target accept/reject rewind, and overmaterialized cleanup use `AllowRunnerRewind`.
-- Verified public runner-backed rewind rejects before scheduler/session/token/KV/runner mutation; policy-boundary tests would fail if allow/reject were flipped. Support matrix now matches the public API contract, with prepared/infallible runner rewind recorded as follow-up.
-- Validation: engine build/fmt/clippy passed; server/CLI builds passed; full engine lib suite now runs locally with ORT 1.27/API 27 (252 passed, 0 failed, 1 ignored); targeted failed-rewind/speculative/checkpoint tests passed.
-
-## 2026-07-28T08:22:00-07:00 — Native CUDA KV capacity derivation
-
-- Replaced the hardcoded 4096 native-CUDA KV fallback with capacity resolution from explicit programmatic/env overrides, otherwise `model.max_sequence_length` clamped to an 85% queried CUDA free-memory budget using actual KV bytes/token.
-- Kept the native path fixed-capacity: growing would replace device allocations/IoBinding pointers and invalidate CUDA graph capture, unlike ORT shared-buffer GQA's grow/rebind/recapture path.
-- Expanded capacity errors to include the source, metadata max length, CUDA free/total bytes when available, KV bytes/token, and both override knobs.
-- Validation: `cargo build -p onnx-genai-engine`, `cargo test -p onnx-genai-engine --lib`, `cargo fmt -p onnx-genai-engine -- --check`, and `cargo clippy -p onnx-genai-engine --all-targets -- -D warnings` passed locally; no CUDA device was available for real native-CUDA allocation/capture execution.
-
-## 2026-07-28T08:53:10-07:00 — Native/ORT KV capacity unification correction
-
-- Justin rejected the narrower "better native default" framing: native and ORT must share one KV capacity mechanism/capability, not two strategies for the same resource.
-- Moved/used `kv_capacity_bucket` as shared policy in `onnx-genai-kv`; ORT imports it and native CUDA now grows by the same bucket policy.
-- Native CUDA growth is compatible with graph capture when treated as a capture boundary: invalidate the graph, replace/copy device KV buffers, then re-warm/re-capture on subsequent single-token steps. Real recapture-after-growth still needs GPU validation.
-- Added `docs/native-ort-kv-capacity.md` to preserve the rationale and remaining validation gap.
-
-## 2026-07-28T09:10:46-07:00 — Capture/growth compatibility clarified
-
-- Justin clarified that dynamic growth and CUDA graph capture are compatible; ORT shared-buffer GQA is the reference, not a counterexample to native growth.
-- Updated the native CUDA comments/design note to describe bucket growth as a graph boundary and removed the obsolete framing that fixed capacity might be required for capture.
-- Native behavior now matches the ORT mechanism: grow by shared bucket, preserve the valid prefix, invalidate the stale capture, then re-capture on the new bucket.
-
-## 2026-07-28T09:16:58-07:00 — DRY shared KV grow driver
-
-- Justin asked for DRY after native mirrored ORT growth. Factored growth orchestration into `onnx-genai-kv::ensure_kv_capacity` with `KvCapacityGrowthBackend`.
-- Both ORT shared-buffer KV and native CUDA consume the shared driver; backend implementations only provide primitives for allocation, prefix preservation, mask replacement, capture invalidation, and commit.
-- Added policy-order tests proving fallible buffer/mask preparation happens before capture invalidation/commit and failure leaves current capacity untouched.
-
-## 2026-07-28T10:05:00-07:00 — Native CUDA KV growth verified on local GPU
-
-- Corrected the earlier bad assumption that this machine had no CUDA device: `nvidia-smi` reports an RTX 4060 Laptop GPU with 8188 MiB.
-- With `ONNX_GENAI_EP=cuda`, `ONNX_GENAI_REQUIRE_CUDA=1`, NVIDIA Python package DLL/header paths, and `ONNX_GENAI_KV_MIN_BUCKET=4`, real native CUDA DeepSeek generation grew KV 4→8→16, re-captured at each bucket, and continued coherently.
-- Capacity diagnostics were also exercised with `ONNX_GENAI_CUDA_KV_MAX_LEN=4`; the error now reports requested length, configured max/source, metadata max, CUDA free/total bytes, KV bytes/token, and the override/remediation knobs.
-
-## 2026-07-28T10:26:45-07:00 — CUDA KV clamp corrected for transient growth
-
-- Justin challenged the "metadata 131072, not clamped" DeepSeek result on the 8 GiB RTX 4060. The first clamp only checked final KV size (`0.85 * free / bytes_per_token`), but growth allocates the new bucket before freeing the old bucket.
-- Tightened the default hard maximum to the largest capacity whose worst old+new bucket transition fits inside the CUDA free-memory headroom budget. For the observed DeepSeek numbers (`free=5925502976`, `bytes/token=28680`), that clamps metadata 131072 to 110080 instead of allowing the 65536→131072 transition to exceed the 85% growth budget.
-
-## 2026-07-28T10:53:59-07:00 — VRAM ceiling removed; growth fails gracefully
-
-- Justin rejected the derived free-memory ceiling as guesswork. Removed the 85% CUDA-memory budget and the transient-growth hard-max arithmetic; only explicit user caps and `model.max_sequence_length` remain as factual ceilings.
-- Kept the transient peak insight in docs/diagnostics: growth holds old and new buckets simultaneously, so failure can happen at roughly `(old + new) * bytes_per_token`.
-- Native CUDA grow allocation/copy/mask failures now translate to an actionable, transactional error that says the old/new bucket, approximate new allocation, approximate transient peak, current CUDA free/total memory, bytes/token, recovery levers, and that session state was left unchanged.
-
-## 2026-07-28T11:43:45-07:00 — Injected KV grow-failure coverage
-
-- Documented the Windows/WDDM finding: exhausting reported free memory does not reliably produce CUDA allocator failure because the GPU memory manager can page/virtualize.
-- Added model-free injected-failure coverage at the shared `KvCapacityGrowthBackend` seam. Allocation failure now asserts the translated actionable error and proves the fake session's buffer id, logical length, capture generation, and capture-valid state remain unchanged before a successful retry.
-- Added mid-sequence injected failures for prefix-copy, mask allocation, and capture invalidation; all prove no commit and unchanged session state. Native/ORT commit phases remain effectively infallible assignments after all fallible work has completed.
-## 2026-07-28T17:40:00+0000
-#365 metadata-hints integration merged after the structural identity remediation chain.
+Engine/KV/runtime-buffer implementer. Runtime owns KV; model geometry is sourced from
+`inference_metadata.yaml`, not ORT-GenAI configuration. Preserve device-buffer ownership,
+past/present aliasing, exact real-model comparison settings, and reviewer lockouts.
+
+## Historical summary through 2026-07-28
+
+- Generalized shared KV, attention-sink SWA, connectors, and prefix payload
+  materialization; equal prefix keys now prove equal content. Remaining work is
+  multi-layer fixtures, graceful recomputation, and heterogeneous connector payloads.
+- Delivered heterogeneous Gemma4 E2B speculative execution and corrected proposer inputs
+  to `embed(last_token) + last_hidden`; correctness improved while performance tuning remains
+  separate.
+- Hardened loaders and fusion: unsupported dtypes fail closed; LayerNorm operand ordering is
+  guarded; opset imports validate recursively; the `nxrt_*` C ABI replaced `ort2_*`.
+- Implemented weight-offload foundations, route-first QMoE selection, CUDA
+  `SparseKvGather` D==0 validation, and CPU CSA claim validation.
+- Contributed to CUDA graph/capture correctness (SequenceAt/Scan parity, Phi decode lock,
+  default-domain Attention and standalone RoPE capture regressions) and to the #291 rewind
+  policy split: public runner rewind rejects before mutation while internal speculative rewind
+  remains permitted.
+- Unified native CUDA and ORT KV capacity policy in `onnx-genai-kv`, including transactional
+  growth and injected allocation/copy/mask/capture-failure tests. Native CUDA growth is a
+  graph boundary: preserve the prefix, invalidate stale capture, and recapture after growth.
+  Real DeepSeek CUDA validation verified 4→8→16 growth and recapture; no speculative
+  free-memory ceiling is imposed.
+
+## 2026-07-29T03:45:00+0000 — PR #382 CPU shared-buffer regression lock
+
+- Under Benny's reviewer lockout, added
+  `cpu_shared_buffer_continuous_batch_uses_declared_kv_pairs`, using
+  `tiny-llm-sharedbuffer` and explicit float32 KV metadata.
+- The engine-level CPU test runs continuous batching and compares sequential generation; it
+  fails at session construction if declared `model.io.kv_inputs` / `kv_outputs` are not
+  threaded to `BatchedSharedBufferDecodeSession`.
+- Revert verification proved the test catches the latent #380 regression previously hidden
+  because the equivalent CUDA E2E auto-skips without CUDA. The repair and test merged in
+  `85b9ba15`.

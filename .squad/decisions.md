@@ -316,3 +316,7 @@ component decoder I/O explicitly, rather than restoring decoder-name guessing.
 **Review rule:** metadata or I/O-detection changes must run the CLI ORT E2E suite in addition
 to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate successfully
 (23/23).
+
+## 2026-07-29 — Shared-buffer decode must thread declared KV pairs
+
+**PR #382 / issue #377 continuation (Benny; reviewed by Lori; regression test by Leon; merged `85b9ba15`).** ORT batched shared-buffer and static-cache decode adapters no longer guess exporter I/O names; they consume declared KV pairs. The repair also restores those pairs when constructing `BatchedSharedBufferDecodeSession`, fixing the latent #380 regression where passing `None` made construction always fail. A CPU engine-level continuous-batch test using `tiny-llm-sharedbuffer` now compares sequential generation and fails at construction if declared `model.io.kv_inputs` / `kv_outputs` stop reaching the session. This is deliberately CPU coverage because the previous CUDA-only E2E auto-skips without CUDA.
