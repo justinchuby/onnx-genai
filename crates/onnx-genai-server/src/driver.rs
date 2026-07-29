@@ -1,4 +1,10 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use onnx_genai::text_to_audio::{SynthesizedAudio, TextToAudioRequest};
@@ -17,6 +23,10 @@ use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
+const MICROBATCH_MIN_WAIT: Duration = Duration::from_millis(2);
+const MICROBATCH_MAX_WAIT: Duration = Duration::from_millis(12);
+const MICROBATCH_SETTLE_WAIT: Duration = Duration::from_millis(1);
+const MICROBATCH_POLL_WAIT: Duration = Duration::from_micros(250);
 
 #[derive(Clone)]
 pub(crate) struct EngineDriver {
@@ -104,6 +114,18 @@ struct DriverRoute {
     metrics: GenerationMetrics,
 }
 
+struct PendingGeneration {
+    request: GenerateRequest,
+    events: mpsc::Sender<DriverEvent>,
+    permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy)]
+struct MicrobatchAdmission<'a> {
+    max_queue_depth: usize,
+    generation_capacity: &'a Semaphore,
+}
+
 // SAFETY: The engine is moved exactly once into the dedicated driver thread.
 // All ORT runners, sessions, KV state, and the continuous batch manager stay
 // owned by that thread and are accessed only by processing channel commands.
@@ -113,10 +135,13 @@ impl EngineDriver {
     pub(crate) fn start(engine: Engine, max_batch: usize, max_queue_depth: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
+        let driver_capacity = generation_capacity.clone();
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, max_batch))
+            .spawn(move || {
+                run_engine_driver(owner, rx, max_batch, max_queue_depth, driver_capacity)
+            })
             .expect("failed to spawn onnx-genai engine driver");
         Self {
             commands,
@@ -127,10 +152,11 @@ impl EngineDriver {
     pub(crate) fn start_pipeline(engine: PipelineEngine, max_queue_depth: usize) -> Self {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
+        let driver_capacity = generation_capacity.clone();
         let owner = EngineOwner(EngineBackend::Pipeline(Box::new(engine)));
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, 1))
+            .spawn(move || run_engine_driver(owner, rx, 1, max_queue_depth, driver_capacity))
             .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
@@ -367,7 +393,13 @@ impl EngineDriver {
     }
 }
 
-fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_batch: usize) {
+fn run_engine_driver(
+    owner: EngineOwner,
+    rx: mpsc::Receiver<DriverCommand>,
+    max_batch: usize,
+    max_queue_depth: usize,
+    generation_capacity: Arc<Semaphore>,
+) {
     let mut engine = match owner.0 {
         EngineBackend::Single(engine) => *engine,
         EngineBackend::Pipeline(mut pipeline) => {
@@ -378,7 +410,13 @@ fn run_engine_driver(owner: EngineOwner, rx: mpsc::Receiver<DriverCommand>, max_
     let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
     if continuous_batch_supported {
         tracing::info!(max_batch, "continuous batch driver enabled");
-        run_static_engine_driver(&mut engine, rx, max_batch);
+        run_static_engine_driver(
+            &mut engine,
+            rx,
+            max_batch,
+            max_queue_depth,
+            &generation_capacity,
+        );
     } else {
         tracing::info!("continuous batch driver disabled; using per-request engine path");
         run_fallback_engine_driver(&mut engine, rx);
@@ -464,6 +502,8 @@ fn run_static_engine_driver(
     engine: &mut Engine,
     mut rx: mpsc::Receiver<DriverCommand>,
     max_batch: usize,
+    max_queue_depth: usize,
+    generation_capacity: &Semaphore,
 ) {
     // The current ContinuousBatchManager API accepts GenerateRequest only.
     // X-Session-Id requests keep using the driver's per-request engine path so
@@ -496,9 +536,15 @@ fn run_static_engine_driver(
                     &mut rx,
                     &mut deferred,
                     max_batch,
-                    *request,
-                    events,
-                    permit,
+                    MicrobatchAdmission {
+                        max_queue_depth,
+                        generation_capacity,
+                    },
+                    PendingGeneration {
+                        request: *request,
+                        events,
+                        permit,
+                    },
                 );
             }
             command => handle_driver_command(engine, command),
@@ -509,46 +555,100 @@ fn run_static_engine_driver(
 fn run_static_batch_until_idle(
     engine: &mut Engine,
     rx: &mut mpsc::Receiver<DriverCommand>,
-    deferred: &mut std::collections::VecDeque<DriverCommand>,
+    deferred: &mut VecDeque<DriverCommand>,
     max_batch: usize,
-    first_request: GenerateRequest,
-    first_events: mpsc::Sender<DriverEvent>,
-    first_permit: OwnedSemaphorePermit,
+    admission: MicrobatchAdmission<'_>,
+    first: PendingGeneration,
 ) {
-    struct PendingGeneration {
-        request: GenerateRequest,
-        events: mpsc::Sender<DriverEvent>,
-        permit: OwnedSemaphorePermit,
-    }
+    let mut initial = vec![first];
 
-    let mut initial = vec![PendingGeneration {
-        request: first_request,
-        events: first_events,
-        permit: first_permit,
-    }];
-    // Give sibling HTTP handlers that were admitted in the same scheduler tick
-    // a tiny chance to reach the driver before choosing the single-request fast
-    // path. Without this, a concurrency-4 client can be serialized simply
-    // because the driver consumed the first request a few microseconds early.
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    while initial.len() < max_batch {
-        match rx.try_recv() {
-            Ok(DriverCommand::Generate {
-                session_id: None,
-                request,
-                events,
-                permit,
-            }) => initial.push(PendingGeneration {
-                request: *request,
-                events,
-                permit,
-            }),
-            Ok(command) => deferred.push_back(command),
-            Err(_) => break,
+    let started = Instant::now();
+    let hard_deadline = started + MICROBATCH_MAX_WAIT;
+    let mut soft_deadline = started + MICROBATCH_MIN_WAIT;
+    let mut saw_pending_sibling = false;
+    loop {
+        let mut accepted = 0_usize;
+        while initial.len() < max_batch {
+            match deferred.pop_front() {
+                Some(DriverCommand::Generate {
+                    session_id: None,
+                    request,
+                    events,
+                    permit,
+                }) => {
+                    initial.push(PendingGeneration {
+                        request: *request,
+                        events,
+                        permit,
+                    });
+                    accepted += 1;
+                }
+                Some(command) => {
+                    deferred.push_front(command);
+                    break;
+                }
+                None => break,
+            }
+        }
+        while initial.len() < max_batch {
+            match rx.try_recv() {
+                Ok(DriverCommand::Generate {
+                    session_id: None,
+                    request,
+                    events,
+                    permit,
+                }) => {
+                    initial.push(PendingGeneration {
+                        request: *request,
+                        events,
+                        permit,
+                    });
+                    accepted += 1;
+                }
+                Ok(command) => deferred.push_back(command),
+                Err(_) => break,
+            }
+        }
+        if accepted > 0 {
+            let settle_deadline = Instant::now() + MICROBATCH_SETTLE_WAIT;
+            soft_deadline = soft_deadline.max(settle_deadline.min(hard_deadline));
+        }
+        if initial.len() >= max_batch {
+            break;
+        }
+
+        let in_flight = admission
+            .max_queue_depth
+            .saturating_sub(admission.generation_capacity.available_permits());
+        let deferred_generations = deferred_generation_count(deferred);
+        let expected_this_batch = in_flight
+            .saturating_sub(deferred_generations)
+            .min(max_batch);
+        if expected_this_batch > initial.len() {
+            saw_pending_sibling = true;
+            soft_deadline = hard_deadline;
+        }
+
+        let now = Instant::now();
+        if now >= hard_deadline || (now >= soft_deadline && expected_this_batch <= initial.len()) {
+            break;
+        }
+        let deadline = if expected_this_batch > initial.len() {
+            hard_deadline
+        } else {
+            soft_deadline
+        };
+        let sleep_for = deadline
+            .saturating_duration_since(now)
+            .min(MICROBATCH_POLL_WAIT);
+        if sleep_for.is_zero() {
+            thread::yield_now();
+        } else {
+            thread::sleep(sleep_for);
         }
     }
 
-    if initial.len() == 1 {
+    if initial.len() == 1 && !saw_pending_sibling {
         let pending = initial
             .pop()
             .expect("the first generation request was queued");
@@ -562,7 +662,11 @@ fn run_static_batch_until_idle(
         return;
     }
 
-    let formed_batch = initial.len().max(1).min(max_batch);
+    let formed_batch = if saw_pending_sibling || initial.len() > 1 {
+        max_batch
+    } else {
+        initial.len().max(1).min(max_batch)
+    };
     let mut manager = match engine.continuous_batch_manager(formed_batch) {
         Ok(manager) => manager,
         Err(err) => {
@@ -589,6 +693,30 @@ fn run_static_batch_until_idle(
     }
 
     loop {
+        while routes.len() + abandoned.len() < manager.max_batch() {
+            match deferred.pop_front() {
+                Some(DriverCommand::Generate {
+                    session_id: None,
+                    request,
+                    events,
+                    permit,
+                }) => {
+                    submit_to_continuous_manager(
+                        &mut manager,
+                        &mut routes,
+                        &mut abandoned,
+                        *request,
+                        events,
+                        permit,
+                    );
+                }
+                Some(command) => {
+                    deferred.push_front(command);
+                    break;
+                }
+                None => break,
+            }
+        }
         while let Ok(command) = rx.try_recv() {
             match command {
                 DriverCommand::Generate {
@@ -631,6 +759,20 @@ fn run_static_batch_until_idle(
             break;
         }
     }
+}
+
+fn deferred_generation_count(deferred: &VecDeque<DriverCommand>) -> usize {
+    deferred
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                DriverCommand::Generate { .. }
+                    | DriverCommand::GeneratePipeline { .. }
+                    | DriverCommand::GenerateFim { .. }
+            )
+        })
+        .count()
 }
 
 fn submit_to_continuous_manager(
