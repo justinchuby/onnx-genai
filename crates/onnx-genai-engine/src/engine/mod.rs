@@ -197,7 +197,17 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_state: None,
+            native_sessions: HashMap::new(),
+            #[cfg(feature = "native-backend")]
+            native_active_session: None,
+            #[cfg(feature = "native-backend")]
+            native_session_counter: 0,
+            #[cfg(feature = "native-backend")]
+            native_max_sessions: 8,
+            #[cfg(feature = "native-backend")]
+            native_kv_budget_bytes: 512 * 1024 * 1024,
+            #[cfg(feature = "native-backend")]
+            native_default_session: None,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
             draft: None,

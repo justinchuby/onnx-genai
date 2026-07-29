@@ -581,11 +581,13 @@ pub struct EngineConfig {
     /// `0` disables the cache and every turn recomputes.
     pub pipeline_cache_bytes: u64,
     /// Maximum number of concurrent native sessions before LRU eviction.
-    /// Defaults to 8. Set to 0 to disable the limit.
+    /// Defaults to 8. This is an unmeasured conservative placeholder until
+    /// real-model session memory is characterized. Set to 0 to disable the limit.
     pub native_max_sessions: usize,
     /// Maximum total bytes for native session KV caches. When exceeded,
-    /// the least-recently-used session is evicted. Defaults to 512 MiB.
-    /// Set to 0 to disable the byte limit.
+    /// the least-recently-used session is evicted. Defaults to 512 MiB. This is
+    /// an unmeasured placeholder, not a fitted model-derived value. Set to 0 to
+    /// disable the byte limit.
     pub native_kv_budget_bytes: u64,
 }
 

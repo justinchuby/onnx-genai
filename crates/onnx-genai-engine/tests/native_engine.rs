@@ -36,7 +36,8 @@ fn engine_generates_through_explicit_native_backend() -> anyhow::Result<()> {
 
     assert_eq!(result.token_ids, vec![1, 1, 1]);
     assert_eq!(streamed, result.token_ids);
-    assert!(engine.create_session().is_err());
+    let session_id = engine.create_session()?;
+    engine.close_session(session_id)?;
     Ok(())
 }
 
@@ -111,7 +112,7 @@ fn native_backend_rejects_unsupported_session_device() {
     let message = format!("{error:#}");
     assert!(
         message.contains("does not support execution provider")
-            && message.contains("WebGpuExecutionProvider"),
+            && (message.contains("WebGpuExecutionProvider") || message.contains("\"webgpu\"")),
         "{message}"
     );
 }
@@ -119,7 +120,7 @@ fn native_backend_rejects_unsupported_session_device() {
 #[test]
 fn native_sub4_cpu_generates_from_multi_token_prompt() -> anyhow::Result<()> {
     let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
     let mut engine = Engine::from_dir(
         &fixture,
         EngineConfig {
@@ -193,7 +194,7 @@ fn native_sub4_cuda_fallback_generates_coherent_decode() -> anyhow::Result<()> {
     }
 
     let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
     let mut explicit = native_cuda_engine(&fixture)?;
     let mut routed = Engine::from_dir_with_session_options(
         &fixture,
@@ -341,7 +342,7 @@ fn engine_native_scalar_gqa_runs_without_metadata_permission() -> anyhow::Result
 #[test]
 fn native_session_incremental_matches_stateless() -> anyhow::Result<()> {
     let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
     let mut engine = Engine::from_dir(
         &fixture,
         EngineConfig {
@@ -379,7 +380,7 @@ fn native_session_incremental_matches_stateless() -> anyhow::Result<()> {
     };
 
     // Session (incremental) generation: same turns through session API.
-    let session_id = engine.create_native_session()?;
+    let session_id = engine.create_session()?;
     let hits_before = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
     let mut context = vec![0u32];
     let mut session_results = Vec::new();
@@ -391,7 +392,7 @@ fn native_session_incremental_matches_stateless() -> anyhow::Result<()> {
         request.options.max_new_tokens = 2;
         request.options.temperature = 0.0;
         request.options.stop_on_eos = false;
-        let result = engine.generate_native_in_session(session_id, request)?;
+        let result = engine.generate_in_session(session_id, request)?;
         context.extend_from_slice(&result.token_ids);
         session_results.push(result.token_ids.clone());
     }
@@ -404,7 +405,7 @@ fn native_session_incremental_matches_stateless() -> anyhow::Result<()> {
         hits_after - hits_before >= 2,
         "incremental prefill counter did not fire: before={hits_before}, after={hits_after}"
     );
-    engine.close_native_session(session_id)?;
+    engine.close_session(session_id)?;
     Ok(())
 }
 
@@ -413,7 +414,7 @@ fn native_session_incremental_matches_stateless() -> anyhow::Result<()> {
 #[test]
 fn native_session_rewind_produces_correct_output() -> anyhow::Result<()> {
     let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
     let mut engine = Engine::from_dir(
         &fixture,
         EngineConfig {
@@ -423,14 +424,14 @@ fn native_session_rewind_produces_correct_output() -> anyhow::Result<()> {
     )?;
 
     // Build 3 turns.
-    let session_id = engine.create_native_session()?;
+    let session_id = engine.create_session()?;
     let mut context = vec![0u32];
     for _ in 0..3 {
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(context.clone()));
         request.options.max_new_tokens = 2;
         request.options.temperature = 0.0;
         request.options.stop_on_eos = false;
-        let result = engine.generate_native_in_session(session_id, request)?;
+        let result = engine.generate_in_session(session_id, request)?;
         context.extend_from_slice(&result.token_ids);
     }
 
@@ -440,7 +441,7 @@ fn native_session_rewind_produces_correct_output() -> anyhow::Result<()> {
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let session_result = engine.generate_native_in_session(session_id, request)?;
+    let session_result = engine.generate_in_session(session_id, request)?;
 
     // Fresh stateless with same edited context must produce identical tokens.
     let mut fresh_engine = Engine::from_dir(
@@ -457,15 +458,158 @@ fn native_session_rewind_produces_correct_output() -> anyhow::Result<()> {
     let fresh_result = fresh_engine.generate(fresh_request)?;
 
     assert_eq!(session_result.token_ids, fresh_result.token_ids);
-    engine.close_native_session(session_id)?;
+    engine.close_session(session_id)?;
     Ok(())
 }
 
-/// Session creation rejects non-native backends and enforces single-session limit.
 #[test]
-fn native_session_creation_guards() -> anyhow::Result<()> {
+fn native_session_switching_matches_cold_start() -> anyhow::Result<()> {
     let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-engine");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let session_a = engine.create_session()?;
+    let session_b = engine.create_session()?;
+
+    let mut context_a = vec![0u32];
+    let mut context_b = vec![0u32, 0];
+    for (session, context) in [(session_a, &mut context_a), (session_b, &mut context_b)] {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(context.clone()));
+        request.options.max_new_tokens = 2;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        let result = engine.generate_in_session(session, request)?;
+        context.extend_from_slice(&result.token_ids);
+    }
+
+    context_a.push(0);
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(context_a.clone()));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    let switched_result = engine.generate_in_session(session_a, request)?;
+
+    let mut fresh = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(context_a));
+    cold_request.options.max_new_tokens = 2;
+    cold_request.options.temperature = 0.0;
+    cold_request.options.stop_on_eos = false;
+    cold_request.options.cold_start = true;
+    let cold_result = fresh.generate(cold_request)?;
+    assert_eq!(switched_result.token_ids, cold_result.token_ids);
+    Ok(())
+}
+
+#[test]
+fn native_session_lru_eviction_keeps_remaining_session_correct() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut engine = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            native_max_sessions: 1,
+            native_kv_budget_bytes: 0,
+            ..EngineConfig::default()
+        },
+    )?;
+    let evicted = engine.create_session()?;
+    let retained = engine.create_session()?;
+    assert!(engine.session_token_count(evicted).is_err());
+
+    let prompt = vec![0u32, 0];
+    let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt.clone()));
+    request.options.max_new_tokens = 2;
+    request.options.temperature = 0.0;
+    request.options.stop_on_eos = false;
+    let retained_result = engine.generate_in_session(retained, request)?;
+
+    let mut fresh = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(prompt));
+    cold_request.options.max_new_tokens = 2;
+    cold_request.options.temperature = 0.0;
+    cold_request.options.stop_on_eos = false;
+    cold_request.options.cold_start = true;
+    let cold_result = fresh.generate(cold_request)?;
+    assert_eq!(retained_result.token_ids, cold_result.token_ids);
+    Ok(())
+}
+
+#[test]
+fn native_stateless_generate_reuses_default_session_by_default() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
+    let mut reused = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+    let mut cold = Engine::from_dir(
+        &fixture,
+        EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            ..EngineConfig::default()
+        },
+    )?;
+
+    let hits_before = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
+    let mut reused_context = vec![0u32];
+    let mut cold_context = vec![0u32];
+    for turn in 0..3 {
+        if turn > 0 {
+            reused_context.push(0);
+            cold_context.push(0);
+        }
+        let mut reused_request =
+            GenerateRequest::new(GeneratePrompt::TokenIds(reused_context.clone()));
+        reused_request.options.max_new_tokens = 2;
+        reused_request.options.temperature = 0.0;
+        reused_request.options.stop_on_eos = false;
+        let reused_result = reused.generate(reused_request)?;
+
+        let mut cold_request = GenerateRequest::new(GeneratePrompt::TokenIds(cold_context.clone()));
+        cold_request.options.max_new_tokens = 2;
+        cold_request.options.temperature = 0.0;
+        cold_request.options.stop_on_eos = false;
+        cold_request.options.cold_start = true;
+        let cold_result = cold.generate(cold_request)?;
+
+        assert_eq!(reused_result.token_ids, cold_result.token_ids);
+        reused_context.extend_from_slice(&reused_result.token_ids);
+        cold_context.extend_from_slice(&cold_result.token_ids);
+    }
+    let hits_after = NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.load(Ordering::Relaxed);
+    assert!(
+        hits_after - hits_before >= 2,
+        "default session did not reuse KV: before={hits_before}, after={hits_after}"
+    );
+    Ok(())
+}
+
+/// Native sessions use the unified session API and allow multiple logical sessions.
+#[test]
+fn native_session_creation_uses_unified_multi_session_api() -> anyhow::Result<()> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-native-sub4-engine");
     let mut engine = Engine::from_dir(
         &fixture,
         EngineConfig {
@@ -474,9 +618,12 @@ fn native_session_creation_guards() -> anyhow::Result<()> {
         },
     )?;
 
-    let _session_id = engine.create_native_session()?;
-    // Second session must fail (Phase 1 single-session).
-    let err = engine.create_native_session().unwrap_err();
-    assert!(err.to_string().contains("already exists"), "{err}");
+    let first = engine.create_session()?;
+    let second = engine.create_session()?;
+    assert_ne!(first, second);
+    assert_eq!(engine.session_token_count(first)?, 0);
+    assert_eq!(engine.session_token_count(second)?, 0);
+    engine.close_session(first)?;
+    engine.close_session(second)?;
     Ok(())
 }

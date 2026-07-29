@@ -185,6 +185,22 @@ impl NativeDecodeSession {
             .map(|state| state.debug_stats(&self.session))
     }
 
+    pub(crate) fn estimated_kv_bytes(&self) -> u64 {
+        if let Some(state) = &self.cuda {
+            return state.logical_kv_bytes(self.current_len);
+        }
+        if let Some(state) = &self.cpu_kv {
+            return state.logical_kv_bytes(self.current_len);
+        }
+        let bytes = self
+            .past
+            .values()
+            .map(|tensor| tensor.dtype.storage_bytes(tensor.numel()))
+            .sum::<usize>()
+            .saturating_add(self.current_len.saturating_mul(std::mem::size_of::<i64>()));
+        bytes.try_into().unwrap_or(u64::MAX)
+    }
+
     pub fn cuda_graph_fallback_reason(&self) -> Option<&str> {
         self.cuda
             .as_ref()
