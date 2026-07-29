@@ -16,3 +16,19 @@
 
 ## 2026-07-28T17:40:00+0000
 Reviewed #364: blocked the partial-cache stat divergence, then approved the guarded fix.
+
+## 2026-07-29T12:30:00Z — tiny-reasoning-fixture REJECT (PR #410)
+
+Mutation proof on Batty's PR #410 sampling fix: commented out `resolve_sampling_defaults`
+per-turn, recreating the #385/#392 forced-greedy bug. Suite stayed green. Issued REJECT;
+Batty locked out of `test/tiny-reasoning-fixture`; Leon took ownership for round 2+.
+
+Durable rule recorded: "Assert on what the code did, not on a summary of what it should
+have done." (`.squad/decisions.md`, reconstructed rules section, 2026-07-29)
+
+Separately: confirmed rubber-duck's empty-answer diagnosis — `quick --greedy
+--max-new-tokens 3` stopping on `</think>` committed an empty assistant turn while
+`manifest.json` asserted the non-emptiness invariant.
+
+Inbox drop `gaff-review-reasoning-fixture.md` was lost when the worktree was deleted
+before Scribe ran; content reconstructed into `.squad/decisions.md`.

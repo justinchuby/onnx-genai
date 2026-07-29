@@ -525,3 +525,84 @@ Merging and deleting the inbox files produces no git diff (expected, not a failu
 **By:** Ernie
 **What:** Added CUDA kernels and CPU-parity coverage for AffineGrid, BatchNormalization, Compress, DynamicQuantizeLinear, GlobalAveragePool, GlobalLpPool, GlobalMaxPool, and LpNormalization. Deferred CenterCropPad, Col2Im, ConvTranspose, GridSample, GroupNormalization, InstanceNormalization, LpPool, NonMaxSuppression, QLinearMatMul, Resize, Unique, and com.microsoft FusedAttention.
 **Why:** The selected operators form a reviewable low-risk batch around fixed-width transforms, channel-wise normalization, and block reductions. Heavy geometry, convolution, detection, and data-dependent operators need dedicated follow-up waves.
+
+## 2026-07-29 — #377 explicit inference-metadata schema fields (Cohaagen; PR `squad/377-explicit-metadata`)
+
+**By:** Cohaagen (shipped; Benny/mobius: emit these names verbatim)
+
+Three new fields replacing the remaining name-guessing sites on #377 (after #380/#382):
+
+1. **`pipeline.strategy.inner_embedding_output: Option<String>`** — non-empty; replaces `nested_autoregressive.rs` guessing "the sole output without logits or present-KV in the name". Absent ⇒ actionable ERROR naming the key.
+2. **`model.io.static_cache: Option<StaticCacheIoSpec>`** — `write_indices_input`, `kv_sequence_length_input`, `key_cache_inputs`/`value_cache_inputs`/`key_cache_outputs`/`value_cache_outputs` (equal-length, positionally paired per layer). Replaces hardcoded port names in `detect_static_cache`. Inconsistent declaration ⇒ ERROR.
+3. **Encoder prompt-input role** — taken from which explicit genai-config field the exporter declared (`model.encoder.inputs.audio_features` vs `.input_ids`); no longer re-derived by string-matching `audio_features` in the port name.
+
+Follow-up: removed last two non-off-limits name-guessing fallbacks. Paged-KV bridge geometry now pairs layers purely from explicit `model.io.kv_inputs`/`kv_outputs` via `pair_kv_ports`; no metadata ⇒ `Ok(None)` (never a name/shape guess). Nested-AR `logits` output resolved by exact match; `contains("logits")` removed; `outer_logits_output`/`inner_logits_output` carried in `NestedAutoregressivePlan`. Decode-state I/O threaded end-to-end via `DecodeState::new_with_io`.
+
+**Remaining name path (off-limits):** `decode_contract.rs` `KvNamingConvention` — consumed only by #99 speculative proposers; out of scope.
+
+**Durable rule:** ALL inference/pipeline metadata except io-SHAPE must be EXPLICIT and GENERAL. Name guessing/historical-name fallback must be replaced by explicit metadata plus a clear ERROR naming the missing key. Only io-SHAPE may disambiguate — do not re-propose deferral.
+
+## 2026-07-29 — Registry-backed model warmup (Lull; PR #407)
+
+**By:** Lull
+
+Added opt-in `warmup` per-model setting and `POST /v1/admin/models/{id}/warm`. Both use `ModelRegistry::warmup`, which performs one deterministic generated token and records a successful warmup idempotently.
+
+**Rule:** Sharing the registry method keeps configured and on-demand warmups identical and allows failures to be retried without corrupting registry state.
+
+## 2026-07-29 — Preserve warmup error categories at the admin boundary (Rachael; PR #407)
+
+**By:** Rachael
+
+`ModelRegistry::warmup` returns typed absent-model, registry, and runtime-failure errors; the admin warm endpoint maps them to 404, 500, and 500 respectively.
+
+**Rule:** A loaded model's failed warmup must not be reported as an unloaded-model 404. Type-drive your error mapping; do not flatten all runtime failures into 404.
+
+## 2026-07-29 — CI timing measurements for fast lane and ARM64 coverage (Pris)
+
+Warm-cache fast lane: 5m43s; cold: 8–9m. Not a "3 minute" lane, but still surfaces Linux failures 12–20 minutes before the full gate's critical path. Windows ARM64 coverage owned the critical path at 18–26m; uninstrumented ARM64 tests fall to ~15m. After ARM64 coverage removal, new critical path is `CLI ORT (Windows x86_64)` at ~18m50s. No Codecov flag disappeared: ARM64 contributed only to the shared `offline` flag, still uploaded by Linux, Windows x86_64, and macOS. Carryforward remains disabled.
+
+Post-removal run 30390299025 passed in 18m54s. Durable rule confirmed: run tests on every platform; instrument for coverage only where coverage is informative. Dropping ARM64 coverage alone did not materially reduce wall-clock because Windows CLI ORT became the new critical path.
+
+## 2026-07-29 — Luv round-3 review: tiny-reasoning fixture, resolved-policy surface (PR #411)
+
+**By:** Luv (APPROVE); Leon (author). Pris (round 1) and Batty (round 2) locked out. Everything verified by building, running, and mutating — not by reading the report. Mutation reverted; worktree clean at `f8ed4fb4`.
+
+**What passed:**
+- `sampling_reaches_the_decode_loop_not_only_the_session_summary`: PASS 10/10 isolation
+- `the_session_summary_reports_the_same_policy_generation_used`: PASS 10/10 isolation
+- Full `repl_e2e` suite: 44/44; lib unit tests: 103/103
+
+**Mutation (per-turn resolution disabled, `/session` left intact):** both generation-observing tests FAIL 3/3; the three `/session`-keyed tests stayed GREEN — confirming they never witness generation. Full suite: 42 passed / 2 failed, exactly the two policy tests. The mutated stats line reads `greedy=true temperature=1 top_k=0`, which is the #385/#392 forced-greedy regression. Red mutated, green intact, deterministic.
+
+**Decisive runtime evidence:** running the mutated binary, `--stats` reported `greedy=true temperature=1 top_k=0` while `/session` still reported `greedy=false temperature=0.6 top_k=20`. The two visibly diverged — which is only possible if the stats value is read from the generation path, not re-derived. A display-only value could not have disagreed with `/session`.
+
+**Luv delta re-check (commit `88fa86b5`):** sampling-policy capture moved into `run_generation_turn` (`output.rs`) at the point of use; two prior manual captures in `interactive.rs` and `generate.rs` removed. Mutation still bites 3/3. `turn` is bound immutably and moved into `backend.generate(turn, …)` at line 278 — between capture and move there is no reassignment, no rebuild of options, no early return. Divergence is now impossible by construction. Verdict: **APPROVE** on delta.
+
+**Named ceiling (non-blocking):** the instrument observes the decode-loop input (resolved `GenerateOptions`), not the engine sampler's behaviour. Engine-internal silent greedy and a future refactor re-resolving options after capture are outside its reach. Engine-layer sampler correctness is a different test's responsibility.
+
+## 2026-07-29 — Reasoning fixture review: reconstructed durable rules (PRs #410, #411)
+
+*Reconstructed from session context, 2026-07-29. These rules were authored in a worktree whose decision inbox was deleted before Scribe ran — the same mistake recorded in the standing operational rule below. Content reflects the authors' stated positions; provenance is session context, not merged inbox drops.*
+
+**A fixture whose every assertion is "the turn was dropped" cannot distinguish correct behaviour from total breakage.** Iteration 1 of the tiny reasoning fixture had no reachable `</think>`, so no input produced a committed answer. A regression dropping every turn would have passed. Fixed by making the close reachable on three prompts, giving one model two reachable greedy outcomes. — *coordinator (PR #410)*
+
+**Assert on what the code did, not on a summary of what it should have done.** Every sampling test keyed on the `/session` display, which resolved sampling independently of generation. Gaff commented out the per-turn `resolve_sampling_defaults` — recreating the #385/#392 forced-greedy bug — and the suite stayed green. The tests pinned a summary line, not a policy. — *Gaff, REJECT (PR #410)*
+
+**Run a new test in isolation before believing it.** The round-2 replacement was a statistical token-stream test. Luv ran it alone: 15/15 failures with the fix intact. Its one green in the full parallel suite was a fluke, and the supporting evidence ("8/8 distinct outputs") was a stderr-timestamp artifact — the test compared stdout only. Nobody had run it alone. — *Luv, REJECT (PR #411 round 2)*
+
+**A near-deterministic fixture cannot witness sampling through its tokens.** At the fixture's declared `temperature 0.6, top_k 20`, decode is effectively greedy: 80/80 no-flag runs byte-identical to the greedy stream. The token-stream assertion was therefore a ~95% false-fail, not the feared false-pass. Raising the run count or picking a seed does not rescue it. — *Luv*
+
+**Instrument the boundary you care about.** Surface the sampling policy generation actually resolved into `--stats`/`--profile` and assert on that: deterministic, no subprocess cost, observes the real object instead of inferring it from output that cannot distinguish the regimes. Decisive evidence: under the mutation the stats line and `/session` visibly disagreed, which is only possible if stats reads the generation path. — *Leon, approved by Luv*
+
+**Two independent resolution sites for one policy is the defect, not an inconvenience.** A summary that can disagree with what generation did is a bug waiting to be re-reported. Deferring it was justified on the false premise that a (broken) test removed the harm. Resolved by one helper called by both `/session` and every turn, each reading the live backend on demand — nothing cached, so no staleness across `/reload`/`/ep`/`/backend`, and disagreement is structurally impossible. — *Leon*
+
+**Close a gap by construction rather than by comment where you can.** Asked for a warning comment about a future refactor re-resolving options after the capture point, Leon instead moved the capture inside the consuming function, reading the exact struct passed to `backend.generate` — no window between capture and use. — *Leon, delta approved by Luv*
+
+**A committed turn with an empty answer poisons context exactly as an unclosed one does.** `quick --greedy --max-new-tokens 3` stopped precisely on `</think>` and committed an empty assistant turn; the commit path was unconditional on non-emptiness while `manifest.json` asserted the invariant. The closed path now drops whitespace-only answers with a diagnostic distinct from "stopped inside reasoning". An overstated invariant is worse than an absent one, because someone will rely on it. — *rubber-duck, confirmed by Gaff, fixed by Batty*
+
+**A checked-in fixture must be reproducible from its generator.** `manifest.json` was corrected directly while the generator's embedded description string was not, so regenerating would have silently reverted the correction. Found during merge-conflict resolution. — *Leon*
+
+**Reviewer depth paid for itself.** Copilot found a stale comment; rubber-duck raised the doubt; Gaff proved it by mutation; Luv disproved the fix by running it in isolation; Leon's third attempt was approved only after Luv independently re-verified, twice. With Copilot review alone this would have merged a test that caught nothing — while existing solely to catch that bug. — *coordinator*
+
+**Scribe repeat failure — worktree deletion before inbox merge (second occurrence 2026-07-29).** The standing operational rule was correct; it was not applied. Consider whether the safeguard should be procedural rather than a remembered rule — e.g. Scribe runs before any worktree removal, or drops are written to the main checkout from the start. Lost drops: `gaff-review-reasoning-fixture.md`, `batty-reasoning-fixture-revision.md`, `leon-reasoning-fixture-round3.md`, `pris-tiny-reasoning-fixture.md`. — *Justin Chu / Scribe*
