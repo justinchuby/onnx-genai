@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Context;
 use onnx_genai_engine::FimConfig;
+use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
@@ -44,6 +45,13 @@ pub(crate) struct ModelHandle {
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
     pub(crate) model_max_context: Option<usize>,
+    /// The model author's declared generation defaults (`do_sample`,
+    /// `temperature`, `top_p`, `top_k`), or `None` when the package declares
+    /// none or is a pipeline (whose sampling is governed by its plan, not a
+    /// single decoder's `search` block). Resolved into every request's
+    /// `GenerateOptions` so a model that ships `do_sample: true` samples by
+    /// default instead of being forced greedy, matching the CLI.
+    pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     /// Declared image/audio input contracts, or `None` for a single decoder
@@ -71,6 +79,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
     pub(crate) model_max_context: Option<usize>,
+    pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
@@ -87,6 +96,7 @@ impl ModelHandle {
             tokenizer,
             chat_template,
             model_max_context,
+            generation_defaults,
             fim_config,
             pipeline,
             multimodal,
@@ -100,6 +110,7 @@ impl ModelHandle {
             tokenizer,
             chat_template,
             model_max_context,
+            generation_defaults,
             fim_config,
             pipeline,
             multimodal,
@@ -549,6 +560,7 @@ mod tests {
             tokenizer,
             chat_template: None,
             model_max_context: None,
+            generation_defaults: None,
             fim_config: None,
             pipeline: false,
             multimodal: None,
