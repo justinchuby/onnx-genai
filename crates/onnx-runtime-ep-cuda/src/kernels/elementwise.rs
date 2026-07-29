@@ -216,6 +216,14 @@ __device__ float op_decomposed_silu_f16(float x) {
     return __half2float(__float2half_rn(__fmul_rn(x, sigmoid_h)));
 }
 
+extern "C" __global__ void decomposed_silu_f16(
+    const __half* x, __half* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        y[i] = __float2half_rn(op_decomposed_silu_f16(__half2float(x[i])));
+    }
+}
+
 extern "C" __global__ void decomposed_silu_mul_f16(
     const __half* a, const __half* b, __half* y, const unsigned long long n) {
     for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -407,10 +415,15 @@ pub struct UnaryFactory {
 }
 
 impl KernelFactory for UnaryFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         Ok(Box::new(UnaryKernel {
             op: self.op,
             runtime: self.runtime.clone(),
+            decomposed_silu: self.op == UnaryOp::Silu
+                && node
+                    .attr(crate::optimizer::DECOMPOSED_SILU_ATTR)
+                    .and_then(Attribute::as_int)
+                    == Some(1),
             last_capture_safe_signature: Mutex::new(None),
         }))
     }
@@ -439,6 +452,7 @@ impl KernelFactory for StandardGeluFactory {
         Ok(Box::new(UnaryKernel {
             op,
             runtime: self.runtime.clone(),
+            decomposed_silu: false,
             last_capture_safe_signature: Mutex::new(None),
         }))
     }
@@ -449,6 +463,7 @@ impl KernelFactory for StandardGeluFactory {
 pub struct UnaryKernel {
     op: UnaryOp,
     runtime: Arc<CudaRuntime>,
+    decomposed_silu: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
 }
 
@@ -501,7 +516,17 @@ impl UnaryKernel {
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed u64")))?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let entry = self.op.entry(dtype);
+        if self.decomposed_silu && dtype != FloatDtype::F16 {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep {op}: decomposed SiLU rounding requires float16, got {:?}",
+                x.dtype
+            )));
+        }
+        let entry = if self.decomposed_silu {
+            "decomposed_silu_f16".to_string()
+        } else {
+            self.op.entry(dtype)
+        };
         if self.op == UnaryOp::Silu {
             onnx_runtime_ep_api::record_kernel_variant!(
                 "silu_separate",
@@ -1222,5 +1247,96 @@ mod tests {
             runtime.free_raw(up_dev).unwrap();
             runtime.free_raw(output_dev).unwrap();
         }
+    }
+
+    #[test]
+    fn marked_standalone_silu_matches_decomposed_fused_path_bit_exactly() {
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("skipping decomposed Silu parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("Silu").is_err() {
+            eprintln!("skipping decomposed Silu parity test: fp16 headers unavailable");
+            return;
+        }
+
+        let input = [-9.0f32, -2.0, -0.25, -0.0, 0.0, 0.125, 1.0, 3.0, 9.0].map(f16::from_f32);
+        let ones = [f16::ONE; 9];
+        let bytes = std::mem::size_of_val(&input);
+        let input_device = runtime.alloc_raw(bytes).unwrap();
+        let ones_device = runtime.alloc_raw(bytes).unwrap();
+        let standalone_device = runtime.alloc_raw(bytes).unwrap();
+        let fused_device = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |values: &[f16]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&input), input_device).unwrap();
+            runtime.htod(as_bytes(&ones), ones_device).unwrap();
+        }
+
+        let shape = [1usize, input.len()];
+        let strides = [input.len() as i64, 1];
+        let device = DeviceId::cuda(0);
+        let standalone_input = [TensorView::new(
+            DevicePtr(input_device as usize as *const c_void),
+            DataType::Float16,
+            &shape,
+            &strides,
+            device,
+        )];
+        let mut standalone_output = [TensorMut::new(
+            DevicePtrMut(standalone_device as usize as *mut c_void),
+            DataType::Float16,
+            &shape,
+            &strides,
+            device,
+        )];
+        UnaryKernel {
+            op: UnaryOp::Silu,
+            runtime: runtime.clone(),
+            decomposed_silu: true,
+            last_capture_safe_signature: Mutex::new(None),
+        }
+        .execute(&standalone_input, &mut standalone_output)
+        .unwrap();
+        launch_silu_mul_f16_raw(
+            &runtime,
+            input_device,
+            ones_device,
+            fused_device,
+            input.len(),
+            true,
+        )
+        .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut standalone = [f16::ZERO; 9];
+        let mut fused = [f16::ZERO; 9];
+        unsafe {
+            runtime
+                .dtoh(
+                    std::slice::from_raw_parts_mut(
+                        standalone.as_mut_ptr().cast::<u8>(),
+                        std::mem::size_of_val(&standalone),
+                    ),
+                    standalone_device,
+                )
+                .unwrap();
+            runtime
+                .dtoh(
+                    std::slice::from_raw_parts_mut(
+                        fused.as_mut_ptr().cast::<u8>(),
+                        std::mem::size_of_val(&fused),
+                    ),
+                    fused_device,
+                )
+                .unwrap();
+            runtime.free_raw(input_device).unwrap();
+            runtime.free_raw(ones_device).unwrap();
+            runtime.free_raw(standalone_device).unwrap();
+            runtime.free_raw(fused_device).unwrap();
+        }
+        assert_eq!(standalone, fused);
     }
 }
