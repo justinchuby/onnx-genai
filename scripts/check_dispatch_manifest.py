@@ -181,7 +181,16 @@ def check_counter_in_file(
     )
     declared = bool(decl_re.search(text))
 
-    fetch_re = re.compile(rf"\b{re.escape(counter)}\.fetch_add\s*\(")
+    # `\s*` around the dot is load-bearing, not defensive. rustfmt wraps a long
+    # increment as
+    #     COUNTER
+    #         .fetch_add(1, Ordering::Relaxed);
+    # and a `COUNTER\.fetch_add` pattern then reports a live branch as dead.
+    # That happened to CONV_POINTWISE_GEMM_TEST_HITS: the lint called a working
+    # 1x1-pointwise dispatch "likely dead code" purely because the line was long.
+    # A lint that cries wolf over formatting teaches people to ignore it, which
+    # costs more than the check is worth. See self_test().
+    fetch_re = re.compile(rf"\b{re.escape(counter)}\s*\.\s*fetch_add\s*\(")
     incremented = bool(fetch_re.search(text))
 
     if not declared:
@@ -411,5 +420,85 @@ def main() -> int:
     return 0
 
 
+def self_test() -> int:
+    """Check the lint's own detection regexes against realistic rustfmt output.
+
+    This lint is a detector, and a detector's failure mode is silence. These
+    cases exist because the counter/increment patterns are matched textually,
+    so any formatting the regexes did not anticipate becomes a blind spot.
+    Every case below is a shape rustfmt actually produces.
+    """
+    import tempfile
+
+    cases = [
+        # (label, source, expect_declared, expect_incremented)
+        (
+            "single-line increment",
+            "static C_TEST_HITS: AtomicUsize = AtomicUsize::new(0);\n"
+            "fn f() { C_TEST_HITS.fetch_add(1, Ordering::Relaxed); }\n",
+            True,
+            True,
+        ),
+        (
+            "rustfmt-wrapped increment (the CONV_POINTWISE_GEMM regression)",
+            "static C_TEST_HITS: AtomicUsize = AtomicUsize::new(0);\n"
+            "fn f() {\n    C_TEST_HITS\n"
+            "        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);\n}\n",
+            True,
+            True,
+        ),
+        (
+            "rustfmt-wrapped declaration",
+            "static C_TEST_HITS: std::sync::atomic::AtomicUsize =\n"
+            "    std::sync::atomic::AtomicUsize::new(0);\n"
+            "fn f() { C_TEST_HITS.fetch_add(1, Ordering::Relaxed); }\n",
+            True,
+            True,
+        ),
+        (
+            "genuinely dead counter must still be reported",
+            "static C_TEST_HITS: AtomicUsize = AtomicUsize::new(0);\n"
+            "fn f() { let _ = C_TEST_HITS.load(Ordering::Relaxed); }\n",
+            True,
+            False,
+        ),
+        (
+            "missing counter must still be reported",
+            "fn f() {}\n",
+            False,
+            False,
+        ),
+    ]
+
+    failures = []
+    with tempfile.TemporaryDirectory(dir=REPO) as tmp:
+        for label, src, want_decl, want_incr in cases:
+            path = Path(tmp) / "case.rs"
+            path.write_text(src)
+            declared, incremented, _ = check_counter_in_file("C_TEST_HITS", path)
+            if (declared, incremented) != (want_decl, want_incr):
+                failures.append(
+                    f"  {label}\n"
+                    f"    expected declared={want_decl} incremented={want_incr}\n"
+                    f"    got      declared={declared} incremented={incremented}"
+                )
+
+    if failures:
+        print("dispatch-manifest lint SELF-TEST FAILED:\n")
+        print("\n".join(failures))
+        print(
+            "\nThe lint's own detection is broken. Until this passes, a green\n"
+            "manifest check proves nothing."
+        )
+        return 1
+
+    print(f"dispatch-manifest lint self-test: {len(cases)} case(s) passed ✓")
+    return 0
+
+
 if __name__ == "__main__":
+    import sys
+
+    if "--self-test" in sys.argv:
+        raise SystemExit(self_test())
     raise SystemExit(main())

@@ -98,11 +98,11 @@ description = "When BNNS rejects (e.g. unsupported dilation), falls to im2col+GE
 [[claim]]
 op = "Conv"
 variant = "pointwise_1x1_gemm"
-platform = "all"
+platform = "aarch64-apple-darwin"
 minimum_tier = "tier2"
 counter = "CONV_POINTWISE_GEMM_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
-description = "1x1 pointwise Conv with weight > L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm"
+description = "1x1 pointwise Conv with weight > E-core L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm. Apple-only: there is no BNNS to bypass elsewhere."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SDPA — aarch64
