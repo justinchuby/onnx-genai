@@ -17,6 +17,27 @@ fn tiny_scatter_llm() -> PathBuf {
         .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
 }
 
+/// Explicit `model.io.static_cache` ABI matching the `tiny-llm-scatter` fixture
+/// graph's actual port names. The scatter control ports are shape-indistinguish-
+/// able integers, so they must be declared rather than name-guessed.
+fn scatter_io() -> onnx_genai_metadata::ModelIoSpec {
+    serde_json::from_str(
+        r#"{
+            "token_input": "input_ids",
+            "logits_output": "logits",
+            "static_cache": {
+                "write_indices_input": "write_indices",
+                "kv_sequence_length_input": "nonpad_kv_seqlen",
+                "key_cache_inputs": ["key_cache.0"],
+                "value_cache_inputs": ["value_cache.0"],
+                "key_cache_outputs": ["updated_key_cache.0"],
+                "value_cache_outputs": ["updated_value_cache.0"]
+            }
+        }"#,
+    )
+    .expect("scatter io spec")
+}
+
 fn tiny_sharedbuffer_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx")
@@ -232,6 +253,73 @@ fn bound_decode_rewind_matches_replay() {
 }
 
 #[test]
+fn static_cache_without_metadata_errors_naming_the_key() {
+    // A static-cache-shaped graph (TensorScatter scatter ABI) that declares no
+    // `model.io.static_cache` must fail closed rather than name-guess the
+    // shape-indistinguishable integer control ports, and the error must name the
+    // exact key to declare.
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_scatter_llm(),
+        deterministic_session_options(),
+    )
+    .expect("session");
+
+    let detect_err = StaticCacheDecodeSession::detect(&session, None)
+        .expect_err("undeclared static cache must fail closed");
+    assert!(
+        detect_err.to_string().contains("model.io.static_cache"),
+        "error must name the missing key: {detect_err}"
+    );
+
+    let new_err = match StaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 1 },
+        None,
+    ) {
+        Ok(_) => panic!("undeclared static cache must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        new_err.to_string().contains("model.io.static_cache"),
+        "error must name the missing key: {new_err}"
+    );
+}
+
+#[test]
+fn static_cache_with_explicit_metadata_classifies_from_fixture() {
+    // The fixture WITH an explicit `model.io.static_cache` block loads and
+    // classifies through the same name-agnostic `StaticCacheAbi::classify` path,
+    // with equal-length positionally-paired cache ports.
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_scatter_llm(),
+        deterministic_session_options(),
+    )
+    .expect("session");
+    let io = scatter_io();
+    let signature = StaticCacheDecodeSession::detect(&session, Some(&io))
+        .expect("detect")
+        .expect("static-cache signature");
+    assert_eq!(signature.layers, 1);
+    assert_eq!(signature.max_len, 16);
+    assert_eq!(signature.kv_dim, 16);
+    assert!(!signature.has_position_ids);
+
+    let mut decode = StaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 1 },
+        Some(&io),
+    )
+    .expect("static decode session");
+    let prefill = decode.prefill(&[1, 5], &[0, 1]).expect("prefill");
+    assert_eq!(prefill.shape(), &[1, 2, 32]);
+    assert_eq!(decode.current_len(), 2);
+}
+
+#[test]
 fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
     let _guard = ort_test_lock().lock().expect("ORT test lock");
     let session = Session::new(
@@ -240,7 +328,8 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
         deterministic_session_options(),
     )
     .expect("session");
-    let signature = StaticCacheDecodeSession::detect(&session)
+    let io = scatter_io();
+    let signature = StaticCacheDecodeSession::detect(&session, Some(&io))
         .expect("detect")
         .expect("static-cache signature");
     assert_eq!(signature.layers, 1);
@@ -248,9 +337,12 @@ fn static_cache_decode_reuses_buffers_and_rewinds_deterministically() {
     assert_eq!(signature.kv_dim, 16);
     assert!(!signature.has_position_ids);
 
-    let mut decode =
-        StaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 1 })
-            .expect("static decode session");
+    let mut decode = StaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 1 },
+        Some(&io),
+    )
+    .expect("static decode session");
     let initial_buffers = decode.buffer_infos().expect("initial buffers");
     assert_eq!(initial_buffers.len(), 2);
 
@@ -332,9 +424,12 @@ fn batched_static_cache_matches_unbatched_rows_and_reuses_slots() {
         .max()
         .expect("traces");
 
-    let mut batched =
-        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 3 })
-            .expect("batched static decode session");
+    let mut batched = BatchedStaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 3 },
+        Some(&scatter_io()),
+    )
+    .expect("batched static decode session");
     let initial_buffers = batched.buffer_infos().expect("initial buffers");
     assert_eq!(initial_buffers.len(), 2);
     assert!(
@@ -427,9 +522,12 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
         .map(|prompt| static_cache_greedy_trace(&session, prompt, 2))
         .collect::<Vec<_>>();
 
-    let mut batched =
-        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
-            .expect("batched static decode session");
+    let mut batched = BatchedStaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 4 },
+        Some(&scatter_io()),
+    )
+    .expect("batched static decode session");
 
     for prompt_index in 0..2 {
         let ids = prompts
@@ -457,9 +555,12 @@ fn batched_static_cache_active_compaction_skips_inactive_rows_and_admits_replace
             BatchedStaticCacheDecodeSession::row_logits(&full_logits, row, 0).expect("row logits");
         assert_batched_matches_individual(&row_logits, &expected[row].logits[2]);
     }
-    let mut full_reference =
-        BatchedStaticCacheDecodeSession::new(&session, StaticCacheDecodeOptions { batch_size: 4 })
-            .expect("full reference");
+    let mut full_reference = BatchedStaticCacheDecodeSession::new(
+        &session,
+        StaticCacheDecodeOptions { batch_size: 4 },
+        Some(&scatter_io()),
+    )
+    .expect("full reference");
     for prompt_index in 0..2 {
         let ids = prompts
             .iter()
@@ -545,9 +646,12 @@ struct StaticTrace {
 }
 
 fn static_cache_greedy_trace(session: &Session, prompt: &[i64], generated: usize) -> StaticTrace {
-    let mut decode =
-        StaticCacheDecodeSession::new(session, StaticCacheDecodeOptions { batch_size: 1 })
-            .expect("static decode session");
+    let mut decode = StaticCacheDecodeSession::new(
+        session,
+        StaticCacheDecodeOptions { batch_size: 1 },
+        Some(&scatter_io()),
+    )
+    .expect("static decode session");
     let mut input_tokens = Vec::new();
     let mut logits = Vec::new();
     for (position, token) in prompt.iter().enumerate() {

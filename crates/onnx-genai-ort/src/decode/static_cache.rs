@@ -1,7 +1,6 @@
 use super::*;
 
 pub(super) struct StaticCachePair {
-    pub(super) index: usize,
     pub(super) key_input: TensorInfo,
     pub(super) value_input: TensorInfo,
     pub(super) key_output: String,
@@ -68,6 +67,7 @@ pub struct StaticCacheDecodeSession<'a> {
     mode: StaticCacheBindingMode,
     buffers: Vec<StaticCacheBuffer>,
     logits_output: String,
+    abi: StaticCacheAbi,
 }
 
 /// Batched stateful decode runner for static-cache TensorScatter models.
@@ -89,17 +89,25 @@ pub struct BatchedStaticCacheDecodeSession<'a> {
     mode: StaticCacheBindingMode,
     buffers: Vec<StaticCacheBuffer>,
     logits_output: String,
+    abi: StaticCacheAbi,
 }
 
 impl<'a> StaticCacheDecodeSession<'a> {
     /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
-    pub fn detect(session: &Session) -> Result<Option<StaticCacheSignature>> {
-        Ok(detect_static_cache(session)?.map(|(signature, _)| signature))
+    pub fn detect(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> Result<Option<StaticCacheSignature>> {
+        Ok(detect_static_cache(session, io)?.map(|(signature, ..)| signature))
     }
 
     /// Create a static-cache decode session if the graph exposes the signature.
-    pub fn new(session: &'a Session, options: StaticCacheDecodeOptions) -> Result<Self> {
-        let (signature, pairs) = detect_static_cache(session)?.ok_or_else(|| {
+    pub fn new(
+        session: &'a Session,
+        options: StaticCacheDecodeOptions,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> Result<Self> {
+        let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(
                 "model does not expose static-cache key_cache/write_indices inputs".into(),
             )
@@ -115,6 +123,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
             mode: StaticCacheBindingMode::InPlaceAlias,
             buffers,
             logits_output,
+            abi,
         })
     }
 
@@ -259,9 +268,11 @@ impl<'a> StaticCacheDecodeSession<'a> {
 
         self.binding.clear()?;
         for input in self.session.inputs() {
-            match input.name.as_str() {
-                "input_ids" => self.binding.bind_input(&input.name, &input_ids_value)?,
-                "position_ids" => {
+            match self.abi.classify(&input.name) {
+                Some(StaticCacheInputRole::Token) => {
+                    self.binding.bind_input(&input.name, &input_ids_value)?
+                }
+                Some(StaticCacheInputRole::Position) => {
                     let Some(position_ids_value) = position_ids_value.as_ref() else {
                         return Err(OrtError::InvalidArgument(
                             "model requires position_ids but none were prepared".into(),
@@ -269,10 +280,17 @@ impl<'a> StaticCacheDecodeSession<'a> {
                     };
                     self.binding.bind_input(&input.name, position_ids_value)?;
                 }
-                "write_indices" => self.binding.bind_input(&input.name, &write_indices)?,
-                "nonpad_kv_seqlen" => self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?,
-                name => {
-                    let Some(buffer) = self.buffers.iter().find(|buffer| buffer.input_name == name)
+                Some(StaticCacheInputRole::WriteIndices) => {
+                    self.binding.bind_input(&input.name, &write_indices)?
+                }
+                Some(StaticCacheInputRole::KvSequenceLength) => {
+                    self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?
+                }
+                None => {
+                    let Some(buffer) = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| buffer.input_name == input.name)
                     else {
                         return Err(OrtError::InvalidArgument(format!(
                             "unsupported static-cache input '{}'",
@@ -363,14 +381,21 @@ impl<'a> StaticCacheDecodeSession<'a> {
 
 impl<'a> BatchedStaticCacheDecodeSession<'a> {
     /// Detect a STATIC-CACHE/TensorScatter signature from ONNX graph I/O.
-    pub fn detect(session: &Session) -> Result<Option<StaticCacheSignature>> {
-        StaticCacheDecodeSession::detect(session)
+    pub fn detect(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> Result<Option<StaticCacheSignature>> {
+        StaticCacheDecodeSession::detect(session, io)
     }
 
     /// Create a batched static-cache decode session with all rows active at
     /// cursor 0.
-    pub fn new(session: &'a Session, options: StaticCacheDecodeOptions) -> Result<Self> {
-        let (signature, pairs) = detect_static_cache(session)?.ok_or_else(|| {
+    pub fn new(
+        session: &'a Session,
+        options: StaticCacheDecodeOptions,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> Result<Self> {
+        let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(
                 "model does not expose static-cache key_cache/write_indices inputs".into(),
             )
@@ -402,6 +427,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             mode: StaticCacheBindingMode::InPlaceAlias,
             buffers,
             logits_output,
+            abi,
         })
     }
 
@@ -897,9 +923,11 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
 
         self.binding.clear()?;
         for input in self.session.inputs() {
-            match input.name.as_str() {
-                "input_ids" => self.binding.bind_input(&input.name, &input_ids_value)?,
-                "position_ids" => {
+            match self.abi.classify(&input.name) {
+                Some(StaticCacheInputRole::Token) => {
+                    self.binding.bind_input(&input.name, &input_ids_value)?
+                }
+                Some(StaticCacheInputRole::Position) => {
                     let Some(position_ids_value) = position_ids_value.as_ref() else {
                         return Err(OrtError::InvalidArgument(
                             "model requires position_ids but none were prepared".into(),
@@ -907,12 +935,16 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                     };
                     self.binding.bind_input(&input.name, position_ids_value)?;
                 }
-                "write_indices" => self.binding.bind_input(&input.name, &write_indices)?,
-                "nonpad_kv_seqlen" => self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?,
-                name => {
+                Some(StaticCacheInputRole::WriteIndices) => {
+                    self.binding.bind_input(&input.name, &write_indices)?
+                }
+                Some(StaticCacheInputRole::KvSequenceLength) => {
+                    self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?
+                }
+                None => {
                     let Some(binding) = prefix_bindings
                         .iter()
-                        .find(|binding| binding.input_name == name)
+                        .find(|binding| binding.input_name == input.name)
                     else {
                         return Err(OrtError::InvalidArgument(format!(
                             "unsupported static-cache input '{}'",
@@ -1036,9 +1068,11 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
 
         self.binding.clear()?;
         for input in self.session.inputs() {
-            match input.name.as_str() {
-                "input_ids" => self.binding.bind_input(&input.name, &input_ids_value)?,
-                "position_ids" => {
+            match self.abi.classify(&input.name) {
+                Some(StaticCacheInputRole::Token) => {
+                    self.binding.bind_input(&input.name, &input_ids_value)?
+                }
+                Some(StaticCacheInputRole::Position) => {
                     let Some(position_ids_value) = position_ids_value.as_ref() else {
                         return Err(OrtError::InvalidArgument(
                             "model requires position_ids but none were prepared".into(),
@@ -1046,10 +1080,17 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
                     };
                     self.binding.bind_input(&input.name, position_ids_value)?;
                 }
-                "write_indices" => self.binding.bind_input(&input.name, &write_indices)?,
-                "nonpad_kv_seqlen" => self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?,
-                name => {
-                    let Some(buffer) = self.buffers.iter().find(|buffer| buffer.input_name == name)
+                Some(StaticCacheInputRole::WriteIndices) => {
+                    self.binding.bind_input(&input.name, &write_indices)?
+                }
+                Some(StaticCacheInputRole::KvSequenceLength) => {
+                    self.binding.bind_input(&input.name, &nonpad_kv_seqlen)?
+                }
+                None => {
+                    let Some(buffer) = self
+                        .buffers
+                        .iter()
+                        .find(|buffer| buffer.input_name == input.name)
                     else {
                         return Err(OrtError::InvalidArgument(format!(
                             "unsupported static-cache input '{}'",

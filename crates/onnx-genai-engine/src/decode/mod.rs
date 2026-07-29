@@ -17,10 +17,7 @@ use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
 use onnx_genai_kv::{KvCacheOps, PagedKvCache};
 use onnx_genai_metadata::{InferenceMetadata, LoopStatePair, PositionProgram};
-use onnx_genai_ort::decode_contract::{
-    KvNamingConvention, matching_past_input as decode_contract_matching_past_input,
-    name_contains_past_key_value, name_contains_present_key_value,
-};
+use onnx_genai_ort::decode_contract::name_contains_past_key_value;
 use onnx_genai_ort::{
     DataType, DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams, Session,
     StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
@@ -52,7 +49,7 @@ pub(crate) use token_sampling::{
     next_session_token_logits, next_session_token_logits_and_hidden,
     next_session_token_logits_and_hiddens, next_session_token_sampled, propose_draft_tokens,
 };
-pub(crate) use values::{clone_value, is_kv_input, is_present_output, matching_past_input};
+pub(crate) use values::{clone_value, is_kv_input};
 
 use logits::{extract_logits_value_next, extract_logits_value_sequence};
 

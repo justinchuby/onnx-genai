@@ -501,6 +501,11 @@ impl Engine {
             return collect_batch_results(results);
         }
 
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
         let mut decode = BatchedStaticCacheDecodeSession::new(
             self.session
                 .as_deref()
@@ -508,6 +513,7 @@ impl Engine {
             StaticCacheDecodeOptions {
                 batch_size: i64::try_from(rows.len()).context("batch size exceeds i64")?,
             },
+            io,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create batched static-cache session: {e}"))?;
 
@@ -603,15 +609,23 @@ impl Engine {
             .context("ORT decoder session is unavailable")?;
         let batch_size = i64::try_from(max_batch).context("batch size exceeds i64")?;
         let decode: Box<dyn BatchedDecodeSession<'_> + '_> = match self.decode_path {
-            ModelDecodePath::StaticCache { .. } => Box::new(
-                BatchedStaticCacheDecodeSession::new(
-                    session,
-                    StaticCacheDecodeOptions { batch_size },
+            ModelDecodePath::StaticCache { .. } => {
+                let io = self
+                    .metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.io.as_ref());
+                Box::new(
+                    BatchedStaticCacheDecodeSession::new(
+                        session,
+                        StaticCacheDecodeOptions { batch_size },
+                        io,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to create continuous static-cache session: {e}")
+                    })?,
                 )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to create continuous static-cache session: {e}")
-                })?,
-            ),
+            }
             ModelDecodePath::PastPresent {
                 shared_buffer: true,
                 max_len,

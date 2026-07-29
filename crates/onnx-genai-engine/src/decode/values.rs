@@ -334,17 +334,6 @@ pub(crate) fn is_kv_input(name: &str) -> bool {
     name_contains_past_key_value(name)
 }
 
-pub(crate) fn is_present_output(name: &str) -> bool {
-    name_contains_present_key_value(name)
-}
-
-pub(crate) fn matching_past_input<'a>(
-    present_name: &str,
-    inputs: &'a [String],
-) -> Option<&'a String> {
-    decode_contract_matching_past_input(present_name, inputs, KvNamingConvention::DottedAndGeneric)
-}
-
 pub(crate) fn is_gather_out_of_bounds(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("gather")

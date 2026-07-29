@@ -1601,7 +1601,7 @@
             }
           ],
           "default": null,
-          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nWhen present, the runtime binds decode-step inputs and outputs from the\ndeclared names instead of inferring them from tensor-name conventions.\nWhen absent, the runtime falls back to the historical name conventions\n(a temporary, transitional behavior)."
+          "description": "Explicit graph I/O port bindings for the single-decoder LLM path.\n\nThe runtime binds decode-step inputs and outputs from the declared names.\nA port that is not declared is resolved ONLY from an unambiguous io-shape\nsignal; when the shape is ambiguous the runtime fails with an actionable\nerror naming the exact key to declare, and never guesses from a tensor\nname."
         },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
@@ -1658,7 +1658,7 @@
       "type": "object"
     },
     "ModelIoSpec": {
-      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. Any port left unset is resolved from an unambiguous\ndtype/shape signal where possible, then falls back to the runtime's\nhistorical name convention for compatibility. A declared port is always\nauthoritative.",
+      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. A port left unset is resolved ONLY from an unambiguous\ndtype/shape signal; when the shape cannot disambiguate the port, the runtime\nfails with an actionable error naming the key to declare rather than\ninterpreting a tensor name. A declared port is always authoritative.",
       "properties": {
         "attention_mask_input": {
           "description": "Attention-mask input, if the graph takes one.",
@@ -1810,6 +1810,17 @@
             "array",
             "null"
           ]
+        },
+        "static_cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StaticCacheIoSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit port binding for a fixed-buffer TensorScatter static KV cache.\n\nA static-cache decoder scatters each step's K/V into pre-allocated,\nfixed-length buffers via an integer write-index vector and a non-pad\nsequence-length vector, rather than growing/appending a cache. These\ncontrol ports are integer vectors and are therefore SHAPE-indistinguish-\nable from one another, so shape cannot disambiguate them: the ABI must be\ndeclared explicitly. When present, this spec is authoritative and the\nruntime binds exactly these ports. When absent, a graph that exposes the\nscatter ABI is REJECTED with an actionable error naming this key rather\nthan having its integer control ports guessed by name."
         },
         "token_input": {
           "description": "Token-id input (e.g. `input_ids`).\n\nA graph MAY declare this together with `inputs_embeds_input`: some fused\ndecoders consume a raw token stream AND a routed pre-embedded sequence in\nthe same forward pass. The two are not mutually exclusive; declaring both\nis a valid, explicit contract.",
@@ -2038,7 +2049,7 @@
             }
           ],
           "default": null,
-          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nWhen present, the runtime binds decode-step ports from the declared\nnames instead of inferring them from tensor-name conventions. When\nabsent, the runtime falls back to the historical name conventions (a\ntemporary, transitional behavior)."
+          "description": "Explicit graph I/O port bindings for this pipeline component.\n\nThe runtime binds decode-step ports from the declared names. A port that\nis not declared is resolved ONLY from an unambiguous io-shape signal;\nwhen the shape is ambiguous the runtime fails with an actionable error\nnaming the key to declare, and never guesses from a tensor name."
         },
         "tokenizer": {
           "description": "Tokenizer filename relative to the package root.\n\nIf absent, loaders may use a shared top-level `tokenizer.json`.",
@@ -2209,6 +2220,13 @@
         "inner": {
           "default": null,
           "description": "Inner autoregressive decoder for a `nested_autoregressive` stage.\n\nThe code_predictor: for each outer frame it runs a short inner AR loop of\n`num_code_groups` steps over the residual codebooks, seeded at inner step\n0 by the outer decoder's `last_hidden_state` (routed via a dataflow edge\n`outer.last_hidden_state -> inner.inputs_embeds`) and threading its own\nper-step code embedding on later steps.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inner_embedding_output": {
+          "description": "Inner decoder output port threaded across inner steps for a\n`nested_autoregressive` stage.\n\nEach inner step consumes the previous step's per-code embedding as its\n`inputs_embeds` seed; this names the inner decoder OUTPUT port that\nproduces that embedding. It is declared explicitly because the port is\nshape-indistinguishable from other float outputs — the runtime must not\ninfer it by tensor name. Absent on a nested stage ⇒ actionable error\nnaming `pipeline.strategy.inner_embedding_output`.",
           "type": [
             "string",
             "null"
@@ -3594,6 +3612,66 @@
         }
       ],
       "type": "string"
+    },
+    "StaticCacheIoSpec": {
+      "description": "Explicit port ABI for a fixed-buffer TensorScatter static KV cache.\n\nDescribes GRAPH STRUCTURE, never a model family. The four per-layer cache\nlists pair positionally per layer and must all have the same length: index\n`i` in each list is layer `i`'s key/value input and updated key/value output.",
+      "properties": {
+        "key_cache_inputs": {
+          "description": "Per-layer static key-cache buffer inputs, positional per layer. Length\nmust equal `value_cache_inputs`, `key_cache_outputs`, and\n`value_cache_outputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "key_cache_outputs": {
+          "description": "Per-layer updated key-cache outputs, paired positionally with\n`key_cache_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "kv_sequence_length_input": {
+          "description": "Input port carrying the non-pad KV sequence length (`int` vector).\nShape-indistinguishable from `write_indices_input`, so it too must be\nnamed explicitly.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "value_cache_inputs": {
+          "description": "Per-layer static value-cache buffer inputs, paired positionally with\n`key_cache_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "value_cache_outputs": {
+          "description": "Per-layer updated value-cache outputs, paired positionally with\n`value_cache_inputs`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "write_indices_input": {
+          "description": "Input port carrying the per-token scatter write positions\n(`int` vector). Shape-indistinguishable from other integer control\ninputs, so it must be named explicitly.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "write_indices_input",
+        "kv_sequence_length_input",
+        "key_cache_inputs",
+        "value_cache_inputs",
+        "key_cache_outputs",
+        "value_cache_outputs"
+      ],
+      "type": "object"
     },
     "StrategyKind": {
       "description": "Generic inference-strategy vocabulary.",

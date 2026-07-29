@@ -47,7 +47,7 @@ fn main() -> onnx_genai_ort::Result<()> {
         Mode::PastPresent => run_past_present(&session, &args, false)?,
         Mode::Shared => run_past_present(&session, &args, true)?,
         Mode::Auto => {
-            if StaticCacheDecodeSession::detect(&session)?.is_some() {
+            if StaticCacheDecodeSession::detect(&session, None)?.is_some() {
                 run_static(&session, &args)?;
             } else {
                 run_past_present(&session, &args, false)?;
@@ -59,10 +59,10 @@ fn main() -> onnx_genai_ort::Result<()> {
 }
 
 fn run_static(session: &Session, args: &Args) -> onnx_genai_ort::Result<()> {
-    let signature = StaticCacheDecodeSession::detect(session)?
+    let signature = StaticCacheDecodeSession::detect(session, None)?
         .ok_or_else(|| invalid("model does not expose static-cache I/O"))?;
     let mut decode =
-        StaticCacheDecodeSession::new(session, StaticCacheDecodeOptions { batch_size: 1 })?;
+        StaticCacheDecodeSession::new(session, StaticCacheDecodeOptions { batch_size: 1 }, None)?;
     let initial_buffers = decode.buffer_infos()?;
     let kv_bytes = initial_buffers
         .iter()

@@ -86,7 +86,7 @@ pub(crate) fn detect_model_decode_path(
     sliding_window: Option<usize>,
     sink_tokens: usize,
 ) -> anyhow::Result<ModelDecodePath> {
-    if let Some(signature) = StaticCacheDecodeSession::detect(session)? {
+    if let Some(signature) = StaticCacheDecodeSession::detect(session, io)? {
         if sliding_window.is_some() {
             anyhow::bail!(
                 "sliding-window attention is not supported by the static-cache decode path; Mobius must emit a rotating/circular static cache contract"

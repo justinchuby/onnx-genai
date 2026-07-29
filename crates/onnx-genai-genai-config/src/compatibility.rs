@@ -990,12 +990,16 @@ impl GenAiConfig {
         // Encoder prompt input, keyed off the declared input SHAPE, not a model
         // name: audio front-ends declare `audio_features`, text encoders declare
         // `input_ids`. Exactly one must be present.
-        let (encoder_input_field, encoder_input) = match (
+        let (encoder_input_field, encoder_input, encoder_input_role) = match (
             encoder.inputs.audio_features.as_deref(),
             encoder.inputs.input_ids.as_deref(),
         ) {
-            (Some(audio), None) => ("model.encoder.inputs.audio_features", audio),
-            (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids),
+            (Some(audio), None) => (
+                "model.encoder.inputs.audio_features",
+                audio,
+                "audio_features_input",
+            ),
+            (None, Some(ids)) => ("model.encoder.inputs.input_ids", ids, "token_input"),
             (Some(_), Some(_)) => {
                 return Err(incomplete(
                     "model.encoder declares both audio_features and input_ids; exactly one encoder prompt input is required",
@@ -1146,14 +1150,10 @@ impl GenAiConfig {
         decoder_io.insert("cross_kv_outputs".into(), json!(cross_kv_outputs));
 
         let mut encoder_io = Map::new();
-        // Audio front-ends declare the mel `audio_features` input; text encoders
-        // reuse the ordinary `token_input`. Keyed off the encoder-input SHAPE
-        // resolved above, never the model name.
-        let encoder_input_role = if encoder_input_field.ends_with("audio_features") {
-            "audio_features_input"
-        } else {
-            "token_input"
-        };
+        // The encoder prompt-input role (`audio_features_input` vs `token_input`)
+        // is taken directly from WHICH explicit genai-config field the exporter
+        // declared (`audio_features` vs `input_ids`), captured in the match
+        // above — never re-derived by string-matching the port name.
         encoder_io.insert(encoder_input_role.into(), json!(encoder_input));
 
         let mut models = Map::new();
