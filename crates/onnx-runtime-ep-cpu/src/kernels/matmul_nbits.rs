@@ -183,6 +183,36 @@ fn mlas_no_shard() -> bool {
     })
 }
 
+/// Override for the MLAS QNBit MatMulNBits route. `0`/`off` disables all MLAS
+/// QNBit calls; `1`/`on` also opts non-Apple ARM64 decode into the KleidiAI QNBit
+/// path for A/B perf probes. Unset keeps the established defaults.
+#[cfg(feature = "mlas")]
+fn mlas_qnbit_env_override() -> Option<bool> {
+    std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("off")
+        })
+}
+
+#[cfg(feature = "mlas")]
+fn mlas_qnbit_enabled() -> bool {
+    mlas_qnbit_env_override().unwrap_or(true)
+}
+
+#[cfg(feature = "mlas")]
+fn arm64_mlas_qnbit_decode_opted_in() -> bool {
+    mlas_qnbit_env_override() == Some(true)
+}
+
+#[cfg(feature = "mlas")]
+fn sqnbit_backend_forced_mlas() -> bool {
+    std::env::var("NXRT_CPU_GEMM_BACKEND")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("mlas"))
+}
+
 /// Force the prefill (`m > 1`) MLAS SQNBit path back to the pre-fix serial
 /// loop (each per-worker shard run with MLAS `multithread=true`, one after
 /// another). The default parallel `(shard x m-row-block)` dispatch is
@@ -320,6 +350,8 @@ static INT4_DIRECT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, feature = "mlas"))]
+static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
@@ -1160,15 +1192,19 @@ impl MatMulNBitsKernel {
     ) -> Result<Option<()>> {
         use crate::backend::CpuBackend;
 
+        if !mlas_qnbit_enabled() {
+            return Ok(None);
+        }
+
         if self.weight_prepacked {
             let comp = self.mlas_compute_type();
             if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
                 && m == 1
                 && zero_points.is_some()
-                && !host_has_mlas_sqnbit_avx512()
+                && !host_supports_mlas_sqnbit_m1_asym_int8()
             {
                 return Err(error(
-                    "weight_prepacked=1 asymmetric CompInt8 M=1 is unavailable on this CPU because the MLAS AVX2 kernel is not numerically correct",
+                    "weight_prepacked=1 asymmetric CompInt8 M=1 is unavailable on this CPU because its MLAS kernel is not numerically correct",
                 ));
             }
 
@@ -1193,18 +1229,29 @@ impl MatMulNBitsKernel {
                     self.bits, self.block_size, self.accuracy_level
                 ))
             })?;
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
                 mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
             });
             return Ok(Some(()));
         }
 
-        // Cheapest gate first: in the decode regime (small `m`), keep the fast
-        // hand int4/int8 path -- it ties MLAS on the bandwidth-bound M=1 GEMV
-        // and avoids int8 activation rounding -- so fall back before any weight
-        // packing. A slow-hand-path case (`accuracy_level != 4`, which would
-        // dequantize to f32 and run a dense GEMV) is left for MLAS below.
-        let hand_decode_is_fast = self.bits == 4 && self.accuracy_level == 4;
+        let prefer_arm64_mlas_decode = prefer_arm64_mlas_qnbit_decode(
+            self.bits,
+            self.block_size,
+            self.accuracy_level,
+            m,
+            group_indices.is_none(),
+        );
+
+        // Cheapest gate first: outside the ARM64 QNBit/KleidiAI route, keep the
+        // fast hand int4 decode path for small `m` and avoid MLAS packing. When
+        // explicitly opted in on non-Apple ARM64, the vendored MLAS QNBit path
+        // can serve accuracy-4 qsi4/qsi8 decode with the same KleidiAI kernels
+        // ORT uses.
+        let hand_decode_is_fast =
+            self.bits == 4 && self.accuracy_level == 4 && !prefer_arm64_mlas_decode;
         if m < sqnbit_decode_min() && hand_decode_is_fast {
             return Ok(None);
         }
@@ -1218,9 +1265,11 @@ impl MatMulNBitsKernel {
         // prefer MLAS SQNBit (CompFp32) whenever MLAS actually has a kernel --
         // this matches ORT/onnxruntime-genai, which treat `accuracy_level` 0/1 as
         // CompFp32 rather than dequantizing the whole weight.
-        let backend_is_mlas = CpuBackend::auto_detect() == CpuBackend::Mlas;
-        let use_mlas = backend_is_mlas || self.accuracy_level != 4;
-        if self.bits != 4 || group_indices.is_some() || !use_mlas {
+        let backend_is_mlas =
+            CpuBackend::auto_detect() == CpuBackend::Mlas || sqnbit_backend_forced_mlas();
+        let use_mlas = backend_is_mlas || self.accuracy_level != 4 || prefer_arm64_mlas_decode;
+        let supports_bits = self.bits == 4 || (prefer_arm64_mlas_decode && self.bits == 8);
+        if !supports_bits || group_indices.is_some() || !use_mlas {
             return Ok(None);
         }
 
@@ -1239,7 +1288,7 @@ impl MatMulNBitsKernel {
         if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
             && m == 1
             && zero_points.is_some()
-            && !host_has_mlas_sqnbit_avx512()
+            && !host_supports_mlas_sqnbit_m1_asym_int8()
         {
             return Ok(None);
         }
@@ -1271,7 +1320,30 @@ impl MatMulNBitsKernel {
             let Some(shards) = shards.as_ref() else {
                 return Ok(None);
             };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
+            return Ok(Some(()));
+        }
+
+        if can_prepack {
+            let cached = if let Some(cached) = self.mlas_packed.get() {
+                cached
+            } else {
+                let built = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+                let _ = self.mlas_packed.set(built);
+                self.mlas_packed
+                    .get()
+                    .expect("constant MatMulNBits MLAS full-width weight was just initialized")
+            };
+            let Some(packed_weight) = cached.as_ref() else {
+                return Ok(None);
+            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| {
+                mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
+            });
             return Ok(Some(()));
         }
 
@@ -1279,6 +1351,8 @@ impl MatMulNBitsKernel {
         let Some(packed_weight) = owned.as_ref() else {
             return Ok(None);
         };
+        #[cfg(all(test, feature = "mlas"))]
+        MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
         mm_profile::time_gemv(|| {
             mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
         });
@@ -3174,6 +3248,42 @@ fn selected_dot_kernel() -> DotKernel {
 /// hosts (Xeon Phi KNL/KNM). On non-x86-64 targets no such kernel exists so this
 /// is always `false`.
 #[cfg(feature = "mlas")]
+fn prefer_arm64_mlas_qnbit_decode(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    m: usize,
+    no_group_indices: bool,
+) -> bool {
+    cfg!(all(
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    )) && arm64_mlas_qnbit_decode_opted_in()
+        && matches!(bits, 4 | 8)
+        && block_size == 128
+        && accuracy_level == 4
+        && m == 1
+        && no_group_indices
+}
+
+#[cfg(feature = "mlas")]
+fn host_supports_mlas_sqnbit_m1_asym_int8() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        host_has_mlas_sqnbit_avx512()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        true
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "mlas")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn host_has_mlas_sqnbit_avx512() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -7028,10 +7138,103 @@ mod tests {
         assert_eq!(
             kernel.packed_int4_weight.get().is_some()
                 || kernel.packed_int4_n16_weight.get().is_some()
-                || kernel.packed_kai_qsi4_weight.get().is_some(),
+                || kernel.packed_kai_qsi4_weight.get().is_some()
+                || {
+                    #[cfg(feature = "mlas")]
+                    {
+                        kernel.mlas_shards.get().is_some()
+                    }
+                    #[cfg(not(feature = "mlas"))]
+                    {
+                        false
+                    }
+                },
             direct_int4
         );
         assert_eq!(kernel.int8_weight.get().is_some(), !direct_int4);
+    }
+
+    #[cfg(all(
+        feature = "mlas",
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    #[test]
+    fn matmulnbits_arm64_mlas_qnbit_reaches_qwen_decode_bits4_and_bits8() {
+        let (k, n) = (128usize, 256usize);
+        let activations: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+            .collect();
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("ONNX_GENAI_CPU_MM_MLAS_QNBIT").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var in tests.
+        unsafe { std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", "1") };
+        for (bits, block_size) in [(4usize, 128usize), (8, 128)] {
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+                .collect();
+            let (packed, scales, zps, _) = if bits == 4 {
+                quantize(&weights, n, k, block_size, true)
+            } else {
+                quantize_8bit(&weights, n, k, block_size, true)
+            };
+            let zps = zps.expect("asymmetric quantization must emit qzeros");
+            if mlas_sys::SQNBitPackedB::new(
+                n,
+                k,
+                bits,
+                block_size,
+                mlas_sys::SQNBitComputeType::Int8,
+                &packed,
+                &scales,
+                Some(&zps),
+            )
+            .is_none()
+            {
+                eprintln!("MLAS QNBit bits={bits} CompInt8 unavailable; skipping reachability");
+                continue;
+            }
+
+            let mut kernel = accuracy4_kernel(k, n, block_size);
+            kernel.bits = bits;
+            kernel.set_constant_inputs(&[false, true, true, true]);
+            let blocks = k.div_ceil(block_size);
+            let blob = block_size * bits / 8;
+            let zp_blob = (blocks * bits).div_ceil(8);
+            let a = Owned::f32(&[1, k], &activations);
+            let b = Owned::u8(&[n, blocks, blob], &packed);
+            let scales = Owned::f32(&[n, blocks], &scales);
+            let zero_points = Owned::u8(&[n, zp_blob], &zps);
+            let mut y = Owned::zeros_f32(&[1, n]);
+
+            let before = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales.view(), zero_points.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            assert!(
+                MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before,
+                "bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
+            );
+            assert!(
+                kernel.mlas_shards.get().is_some(),
+                "bits={bits} block{block_size} must prepack MLAS QNBit shards once",
+            );
+            assert!(
+                kernel.packed_kai_qsi4_weight.get().is_none()
+                    && kernel.packed_kai_qsi8_weight.get().is_none(),
+                "bits={bits} block{block_size} must prefer MLAS over the native KAI fallback",
+            );
+        }
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT", value),
+                None => std::env::remove_var("ONNX_GENAI_CPU_MM_MLAS_QNBIT"),
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -7090,22 +7293,42 @@ mod tests {
             let scales = Owned::f32(&[n, blocks], &scales);
             let mut y = Owned::zeros_f32(&[1, n]);
             let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            #[cfg(feature = "mlas")]
+            let before_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
             kernel
                 .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
                 .unwrap();
+            let reached_kai = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before;
+            #[cfg(feature = "mlas")]
+            let reached_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before_mlas;
+            #[cfg(not(feature = "mlas"))]
+            let reached_mlas = false;
             assert!(
-                KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before,
-                "aarch64 KAI qsi4 dot-product path was not reached for K={k} N={n}"
+                reached_kai || reached_mlas,
+                "aarch64 bits=4/block128 decode reached neither MLAS QNBit nor KAI SDOT for K={k} N={n}",
             );
             assert!(
-                kernel.packed_kai_qsi4_weight.get().is_some(),
-                "block-128 direct int4 path must cache the KAI-style packed qsi4 weight"
+                kernel.packed_kai_qsi4_weight.get().is_some() || {
+                    #[cfg(feature = "mlas")]
+                    {
+                        kernel.mlas_shards.get().is_some()
+                    }
+                    #[cfg(not(feature = "mlas"))]
+                    {
+                        false
+                    }
+                },
+                "block-128 direct int4 path must cache packed KAI or MLAS QNBit weight",
             );
             assert!(
                 kernel.int8_weight.get().is_none(),
                 "block-128 direct int4 path must bypass the int8 prepack fallback"
             );
-            assert_close(&y.to_f32(), &dot);
+            if reached_kai {
+                assert_close(&y.to_f32(), &dot);
+            } else {
+                mlas_close(&y.to_f32(), &dot, 2e-1, "aarch64 MLAS qsi4 decode");
+            }
         }
     }
 
@@ -7312,17 +7535,35 @@ mod tests {
         let zps = Owned::u8(&[n, blocks.div_ceil(2)], &zero_points);
         let mut y = Owned::zeros_f32(&[1, n]);
         let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+        #[cfg(feature = "mlas")]
+        let before_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed);
         kernel
             .execute(
                 &[a.view(), b.view(), scales.view(), zps.view()],
                 &mut [y.view_mut()],
             )
             .unwrap();
+        let reached_kai = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before;
+        #[cfg(feature = "mlas")]
+        let reached_mlas = MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > before_mlas;
+        #[cfg(not(feature = "mlas"))]
+        let reached_mlas = false;
         assert!(
-            KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before,
-            "real Qwen bits=4/block128/asymmetric shape did not reach KAI SDOT"
+            reached_kai || reached_mlas,
+            "real Qwen bits=4/block128/asymmetric shape reached neither MLAS QNBit nor KAI SDOT",
         );
-        assert!(kernel.packed_kai_qsi4_weight.get().is_some());
+        assert!(
+            kernel.packed_kai_qsi4_weight.get().is_some() || {
+                #[cfg(feature = "mlas")]
+                {
+                    kernel.mlas_shards.get().is_some()
+                }
+                #[cfg(not(feature = "mlas"))]
+                {
+                    false
+                }
+            }
+        );
         assert!(kernel.int8_weight.get().is_none());
         assert_qai8dxp_close(&y.to_f32(), &expected);
     }
@@ -10481,7 +10722,18 @@ mod tests {
                             }
                             // CompInt8 quantizes A to int8, so it needs a looser
                             // tolerance than the near-exact CompFp32 dequant.
-                            let tol = if accuracy_level == 4 { 6e-2 } else { 2e-3 };
+                            let tol = if accuracy_level == 4 {
+                                #[cfg(target_arch = "aarch64")]
+                                {
+                                    2e-1
+                                }
+                                #[cfg(not(target_arch = "aarch64"))]
+                                {
+                                    6e-2
+                                }
+                            } else {
+                                2e-3
+                            };
                             mlas_close(
                                 &out,
                                 &expected,
@@ -12218,10 +12470,7 @@ mod tests {
             });
         };
 
-        eprintln!(
-            "decode-step probe: {} weight bytes/token, {threads} decode threads",
-            weight_bytes
-        );
+        eprintln!("decode-step probe: {weight_bytes} weight bytes/token, {threads} decode threads");
         step("hand", &run_hand);
         step("mlas-int8", &run_mlas_int8);
         step("mlas-fp32", &run_mlas_fp32);
