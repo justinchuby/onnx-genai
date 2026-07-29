@@ -3054,7 +3054,7 @@ impl DotKernel {
         {
             matches!(self, DotKernel::NeonDot)
                 && block_size.is_multiple_of(32)
-                && Self::arm64_int4_direct_enabled()
+                && Self::arm64_kai_sdot_direct_enabled()
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
@@ -3080,7 +3080,7 @@ impl DotKernel {
             matches!(self, DotKernel::NeonDot)
                 && matches!(bits, 4 | 8)
                 && block_size.is_multiple_of(32)
-                && Self::arm64_int4_direct_enabled()
+                && Self::arm64_kai_sdot_direct_enabled()
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -3105,6 +3105,22 @@ impl DotKernel {
                 let value = value.trim();
                 !value.is_empty() && value != "0"
             })
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn arm64_kai_sdot_direct_enabled() -> bool {
+        #[cfg(test)]
+        {
+            true
+        }
+        #[cfg(not(test))]
+        {
+            if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
+                let value = value.trim();
+                return !value.is_empty() && value != "0";
+            }
+            !cfg!(any(target_os = "macos", target_os = "ios"))
         }
     }
 }
@@ -3372,6 +3388,7 @@ fn prepack_kai_sdot_from_bytes(
 
 struct Qai8dxpActivation {
     values: Vec<i8>,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     group_words: Vec<u32>,
     scale: f32,
     zero_point: i32,

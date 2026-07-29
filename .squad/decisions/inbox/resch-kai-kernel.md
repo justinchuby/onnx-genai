@@ -199,3 +199,32 @@ Honest gate: do not enable by default yet. The path remains opt-in behind `ONNX_
 ### Remaining gap
 
 The last ~10% on qwen3-0.6b is no longer a threading or tail issue. It is the inner-loop instruction schedule: Rust intrinsics are close but still not KleidiAI-dense. The next step should be a Luba-reviewed hand-scheduled aarch64 ukernel (`global_asm` or equivalent) for the existing N16 layout, especially qsi8 block128 and qsi4 block32. Avoid speculative N32 unless guarded per Snapdragon and validated because the generic N32 experiment showed register pressure can erase the theoretical ILP win.
+
+## 2026-07-29 default-on decision
+
+The ORT comparison was the wrong shipping gate for the native EP: ORT is a separate backend. For users selecting the native CPU EP, the real comparison is the native fallback (~69 tok/s in the benchmark window) versus the KAI packed-SDOT path (`96.27 tok/s` best robust median). That is a ~39% native-EP decode speedup on qwen3-0.6b with correctness green.
+
+### Trajectory banked
+
+- 57 tok/s: gated-off native fallback / old path.
+- 71 tok/s: KAI-style qsi4/qsi8 packed RHS and qA8dxp activation; avoided N16's int8 expansion.
+- 83 tok/s: non-Apple ARM64 persistent decode default raised to 8 workers; thread sweep showed 8 is the local plateau.
+- 96 tok/s: Luba N16 retile; 16 outputs per tile, tile-major metadata, precomputed K4 activation words, 8 accumulator chains, non-Apple 512B prefetch.
+
+### Default-on scope
+
+Enabled by default only for non-Apple `aarch64` when runtime dotprod detection selects `DotKernel::NeonDot`. Apple Silicon remains default-off for this KAI route so existing Accelerate/NEON/AMX-oriented routing is not changed. x86 and non-dotprod aarch64 are unchanged. `ONNX_GENAI_CPU_ARM64_INT4_DIRECT` remains an explicit override: non-empty/non-zero forces on (including for testing); `0`/empty forces off.
+
+Validation confirms the default no-env path now selects the KAI output stream; `ONNX_GENAI_CPU_ARM64_INT4_DIRECT=0` returns to the old fallback stream and measured `60.67 tok/s` in a short loaded check. Current host timing was noisy under load, but the committed robust benchmark remains `96.27 tok/s` from the clean N16 window.
+
+### Final native numbers
+
+| Model | Native KAI | Native fallback/before | Speedup vs native fallback/before | Roofline | % roofline | ORT | % ORT |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| qwen3-0.6b CPU-4 | 96.27 tok/s | ~69 tok/s | ~1.39x | 211 | 45.6% | 105.68 | 91.1% |
+| qwen2.5-0.5b CPU-4 | 142.60 tok/s | 82.41 tok/s | 1.73x | 344 | 41.5% | 184.48 | 77.3% |
+| qwen3-1.7b CPU-2 | 38.82 tok/s | 25.48 tok/s | 1.52x | 76.5 | 50.7% | 49.52 | 78.4% |
+
+### Remaining lever
+
+To close 96 -> 105+ and beat ORT, the remaining work is a hand-scheduled NEON assembly/global-asm ukernel for the current N16 layout, especially qsi8 block128 and qsi4 block32. Speculative Rust-intrinsics N32 and 256B prefetch experiments did not hold up in median runs, so future work should focus on exact instruction scheduling rather than wider generic unrolls.
