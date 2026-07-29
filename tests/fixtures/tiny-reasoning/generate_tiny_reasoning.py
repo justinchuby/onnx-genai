@@ -7,9 +7,9 @@ Run from the onnx-genai repo root with only the Python standard library::
 
 Unlike ``tests/fixtures/tiny-llm/generate_tiny_llm.py`` this generator needs no
 Mobius/torch: the reasoning fixture is a thin, fully regenerable derivation of
-the already-committed ``tiny-llm`` graph. It reuses that model's ONNX graph and
-tokenizer verbatim and layers three things on top that turn a plain tiny LLM
-into a reasoning one:
+the already-committed ``tiny-llm`` graph. It reuses that model's ONNX graph
+verbatim and its tokenizer with a single vocab entry renamed (see below), and
+layers four things on top that turn a plain tiny LLM into a reasoning one:
 
 1. a **chat template** (``tokenizer_config.json``) that opens a ``<think>``
    reasoning span right after the assistant generation prompt, exactly the way a
@@ -21,7 +21,11 @@ into a reasoning one:
    greedy fallback);
 3. a deliberately **low context** (inherited ``max_sequence_length`` of 16, the
    size of the graph's position table) so context exhaustion is reached in a few
-   tokens and is cheap to hit in CI.
+   tokens and is cheap to hit in CI;
+4. a **reachable close**: the one vocab entry tiny-llm's greedy decode reaches
+   only on the ``quick``/``fox``/``dog`` prompts is renamed to ``</think>`` (see
+   CLOSE_TOKEN_* below), so those prompts close the span and commit while every
+   other prompt degenerates -- one model, two reachable greedy outcomes.
 
 Why this reproduces the bug shape -- and why it can also succeed. The fixture
 must express *both* invariant outcomes on one model, or a regression that drops

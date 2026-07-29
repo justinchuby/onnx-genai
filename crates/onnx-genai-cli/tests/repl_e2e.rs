@@ -417,10 +417,14 @@ fn two_ctrl_c_presses_are_needed_to_exit_an_idle_prompt() {
 
 /// The committed tiny reasoning fixture, whose chat template opens a `<think>`
 /// reasoning span after the generation prompt the way a real reasoning model's
-/// template does. Its tiny vocabulary has no token that decodes to the closing
-/// `</think>`, so the span never closes and the model degenerates under greedy
-/// decoding -- the whole reason this fixture exists. See
-/// `tests/fixtures/tiny-reasoning/generate_tiny_reasoning.py`.
+/// template does. Its vocabulary *does* contain `</think>` (id 22), but greedy
+/// decoding only reaches it on the `quick`/`fox`/`dog` prompts -- where it lands
+/// at position 3 immediately before a real word -- so those close the span and
+/// commit a non-empty answer, while every other prompt never reaches id 22 and
+/// degenerates under greedy. That asymmetry is deliberate: it is one model with
+/// two reachable greedy outcomes (close-and-commit vs degenerate-and-drop), so
+/// the drop assertions mean something by contrast and the positive path is
+/// covered too. See `tests/fixtures/tiny-reasoning/generate_tiny_reasoning.py`.
 fn reasoning_model() -> PathBuf {
     fixture("tiny-reasoning")
 }
