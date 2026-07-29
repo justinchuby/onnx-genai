@@ -24,6 +24,7 @@ use crate::runtime::CudaRuntime;
 pub mod activations;
 pub mod argreduce;
 pub mod attention;
+pub mod batch_normalization;
 pub mod bitwise;
 pub mod block_quant;
 pub mod block_quantized_matmul;
@@ -37,6 +38,7 @@ pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumprod;
 pub mod cumsum;
+pub mod data_transform;
 pub(crate) mod device_argmax;
 pub mod dropout;
 pub mod elementwise;
@@ -46,6 +48,7 @@ pub mod fused_gemm;
 pub mod gather;
 pub mod gather_block_quantized;
 pub mod gemm;
+pub mod global_reduction;
 mod gqa_decode;
 mod gqa_decode_fp16;
 pub mod group_query_attention;
@@ -300,6 +303,14 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "DequantizeLinear",
     "Dropout",
     "NonZero",
+    "AffineGrid",
+    "BatchNormalization",
+    "Compress",
+    "DynamicQuantizeLinear",
+    "GlobalAveragePool",
+    "GlobalLpPool",
+    "GlobalMaxPool",
+    "LpNormalization",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -403,6 +414,52 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("AffineGrid", "", 20),
+        Box::new(data_transform::AffineGridFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Compress", "", 11),
+        Box::new(data_transform::CompressFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("BatchNormalization", "", 7),
+        Box::new(batch_normalization::BatchNormalizationFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("LpNormalization", "", 1),
+        Box::new(global_reduction::LpNormalizationFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for (op, kind) in [
+        (
+            "GlobalAveragePool",
+            global_reduction::GlobalPoolKind::Average,
+        ),
+        ("GlobalMaxPool", global_reduction::GlobalPoolKind::Max),
+    ] {
+        reg.register(
+            OpKey::new(op, "", 1),
+            Box::new(global_reduction::GlobalPoolFactory {
+                kind,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("GlobalLpPool", "", 2),
+        Box::new(global_reduction::GlobalPoolFactory {
+            kind: global_reduction::GlobalPoolKind::Lp(2),
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Pad", "", 1),
         Box::new(pad::PadFactory {
             runtime: runtime.clone(),
@@ -430,6 +487,12 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    reg.register(
+        OpKey::new("DynamicQuantizeLinear", "", 11),
+        Box::new(quantization::DynamicQuantizeLinearFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     for version in [13, 22] {
         reg.register(
             OpKey::new("Dropout", "", version),
