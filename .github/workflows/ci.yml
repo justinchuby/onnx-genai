@@ -227,6 +227,9 @@ jobs:
       - name: Check dispatch branches have reachability tests
         run: python3 scripts/check_dispatch_reachability.py
 
+      - name: Check dispatch manifest lint can still detect (self-test)
+        run: python3 scripts/check_dispatch_manifest.py --self-test
+
       - name: Check dispatch manifest claims have proving counters
         run: python3 scripts/check_dispatch_manifest.py
 
