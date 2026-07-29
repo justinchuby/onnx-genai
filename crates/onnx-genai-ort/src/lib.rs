@@ -12,7 +12,7 @@ pub mod binding;
 pub mod chat_template;
 pub mod component;
 #[cfg(feature = "cuda")]
-pub(crate) mod cuda_rt;
+pub mod cuda_rt;
 pub mod decode;
 pub mod decode_contract;
 #[cfg(feature = "cuda")]
@@ -20,6 +20,7 @@ pub(crate) mod device_sampler;
 pub mod eagle3;
 pub mod env;
 pub mod error;
+pub mod io_roles;
 pub mod loader;
 pub mod mtp;
 mod pipeline_admission;

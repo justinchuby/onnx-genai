@@ -77,7 +77,15 @@ libc = "0.2"
 # The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
 image = { workspace = true, features = ["png"] }
 onnx-genai = { workspace = true }
+onnx-genai-metadata = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# PTY-driven e2e tests: openpty/dup to verify TTY-only rendering branches.
+# nix is already in the dependency tree via ctrlc; no version bump needed.
+# Features: "term" for nix::pty::openpty, "fs" for nix::unistd::dup,
+#            "poll" for nix::poll::poll (used for read timeouts in drain_pty_master).
+nix = { version = "0.31", default-features = false, features = ["term", "fs", "poll"] }
 
 [dependencies.pyo3]
 version = "0.29"

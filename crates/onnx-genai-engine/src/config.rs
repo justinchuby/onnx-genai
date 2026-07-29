@@ -3,7 +3,8 @@
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
 use onnx_genai_metadata::{
-    MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode, MtpProposerSpec,
+    GenerationDefaults, MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode,
+    MtpProposerSpec,
 };
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
@@ -907,6 +908,95 @@ impl Default for GenerateOptions {
     }
 }
 
+/// Sampling controls a caller explicitly requested.
+///
+/// Each `None` means the caller did not specify that control, so
+/// [`GenerateOptions::resolve_sampling_defaults`] falls back to the model's
+/// author-declared defaults and then to the runtime fallback already held in
+/// [`GenerateOptions`]. This type carries the "explicit flag wins" half of the
+/// precedence contract; the model-declared half lives in
+/// [`GenerationDefaults`](onnx_genai_metadata::GenerationDefaults).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingOverrides {
+    /// Explicit greedy decision: `Some(true)` forces deterministic argmax,
+    /// `Some(false)` forces stochastic sampling, `None` defers to the model's
+    /// declared `do_sample` (then the runtime fallback).
+    pub greedy: Option<bool>,
+    /// Explicit sampling temperature.
+    pub temperature: Option<f32>,
+    /// Explicit nucleus (top-p) threshold.
+    pub top_p: Option<f32>,
+    /// Explicit top-k cutoff.
+    pub top_k: Option<usize>,
+}
+
+impl GenerateOptions {
+    /// Resolve sampling controls against a model author's declared generation
+    /// defaults, applying a strict precedence.
+    ///
+    /// Highest priority first:
+    /// 1. an explicit caller override in `overrides`;
+    /// 2. the author's declared default in `declared` — the `do_sample`,
+    ///    `temperature`, `top_p`, and `top_k` values a model publishes in
+    ///    inference metadata (or a compatible `genai_config.json` `search` block);
+    /// 3. the runtime fallback already stored in `self` (greedy).
+    ///
+    /// The runtime's hardcoded `greedy: true` is therefore used only when the
+    /// caller is silent *and* the model declares nothing. It never overrides a
+    /// value the model actually published — a reasoning model that ships
+    /// `do_sample: true, temperature: 0.6` (precisely because greedy decoding
+    /// makes it loop) now decodes stochastically by default. This keeps the
+    /// runtime from baking in a decoding assumption the model contradicts
+    /// (RULES.md rule 2).
+    ///
+    /// After the four controls are resolved, a *resolved* temperature of `0.0`
+    /// forces `greedy = true`, regardless of where that zero came from (an
+    /// explicit caller override, or a model that declares `do_sample: true`
+    /// alongside `temperature: 0.0`). Temperature zero has no stochastic meaning
+    /// — the sampler already collapses it to argmax — so the resolved
+    /// `GenerateOptions` is made self-consistent here rather than leaving a
+    /// `greedy: false, temperature: 0.0` state that reads as "sample at zero".
+    /// Every consumer (not just the CLI) therefore inherits the
+    /// `temperature 0 -> greedy` mapping by construction.
+    pub fn resolve_sampling_defaults(
+        &mut self,
+        declared: Option<&GenerationDefaults>,
+        overrides: &SamplingOverrides,
+    ) {
+        self.greedy = match overrides.greedy {
+            Some(greedy) => greedy,
+            None => match declared.and_then(|declared| declared.do_sample) {
+                Some(do_sample) => !do_sample,
+                None => self.greedy,
+            },
+        };
+        if let Some(temperature) = overrides
+            .temperature
+            .or_else(|| declared.and_then(|declared| declared.temperature))
+        {
+            self.temperature = temperature;
+        }
+        if let Some(top_p) = overrides
+            .top_p
+            .or_else(|| declared.and_then(|declared| declared.top_p))
+        {
+            self.top_p = top_p;
+        }
+        if let Some(top_k) = overrides
+            .top_k
+            .or_else(|| declared.and_then(|declared| declared.top_k))
+        {
+            self.top_k = top_k;
+        }
+        // A resolved temperature of zero is greedy by definition; keep the flag
+        // and the value consistent so the decision is inspectable rather than
+        // implicit in the sampler (RULES.md rule 5).
+        if self.temperature == 0.0 {
+            self.greedy = true;
+        }
+    }
+}
+
 /// Built-in constrained decoding grammars.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerateConstraint {
@@ -1353,3 +1443,171 @@ pub struct GenerateToken {
 
 /// Streaming callback shape. Returning an error aborts generation.
 pub type GenerateTokenCallback<'a> = dyn FnMut(GenerateToken) -> anyhow::Result<()> + Send + 'a;
+
+#[cfg(test)]
+mod sampling_defaults_tests {
+    use super::*;
+    use onnx_genai_metadata::GenerationDefaults;
+
+    fn declared(do_sample: Option<bool>, temperature: Option<f32>) -> GenerationDefaults {
+        GenerationDefaults {
+            do_sample,
+            temperature,
+            top_k: None,
+            top_p: None,
+            repetition_penalty: None,
+            num_beams: None,
+            num_return_sequences: None,
+            min_length: None,
+            max_length: None,
+            length_penalty: None,
+            no_repeat_ngram_size: None,
+            diversity_penalty: None,
+            early_stopping: None,
+        }
+    }
+
+    // Row 1: model declares sampling, caller is silent -> the model's regime is used.
+    #[test]
+    fn model_sampling_used_when_no_flags() {
+        let mut options = GenerateOptions::default();
+        let model = GenerationDefaults {
+            top_p: Some(0.95),
+            top_k: Some(40),
+            ..declared(Some(true), Some(0.6))
+        };
+        options.resolve_sampling_defaults(Some(&model), &SamplingOverrides::default());
+        assert!(!options.greedy, "model do_sample=true must disable greedy");
+        assert_eq!(options.temperature, 0.6);
+        assert_eq!(options.top_p, 0.95);
+        assert_eq!(options.top_k, 40);
+    }
+
+    // Row 2: explicit --greedy wins even when the model asks to sample.
+    #[test]
+    fn explicit_greedy_overrides_model_sampling() {
+        let mut options = GenerateOptions::default();
+        let model = declared(Some(true), Some(0.6));
+        let overrides = SamplingOverrides {
+            greedy: Some(true),
+            ..SamplingOverrides::default()
+        };
+        options.resolve_sampling_defaults(Some(&model), &overrides);
+        assert!(
+            options.greedy,
+            "explicit greedy must beat model do_sample=true"
+        );
+    }
+
+    // Row 3: model declares nothing -> greedy fallback is preserved.
+    #[test]
+    fn greedy_fallback_when_model_declares_nothing() {
+        let mut options = GenerateOptions::default();
+        assert!(options.greedy);
+        options.resolve_sampling_defaults(None, &SamplingOverrides::default());
+        assert!(options.greedy, "no declaration and no flags stays greedy");
+        // A declaration that omits do_sample is equally silent on the greedy question.
+        let mut options = GenerateOptions::default();
+        options
+            .resolve_sampling_defaults(Some(&declared(None, None)), &SamplingOverrides::default());
+        assert!(options.greedy);
+    }
+
+    // An explicit `--greedy` override is applied and the caller's explicit
+    // temperature travels with it. This pins override precedence and value
+    // pass-through; it does *not* exercise temperature-0 handling, because the
+    // greedy result here is driven by `greedy: Some(true)`, not by the zero.
+    // (The `temperature == 0 -> greedy` mapping is pinned separately below.)
+    #[test]
+    fn explicit_greedy_override_is_applied_and_keeps_its_temperature() {
+        let mut options = GenerateOptions::default();
+        let model = declared(Some(true), Some(0.6));
+        let overrides = SamplingOverrides {
+            greedy: Some(true),
+            temperature: Some(0.0),
+            ..SamplingOverrides::default()
+        };
+        options.resolve_sampling_defaults(Some(&model), &overrides);
+        assert!(
+            options.greedy,
+            "explicit greedy=Some(true) must win over model do_sample=true"
+        );
+        assert_eq!(
+            options.temperature, 0.0,
+            "the caller's explicit temperature must be carried through"
+        );
+    }
+
+    // The resolver itself maps a resolved `temperature == 0.0` to greedy, even
+    // when the caller left `greedy` unspecified and the model asks to sample.
+    // This is the property the old test name falsely claimed: here the greedy
+    // result is driven purely by the zero temperature, not by an explicit
+    // greedy flag. Answers "what does `temperature: Some(0.0)` without `greedy`
+    // do?" — deterministic argmax, never stochastic sampling at zero.
+    #[test]
+    fn resolved_temperature_zero_forces_greedy_without_explicit_greedy() {
+        let mut options = GenerateOptions::default();
+        let model = declared(Some(true), Some(0.6));
+        let overrides = SamplingOverrides {
+            greedy: None,
+            temperature: Some(0.0),
+            ..SamplingOverrides::default()
+        };
+        options.resolve_sampling_defaults(Some(&model), &overrides);
+        assert!(
+            options.greedy,
+            "temperature 0 must collapse to greedy even against model do_sample=true"
+        );
+        assert_eq!(options.temperature, 0.0);
+
+        // A model that itself declares temperature 0 alongside do_sample=true is
+        // likewise resolved to greedy, with no caller override at all.
+        let mut options = GenerateOptions::default();
+        let model = declared(Some(true), Some(0.0));
+        options.resolve_sampling_defaults(Some(&model), &SamplingOverrides::default());
+        assert!(
+            options.greedy,
+            "a model-declared temperature of 0 also collapses to greedy"
+        );
+    }
+
+    // Explicit sampling flags win over a model that declares greedy, and the
+    // caller's value is kept while unspecified controls fall back to the model.
+    #[test]
+    fn explicit_sampling_overrides_model_greedy_and_keeps_caller_values() {
+        let mut options = GenerateOptions::default();
+        let model = GenerationDefaults {
+            top_p: Some(0.9),
+            ..declared(Some(false), Some(0.3))
+        };
+        let overrides = SamplingOverrides {
+            greedy: Some(false),
+            temperature: Some(0.8),
+            ..SamplingOverrides::default()
+        };
+        options.resolve_sampling_defaults(Some(&model), &overrides);
+        assert!(
+            !options.greedy,
+            "explicit sampling must beat model do_sample=false"
+        );
+        assert_eq!(options.temperature, 0.8, "caller temperature wins");
+        assert_eq!(
+            options.top_p, 0.9,
+            "unspecified top_p falls back to the model"
+        );
+    }
+
+    // do_sample=false is honored as an explicit greedy declaration by the model.
+    #[test]
+    fn model_do_sample_false_selects_greedy() {
+        let mut options = GenerateOptions {
+            greedy: false,
+            ..Default::default()
+        };
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(false), None)),
+            &SamplingOverrides::default(),
+        );
+        assert!(options.greedy, "model do_sample=false must select greedy");
+    }
+}

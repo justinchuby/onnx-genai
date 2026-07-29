@@ -20,8 +20,10 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
-    MirostatConfig, MirostatVersion, ResourceLimit, TokenLogprob, XtcConfig, parse_resource_limit,
+    MirostatConfig, MirostatVersion, ResourceLimit, SamplingOverrides, TokenLogprob, XtcConfig,
+    parse_resource_limit,
 };
+use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -44,7 +46,8 @@ use crate::{
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
         ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
+        ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode,
+        Usage,
     },
 };
 

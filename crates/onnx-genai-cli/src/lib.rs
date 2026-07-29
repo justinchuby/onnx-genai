@@ -48,14 +48,14 @@ use interactive::run_repl;
 use interactive::{
     InterruptAction, Interrupted, ReplInputMode, apply_context_sized_max_new_tokens,
     context_exhaustion_error, context_window_is_full, drop_exhausted_repl_turn,
-    initial_repl_show_stats, interrupt_action, is_interrupt_error,
-    plain_stream_needs_trailing_newline, repl_input_mode, stage_attachment,
+    initial_repl_show_stats, interrupt_action, is_interrupt_error, repl_input_mode,
+    stage_attachment,
 };
 use model_inspection::{list, show, version};
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::text_to_audio::TextToAudioRequest;
 use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
-use onnx_genai::{EngineConfig, GenerateOptions, StopSequence};
+use onnx_genai::{EngineConfig, GenerateOptions, SamplingOverrides, StopSequence};
 use onnx_genai_server::{ServeArgs, run_serve};
 use output::write_merged_trace;
 use profile::RunProfile;
@@ -214,6 +214,37 @@ impl SamplingArgs {
         }
         options.stop_sequences = self.stop.iter().cloned().map(StopSequence::Text).collect();
         options
+    }
+
+    /// The caller's *explicit* sampling selections, for
+    /// [`GenerateOptions::resolve_sampling_defaults`].
+    ///
+    /// This is the "flags win" half of the precedence contract. A greedy
+    /// decision is explicit when the user forced determinism (`--greedy` or
+    /// `--temperature 0`) or requested sampling (`--no-greedy`, or any positive
+    /// sampling control). When the user is silent about greediness the decision
+    /// is deferred (`None`) so the model's declared `do_sample` can drive it.
+    fn sampling_overrides(&self) -> SamplingOverrides {
+        let forces_greedy = self.greedy || self.temperature == Some(0.0);
+        let requests_sampling = self.no_greedy
+            || self
+                .temperature
+                .is_some_and(|temperature| temperature > 0.0)
+            || self.top_p.is_some()
+            || self.top_k.is_some_and(|top_k| top_k > 0);
+        let greedy = if forces_greedy {
+            Some(true)
+        } else if requests_sampling {
+            Some(false)
+        } else {
+            None
+        };
+        SamplingOverrides {
+            greedy,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+        }
     }
 }
 
@@ -1162,18 +1193,6 @@ mod tests {
     }
 
     #[test]
-    fn plain_stream_newline_depends_on_this_turns_renderer_usage() {
-        let pending_live_renderer = live_turn::LiveTurn::Pending;
-        assert!(pending_live_renderer.is_active());
-        assert!(plain_stream_needs_trailing_newline(false));
-        assert!(!plain_stream_needs_trailing_newline(true));
-        assert!(
-            plain_stream_needs_trailing_newline(false),
-            "a pending reusable live renderer must not suppress the newline when this turn did not use it"
-        );
-    }
-
-    #[test]
     fn one_ctrl_c_stops_the_generation_and_two_exit() {
         // Idle prompt: the first press only warns, the second leaves.
         assert_eq!(
@@ -1594,11 +1613,14 @@ mod tests {
             generated_tokens: 5,
             completed_turns: 1,
         };
+        let sampling_overrides = SamplingOverrides::default();
 
         let summary = interactive::SessionSummary {
             settings: &settings,
             resolved_decode_backend: EngineDecodeBackend::Ort,
             options: &options,
+            generation_defaults: None,
+            sampling_overrides: &sampling_overrides,
             history: &history,
             usage: &usage,
         }
@@ -1617,6 +1639,51 @@ mod tests {
              \x20\x20tokens: prompt=14 generated=5"
         );
         assert!(!summary.contains("private"), "{summary}");
+    }
+
+    #[test]
+    fn session_summary_displays_effective_model_sampling_defaults() {
+        let settings =
+            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
+        let options = GenerateOptions {
+            max_new_tokens: 32,
+            ..GenerateOptions::default()
+        };
+        let defaults = onnx_genai::metadata::GenerationDefaults {
+            do_sample: Some(true),
+            temperature: Some(0.6),
+            top_k: Some(20),
+            top_p: Some(0.95),
+            repetition_penalty: None,
+            num_beams: None,
+            num_return_sequences: None,
+            min_length: None,
+            max_length: None,
+            length_penalty: None,
+            no_repeat_ngram_size: None,
+            diversity_penalty: None,
+            early_stopping: None,
+        };
+        let usage = interactive::SessionUsage::default();
+        let sampling_overrides = SamplingOverrides::default();
+
+        let summary = interactive::SessionSummary {
+            settings: &settings,
+            resolved_decode_backend: EngineDecodeBackend::Ort,
+            options: &options,
+            generation_defaults: Some(&defaults),
+            sampling_overrides: &sampling_overrides,
+            history: &[],
+            usage: &usage,
+        }
+        .to_string();
+
+        assert!(
+            summary.contains(
+                "sampling: max_new_tokens=32 max_context=auto temperature=0.6 top_p=0.95 top_k=20 greedy=false"
+            ),
+            "{summary}"
+        );
     }
 
     #[test]

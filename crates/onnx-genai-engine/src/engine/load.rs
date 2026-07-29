@@ -250,6 +250,11 @@ impl Engine {
                 native_device.clone(),
                 governor.weight_offload_host_cache(),
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                metadata
+                    .model
+                    .as_ref()
+                    .and_then(|model| model.max_sequence_length),
+                crate::decode::key_sequence_lengths_policy(&metadata),
                 config.decode_precision,
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
@@ -374,16 +379,15 @@ fn resolve_metadata_and_decode_path(
         anyhow::bail!("Unsupported capabilities: {unsupported:?}");
     }
 
-    // Optional cap on the runtime-owned fixed-capacity KV buffer. Foundry /
+    // Optional explicit cap on runtime-owned KV growth. Foundry /
     // onnxruntime-genai `genai_config.json` models advertise the model's full
-    // `context_length` (e.g. 32k-131k) as their max sequence length, and the
-    // shared-buffer decode path pre-allocates a KV buffer of exactly that many
-    // tokens up front — regardless of how many tokens a request will actually
-    // generate. On memory-constrained devices that over-allocation exhausts
-    // VRAM (spilling to shared system memory over PCIe) even for short runs.
-    // `ONNX_GENAI_KV_MAX_LEN` caps that capacity to the caller's real
-    // generation budget (prompt + max_new_tokens), mirroring the native
-    // path's `ONNX_GENAI_CUDA_KV_MAX_LEN`. Unset = unchanged (full context).
+    // `context_length` (e.g. 32k-131k) as their max sequence length. The
+    // shared-buffer decode path pre-allocates at an initial power-of-two bucket
+    // (256 tokens by default, overridden by `ONNX_GENAI_KV_MIN_BUCKET`) and grows
+    // on demand up to the model's declared `max_length`; it does not pre-allocate
+    // the full context. `ONNX_GENAI_KV_MAX_LEN` caps growth below the model
+    // maximum, mirroring the native path's `ONNX_GENAI_CUDA_KV_MAX_LEN`.
+    // Unset = model metadata is the factual ceiling.
     let kv_shared_buffer_cap = shared_buffer_cap_from_env();
     let metadata_max_context = metadata
         .model
@@ -401,6 +405,7 @@ fn resolve_metadata_and_decode_path(
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
             session,
+            metadata.model.as_ref().and_then(|model| model.io.as_ref()),
             metadata_max_context,
             shared_kv_max_len,
             sliding_window,
@@ -451,6 +456,12 @@ fn load_draft_model(
     let draft = if let Some(draft_model_path) = &config.draft_model {
         let draft_directory = ModelDirectory::load(draft_model_path)
             .map_err(|e| anyhow::anyhow!("Failed to resolve draft model directory: {e}"))?;
+        let draft_io = draft_directory
+            .metadata_path
+            .as_deref()
+            .map(onnx_genai_metadata::load_metadata)
+            .transpose()?
+            .and_then(|metadata| metadata.model.and_then(|model| model.io));
         let draft_session = Session::new(
             environment,
             &draft_directory.model_path,
@@ -469,7 +480,7 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(&draft_session, metadata_max_context, None, None, 0)?;
+            detect_model_decode_path(&draft_session, None, metadata_max_context, None, None, 0)?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             config.page_size,
@@ -488,6 +499,7 @@ fn load_draft_model(
         Some(DraftModel {
             session: Box::new(draft_session),
             decode_path: draft_decode_path,
+            io: draft_io,
             kv_model: draft_kv_model,
             kv_cache: draft_kv_cache,
         })

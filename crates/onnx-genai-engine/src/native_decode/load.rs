@@ -1,11 +1,27 @@
 use super::*;
 
+fn native_metadata_max_len_from_model_path(path: &Path) -> Option<usize> {
+    let root = if path.is_dir() { path } else { path.parent()? };
+    [
+        "inference_metadata.yaml",
+        "inference_metadata.yml",
+        "inference_metadata.json",
+    ]
+    .iter()
+    .map(|name| root.join(name))
+    .find(|path| path.is_file())
+    .and_then(|path| onnx_genai_metadata::load_metadata(&path).ok())
+    .and_then(|metadata| metadata.model.and_then(|model| model.max_sequence_length))
+}
+
 impl NativeDecodeSession {
     pub(crate) fn load_with_weight_offload_host_cache(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
         io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
+        key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
         decode_precision: DecodePrecision,
     ) -> anyhow::Result<Self> {
         let preference = match device {
@@ -47,21 +63,67 @@ impl NativeDecodeSession {
             builder = builder.execution_provider(Arc::new(ep));
         }
         let session = builder.build().context("load native decoder model")?;
-        Self::from_session_with_cuda_kv_max_len_and_io(session, None, io)
+        Self::validate_key_sequence_lengths_contract(&session, key_sequence_lengths_policy)?;
+        Self::from_session_with_cuda_options_and_io(
+            session,
+            NativeDecodeCudaOptions {
+                kv_max_len: None,
+                metadata_max_len,
+                graph_capture: None,
+            },
+            io,
+        )
     }
 
-    /// Load with an explicit CUDA KV capacity. `None` uses
-    /// `ONNX_GENAI_CUDA_KV_MAX_LEN`, then the 4096-token default.
+    fn validate_key_sequence_lengths_contract(
+        session: &InferenceSession,
+        policy: crate::decode::KeySequenceLengthsPolicy,
+    ) -> anyhow::Result<()> {
+        for (_, node) in session.graph().nodes.iter() {
+            // This registry is semantic, not name inference: each supported attention
+            // schema declares the input position carrying key-sequence lengths.
+            // Add future attention schemas here when their native kernel lands.
+            let key_sequence_lengths_index = match (node.domain.as_str(), node.op_type.as_str()) {
+                ("com.microsoft", "GroupQueryAttention") => 5,
+                _ => continue,
+            };
+            let Some(value_id) = node
+                .inputs
+                .get(key_sequence_lengths_index)
+                .and_then(|input| *input)
+            else {
+                continue;
+            };
+            let value = session.graph().value(value_id);
+            if value.shape.is_empty()
+                && policy == crate::decode::KeySequenceLengthsPolicy::Canonical
+            {
+                bail!(
+                    "attention key-sequence lengths input '{}' is scalar, but metadata does not declare model.attention.key_sequence_lengths.scalar_broadcast: unit_batch; the default contract requires contiguous int32 [batch_size]",
+                    value.name.as_deref().unwrap_or("<anonymous>")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Load with an explicit CUDA KV capacity. `None` resolves in order:
+    /// `ONNX_GENAI_CUDA_KV_MAX_LEN`, then `model.max_sequence_length` from
+    /// inference metadata, then unbounded growth until the device refuses
+    /// allocation. No free-memory ceiling is derived; the hard maximum comes
+    /// only from an explicit override or the model's declared context limit.
     pub fn load_with_cuda_kv_max_len(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         cuda_kv_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
+        let metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
         Self::load_with_cuda_options(
             path,
             device,
             NativeDecodeCudaOptions {
                 kv_max_len: cuda_kv_max_len,
+                metadata_max_len,
                 graph_capture: None,
             },
         )
@@ -77,8 +139,11 @@ impl NativeDecodeSession {
     pub fn load_with_cuda_options(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
-        options: NativeDecodeCudaOptions,
+        mut options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
+        if options.metadata_max_len.is_none() {
+            options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
+        }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
             NativeDecodeDevice::Cuda { index } => DevicePreference::Gpu { index },
@@ -109,6 +174,7 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn from_session_with_cuda_kv_max_len_and_io(
         session: InferenceSession,
         cuda_kv_max_len: Option<usize>,
@@ -118,13 +184,14 @@ impl NativeDecodeSession {
             session,
             NativeDecodeCudaOptions {
                 kv_max_len: cuda_kv_max_len,
+                metadata_max_len: None,
                 graph_capture: None,
             },
             io,
         )
     }
 
-    fn from_session_with_cuda_options(
+    pub(crate) fn from_session_with_cuda_options(
         session: InferenceSession,
         cuda_options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
@@ -147,24 +214,28 @@ impl NativeDecodeSession {
             .iter()
             .map(|meta| meta.name.clone())
             .collect::<Vec<_>>();
+        let role_inputs = role_tensor_info(session.inputs());
+        let role_outputs = role_tensor_info(session.outputs());
 
         let sequence_source = io
             .and_then(|io| io.sequence_source)
             .unwrap_or(SequenceInputKind::TokenIds);
         let token_input = if sequence_source == SequenceInputKind::TokenIds {
             Some(declared_or_detected_input(
-                &input_names,
+                &role_inputs,
                 io.and_then(|io| io.token_input.as_deref()),
-                &["input_ids", "decoder_input_ids"],
+                StructuralRole::IntegerSequence,
+                "model.io",
                 "token_input",
             )?)
         } else {
             io.and_then(|io| io.token_input.as_deref())
                 .map(|name| {
                     declared_or_detected_input(
-                        &input_names,
+                        &role_inputs,
                         Some(name),
-                        &["input_ids", "decoder_input_ids"],
+                        StructuralRole::IntegerSequence,
+                        "model.io",
                         "token_input",
                     )
                 })
@@ -172,45 +243,51 @@ impl NativeDecodeSession {
         };
         let inputs_embeds_input = if sequence_source == SequenceInputKind::InputsEmbeds {
             Some(declared_or_detected_input(
-                &input_names,
+                &role_inputs,
                 io.and_then(|io| io.inputs_embeds_input.as_deref()),
-                &["inputs_embeds"],
+                StructuralRole::EmbeddingSequence,
+                "model.io",
                 "inputs_embeds_input",
             )?)
         } else {
             io.and_then(|io| io.inputs_embeds_input.as_deref())
                 .map(|name| {
                     declared_or_detected_input(
-                        &input_names,
+                        &role_inputs,
                         Some(name),
-                        &["inputs_embeds"],
+                        StructuralRole::EmbeddingSequence,
+                        "model.io",
                         "inputs_embeds_input",
                     )
                 })
                 .transpose()?
         };
         let attention_mask = optional_declared_or_detected_input(
-            &input_names,
+            &role_inputs,
             io.and_then(|io| io.attention_mask_input.as_deref()),
-            &["attention_mask"],
+            StructuralRole::None,
+            "model.io",
             "attention_mask_input",
         )?;
         let position_ids = optional_declared_or_detected_input(
-            &input_names,
+            &role_inputs,
             io.and_then(|io| io.position_ids_input.as_deref()),
-            &["position_ids"],
+            StructuralRole::None,
+            "model.io",
             "position_ids_input",
         )?;
         let logits = declared_or_detected_output(
-            &output_names,
+            &role_outputs,
             io.and_then(|io| io.logits_output.as_deref()),
-            &["logits"],
+            StructuralRole::ScoreOutput,
+            "model.io",
             "logits_output",
         )?;
         let hidden_output = optional_declared_or_detected_output(
-            &output_names,
+            &role_outputs,
             io.and_then(|io| io.hidden_output.as_deref()),
-            &[],
+            StructuralRole::None,
+            "model.io",
             "hidden_output",
         )?;
         let kv_ownership = io
@@ -226,21 +303,10 @@ impl NativeDecodeSession {
                 (Some(inputs), Some(outputs)) => (inputs.clone(), outputs.clone()),
                 (None, None) => (Vec::new(), Vec::new()),
                 _ => bail!(
-                    "native target decoder metadata must declare io.kv_inputs and io.kv_outputs together"
+                    "native target decoder metadata must declare model.io.kv_inputs and model.io.kv_outputs together"
                 ),
             },
-            None => (
-                input_names
-                    .iter()
-                    .filter(|name| is_past_name(name))
-                    .cloned()
-                    .collect(),
-                output_names
-                    .iter()
-                    .filter(|name| is_present_name(name))
-                    .cloned()
-                    .collect(),
-            ),
+            None => (Vec::new(), Vec::new()),
         };
 
         // Fixed loop-carried recurrent states (hybrid linear-attention
@@ -267,32 +333,21 @@ impl NativeDecodeSession {
 
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
-                "native decode requires decoder-with-past I/O; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
+                "native decode requires explicit decoder state; declare model.io.kv_inputs and model.io.kv_outputs (or model.io.state_pairs)"
             );
         }
 
         let mut present_to_past = HashMap::new();
-        if io.is_some() {
-            // KV pairs pair positionally; state pairs carry explicit names.
-            let kv_pair_count = kv_inputs.len() - state_pairs.len();
-            present_to_past.extend(
-                present_outputs
-                    .iter()
-                    .take(kv_pair_count)
-                    .cloned()
-                    .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
-            );
-            present_to_past.extend(state_pairs.iter().cloned());
-        } else {
-            for output in &present_outputs {
-                let Some(input) = matching_past_name(output, &kv_inputs) else {
-                    bail!(
-                        "native decoder present output '{output}' has no matching past input; inputs: {kv_inputs:?}"
-                    );
-                };
-                present_to_past.insert(output.clone(), input);
-            }
-        }
+        // KV lists pair positionally; state pairs carry explicit names.
+        let kv_pair_count = kv_inputs.len() - state_pairs.len();
+        present_to_past.extend(
+            present_outputs
+                .iter()
+                .take(kv_pair_count)
+                .cloned()
+                .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
+        );
+        present_to_past.extend(state_pairs.iter().cloned());
         if present_to_past.len() != kv_inputs.len() {
             bail!(
                 "native decoder has incomplete past/present pairs; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
@@ -369,11 +424,25 @@ impl NativeDecodeSession {
             let attention_mask = attention_mask
                 .as_deref()
                 .context("native CUDA target decode requires a declared attention-mask input")?;
+            let bytes_per_token = DecodeCudaState::kv_bytes_per_token(&session, &present_to_past)?;
+            let device_memory = cuda_device_memory_snapshot(session.device_id().index as i32).ok();
             let max_len = match cuda_options.kv_max_len {
                 Some(0) => bail!("CUDA KV max length must be greater than zero"),
-                Some(value) => value,
-                None => cuda_kv_max_len_from_env()?,
+                Some(value) => Some(value),
+                None => None,
             };
+            let env_max_len = if max_len.is_some() {
+                None
+            } else {
+                cuda_kv_max_len_from_env()?
+            };
+            let capacity = resolve_cuda_kv_capacity(
+                max_len,
+                env_max_len,
+                cuda_options.metadata_max_len,
+                bytes_per_token,
+                device_memory,
+            )?;
             let runtime_config = onnx_genai_runtime_config::runtime_config();
             let graph_enabled = resolve_graph_capture_enabled(
                 cuda_options.graph_capture,
@@ -385,7 +454,7 @@ impl NativeDecodeSession {
                 },
             );
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
-            span.set_arg("max_len", max_len as u64);
+            span.set_arg("max_len", capacity.max_len as u64);
             span.set_arg("kv_pairs", present_to_past.len() as u64);
             span.set_arg("graph_capture", graph_enabled);
             Some(DecodeCudaState::new(
@@ -397,7 +466,7 @@ impl NativeDecodeSession {
                     logits: &logits,
                 },
                 &present_to_past,
-                max_len,
+                capacity,
                 graph_enabled,
             )?)
         } else {

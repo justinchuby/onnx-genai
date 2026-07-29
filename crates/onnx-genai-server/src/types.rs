@@ -163,10 +163,10 @@ pub struct CompletionRequest {
 }
 
 impl ChatCompletionRequest {
-    pub(crate) fn wants_json_object(&self) -> bool {
+    pub(crate) fn wants_constrained_json(&self) -> bool {
         matches!(
-            self.response_format.as_ref().map(|format| &format.kind),
-            Some(ResponseFormatType::JsonObject)
+            self.response_format.as_ref(),
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
         )
     }
 
@@ -580,16 +580,19 @@ pub struct ToolChoiceFunction {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ResponseFormat {
-    #[serde(rename = "type")]
-    pub kind: ResponseFormatType,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseFormatType {
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
     Text,
     JsonObject,
+    JsonSchema { json_schema: JsonSchemaSpec },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JsonSchemaSpec {
+    pub name: String,
+    pub schema: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

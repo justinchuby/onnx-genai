@@ -24,6 +24,38 @@ fn fixture(name: &str) -> PathBuf {
     repository_root().join("tests/fixtures").join(name)
 }
 
+#[test]
+fn encoder_decoder_fixtures_declare_ambiguous_decoder_roles() {
+    for (fixture_name, expected_encoder_input) in [
+        ("tiny-whisper", Some("encoder_hidden_states")),
+        ("tiny-tts", None),
+    ] {
+        let metadata = onnx_genai_metadata::load_metadata(
+            &fixture(fixture_name).join("inference_metadata.yaml"),
+        )
+        .expect("fixture metadata must load");
+        let decoder_io = metadata
+            .pipeline
+            .as_ref()
+            .and_then(|pipeline| pipeline.models.get("decoder"))
+            .and_then(|decoder| decoder.io.as_ref())
+            .expect("encoder-decoder fixture must declare decoder io");
+
+        assert_eq!(decoder_io.token_input.as_deref(), Some("decoder_input_ids"));
+        assert_eq!(
+            decoder_io.position_ids_input.as_deref(),
+            Some("position_ids")
+        );
+        assert_eq!(decoder_io.logits_output.as_deref(), Some("logits"));
+        assert_eq!(
+            decoder_io.encoder_hidden_states_input.as_deref(),
+            expected_encoder_input
+        );
+        assert_eq!(decoder_io.kv_inputs.as_ref().map(Vec::len), Some(2));
+        assert_eq!(decoder_io.kv_outputs.as_ref().map(Vec::len), Some(2));
+    }
+}
+
 fn run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
         .args(arguments)
@@ -241,6 +273,32 @@ fn piped_generate_stdout_is_byte_identical_with_or_without_default_stats() {
     assert!(
         !base_stdout.lines().any(looks_like_compact_stats_line),
         "stats line must not contaminate piped stdout: {base_stdout}"
+    );
+}
+
+#[test]
+fn piped_stream_output_always_ends_with_a_trailing_newline() {
+    // `--stream` piped output has always ended with a trailing newline.
+    // This pins the byte-stable guarantee: removing the unconditional
+    // newline on the grounds that the model "already ended with one"
+    // would silently break any script or pipeline that depends on the
+    // line boundary.
+    let output = run(&[
+        "generate",
+        fixture("tiny-llm").to_str().unwrap(),
+        "--prompt",
+        "hello",
+        "--raw",
+        "--max-new-tokens",
+        "4",
+        "--stream",
+    ]);
+
+    assert!(output.status.success(), "failed: {}", stderr(&output));
+    assert!(
+        output.stdout.last() == Some(&b'\n'),
+        "piped --stream output must end with a trailing newline; got: {:?}",
+        stdout(&output)
     );
 }
 

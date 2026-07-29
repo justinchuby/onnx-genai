@@ -217,14 +217,14 @@ impl TokenTimings {
 }
 
 impl RunProfile {
-    /// One line of per-turn numbers for an interactive session.
+    /// Per-turn numbers for an interactive session.
     ///
     /// The full report is a page long and ends in a per-stage table, which is
     /// the wrong shape to print after every REPL turn. This keeps the numbers a
     /// reader actually watches turn to turn — how much went in, how much came
-    /// out, how fast, and how much was not recomputed — on a single line.
+    /// out, how fast, and how much was not recomputed — in a compact block.
     ///
-    /// Fields that were never measured are omitted rather than shown as zero.
+    /// Single-line layout kept for non-TTY/scripted opt-in output.
     pub(crate) fn to_stats_line(&self) -> String {
         let mut parts = Vec::new();
         if let Some(prompt_tokens) = self.prompt_tokens {
@@ -232,6 +232,18 @@ impl RunProfile {
         }
         if self.timings.tokens() > 0 {
             parts.push(format!("{} out", self.timings.tokens()));
+        }
+        if let Some(hit) = self.prefix_cache_hit {
+            if let Some(prompt_tokens) = self.prompt_tokens.filter(|tokens| *tokens > 0) {
+                parts.push(format!(
+                    "cache {}/{} ({})",
+                    format_token_count(hit),
+                    format_token_count(prompt_tokens),
+                    format_percent(hit, prompt_tokens)
+                ));
+            } else if hit > 0 {
+                parts.push(format!("cache {}", format_token_count(hit)));
+            }
         }
         if let Some(context) = self.context {
             parts.push(format!("ctx {context}"));
@@ -249,19 +261,16 @@ impl RunProfile {
         if let Some(rate) = self.timings.decode_tokens_per_second() {
             parts.push(format!("{rate:.1} tok/s"));
         }
-
         if let Some(ttft) = self.timings.time_to_first_token() {
             parts.push(format!("ttft {:.0} ms", ttft.as_secs_f64() * 1000.0));
         }
-
-        // Reuse is the whole point of the cache, so it is reported whenever
-        // there was any, from whichever cache served it.
-        let reused = self.prefix_cache_hit.unwrap_or(0) as u64
-            + self
-                .multimodal_reuse
-                .map_or(0, |reuse| reuse.prefix_reused_tokens);
-        if reused > 0 {
-            parts.push(format!("{reused} reused"));
+        if let Some(reuse) = self.multimodal_reuse
+            && reuse.prefix_reused_tokens > 0
+        {
+            parts.push(format!(
+                "mm-prefix {}",
+                format_token_count(reuse.prefix_reused_tokens as usize)
+            ));
         }
         if let Some(reuse) = self.multimodal_reuse
             && reuse.encoder_hits + reuse.encoder_misses > 0
@@ -272,10 +281,111 @@ impl RunProfile {
                 reuse.encoder_hits + reuse.encoder_misses
             ));
         }
+        if let Some(pages) = self.pages.filter(|pages| !pages.is_idle()) {
+            parts.push(pages.to_verbose_stats_part());
+        }
         if let Some(peak) = self.memory.peak_resident_bytes {
             parts.push(format!("rss {}", format_bytes(peak)));
         }
+        Self::format_stats_parts(parts)
+    }
 
+    /// TTY layout with an explicit field-boundary break.
+    ///
+    /// The first line is generation performance and termination; the second is
+    /// cache, context, scheduler and memory behavior. Keeping the break
+    /// deliberate avoids terminal-width-dependent accidental wrapping.
+    pub(crate) fn to_stats_block(&self) -> String {
+        let (headline, resources) = self.stats_parts();
+        match (headline.is_empty(), resources.is_empty()) {
+            (true, true) => "[ no measurements for this turn ]".to_string(),
+            (false, true) => Self::format_stats_parts(headline),
+            (true, false) => Self::format_stats_parts(resources),
+            (false, false) => format!(
+                "{}\n{}",
+                Self::format_stats_parts(headline),
+                Self::format_stats_parts(resources)
+            ),
+        }
+    }
+
+    fn stats_parts(&self) -> (Vec<String>, Vec<String>) {
+        let mut headline = Vec::new();
+        let mut resources = Vec::new();
+        if let Some(prompt_tokens) = self.prompt_tokens {
+            headline.push(format!("{prompt_tokens} in"));
+        }
+        if self.timings.tokens() > 0 {
+            headline.push(format!("{} out", self.timings.tokens()));
+        }
+        if let Some(backend) = &self.decode_backend {
+            headline.push(format!("backend {backend}"));
+        }
+        if let Some(rate) = self.timings.decode_tokens_per_second() {
+            headline.push(format!("{rate:.1} tok/s"));
+        }
+        if let Some(rate) = self.timings.end_to_end_tokens_per_second() {
+            headline.push(format!("e2e {rate:.1} tok/s"));
+        }
+        if let Some(ttft) = self.timings.time_to_first_token() {
+            headline.push(format!("ttft {:.0} ms", ttft.as_secs_f64() * 1000.0));
+        }
+        if let Some(reason) = &self.finish_reason {
+            headline.push(format!("finish {}", compact_finish_reason(reason)));
+        }
+        if let Some(hit) = self.prefix_cache_hit {
+            if let Some(prompt_tokens) = self.prompt_tokens.filter(|tokens| *tokens > 0) {
+                resources.push(format!(
+                    "cache {}/{} {}",
+                    format_token_count(hit),
+                    format_token_count(prompt_tokens),
+                    format_percent(hit, prompt_tokens)
+                ));
+            } else if hit > 0 {
+                resources.push(format!("cache {}", format_token_count(hit)));
+            }
+        }
+        if let Some(context) = self.context {
+            resources.push(format!(
+                "ctx {}/{}",
+                format_token_count(context.used_tokens),
+                format_token_count(context.max_tokens)
+            ));
+        }
+        if let Some(cap) = self.budget_cap {
+            headline.push(format!(
+                "cap {}->{}",
+                format_token_count(cap.requested_max_new_tokens),
+                format_token_count(cap.admitted_max_new_tokens)
+            ));
+        }
+        if let Some(reuse) = self.multimodal_reuse
+            && reuse.prefix_reused_tokens > 0
+        {
+            resources.push(format!(
+                "mm {}",
+                format_token_count(reuse.prefix_reused_tokens as usize)
+            ));
+        }
+        if let Some(reuse) = self.multimodal_reuse
+            && reuse.encoder_hits + reuse.encoder_misses > 0
+        {
+            resources.push(format!(
+                "enc {}/{}",
+                reuse.encoder_hits,
+                reuse.encoder_hits + reuse.encoder_misses
+            ));
+        }
+        if let Some(pages) = self.pages.filter(|pages| !pages.is_idle()) {
+            resources.push(pages.to_stats_part());
+        }
+        if let Some(peak) = self.memory.peak_resident_bytes {
+            resources.push(format!("rss {}", format_bytes(peak)));
+        }
+        (headline, resources)
+    }
+
+    fn format_stats_parts(parts: Vec<String>) -> String {
         if parts.is_empty() {
             "[ no measurements for this turn ]".to_string()
         } else {
@@ -300,6 +410,24 @@ fn format_token_count(tokens: usize) -> String {
         format!("{:.1}k", tokens as f64 / 1000.0)
     } else {
         tokens.to_string()
+    }
+}
+
+fn format_percent(numerator: usize, denominator: usize) -> String {
+    if denominator == 0 {
+        return "0%".to_string();
+    }
+    format!("{:.0}%", numerator as f64 / denominator as f64 * 100.0)
+}
+
+fn compact_finish_reason(reason: &str) -> &str {
+    match reason {
+        "MaxTokens" => "max",
+        "StopSequence" => "stop-seq",
+        "Eos" | "EOS" => "eos",
+        "Stop" => "stop",
+        "Interrupted" => "interrupt",
+        other => other,
     }
 }
 
@@ -347,6 +475,34 @@ impl PageActivity {
             && self.hot_evictions == 0
             && self.prefix_evictions == 0
             && self.allocation_failures == 0
+    }
+
+    fn to_stats_part(self) -> String {
+        let mut part = format!("pg +{}/-{}", self.allocations, self.frees);
+        if self.hot_evictions > 0 {
+            part.push_str(&format!(" hot {}", self.hot_evictions));
+        }
+        if self.prefix_evictions > 0 {
+            part.push_str(&format!(" pref {}", self.prefix_evictions));
+        }
+        if self.allocation_failures > 0 {
+            part.push_str(&format!(" fail {}", self.allocation_failures));
+        }
+        part
+    }
+
+    fn to_verbose_stats_part(self) -> String {
+        let mut part = format!("pages +{} / -{}", self.allocations, self.frees);
+        if self.hot_evictions > 0 {
+            part.push_str(&format!(" hot-evict {}", self.hot_evictions));
+        }
+        if self.prefix_evictions > 0 {
+            part.push_str(&format!(" prefix-evict {}", self.prefix_evictions));
+        }
+        if self.allocation_failures > 0 {
+            part.push_str(&format!(" fail {}", self.allocation_failures));
+        }
+        part
     }
 }
 
@@ -471,7 +627,16 @@ impl RunProfile {
             );
         }
         if let Some(hit) = self.prefix_cache_hit.filter(|hit| *hit > 0) {
-            let _ = writeln!(out, "{:<24} {:>10} tokens", "prefix cache reuse", hit);
+            let share = self
+                .prompt_tokens
+                .filter(|tokens| *tokens > 0)
+                .map(|tokens| format!(" ({})", format_percent(hit, tokens)))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "{:<24} {:>10} tokens{share}",
+                "prefix cache reuse", hit
+            );
         }
         if let Some(reuse) = self.multimodal_reuse.filter(|reuse| !reuse.is_idle()) {
             if reuse.encoder_hits + reuse.encoder_misses > 0 {
@@ -718,6 +883,12 @@ impl RunProfile {
         }
         if let Some(hit) = self.prefix_cache_hit {
             fields.push(format!("\"prefix_cache_hit_tokens\":{hit}"));
+            if let Some(prompt_tokens) = self.prompt_tokens.filter(|tokens| *tokens > 0) {
+                fields.push(format!(
+                    "\"prefix_cache_hit_percent\":{:.4}",
+                    hit as f64 / prompt_tokens as f64 * 100.0
+                ));
+            }
         }
         if let Some(reuse) = self.multimodal_reuse.filter(|reuse| !reuse.is_idle()) {
             fields.push(format!(
@@ -837,6 +1008,7 @@ fn json_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     fn timings(first_ms: u64, gaps_ms: &[u64]) -> TokenTimings {
         // Build the timings directly: sleeping for real would make the test slow
@@ -1173,6 +1345,122 @@ mod tests {
         let line = profile.to_stats_line();
 
         assert!(line.contains("ctx 3.1k / 8.2k"), "{line}");
+    }
+
+    #[test]
+    fn stats_line_and_reports_expose_prefix_cache_reuse() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.prompt_tokens = Some(613);
+        profile.prefix_cache_hit = Some(598);
+
+        let line = profile.to_stats_line();
+        let text = profile.to_text();
+        let json: serde_json::Value = serde_json::from_str(&profile.to_json()).unwrap();
+
+        assert!(line.contains("cache 598/613 (98%)"), "{line}");
+        assert!(
+            text.contains("prefix cache reuse") && text.contains("598 tokens (98%)"),
+            "{text}"
+        );
+        assert_eq!(json["prefix_cache_hit_tokens"], 598);
+        assert!((json["prefix_cache_hit_percent"].as_f64().unwrap() - 97.553).abs() < 0.01);
+    }
+
+    #[test]
+    fn stats_block_has_a_deliberate_two_line_full_layout() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.prompt_tokens = Some(613);
+        profile.timings = timings(116, &vec![24; 63]);
+        profile.decode_backend = Some("native".to_string());
+        profile.finish_reason = Some("StopSequence".to_string());
+        profile.prefix_cache_hit = Some(598);
+        profile.context = Some(ContextUsage {
+            used_tokens: 677,
+            max_tokens: 8192,
+        });
+        profile.budget_cap = Some(BudgetCap {
+            requested_max_new_tokens: 3584,
+            admitted_max_new_tokens: 128,
+        });
+        profile.multimodal_reuse = Some(MultimodalReuse {
+            encoder_hits: 1,
+            encoder_misses: 1,
+            encoder_bytes: 1_048_576,
+            prefix_reused_tokens: 120,
+            prefill_tokens: 64,
+        });
+        profile.pages = Some(PageActivity {
+            allocations: 5,
+            frees: 2,
+            hot_evictions: 1,
+            prefix_evictions: 3,
+            allocation_failures: 1,
+        });
+        profile.memory.peak_resident_bytes = Some(2_684_354_560);
+
+        let block = profile.to_stats_block();
+        let lines = block.lines().collect::<Vec<_>>();
+
+        assert_eq!(
+            block,
+            "[ 613 in · 64 out · backend native · 41.7 tok/s · e2e 39.3 tok/s · ttft 116 ms · finish stop-seq · cap 3.6k->128 ]\n\
+             [ cache 598/613 98% · ctx 677/8.2k · mm 120 · enc 1/2 · pg +5/-2 hot 1 pref 3 fail 1 · rss 2.5 GiB ]"
+        );
+        assert_eq!(lines.len(), 2, "rendered stats block:\n{block}");
+        assert_eq!(
+            UnicodeWidthStr::width(lines[0]),
+            114,
+            "headline display width changed; rendered stats block:\n{block}"
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(lines[1]),
+            100,
+            "resource display width changed; rendered stats block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn stats_block_width_uses_display_width_not_scalar_count() {
+        // An unknown finish reason passes through `compact_finish_reason`
+        // unchanged, so a CJK character in a model's stop token reaches the
+        // rendered line. "字" is U+5B57: one scalar value, two terminal columns.
+        // This test exists to prove that `UnicodeWidthStr::width` and
+        // `chars().count()` disagree for such input — if they agreed, the
+        // width assertion in `stats_block_has_a_deliberate_two_line_full_layout`
+        // above would pass even with `chars().count()`, giving false confidence.
+        let mut profile = RunProfile::new("m".to_string());
+        profile.finish_reason = Some("字".to_string());
+
+        let block = profile.to_stats_block();
+        let line = block.lines().next().unwrap_or("");
+
+        let char_count = line.chars().count();
+        let display_width = UnicodeWidthStr::width(line);
+
+        assert!(
+            display_width > char_count,
+            "a line containing a wide character must have display_width > chars().count(); \
+             got display_width={display_width}, chars={char_count}; line: {line:?}"
+        );
+    }
+
+    #[test]
+    fn stats_line_names_page_activity_when_it_happened() {
+        let mut profile = RunProfile::new("m".to_string());
+        profile.pages = Some(PageActivity {
+            allocations: 5,
+            frees: 2,
+            hot_evictions: 1,
+            prefix_evictions: 3,
+            allocation_failures: 1,
+        });
+
+        let line = profile.to_stats_line();
+
+        assert!(line.contains("pages +5 / -2"), "{line}");
+        assert!(line.contains("hot-evict 1"), "{line}");
+        assert!(line.contains("prefix-evict 3"), "{line}");
+        assert!(line.contains("fail 1"), "{line}");
     }
 
     #[test]

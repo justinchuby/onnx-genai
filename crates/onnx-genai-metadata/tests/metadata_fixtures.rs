@@ -101,6 +101,29 @@ fn parses_valid_json_fixture() {
 }
 
 #[test]
+fn parses_top_level_generation_defaults_from_v1_yaml() {
+    let yaml = r#"
+schema_version: v1
+generation:
+  do_sample: true
+  temperature: 0.6
+  top_k: 20
+  top_p: 0.95
+  repetition_penalty: 1.0
+  num_beams: 1
+"#;
+    let metadata: InferenceMetadata = serde_yaml::from_str(yaml).expect("metadata parses");
+    let generation = metadata.generation.expect("generation section");
+
+    assert_eq!(generation.do_sample, Some(true));
+    assert_eq!(generation.temperature, Some(0.6));
+    assert_eq!(generation.top_k, Some(20));
+    assert_eq!(generation.top_p, Some(0.95));
+    assert_eq!(generation.repetition_penalty, Some(1.0));
+    assert_eq!(generation.num_beams, Some(1));
+}
+
+#[test]
 fn attention_key_sequence_lengths_unit_batch_parses_and_round_trips() {
     let yaml = r#"
 model:

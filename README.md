@@ -160,11 +160,16 @@ most detailed section.
 without the full `--profile` report. `generate` uses the same compact line for
 terminal text generation unless `--no-stats` is passed. While a REPL reply
 streams, the numbers update live beneath it; when the turn ends they settle into
-one line:
+a deliberate two-line block: performance and termination first, cache/scheduler/
+memory behavior second.
 
 ```text
-[ 613 in · 64 out · 41.2 tok/s · ttft 116 ms · 598 reused · encoder 1/1 · rss 2.5 GiB ]
+[ 613 in · 64 out · backend native · 41.7 tok/s · e2e 39.3 tok/s · ttft 116 ms · finish stop-seq · cap 3.6k->128 ]
+[ cache 598/613 98% · ctx 677/8.2k · mm 120 · enc 1/2 · pg +5/-2 hot 1 pref 3 fail 1 · rss 2.5 GiB ]
 ```
+
+If the scheduler had to admit a smaller decode budget, or the KV page pool
+allocated/freed/evicted pages during the turn, those appear in this block.
 
 The live view is drawn with [ratatui](https://ratatui.rs) into an *inline*
 viewport rather than an alternate screen, so finished lines spill into the

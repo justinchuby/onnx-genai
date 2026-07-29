@@ -908,6 +908,18 @@ mod tests {
         Ok((environment, session))
     }
 
+    fn fixture_io(name: &str) -> anyhow::Result<onnx_genai_metadata::ModelIoSpec> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+            .join("inference_metadata.yaml");
+        let metadata = onnx_genai_metadata::load_metadata(&path)?;
+        metadata
+            .model
+            .and_then(|model| model.io)
+            .with_context(|| format!("fixture '{name}' must declare model.io"))
+    }
+
     fn tensor_config() -> PageTensorConfig {
         PageTensorConfig {
             num_layers: 1,
@@ -1199,7 +1211,8 @@ mod tests {
                 head_dim: 8,
             }],
         };
-        let mut state = DecodeState::new(&session)?;
+        let io = fixture_io("tiny-llm")?;
+        let mut state = DecodeState::new_with_io(&session, Some(&io))?;
         state
             .past
             .insert("stale".into(), Value::from_vec_f32(vec![0.0], &[1])?);
@@ -1294,7 +1307,8 @@ mod tests {
                 }],
             )?;
         }
-        let mut decode_state = DecodeState::new(&session)?;
+        let io = fixture_io("tiny-llm")?;
+        let mut decode_state = DecodeState::new_with_io(&session, Some(&io))?;
         let mut count = 3;
 
         rewind_decode_state_to_len(
@@ -1373,7 +1387,8 @@ mod tests {
             ),
         ] {
             let (_environment, session) = load_session(fixture_name)?;
-            let mut state = DecodeState::new_for_path(&session, &path)?;
+            let io = fixture_io(fixture_name)?;
+            let mut state = DecodeState::new_for_path_with_io(&session, &path, Some(&io))?;
             let mut cache = PagedKvCache::new(2, 8);
             let seq = cache.create_sequence();
             run_decode_session_logits(&mut state, &[2, 4, 3], 0)?;
@@ -1406,7 +1421,8 @@ mod tests {
     fn windowed_past_present_keeps_absolute_positions_with_bounded_past() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let path = detect_model_decode_path(&session, None, None, Some(2), 0)?;
+        let io = fixture_io("tiny-llm")?;
+        let path = detect_model_decode_path(&session, Some(&io), None, None, Some(2), 0)?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -1416,7 +1432,7 @@ mod tests {
                 sink_tokens: None,
             }
         ));
-        let mut state = DecodeState::new_for_path(&session, &path)?;
+        let mut state = DecodeState::new_for_path_with_io(&session, &path, Some(&io))?;
 
         run_decode_step(&session, &mut state, &[2, 4], 0)?;
         assert_eq!(state.retained_kv_len(2), 2);
@@ -1430,7 +1446,7 @@ mod tests {
         // paged sliding-window path (shared_buffer: false), since the append-only
         // single shared buffer cannot express windowed eviction.
         assert!(matches!(
-            detect_model_decode_path(&session, Some(16), Some(16), Some(2), 0)?,
+            detect_model_decode_path(&session, Some(&io), Some(16), Some(16), Some(2), 0)?,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,
@@ -1453,7 +1469,8 @@ mod tests {
             sliding_window: Some(2),
             sink_tokens: Some(1),
         };
-        let mut state = DecodeState::new_for_path(&session, &path)?;
+        let io = fixture_io("tiny-llm")?;
+        let mut state = DecodeState::new_for_path_with_io(&session, &path, Some(&io))?;
         assert_eq!(state.sink_tokens(), 1);
 
         // present_len=2, window covers the whole buffer (window_start=0 <= sink).
@@ -1496,18 +1513,17 @@ mod tests {
         assert!(!session.input_names().iter().any(|name| name == "input_ids"));
         assert!(!session.output_names().iter().any(|name| name == "logits"));
 
-        // Without an `io` block, the name-convention fallback cannot bind the
-        // renamed token input and decoding fails.
-        let mut convention_state = DecodeState::new(&session)?;
-        let convention_err = match run_decode_step(&session, &mut convention_state, &[2, 4], 0) {
-            Ok(_) => panic!("name-convention binding must not decode a renamed graph"),
+        // Shape cannot distinguish the three integer sequence inputs, so
+        // initialization fails closed and names are not consulted.
+        let convention_err = match DecodeState::new(&session) {
+            Ok(_) => panic!("ambiguous shapes must require metadata"),
             Err(error) => error,
         };
         assert!(
             convention_err
                 .to_string()
-                .contains("unsupported model input"),
-            "expected name-convention binding to fail, got: {convention_err}"
+                .contains("declare the exact graph port in model.io.token_input"),
+            "expected actionable metadata error, got: {convention_err}"
         );
 
         // Load the explicit `io` block from the fixture's inference metadata and
@@ -1554,7 +1570,10 @@ mod tests {
         let mut state = EngineSession {
             tokens: vec![2, 4, 3],
             kv_token_count: 4,
-            decode_state: DecodeState::new(&session)?,
+            decode_state: {
+                let io = fixture_io("tiny-llm-scatter")?;
+                DecodeState::new_with_io(&session, Some(&io))?
+            },
             draft: None,
             sampled_fastpath_failed: false,
         };

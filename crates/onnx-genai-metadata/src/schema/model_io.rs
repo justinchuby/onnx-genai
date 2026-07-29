@@ -42,11 +42,10 @@ pub struct ModelCapabilities {
 /// Explicit binding of the graph ports the decode step reads and writes.
 ///
 /// Every field is optional so a model package can declare only the ports its
-/// graph exposes. Any port left unset falls back to the runtime's historical
-/// tensor-name convention (a temporary, transitional behavior removed once all
-/// emitters populate this block). Declaring an `io` block lets a graph use
-/// arbitrary tensor names — the runtime never infers a port by name or dtype
-/// for a declared port.
+/// graph exposes. Any port left unset is resolved from an unambiguous
+/// dtype/shape signal where possible, then falls back to the runtime's
+/// historical name convention for compatibility. A declared port is always
+/// authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct ModelIoSpec {
     /// Which declared sequence port drives autoregressive execution.

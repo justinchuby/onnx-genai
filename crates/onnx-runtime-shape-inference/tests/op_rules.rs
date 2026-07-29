@@ -279,8 +279,161 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 205);
-    assert_eq!(registry.entry_count(), 247);
+    assert_eq!(registry.operator_count(), 208);
+    assert_eq!(registry.entry_count(), 253);
+}
+
+fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
+    with_attr(
+        with_attr(
+            node(op, 3, outputs),
+            "direction",
+            Attribute::String(direction.as_bytes().to_vec()),
+        ),
+        "hidden_size",
+        Attribute::Int(hidden_size),
+    )
+}
+
+#[test]
+fn recurrent_forward_and_bidirectional_shapes_cover_all_three_ops() {
+    for op in ["RNN", "GRU", "LSTM"] {
+        let output_count = if op == "LSTM" { 3 } else { 2 };
+        for (direction, directions) in [("forward", 1), ("bidirectional", 2)] {
+            let outputs = run(
+                &recurrent_node(op, output_count, direction, 11),
+                vec![f32in(vec![c(5), c(3), c(7)])],
+                13,
+            );
+            assert_eq!(
+                out_shape(&outputs),
+                vec![c(5), c(directions), c(3), c(11)],
+                "{op} {direction} Y"
+            );
+            assert_eq!(
+                outputs[1].type_info.as_ref().unwrap().shape,
+                vec![c(directions), c(3), c(11)],
+                "{op} {direction} Y_h"
+            );
+            assert_eq!(outputs.len(), output_count, "{op} output arity");
+            if op == "LSTM" {
+                assert_eq!(
+                    outputs[2].type_info.as_ref().unwrap().shape,
+                    vec![c(directions), c(3), c(11)],
+                    "LSTM {direction} Y_c"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn recurrent_symbolic_sequence_and_batch_dims_propagate() {
+    let outputs = run(
+        &recurrent_node("LSTM", 3, "bidirectional", 13),
+        vec![f32in(vec![sym(80), sym(81), c(17)])],
+        13,
+    );
+    assert_eq!(out_shape(&outputs), vec![sym(80), c(2), sym(81), c(13)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(2), sym(81), c(13)]
+    );
+    assert_eq!(
+        outputs[2].type_info.as_ref().unwrap().shape,
+        vec![c(2), sym(81), c(13)]
+    );
+}
+
+#[test]
+fn recurrent_opset_14_layout_controls_axis_order() {
+    for op in ["RNN", "GRU", "LSTM"] {
+        let output_count = if op == "LSTM" { 3 } else { 2 };
+        let batch_major = with_attr(
+            recurrent_node(op, output_count, "bidirectional", 19),
+            "layout",
+            Attribute::Int(1),
+        );
+        let outputs = run(&batch_major, vec![f32in(vec![sym(82), sym(83), c(23)])], 14);
+        assert_eq!(
+            out_shape(&outputs),
+            vec![sym(82), sym(83), c(2), c(19)],
+            "{op} layout=1 Y"
+        );
+        assert_eq!(
+            outputs[1].type_info.as_ref().unwrap().shape,
+            vec![sym(82), c(2), c(19)],
+            "{op} layout=1 Y_h"
+        );
+
+        let sequence_major = with_attr(
+            recurrent_node(op, output_count, "forward", 19),
+            "layout",
+            Attribute::Int(0),
+        );
+        let outputs = run(
+            &sequence_major,
+            vec![f32in(vec![sym(83), sym(82), c(23)])],
+            14,
+        );
+        assert_eq!(
+            out_shape(&outputs),
+            vec![sym(83), c(1), sym(82), c(19)],
+            "{op} layout=0 Y"
+        );
+    }
+}
+
+#[test]
+fn recurrent_pre_14_ignores_layout_attribute() {
+    let node = with_attr(
+        recurrent_node("GRU", 2, "forward", 29),
+        "layout",
+        Attribute::Int(1),
+    );
+    let outputs = run(&node, vec![f32in(vec![sym(84), sym(85), c(31)])], 13);
+    assert_eq!(out_shape(&outputs), vec![sym(84), c(1), sym(85), c(29)]);
+    assert_eq!(
+        outputs[1].type_info.as_ref().unwrap().shape,
+        vec![c(1), sym(85), c(29)]
+    );
+}
+
+#[test]
+fn recurrent_missing_hidden_size_is_permissive() {
+    for op in ["RNN", "GRU", "LSTM"] {
+        let outputs = run(&node(op, 3, 3), vec![f32in(vec![c(5), c(3), c(7)])], 14);
+        assert!(
+            outputs.iter().all(|output| output.type_info.is_none()),
+            "{op}"
+        );
+    }
+}
+
+#[test]
+fn recurrent_only_sets_declared_outputs() {
+    for op in ["RNN", "GRU", "LSTM"] {
+        for output_count in 1..=if op == "LSTM" { 3 } else { 2 } {
+            let outputs = run(
+                &recurrent_node(op, output_count, "forward", 37),
+                vec![f32in(vec![c(5), c(3), c(7)])],
+                14,
+            );
+            assert_eq!(outputs.len(), output_count, "{op}");
+            assert!(outputs.iter().all(|output| output.type_info.is_some()));
+        }
+    }
+
+    for op in ["RNN", "GRU"] {
+        let outputs = run(
+            &recurrent_node(op, 3, "forward", 37),
+            vec![f32in(vec![c(5), c(3), c(7)])],
+            14,
+        );
+        assert!(outputs[0].type_info.is_some(), "{op} Y");
+        assert!(outputs[1].type_info.is_some(), "{op} Y_h");
+        assert!(outputs[2].type_info.is_none(), "{op} has no Y_c");
+    }
 }
 
 #[test]

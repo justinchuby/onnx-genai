@@ -19,6 +19,7 @@ mod ml;
 mod movement;
 mod norm;
 mod pooling;
+mod recurrent;
 mod selection;
 mod sequence;
 mod signal;
@@ -56,6 +57,7 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     movement::register(registry);
     data_ops::register(registry);
     pooling::register(registry);
+    recurrent::register(registry);
     selection::register(registry);
     sequence::register(registry);
     generator::register(registry);

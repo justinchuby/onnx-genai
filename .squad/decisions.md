@@ -183,6 +183,69 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   unmerged; all H200 capacity was occupied externally. Granite MoE runs on ORT
   CUDA but exports unfused MatMuls, while the fused fixture verifies route-first
   CPU paging independently.
+## 2026-07-28T13:50:00Z — MobileNetV2 remaining gap: Clip dispatch-miss (defect #14)
+
+Per-op profiling on MobileNetV2-12: Clip dominated at 76.8% of runtime. Fixed with
+`clip_contiguous_f32_fast()` — NEON-accelerated zero-copy path. Per-op: 34ms → 0.86ms
+(39.5x). Amdahl projected 3.93x; measured 3.75–3.91x model speedup. Residual gap (11.5ms
+vs ORT 6.3ms) is Conv-dominated, no single lever remaining. **PR #359.**
+
+## 2026-07-28 — NEON fast path for Relu (MLAS gate audit item #2)
+
+Relu was second HIGH-priority violation: only fast path behind `cfg(feature="mlas")`.
+ResNet-18: Relu 0.43 ms (5.17%) before → 0.094 ms (1.17%) after. Per-op: 4.6×. Model:
+1.044× (within Amdahl projection). Added `clip_contiguous_f32_fast()` pattern. Manifest
+row for `(Relu, contiguous_f32, all, tier2)` with `RELU_F32_FAST_TEST_HITS` counter.
+
+## 2026-07-28 — Standing Directive: Hardware-Rationale Accuracy in Dispatch Comments
+
+Source comments justifying dispatch thresholds with hardware figures must: (1) cite
+verified figure from specs/teardown/on-device; (2) state if constant is derived or fitted;
+(3) if fitted, state measured bracket and confirmed platforms. Wrong rationale is worse
+than no rationale — prevents future engineers from silently breaking working dispatch.
+
+## 2026-07-28 — Thin-M GEMM bypass for f32 prefill on Apple Silicon
+
+For small M (2-16) with large B (K×N > 4M), cblas only achieves ~25 GB/s; bypass to
+NEON column-parallel path for constant (pre-transposed) weights. M crossover at 16 measured
+on M1 Max, bracket [16,24]. TinyStories-33M TTFT: 17.7ms → 13.3ms (-25%). f32 weight
+transposes precomputed at model load. Counter: `THIN_M_GEMM_TEST_HITS`. **PR #351.**
+
+## 2026-07-28 — report time-to-first-token from process start
+
+`compare.rs` now reports process start → first token ms (model_load + TTFT) as derived
+column. TTFT alone favors runtimes that front-load work into model load (ORT pre-packs).
+Cold-start metric: native 55–57.5ms, ORT 150–165.5ms (2.6–2.7×). Updated
+`examples/profiles/README.md` with mechanism explanation.
+
+## 2026-07-28 — Republish profile figures with load context
+
+Measurements at load 2.5–3.7 show: qwen2.5-0.5b-f16: 1.72× decode, 1.68× e2e, 5.01×
+cold-start. TinyStories-33M: 0.91× decode (ORT wins), 0.82× e2e (ORT wins), 2.47×
+cold-start. Verified against Justin's independent measurement (< 2% agreement). Every
+number carries host load context. Unflattering numbers preserved in README.
+
+## 2026-07-28T00:00:00Z — probe the stream you are writing to
+
+`emit_stats_line` in PR #372: stats written to stderr but probed stdout TTY status, inverting
+decision under redirection. **Durable rule:** probe the stream you are writing to. Stats on
+stderr → test `stderr().is_terminal()`. Never cross-probe. Extracted `stats_text()` for pure
+testable logic; added `stats_format_follows_stderr_not_stdout` unit test covering all 4 cases.
+
+## 2026-07-28 — Feature Gate Coverage Lint
+
+Added `scripts/check_feature_gate_coverage.py` — sixth CI layer targeting blind spot:
+cfg-gated performance paths whose fallback is unmonitored. Audit findings: CRITICAL (Clip),
+HIGH (Relu), MEDIUM (GlobalPool) — double-copy allocations on macOS. No other feature flags
+guard kernel performance paths. Script catches missing *instrumentation* on fallback paths,
+not missing optimizations — manifest then makes tier visible for human review.
+
+## 2026-07-28 — Roofline ceiling: cache-assisted threshold for small models
+
+TinyStories-33M (107M params, 267.8 MB decode set) exceeds 100% because SLC (48 MiB = 18%
+coverage) provides inter-token reuse lift. Broadened check from "cache_resident" (entire model
+fits) to "cache_assisted" (SLC ≥ 10% of decode set). Roofline ceiling marked informational
+for cache-assisted models. No change to floor constants. **PR #354.**
 
 ## 2026-07-28T04:30:00-07:00 — CLI improvement track durable lessons
 
@@ -224,3 +287,48 @@ Phase 1 landed in #289. Remaining phases cover session/runtime interaction — `
 `/rewind` — which depend on runtime APIs tracked in
 `docs/research/cli/04-runtime-capability-inventory.md` and `06-fork-rewind-api.md`.
 Fork is reserved behind a type gate and **not yet enabled on any backend**.
+
+## 2026-07-28 — Declarative, name-agnostic model I/O and shared-KV contracts
+
+**PR #373 / issue #231 (Melina; reviewed by Richter; merged `61d3bdac`).** Decoder and
+proposer ports resolve first from exact `model.io` / `speculative.io` declarations, then
+from unique dtype/shape signals; legacy terminal-name matching remains compatibility-only.
+Declared KV lists pair positionally. Attention representation permissions are independent of
+attention implementation, and `io.kv_update: shared_buffer` declares operator-agnostic
+shared-buffer KV updates. Strict attention sequence-length validation rejects incompatible
+contracts early.
+
+## 2026-07-28 — Honest route-first QMoE residency tests under coverage
+
+**PR #378 (Nandez; reviewed by Kuato; merged `ac75e146`).** Coverage-mode route-first QMoE
+offload assertions now reflect the scheduler contract: serial execution peaks at one resident
+expert; prefetch peaks in `[1, 2]` and remains below selected experts. The shared
+`hold_metrics_test_lock` helper is poison-recovering across 20 call sites, preventing a
+previous test panic from cascading into phantom residency regressions on unrelated PRs.
+
+## 2026-07-29 — Core decode ports must not depend on exporter names
+
+**PR #380 / issue #377 (Melina; reviewed by Cohaagen; merged `47c3331d`).** The core decode
+path resolves roles only from explicit metadata or a unique tensor-shape match, and reports
+the required metadata key for ambiguity. Encoder-decoder Whisper/TTS fixtures declare
+component decoder I/O explicitly, rather than restoring decoder-name guessing.
+
+**Review rule:** metadata or I/O-detection changes must run the CLI ORT E2E suite in addition
+to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate successfully
+(23/23).
+
+## 2026-07-29 — Shared-buffer decode must thread declared KV pairs
+
+**PR #382 / issue #377 continuation (Benny; reviewed by Lori; regression test by Leon; merged `85b9ba15`).** ORT batched shared-buffer and static-cache decode adapters no longer guess exporter I/O names; they consume declared KV pairs. The repair also restores those pairs when constructing `BatchedSharedBufferDecodeSession`, fixing the latent #380 regression where passing `None` made construction always fail. A CPU engine-level continuous-batch test using `tiny-llm-sharedbuffer` now compares sequential generation and fails at construction if declared `model.io.kv_inputs` / `kv_outputs` stop reaching the session. This is deliberately CPU coverage because the previous CUDA-only E2E auto-skips without CUDA.
+
+## 2026-07-29 — Recurrent shape geometry shares an opset-aware contract
+
+**PR #386 / issue #355 slice (Hauser; reviewed by Helm; merged `39c28b44`).** RNN, GRU, and LSTM shape inference share `recurrent()`, which propagates symbolic sequence and batch dimensions, derives direction count and hidden size, and emits only declared Y/Y_h/Y_c outputs (including LSTM Y_c). Registrations at opsets 1 and 14 enforce the layout boundary: pre-14 ignores a stray `layout`, while 14+ honors it. Missing or insufficient shape information remains permissive rather than panicking. Helm independently checked ONNX axis order for both layouts and ran the recurrent suite (238 tests) plus clean clippy.
+
+## 2026-07-29 — OpenAI JSON Schema response format reaches engine constraints
+
+**PR #388 / issue #183 follow-up (Tony; reviewed by Harry; merged `804ba860`).** Chat completions accept OpenAI Structured Outputs `response_format: {type: "json_schema", json_schema: {name, schema, strict?}}` and map the schema object to `GenerateConstraint::JsonSchema`; malformed schema/name input produces a type-driven HTTP 400. `wants_json_object` became `wants_constrained_json`, so streaming buffering and incomplete-JSON retry apply to both constrained formats. Forced specific-tool choice retains its Lark-constraint precedence. Harry independently verified live llguidance consumption, targeted tests, and clean clippy; the two full HTTP-suite failures reproduce on origin/main from an unrelated tiny-fixture context limit.
+
+## 2026-07-29 — Tool-call parser handles Qwen, Llama, and Mistral formats
+
+**PR #390 / issue #183 follow-up (Stevens; reviewed by Edgemar; merged `0e62150e`).** `parse_tool_calls` recognizes Qwen/Hermes `<tool_call>` objects, Llama 3 `<|python_tag|>` objects, and Mistral `[TOOL_CALLS]` arrays. A serde `StreamDeserializer::byte_offset()` prefix scanner consumes consecutive complete top-level Llama JSON values (including semicolons inside strings) without naive splitting and terminates safely on malformed input or model terminators. One converter prefers `arguments`, falls back to `parameters`, and assigns sequential IDs. Edgemar independently ran eight parser tests and clean clippy; the roughly 49 local `tests.rs` failures are pre-existing missing-weights-fixture failures.

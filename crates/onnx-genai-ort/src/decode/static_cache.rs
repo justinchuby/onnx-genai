@@ -15,6 +15,45 @@ pub(super) struct StaticCacheBuffer {
     pub(super) alternate: Option<Arc<Value>>,
 }
 
+/// Resolve the static-cache logits output name-agnostically.
+///
+/// A static-cache graph exposes exactly one output that is not a runtime-owned
+/// KV cache buffer (`updated_*`); that output is the logits. It is selected by
+/// excluding the resolved cache output ports, never by interpreting the port
+/// name.
+fn resolve_static_cache_logits_output(
+    session: &Session,
+    buffers: &[StaticCacheBuffer],
+) -> Result<String> {
+    let cache_outputs = buffers
+        .iter()
+        .map(|buffer| buffer.output_name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    logits_output_by_exclusion(session.output_names(), &cache_outputs)
+}
+
+/// Select the sole output that is not a runtime-owned KV cache buffer.
+fn logits_output_by_exclusion(
+    output_names: &[String],
+    cache_outputs: &std::collections::HashSet<&str>,
+) -> Result<String> {
+    let mut non_cache = output_names
+        .iter()
+        .filter(|name| !cache_outputs.contains(name.as_str()));
+    let logits = non_cache.next().cloned().ok_or_else(|| {
+        OrtError::InvalidArgument(
+            "static-cache model exposes no non-cache output to read logits from".into(),
+        )
+    })?;
+    if non_cache.next().is_some() {
+        return Err(OrtError::InvalidArgument(
+            "static-cache model exposes multiple non-cache outputs; declare model.io.logits_output"
+                .into(),
+        ));
+    }
+    Ok(logits)
+}
+
 /// Stateful decode runner for Mobius/STATIC-CACHE TensorScatter models.
 ///
 /// The runtime owns fixed `[B, MAX_LEN, KV_DIM]` key/value buffers. The model's
@@ -28,6 +67,7 @@ pub struct StaticCacheDecodeSession<'a> {
     current_len: usize,
     mode: StaticCacheBindingMode,
     buffers: Vec<StaticCacheBuffer>,
+    logits_output: String,
 }
 
 /// Batched stateful decode runner for static-cache TensorScatter models.
@@ -48,6 +88,7 @@ pub struct BatchedStaticCacheDecodeSession<'a> {
     physical_to_logical: Vec<Option<usize>>,
     mode: StaticCacheBindingMode,
     buffers: Vec<StaticCacheBuffer>,
+    logits_output: String,
 }
 
 impl<'a> StaticCacheDecodeSession<'a> {
@@ -64,6 +105,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
             )
         })?;
         let buffers = allocate_static_cache_buffers(options.batch_size, &pairs)?;
+        let logits_output = resolve_static_cache_logits_output(session, &buffers)?;
         Ok(Self {
             session,
             binding: IoBinding::new(session)?,
@@ -72,6 +114,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
             current_len: 0,
             mode: StaticCacheBindingMode::InPlaceAlias,
             buffers,
+            logits_output,
         })
     }
 
@@ -293,7 +336,7 @@ impl<'a> StaticCacheDecodeSession<'a> {
             .collect::<Vec<_>>();
         let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
         for (name, value) in self.session.output_names().iter().zip(outputs) {
-            if is_logits_output(name) {
+            if name == &self.logits_output {
                 return value.ok_or_else(|| {
                     OrtError::InvalidArgument("logits unexpectedly aliased a KV buffer".into())
                 });
@@ -344,6 +387,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             ));
         }
         let buffers = allocate_static_cache_buffers(options.batch_size, &pairs)?;
+        let logits_output = resolve_static_cache_logits_output(session, &buffers)?;
         let logical_to_physical = (0..batch_size).map(Some).collect::<Vec<_>>();
         let physical_to_logical = (0..batch_size).map(Some).collect::<Vec<_>>();
         Ok(Self {
@@ -357,6 +401,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             physical_to_logical,
             mode: StaticCacheBindingMode::InPlaceAlias,
             buffers,
+            logits_output,
         })
     }
 
@@ -908,7 +953,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             }
         }
         for (name, value) in self.session.output_names().iter().zip(outputs) {
-            if is_logits_output(name) {
+            if name == &self.logits_output {
                 return value.ok_or_else(|| {
                     OrtError::InvalidArgument("logits unexpectedly aliased a KV buffer".into())
                 });
@@ -1068,7 +1113,7 @@ impl<'a> BatchedStaticCacheDecodeSession<'a> {
             .collect::<Vec<_>>();
         let outputs = self.binding.output_values_or_borrowed(&borrowed_outputs)?;
         for (name, value) in self.session.output_names().iter().zip(outputs) {
-            if is_logits_output(name) {
+            if name == &self.logits_output {
                 return value.ok_or_else(|| {
                     OrtError::InvalidArgument("logits unexpectedly aliased a KV buffer".into())
                 });
@@ -1206,5 +1251,55 @@ impl<'a> BatchedDecodeSession<'a> for BatchedStaticCacheDecodeSession<'a> {
     }
     fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
         BatchedStaticCacheDecodeSession::step_active(self, next_token_ids, position_ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logits_output_by_exclusion;
+    use std::collections::HashSet;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// The logits output is the sole output that is not a runtime-owned KV cache
+    /// buffer, selected without interpreting any port name.
+    #[test]
+    fn logits_is_the_unique_non_cache_output() {
+        let outputs = names(&[
+            "opaque_scores",
+            "updated_key_cache.0",
+            "updated_value_cache.0",
+        ]);
+        let cache: HashSet<&str> = ["updated_key_cache.0", "updated_value_cache.0"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            logits_output_by_exclusion(&outputs, &cache).unwrap(),
+            "opaque_scores"
+        );
+    }
+
+    #[test]
+    fn no_non_cache_output_is_an_error() {
+        let outputs = names(&["updated_key_cache.0"]);
+        let cache: HashSet<&str> = ["updated_key_cache.0"].into_iter().collect();
+        let error = logits_output_by_exclusion(&outputs, &cache).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("no non-cache output"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn multiple_non_cache_outputs_require_metadata() {
+        let outputs = names(&["scores", "hidden", "updated_key_cache.0"]);
+        let cache: HashSet<&str> = ["updated_key_cache.0"].into_iter().collect();
+        let error = logits_output_by_exclusion(&outputs, &cache).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("model.io.logits_output"),
+            "{error:?}"
+        );
     }
 }

@@ -1611,7 +1611,7 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
-        let expose_logical_input_shape = self.input_index.get(&input_name).is_none_or(|&vid| {
+        let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
             if output_name.is_some() {
                 !self.binding_consumers_use_physical_capacity(vid)
             } else {

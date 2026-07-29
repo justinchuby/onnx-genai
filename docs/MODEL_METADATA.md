@@ -218,6 +218,20 @@ the target decoder's carried cache tensors to the proposer step; native CUDA
 device-buffer aliasing is a separate capability and fails with an actionable
 error rather than falling back to ORT.
 
+I/O role resolution follows one reusable priority order: an exact `model.io` or
+`speculative.io` declaration, then a unique tensor-shape signal. Graph port
+names are never interpreted. When shapes are ambiguous—for example, token IDs,
+attention masks, and position IDs all having rank two, or multiple same-shaped
+KV tensors—the corresponding metadata fields are required and loading fails
+with an error naming the missing field.
+
+Attention representation metadata is interpreted independently of
+`model.attention.type`. In particular, `key_sequence_lengths.scalar_broadcast`
+controls the representation contract rather than selecting an implementation,
+and `model.io.kv_update: shared_buffer` declares fixed-capacity KV behavior
+without requiring a particular attention operator name. Omitting the scalar
+permission keeps the canonical vector requirement.
+
 ## Colocation Groups
 
 Nodes with the same `onnx_runtime.group` value are treated as a colocation set.

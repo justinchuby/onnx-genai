@@ -70,8 +70,7 @@ impl Engine {
             .and_then(|model| model.io.as_ref());
         let mut decode_state = DecodeState::new_with_io(session, io)
             .context("failed to initialize embedding model inputs")?;
-        // Prefer the caller's explicit request, then a declared `io.hidden_output`;
-        // otherwise fall back to tensor-name conventions.
+        // Prefer the caller's explicit request, then the declared hidden-output role.
         let declared_hidden = options
             .hidden_state_output
             .as_deref()
@@ -115,55 +114,9 @@ fn resolve_hidden_state_output<'a>(
         return Ok(&output.name);
     }
 
-    let candidates = session
-        .outputs()
-        .iter()
-        .filter(|output| {
-            output.name.to_ascii_lowercase().contains("hidden")
-                && validate_hidden_output(output).is_ok()
-        })
-        .collect::<Vec<_>>();
-
-    for preferred in ["last_hidden_state", "hidden_states"] {
-        if let Some(output) = candidates
-            .iter()
-            .find(|output| output.name.eq_ignore_ascii_case(preferred))
-        {
-            return Ok(&output.name);
-        }
-    }
-
-    let mut numbered = candidates
-        .iter()
-        .filter_map(|output| {
-            output
-                .name
-                .to_ascii_lowercase()
-                .strip_prefix("hidden_states.")
-                .and_then(|suffix| suffix.parse::<usize>().ok())
-                .map(|layer| (layer, output))
-        })
-        .collect::<Vec<_>>();
-    numbered.sort_by_key(|(layer, _)| *layer);
-    if let Some((_, output)) = numbered.last() {
-        return Ok(&output.name);
-    }
-
-    if let [output] = candidates.as_slice() {
-        return Ok(&output.name);
-    }
-    if candidates.is_empty() {
-        anyhow::bail!(
-            "model does not expose a usable per-token hidden-state output; available outputs: {:?}",
-            session.output_names()
-        );
-    }
     anyhow::bail!(
-        "model exposes multiple hidden-state outputs {:?}; set EmbeddingOptions::hidden_state_output explicitly",
-        candidates
-            .iter()
-            .map(|output| output.name.as_str())
-            .collect::<Vec<_>>()
+        "model does not expose a usable per-token hidden-state output; set model.io.hidden_output or EmbeddingOptions::hidden_state_output (available outputs: {:?})",
+        session.output_names()
     )
 }
 
@@ -346,8 +299,16 @@ mod tests {
         let mut engine = engine("tiny-mtp-full")?;
         let input_ids = [2, 4, 3];
         let session = engine.session.as_deref().expect("ORT test engine");
-        let output_name = resolve_hidden_state_output(session, None)?.to_string();
-        let mut decode_state = DecodeState::new(session)?;
+        let io = engine
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref())
+            .cloned()
+            .expect("fixture declares model.io");
+        let output_name =
+            resolve_hidden_state_output(session, io.hidden_output.as_deref())?.to_string();
+        let mut decode_state = DecodeState::new_with_io(session, Some(&io))?;
         let outputs = run_decode_step(session, &mut decode_state, &input_ids, 0)?;
         let hidden = extract_hidden_sequence(session, &outputs, &output_name, input_ids.len())?;
 

@@ -1,3 +1,6 @@
+use super::env_config::{
+    default_cpu_ort_intra_op_threads_for_available_on, effective_intra_op_threads,
+};
 use super::*;
 
 #[test]
@@ -204,6 +207,40 @@ fn strict_providers_include_cuda_and_plugins() {
     let cpu = SessionOptions::cpu();
     assert!(!requested_non_cpu_provider(&cpu));
     assert!(!requested_strict_provider(&cpu));
+}
+
+#[test]
+fn explicit_intra_op_threads_override_auto_default() {
+    let options = SessionOptions::cpu().with_intra_op_threads(3);
+    assert_eq!(effective_intra_op_threads(&options), 3);
+}
+
+#[test]
+fn windows_arm64_cpu_ort_default_uses_half_concurrency_capped() {
+    assert_eq!(
+        default_cpu_ort_intra_op_threads_for_available_on(12, true),
+        Some(6)
+    );
+    assert_eq!(
+        default_cpu_ort_intra_op_threads_for_available_on(8, true),
+        Some(4)
+    );
+    assert_eq!(
+        default_cpu_ort_intra_op_threads_for_available_on(2, true),
+        Some(1)
+    );
+    assert_eq!(
+        default_cpu_ort_intra_op_threads_for_available_on(64, true),
+        Some(16)
+    );
+}
+
+#[test]
+fn cpu_ort_auto_default_is_disabled_off_windows_arm64() {
+    assert_eq!(
+        default_cpu_ort_intra_op_threads_for_available_on(12, false),
+        None
+    );
 }
 
 #[cfg(feature = "cuda")]

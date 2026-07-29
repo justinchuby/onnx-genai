@@ -2,8 +2,33 @@
 //!
 //! Pure code motion from `decode.rs`.
 
-use super::values::{is_kv_input, is_present_output};
 use super::*;
+
+#[cfg(any(test, feature = "native-backend"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeySequenceLengthsPolicy {
+    Canonical,
+    UnitBatchScalar,
+}
+
+#[cfg(any(test, feature = "native-backend"))]
+/// Resolve the representation contract independently of an attention op name.
+pub(crate) fn key_sequence_lengths_policy(
+    metadata: &InferenceMetadata,
+) -> KeySequenceLengthsPolicy {
+    match metadata
+        .model
+        .as_ref()
+        .and_then(|model| model.attention.as_ref())
+        .and_then(|attention| attention.key_sequence_lengths.as_ref())
+        .and_then(|lengths| lengths.scalar_broadcast)
+    {
+        Some(onnx_genai_metadata::SequenceLengthScalarBroadcast::UnitBatch) => {
+            KeySequenceLengthsPolicy::UnitBatchScalar
+        }
+        None => KeySequenceLengthsPolicy::Canonical,
+    }
+}
 
 pub(crate) fn session_decode_input_tokens(
     state: &EngineSession,
@@ -55,6 +80,7 @@ pub(crate) fn draft_decode_input_tokens(
 
 pub(crate) fn detect_model_decode_path(
     session: &Session,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
     metadata_max_context: Option<usize>,
     shared_kv_max_len: Option<usize>,
     sliding_window: Option<usize>,
@@ -71,11 +97,12 @@ pub(crate) fn detect_model_decode_path(
         });
     }
 
-    let has_kv_inputs = session.inputs().iter().any(|info| is_kv_input(&info.name));
-    let has_present_outputs = session
-        .outputs()
-        .iter()
-        .any(|info| is_present_output(&info.name));
+    let has_kv_inputs = io
+        .and_then(|io| io.kv_inputs.as_ref())
+        .is_some_and(|ports| !ports.is_empty());
+    let has_present_outputs = io
+        .and_then(|io| io.kv_outputs.as_ref())
+        .is_some_and(|ports| !ports.is_empty());
     if has_kv_inputs || has_present_outputs {
         if sliding_window.is_some() {
             // Sliding-window models take the bounded paged past/present path
@@ -192,8 +219,13 @@ pub(crate) fn sink_tokens_from_metadata(metadata: &InferenceMetadata) -> usize {
 /// max-length buffer for O(1)/token KV, matching the fp16 GQA path.
 pub(crate) fn shared_kv_buffer_len_from_metadata(metadata: &InferenceMetadata) -> Option<usize> {
     let model = metadata.model.as_ref()?;
-    let attention = model.attention.as_ref()?;
-    if !is_group_query_attention(&attention.attention_type) {
+    let declared_shared_buffer =
+        model.io.as_ref().and_then(|io| io.kv_update.as_deref()) == Some("shared_buffer");
+    let legacy_group_query_attention = model
+        .attention
+        .as_ref()
+        .is_some_and(|attention| is_group_query_attention(&attention.attention_type));
+    if !declared_shared_buffer && !legacy_group_query_attention {
         return None;
     }
     if !metadata_kv_is_share_buffer_dtype(metadata) {

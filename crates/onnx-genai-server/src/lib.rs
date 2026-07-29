@@ -52,7 +52,7 @@ pub use types::{
     CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData,
     EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse, EmbeddingUsage,
     EmbeddingVector, ImageData, ImageGenerationRequest, ImageGenerationResponse,
-    ImageResponseFormat, ImageUrl, InputAudio, ResponseFormat, ResponseFormatType, SpeechRequest,
+    ImageResponseFormat, ImageUrl, InputAudio, JsonSchemaSpec, ResponseFormat, SpeechRequest,
     SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceFunction, ToolChoiceMode,
     ToolChoiceSpecific, Usage,
 };

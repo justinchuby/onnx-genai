@@ -1658,7 +1658,7 @@
       "type": "object"
     },
     "ModelIoSpec": {
-      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. Any port left unset falls back to the runtime's historical\ntensor-name convention (a temporary, transitional behavior removed once all\nemitters populate this block). Declaring an `io` block lets a graph use\narbitrary tensor names — the runtime never infers a port by name or dtype\nfor a declared port.",
+      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. Any port left unset is resolved from an unambiguous\ndtype/shape signal where possible, then falls back to the runtime's\nhistorical name convention for compatibility. A declared port is always\nauthoritative.",
       "properties": {
         "attention_mask_input": {
           "description": "Attention-mask input, if the graph takes one.",
