@@ -64,3 +64,13 @@ guessing / historical-name fallback must be replaced by explicit metadata plus a
 clear ERROR (naming the exact missing key) when the required metadata is absent.
 These fields let the exporter state graph structure directly so the runtime
 never interprets a graph port name.
+
+---
+
+**SHIPPED (2026-07-29, branch `squad/377-explicit-metadata`):** All three fields
+above landed exactly as specified — `PipelineStrategy.inner_embedding_output:
+Option<String>`, `ModelIoSpec.static_cache: Option<StaticCacheIoSpec>` (with
+`write_indices_input`, `kv_sequence_length_input`, `key_cache_inputs`,
+`value_cache_inputs`, `key_cache_outputs`, `value_cache_outputs`), and the
+encoder-role emission change (no new schema field). Committed regenerated
+`schema/inference_metadata.schema.json`. Benny/mobius: emit these names verbatim.
