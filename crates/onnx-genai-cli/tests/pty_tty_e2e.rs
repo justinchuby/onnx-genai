@@ -37,7 +37,7 @@ mod pty_tty {
     use std::os::unix::io::AsFd;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use nix::pty::{OpenptyResult, Winsize, openpty};
     use nix::unistd::dup;
@@ -60,7 +60,7 @@ mod pty_tty {
     /// screen height is 0 (`to_draw = min(h, 0) = 0`, so it never makes
     /// forward progress).  A future type-ahead / streaming test that drives
     /// `run` (rather than the one-shot `generate` the tests below use) would
-    /// hang the whole harness for the 30-second `drain_pty_master` timeout — and
+    /// hang the whole harness for the `drain_pty_master` idle timeout — and
     /// then time out CI — with a 0×0 window.  24×80 is the smallest ordinary
     /// terminal size that avoids that trap; the exact numbers are not magic,
     /// only "non-zero and realistic".
@@ -82,45 +82,86 @@ mod pty_tty {
         (master, slave)
     }
 
-    /// Drain all bytes from a PTY master until EIO (the slave side is fully
-    /// closed) or EOF, with a 30-second timeout.
+    /// How long `drain_pty_master` waits **for the next byte** before it gives
+    /// up.  This is an *idle* timeout, reset on every byte received — not a
+    /// total budget — and that distinction is deliberate.
     ///
-    /// The timeout prevents a child that never closes the slave from blocking
-    /// the test runner indefinitely.  When the timeout fires the function
-    /// returns whatever bytes were collected; the test will then fail on its
-    /// own assertions rather than hanging the CI job for hours.
-    fn drain_pty_master(master: OwnedFd) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+    /// Two regimes this harness must tolerate without either hanging CI or
+    /// flaking on a false content failure:
+    ///
+    /// * **Slow start.**  The child writes nothing to *stdout* until its first
+    ///   token, because the model must load first (its progress logs go to
+    ///   stderr, not the PTY).  On the slowest real machine measured for this
+    ///   suite — a debug build over WSL 2's `/mnt/c` under parallel test load —
+    ///   cold load-to-first-token was ~48 s.  A previous **30 s total** budget
+    ///   lost to exactly that and returned an *empty* read, which then tripped
+    ///   the trailing-newline assertion and masqueraded as a rendering defect.
+    ///   120 s is ~2.5× that measured worst case: headroom for a cold CI runner
+    ///   with a cold cargo/model cache, not a number picked to feel safe.
+    /// * **Long stream.**  A future test that drives the `run` REPL against a
+    ///   real, many-token reply streams for a long time.  Because the clock is
+    ///   reset on every byte, an arbitrarily long reply never trips the timeout
+    ///   as long as tokens keep arriving; only a genuinely *stuck* child (no
+    ///   byte for the whole idle window) fails — and it fails promptly instead
+    ///   of hanging the runner for the job's hard limit.
+    const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// Outcome of draining a PTY master.
+    ///
+    /// `timed_out` distinguishes the two ways draining can end so a caller can
+    /// report them differently (RULES.md rule 1): `false` means the child
+    /// closed the slave (clean EOF/EIO — draining is complete), `true` means no
+    /// byte arrived for `DRAIN_IDLE_TIMEOUT` (a stuck or too-slow child).
+    /// Callers **must** check `timed_out` before asserting on `bytes`, so a
+    /// "the child stopped producing output" failure never masquerades as a
+    /// "the content was wrong" failure.
+    struct DrainOutcome {
+        bytes: Vec<u8>,
+        timed_out: bool,
+    }
+
+    /// Drain bytes from a PTY master until the child closes the slave (clean
+    /// EOF/EIO) or no byte arrives for `DRAIN_IDLE_TIMEOUT` (a stuck child).
+    ///
+    /// Uses `poll()` with the idle timeout instead of a blocking `read()` so a
+    /// child that never writes cannot block the test runner forever.  Each
+    /// `poll()` waits up to the full idle window for the *next* byte, so the
+    /// clock is effectively reset on every successful read: a slow start or a
+    /// long stream is tolerated, while a genuinely stuck child still fails.
+    fn drain_pty_master(master: OwnedFd) -> DrainOutcome {
         let mut file: std::fs::File = master.into();
         let mut buf = [0u8; 4096];
         let mut collected = Vec::new();
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            // poll() with a deadline instead of blocking read() so a child
-            // that never exits cannot block the test harness forever.
             let ready = {
                 let borrowed = file.as_fd();
                 let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
                 poll(
                     &mut fds,
-                    PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX),
+                    PollTimeout::try_from(DRAIN_IDLE_TIMEOUT).unwrap_or(PollTimeout::MAX),
                 )
                 .unwrap_or(0)
             };
             if ready == 0 {
-                break; // timeout
+                // No byte arrived within the idle window: a stuck/too-slow
+                // child.  Return what we have and flag it so the caller reports
+                // a timeout, not a content mismatch.
+                return DrainOutcome {
+                    bytes: collected,
+                    timed_out: true,
+                };
             }
             match file.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => break, // EOF: slave closed cleanly.
                 Ok(n) => collected.extend_from_slice(&buf[..n]),
                 // EIO when the last holder of the slave closes it (child exits).
                 Err(_) => break,
             }
         }
-        collected
+        DrainOutcome {
+            bytes: collected,
+            timed_out: false,
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -239,9 +280,31 @@ mod pty_tty {
         // Drain concurrently so the child never blocks writing to the PTY.
         let drain = std::thread::spawn(move || drain_pty_master(master));
         let _ = child.wait_with_output().expect("child must exit cleanly");
-        let pty_bytes = drain.join().expect("drain thread must finish");
+        let outcome = drain.join().expect("drain thread must finish");
 
-        let pty_out = String::from_utf8_lossy(&pty_bytes);
+        // Separate "the child stopped producing output" from "the content was
+        // wrong" (RULES.md rule 1).  A timeout here is NOT a trailing-newline
+        // defect, and reporting it as one would send whoever triages it hunting
+        // a rendering bug that isn't there.  Check it first, with an actionable
+        // message, so the two failures can never be confused.
+        assert!(
+            !outcome.timed_out,
+            "timed out after {}s with no new bytes from the PTY master while \
+             waiting for the streamed reply ({} byte(s) collected so far). This \
+             is a stuck or too-slow child, NOT a trailing-newline defect. What \
+             to check, in order: (1) the `tests/fixtures/tiny-llm` model still \
+             loads and streams under `generate --stream`; (2) the machine is \
+             not so loaded that cold load-to-first-token exceeds the {}s idle \
+             budget (`DRAIN_IDLE_TIMEOUT`) — raise it if a slower baseline is \
+             now normal; (3) only after ruling those out, suspect the newline \
+             logic. Bytes so far: {:?}",
+            DRAIN_IDLE_TIMEOUT.as_secs(),
+            outcome.bytes.len(),
+            DRAIN_IDLE_TIMEOUT.as_secs(),
+            String::from_utf8_lossy(&outcome.bytes),
+        );
+
+        let pty_out = String::from_utf8_lossy(&outcome.bytes);
 
         // ONLCR converts \n → \r\n, so the final separator must be \r\n.
         assert!(
