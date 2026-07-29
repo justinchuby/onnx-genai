@@ -72,10 +72,6 @@ pub(super) fn initial_repl_show_stats(mode: ReplInputMode, no_stats: bool) -> bo
     matches!(mode, ReplInputMode::Tty) && !no_stats
 }
 
-pub(super) fn plain_stream_needs_trailing_newline(used_live_this_turn: bool) -> bool {
-    !used_live_this_turn
-}
-
 struct ReplPrompt;
 
 impl Prompt for ReplPrompt {
@@ -975,6 +971,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             None => println!("timeline off"),
                         }
                     }
+
                     Ok(ProfileSetting::Toggle(on)) => {
                         show_profile = on;
                         if on && onnx_genai::ort::profile::trace_destination().is_none() {
@@ -1294,7 +1291,6 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             profile.memory = memory;
         }
         let pages_before = backend.page_stats();
-        let used_live_this_turn = show_stats && live.is_active();
         match run_generation_turn(
             &mut backend,
             turn,
@@ -1307,9 +1303,6 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
             show_stats.then_some(&mut live),
         ) {
             Ok(output) => {
-                if plain_stream_needs_trailing_newline(used_live_this_turn) {
-                    println!();
-                }
                 // Reasoning models are trained with earlier turns' thinking
                 // removed, so replaying it degrades quality and inflates the
                 // context. Only the answer becomes history.
@@ -1352,7 +1345,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                 // Drop the interrupted turn from history so a partial/aborted
                 // reply never pollutes the conversation context, then return to
                 // the prompt instead of exiting.
-                eprintln!("\n^C interrupted (press Ctrl-C again to exit)");
+                eprintln!("^C interrupted (press Ctrl-C again to exit)");
                 history.pop();
             }
             Err(error) => {
@@ -1395,4 +1388,16 @@ pub(super) fn stage_attachment(
         );
     }
     Ok(Some(path))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tty_mode_enables_live_stats_by_default() {
+        assert!(matches!(repl_input_mode(true, true), ReplInputMode::Tty));
+        assert!(initial_repl_show_stats(ReplInputMode::Tty, false));
+        assert!(!initial_repl_show_stats(ReplInputMode::Tty, true));
+        assert!(!initial_repl_show_stats(ReplInputMode::Plain, false));
+    }
 }

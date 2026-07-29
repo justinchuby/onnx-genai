@@ -151,12 +151,14 @@ impl LiveTurn {
     }
 
     /// End the turn: spill the whole reply into scrollback and clear the area.
-    pub(crate) fn finish(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn finish(&mut self, output_needs_trailing_newline: bool) -> anyhow::Result<()> {
         match self {
-            Self::Active(active) => active.finish(),
-            // Nothing was rendered, so the plain path still owes a newline.
+            Self::Active(active) => active.finish(output_needs_trailing_newline),
+            // Nothing was rendered, so any TTY separator still belongs to the plain path.
             _ => {
-                println!();
+                if output_needs_trailing_newline {
+                    println!();
+                }
                 Ok(())
             }
         }
@@ -244,7 +246,10 @@ impl Active {
         Ok(())
     }
 
-    fn finish(&mut self) -> anyhow::Result<()> {
+    fn finish(&mut self, output_needs_trailing_newline: bool) -> anyhow::Result<()> {
+        if output_needs_trailing_newline {
+            self.lines.push(Vec::new());
+        }
         let width = self.width();
         for line in std::mem::take(&mut self.lines) {
             self.commit(line, width)?;

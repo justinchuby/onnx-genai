@@ -849,3 +849,26 @@ fn pages_is_offered_in_help() {
     ));
     assert!(output.contains("/pages"), "{output}");
 }
+
+#[test]
+fn stream_reply_to_a_pipe_always_ends_with_a_trailing_newline() {
+    // The terminating newline after each streaming reply in piped mode is a
+    // byte-stable guarantee for any script or pipeline consuming `run`.
+    // This test pins it so a future reviewer cannot plausibly argue the
+    // unconditional newline is "redundant" when the model reply already ends
+    // with one.
+    //
+    // In piped mode the generated tokens arrive on stdout followed by the
+    // trailing newline, then the next `>>> ` prompt. A two-turn session
+    // therefore contains `\n>>> ` in its stdout.
+    let output = stdout_text(&repl(
+        &text_model(),
+        &["--raw", "--max-new-tokens", "2"],
+        "hello\n\n",
+    ));
+
+    assert!(
+        output.contains("\n>>> "),
+        "piped streaming output must end with a trailing newline before the next prompt: {output:?}"
+    );
+}

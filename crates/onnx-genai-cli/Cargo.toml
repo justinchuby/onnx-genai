@@ -80,6 +80,13 @@ onnx-genai = { workspace = true }
 onnx-genai-metadata = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+# PTY-driven e2e tests: openpty/dup to verify TTY-only rendering branches.
+# nix is already in the dependency tree via ctrlc; no version bump needed.
+# Features: "term" for nix::pty::openpty, "fs" for nix::unistd::dup,
+#            "poll" for nix::poll::poll (used for read timeouts in drain_pty_master).
+nix = { version = "0.31", default-features = false, features = ["term", "fs", "poll"] }
+
 [dependencies.pyo3]
 version = "0.29"
 # `abi3-py310` builds against the limited API (a single cp310-abi3 module usable

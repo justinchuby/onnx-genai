@@ -133,3 +133,13 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 ## 2026-07-28T11:20:06+0000 — Independent #75 lockout revision
 - Took ownership of PR #346's revision after Holden requested changes and Bryant was locked out.
 - `c20ec211` corrected StringNormalizer/TfIdfVectorizer default-domain registration and LabelEncoder-1 default-attribute dtype selection; Holden re-approved.
+
+## 2026-07-28T10:10:00-07:00 — REPL newline and stats polish
+
+- Fixed TTY turn finalization so generated text that lacks its own trailing newline is followed by exactly one CLI-owned separator before the next prompt/status/error path; piped REPL output keeps the legacy byte-stable separator behavior.
+- Expanded compact stats/profile reporting with explicit prefix-cache hit tokens plus percent of prompt, KV page activity on the compact line, and matching JSON/profile fields.
+
+## 2026-07-28T10:33:00-07:00 — REPL stats block two-line follow-up
+
+- Revised TTY stats rendering from a squeezed one-line string to a deliberate two-line block: performance/termination first, cache/context/scheduler/pages/RSS second.
+- Restored compact finish reason and end-to-end throughput to the always-on TTY block now that Justin allowed two lines; non-TTY opt-in stats keep the single-line formatter for byte stability.

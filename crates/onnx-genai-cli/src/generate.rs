@@ -130,9 +130,7 @@ fn generate_text(
         None,
     ) {
         Ok(output) => {
-            if args.stream {
-                println!();
-            } else {
+            if !args.stream {
                 println!("{output}");
             }
             if let (Some(before), Some(after)) = (pages_before, backend.page_stats()) {
@@ -144,7 +142,7 @@ fn generate_text(
         }
         Err(error) if is_interrupt_error(&error) => {
             // A Ctrl-C during a one-shot generation aborts and exits non-zero.
-            eprintln!("\n^C interrupted");
+            eprintln!("^C interrupted");
             std::process::exit(EXIT_INTERRUPTED);
         }
         Err(error) => Err(error),
