@@ -6,6 +6,7 @@
 //! id    = "my-llm"
 //! path  = "/models/my-llm"
 //! eager = true
+//! warmup = true
 //!
 //! [[models]]
 //! id    = "my-embedder"
@@ -51,6 +52,10 @@ pub struct ModelSpec {
     /// loaded on the first request that routes to it (or via the admin load endpoint).
     #[serde(default = "default_true")]
     pub eager: bool,
+    /// If `true`, run a small generation after each load to initialize lazy
+    /// runtime allocations before the first user request. Defaults to `false`.
+    #[serde(default)]
+    pub warmup: bool,
 }
 
 /// Top-level structure for a TOML or JSON multi-model config file.
@@ -140,6 +145,7 @@ pub fn from_models_dir(dir: &Path) -> anyhow::Result<Vec<ModelSpec>> {
             id,
             path,
             eager: true,
+            warmup: false,
         });
     }
     specs.sort_by(|a, b| a.id.cmp(&b.id));
@@ -189,6 +195,7 @@ path = "/models/a"
         assert_eq!(config.models[0].id, "llm-a");
         assert_eq!(config.models[0].path, PathBuf::from("/models/a"));
         assert!(config.models[0].eager, "eager defaults to true");
+        assert!(!config.models[0].warmup, "warmup defaults to false");
     }
 
     #[test]
@@ -205,12 +212,26 @@ eager = false
     }
 
     #[test]
+    fn parse_toml_with_warmup() {
+        let toml = r#"
+[[models]]
+id     = "llm-a"
+path   = "/models/a"
+warmup = true
+"#;
+        let config: ModelsConfig = toml::from_str(toml).unwrap();
+        let config = config.validate().unwrap();
+        assert!(config.models[0].warmup);
+    }
+
+    #[test]
     fn parse_json_minimal() {
         let json = r#"{"models":[{"id":"my-model","path":"/models/x"}]}"#;
         let config: ModelsConfig = serde_json::from_str(json).unwrap();
         let config = config.validate().unwrap();
         assert_eq!(config.models[0].id, "my-model");
         assert!(config.models[0].eager);
+        assert!(!config.models[0].warmup);
     }
 
     #[test]
@@ -219,6 +240,14 @@ eager = false
         let config: ModelsConfig = serde_json::from_str(json).unwrap();
         let config = config.validate().unwrap();
         assert!(!config.models[0].eager);
+    }
+
+    #[test]
+    fn parse_json_warmup() {
+        let json = r#"{"models":[{"id":"m","path":"/p","warmup":true}]}"#;
+        let config: ModelsConfig = serde_json::from_str(json).unwrap();
+        let config = config.validate().unwrap();
+        assert!(config.models[0].warmup);
     }
 
     #[test]

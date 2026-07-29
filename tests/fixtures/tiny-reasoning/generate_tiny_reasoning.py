@@ -183,8 +183,11 @@ def main() -> None:
             "reasoning span has a reachable close. Greedy degenerates on most "
             "prompts (no answer, exchange dropped) but closes and commits a "
             "non-empty answer on the 'quick'/'fox'/'dog' family, so CI can assert "
-            "both the drop and the commit halves of the reasoning-progress and "
-            "non-empty-committed invariants on CPU."
+            "both halves of the reasoning-progress invariant on CPU: the "
+            "degenerate drop and the non-empty-close commit. The 'quick' close "
+            "also lands exactly on </think> at a 3-token budget, giving CI the "
+            "closed-but-empty boundary that pins the non-empty-committed guard on "
+            "the closed path."
         ),
         "reasoning_open_delimiter": "<think>",
         "reasoning_close_delimiter": "</think>",

@@ -6,6 +6,7 @@ use onnx_runtime_optimizer::{
 };
 
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
+pub(crate) const DECOMPOSED_SILU_ATTR: &str = "_cuda_decomposed_silu";
 
 /// Private marker set on a `MatMulNBits` node whose trailing bias input came
 /// from folding a *separate* elementwise `Add(MatMulNBits(x), bias)`.
@@ -75,8 +76,13 @@ const GATE_UP_SWIGLU_SUPPORTED_BITS: i64 = 4;
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaSwiGluFusion;
 
+/// Lower an exact `x * Sigmoid(x)` pair to the CUDA EP's fused SiLU kernel.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaSiluFusion;
+
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
+        Box::new(CudaSiluFusion),
         Box::new(CudaFoldConstantTranspose),
         // Runs before the fusions so they see the fp16-native normalization
         // form (no `Cast` wrappers) that the rest of the pipeline expects.
@@ -90,6 +96,79 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // cond readback / graph split so decode captures as a single graph.
         Box::new(CudaOnDeviceConstantSelect),
     ]
+}
+
+impl OptimizationPass for CudaSiluFusion {
+    fn name(&self) -> &str {
+        "CudaSiluFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        let sigmoid_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Sigmoid"
+                    && node.is_default_domain()
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for sigmoid_id in sigmoid_ids {
+            let Some(sigmoid) = graph.try_node(sigmoid_id) else {
+                continue;
+            };
+            let Some(x) = sigmoid.inputs[0] else {
+                continue;
+            };
+            if graph.value(x).dtype != DataType::Float16 {
+                continue;
+            }
+            let sigmoid_output = sigmoid.outputs[0];
+            if graph.outputs.contains(&sigmoid_output) {
+                continue;
+            }
+            let consumers = graph.consumers(sigmoid_output);
+            if consumers.len() != 1 {
+                continue;
+            }
+            let mul_id = consumers[0];
+            let mul = graph.node(mul_id);
+            if mul.op_type != "Mul"
+                || !mul.is_default_domain()
+                || mul.inputs.len() != 2
+                || mul.outputs.len() != 1
+                || !((mul.inputs[0] == Some(x) && mul.inputs[1] == Some(sigmoid_output))
+                    || (mul.inputs[1] == Some(x) && mul.inputs[0] == Some(sigmoid_output)))
+            {
+                continue;
+            }
+
+            let mut silu = mul.clone();
+            silu.op_type = "Silu".to_string();
+            silu.domain = MICROSOFT_DOMAIN.to_string();
+            silu.version = None;
+            silu.inputs = vec![Some(x)];
+            silu.attributes.clear();
+            silu.attributes
+                .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
+            graph.replace_node(mul_id, silu);
+            graph.remove_node(sigmoid_id);
+            graph
+                .opset_imports
+                .entry(MICROSOFT_DOMAIN.to_string())
+                .or_insert(1);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
 }
 
 /// Drop the redundant `Cast` pairs that some exporters (e.g. Phi-4-mini) wrap
@@ -1269,6 +1348,11 @@ impl OptimizationPass for CudaSwiGluFusion {
             fused
                 .attributes
                 .insert(SILU_MUL_FUSION_ATTR.into(), Attribute::Int(1));
+            if silu.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int) == Some(1) {
+                fused
+                    .attributes
+                    .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
+            }
             graph.replace_node(mul_id, fused);
             graph.remove_node(silu_id);
             changed = true;
@@ -1319,6 +1403,7 @@ struct GateUpSwiGluPlan {
     up_zero_points: Option<ValueId>,
     gate_out: ValueId,
     up_out: ValueId,
+    decomposed_silu: bool,
 }
 
 impl OptimizationPass for CudaGateUpSwiGluFusion {
@@ -1377,6 +1462,11 @@ impl OptimizationPass for CudaGateUpSwiGluFusion {
             fused
                 .attributes
                 .insert(GATE_UP_SWIGLU_FUSION_ATTR.into(), Attribute::Int(1));
+            if plan.decomposed_silu {
+                fused
+                    .attributes
+                    .insert(DECOMPOSED_SILU_ATTR.into(), Attribute::Int(1));
+            }
             graph.replace_node(plan.mul_id, fused);
             debug_assert_eq!(graph.consumers(plan.gate_out).len(), 0);
             debug_assert_eq!(graph.consumers(plan.up_out).len(), 0);
@@ -1445,6 +1535,7 @@ impl CudaGateUpSwiGluFusion {
             up_zero_points: up.zero_points,
             gate_out,
             up_out,
+            decomposed_silu: mul.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int) == Some(1),
         })
     }
 
@@ -2661,21 +2752,30 @@ mod tests {
 
     #[test]
     fn gate_up_pass_chains_after_swiglu_fusion() {
-        // End-to-end through the real CUDA pass list: Sigmoid+Mul... is already
-        // Silu here, so CudaSwiGluFusion tags the Mul and CudaGateUpSwiGluFusion
-        // collapses the pair.
+        // End-to-end through the real CUDA pass list: the exported
+        // x*Sigmoid(x) decomposition becomes Silu, then the SwiGLU passes
+        // collapse both projections and the trailing activation/multiply.
         let mut graph = Graph::new();
         graph.opset_imports.insert(String::new(), 17);
-        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
         let x = value(&mut graph, "x", DataType::Float16, QWEN_GATE_UP_K);
         graph.add_input(x);
         let gate_out = projection(&mut graph, "gate", x, QWEN_GATE_UP_K, QWEN_GATE_UP_N);
         let up_out = projection(&mut graph, "up", x, QWEN_GATE_UP_K, QWEN_GATE_UP_N);
+        let sigmoid_out = value(&mut graph, "sigmoid", DataType::Float16, QWEN_GATE_UP_N);
         let silu_out = value(&mut graph, "silu", DataType::Float16, QWEN_GATE_UP_N);
         let out = value(&mut graph, "output", DataType::Float16, QWEN_GATE_UP_N);
-        let mut silu = Node::new(NodeId(0), "Silu", vec![Some(gate_out)], vec![silu_out]);
-        silu.domain = MICROSOFT_DOMAIN.into();
-        graph.insert_node(silu);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Sigmoid",
+            vec![Some(gate_out)],
+            vec![sigmoid_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(gate_out), Some(sigmoid_out)],
+            vec![silu_out],
+        ));
         graph.insert_node(Node::new(
             NodeId(0),
             "Mul",
@@ -2695,6 +2795,10 @@ mod tests {
             fused
                 .attr(GATE_UP_SWIGLU_FUSION_ATTR)
                 .and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            fused.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int),
             Some(1)
         );
         assert!(graph.validate().is_ok());

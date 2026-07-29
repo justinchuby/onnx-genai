@@ -35,11 +35,81 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
         "Dropout" => dropout(node, input_dtypes),
         "NonZero" => nonzero(node, input_dtypes),
+        "AffineGrid" => affine_grid(node, input_dtypes),
+        "BatchNormalization" => batch_normalization(node, input_dtypes),
+        "Compress" => compress(node, input_dtypes),
+        "DynamicQuantizeLinear" => dynamic_quantize_linear(node, input_dtypes),
+        "GlobalAveragePool" | "GlobalMaxPool" => global_pool(node, input_dtypes),
+        "GlobalLpPool" => global_lp_pool(node, input_dtypes),
+        "LpNormalization" => lp_normalization(node, input_dtypes),
         _ => return None,
     };
     result
         .err()
         .map(|reason| format!("{}: {reason}", node.op_type))
+}
+
+const CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
+fn affine_grid(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "theta")?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "size")?;
+    bool_attribute(node, "align_corners")
+}
+
+fn batch_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 5, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    for (index, name) in [(1, "scale"), (2, "B"), (3, "input_mean"), (4, "input_var")] {
+        if input_dtypes[index] != input_dtypes[0] {
+            return Err(format!(
+                "input {index} ('{name}') dtype {:?} must match X dtype {:?}",
+                input_dtypes[index], input_dtypes[0]
+            ));
+        }
+    }
+    match node.attr("training_mode") {
+        None => Ok(()),
+        Some(attribute) if attribute.as_int() == Some(0) => Ok(()),
+        Some(_) => Err("attribute 'training_mode' must be 0".into()),
+    }
+}
+
+fn compress(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_fixed_width(input_dtypes, 0, "input")?;
+    require_dtype(input_dtypes, 1, DataType::Bool, "condition")
+}
+
+fn dynamic_quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 3, 3)?;
+    require_dtype(input_dtypes, 0, DataType::Float32, "X")
+}
+
+fn global_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+}
+
+fn global_lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    global_pool(node, input_dtypes)?;
+    match node.attr("p") {
+        None => Ok(()),
+        Some(attribute) if matches!(attribute.as_int(), Some(value) if value > 0 && value <= i32::MAX as i64) => {
+            Ok(())
+        }
+        Some(_) => Err("attribute 'p' must be a positive 32-bit integer".into()),
+    }
+}
+
+fn lp_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    global_pool(node, input_dtypes)?;
+    match node.attr("p") {
+        None => Ok(()),
+        Some(attribute) if matches!(attribute.as_int(), Some(1 | 2)) => Ok(()),
+        Some(_) => Err("attribute 'p' must be 1 or 2".into()),
+    }
 }
 
 fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
