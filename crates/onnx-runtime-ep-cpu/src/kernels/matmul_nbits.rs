@@ -6,8 +6,9 @@
 //! first within each byte. For M=1 decode, constant quantized weights are
 //! prepacked once and reused by a N-parallel GEMV. For symmetric block-32
 //! int4 M=1, `accuracy_level=4` streams the packed weights directly into a VNNI
-//! dot product. Other int4 accuracy-level-4 shapes keep the weights in int8 and
-//! quantize each activation into int8 per K-block (matching ORT/MLAS CompInt8).
+//! dot product on x86, or an opt-in ARM dot-product int4 GEMV on aarch64. Other
+//! int4 accuracy-level-4 shapes keep the weights in int8 and quantize each
+//! activation into int8 per K-block (matching ORT/MLAS CompInt8).
 //! `weight_prepacked=1` accepts the host-specific buffer produced by
 //! `MlasQNBitGemmPackQuantBData`, avoiding the standard-layout-to-MLAS repack.
 //! The 2-bit path decodes packed weights directly inside its f32 GEMV/GEMM,
@@ -279,6 +280,9 @@ struct PackedInt4Weight {
     values: Vec<u8>,
     scales: Vec<f32>,
 }
+
+#[cfg(test)]
+static INT4_DIRECT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
@@ -679,10 +683,9 @@ impl Kernel for MatMulNBitsKernel {
         } else if self.bits == 4
             && self.accuracy_level == 4
             && m == 1
-            && self.block_size == 32
             && zero_points.is_none()
             && group_indices.is_none()
-            && dot_kernel.uses_vnni_int4_direct()
+            && dot_kernel.supports_int4_direct(self.block_size)
         {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -714,6 +717,7 @@ impl Kernel for MatMulNBitsKernel {
                     result,
                     self.k,
                     self.n,
+                    self.block_size,
                     dot_kernel,
                 );
             })?;
@@ -2738,6 +2742,12 @@ enum DotKernel {
     /// AdvSIMD) that is bit-exact vs scalar.
     #[cfg(target_arch = "aarch64")]
     Neon,
+    /// ARMv8.2-A dot-product int4 decode kernel. This consumes signed int8
+    /// activations and signed int4 weights (`q - 8`), so it uses signed `sdot`
+    /// via inline asm rather than the unavailable mixed unsigned/signed
+    /// dot-product intrinsic.
+    #[cfg(target_arch = "aarch64")]
+    NeonDot,
 }
 
 impl DotKernel {
@@ -2745,6 +2755,7 @@ impl DotKernel {
     /// activation layout and may take the int4-direct decode path. `Scalar`
     /// and `Avx2` use the natural layout / int8 route, so they must NOT enter
     /// that path (a wrong classification silently corrupts decode).
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     fn uses_vnni_int4_direct(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
@@ -2753,6 +2764,47 @@ impl DotKernel {
         #[cfg(not(target_arch = "x86_64"))]
         {
             false
+        }
+    }
+
+    /// Whether this host kernel can consume the packed int4 weight directly for
+    /// M=1 decode. x86 VNNI currently supports only block-32 because its
+    /// deinterleaved activation layout is hard-coded at that granularity; the
+    /// aarch64 dot-product kernel handles any quantization block that is a
+    /// multiple of 32, including the Foundry Qwen3 block-128 graph.
+    fn supports_int4_direct(self, block_size: usize) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.uses_vnni_int4_direct() && block_size == 32
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            matches!(self, DotKernel::NeonDot)
+                && block_size.is_multiple_of(32)
+                && Self::arm64_int4_direct_enabled()
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = block_size;
+            false
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn arm64_int4_direct_enabled() -> bool {
+        #[cfg(test)]
+        {
+            true
+        }
+        #[cfg(not(test))]
+        {
+            // Correctness is locked, but the first SDOT implementation has not
+            // yet cleared the full-model perf gate on X Elite. Keep it opt-in
+            // while we iterate on the packed RHS/N-tiled microkernel.
+            std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
+            })
         }
     }
 }
@@ -2782,6 +2834,9 @@ fn selected_dot_kernel() -> DotKernel {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return DotKernel::NeonDot;
+        }
         // NEON/AdvSIMD is baseline on aarch64, so the SIMD int8 dot is always
         // available — never fall back to the slow scalar path on ARM. The
         // kernel uses the widen-`vmlal` baseline, bit-exact vs scalar.
@@ -2854,20 +2909,22 @@ fn int4_matmul_m1(
     result: &mut [f32],
     k: usize,
     n: usize,
+    block_size: usize,
     dot_kernel: DotKernel,
 ) {
-    const BLOCK_SIZE: usize = 32;
-    const PACKED_BLOCK_SIZE: usize = BLOCK_SIZE / 2;
-
-    let k_blocks = k.div_ceil(BLOCK_SIZE);
-    let padded_k = k_blocks * BLOCK_SIZE;
+    debug_assert!(block_size.is_multiple_of(32));
+    #[cfg(target_arch = "x86_64")]
+    debug_assert!(!dot_kernel.uses_vnni_int4_direct() || block_size == 32);
+    let packed_block_size = block_size / 2;
+    let k_blocks = k.div_ceil(block_size);
+    let padded_k = k_blocks * block_size;
     debug_assert_eq!(activation.len(), k);
-    debug_assert_eq!(weight.values.len(), n * k_blocks * PACKED_BLOCK_SIZE);
+    debug_assert_eq!(weight.values.len(), n * k_blocks * packed_block_size);
     debug_assert_eq!(weight.scales.len(), n * k_blocks);
     debug_assert_eq!(result.len(), n);
 
     let (activation, activation_scales) =
-        quantize_activation_signed(activation, padded_k, BLOCK_SIZE);
+        quantize_activation_signed(activation, padded_k, block_size);
     // The SIMD int4 kernels consume a deinterleaved activation layout (evens
     // then odds per 32-block) so they can skip the per-block nibble
     // deinterleave; the scalar reference keeps natural order. Deinterleave once
@@ -2900,11 +2957,13 @@ fn int4_matmul_m1(
     } else {
         Vec::new()
     };
+    #[cfg(test)]
+    INT4_DIRECT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
     let compute = |output_start: usize, outputs: &mut [f32]| {
         for (offset, output) in outputs.iter_mut().enumerate() {
             let output_index = output_start + offset;
-            let packed_start = output_index * k_blocks * PACKED_BLOCK_SIZE;
-            let packed_end = packed_start + k_blocks * PACKED_BLOCK_SIZE;
+            let packed_start = output_index * k_blocks * packed_block_size;
+            let packed_end = packed_start + k_blocks * packed_block_size;
             let scale_start = output_index * k_blocks;
             let scale_end = scale_start + k_blocks;
             *output = int4_dot_row(
@@ -2913,6 +2972,7 @@ fn int4_matmul_m1(
                 &weight.scales[scale_start..scale_end],
                 &activation_scales,
                 &act_sum8,
+                block_size,
                 dot_kernel,
             );
         }
@@ -3074,6 +3134,7 @@ fn int4_dot_row(
     scales: &[f32],
     activation_scales: &[f32],
     act_sum8: &[i32],
+    block_size: usize,
     _kernel: DotKernel,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -3105,24 +3166,57 @@ fn int4_dot_row(
             DotKernel::Scalar => {}
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if matches!(_kernel, DotKernel::NeonDot) {
+            // SAFETY: selected_dot_kernel checked FEAT_DotProd and the caller
+            // provides block_size as a multiple of 32.
+            return unsafe {
+                int4_dot_row_neon_dot(
+                    activation,
+                    packed_weight,
+                    scales,
+                    activation_scales,
+                    block_size,
+                )
+            };
+        }
+    }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = act_sum8;
-    int4_dot_row_scalar(activation, packed_weight, scales, activation_scales)
+    int4_dot_row_scalar_block(
+        activation,
+        packed_weight,
+        scales,
+        activation_scales,
+        block_size,
+    )
 }
 
+#[allow(dead_code)]
 fn int4_dot_row_scalar(
     activation: &[i8],
     packed_weight: &[u8],
     scales: &[f32],
     activation_scales: &[f32],
 ) -> f32 {
-    debug_assert_eq!(activation.len(), scales.len() * 32);
-    debug_assert_eq!(packed_weight.len(), scales.len() * 16);
+    int4_dot_row_scalar_block(activation, packed_weight, scales, activation_scales, 32)
+}
+
+fn int4_dot_row_scalar_block(
+    activation: &[i8],
+    packed_weight: &[u8],
+    scales: &[f32],
+    activation_scales: &[f32],
+    block_size: usize,
+) -> f32 {
+    debug_assert_eq!(activation.len(), scales.len() * block_size);
+    debug_assert_eq!(packed_weight.len(), scales.len() * (block_size / 2));
     debug_assert_eq!(activation_scales.len(), scales.len());
     let mut value = 0.0f32;
     for (block, &scale) in scales.iter().enumerate() {
-        let activation = &activation[block * 32..(block + 1) * 32];
-        let packed = &packed_weight[block * 16..(block + 1) * 16];
+        let activation = &activation[block * block_size..(block + 1) * block_size];
+        let packed = &packed_weight[block * (block_size / 2)..(block + 1) * (block_size / 2)];
         let mut dot = 0i32;
         for (pair, &byte) in packed.iter().enumerate() {
             dot += activation[pair * 2] as i32 * (i32::from(byte & 0x0f) - 8);
@@ -3131,6 +3225,75 @@ fn int4_dot_row_scalar(
         value += dot as f32 * (scale * activation_scales[block]);
     }
     value
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn int4_dot_row_neon_dot(
+    activation: &[i8],
+    packed_weight: &[u8],
+    scales: &[f32],
+    activation_scales: &[f32],
+    block_size: usize,
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    debug_assert!(block_size.is_multiple_of(32));
+    debug_assert_eq!(activation.len(), scales.len() * block_size);
+    debug_assert_eq!(packed_weight.len(), scales.len() * (block_size / 2));
+    debug_assert_eq!(activation_scales.len(), scales.len());
+
+    let low_mask = vdupq_n_u8(0x0f);
+    let zp = vdupq_n_s8(8);
+    let mut value = 0.0f32;
+    for (block, &scale) in scales.iter().enumerate() {
+        let mut block_acc = vdupq_n_s32(0);
+        let activation_base = block * block_size;
+        let packed_base = block * (block_size / 2);
+        for sub in 0..(block_size / 32) {
+            // SAFETY: slice lengths are validated above; each sub-block owns
+            // 16 packed bytes and 32 activation bytes.
+            let packed_ptr = unsafe { packed_weight.as_ptr().add(packed_base + sub * 16) };
+            let act_ptr = unsafe { activation.as_ptr().add(activation_base + sub * 32) };
+
+            // SAFETY: pointers above are in bounds for one vector load.
+            let packed = unsafe { vld1q_u8(packed_ptr) };
+            let low = vandq_u8(packed, low_mask);
+            let high = vshrq_n_u8::<4>(packed);
+            let w0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low, high)), zp);
+            let w1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low, high)), zp);
+            // SAFETY: pointers above are in bounds for two vector loads.
+            let a0 = unsafe { vld1q_s8(act_ptr) };
+            let a1 = unsafe { vld1q_s8(act_ptr.add(16)) };
+            block_acc = unsafe { sdot_i8x16(block_acc, a0, w0) };
+            block_acc = unsafe { sdot_i8x16(block_acc, a1, w1) };
+        }
+        let block_dot = vaddvq_s32(block_acc);
+        value += block_dot as f32 * (scale * activation_scales[block]);
+    }
+    value
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_i8x16(
+    acc: std::arch::aarch64::int32x4_t,
+    lhs: std::arch::aarch64::int8x16_t,
+    rhs: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut out = acc;
+    // SAFETY: `sdot` is available because callers are `target_feature =
+    // "dotprod"` and runtime-gated by `is_aarch64_feature_detected!("dotprod")`.
+    unsafe {
+        std::arch::asm!(
+            "sdot {out:v}.4s, {lhs:v}.16b, {rhs:v}.16b",
+            out = inout(vreg) out,
+            lhs = in(vreg) lhs,
+            rhs = in(vreg) rhs,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    out
 }
 
 /// 256-bit VNNI int4 block dot. `activation` MUST be in the deinterleaved
@@ -3865,7 +4028,7 @@ fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     #[cfg(target_arch = "aarch64")]
     {
         match _kernel {
-            DotKernel::Neon => {
+            DotKernel::Neon | DotKernel::NeonDot => {
                 // SAFETY: NEON/AdvSIMD is baseline on aarch64; the `i8mm` fast
                 // path inside is runtime-gated by `is_aarch64_feature_detected!`.
                 return unsafe { dot_u8_i8_neon(activation, weight) };
@@ -5310,7 +5473,7 @@ mod tests {
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
-        let direct_int4 = selected_dot_kernel().uses_vnni_int4_direct();
+        let direct_int4 = selected_dot_kernel().supports_int4_direct(block_size);
         let cached = if direct_int4 {
             kernel
                 .packed_int4_weight
@@ -5339,6 +5502,99 @@ mod tests {
         assert!(kernel.weight_nk.get().is_none());
         assert_eq!(kernel.packed_int4_weight.get().is_some(), direct_int4);
         assert_eq!(kernel.int8_weight.get().is_some(), !direct_int4);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn matmulnbits_arm64_dot_direct_int4_block128_qwen_shapes_match_reference() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        let block_size = 128usize;
+        assert!(selected_dot_kernel().supports_int4_direct(block_size));
+        for &(k, n) in &[
+            (1000usize, 257usize), // K tail inside the final block.
+            (1024, 1024),          // attention/output projection.
+            (1024, 3072),          // gate/up projection.
+            (2048, 1024),          // grouped attention projection.
+            (3072, 1024),          // FFN down projection.
+        ] {
+            let activations: Vec<f32> = (0..k)
+                .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 31 % 251) as f32 - 125.0) / 50.0)
+                .collect();
+            let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+            let packed_weight = PackedInt4Weight {
+                values: packed.clone(),
+                scales: scales.clone(),
+            };
+            let mut scalar = vec![0.0f32; n];
+            let mut dot = vec![0.0f32; n];
+            int4_matmul_m1(
+                &activations,
+                &packed_weight,
+                &mut scalar,
+                k,
+                n,
+                block_size,
+                DotKernel::Scalar,
+            );
+            int4_matmul_m1(
+                &activations,
+                &packed_weight,
+                &mut dot,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+            assert_close(&dot, &scalar);
+
+            let blocks = k.div_ceil(block_size);
+            let fallback_kernel = accuracy4_kernel(k, n, block_size);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let int8_weight = fallback_kernel
+                .prepack_int8_weight(&b.view(), &scales_t.view(), None)
+                .unwrap();
+            let mut old_native_fallback = vec![0.0f32; n];
+            int8_matmul(
+                &activations,
+                &int8_weight,
+                &mut old_native_fallback,
+                1,
+                k,
+                n,
+                block_size,
+                selected_dot_kernel(),
+            );
+            assert_close(&dot, &old_native_fallback);
+
+            let mut kernel = accuracy4_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let a = Owned::f32(&[1, k], &activations);
+            let scales = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            let before = INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+                .unwrap();
+            assert!(
+                INT4_DIRECT_M1_TEST_CALLS.load(Ordering::Relaxed) > before,
+                "aarch64 dot-product direct int4 path was not reached for K={k} N={n}"
+            );
+            assert!(
+                kernel.packed_int4_weight.get().is_some(),
+                "block-128 direct int4 path must cache the packed-nibble weight"
+            );
+            assert!(
+                kernel.int8_weight.get().is_none(),
+                "block-128 direct int4 path must bypass the int8 prepack fallback"
+            );
+            assert_close(&y.to_f32(), &scalar);
+        }
     }
 
     #[test]
@@ -5548,6 +5804,7 @@ mod tests {
             &mut scalar,
             k,
             n,
+            block_size,
             DotKernel::Scalar,
         );
         int4_matmul_m1(
@@ -5556,6 +5813,7 @@ mod tests {
             &mut actual,
             k,
             n,
+            block_size,
             selected_dot_kernel(),
         );
         assert_eq!(
@@ -5669,6 +5927,7 @@ mod tests {
             &mut int4_out,
             k,
             n,
+            block_size,
             DotKernel::Scalar,
         );
 
@@ -5759,6 +6018,7 @@ mod tests {
                 &mut native,
                 k,
                 n,
+                block_size,
                 selected_dot_kernel(),
             );
             let case_rel = rmse(&native, &oracle) / oracle_rms;
@@ -5859,7 +6119,15 @@ mod tests {
             }
             for kernel in kernels {
                 let mut native = vec![0.0; n];
-                int4_matmul_m1(&activations, &packed_weight, &mut native, k, n, kernel);
+                int4_matmul_m1(
+                    &activations,
+                    &packed_weight,
+                    &mut native,
+                    k,
+                    n,
+                    block_size,
+                    kernel,
+                );
                 assert_eq!(
                     usize::from(native[1] > native[0]),
                     oracle_argmax,
@@ -7009,14 +7277,14 @@ mod tests {
     }
 
     /// aarch64 must never fall back to the scalar dot: `selected_dot_kernel`
-    /// picks `Neon`, and the forced `Neon` int8 dot stays bit-exact vs scalar.
+    /// picks a NEON-family kernel, and the forced `Neon` int8 dot stays
+    /// bit-exact vs scalar.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn selected_dot_kernel_is_neon_on_aarch64() {
-        assert_eq!(
-            selected_dot_kernel(),
-            DotKernel::Neon,
-            "aarch64 must select the NEON int8 dot, never Scalar"
+        assert!(
+            matches!(selected_dot_kernel(), DotKernel::Neon | DotKernel::NeonDot),
+            "aarch64 must select a NEON-family dot, never Scalar"
         );
         let activation: Vec<u8> = (0..128).map(|i| ((i * 29 + 7) % 255) as u8).collect();
         let weight: Vec<i8> = (0..128).map(|i| ((i * 17 % 31) as i8) - 15).collect();
@@ -7217,7 +7485,15 @@ mod tests {
             .build()
             .unwrap()
             .install(|| {
-                int4_matmul_m1(&activations, &packed_weight, &mut serial, k, n, dot_kernel);
+                int4_matmul_m1(
+                    &activations,
+                    &packed_weight,
+                    &mut serial,
+                    k,
+                    n,
+                    block_size,
+                    dot_kernel,
+                );
             });
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
@@ -7230,6 +7506,7 @@ mod tests {
                     &mut parallel,
                     k,
                     n,
+                    block_size,
                     dot_kernel,
                 );
             });
@@ -8349,7 +8626,15 @@ mod tests {
         with_decode_pool_scope(true, || {
             for op in 0..6usize {
                 let mut output = vec![0.0f32; n];
-                int4_matmul_m1(&activation, &packed, &mut output, k, n, dot_kernel);
+                int4_matmul_m1(
+                    &activation,
+                    &packed,
+                    &mut output,
+                    k,
+                    n,
+                    block_size,
+                    dot_kernel,
+                );
                 for value in &output {
                     bytes.extend_from_slice(&value.to_bits().to_le_bytes());
                 }
@@ -9656,7 +9941,15 @@ mod tests {
                     let hand_us = if m == 1 {
                         time(threads, || {
                             let mut out = vec![0.0f32; n];
-                            int4_matmul_m1(&a, &int4_weight, &mut out, k, n, dot_kernel);
+                            int4_matmul_m1(
+                                &a,
+                                &int4_weight,
+                                &mut out,
+                                k,
+                                n,
+                                block_size,
+                                dot_kernel,
+                            );
                         })
                     } else {
                         time(threads, || {
@@ -9687,13 +9980,12 @@ mod tests {
         }
     }
 
-    /// Focused int4 M=1 GEMV micro-bench at 0.6B (Qwen3-0.6B) decode shapes,
-    /// reporting ns/call, GB/s (int4 weight bytes streamed = N*K/2) and GFLOP/s
-    /// (2*N*K) for the hand VNNI GEMV vs MLAS SQNBit CompInt8, at 1 and 32
-    /// threads, median-of-5. This is the Phase-1 gating probe for the int4 GEMV
-    /// decode kernel: the ratio hand_ns/mlas_ns is "how much slower than MLAS we
-    /// are" (>1 = slower). Shapes are a probe fixture; production never hardcodes
-    /// them. Run with:
+    /// Focused int4 M=1 GEMV micro-bench at Foundry Qwen3-0.6B block-128 decode
+    /// shapes, reporting ns/call, GB/s (int4 weight bytes streamed = N*K/2) and
+    /// GFLOP/s (2*N*K) for the direct int4 GEMV, the old native int8-prepack
+    /// fallback, and MLAS SQNBit CompInt8. This is the Phase-1 gating probe for
+    /// the ARM64 int4 GEMV decode kernel: direct/mlas >1 means slower than MLAS.
+    /// Shapes are a probe fixture; production never hardcodes them. Run with:
     ///   cargo test -p onnx-runtime-ep-cpu --features mlas --release \
     ///     int4_gemv_decode_microbench -- --ignored --nocapture
     #[cfg(feature = "mlas")]
@@ -9726,21 +10018,22 @@ mod tests {
             })
         }
 
-        let block_size = 32usize;
+        let block_size = 128usize;
         let dot_kernel = selected_dot_kernel();
-        // (label, K, N) for one Qwen3-0.6B (hidden=1024, intermediate=3072,
-        // vocab=151936) decode token. qkv is the fused q(2048)+k(1024)+v(1024).
+        // (label, K, N) for exact int4 MatMulNBits shapes observed in the
+        // Foundry qwen3-0.6b-generic-cpu-4/v4 graph (hidden=1024,
+        // intermediate=3072, grouped q/k/v widths).
         let shapes: &[(&str, usize, usize)] = &[
-            ("qkv_proj", 1024, 4096),
+            ("q_proj", 1024, 2048),
+            ("kv/o_proj", 1024, 1024),
             ("o_proj", 2048, 1024),
             ("gate_proj", 1024, 3072),
             ("up_proj", 1024, 3072),
             ("down_proj", 3072, 1024),
-            ("lm_head", 1024, 151936),
         ];
 
         eprintln!(
-            "int4 GEMV M=1 microbench (Qwen3-0.6B shapes), dot_kernel={dot_kernel:?}, median-of-5"
+            "int4 GEMV M=1 microbench (Foundry Qwen3-0.6B block-128 shapes), dot_kernel={dot_kernel:?}, median-of-5"
         );
         for &(label, k, n) in shapes {
             let weights_nk = pseudo(n * k, 0.3);
@@ -9749,6 +10042,13 @@ mod tests {
                 values: packed_bytes.clone(),
                 scales: scales.clone(),
             };
+            let blocks = k.div_ceil(block_size);
+            let kernel = accuracy4_kernel(k, n, block_size);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed_bytes);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let int8_weight = kernel
+                .prepack_int8_weight(&b.view(), &scales_t.view(), None)
+                .unwrap();
             let mlas_packed = mlas_sys::SQNBitPackedB::new(
                 n,
                 k,
@@ -9765,24 +10065,32 @@ mod tests {
             let flops = 2.0 * (n as f64) * (k as f64);
 
             for threads in [1usize, 32] {
-                let hand_ns = median_ns(threads, || {
+                let direct_ns = median_ns(threads, || {
                     let mut out = vec![0.0f32; n];
-                    int4_matmul_m1(&a, &int4_weight, &mut out, k, n, dot_kernel);
+                    int4_matmul_m1(&a, &int4_weight, &mut out, k, n, block_size, dot_kernel);
+                });
+                let old_native_ns = median_ns(threads, || {
+                    let mut out = vec![0.0f32; n];
+                    int8_matmul(&a, &int8_weight, &mut out, 1, k, n, block_size, dot_kernel);
                 });
                 let mlas_ns = median_ns(threads, || {
                     let mut out = vec![0.0f32; n];
                     mlas_sys::sqnbit_gemm(&mlas_packed, 1, &a, None, &mut out, true);
                 });
-                let hand_gbs = weight_bytes / hand_ns;
+                let direct_gbs = weight_bytes / direct_ns;
+                let old_native_gbs = weight_bytes / old_native_ns;
                 let mlas_gbs = weight_bytes / mlas_ns;
-                let hand_gflops = flops / hand_ns;
+                let direct_gflops = flops / direct_ns;
+                let old_native_gflops = flops / old_native_ns;
                 let mlas_gflops = flops / mlas_ns;
                 eprintln!(
                     "{label:10} K={k:6} N={n:6} {threads:2}t: \
-                     hand {hand_ns:8.0}ns {hand_gbs:6.1}GB/s {hand_gflops:6.1}GF | \
+                     direct {direct_ns:8.0}ns {direct_gbs:6.1}GB/s {direct_gflops:6.1}GF | \
+                     old {old_native_ns:8.0}ns {old_native_gbs:6.1}GB/s {old_native_gflops:6.1}GF | \
                      mlas {mlas_ns:8.0}ns {mlas_gbs:6.1}GB/s {mlas_gflops:6.1}GF | \
-                     ratio(hand/mlas)={:.2}x",
-                    hand_ns / mlas_ns
+                     ratio(direct/old)={:.2}x ratio(direct/mlas)={:.2}x",
+                    direct_ns / old_native_ns,
+                    direct_ns / mlas_ns
                 );
             }
         }
@@ -9883,7 +10191,7 @@ mod tests {
             for w in &built {
                 let a = vec![0.03f32; w.k];
                 let mut out = vec![0.0f32; w.n];
-                int4_matmul_m1(&a, &w.int4, &mut out, w.k, w.n, dot_kernel);
+                int4_matmul_m1(&a, &w.int4, &mut out, w.k, w.n, block_size, dot_kernel);
             }
         };
         let run_mlas_int8 = || {
