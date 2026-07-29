@@ -290,32 +290,36 @@ the picture reverses because:
 
 Measured 2026-07-28 on Apple M1 Max (32 GiB, macOS 26.5.2), interleaved A/B,
 3 repetitions, greedy decode with 30 tokens/turn.
+**All numbers below taken under exclusive bench lock at load 1.5–3.6.**
 
 ### TinyStories-33M (FP32)
 
 | Metric | Value |
 |---|---|
-| **Break-even turn** | **3** |
-| ORT load penalty | 103 ms (3.2× slower than native) |
-| ORT per-turn advantage (steady-state) | 185 ms/turn faster |
-| Native steady-state TTFT | 93.4 ms (3.2× slower than ORT's 29.4 ms) |
-| Native steady-state decode | 236 ms (2.1× slower than ORT's 115 ms) |
-| Over 10 turns | **ORT 2.0× faster overall** |
-| Native TTFT growth | 22 ms → 148 ms (6.8× across 10 turns) |
-| ORT TTFT growth | 9 ms → 31 ms (flat — only new-token prefill) |
+| **Break-even turn** | **2** |
+| ORT load penalty | 158 ms (4.5× slower than native) |
+| ORT per-turn advantage (steady-state) | 198 ms/turn faster |
+| Native steady-state TTFT | 93 ms (3.4× slower than ORT's 28 ms) |
+| Native steady-state decode | 236 ms (2.3× slower than ORT's 103 ms) |
+| Over 10 turns | **ORT 2.1× faster overall** |
+| Native TTFT growth | 23 ms → 148 ms (6.5× across 10 turns) |
+| ORT TTFT growth | 12 ms → 30 ms (flat — only new-token prefill) |
+
+Corroborated with second run at load 1.7–3.6: break-even turn 1, ORT 2.3×
+faster overall, steady-state TTFT ratio 3.8×.
 
 ### Qwen2.5-0.5B-FP16
 
 | Metric | Value |
 |---|---|
-| **Break-even turn** | **5–8** (load-dependent) |
-| ORT load penalty | 1827 ms (6.4× slower than native) |
-| ORT per-turn advantage (steady-state) | 712 ms/turn faster |
-| Native steady-state TTFT | 519 ms (3.1× slower than ORT's 169 ms) |
-| Native steady-state decode | 1295 ms (1.4× slower than ORT's 933 ms) |
-| Over 10 turns | **ORT 1.2× faster overall** |
-| Native TTFT growth | 93 ms → 762 ms (8.1× across 10 turns) |
-| ORT TTFT growth | 162 ms → 151 ms (flat) |
+| **Break-even turn** | **8** |
+| ORT load penalty | 1494 ms (6.2× slower than native) |
+| ORT per-turn advantage (steady-state) | 465 ms/turn faster |
+| Native steady-state TTFT | 463 ms (3.1× slower than ORT's 150 ms) |
+| Native steady-state decode | 922 ms (1.2× slower than ORT's 770 ms) |
+| Over 10 turns | **ORT 1.18× faster overall** |
+| Native TTFT growth | 92 ms → 743 ms (8.1× across 10 turns) |
+| ORT TTFT growth | 129 ms → 150 ms (flat) |
 
 ### Why this reverses the published conclusion
 
@@ -346,8 +350,8 @@ This is NOT the cause of the multi-turn deficit.
 
 | Model | Per-prefill target | Per-decode target |
 |---|---|---|
-| TinyStories-33M | ≤ 29 ms (currently 93 ms, −69%) | ≤ 115 ms (currently 236 ms, −51%) |
-| Qwen2.5-0.5B-f16 | ≤ 169 ms (currently 519 ms, −67%) | ≤ 933 ms (currently 1295 ms, −28%) |
+| TinyStories-33M | ≤ 28 ms (currently 93 ms, −70%) | ≤ 103 ms (currently 236 ms, −56%) |
+| Qwen2.5-0.5B-f16 | ≤ 150 ms (currently 463 ms, −68%) | ≤ 770 ms (currently 922 ms, −16%) |
 
 These reductions are unreachable by kernel speedup alone — the O(context)
 re-prefill makes it structurally impossible to match ORT's O(new_tokens)
@@ -355,14 +359,16 @@ prefill. **Session-persistent KV is the prerequisite.**
 
 ## Batch inference — vision models
 
-At batch=1, native is 0.43× ORT speed on MobileNetV2 (12 ms vs 5 ms).
+**Measured under exclusive bench lock at load 2.3–3.0.**
+
+At batch=1, native is 0.50× ORT speed on MobileNetV2 (11.6 ms vs 5.8 ms).
 Native crashes (segfault) at batch>1 — a known correctness bug in the native
 runtime's batch-dimension handling for CNN models.
 
-ORT throughput scaling with batch (MobileNetV2, Apple M1 Max):
-- batch=1: 191 samples/s
-- batch=4: 342 samples/s (1.8×)
-- batch=16: 363 samples/s (1.9×)
+ORT throughput scaling with batch (MobileNetV2, Apple M1 Max, load 2.3–3.0):
+- batch=1: 172 samples/s
+- batch=4: 356 samples/s (2.1×)
+- batch=16: 372 samples/s (2.2×)
 
 The prior "15× batch advantage" claim (from an earlier session) collapsed
 because it was estimated rather than measured against ORT. Measured ORT scales

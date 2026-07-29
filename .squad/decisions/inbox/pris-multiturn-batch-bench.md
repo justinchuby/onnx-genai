@@ -14,12 +14,15 @@ across a session — and if so, what the fix is.
 
 ## Findings
 
+All measurements taken under exclusive bench lock at load 1.5–3.6 on Apple M1 Max.
+Corroborated with second runs at comparable load.
+
 ### Multi-turn LLM
 
 | Model | Break-even turn | ORT overall advantage (10 turns) |
 |---|---|---|
-| TinyStories-33M (f32) | 3 | 2.0× |
-| Qwen2.5-0.5B (f16) | 5–8 | 1.2× |
+| TinyStories-33M (f32) | 2 | 2.1× |
+| Qwen2.5-0.5B (f16) | 8 | 1.18× |
 
 **Root cause: NOT pre-packing amortisation.** The native backend has no
 session-persistent KV cache. Each turn re-prefills the entire conversation
@@ -31,14 +34,14 @@ while ORT TTFT stays flat.
 
 | Model | Native TTFT ms | ORT TTFT ms | Ratio |
 |---|---|---|---|
-| TinyStories-33M | 93.4 | 29.4 | 3.2× ORT faster |
-| Qwen2.5-0.5B-f16 | 519 | 169 | 3.1× ORT faster |
+| TinyStories-33M | 93 | 28 | 3.4× ORT faster |
+| Qwen2.5-0.5B-f16 | 463 | 150 | 3.1× ORT faster |
 
 ### Batch vision (MobileNetV2)
 
-- Batch=1: native 0.43× ORT (12 ms vs 5 ms)
+- Batch=1: native 0.50× ORT (11.6 ms vs 5.8 ms)
 - Batch>1: **native crashes (segfault)** — correctness bug
-- ORT scales 1.9× from batch=1→16
+- ORT scales 2.2× from batch=1→16
 
 ### Cache survival (PR #353)
 
