@@ -157,6 +157,8 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
+            native_session_state: None,
+            #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
             draft,
             mtp,
@@ -289,6 +291,7 @@ impl Engine {
             sessions: HashMap::new(),
             session: None,
             native_session: Some(native_session),
+            native_session_state: None,
             native_shared_kv_proposer,
             draft: None,
             mtp: None,
