@@ -470,11 +470,17 @@ fn a_model_without_reasoning_delimiters_reports_nothing_about_them() {
 
 /// Ten distinct in-vocabulary prompts, keeping the reasoning session in the
 /// design's 8-12 turn band (docs/research/testing/00-integration-stress-design.md,
-/// scenario `ci_tiny_reasoning_pressure_cpu_ort`). The exact words do not matter:
-/// the fixture degenerates on any prompt because its reasoning span has no
-/// reachable close, so these assert on *properties*, never on generated tokens.
+/// scenario `ci_tiny_reasoning_pressure_cpu_ort`).
+///
+/// These are the *degenerate* prompts: on each of them the greedy attractor
+/// never reaches the renamed close token (id 22), so the reasoning span stays
+/// open and every turn is dropped. The "quick"/"fox"/"dog" family is
+/// deliberately excluded because those *do* close (see the positive test);
+/// mixing them in would break the "every turn drops" contract these prompts
+/// pin. The exact words still do not matter to the assertions, which key on
+/// properties (a drop note, a resource stop, empty history) not tokens.
 const REASONING_TURNS: &[&str] = &[
-    "hello", "world", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+    "hello", "world", "the", "brown", "jumps", "over", "lazy", ".", ",", "tok16",
 ];
 
 /// Build a `run` script that sends every reasoning turn then asks for `/session`.
@@ -594,32 +600,86 @@ fn temperature_zero_forces_greedy_even_when_the_model_declares_do_sample() {
 }
 
 #[test]
-fn the_declared_stochastic_regime_still_terminates_without_committing_an_answer() {
-    // The design asks for greedy plus a stochastic path. Under the model's
-    // declared do_sample the generated tokens differ run to run, but the outcome
-    // is deterministic: the span still cannot close, so generation terminates at
-    // the budget and each unclosed turn is dropped rather than hanging or being
-    // committed empty (termination + non-empty-committed invariants).
+fn a_reasoning_turn_that_closes_its_span_commits_a_non_empty_answer() {
+    // The positive half of the reasoning-progress invariant, and the reason the
+    // fixture has a *reachable* close: a turn whose generated text closes the
+    // </think> span with visible answer text after it must be committed, not
+    // dropped. Without this a regression that drops *every* turn would pass
+    // against a fixture that can only ever drop -- it could not tell "correctly
+    // dropped" from "commit path broken". "quick" is the deterministic greedy
+    // prompt whose attractor reaches the renamed close token followed by a real
+    // word, so the span closes with a non-empty answer.
     let output = text(&repl(
+        &reasoning_model(),
+        &["--greedy", "--max-new-tokens", "8"],
+        "quick\n/session\n\n",
+    ));
+
+    // The span actually closed: the close delimiter was emitted, and the turn
+    // was not reported as stopping inside the reasoning.
+    assert!(
+        output.contains("</think>"),
+        "the reasoning span must close for this prompt: {output}"
+    );
+    assert!(
+        !output.contains("stopped inside the model's reasoning"),
+        "a closed reasoning turn must not be dropped: {output}"
+    );
+    // The committed answer is non-empty: there is visible text after the close
+    // delimiter. Keyed on the *presence* of answer text, not its token identity,
+    // so regenerating the fixture (which can move the answer word) never breaks
+    // this. The runtime does not itself guard a closed-but-empty answer (see the
+    // decision record), so this asserts the property directly.
+    let answer = output
+        .rsplit_once("</think>")
+        .map(|(_, tail)| tail.lines().next().unwrap_or("").trim())
+        .unwrap_or("");
+    assert!(
+        !answer.is_empty(),
+        "the committed answer after the close must be non-empty: {output}"
+    );
+    // /session shows history incrementing: exactly the user turn and its
+    // committed assistant answer, and one completed turn.
+    assert!(
+        output.contains("messages: 2 (system: 0, user: 1, assistant: 1)"),
+        "the committed turn must increment history to one user + one assistant: {output}"
+    );
+    assert!(
+        output.contains("completed turns: 1"),
+        "the closed turn must count as one completed turn: {output}"
+    );
+}
+
+#[test]
+fn the_declared_stochastic_regime_still_terminates_without_hanging() {
+    // The design asks for greedy plus a stochastic path. Under the model's
+    // declared do_sample the generated tokens differ run to run, so -- unlike the
+    // greedy tests -- the per-turn outcome (drop vs close) is not fixed: sampling
+    // can reach the close token on prompts greedy would not. What is invariant is
+    // termination: the stochastic regime must be the one in force, and every turn
+    // must run to a classified stop and reach the /session prompt rather than
+    // hanging inside an unbounded reasoning loop. Asserting a fixed drop count
+    // here would be flaky for exactly the reason the sampling matters, so this
+    // pins termination and policy, not an outcome tally.
+    let output = repl(
         &reasoning_model(),
         &["--max-new-tokens", "16"],
         &reasoning_session_script(),
-    ));
-    assert!(
-        output.contains("greedy=false"),
-        "the declared regime must be stochastic: {output}"
     );
-    let drops = output
-        .matches("stopped inside the model's reasoning")
-        .count();
-    assert_eq!(
-        drops,
-        REASONING_TURNS.len(),
-        "each stochastic reasoning turn must also drop, got {drops}: {output}"
+    let combined = text(&output);
+    assert!(
+        output.status.success(),
+        "the stochastic session must terminate cleanly, not hang: {combined}"
     );
     assert!(
-        output.contains("messages: 0 (system: 0, user: 0, assistant: 0)"),
-        "no unclosed reasoning turn may be committed to history: {output}"
+        combined.contains("greedy=false"),
+        "the declared regime must be stochastic: {combined}"
+    );
+    // Reaching the /session summary proves all ten turns ran to a stop and the
+    // REPL stayed live through them (no unbounded loop swallowed the session).
+    assert!(
+        combined.contains("messages:") && combined.contains("completed turns:"),
+        "the session must run every turn through to the /session summary: {combined}"
     );
 }
 
