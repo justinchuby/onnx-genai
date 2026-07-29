@@ -1979,6 +1979,23 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         value.as_deref(),
         available,
     );
+    // Snapdragon/X Elite style ARM64 hosts have measured their decode roofline
+    // at 6--8 workers, and the KAI-style packed SDOT path still scales from the
+    // generic `available/2` default (6 on a 12-way Oryon) to 8 workers. Keep the
+    // generic half-machine rule for other platforms, but use the measured ARM64
+    // topology ceiling when no explicit budget was provided.
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    if decode_threads_override().is_none()
+        && value
+            .as_deref()
+            .is_none_or(|v| v.is_empty() || v.parse::<usize>().is_err())
+        && available >= MAX_TOPOLOGY_DECODE_THREADS
+    {
+        return Some(MAX_TOPOLOGY_DECODE_THREADS.min(available));
+    }
     // On Apple Silicon, when no explicit thread count was set, override the
     // generic `available/2` default with `P_cores - 1`. The SPMD dispatcher
     // thread spin-waits on completion counters, occupying one P-core; using

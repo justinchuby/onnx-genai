@@ -72,3 +72,51 @@ Keep this commit as the correctness/reachability milestone and ask Luba to turn 
 - add prefetch for next N tile/K block and split N tiles across decode_affinity threads.
 
 This should be portable to Snapdragon and Apple NEON+dotprod. Apple Silicon should use this NEON path where Accelerate cannot cover quantized decode; AMX/Accelerate routes must remain untouched.
+
+## 2026-07-29 profiling-driven iteration
+
+Follow-up after `d073dfa3` focused on diagnosing the 71 tok/s plateau before further microkernel tuning.
+
+### Thread saturation
+
+With the KAI path gated on and the original committed inner loop, qwen3-0.6b scaled strongly with decode workers:
+
+| Workers | Native throughput |
+| ---: | ---: |
+| 1 | 17.46 tok/s |
+| 2 | 32.89 tok/s |
+| 4 | 52.68 tok/s |
+| 6 | 73.30 tok/s |
+| 8 | 85.72 tok/s |
+| 10 | 69.68 tok/s |
+| 12 | 60.68 tok/s |
+
+Diagnosis: the previous no-env benchmark was effectively under-threaded on this 12-way ARM64 Windows/Oryon host because the persistent-pool default was `available/2` = 6. The kernel is still compute/dequant-bound, but it needs 8 workers to approach the local plateau; oversubscribing beyond 8 hurts dispatcher/worker scheduling.
+
+### Op profile
+
+`ONNX_GENAI_PROFILE_OPS=1` on qwen3-0.6b showed steady decode still dominated by `MatMulNBits`: typically ~83-87% of per-forward wall time after warmup (197 `MatMulNBits` calls per forward). The first profiled pass includes prefill and reports ~99.75% `MatMulNBits`; the steady passes are the relevant decode signal. This confirms the optimization target is still the quantized GEMV path, not attention or layernorm.
+
+### Inner-loop IPC experiment
+
+I tried a non-committed NEON change that widened the hot path to 8 outputs and split each K block across four independent SDOT accumulator chains to hide dotprod latency. It regressed qwen3-0.6b at 8 workers to 77.32 tok/s, so I reverted it. The likely cause is extra register pressure and front-end/unpack pressure overpowering the latency hiding in Rust intrinsics. This points toward a hand-scheduled KleidiAI-style 32-K assembly/intrinsics ukernel rather than larger generic Rust unrolls.
+
+### Committed fix
+
+Committed only the robust top fix: on non-Apple aarch64, when the user has not explicitly set `ONNX_GENAI_CPU_DECODE_THREADS`, default the persistent decode pool to the existing topology ceiling of 8 workers (instead of generic `available/2`). Apple Silicon keeps its P-core-specific rule; x86 and explicit budgets are unchanged.
+
+### After numbers
+
+Median steady decode, gated-on native:
+
+| Model | Roofline | Native before | Native after | After % roofline | ORT | ORT % roofline | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| qwen3-0.6b CPU-4 | 211 tok/s | 71.31 tok/s | 83.53 tok/s | 39.6% | 105.68 tok/s | 50.1% | +17%; still below ORT |
+| qwen2.5-0.5b CPU-4 | 344 tok/s | 82.41 tok/s | 94.15 tok/s | 27.4% | 184.48 tok/s | 53.6% | +14%; still below ORT |
+| qwen3-1.7b CPU-2 | 76.5 tok/s | 25.48 tok/s | 27.01 tok/s | 35.3% | 49.52 tok/s | 64.7% | slight gain; still below ORT |
+
+Honest gate: still does not beat ORT, so the KAI path remains opt-in behind `ONNX_GENAI_CPU_ARM64_INT4_DIRECT`.
+
+### Remaining gap
+
+The next required step is not blind unrolling. We need Luba's hand-scheduled NEON microkernel advice applied at the exact KleidiAI granularity: N=4/8, K32 subblocks, minimal qsi4 unpack, enough independent SDOT issue without spilling, and prefetch only once the assembly schedule is stable. The Rust intrinsics loop is now threaded correctly but still not instruction-dense enough to reach ORT's ~50% roofline.
