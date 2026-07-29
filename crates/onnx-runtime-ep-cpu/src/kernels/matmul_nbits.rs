@@ -299,12 +299,12 @@ struct PackedN16SdotWeight {
     zero_point_offsets: Vec<i16>,
 }
 
-const KAI_SDOT_OUTPUTS: usize = 4;
+const KAI_SDOT_OUTPUTS: usize = 16;
 const KAI_SDOT_K_GROUP: usize = 4;
 
 /// KleidiAI-inspired ARM decode prepack. Int4 weights stay packed (two
 /// nibbles per byte); int8 weights stay one byte per weight centered around
-/// 128. Layout: `[ceil(N/4), k_blocks, block_size/4, 4 outputs, payload]`,
+/// 128. Layout: `[ceil(N/16), k_blocks, block_size/4, 16 outputs, payload]`,
 /// where payload is 2 bytes for qsi4 and 4 bytes for qsi8.
 struct PackedKaiSdotWeight {
     bits: usize,
@@ -2641,22 +2641,23 @@ fn numa_place_n16_sdot(weight: PackedN16SdotWeight, n: usize) -> PackedN16SdotWe
 }
 
 fn numa_place_kai_sdot(weight: PackedKaiSdotWeight, n: usize) -> PackedKaiSdotWeight {
+    let tiles = n.div_ceil(KAI_SDOT_OUTPUTS);
     if let Some(numa) = numa_decode_active() {
         return PackedKaiSdotWeight {
             bits: weight.bits,
-            values: numa.place_rows(&weight.values, n.div_ceil(KAI_SDOT_OUTPUTS)),
-            scales: numa.place_rows(&weight.scales, n),
-            rhs_sums: numa.place_rows(&weight.rhs_sums, n),
-            zero_point_offsets: numa.place_rows(&weight.zero_point_offsets, n),
+            values: numa.place_rows(&weight.values, tiles),
+            scales: numa.place_rows(&weight.scales, tiles),
+            rhs_sums: numa.place_rows(&weight.rhs_sums, tiles),
+            zero_point_offsets: numa.place_rows(&weight.zero_point_offsets, tiles),
         };
     }
     if let Some(spmd) = spmd_decode_active() {
         return PackedKaiSdotWeight {
             bits: weight.bits,
-            values: spmd.place_rows(&weight.values, n.div_ceil(KAI_SDOT_OUTPUTS)),
-            scales: spmd.place_rows(&weight.scales, n),
-            rhs_sums: spmd.place_rows(&weight.rhs_sums, n),
-            zero_point_offsets: spmd.place_rows(&weight.zero_point_offsets, n),
+            values: spmd.place_rows(&weight.values, tiles),
+            scales: spmd.place_rows(&weight.scales, tiles),
+            rhs_sums: spmd.place_rows(&weight.rhs_sums, tiles),
+            zero_point_offsets: spmd.place_rows(&weight.zero_point_offsets, tiles),
         };
     }
     weight
@@ -3302,13 +3303,16 @@ fn prepack_kai_sdot_from_bytes(
     let zero_point_row_size = layout.zero_point_row_size(k_blocks);
     let midpoint = 1i16 << (bits - 1);
     let mut values = vec![0u8; tile_count * tile_stride];
-    let mut rhs_sums = vec![0i32; n * k_blocks];
-    let mut zero_point_offsets = vec![0i16; n * k_blocks];
+    let meta_stride = k_blocks * KAI_SDOT_OUTPUTS;
+    let mut packed_scales = vec![0.0f32; tile_count * meta_stride];
+    let mut rhs_sums = vec![0i32; tile_count * meta_stride];
+    let mut zero_point_offsets = vec![0i16; tile_count * meta_stride];
 
     for output in 0..n {
         let tile = output / KAI_SDOT_OUTPUTS;
         let lane = output % KAI_SDOT_OUTPUTS;
         for block in 0..k_blocks {
+            let meta = tile * meta_stride + block * KAI_SDOT_OUTPUTS + lane;
             let zero_point = zero_points.map_or(midpoint as u8, |points| {
                 layout.zero_point(
                     Some(
@@ -3318,7 +3322,8 @@ fn prepack_kai_sdot_from_bytes(
                     block,
                 )
             });
-            zero_point_offsets[output * k_blocks + block] = midpoint - zero_point as i16;
+            packed_scales[meta] = scales[output * k_blocks + block];
+            zero_point_offsets[meta] = midpoint - zero_point as i16;
             let mut sum = 0i32;
             for group in 0..groups_per_block {
                 let base = tile * tile_stride
@@ -3352,14 +3357,14 @@ fn prepack_kai_sdot_from_bytes(
                     }
                 }
             }
-            rhs_sums[output * k_blocks + block] = sum;
+            rhs_sums[meta] = sum;
         }
     }
 
     PackedKaiSdotWeight {
         bits,
         values,
-        scales,
+        scales: packed_scales,
         rhs_sums,
         zero_point_offsets,
     }
@@ -3367,6 +3372,7 @@ fn prepack_kai_sdot_from_bytes(
 
 struct Qai8dxpActivation {
     values: Vec<i8>,
+    group_words: Vec<u32>,
     scale: f32,
     zero_point: i32,
     block_sums: Vec<i32>,
@@ -3413,8 +3419,20 @@ fn quantize_activation_qai8dxp(
         block_sums[block] += q;
         block_counts[block] += 1;
     }
+    let group_words = values
+        .chunks_exact(KAI_SDOT_K_GROUP)
+        .map(|group| {
+            u32::from_le_bytes([
+                group[0] as u8,
+                group[1] as u8,
+                group[2] as u8,
+                group[3] as u8,
+            ])
+        })
+        .collect();
     Qai8dxpActivation {
         values,
+        group_words,
         scale,
         zero_point,
         block_sums,
@@ -3435,10 +3453,11 @@ fn kai_sdot_matmul_m1(
     debug_assert!(block_size.is_multiple_of(KAI_SDOT_K_GROUP));
     let k_blocks = k.div_ceil(block_size);
     let padded_k = k_blocks * block_size;
+    let packed_meta_len = n.div_ceil(KAI_SDOT_OUTPUTS) * k_blocks * KAI_SDOT_OUTPUTS;
     debug_assert_eq!(activation.len(), k);
-    debug_assert_eq!(weight.scales.len(), n * k_blocks);
-    debug_assert_eq!(weight.rhs_sums.len(), n * k_blocks);
-    debug_assert_eq!(weight.zero_point_offsets.len(), n * k_blocks);
+    debug_assert_eq!(weight.scales.len(), packed_meta_len);
+    debug_assert_eq!(weight.rhs_sums.len(), packed_meta_len);
+    debug_assert_eq!(weight.zero_point_offsets.len(), packed_meta_len);
     debug_assert_eq!(result.len(), n);
 
     let activation = quantize_activation_qai8dxp(activation, padded_k, block_size);
@@ -3511,6 +3530,13 @@ fn kai_group_payload(bits: usize) -> usize {
     if bits == 4 { 2 } else { KAI_SDOT_K_GROUP }
 }
 
+#[inline]
+fn kai_meta_index(output: usize, block: usize, k_blocks: usize) -> usize {
+    let tile = output / KAI_SDOT_OUTPUTS;
+    let lane = output % KAI_SDOT_OUTPUTS;
+    tile * k_blocks * KAI_SDOT_OUTPUTS + block * KAI_SDOT_OUTPUTS + lane
+}
+
 fn kai_centered_weight(
     weight: &PackedKaiSdotWeight,
     output: usize,
@@ -3570,7 +3596,7 @@ fn kai_sdot_matmul_m1_scalar(
                     acc += a * w;
                 }
             }
-            let idx = output * k_blocks + block;
+            let idx = kai_meta_index(output, block, k_blocks);
             let correction = kai_qai8_correction(
                 activation,
                 weight.rhs_sums[idx],
@@ -3615,7 +3641,7 @@ unsafe fn kai_sdot_matmul_m1_neon_dot(
             && offset + KAI_SDOT_OUTPUTS <= result.len()
         {
             let out =
-                unsafe { kai_sdot_quad_neon(activation, weight, output, k_blocks, block_size) };
+                unsafe { kai_sdot_tile_neon(activation, weight, output, k_blocks, block_size) };
             result[offset..offset + KAI_SDOT_OUTPUTS].copy_from_slice(&out);
             offset += KAI_SDOT_OUTPUTS;
         } else {
@@ -3635,7 +3661,7 @@ unsafe fn kai_sdot_matmul_m1_neon_dot(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn kai_sdot_quad_neon(
+unsafe fn kai_sdot_tile_neon(
     activation: &Qai8dxpActivation,
     weight: &PackedKaiSdotWeight,
     output_start: usize,
@@ -3649,53 +3675,182 @@ unsafe fn kai_sdot_quad_neon(
     let group_stride = KAI_SDOT_OUTPUTS * payload;
     let tile_stride = k_blocks * groups_per_block * group_stride;
     let tile = output_start / KAI_SDOT_OUTPUTS;
-    let mut total = vdupq_n_f32(0.0);
+    let meta_tile_base = tile * k_blocks * KAI_SDOT_OUTPUTS;
+    let mut total0 = vdupq_n_f32(0.0);
+    let mut total1 = vdupq_n_f32(0.0);
+    let mut total2 = vdupq_n_f32(0.0);
+    let mut total3 = vdupq_n_f32(0.0);
     for block in 0..k_blocks {
-        let mut acc_i32 = vdupq_n_s32(0);
+        let mut acc0_even = vdupq_n_s32(0);
+        let mut acc1_even = vdupq_n_s32(0);
+        let mut acc2_even = vdupq_n_s32(0);
+        let mut acc3_even = vdupq_n_s32(0);
+        let mut acc0_odd = vdupq_n_s32(0);
+        let mut acc1_odd = vdupq_n_s32(0);
+        let mut acc2_odd = vdupq_n_s32(0);
+        let mut acc3_odd = vdupq_n_s32(0);
         for group in 0..groups_per_block {
-            let activation_base = block * block_size + group * KAI_SDOT_K_GROUP;
-            let word = u32::from_le_bytes([
-                activation.values[activation_base] as u8,
-                activation.values[activation_base + 1] as u8,
-                activation.values[activation_base + 2] as u8,
-                activation.values[activation_base + 3] as u8,
-            ]);
+            let word = activation.group_words[block * groups_per_block + group];
             let act = vreinterpretq_s8_u32(vdupq_n_u32(word));
             let weight_base =
                 tile * tile_stride + (block * groups_per_block + group) * group_stride;
-            let weights = if weight.bits == 4 {
-                let packed = unsafe { vld1_u8(weight.values.as_ptr().add(weight_base)) };
-                let packed = vcombine_u8(packed, vdup_n_u8(0));
-                let low = vandq_u8(packed, vdupq_n_u8(0x0f));
-                let high = vshrq_n_u8::<4>(packed);
-                let unpacked = vzip1q_u8(low, high);
-                vsubq_s8(vreinterpretq_s8_u8(unpacked), vdupq_n_s8(8))
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                let ahead = if weight.bits == 4 { 16 } else { 8 };
+                if group + ahead < groups_per_block {
+                    let prefetch_base = tile * tile_stride
+                        + (block * groups_per_block + group + ahead) * group_stride;
+                    unsafe {
+                        kai_prefetch_l1(weight.values.as_ptr().wrapping_add(prefetch_base));
+                    }
+                }
+            }
+            let (acc0, acc1, acc2, acc3) = if group.is_multiple_of(2) {
+                (
+                    &mut acc0_even,
+                    &mut acc1_even,
+                    &mut acc2_even,
+                    &mut acc3_even,
+                )
             } else {
-                unsafe { vld1q_s8(weight.values.as_ptr().add(weight_base) as *const i8) }
+                (&mut acc0_odd, &mut acc1_odd, &mut acc2_odd, &mut acc3_odd)
             };
-            acc_i32 = unsafe { sdot_i8x16(acc_i32, act, weights) };
+            if weight.bits == 4 {
+                let packed0 = unsafe { vld1q_u8(weight.values.as_ptr().add(weight_base)) };
+                let low0 = vandq_u8(packed0, vdupq_n_u8(0x0f));
+                let high0 = vshrq_n_u8::<4>(packed0);
+                let w0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low0, high0)), vdupq_n_s8(8));
+                let w1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low0, high0)), vdupq_n_s8(8));
+                let packed1 = unsafe { vld1q_u8(weight.values.as_ptr().add(weight_base + 16)) };
+                let low1 = vandq_u8(packed1, vdupq_n_u8(0x0f));
+                let high1 = vshrq_n_u8::<4>(packed1);
+                let w2 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low1, high1)), vdupq_n_s8(8));
+                let w3 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low1, high1)), vdupq_n_s8(8));
+                *acc0 = unsafe { sdot_i8x16(*acc0, act, w0) };
+                *acc1 = unsafe { sdot_i8x16(*acc1, act, w1) };
+                *acc2 = unsafe { sdot_i8x16(*acc2, act, w2) };
+                *acc3 = unsafe { sdot_i8x16(*acc3, act, w3) };
+            } else {
+                let ptr = unsafe { weight.values.as_ptr().add(weight_base) as *const i8 };
+                let w0 = unsafe { vld1q_s8(ptr) };
+                let w1 = unsafe { vld1q_s8(ptr.add(16)) };
+                let w2 = unsafe { vld1q_s8(ptr.add(32)) };
+                let w3 = unsafe { vld1q_s8(ptr.add(48)) };
+                *acc0 = unsafe { sdot_i8x16(*acc0, act, w0) };
+                *acc1 = unsafe { sdot_i8x16(*acc1, act, w1) };
+                *acc2 = unsafe { sdot_i8x16(*acc2, act, w2) };
+                *acc3 = unsafe { sdot_i8x16(*acc3, act, w3) };
+            }
         }
-        let mut correction = [0i32; KAI_SDOT_OUTPUTS];
-        let mut scales = [0.0f32; KAI_SDOT_OUTPUTS];
-        for lane in 0..KAI_SDOT_OUTPUTS {
-            let output = output_start + lane;
-            let idx = output * k_blocks + block;
-            correction[lane] = kai_qai8_correction(
-                activation,
-                weight.rhs_sums[idx],
-                weight.zero_point_offsets[idx] as i32,
-                block,
-            );
-            scales[lane] = weight.scales[idx];
-        }
-        let block_i32 = vaddq_s32(acc_i32, unsafe { vld1q_s32(correction.as_ptr()) });
-        let block_f32 = vcvtq_f32_s32(block_i32);
-        let scale = vmulq_n_f32(unsafe { vld1q_f32(scales.as_ptr()) }, activation.scale);
-        total = vaddq_f32(total, vmulq_f32(block_f32, scale));
+        let acc0 = vaddq_s32(acc0_even, acc0_odd);
+        let acc1 = vaddq_s32(acc1_even, acc1_odd);
+        let acc2 = vaddq_s32(acc2_even, acc2_odd);
+        let acc3 = vaddq_s32(acc3_even, acc3_odd);
+        let meta = meta_tile_base + block * KAI_SDOT_OUTPUTS;
+        let rhs = unsafe { weight.rhs_sums.as_ptr().add(meta) };
+        let zp = unsafe { weight.zero_point_offsets.as_ptr().add(meta) };
+        let scale = unsafe { weight.scales.as_ptr().add(meta) };
+        let centered_activation_sum =
+            activation.block_sums[block] - activation.zero_point * activation.block_counts[block];
+        let corr0 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs),
+                vmovl_s16(vld1_s16(zp)),
+            )
+        };
+        let corr1 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs.add(4)),
+                vmovl_s16(vld1_s16(zp.add(4))),
+            )
+        };
+        let corr2 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs.add(8)),
+                vmovl_s16(vld1_s16(zp.add(8))),
+            )
+        };
+        let corr3 = unsafe {
+            kai_qai8_correction_vec_neon(
+                activation.zero_point,
+                centered_activation_sum,
+                vld1q_s32(rhs.add(12)),
+                vmovl_s16(vld1_s16(zp.add(12))),
+            )
+        };
+        total0 = unsafe { kai_accumulate_block_neon(acc0, corr0, scale, activation.scale, total0) };
+        total1 = unsafe {
+            kai_accumulate_block_neon(acc1, corr1, scale.add(4), activation.scale, total1)
+        };
+        total2 = unsafe {
+            kai_accumulate_block_neon(acc2, corr2, scale.add(8), activation.scale, total2)
+        };
+        total3 = unsafe {
+            kai_accumulate_block_neon(acc3, corr3, scale.add(12), activation.scale, total3)
+        };
     }
     let mut out = [0.0f32; KAI_SDOT_OUTPUTS];
-    unsafe { vst1q_f32(out.as_mut_ptr(), total) };
+    unsafe {
+        vst1q_f32(out.as_mut_ptr(), total0);
+        vst1q_f32(out.as_mut_ptr().add(4), total1);
+        vst1q_f32(out.as_mut_ptr().add(8), total2);
+        vst1q_f32(out.as_mut_ptr().add(12), total3);
+    };
     out
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+#[inline(always)]
+unsafe fn kai_prefetch_l1(ptr: *const u8) {
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn kai_qai8_correction_vec_neon(
+    activation_zero_point: i32,
+    centered_activation_sum: i32,
+    rhs_sum: std::arch::aarch64::int32x4_t,
+    zero_point_offset: std::arch::aarch64::int32x4_t,
+) -> std::arch::aarch64::int32x4_t {
+    use std::arch::aarch64::*;
+
+    vaddq_s32(
+        vmulq_n_s32(rhs_sum, -activation_zero_point),
+        vmulq_n_s32(zero_point_offset, centered_activation_sum),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn kai_accumulate_block_neon(
+    acc: std::arch::aarch64::int32x4_t,
+    correction: std::arch::aarch64::int32x4_t,
+    scale: *const f32,
+    activation_scale: f32,
+    total: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    let block_i32 = vaddq_s32(acc, correction);
+    let block_f32 = vcvtq_f32_s32(block_i32);
+    let scale = vmulq_n_f32(unsafe { vld1q_f32(scale) }, activation_scale);
+    vaddq_f32(total, vmulq_f32(block_f32, scale))
 }
 
 fn prepack_n16_sdot_from_bytes(

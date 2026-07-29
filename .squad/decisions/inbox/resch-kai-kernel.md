@@ -120,3 +120,46 @@ Honest gate: still does not beat ORT, so the KAI path remains opt-in behind `ONN
 ### Remaining gap
 
 The next required step is not blind unrolling. We need Luba's hand-scheduled NEON microkernel advice applied at the exact KleidiAI granularity: N=4/8, K32 subblocks, minimal qsi4 unpack, enough independent SDOT issue without spilling, and prefetch only once the assembly schedule is stable. The Rust intrinsics loop is now threaded correctly but still not instruction-dense enough to reach ORT's ~50% roofline.
+
+## 2026-07-29 Luba N16 retile iteration
+
+Luba identified the main remaining IPC bottleneck in `d073dfa3`: the KAI path was still an N=4 ukernel with one `int32x4` SDOT dependency chain, so Oryon's ~3--4 cycle dotprod latency was not hidden.
+
+### Change
+
+Retiled the KAI packed SDOT path to N=16:
+
+- `KAI_SDOT_OUTPUTS=16` with tile-major RHS layout.
+- qsi4 group layout is now 16 outputs per K4: two 16-byte loads cover outputs 0--7 and 8--15; `zip1/zip2` produce four SDOT weight vectors for outputs 0--3, 4--7, 8--11, 12--15.
+- qsi8 uses the same N16 structure with four contiguous 16-byte signed-weight loads and no unpack.
+- Metadata is tile-major too: scales, RHS sums, and zero-point offsets are contiguous by block/lane, so the NEON path loads four-lane vectors instead of stack-building arrays.
+- Activation K4 words are precomputed once in the qA8dxp pack, removing `u32::from_le_bytes` from the hot group loop.
+- Split even/odd K groups into 8 int32 accumulator chains (two per N4 lane group) to increase SDOT latency hiding beyond the basic four-chain N16 form.
+- Added non-Apple aarch64 `prfm pldl1keep` about 512B ahead (16 qsi4 groups / 8 qsi8 groups); Apple remains prefetch-free to avoid a portability regression.
+
+### Validation
+
+Passed:
+
+- `cargo check -p onnx-runtime-ep-cpu --tests --quiet`
+- `cargo clippy -p onnx-runtime-ep-cpu --tests --quiet -- -D warnings`
+- `cargo test -p onnx-runtime-ep-cpu kai_sdot --quiet`
+- `cargo test -p onnx-runtime-ep-cpu arm64_kai --quiet`
+- `cargo test -p onnx-runtime-ep-cpu matmulnbits_8bit --quiet`
+- `cargo test -p onnx-runtime-ep-cpu matmulnbits --quiet`
+
+### Benchmarks
+
+Gated-on native, no explicit `ONNX_GENAI_CPU_DECODE_THREADS` (non-Apple ARM64 now defaults to 8 workers):
+
+| Model | Roofline | Before N16 | After N16 | After % roofline | ORT | ORT % roofline | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| qwen3-0.6b CPU-4 | 211 tok/s | 83.53 tok/s | 96.27 tok/s | 45.6% | 105.68 tok/s | 50.1% | +15%; still below ORT |
+| qwen2.5-0.5b CPU-4 | 344 tok/s | 94.15 tok/s | 142.60 tok/s | 41.5% | 184.48 tok/s | 53.6% | +51%; still below ORT |
+| qwen3-1.7b CPU-2 | 76.5 tok/s | 27.01 tok/s | 38.82 tok/s | 50.7% | 49.52 tok/s | 64.7% | +44%; still below ORT |
+
+Best individual qwen3-0.6b N16 run reached 103.44 tok/s, close to ORT, but median is 96.27 tok/s. Honest gate remains opt-in; do not enable by default yet.
+
+### Remaining gap
+
+N16/8-accumulator retile confirms Luba's latency diagnosis and recovers a large share of the gap, especially on qsi8-heavy models. The remaining ~9 tok/s gap to ORT on qwen3-0.6b likely needs a hand-scheduled assembly or `global_asm` ukernel to reduce register moves/LLVM scheduling noise and tune prefetch without extra front-end pressure. N32 remains a Snapdragon-only experiment, but should be guarded because the N=8/N16 generic Rust-unroll experiments showed register pressure can erase the latency-hiding gain.
