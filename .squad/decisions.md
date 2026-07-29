@@ -525,3 +525,222 @@ Merging and deleting the inbox files produces no git diff (expected, not a failu
 **By:** Ernie
 **What:** Added CUDA kernels and CPU-parity coverage for AffineGrid, BatchNormalization, Compress, DynamicQuantizeLinear, GlobalAveragePool, GlobalLpPool, GlobalMaxPool, and LpNormalization. Deferred CenterCropPad, Col2Im, ConvTranspose, GridSample, GroupNormalization, InstanceNormalization, LpPool, NonMaxSuppression, QLinearMatMul, Resize, Unique, and com.microsoft FusedAttention.
 **Why:** The selected operators form a reviewable low-risk batch around fixed-width transforms, channel-wise normalization, and block reductions. Heavy geometry, convolution, detection, and data-dependent operators need dedicated follow-up waves.
+
+
+### 2026-07-29: Native CUDA versus ORT CUDA decode standing
+**By:** Doug
+
+**What:** On commit `37d87e27c6272dc1ab7a44138c21318f23794b9f`, NVIDIA H200
+(GPU 0, ~143 GB, idle), CPU-pinned to core 1, steady greedy decode with the same
+prompt (`Explain what a transformer is in two sentences.`), 128 generated tokens,
+2 warmups, 3 measured runs, and 8 skipped decode tokens:
+
+| Foundry Local model | Native CUDA | ORT CUDA | Native/ORT | Directive |
+|---|---:|---:|---:|---|
+| Qwen2.5-7B Instruct int4 | 252.09 tok/s | 273.08 tok/s | 0.923x | **FAIL** |
+| Phi-4 Mini Instruct | 279.53 tok/s | 232.43 tok/s | 1.203x | **PASS** |
+| Qwen2.5-1.5B Instruct int4 | 563.49 tok/s | 433.81 tok/s | 1.299x | **PASS** |
+
+Qwen2.5-7B values are medians across two alternating benchmark groups. Native
+group medians were 252.37 and 251.80 tok/s; ORT medians were 274.64 and 271.52
+tok/s. Native is 20.995 tok/s (7.69%) slower than ORT and 16.53% below the
+historical ~302 tok/s native baseline. Within-group run spread was <=0.35 tok/s
+native and <=1.86 tok/s ORT. Generated text was coherent for both backends on all
+three models; native Qwen2.5-7B showed no garbled or repeated-token regression.
+
+Native beats ORT substantially on the smaller models, so the principal
+opportunity is model/shape-specific in the 7B int4 decode path, especially
+MatMulNBits memory traffic, kernel selection, and launch/capture overhead rather
+than a universal engine-loop problem. Native prefill was also much slower than
+ORT (Qwen2.5-7B ~66.6 ms versus ~11.5 ms), though prefill is excluded from the
+standing steady-decode comparison. A requested native trace was not emitted by
+the real-model flow, so detailed per-op attribution remains a benchmark-harness
+follow-up.
+
+Build:
+```bash
+cd /home/justinchu/onnx-genai
+source .cudaenv.sh
+CUDA_VISIBLE_DEVICES=0 taskset -c 1 cargo build --release \
+  -p onnx-genai-bench --bin profile_native \
+  --features bench-native,bench-ort,cuda
+```
+
+Run template (repeated with each model and `BACKEND=native`, then `ort`):
+```bash
+source /home/justinchu/onnx-genai/.cudaenv.sh
+export ONNX_GENAI_ORT_LIB="$ORT_ROOT/lib/libonnxruntime.so.1.27.0"
+CUDA_VISIBLE_DEVICES=0 taskset -c 1 \
+  /home/justinchu/onnx-genai/target/release/profile_native \
+  --model "$MODEL" --ep cuda --backend "$BACKEND" --steady \
+  --tokens 128 --warmups 2 --runs 3 --decode-skip 8 \
+  --prompt 'Explain what a transformer is in two sentences.'
+```
+
+Model paths:
+```text
+/home/justinchu/.foundry/cache/models/Microsoft/qwen2.5-7b-instruct-cuda-gpu-4/v4
+/home/justinchu/.foundry/cache/models/Microsoft/Phi-4-mini-instruct-cuda-gpu-5/v5
+/home/justinchu/.foundry/cache/models/Microsoft/qwen2.5-1.5b-instruct-cuda-gpu-4/v4
+```
+
+**Why:** The standing directive requires native CUDA EP decode to outperform ORT
+on Foundry Local models. Current main passes on Phi-4 Mini and Qwen2.5-1.5B but
+fails on the primary Qwen2.5-7B target, with a material regression from the
+historical native baseline.
+
+
+### 2026-07-29: Restore CUDA SiLU decomposition fusion
+**By:** Kuato
+**What:** Bisected the 302→252 tok/s regression to `598f8622` (#202), not KV capacity (`f0a4e7f1`), weight paging (`8bbf0332`), or compute-in-place (`fc262e6f`/`74d50f6e`). Restored CUDA-scoped `x * Sigmoid(x)` lowering and preserved the exported three-op fp16 rounding through the fused SwiGLU and MatMulNBits paths. Qwen2.5-7B improved 252.04→307.83 tok/s versus ORT 272.44; Phi-4-mini improved 279.54→314.91 versus ORT 231.85; Qwen2.5-1.5B improved 562.61→717.37 versus ORT 443.83. Fixed native token IDs are identical to pre-fix native IDs.
+**Why:** `598f8622` removed session-global `fuse_silu_patterns` while moving private fusions to provider scope, but restored SiLU decomposition only for CPU. CUDA stopped forming its tagged SwiGLU and paired gate/up MatMulNBits fusion: Qwen2.5-7B grew from 113 to 141 MatMulNBits calls and added 28 Sigmoid plus 56 Mul calls per forward. CUDA-owned lowering restores the intended fusion without exposing private ops to other providers; a marker selects an epilogue reproducing the original fp16 Sigmoid and Mul rounding exactly.
+
+
+### 2026-07-29: #377 explicit metadata fields
+
+**By:** Cohaagen
+
+**What:**
+
+New explicit inference-metadata fields that replace the remaining name-guessing
+sites tracked on #377 (after #380 / #382). Every field describes GRAPH
+STRUCTURE, never a model family. Mobius/export (Benny's workstream) must emit
+exactly these names/types so the runtime never falls back to a name guess.
+
+1. `pipeline.strategy.inner_embedding_output` — `Option<String>` (non-empty).
+   - Replaces: `nested_autoregressive.rs::resolve_inner_embedding_output`, which
+     picked the inner decoder's per-code embedding output by guessing "the sole
+     output whose name does not contain `logits` and is not a present-KV port"
+     (`to_ascii_lowercase().contains("logits")` + `is_present_output`).
+   - Semantics: the inner (code-predictor) decoder output port whose value is
+     threaded back into the next inner step's `inputs_embeds` seed. Declared on
+     the `nested_autoregressive` strategy (top-level or composite stage),
+     alongside `outer`/`inner`/`num_code_groups`. Absent ⇒ actionable ERROR
+     naming `pipeline.strategy.inner_embedding_output`.
+
+2. `model.io.static_cache` — `Option<StaticCacheIoSpec>`.
+   New struct `StaticCacheIoSpec`:
+   - `write_indices_input: String` (non-empty) — scatter write-position input
+     (was hardcoded `"write_indices"`).
+   - `kv_sequence_length_input: String` (non-empty) — non-pad KV sequence-length
+     input (was hardcoded `"nonpad_kv_seqlen"`).
+   - `key_cache_inputs: Vec<String>` / `value_cache_inputs: Vec<String>` —
+     per-layer static K/V cache buffer inputs, positional per layer (were
+     hardcoded `"key_cache.{i}"` / `"value_cache.{i}"`).
+   - `key_cache_outputs: Vec<String>` / `value_cache_outputs: Vec<String>` —
+     per-layer updated K/V cache outputs, positionally paired with the inputs
+     (were hardcoded `"updated_key_cache.{i}"` / `"updated_value_cache.{i}"`).
+   - Replaces: `decode/io.rs::detect_static_cache`, which selected the
+     TensorScatter static-cache ABI by hardcoded port names (int vectors are
+     shape-indistinguishable, so shape alone cannot disambiguate). When
+     `model.io.static_cache` is present it is authoritative and name-agnostic;
+     the four cache lists must be equal length and pair positionally. Declared
+     but inconsistent (unequal lengths, missing ports) ⇒ ERROR naming the key.
+
+3. (compatibility emission, no schema field) encoder prompt-input role.
+   - Replaces: `compatibility.rs:1152` `encoder_input_field.ends_with("audio_features")`.
+   - The role (`audio_features_input` vs `token_input`) is now taken directly
+     from WHICH explicit genai-config field the exporter declared
+     (`model.encoder.inputs.audio_features` vs `.input_ids`), captured in the
+     existing match, never re-derived by string-matching the port name.
+
+**Still name-based after this change (documented, needs contract before removal
+— unchanged from #382's deferral, NOT regressed here):**
+- Paged-KV bridge geometry (`engine/kv_bridge.rs`): key/value substring +
+  `kv_layer_index` + `matching_past_input`. Made metadata-authoritative when
+  `model.io.kv_inputs`/`kv_outputs` are declared; name matching remains only for
+  the no-metadata path. CUDA-only, correctness-critical (mis-resolved port
+  corrupts generation), no CPU fixture — full removal deferred with the paged
+  contract.
+- `decode_contract.rs` KV name convention (`kv_suffix`, `KvNamingConvention`):
+  still consumed by the off-limits #99 speculative proposers; cannot be deleted
+  from this workstream.
+
+**Why:** Justin's #377 directive — ALL inference/pipeline metadata except io
+SHAPE must be EXPLICIT and GENERAL; only io-shape may disambiguate. Name
+guessing / historical-name fallback must be replaced by explicit metadata plus a
+clear ERROR (naming the exact missing key) when the required metadata is absent.
+These fields let the exporter state graph structure directly so the runtime
+never interprets a graph port name.
+
+---
+
+**SHIPPED (2026-07-29, branch `squad/377-explicit-metadata`):** All three fields
+above landed exactly as specified — `PipelineStrategy.inner_embedding_output:
+Option<String>`, `ModelIoSpec.static_cache: Option<StaticCacheIoSpec>` (with
+`write_indices_input`, `kv_sequence_length_input`, `key_cache_inputs`,
+`value_cache_inputs`, `key_cache_outputs`, `value_cache_outputs`), and the
+encoder-role emission change (no new schema field). Committed regenerated
+`schema/inference_metadata.schema.json`. Benny/mobius: emit these names verbatim.
+
+---
+
+### 2026-07-29: #377 follow-up — closed remaining name fallbacks (paged-KV, nested-AR logits)
+**By:** Cohaagen
+**What:** Per Justin's "don't defer", removed the last two non-off-limits
+name-guessing fallbacks. NO new schema fields were needed — both reuse existing
+`ModelIoSpec` ports.
+
+1. **Paged-KV bridge geometry (`engine/kv_bridge.rs`) — now fully name-free.**
+   - Removed the name-based `is_present_output` / `to_ascii_lowercase().contains("key"|"value")`
+     / `kv_layer_index` / `matching_past_input` resolution.
+   - `infer_kv_model_info(session, io, page_size, dtype)` now pairs layers purely
+     from explicit `model.io.kv_inputs`/`kv_outputs` (equal-length, positional
+     per-layer `[key, value]`) via the pure, session-free, unit-tested
+     `pair_kv_ports` helper. Extracted `resolve_kv_layers`, `require_present_kv_output`,
+     `require_kv_input`.
+   - No metadata ⇒ **`Ok(None)`** (build no paged cache), never a name/shape guess:
+     a growing paged present output is shape-indistinguishable from a static-cache
+     buffer or a logits/hidden output. KV correctness for the decode loop is
+     enforced independently by the decode-path resolver (`decode::resolved_io`),
+     which already fails closed naming `model.io.kv_inputs`/`kv_outputs`.
+   - Declaring only one of `kv_inputs`/`kv_outputs` ⇒ ERROR naming both keys.
+
+2. **Nested-AR `logits` output — explicit, no `contains("logits")` guess.**
+   - `named_output` reduced to exact-match; the `contains` substring fallback removed.
+   - `NestedAutoregressivePlan` now carries `outer_logits_output` / `inner_logits_output`
+     from each component's explicit `models.{component}.io.logits_output`
+     (`require_component_logits_output` errors naming the key when absent/empty).
+
+3. **Decode-state I/O threading (completes the mission end-to-end).** The nested-AR
+   loop resolved the talker/code_predictor from tensor SHAPE (`DecodeState::new`,
+   io=None). Now threads each component's explicit `io` via
+   `DecodeState::new_with_io` (new `NestedAutoregressivePlan.outer_io`/`inner_io`).
+   Fixtures updated to declare the required explicit ports (`token_input` /
+   `sequence_source: inputs_embeds` + `inputs_embeds_input`, `position_ids_input`,
+   `logits_output`, `kv_inputs`/`kv_outputs`): `tiny-tts-nested`,
+   `tiny-tts-nested-preembed`, `tiny-tts-nested-prefill`, plus the inline
+   `pipeline_executor` and `optional_modality_pipeline_e2e` test fixtures.
+
+**Only remaining name path:** `decode_contract.rs` KV name convention
+(`kv_suffix`, `name_contains_past_key_value`, `KvNamingConvention`) — consumed
+ONLY by the off-limits #99 speculative-decoding proposers; left intact per scope.
+
+**Why:** Justin's #377 directive — no deferral; explicit metadata + actionable
+errors, only io-SHAPE may disambiguate. Paged-KV pairing cannot be disambiguated
+by shape, so it is metadata-only with a clear error, and the paged resolver is
+now name-free.
+
+
+### 2026-07-29: Static-cache scatter ABI is explicit-or-error (no name-guessing)
+**By:** Matthias
+**What:** Removed `detect_static_cache_by_convention` from `crates/onnx-genai-ort/src/decode/io.rs`. A TensorScatter static-cache graph is now bound ONLY from `model.io.static_cache`; a scatter-shaped graph without that block fails closed with an error naming `model.io.static_cache` instead of binding by the hardcoded `write_indices`/`nonpad_kv_seqlen`/`key_cache.{i}`/`updated_key_cache.{i}` ports. In-repo static-cache fixtures (`tests/fixtures/tiny-llm-scatter`, engine `model-package-cpu`) now declare the block explicitly.
+**Why:** Completes #377 for the static-cache path (Quaid's PR #412 REQUEST-CHANGES blocker): the scatter control ports are shape-indistinguishable integers, so per #377 they must be explicit or an error — never inferred from port names. `StaticCacheAbi::classify` (the explicit path) stays authoritative and name-agnostic; #99 specdec `KvNamingConvention` is untouched. Exporters/authors emitting static-cache graphs MUST now declare `model.io.static_cache` (write_indices_input, kv_sequence_length_input, and equal-length positionally-paired key/value cache input/output lists).
+
+
+### 2026-07-29: Registry-backed model warmup
+**By:** Lull
+**What:** Added an opt-in `warmup` per-model setting and `POST /v1/admin/models/{id}/warm`. Both use `ModelRegistry::warmup`, which performs one deterministic generated token and records a successful warmup idempotently.
+**Why:** The first generation initializes lazy runtime allocations; sharing the registry method keeps configured and on-demand warmups identical while allowing failures to be retried without corrupting registry state.
+
+
+### 2026-07-29: Preserve warmup error categories at the admin boundary
+**By:** Rachael
+**What:** `ModelRegistry::warmup` now returns typed absent-model, registry, and runtime-failure errors; the admin warm endpoint maps them to 404, 500, and 500 respectively.
+**Why:** A loaded model's failed warmup must not be reported as an unloaded-model 404.
+
+
+### 2026-07-29: CPU PackedVarlenAttention shares the scalar SDPA core
+**By:** Johnny
+**What:** Register `pkg.nxrt::PackedVarlenAttention` on the CPU EP with the CUDA v1 schema, while factoring packed segment execution into a helper shared with CPU `VarlenAttention`.
+**Why:** Sharing f32 accumulation, split-sqrt scaling, softcap, GQA grouping, and tail-aligned causal masking prevents CPU packed and padded-entry kernels from drifting numerically.
