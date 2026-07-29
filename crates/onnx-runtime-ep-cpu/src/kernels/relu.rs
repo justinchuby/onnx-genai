@@ -28,6 +28,8 @@
 
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
+#[cfg(feature = "mlas")]
+use onnx_runtime_ir::DataType;
 use onnx_runtime_ir::Node;
 
 use super::check_arity;
