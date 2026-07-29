@@ -196,5 +196,5 @@ mod tensor;
 use tensor::device_logits_to_host_value;
 use tensor::{
     allocate_static_cache_buffers, clone_value_to_owned, empty_past_value, gather_logits_rows,
-    is_logits_output, to_f32_logits, zeroed_value,
+    to_f32_logits, zeroed_value,
 };

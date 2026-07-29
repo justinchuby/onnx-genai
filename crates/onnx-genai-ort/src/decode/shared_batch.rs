@@ -34,14 +34,141 @@ pub struct BatchedSharedBufferDecodeSession<'a> {
     max_len: usize,
     row_lens: Vec<usize>,
     active: Vec<bool>,
-    has_position_ids: bool,
+    token_input: String,
+    attention_mask_input: String,
+    position_ids_input: Option<String>,
+    logits_output: String,
+}
+
+/// Resolved decode-step graph-port roles for a shared-buffer batched session.
+///
+/// Every role is selected from explicit `model.io` metadata or an unambiguous
+/// tensor-shape signal; graph port names are never interpreted.
+#[derive(Debug)]
+struct SharedBufferRoles {
+    token_input: String,
+    attention_mask_input: String,
+    position_ids_input: Option<String>,
+    logits_output: String,
+}
+
+impl SharedBufferRoles {
+    fn resolve(
+        session: &Session,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        kv_pairs: &[KvPair],
+    ) -> Result<Self> {
+        Self::resolve_from_ports(session.inputs(), session.outputs(), io, kv_pairs)
+    }
+
+    fn resolve_from_ports(
+        inputs: &[TensorInfo],
+        outputs: &[TensorInfo],
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        kv_pairs: &[KvPair],
+    ) -> Result<Self> {
+        use crate::io_roles::{
+            is_rank_one_or_two_sequence, is_rank_one_to_three_output, resolve_port,
+        };
+        let input_excluded = kv_pairs
+            .iter()
+            .map(|pair| pair.past.as_str())
+            .chain(
+                [
+                    io.and_then(|io| io.attention_mask_input.as_deref()),
+                    io.and_then(|io| io.position_ids_input.as_deref()),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .collect::<std::collections::HashSet<_>>();
+        let resolve_input =
+            |declared: Option<&str>, role: &str, structural: fn(&TensorInfo) -> bool| {
+                resolve_port(inputs, declared, role, |tensor| {
+                    !input_excluded.contains(tensor.name.as_str()) && structural(tensor)
+                })
+                .map_err(OrtError::InvalidArgument)
+                .map(|port| port.map(|port| port.name))
+            };
+        let never = |_: &TensorInfo| false;
+        let token_input = resolve_input(
+            io.and_then(|io| io.token_input.as_deref()),
+            "model.io.token_input",
+            is_rank_one_or_two_sequence,
+        )?
+        .ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "cannot resolve token input from tensor shape; declare model.io.token_input".into(),
+            )
+        })?;
+        // The attention mask is shape-ambiguous against other integer sequence
+        // inputs, so it is only ever taken from explicit metadata.
+        let attention_mask_input = resolve_input(
+            io.and_then(|io| io.attention_mask_input.as_deref()),
+            "model.io.attention_mask_input",
+            never,
+        )?
+        .ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "shared-buffer batching derives each row's KV length from an attention mask; \
+                 declare model.io.attention_mask_input"
+                    .into(),
+            )
+        })?;
+        let position_ids_input = resolve_input(
+            io.and_then(|io| io.position_ids_input.as_deref()),
+            "model.io.position_ids_input",
+            never,
+        )?;
+        let present_excluded = kv_pairs
+            .iter()
+            .map(|pair| pair.present.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let logits_output = resolve_port(
+            outputs,
+            io.and_then(|io| io.logits_output.as_deref()),
+            "model.io.logits_output",
+            |tensor| {
+                !present_excluded.contains(tensor.name.as_str())
+                    && is_rank_one_to_three_output(tensor)
+            },
+        )
+        .map_err(OrtError::InvalidArgument)?
+        .map(|port| port.name)
+        .ok_or_else(|| {
+            OrtError::InvalidArgument(
+                "cannot resolve logits output from tensor shape; declare model.io.logits_output"
+                    .into(),
+            )
+        })?;
+        Ok(Self {
+            token_input,
+            attention_mask_input,
+            position_ids_input,
+            logits_output,
+        })
+    }
 }
 
 impl<'a> BatchedSharedBufferDecodeSession<'a> {
     /// Create a batched share-buffer decode session with all rows active at
     /// cursor 0. KV buffers are allocated once as `[batch, kv_heads, max_len,
     /// head_dim]` on the session's device allocator when available.
+    ///
+    /// Graph-port roles (token, attention-mask, position, logits) and the
+    /// past/present KV pairs are resolved from explicit `model.io` metadata or an
+    /// unambiguous tensor-shape signal; graph port names are never interpreted.
     pub fn new(session: &'a Session, options: SharedBufferBatchOptions) -> Result<Self> {
+        Self::new_with_io(session, options, None)
+    }
+
+    /// Create a batched share-buffer decode session using declarative
+    /// `model.io` graph-port roles when present.
+    pub fn new_with_io(
+        session: &'a Session,
+        options: SharedBufferBatchOptions,
+        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    ) -> Result<Self> {
         let batch_size = usize::try_from(options.batch_size).map_err(|_| {
             OrtError::InvalidArgument(format!(
                 "batch_size must be positive, got {}",
@@ -58,27 +185,15 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
                 "shared-buffer batch requires max_len > 0".into(),
             ));
         }
-        let kv_pairs = infer_kv_pairs(session, None)?;
+        let kv_pairs = infer_kv_pairs(session, io)?;
         if kv_pairs.is_empty() {
             return Err(OrtError::InvalidArgument(
-                "model exposes no past/present KV pairs for shared-buffer batching".into(),
-            ));
-        }
-        let has_position_ids = session.inputs().iter().any(|input| {
-            let lower = input.name.to_ascii_lowercase();
-            lower == "position_ids" || lower.ends_with(".position_ids")
-        });
-        let has_attention_mask = session.inputs().iter().any(|input| {
-            let lower = input.name.to_ascii_lowercase();
-            lower == "attention_mask" || lower.ends_with(".attention_mask")
-        });
-        if !has_attention_mask {
-            return Err(OrtError::InvalidArgument(
-                "shared-buffer batching requires an attention_mask input to signal per-row \
-                 sequence lengths"
+                "shared-buffer batching requires declared past/present KV pairs; declare \
+                 model.io.kv_inputs and model.io.kv_outputs"
                     .into(),
             ));
         }
+        let roles = SharedBufferRoles::resolve(session, io, &kv_pairs)?;
         let mut this = Self {
             session,
             binding: IoBinding::new(session)?,
@@ -89,7 +204,10 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
             max_len: options.max_len,
             row_lens: vec![0; batch_size],
             active: vec![true; batch_size],
-            has_position_ids,
+            token_input: roles.token_input,
+            attention_mask_input: roles.attention_mask_input,
+            position_ids_input: roles.position_ids_input,
+            logits_output: roles.logits_output,
         };
         this.allocate_shared_buffers()?;
         Ok(this)
@@ -189,7 +307,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         let mut advances = vec![false; self.batch_size];
         for (active_index, &row) in rows.iter().enumerate() {
             full_input[row] = next_token_ids[active_index];
-            if self.has_position_ids && active_index < position_ids.len() {
+            if self.position_ids_input.is_some() && active_index < position_ids.len() {
                 full_position[row] = position_ids[active_index];
             }
             advances[row] = true;
@@ -301,7 +419,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         let attention_mask_value = Value::from_slice_i64(&mask, &[batch_i64, width_i64])
             .map_err(|e| OrtError::InvalidArgument(format!("build attention_mask value: {e}")))?;
 
-        let position_ids_value = if self.has_position_ids {
+        let position_ids_value = if self.position_ids_input.is_some() {
             let flat = if position_ids.len() == batch {
                 position_ids.to_vec()
             } else {
@@ -315,14 +433,13 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
         let bind_span = crate::prof_span!("ort.bind_inputs");
         self.binding.clear()?;
         for input in self.session.inputs() {
-            let lower = input.name.to_ascii_lowercase();
-            if lower == "input_ids" || lower.ends_with(".input_ids") {
+            if input.name == self.token_input {
                 self.binding
                     .bind_input(&input.name, &input_ids_value)
                     .map_err(|e| {
                         OrtError::InvalidArgument(format!("bind input_ids '{}': {e}", input.name))
                     })?;
-            } else if lower == "attention_mask" || lower.ends_with(".attention_mask") {
+            } else if input.name == self.attention_mask_input {
                 self.binding
                     .bind_input(&input.name, &attention_mask_value)
                     .map_err(|e| {
@@ -332,7 +449,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
                         ))
                     })?;
             } else if let Some(position_ids_value) = position_ids_value.as_ref()
-                && (lower == "position_ids" || lower.ends_with(".position_ids"))
+                && self.position_ids_input.as_deref() == Some(input.name.as_str())
             {
                 self.binding
                     .bind_input(&input.name, position_ids_value)
@@ -408,7 +525,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
             .map_err(|e| OrtError::InvalidArgument(format!("extract batched outputs: {e}")))?;
         let mut logits = None;
         for (name, value) in self.session.output_names().iter().zip(outputs) {
-            if is_logits_output(name) {
+            if name == &self.logits_output {
                 logits = value;
                 break;
             }
@@ -472,5 +589,113 @@ impl<'a> BatchedDecodeSession<'a> for BatchedSharedBufferDecodeSession<'a> {
     }
     fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
         BatchedSharedBufferDecodeSession::step_active(self, next_token_ids, position_ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DataType, TensorInfo};
+    use onnx_genai_metadata::ModelIoSpec;
+
+    fn tensor(name: &str, dtype: DataType, shape: &[i64]) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype,
+            shape: shape.to_vec(),
+        }
+    }
+
+    fn kv_pair(past: &str, present: &str) -> KvPair {
+        KvPair {
+            past: past.to_string(),
+            present: present.to_string(),
+            input: tensor(past, DataType::Float32, &[1, 2, 4, 8]),
+            seq_axis: 2,
+        }
+    }
+
+    fn io_with_roles() -> ModelIoSpec {
+        serde_json::from_str(
+            r#"{
+                "token_input": "opaque_tokens",
+                "attention_mask_input": "opaque_mask",
+                "position_ids_input": "opaque_positions",
+                "logits_output": "opaque_scores"
+            }"#,
+        )
+        .expect("io spec")
+    }
+
+    /// Non-standard port names must resolve purely from explicit metadata; graph
+    /// port names are never interpreted.
+    #[test]
+    fn explicit_metadata_resolves_non_standard_names() {
+        let inputs = vec![
+            tensor("opaque_tokens", DataType::Int64, &[-1, -1]),
+            tensor("opaque_mask", DataType::Int64, &[-1, -1]),
+            tensor("opaque_positions", DataType::Int64, &[-1, -1]),
+            tensor("layer0.past", DataType::Float32, &[1, 2, 4, 8]),
+        ];
+        let outputs = vec![
+            tensor("opaque_scores", DataType::Float32, &[-1, -1, 32]),
+            tensor("layer0.present", DataType::Float32, &[1, 2, 4, 8]),
+        ];
+        let pairs = vec![kv_pair("layer0.past", "layer0.present")];
+        let io = io_with_roles();
+        let roles =
+            SharedBufferRoles::resolve_from_ports(&inputs, &outputs, Some(&io), &pairs).unwrap();
+        assert_eq!(roles.token_input, "opaque_tokens");
+        assert_eq!(roles.attention_mask_input, "opaque_mask");
+        assert_eq!(
+            roles.position_ids_input.as_deref(),
+            Some("opaque_positions")
+        );
+        assert_eq!(roles.logits_output, "opaque_scores");
+    }
+
+    /// A single unambiguous rank-two integer sequence input and a single
+    /// score-shaped output resolve by shape, with no attention mask declared.
+    #[test]
+    fn unique_shape_resolves_without_names_or_metadata() {
+        let inputs = vec![
+            tensor("weird_name", DataType::Int64, &[-1, -1]),
+            tensor("kv.past", DataType::Float32, &[1, 2, 4, 8]),
+        ];
+        let outputs = vec![
+            tensor("scores", DataType::Float32, &[-1, -1, 32]),
+            tensor("kv.present", DataType::Float32, &[1, 2, 4, 8]),
+        ];
+        let pairs = vec![kv_pair("kv.past", "kv.present")];
+        // The attention mask is required for shared-buffer batching and is never
+        // shape-resolved, so an absent declaration is a clear error.
+        let error =
+            SharedBufferRoles::resolve_from_ports(&inputs, &outputs, None, &pairs).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("model.io.attention_mask_input"),
+            "{error:?}"
+        );
+    }
+
+    /// Multiple shape-ambiguous integer sequence inputs must fail with an
+    /// actionable error naming the metadata key to declare.
+    #[test]
+    fn ambiguous_token_input_requires_metadata() {
+        let inputs = vec![
+            tensor("input_ids", DataType::Int64, &[-1, -1]),
+            tensor("attention_mask", DataType::Int64, &[-1, -1]),
+            tensor("kv.past", DataType::Float32, &[1, 2, 4, 8]),
+        ];
+        let outputs = vec![
+            tensor("logits", DataType::Float32, &[-1, -1, 32]),
+            tensor("kv.present", DataType::Float32, &[1, 2, 4, 8]),
+        ];
+        let pairs = vec![kv_pair("kv.past", "kv.present")];
+        let error =
+            SharedBufferRoles::resolve_from_ports(&inputs, &outputs, None, &pairs).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("model.io.token_input"),
+            "{error:?}"
+        );
     }
 }

@@ -14,6 +14,12 @@ use std::time::Instant;
 use onnx_genai_engine::{Engine, EngineConfig, GeneratePrompt, GenerateRequest};
 use onnx_genai_ort::{SessionOptions, ep_selection};
 
+fn tiny_shared_buffer_fixture() -> anyhow::Result<PathBuf> {
+    Ok(Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm-sharedbuffer")
+        .canonicalize()?)
+}
+
 fn shared_buffer_model_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("ONNX_GENAI_SHARED_BUFFER_MODEL") {
         let path = PathBuf::from(dir);
@@ -32,12 +38,44 @@ fn cuda_engine(model_dir: &Path) -> anyhow::Result<Engine> {
     )
 }
 
+fn deterministic_cpu_engine(model_dir: &Path) -> anyhow::Result<Engine> {
+    Engine::from_dir_with_session_options(
+        model_dir,
+        EngineConfig::default(),
+        SessionOptions::default().with_intra_op_threads(1),
+    )
+}
+
 fn token_request(tokens: Vec<u32>, max_new_tokens: usize) -> GenerateRequest {
     let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(tokens));
     request.options.max_new_tokens = max_new_tokens;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
     request
+}
+
+/// The engine must pass the fixture's declarative `model.io` KV pairs into the
+/// shared-buffer session. Without that wiring, session construction reports
+/// that no past/present KV pairs were declared before any decode step can run.
+#[test]
+fn cpu_shared_buffer_continuous_batch_uses_declared_kv_pairs() -> anyhow::Result<()> {
+    let fixture = tiny_shared_buffer_fixture()?;
+    let requests = vec![
+        token_request(vec![4, 5], 3),
+        token_request(vec![6, 7, 8], 2),
+    ];
+
+    let expected = requests
+        .iter()
+        .cloned()
+        .map(|request| deterministic_cpu_engine(&fixture)?.generate(request))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut engine = deterministic_cpu_engine(&fixture)?;
+    let actual = engine.run_continuous_batch(requests, 2)?;
+
+    assert_eq!(actual, expected);
+    Ok(())
 }
 
 /// Continuous batching over a shared-buffer model must match running each
