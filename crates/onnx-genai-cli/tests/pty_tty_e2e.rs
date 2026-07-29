@@ -181,9 +181,13 @@ mod pty_tty {
     // ONLCR flag maps every `\n` → `\r\n`).  A double CRLF (`\r\n\r\n`)
     // would be the blank-line defect this code path was introduced to prevent.
     //
-    // The test is most discriminating when the model output ends with `\n`
-    // (buggy "always add" code produces `\r\n\r\n`).  It also catches the
-    // "never add" regression in the opposite case (assertion on `ends_with
+    // Coverage note: the tiny-llm fixture emits `tok22tok22tok20<eos>` with no
+    // trailing `\n`, so `needs_trailing_newline` is always `true` here and the
+    // "skip when already ends with \n" branch is never exercised by this test.
+    // That branch — and the predicate as a whole — is covered by the unit tests
+    // in `output.rs::tests::tty_trailing_newline_predicate_covers_all_cases`.
+    // This test is the integration proof that the "add" path is wired to a real
+    // terminal; it catches a "never add" regression (assertion on `ends_with
     // \r\n` would fail).
     // ─────────────────────────────────────────────────────────────────────────
     #[test]

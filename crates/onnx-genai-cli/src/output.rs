@@ -134,6 +134,18 @@ fn budget_cap_notice(cap: GenerationBudgetCap) -> String {
     )
 }
 
+/// Whether a TTY streaming reply needs a trailing newline added by the caller.
+///
+/// Returns `true` when the reply is non-empty **and** its last character is
+/// not `\n`.  Extracted from `run_generation_turn` so the decision is directly
+/// unit-testable without a full generate pipeline or a real terminal.
+///
+/// The piped path always emits an unconditional newline (preserving historical
+/// byte-stable behaviour for scripts); this predicate is only for the TTY path.
+fn needs_trailing_newline(output: &str) -> bool {
+    !output.is_empty() && !output.ends_with('\n')
+}
+
 fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
     show_stats && !show_profile
 }
@@ -251,7 +263,7 @@ pub(super) fn run_generation_turn(
         print!("\x1b[0m");
         let _ = io::stdout().flush();
     }
-    let output_needs_trailing_newline = !output.is_empty() && !output.ends_with('\n');
+    let output_needs_trailing_newline = needs_trailing_newline(&output);
     if let Some(live) = live {
         live.finish(output_needs_trailing_newline)?;
     } else if stream {
@@ -338,6 +350,40 @@ mod tests {
         assert!(should_emit_stats_line(true, false));
         assert!(!should_emit_stats_line(true, true));
         assert!(!should_emit_stats_line(false, false));
+    }
+
+    /// `needs_trailing_newline` is the predicate that determines whether the
+    /// TTY streaming path adds a `\n` after the reply.  It must return `true`
+    /// exactly when the output would leave the cursor in the middle of a line —
+    /// that is, when the output is non-empty **and** does not already end with
+    /// a newline.  Every case is testable in isolation because the predicate
+    /// is a pure function with no I/O dependency.
+    ///
+    /// The PTY integration test (`pty_tty_e2e.rs`) confirms that this predicate
+    /// is wired to a real terminal, but it cannot distinguish the conditional
+    /// from an unconditional `println!()` for the current tiny-llm fixture
+    /// (which never emits a trailing `\n`).  These unit tests close that gap.
+    #[test]
+    fn tty_trailing_newline_predicate_covers_all_cases() {
+        // Normal reply with no trailing newline: cursor is mid-line → needs one.
+        assert!(needs_trailing_newline("hello world"));
+
+        // Reply that already ends with \n: cursor is at a new line → no extra.
+        // This is the case the conditional prevents a visible blank line for.
+        assert!(!needs_trailing_newline("hello world\n"));
+
+        // Empty output (e.g. --max-new-tokens 0): nothing to terminate.
+        assert!(!needs_trailing_newline(""));
+
+        // Multi-line reply ending with \n — still no extra newline needed.
+        assert!(!needs_trailing_newline("line one\nline two\n"));
+
+        // Reply ending with \n followed by trailing spaces: the last character
+        // is not \n, so the cursor is mid-line and a newline is required.
+        assert!(needs_trailing_newline("hello\n "));
+
+        // Newline is not the last character even if one appears inside.
+        assert!(needs_trailing_newline("line one\nno newline at end"));
     }
 
     /// The stats format is determined by stderr's terminal state, not stdout's.
