@@ -66,6 +66,7 @@ pub use graph::Graph;
 pub use graph_view::{ConsumerUse, FrozenGraph, GraphView, GraphViewCache, NodeIndex, ValueIndex};
 pub use layout::{
     MemoryFormat, TensorLayout, broadcast_shapes, compute_contiguous_strides, is_contiguous,
+    is_dense,
 };
 pub use node::{Attribute, Node, NodeId, RUNTIME_DOMAIN};
 pub use shape::{

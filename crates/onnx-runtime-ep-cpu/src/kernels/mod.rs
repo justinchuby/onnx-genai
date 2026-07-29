@@ -42,6 +42,7 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+pub mod dense_elementwise;
 pub mod dropout;
 pub mod elementwise;
 pub mod expand;
