@@ -2200,6 +2200,7 @@ dependencies = [
  "ctrlc",
  "image",
  "libc",
+ "nix",
  "onnx-genai",
  "onnx-genai-engine",
  "onnx-genai-server",

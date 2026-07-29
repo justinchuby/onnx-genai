@@ -31,10 +31,13 @@
 
 #[cfg(unix)]
 mod pty_tty {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::io::Read;
     use std::os::fd::OwnedFd;
+    use std::os::unix::io::AsFd;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
     use nix::pty::{OpenptyResult, openpty};
     use nix::unistd::dup;
@@ -56,14 +59,36 @@ mod pty_tty {
     }
 
     /// Drain all bytes from a PTY master until EIO (the slave side is fully
-    /// closed) or EOF.  Intended to run in a background thread so the child
-    /// process is never blocked on a full PTY write buffer.
+    /// closed) or EOF, with a 30-second timeout.
+    ///
+    /// The timeout prevents a child that never closes the slave from blocking
+    /// the test runner indefinitely.  When the timeout fires the function
+    /// returns whatever bytes were collected; the test will then fail on its
+    /// own assertions rather than hanging the CI job for hours.
     fn drain_pty_master(master: OwnedFd) -> Vec<u8> {
-        // Convert to a File so we can call Read::read without unsafe.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut file: std::fs::File = master.into();
         let mut buf = [0u8; 4096];
         let mut collected = Vec::new();
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // poll() with a deadline instead of blocking read() so a child
+            // that never exits cannot block the test harness forever.
+            let ready = {
+                let borrowed = file.as_fd();
+                let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+                poll(
+                    &mut fds,
+                    PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX),
+                )
+                .unwrap_or(0)
+            };
+            if ready == 0 {
+                break; // timeout
+            }
             match file.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => collected.extend_from_slice(&buf[..n]),
@@ -98,7 +123,7 @@ mod pty_tty {
         let slave_stdin = dup(&slave).expect("dup must succeed");
         let slave_stdout = slave;
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+        let child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
             .arg("generate")
             .arg(text_model())
             .arg("--raw")
@@ -167,7 +192,7 @@ mod pty_tty {
         let slave_stdin = dup(&slave).expect("dup must succeed");
         let slave_stdout = slave;
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
+        let child = Command::new(env!("CARGO_BIN_EXE_onnx-genai"))
             .arg("generate")
             .arg(text_model())
             .arg("--raw")
