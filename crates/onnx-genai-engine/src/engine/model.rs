@@ -37,9 +37,28 @@ pub struct Engine {
     /// by the server's fallback driver in this first milestone.
     #[cfg(feature = "native-backend")]
     pub(crate) native_session: Option<crate::native_decode::NativeDecodeSession>,
-    /// Persistent native session state for incremental KV reuse across turns.
+    /// Multi-session native state: per-session token history keyed by session id.
+    /// The active session (whose KV is loaded in `native_session`) is tracked by
+    /// `native_active_session`. When switching, the engine re-prefills from the
+    /// target session's token history.
     #[cfg(feature = "native-backend")]
-    pub(crate) native_session_state: Option<NativeSessionState>,
+    pub(crate) native_sessions: HashMap<SessionId, NativeSessionState>,
+    /// Which native session currently has its KV state loaded in `native_session`.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_active_session: Option<SessionId>,
+    /// Monotonic counter for native session id generation.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_session_counter: u64,
+    /// Maximum concurrent native sessions before LRU eviction.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_max_sessions: usize,
+    /// Maximum total bytes for native session KV caches.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_kv_budget_bytes: u64,
+    /// Implicit "default" native session used by the stateless `generate()` path
+    /// for transparent KV reuse.
+    #[cfg(feature = "native-backend")]
+    pub(crate) native_default_session: Option<SessionId>,
     /// Native shared-KV proposer loaded from the same metadata contract.
     #[cfg(feature = "native-backend")]
     pub(crate) native_shared_kv_proposer: Option<NativeSharedKvProposerModel>,
@@ -92,6 +111,11 @@ unsafe impl Send for Engine {}
 pub(crate) struct NativeSessionState {
     /// Full token history of this session (prompt + generated tokens from all turns).
     pub(crate) tokens: Vec<TokenId>,
+    /// Monotonically increasing access counter for LRU eviction.
+    pub(crate) last_access: u64,
+    /// Estimated KV memory bytes for this session (computed from model geometry
+    /// and token count).
+    pub(crate) estimated_kv_bytes: u64,
 }
 
 pub(crate) struct MtpModel {

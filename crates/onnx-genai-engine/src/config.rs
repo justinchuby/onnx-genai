@@ -580,6 +580,13 @@ pub struct EngineConfig {
     /// so its outputs are kept, keyed by the exact bytes that produced them.
     /// `0` disables the cache and every turn recomputes.
     pub pipeline_cache_bytes: u64,
+    /// Maximum number of concurrent native sessions before LRU eviction.
+    /// Defaults to 8. Set to 0 to disable the limit.
+    pub native_max_sessions: usize,
+    /// Maximum total bytes for native session KV caches. When exceeded,
+    /// the least-recently-used session is evicted. Defaults to 512 MiB.
+    /// Set to 0 to disable the byte limit.
+    pub native_kv_budget_bytes: u64,
 }
 
 impl Default for EngineConfig {
@@ -604,6 +611,8 @@ impl Default for EngineConfig {
             // a conversation about a few images keeps all of them, small enough
             // to be an unremarkable line in a process's memory profile.
             pipeline_cache_bytes: 512 * 1024 * 1024,
+            native_max_sessions: 8,
+            native_kv_budget_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -875,6 +884,11 @@ pub struct GenerateOptions {
     /// The chosen token is always included in `TokenLogprob::top`, in addition to the
     /// requested alternatives when it is not already among them.
     pub top_logprobs: Option<usize>,
+    /// Force a cold start (full KV reset) even when session-persistent KV reuse
+    /// is available. Default is `false`, which allows the engine to reuse cached
+    /// KV state for matching prompt prefixes. Set to `true` for A/B measurement
+    /// or when guaranteed-cold behaviour is required.
+    pub cold_start: bool,
 }
 
 impl Default for GenerateOptions {
@@ -904,6 +918,7 @@ impl Default for GenerateOptions {
             speculative_mode: None,
             constraint: None,
             top_logprobs: None,
+            cold_start: false,
         }
     }
 }
