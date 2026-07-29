@@ -44,7 +44,8 @@ use crate::{
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
         ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
+        ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode,
+        Usage,
     },
 };
 

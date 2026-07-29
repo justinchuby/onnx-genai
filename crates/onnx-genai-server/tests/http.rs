@@ -395,11 +395,24 @@ async fn concurrent_static_cache_chat_completions_share_batched_driver() {
 }
 
 #[test]
-fn response_format_maps_to_generate_constraint_only_for_json_object() {
+fn response_format_maps_to_the_requested_generate_constraint() {
     let json_request = chat_request(json!({
         "model": "tiny-llm",
         "messages": [{"role": "user", "content": "hello"}],
         "response_format": {"type": "json_object"}
+    }));
+    let schema = json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"]
+    });
+    let json_schema_request = chat_request(json!({
+        "model": "tiny-llm",
+        "messages": [{"role": "user", "content": "hello"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": schema, "strict": true}
+        }
     }));
     let text_request = chat_request(json!({
         "model": "tiny-llm",
@@ -416,6 +429,12 @@ fn response_format_maps_to_generate_constraint_only_for_json_object() {
         Some(GenerateConstraint::Json)
     );
     assert_eq!(
+        build_generate_request(&json_schema_request)
+            .options
+            .constraint,
+        Some(GenerateConstraint::JsonSchema(schema.to_string()))
+    );
+    assert_eq!(
         build_generate_request(&text_request).options.constraint,
         None
     );
@@ -423,6 +442,45 @@ fn response_format_maps_to_generate_constraint_only_for_json_object() {
         build_generate_request(&absent_request).options.constraint,
         None
     );
+}
+
+#[tokio::test]
+async fn chat_completions_rejects_malformed_json_schema() {
+    let app = test_app().await;
+    for json_schema in [
+        json!({"name": "answer"}),
+        json!({"name": "answer", "schema": "not an object"}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "tiny-llm",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "response_format": {"type": "json_schema", "json_schema": json_schema}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("schema")),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -441,7 +499,15 @@ fn forced_specific_tool_choice_builds_lark_tool_call_constraint() {
                 }
             }
         }],
-        "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "schema": {"type": "object"},
+                "strict": true
+            }
+        }
     }));
 
     let Some(GenerateConstraint::Lark(grammar)) =

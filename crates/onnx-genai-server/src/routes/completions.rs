@@ -425,7 +425,7 @@ async fn run_chat_completion(
     };
 
     let session_for_count = session_lookup;
-    let wants_json_object = request.wants_json_object();
+    let wants_constrained_json = request.wants_constrained_json();
     let result = collect_generation_result(if handle.pipeline {
         handle
             .engine
@@ -478,7 +478,8 @@ async fn run_chat_completion(
             )
         }
         Err(err)
-            if wants_json_object && json_constraint_stopped_incomplete_message(&err.message) =>
+            if wants_constrained_json
+                && json_constraint_stopped_incomplete_message(&err.message) =>
         {
             (Some("{}".to_string()), None, 0, "stop", None)
         }
@@ -572,7 +573,7 @@ async fn stream_chat_completion(
         request.max_tokens,
         handle.model_max_context,
     )?;
-    let wants_json_object = request.wants_json_object();
+    let wants_constrained_json = request.wants_constrained_json();
     let mut generation_request = prepared.request;
     generation_request.options.max_context = handle.model_max_context;
     let (tx, rx) = mpsc::channel(16);
@@ -613,7 +614,7 @@ async fn stream_chat_completion(
                     let content = stop_buffer.push(&token.text);
                     if buffer_for_tool_detection {
                         buffered_text.push_str(&content);
-                    } else if !wants_json_object && !content.is_empty() {
+                    } else if !wants_constrained_json && !content.is_empty() {
                         send_stream_chunk(&tx, content_chunk(&id, created, &model, content, None))
                             .await?;
                     }
@@ -690,7 +691,7 @@ async fn stream_chat_completion(
                         send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
                             .await?;
                     }
-                } else if wants_json_object {
+                } else if wants_constrained_json {
                     if !result.text.is_empty() {
                         send_stream_chunk(
                             &tx,
@@ -731,7 +732,9 @@ async fn stream_chat_completion(
                     .await?;
                 }
             }
-            Err(err) if wants_json_object && json_constraint_stopped_incomplete_message(&err) => {
+            Err(err)
+                if wants_constrained_json && json_constraint_stopped_incomplete_message(&err) =>
+            {
                 send_stream_chunk(
                     &tx,
                     content_chunk(&id, created, &model, "{}".to_string(), None),
@@ -1317,13 +1320,23 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
     if let Some(stop) = request.stop.clone() {
         options.stop_sequences = stop.into_sequences();
     }
-    if request.wants_json_object() {
-        options.constraint = Some(GenerateConstraint::Json);
+    if let Some(constraint) = response_format_constraint(request) {
+        options.constraint = Some(constraint);
     }
     if let Some(constraint) = forced_tool_choice_constraint(request) {
         options.constraint = Some(constraint);
     }
     options
+}
+
+fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
+    match request.response_format.as_ref()? {
+        ResponseFormat::JsonObject => Some(GenerateConstraint::Json),
+        ResponseFormat::JsonSchema { json_schema } => serde_json::to_string(&json_schema.schema)
+            .ok()
+            .map(GenerateConstraint::JsonSchema),
+        ResponseFormat::Text => None,
+    }
 }
 
 fn forced_tool_choice_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
