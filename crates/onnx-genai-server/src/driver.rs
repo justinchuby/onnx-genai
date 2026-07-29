@@ -507,7 +507,7 @@ fn run_static_engine_driver(
 }
 
 fn run_static_batch_until_idle(
-    engine: &Engine,
+    engine: &mut Engine,
     rx: &mut mpsc::Receiver<DriverCommand>,
     deferred: &mut std::collections::VecDeque<DriverCommand>,
     max_batch: usize,
@@ -515,26 +515,78 @@ fn run_static_batch_until_idle(
     first_events: mpsc::Sender<DriverEvent>,
     first_permit: OwnedSemaphorePermit,
 ) {
-    let mut manager = match engine.continuous_batch_manager(max_batch) {
+    struct PendingGeneration {
+        request: GenerateRequest,
+        events: mpsc::Sender<DriverEvent>,
+        permit: OwnedSemaphorePermit,
+    }
+
+    let mut initial = vec![PendingGeneration {
+        request: first_request,
+        events: first_events,
+        permit: first_permit,
+    }];
+    // Give sibling HTTP handlers that were admitted in the same scheduler tick
+    // a tiny chance to reach the driver before choosing the single-request fast
+    // path. Without this, a concurrency-4 client can be serialized simply
+    // because the driver consumed the first request a few microseconds early.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    while initial.len() < max_batch {
+        match rx.try_recv() {
+            Ok(DriverCommand::Generate {
+                session_id: None,
+                request,
+                events,
+                permit,
+            }) => initial.push(PendingGeneration {
+                request: *request,
+                events,
+                permit,
+            }),
+            Ok(command) => deferred.push_back(command),
+            Err(_) => break,
+        }
+    }
+
+    if initial.len() == 1 {
+        let pending = initial
+            .pop()
+            .expect("the first generation request was queued");
+        run_fallback_generation(
+            engine,
+            None,
+            pending.request,
+            pending.events,
+            pending.permit,
+        );
+        return;
+    }
+
+    let formed_batch = initial.len().max(1).min(max_batch);
+    let mut manager = match engine.continuous_batch_manager(formed_batch) {
         Ok(manager) => manager,
         Err(err) => {
             crate::metrics::generation_queue_cancelled();
-            let _ = first_events.try_send(DriverEvent::Error(format!(
-                "continuous batch setup failed: {err}"
-            )));
+            for pending in initial {
+                let _ = pending.events.try_send(DriverEvent::Error(format!(
+                    "continuous batch setup failed: {err}"
+                )));
+            }
             return;
         }
     };
     let mut routes: HashMap<usize, DriverRoute> = HashMap::new();
     let mut abandoned = HashMap::new();
-    submit_to_continuous_manager(
-        &mut manager,
-        &mut routes,
-        &mut abandoned,
-        first_request,
-        first_events,
-        first_permit,
-    );
+    for pending in initial {
+        submit_to_continuous_manager(
+            &mut manager,
+            &mut routes,
+            &mut abandoned,
+            pending.request,
+            pending.events,
+            pending.permit,
+        );
+    }
 
     loop {
         while let Ok(command) = rx.try_recv() {
@@ -544,14 +596,25 @@ fn run_static_batch_until_idle(
                     request,
                     events,
                     permit,
-                } => submit_to_continuous_manager(
-                    &mut manager,
-                    &mut routes,
-                    &mut abandoned,
-                    *request,
-                    events,
-                    permit,
-                ),
+                } => {
+                    if routes.len() + abandoned.len() < manager.max_batch() {
+                        submit_to_continuous_manager(
+                            &mut manager,
+                            &mut routes,
+                            &mut abandoned,
+                            *request,
+                            events,
+                            permit,
+                        );
+                    } else {
+                        deferred.push_back(DriverCommand::Generate {
+                            session_id: None,
+                            request,
+                            events,
+                            permit,
+                        });
+                    }
+                }
                 command => deferred.push_back(command),
             }
         }
