@@ -120,6 +120,9 @@ static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 const MAX_TOPOLOGY_DECODE_THREADS: usize = 8;
 static DECODE_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
     OnceLock::new();
+#[cfg(feature = "mlas")]
+static MLAS_QNBIT_POOL: OnceLock<std::result::Result<Option<rayon::ThreadPool>, String>> =
+    OnceLock::new();
 
 /// Upper bound on the bounded pool used for the **dense-f32** decode path (see
 /// [`configured_dense_decode_threads`]). Unlike the quantized `MatMulNBits`
@@ -1232,8 +1235,10 @@ impl MatMulNBitsKernel {
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-            });
+                with_mlas_qnbit_pool(|| {
+                    mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
+                })
+            })?;
             return Ok(Some(()));
         }
 
@@ -1307,7 +1312,7 @@ impl MatMulNBitsKernel {
         // is not bit-stable across N-partition boundaries (it can differ by ~1
         // ULP), so this hatch restores byte-for-byte the pre-sharding output for
         // A/B parity checks or a host where the reordering ever matters.
-        if can_prepack && !mlas_no_shard() {
+        if can_prepack && !mlas_no_shard() && !prefer_arm64_mlas_decode {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
@@ -1342,8 +1347,10 @@ impl MatMulNBitsKernel {
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-            });
+                with_mlas_qnbit_pool(|| {
+                    mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
+                })
+            })?;
             return Ok(Some(()));
         }
 
@@ -1354,8 +1361,10 @@ impl MatMulNBitsKernel {
         #[cfg(all(test, feature = "mlas"))]
         MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
         mm_profile::time_gemv(|| {
-            mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-        });
+            with_mlas_qnbit_pool(|| {
+                mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
+            })
+        })?;
         Ok(Some(()))
     }
 
@@ -2480,6 +2489,15 @@ fn with_decode_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> 
         return Ok(operation());
     }
     match DECODE_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
+        Ok(Some(pool)) => Ok(pool.install(operation)),
+        Ok(None) => Ok(operation()),
+        Err(message) => Err(error(message.clone())),
+    }
+}
+
+#[cfg(feature = "mlas")]
+fn with_mlas_qnbit_pool<T: Send>(operation: impl FnOnce() -> T + Send) -> Result<T> {
+    match MLAS_QNBIT_POOL.get_or_init(|| build_decode_pool(configured_decode_threads())) {
         Ok(Some(pool)) => Ok(pool.install(operation)),
         Ok(None) => Ok(operation()),
         Err(message) => Err(error(message.clone())),
@@ -7219,8 +7237,8 @@ mod tests {
                 "bits={bits} block{block_size} asymmetric M=1 decode must route through MLAS QNBit",
             );
             assert!(
-                kernel.mlas_shards.get().is_some(),
-                "bits={bits} block{block_size} must prepack MLAS QNBit shards once",
+                kernel.mlas_packed.get().and_then(Option::as_ref).is_some(),
+                "bits={bits} block{block_size} must prepack one full-width MLAS QNBit weight",
             );
             assert!(
                 kernel.packed_kai_qsi4_weight.get().is_none()
