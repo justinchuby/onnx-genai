@@ -981,6 +981,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "block-quantized MoE expert GEMV + routing",
     ));
     p.push(dedicated(
+        "GroupedLoraDelta",
+        "../src/kernels/grouped_lora.rs",
+        "mixed-adapter CUDA/CPU/closed-form LoRA parity",
+    ));
+    p.push(dedicated(
         "FusedMatMulBias",
         "fused_epilogue_gpu.rs",
         "cuBLASLt BIAS epilogue",
