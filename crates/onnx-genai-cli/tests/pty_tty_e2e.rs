@@ -39,7 +39,7 @@ mod pty_tty {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use nix::pty::{OpenptyResult, openpty};
+    use nix::pty::{OpenptyResult, Winsize, openpty};
     use nix::unistd::dup;
 
     fn repository_root() -> PathBuf {
@@ -52,9 +52,33 @@ mod pty_tty {
 
     /// Open a fresh PTY pair.  The slave is the child-side terminal device;
     /// the master is the parent-side pipe into/out of that device.
+    ///
+    /// The slave is given a real 24×80 window size on purpose — **do not pass
+    /// `None` here.**  `openpty(None, ..)` leaves the window at 0×0, and the
+    /// `run` REPL's inline viewport (`live_turn.rs`) renders through ratatui's
+    /// `insert_before_no_scrolling_regions`, which infinite-loops when the
+    /// screen height is 0 (`to_draw = min(h, 0) = 0`, so it never makes
+    /// forward progress).  A future type-ahead / streaming test that drives
+    /// `run` (rather than the one-shot `generate` the tests below use) would
+    /// hang the whole harness for the 30-second `drain_pty_master` timeout — and
+    /// then time out CI — with a 0×0 window.  24×80 is the smallest ordinary
+    /// terminal size that avoids that trap; the exact numbers are not magic,
+    /// only "non-zero and realistic".
+    ///
+    /// Companion gotcha for anyone writing input into the master: a terminal
+    /// sends **CR (`\r`)** for Enter, and crossterm maps CR → `Enter`.  Writing
+    /// `\n` (LF) instead leaves the line un-terminated, so `read_line` never
+    /// returns and the child hangs — another false "swallowed input".  Send
+    /// `\r`, not `\n`.
     fn open_pty() -> (OwnedFd, OwnedFd) {
+        let winsize = Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         let OpenptyResult { master, slave } =
-            openpty(None, None).expect("openpty must succeed on this platform");
+            openpty(Some(&winsize), None).expect("openpty must succeed on this platform");
         (master, slave)
     }
 
