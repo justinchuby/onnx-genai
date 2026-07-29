@@ -2934,14 +2934,20 @@ impl DotKernel {
 
     #[cfg(target_arch = "aarch64")]
     fn arm64_int4_direct_enabled() -> bool {
-        // The N16 tile-major SDOT path is the production ARM64 decode route.
-        // Keep the historical knob as an opt-out for field A/Bs.
-        std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT")
-            .map(|value| {
+        #[cfg(test)]
+        {
+            true
+        }
+        #[cfg(not(test))]
+        {
+            // The asymmetric N16 SDOT kernels are correctness-locked, but the
+            // first full-model Qwen3 measurement regressed decode throughput.
+            // Keep them opt-in while the microkernel is tightened.
+            std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
                 let value = value.trim();
-                value.is_empty() || value != "0"
+                !value.is_empty() && value != "0"
             })
-            .unwrap_or(true)
+        }
     }
 }
 
