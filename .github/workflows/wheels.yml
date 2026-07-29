@@ -35,10 +35,15 @@ jobs:
           - name: Windows AMD64
             os: windows-latest
             archs: AMD64
-          # macos-15-intel is GitHub's final hosted Intel runner line.
-          - name: macOS x86_64
-            os: macos-15-intel
-            archs: x86_64
+          # macOS is Apple Silicon (arm64) ONLY, deliberately — not an oversight.
+          # The macOS x86_64 (Intel) matrix entry was removed 2026-07-29: we no
+          # longer ship an Intel-Mac wheel. ONNX Runtime is pinned to 1.27.0 (for
+          # ORT_API_VERSION 27) and upstream publishes no osx-x86_64 prebuilt at
+          # that version, so an Intel row could only ever fail the build. Do NOT
+          # re-add an x86_64 / macos-13 / macos-15-intel row without first sourcing
+          # an Intel-macOS ONNX Runtime; a job that can never pass just trains
+          # everyone to ignore a red pipeline.
+          # See .squad/decisions.md and crates/onnx-runtime-python/README.md.
           # macos-14 is the GitHub-hosted Apple Silicon runner.
           - name: macOS arm64
             os: macos-14
@@ -95,7 +100,13 @@ jobs:
           if-no-files-found: error
 
   cuda-wheels:
-    name: CUDA wheel scaffold (${{ matrix.name }})
+    # Job-level `if:` is evaluated before matrix expansion, so a skipped job
+    # cannot interpolate its own matrix values — a name like
+    # "CUDA wheel scaffold (${{ matrix.name }})" renders the literal
+    # "${{ matrix.name }}" in the checks list when this job is skipped (the
+    # default). Keep the name matrix-free so it is stable and readable whether
+    # the job runs or is skipped. GitHub still disambiguates the two runs.
+    name: CUDA wheel scaffold
     if: github.event_name == 'workflow_dispatch' && inputs.build_cuda
     strategy:
       fail-fast: false

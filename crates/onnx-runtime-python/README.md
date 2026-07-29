@@ -47,6 +47,22 @@ pip install target/wheels/nxrt-*.whl
 `ml_dtypes` is an optional runtime dependency, needed only to return `bfloat16`
 outputs as numpy arrays: `pip install nxrt[bfloat16]`.
 
+### Supported wheel platforms
+
+Prebuilt CPU wheels are published for:
+
+| Platform | Architecture |
+|---|---|
+| Linux | x86_64 |
+| Windows | AMD64 |
+| macOS | arm64 (Apple Silicon) |
+
+There is **no macOS x86_64 (Intel) wheel**. `nxrt` links ONNX Runtime 1.27.0
+(required for `ORT_API_VERSION` 27), and upstream ONNX Runtime stopped
+publishing an `osx-x86_64` prebuilt binary after the 1.22.x series — v1.27.0
+ships only `osx-arm64`. Intel-Mac users can still build from source against a
+locally supplied ONNX Runtime by setting `ORT_ROOT` before `maturin build`.
+
 ## API
 
 | Symbol | Description |
