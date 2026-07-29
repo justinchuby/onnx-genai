@@ -6,8 +6,11 @@
 //! Rayon-backed parallel-for backend (see [`ensure_threading`] and
 //! `vendor/shim.cpp`) so MLAS keeps its own cache-aware GEMM tile partitioning
 //! while executing the tiles across the current Rayon pool — the same pool the
-//! rest of `onnx-runtime-ep-cpu` uses, so there is no oversubscription. See
-//! `docs/MLAS_SYS_SPIKE.md` for the original single-thread feasibility spike.
+//! rest of `onnx-runtime-ep-cpu` uses, so there is no oversubscription. QNBit
+//! callers that need ORT-style one-call-per-node parallelism can instead use
+//! [`MlasThreadPool`], which installs a bounded Rayon pool around MLAS's
+//! standalone `MLAS_THREADPOOL` hooks. See `docs/MLAS_SYS_SPIKE.md` for the
+//! original single-thread feasibility spike.
 
 use std::os::raw::c_int;
 use std::os::raw::c_void;
@@ -269,6 +272,47 @@ fn ensure_threading() {
     THREADING_INIT.call_once(|| unsafe {
         mlas_set_threading(rayon_parallel_for, rayon_max_threads, std::ptr::null_mut());
     });
+}
+
+/// Bounded thread pool for driving standalone MLAS calls through the
+/// `MLAS_THREADPOOL*` parameter.
+///
+/// In the vendored standalone MLAS build, `MLAS_THREADPOOL` is only a forward
+/// declaration of ORT's `onnxruntime::concurrency::ThreadPool` (see
+/// `vendor/mlas/onnxruntime/core/mlas/inc/mlas.h`). There is no standalone ORT
+/// thread-pool class to construct. Instead, `vendor/shim.cpp` passes a non-null
+/// sentinel to APIs such as `MlasQNBitGemmBatch`, and the standalone
+/// `MlasGetMaximumThreadCount` / `MlasTrySimpleParallel` hooks route work onto
+/// the Rayon pool active at the call site. Installing this wrapper bounds that
+/// active pool to exactly `thread_count` workers for the duration of the MLAS
+/// call.
+pub struct MlasThreadPool {
+    pool: rayon::ThreadPool,
+    thread_count: usize,
+}
+
+impl MlasThreadPool {
+    /// Create a bounded MLAS backing pool. A count of 6-8 is the intended
+    /// decode range on machines where roofline measurements show saturation
+    /// there; callers remain responsible for choosing the policy.
+    pub fn new(thread_count: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
+        assert!(thread_count > 0, "thread_count must be non-zero");
+        ensure_threading();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .thread_name(|idx| format!("mlas-sys-{idx}"))
+            .build()?;
+        Ok(Self { pool, thread_count })
+    }
+
+    /// Number of worker threads available to MLAS while this pool is installed.
+    pub fn thread_count(&self) -> usize {
+        self.thread_count
+    }
+
+    fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(op)
+    }
 }
 
 /// Runtime-selected f32 GEMM microkernel: 512 = AVX-512F, 3 = FMA3/AVX2,
@@ -980,6 +1024,71 @@ impl Drop for SQNBitPackedB {
     }
 }
 
+/// Return the exact MLAS scratch size for one `MlasQNBitGemmBatch` call with
+/// this packed weight and row count.
+///
+/// This is a direct wrapper over `MlasQNBitGemmBatchWorkspaceSize(M, N, K,
+/// BatchN=1, ...)`; non-zero means the caller must provide a workspace buffer to
+/// `MlasQNBitGemmBatch`.
+pub fn sqnbit_gemm_workspace_size(packed: &SQNBitPackedB, m: usize) -> usize {
+    unsafe {
+        mlas_qnbit_gemm_workspace_size(
+            m,
+            packed.n,
+            packed.k,
+            packed.bits,
+            packed.blk_len,
+            packed.has_zp as c_int,
+            packed.comp.raw(),
+        )
+    }
+}
+
+/// Reusable scratch buffer for `MlasQNBitGemmBatch`.
+///
+/// MLAS documents that callers should allocate the byte count returned by
+/// `MlasQNBitGemmBatchWorkspaceSize` and pass it to `MlasQNBitGemmBatch`.
+/// `mlas-sys` over-allocates by 64 bytes because the current MLAS kernels round
+/// the pointer up internally before using the scratch region.
+#[derive(Default)]
+pub struct SQNBitGemmWorkspace {
+    buffer: Vec<u8>,
+}
+
+impl SQNBitGemmWorkspace {
+    /// Create an empty workspace. It grows on first use and is then reused.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure this workspace can satisfy a GEMM with `(packed, m)`, returning
+    /// the MLAS-required byte count (excluding the internal alignment slack).
+    pub fn reserve_for(&mut self, packed: &SQNBitPackedB, m: usize) -> usize {
+        let size = sqnbit_gemm_workspace_size(packed, m);
+        if size != 0 {
+            let needed = size + 64;
+            if self.buffer.len() < needed {
+                self.buffer.resize(needed, 0);
+            }
+        }
+        size
+    }
+
+    /// Currently allocated byte length, including the 64-byte alignment slack.
+    pub fn allocated_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn ptr_for(&mut self, required_size: usize) -> *mut u8 {
+        if required_size == 0 {
+            std::ptr::null_mut()
+        } else {
+            debug_assert!(self.buffer.len() >= required_size + 64);
+            self.buffer.as_mut_ptr()
+        }
+    }
+}
+
 /// Compute `C = A * dequant(packed) + bias` for row-major `A` (`m x k`) and
 /// `C` (`m x n`), reusing a pre-packed blockwise-quantized weight.
 ///
@@ -996,10 +1105,58 @@ pub fn sqnbit_gemm(
 ) {
     let n = packed.n;
     assert_eq!(c.len(), m * n, "C must be m*n");
+    let mut workspace = SQNBitGemmWorkspace::new();
+    sqnbit_gemm_with_workspace(packed, m, a, bias, c, &mut workspace, multithread);
+}
+
+/// Same as [`sqnbit_gemm`], but reuses caller-owned MLAS scratch across calls.
+pub fn sqnbit_gemm_with_workspace(
+    packed: &SQNBitPackedB,
+    m: usize,
+    a: &[f32],
+    bias: Option<&[f32]>,
+    c: &mut [f32],
+    workspace: &mut SQNBitGemmWorkspace,
+    multithread: bool,
+) {
+    let n = packed.n;
+    assert_eq!(c.len(), m * n, "C must be m*n");
     // Contiguous output: leading dimension equals the packed weight's N.
     // SAFETY: `c` is `m * n` contiguous f32s, so writing `m` rows of `n`
     // columns at stride `n` stays in bounds.
-    unsafe { sqnbit_gemm_into(packed, m, a, bias, c.as_mut_ptr(), n, multithread) };
+    unsafe {
+        sqnbit_gemm_into_with_workspace(
+            packed,
+            m,
+            a,
+            bias,
+            c.as_mut_ptr(),
+            n,
+            workspace,
+            multithread,
+        )
+    };
+}
+
+/// Same as [`sqnbit_gemm_with_workspace`], but installs a bounded MLAS backing
+/// pool for this call. MLAS sees a non-null `MLAS_THREADPOOL*`, partitions the
+/// QNBit batch internally, and the standalone hooks execute those partitions on
+/// `thread_pool.thread_count()` Rayon workers.
+pub fn sqnbit_gemm_with_threadpool(
+    packed: &SQNBitPackedB,
+    m: usize,
+    a: &[f32],
+    bias: Option<&[f32]>,
+    c: &mut [f32],
+    workspace: &mut SQNBitGemmWorkspace,
+    thread_pool: &MlasThreadPool,
+) {
+    let n = packed.n;
+    assert_eq!(c.len(), m * n, "C must be m*n");
+    let c_addr = c.as_mut_ptr() as usize;
+    thread_pool.install(|| unsafe {
+        sqnbit_gemm_into_with_workspace(packed, m, a, bias, c_addr as *mut f32, n, workspace, true)
+    });
 }
 
 /// Compute one N-shard of `C = A * dequant(packed) + bias` into a caller-owned
@@ -1022,6 +1179,27 @@ pub unsafe fn sqnbit_gemm_into(
     ldc: usize,
     multithread: bool,
 ) {
+    let mut workspace = SQNBitGemmWorkspace::new();
+    unsafe {
+        sqnbit_gemm_into_with_workspace(packed, m, a, bias, c, ldc, &mut workspace, multithread);
+    }
+}
+
+/// Same as [`sqnbit_gemm_into`], but reuses caller-owned MLAS scratch.
+///
+/// # Safety
+/// Same requirements as [`sqnbit_gemm_into`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sqnbit_gemm_into_with_workspace(
+    packed: &SQNBitPackedB,
+    m: usize,
+    a: &[f32],
+    bias: Option<&[f32]>,
+    c: *mut f32,
+    ldc: usize,
+    workspace: &mut SQNBitGemmWorkspace,
+    multithread: bool,
+) {
     let (k, n) = (packed.k, packed.n);
     assert_eq!(a.len(), m * k, "A must be m*k");
     assert!(ldc >= n, "ldc must be >= packed N");
@@ -1030,29 +1208,8 @@ pub unsafe fn sqnbit_gemm_into(
     }
     ensure_threading();
 
-    let ws_size = unsafe {
-        mlas_qnbit_gemm_workspace_size(
-            m,
-            n,
-            k,
-            packed.bits,
-            packed.blk_len,
-            packed.has_zp as c_int,
-            packed.comp.raw(),
-        )
-    };
-    // MLAS rounds the workspace pointer up to an internal alignment, so
-    // over-allocate to keep the aligned [start, start+ws_size) region in bounds.
-    let mut workspace: Vec<u8> = if ws_size == 0 {
-        Vec::new()
-    } else {
-        vec![0u8; ws_size + 64]
-    };
-    let ws_ptr = if ws_size == 0 {
-        std::ptr::null_mut()
-    } else {
-        workspace.as_mut_ptr()
-    };
+    let ws_size = workspace.reserve_for(packed, m);
+    let ws_ptr = workspace.ptr_for(ws_size);
 
     let zp_ptr = packed.zp.as_ref().map_or(std::ptr::null(), |z| z.as_ptr()) as *const c_void;
     let bias_ptr = bias.map_or(std::ptr::null(), <[f32]>::as_ptr);
@@ -1078,6 +1235,37 @@ pub unsafe fn sqnbit_gemm_into(
             multithread as c_int,
         );
     }
+}
+
+/// Same as [`sqnbit_gemm_into_with_workspace`], but installs a bounded MLAS
+/// backing pool for the duration of the call.
+///
+/// # Safety
+/// Same requirements as [`sqnbit_gemm_into`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sqnbit_gemm_into_with_threadpool(
+    packed: &SQNBitPackedB,
+    m: usize,
+    a: &[f32],
+    bias: Option<&[f32]>,
+    c: *mut f32,
+    ldc: usize,
+    workspace: &mut SQNBitGemmWorkspace,
+    thread_pool: &MlasThreadPool,
+) {
+    let c_addr = c as usize;
+    thread_pool.install(|| unsafe {
+        sqnbit_gemm_into_with_workspace(
+            packed,
+            m,
+            a,
+            bias,
+            c_addr as *mut f32,
+            ldc,
+            workspace,
+            true,
+        );
+    });
 }
 
 #[cfg(test)]
@@ -1591,6 +1779,86 @@ mod tests {
         );
     }
 
+    fn check_sqnbit_bounded_pool_matches_single_thread(comp: SQNBitComputeType) {
+        let (m, n, k, block_size) = (3usize, 96usize, 256usize, 128usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.019 + 0.13).sin()) * 1.7)
+            .collect();
+        let (packed_b, scales, zps, _) = quantize_int4(&weights, n, k, block_size, true);
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.007 + 0.31).cos()) * 0.7)
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin()).collect();
+
+        let packed = match SQNBitPackedB::new(
+            n,
+            k,
+            4,
+            block_size,
+            comp,
+            &packed_b,
+            &scales,
+            zps.as_deref(),
+        ) {
+            Some(p) => p,
+            None => {
+                eprintln!("SQNBit bounded-pool check comp={comp:?} unavailable on host; skipping");
+                return;
+            }
+        };
+
+        let mut single = vec![0.0f32; m * n];
+        sqnbit_gemm(&packed, m, &a, Some(&bias), &mut single, false);
+
+        let pool = MlasThreadPool::new(2).expect("bounded MLAS thread pool");
+        assert_eq!(pool.thread_count(), 2);
+        let mut workspace = SQNBitGemmWorkspace::new();
+        let required = sqnbit_gemm_workspace_size(&packed, m);
+
+        let mut pooled = vec![0.0f32; m * n];
+        sqnbit_gemm_with_threadpool(
+            &packed,
+            m,
+            &a,
+            Some(&bias),
+            &mut pooled,
+            &mut workspace,
+            &pool,
+        );
+        assert!(
+            required == 0 || workspace.allocated_len() >= required + 64,
+            "workspace must retain the MLAS-required scratch plus alignment slack"
+        );
+        assert!(
+            single
+                .iter()
+                .zip(&pooled)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "bounded-pool SQNBit output must be bit-identical to the single-thread path"
+        );
+
+        let allocated = workspace.allocated_len();
+        let mut pooled_again = vec![0.0f32; m * n];
+        sqnbit_gemm_with_threadpool(
+            &packed,
+            m,
+            &a,
+            Some(&bias),
+            &mut pooled_again,
+            &mut workspace,
+            &pool,
+        );
+        assert_eq!(
+            workspace.allocated_len(),
+            allocated,
+            "workspace should be reused without reallocating for the same shape"
+        );
+        assert_eq!(
+            pooled.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            pooled_again.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn sqnbit_packed_b_is_send_sync() {
         assert_send_sync::<SQNBitPackedB>();
@@ -1612,6 +1880,7 @@ mod tests {
     fn sqnbit_bits4_and_bits8_block128_with_zero_points_round_trip() {
         for comp in [SQNBitComputeType::Fp32, SQNBitComputeType::Int8] {
             check_sqnbit(comp, 3, 96, 256, 128, true, true);
+            check_sqnbit_bounded_pool_matches_single_thread(comp);
         }
         check_sqnbit_bits8_block128_with_zp(SQNBitComputeType::Int8, 3);
     }
