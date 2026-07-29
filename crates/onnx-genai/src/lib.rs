@@ -21,6 +21,7 @@ pub use onnx_genai_engine::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken,
     GenerateTokenCallback, GenerationBudgetCap, GreedySampler, JsonConstraint, LogitProcessor,
     MirostatConfig, MirostatVersion, ProcessorChain, ProcessorChainBuilder, ProcessorContext,
-    ProcessorSignal, Sampler, SessionId, SpeculativeAcceptContext, SpeculativeProposal,
-    SpeculativeProposer, SpeculativeProposerContext, StopSequence, TokenId, XtcConfig,
+    ProcessorSignal, Sampler, SamplingOverrides, SessionId, SpeculativeAcceptContext,
+    SpeculativeProposal, SpeculativeProposer, SpeculativeProposerContext, StopSequence, TokenId,
+    XtcConfig,
 };

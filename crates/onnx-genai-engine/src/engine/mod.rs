@@ -49,9 +49,9 @@ pub use crate::config::{
     GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
     KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
     MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    RewindTokenCount, ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability,
-    SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig, SpeculativeMode,
-    TokenLogprob, XtcConfig, parse_resource_limit,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
+    SpeculativeMode, TokenLogprob, XtcConfig, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{

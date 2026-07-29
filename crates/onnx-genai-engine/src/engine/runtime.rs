@@ -16,7 +16,56 @@ fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
     }
 }
 
+fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
+    metadata
+        .tokens
+        .as_ref()
+        .and_then(|tokens| tokens.eos_token_id.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|&id| TokenId::try_from(id).ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod eos_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_eos_token_ids_preserves_multiple_valid_ids() {
+        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
+            "tokens": { "eos_token_id": [151645, -1, 4294967296_u64, 151643] }
+        }))
+        .unwrap();
+
+        assert_eq!(metadata_eos_token_ids(&metadata), vec![151645, 151643]);
+    }
+}
+
 impl Engine {
+    fn default_eos_token_ids(&self) -> Vec<TokenId> {
+        let mut ids = metadata_eos_token_ids(&self.metadata);
+        for id in self.tokenizer.eos_token_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
+        if !options.stop_on_eos || options.eos_token_id.is_some() {
+            return;
+        }
+        let ids = self.default_eos_token_ids();
+        if let Some(&id) = ids.first() {
+            options.eos_token_id = Some(id);
+        }
+        for id in ids {
+            push_unique_stop_sequence(&mut options.stop_sequences, StopSequence::Tokens(vec![id]));
+        }
+    }
+
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
     pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
@@ -36,9 +85,7 @@ impl Engine {
         reject_native_request_speculation(&request.options)?;
         request.options.validate()?;
         let mut options = request.options;
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer.eos_token_id();
-        }
+        self.apply_eos_defaults(&mut options);
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -332,9 +379,7 @@ impl Engine {
         self.last_speculative_stats = SpeculativeStats::default();
         request.options.validate()?;
         let mut options = request.options.clone();
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer.eos_token_id();
-        }
+        self.apply_eos_defaults(&mut options);
         let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
@@ -875,15 +920,7 @@ impl Engine {
     }
 
     fn fim_options(&self, fim_config: &FimConfig, mut options: GenerateOptions) -> GenerateOptions {
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer.eos_token_id();
-        }
-        for eos_token_id in self.tokenizer.eos_token_ids() {
-            push_unique_stop_sequence(
-                &mut options.stop_sequences,
-                StopSequence::Tokens(vec![eos_token_id]),
-            );
-        }
+        self.apply_eos_defaults(&mut options);
         for token in [
             fim_config.prefix_token.as_str(),
             fim_config.middle_token.as_str(),
@@ -1146,9 +1183,7 @@ impl Engine {
     ) -> anyhow::Result<ActiveGenerate> {
         request.request.options.validate()?;
         let mut options = request.request.options.clone();
-        if options.eos_token_id.is_none() {
-            options.eos_token_id = self.tokenizer.eos_token_id();
-        }
+        self.apply_eos_defaults(&mut options);
         let prompt_tokens = self.tokenize_prompt(&request.request.prompt)?;
         if prompt_tokens.is_empty() {
             anyhow::bail!("prompt must contain at least one token");
