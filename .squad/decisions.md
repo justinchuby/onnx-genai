@@ -332,3 +332,44 @@ to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate success
 ## 2026-07-29 — Tool-call parser handles Qwen, Llama, and Mistral formats
 
 **PR #390 / issue #183 follow-up (Stevens; reviewed by Edgemar; merged `0e62150e`).** `parse_tool_calls` recognizes Qwen/Hermes `<tool_call>` objects, Llama 3 `<|python_tag|>` objects, and Mistral `[TOOL_CALLS]` arrays. A serde `StreamDeserializer::byte_offset()` prefix scanner consumes consecutive complete top-level Llama JSON values (including semicolons inside strings) without naive splitting and terminates safely on malformed input or model terminators. One converter prefers `arguments`, falls back to `parameters`, and assigns sequential IDs. Edgemar independently ran eight parser tests and clean clippy; the roughly 49 local `tests.rs` failures are pre-existing missing-weights-fixture failures.
+
+## 2026-07-28 — Fact-Checker Verdict: ORT shared-buffer KV allocation strategy
+
+**Requested by:** Justin Chu (@justinchuby)  
+**Blocks:** PR #367 (`fix/cuda-kv-capacity`)
+
+**Verdict: ✅ PR #367's wording is correct. `main`'s wording is stale.**
+
+ORT shared-buffer KV allocation: `kv_capacity_bucket(0, max_length)` at `dynamic.rs:386` allocates the **minimum bucket (256)** via and grows lazily by `ensure_kv_capacity`, not by pre-allocating the full context. `main`'s comment describing pre-allocation is stale — it predates the bucketing policy. PR #367's wording is verified by code tracing and passing tests `kv_capacity_bucket_rounds_to_power_of_two_min_256` and `ensure_kv_capacity_orders_fallible_work_before_invalidation`.
+
+### 2026-07-28: CI tiering rejected; run full coverage on PRs
+
+**By:** Pris
+
+CI has two parallel PR signals: a Linux-only uninstrumented `Fast (Linux x86_64)` job in `ci.yml` for early feedback, and the full coverage gate. PRs, `main` pushes, nightly schedules, and manual dispatch still run the full signal: quality checks, security audit, coverage-instrumented offline crate tests across Linux x86_64 / Windows x86_64 / macOS arm64, uninstrumented Windows ARM64 offline crate tests, Linux-only MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes. Rule: run tests on every platform; instrument for coverage only where the coverage is informative. The fast lane is deliberately duplicated work, has no `needs`, and does not gate or serialize the full lane; passing it alone is not merge-ready. The `ci:full` label trigger was removed because it became a no-op. Codecov carryforward remains disabled because PRs upload the same four flags as `main`.
+
+Rationale: Tiering was tried to reduce PR cost. The first split had the axis wrong: platforms are signal in this repo, while instrumentation is cost. Justin decided the coverage runtime is acceptable and requested a Linux-only no-coverage fast lane for fail-fast ergonomics, so the final choice is to pay the full cost rather than risk reintroducing blind spots.
+
+### 2026-07-28: Windows ARM64 coverage removal
+
+**By:** Pris
+
+Removed the `Rust coverage (Windows ARM64)` job and replaced it with `Rust (Windows ARM64)` uninstrumented tests. Windows ARM64 platform execution catches real platform bugs, but coverage for these pure-Rust crates duplicates x64/macOS coverage while owning the full-gate critical path (18-26m). Uninstrumented ARM64 tests retain the platform signal without coverage overhead. Full CI now passes in 18m54s with new critical path: `CLI ORT (Windows x86_64)` at 18m50s. No Codecov flag disappears; ARM64 had only contributed to the shared `offline` flag.
+
+### 2026-07-28: Multi-turn and batch benchmarks reveal structural native deficit
+
+**Author:** Pris  
+**Affects:** Iran, Deckard (native backend architecture)
+
+**Root cause: Native backend has no session-persistent KV cache.** Each turn re-prefills the entire conversation (O(context_length)). ORT preserves KV, so each turn prefills only new tokens (O(new_tokens)).
+
+**Multi-turn findings (Apple M1 Max, load 1.5–3.6):**
+- TinyStories-33M: ORT breaks even at turn 2; ORT 2.1× faster over 10 turns.
+- Qwen2.5-0.5B: ORT breaks even at turn 8; ORT 1.18× faster over 10 turns.
+- At turns 3–10, native TTFT is 3.1–3.4× slower than ORT per prefill (no KV reuse).
+
+**Batch vision (MobileNetV2):**
+- Batch=1: native 0.50× ORT (11.6 ms vs 5.8 ms).
+- Batch>1: native crashes (segfault) — correctness bug.
+
+**Should we pre-pack?** No — pre-packing would not address the O(context_length) vs O(new_tokens) structural disadvantage. Session-persistent KV is the priority; pre-packing is deferred until after persistent KV lands. Weight transpose caches ARE correctly reused across turns (168 stable Qwen entries, 25 stable TinyStories entries), so the deficit is not cache reuse.
