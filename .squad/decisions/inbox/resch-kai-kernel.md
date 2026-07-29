@@ -163,3 +163,39 @@ Best individual qwen3-0.6b N16 run reached 103.44 tok/s, close to ORT, but media
 ### Remaining gap
 
 N16/8-accumulator retile confirms Luba's latency diagnosis and recovers a large share of the gap, especially on qsi8-heavy models. The remaining ~9 tok/s gap to ORT on qwen3-0.6b likely needs a hand-scheduled assembly or `global_asm` ukernel to reduce register moves/LLVM scheduling noise and tune prefetch without extra front-end pressure. N32 remains a Snapdragon-only experiment, but should be guarded because the N=8/N16 generic Rust-unroll experiments showed register pressure can erase the latency-hiding gain.
+
+## 2026-07-29 final profiling pass toward ORT
+
+Goal: close the remaining qwen3-0.6b gap after the N16 retile (`96.27 tok/s` vs ORT `105.68 tok/s`).
+
+### Profile / shape diagnosis
+
+`ONNX_GENAI_PROFILE_OPS=1` on the N16 state still shows steady decode dominated by `MatMulNBits`: representative warmed forwards are ~82--86% `MatMulNBits` across 197 calls. Attention/layernorm are not the gap.
+
+Model shape scan:
+
+- qwen3-0.6b: 197 `MatMulNBits`; 105 qsi8 block128, 92 qsi4 block128; every N is divisible by 16, so there is no N16 tail penalty.
+- qwen2.5-0.5b: 121 `MatMulNBits`; all qsi4 block32; every N is divisible by 16. Its larger ORT gap is not tail handling; it is block32 qsi4 scale/correction frequency and unpack density.
+- qwen3-1.7b: 197 `MatMulNBits`; 101 qsi8 block128, 96 qsi4 block128; every N is divisible by 16. Its gap is likewise not tails.
+
+### Experiments attempted but not kept
+
+- qsi8 N32 tile: two N16 tiles in one qsi8-only ukernel, sharing the activation broadcast over 32 outputs. This reached ~100 tok/s in a short qwen3-0.6b run but did not hold up in median-of-5 (`94.91 tok/s`), likely due register pressure / scheduler noise. Reverted.
+- 256B prefetch distance (qsi4 ahead=8 groups, qsi8 ahead=4 groups) regressed qwen3-0.6b to `94.49 tok/s`; 512B remains better. Reverted.
+- Explicit thread sweep on the N16 state still peaks at 8 workers; 10/12 workers regress. The current non-Apple ARM64 default of 8 workers remains correct.
+
+### Result / gate
+
+No new code was kept in this pass. Best robust committed state remains `5d591666`:
+
+| Model | Native N16 | Roofline | % roofline | ORT | % of ORT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| qwen3-0.6b CPU-4 | 96.27 tok/s | 211 | 45.6% | 105.68 | 91.1% |
+| qwen2.5-0.5b CPU-4 | 142.60 tok/s | 344 | 41.5% | 184.48 | 77.3% |
+| qwen3-1.7b CPU-2 | 38.82 tok/s | 76.5 | 50.7% | 49.52 | 78.4% |
+
+Honest gate: do not enable by default yet. The path remains opt-in behind `ONNX_GENAI_CPU_ARM64_INT4_DIRECT`.
+
+### Remaining gap
+
+The last ~10% on qwen3-0.6b is no longer a threading or tail issue. It is the inner-loop instruction schedule: Rust intrinsics are close but still not KleidiAI-dense. The next step should be a Luba-reviewed hand-scheduled aarch64 ukernel (`global_asm` or equivalent) for the existing N16 layout, especially qsi8 block128 and qsi4 block32. Avoid speculative N32 unless guarded per Snapdragon and validated because the generic N32 experiment showed register pressure can erase the theoretical ILP win.
