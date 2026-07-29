@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use onnx_genai::engine::{EngineDecodeBackend, PipelineEngine, PipelineGenerateRequest};
+use onnx_genai::metadata::GenerationDefaults;
 use onnx_genai::ort::profile::TraceVerbosity;
 use onnx_genai::ort::{ChatMessage, ChatRole, SessionOptions, Tokenizer, ep_selection};
 use onnx_genai::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
-    GenerateTokenCallback,
+    GenerateTokenCallback, SamplingOverrides,
 };
 use onnx_genai_server::multimodal::{self, MultimodalInput, MultimodalSpecs};
 use reedline::{
@@ -437,12 +438,16 @@ pub(super) struct SessionSummary<'a> {
     pub(super) settings: &'a SessionSettings,
     pub(super) resolved_decode_backend: EngineDecodeBackend,
     pub(super) options: &'a GenerateOptions,
+    pub(super) generation_defaults: Option<&'a GenerationDefaults>,
+    pub(super) sampling_overrides: &'a SamplingOverrides,
     pub(super) history: &'a [ChatMessage],
     pub(super) usage: &'a SessionUsage,
 }
 
 impl fmt::Display for SessionSummary<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut options = self.options.clone();
+        options.resolve_sampling_defaults(self.generation_defaults, self.sampling_overrides);
         let system_messages = self
             .history
             .iter()
@@ -481,15 +486,15 @@ impl fmt::Display for SessionSummary<'_> {
         writeln!(
             formatter,
             "  sampling: max_new_tokens={} max_context={} temperature={} top_p={} top_k={} greedy={}",
-            self.options.max_new_tokens,
-            self.options
+            options.max_new_tokens,
+            options
                 .max_context
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "auto".to_string()),
-            self.options.temperature,
-            self.options.top_p,
-            self.options.top_k,
-            self.options.greedy
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            options.greedy
         )?;
         writeln!(
             formatter,
@@ -673,6 +678,18 @@ impl Backend {
         match self {
             Self::Text(engine) => engine.effective_max_context(options),
             Self::Pipeline(_) => options.max_context,
+        }
+    }
+
+    /// The model author's declared generation defaults, when the loaded package
+    /// ships them. Single-model text engines expose their `genai_config.json`
+    /// `search` block or native inference metadata `generation` block; pipelines
+    /// report `None` (their sampling is governed by the pipeline plan, not a
+    /// single decoder's declared defaults).
+    pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
+        match self {
+            Self::Text(engine) => engine.metadata().generation.as_ref(),
+            Self::Pipeline(_) => None,
         }
     }
 
@@ -905,6 +922,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
     let default_trace_path = PathBuf::from("onnx-genai-session.perfetto.json");
     let mut show_stats = initial_repl_show_stats(input_mode, args.no_stats);
     let sampling_options = args.sampling.to_options();
+    let sampling_overrides = args.sampling.sampling_overrides();
     let mut session_usage = SessionUsage::default();
     // Inert unless stdout is a terminal, so a piped session is byte-for-byte
     // what it was before.
@@ -1068,6 +1086,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             settings: &settings,
                             resolved_decode_backend: backend.decode_backend(),
                             options: &sampling_options,
+                            generation_defaults: backend.generation_defaults(),
+                            sampling_overrides: &sampling_overrides,
                             history: &history,
                             usage: &session_usage,
                         }
@@ -1082,6 +1102,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         settings: &settings,
                         resolved_decode_backend: backend.decode_backend(),
                         options: &sampling_options,
+                        generation_defaults: backend.generation_defaults(),
+                        sampling_overrides: &sampling_overrides,
                         history: &history,
                         usage: &session_usage,
                     }
@@ -1152,6 +1174,8 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                             settings: &settings,
                             resolved_decode_backend: backend.decode_backend(),
                             options: &sampling_options,
+                            generation_defaults: backend.generation_defaults(),
+                            sampling_overrides: &sampling_overrides,
                             history: &history,
                             usage: &session_usage,
                         }
@@ -1248,6 +1272,10 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
         }
         let rendered = build_turn_prompt(template.as_ref(), &history)?;
         let mut turn_options = sampling_options.clone();
+        // Resolve against the *current* backend each turn so the model's
+        // declared sampling regime is honored, and stays correct across a
+        // `/reload` that swaps in a model with different declared defaults.
+        turn_options.resolve_sampling_defaults(backend.generation_defaults(), &sampling_overrides);
         let prompt_tokens = backend.prompt_tokens(&rendered).unwrap_or_default();
         let effective_max_context = backend.effective_max_context(&turn_options);
         if let Some(message) =

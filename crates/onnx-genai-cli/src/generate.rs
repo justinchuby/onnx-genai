@@ -95,6 +95,13 @@ fn generate_text(
     let mut backend = Backend::load(model_dir, args.engine.to_config())?;
     profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
     profile.phase("model load", load_started.elapsed());
+    // Honor the model's declared sampling regime (e.g. a reasoning model that
+    // ships do_sample=true) now that metadata is loaded; explicit CLI flags
+    // still win. Without this a model that degenerates under greedy would loop.
+    turn.options.resolve_sampling_defaults(
+        backend.generation_defaults(),
+        &args.sampling.sampling_overrides(),
+    );
     let prompt_tokens = backend.prompt_tokens(&turn.prompt).unwrap_or_default();
     let effective_max_context = backend.effective_max_context(&turn.options);
     if let Some(limit) = context_window_is_full(prompt_tokens, effective_max_context) {

@@ -25,8 +25,8 @@ pub use ep_compat::{
 pub use options::{SessionOptions, available_execution_providers, ep_selection};
 
 use env_config::{
-    cuda_device_id_from_env, device_kv_enabled_from_env, fixed_capacity_present_binding_supported,
-    intra_op_threads_from_env, is_textproto_path, requested_non_cpu_provider,
+    cuda_device_id_from_env, device_kv_enabled_from_env, effective_intra_op_threads,
+    fixed_capacity_present_binding_supported, is_textproto_path, requested_non_cpu_provider,
     requested_strict_provider, shared_kv_present_binding_opt_in_from_env,
 };
 use providers::{append_execution_providers, apply_webgpu_provider_options};
@@ -640,19 +640,7 @@ impl RawSessionOptions {
             // SAFETY: `this.ptr` is a valid session options handle.
             crate::error::check_status(unsafe { set_opt(this.ptr.as_ptr(), level) })?;
         }
-        // Resolve the effective intra-op thread count. An explicit
-        // `with_intra_op_threads(n)` (n > 0) always wins so exact-equality tests
-        // keep forcing single-thread ORT. When the caller left it at the default
-        // (0 = "ORT decides"), `ONNX_GENAI_INTRA_OP_THREADS` may override it.
-        // This is the profiler-identified lever: ORT's default oversubscribes
-        // Apple-silicon efficiency cores (10-thread decode is ~2x slower than a
-        // 6-8 performance-core config), so operators can pin it without a code
-        // change. See the CPU decode profiling decision note.
-        let effective_intra_op = if options.intra_op_num_threads > 0 {
-            options.intra_op_num_threads
-        } else {
-            intra_op_threads_from_env().unwrap_or(0)
-        };
+        let effective_intra_op = effective_intra_op_threads(options);
         if effective_intra_op > 0
             && let Some(set_threads) = api.SetIntraOpNumThreads
         {
