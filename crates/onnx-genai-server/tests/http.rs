@@ -6,7 +6,7 @@ use onnx_genai::{Engine, EngineConfig, GeneratePrompt};
 use onnx_genai_engine::GenerateConstraint;
 use onnx_genai_server::{
     AppState, ChatCompletionRequest, ServerConfig, app, build_generate_request,
-    parse_assistant_output,
+    parse_assistant_output, parse_tool_calls,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -676,6 +676,87 @@ fn parser_converts_qwen_tool_call_blocks_to_openai_tool_calls() {
     let second_args: Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
     assert_eq!(second_args["path"], "src/lib.rs");
     assert_eq!(second_args["content"], "ok");
+}
+
+#[test]
+fn parser_keeps_qwen_single_tool_call_behavior() {
+    let calls = parse_tool_calls(
+        r#"<tool_call>{"name":"read_file","arguments":{"path":"src/lib.rs"}}</tool_call>"#,
+    );
+
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[0].function.name, "read_file");
+    assert_eq!(calls[0].function.arguments, r#"{"path":"src/lib.rs"}"#);
+}
+
+#[test]
+fn parser_converts_llama_parameters_with_eom_terminator() {
+    let calls = parse_tool_calls(
+        r#"<|python_tag|>{"name":"get_weather","parameters":{"city":"Paris"}}<|eom_id|>"#,
+    );
+
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[0].function.name, "get_weather");
+    assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+}
+
+#[test]
+fn parser_converts_semicolon_separated_llama_calls() {
+    let calls = parse_tool_calls(
+        r#"<|python_tag|>{"name":"first","parameters":{"text":"a;b"}}; {"name":"second","parameters":{"value":2}}<|eot_id|>"#,
+    );
+
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[0].function.name, "first");
+    assert_eq!(calls[0].function.arguments, r#"{"text":"a;b"}"#);
+    assert_eq!(calls[1].id, "call_1");
+    assert_eq!(calls[1].function.name, "second");
+    assert_eq!(calls[1].function.arguments, r#"{"value":2}"#);
+}
+
+#[test]
+fn parser_converts_mistral_tool_call_array() {
+    let calls = parse_tool_calls(
+        r#"[TOOL_CALLS][{"invalid":"missing-name"},{"name":"first","arguments":{"value":1}},{"name":"second","arguments":{"value":2}}]"#,
+    );
+
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "call_0");
+    assert_eq!(calls[0].function.name, "first");
+    assert_eq!(calls[1].id, "call_1");
+    assert_eq!(calls[1].function.name, "second");
+}
+
+#[test]
+fn parser_prefers_arguments_over_parameters() {
+    let calls = parse_tool_calls(
+        r#"<|python_tag|>{"name":"choose","arguments":{"source":"arguments"},"parameters":{"source":"parameters"}}"#,
+    );
+
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.arguments, r#"{"source":"arguments"}"#);
+}
+
+#[test]
+fn parser_skips_malformed_tool_call_formats() {
+    assert!(parse_tool_calls(r#"<tool_call>{"name":</tool_call>"#).is_empty());
+    assert!(parse_tool_calls(r#"<|python_tag|>{"name":"broken""#).is_empty());
+    assert!(parse_tool_calls(r#"[TOOL_CALLS]{"name":"not-an-array"}"#).is_empty());
+    assert!(parse_tool_calls("").is_empty());
+    assert!(parse_tool_calls("ordinary assistant text").is_empty());
+}
+
+#[test]
+fn plain_assistant_output_preserves_content() {
+    let output = "ordinary assistant text".to_string();
+    let parsed = parse_assistant_output(output.clone(), "stop");
+
+    assert_eq!(parsed.content, Some(output));
+    assert!(parsed.tool_calls.is_none());
+    assert_eq!(parsed.finish_reason, "stop");
 }
 
 #[tokio::test]

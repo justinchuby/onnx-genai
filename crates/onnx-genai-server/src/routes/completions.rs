@@ -1536,7 +1536,23 @@ fn tool_choice_prompt(tool_choice: &ToolChoice) -> String {
 }
 
 pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
+    // Model families do not normally mix formats. When they do, use Qwen,
+    // Llama, then Mistral order so generated call IDs remain deterministic.
+    let parsed_calls = extract_qwen_tool_calls(output)
+        .into_iter()
+        .chain(extract_llama_tool_calls(output))
+        .chain(extract_mistral_tool_calls(output));
     let mut calls = Vec::new();
+    for value in parsed_calls {
+        if let Some(call) = parsed_tool_call_to_openai(calls.len(), value) {
+            calls.push(call);
+        }
+    }
+    calls
+}
+
+fn extract_qwen_tool_calls(output: &str) -> Vec<serde_json::Value> {
+    let mut values = Vec::new();
     let mut rest = output;
     while let Some(start) = rest.find("<tool_call>") {
         rest = &rest[start + "<tool_call>".len()..];
@@ -1544,14 +1560,59 @@ pub fn parse_tool_calls(output: &str) -> Vec<ChatMessageToolCall> {
             break;
         };
         let body = rest[..end].trim();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
-            && let Some(call) = parsed_tool_call_to_openai(calls.len(), value)
-        {
-            calls.push(call);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            values.push(value);
         }
         rest = &rest[end + "</tool_call>".len()..];
     }
-    calls
+    values
+}
+
+fn extract_llama_tool_calls(output: &str) -> Vec<serde_json::Value> {
+    const MARKER: &str = "<|python_tag|>";
+    let mut values = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find(MARKER) {
+        rest = &rest[start + MARKER.len()..];
+        let mut json = rest;
+        loop {
+            json = json.trim_start();
+            if let Some(after_separator) = json.strip_prefix(';') {
+                json = after_separator;
+                continue;
+            }
+            if json.is_empty() || json.starts_with("<|") {
+                break;
+            }
+            let Some((value, consumed)) = parse_json_value_prefix(json) else {
+                break;
+            };
+            values.push(value);
+            json = &json[consumed..];
+        }
+    }
+    values
+}
+
+fn extract_mistral_tool_calls(output: &str) -> Vec<serde_json::Value> {
+    const MARKER: &str = "[TOOL_CALLS]";
+    let mut values = Vec::new();
+    let mut rest = output;
+    while let Some(start) = rest.find(MARKER) {
+        rest = &rest[start + MARKER.len()..];
+        if let Some((serde_json::Value::Array(calls), _)) =
+            parse_json_value_prefix(rest.trim_start())
+        {
+            values.extend(calls);
+        }
+    }
+    values
+}
+
+fn parse_json_value_prefix(input: &str) -> Option<(serde_json::Value, usize)> {
+    let mut stream = serde_json::Deserializer::from_str(input).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    Some((value, stream.byte_offset()))
 }
 
 #[derive(Debug, Clone)]
@@ -1591,6 +1652,7 @@ fn parsed_tool_call_to_openai(
     let name = value.get("name")?.as_str()?.to_string();
     let arguments = value
         .get("arguments")
+        .or_else(|| value.get("parameters"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     Some(ChatMessageToolCall {
