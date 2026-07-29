@@ -21,6 +21,12 @@ use onnx_genai_ort::decode::{
 use onnx_genai_ort::{BatchedStaticCacheDecodeSession, StaticCacheDecodeOptions};
 use std::collections::VecDeque;
 
+/// The `lora.segments` routing id for a base-only row — the kernel's null route
+/// (design §J.3): a row with this id gets no adapter delta. A row bound to an
+/// adapter carries that adapter's [`AdapterId`](onnx_runtime_ep_api::AdapterId)
+/// value instead.
+const BASE_LORA_ROUTE: i32 = -1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContinuousBatchHandle {
     pub id: usize,
@@ -67,6 +73,11 @@ struct PendingContinuousRequest {
     options: GenerateOptions,
     chain: ProcessorChain,
     max_context: Option<usize>,
+    /// The grouped-LoRA route this request was admitted with, resolved once at
+    /// submit (design §J.4): the selected adapter's id, or [`BASE_LORA_ROUTE`]
+    /// for a base-only request. Never re-resolved per step, so a row cannot
+    /// inherit another request's adapter.
+    lora_route: i32,
 }
 
 struct ContinuousBatchRow {
@@ -78,6 +89,11 @@ struct ContinuousBatchRow {
     max_context: Option<usize>,
     state: DecodeLoopState,
     pending_logits: Option<Vec<f32>>,
+    /// The grouped-LoRA route this running sequence is bound to for every decode
+    /// step (design §J.4 P2e): the admitted adapter's id, or [`BASE_LORA_ROUTE`]
+    /// for base-only. Written into `lora.segments[physical_row]` each step so one
+    /// continuous batch can carry several adapters at once.
+    lora_route: i32,
 }
 
 impl ContinuousBatchRow {
@@ -106,14 +122,38 @@ pub struct ContinuousBatchManager<'a> {
     rows: Vec<Option<ContinuousBatchRow>>,
     events: VecDeque<ContinuousBatchEvent>,
     next_handle: usize,
+    /// Name → `lora.segments` route id for every adapter this session admits
+    /// (design §J.4 P2e). Empty for a base-only / non-grouped session, which
+    /// keeps the routing machinery dormant: no per-step `segments` buffer is
+    /// built or fed, so the base path is byte-for-byte unchanged.
+    lora_adapter_routes: Vec<(String, i32)>,
+    /// Reused per-step routing buffer (design perf gate). Refilled in place each
+    /// decode step so the `lora.segments` payload is not reallocated per token.
+    lora_route_scratch: Vec<i32>,
 }
 
 impl<'a> ContinuousBatchManager<'a> {
     fn new(
+        decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
+        tokenizer: &'a Tokenizer,
+        metadata_max_context: Option<usize>,
+        max_batch: usize,
+    ) -> anyhow::Result<Self> {
+        Self::with_lora_adapter_routes(
+            decode,
+            tokenizer,
+            metadata_max_context,
+            max_batch,
+            Vec::new(),
+        )
+    }
+
+    fn with_lora_adapter_routes(
         mut decode: Box<dyn BatchedDecodeSession<'a> + 'a>,
         tokenizer: &'a Tokenizer,
         metadata_max_context: Option<usize>,
         max_batch: usize,
+        lora_adapter_routes: Vec<(String, i32)>,
     ) -> anyhow::Result<Self> {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
@@ -133,7 +173,86 @@ impl<'a> ContinuousBatchManager<'a> {
             rows: (0..max_batch).map(|_| None).collect(),
             events: VecDeque::new(),
             next_handle: 0,
+            lora_adapter_routes,
+            lora_route_scratch: Vec::new(),
         })
+    }
+
+    /// Whether this session routes per-row grouped-LoRA adapters (design §J.4
+    /// P2e). False for a base-only / non-grouped session, in which case the
+    /// per-step `lora.segments` feed is skipped entirely (fast-path preservation).
+    fn lora_routing_enabled(&self) -> bool {
+        !self.lora_adapter_routes.is_empty()
+    }
+
+    /// Resolve a request's selected adapter name to its `lora.segments` route id
+    /// (design §J.4). `None` ⇒ base-only ([`BASE_LORA_ROUTE`]). An unknown name
+    /// fails loud at admission — never a silent base fallback — and a session
+    /// with no grouped pool rejects any explicit adapter selection.
+    fn resolve_lora_route(&self, adapter: Option<&str>) -> anyhow::Result<i32> {
+        match adapter {
+            None => Ok(BASE_LORA_ROUTE),
+            Some(name) if self.lora_adapter_routes.is_empty() => anyhow::bail!(
+                "per-request LoRA adapter {name:?} was requested, but this continuous-batch \
+                 session was not loaded with a grouped-LoRA pool (configure \
+                 EngineConfig::lora_adapters)"
+            ),
+            Some(name) => self
+                .lora_adapter_routes
+                .iter()
+                .find(|(adapter_name, _)| adapter_name == name)
+                .map(|(_, route)| *route)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown LoRA adapter {name:?}; loaded adapters: [{}]",
+                        self.lora_adapter_routes
+                            .iter()
+                            .map(|(adapter_name, _)| adapter_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }),
+        }
+    }
+
+    /// Feed the physical-row-indexed `lora.segments` for the next `step_select` /
+    /// `prefill` call: `segments[physical_row]` is that row's sequence adapter
+    /// route, empty slots route to base ([`BASE_LORA_ROUTE`]). A no-op (no
+    /// allocation, no session call) unless this session routes adapters.
+    fn feed_physical_lora_routes(&mut self) -> anyhow::Result<()> {
+        if !self.lora_routing_enabled() {
+            return Ok(());
+        }
+        self.lora_route_scratch.clear();
+        self.lora_route_scratch.resize(self.rows.len(), BASE_LORA_ROUTE);
+        for row in self.rows.iter().flatten() {
+            self.lora_route_scratch[row.physical_row] = row.lora_route;
+        }
+        self.decode
+            .set_lora_routes(&self.lora_route_scratch)
+            .map_err(|e| anyhow::anyhow!("Failed to feed continuous grouped-LoRA segments: {e}"))
+    }
+
+    /// Feed the active-row-ordered `lora.segments` for the next `step_active`
+    /// call: `segments[i]` is the adapter route of the i-th active row in
+    /// `active_rows` order, matching how `step_active` orders its inputs/logits.
+    /// A no-op unless this session routes adapters.
+    fn feed_active_lora_routes(&mut self, active_rows: &[usize]) -> anyhow::Result<()> {
+        if !self.lora_routing_enabled() {
+            return Ok(());
+        }
+        self.lora_route_scratch.clear();
+        self.lora_route_scratch.reserve(active_rows.len());
+        for &logical_row in active_rows {
+            let route = self.rows[logical_row]
+                .as_ref()
+                .context("active continuous row is not assigned")?
+                .lora_route;
+            self.lora_route_scratch.push(route);
+        }
+        self.decode
+            .set_lora_routes(&self.lora_route_scratch)
+            .map_err(|e| anyhow::anyhow!("Failed to feed continuous grouped-LoRA segments: {e}"))
     }
 
     /// Queue a request for the next available decode row.
@@ -159,6 +278,9 @@ impl<'a> ContinuousBatchManager<'a> {
         }
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.tokenizer))?;
+        let lora_route = self
+            .resolve_lora_route(options.adapter.as_deref())
+            .context("resolve per-request LoRA adapter for continuous batch")?;
         if reached_context_limit(prompt_tokens.len(), max_context) {
             ensure_constrained_finish(&options, "", FinishReason::Length)?;
             self.events.push_back(ContinuousBatchEvent::Finished {
@@ -173,6 +295,7 @@ impl<'a> ContinuousBatchManager<'a> {
             options,
             chain,
             max_context,
+            lora_route,
         });
         Ok(handle)
     }
@@ -249,7 +372,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 .map_err(|e| anyhow::anyhow!("Failed to assign continuous row: {e}"))?;
             let rng = SamplingRng::for_row(pending.options.seed, row_index);
             let loop_state = DecodeLoopState::with_rng(0, rng, pending.options.top_logprobs);
-            let mut row = ContinuousBatchRow {
+            let row = ContinuousBatchRow {
                 handle: pending.handle,
                 physical_row: row_index,
                 context_tokens: pending.prompt_tokens,
@@ -258,9 +381,10 @@ impl<'a> ContinuousBatchManager<'a> {
                 max_context: pending.max_context,
                 state: loop_state,
                 pending_logits: None,
+                lora_route: pending.lora_route,
             };
-            prefill_continuous_row(&mut *self.decode, &mut row)?;
             self.rows[row_index] = Some(row);
+            self.prefill_continuous_row(row_index)?;
         }
         Ok(())
     }
@@ -374,6 +498,7 @@ impl<'a> ContinuousBatchManager<'a> {
                     .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
                     as i64;
             }
+            self.feed_active_lora_routes(&active_rows)?;
             let logits = self
                 .decode
                 .step_active(&input_ids, &position_ids)
@@ -405,6 +530,7 @@ impl<'a> ContinuousBatchManager<'a> {
                 advance_rows[row.physical_row] = true;
             }
         }
+        self.feed_physical_lora_routes()?;
         let logits = self
             .decode
             .step_select(&input_ids, &position_ids, &advance_rows)
@@ -413,6 +539,49 @@ impl<'a> ContinuousBatchManager<'a> {
             if advance_rows[row.physical_row] {
                 row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
             }
+        }
+        Ok(())
+    }
+
+    /// Prefill a freshly admitted row one prompt token at a time. The row is
+    /// already stored at `self.rows[row_index]`, so the per-step `lora.segments`
+    /// feed can route every physical slot to its own sequence's adapter (design
+    /// §J.4 P2e) — the prefilling row to its admitted adapter, other live rows to
+    /// theirs, empty slots to base.
+    fn prefill_continuous_row(&mut self, row_index: usize) -> anyhow::Result<()> {
+        let context_len = self.rows[row_index]
+            .as_ref()
+            .context("continuous row disappeared before prefill")?
+            .context_tokens
+            .len();
+        for offset in 0..context_len {
+            let batch_size = self.decode.batch_size();
+            let mut input_ids = vec![0_i64; batch_size];
+            let mut position_ids = vec![0_i64; batch_size];
+            let mut advance_rows = vec![false; batch_size];
+            let physical_row = {
+                let row = self.rows[row_index]
+                    .as_ref()
+                    .context("continuous row disappeared during prefill")?;
+                input_ids[row.physical_row] = i64::from(row.context_tokens[offset]);
+                advance_rows[row.physical_row] = true;
+                row.physical_row
+            };
+            position_ids[physical_row] = self
+                .decode
+                .row_len(physical_row)
+                .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
+                as i64;
+            self.feed_physical_lora_routes()?;
+            let logits = self
+                .decode
+                .step_select(&input_ids, &position_ids, &advance_rows)
+                .map_err(|e| anyhow::anyhow!("Continuous static-cache prefill failed: {e}"))?;
+            let extracted = row_logits(&logits, physical_row, 0)?;
+            self.rows[row_index]
+                .as_mut()
+                .context("continuous row disappeared after prefill step")?
+                .pending_logits = Some(extracted);
         }
         Ok(())
     }
@@ -687,28 +856,6 @@ impl Engine {
     }
 }
 
-fn prefill_continuous_row(
-    decode: &mut dyn BatchedDecodeSession<'_>,
-    row: &mut ContinuousBatchRow,
-) -> anyhow::Result<()> {
-    for offset in 0..row.context_tokens.len() {
-        let mut input_ids = vec![0_i64; decode.batch_size()];
-        let mut position_ids = vec![0_i64; decode.batch_size()];
-        let mut advance_rows = vec![false; decode.batch_size()];
-        input_ids[row.physical_row] = i64::from(row.context_tokens[offset]);
-        position_ids[row.physical_row] = decode
-            .row_len(row.physical_row)
-            .map_err(|e| anyhow::anyhow!("Failed to read continuous row length: {e}"))?
-            as i64;
-        advance_rows[row.physical_row] = true;
-        let logits = decode
-            .step_select(&input_ids, &position_ids, &advance_rows)
-            .map_err(|e| anyhow::anyhow!("Continuous static-cache prefill failed: {e}"))?;
-        row.pending_logits = Some(row_logits(&logits, row.physical_row, 0)?);
-    }
-    Ok(())
-}
-
 fn collect_finished_events(
     events: Vec<ContinuousBatchEvent>,
     results: &mut [Option<GenerateResult>],
@@ -847,5 +994,439 @@ mod tests {
         assert_eq!(sequence(0), sequence(0));
         assert_eq!(sequence(1), sequence(1));
         assert_ne!(sequence(0), sequence(1));
+    }
+}
+
+/// Acceptance coverage for design §J.4 P2e — mixed-adapter rows within ONE
+/// continuous batch. Drives the real [`ContinuousBatchManager`] (submit → step →
+/// poll) over a grouped-LoRA session and asserts that one batch carrying three
+/// sequences bound to adapter A, adapter B, and base produces per-row-correct
+/// outputs. The `GroupedProbeSession` is a decode-session test double for the KV
+/// runner only: it runs the **real** `GroupedLoraDelta` kernel (via
+/// [`InferenceSession`]) on the per-row `lora.segments` the manager builds, so a
+/// whole-batch-to-base manager fails this test (row A and row B would collapse to
+/// base). The kernel's own per-row math is proven separately by
+/// `onnx-runtime-session`'s `grouped_two_adapters_route_per_row`.
+#[cfg(all(test, feature = "native-backend"))]
+mod lora_continuous_batch_tests {
+    use super::*;
+    use onnx_genai_ort::{OrtError, Value};
+    use onnx_runtime_ir::{
+        Attribute, DataType as IrDataType, Dim, Graph, Node, NodeId, TensorData, WeightRef,
+        static_shape,
+    };
+    use onnx_runtime_loader::encoder::{Model, write_model};
+    use onnx_runtime_session::lora_inject::{LoraAdapterSpec, LoraModuleSpec};
+    use onnx_runtime_session::{InferenceSession, Tensor};
+
+    const K: usize = 16;
+    const N: usize = 3;
+    const RANK: usize = 2;
+
+    fn f32_le(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn i32_le(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// `scale · ((x · A_t) · B_t)` from the injection factors (fp32 accumulators),
+    /// the authoritative per-adapter delta a routed row must reproduce.
+    fn reference_delta(x: &[f32], a_t: &[f32], b_t: &[f32], scale: f32) -> Vec<f32> {
+        let mut mid = vec![0.0f64; RANK];
+        for j in 0..RANK {
+            let mut acc = 0.0f64;
+            for p in 0..K {
+                acc += x[p] as f64 * a_t[p * RANK + j] as f64;
+            }
+            mid[j] = acc;
+        }
+        let mut delta = vec![0.0f32; N];
+        for j in 0..N {
+            let mut acc = 0.0f64;
+            for p in 0..RANK {
+                acc += mid[p] * b_t[p * N + j] as f64;
+            }
+            delta[j] = (acc * scale as f64) as f32;
+        }
+        delta
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(index, _)| index)
+            .unwrap()
+    }
+
+    /// A single-layer `q_proj` int4 base projection that dequantizes to zero
+    /// (every nibble is the affine zero point `0x8`), so the observable output
+    /// isolates the grouped-LoRA delta. The activation `x[batch, K]` uses a
+    /// symbolic batch dim so the same session runs any batch width.
+    fn write_zero_base_batch_model(path: &std::path::Path) {
+        const BITS: usize = 4;
+        const BLOCK_SIZE: usize = 16;
+        let k_blocks = K / BLOCK_SIZE;
+        let blob_size = BLOCK_SIZE * BITS / 8;
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert("com.microsoft".to_string(), 1);
+
+        let batch = graph.intern_symbol("batch");
+        let x = graph.create_named_value(
+            "x",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(K)],
+        );
+        graph.add_input(x);
+
+        let weight = graph.create_named_value(
+            "model.layers.0.attn.q_proj.MatMulNBits.qweight",
+            IrDataType::Uint8,
+            static_shape([N, k_blocks, blob_size]),
+        );
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Uint8,
+                vec![N, k_blocks, blob_size],
+                vec![0x88u8; N * k_blocks * blob_size],
+            )),
+        );
+        let scales = graph.create_named_value(
+            "model.layers.0.attn.q_proj.MatMulNBits.scales",
+            IrDataType::Float32,
+            static_shape([N, k_blocks]),
+        );
+        graph.set_initializer(
+            scales,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Float32,
+                vec![N, k_blocks],
+                f32_le(&vec![1.0f32; N * k_blocks]),
+            )),
+        );
+
+        let y = graph.create_named_value(
+            "y",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(N)],
+        );
+        let mut node = Node::new(
+            NodeId(0),
+            "MatMulNBits",
+            vec![Some(x), Some(weight), Some(scales)],
+            vec![y],
+        );
+        node.name = "/model/layers.0/attn/q_proj/MatMulNBits".to_string();
+        node.domain = "com.microsoft".to_string();
+        node.attributes.insert("K".to_string(), Attribute::Int(K as i64));
+        node.attributes.insert("N".to_string(), Attribute::Int(N as i64));
+        node.attributes.insert("bits".to_string(), Attribute::Int(BITS as i64));
+        node.attributes
+            .insert("block_size".to_string(), Attribute::Int(BLOCK_SIZE as i64));
+        graph.insert_node(node);
+        graph.add_output(y);
+
+        write_model(&Model::new(&graph), path).unwrap();
+    }
+
+    fn lora_spec(name: &str, a_t: &[f32], b_t: &[f32], scale: f32) -> LoraAdapterSpec {
+        LoraAdapterSpec {
+            name: name.to_string(),
+            modules: vec![LoraModuleSpec {
+                module_name: "self_attn.q_proj".to_string(),
+                layer_index: 0,
+                rank: RANK,
+                scale,
+                a_t: TensorData::from_raw(IrDataType::Float32, vec![K, RANK], f32_le(a_t)),
+                b_t: TensorData::from_raw(IrDataType::Float32, vec![RANK, N], f32_le(b_t)),
+            }],
+        }
+    }
+
+    /// A `BatchedDecodeSession` that runs the real grouped-LoRA `InferenceSession`
+    /// on a fixed activation, so each physical row's logits depend ONLY on the
+    /// per-row `lora.segments` route the manager feeds. KV-free (the base model is
+    /// a pure projection), so `row_len`/positions are bookkeeping only.
+    struct GroupedProbeSession {
+        session: InferenceSession,
+        segments_input: String,
+        fixed_x: Vec<f32>,
+        batch_size: usize,
+        row_lens: Vec<usize>,
+        active: Vec<bool>,
+        routes: Vec<i32>,
+    }
+
+    impl GroupedProbeSession {
+        fn run_rows(&mut self, rows: usize) -> onnx_genai_ort::Result<Value> {
+            if self.routes.len() != rows {
+                return Err(OrtError::InvalidArgument(format!(
+                    "probe fed {} routes for {rows} activation rows",
+                    self.routes.len()
+                )));
+            }
+            let mut x = Vec::with_capacity(rows * K);
+            for _ in 0..rows {
+                x.extend_from_slice(&self.fixed_x);
+            }
+            let x_tensor = Tensor::from_f32(&[rows, K], &x)
+                .map_err(|e| OrtError::InvalidArgument(format!("probe x tensor: {e}")))?;
+            let seg_tensor =
+                Tensor::from_raw(IrDataType::Int32, vec![rows], &i32_le(&self.routes))
+                    .map_err(|e| OrtError::InvalidArgument(format!("probe segments tensor: {e}")))?;
+            let outputs = self
+                .session
+                .run(&[("x", &x_tensor), (self.segments_input.as_str(), &seg_tensor)])
+                .map_err(|e| OrtError::InvalidArgument(format!("probe grouped run: {e}")))?;
+            let y = outputs[0].to_vec_f32();
+            Value::from_slice_f32(&y, &[rows as i64, 1, N as i64])
+        }
+    }
+
+    impl<'a> BatchedDecodeSession<'a> for GroupedProbeSession {
+        fn batch_size(&self) -> usize {
+            self.batch_size
+        }
+        fn max_len(&self) -> usize {
+            1 << 20
+        }
+        fn row_len(&self, row: usize) -> onnx_genai_ort::Result<usize> {
+            Ok(self.row_lens[row])
+        }
+        fn active_rows(&self) -> Vec<usize> {
+            (0..self.batch_size).filter(|&row| self.active[row]).collect()
+        }
+        fn deactivate_row(&mut self, row: usize) -> onnx_genai_ort::Result<()> {
+            self.active[row] = false;
+            Ok(())
+        }
+        fn assign_row(&mut self, row: usize) -> onnx_genai_ort::Result<()> {
+            self.active[row] = true;
+            self.row_lens[row] = 0;
+            Ok(())
+        }
+        fn set_lora_routes(&mut self, routes: &[i32]) -> onnx_genai_ort::Result<()> {
+            self.routes.clear();
+            self.routes.extend_from_slice(routes);
+            Ok(())
+        }
+        fn step_select(
+            &mut self,
+            next_token_ids: &[i64],
+            _position_ids: &[i64],
+            advance_rows: &[bool],
+        ) -> onnx_genai_ort::Result<Value> {
+            let logits = self.run_rows(next_token_ids.len())?;
+            for row in 0..self.batch_size {
+                if self.active[row] && advance_rows[row] {
+                    self.row_lens[row] += 1;
+                }
+            }
+            Ok(logits)
+        }
+        fn step_active(
+            &mut self,
+            next_token_ids: &[i64],
+            _position_ids: &[i64],
+        ) -> onnx_genai_ort::Result<Value> {
+            let logits = self.run_rows(next_token_ids.len())?;
+            for row in 0..self.batch_size {
+                if self.active[row] {
+                    self.row_lens[row] += 1;
+                }
+            }
+            Ok(logits)
+        }
+    }
+
+    fn tokenizer() -> Tokenizer {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm-scatter/tokenizer.json");
+        Tokenizer::from_file(path).expect("load fixture tokenizer")
+    }
+
+    fn base_request(adapter: Option<&str>) -> GenerateRequest {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+        request.options.max_new_tokens = 1;
+        request.options.greedy = true;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        request.options.eos_token_id = Some(1_000_000);
+        request.options.adapter = adapter.map(str::to_string);
+        request
+    }
+
+    #[test]
+    fn continuous_batch_routes_mixed_adapters_per_row() {
+        // Adapter A projects onto vocab index 1; adapter B onto index 2; base is
+        // the exact zero vector (argmax 0). Distinct nonzero argmaxes make the
+        // routing observable in the emitted token and non-tautological: a
+        // whole-batch-to-base manager emits token 0 for every row and fails.
+        let fixed_x: Vec<f32> = vec![1.0; K];
+        let scale = 1.0f32;
+        // A_t is [K, RANK]; column 0 sums the activation into hidden unit 0.
+        let mut a_t = vec![0.0f32; K * RANK];
+        for p in 0..K {
+            a_t[p * RANK] = 0.1; // -> mid[0] = 0.1 * sum(x) = 0.1 * K
+        }
+        // B_t is [RANK, N]; hidden unit 0 drives one distinct vocab column each.
+        let mut b_t_a = vec![0.0f32; RANK * N];
+        b_t_a[1] = 1.0; // row 0 (hidden 0) -> vocab 1
+        let mut b_t_b = vec![0.0f32; RANK * N];
+        b_t_b[2] = 1.0; // row 0 (hidden 0) -> vocab 2
+
+        let delta_a = reference_delta(&fixed_x, &a_t, &b_t_a, scale);
+        let delta_b = reference_delta(&fixed_x, &a_t, &b_t_b, scale);
+        let token_a = argmax(&delta_a);
+        let token_b = argmax(&delta_b);
+        assert_ne!(token_a, 0, "adapter A must route off the base argmax");
+        assert_ne!(token_b, 0, "adapter B must route off the base argmax");
+        assert_ne!(token_a, token_b, "adapters A and B must be distinguishable");
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        write_zero_base_batch_model(&model_path);
+
+        let session = InferenceSession::builder()
+            .model(&model_path)
+            .lora_adapters(vec![
+                lora_spec("adapter_a", &a_t, &b_t_a, scale),
+                lora_spec("adapter_b", &a_t, &b_t_b, scale),
+            ])
+            .build()
+            .expect("build grouped multi-adapter session");
+
+        let segments_input = session
+            .lora_segments_input()
+            .expect("grouped session exposes a segments input")
+            .to_string();
+        let route_a = session.resolve_lora_adapter("adapter_a").expect("resolve A").0 as i32;
+        let route_b = session.resolve_lora_adapter("adapter_b").expect("resolve B").0 as i32;
+
+        let max_batch = 3;
+        let probe = GroupedProbeSession {
+            session,
+            segments_input,
+            fixed_x,
+            batch_size: max_batch,
+            row_lens: vec![0; max_batch],
+            active: vec![false; max_batch],
+            routes: Vec::new(),
+        };
+
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(probe),
+            &tokenizer,
+            None,
+            max_batch,
+            vec![
+                ("adapter_a".to_string(), route_a),
+                ("adapter_b".to_string(), route_b),
+            ],
+        )
+        .expect("build continuous-batch manager");
+
+        // Handle order: 0 -> adapter A, 1 -> adapter B, 2 -> base.
+        let handle_a = manager.submit(base_request(Some("adapter_a"))).unwrap();
+        let handle_b = manager.submit(base_request(Some("adapter_b"))).unwrap();
+        let handle_base = manager.submit(base_request(None)).unwrap();
+
+        let mut first_token = std::collections::HashMap::new();
+        // Drain the initial admission events, then step to completion.
+        let record = |events: Vec<ContinuousBatchEvent>,
+                      sink: &mut std::collections::HashMap<usize, u32>| {
+            for event in events {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    sink.entry(handle.id).or_insert(token.token_id);
+                }
+            }
+        };
+        record(manager.poll(), &mut first_token);
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            record(manager.poll(), &mut first_token);
+            guard += 1;
+            assert!(guard < 64, "continuous batch failed to drain");
+        }
+
+        assert_eq!(
+            first_token.get(&handle_a.id).copied(),
+            Some(token_a as u32),
+            "row bound to adapter A must emit A's argmax token"
+        );
+        assert_eq!(
+            first_token.get(&handle_b.id).copied(),
+            Some(token_b as u32),
+            "row bound to adapter B must emit B's argmax token"
+        );
+        assert_eq!(
+            first_token.get(&handle_base.id).copied(),
+            Some(0u32),
+            "base row must emit the zero-base argmax token"
+        );
+    }
+
+    /// An unknown adapter name fails loud at admission (never a silent base
+    /// fallback), and a base-only request is admitted with the null route.
+    #[test]
+    fn continuous_batch_unknown_adapter_fails_loud() {
+        let fixed_x: Vec<f32> = vec![1.0; K];
+        let scale = 1.0f32;
+        let mut a_t = vec![0.0f32; K * RANK];
+        for p in 0..K {
+            a_t[p * RANK] = 0.1;
+        }
+        let mut b_t_a = vec![0.0f32; RANK * N];
+        b_t_a[1] = 1.0;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        write_zero_base_batch_model(&model_path);
+        let session = InferenceSession::builder()
+            .model(&model_path)
+            .lora_adapters(vec![lora_spec("adapter_a", &a_t, &b_t_a, scale)])
+            .build()
+            .expect("build grouped session");
+        let segments_input = session.lora_segments_input().unwrap().to_string();
+        let route_a = session.resolve_lora_adapter("adapter_a").unwrap().0 as i32;
+
+        let max_batch = 2;
+        let probe = GroupedProbeSession {
+            session,
+            segments_input,
+            fixed_x,
+            batch_size: max_batch,
+            row_lens: vec![0; max_batch],
+            active: vec![false; max_batch],
+            routes: Vec::new(),
+        };
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(probe),
+            &tokenizer,
+            None,
+            max_batch,
+            vec![("adapter_a".to_string(), route_a)],
+        )
+        .expect("build manager");
+
+        let error = manager
+            .submit(base_request(Some("nope")))
+            .expect_err("unknown adapter must fail loud at admission");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unknown LoRA adapter"),
+            "unexpected error: {message}"
+        );
+        // Base-only still admits fine.
+        manager.submit(base_request(None)).expect("base-only admits");
     }
 }

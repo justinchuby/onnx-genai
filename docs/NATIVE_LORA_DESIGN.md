@@ -1047,15 +1047,49 @@ than the previous misleading "session was not loaded with a grouped pool" error.
   three-adapter routing stress test verify correct, stable routing. CUDA-graph
   capture intentionally splits at this eager seam until device-side grouping and
   fixed capture-safe page tables land.
+* **Mixed-adapter rows within ONE continuous batch** (§J.4/§J.5 P2e): the
+  `ContinuousBatchManager` now threads a per-row `adapter_id` end to end. Each
+  `PendingContinuousRequest` / `ContinuousBatchRow` carries the `lora_route`
+  (`i32` segment id, `-1` == base) it was admitted with; the route is resolved at
+  `submit` time from the request's `GenerateOptions.adapter` against the loaded
+  adapter→route map (`resolve_lora_route`), failing loud on an unknown name
+  (reusing the "unknown LoRA adapter" message that names the loaded adapters) and
+  on an explicit adapter when no grouped pool is configured — never a silent base
+  fallback. Before every decode call the manager builds the `lora.segments`
+  tensor per row into a **reused scratch buffer** (`lora_route_scratch`, cleared
+  and refilled in place with no per-step heap allocation after warmup) and feeds
+  it through the new `BatchedDecodeSession::set_lora_routes` trait method:
+  `feed_physical_lora_routes` fills physical-row-indexed segments (empty slots →
+  base) before `step_select` / prefill, and `feed_active_lora_routes` fills
+  active-row-ordered segments before `step_active`, matching how each call orders
+  its rows. `set_lora_routes` defaults to a no-op, and the whole path is skipped
+  when `lora_adapter_routes` is empty, so the ≤1-adapter / all-base fast path
+  stays byte-for-byte Phase-1 and the ORT `BatchedStaticCacheDecodeSession`
+  (which has no grouped op) is unaffected.
+* Test: engine `continuous_batch_routes_mixed_adapters_per_row`
+  (`native-backend`) drives the **real** `ContinuousBatchManager` with three
+  submitted requests — bound to adapter A, adapter B, and base — through a
+  decode-session double (`GroupedProbeSession`) that runs the **real** grouped
+  `GroupedLoraDelta` kernel via a native `InferenceSession`. The zero base model
+  makes each row's argmax depend solely on the per-row route: the A row emits A's
+  delta argmax, the B row emits B's, the base row emits token 0. It is
+  non-tautological — a whole-batch-to-base manager emits token 0 for every row
+  and fails (verified by temporarily forcing all routes to base).
+  `continuous_batch_unknown_adapter_fails_loud` covers the admission-time
+  fail-loud path.
 
 **Deferred (honestly not done in this pass).**
 
-* **Mixed-adapter rows within ONE continuous batch** (§J.4/§J.5 P2e): threading a
-  per-row `adapter_id` through `scheduler::Request` / `RunningSequence` /
-  `ContinuousBatchRow` in the batched `ContinuousBatchManager` backend so a
-  single batch carries several adapters at once. The native single-session
-  backend delivers **per-request-grouped** selection (one adapter per generate
-  call), which is end-to-end reachable and tested; the batched backend still
-  routes a whole batch to base. This is the remaining step to the full §J vision.
+* **Native engine-level continuous-batch decode backend**: the per-row routing
+  wiring above lives in `ContinuousBatchManager` + `BatchedDecodeSession` and is
+  proven against a decode-session double running the real grouped kernel. It is
+  NOT yet reachable from a production native continuous-batch backend, because
+  today's `ContinuousBatchManager` runs only on the ORT backend
+  (`BatchedStaticCacheDecodeSession`), whose `libonnxruntime.so` session has no
+  `GroupedLoraDelta` op, and the native backend does not yet expose a
+  continuous-batch decode session. `generate_batched_static` remains base-only.
+  Wiring a native KV-cache continuous-batch decode session that implements
+  `set_lora_routes` against the grouped `InferenceSession` is the remaining step
+  to ship mixed-adapter batching as a product surface.
 * **Speculative decoding + grouped adapter** combined: rejected fail-loud (the
   draft/verify paths do not yet thread the route).
