@@ -58,11 +58,19 @@ ENV/
 htmlcov/
 .tox/
 
-# Squad: ignore runtime state (logs, inbox, sessions)
+# Squad: ignore runtime state (logs, sessions)
 # Note: .squad/casting/* is identity and MUST be committed to main, not ignored
+# Note: .squad/decisions/inbox/ is intentionally TRACKED (not ignored). It was
+# originally grouped with runtime scratch in the 2026-07-12 "Add squad" commit on
+# the assumption that drops are consumed and cleared on the same machine that wrote
+# them. That assumption failed: worktrees were deleted before Scribe merged, losing
+# drops that existed only locally, and with multiple machines writing concurrently a
+# drop is invisible on other machines until merged. Tracking makes drops a durable
+# queue that survives worktree deletion and is visible in-flight; concurrent Scribes
+# add distinct files (no conflict) and delete/delete resolves cleanly on merge.
+# See .squad/decisions.md — "2026-07-29 — Decision inbox is a tracked durable queue".
 .squad/orchestration-log/
 .squad/log/
-.squad/decisions/inbox/
 .squad/sessions/
 .squad/.scratch/
 .squad/.cache/

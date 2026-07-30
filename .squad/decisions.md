@@ -323,6 +323,11 @@ reference, not equivalent to the normal project-default ORT `all` configuration.
 No project ORT pin, Cargo file, environment example, or CUDA kernel was committed.
 
 
+### 2026-07-30: Add QLinearMatMul and common Resize CUDA parity
+**By:** Kuato
+**What:** CUDA now claims QLinearMatMul for Int8/Uint8 per-tensor and operand-axis quantization, plus Resize nearest/linear with half_pixel, align_corners, and asymmetric coordinates using scales or sizes. Cubic, pytorch_half_pixel, tf_crop_and_resize, half_pixel_symmetric, antialiasing, and non-stretch aspect policies remain fail-closed.
+**Why:** These implementations match the CPU EP's integer accumulation/requantization and interpolation formulas while raising standard-domain CUDA parity from 139/145 to 141/145 without claiming unsupported Resize semantics.
+
 ### 2026-07-30: Land the remaining tractable CUDA index and pooling operators
 **By:** Kuato
 **What:** Added CUDA `LpPool`, `CenterCropPad`, and `Col2Im`, raising `CUDA_COVERED_OPS` from 154 to 157. `LpPool` uses a general N-D NVRTC window reduction, while the two index transforms share one dtype-aware NVRTC module.
@@ -559,3 +564,63 @@ Opt-in `warmup` per-model setting and `POST /v1/admin/models/{id}/warm` both use
 **Reviewer depth paid for itself.** Copilot found a stale comment; rubber-duck raised the doubt; Gaff proved it by mutation; Luv disproved the fix by running it in isolation; Leon's third attempt was approved only after Luv independently re-verified, twice. With Copilot review alone this would have merged a test that caught nothing — while existing solely to catch that bug. — *coordinator*
 
 **Scribe repeat failure — worktree deletion before inbox merge (second occurrence 2026-07-29).** The standing operational rule was correct; it was not applied. Consider whether the safeguard should be procedural rather than a remembered rule — e.g. Scribe runs before any worktree removal, or drops are written to the main checkout from the start. Lost: `gaff-review-reasoning-fixture.md`, `batty-reasoning-fixture-revision.md`, `leon-reasoning-fixture-round3.md`, `pris-tiny-reasoning-fixture.md`. — *Justin Chu / Scribe*
+
+## 2026-07-29 — Decision inbox is a tracked durable queue (not gitignored scratch)
+
+**By:** Scribe (tidy round 1)
+
+**What:** `.squad/decisions/inbox/` is now **tracked in git** rather than ignored.
+`.gitignore` no longer lists it; `inbox/README.md` keeps the directory present and
+documents the semantics. The charter's responsibility #2 is updated to match.
+
+**Why:** The inbox was gitignored in the 2026-07-12 "Add squad" commit, grouped with
+runtime scratch (logs, sessions) on the assumption that drops are consumed and cleared
+on the same machine that wrote them. With worktrees deleted before Scribe merges, and
+three teams writing decision logs concurrently on separate machines, that assumption is
+false — drops that live only locally are lost on worktree deletion (four records lost on
+2026-07-29, others earlier) and drops on other machines are invisible here until merged.
+Tracking fixes all three: drops survive worktree deletion, are visible in-flight across
+machines, and concurrent Scribes each add distinct files that git merges without
+conflict (the only overlap, merge-and-delete, is a clean delete/delete). This is the
+structural version of the fix already noted under "Concurrent Scribe runs are a
+structural hazard": assemble `decisions.md` from inbox drops instead of hand-merging.
+
+**Costs accepted (honest accounting):** more churn in git history; drops now appear in
+PR diffs where they previously did not; and we deliberately override a line that had
+been in place since the initial squad scaffolding. That line was not a considered
+inbox-specific decision — it was a bulk "ignore runtime state" grouping — and its one
+real premise (drops are transient and cleared) still holds: Scribe still deletes drops
+after merge. Only the durability assumption was wrong, so tracking is compatible with
+the original intent rather than a reversal of a deliberate choice.
+
+## 2026-07-29 — Scribe tidy round 2: what to check next
+
+**By:** Scribe (tidy round 1)
+
+Round 1 compacted five histories, made the inbox tracked, and merged one drop. Round 2
+should be concrete about drift, because three other teams merge into this repo between
+runs:
+
+- **`decisions.md` size.** It was 26,144 bytes this afternoon, 35,644 at the start of
+  round 1, and ~36,900 after round 1's merge + these records. The 50 KB size gate has
+  **not** fired yet. Round 2: re-measure first; if it is near or over 50 KB, archive the
+  older narrative `2026-07-29` entries (the reasoning-fixture block, the PTY/terminal
+  block) to `.squad/decisions-archive/2026-07.md` and leave pointers. Expect other
+  teams' merges to have added new dated `## 2026-07-…` sections and possibly reinflated
+  the file after any compaction — re-run compaction against tip immediately before merge.
+- **Inbox.** Now tracked, so round 2 can see drops from other machines directly. Merge
+  every `*.md` except `README.md`, dedupe against existing `decisions.md` entries
+  (other teams may have merged the same drop), delete merged files, keep `README.md`.
+- **Histories to re-check for the chronicle gate (>8 dated entries, or oldest live entry
+  predating the previous wave relative to that file's newest entry):** deckard and roy
+  will re-accumulate fastest (they gained dated entries every wave); bryant and wallace
+  are the small-file/pure-chronicle pattern the byte gate misses, so re-apply the entry
+  gate, not bytes. Sweep all of `.squad/agents/*/history.md` — live histories totalled
+  126,049 bytes across 82 files at round 1, and other teams' agents drift independently.
+- **Do not archive agent directories.** Charter requires activity evidence and fail-closed
+  behaviour; with three other teams active, absence of local commits/drops/history proves
+  nothing. Investigate only; never archive on registry/team.md absence alone.
+- **Evidence to want:** for each compaction, before/after bytes and a live+archive ≥
+  original check per file; for `decisions.md`, the byte figure and whether any prior
+  compaction was silently reinflated by concurrent appends (compare the "Last compacted"
+  header against the newest entry date).
