@@ -2,6 +2,18 @@
 
 MEASURED-AT: 37d0d72e
 
+> **PIN UNDER REVISION — read this before the line above.** The author of that pin
+> (`37d0d72e`) publicly retired it after four later fixes landed, and a replacement
+> had not been cut when this line was written. **Line 3 is therefore a declaration of
+> where this document was measured, not a claim about what the PR should ship from.**
+> When a new pin is cut, the correction here is an *append* of a second `MEASURED-AT`
+> line, never an edit of line 3 — the freshness guard reads every declaration in the
+> file and scores the newest, so appending preserves the audit trail that editing
+> would destroy. **And the two numbers derived at that pin — 213 ACs and the 85-file
+> exposure ratchet — must be RE-DERIVED at the new SHA, not carried across.** A hex
+> substitution that leaves them standing produces a document that is internally
+> consistent, confidently wrong, and carries the new SHA as its warrant.
+
 > The line above is deliberately undecorated: bare lowercase hex, column 1,
 > nothing before or after it. It carried blockquote and bold markup until the
 > convention's author published the grammar, at which point I ran their parser
