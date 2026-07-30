@@ -598,14 +598,19 @@ test('Prometheus metrics become measured fields', async () => {
 });
 
 test('the in-flight gauge is NEVER exposed as the engine batch size', async () => {
-  // The single most dangerous metric on the server: onnx_genai_batch_size_current
-  // is documented "Current generation batch size" but is incremented per HTTP
-  // generation and decremented on drop, so it counts requests in flight. With
-  // max_batch pinned at 4, this body reports 3 in flight -- and on a busier
-  // server it would report 8 while the engine batched only 4.
+  // The single most dangerous quantity the server publishes. It is serialised as
+  // /v1/status.batch_in_flight from snapshot.current_batch_size, and it is
+  // incremented per HTTP generation and decremented on drop -- so it counts
+  // requests in flight, NOT the width the engine actually batched. On a busy
+  // server it reads 8 while the engine batched only 4.
+  //
+  // This field used to be read from /metrics (onnx_genai_batch_size_current) and
+  // was rebound to /v1/status. Inject through the endpoint the catalogue actually
+  // reads: feeding the old route does not error, it silently supplies nothing and
+  // the store returns the other endpoint's value instead.
   const store = createTelemetryStore({
     baseUrl: BASE_URL,
-    fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.METRICS]: { text: metricsBody({ inFlight: 8 }) } })),
+    fetchImpl: fakeFetch(healthyRoutes({ [ENDPOINTS.STATUS]: { body: statusBody({ batch_in_flight: 8 }) } })),
   });
   await store.pollOnce();
   const { fields } = store.getSnapshot();
