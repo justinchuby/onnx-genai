@@ -233,7 +233,7 @@ function ageSeparator() {
  * @returns {HTMLElement}
  */
 export function renderField(field, options = {}) {
-  const state = renderStateOf(field);
+  const state = renderStateOf(field, { strict: options.strict });
   const label = options.label ?? field?.label ?? 'value';
   const unit = field?.unit ?? '';
   const sourceClass = normaliseSourceClass(options.sourceClass ?? field?.source);

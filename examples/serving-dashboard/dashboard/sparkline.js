@@ -114,7 +114,7 @@ const IMPLICIT_GAP_CADENCE_MULTIPLE = 3;
 export function planSparkline(series, options) {
   const { width, height, windowMs, nowMs, cadenceMs, padY = 2, zeroBaseline = true } = options;
 
-  const state = renderStateOf(seriesAsField(series));
+  const state = renderStateOf(seriesAsField(series), { strict: options?.strict });
 
   if (state === RENDER_STATES.NOT_APPLICABLE) {
     return emptyPlan('not-applicable', width, height, CAPTION_NOT_APPLICABLE, false);

@@ -51,20 +51,36 @@ describe('planSparkline — the honesty rules', () => {
   it('treats an unrecognised state as unavailable rather than renderable', () => {
     // The safe direction. An em-dash for a value we could have shown is
     // cosmetic; a line for a value we could not is a fabricated measurement.
-    const plan = planSparkline({ state: 'totally-new-vocabulary', t: [NOW], v: [5] }, GEOMETRY);
+    const series = { state: 'totally-new-vocabulary', t: [NOW], v: [5] };
+    const plan = planSparkline(series, { ...GEOMETRY, strict: false });
 
     assert.equal(plan.mode, 'unavailable');
     assert.deepEqual(plan.polylines, []);
+
+    // Under test the same drift stops the build rather than quietly hatching.
+    assert.throws(() => planSparkline(series, GEOMETRY));
   });
 
   it('plots a series only for the ruled "ok" state', () => {
     const plan = planSparkline(seriesOf([[1000, 5], [500, 7]], { state: 'ok' }), GEOMETRY);
     assert.equal(plan.mode, 'data');
 
-    // The retired 'measured' spelling must not draw a line. Drawing one would
-    // mean a vocabulary drift renders as confident data.
-    const retired = planSparkline(seriesOf([[1000, 5], [500, 7]], { state: 'measured' }), GEOMETRY);
-    assert.notEqual(retired.mode, 'data');
+    // Both ruled spellings of the measured state draw the line. Recognising
+    // only one would silently hatch a live series as NOT MEASURABLE YET the
+    // moment the enum flipped -- a working metric drawn as unmeasurable.
+    const alternate = planSparkline(
+      seriesOf([[1000, 5], [500, 7]], { state: 'measured' }),
+      GEOMETRY,
+    );
+    assert.equal(alternate.mode, 'data');
+
+    // A genuinely unknown state still must not draw. That guard is the point;
+    // it is only the two ratified spellings that are treated as the same word.
+    const unknown = planSparkline(
+      seriesOf([[1000, 5], [500, 7]], { state: 'live' }),
+      { ...GEOMETRY, strict: false },
+    );
+    assert.notEqual(unknown.mode, 'data');
   });
 
   it('distinguishes pending (no samples yet) from unavailable (never coming)', () => {

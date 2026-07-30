@@ -95,10 +95,17 @@ describe('renderField — a measured zero and an unmeasurable value must look di
   });
 
   it('degrades an unknown state to an em-dash rather than printing the value', () => {
-    const node = renderField({ value: 99, state: 'freshly-invented', label: 'Anything' });
+    // Non-strict is the browser path: never throw, never print the value.
+    const node = renderField(
+      { value: 99, state: 'freshly-invented', label: 'Anything' },
+      { strict: false },
+    );
 
     assert.equal(node.getAttribute('data-state'), 'unavailable');
     assert.doesNotMatch(node.textContent, /99/);
+
+    // ...and in development the same field stops the build instead.
+    assert.throws(() => renderField({ value: 99, state: 'freshly-invented', label: 'Anything' }));
   });
 
   it('shows a stale value with its age instead of presenting it as current', () => {
@@ -385,5 +392,31 @@ describe('rendered text is legible without stylesheets', () => {
     );
 
     assert.match(rendered.textContent, /3 of 4/);
+  });
+});
+
+describe('renderField — a wire-spelling flip must not blank the dashboard', () => {
+  it('renders the SAME number under both ratified spellings of measured', () => {
+    // The failure this prevents is silent and inverted: if the panels knew only
+    // the spelling that did not ship, every live field would fall to the
+    // unknown-state path and the page would fill with em-dashes while the
+    // server answered perfectly. Nothing would be logged, and the dashboard's
+    // own honesty machinery would be the thing testifying the data is absent.
+    const ok = renderField({ value: 41, state: 'ok', label: 'Tokens', unit: 'tok/s' });
+    const measured = renderField({ value: 41, state: 'measured', label: 'Tokens', unit: 'tok/s' });
+
+    assert.equal(measured.getAttribute('data-state'), ok.getAttribute('data-state'));
+    assert.equal(measured.textContent, ok.textContent);
+    assert.match(measured.textContent, /41/);
+  });
+
+  it('still renders a genuine zero as a stark 0 under either spelling', () => {
+    // The documented-zero trap: a real measured 0 must never be mistaken for a
+    // missing value, and that must hold on both sides of the rename.
+    for (const state of ['ok', 'measured']) {
+      const node = renderField({ value: 0, state, label: 'Cache hits', unit: '%' });
+      assert.match(node.textContent, /0/, `a measured zero vanished under state="${state}"`);
+      assert.doesNotMatch(node.textContent, /—/, `a measured zero em-dashed under "${state}"`);
+    }
   });
 });

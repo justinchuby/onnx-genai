@@ -287,3 +287,82 @@ describe('panels declare their capability requirement', () => {
     );
   });
 });
+
+describe('honesty lint — the measured state is never compared as a literal', () => {
+  // WHY THIS LINT EXISTS.
+  //
+  // The wire spelling of the measured state has been ruled three times in one
+  // session ('measured' -> 'ok' -> 'measured') and it lives in a file this
+  // dashboard does not own. `field-state.js` resolves BOTH spellings, so any
+  // code going through `renderStateOf`/`normaliseState` survives a flip.
+  //
+  // A raw `field.state === 'ok'` does not. It fails in the worst available
+  // direction: silently, and toward showing LESS than we measured. A flipped
+  // enum turns every live sparkline into a hatched NOT MEASURABLE YET panel
+  // over a server answering perfectly — no error, no 404, nothing in DevTools,
+  // and the dashboard's own honesty machinery testifying that the data is not
+  // there. That is close to the most expensive bug this project could ship,
+  // because every instinct would send someone to debug the server.
+  //
+  // Both spellings are banned as comparison literals, including the one that
+  // is currently correct: pinning today's spelling is exactly the mistake.
+  const MEASURED_LITERAL = /(?:[.\w]*state\s*[!=]==?\s*['"](?:ok|measured)['"])/;
+  const MEASURED_LITERAL_REVERSED = /['"](?:ok|measured)['"]\s*[!=]==?\s*[.\w]*[Ss]tate/;
+
+  it('compares through field-state.js rather than against a spelling', () => {
+    /** @type {string[]} */
+    const offenders = [];
+
+    for (const name of sourceFiles()) {
+      // field-state.js owns the vocabulary; the literals live in its alias
+      // table by design. Every other module must go through it.
+      if (name === 'field-state.js') continue;
+
+      const source = stripComments(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8'));
+      source.split('\n').forEach((line, index) => {
+        if (MEASURED_LITERAL.test(line) || MEASURED_LITERAL_REVERSED.test(line)) {
+          offenders.push(`${name}:${index + 1}: ${line.trim()}`);
+        }
+      });
+    }
+
+    assert.deepEqual(
+      offenders,
+      [],
+      'Compare states via normaliseState()/renderStateOf() and RENDER_STATES, never against ' +
+        `a spelling. A wire rename then blanks these panels silently:\n${offenders.join('\n')}`,
+    );
+  });
+
+  it('MUTATION TEST — the lint actually catches a raw comparison', () => {
+    // An unenforced lint is worse than no lint: it advertises a guarantee it
+    // does not provide. Both orderings and both spellings must be caught.
+    const shouldCatch = [
+      "if (field.state === 'ok') {",
+      "if (base.state !== 'measured') {",
+      "return f.state == 'ok';",
+      "if ('ok' === field.state) {",
+      "  const live = someField.state === 'measured';",
+    ];
+    for (const line of shouldCatch) {
+      assert.ok(
+        MEASURED_LITERAL.test(line) || MEASURED_LITERAL_REVERSED.test(line),
+        `lint missed a raw measured-state comparison: ${line}`,
+      );
+    }
+
+    // ...and must not fire on the legitimate shapes, or it gets disabled.
+    const shouldPass = [
+      'if (normaliseState(base.state) !== RENDER_STATES.OK) {',
+      "if (field.state === 'pending') {",
+      "if (typeof field.state !== 'string') {",
+      "const label = 'ok';",
+    ];
+    for (const line of shouldPass) {
+      assert.ok(
+        !MEASURED_LITERAL.test(line) && !MEASURED_LITERAL_REVERSED.test(line),
+        `lint fired on a legitimate line: ${line}`,
+      );
+    }
+  });
+});

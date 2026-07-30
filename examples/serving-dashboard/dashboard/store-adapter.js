@@ -28,6 +28,7 @@
 
 import { derivedField, hasValue, numericValueOf, pendingField } from '../telemetry-field.js';
 import { CONNECTION_STATES } from '../telemetry-store.js';
+import { RENDER_STATES, normaliseState } from './field-state.js';
 
 /** Samples retained per key. At 250 ms that is ~5 minutes of history. */
 const DEFAULT_CAPACITY = 1200;
@@ -295,7 +296,7 @@ export function adaptStore(telemetryStore, options = {}) {
      */
     rateSeries(key, windowMs) {
       const base = this.series(key, windowMs);
-      if (base.state !== 'ok' || base.t.length < 2) {
+      if (normaliseState(base.state) !== RENDER_STATES.OK || base.t.length < 2) {
         return {
           state: 'unavailable',
           t: [],
@@ -462,7 +463,7 @@ function markStalledOrigin(field, connection) {
   // Only a currently-live value can be downgraded. Anything already stale keeps
   // its ORIGINAL observation time, and unavailable/pending/not-applicable are
   // saying something truer than "stale" already.
-  if (field?.state !== 'ok' && field?.state !== 'measured') {
+  if (normaliseState(field?.state) !== RENDER_STATES.OK) {
     return field;
   }
   return {

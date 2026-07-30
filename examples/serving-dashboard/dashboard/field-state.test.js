@@ -29,19 +29,51 @@ describe('renderStateOf', () => {
     assert.equal(renderStateOf({ state: 'not-applicable' }), RENDER_STATES.NOT_APPLICABLE);
   });
 
-  it('no longer bridges the retired "measured" spelling', () => {
-    // The vocabulary is ruled and 'ok' won, so the bridge is gone. A producer
-    // still emitting 'measured' now degrades to an em-dash rather than being
-    // silently translated — visible, and in the safe direction.
-    // state-vocabulary.test.js is what stops that degradation being silent.
-    assert.equal(renderStateOf({ state: 'measured', value: 5 }), RENDER_STATES.UNAVAILABLE);
+  it('renders a measured value under EITHER ruled spelling', () => {
+    // The wire spelling of this one state has been ruled three times in a
+    // single session, in a file this dashboard does not own. Accepting both is
+    // the only option that cannot blank the page: if the panels recognised
+    // only the spelling that did NOT ship, every field would resolve through
+    // the unknown-state path and the whole dashboard would render em-dashes
+    // over a server answering perfectly, with nothing logged anywhere.
+    //
+    // It fabricates nothing, because the two spellings make the identical
+    // claim -- neither promotes a value the server did not vouch for. Drift is
+    // caught by state-vocabulary.test.js, which drives the real store.
+    assert.equal(renderStateOf({ state: 'ok', value: 5 }), RENDER_STATES.OK);
+    assert.equal(renderStateOf({ state: 'measured', value: 5 }), RENDER_STATES.OK);
   });
 
-  it('resolves an unrecognised state to unavailable, never to renderable', () => {
-    // The safe direction, and the whole reason this module exists: a vocabulary
-    // change upstream must degrade to an honest em-dash, not to a number.
-    assert.equal(renderStateOf({ state: 'live', value: 5 }), RENDER_STATES.UNAVAILABLE);
-    assert.equal(renderStateOf({ state: '', value: 5 }), RENDER_STATES.UNAVAILABLE);
+  it('THROWS on an unrecognised state under test, naming the ruled vocabulary', () => {
+    // Under `node --test` an unknown state means a producer has drifted from
+    // the ruled five. Degrading it to an em-dash is how a real measurement
+    // vanishes for an hour with nothing in any log; stopping the build is the
+    // only thing that reliably gets it fixed.
+    assert.throws(
+      () => renderStateOf({ state: 'live', value: 5 }),
+      (error) => {
+        assert.match(error.message, /Unrecognised field state "live"/);
+        // The message must name the legal values, or the reader's next step is
+        // to go source-diving for an allow-list they did not know existed.
+        assert.match(error.message, /not-applicable/);
+        return true;
+      },
+    );
+  });
+
+  it('degrades to an em-dash instead of throwing when NOT strict (the browser)', () => {
+    // The branch that runs in front of an audience. A throw here white-screens
+    // a panel mid-demo; an em-dash is the honest rendering of "we do not know
+    // what this is". Tested explicitly because the default under Node is the
+    // other branch, which would otherwise leave this one never executed.
+    assert.equal(
+      renderStateOf({ state: 'live', value: 5 }, { strict: false }),
+      RENDER_STATES.UNAVAILABLE,
+    );
+    assert.equal(
+      renderStateOf({ state: '', value: 5 }, { strict: false }),
+      RENDER_STATES.UNAVAILABLE,
+    );
   });
 
   it('treats a missing or malformed field as unavailable rather than throwing', () => {

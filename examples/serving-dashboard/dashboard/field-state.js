@@ -63,8 +63,36 @@ export const RENDER_STATES = Object.freeze({
  *
  * @type {Readonly<Record<string, RenderState>>}
  */
+/**
+ * True under `node --test`, false in a browser.
+ *
+ * Deliberately inferred rather than configured: a build-time flag would need a
+ * bundler, which this project does not have, and a hand-set flag is one someone
+ * eventually ships in the wrong position.
+ */
+const IS_DEVELOPMENT = typeof globalThis.process?.versions?.node === 'string';
+
 const STATE_ALIASES = Object.freeze({
+  // BOTH SPELLINGS OF THE MEASURED STATE ARE ACCEPTED, DELIBERATELY.
+  //
+  // This is not indecision. The wire spelling has been ruled three times in
+  // one session -- 'measured', then 'ok', then back to 'measured' -- and it
+  // lives in a file this dashboard does not own. The two directions of being
+  // wrong are wildly asymmetric:
+  //
+  //   Accept only the spelling that ships -> nothing changes.
+  //   Accept only the spelling that DOESN'T -> every field on the page
+  //     resolves through the unknown-state path to an em-dash. The entire
+  //     dashboard goes blank, reporting "we cannot measure any of this" about
+  //     a server that is answering perfectly, with no error anywhere.
+  //
+  // Accepting both cannot fabricate anything: both spellings mean exactly the
+  // same claim, so neither promotes a value the server did not vouch for. The
+  // drift risk that retired the old bridge is covered separately and better by
+  // state-vocabulary.test.js, which drives the REAL store and fails the build
+  // naming any field whose state is not one of the ruled five.
   ok: RENDER_STATES.OK,
+  measured: RENDER_STATES.OK,
   pending: RENDER_STATES.PENDING,
   stale: RENDER_STATES.STALE,
   unavailable: RENDER_STATES.UNAVAILABLE,
@@ -125,7 +153,12 @@ export function ageMsOf(field, nowMs = Date.now()) {
  * @returns {boolean}
  */
 export function isPastStaleCeiling(field, ceilingMs = DEFAULT_STALE_CEILING_MS, nowMs = Date.now()) {
-  if (renderStateOf(field) !== RENDER_STATES.STALE) return false;
+  // Never strict. This is a predicate, not the choke point: whoever is about to
+  // RENDER this field has already resolved its state and thrown if it drifted.
+  // Duplicating the throw here would mean an unknown state raises from whichever
+  // helper happened to touch it first, with a stack that points at staleness
+  // rather than at vocabulary drift.
+  if (renderStateOf(field, { strict: false }) !== RENDER_STATES.STALE) return false;
   const ageMs = ageMsOf(field, nowMs);
   return ageMs === null || ageMs > ceilingMs;
 }
@@ -147,6 +180,26 @@ export function formatAge(ageMs) {
 }
 
 /**
+ * Normalise a bare state STRING to its render state, with no value inspection.
+ *
+ * `renderStateOf` is the right entry point for a field, but it also downgrades
+ * a measured field carrying no `value` — correct for a scalar, wrong for a
+ * Series, whose samples live in `t`/`v` and which has no `value` at all.
+ * Passing one to `renderStateOf` reports every live series as unavailable.
+ *
+ * Use this wherever the question is purely "which state is this word", so that
+ * the two ratified spellings of the measured state stay resolved in ONE table
+ * instead of being re-compared as literals at each call site.
+ *
+ * @param {string|null|undefined} state
+ * @returns {RenderState|null} null when the word is not in the vocabulary.
+ */
+export function normaliseState(state) {
+  if (typeof state !== 'string') return null;
+  return STATE_ALIASES[state] ?? null;
+}
+
+/**
  * Normalise any field-like object to a render state.
  *
  * A null/undefined field is `unavailable`, not a crash: `store.field()` is
@@ -154,14 +207,43 @@ export function formatAge(ageMs) {
  * page if that contract is ever broken.
  *
  * @param {{state?: string, value?: unknown}|null|undefined} field
+ * @param {object} [options]
+ * @param {boolean} [options.strict] Throw on an unrecognised state instead of
+ *   degrading to `unavailable`. Defaults to true under Node and false in a
+ *   browser. Exposed so the BROWSER path is covered by tests too — it is the
+ *   one that runs in front of an audience, and a default-only implementation
+ *   would leave it the only branch never executed.
  * @returns {RenderState}
  */
-export function renderStateOf(field) {
+export function renderStateOf(field, { strict = IS_DEVELOPMENT } = {}) {
   if (!field || typeof field.state !== 'string') {
     return RENDER_STATES.UNAVAILABLE;
   }
   const mapped = STATE_ALIASES[field.state];
   if (mapped === undefined) {
+    // LOUD IN DEVELOPMENT, SAFE IN FRONT OF AN AUDIENCE.
+    //
+    // A fall-through that renders an unrecognised state's value as though it
+    // were measured is the most dangerous shape this code can take, so it is
+    // not an option in either environment. But the two environments want
+    // opposite failures beyond that.
+    //
+    // Under `node --test` an unknown state means a producer has drifted from
+    // the ruled vocabulary, and the only way that gets fixed is if it stops
+    // the build. Silently em-dashing it is how a real measurement disappears
+    // for an hour with nothing in any log.
+    //
+    // In a browser the same throw would white-screen a panel mid-demo. An
+    // em-dash is the honest rendering of "we do not know what this is", and it
+    // is strictly better than a blank rectangle in front of a room.
+    if (strict) {
+      throw new Error(
+        `Unrecognised field state ${JSON.stringify(field.state)}. The ruled vocabulary is ` +
+          `${Object.keys(STATE_ALIASES).join(', ')}. Refusing to render its value, because an ` +
+          'unrecognised state is not a measurement — if this is a new ruled state, add it to ' +
+          'STATE_ALIASES; if a producer has drifted, fix the producer.',
+      );
+    }
     return RENDER_STATES.UNAVAILABLE;
   }
   // A field claiming to be measured while carrying no value is a store bug.
