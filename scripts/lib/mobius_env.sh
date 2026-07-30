@@ -255,6 +255,8 @@ mobius_report_failure() {
       mobius_log ""
       mobius_log "Note: do NOT run 'pip install mobius' - that name belongs to an"
       mobius_log "unrelated project on PyPI. The distribution is 'mobius-ai'."
+      mobius_log "See README.md, section 'Build a model with Mobius', for the"
+      mobius_log "full prerequisites."
       ;;
   esac
 }

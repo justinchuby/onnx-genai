@@ -129,6 +129,33 @@ case "$(basename "$OUT_DIR")" in
     ;;
 esac
 
+# A directory name is a promise about CONTENT that nothing else checks. The demo
+# keys off it: run-demo.sh looks for a `*-scatter*` directory and loads whatever
+# is inside. So `OUT_DIR=models/qwen2.5-0.5b-scatter-v2` with STATIC_CACHE unset
+# - dropping one variable while copying the scatter command - writes a DYNAMIC
+# model under a name that promises a static-cache one.
+#
+# That failure is silent and self-consistent downstream: the model loads, serves
+# correctly, and Scenario A honestly reports that it never batches. Nothing
+# errors. The visitor concludes continuous batching does not exist, rather than
+# that the model is the wrong kind. Refuse at the producer, which is the first
+# place the mismatch is visible at all.
+case "$(basename "$OUT_DIR")" in
+  *scatter*)
+    if ! truthy "$STATIC_CACHE"; then
+      printf 'error: OUT_DIR is named %s but STATIC_CACHE is not set.\n' \
+        "$(basename "$OUT_DIR")" >&2
+      printf '       That builds a DYNAMIC-cache model into a directory whose\n' >&2
+      printf '       name promises a static-cache (scatter) one. It would load\n' >&2
+      printf '       and answer correctly while never batching, and nothing\n' >&2
+      printf '       downstream would report an error.\n' >&2
+      printf '       Re-run with STATIC_CACHE=1, or choose a name without\n' >&2
+      printf '       "scatter" in it.\n' >&2
+      exit 2
+    fi
+    ;;
+esac
+
 # Building into a directory that already has contents is the root cause of two
 # separate defects, so it is refused rather than warned about:
 #

@@ -706,7 +706,46 @@ for suffix in ortpackage nxpackage; do
   fi
 done
 
+# A scatter-named directory promises a static-cache model. Building a dynamic
+# one into it produces a model that loads, serves, and never batches, with no
+# error anywhere downstream — so the producer refuses it.
+TESTS_RUN=$((TESTS_RUN + 1))
+if output="$(OUT_DIR="$outdir_tmp/qwen2.5-0.5b-scatter-v2" DRY_RUN=1 \
+  "$SCRIPT" 2>&1)"; then
+  fail "refuses a scatter-named OUT_DIR without STATIC_CACHE" \
+    "built a dynamic model into a scatter-named directory: $output"
+else
+  case "$output" in
+    *"STATIC_CACHE is not set"*)
+      pass "refuses a scatter-named OUT_DIR without STATIC_CACHE" ;;
+    *) fail "refuses a scatter-named OUT_DIR without STATIC_CACHE" \
+        "unhelpful error: $output" ;;
+  esac
+fi
+
+# The same name WITH STATIC_CACHE=1 is the intended path and must stay open.
+TESTS_RUN=$((TESTS_RUN + 1))
+if output="$(OUT_DIR="$outdir_tmp/qwen2.5-0.5b-scatter-v2" STATIC_CACHE=1 \
+  DRY_RUN=1 "$SCRIPT" 2>&1)"; then
+  pass "allows a scatter-named OUT_DIR when STATIC_CACHE is set"
+else
+  fail "allows a scatter-named OUT_DIR when STATIC_CACHE is set" \
+    "the guard rejected the correct invocation: $output"
+fi
+
 rm -rf "$outdir_tmp"
+
+# The Mobius error points readers at a README heading. A pointer to a heading
+# that has been renamed is worse than no pointer: it sends someone to search a
+# document for text that is not there. Assert the anchor still exists.
+TESTS_RUN=$((TESTS_RUN + 1))
+cited_heading="Build a model with Mobius"
+if grep -q "^#\{1,4\} $cited_heading" "$ROOT/README.md"; then
+  pass "the README heading cited by the Mobius error still exists"
+else
+  fail "the README heading cited by the Mobius error still exists" \
+    "scripts/lib/mobius_env.sh sends readers to README.md section '$cited_heading', which no longer exists; update both together"
+fi
 
 # A raw skip-printf bypasses the counter, so the summary would under-report and
 # the weaker green becomes invisible again. Comments are stripped before the
