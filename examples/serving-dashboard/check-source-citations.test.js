@@ -69,9 +69,16 @@ const CITED_EXTENSIONS = ['rs', 'js', 'css', 'html', 'sh'];
 
 const trackedSourceFiles = execFileSync(
   'git',
-  // `ls-tree HEAD`, not `ls-files`: the index can contain a file that HEAD does
-  // not, so a citation into a newly-added-but-uncommitted file would resolve.
-  ['ls-tree', '-r', '--name-only', 'HEAD'],
+  // `ls-tree`, not `ls-files`: the index can contain a file that the shipping
+  // ref does not, so a citation into a newly-added-but-uncommitted file would
+  // resolve.
+  //
+  // And SHIPPING_REF, not the literal `HEAD` this used to spell. `lineCountOf`
+  // and `shippedFile` read the shipping ref, so a literal here builds the
+  // candidate inventory from a different commit whenever a reviewer pins one
+  // via SHIPPING_TREE_REF or REVIEW_SHA -- the exact mixing the comment on
+  // `shippedFile` forbids. Identical when neither is set.
+  ['ls-tree', '-r', '--name-only', SHIPPING_REF],
   {
     cwd: repoRoot,
     encoding: 'utf8',
@@ -436,7 +443,12 @@ test('a cited line still sits beside the symbol the prose names', () => {
     if (wideAnchors.length === 0) continue;
 
     const perFile = candidates.map((c) => {
-      const lines = readFileSync(join(repoRoot, c), 'utf8').split('\n');
+      // shippedFile, NOT readFileSync. This was the last call site still
+      // reading the desk after the rest of the file was converted, and it is
+      // the one that decides the verdict: with the symbol renamed in the
+      // working copy and untouched in HEAD, this check reported that it
+      // "appears ANYWHERE" in a file where it appears twice.
+      const lines = shippedFile(c).split('\n');
       return { c, lines };
     });
 
@@ -700,5 +712,66 @@ test('every source path the README cites resolves to exactly one tracked file', 
       'number -- the line number is the part that rots, and a repaired one is ' +
       'stale again by the next commit. The path plus a symbol name survives ' +
       'every rebase.',
+  );
+});
+
+// RATCHET. This is not a claim about the README; it is a claim about THIS FILE,
+// and it exists because the defect it forbids has now been introduced twice.
+//
+// Every content read here must go through `shippedFile`, because a citation is
+// a promise to someone holding the shipped tree. The conversion away from
+// `readFileSync` left one call site behind -- the one inside the symbol-identity
+// check, which is the arm that decides the verdict -- and the result was
+// demonstrable rather than theoretical: renaming a cited symbol in the working
+// copy while leaving HEAD untouched made this file report that the symbol
+// "appears ANYWHERE" in a file where it appears twice.
+//
+// It fails in both directions, and the second is the dangerous one. A symbol
+// present on a desk and absent from the shipping tree turns this check GREEN
+// over a README that is false for every reviewer who clones it.
+test('RATCHET: this checker reads no source from the working tree', () => {
+  const selfPath = fileURLToPath(import.meta.url);
+  const self = readFileSync(selfPath, 'utf8');
+
+  // Anti-vacuity: an empty or unreadable self is indistinguishable from a
+  // clean one to every assertion below.
+  assert.ok(
+    self.length > 10_000,
+    `read only ${self.length} bytes of this file; the scan has no subject`,
+  );
+
+  // A disk read of a path built from the repository root. The guard's own read
+  // above is deliberately NOT of this shape -- its subject is the code about to
+  // run, not a claim about what is published.
+  const DESK_READ = /readFileSync\(\s*join\(\s*repoRoot/;
+
+  // Positive control on the regex itself. A pattern that can no longer match
+  // the construct it bans is indistinguishable, from the assertion below, from
+  // a file that does not contain it.
+  //
+  // Assembled from fragments rather than written out: a literal specimen would
+  // be found by the scan below in this very file, and the guard would report
+  // its own probe as the violation.
+  const SPECIMEN = 'const lines = readFileSync(' + "join(" + "repoRoot, c), 'utf8');";
+  assert.match(
+    SPECIMEN,
+    DESK_READ,
+    'the ban pattern no longer matches the exact line it was written to forbid',
+  );
+
+  assert.doesNotMatch(
+    self,
+    DESK_READ,
+    'a working-tree read is back in this file. It reads correctly on your desk ' +
+      'and grades the README against a tree no reviewer has. Use shippedFile().',
+  );
+
+  // Positive control on the replacement: the ban is only meaningful if the
+  // sanctioned vocabulary is actually in use here.
+  const shippedReads = (self.match(/\bshippedFile\(/g) ?? []).length;
+  assert.ok(
+    shippedReads >= 4,
+    `only ${shippedReads} shippedFile() call(s); this file has stopped reading ` +
+      'the shipping tree rather than started reading it correctly',
   );
 });
