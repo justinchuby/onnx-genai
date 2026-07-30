@@ -170,6 +170,13 @@ mod phase_profile {
         rows
     }
 
+    /// Clear accumulated phase statistics.
+    pub fn reset() {
+        if let Ok(mut reg) = registry().lock() {
+            reg.clear();
+        }
+    }
+
     /// Scoped timer that records its lifetime to `phase` on drop.
     pub struct PhaseSpan {
         phase: &'static str,
@@ -269,6 +276,10 @@ fn trace_span(name: &'static str, cat: &'static str) -> Option<SpanGuard> {
 /// depends on both merges the two.
 pub fn exec_phase_stats() -> Vec<(&'static str, u128, u64)> {
     phase_profile::all_stats()
+}
+
+pub fn reset_exec_phase_profile() {
+    phase_profile::reset();
 }
 
 pub fn print_exec_phase_profile() {
