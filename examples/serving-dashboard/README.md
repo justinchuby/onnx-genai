@@ -809,7 +809,7 @@ a hit each:
 
 | | hits / lookups |
 | --- | --- |
-| before | 15 / 16 |
+| immediately before these two probes (counter already warm, not a baseline) | 15 / 16 |
 | after a unique prompt | 16 / 17 |
 | after a second unique prompt | 17 / 18 |
 

@@ -838,6 +838,52 @@ test('the QA plan matches whether the prefix scenario is actually cut', () => {
 // to share a number. A checker that reddened on `95 % CI` would be reworded
 // away within a day. The property is CO-OCCURRENCE: a rate inside a paragraph
 // that is describing the twelve-request block.
+// A table row carrying a counter reading: `| … | 15 / 16 |`. Deliberately
+// matches the SHAPE of a hits/lookups pair, not any specific figure, so the
+// check keeps working after the numbers are re-measured.
+const RATE_IN_ROW = /\|\s*\d+\s*\/\s*\d+\s*\|/;
+
+test('no counter reading is labelled as a baseline when it is a mid-run snapshot', () => {
+  // THE DEFECT THIS PINS, AND WHY IT IS DELIBERATELY TINY.
+  //
+  // The README's counter table read `| before | 15 / 16 |`. Every number in it
+  // was correct and the argument it supports -- +12 hits for twelve requests,
+  // six of which shared nothing -- is airtight. The single word `before` was
+  // the defect: it claims PROVENANCE. It reads as "the state before the
+  // experiment began", i.e. a baseline, when 15/16 is a mid-run snapshot off
+  // an already-warm counter. @376a0297's finding is that the only two false
+  // statements in this whole class were a STABILITY claim and a PROVENANCE
+  // claim -- never a rate.
+  //
+  // SCOPED TO README.md, AND ROW LABELS ONLY, ON PURPOSE. The broad form of
+  // this check ("every quoted rate must carry its counter readings") would
+  // redden four files that use these figures correctly as EVIDENCE -- both
+  // tripwires, telemetry-provenance.js, and my own signed retraction. A guard
+  // that fires on correct files is one somebody deletes by Friday, and they
+  // take the real check with it. The tell is grammar, not arithmetic, and
+  // grammar is not mechanisable -- but THIS much is: a one-word row label
+  // asserting priority over a counter reading.
+  const rows = shipped('README.md')
+    .split('\n')
+    .filter((l) => /^\|/.test(l) && RATE_IN_ROW.test(l));
+
+  assert.ok(rows.length > 0, 'no counter-reading table rows found in README.md — this check would pass vacuously; the hits/lookups table is expected here');
+
+  const offenders = rows.filter((l) => /^\|\s*(before|baseline|start(?:ing)?|initial|at rest)\s*\|/i.test(l));
+  assert.deepEqual(
+    offenders,
+    [],
+    'a counter-reading row is labelled as if it were a baseline:\n' +
+      offenders.map((o) => `  ${o.trim()}`).join('\n') +
+      '\nThese readings come off a cumulative counter on a warm server, so the ' +
+      'first row is not a starting state -- it is wherever the counter happened ' +
+      'to be. Labelling it `before` turns a correct delta into a false claim ' +
+      'about provenance, which is the one thing the surrounding section exists ' +
+      'to disprove. Say what the row IS ("immediately before these two probes, ' +
+      'counter already warm"), not when it happened.',
+  );
+});
+
 test('no document attributes a hit RATE to the twelve-request block', () => {
   const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
     .toString()
