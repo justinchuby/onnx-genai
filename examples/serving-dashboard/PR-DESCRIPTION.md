@@ -29,6 +29,28 @@ GET /v1/status
                         share each decode step"
 ```
 
+### The mechanism on the wire, as counts
+
+Counts, not durations. Durations on this hardware are not resolvable (see below);
+concurrency is.
+
+```
+SAME BINARY - SAME FLAGS - SAME PROBE - 4 concurrent requests - only the model differs
+
+  batched arm      MAX active_batch_size = 4    418 samples   distinct {0, 4}
+  one-row arm      MAX active_batch_size = 1    577 samples   distinct {0, 1}
+  COMPLETIONS      4 of 4 on both arms.  ZERO errors.   <- the denominator
+```
+
+`distinct {0, 4}` with no intermediate value is the mechanism itself: all four
+generations were admitted to a single decode step, not four that happened to
+overlap. Overlapping requests would show 2s and 3s.
+
+**Each arm is the other's positive control.** A `1` from an instrument that has
+never returned anything else is a dead needle. The same probe, in the same
+minute, returned `4` on the other origin — so `1` is a measurement rather than a
+flatline. This is the only reason the negative result is admissible.
+
 ### KV cache paging
 
 The cache is a page table over a fixed pool, not a contiguous per-sequence
@@ -325,6 +347,23 @@ by three different readers, none of whom misremembered — all three read it.
 quarter of its corpus is a guard that passes by sampling.
 
 `AC196`, `AC199`, `AC200` and `AC201` are named, mechanisable, and unwritten.
+
+### A label can be accurate and still misinform
+
+The two model directories are named for their attention implementation. One of
+them is, as a consequence, the arm that structurally cannot batch — that is the
+whole point of the comparison above.
+
+Nothing in the name says so. Several people on this project benchmarked the
+non-batching arm expecting batching numbers, and every instrument agreed with
+them: the label was accurate, the server was healthy, the requests succeeded,
+and the results were meaningless for the question being asked.
+
+**No test can catch this.** A name that is true is indistinguishable from a name
+that is informative to every checker in this repository. The only defence is a
+reader who knows what the arm is for, which is precisely the defence that does
+not scale — and it is why the refusal reason is now printed in the response body
+rather than left for the operator to infer from a number.
 
 ### Attribution
 
