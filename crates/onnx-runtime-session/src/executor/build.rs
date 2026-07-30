@@ -354,9 +354,9 @@ pub(super) fn build_lazy_weight_handles(
         let graph_value = graph.value(value);
         let consumers = graph.consumers(value);
         // A weight is offload-eligible only if it feeds exclusively into offload
-        // boundary ops (BlockQuantizedMoE or QMoE) and nothing else. Capture the
-        // boundary from the first consumer so the lazy handle carries the right
-        // binding site.
+        // boundary ops (BlockQuantizedMoE, QMoE, or MatMulNBits) and nothing
+        // else. Capture the boundary from the first consumer so the lazy handle
+        // carries the right binding site.
         let mut boundary = None;
         let lazy_only = graph_value.producer.is_none()
             && !graph.outputs.contains(&value)

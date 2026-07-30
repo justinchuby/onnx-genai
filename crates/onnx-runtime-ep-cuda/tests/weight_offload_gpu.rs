@@ -394,3 +394,73 @@ fn residency_never_evicts_a_referenced_page() {
         "both pages stay resident, transiently over budget"
     );
 }
+
+/// Live-dispatch path: `resident_materialized` (the entry point the CUDA EP's
+/// `page_lazy_weight` calls) must materialize a lazy weight's canonical bytes,
+/// stream them host→device, evict under a tiny budget, and stay byte-identical
+/// to the resident upload. Also proves the process-global counters advance so an
+/// opaque end-to-end run can observe that paging really happened.
+#[test]
+fn residency_materialized_pages_evicts_and_matches_resident() {
+    let ep = match CudaExecutionProvider::new_default() {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("skip: no CUDA GPU available ({e})");
+            return;
+        }
+    };
+
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+    let b0: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 + 0.125).collect();
+    let b1: Vec<f32> = (0..k * n).map(|i| (i as f32) * -0.5 + 3.0).collect();
+    let page_bytes = (k * n * 4) as u64;
+
+    let rt = ep.runtime();
+    let resident_out = |b: &[f32]| {
+        let buf = ep.allocate(std::mem::size_of_val(b), 256).unwrap();
+        // SAFETY: buffer sized for b's bytes.
+        unsafe { rt.htod(f32_bytes(b), cuptr(buf.as_ptr())).unwrap() }
+        let out = run_matmul_with_b_ptr(&ep, &a, buf.as_ptr(), m, k, n);
+        ep.deallocate(buf).unwrap();
+        out
+    };
+    let resident_b0 = resident_out(&b0);
+    let resident_b1 = resident_out(&b1);
+
+    let (_host, lazies) = combined_weights(&[b0.clone(), b1.clone()], k, n);
+    let residency = ep.weight_residency(page_bytes);
+    onnx_runtime_ep_cuda::reset_global_offload_stats();
+
+    // Miss on weight 0 via the materialized (no MmapRegionSource) path.
+    let page0 = residency.resident_materialized(0, &lazies[0]).unwrap();
+    let out0 = run_matmul_with_b_ptr(&ep, &a, page0.device_ptr(), m, k, n);
+    assert_eq!(
+        out0, resident_b0,
+        "materialized weight 0 must match resident"
+    );
+    assert_eq!(page0.len() as u64, page_bytes);
+    drop(page0);
+
+    // Miss on weight 1 under the one-page budget evicts weight 0.
+    let page1 = residency.resident_materialized(1, &lazies[1]).unwrap();
+    let out1 = run_matmul_with_b_ptr(&ep, &a, page1.device_ptr(), m, k, n);
+    assert_eq!(
+        out1, resident_b1,
+        "materialized weight 1 must match resident"
+    );
+
+    let stats = residency.stats();
+    assert_eq!(stats.page_ins, 2, "each miss must page in");
+    assert_eq!(
+        stats.evictions, 1,
+        "one-page budget must evict the LRU page"
+    );
+    assert_eq!(stats.pages_resident, 1);
+
+    let global = onnx_runtime_ep_cuda::global_offload_stats();
+    assert!(
+        global.page_ins >= 2 && global.evictions >= 1,
+        "process-global counters must observe paging: {global:?}"
+    );
+}

@@ -542,6 +542,16 @@ pub(super) struct InInfo {
     pub(super) backing: TensorBacking,
     /// Length in bytes of the backing (root) allocation, for the bounds gate.
     pub(super) root_len: usize,
+    /// True for a lazy weight the EP declined to page into device memory (offload
+    /// disabled or no residency); such inputs stay absent and are routed to the
+    /// kernel as a lazy `KernelInput::Weight` instead of a bound view.
+    pub(super) lazy_unresolved: bool,
+    /// Keep-alive for a lazy weight the EP paged into device memory: pins the VRAM
+    /// page for the kernel's lifetime, then makes it evictable when the `InInfo`
+    /// is dropped after dispatch. When `Some`, `base_ptr`/`device` point at the
+    /// paged bytes and `present` is true. Held for its `Drop` side effect only.
+    #[allow(dead_code)]
+    pub(super) paged: Option<onnx_runtime_ep_api::PagedWeight>,
 }
 
 #[derive(Clone)]

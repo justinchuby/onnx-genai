@@ -97,17 +97,22 @@ pub enum LazyWeightBoundary {
     BlockQuantizedMoe,
     /// `com.microsoft::QMoE`, the boundary real DeepSeek/GLM/Qwen exports use.
     QMoe,
+    /// `com.microsoft::MatMulNBits`, the packed INT4/INT8 GEMV boundary that
+    /// dominates dense-model (e.g. Qwen2.5) VRAM.
+    MatMulNBits,
 }
 
 impl LazyWeightBoundary {
     /// Every op boundary at which a lazy weight may be device-paged.
-    pub const ALL: [LazyWeightBoundary; 2] = [Self::BlockQuantizedMoe, Self::QMoe];
+    pub const ALL: [LazyWeightBoundary; 3] =
+        [Self::BlockQuantizedMoe, Self::QMoe, Self::MatMulNBits];
 
     /// Canonical (domain, op_type) this boundary binds at.
     fn identity(self) -> (&'static str, &'static str) {
         match self {
             Self::BlockQuantizedMoe => ("pkg.nxrt", "BlockQuantizedMoE"),
             Self::QMoe => ("com.microsoft", "QMoE"),
+            Self::MatMulNBits => ("com.microsoft", "MatMulNBits"),
         }
     }
 
@@ -245,6 +250,14 @@ impl WeightHandle {
     pub fn is_lazy_for(&self, capabilities: &ExecutionProviderCapabilities) -> bool {
         matches!(self, Self::Lazy(_)) && capabilities.advertises(NXRT_WEIGHT_PAGING_CAPABILITY)
     }
+
+    /// Borrow the inner [`LazyWeight`] when this handle is lazy.
+    pub fn as_lazy(&self) -> Option<&LazyWeight> {
+        match self {
+            Self::Lazy(weight) => Some(weight),
+            Self::Resident(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +308,70 @@ pub trait LazyDeviceWeightBinder {
 /// this; the returned slice must stay valid for the duration of the copy.
 pub trait MmapRegionSource {
     fn region_bytes(&self, region: &ExternalMmapRegion) -> Result<&[u8], WeightHandleError>;
+}
+
+/// A lazy weight paged into device memory by an EP, ready for a kernel to read.
+///
+/// The executor substitutes its [`device_ptr`](Self::device_ptr) into the input
+/// `TensorView` for the weight and holds this value for the kernel's lifetime.
+/// `keep_alive` owns whatever device residency the EP allocated (e.g. a VRAM
+/// page), so the memory stays resident until the executor drops the binding —
+/// after the kernel has run.
+pub struct PagedWeight {
+    device_ptr: *const std::ffi::c_void,
+    device: onnx_runtime_ir::DeviceId,
+    len: usize,
+    keep_alive: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl PagedWeight {
+    pub fn new(
+        device_ptr: *const std::ffi::c_void,
+        device: onnx_runtime_ir::DeviceId,
+        len: usize,
+        keep_alive: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            device_ptr,
+            device,
+            len,
+            keep_alive,
+        }
+    }
+
+    /// Opaque device pointer to the paged weight bytes.
+    pub fn device_ptr(&self) -> *const std::ffi::c_void {
+        self.device_ptr
+    }
+
+    /// Device the paged bytes live on.
+    pub fn device(&self) -> onnx_runtime_ir::DeviceId {
+        self.device
+    }
+
+    /// Number of bytes resident in the paged allocation.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the paged allocation is empty (never true for a valid page).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the residency keep-alive (for downcasting / observability).
+    pub fn keep_alive(&self) -> &Arc<dyn std::any::Any + Send + Sync> {
+        &self.keep_alive
+    }
+}
+
+impl std::fmt::Debug for PagedWeight {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PagedWeight")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
+    }
 }
 
 /// CPU-only Phase-3a binder: callers must use the host materialization route.

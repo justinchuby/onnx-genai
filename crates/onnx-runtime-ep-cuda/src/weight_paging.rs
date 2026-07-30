@@ -17,6 +17,7 @@
 //! page, and async prefetch overlap (issues #82/#87).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
@@ -26,6 +27,40 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::DataType;
 
 use crate::runtime::{CudaRuntime, raw_ptr};
+
+/// Process-global weight-offload activity counters. Every [`CudaWeightResidency`]
+/// updates these in addition to its own instance stats, so an end-to-end decode
+/// driven through an opaque engine (where the residency handle is not reachable)
+/// can still be observed — e.g. a token-parity test asserting that paging and
+/// eviction actually happened. Instance [`CudaResidencyStats`] remain the precise
+/// per-cache view; these are a coarse cross-cache tally.
+static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-global weight-offload counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlobalOffloadStats {
+    pub page_ins: u64,
+    pub hits: u64,
+    pub evictions: u64,
+}
+
+/// Read the process-global weight-offload counters.
+pub fn global_offload_stats() -> GlobalOffloadStats {
+    GlobalOffloadStats {
+        page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
+        hits: GLOBAL_HITS.load(Ordering::Relaxed),
+        evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the process-global weight-offload counters (test observability helper).
+pub fn reset_global_offload_stats() {
+    GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
+    GLOBAL_HITS.store(0, Ordering::Relaxed);
+    GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
+}
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
 /// same knob as the CPU host-cache offload path (`onnx_runtime_ep_cpu`) so a
@@ -102,6 +137,35 @@ pub struct CudaWeightPage {
 }
 
 impl CudaWeightPage {
+    /// Allocate a VRAM page and copy `bytes` host→device into it. The bytes are
+    /// the canonical (compressed) backing of the tensor, so the page is
+    /// byte-identical to a resident upload. Frees the allocation on copy failure.
+    pub fn upload(
+        runtime: &Arc<CudaRuntime>,
+        dtype: DataType,
+        shape: Vec<usize>,
+        bytes: &[u8],
+    ) -> Result<Self, WeightHandleError> {
+        if bytes.is_empty() {
+            return Err(WeightHandleError::MissingRegions);
+        }
+        let ptr = runtime
+            .alloc_raw(bytes.len())
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("VRAM alloc: {error}")))?;
+        let page = Self {
+            runtime: Arc::clone(runtime),
+            ptr,
+            len: bytes.len(),
+            dtype,
+            shape,
+        };
+        // SAFETY: `ptr` owns `bytes.len()` bytes; `page`'s Drop frees it if the
+        // copy below fails.
+        unsafe { runtime.htod(bytes, ptr) }
+            .map_err(|error| WeightHandleError::DeviceBinding(format!("H2D copy: {error}")))?;
+        Ok(page)
+    }
+
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
     pub fn device_ptr(&self) -> *const std::ffi::c_void {
         raw_ptr(self.ptr)
@@ -272,28 +336,73 @@ impl CudaWeightResidency {
         weight: &LazyWeight,
         source: &S,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
-        {
-            let mut inner = self.lock();
-            if let Some(page) = inner.pages.get(&key).cloned() {
-                inner.touch(key);
-                inner.hits += 1;
-                return Ok(page);
-            }
+        if let Some(hit) = self.get_hit(key) {
+            return Ok(hit);
         }
-
-        // Page in outside the lock is unnecessary here (single device, cheap),
-        // but do the H2D copy before re-locking so a failed bind never mutates
-        // cache accounting.
+        // Copy region bytes host→device before re-locking so a failed bind never
+        // mutates cache accounting.
         let pager = CudaWeightPager::new(Arc::clone(&self.runtime), source);
         let page = Arc::new(pager.bind_block_quantized_moe(weight)?);
-        let bytes = page.len() as u64;
+        self.admit(key, page)
+    }
 
+    /// Live-dispatch entry point: return the device page for `key`, paging it in
+    /// on a miss by materializing the weight's canonical (compressed) bytes and
+    /// streaming them host→device, with LRU eviction under the VRAM budget. The
+    /// materialized bytes are the exact resident backing, so the page is
+    /// byte-identical to a stock upload.
+    pub fn resident_materialized(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        if let Some(hit) = self.get_hit(key) {
+            return Ok(hit);
+        }
+        let resident = weight.materialize()?;
+        let page = Arc::new(CudaWeightPage::upload(
+            &self.runtime,
+            resident.dtype,
+            resident.shape.clone(),
+            resident.bytes(),
+        )?);
+        self.admit(key, page)
+    }
+
+    /// Look up `key`, marking it most-recently-used and counting a hit.
+    fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
+        let mut inner = self.lock();
+        if let Some(page) = inner.pages.get(&key).cloned() {
+            inner.touch(key);
+            inner.hits += 1;
+            GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+            Some(page)
+        } else {
+            None
+        }
+    }
+
+    /// Insert a freshly paged-in `page` under `key`, evicting LRU pages to fit the
+    /// budget. Synchronizes the compute stream first (unless capturing) so no
+    /// in-flight kernel still references an about-to-be-freed page's VRAM.
+    fn admit(
+        &self,
+        key: u64,
+        page: Arc<CudaWeightPage>,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        let bytes = page.len() as u64;
+        if !self.runtime.is_capturing().unwrap_or(false) {
+            self.runtime.synchronize().map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("stream sync: {error}"))
+            })?;
+        }
         let mut inner = self.lock();
         // A concurrent caller may have populated `key` while we paged in; prefer
         // the already-resident page and drop ours (its Drop frees the VRAM).
         if let Some(existing) = inner.pages.get(&key).cloned() {
             inner.touch(key);
             inner.hits += 1;
+            GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
         inner.evict_to_fit(bytes);
@@ -302,6 +411,7 @@ impl CudaWeightResidency {
         inner.resident_bytes += bytes;
         inner.peak_resident_bytes = inner.peak_resident_bytes.max(inner.resident_bytes);
         inner.page_ins += 1;
+        GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
         Ok(page)
     }
 
@@ -360,6 +470,7 @@ impl ResidencyInner {
                 if let Some(page) = self.pages.remove(&key) {
                     self.resident_bytes = self.resident_bytes.saturating_sub(page.len() as u64);
                     self.evictions += 1;
+                    GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
                     // `page`'s Drop frees the VRAM here (sole owner).
                 }
                 self.order.remove(index);

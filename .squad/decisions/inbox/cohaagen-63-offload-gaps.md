@@ -78,6 +78,63 @@ knobs only drive the **CPU** QMoE host-cache subsystem
   #384 load chain for 27B; validate mechanism on 7B first).
 - Async H2D prefetch overlap (issue #87) and routed-expert paging (issue #82).
 
+## Increment 2 (delivered in this branch — GAP A/B/C CLOSED)
+
+Wired the pager into the **live decode hot-path**, gated behind
+`ONNX_GENAI_WEIGHT_OFFLOAD=1`. Chosen architecture: resolve lazy weights to a
+device pointer in the **dispatch layer** via a new kernel-agnostic EP trait
+method, so all ~6600-line kernels stay **untouched** (correctness risk down).
+
+- **GAP A — capability advertised.** `CudaExecutionProvider` now constructs a
+  `CudaWeightResidency` from `DeviceOffloadPolicy::from_env()` and overrides
+  `capabilities()` to return `nxrt_weight_paging()` **only when offload is
+  enabled** (`residency.is_some()`); otherwise `stock()`. This is what makes
+  `build_lazy_weight_handles` mint real lazy handles for boundary-matched
+  weights. Default (offload off) → stock caps → byte-identical fast path.
+- **GAP B — kernel-side resolution.** New `ExecutionProvider::page_lazy_weight`
+  trait method (default `Ok(None)`); the CUDA EP implements it by paging the
+  lazy weight through `CudaWeightResidency::resident_materialized` and returning
+  a `PagedWeight` whose keep-alive pins the VRAM page for the kernel's lifetime.
+  Stream-safety: `admit()` synchronizes the compute stream before evicting a
+  page (skipped during graph capture, where offload does not run), so no
+  in-flight kernel can reference freed VRAM — no use-after-free.
+- **GAP C — dispatch invokes the pager.** `build_input_bindings` now calls
+  `page_lazy_weight` for lazy inputs: on `Some` it binds a normal contiguous
+  device view over the paged bytes and stores the `PagedWeight` keep-alive in
+  `InInfo`; on `None` it leaves the input absent + `lazy_unresolved` so it still
+  routes to the kernel as a `KernelInput::Weight`. `has_lazy_inputs` is
+  recomputed from the unresolved set so paged weights take the normal compute
+  path.
+- **GAP E extended:** `LazyWeightBoundary` now also recognizes
+  `com.microsoft::MatMulNBits`, so int4 MatMulNBits weights (where the VRAM
+  pressure lives on non-MoE models like Qwen) are pageable.
+- **Observability:** process-global page-in/hit/eviction counters
+  (`global_offload_stats` / `reset_global_offload_stats`) so an opaque
+  end-to-end decode can assert paging really happened.
+
+### Validation (real numbers, Qwen3-0.6B int4 MatMulNBits, native CUDA, device 0)
+
+Trusted model whose native-CUDA output is locked by `qwen3_0_6b_native_cuda_e2e`.
+
+- Greedy 32-token decode, offload OFF → baseline token IDs.
+- Same with `ONNX_GENAI_WEIGHT_OFFLOAD=1` + `..._DEVICE_BYTES=2097152` (2 MiB).
+- **Token IDs IDENTICAL** (offload transparent/correct).
+- **page_ins = 12544, evictions = 12541** (paging + eviction really fired).
+- Cost: baseline 2.79 tok/s → offloaded 2.30 tok/s (**~1.21× slowdown** from H2D
+  traffic under an aggressively tiny budget — expected).
+- Test: `weight_offload_native_cuda_e2e::offloaded_native_cuda_decode_is_token_identical_and_pages`
+  (`#[ignore]`, GPU + declared-io export required; skips gracefully on the #384
+  metadata gap). Plus GPU unit test
+  `weight_offload_gpu::residency_materialized_pages_evicts_and_matches_resident`.
+
+### Still remaining after increment 2
+
+- Async H2D prefetch overlap (issue #87) to hide paging latency.
+- Routed-expert (per-expert) QMoE paging (issue #82) — page only the experts a
+  token actually routes to, not the whole weight.
+- 27B/35B-A3B end-to-end validation is blocked on the #384 native load chain
+  (metadata `model.io` port auto-wiring); mechanism is proven on 7B/0.6B.
+
 ## Risks
 
 - Correctness-critical EP: the default (offload-off) path must stay
