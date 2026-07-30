@@ -56,7 +56,7 @@ import * as throughput from './throughput.js';
 /**
  * @typedef {object} PanelModule
  * @property {object} meta
- * @property {(root: HTMLElement, store: object) => {destroy: () => void}} mount
+ * @property {(root: HTMLElement, store: object) => {unmount: () => void}} mount
  */
 
 /**

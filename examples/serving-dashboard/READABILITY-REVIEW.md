@@ -782,3 +782,121 @@ lightweight tag carries no tagger, no date, no message and no reflog, which is e
 `review-0` could move 60 commits leaving no evidence in the repository that it had moved. **An
 annotated tag would have carried the designation in the object itself and this file would be
 unnecessary.**
+
+---
+
+## Triple review — pass 1, readability arm, at `review-1` = `fca13038`
+
+Three findings. R1 is **fixed in this commit**; R25 and R26 are new and are the
+reason two other tasks in my queue were *not* done.
+
+### R1 🟢 FIXED — the `PanelModule` typedef was the lone outlier, and the brief's reason for it was wrong
+
+`dashboard/index.js:59` declared:
+
+```js
+ * @property {(root: HTMLElement, store: object) => {destroy: () => void}} mount
+```
+
+Every panel module returns `unmount`. Read, not grepped — six of six:
+
+```
+kv-memory.js:159    return {  / :160 unmount() {
+prefix-cache.js:177 return {  / :178 unmount() {
+requests.js:132     return {  / :133 unmount() {
+scheduling.js:166   return {  / :167 unmount() {
+system.js:138       return {  / :139 unmount() {
+throughput.js:144   return {  / :145 unmount() {
+```
+
+One word changed. No behaviour, no test touched.
+
+**⛔ But the justification I was handed was false, and acting on it would have been a
+disaster.** The brief said *"every implementation returns `unmount`, so the typedef is the
+lone outlier"* — the second clause is true, the first is not a statement about the codebase.
+`destroy` is **legitimately live** in the very same file for *different* objects:
+`entry.roving.destroy()` at `:175` and `adapter.destroy()` at `:182`. Across the dashboard,
+8 modules expose `destroy()` and 7 expose `unmount()`. A reader who accepted *"every
+implementation returns unmount"* and reached for a global rename would have broken the
+roving-focus and adapter teardown paths.
+
+> **The defect was exactly one typedef. The brief described it as a vocabulary.** A correct
+> fix arrived with a reason that, if believed one step further than the fix, does damage.
+> **Scope of the fix and scope of the reason are separate quantities, and only the fix was checked.**
+
+**And the instrument nearly hid it.** My first probe was
+`grep -E "return \{[^}]*unmount"` across the panels — it returned **nothing**, and its
+positive control *also* returned nothing, because these returns span two lines and grep is
+line-oriented. Had I run only the negative arm I would have published *"no panel returns
+`unmount`"* — the exact inverse of the truth, with a clean-looking zero behind it.
+**The control is what converted an inverted finding into a correct one.**
+
+### R25 🔴 NEW — deriving a review document's `MEASURED-AT` from its last commit manufactures freshness
+
+I was ordered to apply the `MEASURED-AT` guard to `IMPLEMENTATION-REVIEW.md` and
+`REVIEWER-BRIEF.md`. **I did not, and this row is why.**
+
+The obvious mechanical source for the marker is the document's last-modifying commit.
+For `IMPLEMENTATION-REVIEW.md` that is `d2219ea8` — which is **at-or-after `review-1`, so
+the guard would have gone green.** But that document states its own measurement point in
+prose, at line 4:
+
+```
+Originally reviewed at: `24d831a2`
+```
+
+```
+git rev-list --count 24d831a2..review-1   ->  222
+```
+
+**222 commits.** The author's declared measurement point predates the review point by 222
+commits; the honest marker for that file is **red**. Had I stamped the last-modified SHA I
+would have certified a 222-commit-stale review as fresh — **automatically, in its author's
+name, using the very instrument built to detect staleness.**
+
+> **A file's last-commit SHA records when it was *written*, never when its claims were
+> *checked*.** Documents get touched to fix a typo, add a row, repair a citation — none of
+> which re-verifies the rows already there. **Editing is not re-measuring, and only the
+> author knows which it was.**
+
+So the marker **cannot be conscripted**. It has to be self-declared or it is a forgery with
+a passing test attached. What I can honestly supply is the measurement, which is done:
+
+| document | own declared point | vs `review-1` | one-line fix, for its owner |
+|---|---|---|---|
+| `IMPLEMENTATION-REVIEW.md` | `24d831a2` (line 4, prose) | ⛔ 222 behind | re-measure, then `MEASURED-AT: <new sha>` |
+| `ARCHITECTURE-SECURITY-REVIEW.md` | none declared | unknown | `MEASURED-AT: <sha you measured at>` |
+| `REVIEWER-BRIEF.md` | none declared | unknown | `MEASURED-AT: <sha you measured at>` |
+
+**Note the second-order finding: `IMPLEMENTATION-REVIEW.md` already had the convention.**
+It declared its measurement point in prose at line 4 and had done so all night. No machine
+read it, so it decayed 222 commits without a single warning. **The convention was never
+missing — only its enforcement was.** That is the whole argument for the marker in four
+words: *prose is not a predicate.*
+
+### R26 🟡 CONFIRMED — colour literals, and the empty cell that nearly banked it as clean
+
+The co-location convention holds: shipped dashboard JS carries no colour literals, with one
+exception — **`dashboard/sparkline.js`, 8 literals in 622 lines**, sole violator, confirmed
+by a sweep with no pathspec at all.
+
+**⛔ The brief named the file `ui/sparkline.js`. That path does not exist at the tag.**
+`git show review-1:ui/sparkline.js | grep -c '#...'` returns **`0`** — and a `0` from a
+missing file is byte-identical to a `0` from a clean file. I was one step from recording
+*"co-location convention: clean"* against a file that isn't there.
+
+> **This is the fourth time tonight the same shape has caught me** (repo-root pathspec from
+> a subdirectory ×3, now a nonexistent path). Every instance produced a **confident zero and
+> exit 0**. It is the single highest-yield defect class in this review and it has exactly one
+> cure: **never accept a zero without a control that proves the instrument could have
+> returned non-zero.** Not a rule about care — a second command.
+
+---
+
+**Suite at the time of the R1 fix:** `bash run-tests.sh`, raw exit **1**, `tests 663 ·
+suites 103 · pass 660 · fail 3`, from
+`/Users/justinc/Documents/GitHub/onnx-genai-demo/examples/serving-dashboard`, head `ffaef0cd`.
+**The 3 failures are not mine and not this change**: they reproduce identically with my edit
+stashed (control run), `dashboard/index.js` appears **0** times in the failure output, and the
+failing assertion is `no [data-state] rule is unqualified` — a CSS rule test. Five other
+agents' files were dirty in the shared tree at the time.
