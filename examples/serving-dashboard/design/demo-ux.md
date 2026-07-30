@@ -3879,3 +3879,60 @@ But @c8d9a40e's broadcast states *"the `'measured'` spelling is retired… anyth
 | D185 | The field-level exception stands, marked NO CURRENT INSTANCE | A dead example invites substituting the nearest field to hand — that is how an exception becomes the default |
 | D186 | Evidence blocks are exempted by written, hashed grant | A quote and an instruction are the same characters; the document that forbids a thing must be able to spell it |
 | D187 | Verify the announcement, including your own | A broadcast reaches more agents than a diff and arrives without the file attached |
+
+---
+
+## 60. DESIGN REVIEW — THE GRAYSCALE GATE, HELD AGAINST SHIPPED CSS (D188–D191)
+
+First review pass with `panels.css` actually linked (`index.html:29`, Lead ruling 9 landed). Everything below is computed from the **shipped token values**, not from my tokens read in isolation.
+
+### 60.1 ✅ The newly-live cascade is clean
+
+`panels.css` sat orphaned for 45 minutes, so its rules have **never once cascaded with `shell.css` in a browser.** Parsed all three stylesheets and cross-indexed every selector: **zero selectors are defined in both files.** No specificity collision, no silent override. The one near-neighbour is `[data-state='not-applicable']` (shell.css:201) and `.value[data-state='not-applicable']` (panels.css:968) — **different specificity, disjoint properties** (colour/border vs flex layout). They compose rather than fight.
+
+### 60.2 🔴 D188 — COLOUR IS DEAD AS A CHANNEL, AND NOW IT IS MEASURED ON WHAT SHIPS
+
+Background `#0d1117`. Every absence state resolved through `var()` and converted to relative luminance:
+
+| pair | contrast | grayscale |
+|---|---|---|
+| `pending` vs `unavailable` | **1.001 : 1** | 57 / 57 |
+| `unavailable` vs `not-applicable` | **1.000 : 1** | 57 / 57 |
+| `stale` vs `unavailable` | **1.044 : 1** | 60 / 57 |
+| `pending` vs `stale` | **1.046 : 1** | 57 / 60 |
+
+All four sit at **1.00–1.05:1 against each other** — against a 3:1 floor. Each is individually fine against the background (4.9–5.2:1, all pass AC), which is exactly why this survives casual review: **every state passes the contrast check that gets run, and no state passes the one that matters.**
+
+> **D188 — ratified with numbers rather than assertion: BETWEEN ABSENCE STATES, COLOUR CARRIES ZERO INFORMATION. The non-colour channel is not reinforcement, it is the ENTIRE signal.** A reviewer who checks each swatch against the background will certify this palette as accessible and will be **measuring the wrong pair.** Contrast-against-background answers *"can I read it?"*; **these four states need *"can I tell WHICH ONE it is?"*, and nothing in WCAG asks that question for us.**
+
+### 60.3 🔴 D189 — `pending`'s SECOND CHANNEL IS INERT ON ITS OWN GLYPH
+
+Given D188, each state must be separated by **glyph + border-style**. Shipped:
+
+| state | glyph | non-colour channel |
+|---|---|---|
+| `stale` | the value | `1px dashed` |
+| `unavailable` | `—` | `1px dotted` |
+| `not-applicable` | panel body | `3px double` |
+| `pending` | `···` | **`font-style: italic`** |
+
+> **D189 — italic is INERT on `···`. An ellipsis is three dots; punctuation has no asymmetric stroke to slant, so `font-style: italic` on this glyph produces a sub-pixel horizontal shift and nothing else.** `pending` is therefore carried by **its glyph alone**, with no redundancy — the only absence state with a single channel, and it is **1.001:1 from `unavailable`**. **The rule LOOKS like it provides a second channel, which is worse than providing none: it is the reason nobody has questioned it.** Recommend `border-bottom: 1px solid` — solid is unclaimed, `dashed`/`dotted`/`double` are taken — or accept glyph-only **explicitly, in writing**, so it is a decision and not an oversight.
+
+### 60.4 🔴 D190 — a doc comment in `shell.css` still specifies the OVERRULED design
+
+`shell.css:190-199`, above the `not-applicable` rule:
+
+> *"It shares the em-dash and the muted colour with `unavailable`… **The hover text carries the full explanation.**"*
+
+That is the design Lead ruling 5 **superseded**: §31 makes `not-applicable` panel-level with the explanation **on screen**. Not mine to edit — reported to @c8d9a40e. And this is the Lead's own standing addition firing exactly as predicted: **a reversal must be grepped through doc comments and test assertions, not just prose.** **The rule below the comment is compliant; the comment above it still teaches the reversed design, and the comment is what the next implementer reads first.**
+
+**AND THE CSS IS AHEAD OF THE RENDERER, WHICH LOCATES @e00032a4's DEFECT 3 PRECISELY:** `panels.css:968` already gives `not-applicable` a **column flex with the caption below the glyph** — the on-screen caption, correctly built. But `formatFieldText:454` returns a **bare em-dash**, so **the caption element is never emitted and that flex rule styles a child that does not exist.** **My `asset-graph.test.js` would report this rule as live and consumed.** It is: the selector matches, the properties apply, and **the feature is still absent** — D184 confirmed at the pixel level.
+
+> **D191 — a CSS rule can be correct, reachable, matched, AND meaningless, because a stylesheet describes how a thing looks IF it is rendered and cannot assert that anything renders it.** Every static check I own inspects the stylesheet or the token graph; **the gap between "styled" and "emitted" is invisible to all of them, and it is where this feature has been hiding all session.** Only a browser closes it — which is why Lead ruling 10 demands the assembled page from `GET /demo/`, and why I am holding these three checks open rather than marking them passed.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D188 | Between absence states, colour carries zero information — measured 1.00–1.05:1 | Each state passes contrast-vs-background; none passes state-vs-state, and only the first gets checked |
+| D189 | `pending` has no working second channel; italic is inert on `···` | A rule that appears to provide a channel is worse than none — it stops the question being asked |
+| D190 | `shell.css:190-199` still specifies hover-based `not-applicable` | The rule complies; the comment above it teaches the reversed design and is read first |
+| D191 | Styled, matched and consumed does not mean rendered | Static checks cannot see the gap between a live selector and an emitted element |
