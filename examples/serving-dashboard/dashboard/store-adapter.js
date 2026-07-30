@@ -27,6 +27,7 @@
 // as evidence.
 
 import { derivedField, hasValue, numericValueOf, pendingField } from '../telemetry-field.js';
+import { CONNECTION_STATES } from '../telemetry-store.js';
 
 /** Samples retained per key. At 250 ms that is ~5 minutes of history. */
 const DEFAULT_CAPACITY = 1200;
@@ -396,7 +397,11 @@ const CAPABILITY_KEYS = Object.freeze({
  */
 function markStalledOrigin(field, connection) {
   const state = connection?.state;
-  if (!state || state === 'connected' || state === 'connecting') {
+  // Bound to the store's exported symbols rather than to string literals: the
+  // field vocabulary already changed under this code once mid-session, and a
+  // silently non-matching literal here fails OPEN — every value would keep
+  // rendering as live through a total outage.
+  if (!state || state === CONNECTION_STATES.CONNECTED || state === CONNECTION_STATES.CONNECTING) {
     return field;
   }
   // Only a currently-live value can be downgraded. Anything already stale keeps
@@ -409,7 +414,7 @@ function markStalledOrigin(field, connection) {
     ...field,
     state: 'stale',
     reason:
-      state === 'no-model'
+      state === CONNECTION_STATES.NO_MODEL
         ? 'The server is running but has no model loaded, so nothing is refreshing this value.'
         : 'The server stopped answering, so this is the last value we received rather than a current one.',
   };

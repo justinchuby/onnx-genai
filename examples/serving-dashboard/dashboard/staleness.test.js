@@ -125,6 +125,24 @@ describe('AC45(c) — the ceiling is per-panel, not global', () => {
 });
 
 describe('AC45(d) — a whole-origin stall marks every panel', () => {
+  it('pins the connection vocabulary it depends on', async () => {
+    // markStalledOrigin fails OPEN: if these names drift, every value keeps
+    // rendering as live through a total outage and nothing looks wrong. The
+    // field vocabulary already changed under this code once mid-session, so
+    // this assertion is not hypothetical.
+    const { CONNECTION_STATES } = await import('../telemetry-store.js');
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(CONNECTION_STATES)),
+      {
+        CONNECTING: 'connecting',
+        CONNECTED: 'connected',
+        UNREACHABLE: 'unreachable',
+        NO_MODEL: 'no-model',
+      },
+      'the store changed its connection vocabulary; markStalledOrigin needs review',
+    );
+  });
+
   /** @param {string} connectionState */
   function storeWithConnection(connectionState) {
     const snapshot = {
