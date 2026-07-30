@@ -2402,3 +2402,183 @@ contradict it in fact dates it.
 assertion that `/v1/models` carries no value containing `MAIN_SEPARATOR`, all of
 this becomes safe. The stale order could be executed and the branch would still
 be defended, because the control would no longer live in a comment.
+
+## §33 — THE CRITICAL ARM, ANSWERED: ①②③④ AND THE APPROVE PREDICATE
+
+MEASURED-AT: `9b06d922`. **Not at `review-2`/`0bc86726`, and the refusal is
+evidenced below.** Splitting the premise from the ask, per the Lead's own rule.
+
+### 0. Why I did not review at the pinned SHA
+
+@c0de4c2e measured `review-2` at **0 dot-segment rules and 0 percent handling**;
+HEAD has 8 and 0 (control `fn ` = 25). So `review-2` refuses dotfiles *only
+incidentally, via the extension allowlist* — the exact mechanism the author's own
+comment says must not be relied on, and the mechanism C21 proves a test already
+mistook for a traversal defence.
+
+**Reviewing security at `review-2` would score a tree whose dotfile guard does
+not exist, and would score my own C19 as inapplicable when it is live at HEAD.**
+The order also lists P1 as closed via `f025ae58` with */v1/models.path BANNED in
+NEVER_BIND* — **§30–§32 show that ban carries an armed self-deletion order.** The
+ask underneath is live; I answer it at HEAD and stamp every number.
+
+### ① THE ASYMMETRY — fails-closed vs fails-silent, decided by a runtime capability
+
+**This is the most serious structural item on the board and I am ranking it
+above everything else on my sheet except C19.**
+
+The Lead's framing is right and the consequence is sharper than stated: the
+silent-downgrade path turns on an **execution-provider capability**, so two
+machines running byte-identical artifacts can disagree. Every provenance
+mechanism this branch ships — SHAs, detached worktrees, hashed bodies, build
+stamps — is a function of *bytes*. **This capability is not a function of bytes,
+so no artifact we can pin will ever determine it.**
+
+**My ruling: the fix is not to make the shared-buffer path fail loud to match.**
+That is the symmetric-looking answer and it is wrong, because it treats the two
+paths as peers. They are not:
+
+```
+static-cache   : capability PRESENT, config ABSENT  -> REFUSES TO BOOT, names keys
+shared-buffer  : config PRESENT, capability ABSENT  -> silently downgrades
+```
+
+The first is a **configuration** error — the operator wrote something false, and
+refusing is correct. The second is an **environment** fact — the operator wrote
+something true that this machine cannot honour. **Refusing to boot on a machine
+that simply lacks a capability makes the demo unlaunchable on the presenter's
+laptop, which is a worse failure than degrading.**
+
+> **The right fix is neither loud-fail nor silent-degrade: it is to make the
+> downgrade a VALUE ON THE WIRE rather than an event in a log. Degrading is
+> legitimate; degrading invisibly is not.**
+
+The honesty layer this branch is *built around* already has the vocabulary for
+exactly this and it is not being used here: a field whose value is *"per_request
+— downgraded, capability absent"* is a measured fact about the running process.
+**The dashboard's entire thesis is that an unavailable thing must say so.** This
+is the one place where the server itself declines to.
+
+**Cost: one field. It is also the only defect on my sheet that a reviewer of the
+merged branch could not discover from the repository**, because the trigger is
+not in the repository. **Follow-up branch is acceptable ONLY if the PR body names
+it.** Silence ships a capability claim we cannot support on an unknown machine.
+
+### ② A SPECIFICATION THAT PERMITS AN EXPLOITABLE IMPLEMENTATION — audit the orders
+
+Accepted, and I have one from tonight to add, which is **mine, against myself**:
+
+C19's fix as I first wrote it said *"ban `%` in `/demo/` paths."* That order is
+satisfiable by an implementation that bans `%` **after** decoding, which is a
+no-op. The predicate must name the input: **reject if the RAW `request.uri()
+.path()` contains `%`, before any decode, with the check ahead of all three
+`return true` paths.** My original wording was a concern wearing a predicate's
+clothes — the exact thing this arm asks me not to file.
+
+**The general form, which is the one worth keeping:**
+
+> **An order is exploitable when it names a PROPERTY without naming the INPUT
+> the property is evaluated on. Every security predicate must say *which bytes*,
+> *at which point in the pipeline*. `demo_path_is_servable` is one function that
+> reads one string, and C19 exists precisely because that string is not the
+> string `ServeDir` opens.**
+
+### ③ THREE DECLARATIONS — and the two halves fail for OPPOSITE reasons
+
+Measured at `9b06d922`:
+
+```
+SOURCE_CLASSES       telemetry-field.js     4 entries, CANONICAL
+SOURCE_CLASS_BADGES  format.js              format.js **IMPORTS SOURCE_CLASSES** ✅
+SOURCE_BADGES        dashboard/panel-kit.js **NO IMPORT of telemetry-field.js AT ALL**
+'simulated' in SOURCE_CLASSES: ABSENT (server, client, derived, estimated)
+```
+
+**These are not two instances of one defect. They have different fixes and only
+one of them is structural:**
+
+- **`format.js` is the cheap one.** It already imports `SOURCE_CLASSES` and then
+  declares a parallel map beside it. Both symbols are in scope in one file, so
+  divergence is *locally detectable* and the repair is local: derive the keys
+  from `Object.values(SOURCE_CLASSES)` and the map cannot drift. **One file, no
+  new module edges.**
+- **`panel-kit.js` is the real finding.** It declares a five-entry badge
+  vocabulary with **no import path to the canonical enum whatsoever.** There is
+  no module edge along which agreement could be enforced, so no lint rule and no
+  single-file test can ever catch its divergence. **It is not out of sync; it is
+  unsynchronisable by construction.**
+
+And `simulated`: **styled and constructible but absent from the canonical enum,
+so no writer can emit it.** That is dead presentation code that reads as a
+supported feature — a badge for a state the system cannot produce. **In a branch
+whose thesis is "never display a number you cannot stand behind," a badge nobody
+can emit is the same error one level up: a vocabulary entry we cannot stand
+behind.** Delete it or add it to the enum; it must not remain half-real.
+
+### ④ THE CSS INVERSION — **IT IS ALREADY BUILT. IT SHIPPED WHILE YOU WERE ASKING.**
+
+```
+shell.css:276-277   .value:not([data-state]),
+                    .value[data-state]:not(measured):not(pending):not(stale)
+                                      :not(unavailable):not(not-applicable)
+shell.css:311-312   the SAME negation list again, for ::after
+shell.css:150       'a panel that forgets to set data-state no longer renders at measured'
+[CONTROL] shell.css data-state rules 16 · panels.css 1 · panels.css 1080 lines
+```
+
+**That is deny-by-default in the cascade, in exactly the form requested: no
+branch, no import, no author cooperation.** An unknown or absent state gets the
+loud treatment. **Answer: it belongs in this PR because it is already in it** —
+@0837fdf9 landed it, and it is the strongest structural control on the front
+end.
+
+**One caveat, in my lane, and it is the reason I am not simply saying "done":**
+the catch-all is an **explicit negation list of five states, written out twice**
+(`:277` and `:312`). Adding a sixth legitimate state requires editing both. Edit
+one and the colour and the `::after` content **disagree for the same state** —
+the treatment splits in half and each half is individually correct.
+
+> **This is the Lead's `sourceBadge()` finding in CSS: two sites agreeing today
+> is a divergence waiting to happen, not defence in depth. The failure direction
+> is safe (a forgotten state renders loud), which is why it is a caveat and not
+> a defect — but the duplication is real and it is one `:is()` away from being a
+> single list.**
+
+### THE APPROVE PREDICATE — the answer I have owed since pass 1
+
+**My verdict has been APPROVE WITH COMMENTS with an empty blocking set since
+pass 2, and it does not move.** Stated as something executable rather than a
+concern, here is the complete set. **Every line is a command with an expected
+value; none is an opinion:**
+
+```
+① C19 — THE ONLY ITEM I WOULD CALL A SECURITY DEFECT.
+   curl -s --path-as-is 'http://127.0.0.1:PORT/demo/%2Egit/config' -o /dev/null -w '%{http_code}'
+     REQUIRED: 404        CURRENTLY: 200 (proven on the wire, both controls discriminate)
+   FIX PREDICATE: the RAW request.uri().path() is rejected when it contains '%',
+                  BEFORE any decode, AHEAD of all three `return true` paths.
+
+② C20 + C22 + C23 — ONE ASSERTION, SIX LINES.
+   assert /v1/models body is NON-EMPTY, then assert no value contains MAIN_SEPARATOR.
+     Closes: the field cannot return · any re-invention under any name fails ·
+             the NEVER_BIND self-deletion order becomes safe to execute.
+
+③ §32 — TWO HUNKS, NOT ONE.
+   telemetry-provenance.js :949  correct the stale FACT
+                           :951-953  DELETE the stale ORDER
+     Fixing only :949 makes the landmine look inspected.
+
+④ THE ASYMMETRY (①) — one field on the wire naming the downgrade,
+   OR one sentence in the PR body naming it as a known gap. Not silence.
+```
+
+**Nothing above blocks the merge.** ① is a demo-asset path on loopback behind a
+`--enable-debug-endpoints` flag; ②③④ are locks and honesty, not live
+exploits. **I would merge this branch today with ① and ④ named in the PR body.**
+
+**And the caveat I may not soften, in the house words: we cannot certify the
+suite is deterministic — 66 green runs and two unexplained reds. Any count is
+proof of the tree at one moment, not proof of stability.**
+
+**My error rate, volunteered: four retractions or corrections tonight — C12,
+C15, C22's prescription, §30.6. Weigh every finding above against that number.**
