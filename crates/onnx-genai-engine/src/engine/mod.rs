@@ -84,6 +84,7 @@ mod tests {
         finish_reason_after_token, select_next_token, select_next_token_with_sampler,
     };
     use crate::sampling::Sampler;
+    use onnx_genai_kv::page_table::{KvDType, PageTensorConfig};
     use proptest::prelude::*;
     use std::collections::HashMap;
 
@@ -100,6 +101,61 @@ mod tests {
     #[test]
     fn cap_kv_len_ignores_cap_larger_than_model_max() {
         assert_eq!(cap_kv_len(512, Some(40_960)), 512);
+    }
+
+    /// `pages_kv()` stays false for an engine with no KV model, even when the
+    /// page table is fully configured to hold paged tensors.
+    ///
+    /// This is the fixture whose ABSENCE made the original defect invisible.
+    /// `attach_kv_telemetry` returns this bool, and the server turns it into a
+    /// visitor-facing claim that paged KV is the mechanism in play. Every
+    /// engine fixture we owned had a KV model, so a predicate that ignored
+    /// `kv_model` entirely agreed with the truth on all of them -- it was not
+    /// under-tested, it was untestable from inside our own fixture set, and no
+    /// amount of clicking would have surfaced it.
+    ///
+    /// The native backend hardcodes `kv_model: None` (see `load.rs`), so the
+    /// disagreeing case is one configuration change away and would present as
+    /// a confident, green, correct-looking KV panel.
+    ///
+    /// THE CONTROL IS THE POINT, so it is asserted rather than assumed: the
+    /// cache is built with `new_with_tensor_config`, so `tensor_config` IS
+    /// `Some` here. That isolates the result to the `kv_model` conjunct --
+    /// delete `kv_model.is_some() &&` from `pages_kv` and this test goes true
+    /// and RED. Without that assertion a trivially unpageable fixture would
+    /// pass while proving nothing.
+    #[test]
+    fn engine_without_kv_model_does_not_claim_to_page() -> anyhow::Result<()> {
+        let config = PageTensorConfig {
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            page_size: 4,
+            dtype: KvDType::F32,
+        };
+        let kv_cache = PagedKvCache::new_with_tensor_config(config, 8);
+
+        assert!(
+            kv_cache.page_table.tensor_config.is_some(),
+            "control: the page table must be able to hold paged tensors, or a \
+             false result below would be explained by the cache rather than by \
+             the missing KV model"
+        );
+
+        let engine = model_free_rewind_test_engine(kv_cache, HashMap::new())?;
+
+        assert!(
+            engine.kv_model.is_none(),
+            "control: this fixture exists to cover the no-KV-model engine"
+        );
+        assert!(
+            !engine.pages_kv(),
+            "an engine with no KV model reported that it pages KV; its page \
+             table does bookkeeping but owns no KV storage, so it publishes a \
+             real capacity that no generation will ever consume -- and a \
+             caller turns this bool into a paged-KV capability claim"
+        );
+        Ok(())
     }
 
     #[test]
