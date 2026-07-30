@@ -1359,3 +1359,94 @@ rather than producing one.
 
 **The refusal is not a lack of data. It is a result: §8 states the floor, and
 the floor exceeds the signal by more than an order of magnitude.**
+
+---
+
+# §10 — AC33 ACCEPTANCE A/B: **EXECUTED IN FULL. VERDICT INCONCLUSIVE.**
+
+**Author:** QA Tester (@fc8b5d97) · 02:41–02:52 PDT
+**Protocol:** §5.1, run as written. **30/30 completions. Nothing was skipped.**
+
+## 10.1 Both arms, both binaries, one session — and identity checked *in the same invocation*
+
+    BEFORE  :8151  preserved clean binary d49d3c8…  governor_family=0  expected 0  OK
+    AFTER   :9242  pinned telemetry build ab175ea1  governor_family=3  expected 3  OK
+
+Both serve the **same model** (`qwen2.5-0.5b`), same machine, same prompt, same
+`max_tokens=512`, alternating in blocks of 5, n=15 per arm.
+
+**The identity check runs inside the measurement script and aborts before the
+first generation if either arm mismatches** — @1cb42f0e's rule. A separate
+identity check is a check of a *different moment*; only an inline one describes
+the binary that produced the numbers.
+
+## 10.2 The headline, with the denominator beside it
+
+    BEFORE   completions 15/15   median 29.09 tok/s   WORST 14.37   CV 20.56%
+    AFTER    completions 15/15   median 30.35 tok/s   WORST 14.38   CV 23.19%
+
+    delta (medians)   +4.32%
+    95% CI of delta   -11.40% .. +20.03%      half-width 15.71 points
+    ACCEPTANCE BAND   +/- 2%
+    VERDICT           INCONCLUSIVE — the CI spans the band (§5 binding rule)
+
+**`15/15` is reported beside every number per @1cb42f0e: a `0` next to `0/4`
+and a `0` next to `4/4` are different universes, and a failed experiment is
+otherwise indistinguishable from a real null result.** Both arms completed
+every attempt, so this is a genuine measurement that could not resolve the
+question — not a broken one.
+
+## 10.3 🔴 THE DECISIVE NUMBER IS NOT THE CI. IT IS THAT ONE RUN CONTAINS THREE INCOMPATIBLE VERDICTS
+
+    block 1   BEFORE 31.95   AFTER 30.35   delta   -5.01%
+    block 2   BEFORE 28.32   AFTER 17.37   delta  -38.67%
+    block 3   BEFORE 29.61   AFTER 33.01   delta  +11.48%
+
+    THREE BLOCKS SPAN 50.1 PERCENTAGE POINTS AGAINST A +/-2% BAND
+    loadavg during the run: 9.78 -> 121.02   (a 12x swing INSIDE one experiment)
+
+> **Any one of these blocks, run alone and reported honestly, is a publishable
+> result. Block 1 says telemetry costs 5%. Block 3 says it *pays* 11%. Block 2
+> says it costs 39%. THEY ARE THE SAME BINARIES, THE SAME PROMPT AND THE SAME
+> TWELVE MINUTES. The reason to run three blocks is not statistical power — it
+> is that a single block cannot tell you it is lying.**
+
+## 10.4 🔻 THIS FALSIFIES MY OWN §5.1 MANDATE — BLOCKS ARE THE WRONG DESIGN HERE
+
+§5.1 requires *"blocks of 5, **not** per-request alternation."* **That
+instruction is mine and this run shows it is wrong under the conditions we
+actually have.**
+
+**Blocks defend against per-request artefacts (warm-up, cache state). Per-request
+alternation defends against *drift*. Those are different threats and you must
+pick the one that dominates. Drift dominates here by an order of magnitude:** a
+block occupies minutes, so a load excursion lands **entirely inside one arm** —
+block 2's AFTER arm ran through a spike that its BEFORE arm never saw, which is
+the whole of that −38.67%.
+
+The evidence that alternation is the better instrument is already in this file:
+**§8's per-request null A/B centred at −0.28 % on a known-zero truth**, while
+this blocked design produced −38.67 % in a single block on an unknown one.
+
+> **⚠️ AMENDMENT TO §5.1: alternate PER REQUEST, discard the first generation per
+> arm as warm-up, and keep the block structure only as a reporting unit. The
+> original rationale was real but it optimised against the smaller threat.**
+>
+> **THE GENERAL FORM: AN EXPERIMENTAL DESIGN IS A CHOICE ABOUT *WHICH*
+> CONFOUNDER YOU CANCEL, NEVER A CHOICE TO CANCEL CONFOUNDING. I wrote "blocks,
+> not alternation" as though it were a quality ranking. It is a trade, and I
+> took the wrong side of it because I picked before I had measured which
+> confounder was larger.**
+
+## 10.5 What ships
+
+**AC33 acceptance verdict: INCONCLUSIVE, protocol fully executed, 30/30
+completions, at a measured noise floor that exceeds the acceptance band by
+roughly an order of magnitude.**
+
+**There is no evidence that telemetry costs anything** — the AFTER arm was
+nominally *faster* — but "no evidence of a cost" is not "proof of <2 %", and
+this file will not blur those. **The one thing that did work exactly as
+predicted is §2's claim that 512-token generations suppress variance: CV fell
+from 28.90 % at 128 tokens to 20.56 %/23.19 % at 512.** The protocol's
+statistical advice was sound; its scheduling advice was not.
