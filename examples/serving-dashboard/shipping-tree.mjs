@@ -65,6 +65,55 @@ export function describeTree() {
 }
 
 /**
+ * Read a file AS IT SHIPS — from HEAD, never from the desk.
+ *
+ * WHY THIS LIVES HERE AND NOT IN EACH CHECK
+ * -----------------------------------------
+ * Two check files independently grew a byte-identical private copy of this
+ * function, and both copies are correct. That is not two authors being
+ * careless; it is an API gap manufacturing duplicates. This module already
+ * owned the question "is the artefact I am about to describe the artefact that
+ * ships" — it simply had no way to HAND YOU that artefact, so everyone who
+ * needed the bytes wrote their own reader. The gap, not the authors, produced
+ * the duplication, and closing it is the only fix that stops the next one.
+ *
+ * WHY HEAD AND NOT `readFileSync`
+ * -------------------------------
+ * Reading the working tree is correct and means the wrong thing, and the two
+ * are indistinguishable whenever the tree is clean — which is exactly when you
+ * are most likely to trust the result. The failure it permits is
+ * one-directional and it is the bad direction: a defect still present in HEAD
+ * but repaired only on disk scores GREEN, and the repair evaporates on the next
+ * checkout. A reviewer clones HEAD. So does CI. So does the demo. Nobody clones
+ * your working tree.
+ *
+ * The inverse failure — a fix on disk that is not yet committed reads RED — is
+ * the safe one, and its remedy is the thing you were going to do anyway.
+ *
+ * THIS FUNCTION THROWS, DELIBERATELY, AND CALLERS MUST NOT "FIX" THAT
+ * ------------------------------------------------------------------
+ * If `rel` is not in HEAD, `git show` exits non-zero and this throws. That is
+ * the existing contract of both private copies and it is preserved here byte
+ * for byte, because the alternative — returning '' — makes an ABSENT file
+ * indistinguishable from an EMPTY one, and every content check in this suite
+ * scores an empty string as CLEAN. A file that vanished would then score green
+ * for having vanished, which is the vacuity this whole directory exists to
+ * prevent.
+ *
+ * @param {string} rel path relative to THIS directory, not the repo root.
+ * @returns {string} the file's bytes as committed at HEAD.
+ */
+export function shipped(rel) {
+  // The `./` is load-bearing: `git show HEAD:<path>` resolves from the REPO
+  // ROOT, not the cwd, so a bare relative path silently resolves to nothing.
+  // `HEAD:./<path>` is the form that honours `cwd`.
+  return execFileSync('git', ['show', `HEAD:./${rel}`], {
+    cwd: HERE,
+    maxBuffer: 64 * 1024 * 1024,
+  }).toString();
+}
+
+/**
  * Fail loudly unless this file lives in the tree we ship.
  *
  * Call this FIRST, before any other assertion in a check file. A check that
