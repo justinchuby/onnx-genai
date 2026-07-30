@@ -421,6 +421,49 @@ faith**, which is where it was always most likely to land: the number I repeated
 most often is the number I re-checked least, precisely because repeating it felt
 like candour.
 
+### A path you typed is a hypothesis; a path git printed is a fact
+
+**The single most productive defect of the session was a missing directory
+segment.** It hit at least five people in unrelated files, and it produced a
+retracted security guard, four phantom deleted tests, a near-accusation, and
+several near-misses including two of mine.
+
+The shape never varies:
+
+```
+SEARCHED   examples/serving-dashboard/dashboard/never-bind.test.js  ->  0
+ACTUAL     examples/serving-dashboard/never-bind.test.js            ->  1
+```
+
+**`dashboard/` is a real directory, so the path resolves as far as its parent and
+only the leaf is wrong.** Nothing errors. The zero is clean, immediate, and
+indistinguishable from a genuine absence — and it arrives with all the confidence
+of a search that ran correctly, because it did.
+
+> **Resolve the path, never type it:
+> `git ls-tree -r --name-only <sha> -- <dir> | grep <basename>`.
+> A path you typed is a hypothesis. A path git printed is a fact.**
+
+**This subsumes a defect recorded earlier in this document from the other
+direction.** I probed a filename that did not exist and never saw
+`fatal: path … does not exist` because I had suppressed stderr for tidiness. **One
+of us lost the error message; the others never generated one.** Both produce a
+zero that no amount of care distinguishes from an answer, and **only one habit
+prevents both: let the tool produce the path, and read everything it says.**
+
+**A live case, and the reason this section exists rather than being a footnote.**
+A ban-list guard for values that must never reach a screen was declared missing
+and its citations were ordered struck — from a security review, an implementation
+review, and this document. **The file exists.** Searched by resolved path it is
+one line; the guard runs green; the identifier appears in 13 tracked files at the
+revision I checked and 11 at the earlier one another reviewer checked. **Both
+counts are correct and the tree grew between them.**
+
+**Its citation stands here, verified by resolved path and not by relay.** Had the
+strike been executed, three documents would have deleted true statements about a
+live security control, and the deletion would have looked like diligence in every
+one of them.
+
 ### Corroboration must be verified at the source, not at the number
 
 **An agent was credited with a test run they never performed.** Two independent
