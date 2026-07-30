@@ -1690,3 +1690,65 @@ At `a755ede5` that same zero means "there is no path here to display."**
 I had filed the two-mechanism divergence risk myself and I would have re-filed it
 tonight on this same zero. The divergence is closed the only way a divergence can
 truly close: **one of the two mechanisms no longer exists.**
+
+---
+
+## §25 — ARTIFACT AUDIT OF MY OWN COMMITS, AND A PREDICATE THAT WOULD HAVE LIBELLED TWELVE COLLEAGUES
+
+Run per the Lead's amendment ② — *verify the artifact, not the intention*.
+
+### Result: clean, and now it is a fact rather than a recollection
+
+    commits touching ARCHITECTURE-SECURITY-REVIEW.md : 27
+    of those, carrying ANY foreign file              : 0
+    CONTROL (1133a874, a known multi-file commit)    : 3 foreign — detector fires
+    fa1fd425, my one source fix                      : routes/mod.rs, alone
+
+Nothing of anyone else's has ever ridden inside a commit of mine. **I believed
+that before I checked. That belief was worth nothing and I should not have
+offered it as a posture line all night.**
+
+### 🧨 But my FIRST predicate was wrong, and its failure mode was defamatory
+
+I began with `git log --grep='f6527cc9'`, reasoning that every commit of mine
+carries my sign-off. It returned **12 commits, every one of them reporting a
+foreign file.**
+
+**Not one of those 12 was mine.** `--grep` matches commits that **MENTION** my
+ID — colleagues citing me, thanking me, correcting me. The files were "foreign"
+because they were *their* files, correctly committed.
+
+> **AN AUTHORSHIP PREDICATE BUILT ON MESSAGE TEXT MEASURES CITATION, NOT
+> AUTHORSHIP. In a crew where everyone signs off in the message and everyone
+> cites everyone, those two sets are nearly DISJOINT — and the more
+> collaborative an agent is, the more commits they will appear to have written.**
+
+And note the shape of the output, because it is what makes this class dangerous:
+**12 rows, uniform format, every one flagged `foreign=1`.** It reads as a
+devastating, well-evidenced finding. Publishing it would have accused twelve
+colleagues of exactly the index-sweep contamination the Lead has been warning
+about all night — **using their correctness as the evidence of their guilt.**
+
+**And the deeper structural fact: every commit in this repository is authored by
+the same git identity.** `--author` cannot separate fourteen agents either.
+**Authorship is simply not recoverable from git metadata here. Only FILE
+OWNERSHIP is.** That is why the corrected predicate is the right one, and it is
+also an argument for one-file-per-agent discipline that nobody has made yet:
+*it is not merely tidy, it is the only thing that makes attribution auditable.*
+
+### ⚠️ @e00032a4's second direction, run on my own SHAs — the result is bad
+
+    c04576f0  in review-1 YES · review-0 YES · HEAD YES
+    fa1fd425  NO · NO · YES        82b66d78  NO · NO · YES
+    b4636338  NO · NO · YES        0225cfbb  NO · NO · YES
+    9e53bed2  NO · NO · YES        2f631e13  NO · NO · YES
+    dadb59e7  NO · NO · YES
+
+**SEVEN OF MY EIGHT COMMITS ARE OUTSIDE EVERY TAG.** My entire pass-2 and pass-3
+output — the C18 fix, the C19 bypass filing, both P1 adjudications, the C15
+retraction, C20 — **is invisible to any reviewer reading a review tag.** A
+reviewer scoring my lane from a tag would find one retraction and conclude I did
+nothing after 04:02.
+
+*Confirming an attribution rather than letting it dangle, per the Lead's new
+rule:* `c04576f0` **is mine** — @e00032a4 cited it correctly.
