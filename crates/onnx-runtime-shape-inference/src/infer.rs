@@ -6,7 +6,9 @@ use onnx_runtime_ir::{
     Attribute, DataType, Dim, Graph, Node, SymbolConstraints, SymbolId, ValueId, WeightRef,
 };
 
-use crate::context::{MergePolicy, NodeIo, SymbolInterner, TypeInfo, TypedShape, merge_shapes};
+use crate::context::{
+    MergePolicy, NodeIo, SymbolInterner, TypeInfo, TypedShape, ValueType, merge_shapes,
+};
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
 use crate::registry::InferenceRegistry;
@@ -65,6 +67,10 @@ impl InferenceRegistry {
 
         let mut types: HashMap<ValueId, TypeInfo> = HashMap::new();
         let mut shape_data: HashMap<ValueId, ShapeData> = HashMap::new();
+        // Parallel container-type layer: only populated for values that are
+        // actually `Sequence`/`Optional`/`Map`. Empty for pure-tensor graphs, so
+        // the tensor-only path is byte-identical.
+        let mut containers: HashMap<ValueId, ValueType> = HashMap::new();
 
         seed_sources(graph, &mut types, &mut shape_data);
         bind_captures(graph, &imported_scope, &mut types, &mut shape_data);
@@ -124,6 +130,7 @@ impl InferenceRegistry {
                 policy,
                 &mut types,
                 &mut shape_data,
+                &mut containers,
                 &mut interner,
             )?;
             if remaining_subgraph_nodes > 0 {
@@ -236,6 +243,7 @@ impl InferenceRegistry {
         Ok(subgraph_results)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn infer_node_outputs(
         &self,
         node: &Node,
@@ -243,9 +251,10 @@ impl InferenceRegistry {
         policy: MergePolicy,
         types: &mut HashMap<ValueId, TypeInfo>,
         shape_data: &mut HashMap<ValueId, ShapeData>,
+        containers: &mut HashMap<ValueId, ValueType>,
         interner: &mut SymbolInterner,
     ) -> Result<(), ShapeInferError> {
-        let inputs = gather_inputs(node, types, shape_data);
+        let inputs = gather_inputs(node, types, shape_data, containers);
         let outputs = self.infer_node(node, opset_imports, inputs, policy, interner)?;
         for (slot, io) in node.outputs.iter().zip(outputs) {
             if let Some(type_info) = io.type_info {
@@ -255,6 +264,9 @@ impl InferenceRegistry {
                 && data.within_bounds()
             {
                 shape_data.insert(*slot, data);
+            }
+            if let Some(value_type) = io.value_type {
+                containers.insert(*slot, value_type);
             }
         }
         Ok(())
@@ -983,6 +995,10 @@ fn remap_node_io(
                 .collect();
             data
         }),
+        // Container edges are not yet propagated across subgraph scope
+        // boundaries (a documented #449 follow-up); tensor scope capture is
+        // unchanged.
+        value_type: None,
     }
 }
 
@@ -1039,6 +1055,7 @@ fn extend_visible_scope(
                     .collect();
                 data
             }),
+            value_type: None,
         });
         scope.insert(name.clone(), binding);
     }
@@ -1049,6 +1066,7 @@ fn gather_inputs(
     node: &Node,
     types: &HashMap<ValueId, TypeInfo>,
     shape_data: &HashMap<ValueId, ShapeData>,
+    containers: &HashMap<ValueId, ValueType>,
 ) -> Vec<NodeIo> {
     node.inputs
         .iter()
@@ -1056,6 +1074,7 @@ fn gather_inputs(
             Some(vid) => NodeIo {
                 type_info: types.get(vid).cloned(),
                 shape_data: shape_data.get(vid).cloned(),
+                value_type: containers.get(vid).cloned(),
             },
             None => NodeIo::default(),
         })

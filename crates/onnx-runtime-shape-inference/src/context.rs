@@ -34,12 +34,111 @@ impl TypeInfo {
     }
 }
 
+/// A tensor leaf inside a [`ValueType`] container element type.
+///
+/// Unlike the top-level [`TypeInfo`] used by the tensor-only path, the `shape`
+/// is *optional*: a container producer such as `SequenceEmpty` knows only the
+/// element `dtype`, never its rank. Representing that honestly (rather than
+/// fabricating a bogus shape) is why this type exists separately from
+/// [`TypeInfo`]. A `TensorType` whose `shape` is known converts to and from a
+/// [`TypeInfo`] losslessly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorType {
+    pub dtype: DataType,
+    /// `None` when the rank/shape is unknown (a dtype-only tensor).
+    pub shape: Option<TypedShape>,
+}
+
+impl TensorType {
+    /// A tensor leaf with a known shape.
+    pub fn new(dtype: DataType, shape: TypedShape) -> Self {
+        Self {
+            dtype,
+            shape: Some(shape),
+        }
+    }
+
+    /// A tensor leaf whose dtype is known but whose shape is not.
+    pub fn dtype_only(dtype: DataType) -> Self {
+        Self { dtype, shape: None }
+    }
+
+    /// The full [`TypeInfo`], available only when the shape is known.
+    pub fn to_type_info(&self) -> Option<TypeInfo> {
+        self.shape
+            .as_ref()
+            .map(|shape| TypeInfo::new(self.dtype, shape.clone()))
+    }
+}
+
+impl From<TypeInfo> for TensorType {
+    fn from(type_info: TypeInfo) -> Self {
+        Self {
+            dtype: type_info.dtype,
+            shape: Some(type_info.shape),
+        }
+    }
+}
+
+/// The full type of a value: a tensor, or a container whose element type is
+/// itself a [`ValueType`].
+///
+/// ONNX values are tensors in the overwhelming majority of graphs; the tensor
+/// path never materialises a `ValueType` at all (a value with no recorded
+/// `ValueType` is, by construction, a plain tensor). The container variants
+/// exist only so `Sequence`/`Optional`/`Map` operators can propagate their
+/// element types. This layer is *additive*: it wraps, and never replaces,
+/// [`TypeInfo`], so the tensor-only path stays byte-identical.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    /// A tensor value.
+    Tensor(TensorType),
+    /// A homogeneous sequence of `element`-typed values.
+    Sequence(Box<ValueType>),
+    /// An optional value that is either present as `element` or absent.
+    Optional(Box<ValueType>),
+    /// A map from `key` (an integer or string dtype) to `value`-typed values.
+    Map(DataType, Box<ValueType>),
+}
+
+impl ValueType {
+    /// A tensor value with a known shape.
+    pub fn tensor(dtype: DataType, shape: TypedShape) -> Self {
+        Self::Tensor(TensorType::new(dtype, shape))
+    }
+
+    /// A sequence whose elements have type `element`.
+    pub fn sequence(element: ValueType) -> Self {
+        Self::Sequence(Box::new(element))
+    }
+
+    /// The tensor leaf, when this value is a tensor.
+    pub fn as_tensor(&self) -> Option<&TensorType> {
+        match self {
+            Self::Tensor(tensor) => Some(tensor),
+            _ => None,
+        }
+    }
+
+    /// The element type, when this value is a sequence.
+    pub fn as_sequence_element(&self) -> Option<&ValueType> {
+        match self {
+            Self::Sequence(element) => Some(element),
+            _ => None,
+        }
+    }
+}
+
 /// The resolved inference state of a single input or output slot: an optional
 /// type and an optional [`ShapeData`] side-value.
 #[derive(Clone, Debug, Default)]
 pub struct NodeIo {
     pub type_info: Option<TypeInfo>,
     pub shape_data: Option<ShapeData>,
+    /// The container type of this slot, when it is a `Sequence`/`Optional`/`Map`
+    /// value. `None` for plain tensors — the overwhelming common case — which
+    /// keeps the tensor-only path byte-identical.
+    pub value_type: Option<ValueType>,
 }
 
 impl NodeIo {
@@ -48,6 +147,16 @@ impl NodeIo {
         Self {
             type_info: Some(type_info),
             shape_data: None,
+            value_type: None,
+        }
+    }
+
+    /// An i/o slot carrying a container [`ValueType`].
+    pub fn container(value_type: ValueType) -> Self {
+        Self {
+            type_info: None,
+            shape_data: None,
+            value_type: Some(value_type),
         }
     }
 }
@@ -209,6 +318,11 @@ impl<'a> InferenceContext<'a> {
         self.inputs.get(i)?.type_info.as_ref()
     }
 
+    /// The container [`ValueType`] of input `i`, if it is a container value.
+    pub fn input_value_type(&self, i: usize) -> Option<&ValueType> {
+        self.inputs.get(i)?.value_type.as_ref()
+    }
+
     /// The inferred shape of input `i`, if resolved.
     pub fn input_shape(&self, i: usize) -> Option<&[DimExpr]> {
         self.input_type(i).map(|t| t.shape.as_slice())
@@ -235,6 +349,13 @@ impl<'a> InferenceContext<'a> {
     pub fn set_output_type(&mut self, i: usize, type_info: TypeInfo) {
         if let Some(slot) = self.outputs.get_mut(i) {
             slot.type_info = Some(type_info);
+        }
+    }
+
+    /// Set the container [`ValueType`] of output `i`.
+    pub fn set_output_value_type(&mut self, i: usize, value_type: ValueType) {
+        if let Some(slot) = self.outputs.get_mut(i) {
+            slot.value_type = Some(value_type);
         }
     }
 

@@ -8,6 +8,7 @@
 
 use crate::registry::InferenceRegistry;
 
+mod container;
 mod custom_ops;
 mod data_ops;
 mod einsum;
@@ -65,4 +66,5 @@ pub fn register_all(registry: &mut InferenceRegistry) {
     signal::register(registry);
     loss::register(registry);
     ml::register(registry);
+    container::register(registry);
 }

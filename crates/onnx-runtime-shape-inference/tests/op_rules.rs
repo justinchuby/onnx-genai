@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, SymbolId, TensorData, ValueId};
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, ShapeInferError, SymbolInterner,
-    TypeInfo,
+    TensorType, TypeInfo, ValueType,
 };
 
 // --- construction helpers -------------------------------------------------
@@ -186,6 +186,7 @@ fn sd_vec(elems: Vec<DimExpr>) -> NodeIo {
     NodeIo {
         type_info: Some(TypeInfo::new(DataType::Int64, vec![c(elems.len() as i64)])),
         shape_data: Some(ShapeData::vector(DataType::Int64, elems)),
+        value_type: None,
     }
 }
 
@@ -194,6 +195,7 @@ fn sd_int_scalar(dtype: DataType, value: DimExpr) -> NodeIo {
     NodeIo {
         type_info: Some(TypeInfo::new(dtype, vec![])),
         shape_data: Some(ShapeData::scalar(dtype, value)),
+        value_type: None,
     }
 }
 
@@ -202,6 +204,7 @@ fn sd_float_scalar(dt: DataType, value: f64) -> NodeIo {
     NodeIo {
         type_info: Some(TypeInfo::new(dt, vec![])),
         shape_data: Some(ShapeData::float_scalar(dt, value)),
+        value_type: None,
     }
 }
 
@@ -212,6 +215,7 @@ fn sd_float_vec(values: Vec<f64>) -> NodeIo {
             vec![c(values.len() as i64)],
         )),
         shape_data: Some(ShapeData::float_vector(DataType::Float32, values)),
+        value_type: None,
     }
 }
 
@@ -279,8 +283,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 209);
-    assert_eq!(registry.entry_count(), 254);
+    assert_eq!(registry.operator_count(), 213);
+    assert_eq!(registry.entry_count(), 258);
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
@@ -2027,6 +2031,7 @@ fn range_static_and_dynamic() {
     let scalar = |value| NodeIo {
         type_info: Some(TypeInfo::new(DataType::Int64, vec![])),
         shape_data: Some(ShapeData::scalar(DataType::Int64, c(value))),
+        value_type: None,
     };
     let outs = run(&n, vec![scalar(1), scalar(10), scalar(2)], 11);
     assert_eq!(out_shape(&outs), vec![c(5)]);
@@ -2878,6 +2883,7 @@ fn unsqueeze_scalar_shape_data_to_vector() {
     let scalar = NodeIo {
         type_info: Some(TypeInfo::new(DataType::Int64, vec![])),
         shape_data: Some(ShapeData::scalar(DataType::Int64, sym(0))),
+        value_type: None,
     };
     let n = with_attr(node("Unsqueeze", 1, 1), "axes", Attribute::Ints(vec![0]));
     let outs = run(&n, vec![scalar], 11);
@@ -5717,4 +5723,203 @@ fn softmax_cross_entropy_loss_reduction_and_log_prob() {
         .type_info
         .is_none()
     );
+}
+
+// --- container types: the Sequence subset (#449) ------------------------------
+
+/// The container [`ValueType`] of output slot 0.
+fn out_value_type(outs: &[NodeIo]) -> &ValueType {
+    outs[0]
+        .value_type
+        .as_ref()
+        .expect("output container type resolved")
+}
+
+/// The tensor leaf of a sequence output's element type.
+fn seq_element_tensor(outs: &[NodeIo]) -> &TensorType {
+    out_value_type(outs)
+        .as_sequence_element()
+        .expect("output is a sequence")
+        .as_tensor()
+        .expect("sequence element is a tensor")
+}
+
+/// A `NodeIo` carrying a sequence-of-tensor container input.
+fn seq_in(dtype: DataType, shape: Option<Vec<DimExpr>>) -> NodeIo {
+    let tensor = match shape {
+        Some(shape) => TensorType::new(dtype, shape),
+        None => TensorType::dtype_only(dtype),
+    };
+    NodeIo::container(ValueType::sequence(ValueType::Tensor(tensor)))
+}
+
+#[test]
+fn sequence_empty_element_dtype_follows_attr_and_defaults_to_float32() {
+    // Default (no `dtype` attr) is Float32, per the ONNX spec.
+    let default = run(&node("SequenceEmpty", 0, 1), vec![], 13);
+    let element = seq_element_tensor(&default);
+    assert_eq!(element.dtype, DataType::Float32);
+    assert!(
+        element.shape.is_none(),
+        "empty sequence element shape is unknown"
+    );
+
+    // Every recognised `dtype` attribute value flows through to the element.
+    for dtype in [DataType::Int64, DataType::Float16, DataType::Bool] {
+        let out = run(
+            &with_attr(
+                node("SequenceEmpty", 0, 1),
+                "dtype",
+                Attribute::Int(dtype.to_onnx() as i64),
+            ),
+            vec![],
+            13,
+        );
+        assert_eq!(seq_element_tensor(&out).dtype, dtype);
+    }
+}
+
+#[test]
+fn sequence_construct_matching_element_dtypes_yield_common_element() {
+    let out = run(
+        &node("SequenceConstruct", 2, 1),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(2), c(3)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.dtype, DataType::Float32);
+    assert_eq!(element.shape.as_deref(), Some([c(2), c(3)].as_slice()));
+}
+
+#[test]
+fn sequence_construct_mismatched_element_dtypes_error() {
+    let error = try_run(
+        &node("SequenceConstruct", 2, 1),
+        vec![f32in(vec![c(2)]), tin(DataType::Int64, vec![c(2)])],
+        13,
+    )
+    .expect_err("mismatched element dtypes must be rejected");
+    assert_invalid(error, "SequenceConstruct", "share a dtype");
+}
+
+#[test]
+fn sequence_construct_disagreeing_extents_degrade_to_symbol_but_keep_rank() {
+    let out = run(
+        &node("SequenceConstruct", 2, 1),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(2), c(5)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.dtype, DataType::Float32);
+    let shape = element.shape.as_ref().expect("rank preserved");
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape[0], c(2), "agreeing extent is preserved");
+    assert_symbolic(&shape[1]);
+}
+
+#[test]
+fn sequence_construct_differing_ranks_yield_unknown_element_shape() {
+    let out = run(
+        &node("SequenceConstruct", 2, 1),
+        vec![f32in(vec![c(2), c(3)]), f32in(vec![c(2)])],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.dtype, DataType::Float32);
+    assert!(
+        element.shape.is_none(),
+        "differing ranks give an unknown shape"
+    );
+}
+
+#[test]
+fn sequence_construct_preserves_symbolic_element_dims() {
+    let batch = DimExpr::symbol(SymbolId(7));
+    let out = run(
+        &node("SequenceConstruct", 2, 1),
+        vec![
+            tin(DataType::Float32, vec![batch.clone(), c(4)]),
+            tin(DataType::Float32, vec![batch.clone(), c(4)]),
+        ],
+        13,
+    );
+    let element = seq_element_tensor(&out);
+    assert_eq!(element.shape.as_deref(), Some([batch, c(4)].as_slice()));
+}
+
+#[test]
+fn sequence_length_is_int64_scalar() {
+    let out = run(
+        &node("SequenceLength", 1, 1),
+        vec![seq_in(DataType::Float32, Some(vec![c(2), c(3)]))],
+        13,
+    );
+    assert_eq!(out_dtype(&out), DataType::Int64);
+    assert_eq!(out_shape(&out), Vec::<DimExpr>::new());
+}
+
+#[test]
+fn sequence_at_recovers_the_element_tensor_type() {
+    let out = run(
+        &node("SequenceAt", 2, 1),
+        vec![
+            seq_in(DataType::Int64, Some(vec![c(6), c(8)])),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    assert_eq!(out_dtype(&out), DataType::Int64);
+    assert_eq!(out_shape(&out), vec![c(6), c(8)]);
+}
+
+#[test]
+fn sequence_at_preserves_symbolic_element_dims() {
+    let seq = DimExpr::symbol(SymbolId(3));
+    let out = run(
+        &node("SequenceAt", 2, 1),
+        vec![
+            seq_in(DataType::Float32, Some(vec![seq.clone(), c(16)])),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    assert_eq!(out_shape(&out), vec![seq, c(16)]);
+}
+
+#[test]
+fn sequence_at_on_dtype_only_element_stays_unresolved() {
+    // `SequenceEmpty` -> `SequenceAt`: the element shape is unknown, so the
+    // tensor output is left unresolved rather than fabricated.
+    let out = run(
+        &node("SequenceAt", 2, 1),
+        vec![
+            seq_in(DataType::Float32, None),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    assert!(out[0].type_info.is_none());
+}
+
+#[test]
+fn sequence_construct_then_at_round_trips_the_element_type() {
+    let constructed = run(
+        &node("SequenceConstruct", 3, 1),
+        vec![
+            f32in(vec![c(2), c(4)]),
+            f32in(vec![c(2), c(4)]),
+            f32in(vec![c(2), c(4)]),
+        ],
+        13,
+    );
+    let recovered = run(
+        &node("SequenceAt", 2, 1),
+        vec![
+            constructed.into_iter().next().unwrap(),
+            tin(DataType::Int64, vec![]),
+        ],
+        13,
+    );
+    assert_eq!(out_dtype(&recovered), DataType::Float32);
+    assert_eq!(out_shape(&recovered), vec![c(2), c(4)]);
 }
