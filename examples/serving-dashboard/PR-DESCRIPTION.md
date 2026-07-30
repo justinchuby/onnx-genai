@@ -356,8 +356,20 @@ its own open set is a marketing document.**
 - **One latency field was measured, certified, and never wired to the panel that
   promises latency.** Found while overturning a ruling of mine that rested on a
   regex which could not match the key it was looking for.
-- **The exposure ratchet is red**, at 91 against an actual 94, and it was left
-  red on purpose rather than raised to green by an author who noticed it.
+- **The exposure ratchet is green in the tree this PR ships** (declared 85) and
+  **red 73 commits later at `ddef0391`** (declared 88, actual 91), where it was
+  left red on purpose rather than raised to green by the author who noticed it.
+  **An earlier draft of this bullet said `91 against an actual 94`; those figures
+  were measured at neither commit and are retracted — see the ratchet section.**
+- **Six of the fifteen unplumbed latency keys have a live histogram on the wire**,
+  and their shared reason string says the data is missing. `ttft` and `e2e` both
+  publish 15 buckets plus `_sum` and `_count`; percentiles are derivable by
+  interpolation with no server change. **The other nine have no clock at all.**
+  One sentence is doing duty for two different defects with two different costs.
+- **Every histogram `_count` is `0`.** Nothing has been asked to generate. A
+  percentile computed over an empty histogram is `NaN` — **a number-shaped
+  nothing** — which is a stronger reason not to ship one tonight than the risk
+  argument this author actually made.
 - **A guard's corpus filter reads 4 of 15 documents**, so a document that
   complied fully with the freshness convention has never been opened by the tool
   that checks compliance. **An exemption ledger cannot record what the corpus
@@ -463,6 +475,31 @@ counts are correct and the tree grew between them.**
 strike been executed, three documents would have deleted true statements about a
 live security control, and the deletion would have looked like diligence in every
 one of them.
+
+### We keep asking the wire about names only we use
+
+**The dashboard's field register calls it `ttft`. The server publishes
+`onnx_genai_time_to_first_token_seconds`.** Measured in the register at HEAD:
+
+```
+'ttft'           -> 6      <- what our checks are written against
+'time_to_first'  -> 0      <- what the server actually emits
+[POS CTL] 'latency' -> 24  <- the instrument reaches the file
+```
+
+**A check written against the register's spelling asks the wire a question the
+wire has never heard, gets `0`, and concludes *not measured*.** The metric is
+there. It has fifteen buckets. **This is the second sighting in two unrelated
+subsystems in one session** — the prefix counters had it hours earlier — and both
+times the confident answer was zero.
+
+> **An internal name is a hypothesis about an external one. A grep against your
+> own vocabulary confirms your vocabulary, not the system.**
+
+**This is the same defect as the resolved-path rule earlier in this document, one
+layer out.** There it was a path we typed instead of resolving; here it is a
+metric name we coined instead of reading. **In both cases the search executes
+perfectly and answers a question about our own naming.**
 
 ### KNOWN GAP — C19, percent-encoded dot segments, unfixed and shipping
 
