@@ -487,7 +487,11 @@ export const PROVENANCE = Object.freeze({
           'engine_continuous_batch_scheduled.rs:82 require prefix_cache_hit_len == 0 for ' +
           'every batched result. A 0 here would imply a cache that tried and missed.',
       },
-      // On the dynamic server the cache IS consulted, so 0 is genuine data.
+      // On the dynamic server the cache IS consulted -- and this counter is
+      // still never 0 there. It rises on every completed generation, so any
+      // premise about what a zero would mean here describes a value the wire
+      // never sends. The arm below disqualifies it on the MECHANISM, never on
+      // its value; see `unfalsifiable`.
       dynamic: {
         unfalsifiable:
           'This counter is not pinned -- it rises on every completed generation, so no '
@@ -756,7 +760,10 @@ export const PROVENANCE = Object.freeze({
     evidence:
       'crates/onnx-genai-server/src/metrics.rs:136-138 — incremented when prefix_cache_hit_len > 0.',
     label: 'Prefix-cache hits',
-    // The same 0 means two opposite things depending on which server answered.
+    // Only the `scatter` arm ever renders 0 here, and it is pinned to it by the
+    // bypass. The `dynamic` arm is never 0 -- so this is not one number meaning
+    // two things; it is one pinned number and one live number counting the
+    // wrong event.
     byOrigin: {
       scatter: {
         // Pinned at literal 0 by the bypass, so 0 is what "still true" looks like.
@@ -769,7 +776,11 @@ export const PROVENANCE = Object.freeze({
           'engine_continuous_batch_scheduled.rs:82 require prefix_cache_hit_len == 0 for every ' +
           'batched result. Showing 0% here would imply a cache that tried and failed.',
       },
-      // On the dynamic server the cache IS consulted, so 0 is real data.
+      // On the dynamic server the cache IS consulted -- and this counter is
+      // still never 0 there. It rises on every completed generation, so any
+      // premise about what a zero would mean here describes a value the wire
+      // never sends. The arm below disqualifies it on the MECHANISM, never on
+      // its value; see `unfalsifiable`.
       dynamic: {
         unfalsifiable:
           'This counter is not pinned -- it rises on every completed generation, so no '

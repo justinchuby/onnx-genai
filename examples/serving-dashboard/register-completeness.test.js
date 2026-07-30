@@ -378,3 +378,135 @@ test('CAN RUN: entries with per-origin classifications exist, so the check above
     'the offender predicate failed to flag a hand-built offender',
   );
 });
+
+// ---------------------------------------------------------------------------
+// A COMMENT THAT LICENSES A CLASSIFICATION MUST NOT OUTLIVE ITS PREMISE.
+//
+// `prefix_cache.hits` and `metrics.prefix_cache_hits` were reclassified to
+// MISATTRIBUTED, and the sentence that had produced the wrong answer survived
+// the fix in both entries, worded differently each time:
+//
+//   "On the dynamic server the cache IS consulted, so 0 is genuine data."
+//   "On the dynamic server the cache IS consulted, so 0 is real data."
+//
+// The counter is never 0 on that server — it rises on every completed
+// generation. So the premise licensed a reading of a number that never
+// arrives. Fixing the classification and leaving the premise in place is the
+// most expensive half-fix available: the next reader re-derives the original
+// wrong answer from the comment and believes they are restoring an invariant.
+//
+// The licence is real but NARROW: the `scatter` arms pin the value with
+// `stubValue: 0`, and there a claim about 0 is simply true. A blanket ban on
+// the phrase would delete two correct sentences to reach two false ones, which
+// is why this checks the ARM'S PINNED-NESS and not the words alone.
+//
+// DELIBERATELY MENTION-BLIND. This guard cannot tell a USE of the premise from
+// a QUOTATION of it, and it caught the first draft of the very fix above for
+// quoting the sentence it was deleting. That is not a bug to be exempted away:
+// `9d2f0408` established that an exemption must never subtract a spelling the
+// defect could also use, and "inside quotes" is trivially available to a real
+// premise. Rewording a comment costs nothing; a quote-aware exemption would
+// open a hole in exactly the shape of the thing being banned. If this fires on
+// prose you believe is innocent, REWORD THE PROSE.
+
+/** A comment asserting that a literal 0 is the honest reading of a counter. */
+const ZERO_IS_DATA = /\b0 is (?:genuine|real|honest|true|valid)\b/i;
+
+/**
+ * The contiguous `//` block immediately above each `byOrigin` arm, keyed
+ * `entryKey/armName`.
+ *
+ * Read from SOURCE rather than from the module because this is the one
+ * property the runtime cannot see: the parser discards a comment long before
+ * any assertion could reach it. Anchored on the keys and arm names the MODULE
+ * declares, so a rename cannot quietly reduce this to scanning nothing.
+ */
+function armLeadComments() {
+  const lines = provenanceSource.split('\n');
+  const found = new Map();
+
+  for (const key of allFieldKeys()) {
+    const entry = PROVENANCE[key];
+    if (!entry?.byOrigin) continue;
+
+    const start = lines.findIndex((line) => line.startsWith(`  '${key}':`));
+    assert.ok(
+      start >= 0,
+      `Could not locate entry '${key}' in telemetry-provenance.js source. If the ` +
+        'literal was reshaped, update this matcher — do NOT delete the test. A ' +
+        'scanner that finds nothing reports a clean bill of health.',
+    );
+
+    for (const arm of Object.keys(entry.byOrigin)) {
+      let at = -1;
+      for (let i = start + 1; i < lines.length; i += 1) {
+        if (lines[i].startsWith("  '")) break; // reached the next entry
+        if (new RegExp(`^ {6}${arm}:`).test(lines[i])) {
+          at = i;
+          break;
+        }
+      }
+      assert.ok(at > 0, `Could not locate arm '${arm}' of '${key}' in the source.`);
+
+      const comment = [];
+      for (let j = at - 1; j >= 0 && /^\s*\/\//.test(lines[j]); j -= 1) {
+        comment.unshift(lines[j].trim().replace(/^\/\/\s?/, ''));
+      }
+      found.set(`${key}/${arm}`, comment.join(' '));
+    }
+  }
+  return found;
+}
+
+test('only an arm pinned to 0 may claim in a comment that 0 is the genuine reading', () => {
+  const offenders = [];
+  for (const [id, comment] of armLeadComments()) {
+    if (!ZERO_IS_DATA.test(comment)) continue;
+    const [key, arm] = id.split('/');
+    if (PROVENANCE[key].byOrigin[arm].stubValue === 0) continue; // pinned: the claim is true
+    offenders.push(`  ${id} — "${comment}"`);
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'A comment above an UNPINNED arm asserts that 0 is the genuine reading. That ' +
+      'arm has no `stubValue`, so its counter is live and the sentence describes a ' +
+      'value the wire never sends. Delete the premise — do not patch the ' +
+      'conclusion beneath it:\n' + offenders.join('\n'),
+  );
+});
+
+test('CAN RUN: arms and their comments are actually being read, and the pattern still matches the defect', () => {
+  const comments = armLeadComments();
+
+  // The scanner reached real arms...
+  assert.ok(
+    comments.size >= 4,
+    `expected at least 4 byOrigin arms in the register, found ${comments.size}`,
+  );
+  // ...and captured real prose from at least some of them, so an empty-string
+  // map cannot be what makes the assertion above pass.
+  assert.ok(
+    [...comments.values()].filter((c) => c.length > 0).length >= 2,
+    'located the arms but captured no comment text from any of them',
+  );
+
+  // The pattern still recognises the exact sentences this guard was built for.
+  // If someone softens the regex, this goes red rather than going quiet.
+  assert.ok(
+    ZERO_IS_DATA.test('On the dynamic server the cache IS consulted, so 0 is genuine data.'),
+    'the pattern no longer matches the original premise it exists to forbid',
+  );
+  assert.ok(
+    ZERO_IS_DATA.test('On the dynamic server the cache IS consulted, so 0 is real data.'),
+    'the pattern no longer matches the second wording of the same premise',
+  );
+
+  // And the licence must still work, or the guard would forbid a true sentence.
+  const pinned = [...comments.keys()].filter((id) => {
+    const [key, arm] = id.split('/');
+    return PROVENANCE[key].byOrigin[arm].stubValue === 0;
+  });
+  assert.ok(pinned.length >= 2, `expected at least 2 arms pinned to a stub value, found ${pinned.length}`);
+});
