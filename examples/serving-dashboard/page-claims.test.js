@@ -348,6 +348,35 @@ describe('the scenario switcher advertises no cut capability', () => {
     );
   });
 
+  // D201: the check above reads DECLARATIONS. The switcher reads an
+  // ENUMERATION -- ui/scenario-switcher.js:52 walks Object.keys(SCENARIOS).
+  // A tombstone in CUT_SCENARIOS is correct and must STAY out of SCENARIOS;
+  // if a key ever appears in both, the switcher renders a tab for a cut
+  // feature whose record explains why it was cut. Validating the source and
+  // validating what the consumer walks are different assertions.
+  //
+  // MUTATION PROVEN: adding 'prefix-cache' back to SCENARIOS fails this.
+  it('never lists a scenario in both SCENARIOS and CUT_SCENARIOS', () => {
+    const block = (name) => {
+      const start = source.indexOf(`export const ${name} = Object.freeze({`);
+      assert.notEqual(start, -1, `${name} is not exported -- this test is vacuous`);
+      return source.slice(start, source.indexOf('\n});', start));
+    };
+    const keys = (name) =>
+      [...block(name).matchAll(/^\s{2}'([\w-]+)':\s*Object\.freeze/gm)].map((m) => m[1]);
+    const live = keys('SCENARIOS');
+    const cut = keys('CUT_SCENARIOS');
+    assert.ok(live.length && cut.length, 'both registries must be non-empty');
+    assert.deepEqual(
+      live.filter((id) => cut.includes(id)),
+      [],
+      'A scenario appears in BOTH the live registry and the cut registry. The ' +
+        'switcher enumerates Object.keys(SCENARIOS), so it would render a ' +
+        'navigable tab for a feature whose own tombstone records that we ' +
+        'measured it absent.',
+    );
+  });
+
   it('registers no scenario id or label naming a cut feature', () => {
     const ids = [...source.matchAll(/id:\s*'([\w-]+)'/g)].map((m) => m[1]);
     const labels = [...source.matchAll(/label:\s*'([^']+)'/g)].map((m) => m[1]);
