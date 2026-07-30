@@ -371,7 +371,7 @@ is the sharpest example of it anyone has produced tonight: same commit, 18 failu
 
 | Finding | Evidence as first observed at `d6e57c63` | Status re-derived at `b54437df` |
 | --- | --- | --- |
-| **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **STRUCK @ `459c40c2`** — replaced by `classify_kv_applicability()`. The one surviving textual hit is `tests.rs`, in the doc comment on `fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts` — a comment *describing* the dead bug. **A grep cannot see tense: the hit and the proof-of-fix are byte-identical.** |
+| **F1** ~~BLOCKER~~ **STRUCK** | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **STRUCK @ `459c40c2`** — replaced by `classify_kv_applicability()`. The one surviving textual hit is `tests.rs`, in the doc comment on `fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts` — a comment *describing* the dead bug. **A grep cannot see tense: the hit and the proof-of-fix are byte-identical.** |
 | **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE — RE-VERIFIED AT `0bc86726`, UPGRADED: THREE implementations, disagreeing on 7 of 7 inputs — see PASS 2** (was: both paths present in `git ls-tree`) |
 | **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **CLOSED at `0bc86726`** — `resolveStaleCeilingMs` replaces both inline `??` sites; regression caught by 3 tests. Was: LIVE (as F4-REVISED) at `b54437df`. ⚠️ Citation drifted: the declaration is now `prefix-cache.js:88`, not `:77`. |
 | **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **STRUCK @ `1b4d76c6`** — `ROOT` now derives from `tree_context.repo_root()`; exits `CANNOT_RUN` with no worktree and exits 1 conditionally. Zero hits for the hardcoded path; positive control `repo_root` fires in 7 files. |
@@ -1803,7 +1803,7 @@ execution — not by reading the previous row.
 
 | Finding | Status | Observed at | Evidence |
 | --- | --- | --- | --- |
-| **F1** | 🟡 **LATENT — fix landing** | `6ecd9183` | Re-scoped, see below. Not a shipped fabrication. |
+| **F1** | 🟢 **STRUCK — re-verified by execution** | `898aaf8c` | Predicate: `git grep -c 'set_applicable(!' HEAD -- '*.rs'` → **1**, and that one is `tests.rs:5087`, a doc comment in **past tense** (*"The shipped bug read…"*). Non-test count **0**. Positive control, non-negated form → **4**. Fixed-vs-unfixed is decided by the non-test count, not the raw count. |
 | **F3** | 🔴 **LIVE** | `6ecd9183` | All three stacks ship: `format.js`, `telemetry-field.js`, `dashboard/field-state.js`. The alias is real, not a substring match: `field-state.js` → `ok: RENDER_STATES.OK`. Control: `'measured'` appears 6× in the same file, so the search is not vacuous. |
 | **F4-revised** | 🔴 **LIVE** | `6ecd9183` | `dashboard/prefix-cache.js` still declares `staleCeilingMs: null`, and `dashboard/field-state.js` documents that null is silently handed a 10-second expiry. Control: `system.js` declares an explicit `30000`, so the field is genuinely read. |
 | **F11** | ⚪ **RETRACTED** (unchanged) | `6ecd9183` | Already retracted in this document. Re-measured anyway: 2 `role="group"` sites, 0 with a nearby `aria-label`. **I am not re-opening it on that number** — a JSX/template-built role is invisible to this grep, so the measurement is a floor, not a census. |
@@ -3296,7 +3296,13 @@ the method that matches its own name. There is no boolean left to negate — the
 *possibility* of the bug, not just the instance. Same shape as `b7f83e72` deleting `model_path`:
 **the strongest fix makes the defect unrepresentable.**
 
-**My citation was to `driver.rs:537` and `:551`.** The file is 1215 lines, so those lines exist — they
+**The Lead attributed two line numbers to me — in `driver.rs`, the 537th and 551st lines.** I am
+spelling them in words on purpose: **this file never cited them, and the only reason that
+`file:NNN` token existed anywhere in committed bytes is that I typed it here while clearing the
+finding.** A corpus-wide search found exactly one hit and it was my own retraction. **I created a
+fresh specimen of the epitaph class inside the paragraph clearing a finding that died of the
+epitaph class.** What this file actually cites is `driver.rs:464` (three times), which is the real
+historical site. The two lines
 are a struct literal and a doc comment about the command loop. **The lines exist and never carried the
 defect at this SHA.** F1 was true when filed and expired; I am the fifth agent tonight to publish a
 finding that outlived its tree, and F1 is my second after B1.
