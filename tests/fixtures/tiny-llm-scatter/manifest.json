@@ -1,6 +1,6 @@
 {
   "generator": "scripts/build_tiny_scatter.py",
-  "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+  "mobius_root": null,
   "mobius_static_cache": true,
   "mobius_cli_flags": [
     "--static-cache",

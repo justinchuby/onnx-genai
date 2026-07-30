@@ -33,10 +33,7 @@ import torch
 REPO = Path(__file__).resolve().parents[1]
 WORK = REPO / "target" / "diffusion-bench"
 RUNNER = REPO / "target" / "release" / "run_diffusion"
-DEFAULT_MLX = (
-    "/Users/justinc/Documents/GitHub/onnxruntime-mlx/python/src/"
-    "onnxruntime_ep_mlx/libonnxruntime_mlx_ep.dylib"
-)
+DEFAULT_MLX = ""
 
 
 def ort_lib_dir() -> str:
@@ -223,13 +220,20 @@ def main() -> int:
     else:
         print(f"  (onnx-genai CPU EP failed)\n{err[-800:]}")
 
-    # (D) onnx-genai MLX EP
-    mlx_env = {"ONNX_GENAI_EP": "metal", "ONNX_GENAI_METAL_EP_LIB": args.mlx_lib}
-    t, err = time_onnx_genai(pdir, shapes, mlx_env, args.iters)
-    if t is not None:
-        results["onnx-genai MLX-EP"] = t
+    # (D) onnx-genai MLX EP. The plugin ships from a separate repository, so
+    # skip this arm rather than reporting it as a failure when unconfigured.
+    if not args.mlx_lib:
+        print(
+            "  (onnx-genai MLX EP skipped: no plugin path; pass --mlx-lib "
+            "or set ONNX_GENAI_METAL_EP_LIB)\n"
+        )
     else:
-        print(f"  (onnx-genai MLX EP failed)\n{err[-1500:]}")
+        mlx_env = {"ONNX_GENAI_EP": "metal", "ONNX_GENAI_METAL_EP_LIB": args.mlx_lib}
+        t, err = time_onnx_genai(pdir, shapes, mlx_env, args.iters)
+        if t is not None:
+            results["onnx-genai MLX-EP"] = t
+        else:
+            print(f"  (onnx-genai MLX EP failed)\n{err[-1500:]}")
 
     print("\n=== denoise loop wall time (best of {}) ===".format(args.iters))
     baseline = results.get("diffusers torch-MPS") or results.get("diffusers torch-CPU")

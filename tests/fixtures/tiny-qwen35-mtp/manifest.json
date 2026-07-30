@@ -1,6 +1,6 @@
 {
   "generator": "scripts/build_tiny_advanced_drafters.py",
-  "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+  "mobius_root": null,
   "seed": 20260712,
   "architecture": "Qwen35MtpModel",
   "task": "Qwen35MtpTask",

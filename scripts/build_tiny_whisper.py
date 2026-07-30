@@ -3,7 +3,7 @@
 
 Mobius builds a real checkpoint with:
 
-  PYTHONPATH=/Users/justinc/Documents/GitHub/mobius/src \
+  PYTHONPATH=$MOBIUS_DIR/src \
     python -m mobius build --model openai/whisper-tiny \
       --task speech-to-text models/whisper/whisper-tiny
 

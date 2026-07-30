@@ -3,7 +3,7 @@
 
 Default command from the onnx-genai repo root:
 
-    PYTHONPATH=/Users/justinc/Documents/GitHub/mobius/src \
+    PYTHONPATH=$MOBIUS_DIR/src \
       python scripts/build_tiny_scatter.py
 
 The model is intentionally tiny and randomly initialized. It uses Mobius'
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -147,7 +148,7 @@ def main() -> None:
 
     manifest = {
         "generator": "scripts/build_tiny_scatter.py",
-        "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+        "mobius_root": os.environ.get("MOBIUS_DIR"),
         "mobius_static_cache": True,
         "mobius_cli_flags": ["--static-cache", f"--max-seq-len={args.max_seq_len}"],
         "seed": SEED,

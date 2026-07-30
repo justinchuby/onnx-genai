@@ -3,7 +3,7 @@
 
 Run from the onnx-genai repository root:
 
-    PYTHONPATH=/Users/justinc/Documents/GitHub/mobius/src \
+    PYTHONPATH=$MOBIUS_DIR/src \
       python scripts/build_tiny_mtp_full.py
 
 The fixture is random and deterministic. It tests MTP orchestration, not model
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -196,7 +197,7 @@ def main() -> None:
     )
     manifest = {
         "generator": "scripts/build_tiny_mtp_full.py",
-        "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+        "mobius_root": os.environ.get("MOBIUS_DIR"),
         "seed": SEED,
         "purpose": "Random deterministic target+MTP fixture for end-to-end orchestration tests.",
         "config": {

@@ -1,6 +1,6 @@
 {
   "generator": "tests/fixtures/tiny-llm/generate_tiny_llm.py",
-  "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+  "mobius_root": null,
   "seed": 20260712,
   "architecture": "GPT2CausalLMModel",
   "vocab_size": 32,

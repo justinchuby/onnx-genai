@@ -3,7 +3,7 @@
 
 Default command from the onnx-genai repo root:
 
-    PYTHONPATH=/Users/justinc/Documents/GitHub/mobius/src \
+    PYTHONPATH=$MOBIUS_DIR/src \
       python tests/fixtures/tiny-llm/generate_tiny_llm.py
 
 The model is intentionally tiny and randomly initialized: vocab=32,
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -131,7 +132,7 @@ def main() -> None:
 
     manifest = {
         "generator": "tests/fixtures/tiny-llm/generate_tiny_llm.py",
-        "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+        "mobius_root": os.environ.get("MOBIUS_DIR"),
         "seed": SEED,
         "architecture": "GPT2CausalLMModel",
         "vocab_size": config.vocab_size,

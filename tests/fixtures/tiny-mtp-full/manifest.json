@@ -1,6 +1,6 @@
 {
   "generator": "scripts/build_tiny_mtp_full.py",
-  "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+  "mobius_root": null,
   "seed": 20260712,
   "purpose": "Random deterministic target+MTP fixture for end-to-end orchestration tests.",
   "config": {

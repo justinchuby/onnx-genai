@@ -3,7 +3,7 @@
 
 Run from the onnx-genai repository root:
 
-    PYTHONPATH=/Users/justinc/Documents/GitHub/mobius/src \
+    PYTHONPATH=$MOBIUS_DIR/src \
       python scripts/build_tiny_advanced_drafters.py
 
 These random, deterministic models validate graph contracts only. They are not
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -136,7 +137,7 @@ def _save_fixture(name: str, module, config, task, contract: dict) -> None:
 
     manifest = {
         "generator": "scripts/build_tiny_advanced_drafters.py",
-        "mobius_root": "/Users/justinc/Documents/GitHub/mobius",
+        "mobius_root": os.environ.get("MOBIUS_DIR"),
         "seed": SEED,
         "architecture": type(module).__name__,
         "task": type(task).__name__,

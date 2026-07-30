@@ -3,8 +3,8 @@
 
 Mobius investigation note:
   The smallest built-in Mobius multimodal example is the real Gemma 3 VLM path:
-    PYTHONPATH=/Users/justinc/Documents/GitHub/mobius/src \
-      python /Users/justinc/Documents/GitHub/mobius/examples/multimodal_generation.py \
+    PYTHONPATH=$MOBIUS_DIR/src \
+      python $MOBIUS_DIR/examples/multimodal_generation.py \
       --model google/gemma-3-4b-pt --save-to models/gemma3-vlm
   That is intentionally not used for this fixture because it downloads a multi-GB
   checkpoint. Mobius currently builds multimodal packages from HuggingFace
