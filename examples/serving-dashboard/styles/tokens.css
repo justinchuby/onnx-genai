@@ -214,6 +214,40 @@
      as one option among five rather than as the baseline the other four
      depart from, and would invite someone to "style" a trustworthy value.
      Use --og-fg. */
+
+  /* ---- KV BLOCK MAP: the first NON-TEXT honesty surface (§85) ----
+     The five field states above are carried by an UNDERLINE GRAMMAR --
+     dashed / dotted / double. That grammar is the entire non-colour channel,
+     because the four absence colours measure 1.0014:1 apart in greyscale
+     (D282). A block-map cell has NO TEXT, so it cannot inherit the grammar,
+     and would fall back to the colour channel alone -- the one channel
+     already measured to be worthless. A grid therefore needs its own
+     non-colour channel or it silently becomes the least honest surface here.
+
+     THE CHANNEL IS HOLLOW vs FILLED, and it carries the product's founding
+     distinction at the one place it is most likely to collapse:
+
+       null            never observed      HOLLOW: no fill, 1px inset stroke
+       ref_count: 0    looked, was empty   FILLED at --og-cell-0
+       beyond mirror   outside the window  NO CELL PAINTED; grid visibly ends
+
+     A freed page keeps its present bit and returns ref_count: 0 -- that is a
+     MEASUREMENT, so it is painted, not dimmed away. Every fill level clears
+     WCAG 1.4.11 (>=3:1) because every fill level is data. */
+  --og-cell-stroke: #566a7b;  /* 3.09:1 on --og-bg-raised -- never observed */
+  --og-cell-0: #74859c;  /* 4.60:1 -- MEASURED zero. Data, not absence. */
+  --og-cell-1: #8da2bd;  /* 6.62:1 */
+  --og-cell-2: #a4bcdc;  /* 8.91:1 */
+  --og-cell-3: #b9d4f8;  /* 11.41:1 */
+  --og-cell-4: #cdebff;  /* 13.95:1 -- full */
+
+  /* stroke vs cell-0 is 1.490:1 AND hollow-vs-filled: the categorical
+     boundary is redundantly coded on two channels. Adjacent ramp steps get
+     only ~1.22-1.44:1, and that asymmetry is deliberate -- mistaking 60% full
+     for 80% full is a small error in a QUANTITY; mistaking "we never looked"
+     for "we looked and it was empty" is a LIE. Spend the contrast budget on
+     categorical boundaries, not ordinal ones. */
+  --og-cell-inset: 1px;
 }
 
 @media (prefers-reduced-motion: reduce) {

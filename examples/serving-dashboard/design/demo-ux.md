@@ -5690,3 +5690,102 @@ did, the guard was right and my earlier `git show` was stale.**
 > tonight it has now cut in both directions on the same instrument within one hour.** The
 > only defence is that a test re-reads the bytes at the moment it runs. **I did not catch
 > this by being careful. I caught it because the guard disagreed with me.**
+
+---
+
+## §85 — The block map is the first surface with nothing to underline
+
+OBSERVED 02:44. @d7cf9b84 landed D256/D258 at `62cc6f47` and corrected my mechanism.
+**The correction is accepted in full, and it makes the conclusion stronger.**
+
+### D286 — I named the wrong slot, and the right slot is worse
+
+I wrote that a freed page produces no element. **Wrong.** Verified in source:
+
+```
+telemetry.rs:98   ref_count | (filled << 16) | ((tier as u64) << 32) | (1 << 40)
+                                                                       ^^^^^^^^
+                  THE PRESENT BIT IS UNCONDITIONAL.
+telemetry.rs:252  if packed & (1 << 40) == 0 { return None }
+```
+
+**A freed page keeps `present = 1` and returns `ref_count: 0` — it was already a
+measurement, correctly.** What `filter_map` was dropping is pages **never written**.
+
+- **D286:** my *conclusion* — that the two facts must not collapse — was right; my
+  *mechanism* was wrong, and the real slot is the more dangerous one. **The wire now
+  carries three facts where I asked for two:** `null` = never observed · `ref_count: 0` =
+  we looked and it was empty · beyond the window = outside the mirror. **And the sparsity
+  peaks at startup, when most pages are untouched — which is precisely the "watch the pool
+  fill" phase that is the demo's headline.** So the collapse I was arguing against would
+  have landed on the most-watched thirty seconds of the product. **Being wrong about the
+  mechanism cost nothing; the reviewer who checked it is why the fix is aimed correctly.**
+
+### D287 — The honesty vocabulary is medium-specific, and nobody noticed because every prior surface was text
+
+- **D287:** the five field states are carried by an **underline grammar** — dashed, dotted,
+  double. Per D282 that grammar is not reinforcement, it is **the entire non-colour
+  channel**, because the four absence colours sit **1.0014:1** apart in greyscale.
+  **A block-map cell HAS NO TEXT. It cannot inherit the grammar. Left alone it would
+  inherit only the colour channel — the one channel I have already measured to be
+  worthless — and would become the least honest surface on the page while looking
+  perfectly consistent with the rest of it.** This is the same shape as D283's route
+  finding, twice in one session: **our honesty apparatus is bound to a medium, and it goes
+  quiet the moment the medium changes. It has now gone quiet on a URL and on a rectangle.**
+
+### D288 — The channel is HOLLOW vs FILLED, and the accessibility floor is what chooses it
+
+```
+null           never observed     HOLLOW -- no fill, 1px inset stroke
+ref_count: 0   looked, was empty  FILLED at --og-cell-0
+beyond mirror  outside the window NO CELL PAINTED; the grid visibly ends
+```
+
+**Every fill level clears WCAG 1.4.11 (≥3:1) because every fill level is data — including
+level 0.** Tokens landed, measured against `--og-bg-raised`:
+
+```
+--og-cell-stroke #566a7b  3.09:1     --og-cell-2 #a4bcdc   8.91:1
+--og-cell-0      #74859c  4.60:1     --og-cell-3 #b9d4f8  11.41:1
+--og-cell-1      #8da2bd  6.62:1     --og-cell-4 #cdebff  13.95:1
+```
+
+- **D288:** I first solved this with level 0 at **1.43:1** — a measured zero rendered
+  almost invisible. **That is the bug the whole design exists to prevent, and I wrote it
+  myself, in the act of preventing it: "empty" reads as "dim" to a designer's hand.
+  A measured zero is DATA AND MUST BE VISIBLE.** Raising it to the floor is what then
+  forces the answer — **once both ignorance and measured-zero must clear 3:1, you cannot
+  separate them by brightness without pushing one below the floor. Shape is not a
+  stylistic preference here; it is the only channel the accessibility floor leaves open.**
+  Final separation is **1.490:1 AND hollow-vs-filled — redundantly coded on two channels**,
+  against the 1.0014:1 the text states must survive on.
+
+- **D289 — spend the contrast budget on CATEGORICAL boundaries, not ordinal ones.**
+  Adjacent ramp steps get only 1.22–1.44:1 and that asymmetry is deliberate. **Mistaking
+  60% full for 80% full is a small error in a QUANTITY. Mistaking "we never looked" for
+  "we looked and found nothing" is A LIE.** A ramp tuned for even perceptual spacing would
+  have spent its budget in exactly the wrong place, and would have looked more elegant
+  doing it.
+
+### D290 — Two guards, and the second one exists because the first is passable while wrong
+
+Shipped in `asset-graph.test.js` (now 9 tests). Mutations proven landed by substitution
+count **and** `git diff --numstat`:
+
+```
+dim cell-0 to #2d3742 (the "make the map calmer" move)  -> floor guard RED
+flatten stroke->cell-0 to 1.040:1, BOTH still above 3:1 -> boundary guard RED, floor GREEN
+delete two ramp levels                                  -> anti-vacuity RED (found 3)
+```
+
+- **D290:** the middle mutation is why there are two assertions. **It keeps every token
+  legal under WCAG and still destroys the distinction — a page that passes its
+  accessibility audit and lies anyway.** A single "are the colours legible" test would
+  have gone green on it. **The floor guard protects the visitor from the design; the
+  boundary guard protects the design from its next well-meaning tuning pass.**
+
+**⚠️ ONE OPEN QUESTION BACK TO @d7cf9b84:** `block_window` returns `Vec::new()` both when
+the mirror is absent and when the window starts beyond it. `mirrored_block_capacity()`
+returns `0` in the first case and non-zero in the second, **so the two ARE recoverable —
+but only if the renderer reads both.** An empty array alone is `absent` and `zero` wearing
+the same coat, one layer below where D286 just fixed it.

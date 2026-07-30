@@ -227,5 +227,63 @@ describe('every design token reaches the screen', () => {
           `into one indistinguishable grey.\nFAILING:\n  ${failures.join('\n  ')}`,
       );
     });
+
+    // The block map is the first surface with no text to underline, so the
+    // dashed/dotted/double grammar cannot reach it. Its channel is hollow-vs-
+    // filled, and these two assertions are what stop that channel decaying
+    // into "two slightly different greys" the next time someone tunes them.
+    it('keeps every block-map fill above the non-text floor', () => {
+      const background = hexOf('--og-bg-raised');
+      const ramp = definitions.filter((t) => /^--og-cell-[0-4]$/.test(t));
+
+      // Anti-vacuity: a ramp that silently lost its tokens would pass the
+      // loop below by iterating zero times, which is the failure mode that
+      // cost this crew four false greens tonight.
+      assert.equal(ramp.length, 5, `expected 5 fill levels, found ${ramp.length}`);
+
+      const failures = [];
+      for (const token of [...ramp, '--og-cell-stroke']) {
+        const measured = ratio(hexOf(token), background);
+        if (measured < NON_TEXT_MIN) {
+          failures.push(`${token} = ${measured.toFixed(2)}:1, needs ${NON_TEXT_MIN}:1`);
+        }
+      }
+
+      assert.deepEqual(
+        failures,
+        [],
+        'A block-map cell is below the WCAG 1.4.11 floor. EVERY fill level is ' +
+          'a MEASUREMENT -- including level 0, which means "we looked at this ' +
+          'page and it was empty", not "we have nothing". Dimming level 0 ' +
+          'towards the background to make the map look calmer is the exact ' +
+          'move that turns a measured zero back into an absence.\n' +
+          `FAILING:\n  ${failures.join('\n  ')}`,
+      );
+    });
+
+    it('separates never-observed from measured-zero on two channels', () => {
+      const separation = ratio(hexOf('--og-cell-stroke'), hexOf('--og-cell-0'));
+      const adjacent = ratio(hexOf('--og-cell-0'), hexOf('--og-cell-1'));
+
+      assert.ok(
+        separation >= 1.3,
+        'The CATEGORICAL boundary -- never-observed vs measured-zero -- has ' +
+          `collapsed to ${separation.toFixed(3)}:1. This pair must stay ` +
+          'redundantly coded: hollow-vs-filled AND a luminance step. The four ' +
+          'text absence states share a 1.0014:1 grey and survive only on ' +
+          'their underline grammar; a grid cell has no underline, so if this ' +
+          'number goes flat the map has ONE channel and it is the one already ' +
+          'measured worthless.',
+      );
+
+      assert.ok(
+        separation > adjacent,
+        `Categorical separation ${separation.toFixed(3)}:1 is no longer wider ` +
+          `than the ordinal step ${adjacent.toFixed(3)}:1. Confusing 60% full ` +
+          'with 80% full is a small error in a quantity; confusing "never ' +
+          'looked" with "looked and found nothing" is a lie. The contrast ' +
+          'budget belongs on the categorical boundary.',
+      );
+    });
   });
 });
