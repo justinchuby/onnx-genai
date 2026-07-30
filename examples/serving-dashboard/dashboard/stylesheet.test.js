@@ -622,3 +622,35 @@ describe('page/stylesheet wiring is complete in BOTH directions', () => {
     assert.deepEqual(duplicated, [], `linked more than once: ${duplicated.join(', ')}`);
   });
 });
+
+// The maps above suppress findings. That makes them the only part of this audit
+// that can be edited to make it pass, and therefore the only place a reason is
+// load-bearing. Same guard as `field-keys.test.js`, over this file's own lists,
+// because the defect it prevents is not specific to either audit: an entry added
+// without a reason is indistinguishable from a decision somebody made.
+describe('this audit\'s own exemptions are decisions, not residue', () => {
+  const PLACEHOLDER = /^(?:todo|tbd|fixme|n\/?a|none|unknown|\?+|-+|x+|\.+)$/i;
+  const MIN_REASON = 12;
+
+  it('every build rule and forwarder states its reason', () => {
+    const bad = [];
+    for (const [key, value] of [...DYNAMIC_PATH_SITES, ...PATH_FORWARDERS]) {
+      const reason = typeof value === 'string' ? value : value?.rule;
+      if (typeof reason !== 'string' || reason.trim() === '') bad.push(`${key} (no reason)`);
+      else if (PLACEHOLDER.test(reason.trim())) bad.push(`${key} (placeholder)`);
+      else if (reason.trim().length < MIN_REASON) bad.push(`${key} (reason too short)`);
+    }
+    assert.deepEqual(
+      bad,
+      [],
+      `${bad.join(', ')} — an entry here suppresses a finding, so it must say WHY. ` +
+        'An entry without a reason is not an exemption, it is a silenced assertion.',
+    );
+  });
+
+  it('is auditing a non-empty set of exemptions', () => {
+    // Without this, the assertion above is green over a map somebody emptied.
+    assert.ok(DYNAMIC_PATH_SITES.size >= 2, `only ${DYNAMIC_PATH_SITES.size} build rules`);
+    assert.ok(PATH_FORWARDERS.size >= 1);
+  });
+});

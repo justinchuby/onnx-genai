@@ -581,3 +581,70 @@ describe('the provenance catalogue defines every field exactly once', () => {
     );
   });
 });
+
+// An exemption list is the only part of an audit that can be edited to make the
+// audit pass. That makes it the one place where a REASON is load-bearing rather
+// than decorative -- and, until now, the one place nothing was checked at all.
+//
+// The two latency keys this file knew about before the extractor was widened
+// were not exempt by anyone's decision. They were the two that happened to also
+// appear as hand-quoted literals, so the regex could see them. They sat in
+// NOT_YET_PUBLISHED in exactly the notation reserved for a deliberate choice,
+// and a reader concluded somebody had surveyed the latency panel. Nobody had.
+//
+// A COINCIDENCE RECORDED IN THE NOTATION OF A DECISION IS INDISTINGUISHABLE
+// FROM A DECISION. These tests make the notation cost something to write.
+describe('the exemptions are decisions, not extractor residue', () => {
+  // Deliberately crude, and that is the point: this cannot judge whether prose is
+  // TRUE. It can only make a bare entry impossible to add silently, so that adding
+  // one is a visible act rather than a default. Anything longer than this is a
+  // test of writing quality, which is not mechanisable and would rot.
+  const PLACEHOLDER = /^(?:todo|tbd|fixme|n\/?a|none|unknown|\?+|-+|x+|\.+)$/i;
+  const MIN_REASON = 12;
+
+  /** @param {string} label @param {Iterable<[string, unknown]>} entries */
+  const auditReasons = (label, entries) => {
+    const bad = [];
+    for (const [key, value] of entries) {
+      const reason = typeof value === 'string' ? value : value?.rule;
+      if (typeof reason !== 'string' || reason.trim() === '') {
+        bad.push(`${key} (no reason)`);
+      } else if (PLACEHOLDER.test(reason.trim())) {
+        bad.push(`${key} (placeholder: "${reason.trim()}")`);
+      } else if (reason.trim().length < MIN_REASON) {
+        bad.push(`${key} (reason too short to name anything: "${reason.trim()}")`);
+      }
+    }
+    assert.deepEqual(
+      bad,
+      [],
+      `${label}: ${bad.join(', ')}. An entry here suppresses a finding, so it must ` +
+        'say WHY in words that name what would discharge it. An entry without a ' +
+        'reason is not an exemption, it is a silenced assertion.',
+    );
+  };
+
+  it('every NOT_YET_PUBLISHED key states why it is not a typo', () => {
+    auditReasons('NOT_YET_PUBLISHED', Object.entries(NOT_YET_PUBLISHED));
+  });
+
+  it('every declared build rule, forwarder and corpus exemption states its reason', () => {
+    auditReasons('DYNAMIC_KEY_SITES', DYNAMIC_KEY_SITES);
+    auditReasons('KEY_FORWARDERS', KEY_FORWARDERS);
+    auditReasons('CORPUS_EXEMPT', CORPUS_EXEMPT);
+  });
+
+  // ANTI-VACUITY. The two assertions above pass trivially over an empty map, and
+  // an empty map is exactly what a future refactor leaves behind. A guard that
+  // cannot distinguish "every entry is justified" from "there are no entries"
+  // is the aggregate-floor defect that hid fifteen vanished paths in
+  // stylesheet.test.js: a total with enough slack to absorb its own parts.
+  it('is auditing a non-empty set of exemptions', () => {
+    assert.ok(
+      Object.keys(NOT_YET_PUBLISHED).length >= 20,
+      `only ${Object.keys(NOT_YET_PUBLISHED).length} exemptions — this guard is scoring ` +
+        'an empty list as a fully justified one',
+    );
+    assert.ok(DYNAMIC_KEY_SITES.size >= 1 && KEY_FORWARDERS.size >= 1);
+  });
+});
