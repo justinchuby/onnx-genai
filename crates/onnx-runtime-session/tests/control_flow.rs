@@ -337,17 +337,25 @@ fn if_materializes_outer_capture_from_persistent_device_input() {
 
     let mut session = InferenceSession::from_graph(g).expect("build session");
     let mut state = session
-        .allocate_device_binding("X", None::<String>, DataType::Float32, vec![2], vec![2])
+        .allocate_device_binding("X", Some("Y"), DataType::Float32, vec![2], vec![2])
         .expect("state binding");
     state
         .write_bytes(0, &f32_bytes(&[5.0, 9.0]))
         .expect("seed state");
     let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[1]).unwrap();
-    let outputs = session
-        .run_with_device_bindings(&[("cond", &cond_t)], std::slice::from_mut(&mut state))
-        .expect("run with captured persistent input");
-
-    assert_eq!(outputs[0].as_ref().unwrap().to_vec_f32(), vec![6.0, 10.0]);
+    for expected in [[6.0, 10.0], [7.0, 11.0]] {
+        let outputs = session
+            .run_with_device_bindings(&[("cond", &cond_t)], std::slice::from_mut(&mut state))
+            .expect("run with captured persistent state");
+        assert!(outputs[0].is_none(), "bound output must stay on device");
+        let values = state
+            .read_bytes()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
+    }
 }
 
 #[test]

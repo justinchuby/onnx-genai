@@ -435,6 +435,7 @@ impl Executor {
         vid: ValueId,
         tensor: &Tensor,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         self.store_output_bytes(
             vid,
@@ -442,6 +443,7 @@ impl Executor {
             tensor.shape.clone(),
             tensor.as_bytes(),
             resolved,
+            external,
         )
     }
 
@@ -452,31 +454,9 @@ impl Executor {
         dims: Vec<usize>,
         bytes: &[u8],
         resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<()> {
-        let numel = checked_numel(&dims, || format!("value#{}", vid.0))?;
-        let need =
-            checked_storage_bytes(dtype, numel, || format!("value#{}", vid.0), &dims)?.max(1);
-        let fits = self
-            .buffers
-            .get(&vid)
-            .map(|b| b.len() == need)
-            .unwrap_or(false);
-        if !fits {
-            if let Some(old) = self.buffers.remove(&vid) {
-                self.ep.deallocate(old)?;
-            }
-            self.shared_buffers.remove(&vid);
-            let buf = self
-                .ep
-                .allocate(need, TensorLayout::contiguous().alignment)?;
-            self.buffers.insert(vid, buf);
-        }
-        let buf = self.buffers.get_mut(&vid).expect("just ensured");
-        self.ep.copy_from_host(bytes, buf)?;
-        self.value_dtypes.insert(vid, dtype);
-        self.buffer_shapes.insert(vid, dims.clone());
-        resolved.insert(vid, dims);
-        Ok(())
+        self.store_raw_tensor_output(vid, dtype, dims, bytes, resolved, external)
     }
 
     /// Prepare one selected control-flow subgraph and materialize only the free
@@ -700,7 +680,7 @@ impl Executor {
         {
             let _s = phase_span!("execif.store_output");
             for (vid, t) in node.outputs.iter().zip(outs.iter()) {
-                self.store_output_tensor(*vid, t, resolved)?;
+                self.store_output_tensor(*vid, t, resolved, external)?;
             }
         }
         // Only enable future skips when the taken branch is loop-invariant.
@@ -1001,7 +981,7 @@ impl Executor {
 
         // Emit outputs: carried finals, then stacked scan outputs.
         for (i, t) in carried.iter().enumerate() {
-            self.store_output_tensor(node.outputs[i], t, resolved)?;
+            self.store_output_tensor(node.outputs[i], t, resolved, external)?;
         }
         for (s, (acc, empty_spec)) in scan_acc.into_iter().zip(empty_scan_specs).enumerate() {
             let (dtype, shape, bytes) = acc.finish_with_empty(empty_spec, s)?;
@@ -1011,6 +991,7 @@ impl Executor {
                 shape,
                 &bytes,
                 resolved,
+                external,
             )?;
         }
         Ok(())
@@ -1369,7 +1350,7 @@ impl Executor {
         }
 
         for (i, t) in state.iter().enumerate() {
-            self.store_output_tensor(node.outputs[i], t, resolved)?;
+            self.store_output_tensor(node.outputs[i], t, resolved, external)?;
         }
         for (s, ((acc, empty_spec), (&axis, &direction))) in scan_acc
             .into_iter()
@@ -1378,7 +1359,14 @@ impl Executor {
             .enumerate()
         {
             let (dtype, shape, bytes) = acc.finish_scan(axis, direction, empty_spec, s)?;
-            self.store_output_bytes(node.outputs[num_state + s], dtype, shape, &bytes, resolved)?;
+            self.store_output_bytes(
+                node.outputs[num_state + s],
+                dtype,
+                shape,
+                &bytes,
+                resolved,
+                external,
+            )?;
         }
         Ok(())
     }
