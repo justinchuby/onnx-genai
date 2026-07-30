@@ -234,6 +234,7 @@ impl Executor {
         &self,
         vid: ValueId,
         resolved: &HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
     ) -> Result<Tensor> {
         let dtype = self.value_dtypes[&vid];
         let shape = resolved.get(&vid).cloned().ok_or_else(|| {
@@ -247,6 +248,28 @@ impl Executor {
                 op: "<control-flow input>".to_string(),
             }
         })?;
+        if let Some(value) = external
+            .inputs
+            .get(&vid)
+            .or_else(|| external.outputs.get(&vid))
+        {
+            let n = checked_storage_bytes(
+                dtype,
+                checked_numel(&shape, || format!("value#{}", vid.0))?,
+                || format!("value#{}", vid.0),
+                &shape,
+            )?;
+            if value.dtype != dtype || value.len < n {
+                return Err(SessionError::Internal(format!(
+                    "external binding for value#{} cannot materialize {:?} {:?} (binding: {:?}, {} bytes)",
+                    vid.0, dtype, shape, value.dtype, value.len
+                )));
+            }
+            let buffer = value.readable_buffer()?;
+            let mut bytes = vec![0_u8; n];
+            self.ep.copy_to_host(&buffer, &mut bytes)?;
+            return Tensor::from_raw(dtype, shape, &bytes);
+        }
         // A view value owns no buffer; materialize its strided bytes contiguous.
         let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
         Tensor::from_raw(dtype, shape, &bytes)
@@ -394,7 +417,7 @@ impl Executor {
             let buf = self
                 .buffers
                 .get(&vid)
-                .ok_or_else(|| SessionError::Internal(format!("value#{} not produced", vid.0)))?;
+                .ok_or_else(|| SessionError::Internal(format!("{} not produced", value_name())))?;
             let mut host = vec![0u8; n];
             self.ep.copy_to_host(buf, &mut host)?;
             Ok(host)
@@ -466,6 +489,7 @@ impl Executor {
         attr_key: &str,
         resolved: &HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
     ) -> Result<PreparedSubgraph> {
         let key = (node_id, attr_key.to_string());
         let body = self.graph.subgraphs.get(&key).ok_or_else(|| {
@@ -482,9 +506,11 @@ impl Executor {
             let tensor = if let Some(&vid) = self.name_index.get(&name) {
                 let materialized = self.buffers.contains_key(&vid)
                     || self.views.contains_key(&vid)
-                    || self.seq_elem_values.contains_key(&vid);
+                    || self.seq_elem_values.contains_key(&vid)
+                    || external.inputs.contains_key(&vid)
+                    || external.outputs.contains_key(&vid);
                 if resolved.contains_key(&vid) && materialized {
-                    self.value_tensor(vid, resolved)?
+                    self.value_tensor(vid, resolved, external)?
                 } else {
                     outer_scope
                         .get(&name)
@@ -552,12 +578,13 @@ impl Executor {
         pi: usize,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         let node = self.graph.node(self.plan[pi].node_id).clone();
         match node.op_type.as_str() {
-            "If" => self.exec_if(&node, resolved, outer_scope),
-            "Loop" => self.exec_loop(&node, resolved, outer_scope),
-            "Scan" => self.exec_scan(&node, resolved, outer_scope),
+            "If" => self.exec_if(&node, resolved, outer_scope, external),
+            "Loop" => self.exec_loop(&node, resolved, outer_scope, external),
+            "Scan" => self.exec_scan(&node, resolved, outer_scope, external),
             other => Err(SessionError::Internal(format!(
                 "exec_control_flow reached non-control-flow op {other:?}"
             ))),
@@ -571,6 +598,7 @@ impl Executor {
         node: &Node,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         {
             let then_branch = self
@@ -612,7 +640,7 @@ impl Executor {
                     op: "If".to_string(),
                     reason: "missing required 'cond' input".to_string(),
                 })?;
-        let cond_t = self.value_tensor(cond_vid, resolved)?;
+        let cond_t = self.value_tensor(cond_vid, resolved, external)?;
         if cond_t.dtype != DataType::Bool {
             return Err(SessionError::DtypeMismatch {
                 name: "If cond".to_string(),
@@ -655,7 +683,7 @@ impl Executor {
             .unwrap_or(false);
         let prepared = {
             let _s = phase_span!("execif.prepare_subgraph");
-            self.prepare_subgraph(node.id, attr_key, resolved, outer_scope)?
+            self.prepare_subgraph(node.id, attr_key, resolved, outer_scope, external)?
         };
         let outs = {
             let _s = phase_span!("execif.run_subgraph");
@@ -814,12 +842,13 @@ impl Executor {
         node: &Node,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         // Inputs: [M, cond, v_initial...]. M and cond may be omitted (None slot)
         // or an empty-name optional; absence means "unbounded" / "true".
         let m: Option<i64> = match node.inputs.first().and_then(|s| *s) {
             Some(vid) => {
-                let t = self.value_tensor(vid, resolved)?;
+                let t = self.value_tensor(vid, resolved, external)?;
                 if t.dtype != DataType::Int64 {
                     return Err(SessionError::DtypeMismatch {
                         name: "Loop M".to_string(),
@@ -841,7 +870,7 @@ impl Executor {
         let mut cond: Option<bool> =
             match node.inputs.get(1).and_then(|s| *s) {
                 Some(vid) => {
-                    let t = self.value_tensor(vid, resolved)?;
+                    let t = self.value_tensor(vid, resolved, external)?;
                     if t.dtype != DataType::Bool {
                         return Err(SessionError::DtypeMismatch {
                             name: "Loop cond".to_string(),
@@ -870,7 +899,7 @@ impl Executor {
                         .to_string(),
                 )
             })?;
-            carried.push(self.value_tensor(vid, resolved)?);
+            carried.push(self.value_tensor(vid, resolved, external)?);
         }
         let num_carried = carried.len();
         let carried_invariants: Vec<(DataType, Vec<usize>)> = carried
@@ -891,7 +920,7 @@ impl Executor {
         let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan)
             .map(|_| TensorStackAccumulator::new())
             .collect();
-        let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope)?;
+        let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope, external)?;
         let mut iter_tensor = scalar_i64_tensor(0)?;
         let mut cond_tensor = scalar_bool_tensor(cond.unwrap_or(true))?;
 
@@ -1142,6 +1171,7 @@ impl Executor {
         node: &Node,
         resolved: &mut HashMap<ValueId, Vec<usize>>,
         outer_scope: &HashMap<String, Tensor>,
+        external: &ExternalBindings,
     ) -> Result<()> {
         let raw_num_scan_inputs = node
             .attr("num_scan_inputs")
@@ -1208,7 +1238,7 @@ impl Executor {
                 reason: "an initial-state input is omitted (empty), which ONNX does not allow"
                     .to_string(),
             })?;
-            state.push(self.value_tensor(vid, resolved)?);
+            state.push(self.value_tensor(vid, resolved, external)?);
         }
         let mut scan_inputs: Vec<Tensor> = Vec::with_capacity(num_scan_inputs);
         for slot in node.inputs.iter().skip(num_state) {
@@ -1216,7 +1246,7 @@ impl Executor {
                 op: "Scan".to_string(),
                 reason: "a scan input is omitted (empty), which ONNX does not allow".to_string(),
             })?;
-            scan_inputs.push(self.value_tensor(vid, resolved)?);
+            scan_inputs.push(self.value_tensor(vid, resolved, external)?);
         }
 
         let mut input_axes = Vec::with_capacity(num_scan_inputs);
@@ -1262,7 +1292,7 @@ impl Executor {
         let mut scan_acc: Vec<TensorStackAccumulator> = (0..num_scan_outputs)
             .map(|_| TensorStackAccumulator::new())
             .collect();
-        let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope)?;
+        let prepared = self.prepare_subgraph(node.id, "body", resolved, outer_scope, external)?;
         let mut scan_slices = Vec::with_capacity(num_scan_inputs);
         if trip_count != 0 {
             for (index, ((input, &axis), &direction)) in scan_inputs
