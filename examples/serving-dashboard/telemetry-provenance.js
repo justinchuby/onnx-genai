@@ -148,17 +148,25 @@ export const PROVENANCE = Object.freeze({
     label: 'Pipeline model',
   },
   'server.model_path': {
-    source: ENDPOINTS.STATUS,
-    path: 'server.model_path',
+    source: ENDPOINTS.MODELS,
+    path: 'served.path',
     classification: 'NOT_PLUMBED',
     unit: null,
     evidence:
-      'No route returns the model directory. /v1/debug/config exposes id, pipeline and ' +
-      'context only — crates/onnx-genai-server/src/routes/admin.rs:93-100.',
+      'No route returns the model directory today. /v1/debug/config exposes id, pipeline ' +
+      'and context only — crates/onnx-genai-server/src/routes/admin.rs:93-100, and the ' +
+      '/v1/models entry carries id/object/created/owned_by — routes/mod.rs:96-101.',
     label: 'Model directory',
     reason:
-      'The server does not expose the model directory path on any endpoint yet. If it is ' +
-      'added, it will appear on /v1/status, which is ungated and already polled.',
+      'The server does not expose the model directory path on any endpoint yet. @d7cf9b84 is ' +
+      'adding it to /v1/models, which is ungated and already polled, so it will appear ' +
+      'here without a flag on a visitor\'s first run.',
+    // POINTED AT THE ENDPOINT IT WILL ARRIVE ON, DELIBERATELY. This entry was
+    // previously aimed at /v1/status, where `path` is never going to appear.
+    // A NOT_PLUMBED entry is checked by asserting its path carries NOTHING, so
+    // an entry aimed at the wrong endpoint can never notice the field going
+    // live -- it would em-dash a real measurement forever, silently. Aimed
+    // here, the staleness check fires the moment the server ships it.
   },
   'server.execution_provider': {
     source: ENDPOINTS.STATUS,
@@ -652,6 +660,34 @@ export const PROVENANCE = Object.freeze({
 
 /** Field keys whose classification means they can never render as a number. */
 export const NEVER_MEASURED_CLASSIFICATIONS = Object.freeze(['DOCUMENTED_ZERO', 'NOT_PLUMBED']);
+
+/**
+ * Wire fields that must NEVER be bound to a panel, whatever they are named.
+ *
+ * These are not stubs. A stub is discoverable: someone greps, finds the
+ * hardcoded literal, and fixes it. These are the more dangerous kind the Lead
+ * made a standing rule — a REAL, CORRECTLY-COMPUTED value under a name that
+ * describes a different quantity. Nothing about the wire looks wrong, so the
+ * error survives every review that checks "is this field computed?".
+ *
+ * Listing them here rather than trusting nobody binds them is the same
+ * principle as the Field envelope itself: enforce it in the shape, not in
+ * developer discipline. `never-bind.test.js` fails the build if one appears.
+ *
+ * @type {ReadonlyArray<{endpoint: string, field: string, why: string}>}
+ */
+export const NEVER_BIND = Object.freeze([
+  Object.freeze({
+    endpoint: ENDPOINTS.MODELS,
+    field: 'created',
+    why:
+      'It is now_unix() computed inside the per-model map at ' +
+      'crates/onnx-genai-server/src/routes/admin.rs:30, so it is the CURRENT TIME, ' +
+      'recomputed on every request. It is not a creation date and it ticks if polled. ' +
+      'Rendered as "created", it would be a confident, precise, wrong fact about when ' +
+      'the model was built.',
+  }),
+]);
 
 /**
  * Look up a field's provenance entry.

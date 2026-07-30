@@ -610,20 +610,76 @@ export function createTelemetryStore({
    * @param {Record<string, SourceResult>} sources
    */
   function readAttribution(sources) {
-    const models = sources[ENDPOINTS.MODELS];
-    if (models?.ok && Array.isArray(models.body?.data)) {
-      const ids = models.body.data.map((entry) => entry?.id).filter((id) => typeof id === 'string');
-      if (ids.length > 0) return { modelIds: ids, primary: ids[0] };
-    }
     const health = sources[ENDPOINTS.HEALTH];
     const fromHealth = health?.ok ? health.body?.model : null;
-    if (typeof fromHealth === 'string' && fromHealth !== '') {
-      return { modelIds: [fromHealth], primary: fromHealth };
+    const served = typeof fromHealth === 'string' && fromHealth !== '' ? fromHealth : null;
+
+    const models = sources[ENDPOINTS.MODELS];
+    if (models?.ok && Array.isArray(models.body?.data)) {
+      const entries = models.body.data;
+      const ids = entries.map((entry) => entry?.id).filter((id) => typeof id === 'string');
+      if (ids.length > 0) {
+        // WHICH ID IS PRIMARY IS NOT A FORMATTING DETAIL -- IT DECIDES WHICH
+        // MODEL EVERY NUMBER ON THE PAGE IS ATTRIBUTED TO.
+        //
+        // This previously took ids[0]. /v1/models is emitted from a registry
+        // whose ids are SORTED, so ids[0] is the alphabetically-first model,
+        // which is not necessarily the one this server is serving. In the
+        // two-model demo "qwen2.5-0.5b" sorts before "qwen2.5-0.5b-scatter-v2",
+        // so a scatter server would have attributed every KV and batching
+        // number to the DYNAMIC model -- the exact silent misattribution the
+        // two-server design exists to make impossible, reintroduced on the
+        // client.
+        //
+        // /health.model is what THIS process is serving, so it wins. The list
+        // is still the right source for the full id set.
+        const primary =
+          (served && ids.includes(served) ? served : null) ??
+          entries.find((entry) => entry?.is_default === true)?.id ??
+          (ids.length === 1 ? ids[0] : null) ??
+          served;
+        return { modelIds: ids, primary: primary ?? null };
+      }
     }
+
+    if (served) return { modelIds: [served], primary: served };
     return { modelIds: [], primary: null };
   }
 
     /**
+   * Expose the ONE model this page is about at a fixed path on the /v1/models
+   * body, so provenance entries can address it as `served.*`.
+   *
+   * WHY A PROJECTION RATHER THAN A DOTTED PATH. /v1/models returns a LIST, and
+   * no dotted path can express "the entry for the model this page is actually
+   * watching". `data.0.path` would be a guess, and @12e42da8 established that
+   * the implicit default is the ALPHABETICALLY FIRST id -- which in the
+   * two-model demo is the dynamic model, not the scatter one. A panel reading
+   * index 0 would therefore describe the wrong model on the scatter server
+   * while looking entirely correct.
+   *
+   * So the entry is selected by the id this page is attributed to, and only
+   * falls back to the server's own `is_default` flag. If neither identifies a
+   * single entry, nothing is projected and the fields stay unavailable -- an
+   * absent directory is a gap, but a CONFIDENT WRONG directory would be a
+   * fabricated fact about the visitor's machine.
+   *
+   * @param {Record<string, SourceResult>} sources
+   */
+  function projectServedModel(sources) {
+    const models = sources[ENDPOINTS.MODELS];
+    if (!models?.ok || !Array.isArray(models.body?.data)) return;
+
+    const entries = models.body.data;
+    const served =
+      entries.find((entry) => entry?.id === attribution.primary) ??
+      entries.find((entry) => entry?.is_default === true) ??
+      (entries.length === 1 ? entries[0] : null);
+
+    if (served) models.body.served = served;
+  }
+
+  /**
    * Explain, in terms a developer can act on, that this file's audit is stale.
    *
    * @param {string} key
@@ -692,6 +748,7 @@ export function createTelemetryStore({
     // attribution, rather than some fields having it and others not.
     attribution = readAttribution(sources);
     warnOnAttributionMismatch();
+    projectServedModel(sources);
 
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const fields = {};
@@ -791,10 +848,10 @@ export function createTelemetryStore({
    */
   function suppressUndefinedHitRate(fields) {
     const rate = fields['prefix_cache.hit_rate'];
-    if (!rate || rate.state !== FIELD_STATES.MEASURED) return;
+    if (!rate || rate.state !== FIELD_STATES.OK) return;
 
     const denominator = fields['metrics.prefix_cache_lookups'] ?? fields['prefix_cache.lookups'];
-    if (!denominator || denominator.state !== FIELD_STATES.MEASURED) return;
+    if (!denominator || denominator.state !== FIELD_STATES.OK) return;
     if (Number(denominator.value) !== 0) return;
 
     fields['prefix_cache.hit_rate'] = unavailableField(
@@ -837,7 +894,7 @@ export function createTelemetryStore({
       unit: 'tokens/s',
     };
 
-    if (!total || total.state !== FIELD_STATES.MEASURED) {
+    if (!total || total.state !== FIELD_STATES.OK) {
       lastTokenSample = null;
       fields['throughput.observed'] = unavailableField(
         'Derived from the cumulative token counter on /metrics, which is not available.',
@@ -963,7 +1020,7 @@ export function createTelemetryStore({
       const entry = resolveForOrigin(PROVENANCE[key], origin);
       const field = fields[key];
 
-      if (field && (field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE)) {
+      if (field && (field.state === FIELD_STATES.OK || field.state === FIELD_STATES.STALE)) {
         aged[key] = staleField(field, reason);
         continue;
       }
