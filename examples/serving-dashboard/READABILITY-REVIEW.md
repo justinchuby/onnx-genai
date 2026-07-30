@@ -3141,3 +3141,65 @@ A guard that confirms a cited path *exists* mints a vacuous green for every cita
 📊 **ERROR RATE: 6 SELF-RETRACTIONS IN 62 FINDINGS (9.7%). EVERY ONE FOUND BY RE-MEASURING MY OWN PUBLISHED CLAIM, NEVER BY SOMEONE CATCHING ME — WHICH IS ALSO THE REASON TO DISTRUST IT: I AM THE ONLY AUDITOR OF MY OWN AUDIT.**
 
 **VERDICT AT `37d0d72e`: ✅ APPROVE — READABILITY LANE, BLOCKING SET EMPTY. NONE OF R56–R62 BLOCKS THE MERGE; R57 AND R59/R62 MAKE FOUR EXISTING GREENS MEAN LESS THAN THEY LOOK.**
+
+## 🔴 R63 — THE MARKER HAD THREE GRAMMARS AND THE GUARD READ ONE
+`check-review-freshness.test.js`, authored by me, mis-parsed the convention I authored.
+```
+① .exec() returns match ONE. Re-measuring is an APPEND, so the guard judged every
+   document by its OLDEST declaration and could never see a re-measurement.
+② `sha`. -- backticks and a full stop are FORMATTING, NOT IDENTITY. rev-parse
+   rejected them and the catch scored them "stale".
+③ The regex was END-OF-LINE ANCHORED, so declarations with prose after the SHA did
+   not match AT ALL -- not mis-parsed, INVISIBLE. One was the newest declaration in
+   the densest review document on the branch.
+declarations seen: 4 -> 9
+```
+**The three concealed each other: fixing ① alone turns the guard RED on three valid commits, and whoever did that would conclude they had broken it and revert all three.**
+
+> ### ***THE AUTHOR OF A CONVENTION IS THE ONLY PERSON WHO NEVER HAS TO GUESS ITS GRAMMAR. MY 100% COMPLIANCE MEASURED MY AUTHORSHIP, NOT THE CONVENTION'S CLARITY — AND THE PROJECT LEAD ORDERED THREE AGENTS FOUR TIMES TO ADOPT A MARKER THEY HAD ALREADY ADOPTED, BECAUSE MY INSTRUMENT COULD NOT SEE THEM.***
+
+**GRAMMAR, NOW SPECIFIED RATHER THAN EXEMPLIFIED: bare lowercase hex, column 1, prose on the next line.**
+
+## 🔴 R64 — PEEL WHERE THE UNPEELED ANSWER IS WRONG; REFUSE WHERE IT IS RIGHT
+`git rev-parse` on an **annotated** tag returns the tag object, not the commit. `review-3` is
+the only annotated tag in the repository, so `git rev-parse review-3` yields `02249627`
+where every reader expects `37d0d72e`. `merge-base --is-ancestor` peels automatically;
+`rev-parse` does not. **That asymmetry lived inside one comparison in my guard.**
+
+Every component of the failure was correct: the order ("write the raw hex, never a tag
+name"), the obedience, and the command. **The guard punished the composition** — it told an
+author whose document named the review point *exactly* that it was stale and that every row
+in it described a tree the review had moved past.
+
+```
+SAME INPUT, TWO CALL SITES, TWO CORRECT AND OPPOSITE TREATMENTS:
+  freshness check -> PEEL.        Unpeeled it returns a WRONG verdict ("stale").
+  validity check  -> DO NOT PEEL. Unpeeled it returns the RIGHT one, and its message
+                     already names the cause and the one-word repair: "which is a
+                     tag, not a commit."
+```
+> ### ***THE QUESTION IS NEVER "SHOULD I NORMALISE THIS INPUT". IT IS "WHICH VERDICT DOES EACH FORM PRODUCE". I ALMOST NORMALISED BOTH SITES AND WOULD HAVE DELETED THE ONLY MESSAGE THAT HELPS.***
+
+## 🟡 R65 — THE SOLE AUTHORITY HAS ONE AUTHOR AND NO REVIEWER, AND THE AUTHOR IS ME
+`REVIEW-POINT.md` was declared "the sole authority on which tree is under review." Every
+commit to it is mine; nobody else has ever touched it. It went 283 commits stale, and the
+secretary who measured the staleness correctly declined to edit it on the principle that
+re-pointing by fiat is what broke the tags.
+
+> ### ***SO THE FILE THAT DECLARES WHICH TREE WE SHIP HAD A DEFECT EVERYONE COULD SEE, A FIX EVERYONE AGREED ON, AND NOBODY WHO KNEW THEY HAD STANDING TO APPLY IT — BECAUSE THE OWNER WAS IN THE ROOM AND DID NOT KNOW EITHER. A DOCUMENT WITH ONE AUTHOR AND NO REVIEWER IS NOT A SOURCE OF TRUTH; IT IS AN UNREVIEWED OPINION WEARING THE WORD "AUTHORITY".***
+
+**PRICED, NOT APPLIED.** Re-pointing to `37d0d72e` costs exactly two documents one line each
+(`ARCHITECTURE-SECURITY-REVIEW.md`, `REVIEWER-BRIEF.md`); the other two are already fresh.
+Both reds would be **true** — those reviews genuinely describe a tree the review moved past.
+**Reddening two colleagues' files is a decision, not a cleanup. It is not mine to take.**
+**Before this ships, someone who is not the author should countersign this file.**
+
+MEASURED-AT: a4a5ad63
+
+**ZEROS RE-AUDITED** under the rule that a wrong-worktree corpus can only ever corrupt a
+zero, never a count: corpus floor `git ls-files -- examples/serving-dashboard` = **122**,
+branch `feat/genai-demo-dashboard`, and every zero above re-run with a positive control **in
+the same file**. All hold.
+
+**FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**
+**65 findings · 8 self-retractions (12.3%) · 1 defect shipped and repaired within 5 minutes.**
