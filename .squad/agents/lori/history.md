@@ -17,3 +17,8 @@
 ## 2026-07-30T09:16:00Z — 27B blocker-chain reviews
 
 - Approved Mary’s rank-3 Conv1D PR #438, now merged; continuing review of Silu inference PR #440.
+
+## 2026-07-30T13:36:00Z — PR #446 offload/capture correctness review
+
+- Independent review of Cohaagen's PR #446 mutual exclusion constraints between weight offload and graph capture; approved and merged.
+- Critical correctness gate for native CUDA live weight-offload path (#63).
