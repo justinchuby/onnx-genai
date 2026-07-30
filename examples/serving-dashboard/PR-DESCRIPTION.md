@@ -624,15 +624,41 @@ arrives exactly when a reader is most inclined to believe it.
 
 ```
 REVISION            37d0d72e
-RUNNER              cargo test
-PASS                264
-FAIL                0
-IGNORED             4
-RAW EXIT            0
+RUNNER              cargo test -p onnx-genai-server --no-fail-fast
+OBSERVATIONS        14 at this revision, by the reviewer who ran them
+GREEN               13  ->  264 pass / 0 fail / 4 ignored / raw exit 0
+RED                  1  ->  263 pass / 1 fail / 4 ignored / raw exit 101
+FAILING TEST        concurrent_static_cache_chat_completions_share_batched_driver
+                    tests/http.rs:388
+                    left  "tok24 , tok28 tok27"
+                    right "fox tok27 <eos>"
+IN ISOLATION        5 of 5 pass — it only fails beside its 28 siblings
 ```
 
-**Revision ruled as the review pin. Status: carried, and reproduced three
-times independently across six binaries.** Note the structural limit honestly: `cargo test` prints one
+**This block previously read `PASS 264 / FAIL 0 / RAW EXIT 0` and described itself
+as reproduced three times. Every one of those numbers was true.** They were three
+samples of a distribution, presented as a property of a commit.
+
+> **A test result is a sample, not a property of a revision.** A green suite
+> proves the suite was green once. Only repetition separates *passes* from
+> *passed* — and if you ran it once, the honest word is *once*.
+
+**The reviewer who found this wrote the expected result down before running it,
+read `263/1/4`, and could not talk themselves past the gap.** Without that
+prediction the sequence is: see exit `101`, assume a lock or disk problem on a
+full machine, re-run, see green, report green. **That is how this survived every
+previous run tonight, including mine.**
+
+**And it is not a harness curiosity, which is why it is in this section rather
+than a footnote.** It is a concurrency test over the *shared batched driver* —
+the mechanism this demo exists to show. It passes 5 of 5 alone and fails only
+beside its siblings, so the interleaving that produced `"tok24 , tok28 tok27"` is
+reachable in the product and not only in the test.
+
+**The direction of failure is the survivable one, and that is not a defence.** It
+fails toward red. But a suite that can go red while the code is fine can also go
+green while the code is not, and this is the only open item on the branch that
+nobody can close by reading. **It must not be quietly re-run until green.** Note the structural limit honestly: `cargo test` prints one
 `test result:` line per test binary and never sums them, so any total is an
 addition someone performed. Without `--no-fail-fast` the denominator shrinks
 precisely when something is wrong.
