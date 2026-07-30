@@ -30,7 +30,7 @@ finding, this document says so and does not restate it.
 
 **Verdict — and it differs by tree, so both are stated rather than one being implied:**
 
-- **At `review-0` (`6ecd9183`), the pinned review artifact: APPROVE WITH ONE BLOCKER — C5.**
+- **At `6ecd9183`, the pinned review artifact: APPROVE WITH ONE BLOCKER — C5.**
   `may_disclose_model_paths()` is present there and keys on the server's bind address, and
   `run-demo.sh` binds loopback by default, so the disclosure branch is the one every demo
   run takes. See §7.7.
@@ -54,9 +54,9 @@ SHA in each row rather than recalled:
 | **C2** stalled-server hang | BLOCKING | ✅ **CLOSED** | `6ecd9183` | ancestor-of-HEAD; re-executed at `c1323e7f`: blackhole socket → typed `RequestTimeoutError` @ 2004 ms, normal-server control → HTTP 200 @ 14 ms — see §1 |
 | **C1** `parseOrigin` host validation | BLOCKING | ✅ **CLOSED** | `023db167` + `be3ab37c` | ancestors-of-HEAD; predicate re-run — see §2 |
 | **C11** router re-fabricates zeros | BLOCKING | 🟡 **real, not blocking** | — | shipping, but zero router processes ran tonight — see §3 |
-| **P1** model-path disclosure | *(not filed)* | 🔴 **LIVE at `review-0`** · 🟡 caption-only at HEAD | `2da3e851` *(post-tag)* | at the tag the Rust still discloses on a loopback bind — see §7.7. The deletion is real but is **not** in the artifact — see §5 |
+| **P1** model-path disclosure | *(not filed)* | 🔴 **LIVE at `6ecd9183`** · 🟡 caption-only at HEAD | `2da3e851` *(post-tag)* | at the tag the Rust still discloses on a loopback bind — see §7.7. The deletion is real but is **not** in the artifact — see §5 |
 
-**Blocking set at `review-0` is one: C5.** At HEAD it is zero. The strongest single change
+**Blocking set at `6ecd9183` is one: C5.** At HEAD it is zero. The strongest single change
 on this branch landed while this document sat stale: the server's path-disclosure
 *conditional* was not fixed, it was **deleted**, and a source-level test now forbids its
 return. That is the design principle this whole review argued for — **make the wrong
@@ -268,11 +268,11 @@ Two consequences worth carrying past this PR:
 | **C9** | Poll fan-out isolates failure but not latency: `Promise.all` means the slowest endpoint gates the cycle | **downgraded** — root cause fixed by `bd2197a4`; `/metrics` worst case now 71.3 ms. **The server fix removes today's instance; C2 removes the class** | measured |
 | **C4** | `batch_in_flight` ÷ `batch_capacity` scope mismatch | low, latent | read |
 | **C7/C8** | `ServeDir` publishes the whole assets directory; no CSP header | minor | read |
-| **C5** | `may_disclose_model_paths()` keys on **bind address rather than peer** — and the demo binds `127.0.0.1` by default, so the disclosure branch is the **default path for every demo run**, not an edge case | 🔴 **LIVE AT `review-0`** · closed at HEAD by `2da3e851` (after the tag) — see §7.2 and §7.7 | executed |
+| **C5** | `may_disclose_model_paths()` keys on **bind address rather than peer** — and the demo binds `127.0.0.1` by default, so the disclosure branch is the **default path for every demo run**, not an edge case | 🔴 **LIVE AT `6ecd9183`** · closed at HEAD by `2da3e851` (after the tag) — see §7.2 and §7.7 | executed |
 | **C6** | `0.0`-on-zero-capacity | **RETRACTED — false positive** | executed |
 | **P1** | **Model-path disclosure — server half CLOSED by deletion, client half is now a caption defect, not a leak.** The server no longer has a disclosure switch at all: `model_path_for_display()` in `routes/admin.rs` takes one argument and returns `file_name()` unconditionally, and `crates/onnx-genai-server/src/tests.rs` `no_configuration_can_re_enable_full_path_disclosure` asserts at *source* level that neither `may_disclose_model_paths` nor `bind_addr` reappears in `crates/onnx-genai-server/src/state.rs`, `crates/onnx-genai-server/src/routes/admin.rs` or `crates/onnx-genai-server/src/cli.rs`. **No absolute path reaches the wire in any configuration.** What survives is that `ui/model-card.js` still labels the value `Directory` and `dashboard/system.js` labels it `model directory`, while the value is now a *basename* — @376a0297 predicted this exact caption defect before it landed | 🟡 **caption, not disclosure** — severity collapsed by the server fix | executed |
 | **C12** | ~~`fetchWithDeadline` is the only network path by discipline, not by construction; nothing asserts it~~ | **RETRACTED — false when filed. See §7.6** | executed |
-| **C15** | `fetchWithDeadline` **silently discards a caller-supplied `signal`** — `{ ...init, signal: controller.signal }` spreads the caller's key and then overwrites it. The docstring promises *"everything else is passed through to the underlying fetch untouched"*; that promise is false for the one key that controls cancellation. Executed at `review-0`: caller's `abort()` leaves the request **PENDING**. 🟡 latent — zero shipped callers pass a signal today | 🟡 NEW, latent, structural — see §8.1 | executed |
+| **C15** | `fetchWithDeadline` **silently discards a caller-supplied `signal`** — `{ ...init, signal: controller.signal }` spreads the caller's key and then overwrites it. The docstring promises *"everything else is passed through to the underlying fetch untouched"*; that promise is false for the one key that controls cancellation. Executed at `6ecd9183`: caller's `abort()` leaves the request **PENDING**. 🟡 latent — zero shipped callers pass a signal today | 🟡 NEW, latent, structural — see §8.1 | executed |
 
 **On C10 and five checkouts:** this deserves more weight than its severity suggests.
 With five checkouts of this repository on one machine, launching from the wrong one
@@ -354,7 +354,7 @@ my "10" counted numerics only. **Two different questions wearing one number.**
 
 ## 9. TRIPLE REVIEW — PASS 1, CRITICAL-REVIEWER ARM
 
-Measured in a clean detached worktree at **`review-1` = `fca13038`**, resolved repo root
+Measured in a clean detached worktree at **`fca13038`**, resolved repo root
 `/private/tmp/rv1-crit`, porcelain 0, `run-tests.sh` **raw unpiped exit 0 · 627 tests ·
 94 suites · 0 fail · 47 files discovered · provenance 0 untracked / 0 missing**.
 (The dispatch quoted 599/91 at this same immutable SHA; my count comes from the canonical
@@ -573,7 +573,7 @@ the standard, and it needs no change.
 The defect is one line up. `fetchWithDeadline` destructures `fetchImpl` and `timeoutMs`
 out of `options`, then calls `fetchImpl(input, { ...init, signal: controller.signal })`.
 A caller-supplied `signal` lands in `init` and is **overwritten by position**. Executed
-against `review-0` bytes:
+against `6ecd9183` bytes:
 
 ```
 caller signal === signal fetch received : false
@@ -582,7 +582,7 @@ after caller abort()                   : PENDING     <- cancellation silently de
 ```
 
 **Reachability, stated before severity: zero shipped callers pass a `signal` at
-`review-0`.** The refactor removed `telemetry-store.js`'s own `AbortController` rather
+`6ecd9183`.** The refactor removed `telemetry-store.js`'s own `AbortController` rather
 than leaving it stranded, so this is **latent, not live** — no regression shipped. The
 `@param` typedef lists `fetchImpl`, `timeoutMs`, `headers`, `cache` and does not invite
 `signal`, which mitigates it further.
@@ -610,10 +610,10 @@ makes the caller's intent survive by construction. (2) Refuse: throw on a caller
 happen is a documentation fix — the interface currently works only because no caller
 exercises the promise it makes, which is an unwritten rule enforced by nothing.
 
-**7.7 — I reported C5 STRUCK against `review-0` and it is LIVE there. That is a false
+**7.7 — I reported C5 STRUCK against `6ecd9183` and it is LIVE there. That is a false
 green in my own lane, and the mechanism is new tonight.**
 
-`may_disclose_model_paths()` exists at `review-0:crates/onnx-genai-server/src/state.rs`
+`may_disclose_model_paths()` exists at `6ecd9183:crates/onnx-genai-server/src/state.rs`
 and reads `self.bind_addr.is_some_and(|addr| addr.ip().is_loopback())`. It was deleted at
 `2da3e851` — *"delete the path-disclosure conditional, because one branch was already
 proven sufficient"* — which is **not an ancestor of the tag**. I measured at `HEAD`, saw
@@ -622,7 +622,7 @@ fix.**
 
 **The mechanism is created by the pin itself and did not exist before it.** While the
 review target was "HEAD, whatever it is now," measuring at HEAD was merely racy. Once the
-target is pinned to `review-0` and the tree keeps moving, **measuring at HEAD is
+target is pinned to `6ecd9183` and the tree keeps moving, **measuring at HEAD is
 systematically optimistic**: every defect fixed after the tag reads as struck. The tag was
 introduced to stop drift, and it does — but only for readers who measure *at the tag*.
 Habit measures at HEAD.
@@ -967,7 +967,7 @@ wrong.** Calling a fixed defect *my mistake* deletes the evidence the fix was ev
 and collects credit for candour in the same motion.
 
 
-## 15. Pass 2 at `review-2` = `0bc86726` — path disclosure across all three layers
+## 15. Pass 2 at `0bc86726` — path disclosure across all three layers
 
 Measured in a clean detached worktree, porcelain 0, raw unpiped exit 0,
 646 tests / 98 suites / 0 failures. Exact agreement with the Lead's number.
@@ -997,7 +997,7 @@ leak stop appearing would be indistinguishable from an instrument I had broken.
 
 They wrote: "the wire field is unchanged, /v1/models still returns the
 absolute path on loopback." That is TRUE OF THE RUNNING PROCESS and FALSE
-OF THE SOURCE AT `review-2`. They measured the wire, which was correct, and
+OF THE SOURCE AT `0bc86726`. They measured the wire, which was correct, and
 inferred the source, which was not. The Rust fix `e556b7f4` landed at 00:18:30.
 
 ### 15.3 THE FINDING — `run-demo.sh:207` is an existence check standing in for a freshness check
@@ -1738,7 +1738,7 @@ also an argument for one-file-per-agent discipline that nobody has made yet:
 
 ### ⚠️ @e00032a4's second direction, run on my own SHAs — the result is bad
 
-    c04576f0  in review-1 YES · review-0 YES · HEAD YES
+    c04576f0  in fca13038 YES · 6ecd9183 YES · HEAD YES
     fa1fd425  NO · NO · YES        82b66d78  NO · NO · YES
     b4636338  NO · NO · YES        0225cfbb  NO · NO · YES
     9e53bed2  NO · NO · YES        2f631e13  NO · NO · YES
@@ -1765,15 +1765,15 @@ rule:* `c04576f0` **is mine** — @e00032a4 cited it correctly.
 
 **A name that contains the object it names cannot drift silently** — the failure
 becomes a contradiction detectable in one command, which is precisely the
-property `review-0` lacked while it moved 60 commits under fourteen agents.
+property `6ecd9183` lacked while it moved 60 commits under fourteen agents.
 
 ### But nothing runs the check
 
     files in the tree mentioning `gate-scored`     : 2
-    CONTROL, files mentioning `review-0`           : 8
+    CONTROL, files mentioning `6ecd9183`           : 8
 
 **The device is self-DESCRIBING, not self-ENFORCING.** It makes the lie
-detectable; it does not make anyone detect it. And `review-0` is still the string
+detectable; it does not make anyone detect it. And `6ecd9183` is still the string
 with four times the footprint, so the cheaper habit still wins.
 
 ### 🔑 The pattern, and this is the finding — it has three independent instances tonight
@@ -2405,18 +2405,18 @@ be defended, because the control would no longer live in a comment.
 
 ## §33 — THE CRITICAL ARM, ANSWERED: ①②③④ AND THE APPROVE PREDICATE
 
-MEASURED-AT: `9b06d922`. **Not at `review-2`/`0bc86726`, and the refusal is
+MEASURED-AT: `9b06d922`. **Not at `0bc86726`, and the refusal is
 evidenced below.** Splitting the premise from the ask, per the Lead's own rule.
 
 ### 0. Why I did not review at the pinned SHA
 
-@c0de4c2e measured `review-2` at **0 dot-segment rules and 0 percent handling**;
-HEAD has 8 and 0 (control `fn ` = 25). So `review-2` refuses dotfiles *only
+@c0de4c2e measured `0bc86726` at **0 dot-segment rules and 0 percent handling**;
+HEAD has 8 and 0 (control `fn ` = 25). So `0bc86726` refuses dotfiles *only
 incidentally, via the extension allowlist* — the exact mechanism the author's own
 comment says must not be relied on, and the mechanism C21 proves a test already
 mistook for a traversal defence.
 
-**Reviewing security at `review-2` would score a tree whose dotfile guard does
+**Reviewing security at `0bc86726` would score a tree whose dotfile guard does
 not exist, and would score my own C19 as inapplicable when it is live at HEAD.**
 The order also lists P1 as closed via `f025ae58` with */v1/models.path BANNED in
 NEVER_BIND* — **§30–§32 show that ban carries an armed self-deletion order.** The
