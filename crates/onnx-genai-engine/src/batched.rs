@@ -2105,6 +2105,163 @@ mod lora_continuous_batch_tests {
             "static-cache base row must emit the zero-base argmax token"
         );
     }
+
+    /// Build a `[1]`-prompt adapter/base request that generates `max_new_tokens`
+    /// tokens (the multi-step decode `native_static_cache_continuous_batch_*`
+    /// single-token tests skip), so the second and later tokens run through the
+    /// KV-backed session's `step_active` path.
+    fn multi_token_request(adapter: Option<&str>, max_new_tokens: usize) -> GenerateRequest {
+        let mut request = base_request(adapter);
+        request.options.max_new_tokens = max_new_tokens;
+        request
+    }
+
+    /// Drive `requests` (each an `(adapter, max_new_tokens)`) through a KV-backed
+    /// native static-cache grouped-LoRA continuous batch of width `max_batch`,
+    /// returning each request's generated token ids in submit order.
+    fn run_static_cache_adapter_rows(
+        requests: &[(Option<&str>, usize)],
+        max_batch: usize,
+    ) -> Vec<Vec<u32>> {
+        let scale = 1.0f32;
+        let mut a_t = vec![0.0f32; K * RANK];
+        for p in 0..K {
+            a_t[p * RANK] = 0.1;
+        }
+        let mut b_t_a = vec![0.0f32; RANK * N];
+        b_t_a[1] = 1.0; // adapter A -> vocab 1 (the zero-base model's stable fixpoint)
+        let mut b_t_b = vec![0.0f32; RANK * N];
+        b_t_b[2] = 1.0; // adapter B -> vocab 2
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        write_zero_base_static_cache_model(&model_path);
+
+        let mut session = InferenceSession::builder()
+            .model(&model_path)
+            .lora_adapters(vec![
+                lora_spec("adapter_a", &a_t, &b_t_a, scale),
+                lora_spec("adapter_b", &a_t, &b_t_b, scale),
+            ])
+            .build()
+            .expect("build grouped multi-adapter static-cache native session");
+        let route_a = session.resolve_lora_adapter("adapter_a").expect("resolve A").0 as i32;
+        let route_b = session.resolve_lora_adapter("adapter_b").expect("resolve B").0 as i32;
+        assert!(
+            NativeStaticCacheBatchedDecodeSession::is_static_cache(&session),
+            "synthetic model must be detected as static-cache"
+        );
+
+        let decode = NativeStaticCacheBatchedDecodeSession::new(&mut session, max_batch)
+            .expect("build native static-cache batched decode session");
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(decode),
+            &tokenizer,
+            None,
+            max_batch,
+            vec![
+                ("adapter_a".to_string(), route_a),
+                ("adapter_b".to_string(), route_b),
+            ],
+        )
+        .expect("build native static-cache continuous-batch manager");
+
+        let mut handle_to_index = std::collections::HashMap::new();
+        for (index, &(adapter, max_new_tokens)) in requests.iter().enumerate() {
+            let handle = manager
+                .submit(multi_token_request(adapter, max_new_tokens))
+                .unwrap();
+            handle_to_index.insert(handle.id, index);
+        }
+
+        let mut generated: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
+        let record = |events: Vec<ContinuousBatchEvent>,
+                      sink: &mut Vec<Vec<u32>>,
+                      map: &std::collections::HashMap<usize, usize>| {
+            for event in events {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    sink[map[&handle.id]].push(token.token_id);
+                }
+            }
+        };
+        record(manager.poll(), &mut generated, &handle_to_index);
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            record(manager.poll(), &mut generated, &handle_to_index);
+            guard += 1;
+            assert!(guard < 64, "native static-cache partial-batch failed to drain");
+        }
+        generated
+    }
+
+    /// Regression for the partial-batch `step_active` grouped-LoRA route defect
+    /// (design §J.10): when FEWER rows are active than physical slots — a NORMAL
+    /// production condition (fewer concurrent requests than `max_batch`) — the
+    /// manager feeds `step_active` **active-row-ordered** routes (length
+    /// `active_rows`), but the KV-backed session runs the FULL physical batch, so
+    /// its `build_segments_tensor` needs a **physical-row-order** route buffer of
+    /// length `batch_size`. Before the fix, `step_active` handed the len-1 active
+    /// routes straight through and `build_segments_tensor(batch_size=3)` rejected
+    /// them ("routes (1) do not match the 3 activation rows"), aborting decode on
+    /// the SECOND token. The existing single-token and full-capacity tests submit
+    /// exactly `batch_size` requests, so they MISS this partial-batch path.
+    ///
+    /// Non-tautological: the row's multi-token output is compared against an
+    /// INDEPENDENT single-sequence (`max_batch = 1`) decode of the same adapter +
+    /// prompt, so a whole-batch-to-base regression (which would emit token 0)
+    /// fails too.
+    #[test]
+    fn native_static_cache_continuous_batch_partial_batch_step_active_routes() {
+        let max_new_tokens = 4;
+
+        // Reference: the same adapter + prompt on a single-sequence (width-1)
+        // static-cache decode, where active_rows always equals batch_size.
+        let reference = run_static_cache_adapter_rows(&[(Some("adapter_a"), max_new_tokens)], 1);
+        assert_eq!(reference.len(), 1);
+        assert_eq!(
+            reference[0].len(),
+            max_new_tokens,
+            "single-sequence reference must generate all tokens"
+        );
+
+        // One adapter-bound request in a width-3 batch: active_rows (1) <
+        // batch_size (3). Pre-fix this aborts on the 2nd token; post-fix it runs.
+        let partial = run_static_cache_adapter_rows(&[(Some("adapter_a"), max_new_tokens)], 3);
+        assert_eq!(partial.len(), 1);
+        assert!(
+            partial[0].len() > 1,
+            "partial-batch decode must proceed PAST the second token (got {} tokens)",
+            partial[0].len()
+        );
+        assert_eq!(
+            partial[0], reference[0],
+            "partial-batch (active_rows < batch_size) adapter row must match the single-sequence decode"
+        );
+
+        // Two-active-of-three mixed case: adapter + base, one slot idle. Both
+        // active rows advance together, so the manager takes the `step_active`
+        // path with active_rows (2) < batch_size (3).
+        let mixed = run_static_cache_adapter_rows(
+            &[(Some("adapter_a"), max_new_tokens), (None, max_new_tokens)],
+            3,
+        );
+        let ref_base = run_static_cache_adapter_rows(&[(None, max_new_tokens)], 1);
+        assert_eq!(mixed.len(), 2);
+        assert!(
+            mixed[0].len() > 1 && mixed[1].len() > 1,
+            "two-of-three partial batch must proceed past the second token"
+        );
+        assert_eq!(
+            mixed[0], reference[0],
+            "adapter row in a two-of-three partial batch must match its single-sequence decode"
+        );
+        assert_eq!(
+            mixed[1], ref_base[0],
+            "base row in a two-of-three partial batch must match its single-sequence decode"
+        );
+    }
 }
 
 /// KV-backed native static-cache continuous batching (design §J.10): the

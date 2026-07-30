@@ -89,6 +89,10 @@ pub struct NativeStaticCacheBatchedDecodeSession<'session> {
     write_indices_scratch: Vec<i64>,
     nonpad_scratch: Vec<i64>,
     segments_scratch: Vec<u8>,
+    /// Reused physical-row-order route buffer (length `batch_size`) used to
+    /// translate `step_active`'s active-row-ordered routes into the physical
+    /// ordering `run_full_batch` actually runs, without a per-step allocation.
+    physical_route_scratch: Vec<i32>,
 }
 
 impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
@@ -285,6 +289,7 @@ impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
             write_indices_scratch: Vec::new(),
             nonpad_scratch: Vec::new(),
             segments_scratch: Vec::new(),
+            physical_route_scratch: Vec::new(),
         })
     }
 
@@ -349,6 +354,47 @@ impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
         tensor.map(Some)
     }
 
+    /// Translate `step_active`'s **active-row-ordered** pending routes (length
+    /// `active_rows.len()`, fed by `ContinuousBatchManager::feed_active_lora_routes`)
+    /// into a **physical-row-order** buffer of length `batch_size`, base-filling
+    /// [`BASE_LORA_ROUTE`] for every physical row that is not active this step and
+    /// placing each active row's route at its physical row index. The physical
+    /// buffer is swapped into `pending_routes` so the subsequent
+    /// `run_full_batch` -> `build_segments_tensor(batch_size)` consumes it in the
+    /// ordering the full physical batch actually runs. Buffers are reused (the
+    /// spare active buffer becomes the next `physical_route_scratch`), so there is
+    /// no per-step heap allocation. A no-op when routing is dormant.
+    fn expand_active_routes_to_physical(&mut self, active_rows: &[usize]) -> OrtResult<()> {
+        if self.lora_segments_input.is_none() {
+            return Ok(());
+        }
+        let mut active_routes = self.pending_routes.take().unwrap_or_default();
+        let mut physical = std::mem::take(&mut self.physical_route_scratch);
+        physical.clear();
+        physical.resize(self.batch_size, BASE_LORA_ROUTE);
+        if !active_routes.is_empty() {
+            if active_routes.len() != active_rows.len() {
+                let observed = active_routes.len();
+                let expected = active_rows.len();
+                active_routes.clear();
+                self.pending_routes = Some(active_routes);
+                self.physical_route_scratch = physical;
+                return Err(OrtError::InvalidArgument(format!(
+                    "native static-cache step_active grouped-LoRA routes ({observed}) do not match the {expected} active rows this step runs"
+                )));
+            }
+            for (active_index, &row) in active_rows.iter().enumerate() {
+                physical[row] = active_routes[active_index];
+            }
+        }
+        // Hand the physical-order buffer to `build_segments_tensor` and keep the
+        // now-spare active buffer around as reusable scratch (no per-step alloc).
+        active_routes.clear();
+        self.physical_route_scratch = active_routes;
+        self.pending_routes = Some(physical);
+        Ok(())
+    }
+
     /// Run one decode step over the full physical batch. `tokens`/`positions` are
     /// physical-row indexed (length `batch_size`); `advances[row]` selects the
     /// rows whose cursor advances this step. Returns physical-row-indexed
@@ -382,7 +428,22 @@ impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
         self.write_indices_scratch.clear();
         self.nonpad_scratch.clear();
         for row in 0..batch {
-            self.write_indices_scratch.push(self.row_lens[row] as i64);
+            // Full-capacity edge (design §J.10): the always-full-batch run also
+            // scatters INACTIVE rows, whose stale cursor can equal `max_len` (a
+            // recycled slot left at capacity before the manager reassigns it).
+            // `TensorScatter` bounds-checks `write_indices`, so `max_len` would
+            // poison the whole step. An inactive row's KV is unused and re-zeroed
+            // on `assign_row`, so clamp its write to the last in-range slot: a
+            // harmless no-op into a discarded slice. Active rows are never clamped
+            // (an advancing row at capacity is caught above; an active
+            // non-advancing row at capacity is the deferred active-row-compaction
+            // item, still §J.10).
+            let write_index = if !self.active[row] && self.row_lens[row] >= self.max_len {
+                self.max_len - 1
+            } else {
+                self.row_lens[row]
+            };
+            self.write_indices_scratch.push(write_index as i64);
             let nonpad = if advances[row] {
                 self.row_lens[row] + 1
             } else {
@@ -640,7 +701,11 @@ impl<'session> BatchedDecodeSession<'session>
             )));
         }
         // Expand active-row-ordered inputs to physical positions; run the full
-        // batch, then gather the active rows' logits back in active order.
+        // batch, then gather the active rows' logits back in active order. The
+        // grouped-LoRA routes fed for this step are active-row-ordered too, so
+        // translate them into physical-row order (length batch_size, base-filled)
+        // before run_full_batch's build_segments_tensor(batch_size) consumes them.
+        self.expand_active_routes_to_physical(&active_rows)?;
         self.token_scratch.clear();
         self.token_scratch.resize(self.batch_size, 0);
         self.position_scratch.clear();

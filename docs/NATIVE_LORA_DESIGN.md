@@ -1208,17 +1208,41 @@ sequence's cache — even though `nonpad_kv_seqlen` already bounds reads to
 `[0, row_lens)`. `deactivate_row` only clears the active flag; the slot's cache is
 reclaimed on the next `assign_row`.
 
-**Grouped LoRA threading.** Identical to the KV-free session: when the graph
-declares a `lora.segments` input (a grouped-LoRA-injected session), each step
-binds an `Int32 [rows]` route tensor from the routes fed by `set_lora_routes`
-(physical-row-indexed for `step_select`/prefill, active-row-ordered for
-`step_active`), reusing a little-endian scratch buffer with no per-step heap
-allocation. `set_lora_routes` reuses the emptied `pending_routes` Vec (swapped
+**Grouped LoRA threading.** Identical to the KV-free session in spirit: when the
+graph declares a `lora.segments` input (a grouped-LoRA-injected session), each
+step binds an `Int32 [rows]` route tensor, reusing a little-endian scratch buffer
+with no per-step heap allocation. The routes fed by `set_lora_routes` are
+**physical-row-indexed** (length `batch_size`) for `step_select`/prefill and
+**active-row-ordered** (length `active_rows().len()`) for `step_active`
+(`ContinuousBatchManager::feed_active_lora_routes`). Because this KV-backed
+session always runs the **full physical batch** (`run_full_batch` binds all
+`batch_size` rows and `build_segments_tensor(batch_size)`), `step_active` must
+translate its active-row-ordered routes into physical-row order **before** the
+run: `expand_active_routes_to_physical` fills a reused length-`batch_size` buffer
+with `BASE_LORA_ROUTE` (-1) for every physical row that is not active this step
+and places each active row's route at its physical row index (buffers are cycled,
+so there is still no per-step heap allocation). Without this translation, a
+partial batch (`active_rows < batch_size` — the NORMAL condition of fewer
+concurrent requests than `max_batch`) fed `active_rows` routes would be rejected
+by `build_segments_tensor`'s `batch_size` length check and abort decode on the
+second token. `set_lora_routes` reuses the emptied `pending_routes` Vec (swapped
 back after each step) so the route Vec itself is not reallocated per step either.
 When the graph declares no `lora.segments` input, routing is dormant and the base
 fast path is preserved byte-for-byte. A static-cache export with grouped LoRA thus
 carries mixed adapters per row **and** independent per-row KV in one native
-continuous batch.
+continuous batch, at any active-row occupancy.
+
+**Full-capacity edge (partial disposition).** The always-full-batch run also
+scatters INACTIVE physical rows. A recycled slot's stale `row_lens[row]` can equal
+`MAX_LEN`, which would make `write_indices = MAX_LEN` — out of range for the
+`TensorScatter` bounds check, poisoning the whole step. `run_full_batch` now
+clamps the write index of an **inactive** row at capacity to the last in-range
+slot (`MAX_LEN - 1`): a harmless no-op into a discarded slice (an inactive row's KV
+is unused and re-zeroed on the next `assign_row`). Active rows are never clamped —
+an *advancing* row at capacity is still caught by the explicit
+`row_lens + 1 > MAX_LEN` guard, and an *active non-advancing* row at capacity
+(gated by manager deactivation timing) remains the deferred **active-row
+compaction** item below rather than being silently corrupted.
 
 **Native-EP capability added / blockers.** No new native-EP primitive was
 required beyond the already-approved `TensorScatter` kernel: the standard
@@ -1243,7 +1267,17 @@ cross-row KV leak or shared-cursor bug makes the batched rows diverge from their
 single-sequence references and fails the test — it is not a self-echo. A second
 test drives a grouped-LoRA-injected static-cache session with three rows bound to
 adapter A, adapter B, and base, asserting per-row routing is observable on the
-KV-backed path (A ≠ B ≠ base), proving grouped routing and per-row KV coexist.
+KV-backed path (A ≠ B ≠ base), proving grouped routing and per-row KV coexist. A
+third test, `native_static_cache_continuous_batch_partial_batch_step_active_routes`,
+closes the partial-batch route gap: it submits an adapter-bound request into a
+width-3 batch (so `active_rows` (1) `< batch_size` (3)) and generates four tokens,
+asserting the row proceeds **past the second token** and its multi-token stream
+matches an independent single-sequence (`batch_size = 1`) decode of the same
+adapter + prompt; a two-active-of-three mixed (adapter + base, one idle slot) case
+is checked the same way. This test fails on the un-fixed session with
+`grouped-LoRA routes (1) do not match the 3 activation rows` and passes after the
+physical-row route expansion — the earlier single-token and full-capacity tests
+submit exactly `batch_size` requests and so miss this path.
 
 **Engine dispatch + server reachability (Runciter follow-up B).** The native
 continuous-batch path is now reachable by real requests, not only tests. The
