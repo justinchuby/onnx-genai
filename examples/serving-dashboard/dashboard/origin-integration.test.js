@@ -40,10 +40,15 @@ function respondingServer(overrides = {}) {
       queue_depth: 3,
       active_sessions: 2,
       batch: { active_size: 4 },
-      // The three fabricated fields, exactly as routes/admin.rs emits them.
-      kv_usage: 0.0,
-      tokens_per_second: 0.0,
-      batch_utilization: 0.0,
+      // routes/admin.rs OMITS every field it cannot compute -- it sends `None`,
+      // so the key is absent from the payload rather than present-and-zero.
+      // These two were zeros here until the telemetry landed; sending them as
+      // zeros now would test a server that no longer exists.
+      // batch_utilization is deliberately present and NON-zero: it is a real
+      // computation over in-flight and capacity today, not a stub.
+      batch_utilization: 0.5,
+      batch_in_flight: 2,
+      batch_capacity: 4,
     },
     '/v1/debug/kv': { prefix_cache_hits: 0, prefix_cache_lookups: 17 },
     '/v1/debug/config': {},
@@ -86,20 +91,25 @@ async function mountAgainstRealStore(origin, moduleName) {
   };
 }
 
-describe('the fabricated zeros never reach the screen', () => {
+describe('the omitted fields never reach the screen as zeros', () => {
+  // batch.utilization was in this list and has been REMOVED from it, which is
+  // the whole point of the change: it is a genuine computation now, so
+  // asserting it is not measured would encode a denial of our own working
+  // telemetry -- the exact defect this sweep existed to remove, one layer up.
+  // Its positive assertion lives in 'genuinely measured fields' below.
   for (const [moduleName, key] of [
     ['throughput', 'throughput.tokens_per_second'],
-    ['scheduling', 'batch.utilization'],
     ['kv-memory', 'kv.usage'],
   ]) {
-    it(`${moduleName} does not render ${key}'s hardcoded 0.0 as a measurement`, async () => {
+    it(`${moduleName} does not render ${key} as a measurement when the server omits it`, async () => {
       const store = createTelemetryStore({ origin: 'scatter', fetchImpl: respondingServer() });
       await store.pollOnce();
 
-      // The server really did send 0.0 on the wire for this key...
+      // The server sends no value at all for this key, so nothing about it is
+      // measurable here and the panel must not claim otherwise.
       const field = store.field(key);
       assert.notEqual(field.state, 'measured', `${key} is being presented as a live measurement`);
-      assert.notEqual(field.state, 'measured', `${key} is being presented as a live measurement`);
+      assert.notEqual(field.value, 0, `${key} materialised a 0 the server never sent`);
       store.stop();
     });
   }
@@ -130,6 +140,13 @@ describe('genuinely measured fields still render as numbers', () => {
     assert.equal(store.field('queue.depth').value, 3);
     assert.equal(store.field('queue.depth').state, 'measured');
     assert.equal(store.field('sessions.active').value, 2);
+
+    // batch.utilization moved out of the suppressed set when it became a real
+    // computation. Asserting it POSITIVELY here is what stops that move from
+    // being a silent loss of coverage: a field dropped from a "must not render"
+    // list and added to no other list is a field nothing checks at all.
+    assert.equal(store.field('batch.utilization').state, 'measured');
+    assert.equal(store.field('batch.utilization').value, 0.5);
 
     const adapter = adaptStore(store);
     const scheduling = await import('./scheduling.js');

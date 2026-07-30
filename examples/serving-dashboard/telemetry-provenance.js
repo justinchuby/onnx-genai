@@ -223,6 +223,13 @@ export const PROVENANCE = Object.freeze({
     path: 'paused_sessions',
     classification: 'STRUCTURALLY_BYPASSED',
     unit: 'sessions',
+    // The wire carries nothing for this field, and that absence is itself the
+    // checkable claim: the day a number arrives, "no session can be paused" has
+    // become false and the staleness detector must fire. Declared explicitly
+    // rather than exempting STRUCTURALLY_BYPASSED as a class -- most entries in
+    // that class DO carry a plausible value, which is the whole reason they are
+    // dangerous, so a blanket exemption would gut the guard to fix one entry.
+    isStub: (value) => value === undefined || value === null,
     evidence:
       'crates/onnx-genai-server/src/routes/admin.rs — `paused_sessions: None`, registered in ' +
       'the handler unavailable map via `FieldUnavailable::not_applicable`, reason ' +
@@ -461,7 +468,7 @@ export const PROVENANCE = Object.freeze({
     classification: 'MEASURED',
     unit: 'requests',
     evidence: 'crates/onnx-genai-server/src/routes/admin.rs:136 (snapshot.current_batch_size)',
-    label: 'Active batch size',
+    label: 'Sequences in the current batch',
   },
   'admission.slots_available': {
     source: ENDPOINTS.DEBUG_KV,
@@ -577,7 +584,7 @@ export const PROVENANCE = Object.freeze({
       'crates/onnx-genai-engine/src/batched.rs:101-110 — ContinuousBatchManager steps a ' +
       'batch but exposes no counter for it; onnx_genai_batch_size_current counts HTTP-layer ' +
       'in-flight generations instead.',
-    label: 'Engine batch size',
+    label: 'Sequences stepped together',
     reason:
       'The engine does not report how many sequences it actually stepped together. The ' +
       'available gauge counts requests in flight, which is a different number whenever ' +

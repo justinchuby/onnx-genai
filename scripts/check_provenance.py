@@ -43,6 +43,32 @@ from pathlib import Path
 
 PROVENANCE_JS = "examples/serving-dashboard/telemetry-provenance.js"
 
+# Anti-shrink floor. A provenance table cannot get more honest by getting
+# smaller: an entry that disappears takes its "this field is not measured"
+# warning with it, and the field it described becomes an unannotated number.
+#
+# This floor is not hypothetical. While correcting this very table I ran a
+# regex edit that silently deleted five entries, and every content check still
+# passed green -- the surviving quotations were all still accurate. Correctness
+# of what remains says nothing about what left. Raise this floor when entries
+# are added; do not lower it to make a red go away.
+MIN_ENTRIES = 36
+
+# Entries whose absence would be most expensive: each one annotates a field
+# that a panel renders, so losing the entry silently promotes an unmeasured
+# number to an unlabelled one.
+REQUIRED_KEYS = (
+    "batch.utilization",
+    "queue.depth",
+    "kv.usage",
+    "kv.pages_used",
+    "kv.pages_total",
+    "kv.pages_shared",
+    "sessions.paused",
+    "throughput.tokens_per_second",
+    "prefix_cache.hashes",
+)
+
 # A quoted source fragment inside an evidence string: `foo: None`
 BACKTICKED = re.compile(r"`([^`]+)`")
 # Path to a Rust/JS source file, with or without a trailing :line
@@ -98,6 +124,17 @@ def check(repo: Path) -> tuple[list[str], dict]:
     failures: list[str] = []
     stats = {"entries": len(entries), "quotes_checked": 0, "entries_with_source": 0}
     cache: dict[str, str] = {}
+
+    if len(entries) < MIN_ENTRIES:
+        failures.append(
+            f"provenance table has {len(entries)} entries, floor is {MIN_ENTRIES}. "
+            f"Entries were removed. A field with no provenance entry renders as a "
+            f"number with no honesty label; fix by restoring the entries, not by "
+            f"lowering MIN_ENTRIES."
+        )
+    for key in REQUIRED_KEYS:
+        if key not in entries:
+            failures.append(f"required provenance entry '{key}' is missing from the table")
 
     for key, e in sorted(entries.items()):
         evidence = e["evidence"]
