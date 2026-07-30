@@ -131,7 +131,7 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
 
 | Flag | Why |
 |---|---|
-| `--model` | The server takes a model **directory**, not a config file. Unlike the CLI it does not normalise the path for you, so passing `.../genai_config.json` is a real footgun. |
+| `--model` | The server takes a model **directory**, not a config file. Unlike the CLI it does not normalise the path for you — but as of `cli.rs:145` it now detects the mistake up front and tells you the exact directory to use instead, rather than failing deep in the loader. |
 | `--demo-assets-dir` | Where the dashboard's static files live. Without it the server looks for `./examples/serving-dashboard` **relative to its working directory**, so a server started from anywhere else serves an explanatory error at `/demo` instead of the page. `run-demo.sh` always passes it, so it works from any directory. |
 | `--models-dir` | **Never used, and worth knowing why.** It loads *every* valid model directory it finds, eagerly. `models/` holds twenty-odd of them, so this means many gigabytes and a very long startup before the demo can serve anything. Each server is pointed at one model with `--model`. |
 | `--max-loaded-models` | **Never set.** The default is unlimited; setting it risks evicting a model mid-demo, which presents as a scenario mysteriously going dead. |
@@ -224,8 +224,8 @@ directions**, each time expecting something different:
 | What we set out to show | How the exclusivity killed it |
 | --- | --- |
 | Prefix caching on the batching server | The paged KV cache owns *both* the page table and the prefix trie. Bypass the cache and you bypass the trie — one cause, two symptoms. |
-| A `preempted` state in the batching swimlane | `batched.rs:757` hardcodes `PreemptionPolicy::Disabled`, and `:713-717` documents it as structural: a batch owns its KV in physical rows that cannot be swapped out and resumed in place. |
-| A memory-pressure knob that shrinks the KV budget | The override moves the accounting *ceiling* only; resident KV is never released, so nothing observable happens. |
+| A `preempted` state in the swimlane | Dead on **both** profiles, for four independent reasons — any one sufficient. Batching: `batched.rs:759` hardcodes `PreemptionPolicy::Disabled` (`:713-717` calls it structural — a batch owns its KV in physical rows that cannot be swapped out and resumed in place), and more decisively, `ContinuousBatchManager` (`batched.rs:101-110`) **has no scheduler field at all**, so the component that could preempt is not present. Dynamic: the server enters via the single-request FCFS path, and its driver runs generations serially, so there is never a second sequence to preempt. |
+| A memory-pressure knob that shrinks the KV budget | Not merely ineffective — **unreachable**. `EngineConfig::from_yaml` is the only code that can set a KV limit or flip `allow_runtime_override`, and it has **no callers outside its own unit tests**. The server builds its config at `cli.rs:127-133` from two fields plus `..Default::default()`, so `allow_runtime_override` is always `false` (`config.rs:602`). There is no flag, file, or env var that reaches it. |
 
 Three features, three investigations, one root cause. That is not bad luck —
 **it is a single architectural property expressing itself repeatedly**, and
@@ -300,13 +300,23 @@ policy (fixed waves of *B*; wave *k+1* is not sent until wave *k* has fully
 completed) and **continuous** (fire immediately). Head-of-line blocking shows up
 as a visible staircase.
 
-**The lane has four states here, permanently, and that is a fact rather than a
-gap.** There is no `preempted` state on this path: `batched.rs:757` hardcodes
-`PreemptionPolicy::Disabled`, and the comment above it explains why this is
-structural rather than a default — a batch owns its KV in physical decode rows
-that cannot be swapped out and resumed in place. The demo labels preemption
-*not applicable here* rather than drawing a fifth lane state that never fires,
-because **a state that never appears is indistinguishable from a bug.**
+**The lane has four states, permanently, on both profiles — and that is a fact
+rather than a gap.** There is no `preempted` state anywhere in this demo. On the
+batching path, `batched.rs:759` hardcodes `PreemptionPolicy::Disabled` and the
+comment above it explains why that is structural rather than a default — a batch
+owns its KV in physical decode rows that cannot be swapped out and resumed in
+place. That alone would be enough, but the stronger fact is that
+`ContinuousBatchManager` (`batched.rs:101-110`) **holds no scheduler at all**:
+preemption is not disabled here so much as absent. On the dynamic path the
+server enters through the single-request FCFS entry point and its driver runs
+generations serially, so there is never a second sequence to preempt.
+
+The demo therefore ships **no preemption counter**, rather than one pinned at
+zero. This is the least visible form of the fabricated zero and the most
+dangerous: a stub reads as missing, but `0 preemptions` reads as *a healthy
+system*, and nothing on screen would distinguish "never happened" from "cannot
+happen". Preemption is labelled *not applicable here* instead, because **a state
+that never appears is indistinguishable from a bug.**
 
 **Both sides of that comparison are real requests to a real server.** The
 baseline is never simulated. Whatever the delta turns out to be on your machine
@@ -374,7 +384,7 @@ adequate.
 ### Scenario C — paged KV block table *(dynamic profile, `:8124`)*
 
 The block grid: which blocks each sequence holds, which are shared, and what
-gets evicted under pressure.
+happens when the pool runs out.
 
 > It is called the **paged KV block table**, never "paged attention". The
 > allocator — allocation, sharing, tiering, materialisation — is real and is
@@ -385,18 +395,35 @@ Blocks render **partially filled**, because the last block of a sequence usually
 is. That gap is the actual cost of paging, and hiding it would make the picture
 prettier and less true.
 
-**Pressure here is real, and there is deliberately no slider.** An earlier design
-exposed a control that lowered the KV budget to force eviction. That control is
-gone, because it did not work and could not have: the override moves the
-accounting *ceiling* only — resident KV is never released, and the repository's
-own test says so in its name
-(`reconfigure_lower_reports_overage_without_evicting`). A slider that visibly
-moved while nothing was evicted would have been a fabricated *interaction*,
-which is the same failure as a fabricated number wearing a costume you can drag.
+**The payoff is admission backpressure, not eviction.** The pool *stops
+accepting*; it is never *reclaimed*. Under pressure `queue.depth` climbs,
+`admission.slots_available` falls to zero and `admission.rejections` increments —
+all server-measured, no privileged endpoint, no engine changes. Nothing is
+evicted, and the demo does not claim otherwise.
 
-Instead the demo fills the pool the honest way: **more concurrent sequences and
-longer prompts, until real allocation genuinely runs out of blocks.** Slower to
-reach, harder to stage, and every eviction you see actually happened.
+That distinction is worth more than it sounds. Eviction is internal housekeeping:
+a visitor has to **take our word** for what the animation means. Backpressure is
+externally observable — it propagates out to admission and the visitor **feels it
+in their own requests slowing down**. We trade an animation they must trust for a
+consequence they can verify, which is the trade this whole demo keeps making.
+
+**There is deliberately no KV-budget slider**, and the reason hardened while this
+was being written. An earlier design exposed a control that lowered the budget to
+force eviction. First it turned out not to work: lowering the limit moves the
+accounting *ceiling* only, resident KV is never released, and the repository's own
+test says so in its name (`reconfigure_lower_reports_overage_without_evicting`).
+Then it turned out the control could not exist at all — the budget is not
+settable at runtime *or* at launch. `EngineConfig::from_yaml` is the only code
+that can set a KV limit or enable runtime override, and **it has no callers
+outside its own unit tests**; the server assembles its config from two fields
+plus defaults (`cli.rs:127-133`), and no flag, config file, or environment
+variable reaches the rest.
+
+So the slider would have been a **fabricated interaction** — the same failure as
+a fabricated number, wearing a costume you can drag. Instead the demo fills the
+pool the honest way: **more concurrent sequences and longer prompts, until
+allocation genuinely runs out of blocks.** Slower to reach, harder to stage, and
+every stall you see actually happened.
 
 ---
 
@@ -634,7 +661,7 @@ drifted between its four appearances.
 |---|---|
 | **The batching timeline is flat — no overlap at all.** | Wrong model. Continuous batching engages *only* on static-cache (`-scatter`) models; on any other model the server silently falls back to the per-request path. Check this before debugging anything else. |
 | A model fails to load, mentioning `model.io.static_cache`. | The static-cache build trap above. `models/qwen2.5-0.5b-scatter` has this defect; use `-scatter-v2`. |
-| `model directory does not exist`, but the path is obviously there. | You pointed `--model` at a **file** — usually `.../genai_config.json`. The `onnx-genai` CLI silently coerces that to its parent directory; the server does not. Pass the directory. |
+| `--model expects a model DIRECTORY, but '...' is a file.` | You pointed `--model` at a file — usually `.../genai_config.json`. The `onnx-genai` CLI coerces that to its parent directory; the server does not. The message names the directory to use; pass that. |
 | KV and prefix panels show `n/a` on the batching scenario. | Correct and expected — see [Why two servers](#why-two-servers). Those metrics are meaningless on that execution path, which is why they read `n/a` rather than `—`. |
 | A panel shows `—` where you expected a number. | That field is not measurable today. Hover it: the reason is specific, and it is never "we forgot". |
 | Numbers are greyed out with an age next to them. | The last poll did not land. The values are real but stale; the connection indicator in the header shows the reconnect state. |
