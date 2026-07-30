@@ -927,15 +927,38 @@ export const NEVER_BIND = Object.freeze([
     endpoint: ENDPOINTS.MODELS,
     field: 'path',
     why:
-      'The configured model directory at crates/onnx-genai-server/src/routes/mod.rs:116-120. ' +
-      'Unlike every other banned field this one is entirely TRUE, and that is exactly why no ' +
-      'classification in this file can reach it -- they all answer "is this value true?". The ' +
-      'ban is about DISCLOSURE. Its own doc comment says "Absolute on loopback; the basename ' +
-      'otherwise", and the demo is loopback on every origin we ship, so the permitted branch ' +
-      'of that defence is 100% of our deployment: the server sends the operator username, home ' +
-      'directory and filesystem layout, verbatim, to anything that polls it. Defensible on the ' +
+      'OBSERVED 04:18, and the server has since been REPAIRED -- see the dated note below. ' +
+      'As measured then, the configured model directory was served by ' +
+      'crates/onnx-genai-server/src/routes/mod.rs:116 in `struct ModelObject`. Unlike every ' +
+      'other banned field this one was entirely TRUE, and that is exactly why no classification ' +
+      'in this file can reach it -- they all answer "is this value true?". The ban is about ' +
+      'DISCLOSURE. Its doc comment then read "Absolute on loopback; the basename otherwise", ' +
+      'and the demo is loopback on every origin we ship, so the permitted branch of that ' +
+      'defence was 100% of our deployment: the server sent the operator username, home ' +
+      'directory and filesystem layout, verbatim, to anything that polled it. Defensible on the ' +
       'wire for an operator asking what is loaded; never defensible on a projector. The page ' +
       'wants IDENTITY, and `server.model_id` already carries it.',
+    // ⛔ DO NOT LIFT THIS BAN ON THE STRENGTH OF THE REPAIR BELOW.
+    //
+    // MEASURED 08:16 at HEAD, in `crates/onnx-genai-server/src/routes/mod.rs`,
+    // symbol-anchored on `struct ModelObject` because the line coordinate above
+    // ALREADY ROTTED ONCE (see the rot note further down):
+    //
+    //     `path` field in struct ModelObject   -> GONE. Not redacted: DELETED.
+    //     'Absolute on loopback' in that file  -> 0   (control: 'fn ' -> 23)
+    //
+    // Landed at b7f83e72 "server: the model directory does not leave the
+    // process", ancestor of HEAD YES, reverse control NO. The author rejected
+    // the basename remedy this entry itself proposes below, on a better
+    // argument than ours: a basename is the last segment of an OPERATOR-CHOSEN
+    // path, so its contents are unbounded -- safe on this machine by luck, not
+    // by construction.
+    //
+    // THE BAN STAYS ANYWAY, AND THAT IS THE POINT OF A BAN. It costs nothing
+    // while the field does not exist, and it is the only thing standing between
+    // a projector and the NEXT author who re-adds a path-shaped field under any
+    // name. A ban lifted because the defect is currently absent is a ban that
+    // was only ever a description.
     // WHEN THIS BAN SHOULD BE LIFTED -- STATED AS A WIRE PREDICATE SO NOBODY
     // HAS TO RE-ARGUE IT. The ban is on a VALUE SHAPE, not on the concept of
     // showing which model build is loaded. Lift it when, and only when, this
