@@ -77,10 +77,21 @@
   /* ── SEMANTIC ──────────────────────────────────────────────────────────
      Derived from Okabe-Ito rather than the default web red/green, because
      red/green is precisely the pair that ~8% of men cannot separate.      */
-  --og-ok: #009e73;
-  --og-warn: #e69f00;
-  --og-bad: #d55e00;
-  --og-info: #56b4e9;
+  --og-ok: #009e73;  /* 5.06:1 on --og-bg-raised, WCAG AA 1.4.3 */
+  --og-warn: #e69f00;  /* 7.69:1 on --og-bg-raised, WCAG AA 1.4.3 */
+  --og-bad: #e8590c;  /* 4.84:1 on --og-bg-raised, WCAG AA 1.4.3 */
+  --og-info: #56b4e9;  /* 7.50:1 on --og-bg-raised, WCAG AA 1.4.3 */
+  /* --og-accent is a BACKGROUND and border colour only -- never `color:`.
+     It is 3.34:1 on --og-bg-raised, which is irrelevant: text on top of it
+     uses --og-accent-fg (#ffffff) at 5.19:1 against the accent itself. A
+     contrast guard that scored every token against the page background
+     would red this one and be wrong. The pairing, not the token, is the
+     unit of a contrast claim.
+
+     I wrote "5.32:1" on the line above from memory and it is 5.19:1. That
+     error survived sixty seconds, in the file whose D291 exists because a
+     hand-written ratio certified a token that failed. Every number here is
+     now computed by asset-graph.test.js, including this one.            */
   --og-accent: #0072b2;
   --og-accent-fg: #ffffff;
 

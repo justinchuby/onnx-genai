@@ -284,7 +284,7 @@ Namespaced `--og-`. This is the complete contract; **no panel may invent a colou
      red/green is precisely the pair 8% of men cannot separate.           */
   --og-ok:            #009e73;   /* Okabe-Ito bluish green                 */
   --og-warn:          #e69f00;   /* Okabe-Ito orange                       */
-  --og-bad:           #d55e00;   /* Okabe-Ito vermillion                   */
+  --og-bad:           #e8590c;   /* Okabe-Ito vermillion, raised — §100    */
   --og-info:          #56b4e9;   /* Okabe-Ito sky blue                     */
   --og-accent:        #0072b2;   /* Okabe-Ito blue — primary action        */
   --og-accent-fg:     #ffffff;
@@ -7152,3 +7152,58 @@ it feels safe and is not.
 | ID | Decision | Rationale |
 |---|---|---|
 | D337 | A guard must assert its subject's POSITIVE binding, not only its exemptions | `[data-state]` → `[data-XXXX]` left 45/45 and 740/740 green with the treatment dead; the new arm reddens by name |
+
+## §100 — The error colour failed AA, and the annotated set was the measured set
+
+`--og-bad` was `#d55e00` at **4.48:1** on `--og-bg-raised`. WCAG AA 1.4.3 is
+4.5:1. It missed by 0.02 — and it is the colour of `.request-state--error`,
+`.connection--offline`, `.metric-row--alarm` and `.metric-row__alarm-note`.
+**The text that tells you something is broken was the only text on the panel
+that failed to be legible.** Found by @c8d9a40e, confirmed here by a third
+independent implementation agreeing to the digit, and raised to `#e8590c` =
+4.84:1 — which also measures *further* from `--og-warn` than the incumbent did
+(71 vs 67 in RGB distance), so the error/warning pair got more separable, not
+less.
+
+**The mechanism is the one worth keeping.** This file already had a guard that
+parses every `N:1 on --og-bg-raised` annotation and fails if the arithmetic
+disagrees. It validates the claims that are **present** and is silent about the
+ones that are **absent** — so the annotated set was exactly the checked set, and
+`--og-bad`, `--og-warn` and `--og-info` carried no annotation at all. Two of
+those three happened to pass. One did not.
+
+That is D337 one file over: **a guard keyed on the artefacts of diligence
+certifies whatever diligence forgot.** An annotation is a record that someone
+looked; scoring only the annotated is scoring only the places someone already
+looked.
+
+The new guard is therefore derived from **usage**, not from a list: it scans
+every `color: var(--og-*)` in every stylesheet and scores what it finds. A new
+token used as text is covered the moment it is written.
+
+Three things it must get right, each of which I got wrong first:
+
+- **The pairing, not the token, is the unit of a contrast claim.** `--og-accent`
+  is 3.34:1 on the page background and entirely correct — it is only ever a
+  `background`. My first version scored every rule against one background and
+  red-flagged the `NO STATE` chip, which declares its own background two lines
+  above its own colour.
+- **Exempt a named selector, never a token.** Exempting `--og-fg-faint` would
+  exempt every future use; exempting `.value__sep` exempts the one separator
+  glyph whose reason is written down.
+- **An exemption must be asserted to still match something**, or it silently
+  covers nothing after a rename — D337's complement, and independently the same
+  failure `check-review-freshness` reports against a stale `KNOWN_ABSTAINERS`
+  entry.
+
+Mutation-verified, scored by the failing test's **name**: restoring `#d55e00`
+*with its annotation* is caught by the pre-existing annotation checker, not by
+this arm — so the honest proof required restoring the true pre-fix state
+(failing hex, **no** annotation), which this arm catches alone, naming all four
+live sites.
+
+| ID | Decision | Rationale |
+|---|---|---|
+| D338 | Contrast is scored from USAGE (`color: var(--og-*)`), never from a token list | The list is written by whoever forgot the annotation; `--og-bad` failed AA unannotated for the whole session |
+| D339 | Score text against the background its own rule declares, not the page background | `--og-accent` at 3.34:1 is correct as a background; the chip declares its own — a single-background guard reds correct work |
+| D340 | A decorative exemption names a SELECTOR and must be asserted to still match | Exempting a token exempts every future use; an exemption that outlives its selector is an invisible permanent hole |

@@ -1552,3 +1552,135 @@ describe('every absence pair is separated on a channel that is written down', ()
     );
   });
 });
+
+describe('every token actually used as text clears WCAG AA', () => {
+  // WHY THIS IS DERIVED FROM USAGE AND NOT FROM A LIST OF TOKENS.
+  //
+  // tokens.css already checks every "N:1 on --og-bg-raised" annotation it
+  // carries. That guard validates the claims that are PRESENT and says nothing
+  // about the ones that are ABSENT -- so a token nobody annotated is a token
+  // nobody checked. --og-bad sat at 4.48:1 (AA is 4.5) as the colour of
+  // `.request-state--error` and `.connection--offline`: the text that says
+  // something is broken was the text that failed to be legible. Found by
+  // @c8d9a40e; confirmed here by a third independent implementation.
+  //
+  // Enumerating tokens would reproduce the defect one level up, because the
+  // enumeration gets written by the same person who forgot the annotation. So
+  // this scans for `color: var(--og-*)` and scores whatever it finds. A new
+  // token used as text is covered the moment it is written, with no edit here.
+  //
+  // THE PAIRING, NOT THE TOKEN, IS THE UNIT OF A CONTRAST CLAIM. --og-accent is
+  // 3.34:1 on --og-bg-raised and entirely correct, because it is only ever a
+  // `background`. My own first version of this guard scored every rule against
+  // the page background and red-flagged the `NO STATE` chip -- which declares
+  // its own background two lines above its own colour. A guard that assumes
+  // one background is a guard that cannot read the thing it is scoring.
+
+  const lin = (c) => (c / 255 <= 0.04045 ? c / 255 / 12.92 : Math.pow((c / 255 + 0.055) / 1.055, 2.4));
+  const lum = (hex) => {
+    const h = hex.replace('#', '');
+    return [0, 2, 4]
+      .map((i) => lin(parseInt(h.slice(i, i + 2), 16)))
+      .reduce((s, v, i) => s + [0.2126, 0.7152, 0.0722][i] * v, 0);
+  };
+  const contrast = (a, b) => {
+    const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  const hexOf = (token) => {
+    const m = css['tokens.css'].match(new RegExp(`--${token}:\\s*(#[0-9a-fA-F]{6})`));
+    return m && m[1];
+  };
+
+  // Decorative text, exempted BY NAMED SELECTOR and never by token. Exempting a
+  // token would silently exempt every future use of it, including informative
+  // ones; exempting a selector exempts exactly the element whose reason is
+  // written down here.
+  const DECORATIVE = {
+    '.value__sep':
+      'a separator glyph present so a value and its age never fuse in textContent; it carries no information of its own',
+    '__marker':
+      'sequence markers encode identity as glyph SHAPE plus fill PATTERN plus colour (tokens.css:208-213); the colour is the third of three encodings and carries nothing alone',
+  };
+
+  // Comments carry prose that looks like selectors and declarations. Strip them
+  // before parsing or the "selector" of a rule becomes its own documentation.
+  const stripped = Object.fromEntries(
+    Object.entries(css).map(([f, t]) => [f, t.replace(/\/\*[\s\S]*?\*\//g, '')]),
+  );
+
+  const rules = Object.entries(stripped).flatMap(([file, text]) =>
+    [...text.matchAll(/([^{}]+)\{([^}]*)\}/g)].map((m) => ({
+      file,
+      sel: m[1].trim().replace(/\s+/g, ' '),
+      decl: m[2],
+    })),
+  );
+
+  // If a rule paints its own background, THAT is what its text sits on.
+  const bgOf = (decl) => {
+    const m = decl.match(/background(?:-color)?:\s*var\(--(og-[a-z0-9-]+)\)/);
+    return m ? hexOf(m[1]) : null;
+  };
+
+  const textRules = rules.flatMap((r) =>
+    [...r.decl.matchAll(/(?:^|[;\s])color:\s*var\(--(og-[a-z0-9-]+)\)/g)].map((d) => ({
+      ...r,
+      token: d[1],
+      against: bgOf(r.decl) || hexOf('og-bg-raised'),
+    })),
+  );
+
+  it('found text rules to score (anti-vacuity)', () => {
+    // A regex drift that matched nothing would make every assertion below pass
+    // over an empty set -- green caused by absence, which this file exists to
+    // refuse.
+    assert.ok(
+      textRules.length >= 15,
+      `Only ${textRules.length} \`color: var(--og-*)\` rule(s) found across ` +
+        `${Object.keys(css).length} stylesheet(s). The scanner has drifted from ` +
+        `the CSS syntax and is scoring nothing.`,
+    );
+  });
+
+  it('resolves its background and known ratios (control)', () => {
+    assert.ok(hexOf('og-bg-raised'), 'background token did not resolve; every ratio is meaningless.');
+    assert.equal(contrast('#ffffff', '#000000').toFixed(2), '21.00', 'white/black must be 21:1');
+    assert.equal(contrast('#151b23', '#151b23').toFixed(2), '1.00', 'identical colours must be 1:1');
+  });
+
+  it('every token used as `color:` clears 4.5:1 against what it sits on', () => {
+    const failures = [];
+    for (const r of textRules) {
+      if (Object.keys(DECORATIVE).some((k) => r.sel.includes(k))) continue;
+      const hex = hexOf(r.token);
+      if (!hex || !r.against) continue;
+      const c = contrast(hex, r.against);
+      if (c < 4.5) {
+        failures.push(`${r.file}  ${r.sel.slice(0, 70)}  --${r.token} ${hex} on ${r.against} = ${c.toFixed(2)}:1`);
+      }
+    }
+    assert.deepEqual(
+      failures,
+      [],
+      `Text below WCAG AA 1.4.3 (4.5:1):\n  ${failures.join('\n  ')}\n` +
+        `Either raise the token, or -- if the text is genuinely decorative -- add ` +
+        `its SELECTOR to DECORATIVE above WITH THE REASON. Do not exempt the token.`,
+    );
+  });
+
+  it('every decorative exemption still matches something, and carries a reason', () => {
+    // An exemption that outlives its selector is a permanent hole nobody can
+    // see. This is D337's complement arm, one file over: assert that the thing
+    // you are exempting still EXISTS, or the exemption silently covers nothing.
+    for (const [key, reason] of Object.entries(DECORATIVE)) {
+      assert.ok(reason.length > 40, `Exemption \`${key}\` has no substantive reason.`);
+      assert.ok(
+        textRules.some((r) => r.sel.includes(key)),
+        `Exemption for \`${key}\` matches no \`color: var(--og-*)\` rule any more. ` +
+          `Either it was renamed -- so this exemption now covers nothing and must be ` +
+          `re-pointed -- or the rule is gone and this entry should be deleted.`,
+      );
+    }
+  });
+});
