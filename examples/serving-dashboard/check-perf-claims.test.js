@@ -1711,11 +1711,26 @@ test('the retracted 9.8 % floor is not stated as live fact outside markdown', ()
   // stops offending, this test FAILS and tells me to delete the row: an
   // exemption that cannot expire is a suppression, and the direction nobody
   // reports is the one where the gap has quietly closed.
-  const DEFERRED = Object.freeze({
-    'scenario-origins.js':
-      'SHIPPED browser code owned by @bb2ee824 (023db167 C1, be3ab37c C13). ' +
-      'Reported to them; not mine to edit under freeze.',
-  });
+  // EMPTY, AND IT EMPTIED ITSELF. The one entry -- `scenario-origins.js`, shipped
+  // browser code owned by @bb2ee824, deferred because reddening another agent's
+  // file under freeze is worse than a deferral that reports itself -- was removed
+  // when its owner landed `cd22dcb7` ("stop citing a withdrawn load-drift figure
+  // in shipped browser code") at 07:51:27. The retracted figure went to 0
+  // occurrences in that file and THIS TEST WENT RED WITHIN ONE MINUTE, naming the
+  // row to delete. That is the whole point of the design: the exemption I retired
+  // earlier tonight recorded its removal condition in a COMMENT and sat dead for
+  // hours; this one recorded it in an ASSERTION and expired the moment it was
+  // obsolete. An exemption that cannot expire is a suppression.
+  //
+  // Note the ORDERING, because it is the safe half of @12e42da8's new rule: the
+  // CONTENT fix landed first and the guard relaxation follows. A stale exemption
+  // only ever REDDENS the branch -- it cannot green a defect. The dangerous order
+  // is the reverse, a guard landing ahead of the prose that satisfies it.
+  //
+  // With no rows, the stale-row check below is vacuously true. That is the correct
+  // terminal state and not a hole: the assertion that carries the real weight is
+  // the offender scan, whose non-vacuity is pinned by named corpus members below.
+  const DEFERRED = Object.freeze({});
 
   const corpus = shippedPaths()
     .filter(Boolean)
