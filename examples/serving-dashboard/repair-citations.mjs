@@ -33,6 +33,10 @@
 //   * It reports declines as loudly as repairs. A tool that silently skips
 //     what it cannot handle produces a clean run that means "I fixed
 //     everything I felt like", and the reader hears "everything is fixed."
+//   * It refuses to WRITE into a dirty README for the same reason it refuses
+//     to READ a dirty source: the file then has two states, and the rewrite
+//     is a whole-file overwrite from a snapshot taken before the repairs were
+//     computed.
 //
 // It is not wired into the test suite and must not be: a check that repairs
 // its own subject can never fail.
@@ -40,13 +44,14 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: HERE })
   .toString()
   .trim();
 const README_PATH = join(HERE, 'README.md');
+const README_REL = relative(REPO, README_PATH);
 const WRITE = process.argv.includes('--write');
 
 // `path/to/file.rs:123` or bare `file.rs:123`, inside backticks.
@@ -236,21 +241,58 @@ for (const r of applied) {
   out = out.slice(0, r.index) + r.replacement + out.slice(r.index + r.full.length);
 }
 
+// Decided BEFORE the verdicts are printed, not at the write site. The label
+// below is the tool's claim about what it did, and a run that prints
+// `REPAIRED` and then refuses to write has told the reader the opposite of
+// what happened -- exactly the silent-skip failure the header forbids.
+const refusedWrite = WRITE && repairs.length > 0 && isDirty(README_REL);
+
 if (repairs.length === 0 && declines.length === 0) {
   console.log('All README citations are anchored to their symbols. Nothing to repair.');
 }
 for (const r of repairs) {
-  console.log(`${WRITE ? 'REPAIRED' : 'WOULD REPAIR'}  ${r.full} -> :${r.target}   (${r.symbol})`);
+  console.log(
+    `${WRITE && !refusedWrite ? 'REPAIRED' : 'WOULD REPAIR'}  ${r.full} -> :${r.target}   (${r.symbol})`,
+  );
 }
 for (const d of declines) console.log(`DECLINED  ${d}`);
 
 if (WRITE && repairs.length > 0) {
-  writeFileSync(README_PATH, out);
-  console.log(`\nWrote ${repairs.length} repair(s). Now run the checker — this tool is ` +
-    `not evidence, it is a suggestion that happens to have edited the file:\n` +
-    `  node --test check-source-citations.test.js`);
+  // THE RULE THIS TOOL ALREADY APPLIES TO EVERY FILE IT CITES, APPLIED TO THE
+  // ONE FILE IT EDITS. `isDirty` refuses a cited source with uncommitted
+  // changes because it has two line numberings and neither is the reviewer's.
+  // README.md was exempt from that argument for no reason other than that it is
+  // the output rather than an input, and it is subject to the identical one:
+  // it is read from the working copy at the top of this file, and the numbers
+  // written into it are counted from HEAD, so repairing a dirty README produces
+  // a document that matches neither tree.
+  //
+  // It is also a lost update. The snapshot was taken before the repairs were
+  // computed and every offset in `repairs` indexes into it, so writing the
+  // whole file back silently discards anything that landed here in between --
+  // which, on a branch several agents are editing, is the ordinary case rather
+  // than the unlucky one.
+  if (refusedWrite) {
+    console.log(
+      `\nREFUSED TO WRITE  ${README_REL} has uncommitted changes. This tool rewrites ` +
+        `the whole file from a snapshot taken before the repairs above were computed, ` +
+        `so writing now would discard that work and anchor HEAD-derived line numbers ` +
+        `into a document that matches neither HEAD nor the tree the reviewer clones. ` +
+        `Commit or stash it and re-run -- the ${repairs.length} repair(s) above are ` +
+        `unaffected and will be found again.`,
+    );
+  } else {
+    writeFileSync(README_PATH, out);
+    console.log(`\nWrote ${repairs.length} repair(s). Now run the checker — this tool is ` +
+      `not evidence, it is a suggestion that happens to have edited the file:\n` +
+      `  node --test check-source-citations.test.js`);
+  }
 }
 if (declines.length > 0) {
   console.log(`\n${declines.length} citation(s) need a human. They are NOT repaired and NOT safe to ignore.`);
   process.exitCode = WRITE ? 0 : 1;
 }
+// After the block above, which sets 0 under --write: a refusal is a failure to
+// do the job it was asked to do, and must not be reported as success merely
+// because some citation elsewhere also needed a human.
+if (refusedWrite) process.exitCode = 1;

@@ -45,6 +45,21 @@ describe('repair-citations reads the shipping tree, not the desk', () => {
 
   const README = () => join(repo, 'tool', 'README.md');
 
+  // `run` deliberately discards exit status. This returns it, because a tool
+  // that refuses to do its job and exits 0 is indistinguishable, to every
+  // caller that is a script rather than a person, from one that succeeded.
+  const runStatus = (...args) => {
+    try {
+      execFileSync('node', [join(repo, 'tool', 'repair-citations.mjs'), ...args], {
+        cwd: repo,
+        encoding: 'utf8',
+        stdio: 'ignore',
+      });
+      return 0;
+    } catch (e) {
+      return e.status;
+    }
+  };
   before(() => {
     repo = mkdtempSync(join(tmpdir(), 'repair-citations-'));
     git('init', '-q');
@@ -140,6 +155,49 @@ describe('repair-citations reads the shipping tree, not the desk', () => {
     // Restore so the suite is order-independent.
     writeFileSync(README(), readFileSync(README(), 'utf8').replace('widget.rs:4`', 'widget.rs:99`'));
     execFileSync('git', ['checkout', '--', 'tool/README.md'], { cwd: repo });
+  });
+
+  it('REFUSES to --write into a README that has uncommitted changes', () => {
+    // The mirror of the dirty-SOURCE refusal above, and the last place the
+    // tool still trusted the desk. `--write` is a whole-file overwrite from a
+    // snapshot taken before the repairs were computed, so on a branch several
+    // agents are editing it discards whatever landed in between -- and the
+    // numbers it stamps in are counted from HEAD, giving a document that
+    // matches neither tree.
+    const pristine = readFileSync(README(), 'utf8');
+    writeFileSync(README(), `${pristine}\nA sentence another agent is still writing.\n`);
+    const dirtyBefore = readFileSync(README(), 'utf8');
+    try {
+      const out = run('--write');
+
+      // POSITIVE CONTROL. Without this the test passes when the tool finds
+      // nothing to repair, which is the same green as a working refusal --
+      // the guard only exists on the `repairs.length > 0` path.
+      assert.match(
+        out,
+        /widget\.rs:99` -> :4\b/,
+        `the tool proposed no repair, so the refusal path was never reached:\n${out}`,
+      );
+      assert.match(out, /REFUSED TO WRITE/, `expected a refusal on a dirty README, got:\n${out}`);
+      assert.equal(
+        readFileSync(README(), 'utf8'),
+        dirtyBefore,
+        'the tool overwrote a README with uncommitted changes',
+      );
+      // It must not claim to have done the thing it just refused to do.
+      assert.doesNotMatch(
+        out,
+        /^REPAIRED/m,
+        `the tool printed REPAIRED for a repair it did not write:\n${out}`,
+      );
+      assert.equal(
+        runStatus('--write'),
+        1,
+        'the refusal exited 0, so any script invoking this tool reads it as done',
+      );
+    } finally {
+      writeFileSync(README(), pristine);
+    }
   });
 
   it('finds citations at all — anti-vacuity', () => {
