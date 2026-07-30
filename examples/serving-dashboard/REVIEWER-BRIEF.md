@@ -5,7 +5,11 @@ that landed on only one code path, the four fields whose captions are wrong, two
 ratios that behave oppositely on purpose, and what we refused to ship.
 
 ```
-MEASURED-AT: 0bc86726          ⛔ STALE — 326 COMMITS BEHIND HEAD 6d7f7d4f (07:13:12).
+MEASURED-AT: ef7c91b9          verified 07:33:25. Prior anchor was `0bc86726`, 326 commits
+                               stale and the same sha @c0de4c2e proved is 210 behind the
+                               dual-green pin. An anchor is the tree I READ, not today's HEAD:
+                               `3b701494` is an ancestor of `ef7c91b9` (three-state merge-base
+                               returns `3b701494` itself, so the two are linear, not divergent).
                                0bc86726 is 04:19:23. IT IS AN ANCESTOR OF HEAD, SO EVERY
                                READING BELOW WAS HONEST WHEN TAKEN. IT IS NOT CURRENT.
 GATE-PIN:    3b701494          ⬅ 06:58:15. THE SHA THE GATE SCORED AND THE ONE TO REVIEW.
