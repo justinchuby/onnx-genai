@@ -179,3 +179,50 @@ test('no state falls through to a blank or an undefined', () => {
     assert.ok(out.title && out.title.length > 0, `${field.state} has no hover text`);
   }
 });
+
+test('an unknown state is refused, never rendered as a measurement', () => {
+  // @0837fdf9 caught this in the old formatFieldText: it branched on the
+  // states it knew and then fell through to `return format(field.value)`, so a
+  // typo or a module written against an older spec rendered its value as
+  // though it had been measured. A default branch that renders as fine is how
+  // AC6 dies quietly, so this one refuses.
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  let out;
+  try {
+    out = formatField({
+      value: 999,
+      state: 'measured', // the value a stale spec would produce
+      source: '/v1/status',
+      sourceClass: SOURCE_CLASSES.SERVER,
+      label: 'Queue depth',
+      unit: 'requests',
+      reason: null,
+      observedAtMs: NOW,
+    });
+  } finally {
+    console.error = originalError;
+  }
+
+  assert.equal(out.text, ABSENT_TEXT, 'must not render the value');
+  assert.ok(!out.text.includes('999'), 'the unverified value must not reach the screen');
+  assert.equal(out.hasValue, false);
+  assert.equal(errors.length, 1, 'and it must be loud, not silent');
+  assert.match(errors[0], /unknown field state/);
+});
+
+test('a custom formatter owns the whole string; the unit is not appended twice', () => {
+  // Found in a browser, not in a test: model-card's formatTokenCount returns
+  // "32,768 tokens" and formatField appended field.unit on top, rendering
+  // "32,768 tokens tokens" on the live page while every unit test passed.
+  const field = measuredField(32768, { source: '/v1/debug/config', unit: 'tokens' });
+  const out = formatField(field, { format: (v) => `${Number(v).toLocaleString()} tokens` });
+  assert.equal(out.text, '32,768 tokens');
+
+  // The default formatter still appends the unit, as every panel expects.
+  assert.equal(formatField(field).text, '32768 tokens');
+
+  // ...and an explicit request still wins, in either direction.
+  assert.equal(formatField(field, { withUnit: false }).text, '32768');
+});

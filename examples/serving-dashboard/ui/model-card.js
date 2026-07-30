@@ -13,7 +13,8 @@
 // This is a shell component, not a dashboard panel, but it follows the same
 // mount(rootElement, telemetryStore) contract so there is one shape to learn.
 
-import { formatFieldText, describeField, FIELD_STATES } from '../telemetry-field.js';
+import { FIELD_STATES } from '../telemetry-field.js';
+import { formatField } from '../format.js';
 
 /**
  * Fields shown on the card, in reading order: identity first, then the two
@@ -85,14 +86,12 @@ export function mountModelCard(rootElement, telemetryStore) {
  * @param {(value: any) => string} [format]
  */
 function renderCardField(element, field, format) {
-  element.textContent = format
-    ? formatFieldText(field, { format })
-    : formatFieldText(field);
+  const rendered = format ? formatField(field, { format }) : formatField(field);
+  element.textContent = rendered.text;
   element.dataset.state = field.state;
 
-  const description = describeField(field);
-  element.title = description;
-  element.setAttribute('aria-label', description);
+  element.title = rendered.title;
+  element.setAttribute('aria-label', rendered.title);
 
   // Absence is never silent: mark it so a reviewer can grep the DOM for any
   // field claiming a value it does not have.

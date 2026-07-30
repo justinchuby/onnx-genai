@@ -456,25 +456,27 @@ export function numericValueOf(field) {
 }
 
 /**
- * The one place the em-dash and the pending ellipsis live. Every panel formats
- * through this so absence looks identical everywhere in the page.
+ * REMOVED: formatFieldText.
  *
- * @param {TelemetryField} field
- * @param {object} [options]
- * @param {(value: any) => string} [options.format] Formatter for the value.
- * @returns {string}
+ * It lived here and had two defects @0837fdf9 caught, both structural rather
+ * than cosmetic:
+ *
+ *  - it branched on `unavailable`, `not-applicable` and `pending`, then fell
+ *    through to `return format(field.value)`. So ANY state it did not know --
+ *    a typo, or a module written against an older spec -- rendered its value
+ *    as though it were a measurement. A default branch that renders as fine is
+ *    how AC6 dies quietly.
+ *  - `stale` returned the bare number, so a dashboard whose server died 12
+ *    seconds ago looked live. Staleness appeared only on hover, which defeats
+ *    the reason the state exists.
+ *
+ * Both are fixed in `format.js`, which handles every state by name and has a
+ * terminal branch for the unknown. Rather than fix them twice, this one is
+ * gone: two rendering paths where one is safe and one is not is the actual
+ * defect, and deleting the unsafe path is the only fix that stays fixed.
+ *
+ * Use `formatField()` from `format.js`.
  */
-export function formatFieldText(field, { format = defaultFormat } = {}) {
-  if (field.state === FIELD_STATES.UNAVAILABLE || field.state === FIELD_STATES.NOT_APPLICABLE) {
-    // Both render an em-dash; the hover text is what distinguishes them, and
-    // describeField() is where that difference is spelled out.
-    return '—';
-  }
-  if (field.state === FIELD_STATES.PENDING) {
-    return '···';
-  }
-  return format(field.value);
-}
 
 /**
  * The tooltip text for a field: what it is, where it came from, how fresh.

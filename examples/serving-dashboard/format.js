@@ -51,6 +51,9 @@ export const SOURCE_CLASS_BADGES = Object.freeze({
   }),
 });
 
+/** Every state this file knows how to render. Anything else is refused. */
+const KNOWN_STATES = new Set(Object.values(FIELD_STATES));
+
 /** Shown instead of a value whenever there is no value. Never a 0. */
 export const ABSENT_TEXT = '—';
 
@@ -98,13 +101,40 @@ export function formatAge(ageMs) {
  *   provenanceWarning: string|null,
  * }}
  */
-export function formatField(
-  field,
-  { format = defaultFormat, withUnit = true, nowMs = Date.now() } = {},
-) {
+export function formatField(field, { format, withUnit, nowMs = Date.now() } = {}) {
+  // A caller who supplies its own formatter owns the ENTIRE display string,
+  // unit included -- `formatTokenCount` returns "32,768 tokens", and appending
+  // field.unit on top of that produced "32,768 tokens tokens" on the live page
+  // while every unit test passed. So the unit is only appended when we did the
+  // formatting ourselves, unless the caller asks otherwise explicitly.
+  const formatValue = format ?? defaultFormat;
+  const appendUnit = withUnit ?? format === undefined;
   const badge = SOURCE_CLASS_BADGES[field.sourceClass] ?? null;
   const present = hasValue(field);
   const isEstimate = field.sourceClass === SOURCE_CLASSES.ESTIMATED;
+
+  // THE TERMINAL BRANCH. Every state is handled BY NAME below; anything else
+  // is a typo or a module written against an older spec, and the one thing it
+  // must never do is render its value as though it were a measurement. A
+  // default branch that renders as fine is how AC6 dies quietly.
+  if (!KNOWN_STATES.has(field.state)) {
+    console.error(
+      `[format] unknown field state ${JSON.stringify(field.state)} for ${
+        field.label ?? 'an unlabelled field'
+      }. Refusing to render its value, because an unrecognised state is not a measurement.`,
+    );
+    return {
+      text: ABSENT_TEXT,
+      state: field.state,
+      badge: badge?.glyph ?? null,
+      badgeLabel: badge?.name ?? null,
+      title: `This value cannot be displayed: its state ${JSON.stringify(field.state)} is not one this page knows how to render.`,
+      hasValue: false,
+      isEstimate: false,
+      ageText: null,
+      provenanceWarning: field.provenanceWarning ?? null,
+    };
+  }
 
   let text;
   let ageText = null;
@@ -112,11 +142,11 @@ export function formatField(
   if (!present) {
     text = field.state === FIELD_STATES.PENDING ? PENDING_TEXT : ABSENT_TEXT;
   } else {
-    const unit = withUnit && field.unit ? ` ${field.unit}` : '';
+    const unit = appendUnit && field.unit ? ` ${field.unit}` : '';
     // The tilde is not decoration. An estimate that looks identical to a
     // measurement IS a fabricated measurement, however carefully the tooltip
     // is worded, because the tooltip is not what gets read.
-    text = `${isEstimate ? '~' : ''}${format(field.value)}${unit}`;
+    text = `${isEstimate ? '~' : ''}${formatValue(field.value)}${unit}`;
 
     if (field.state === FIELD_STATES.STALE) {
       // AC25: the age must be in WORDS. A colour shift alone disappears in
