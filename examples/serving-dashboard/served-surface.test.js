@@ -134,7 +134,11 @@ const servedButNotNeeded = classified.filter(
 // THIS NUMBER COUNTS THE FILES THAT MEASURE IT. Test files are served -- I
 // checked, `/demo/asset-graph.test.js` returns 44356 bytes -- so adding a suite
 // that measures the exposure also enlarges it by one. It was 82 when this file
-// was the only such suite; `fetch-chokepoint.test.js` made it 83. Recording
+// was the only such suite; `fetch-chokepoint.test.js` made it 83, and
+// `frame-metadata.test.js` -- the census asserting every store frame carries
+// its catalogue caption -- makes it 84. A visitor may have that one: it
+// contains no credential, no path, and no fixture, only assertions about
+// captions the page already paints in front of them. Recording
 // that rather than quietly pinning the pre-existing number: a ratchet whose
 // author exempts their own contribution is not a ratchet, and the first
 // exemption is the one that teaches everyone else the number is negotiable.
@@ -142,7 +146,7 @@ const servedButNotNeeded = classified.filter(
 // Raising it is therefore a NORMAL and expected part of adding a guard, and it
 // is not the same act as raising it to accommodate a new document or fixture.
 // The diff shows which one you did.
-const MAX_SERVED_BUT_NOT_NEEDED = 83;
+const MAX_SERVED_BUT_NOT_NEEDED = 84;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
