@@ -347,6 +347,57 @@ enforce it:**
   answer, and no error is ever printed.** ***The two most dangerous words in a
   measurement are the ones nobody thought were a measurement.***
 
+### The closing argument: who is looking is part of the measurement
+
+**Every defect above is one defect wearing different clothes.** We kept building
+instruments that could not tell **nothing** from **something**, and each time we
+found one we assumed it was the last.
+
+**The kind, with named instances — deliberately not a tally, because the count
+is still moving and a number frozen here would rot the way three others in this
+document already did:**
+
+| the instrument said | what was actually true |
+|---|---|
+| `—` (no data) | 46 live observations |
+| `OK: every citation resolves` | the sources were absent; a universal over an empty set is vacuously true, **and its confidence scaled with how much was missing** |
+| a suite of unchanged size | an archive with no `.git` had disarmed ten guards and dropped sixty-six tests |
+| `exit 1` — a defect was found | a tool had crashed with a traceback |
+| a red test | a guard **refusing to run** |
+| a file cited as at-risk | the file did not exist |
+| a spec that never mentioned the P1 | absence makes no claim, so no sweep can ever find it |
+| a green disclosure guard | it read a hardcoded list of three files, and the leak was in the fourth |
+| `-x $binary` — the build is present | a process from an entirely different tree |
+
+**Nothing in that column on the left was a lie.** Each was a correct reading by a
+correctly-built instrument. **They were true, and then they weren't, and nothing
+told us.** *The missing field was never rigour — it was an expiry date.*
+
+**And the last two instances are the ones worth carrying, because they are about
+people rather than tools:**
+
+> ### A layout makes a claim no string-reader can see.
+> ### An `aria-label` leaks through a channel no sighted reviewer can check.
+> ### **Who is looking is part of the measurement.**
+
+**This is why the five-field standard we enforced all session — revision, exit
+code, denominator, positive control, clock — was not enough, and the reason is
+uncomfortable: *every one of those fields gets **stronger** as you measure the
+wrong channel harder.*** Two people checked this page for a path leak in a real
+browser and found clean text and a clean tooltip — **a flawless five-field result
+about a channel that was not leaking.** ***Rigour is orthogonal to aim. A
+discipline that measures only rigour will certify a perfectly-executed
+measurement of the wrong thing.***
+
+**So the sixth field is the one no instrument can supply, and it is the habit
+this release is really arguing for:**
+
+> ### *What would I have seen if I had looked somewhere else?*
+
+**That is the whole product in one line.** The dashboard's job is not to be
+confident. **It is to say `—` when it does not know, and to say it loudly enough
+that you go and look somewhere else.**
+
 ### Verification, at one revision, with denominators
 
 **Every number here carries its revision and its denominator, or it is not
