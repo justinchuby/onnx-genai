@@ -134,23 +134,55 @@ pub(crate) struct HealthResponse {
 /// yet measurable. Rendering either as a zero would claim a measurement.
 #[derive(Debug, Serialize)]
 pub(crate) struct FieldUnavailable {
-    /// One of `unavailable` or `not-applicable`.
+    /// Always one of [`FieldUnavailable::CODES`].
     pub(crate) code: &'static str,
     /// Human-readable explanation, safe to show in a UI.
     pub(crate) detail: &'static str,
 }
 
 impl FieldUnavailable {
+    pub(crate) const UNAVAILABLE: &'static str = "unavailable";
+    pub(crate) const NOT_APPLICABLE: &'static str = "not-applicable";
+    pub(crate) const PENDING: &'static str = "pending";
+
+    /// Every code this server can put on the wire.
+    ///
+    /// This exists to be READ -- by the test below, and by the dashboard's
+    /// cross-boundary contract test, which cannot import a Rust enum and
+    /// otherwise has to grep for string literals.
+    ///
+    /// 🔴 Grepping was not merely inelegant, it UNDER-COUNTED. `pending` used
+    /// to be produced by mutating an already-built `not_applicable` response
+    /// (`u.code = "pending"`), so `grep 'code: "'` found two of the three
+    /// codes and a consumer deriving its vocabulary that way would have been
+    /// green while blind to the state that resolves by waiting -- the one
+    /// state whose whole purpose is to be polled again. A vocabulary that is
+    /// only discoverable by reading control flow is not a contract.
+    pub(crate) const CODES: [&'static str; 3] =
+        [Self::UNAVAILABLE, Self::NOT_APPLICABLE, Self::PENDING];
+
+    /// The mechanism is in play but the number is not measurable yet.
     pub(crate) const fn unavailable(detail: &'static str) -> Self {
         Self {
-            code: "unavailable",
+            code: Self::UNAVAILABLE,
             detail,
         }
     }
 
+    /// The mechanism is not in play on this model at all, so there is nothing
+    /// to wait for. Polling again will not change this answer.
     pub(crate) const fn not_applicable(detail: &'static str) -> Self {
         Self {
-            code: "not-applicable",
+            code: Self::NOT_APPLICABLE,
+            detail,
+        }
+    }
+
+    /// Not determined yet, and it will resolve on its own -- so unlike
+    /// `not_applicable`, a client should keep polling.
+    pub(crate) const fn pending(detail: &'static str) -> Self {
+        Self {
+            code: Self::PENDING,
             detail,
         }
     }
@@ -808,11 +840,12 @@ impl BlockTableResponse {
     /// The decode path is not chosen yet. Distinct from `not_applicable`:
     /// this one will change on its own, and a client should keep polling.
     pub(crate) fn pending(model_id: Option<String>, detail: &'static str) -> Self {
+        // Built from its own constructor rather than by patching a
+        // `not_applicable` response after the fact. The old form produced a
+        // wire value that no constructor mentioned, which made the server's
+        // vocabulary undiscoverable by any means short of reading this method.
         let mut response = Self::not_applicable(model_id, detail);
-        response.unavailable = response.unavailable.map(|mut u| {
-            u.code = "pending";
-            u
-        });
+        response.unavailable = Some(FieldUnavailable::pending(detail));
         response
     }
 

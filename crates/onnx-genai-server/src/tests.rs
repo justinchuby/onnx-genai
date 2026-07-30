@@ -4447,6 +4447,87 @@ async fn kv_blocks_renders_no_numbers_until_paged_kv_is_known_to_be_in_use() {
     }
 }
 
+/// AC141: the server's field-state vocabulary must be DISCOVERABLE, not just
+/// correct.
+///
+/// No test on either side of a process boundary can observe a mismatch across
+/// it, so the dashboard's contract test has to derive the server's vocabulary
+/// somehow -- and the only handle it has is this crate's source. That makes
+/// `FieldUnavailable::CODES` a published contract rather than a convenience,
+/// and this test is what keeps it honest in both directions:
+///
+///   - every code a constructor can emit is a MEMBER of `CODES`, so the
+///     dashboard cannot receive a state it was never told about;
+///   - every member of `CODES` is REACHABLE from a constructor, so we do not
+///     advertise a state the client must handle and the server never sends.
+///
+/// The second direction is the one that would have rotted quietly. A code
+/// listed but never emitted is untestable from the client side -- it can only
+/// ever be handled speculatively.
+#[test]
+fn every_field_state_the_server_can_emit_is_in_its_published_vocabulary() {
+    use crate::routes::FieldUnavailable;
+
+    let emitted = [
+        FieldUnavailable::unavailable("d").code,
+        FieldUnavailable::not_applicable("d").code,
+        FieldUnavailable::pending("d").code,
+    ];
+
+    for code in emitted {
+        assert!(
+            FieldUnavailable::CODES.contains(&code),
+            "the server emits {code:?}, which is not in its published \
+             vocabulary; a client deriving from CODES would meet a state it \
+             was never told about"
+        );
+    }
+    for code in FieldUnavailable::CODES {
+        assert!(
+            emitted.contains(&code),
+            "{code:?} is published but no constructor produces it; a client \
+             must handle a state that can never arrive, and no test on either \
+             side of the boundary can prove it is dead"
+        );
+    }
+    assert_eq!(
+        FieldUnavailable::CODES.len(),
+        emitted.len(),
+        "the vocabulary and the constructors have drifted apart in size"
+    );
+}
+
+/// Regression: `pending` must come from a constructor, not from patching a
+/// built response.
+///
+/// 🔴 It used to be produced by `u.code = "pending"` on an already-built
+/// `not_applicable` response. The wire value was correct, and the vocabulary
+/// was still undiscoverable: `grep 'code: "'` over this crate returned
+/// `unavailable` and `not-applicable` and MISSED `pending` entirely. A
+/// consumer deriving its state set that way would have been green while blind
+/// to the one state whose entire meaning is "poll me again" -- so the failure
+/// would have shown up as a dashboard that waits forever without knowing it
+/// is waiting.
+///
+/// This asserts the string is reachable through the response builder, which is
+/// the path the route actually takes.
+#[test]
+fn the_pending_state_is_reachable_through_the_response_builder() {
+    let value = serde_json::to_value(crate::routes::BlockTableResponse::pending(
+        Some("m".into()),
+        "the driver has not finished selecting a decode path yet",
+    ))
+    .expect("serialise");
+
+    assert_eq!(value["unavailable"]["code"], "pending");
+    assert_eq!(
+        value["unavailable"]["detail"], "the driver has not finished selecting a decode path yet",
+        "the detail must survive the pending path -- patching the code on a \
+         not_applicable response previously risked keeping the wrong reason"
+    );
+    assert_eq!(value["applicable"], false);
+}
+
 /// "We have not determined the decode path yet" and "the decoder does not use
 /// paged KV" are different claims, and only one of them resolves by waiting.
 #[test]
