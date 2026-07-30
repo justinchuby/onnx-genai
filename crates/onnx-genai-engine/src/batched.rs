@@ -652,7 +652,30 @@ impl Engine {
                     })?,
                 )
             }
-            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => {
+            // These two refusals are reported separately because they have
+            // OPPOSITE operator remedies. A past/present model reaching here has
+            // `shared_buffer: false`, which is decided by
+            // `supports_fixed_capacity_present_binding()` -- an execution-provider
+            // capability plus an explicit opt-in -- so the same model on the same
+            // disk can batch or not depending on how the server was launched. A
+            // legacy model cannot batch under any launch. Collapsing them emits
+            // one sentence that tells an operator to change the model when the
+            // real fix may be an environment variable, and vice versa.
+            ModelDecodePath::PastPresent { .. } => {
+                anyhow::bail!(
+                    "continuous batching requires a shared KV buffer, and this \
+                     past/present model is not using one: the execution provider \
+                     did not report fixed-capacity present binding, or it was not \
+                     opted into at launch"
+                );
+            }
+            ModelDecodePath::Legacy => {
+                // This string is pinned CHARACTER BY CHARACTER by the README, by
+                // check-perf-claims.test.js, and by batch_driver.rs's test. It
+                // stays on one line and byte-identical: an operator matches a
+                // quoted error against their own terminal, and reflowing it onto
+                // a continuation would break every one of those without changing
+                // a single thing a reader sees.
                 anyhow::bail!(
                     "continuous batching requires a STATIC-CACHE or shared-buffer past/present model"
                 );
