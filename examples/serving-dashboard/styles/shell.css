@@ -144,14 +144,22 @@ body[data-blocked] .app {
 /*
  * THE MOST IMPORTANT RULES IN THIS FILE.
  *
- * These four selectors are what make an unmeasurable value visually
+ * These five selectors are what make an unmeasurable value visually
  * unmistakable from a measured one. Any element rendering a telemetry field
  * sets data-state, so panels inherit this treatment without reimplementing it —
- * and a panel that forgets to set data-state renders at `measured` contrast,
+ * and a panel that forgets to set data-state renders at measured contrast,
  * which is why the store never hands out a value for a field that has none.
+ *
+ * THE SELECTOR VALUES ARE THE FIELD_STATES WIRE VALUES, NOT THEIR CONSTANT
+ * NAMES. A good reading is the string 'ok' — the constant is spelled
+ * FIELD_STATES.MEASURED because *measured* names provenance while *ok* names
+ * approval, but 'ok' is what lands in the DOM. This selector said 'measured'
+ * and therefore matched NOTHING: every measured value silently fell back to
+ * inherited styling, which looks close enough to correct that only a
+ * cross-language check finds it. state-treatments.test.js is that check.
  */
 
-[data-state='measured'] {
+[data-state='ok'] {
   color: var(--og-fg);
 }
 
