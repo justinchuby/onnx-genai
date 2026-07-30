@@ -4924,3 +4924,132 @@ repository that can decide which `state.rs` a reader is standing in. Adoption is
 rather than quietly qualifying them under freeze.** The repair is the crate-relative
 path — `onnx-genai-server/src/state.rs:25` — which costs nothing and is mine to make
 when the freeze lifts.
+
+---
+
+## R96 — the guard's headline sentence is a measurement of a binary that no longer exists
+
+**Verdict: NOT blocking. But it retires the debate the crew has spent the last
+hour having, and it should be settled before the cap is touched.**
+
+`served-surface.test.js` opens with the clearest sentence in the suite:
+
+> `// Served surface — what a visitor can actually FETCH from /demo/.`
+
+and backs it with the strongest evidence any guard on this branch offers — a
+live HTTP measurement, a byte count, a content type, and a re-run recipe:
+
+> `Result at the time of writing: 111 of 111 served, 0 refused (112 with this file).`
+> `` `/demo/READABILITY-REVIEW.md` returns 61588 bytes of `text/markdown`. ``
+
+**That measurement cannot be reproduced against the code at HEAD, and the reason
+is not that anyone was careless.** `crates/onnx-genai-server/src/demo_assets.rs`
+now carries two refusals that did not exist when the number was taken:
+
+- `const SERVABLE_EXTENSIONS: [&str; 9]` — `html js mjs css json svg png ico woff2`.
+  **`md` is not in it.** Every one of the 16 tracked `.md` files under the demo
+  directory — this document included — returns 404, not 61588 bytes.
+- `name.ends_with(".test.js") || name.ends_with(".test.mjs")` — the whole TEST
+  class, refused by name.
+
+The header is not wrong. **It is a correctly-taken measurement of a binary built
+from a tree in which `demo_assets.rs` did not exist** — the sibling-repo build
+@c0de4c2e identified. Both readings are true; they are true of different servers.
+
+### What the cap actually governs
+
+Replicating `CLASSES` and `classify()` exactly — same order, `find` semantics,
+first match wins — against `ls-tree HEAD`, then filtering by what the server at
+HEAD will actually hand over:
+
+```
+FLOOR tracked            : 125
+unclassified (null)      : 0        <- the guard's own coverage arm is honest
+guard servedButNotNeeded : 94       <- what MAX_SERVED_BUT_NOT_NEEDED = 91 governs
+ACTUALLY fetchable @HEAD : 9        <- what a visitor can reach
+                           10.4x overstatement
+```
+
+The nine, itemised rather than counted, because a number nobody can enumerate is
+how this guard got into trouble in the first place:
+
+```
+absolute-path.mjs                [TOOLING]
+capture-telemetry-fixtures.mjs   [TOOLING]
+dashboard/package.json           [TOOLING]
+design/skeleton.html             [DESIGN]
+fixtures/captures/dynamic.json   [FIXTURE]
+fixtures/captures/manifest.json  [FIXTURE]
+fixtures/captures/scatter.json   [FIXTURE]
+repair-citations.mjs             [TOOLING]
+shipping-tree.mjs                [TOOLING]
+```
+
+**@f6527cc9 got here first and got there by a different route. Their figure was
+8; mine is 9.** I am publishing the gap rather than averaging it — one file
+separates us and neither of us should ship a number the other cannot reproduce.
+**My own first pass said 4, and it was wrong: I omitted the TOOLING class, whose
+`.mjs` and `package.json` members are both on the allowlist.** That is
+self-retraction #13, and it happened inside the finding that corrects everyone
+else's arithmetic.
+
+### Why this does not dissolve the concern — it aims it
+
+The reflex on seeing 94 collapse to 9 is relief. **It should not be.** The single
+most dangerous file the guard ever named is still in the reachable nine:
+`design/skeleton.html` is served as `text/html`, so a browser **renders** it, and
+the paragraph it calls "the entire thesis of this design" asserts the
+prefix-cache `0.0%` is "a real measurement" — a claim this branch has since
+established is a hardcoded constant. **The 85 files that dropped out were the
+harmless ones.** Refusing `.md` and `.test.js` removed exactly the classes nobody
+was worried about and left the one that renders.
+
+### The readability defect, stated in my lane
+
+The guard's name, its header sentence, and its constant all say **fetchable**.
+Its field says something else, and says it correctly:
+
+```
+{ name: 'TEST', needsToBeServed: false, ... }
+const servedButNotNeeded = ...
+```
+
+`needsToBeServed` is a claim about **intent** — should this file be published.
+`fetchable` is a claim about **the server's behaviour**. **Those were the same
+quantity when the header was written, because the server refused nothing.** The
+allowlist made them different quantities and the vocabulary never split.
+
+> ***A predicate and the sentence that names it can be written on the same day,
+> be identically true, and drift apart without either one being edited — because
+> what changed was neither of them. It was the thing they both described.***
+
+This is R91's law with the arrow reversed. There, a stale pin biased a verdict
+toward reporting things as **missing**. Here, a stale measurement biases a guard
+toward reporting things as **exposed**. **A frozen observation of a moving system
+is not merely out of date; its error has a direction, and the direction is set by
+which way the system moved, not by anything in the observation.**
+
+### Recommendation — and it supersedes my own R94
+
+R94 put a third option on the table: drop the TEST class, ratchet the remaining
+30. **I withdraw it as the best option.** It was reasoning about the right number
+in the wrong units.
+
+- ⛔ **Do not raise 91 to 94.** Unchanged from R94, and now for a stronger reason:
+  it buys a lease on a quantity that is 10.4x larger than the risk.
+- ⛔ **Do not lower 91 to 9 under freeze either.** That is a real code change to a
+  guard whose predicate is wrong; changing the constant leaves the wrong
+  predicate in place and hides the defect behind a green.
+- ✅ **Correct the header sentence and disclose the delta in the PR body.** The
+  measurement should read as what it is: *"111 of 111 at the time of writing,
+  against a build predating `demo_assets.rs`. At HEAD the extension allowlist and
+  the `.test.js` refusal reduce the reachable set to 9; see the itemisation."*
+  A sentence is not a code change, and this one is the only artefact currently
+  telling a reviewer something false.
+- ✅ **The PR body names `design/skeleton.html`,** not the count. The count has
+  been wrong in three different ways tonight; the file has been dangerous in
+  exactly one way the whole time.
+
+**The cap is not the finding. The cap was never the finding. Nine files are
+reachable, one of them renders a false claim as a web page, and we spent an hour
+negotiating a constant that governs eighty-five files the server already refuses.**
