@@ -9,6 +9,67 @@ Every claim below is stamped with the short HEAD it was verified at, read via
 The tree moved under us repeatedly while this was written, which is why the
 stamps differ between sections. A stamp makes a claim **dated, not true**.
 
+
+---
+
+## 0.0 Six rules that outrank everything else in this document
+
+Added at `d262a2bf`, 02:47, after the branch moved under the rest of this brief.
+Each was verified by the Secretary against committed bytes, not relayed. Where a
+claim below contradicts a later section, **this section wins** — it is newer.
+
+**1. Before you blame a code path, prove it ran.** The server benchmarked all
+night had its continuous batch driver **disabled**; `driver.rs` logs
+`"continuous batch driver disabled; using per-request engine path"` and takes a
+per-request fallback. Every batching number we produced describes a machine that
+was not batching, and a row count of `1` was the *honest* answer for that path.
+A mechanism that explains your symptom perfectly is not evidence it was involved.
+
+**2. A green suite is not evidence.** Live defects currently sit *inside* a fully
+green run, and most have no test that could ever fail — they are not places the
+suite went red, they are places no test was ever pointed. The sharpest instance:
+`dashboard/scheduling.js` hardcodes the caption `'Batch limit'` over a value that
+is `min(max_batch, max_queue_depth)`, overriding the catalogue's
+`'Effective batch capacity'`. Hundreds of tests passed above that pixel.
+**A clean working tree and a green suite are the same shape of non-evidence, and
+both are most dangerous because they are most reassuring.**
+
+**3. A sha without its tree state is not a coordinate.** One reviewer measured 18
+failures on a dirty tree and near-total green **at the same sha**; the failures
+were colleagues' in-flight edits. Filing them would have been seventeen false
+defects against two people, each perfectly reproducible by the filer and
+impossible for anyone else. **Quote the sha and `git status --porcelain`, always.**
+
+**4. Run the suite in a git worktree, not an extracted archive.** Two test files
+shell out to `git rev-parse --show-toplevel`. In a `git archive` extract there is
+no `.git`, so they fail — and they take their whole files down with them, losing
+58 tests *silently* while reporting a plausible count. A hermetic container and a
+suite that asks the environment who it is are incompatible.
+Use `git worktree add --detach`, confirm `porcelain 0`, and **assert a floor**
+(`tests >= 500`) so a run that covers half the tree cannot report success.
+
+**5. An emphatic ruling decays at exactly the same rate as a tentative one, and
+is obeyed longer.** A ruling issued here as "ninth and final" was retracted: it
+named `FIELD_STATES.OK`, which is `undefined`. Obeying it would have compared
+every field against `undefined` — never true, no error, no warning — and blanked
+every measurement on the page **while keeping every test green**. The enum is
+five states, long spelling; `telemetry-field.js` carries the incident in its own
+doc comment. **If a ruling contradicts the disk, the disk wins.**
+
+**6. Nothing on this branch has been opened in a browser.** All three reviewers
+independently refused to let their sign-off be read as browser verification. The
+remaining questions — does the page render, does it render *correctly* — are not
+answerable from a terminal, and no number of code reviews closes them.
+
+### And one about this document
+
+`grep` cannot see negation. The string `'Batch limit'` appears in
+`dashboard/honesty.test.js` in a list of spellings a lint **must catch** and in a
+list it **must not** — nine lines apart, identical to any search, opposite in
+meaning. A hit tells you a test *mentions* a string; it tells you nothing about
+whether the test **requires** or **forbids** it, and those prescribe opposite
+edits. We ruled *execute, don't grep* for values hours ago. **The same rule
+applies to assertions, and the `!` is invisible to every tool we own.**
 ---
 
 ## 0. Stand in the right worktree, or every answer below is wrong
