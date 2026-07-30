@@ -169,11 +169,40 @@ single 24-token completion ~2.2 s; four concurrent 32-token completions ~8.7 s
 total. **Timings are not a pass criterion** — they vary ~10% with background
 load alone.
 
-### 5. Only now promote it
+### 5. Only now promote it — to a NEW directory, never onto an existing one
 
 ```bash
-mv /tmp/qwen-scatter models/qwen2.5-0.5b-scatter-v2
+# The destination MUST NOT EXIST. Bump the version rather than replacing.
+test ! -e models/qwen2.5-0.5b-scatter-v3 || { echo "destination exists; bump the version"; exit 1; }
+mv /tmp/qwen-scatter models/qwen2.5-0.5b-scatter-v3
+scripts/verify_model.sh models/qwen2.5-0.5b-scatter-v3   # RE-VERIFY AT THE FINAL PATH
 ```
+
+> **☠️ AN EARLIER VERSION OF THIS STEP SAID `mv /tmp/qwen-scatter
+> models/qwen2.5-0.5b-scatter-v2`, AND ITS FAILURE MODE IS SILENT.** `models/`
+> is gitignored, so `-v2` is the only copy of the only known-good static model
+> in the project and @fc8b5d97's performance baseline is measured against it.
+> But it would not have been *destroyed*, which is the part worth understanding:
+>
+> **`mv src dst` where `dst` is an existing directory moves `src` INSIDE it**,
+> producing `…-v2/qwen-scatter/`. `resolve_model_path`
+> (`crates/onnx-genai-ort/src/loader.rs:398-400`) scans with
+> **`std::fs::read_dir` — non-recursive — and filters on `path.is_file()`**, so
+> the nested copy is invisible to it. It does *not* trip the multiple-`.onnx`
+> hard error documented above. The directory still resolves, and it resolves to
+> the **original** `model.onnx`.
+>
+> **So the promotion silently does nothing, and everything downstream passes —
+> against the model you believed you had just replaced.** `verify_model.sh`
+> would certify it, because the model it loaded genuinely is good. The tool
+> built to prevent false confidence becomes the thing producing it.
+>
+> **This is why step 5 re-runs verification at the FINAL path.** Verifying an
+> artifact at the path where it was *built* proves nothing about the path where
+> it will be *used*, and every step between the two is unverified.
+
+Leave `-v2` in place. Nothing needs to be deleted; a superseded model dir costs
+disk and removes a rollback.
 
 ## Gotchas
 
