@@ -1796,3 +1796,68 @@ footnote:** a retraction, a confession and a self-assigned error rate are all *m
 they get the same treatment as any other measurement in this PR — a positive control, a stated
 instrument, and a revision. Several in this document have been re-measured for exactly that
 reason. **The ones that survived are cited. The one that did not is the paragraph you just read.**
+
+## The exposure ratchet: a publishing decision, made deliberately, in writing
+
+The served-surface guard is red at HEAD. It is not reporting a defect, and it should not be
+silenced. It is refusing to let a publishing decision happen by accumulation — which is the best
+thing any guard on this branch does. Two agents proposed opposite remedies, and the choice
+between them is a product decision rather than a code one, so it is recorded here.
+
+**Measured by me at HEAD, with the guard read from source:**
+
+```
+served-surface.test.js @ HEAD — 327 lines
+  :204  const MAX_SERVED_BUT_NOT_NEEDED = 91      <- was 85 at the review point
+  :108  INTERNAL_DOC  matches /\.md$/
+  :107  DESIGN · :110 TOOLING · :114 FIXTURE
+
+tracked .md under the served root ............. 16
+  of those carrying the operator's home dir ....  8   <- MY count, at HEAD
+  [NEG CTL] .............................. 0
+```
+
+### Why raising the cap is the wrong instrument
+
+The numerator mixes two populations whose exposure means opposite things:
+
+| class | why it is in the numerator | what a rise means |
+|---|---|---|
+| TEST (the large majority) | we wrote a guard | **quality work happened** |
+| FIXTURE, TOOLING | we added a fixture | build hygiene |
+| INTERNAL_DOC | we wrote a review document | **a real publishing decision** |
+
+> **Every test file this crew wrote tonight incremented a counter named "exposure." The harder
+> the review worked, the redder the ship gate got. A metric that moves against you when you do
+> the right thing will be raised until it stops meaning anything — and raising it is exactly
+> what "just bump 91 to 93" does.**
+
+Raising the cap launders the one signal in the number that matters. **The correct change is
+stricter, not looser: drop the TEST class out of the numerator and ratchet the remainder — the
+documents and tooling — at its true, much smaller count.** That is a tighter bound on precisely
+the class the guard was written to catch, and it removes a feedback loop in which writing a test
+is arithmetically indistinguishable from leaking a document.
+
+### The sentence the guard asks for, which is the actual deliverable
+
+The guard demands that whoever moves the number say why a visitor may have these files. Here it
+is, and it is a decision, not a description:
+
+> **The internal review documents stay in the served directory and are not published. They are
+> refused by the extension allowlist — `md` is not in `SERVABLE_EXTENSIONS` — and moving them
+> out would rot citations across the review corpus for no gain in safety. This is accepted
+> deliberately and with a known cost: eight of them contain the operator's home directory, so
+> the allowlist is doing secrecy work, and it is documented as a rendering concern. Adding
+> `md` to that list publishes eight files containing a real filesystem path. Anyone who adds it
+> must move those files first.**
+
+**That last sentence is the product requirement, and it belongs in a test rather than in this
+paragraph**, because a PR body is read once and an assertion is read every time someone changes
+the file. Filed as such: the invariant is that `md` is absent from `SERVABLE_EXTENSIONS`, and the
+assertion message should name the cost so it reddens in front of the person adding it, for a
+reason they can act on.
+
+**Not landed here.** The constant, the class change and the new assertion are three edits to two
+files I do not own, under a freeze, in the last hour. This section supplies the decision and the
+justification the guard asked for; whoever holds those files can land them in one commit with
+this text as the rationale.
