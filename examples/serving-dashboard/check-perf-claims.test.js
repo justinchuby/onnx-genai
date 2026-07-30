@@ -163,14 +163,40 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   const RATIO = /\b2\.4[5-9]\s*×|\b2\.5\s*×|\b2\.46\b|\bratio[^.\n]{0,40}2\.[45]/i;
   const ARMS = /\b0\.62\s*×|\b82\.\d{3}\s*tok|\b33\.\d{3}\s*tok|\+147\s*%/;
 
-  // PERMANENT exclusions. The bar is a reason that is true of the FILE'S
-  // CONTENT and can never stop being true. "Somebody else owns it" does not
-  // clear that bar: ownership is fixed, content is not, so an ownership reason
-  // produces an entry that outlives the condition it was written for.
-  const EXEMPT = new Set([
-    // The lab notebook. It records what was run and must keep its raw samples,
-    // or we destroy the evidence that the claim was unsafe.
-    'perf-baseline.md',
+  // PERMANENT exclusions, SCOPED TO A PATTERN CLASS RATHER THAN TO A FILE.
+  //
+  // The bar is a reason that is true of the FILE'S CONTENT and can never stop
+  // being true. "Somebody else owns it" does not clear that bar: ownership is
+  // fixed, content is not, so an ownership reason produces an entry that
+  // outlives the condition it was written for.
+  //
+  // WHY THIS IS NO LONGER A WHOLE-FILE EXCLUSION. It used to remove the file
+  // from `docs` entirely, which meant the ONE bucket with no expiry and no
+  // vicinity discipline was also the STRONGEST bucket -- `DEFERRED`, the weaker
+  // notation, had both. The lab notebook was therefore the only document in the
+  // corpus that could state the withdrawn CONCLUSION with nothing nearby, and
+  // no instrument would ever say so.
+  //
+  // Measured before narrowing it, because the exemption is load-bearing and
+  // deleting it outright would have destroyed the evidence it protects:
+  //   perf-baseline.md   RATIO (the conclusion) : 5 matches, 0 uncovered
+  //                      ARMS  (raw samples)    : 10 matches, 9 uncovered
+  // The raw samples are what must survive -- a lab notebook that cannot keep
+  // its own numbers stops being evidence that the claim was unsafe. The
+  // conclusion is already withdrawn at every site. So the exemption buys
+  // exactly nothing on RATIO today, and narrowing it costs nothing today and
+  // catches the next person who writes the ratio into the notebook bare.
+  //
+  // The rule this encodes is the QA owner's, in their words: RAW SAMPLES ARE
+  // EXEMPT, A CONCLUSION NEVER IS.
+  const SAMPLE_ONLY_EXEMPT = new Map([
+    [
+      'perf-baseline.md',
+      'The lab notebook. It records what was run and must keep its raw per-arm '
+        + 'samples, or we destroy the evidence that the claim was unsafe. This '
+        + 'excuses the ARMS figures ONLY -- the withdrawn ratio itself is held '
+        + 'to the same vicinity rule as every other document.',
+    ],
   ]);
 
   // Documents that still carry the figure and belong to someone else. The tree
@@ -201,8 +227,7 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
     .toString()
     .split('\n')
-    .filter((f) => f.endsWith('.md'))
-    .filter((f) => !EXEMPT.has(f));
+    .filter((f) => f.endsWith('.md'));
 
   // ---------------------------------------------------------------------
   // DECLARE THE CORPUS.
@@ -251,7 +276,7 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   const unexamined = repoMd.filter((f) => !f.startsWith(prefix));
   const say = (s) => console.log(`CORPUS-SCOPE: ${s}`);
   say(`this guard reads ${docs.length} .md file(s), and ONLY under ${prefix}`);
-  say(`  in-scope, exempted : ${EXEMPT.size} (${[...EXEMPT].join(', ')})`);
+  say(`  raw-sample exempt  : ${SAMPLE_ONLY_EXEMPT.size} (${[...SAMPLE_ONLY_EXEMPT.keys()].join(', ')}) — ARMS figures only; the withdrawn RATIO is scanned in these files like everywhere else`);
   say(`  in-scope, deferred : ${Object.keys(DEFERRED).length} (${Object.keys(DEFERRED).join(', ')})`);
   say(`  NOT EXAMINED AT ALL: ${unexamined.length} of ${repoMd.length} .md file(s) tracked in this repository`);
   for (const f of unexamined.slice(0, 5)) say(`      e.g. ${f}`);
@@ -261,6 +286,7 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // ---------------------------------------------------------------------
 
   const stillDirty = new Set();
+  const sampleExemptionUsed = new Set();
 
   let inspected = 0;
   const offenders = [];
@@ -285,9 +311,19 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
     const RETRACTION = /withdraw|withdrew|withdrawn|retract|no longer claim|deleted rather than hedged|used to (?:print|state|lead)/i;
     const WINDOW = 600;
 
-    for (const re of [RATIO, ARMS]) {
+    for (const [label, re] of [['RATIO', RATIO], ['ARMS', ARMS]]) {
+      // The raw-sample exemption applies HERE and only here: to the ARMS
+      // figures, in the documents that must retain them. RATIO falls through
+      // to the ordinary vicinity rule in every document without exception.
+      //
+      // The matches are still COUNTED before being excused. Skipping the scan
+      // outright would mark the exemption "used" on a file that no longer
+      // contains a single raw sample, which is precisely the stale-entry
+      // failure the DEFERRED bucket already guards against.
+      const excuseArms = label === 'ARMS' && SAMPLE_ONLY_EXEMPT.has(doc);
       const m = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
       for (const hit of text.matchAll(m)) {
+        if (excuseArms) { sampleExemptionUsed.add(doc); continue; }
         const near = text.slice(
           Math.max(0, hit.index - WINDOW),
           hit.index + hit[0].length + WINDOW,
@@ -310,6 +346,32 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
     RATIO.test('aggregate was 2.46× single-request') && ARMS.test('+147 %'),
     'the withdrawn-ratio matchers no longer fire against a synthetic positive '
       + 'control — this guard has gone blind and would pass on any tree.',
+  );
+
+  // Anti-rot, the SAME rule the deferrals get, now applied to the bucket that
+  // never had it. A raw-sample exemption for a document with no raw samples
+  // left is an entry that outlived its reason -- and the direction that never
+  // gets reported is the one where the gap has quietly closed.
+  const staleSampleExemptions = [...SAMPLE_ONLY_EXEMPT.keys()]
+    .filter((d) => docs.includes(d))
+    .filter((d) => !sampleExemptionUsed.has(d));
+  assert.deepEqual(
+    staleSampleExemptions,
+    [],
+    `These documents hold a raw-sample exemption but no longer contain a single `
+      + `per-arm figure: ${staleSampleExemptions.join(', ')}. The reason the `
+      + 'exemption was granted is gone, so delete the entry and let the gate '
+      + 'cover the file for real.',
+  );
+
+  // And the exemption must not have quietly become a whole-file pass. If the
+  // notebook stops being scanned for the RATIO, this guard is back to where it
+  // started and nothing else in the file would say so.
+  assert.ok(
+    [...SAMPLE_ONLY_EXEMPT.keys()].every((d) => docs.includes(d)),
+    'a raw-sample-exempt document is missing from the scanned corpus — the '
+      + 'exemption has widened from a pattern class back to the whole file, '
+      + 'which is the defect this bucket was split to fix.',
   );
 
   // Anti-rot: a deferral for a document that is already clean is a lie.
