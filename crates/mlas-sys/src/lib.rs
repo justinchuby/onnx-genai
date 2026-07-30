@@ -238,6 +238,8 @@ const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS
 static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+static MLAS_PARALLEL_FOR_BLOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MLAS_PARALLEL_FOR_BLOCKS_CLAIMED: AtomicUsize = AtomicUsize::new(0);
 
 /// Snapshot of the vendored-MLAS standalone threading backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -250,6 +252,10 @@ pub struct MlasThreadingStats {
     pub serial_fallback_calls: usize,
     /// Degree of parallelism reported to MLAS by `MlasGetMaximumThreadCount`.
     pub pool_threads: usize,
+    /// Number of MLAS callbacks run through ORT-style dynamic block claiming.
+    pub dynamic_block_calls: usize,
+    /// Number of individual MLAS work-item blocks claimed dynamically.
+    pub dynamic_blocks_claimed: usize,
 }
 
 /// Return the current MLAS backend stats. Intended for diagnostics and microbenchmarks.
@@ -259,6 +265,8 @@ pub fn mlas_threading_stats() -> MlasThreadingStats {
         scheduled_iterations: MLAS_PARALLEL_FOR_ITERATIONS.load(Ordering::Relaxed),
         serial_fallback_calls: MLAS_PARALLEL_FOR_FALLBACKS.load(Ordering::Relaxed),
         pool_threads: mlas_threading_degree(),
+        dynamic_block_calls: MLAS_PARALLEL_FOR_BLOCK_CALLS.load(Ordering::Relaxed),
+        dynamic_blocks_claimed: MLAS_PARALLEL_FOR_BLOCKS_CLAIMED.load(Ordering::Relaxed),
     }
 }
 
@@ -267,6 +275,86 @@ pub fn reset_mlas_threading_stats() {
     MLAS_PARALLEL_FOR_CALLS.store(0, Ordering::Relaxed);
     MLAS_PARALLEL_FOR_ITERATIONS.store(0, Ordering::Relaxed);
     MLAS_PARALLEL_FOR_FALLBACKS.store(0, Ordering::Relaxed);
+    MLAS_PARALLEL_FOR_BLOCK_CALLS.store(0, Ordering::Relaxed);
+    MLAS_PARALLEL_FOR_BLOCKS_CLAIMED.store(0, Ordering::Relaxed);
+}
+
+/// MLAS `MlasQNBitGemmBatch` thread partitioning for a single call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SQNBitMlasPartition {
+    /// Complexity-derived target after MLAS caps it to `max_threads * 8`.
+    pub target_thread_count: usize,
+    /// Number of N/M tiles MLAS passes to `MlasTrySimpleParallel` per GEMM.
+    pub threads_per_gemm: usize,
+    /// M tile count (`ceil(M / 128)`).
+    pub thread_count_m: usize,
+    /// N tile count (`ceil(N / stride_n)`).
+    pub thread_count_n: usize,
+    /// M tile width, fixed by MLAS QNBit.
+    pub stride_m: usize,
+    /// N tile width after MLAS aligns the complexity-derived split to 16 columns.
+    pub stride_n: usize,
+    /// Total work-item count passed to the thread-pool callback.
+    pub work_items: usize,
+    /// ORT `SimpleParallelFor` work items: at most one claimant per pool lane.
+    pub ort_claimants: usize,
+    /// ORT `LoopCounter` shards: at most eight, capped by pool lanes and blocks.
+    pub ort_loop_counter_shards: usize,
+}
+
+/// Reproduce the QNBit partition calculation in MLAS's `MlasQNBitGemmBatch`.
+pub fn sqnbit_mlas_partitioning(
+    m: usize,
+    n: usize,
+    k: usize,
+    batch_n: usize,
+    max_threads: usize,
+) -> SQNBitMlasPartition {
+    const THREAD_COMPLEXITY: usize = 65_536;
+    const STRIDE_N_ALIGN: usize = 16;
+    const STRIDE_M: usize = 128;
+    const MAX_LOOP_COUNTER_SHARDS: usize = 8;
+
+    assert!(batch_n > 0, "batch_n must be non-zero");
+    let complexity = m
+        .saturating_mul(n)
+        .saturating_mul(k)
+        .saturating_mul(batch_n);
+    let maximum_thread_count = max_threads.max(1).saturating_mul(8);
+    let mut target_thread_count = complexity / THREAD_COMPLEXITY + 1;
+    target_thread_count = target_thread_count.min(maximum_thread_count);
+
+    let mut threads_per_gemm = (target_thread_count / batch_n).max(1);
+    let mut nc = n;
+    if threads_per_gemm > 1 {
+        let blocked_m = m.div_ceil(STRIDE_M);
+        let max_nc = n.saturating_mul(blocked_m).div_ceil(threads_per_gemm);
+        if max_nc < nc {
+            nc = nc.min(max_nc.div_ceil(STRIDE_N_ALIGN) * STRIDE_N_ALIGN);
+        }
+    }
+
+    let thread_count_m = m.div_ceil(STRIDE_M);
+    let thread_count_n = n.div_ceil(nc);
+    threads_per_gemm = thread_count_m * thread_count_n;
+    let work_items = threads_per_gemm * batch_n;
+    let ort_claimants = max_threads.max(1).min(work_items.max(1));
+    let ort_loop_counter_shards = work_items
+        .min(MAX_LOOP_COUNTER_SHARDS)
+        .min(max_threads.max(1))
+        .max(1);
+
+    SQNBitMlasPartition {
+        target_thread_count,
+        threads_per_gemm,
+        thread_count_m,
+        thread_count_n,
+        stride_m: STRIDE_M,
+        stride_n: nc,
+        work_items,
+        ort_claimants,
+        ort_loop_counter_shards,
+    }
 }
 
 fn default_mlas_thread_count() -> usize {
@@ -317,7 +405,10 @@ unsafe extern "C" fn work_stealing_parallel_for(
     // output partition, so concurrent invocation is race-free.
     let task_ctx = task_ctx as usize;
     if let Some(pool) = global_mlas_pool() {
-        pool.parallel_for(0, iterations as usize, 1, |begin, end| {
+        let total = iterations as usize;
+        MLAS_PARALLEL_FOR_BLOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+        MLAS_PARALLEL_FOR_BLOCKS_CLAIMED.fetch_add(total, Ordering::Relaxed);
+        pool.parallel_for(0, total, 1, |begin, end| {
             for tid in begin..end {
                 // SAFETY: `task_ctx` is valid for the whole MLAS call that
                 // drives this parallel-for; each `tid` touches a disjoint
@@ -1983,6 +2074,26 @@ mod tests {
             stats.serial_fallback_calls, 0,
             "work-stealing backend should be available"
         );
+    }
+
+    #[test]
+    fn sqnbit_partitioning_matches_mlas_qwen3_shapes() {
+        let threads = 8usize;
+        let cases = [
+            (1024usize, 16usize, 64usize),
+            (2048, 32, 64),
+            (3072, 48, 64),
+            (5120, 64, 80),
+            (8192, 64, 128),
+        ];
+        for &(n, expected_tiles, expected_stride_n) in &cases {
+            let p = sqnbit_mlas_partitioning(1, n, 1024, 1, threads);
+            assert_eq!(p.work_items, expected_tiles, "N={n}: {p:?}");
+            assert_eq!(p.thread_count_n, expected_tiles, "N={n}: {p:?}");
+            assert_eq!(p.stride_n, expected_stride_n, "N={n}: {p:?}");
+            assert_eq!(p.ort_claimants, threads, "N={n}: {p:?}");
+            assert_eq!(p.ort_loop_counter_shards, 8, "N={n}: {p:?}");
+        }
     }
 
     #[test]

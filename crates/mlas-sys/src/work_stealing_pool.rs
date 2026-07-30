@@ -2,9 +2,9 @@
 //!
 //! This is the Rust-side prototype of the ORT/Eigen design: workers are created
 //! once, stay in a spin-then-park loop between dispatches, and each parallel-for
-//! publishes per-worker shards that idle workers can steal from. The API accepts
-//! stack-borrowing closures because `parallel_for` does not return until every
-//! worker has left the closure.
+//! publishes ORT-style `LoopCounter` shards that workers dynamically claim from.
+//! The API accepts stack-borrowing closures because `parallel_for` does not
+//! return until every worker has left the closure.
 
 use std::cell::UnsafeCell;
 use std::panic::{self, AssertUnwindSafe};
@@ -18,6 +18,7 @@ type JobFn = unsafe fn(*const (), usize, usize);
 const SPIN_LOOP_BUDGET: usize = 1 << 12;
 const YIELD_ROUNDS: usize = 64;
 const PARK_TIMEOUT: Duration = Duration::from_micros(50);
+const MAX_LOOP_COUNTER_SHARDS: usize = 8;
 
 #[repr(align(128))]
 struct PaddedAtomicUsize(AtomicUsize);
@@ -40,12 +41,12 @@ impl PaddedAtomicUsize {
     }
 }
 
-struct WorkerQueue {
+struct LoopCounterShard {
     next: PaddedAtomicUsize,
     end: PaddedAtomicUsize,
 }
 
-impl WorkerQueue {
+impl LoopCounterShard {
     fn new() -> Self {
         Self {
             next: PaddedAtomicUsize::new(0),
@@ -61,7 +62,9 @@ struct Job {
     begin: usize,
     end: usize,
     grain: usize,
-    chunks: usize,
+    num_shards: usize,
+    work_items: usize,
+    claims: usize,
 }
 
 impl Job {
@@ -72,7 +75,9 @@ impl Job {
             begin: 0,
             end: 0,
             grain: 1,
-            chunks: 0,
+            num_shards: 1,
+            work_items: 0,
+            claims: 0,
         }
     }
 }
@@ -84,7 +89,8 @@ struct Shared {
     active: AtomicUsize,
     shutdown: AtomicBool,
     panicked: AtomicBool,
-    queues: Vec<WorkerQueue>,
+    shards: Vec<LoopCounterShard>,
+    thread_count: usize,
     job: UnsafeCell<Job>,
 }
 
@@ -95,10 +101,11 @@ unsafe impl Sync for Shared {}
 ///
 /// The pool is intentionally small and synchronous: at most one `parallel_for`
 /// may run at a time, and the caller blocks until all worker threads complete.
-/// Work is published as a set of fixed-size chunks, initially striped across
-/// worker-local queues; when one worker runs out, it atomically steals chunks
-/// from the other queues. This mirrors the ORT `LoopCounter` property that a
-/// delayed worker does not strand an entire static shard.
+/// Work is published exactly like ORT's `ParallelForFixedBlockSizeScheduling`:
+/// at most one work item per pool lane, up to eight `LoopCounter` shards, and a
+/// fixed block size (`grain`). Each work item starts at its home shard and
+/// atomically claims the next block, then scans the remaining shards. A delayed
+/// worker therefore cannot strand a static range behind a barrier.
 pub struct WorkStealingThreadPool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
@@ -119,7 +126,10 @@ impl WorkStealingThreadPool {
             active: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
-            queues: (0..thread_count).map(|_| WorkerQueue::new()).collect(),
+            shards: (0..MAX_LOOP_COUNTER_SHARDS)
+                .map(|_| LoopCounterShard::new())
+                .collect(),
+            thread_count,
             job: UnsafeCell::new(Job::empty()),
         });
 
@@ -151,7 +161,7 @@ impl WorkStealingThreadPool {
 
     /// Degree of parallelism, including the caller thread.
     pub fn thread_count(&self) -> usize {
-        self.shared.queues.len()
+        self.shared.thread_count
     }
 
     /// Run `body(start, end)` over `[begin, end)` using chunks of at least `grain`.
@@ -172,16 +182,29 @@ impl WorkStealingThreadPool {
             return;
         }
 
-        let chunks = len.div_ceil(grain);
+        let num_blocks = len / grain;
+        let claims = len.div_ceil(grain);
+        let num_shards = loop_counter_shards(len, self.thread_count(), grain);
+        let work_items = self.thread_count().min(num_blocks.max(1));
         let _dispatch_guard = self.dispatch_lock.lock().unwrap();
         self.shared.panicked.store(false, Ordering::Relaxed);
 
-        let lanes = self.thread_count();
-        for (lane, queue) in self.shared.queues.iter().enumerate() {
-            let start = lane * chunks / lanes;
-            let end = (lane + 1) * chunks / lanes;
-            queue.next.store(start, Ordering::Relaxed);
-            queue.end.store(end, Ordering::Relaxed);
+        let blocks_per_shard = num_blocks / num_shards;
+        let iterations_per_shard = blocks_per_shard * grain;
+        for (shard_idx, shard) in self.shared.shards.iter().enumerate() {
+            if shard_idx < num_shards {
+                let start = shard_idx * iterations_per_shard;
+                let end = if shard_idx + 1 == num_shards {
+                    len
+                } else {
+                    (shard_idx + 1) * iterations_per_shard
+                };
+                shard.next.store(start, Ordering::Relaxed);
+                shard.end.store(end, Ordering::Relaxed);
+            } else {
+                shard.next.store(0, Ordering::Relaxed);
+                shard.end.store(0, Ordering::Relaxed);
+            }
         }
 
         unsafe fn call<F>(data: *const (), begin: usize, end: usize)
@@ -199,13 +222,19 @@ impl WorkStealingThreadPool {
                 begin,
                 end,
                 grain,
-                chunks,
+                num_shards,
+                work_items,
+                claims,
             };
         }
 
-        self.shared.remaining.store(chunks, Ordering::Release);
+        self.shared.remaining.store(claims, Ordering::Release);
         self.shared.epoch.fetch_add(1, Ordering::Release);
-        for worker in &self.worker_threads {
+        for worker in self
+            .worker_threads
+            .iter()
+            .take(work_items.saturating_sub(1))
+        {
             worker.unpark();
         }
 
@@ -301,15 +330,22 @@ fn run_job(shared: &Shared, worker_id: usize) {
     let Some(call) = job.call else {
         return;
     };
+    if worker_id >= job.work_items {
+        return;
+    }
 
+    let home_shard = worker_id % job.num_shards;
+    let mut shard = home_shard;
     while !shared.panicked.load(Ordering::Acquire) {
-        let chunk = claim_chunk(shared, worker_id).or_else(|| steal_chunk(shared, worker_id));
-        let Some(chunk) = chunk else {
+        let Some((iter_begin, iter_end)) =
+            claim_iterations(shared, home_shard, &mut shard, job.grain, job.num_shards)
+        else {
             break;
         };
-        debug_assert!(chunk < job.chunks);
-        let begin = job.begin + chunk * job.grain;
-        let end = job.end.min(begin + job.grain);
+        debug_assert!(iter_begin < job.end - job.begin);
+        debug_assert!(iter_begin / job.grain <= job.claims);
+        let begin = job.begin + iter_begin;
+        let end = job.begin + iter_end.min(job.end - job.begin);
         shared.active.fetch_add(1, Ordering::AcqRel);
         let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
             call(job.data, begin, end);
@@ -323,25 +359,43 @@ fn run_job(shared: &Shared, worker_id: usize) {
     }
 }
 
-fn claim_chunk(shared: &Shared, queue_id: usize) -> Option<usize> {
-    let queue = &shared.queues[queue_id];
-    let end = queue.end.load(Ordering::Relaxed);
-    if queue.next.load(Ordering::Relaxed) >= end {
-        return None;
-    }
-    let chunk = queue.next.fetch_add(1, Ordering::AcqRel);
-    (chunk < end).then_some(chunk)
-}
+fn claim_iterations(
+    shared: &Shared,
+    home_shard: usize,
+    shard: &mut usize,
+    block_size: usize,
+    num_shards: usize,
+) -> Option<(usize, usize)> {
+    loop {
+        let counter = &shared.shards[*shard];
+        let end = counter.end.load(Ordering::Relaxed);
+        if counter.next.load(Ordering::Relaxed) < end {
+            let start = counter.next.fetch_add(block_size, Ordering::AcqRel);
+            if start < end {
+                return Some((start, (start + block_size).min(end)));
+            }
+        }
 
-fn steal_chunk(shared: &Shared, worker_id: usize) -> Option<usize> {
-    let workers = shared.queues.len();
-    for offset in 1..workers {
-        let victim = (worker_id + offset) % workers;
-        if let Some(chunk) = claim_chunk(shared, victim) {
-            return Some(chunk);
+        *shard = (*shard + 1) % num_shards;
+        if *shard == home_shard {
+            return None;
         }
     }
-    None
+}
+
+fn loop_counter_shards(
+    num_iterations: usize,
+    degree_of_parallelism: usize,
+    block_size: usize,
+) -> usize {
+    let num_blocks = num_iterations / block_size;
+    let mut num_shards = if num_blocks == 0 {
+        1
+    } else {
+        num_blocks.min(MAX_LOOP_COUNTER_SHARDS)
+    };
+    num_shards = num_shards.min(degree_of_parallelism.max(1));
+    num_shards.max(1)
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use mlas_sys::{
-    mlas_threading_stats, reset_mlas_threading_stats, sqnbit_gemm_with_workspace,
+    mlas_threading_degree, mlas_threading_stats, reset_mlas_threading_stats,
+    sqnbit_gemm_into_with_workspace, sqnbit_gemm_with_workspace, sqnbit_mlas_partitioning,
     SQNBitComputeType, SQNBitGemmWorkspace, SQNBitPackedB, WorkStealingThreadPool,
 };
 use rayon::prelude::*;
@@ -112,7 +113,7 @@ fn main() {
 }
 
 fn qnbit_internal_pool_bench() {
-    let (m, n, k, block_size) = (1usize, 2048usize, 2048usize, 32usize);
+    let (m, n, k, block_size) = (1usize, 3072usize, 1024usize, 128usize);
     let weights: Vec<f32> = (0..n * k)
         .map(|i| ((i as f32 * 0.017 + 0.11).sin()) * 1.3)
         .collect();
@@ -141,6 +142,15 @@ fn qnbit_internal_pool_bench() {
         .collect();
     let mut c = vec![0.0f32; m * n];
     let mut workspace = SQNBitGemmWorkspace::new();
+    let partition = sqnbit_mlas_partitioning(m, n, k, 1, mlas_threading_degree());
+    println!(
+        "mlas-qnbit/partition   M={m} N={n} K={k} blk={block_size} comp={comp:?} \
+         stride_n={} tiles={} claimants={} shards={}",
+        partition.stride_n,
+        partition.work_items,
+        partition.ort_claimants,
+        partition.ort_loop_counter_shards
+    );
 
     for _ in 0..5 {
         sqnbit_gemm_with_workspace(&packed, m, &a, None, &mut c, &mut workspace, true);
@@ -154,12 +164,163 @@ fn qnbit_internal_pool_bench() {
     );
     let stats = mlas_threading_stats();
     println!(
-        "mlas-qnbit/stats        comp={comp:?} calls={} iterations={} pool_threads={} fallbacks={}",
+        "mlas-qnbit/stats        comp={comp:?} calls={} iterations={} dynamic_blocks={} pool_threads={} fallbacks={}",
         stats.parallel_for_calls,
         stats.scheduled_iterations,
+        stats.dynamic_blocks_claimed,
         stats.pool_threads,
         stats.serial_fallback_calls
     );
+
+    let static_bench = StaticQnbitBench::new(
+        threads_for_static(),
+        n,
+        k,
+        block_size,
+        &packed_b,
+        &scales,
+        zps.as_deref(),
+        comp,
+    );
+    if let Some(static_bench) = static_bench {
+        let mut c_static = vec![0.0f32; m * n];
+        for _ in 0..5 {
+            static_bench.run(m, &a, &mut c_static);
+        }
+        report(
+            "mlas-qnbit/static-split",
+            measure(QNBIT_ITERS, |_| {
+                static_bench.run(m, &a, &mut c_static);
+            }),
+        );
+        let balance = static_bench.measure_balance(m, &a, &mut c_static);
+        println!("mlas-qnbit/static-balance ns/thread={balance:?}");
+    }
+}
+
+fn threads_for_static() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+struct StaticQnbitShard {
+    start_n: usize,
+    packed: SQNBitPackedB,
+    workspace: UnsafeCell<SQNBitGemmWorkspace>,
+}
+
+unsafe impl Sync for StaticQnbitShard {}
+
+struct StaticQnbitBench {
+    pool: FixedSpmdPool,
+    shards: Vec<StaticQnbitShard>,
+    ldc: usize,
+}
+
+impl StaticQnbitBench {
+    fn new(
+        threads: usize,
+        n: usize,
+        k: usize,
+        block_size: usize,
+        packed_b: &[u8],
+        scales: &[f32],
+        zps: Option<&[u8]>,
+        comp: SQNBitComputeType,
+    ) -> Option<Self> {
+        let blocks = k.div_ceil(block_size);
+        let blob = block_size / 2;
+        let zp_row = blocks.div_ceil(2);
+        let ranges = aligned_ranges(n, threads, 16);
+        let mut shards = Vec::with_capacity(ranges.len());
+        for (start, len) in ranges {
+            let pb = &packed_b[start * blocks * blob..(start + len) * blocks * blob];
+            let sc = &scales[start * blocks..(start + len) * blocks];
+            let zp = zps.map(|z| &z[start * zp_row..(start + len) * zp_row]);
+            let packed = SQNBitPackedB::new(len, k, 4, block_size, comp, pb, sc, zp)?;
+            shards.push(StaticQnbitShard {
+                start_n: start,
+                packed,
+                workspace: UnsafeCell::new(SQNBitGemmWorkspace::new()),
+            });
+        }
+        Some(Self {
+            pool: FixedSpmdPool::new(shards.len()).ok()?,
+            shards,
+            ldc: n,
+        })
+    }
+
+    fn run(&self, m: usize, a: &[f32], c: &mut [f32]) {
+        let c_addr = c.as_mut_ptr() as usize;
+        self.pool.parallel_for(0, self.shards.len(), |begin, end| {
+            for shard_id in begin..end {
+                let shard = &self.shards[shard_id];
+                unsafe {
+                    sqnbit_gemm_into_with_workspace(
+                        &shard.packed,
+                        m,
+                        a,
+                        None,
+                        (c_addr as *mut f32).add(shard.start_n),
+                        self.ldc,
+                        &mut *shard.workspace.get(),
+                        false,
+                    );
+                }
+            }
+        });
+    }
+
+    fn measure_balance(&self, m: usize, a: &[f32], c: &mut [f32]) -> Vec<u64> {
+        let c_addr = c.as_mut_ptr() as usize;
+        let timings = (0..self.shards.len())
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>();
+        self.pool.parallel_for(0, self.shards.len(), |begin, end| {
+            for shard_id in begin..end {
+                let shard = &self.shards[shard_id];
+                let start = Instant::now();
+                unsafe {
+                    sqnbit_gemm_into_with_workspace(
+                        &shard.packed,
+                        m,
+                        a,
+                        None,
+                        (c_addr as *mut f32).add(shard.start_n),
+                        self.ldc,
+                        &mut *shard.workspace.get(),
+                        false,
+                    );
+                }
+                timings[shard_id].store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        });
+        timings
+            .iter()
+            .map(|timing| timing.load(Ordering::Relaxed))
+            .collect()
+    }
+}
+
+fn aligned_ranges(n: usize, parts: usize, align: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for part in 0..parts {
+        let mut end = if part + 1 == parts {
+            n
+        } else {
+            ((part + 1) * n / parts).div_ceil(align) * align
+        };
+        end = end.clamp(start, n);
+        if end > start {
+            ranges.push((start, end - start));
+        }
+        start = end;
+    }
+    ranges
 }
 
 fn simulated_contention(iter: usize, begin: usize) {
