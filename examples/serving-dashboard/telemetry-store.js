@@ -19,6 +19,7 @@
 import {
   measuredField,
   unavailableField,
+  pendingField,
   staleField,
   FIELD_STATES,
 } from './telemetry-field.js';
@@ -51,6 +52,22 @@ export const DEFAULT_POLL_INTERVAL_MS = 250;
 
 /** Backoff for reconnection attempts while unreachable, in milliseconds. */
 const RECONNECT_BACKOFF_MS = Object.freeze([500, 1000, 2000, 4000, 4000, 8000]);
+
+/**
+ * How long to stop re-requesting an endpoint that answered with an HTTP error.
+ *
+ * A disabled debug endpoint (404) or a model-less server (500) returns the same
+ * error on every poll. At the 250 ms dashboard cadence that is four failed
+ * requests per second forever — a console flood that buries real errors and
+ * makes the page look broken to anyone with DevTools open.
+ *
+ * The endpoint is retried on this slower cadence instead, so the page still
+ * recovers by itself once the operator fixes the cause (which the failure
+ * states promise it will) without hammering an endpoint we know is failing.
+ * Transport failures are not suppressed here — those back the whole cycle off
+ * via RECONNECT_BACKOFF_MS.
+ */
+const ENDPOINT_ERROR_RETRY_MS = 10_000;
 
 /**
  * @typedef {object} ConnectionStatus
@@ -117,6 +134,13 @@ export function createTelemetryStore({
   /** @type {ReturnType<typeof setTimeout>|null} */
   let timerHandle = null;
   let consecutiveFailures = 0;
+  /**
+   * Endpoints that answered with an HTTP error, and the last failure we saw
+   * from each. While suppressed, the cached failure is replayed instead of
+   * issuing a request, so panels keep their explanation without the network
+   * noise. @type {Map<string, {retryAtMs: number, result: SourceResult}>}
+   */
+  const suppressedEndpoints = new Map();
 
   /** @type {TelemetryStore} */
   const store = {
@@ -228,12 +252,14 @@ export function createTelemetryStore({
    * @returns {Promise<Record<string, SourceResult>>}
    */
   async function fetchAllSources() {
-    const paths = [
-      ENDPOINTS.HEALTH,
-      ENDPOINTS.STATUS,
-      ENDPOINTS.DEBUG_KV,
-      ENDPOINTS.DEBUG_CONFIG,
-    ];
+    // While unreachable, probe only the two ungated endpoints that determine
+    // the connection state. Asking a server we cannot reach for detail it
+    // cannot give quadruples the failed-request noise for no information.
+    const paths =
+      snapshot.connection.state === CONNECTION_STATES.UNREACHABLE
+        ? [ENDPOINTS.HEALTH, ENDPOINTS.STATUS]
+        : [ENDPOINTS.HEALTH, ENDPOINTS.STATUS, ENDPOINTS.DEBUG_KV, ENDPOINTS.DEBUG_CONFIG];
+
     const settled = await Promise.all(paths.map((path) => fetchJson(path)));
     /** @type {Record<string, SourceResult>} */
     const byPath = {};
@@ -257,20 +283,34 @@ export function createTelemetryStore({
    * @returns {Promise<SourceResult>}
    */
   async function fetchJson(path) {
+    // Replay a recent HTTP failure rather than re-issuing a request we already
+    // know will fail. The visitor still sees the same explanation; DevTools
+    // does not fill with identical errors.
+    const suppressed = suppressedEndpoints.get(path);
+    if (suppressed && now() < suppressed.retryAtMs) {
+      return suppressed.result;
+    }
+
     try {
       const response = await fetchImpl(`${baseUrl}${path}`, {
         headers: { accept: 'application/json' },
         cache: 'no-store',
       });
       if (!response.ok) {
-        return {
+        const result = {
           ok: false,
           body: null,
           status: response.status,
           serverMessage: await readServerMessage(response),
           transportError: null,
         };
+        suppressedEndpoints.set(path, {
+          retryAtMs: now() + ENDPOINT_ERROR_RETRY_MS,
+          result,
+        });
+        return result;
       }
+      suppressedEndpoints.delete(path);
       return {
         ok: true,
         body: await response.json(),
@@ -279,6 +319,10 @@ export function createTelemetryStore({
         transportError: null,
       };
     } catch (error) {
+      // Transport failures are handled by the whole-cycle backoff, not here:
+      // suppressing them per-endpoint would delay recovery when the server
+      // comes back.
+      suppressedEndpoints.delete(path);
       return {
         ok: false,
         body: null,
@@ -530,14 +574,39 @@ export function createTelemetryStore({
   }
 
   /**
+   * Age the field map because the server went away.
+   *
+   * A field that HAS a value goes stale, keeping its last reading and its
+   * original timestamp. A field that has NO value gets its reason re-derived
+   * rather than inherited: an unavailable field carried forward from an earlier
+   * connection state keeps that state's explanation, so a visitor hovering
+   * `queue.depth` on a dead server could be told "the server has no model
+   * loaded" — a confident, specific, wrong answer, which is worse than none.
+   *
    * @param {Readonly<Record<string, import('./telemetry-field.js').TelemetryField>>} fields
    * @param {string} reason
    */
   function ageFields(fields, reason) {
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const aged = {};
-    for (const [key, field] of Object.entries(fields)) {
-      aged[key] = staleField(field, reason);
+    for (const key of allFieldKeys()) {
+      const entry = PROVENANCE[key];
+      const field = fields[key];
+
+      if (field && (field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE)) {
+        aged[key] = staleField(field, reason);
+        continue;
+      }
+
+      // Never-measurable fields keep their permanent explanation — it is true
+      // regardless of whether the server is up.
+      aged[key] = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)
+        ? unavailableField(entry.reason, { source: entry.source, unit: entry.unit })
+        : pendingField(
+            `The server at ${baseUrl} is not responding, so no measurement has arrived for this ` +
+              'field yet. It will fill in when the server returns.',
+            { source: entry.source, unit: entry.unit },
+          );
     }
     return Object.freeze(aged);
   }
@@ -576,10 +645,16 @@ function initialSnapshot(baseUrl, timestampMs) {
   const fields = {};
   for (const key of allFieldKeys()) {
     const entry = PROVENANCE[key];
-    fields[key] = unavailableField('Waiting for the first poll to complete.', {
-      source: entry.source,
-      unit: entry.unit,
-    });
+    // A measurable field before the first poll is PENDING — it will resolve on
+    // its own. A documented zero is UNAVAILABLE from the very first frame,
+    // because no amount of waiting will ever produce a value for it, and
+    // showing a spinner for it would promise something that is never coming.
+    fields[key] = NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)
+      ? unavailableField(entry.reason, { source: entry.source, unit: entry.unit })
+      : pendingField('Waiting for the first poll to complete.', {
+          source: entry.source,
+          unit: entry.unit,
+        });
   }
   return Object.freeze({
     timestampMs,

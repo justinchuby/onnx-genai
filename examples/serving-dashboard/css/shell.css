@@ -1,0 +1,489 @@
+/* Copyright (c) Microsoft Corporation. */
+
+/*
+ * Page shell: layout, header, failure states, provenance footer.
+ *
+ * Owned by the demo developer. Dashboard panels style themselves inside their
+ * own [data-panel] root; the shell only lays out the grid they sit in.
+ *
+ * Every value here references a token from ../styles/tokens.css (designer-
+ * owned). Per that file's rule 1, this stylesheet defines no raw colour,
+ * spacing value or font size — if something is missing it is a design request,
+ * not a local decision.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--og-bg);
+  color: var(--og-fg);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-md);
+  line-height: var(--og-leading-body);
+}
+
+/* Focus is always visible. A keyboard user must never lose their place. */
+:focus-visible {
+  outline: var(--og-focus-ring);
+  outline-offset: var(--og-focus-offset);
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: var(--og-space-3);
+  padding: var(--og-space-3) var(--og-space-5);
+  background: var(--og-bg-raised);
+  color: var(--og-fg);
+  border-radius: var(--og-radius-sm);
+  z-index: 100;
+}
+
+.skip-link:focus {
+  left: var(--og-space-3);
+}
+
+/* ---------------------------------------------------------------- app shell */
+
+.app {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: var(--og-space-6);
+}
+
+.app__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--og-space-6);
+  padding-bottom: var(--og-space-6);
+  border-bottom: 1px solid var(--og-border);
+}
+
+.app__identity {
+  flex: 0 0 auto;
+}
+
+.app__title {
+  margin: 0;
+  font-size: var(--og-type-xl);
+  letter-spacing: -0.02em;
+}
+
+.app__subtitle {
+  margin: var(--og-space-2) 0 0;
+  color: var(--og-fg-muted);
+  font-size: var(--og-type-sm);
+}
+
+.app__stage {
+  padding: var(--og-space-7) 0;
+}
+
+.app__footer {
+  padding-top: var(--og-space-7);
+  border-top: 1px solid var(--og-border);
+}
+
+.app__footer-heading,
+.scenario__heading,
+.dashboard__heading {
+  font-size: var(--og-type-lg);
+  margin: 0 0 var(--og-space-5);
+}
+
+/*
+ * Everything below the blocking layer is inert while a blocking failure is on
+ * screen. `inert` is not available everywhere, so pointer-events plus the
+ * hidden attribute on the app do the work; this is belt and braces for the
+ * moment between a state change and the app being hidden.
+ */
+body[data-blocked] .app {
+  pointer-events: none;
+  user-select: none;
+  filter: saturate(0.25) brightness(0.5);
+}
+
+/* ------------------------------------------------------------- model card */
+
+.model-card {
+  flex: 1 1 auto;
+  min-width: 20rem;
+  background: var(--og-bg-raised);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-md);
+  padding: var(--og-space-4) var(--og-space-5);
+}
+
+.model-card__fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--og-space-2) var(--og-space-5);
+  margin: 0;
+  font-size: var(--og-type-sm);
+}
+
+.model-card__label {
+  color: var(--og-fg-muted);
+  font-weight: 500;
+}
+
+.model-card__value {
+  margin: 0;
+  font-family: var(--og-font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------- the four states */
+
+/*
+ * THE MOST IMPORTANT RULES IN THIS FILE.
+ *
+ * These four selectors are what make an unmeasurable value visually
+ * unmistakable from a measured one. Any element rendering a telemetry field
+ * sets data-state, so panels inherit this treatment without reimplementing it —
+ * and a panel that forgets to set data-state renders at `measured` contrast,
+ * which is why the store never hands out a value for a field that has none.
+ */
+
+[data-state='measured'] {
+  color: var(--og-fg);
+}
+
+[data-state='pending'] {
+  color: var(--og-pending-fg);
+  font-style: italic;
+}
+
+[data-state='stale'] {
+  color: var(--og-stale-fg);
+  border-bottom: 1px dashed var(--og-stale-rule);
+  cursor: help;
+}
+
+[data-state='unavailable'] {
+  color: var(--og-unavail-fg);
+  /* The dotted underline is the second channel: absence is legible in
+     greyscale, in a compressed screenshot, and on a projector. */
+  border-bottom: 1px dotted var(--og-unavail-rule);
+  cursor: help;
+  /* Reserve the space a real value would occupy, so nothing reflows on the day
+     the server learns to measure it. Layout shift on data arrival makes a page
+     feel unreliable at exactly the moment it becomes more reliable. */
+  min-width: var(--og-value-slot);
+  display: inline-block;
+}
+
+/* ---------------------------------------------------- connection indicator */
+
+.connection-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--og-space-3);
+  padding: var(--og-space-3) var(--og-space-4);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-sm);
+  font-size: var(--og-type-sm);
+  white-space: nowrap;
+}
+
+.connection-indicator__dot {
+  font-size: var(--og-type-sm);
+  line-height: 1;
+}
+
+.connection-indicator[data-state='connected'] .connection-indicator__dot {
+  color: var(--og-ok);
+}
+
+.connection-indicator[data-state='connecting'] .connection-indicator__dot {
+  color: var(--og-fg-muted);
+}
+
+.connection-indicator[data-state='no-model'] .connection-indicator__dot {
+  color: var(--og-warn);
+}
+
+.connection-indicator[data-state='unreachable'] .connection-indicator__dot {
+  color: var(--og-bad);
+}
+
+/* --------------------------------------------------------- failure states */
+
+/*
+ * Full-stage, never a toast over dead charts. A visitor who sees empty panels
+ * concludes the product is broken; a visitor who sees this concludes they
+ * missed a step.
+ */
+.failure-state {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: var(--og-space-6);
+  background: var(--og-bg);
+  overflow-y: auto;
+}
+
+.failure-state[hidden] {
+  display: none;
+}
+
+.failure-state__panel {
+  max-width: 46rem;
+  width: 100%;
+  background: var(--og-bg-raised);
+  border: 1px solid var(--og-border-strong);
+  border-radius: var(--og-radius-lg);
+  padding: var(--og-space-7);
+}
+
+.failure-state__eyebrow {
+  margin: 0 0 var(--og-space-3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: var(--og-type-xs);
+  font-weight: 600;
+  color: var(--og-warn);
+}
+
+.failure-state__title {
+  margin: 0 0 var(--og-space-4);
+  font-size: var(--og-type-lg);
+  line-height: var(--og-leading-tight);
+}
+
+.failure-state__lead {
+  margin: 0 0 var(--og-space-6);
+  color: var(--og-fg-muted);
+}
+
+.failure-state__subtitle {
+  margin: var(--og-space-6) 0 var(--og-space-4);
+  font-size: var(--og-type-md);
+}
+
+.failure-state__note {
+  margin: var(--og-space-4) 0 0;
+  color: var(--og-fg-muted);
+  font-size: var(--og-type-sm);
+}
+
+/* Text authored by the server or the browser, quoted verbatim and visibly
+   attributed so the visitor can tell it apart from our words. */
+.failure-state__verbatim {
+  margin: 0 0 var(--og-space-5);
+  padding: var(--og-space-4);
+  border-left: 3px solid var(--og-border-strong);
+  background: var(--og-bg-sunken);
+  border-radius: var(--og-radius-sm);
+}
+
+.failure-state__verbatim-label {
+  font-size: var(--og-type-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--og-fg-subtle);
+  margin-bottom: var(--og-space-2);
+}
+
+.failure-state__verbatim-text {
+  margin: 0;
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.failure-state__command {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--og-space-3);
+}
+
+.failure-state__command-text {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: var(--og-space-5);
+  background: var(--og-bg-sunken);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-sm);
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-sm);
+  overflow-x: auto;
+}
+
+.failure-state__copy {
+  flex: 0 0 auto;
+  padding: var(--og-space-3) var(--og-space-4);
+  background: var(--og-bg);
+  color: var(--og-fg);
+  border: 1px solid var(--og-border-strong);
+  border-radius: var(--og-radius-sm);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-sm);
+  cursor: pointer;
+}
+
+.failure-state__copy:hover {
+  border-color: var(--og-info);
+}
+
+.failure-state__retry {
+  display: flex;
+  align-items: center;
+  gap: var(--og-space-3);
+  margin: var(--og-space-6) 0 0;
+  color: var(--og-fg-muted);
+  font-size: var(--og-type-sm);
+}
+
+.failure-state__retry-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--og-warn);
+  /* Duration is a raw value rather than a token because the motion tokens are
+     zeroed under prefers-reduced-motion, and a zero-duration infinite
+     animation is a busy-loop. The global reduced-motion rule in tokens.css
+     stops this animation outright instead. */
+  animation: retry-pulse 1.6s ease-in-out infinite;
+}
+
+/*
+ * The one animation in the shell, and it earns its place: it indicates activity
+ * that is genuinely happening (the store really is retrying on a timer). It is
+ * suppressed under prefers-reduced-motion by the global rule in tokens.css.
+ */
+@keyframes retry-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/*
+ * Suppress the pulse outright under reduced motion. The dot stays visible and
+ * the countdown text keeps updating, so no information is lost — only the
+ * movement is. tokens.css zeroes the duration tokens, but this animation uses a
+ * raw duration (a zero-duration infinite animation is a busy-loop), so it needs
+ * an explicit rule.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .failure-state__retry-dot {
+    animation: none;
+  }
+}
+
+/* ---------------------------------------------------------------- scenarios */
+
+.scenario {
+  margin-bottom: var(--og-space-8);
+}
+
+/*
+ * Scenarios are laid out so any one of them can be removed without leaving a
+ * hole — auto-fit collapses the row rather than stranding an empty cell. The
+ * prefix-cache scenario is at risk pending confirmation that the counter moves
+ * on this decode path, and the layout must not depend on it existing.
+ */
+[data-scenario] {
+  margin-bottom: var(--og-space-6);
+}
+
+[data-scenario][hidden] {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- dashboard */
+
+.dashboard__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: var(--og-space-5);
+}
+
+/*
+ * Panel roots. The shell gives each panel a box and nothing else — everything
+ * inside is the dashboard developer's. This is the seam; the shell never draws
+ * across it.
+ */
+[data-panel] {
+  background: var(--og-bg-raised);
+  border: 1px solid var(--og-border);
+  border-radius: var(--og-radius-md);
+  padding: var(--og-space-5);
+  min-height: 8rem;
+}
+
+/* --------------------------------------------------------- provenance table */
+
+.provenance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--og-type-sm);
+}
+
+.provenance-table caption {
+  text-align: left;
+  color: var(--og-fg-muted);
+  padding-bottom: var(--og-space-4);
+}
+
+.provenance-table th,
+.provenance-table td {
+  text-align: left;
+  padding: var(--og-space-3) var(--og-space-4);
+  border-bottom: 1px solid var(--og-border);
+  vertical-align: top;
+}
+
+.provenance-table th {
+  color: var(--og-fg-muted);
+  font-weight: 600;
+}
+
+.provenance-table td:last-child {
+  font-family: var(--og-font-mono);
+  font-size: var(--og-type-xs);
+  color: var(--og-fg-subtle);
+}
+
+/* Classification is marked with a leading glyph as well as colour. */
+.provenance-table tr[data-classification='MEASURED'] td:nth-child(3)::before {
+  content: '● ';
+  color: var(--og-ok);
+}
+
+.provenance-table tr[data-classification='DOCUMENTED_ZERO'] td:nth-child(3)::before {
+  content: '▲ ';
+  color: var(--og-warn);
+}
+
+.provenance-table tr[data-classification='NOT_PLUMBED'] td:nth-child(3)::before {
+  content: '○ ';
+  color: var(--og-fg-subtle);
+}
+
+/* ------------------------------------------------------------------ 1280px */
+
+/* AC: usable and legible at 1280x720 with no horizontal scrolling. */
+@media (max-width: 1280px) {
+  .app {
+    padding: var(--og-space-5);
+  }
+
+  .app__header {
+    gap: var(--og-space-5);
+  }
+}

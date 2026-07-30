@@ -1,0 +1,124 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation. -->
+<!--
+  onnx-genai serving dashboard.
+
+  Vanilla ES modules, served statically by the onnx-genai server at GET /demo.
+  No build step, no bundler, no npm install: a visitor runs the server and opens
+  the page, and that is the entire setup. Same-origin by construction, so there
+  is no CORS configuration to get wrong.
+
+  Layout ownership is strict and deliberate, because two developers build here
+  in parallel:
+    - the page shell, model card, failure states and scenario stage: demo dev
+    - everything mounted into [data-panel]:                          dashboard dev
+  Each dashboard panel is a module exporting mount(rootElement, telemetryStore).
+  See CONTRACT.md.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onnx-genai — serving dashboard</title>
+    <meta
+      name="description"
+      content="Live demonstration of continuous batching, paged KV block allocation and prefix caching in onnx-genai."
+    />
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./css/shell.css" />
+    <!-- Inline empty favicon: without it every load logs a failed /favicon.ico
+         request, and "zero failed network requests in DevTools" is a bar this
+         demo is held to. -->
+    <link rel="icon" href="data:," />
+  </head>
+  <body data-app-state="starting">
+    <a class="skip-link" href="#stage">Skip to the demo</a>
+
+    <!--
+      The file:// guard. Shown by default and hidden by app.js on first run.
+      It must be inline markup rather than script-rendered: when the page is
+      opened from disk the module scripts below are blocked by CORS and never
+      execute, so anything they would have drawn never appears. A visitor who
+      double-clicks index.html sees this instead of a blank white page.
+    -->
+    <div id="file-protocol-guard" class="failure-state" role="alert">
+      <div class="failure-state__panel">
+        <p class="failure-state__eyebrow">Opened from disk</p>
+        <h1 class="failure-state__title">
+          This page has to be served by the onnx-genai server.
+        </h1>
+        <p class="failure-state__lead">
+          It reads live telemetry from the server over HTTP. Opened as a
+          <code>file://</code> URL there is no server to read from, and the
+          browser blocks its JavaScript modules before they run.
+        </p>
+        <h2 class="failure-state__subtitle">Run the server, then open the demo</h2>
+        <pre class="failure-state__command-text" tabindex="0">
+cargo build --release -p onnx-genai-server
+
+ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
+  --model models/qwen2.5-0.5b-scatter-v2 \
+  --model-id qwen-scatter \
+  --addr 127.0.0.1:8123 \
+  --enable-debug-endpoints</pre
+        >
+        <p class="failure-state__note">
+          Then open <strong>http://127.0.0.1:8123/demo</strong> — the server
+          serves this page itself.
+        </p>
+      </div>
+    </div>
+
+    <!-- The blocking failure layer. Owns the whole stage when active. -->
+    <div id="failure-state" hidden></div>
+
+    <div id="app" class="app" hidden>
+      <header class="app__header">
+        <div class="app__identity">
+          <h1 class="app__title">onnx-genai</h1>
+          <p class="app__subtitle">Continuous batching, paged KV, prefix caching — live</p>
+        </div>
+        <div id="model-card"></div>
+        <div id="connection-indicator" class="connection-indicator" role="status"></div>
+      </header>
+
+      <main id="stage" class="app__stage" tabindex="-1">
+        <section class="scenario" aria-labelledby="scenario-heading">
+          <h2 id="scenario-heading" class="scenario__heading">Scenarios</h2>
+          <!--
+            Scenario mounts. Each is independent and removable: the prefix-cache
+            scenario is at risk pending confirmation that the counter moves on
+            this decode path, and the grid must not leave a hole if it is cut.
+          -->
+          <div id="scenario-batching" data-scenario="continuous-batching"></div>
+          <div id="scenario-paged-kv" data-scenario="paged-kv-block-table"></div>
+          <div id="scenario-prefix-cache" data-scenario="prefix-caching" hidden></div>
+        </section>
+
+        <section class="dashboard" aria-labelledby="dashboard-heading">
+          <h2 id="dashboard-heading" class="dashboard__heading">Server telemetry</h2>
+          <!--
+            Panel mounts, owned by the dashboard developer. The shell only
+            supplies the element and the store; it never draws inside these.
+          -->
+          <div class="dashboard__grid">
+            <div data-panel="throughput"></div>
+            <div data-panel="latency"></div>
+            <div data-panel="batching"></div>
+            <div data-panel="kv-blocks"></div>
+            <div data-panel="prefix-cache"></div>
+            <div data-panel="system"></div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="app__footer">
+        <h2 class="app__footer-heading">What's real, and what isn't</h2>
+        <!-- Generated from telemetry-provenance.js so it cannot drift from the code. -->
+        <div id="provenance-table"></div>
+      </footer>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

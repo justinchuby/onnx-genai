@@ -35,34 +35,50 @@ parseable number for them.** You cannot accidentally bind a panel to a lie.
 
 ```js
 {
-  value:        3,              // null whenever state === 'unavailable'
-  state:        'measured',     // 'measured' | 'unavailable' | 'stale'
+  value:        3,              // null unless state is 'measured' or 'stale'
+  state:        'measured',     // 'measured' | 'pending' | 'stale' | 'unavailable'
   source:       '/v1/status',   // or 'client' | 'derived' | endpoint path
   reason:       null,           // required sentence whenever state !== 'measured'
   unit:         'requests',     // or null
-  observedAtMs: 1785390093123,  // null when unavailable
+  observedAtMs: 1785390093123,  // null when unavailable or pending
   derivedFrom:  null            // field keys, when source === 'derived'
 }
 ```
 
 | `state` | Meaning | Render as |
 |---|---|---|
-| `measured` | The server computed this, just now. | The number. |
-| `unavailable` | No value exists — not measurable yet, endpoint disabled, or structurally inapplicable. | **Em-dash `—`** with `reason` in the tooltip. Never `0`, never blank, never `undefined`. |
+| `measured` | The server computed this, just now. Includes a genuine zero. | The number, full contrast, no apology. |
+| `pending` | Measurable, but no sample has arrived yet. **Resolves on its own.** | `···` |
 | `stale` | Was measured; the latest poll did not refresh it. `value` is the last good reading. | The number, visibly de-emphasised, with its age. |
+| `unavailable` | No value exists and **none is coming** without a server or config change. | **Em-dash `—`** with `reason` in the tooltip. Never `0`, never blank, never `undefined`. |
+
+`pending` and `unavailable` are deliberately separate. Pending resolves by
+itself; unavailable never will. Telling a visitor to wait for a number that is
+never coming is its own small dishonesty — so `kv.usage` is `unavailable` from
+the very first frame, while `queue.depth` is `pending` until the first poll
+lands. (Vocabulary resolved with the dashboard developer: `pending` was their
+proposal and it is a genuine improvement; `measured` is kept over `ok` because it
+names the property that actually matters — provenance, not approval.)
 
 `observedAtMs` on a stale field is the **original** observation time, so age
 keeps growing across repeated failed polls instead of resetting. That is what
 lets a panel say "12s old" honestly.
 
 Build fields with the helpers in `telemetry-field.js` — `measuredField`,
-`unavailableField`, `staleField`, `derivedField`. Never construct the object
-literal by hand; the helpers reject a `measuredField(null)` and an
-`unavailableField()` with no reason, which is exactly where this would rot.
+`pendingField`, `unavailableField`, `staleField`, `derivedField`. Never
+construct the object literal by hand; the helpers reject a `measuredField(null)`
+and an `unavailableField()` with no reason, which is exactly where this would rot.
 
-**Derivation is contagious.** `derivedField` returns `unavailable` if *any*
-input is unavailable. A ratio computed from a documented zero is still a
-fabricated number.
+**Read state before value, always.** `hasValue(field)` and
+`numericValueOf(field)` are the guards — calling either *is* reading the state,
+so a panel that reaches a value through them is correct by construction, and a
+reviewer can grep for a `.value` access not preceded by one. `numericValueOf`
+returns `null` rather than a number, because a bare `null` value coerces to `0`
+in `+` and `<`, which is precisely how a fabricated zero reaches the screen.
+
+**Derivation is contagious.** `derivedField` returns `unavailable` if any input
+is unavailable, and `pending` if any input is pending. A ratio computed from a
+documented zero is still a fabricated number.
 
 ---
 
@@ -98,7 +114,8 @@ Guarantees you may rely on:
 - **Backoff while unreachable.** 500 ms → 8 s, so a dead server does not produce
   a console flood or a request storm.
 - **Every field key exists in every snapshot**, including the very first one
-  before any poll completes. There is no "not loaded yet" hole to code around.
+  before any poll completes. There is no "not loaded yet" hole to code around —
+  measurable fields start `pending`, documented zeros start `unavailable`.
 
 ### Field keys
 

@@ -321,17 +321,146 @@ test('at most one poll cycle is in flight at a time', async () => {
   assert.ok(maxInFlight <= 4, `expected <= 4 concurrent requests, saw ${maxInFlight}`);
 });
 
+test('a failing endpoint is not re-requested on every poll (no console flood)', async () => {
+  // A disabled debug endpoint or a model-less server returns the same error
+  // forever. At 250ms that is 4 failed requests/second — a flood that buries
+  // real errors. The failure must persist for panels without the network noise.
+  let debugKvRequests = 0;
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: async (url) => {
+      if (url.endsWith(ENDPOINTS.DEBUG_KV)) {
+        debugKvRequests += 1;
+        return jsonResponse(404, { error: { message: 'not found', type: 'server_error' } });
+      }
+      return fakeFetch(routes)(url);
+    },
+  });
+
+  await store.pollOnce();
+  await store.pollOnce();
+  await store.pollOnce();
+  await store.pollOnce();
+
+  assert.equal(debugKvRequests, 1, 'the failing endpoint was requested exactly once');
+  // The explanation must survive suppression — panels still need it.
+  const field = store.field('prefix_cache.hits');
+  assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
+  assert.match(field.reason, /--enable-debug-endpoints/);
+  // Healthy endpoints keep polling normally.
+  assert.equal(store.field('queue.depth').state, FIELD_STATES.MEASURED);
+});
+
+test('a suppressed endpoint recovers once its retry window elapses', async () => {
+  // The failure states promise the page recovers on its own. It must.
+  let clock = 1_000_000;
+  let failing = true;
+  let requests = 0;
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      if (url.endsWith(ENDPOINTS.DEBUG_KV)) {
+        requests += 1;
+        if (failing) {
+          return jsonResponse(404, { error: { message: 'not found', type: 'server_error' } });
+        }
+      }
+      return fakeFetch(routes)(url);
+    },
+  });
+
+  await store.pollOnce();
+  assert.equal(requests, 1);
+
+  await store.pollOnce();
+  assert.equal(requests, 1, 'still suppressed inside the retry window');
+
+  failing = false;
+  clock += 11_000;
+  await store.pollOnce();
+  assert.equal(requests, 2, 'retried after the window elapsed');
+  assert.equal(store.field('prefix_cache.hits').state, FIELD_STATES.MEASURED);
+});
+
+test('an unavailable field never inherits an explanation from an unrelated earlier state', async () => {
+  // Caught in the browser: after no-model -> unreachable, hovering queue.depth
+  // said "the server has no model loaded". A confident, specific, WRONG answer
+  // is worse than no answer — the reason must be re-derived, not carried over.
+  let mode = 'nomodel';
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    fetchImpl: async (url) => {
+      if (mode === 'dead') throw new TypeError('Failed to fetch');
+      if (url.endsWith(ENDPOINTS.STATUS)) {
+        return jsonResponse(200, statusBody({ healthy: false }));
+      }
+      return fakeFetch(routes)(url);
+    },
+  });
+
+  await store.pollOnce();
+  assert.match(store.field('queue.depth').reason, /no model loaded/);
+
+  mode = 'dead';
+  await store.pollOnce();
+
+  const snapshot = store.getSnapshot();
+  assert.equal(snapshot.connection.state, CONNECTION_STATES.UNREACHABLE);
+  const field = store.field('queue.depth');
+  assert.doesNotMatch(
+    field.reason,
+    /no model loaded/,
+    'the no-model explanation must not survive into the unreachable state',
+  );
+  assert.match(field.reason, /not responding/);
+
+  // A permanently-unmeasurable field keeps its own true explanation throughout.
+  assert.match(store.field('kv.usage').reason, /hardcoded 0\.0/);
+});
+
 test('the store is inert until start() is called', () => {
   const store = storeWith(healthyRoutes());
   assert.equal(store.isRunning, false);
   assert.equal(store.getSnapshot().connection.state, CONNECTION_STATES.CONNECTING);
 });
 
+test('before the first poll, measurable fields are PENDING and documented zeros are UNAVAILABLE', () => {
+  // The distinction matters to the visitor: pending resolves on its own,
+  // unavailable never will. Showing a spinner for `kv.usage` would promise a
+  // number that is never coming.
+  const store = storeWith(healthyRoutes());
+
+  assert.equal(store.field('queue.depth').state, FIELD_STATES.PENDING);
+  assert.equal(store.field('queue.depth').value, null);
+  assert.equal(store.field('kv.usage').state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(store.field('throughput.tokens_per_second').state, FIELD_STATES.UNAVAILABLE);
+});
+
+test('a pending field does not become stale — a value that never arrived cannot age', async () => {
+  const store = storeWith({
+    [ENDPOINTS.HEALTH]: new TypeError('Failed to fetch'),
+    [ENDPOINTS.STATUS]: new TypeError('Failed to fetch'),
+    [ENDPOINTS.DEBUG_KV]: new TypeError('Failed to fetch'),
+    [ENDPOINTS.DEBUG_CONFIG]: new TypeError('Failed to fetch'),
+  });
+  await store.pollOnce();
+
+  assert.equal(store.field('queue.depth').state, FIELD_STATES.PENDING);
+});
+
 test('every field is present in the very first snapshot, before any poll', () => {
   const store = storeWith(healthyRoutes());
   const snapshot = store.getSnapshot();
   for (const field of Object.values(snapshot.fields)) {
-    assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
+    assert.ok(
+      field.state === FIELD_STATES.PENDING || field.state === FIELD_STATES.UNAVAILABLE,
+      'no field may claim to be measured before the first poll',
+    );
+    assert.equal(field.value, null);
     assert.ok(field.reason);
   }
 });

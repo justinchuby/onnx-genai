@@ -17,23 +17,30 @@
 // branch on `field.state` before rendering.
 
 /**
- * @typedef {'measured' | 'unavailable' | 'stale'} FieldState
+ * @typedef {'measured' | 'pending' | 'stale' | 'unavailable'} FieldState
  *
  * - `measured`    — the server genuinely computed this value, just now.
- * - `unavailable` — no value exists. Either the server cannot measure it yet,
- *                   the endpoint that carries it is disabled, or the field is
- *                   structurally inapplicable to the current decode path.
- *                   `value` is ALWAYS `null`. Render an em-dash, never a zero.
+ *                   Includes a genuine zero, which renders at full contrast.
+ * - `pending`     — measurable, but no sample has arrived yet (the first poll
+ *                   has not completed). `value` is `null`. Renders `···`.
+ *                   Distinct from `unavailable` because pending resolves ON ITS
+ *                   OWN and unavailable does not — telling a visitor to wait for
+ *                   a number that will never arrive is its own small dishonesty.
  * - `stale`       — this WAS measured, but the most recent poll did not refresh
  *                   it (server unreachable, request in flight too long).
  *                   `value` is the last known good value; `observedAtMs` says
  *                   how old it is. Render it visibly de-emphasised with its age.
+ * - `unavailable` — no value exists and none is coming without a server or
+ *                   configuration change. Either the server cannot measure it
+ *                   yet, the endpoint that carries it is disabled, or the field
+ *                   is structurally inapplicable to the current decode path.
+ *                   `value` is ALWAYS `null`. Render an em-dash, never a zero.
  */
 
 /**
  * @typedef {object} TelemetryField
  * @property {number|string|boolean|Array|object|null} value
- *   The measurement. `null` whenever `state === 'unavailable'`.
+ *   The measurement. `null` whenever `state` is `unavailable` or `pending`.
  * @property {FieldState} state
  * @property {string} source
  *   Where the value came from, precisely enough to curl it. Examples:
@@ -48,8 +55,8 @@
  *   unitless/ordinal values. Panels must not invent units.
  * @property {number|null} observedAtMs
  *   `Date.now()` at the moment the value was read off the wire. `null` for
- *   unavailable fields. For `stale` fields this is the ORIGINAL observation
- *   time, which is exactly what a panel needs to render an age.
+ *   unavailable and pending fields. For `stale` fields this is the ORIGINAL
+ *   observation time, which is exactly what a panel needs to render an age.
  * @property {string[]|null} derivedFrom
  *   For `source === 'derived'`, the field keys this was computed from, so the
  *   footer provenance table can be generated rather than hand-maintained.
@@ -58,8 +65,9 @@
 /** Legal values of `TelemetryField.state`. */
 export const FIELD_STATES = Object.freeze({
   MEASURED: 'measured',
-  UNAVAILABLE: 'unavailable',
+  PENDING: 'pending',
   STALE: 'stale',
+  UNAVAILABLE: 'unavailable',
 });
 
 /**
@@ -126,9 +134,40 @@ export function unavailableField(reason, { source = 'unavailable', unit = null }
 }
 
 /**
+ * Build a pending field: this IS measurable, but no sample has arrived yet.
+ *
+ * Only correct before the first successful poll. Never use it for something the
+ * server cannot measure — that is {@link unavailableField}. The distinction is
+ * the whole point: pending resolves by itself, unavailable never will, and a
+ * visitor waiting for a number that is never coming has been misled.
+ *
+ * @param {string} reason
+ * @param {object} [options]
+ * @param {string} [options.source]
+ * @param {string|null} [options.unit]
+ * @returns {TelemetryField}
+ */
+export function pendingField(reason, { source = 'unknown', unit = null } = {}) {
+  if (!reason) {
+    throw new TypeError('pendingField() requires a reason explaining what is being waited on.');
+  }
+  return Object.freeze({
+    value: null,
+    state: FIELD_STATES.PENDING,
+    source,
+    reason,
+    unit,
+    observedAtMs: null,
+    derivedFrom: null,
+  });
+}
+
+/**
  * Age a previously-measured field because the latest poll did not refresh it.
  *
- * An already-unavailable field stays unavailable — absence does not go stale.
+ * Unavailable and pending fields are returned unchanged: absence has no age,
+ * and a value that never arrived cannot go stale.
+ *
  * An already-stale field keeps its ORIGINAL `observedAtMs`, so age keeps
  * growing across repeated failed polls instead of resetting each time.
  *
@@ -137,7 +176,7 @@ export function unavailableField(reason, { source = 'unavailable', unit = null }
  * @returns {TelemetryField}
  */
 export function staleField(field, reason) {
-  if (field.state === FIELD_STATES.UNAVAILABLE) {
+  if (field.state === FIELD_STATES.UNAVAILABLE || field.state === FIELD_STATES.PENDING) {
     return field;
   }
   return Object.freeze({
@@ -175,6 +214,16 @@ export function derivedField(inputs, compute, { unit = null, undefinedReason } =
     );
   }
 
+  // Pending is also contagious, but it resolves on its own, so the result is
+  // pending rather than unavailable — the visitor should wait, not give up.
+  const waiting = keys.filter((key) => inputs[key].state === FIELD_STATES.PENDING);
+  if (waiting.length > 0) {
+    return pendingField(
+      `Waiting on ${waiting.join(', ')} before this can be derived.`,
+      { source: 'derived', unit },
+    );
+  }
+
   const values = {};
   for (const key of keys) {
     values[key] = inputs[key].value;
@@ -201,19 +250,43 @@ export function derivedField(inputs, compute, { unit = null, undefinedReason } =
 }
 
 /**
- * True when a panel may render `field.value` as a number/graphic.
+ * True when a panel may read `field.value` and render it.
+ *
  * `stale` counts as renderable — but the panel must show it as aged.
+ * `pending` and `unavailable` do not: both carry a `null` value.
+ *
+ * This is THE GUARD. Calling it IS reading the state, so any panel that reaches
+ * a value through it is correct by construction, and reviewers can grep for a
+ * `.value` access not preceded by one of these.
  *
  * @param {TelemetryField} field
  * @returns {boolean}
  */
 export function hasValue(field) {
-  return field.state !== FIELD_STATES.UNAVAILABLE;
+  return field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE;
 }
 
 /**
- * The one place the em-dash lives. Every panel formats through this so an
- * unavailable field looks identical everywhere in the page.
+ * Read a numeric value, or `null` when the field is not renderable.
+ *
+ * Use this anywhere a panel does arithmetic. It makes the unavailable case
+ * impossible to skip, because `null` does not silently behave like a number in
+ * the comparisons panels actually write — whereas a bare `field.value` of
+ * `null` coerces to 0 in `+` and `<`, which is precisely how a fabricated zero
+ * would get onto the screen.
+ *
+ * @param {TelemetryField} field
+ * @returns {number|null}
+ */
+export function numericValueOf(field) {
+  if (!hasValue(field)) return null;
+  const numeric = Number(field.value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+/**
+ * The one place the em-dash and the pending ellipsis live. Every panel formats
+ * through this so absence looks identical everywhere in the page.
  *
  * @param {TelemetryField} field
  * @param {object} [options]
@@ -223,6 +296,9 @@ export function hasValue(field) {
 export function formatFieldText(field, { format = defaultFormat } = {}) {
   if (field.state === FIELD_STATES.UNAVAILABLE) {
     return '—';
+  }
+  if (field.state === FIELD_STATES.PENDING) {
+    return '···';
   }
   return format(field.value);
 }
@@ -239,6 +315,9 @@ export function formatFieldText(field, { format = defaultFormat } = {}) {
 export function describeField(field, nowMs = Date.now()) {
   if (field.state === FIELD_STATES.UNAVAILABLE) {
     return `Unavailable — ${field.reason} (would come from ${field.source})`;
+  }
+  if (field.state === FIELD_STATES.PENDING) {
+    return `Waiting for the first measurement — ${field.reason} (from ${field.source})`;
   }
   const unitSuffix = field.unit ? ` ${field.unit}` : '';
   const ageSeconds = Math.round((nowMs - (field.observedAtMs ?? nowMs)) / 1000);
