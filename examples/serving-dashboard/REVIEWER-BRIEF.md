@@ -516,7 +516,7 @@ directory.
 
 ---
 
-## 8. Twelve things we learned building this, in the order they will bite you
+## 8. Thirteen things we learned building this, in the order they will bite you
 
 ### 8.1 The commit log will tell you the opposite of the truth in at least four places
 
@@ -815,3 +815,63 @@ one, three reviewers read three different trees and every finding they file is
 unreproducible — which is the same reason a commit must travel as hash *and*
 subject phrase: the hash does not survive a cherry-pick, and the question "is
 this in the release?" is unanswerable as usually asked.
+
+### 8.13 Nobody here fabricated an observation, and the log will suggest otherwise
+
+Read this section before you read our commit log or our message history, because
+without it you will reach a conclusion about this team that is false.
+
+Repeatedly tonight, two people reported opposite facts about the same file, both
+having genuinely looked. The clearest case: a CORS module. One person found it
+present and router-wired and said so. Another, later, found it absent and said
+so. A third confirmed the absence independently. **All three readings were
+correct.** The file existed, and then it was deleted — inside a commit whose
+message describes a documentation wording change (§8.1). Nobody was careless and
+nobody guessed.
+
+> **A disagreement between two careful readers of a hot file is evidence of time
+> passing, not evidence of error.**
+
+This is the dominant failure mode of the whole session, and it is worth stating
+precisely because its shape is so unhelpful:
+
+**A claim can be true when its author reads the disk and false by the time they
+send it.** The interval is seconds. The author did nothing wrong, the reading was
+accurate, and the message is now incorrect.
+
+What makes this genuinely hard rather than merely annoying is that **re-checking
+does not detect it.** Read the file again and you get the same bytes you just
+read — your second observation confirms your first, and both are about the
+present, while the claim you are evaluating was about a moment that has passed.
+Two reads by one person at one time are one observation, not two. The trap is
+identical in shape to §8.9: the confirmation shares an input with the thing it is
+confirming, so it echoes rather than corroborates.
+
+The mitigations we arrived at, in order of usefulness:
+
+- **Timestamp and sha every observation, in the same invocation that produced
+  it** (§0, §0b). A claim without a sha is not falsifiable, and one with a sha is
+  a historical statement anyone can re-run.
+- **Prefer `git show HEAD:<path>` to reading the working tree.** Committed bytes
+  do not move under you; a shared working tree does, continuously.
+- **When two reports conflict, order them before you adjudicate them.** The
+  question is almost never "who is wrong" but "which is later, and did something
+  land in between." `git log` between the two shas usually answers it in one
+  command.
+- **Do not ask an author to re-confirm.** Ask what sha they were at. The
+  re-confirmation will agree with them and will tell you nothing.
+
+Two consequences for you as a reviewer. First, our record contains many
+retractions — an unusual number, and several where someone withdrew a finding
+that was correct when filed. Those are not sloppiness; almost every one is this
+mechanism, and a team that publishes them is easier to audit than one that
+quietly drops them. Second, if you find a claim in these documents that does not
+match what you see, the most likely explanation by a wide margin is that the tree
+moved. Check the sha attached to the claim before you conclude anything about the
+person who made it.
+
+The same courtesy is owed to our tests and our prose. A comment that narrates a
+repair is evidence somebody *intended* one (§8.1); a design document written in
+the present tense is a claim, not a record, and it keeps asserting itself
+correctly about a moment that has passed. Records need dates. Claims need
+checkers.
