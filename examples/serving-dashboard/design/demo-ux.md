@@ -3311,3 +3311,60 @@ Computation settles *separation*. It cannot settle:
 | D142 | For absence states the non-colour channel is the ENTIRE signal, not reinforcement | All pairs ≤1.16:1 grayscale; `unavailable`/`pending` are 1.001:1 |
 | D143 | `state-channel.test.js` is a correctness test, not a lint | It guards the only channel that carries absence semantics |
 | D144 | AC52 stays OPEN; three named render checks go to the browser pass | Arithmetic settles separation, not legibility |
+
+---
+
+## 49. 🔒 THE ONE-LINE RULING PANEL AUTHORS ACTUALLY NEED (D145–D147)
+
+@c0de4c2e is right that four live names for one concept is divergence *inside the honesty layer*, and right that asking me who was correct is worthless next to asking me what to type. So the ruling is a rule about **which question a panel is allowed to ask**, not about which word wins.
+
+### 49.1 🔒 D145 — PANELS BRANCH ON `state`. ONLY ON `state`. EVER.
+
+```js
+// ✅ the only shape a panel may use
+if (field.state === FIELD_STATES.NOT_APPLICABLE) { ... }
+
+// ❌ forbidden in any panel, for any purpose
+if (field.classification === 'STRUCTURALLY_BYPASSED') { ... }
+```
+
+**Nothing "wins", because they were never competing — they answer different questions, and only one of them is a rendering instruction.**
+
+| name | axis | answers | who reads it |
+|---|---|---|---|
+| `state` | **runtime**, this poll | *how do I render this cell?* | **panels — exclusively** |
+| `classification` | **static**, implementation truth at HEAD | *why is it like that?* | the registry, `reason` copy, AC54's generated table |
+| `Bypassed` (§4.7) | — | — | **retired, D138. My term. Gone.** |
+| em-dash / `n/a` | presentation | the glyph `state` resolves to | `formatFieldText`, nothing else |
+
+`state` is already a **total pure function of `classification` + liveness** (D136), so **every question a panel could answer from `classification` is already answered, correctly and earlier, by `state`.** A panel reading `classification` is not getting more information — **it is re-deriving a mapping that has already been made, and it will drift the moment a classification is added.**
+
+- **D145:** **`classification` is INPUT to the envelope; `state` is its OUTPUT. A panel consuming an input has reached around the contract.** That is the whole of the ruling, and it is enforceable by grep.
+
+### 49.2 D146 — WHY THIS IS THE SAFE DIRECTION EVEN THOUGH `classification` IS RICHER
+
+The tempting objection is that `classification` carries more detail, so surely a panel wanting nuance should read it. **That is exactly backwards, because the nuance is not renderable.** §21 gives five treatments; there is no sixth glyph waiting for `DOCUMENTED_ZERO` that `NOT_PLUMBED` shouldn't get. **The extra detail exists to be READ BY A CONTRIBUTOR deciding whether to plumb an endpoint or delete a field — it is a maintenance signal, not a visitor-facing one.** Routing it to a panel converts a maintenance fact into a rendering decision, which is how a five-state vocabulary quietly becomes a nine-state one.
+
+### 49.3 🔴 D147 — AND THE ORIGIN-KEYING IS 100% ON FIELDS THAT WERE DELETED
+
+@c0de4c2e reported 3 of 35 entries carry `byOrigin`. At HEAD it is **5 of 46** — and I checked *which five*:
+
+```
+:332 prefix_cache.hits          :359 prefix_cache.lookups
+:541 metrics.prefix_cache_hits  :567 metrics.prefix_cache_lookups
+:599 prefix_cache.hit_rate
+```
+
+**All five are prefix-cache fields. Every one of them is a field the Lead removed from the demo entirely on the RED verification.** So the per-origin override machinery is **fully built, correct, tested — and applied exclusively to the fields that must never render.** `kv.*` and `batch.*`, which *will* ship and *do* differ by server, carry **no override at all.**
+
+Two corrections to the report, because the difference changes the fix:
+- **`batch.*` is not INVERTED — it is ABSENT.** No `byOrigin` key exists on it, so there is nothing set backwards. That is better news (nothing to un-break) and worse news (nothing to notice): **an inverted flag is a bug someone eventually sees; a missing dimension renders a plausible number on both servers forever.**
+- The machinery is **not** the missing piece. `provenanceFor(key, origin)` works (`:755-756`) and is proven by five entries. **This is a data gap, not an engineering gap** — which is why it is finishable tonight.
+
+- **D147:** whoever adds `byOrigin` to `kv.*` and `batch.*` must **derive the direction from the incrementing code, never from the field name** (QA-PLAN §7). Getting it backwards renders Scenario A's headline metric as `n/a` **on the exact server carrying the 2.46× number**, and — per §48 — a wrongly-`n/a` field is *indistinguishable from three other absence states without its border*. **Two of our failure modes would have to be believed at once, and both are silent.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D145 | Panels branch on `state` only; `classification` is registry/copy-only | `classification` is input, `state` is output; consuming an input reaches around the contract |
+| D146 | The extra classification detail is a CONTRIBUTOR signal, not a visitor one | There is no sixth glyph; routing it to panels grows the vocabulary silently |
+| D147 | `byOrigin` on `kv.*`/`batch.*` is a DATA gap, not an engineering gap; direction from the incrementing code | All 5 existing overrides sit on deleted prefix fields; a missing dimension never announces itself |
