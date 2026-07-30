@@ -2520,3 +2520,42 @@ The field-level em-dash-plus-caption survives only for the rare mixed case (a si
 |---|---|---|
 | D91 | `measured` restored; **D65 reversed** | `ok` is a verdict, `measured` is a provenance claim. `state:'ok', value:0` invites hiding the zero — a safety property, not naming taste |
 | D92 | Deference is a failure mode; a concession needs the same audit as an assertion | I accepted a clean argument without seeking its counter, because conceding felt like good practice. The people who disagreed found it |
+
+---
+
+## 33. STATE PRECEDENCE IN DERIVATION — `not-applicable` DOMINATES, AND MAY NEVER BECOME A ZERO
+
+@c0de4c2e asked whether `not-applicable` is contagious through `derivedFrom`, and correctly called it **a precedence decision, not an inference**. Ruling it explicitly so nobody implements it by taste.
+
+### 33.1 The total order
+
+```
+not-applicable  >  unavailable  >  pending  >  stale  >  measured
+```
+**A derived field takes the HIGHEST-PRECEDENCE state among its inputs.** Rationale, one line each:
+- **`not-applicable` dominates everything.** `pending`, `stale`, `unavailable` all mean *the number could still arrive*. `not-applicable` means **it never will, by construction.** A value derived from a structurally-absent input is not late — it is meaningless on this path.
+- **`unavailable` over `pending`** — one input that needs engineering work outranks one that needs 200 ms.
+- **`stale` over `measured`** — one stale input makes the whole derivation stale; freshness is a floor, not an average.
+
+### 33.2 D94 — THE RULE THAT ACTUALLY PROTECTS US: a `not-applicable` input may NEVER be substituted with `0` in a derivation
+
+This is where contagion will be quietly broken, because contagion is *inconvenient* exactly where it bites. Consider a memory total where `paged_kv_bytes` is `not-applicable` on the static path. The tempting reading is *"structurally absent means it genuinely contributes zero bytes, so just add 0."*
+
+**Refuse it.** That reasoning is **how the fabricated zero gets back in** — and it arrives wearing a correctness argument, which is why it's more dangerous than the original bug. @bb2ee824's `numericValueOf` returning `null` rather than a number is the enforcement, and the Lead is right that it must treat `not-applicable` as valueless too.
+
+**But blanking every total is a bad answer too**, so the honest resolution is §16's label rule, which we already ratified:
+
+> **IF A TOTAL IS STILL WANTED, THE DERIVATION DOES NOT SUBSTITUTE A ZERO — IT NARROWS ITS LABEL TO THE TERMS IT ACTUALLY SUMMED.**
+> Not `Total KV memory` computed over two terms and one silent zero. **`Weights + activations`**, computed over exactly what exists on this path.
+
+A narrowed label is **true on every profile**, needs no asterisk, and states the architectural fact in the one place the visitor is already reading. **The label is part of the claim** — the same principle that stopped us calling in-flight HTTP requests "batch size".
+
+### 33.3 On the grayscale collapse risk (§8.2 QA gate) — it cannot fire as specified
+
+@c0de4c2e flags `unavailable` (hatched) vs `not-applicable` (explained) as the live collapse risk. **§31 already dissolves it structurally rather than visually: `not-applicable` is a PANEL-level treatment and `unavailable` is a FIELD-level one.** One replaces a panel body with prose; the other is an em-dash in a value slot inside an otherwise-live panel. **They cannot render identically in grayscale because they do not render at the same scale.** That is a stronger guarantee than any contrast ratio — **it survives the screenshot test by construction, not by tuning.** Keep the QA gate anyway; a gate that passes by construction costs nothing to run.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D93 | Precedence `not-applicable > unavailable > pending > stale > measured`; derived takes the highest | Only `not-applicable` asserts the value never arrives; the rest are timing |
+| D94 | A `not-applicable` input is **never** substituted with `0`; narrow the LABEL instead (§16) | "Structurally absent means it contributes zero" is the fabricated zero returning with a correctness argument |
+| D95 | `reason_code` on the wire, prose `reason` in the client — both, neither optional | Server owns classification, client owns voice; a stale client table can't contradict the server |
