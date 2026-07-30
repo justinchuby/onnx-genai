@@ -221,15 +221,20 @@ describe('KV block-window aggregation', () => {
     // use, 37 shared, 20 free, and 93.3% utilization. The disagreement is
     // deliberate: global scalars must not be recomputed from this partial scan.
     const scannedPages = 256;
+    const wholePoolPagesUsed = 280;
+    const wholePoolPagesTotal = 300;
+    const wholePoolPagesShared = 37;
+    const wholePoolPagesFree = 20;
+    const wholePoolUtilization = wholePoolPagesUsed / wholePoolPagesTotal;
     const blockTable = syntheticBlockTable({
-      pagesInUse: 280,
-      pagesShared: 37,
-      pagesFree: 20,
-      utilization: 280 / 300,
+      pagesInUse: wholePoolPagesUsed,
+      pagesShared: wholePoolPagesShared,
+      pagesFree: wholePoolPagesFree,
+      utilization: wholePoolUtilization,
       refCounts: Array(scannedPages).fill(1),
       filledSlots: Array(scannedPages).fill(16),
-      total: 300,
-      poolTotal: 300,
+      total: wholePoolPagesTotal,
+      poolTotal: wholePoolPagesTotal,
     });
     const windowDerivedPagesUsed = blockTable.blocks.ref_counts.filter(
       (refCount) => typeof refCount === 'number' && refCount > 0,
@@ -242,37 +247,37 @@ describe('KV block-window aggregation', () => {
     const windowDerivedUtilization = windowDerivedPagesUsed / windowDerivedPagesTotal;
 
     assert.notEqual(
-      blockTable.pages_in_use,
+      wholePoolPagesUsed,
       windowDerivedPagesUsed,
       'cross-scope fixture is meaningless unless whole-pool used differs from window-derived used',
     );
     assert.notEqual(
-      blockTable.window.pool_total,
+      wholePoolPagesTotal,
       windowDerivedPagesTotal,
       'cross-scope fixture is meaningless unless whole-pool total differs from window-derived total',
     );
     assert.notEqual(
-      blockTable.pages_in_use / blockTable.window.pool_total,
+      wholePoolUtilization,
       windowDerivedUtilization,
       'cross-scope fixture is meaningless unless whole-pool utilization differs from window-derived utilization',
     );
     assert.notEqual(
-      blockTable.window.pool_total - blockTable.pages_in_use,
+      wholePoolPagesFree,
       windowDerivedPagesFree,
       'cross-scope fixture is meaningless unless whole-pool free differs from window-derived free',
     );
     assert.notEqual(
-      blockTable.pages_shared,
+      wholePoolPagesShared,
       windowDerivedPagesShared,
       'cross-scope fixture is meaningless unless whole-pool shared differs from window-derived shared',
     );
     const { store } = await pollBlockTable(blockTable);
 
     for (const [key, expectedValue] of [
-      ['kv.pages_used', 280],
-      ['kv.pages_total', 300],
-      ['kv.pages_shared', 37],
-      ['kv.usage', 280 / 300],
+      ['kv.pages_used', wholePoolPagesUsed],
+      ['kv.pages_total', wholePoolPagesTotal],
+      ['kv.pages_shared', wholePoolPagesShared],
+      ['kv.usage', wholePoolUtilization],
     ]) {
       const field = store.field(key);
       assert.equal(field.state, 'measured', `${key} must remain a whole-pool measurement`);
@@ -280,7 +285,7 @@ describe('KV block-window aggregation', () => {
     }
     assert.equal(
       store.field('kv.pages_total').value - store.field('kv.pages_used').value,
-      20,
+      wholePoolPagesFree,
       'free pages must remain the whole-pool total minus whole-pool pages in use',
     );
 
