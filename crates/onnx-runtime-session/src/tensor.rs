@@ -199,6 +199,12 @@ pub(crate) fn host_bytes_mut(buffer: &mut DeviceBuffer) -> &mut [u8] {
         "host_bytes_mut on non-host device {:?}",
         buffer.device()
     );
+    assert!(
+        !buffer.is_read_only_borrow(),
+        "host_bytes_mut called on a read-only Borrowed buffer: writing through an \
+         alias of foreign read-only memory (e.g. an mmap'd weight file) is undefined \
+         behaviour"
+    );
     if buffer.is_empty() {
         return &mut [];
     }
@@ -990,6 +996,30 @@ mod tests {
             1,
             "guard runs exactly once on drop"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "read-only Borrowed buffer")]
+    fn as_bytes_mut_rejects_read_only_borrowed_buffer() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut backing = [1.0f32, 2.0, 3.0, 4.0];
+        let ptr = backing.as_mut_ptr() as *mut c_void;
+        // SAFETY: `backing` outlives the tensor built below; 16 bytes, 4-aligned.
+        let buffer = unsafe {
+            DeviceBuffer::from_borrowed_parts(ptr, DeviceId::cpu(), backing.len() * 4, 4)
+        };
+        assert!(buffer.is_read_only_borrow());
+        let mut tensor = Tensor::from_borrowed_parts_with_guard(
+            shared_cpu_ep(),
+            DataType::Float32,
+            vec![4],
+            TensorLayout::contiguous(),
+            buffer,
+            Box::new(CountingGuard(drops.clone())),
+        );
+        // Handing out a writable host slice over read-only foreign memory is UB;
+        // the guard must fail loud instead.
+        let _ = tensor.as_bytes_mut();
     }
 
     #[test]
