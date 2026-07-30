@@ -224,6 +224,37 @@ test('an INCOMPLETE checkout refuses to run the suite at all, rather than report
   assert.doesNotMatch(out, /reconciliation/);
 });
 
+/** A fixture whose FIRST test commits to the repository it is running in. */
+const HEAD_MOVING_SUITE = [
+  "import { describe, it } from 'node:test';",
+  "import assert from 'node:assert/strict';",
+  "import { execFileSync } from 'node:child_process';",
+  "import { writeFileSync } from 'node:fs';",
+  "describe('a suite that moves HEAD underneath itself', () => {",
+  "  it('commits while the suite is running', () => {",
+  "    writeFileSync('landed-mid-run.txt', 'another agent committed\\n');",
+  "    const git = (...a) => execFileSync('git', a, { encoding: 'utf8' });",
+  "    git('add', 'landed-mid-run.txt');",
+  "    git('commit', '-q', '-m', 'a commit that lands mid-run');",
+  '    assert.ok(true);',
+  '  });',
+  '});',
+  '',
+].join('\n');
+
+test('a commit landing MID-RUN fails the whole run, because no single tree was measured', () => {
+  const root = repo({ ...healthyFiles(), 'mover.test.js': HEAD_MOVING_SUITE });
+  const { status, out } = runRunner(root, { minTests: 5 });
+  assert.equal(status, 1);
+  assert.match(out, /HEAD MOVED WHILE THE SUITE WAS RUNNING/);
+  assert.match(out, /graded against DIFFERENT TREES/);
+  assert.match(out, /MOVED MID-RUN/);
+  // The point is that EVERY OTHER SIGNAL LOOKED FINE. This run had zero failing
+  // tests, a complete checkout and a clean start; the only thing wrong with it
+  // was that its subject changed halfway through, which no other check can see.
+  assert.match(out, /failed {11}: 0/);
+});
+
 test('a failing test is named LAST, so a piped run keeps the diagnosis', () => {
   const root = repo({ ...healthyFiles(), 'broken.test.js': FAILING_SUITE });
   const { status, out } = runRunner(root);

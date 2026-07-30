@@ -167,8 +167,10 @@ fi
 # DIFFERENT BYTES while one documented command reached only one of them.
 dupes=$(printf '%s\n' "${test_files[@]}" | sed 's|.*/||' | sort | uniq -d)
 
+head_before=$(git rev-parse HEAD 2>/dev/null || echo 'no-git')
 output=$(node --test "${test_files[@]}" 2>&1)
 node_status=$?
+head_after=$(git rev-parse HEAD 2>/dev/null || echo 'no-git')
 echo "$output"
 
 field() { echo "$output" | grep -E "^. $1 " | tail -1 | awk '{print $3}'; }
@@ -181,6 +183,7 @@ echo ""
 echo "── reconciliation ─────────────────────────────"
 echo "  tree             : $(pwd)"
 echo "  head / dirty     : $(git rev-parse --short HEAD 2>/dev/null || echo 'no-git') / $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted"
+echo "  head before/after: ${head_before:0:8} -> ${head_after:0:8}$([[ ${head_before} != "${head_after}" ]] && echo '  ⛔ MOVED MID-RUN')"
 echo "  discovered files : ${discovered}"
 echo "  suites executed  : ${suites:-<unparsed>}"
 echo "  tests            : ${tests:-<unparsed>}"
@@ -189,6 +192,37 @@ echo "  provenance       : ${provenance}"
 echo "  checkout         : ${#incomplete[@]} tracked file(s) missing from this working tree"
 
 status=0
+
+# DID THE TREE HOLD STILL WHILE WE MEASURED IT?
+#
+# THIS SUITE TAKES MINUTES AND FOURTEEN AGENTS COMMIT TO THIS BRANCH, SO HEAD
+# MOVES DURING RUNS. Many tests here resolve claims against `HEAD` rather than
+# the worktree -- deliberately, so a dirty desk cannot fake a green -- which
+# means a commit landing mid-run gives EARLY files one tree and LATE files
+# another. The result is a red that does not reproduce.
+#
+# OBSERVED, NOT HYPOTHESISED: one run reported 4 failures including a CAN RUN
+# control, and `prefix-counters-forbidden.test.js` then passed 4/4 in isolation
+# seconds later. Nothing was wrong with it. HEAD had moved underneath the run.
+#
+# A phantom red is expensive in both directions: chased, it costs an hour on a
+# defect that does not exist; dismissed, it trains everyone to wave away the
+# real one. Neither is acceptable, and the only honest output is to say the
+# measurement has no single subject.
+#
+# NOTE THIS IS NOT THE `dirty` COUNT. A clean porcelain at the start and a clean
+# porcelain at the end are perfectly compatible with two different commits.
+if [[ ${head_before} != "${head_after}" ]]; then
+  echo "FAIL: HEAD MOVED WHILE THE SUITE WAS RUNNING." >&2
+  echo "      before: ${head_before}" >&2
+  echo "      after:  ${head_after}" >&2
+  echo "      Tests here resolve claims against HEAD, so files that ran early" >&2
+  echo "      and files that ran late were graded against DIFFERENT TREES." >&2
+  echo "      Every count above describes no single commit. Any failure may be" >&2
+  echo "      a phantom, and any pass may be stale. RE-RUN; do not triage this" >&2
+  echo "      output, and do not quote its numbers." >&2
+  status=1
+fi
 
 if [[ -n ${dupes} ]]; then
   echo "WARN: the same test filename appears in more than one directory:" >&2
