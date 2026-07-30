@@ -3625,3 +3625,70 @@ My first implementation inferred the exemption: exempt a sketch if a supersessio
 | D165 | The design document is scanned; fenced blocks only | Prose explains, a sketch instructs. Banning the words outright would forbid the honest treatment with the dishonest one |
 | D166 | Exemptions are hashed, written, and shrink-only | A heuristic exemption means nobody decided; a hash means editing the sketch revokes it |
 | D167 | No ✓/✗ for a capability our own instruments disagree about | A binary tick is the most confident shape on the page; it must not carry the least certain fact |
+
+---
+
+## 55. THE GATED 404, AND THREE LABELS THAT LIE (D168–D172)
+
+### 55.1 🔴 D168 — AC62 EXPOSES A HOLE IN MY OWN FIVE-STATE VOCABULARY, AND IT IS NOT A SIXTH STATE
+
+@376a0297: two of the five polled endpoints are behind `--enable-debug-endpoints`, **and the gate returns `404`, not `403`.**
+
+**Every one of my five states describes THE SYSTEM. This one describes THE VISITOR'S SITUATION.**
+
+| state | who it is about | can the viewer act? |
+|---|---|---|
+| `pending` · `stale` | the connection | no, wait |
+| `unavailable` | our plumbing | no, it's our to-do |
+| `not-applicable` | the architecture | no, it's a fact |
+| **a gated 404** | **THE VIEWER'S OWN COMMAND LINE** | **YES — five seconds** |
+
+**The entire honesty layer was designed on an assumption I never noticed I was making: that an absence is never the visitor's fault and never the visitor's to fix.** Here it is both. An em-dash — our glyph for *nothing is hidden, and there's nothing you can do* — **would be the single most unhelpful mark on the page**, because the fix is one flag away and we know exactly which one.
+
+> **D168 — NO SIXTH STATE. A new `classification` — `GATED` — mapping to `state: 'unavailable'`.** It fits D161 exactly: **`unavailable` is the PROMISE state, and a gated endpoint is the most keepable promise we have.** Panels still branch on `state` only; the **remedy copy is generated from `classification`**, which is precisely what that axis is for. **No envelope key, no state, no panel logic — the whole feature lives in the copy layer.** This is the first real load test of the two-axis design and it holds.
+
+### 55.2 D169 — THE REMEDY IS ON SCREEN, SELECTABLE, AND COMPLETE
+
+```
+┌ KV memory ───────────────── needs one flag ─┐
+│                                              │
+│  This panel reads /v1/debug/kv, which is     │
+│  off by default. Restart with:               │
+│                                              │
+│    cargo run -- --model <path> \              │
+│        --enable-debug-endpoints               │
+│                                              │
+│  The server returns 404 rather than 403 for  │
+│  gated routes, so this looks like a missing  │
+│  URL. It isn't — the route is compiled in.   │
+└──────────────────────────────────────────────┘
+```
+
+- **The full command, not the flag name.** A flag name makes the visitor reconstruct an invocation they haven't typed yet; **the gap between *knowing the fix* and *having the fix* is where people quit.**
+- **Selectable text, never an image, never hover-only.** Same rule as D162: **no hover on touch, none on keyboard, none in a screenshot.**
+- **We name the 404/403 discrepancy OUT LOUD.** @376a0297 is right that this failure is uniquely cruel: **`403` is self-diagnosing, `404` actively misdirects** — it says *this endpoint does not exist*, so the visitor concludes wrong URL, stale build, or broken demo. **They will re-read the README hunting for a path, and the README will look correct, because it is.** Explaining the discrepancy costs one sentence and is the difference between a five-second fix and abandoning the page.
+- **Never `server not detected`.** The server is running and answering. **An error message that misidentifies a working component as absent is the CORS failure again** — we'd tell someone to start a process they're already running.
+
+### 55.3 D170–D172 — THREE LABELS, VERIFIED AGAINST THE INCREMENTING CODE
+
+@12e42da8's rule, now my review criterion: **a real measurement of the wrong quantity is more dangerous than a stub. A stub is discoverable — someone greps and finds the literal. A CORRECTLY-COMPUTED NUMBER UNDER A WRONG NAME LOOKS PERFECT FOREVER.**
+
+| field | forbidden label | required label | why |
+|---|---|---|---|
+| `active_sessions` | ~~active sessions~~ *(Scenario A)* | **not rendered on A at all** | counts persistent `X-Session-Id` sessions. **4 concurrent header-less requests display `0`** |
+| `vram.used` | ~~VRAM~~ · ~~GPU memory~~ | **KV budget used** | it is KV byte-budget accounting, not a device query |
+| `host_ram.used` | ~~demo memory~~ · ~~our usage~~ | **whole machine** | includes the browser, the editor, and our second server |
+
+> **D170 — `active_sessions` IS THE WORST ONE, AND IT IS WORSE THAN A WRONG LABEL: IT WOULD HAVE CONTRADICTED THE VISITOR'S OWN EYES.** They fire four requests, **watch four streams of tokens interleave on screen**, and a panel reading *active sessions* says `0`. **And the number is perfectly correct.** That is not a panel bug anyone forgives — **it is the moment they stop believing every other number on the page**, including the true ones we worked hardest on. **Bind `batch.in_flight` (AC59) for concurrency; `active_sessions` only on Scenario B, where sessions are real and the number is interesting.**
+>
+> **D171 — this is D149 generalised, and it is now a standing check rather than three fixes: A LABEL IS AN UNVERIFIED CLAIM ATTACHED TO A VERIFIED NUMBER, AND IT INHERITS THE NUMBER'S CREDIBILITY WITHOUT EARNING ANY OF IT.** Our provenance machinery authenticates the value and **ships the caption unexamined**. Verify the NAME against the INCREMENTING CODE — *"it's a real number"* is not sufficient and never was.
+>
+> **D172 — a truncated `sessions[].id` renders WITH its truncation visible** (`a3f9…`, never `a3f9`). Full session ids are bearer credentials and must not be shown; **but an identifier silently shortened is a complete-looking value that will not match anything a visitor greps for.** The ellipsis is the honest part.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D168 | Gated 404 = new `classification: GATED` → `state: 'unavailable'`. No sixth state | Our five states describe the SYSTEM; this one describes the VIEWER'S SITUATION — the only absence they can fix |
+| D169 | Full command on screen, selectable, and name the 404-vs-403 discrepancy | `403` self-diagnoses; `404` actively misdirects toward a URL hunt that a correct README cannot end |
+| D170 | `active_sessions` never renders on Scenario A | It would read `0` while four streams visibly interleave — correct, and it costs us every other number |
+| D171 | Verify the LABEL against the incrementing code, not just the value | A label inherits the number's credibility without earning any of it |
+| D172 | Truncated ids show their truncation | A silently shortened identifier looks complete and matches nothing |
