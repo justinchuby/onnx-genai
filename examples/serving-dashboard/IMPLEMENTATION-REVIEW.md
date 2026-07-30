@@ -2428,3 +2428,74 @@ disagreeing on the millisecond is stronger evidence than either alone.**
 all of the above and none of tonight's churn touches it: the file that could be
 tested got fixed; the file that could not, did not.** `cargo test` has still never
 been run.
+
+---
+
+## F28 — `review-1` is 27 commits BEHIND `review-0`. The review pin moved backwards. 🔴 TIME-CRITICAL
+
+`@12e42da8` announced *REVIEW SHA UPDATED — `review-1` = `fca13038`. THIS IS THE
+ARTIFACT THE THREE REVIEWERS WILL READ.* **Measured, it is older than the pin it
+replaced:**
+
+```
+merge-base(review-0, review-1) = fca13038  == review-1 ITSELF
+  review-1 = fca13038   04:02:36
+  review-0 = 0aac6bb1   04:16:22          <- 13m46s NEWER
+  commits only on review-1 side :  0
+  commits only on review-0 side : 27      <- review-1 IS AN ANCESTOR OF review-0
+CONTROL: both are ancestors of HEAD (d7660e15) ✅ · HEAD-ancestor-of-review-1 exit 1 ✅
+```
+
+**"Updated" moved the review point back 27 commits.** Both pins are legitimate
+commits on the branch, and this is not a mistake about git — it is a naming
+convention where the ordinal implies recency and the tag does not carry it.
+**`review-N+1` reads as *later*. Nothing enforces that, and here it is false.**
+
+**The consequence is concrete and it is in my lane, measured on the module that
+closed C2:**
+
+```
+test 'the poll loop survives a stalling server — attempts GROW, they never freeze'
+   HEAD     -> 1      review-0 -> 1      review-1 -> 0
+   CONTROL 'stalling server' at HEAD -> 3   (the instrument reaches)
+tests declared in request-deadline.test.js:   review-0 / HEAD -> 8   review-1 -> 7
+```
+
+**That test is the one covering the module's headline failure mode** — the one
+`request-deadline.js` documents *with numbers* in its own header at review-1
+(`attempts climb 9, 11, 11, 13` vs `attempts freeze at 7, 7, 7, 7`). **At the
+pinned artefact the header describes a failure mode that has no test, because the
+pin predates the test.** A reviewer reading `review-1` will find that gap and file
+it, and the gap does not exist on the branch.
+
+**🔻 AND I ALMOST FILED EXACTLY THAT, WHICH IS THE REASON THIS ENTRY EXISTS.** My
+first reading of `git diff 32bf88e7 review-1` was **"43 deletions — a test was
+deleted during the freeze."** It was not deleted. **`git diff A B` renders
+*B is older* and *B removed it* as the identical hunk, and I read a backwards
+move as a deletion and had the accusation drafted.** The only thing that stopped
+it was running `merge-base --is-ancestor` **before** publishing rather than after.
+
+**➡️ THIS IS THE SECOND HALF OF F27 AND IT CORRECTS MY OWN PRESCRIPTION.** I said
+*ancestry measures the clock, the diff measures the subject — use the diff.*
+**That is right about staleness and wrong about direction: `git diff` is
+symmetric and will tell you a fix is a regression if you hand it the arguments in
+the order you assumed rather than the order the graph has.** The complete form
+needs both, and the ancestry check must come **first**:
+
+```
+git merge-base --is-ancestor <mine> <theirs>  # 1. WHICH WAY DOES TIME RUN?
+git diff --quiet <mine> <theirs> -- <cited>   # 2. DID MY SUBJECT MOVE?
+```
+
+**Neither alone is sound. Ancestry without content is vacuous (F27: 85.5%).
+Content without ancestry is directionless (F28: it manufactures a deletion).**
+
+**✅ RECOMMENDED, and it is cheap:** re-pin `review-2` at or after `0aac6bb1`, or
+rename to carry the timestamp rather than an ordinal. **And whichever pin is
+chosen, `git merge-base --is-ancestor <old-pin> <new-pin>` should be printed in
+the announcement — one line, and it makes a backwards move impossible to miss.**
+
+**F26 is unaffected and holds at both pins**, which is the one piece of good news
+here: the signal-discard mutation passes **8/8 at HEAD** and **7/7 at `review-1`**,
+raw exit 0 both times. **The guard hole is a property of the assertion, not of
+the pin.**
