@@ -83,6 +83,26 @@ const ENDPOINT_CADENCE_MS = Object.freeze({
 export const MIN_POLL_INTERVAL_MS = 100;
 export const DEFAULT_POLL_INTERVAL_MS = 250;
 
+/**
+ * How long a single request may stay silent before we give up on it.
+ *
+ * A SERVER THAT FAILS AND A SERVER THAT STALLS ARE COMPLETELY DIFFERENT
+ * FAILURES, AND ONLY ONE OF THEM WAS HANDLED. If the server refuses the socket,
+ * `fetch` rejects, the cycle records a `transportError`, and the reconnect
+ * ladder does its job. If the server ACCEPTS the socket and then never replies
+ * — which is precisely what an inference server does mid-long-generation — the
+ * promise never settles, `pollInFlight` never clears, and every later tick
+ * returns early. The page then shows its last good numbers, with their original
+ * timestamps, FOREVER. Not stale, not unavailable: stopped, while looking
+ * healthy. That is the one rendering this product must never produce, and it
+ * was the only absence state we had no vocabulary for.
+ *
+ * The timeout does not invent a new failure mode; it converts an unhandled one
+ * into the handled one. Two seconds is deliberately many multiples of the
+ * poll interval: this exists to break a hang, not to police a slow server.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
+
 /** Backoff for reconnection attempts while unreachable, in milliseconds. */
 const RECONNECT_BACKOFF_MS = Object.freeze([500, 1000, 2000, 4000, 4000, 8000]);
 
@@ -135,6 +155,9 @@ const ENDPOINT_ERROR_RETRY_MS = 10_000;
  *   Origin of the server. Defaults to the page's own origin, because the server
  *   serves this demo at GET /demo — same-origin, no CORS, nothing to configure.
  * @param {number} [options.pollIntervalMs] 250-500 ms. Clamped to >= 100 ms.
+ * @param {number} [options.requestTimeoutMs]
+ *   How long one request may stay silent before it is aborted and reported as a
+ *   transport error. See DEFAULT_REQUEST_TIMEOUT_MS.
  * @param {typeof fetch} [options.fetchImpl] Injected for tests.
  * @param {() => number} [options.now] Injected for tests.
  * @returns {TelemetryStore}
@@ -147,6 +170,7 @@ export function createTelemetryStore({
   // can never be shown without saying which server produced it.
   origin = 'scatter',
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   fetchImpl = typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined,
   now = () => Date.now(),
 } = {}) {
@@ -407,10 +431,23 @@ export function createTelemetryStore({
       return suppressed.result;
     }
 
+    // A stalled server is indistinguishable from a working one until you give
+    // up on it, so every request carries its own deadline. `timedOut` is
+    // tracked explicitly rather than read back off the abort reason, because
+    // the reason is a moving target across runtimes and this message is
+    // visitor-facing.
+    const controller = new AbortController();
+    let timedOut = false;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, requestTimeoutMs);
+
     try {
       const response = await fetchImpl(`${baseUrl}${path}`, {
         headers: { accept: isText ? 'text/plain' : 'application/json' },
         cache: 'no-store',
+        signal: controller.signal,
       });
       if (!response.ok) {
         const result = {
@@ -447,8 +484,31 @@ export function createTelemetryStore({
         body: null,
         status: null,
         serverMessage: null,
-        transportError: error instanceof Error ? error.message : String(error),
+        // A timeout gets its own sentence rather than the runtime's abort text.
+        // "This operation was aborted" reads like the dashboard did something
+        // wrong; the visitor needs to know the SERVER went quiet, and for how
+        // long, because that distinguishes a hung generation from a dead port.
+        transportError: timedOut
+          ? `no response within ${requestTimeoutMs} ms — the server accepted the ` +
+            'connection but never replied'
+          : error instanceof Error
+            ? error.message
+            : String(error),
       };
+    } finally {
+      // Cleared on every path, including the successful ones that return from
+      // inside the try.
+      //
+      // HONEST SCOPE OF THIS LINE, because it looks like it prevents more than
+      // it does: a leaked timer would NOT abort a later request. Each call gets
+      // its own controller, and by the time the timer fired its signal would
+      // already be detached from a settled fetch, so the abort is inert. What
+      // this prevents is one live timer per request accumulating for as long as
+      // the page is open — a resource leak on a page designed to be left open
+      // on a screen all day. Deleting this line reddens NO test, which is why
+      // the limit is written here rather than asserted somewhere it would pass
+      // vacuously.
+      clearTimeout(deadline);
     }
   }
 
