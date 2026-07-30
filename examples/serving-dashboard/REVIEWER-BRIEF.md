@@ -516,7 +516,7 @@ directory.
 
 ---
 
-## 8. Six things we learned building this, in the order they will bite you
+## 8. Twelve things we learned building this, in the order they will bite you
 
 ### 8.1 The commit log will tell you the opposite of the truth in at least four places
 
@@ -706,3 +706,112 @@ binary by its behaviour in the same invocation as the measurement.** `ps` cannot
 tell you which code is executing — two server pairs here shared a binary path
 while the older processes held the older inode, and only a payload field
 distinguished them.
+
+### 8.10 A 200 is not evidence that a file exists; a 404 is self-certifying
+
+We verified a served page four times in ten minutes and got the wrong answer
+three of those times. Every error was the same error wearing a different
+costume: the instrument was healthy, its output was accurate, and it was aimed
+somewhere we did not intend.
+
+```
+probed four ports nobody was listening on   -> 000 000 000 000
+`lsof | head -5`                            -> hid four of nine listeners
+probed the agent harness's own UI           -> 200 200 200 200   <- the dangerous one
+probed the right port at the wrong prefix   -> 404
+```
+
+The third one nearly closed a release gate. The origin was a single-page app
+with a catch-all route, so it answered `200` and returned its own `index.html`
+for *every* path — including `styles/shell.css`, which is not a stylesheet it
+has ever had. `curl -o /dev/null -w '%{http_code}'` discards the response body,
+which is the only evidence that distinguishes the file you asked for from the
+fallback you were given.
+
+So the rule is narrower and sharper than "don't trust curl":
+
+> **A `200` needs a hash. A `404` needs only a sibling `200`.**
+
+A catch-all origin *cannot produce a 404*. So if an origin ever returns one, it
+has no fallback, and its other answers can be trusted. This is why the
+nine-way confirmation that `prefix-cache.js` is not served is sound: it was
+always `404` for the missing file and `200` for a sibling in the same directory
+in the same second. Compare bytes when the answer is *present*; a sibling
+control is sufficient when the answer is *absent*.
+
+Note which way each error cut. The three false negatives cost one re-run each,
+because a "not found" makes you keep looking. The single false positive would
+have shipped: it agreed with what we wanted, so it terminated the search.
+**The error that survives review is always the one that agrees with you.**
+
+And when you compare, compare against `git show HEAD:<path>` rather than the
+file on disk. Our working tree was dirty in five files while we were measuring;
+"served matches disk" and "served matches what ships" are different claims, and
+only the second one is about the reviewer's clone.
+
+### 8.11 A hand-reconstructed status presented as a query is a guess in costume
+
+The task graph that was this project's mandated source of truth never returned
+output to its reader, once, in the entire session. Every status in this document
+was assembled from message traffic and re-verified against `git` and the
+worktree.
+
+That was disclosed rather than papered over, and the disclosure is the reusable
+part. The graph was not merely silent — it was wrong in both directions at once.
+It replayed at least seven superseded orders as live ones, carrying full
+authority and no timestamp; it marked a node complete without its author's
+signal; it attached a new upstream dependency to an already-complete node, so it
+simultaneously asserted that work was finished and that its input was mid-repair.
+Adding an edge does not un-complete a node, and no reader could see any of it,
+because the read side had never worked.
+
+Two consequences worth carrying:
+
+- **A replayed order is indistinguishable from a fresh one.** It has your lead's
+  name on it, it has no timestamp, and it reads as more urgent than whatever you
+  are actually doing. Prefer the message body, which is written in the moment,
+  over the title, which is assembled from history. An instruction whose premise
+  has changed is void — check the premise, not the phrasing.
+- **A disclosed manual ledger beats an undisclosed one, and both lose to a
+  verified one.** The prohibition on redundant checklists exists to stop an
+  authoritative-looking document going stale in silence. A ledger that is
+  re-derived from disk every sweep, and says openly that it is, is the opposite
+  of that failure — but only because of the re-derivation, not the disclosure.
+
+Stated generally, and it is the same defect this product exists to refuse, one
+level up from the code: **presenting a reconstruction in the visual grammar of a
+measurement is the process version of rendering an unplumbed field as a
+confident zero.** Be visibly manual rather than invisibly manual.
+
+### 8.12 Add "should this exist at all?" to the claims family
+
+Earlier sections list the ways a claim about an artefact can be true or false
+independently: it exists, it is inside a repository, it is committed, it is
+wired, it is reachable from a branch, it is in the right checkout. Every one of
+those looks identical when it passes.
+
+There is one more, and we found it the expensive way: **it should be there at
+all.** An end-to-end verification here certified the build by fetching a
+scenario route and asserting `200`. The route was healthy. The check was correct
+for its purpose. It was also the route to the one feature we had proved absent
+and ruled unshippable — so the URL used to certify the build was the URL of the
+thing that should not have been in the build.
+
+A route can be perfectly healthy and still be a route to something that should
+not exist. No status code will ever tell you that, because health and
+desirability are unrelated properties and only one of them is on the wire.
+
+The same distinction decides a question that looks inconsistent from outside:
+a panel bound to zero fields is honest, while a tab advertising a cut scenario
+is not. **Panels display values; tabs advertise capabilities.** A cut field in a
+panel is a wrong reading. A cut scenario in a switcher is a wrong product — a
+clickable promise made before the visitor sees a single number.
+
+Finally, a gate is a measurement at a sha, not a state of the world. This one
+was scored green at a commit that was one behind the branch by the time the
+result was written down, on a branch moving at roughly one commit every two
+minutes. A hand-off therefore needs a *frozen sha*, not a green light. Without
+one, three reviewers read three different trees and every finding they file is
+unreproducible — which is the same reason a commit must travel as hash *and*
+subject phrase: the hash does not survive a cherry-pick, and the question "is
+this in the release?" is unanswerable as usually asked.
