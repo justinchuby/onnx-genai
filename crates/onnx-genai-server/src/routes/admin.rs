@@ -501,14 +501,29 @@ pub(crate) async fn admin_unload_model(
 }
 
 #[cfg(feature = "metrics")]
+/// `GET /metrics` -- Prometheus exposition.
+///
+/// The resource-governor family is read through `resource_snapshot()`, which
+/// since AC31 is served off the driver thread. It previously queued behind a
+/// `DriverCommand`, which is why this endpoint was measured at 51,010 ms under
+/// load while `/v1/status` answered in 26 ms; it now answers in 71 ms worst of
+/// 1,067 polls under sustained load.
+///
+/// When the governor cannot be read the family is absent, so this ALWAYS emits
+/// `onnxgenai_resource_governor_available` to say which case a scrape is in.
+/// Silently dropping the gauges made an unreadable governor look exactly like
+/// a scrape gap -- the one shape operators read as "nothing to see".
 pub(crate) async fn prometheus_metrics(
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let mut output = crate::metrics::encode_prometheus();
-    if let Some(handle) = state.registry.resolve("").map_err(map_registry_error)?
-        && let Ok(snapshot) = handle.engine.resource_snapshot().await
-    {
-        output.push_str(&crate::metrics::encode_resource_governor(&snapshot));
+    let snapshot = match state.registry.resolve("").map_err(map_registry_error)? {
+        Some(handle) => handle.engine.resource_snapshot().await.ok(),
+        None => None,
+    };
+    match snapshot {
+        Some(snapshot) => output.push_str(&crate::metrics::encode_resource_governor(&snapshot)),
+        None => output.push_str(&crate::metrics::encode_resource_governor_unavailable()),
     }
     Ok((
         [(

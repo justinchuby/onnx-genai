@@ -1563,6 +1563,113 @@ async fn metrics_exposes_prometheus_families_and_request_counter_increments() {
     assert!(after_health >= before_health + 2);
 }
 
+/// `/metrics` must say WHICH case a scrape is in when the governor family is
+/// absent.
+///
+/// The handler previously used `if let Ok(snapshot) = ...`, so an unreadable
+/// governor dropped the whole `onnxgenai_*` family with no trace. In Prometheus
+/// a series that simply stops is indistinguishable from a scrape gap, a
+/// restart, or a relabel -- the graph just ends, which is the one shape an
+/// operator reads as "nothing to see". An absent resource ceiling is exactly
+/// the condition you most need to alert on, so it must be published, not
+/// omitted.
+///
+/// This asserts the INVARIANT BINDING the marker to the family, not merely that
+/// a string is present: the marker must be 1 exactly when the gauges are there.
+///
+/// ⚠️ WHAT THIS TEST CANNOT PROVE, stated because I measured it rather than
+/// assumed it: `tiny_state`'s governor ALWAYS resolves, so this exercises only
+/// the success branch. Reverting the handler to the old silent-omission form
+/// leaves this test GREEN -- verified by mutation, not by reasoning. The
+/// absent branch is covered by
+/// `an_unreadable_governor_is_published_as_absent_not_omitted`, which drives
+/// the encoder directly because no route-level fixture can make the governor
+/// fail on demand.
+///
+/// Note this deliberately does NOT use `prometheus_sample`, whose `unwrap_or(0)`
+/// renders an ABSENT metric as the value `0` -- the precise absent/zero
+/// conflation this test exists to detect. It would report success on a handler
+/// that emitted nothing at all.
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_states_governor_availability_rather_than_dropping_the_family() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    let marker = crate::metrics::RESOURCE_GOVERNOR_AVAILABLE;
+    let available = body
+        .lines()
+        .find_map(|line| line.strip_prefix(marker)?.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "{marker} is absent. Every scrape must state whether the \
+                 resource-governor gauges are real; without it an unreadable \
+                 governor is indistinguishable from a scrape gap.\n{body}"
+            )
+        });
+
+    // The family and its marker must agree in BOTH directions, which is what
+    // makes this a guard rather than a spelling check.
+    let family_present = body.contains("onnxgenai_vram_limit_bytes");
+    match available {
+        1 => assert!(
+            family_present,
+            "{marker} is 1 but the governor gauges are absent; the marker \
+             promises readings that are not there"
+        ),
+        0 => assert!(
+            !family_present,
+            "{marker} is 0 but the governor gauges are present; the marker \
+             disclaims readings that ARE there, so operators would discard \
+             good data"
+        ),
+        other => panic!("{marker} must be 0 or 1, got {other}"),
+    }
+}
+
+/// The unavailable branch, driven directly because no route fixture reaches it.
+///
+/// This is the half that carries the fix. It is mutation-verified: deleting the
+/// `RESOURCE_GOVERNOR_AVAILABLE` gauge from `encode_resource_governor_unavailable`
+/// (i.e. returning the empty string, which is what the old handler effectively
+/// did) reddens this and nothing else in the suite.
+#[cfg(feature = "metrics")]
+#[test]
+fn an_unreadable_governor_is_published_as_absent_not_omitted() {
+    let marker = crate::metrics::RESOURCE_GOVERNOR_AVAILABLE;
+    let output = crate::metrics::encode_resource_governor_unavailable();
+
+    assert!(
+        output.contains(&format!("{marker} 0\n")),
+        "an unreadable governor must publish {marker} 0. Emitting nothing \
+         makes a broken governor look identical to a scrape gap, and the \
+         resource ceilings are exactly what an operator needs to alert on \
+         when they cannot be read.\ngot: {output:?}"
+    );
+    assert!(
+        output.contains(&format!("# TYPE {marker} gauge")),
+        "the marker must carry its TYPE line or Prometheus will not scrape \
+         it as a gauge:\n{output}"
+    );
+
+    // The disclaimer must not be accompanied by the readings it disclaims.
+    assert!(
+        !output.contains("onnxgenai_vram_limit_bytes"),
+        "the unavailable path emitted governor gauges; a 0 marker beside real \
+         readings would make operators discard good data:\n{output}"
+    );
+}
+
 #[tokio::test]
 async fn resources_get_and_admin_vram_override_report_governor_state() {
     let router = app(resource_state(true));
