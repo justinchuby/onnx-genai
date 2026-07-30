@@ -673,3 +673,54 @@ above existed only in chat until this commit.
   an assumption nothing enforces.
 - **The panel registry's pinned count**, which forces a change in what the demo claims
   to be a deliberate act rather than a merge artefact.
+
+## 10. Pass 1, re-measured after `MISATTRIBUTED` landed: the fix moved three fields and left the mechanism exactly where it was
+
+Measured by **executing** the catalogue at HEAD `c97305d8`, walking every `byOrigin`
+override rather than grepping for them. Denominator published; a zero here is a broken
+instrument, not a clean tree.
+
+```
+total byOrigin overrides ......... 10   (RED at 0)
+downgrades ........................ 8   with their own `reason`: 8
+upgrades to MEASURED .............. 2   with their own `reason`: 0
+```
+
+Before @bb2ee824's fix the split was 5/5 with reasons and 5/5 without. It is now 8/8 and
+0/2. **Three fields moved from the evidence-free column into the evidence-carrying one and
+the split stayed perfect.** That is the strongest confirmation the asymmetry is structural
+rather than clerical: a real fix, made by a careful author who was not thinking about my
+finding, landed on exactly the side the schema makes expensive and did not disturb the
+side it makes free. `scripts/check_provenance.py` still contains `byOrigin` zero times, so
+nothing in the guard would have noticed either way.
+
+### 10.1 The two survivors are not the same defect, and one of them vindicates the author who declined it
+
+@bb2ee824 deliberately left the `lookups` pair alone, reasoning that it *honestly counts
+completed generations and is already labelled that — a true number with a fixable name is a
+relabel, not a reclassification.* Measured against four live servers spanning both
+repositories and both build generations, that reasoning is **correct for one entry and
+false for the other**, because the two read different endpoints:
+
+```
+metrics.prefix_cache_lookups  -> /metrics   onnx_genai_prefix_cache_lookups_total
+    SERVED. 3 occurrences. control: 83 onnx_genai_ metrics present.   RESOLVES ✅
+
+prefix_cache.lookups          -> /v1/debug/kv   path 'prefix_cache_lookups'
+    NOT SERVED by any of :9123 :8123 :8124 :8133 :8134 — all four agree.
+    the key is now `generations_completed`.                          DOES NOT RESOLVE ⛔
+```
+
+So the rename landed on the JSON debug endpoint and **not** on the Prometheus endpoint.
+The same logical quantity is published by the same process under the old name in one
+surface and a new name in the other. This is the part worth carrying past the demo: we have
+been discussing this as *the dashboard is stale relative to the server*, and it is not.
+**The server disagrees with itself, and the dashboard is faithfully following one half of
+it.** A consumer cannot be "updated for the rename" because there is no single rename to
+be updated for.
+
+The floor mattered here. My first read of `:9124` returned zero bytes and zero occurrences
+of the key — which is byte-identical to the finding I was looking for. The port was dead.
+An absent key and an absent server produce the same number, and only the length check told
+them apart.
+
