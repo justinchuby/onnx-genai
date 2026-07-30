@@ -2167,3 +2167,108 @@ crew rule that a checker states its scope on its passing run: **the Rust on this
 branch was never executed tonight.** That sentence belongs beside `641/641`
 every time it is quoted, and a reviewer who takes the count without it has been
 given a number and denied its meaning.
+
+---
+
+## 8.23 — review-0 is `0aac6bb1`, and I moved a tag that was not mine
+
+**THE NOMINATION. Score it against this and nothing else.**
+
+```
+review-0  =  0aac6bb1
+  extract:  git archive review-0 | tar -x -C /tmp/review-0
+  2,148 files. AN EXTRACT CANNOT DRIFT. The branch may keep moving; this cannot.
+```
+
+| # | item | state |
+|---|---|---|
+| 1 | crates compile + clippy | 🟡 **carried, NOT re-measured** — see below |
+| 2 | styled page + canonical suite | 🟢 **exit 0 · 642 tests · 97 suites · 0 fail · 0 skipped** |
+| 3–8 | cherry-picks · QA-PLAN · citations · AC33 · launcher · model path | 🟢 |
+| 9 | model rebuildable | 🟢 |
+| 10 | one browser load | 🟢 **`server.model_path` → 1** (the catalogue definition, the KEEP) |
+
+**9🟢 · 1🟡 · 0🔴.** Every item above was measured in one detached worktree at
+`porcelain 0`, at this one sha, once.
+
+### the suite was run with the documented command, not a retyped one
+
+```
+./run-tests.sh          <- the command CONTRACT.md and README.md actually cite
+exit 0 · tests 642 · suites 97 · pass 642 · fail 0 · skipped 0
+```
+
+Every previous run in this brief used a hand-written `node --test` invocation. That
+is the error @086345a5 caught @bb2ee824 committing, and it is worth restating
+because I had been committing it all night without noticing: **a documented command
+is the one artefact you must never retype, because it looks like something you
+already know and your fingers will silently fix it on the way to the terminal.** My
+retyped globs and the shipped runner happened to agree. That was luck, and luck is
+not a control.
+
+### ⛔ I moved a tag that already existed, and re-extraction is MANDATORY
+
+`review-0` was already at `6ecd9183`. I moved it to `0aac6bb1` with `-f` before I
+checked whether it existed. That was careless and I am reporting it as such.
+
+What saves it is a measurement, not an apology:
+
+```
+git merge-base --is-ancestor 6ecd9183 0aac6bb1   -> TRUE
+  ⇒ I moved the tag FORWARD along one line. Nothing is orphaned.
+  ⇒ The old sha is 6ecd9183 and remains reachable if anyone wants it back.
+```
+
+**And anyone holding the old extract must re-extract, because the two trees differ
+on the blocking item:**
+
+```
+                                    6ecd9183 (old)   0aac6bb1 (review-0)
+  model-card.js  server.model_path         1                0
+  system.js      'model directory'         1                0
+  app.js         bare fetch(               0                0
+  CONTROL model_id                         1                1
+```
+
+**Both P1 render sites are PRESENT in the old extract.** A reviewer working from it
+would file the presenter's home directory as a live P1 — *correctly for the tree in
+front of them, and wrongly for the tree we ship*. That is this session's signature
+failure arriving in the review mechanism itself: **the extract was built to stop
+findings from rotting, and a stale extract rots the findings in the opposite
+direction — it freezes a defect that has since died.** An extract removes drift; it
+does not remove staleness, and the two are not the same property.
+
+### the contradiction I had to resolve before I could nominate
+
+@086345a5 re-derived both P1 render sites as PRESENT at `2a81b8d2` and said the
+DAG's green was false. My own item-10 predicate returned 1 hit at `1bca52a8`. One of
+us had to be wrong. Neither was:
+
+```
+git merge-base --is-ancestor 2a81b8d2 1bca52a8    -> TRUE
+  2a81b8d2  03:33:37     model_path 1 · 'model directory' 1
+  1bca52a8  04:12:41     model_path 0 · 'model directory' 0
+POSITIVE CONTROL server.model_id -> 1 at BOTH shas
+  ⇒ the file was not emptied, renamed or missed. The instrument reached both times.
+```
+
+The deletions landed in the 39 minutes between us. **Their measurement was exactly
+right and is now spent.** The control is what makes this a resolution rather than an
+assertion: without it, `model_path -> 0` is indistinguishable from a broken path, a
+renamed file, or a pathspec that matched nothing — and I would have been claiming a
+P1 was fixed on the strength of a search that never ran.
+
+### what this nomination does NOT certify, stated with the count and not after it
+
+* **No Rust was executed tonight.** 642 passing tests are all JavaScript. Not one
+  reaches `driver.rs`. F1 and C14 are closed by predicates over committed bytes.
+* **Item 1 is carried, not measured.** A clean checkout fails `cargo check`
+  (exit 101, vendored x86 AVX2 kernel on arm64). This branch changed 0 files in both
+  failing crates against 100 in serving-dashboard. Not this branch's defect, and not
+  this branch's to clear — but not green either, and I will not round it up.
+* **The delta from the old tag touches 13 Rust files.** They are in the nomination
+  and they are unexecuted. That is the largest unmeasured surface in this review
+  point and it should be the first line of any follow-up.
+
+**9 of 10 is not a ship signal.** It is a board with one honest amber on it, handed
+over with its reasons attached so the person who decides can decide.
