@@ -2213,6 +2213,8 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 
       Batching does not make any single request faster.
       Range spans 2 occasions · CPU EP · max_batch from payload · one machine
+      The INTERVAL is the claim. `2.46×` alone is withdrawn (§101): it is
+      the low end of two occasions, never the result.
 ```
 
 > 🔴 **THE SKETCH ABOVE PREVIOUSLY READ `2.46× faster` AND `n=15 · CV 1.98%`. BOTH WERE STRUCK IN §101 AND THE CORRECTION IS SHOWN RATHER THAN SILENTLY APPLIED.** A byte-identical binary put the denominator **9.77% lower** 75 minutes later, moving the ratio to **2.72×**. `2.46` asserts ±0.203% resolution against **9.77% observed — a 48.1× shortfall**. **And `CV 1.98%` was the within-run spread of ONE ARM, not the dispersion of the RATIO — a correct statistic attached to the wrong quantity, which manufactures support rather than reporting it (D342).**
@@ -2457,6 +2459,8 @@ Same principle as D83 (*layout space is a claim about significance*), one level 
   Batching does not make any single request faster.
   It trades per-stream latency for total throughput.
   Range spans 2 occasions · CPU EP · max_batch from payload · not a performance claim
+  The INTERVAL is the claim. `2.46×` alone is withdrawn (§101): it is
+  the low end of two occasions, never the result.
 ```
 
 > 🔴 **THIS SKETCH READ `2.46× faster`, `n=15 · CV 1.98%` AND `max_batch=4` UNTIL §101. ALL THREE WERE WRONG AND EACH WAS FORBIDDEN BY A RULE ALREADY WRITTEN IN §24.2** — the point figure by D341, the misattributed dispersion by D342, and the literal `max_batch=4` by §24.2's own closing note that *a compile-time constant may not pose as a measured run parameter* on the one line whose job is to say how the measurement was taken.
