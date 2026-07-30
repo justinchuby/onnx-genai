@@ -463,6 +463,39 @@ Enforced by the dispatch inside `run_static_batch_until_idle` (`driver.rs:575-59
 
 **Status:** the fix is funded — delete `looks_like_model_dir` and unify on `ModelDirectory::load(...).is_ok()`. Update this section to ENFORCED when it lands.
 
+### 5.13 A metric's name is part of its contract — **ASSUMED, NOT ENFORCED** ⚠️
+
+> A field must mean what its name says. Before consuming a metric, read the code that **increments** it, not the code that declares it.
+
+**Why this is the sharpest observability trap in this codebase:** a stub is discoverable — someone greps and finds the hardcoded literal. **A correctly-computed number under a misleading name looks perfect forever.** It survives review, passes any "is this field populated?" check, and produces confident, precise, wrong conclusions.
+
+Verified instances in this repo, all genuinely measured and all easy to misread:
+
+| Field | Name implies | Actually counts | Evidence |
+|---|---|---|---|
+| `prefix_cache_lookups` | cache lookups | **completed generations** — incremented unconditionally, with no predicate | `metrics.rs:130-135` |
+| `active_sessions` | concurrent requests | **persistent `X-Session-Id` sessions** — 4 concurrent stateless requests report `0` | `session.rs:73`, `:106` |
+| `vram.used` | GPU memory in use | the scheduler's **KV byte-budget accounting** | `governor.rs:548`, `:554` |
+| `host_ram.used` | this process's memory | **whole-machine** OS query, including every other process | `governor.rs:575-579` |
+
+**What breaks if violated:** the failure is silent and self-confirming. `prefix_cache_lookups` is the cautionary case — it would read `5` on a build with the prefix cache **deleted entirely**, so any hit-rate derived from it is a ratio against an unrelated denominator.
+
+**Rule for consumers:** if a name is wrong, **rename it at your boundary** to what it actually measures. Do not inherit a misleading name because upstream chose it. Naming `active_sessions` "concurrent requests" in a UI would be a fabricated measurement even though the number itself is correct.
+
+### 5.14 A getter's existence does not mean the value survives the path — **ASSUMED, NOT ENFORCED** ⚠️
+
+> Check that the field you need survives the *whole* call chain. A correctly-named function can compute exactly what you want and then discard it one line later.
+
+Three independent instances:
+
+- **`PageUsage` collapses page identity into a count.** `SequenceUsage.pages` is `pages.len()` (`page_table.rs:867-875`) — the `Vec<PageId>` is consumed to produce a length. The table knows *which* pages each sequence holds (`self.sequences`, `page_table.rs:619-620`), but that mapping never crosses the API boundary. **Consequence:** per-block sequence ownership — colouring a block grid by owning sequence — cannot be built from `page_usage()` as it stands.
+- **`GovernorReconfigureOutcome` drops the eviction plan**, so a caller learns that reconfiguration happened but not what it decided.
+- **`driver.rs:735-739` discards the reconfigure result** entirely.
+
+**Why it holds:** each of these was a reasonable narrowing for its original caller — a length is all the original consumer needed.
+
+**What breaks if violated:** you discover mid-implementation that the data was computed and thrown away, and the fix is an API change in a lower crate rather than the "just call the getter" you planned for. Widening the return type is usually the right fix; recomputing at the call site duplicates the invariant.
+
 ---
 
 ## 6. Concurrency model
