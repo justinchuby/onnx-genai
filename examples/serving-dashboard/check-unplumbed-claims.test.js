@@ -283,21 +283,66 @@ describe('every claim of absence is evidenced and still true', () => {
     // keep its own copy -- is enforced BELOW, structurally, against the
     // shipped source rather than against a runtime value.
     const REGISTRY = 'unplumbed-registry.mjs';
+    const INVENTORY_NAMES = ['NOT_YET_PUBLISHED', 'UNPLUMBED_CLAIMS', 'UNPLUMBED'];
+
+    // A declaration BOUND TO AN OBJECT LITERAL is a second inventory. Binding
+    // to a call or an identifier (`= summaryAllowlist();`, `= UNPLUMBED;`) is a
+    // derivation and is exactly what we want.
+    const inventoryLiteralsIn = (source) =>
+      INVENTORY_NAMES.filter((name) =>
+        new RegExp(
+          `(?:const|let|var|export const)\\s+${name}\\s*=\\s*(?:Object\\.freeze\\(\\s*)?\\{`,
+        ).test(source),
+      );
+
+    const registryPath = shippedPaths().find((p) => p.endsWith(REGISTRY));
+    assert.ok(registryPath, `${REGISTRY} is not at the shipping ref at all.`);
+
+    // ANTI-VACUITY, both directions, and BOTH CONTROLS ARE REAL SHIPPED FILES
+    // rather than fixtures.
+    //
+    // The corpus scan below passes if `inventoryLiteralsIn` never matches
+    // anything -- a broken regex, a reformatted declaration style, an empty
+    // corpus -- and it would then report a confident green having read nothing.
+    // Zero redeclarations is also the permanent goal state, so there is no real
+    // positive occurrence left to anchor on. That is the trap I walked into on
+    // the by-name guard: an anti-vacuity control anchored on a real DEFECT
+    // breaks the moment the defect is legitimately repaired.
+    //
+    // The way out here is that ONE legitimate occurrence must exist forever, by
+    // definition: the registry itself declares the literal. So the detector is
+    // proved against the file it deliberately skips. That control cannot rot,
+    // because the day it stops holding, the single definition is gone.
+    //
+    // Using real files also sidesteps the second trap: a synthetic fixture
+    // containing an inventory literal would sit in THIS file's source, which is
+    // itself in the scanned corpus, and the guard would flag its own sample data.
+    assert.deepEqual(
+      inventoryLiteralsIn(stripRustComments(shipped(registryPath))),
+      ['UNPLUMBED'],
+      `The detector could not find the inventory literal in ${REGISTRY}, which is ` +
+        'the one file that definitely contains it. The scan below is therefore ' +
+        'reading a corpus it cannot interpret, and its empty result means nothing.',
+    );
+
+    // NEGATIVE CONTROL: this file derives (`const UNPLUMBED_CLAIMS = UNPLUMBED;`)
+    // and must NOT be read as a declaration. A detector that cannot tell a
+    // derivation from a definition would flag every correct consumer, and a
+    // guard that reddens on correct code gets deleted by whoever hits it.
+    assert.deepEqual(
+      inventoryLiteralsIn('const UNPLUMBED_CLAIMS = UNPLUMBED;\nexport const NOT_YET_PUBLISHED = summaryAllowlist();'),
+      [],
+      'The detector treats a derivation as a second inventory, so every correctly ' +
+        'migrated consumer would be reported as a duplicate.',
+    );
+
     const redeclared = [];
 
     for (const path of shippedPaths()) {
       if (!/\.(?:js|mjs)$/.test(path)) continue;
-      if (path.endsWith(REGISTRY)) continue;
-      const source = stripRustComments(shipped(path));
-
-      for (const name of ['NOT_YET_PUBLISHED', 'UNPLUMBED_CLAIMS', 'UNPLUMBED']) {
-        // A declaration BOUND TO AN OBJECT LITERAL is a second inventory.
-        // Binding to a call or an identifier (`= summaryAllowlist();`,
-        // `= UNPLUMBED;`) is a derivation and is exactly what we want.
-        const literal = new RegExp(
-          `(?:const|let|var|export const)\\s+${name}\\s*=\\s*(?:Object\\.freeze\\(\\s*)?\\{`,
-        );
-        if (literal.test(source)) redeclared.push(`${path} declares ${name} as its own object literal`);
+      if (path === registryPath) continue;
+      for (const name of inventoryLiteralsIn(stripRustComments(shipped(path)))) {
+        redeclared.push(`${path} declares ${name} as its own object literal`);
       }
     }
 
@@ -312,6 +357,7 @@ describe('every claim of absence is evidenced and still true', () => {
         'on earth reconciling them -- keyset drift was guarded, wording drift was ' +
         'not, and a corrected reason beside a stale one is invisible.',
     );
+
   });
 
   it('every entry is classified, and the taxonomy is not decorative', () => {
