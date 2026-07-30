@@ -104,7 +104,13 @@ export default function mount(rootElement, telemetryStore) {
     const waiting = telemetryStore.field('scheduler.waiting');
     const admissionSlots = telemetryStore.field('admission.slots_available');
     const batchSize = telemetryStore.field('batch.active_size');
-    const maxBatch = telemetryStore.field('scheduler.max_batch');
+    // `scheduler.max_batch` had ZERO producers -- no provenance entry and no
+    // server field -- so this rendered unavailable on every live server while
+    // four test fixtures supplied it. The suite was green because the tests
+    // handed the panel the value the server could not. `batch_capacity` is the
+    // served denominator, and it is min(max_batch, max_queue_depth): max_batch
+    // alone overstates the ceiling when the queue is the binding constraint.
+    const maxBatch = telemetryStore.field('batch.capacity');
     const queueDepth = telemetryStore.field('queue.depth');
     const rejections = telemetryStore.field('admission.rejections');
     const allocationFailures = telemetryStore.field('kv.allocation_failures');

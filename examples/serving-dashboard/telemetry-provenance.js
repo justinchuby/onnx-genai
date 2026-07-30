@@ -610,16 +610,39 @@ export const PROVENANCE = Object.freeze({
   // plausible label — worse than a hardcoded zero, because nothing about the
   // value looks wrong. It is exposed here under a name that says what it
   // actually counts.
+  // AND IT NO LONGER COSTS A STALL, WHICH IS WHY AC63 AND D88 ARE NO LONGER IN
+  // CONFLICT. This used to be read off /metrics, and D87/D88 banned polling
+  // that endpoint (14,784 ms during a generation vs 0.8 ms idle -- it stalls
+  // precisely when concurrency is worth showing). The server now emits the same
+  // count directly on /v1/status at ~1.8 ms, so the field the ruling asked us
+  // to bind is reachable without the stall. The caveat above is unchanged: this
+  // counts REQUESTS IN FLIGHT, not the engine batch.
   'batch.in_flight': {
-    source: ENDPOINTS.METRICS,
-    metric: 'onnx_genai_batch_size_current',
-    kind: 'scalar',
+    source: ENDPOINTS.STATUS,
+    path: 'batch_in_flight',
     classification: 'MEASURED',
     unit: 'requests',
     evidence:
-      'crates/onnx-genai-server/src/metrics.rs:112 (fetch_add on generation start) and :145 ' +
-      '(decrement in Drop). Counts in-flight generations, NOT the engine batch.',
+      'crates/onnx-genai-server/src/routes/admin.rs:175 (batch_in_flight, from ' +
+      'snapshot.current_batch_size). Counts in-flight generations, NOT the engine batch.',
     label: 'Generations in flight',
+  },
+  // The denominator, SERVED rather than assumed. It is
+  // `effective_batch_capacity()` = min(max_batch, max_queue_depth), NOT
+  // max_batch: max_batch alone overstates the ceiling whenever the queue is the
+  // binding constraint, so occupancy would read low against a limit the server
+  // would never reach. A panel previously bound `scheduler.max_batch`, which no
+  // server has ever emitted -- four test fixtures supplied it, so the suite was
+  // green while the panel was permanently degraded live.
+  'batch.capacity': {
+    source: ENDPOINTS.STATUS,
+    path: 'batch_capacity',
+    classification: 'MEASURED',
+    unit: 'requests',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs:178 ' +
+      '(batch_capacity, from state.config.effective_batch_capacity()).',
+    label: 'Batch limit',
   },
   // The number a viewer actually wants — how many sequences the engine stepped
   // together — is not exposed by anything. ContinuousBatchManager does not

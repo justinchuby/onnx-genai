@@ -148,7 +148,7 @@ const MEASURED_FIELDS = (() => {
 
     'scheduler.running': measured(3, { source: 'server' }),
     'scheduler.waiting': measured(5, { source: 'server' }),
-    'scheduler.max_batch': measured(4, { source: 'server' }),
+    'batch.capacity': measured(4, { source: 'server' }),
     'scheduler.preemptions_total': measured(1, { source: 'server' }),
     'queue.depth': measured(5, { source: 'server' }),
     'queue.depth_peak': measured(9, { source: 'server' }),

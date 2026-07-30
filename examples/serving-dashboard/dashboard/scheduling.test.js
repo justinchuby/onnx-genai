@@ -31,7 +31,7 @@ function storeWith(overrides = {}) {
       'scheduler.waiting': measured(2, { unit: 'requests', label: 'Waiting' }),
       'admission.slots_available': measured(248, { unit: 'slots' }),
       'batch.active_size': measured(6, { unit: 'sequences' }),
-      'scheduler.max_batch': unavailable(
+      'batch.capacity': unavailable(
         "Occupancy needs the server's max batch size, which isn't surfaced.",
       ),
       'queue.depth': measured(2, { unit: 'requests' }),
@@ -105,7 +105,7 @@ describe('scheduling panel — the batch occupancy denominator', () => {
       storeWith({
         fields: {
           'batch.active_size': measured(3, { unit: 'sequences' }),
-          'scheduler.max_batch': measured(4, { unit: 'sequences' }),
+          'batch.capacity': measured(4, { unit: 'requests' }),
         },
       }),
     );
@@ -249,7 +249,7 @@ describe('scheduling panel — describe() for AC28', () => {
       storeWith({
         fields: {
           'batch.active_size': measured(3),
-          'scheduler.max_batch': measured(4),
+          'batch.capacity': measured(4),
         },
       }),
     );

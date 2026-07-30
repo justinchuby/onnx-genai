@@ -64,7 +64,6 @@ const NOT_YET_PUBLISHED = Object.freeze({
 
   // Scheduler detail beyond queue.depth.
   'queue.depth_peak': 'peak tracking not yet plumbed server-side',
-  'scheduler.max_batch': 'scheduler introspection not yet plumbed',
   'scheduler.preemptions_total': 'scheduler introspection not yet plumbed',
   'scheduler.running': 'scheduler introspection not yet plumbed',
   'scheduler.waiting': 'scheduler introspection not yet plumbed',
@@ -115,20 +114,44 @@ function respondingServer() {
   const bodies = {
     '/health': { status: 'ok' },
     '/v1/models': { data: [{ id: 'phi-3' }] },
+    // FIELD NAMES HERE ARE RECONCILED AGAINST THE RUST HANDLERS BY THE TEST
+    // BELOW. This payload decides what publishedKeys() believes the server
+    // emits, so a field missing HERE makes a real server field look unplumbed
+    // -- which is exactly how `batch_capacity` stayed invisible while a panel
+    // bound a key that never existed.
     '/v1/status': {
       healthy: true,
       model_id: 'phi-3',
       node_id: 'node-1',
-      context_length: 4096,
       queue_depth: 3,
       active_sessions: 2,
       batch: { active_size: 4 },
       kv_usage: 0.0,
       tokens_per_second: 0.0,
       batch_utilization: 0.0,
+      batch_in_flight: 4,
+      batch_capacity: 8,
     },
-    '/v1/debug/kv': { prefix_cache_hits: 0, prefix_cache_lookups: 17 },
-    '/v1/debug/config': {},
+    '/v1/debug/kv': {
+      prefix_cache_hits: 0,
+      prefix_cache_lookups: 17,
+      kv_pages_used: 12,
+      kv_pages_total: 64,
+      kv_pages_shared: 3,
+      prefix_hashes: 5,
+    },
+    // Was `{}`, which starved every server.* key sourced from this endpoint --
+    // so `server.context_length` looked unplumbed while the server has served
+    // it as `model_max_context` all along. The fixture had ALSO put a
+    // `context_length` field on /v1/status, a name no handler emits.
+    '/v1/debug/config': {
+      model_id: 'phi-3',
+      pipeline: 'scatter',
+      max_output_tokens: 512,
+      max_sessions: 32,
+      max_queue_depth: 16,
+      model_max_context: 4096,
+    },
     '/v1/resources': {},
     '/metrics': '',
   };
@@ -213,5 +236,60 @@ describe('every field key a panel requests is reconciled against the store', () 
     }
 
     assert.deepEqual(strays, [], strays.join('\n'));
+  });
+});
+
+// THE CHECK THAT WOULD HAVE CAUGHT TONIGHT'S DEAD BINDING, AIMED AT THE ONE
+// ARTEFACT NOTHING ELSE IN THIS FILE VERIFIES: THE FAKE SERVER ITSELF.
+//
+// Every other test here reconciles panels against `publishedKeys()`. But
+// publishedKeys() polls `respondingServer()`, which is a payload WE wrote. So
+// the entire reconciliation rests on a fixture, and a fixture cannot testify
+// about a server. If the payload omits a field the real server sends, that
+// field looks unplumbed to every check above -- and a panel binding a
+// NONEXISTENT key alongside it looks equally unplumbed, so the two become
+// indistinguishable.
+//
+// That is precisely what happened. The payload omitted `batch_capacity`, which
+// the server has been serving all along, while a panel bound
+// `scheduler.max_batch`, which nothing has ever served. Both rendered a calm
+// em-dash. The "this key has ARRIVED, stop em-dashing it" check could never
+// fire, because the fixture never let it arrive.
+//
+// So this test reads the Rust handler and asserts our fake speaks the same
+// vocabulary as the real one. It is the only check here whose inputs are not
+// both written by us.
+describe('the fake server is reconciled against the Rust handler it imitates', () => {
+  it('invents no field the real /v1/status and /v1/debug/kv do not serve', async () => {
+    const { readFile } = await import('node:fs/promises');
+    // Read every handler + state file, not just admin.rs: the response structs
+    // are split across routes/mod.rs and state.rs, and checking one file would
+    // report honest fields as invented -- a false positive, which teaches the
+    // team to ignore this test and is worse than not having it.
+    const crate = new URL('../../../crates/onnx-genai-server/src/', import.meta.url);
+    const sources = ['routes/admin.rs', 'routes/mod.rs', 'state.rs', 'metrics.rs'];
+    const handler = (
+      await Promise.all(sources.map((f) => readFile(new URL(f, crate), 'utf8')))
+    ).join('\n');
+
+    const fixture = respondingServer();
+    const invented = [];
+    for (const path of ['/v1/status', '/v1/debug/kv']) {
+      const response = await fixture(`http://127.0.0.1:8123${path}`);
+      for (const name of Object.keys(await response.json())) {
+        // `batch` is a client-side nesting the store flattens, not a wire name.
+        if (name === 'batch') continue;
+        if (new RegExp(`\\b${name}\\b`).test(handler)) continue;
+        invented.push(`${path} fixture sends "${name}", absent from the handler sources`);
+      }
+    }
+
+    assert.deepEqual(
+      invented,
+      [],
+      `${invented.join('\n')}\n\nThe fake server sends a field the real one does not. Every ` +
+        'key check in this file polls that fake, so an invented field makes a panel binding ' +
+        'it look healthy in CI and em-dash forever in front of an audience.',
+    );
   });
 });

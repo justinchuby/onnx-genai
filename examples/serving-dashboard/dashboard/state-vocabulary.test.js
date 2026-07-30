@@ -258,3 +258,53 @@ describe('no two of the five states render identically', () => {
     uninstall();
   });
 });
+
+// THE ENUM IS CONTESTED WHILE THE PANELS ARE BEING BUILT, AND THE PANELS MUST
+// NOT CARE.
+//
+// The store's constant has flipped between `MEASURED: 'ok'` and
+// `MEASURED: 'measured'` more than once tonight, and telemetry-field.js still
+// carries a long comment about the version where the constant and its value
+// disagreed. That bug had NO SYMPTOM: `field.state === 'measured'` was false
+// for every measured field, and the formatter fell through to rendering a
+// plain number anyway, so the comparison failed silently while the output
+// still looked right.
+//
+// The defence is that the panel layer normalises both spellings at one choke
+// point instead of comparing raw strings. That makes the ruling — whichever
+// way it lands — a store-side change with no panel edits, and it means a
+// half-applied rename cannot produce a page that looks fine and compares
+// wrong. This test exists so nobody "tidies away" the alias.
+describe('the panel layer survives either spelling of the measured state', () => {
+  it("normalises both 'ok' and 'measured' to the same render state", () => {
+    for (const spelling of ['ok', 'measured']) {
+      const field = { value: 20.7, state: spelling, source: 'server', unit: 'tokens/s' };
+      assert.equal(
+        renderStateOf(field),
+        RENDER_STATES.OK,
+        `state '${spelling}' must render as a measurement, whichever the store ships`,
+      );
+    }
+  });
+
+  it('renders an identical DOM for both spellings, not merely an equal state', async () => {
+    const { installFakeDom } = await import('./testing/fake-dom.js');
+    const uninstall = installFakeDom();
+    const { renderField } = await import('./panel-kit.js');
+    const render = (spelling) => {
+      const element = renderField(
+        { value: 20.7, state: spelling, source: 'server', unit: 'tokens/s' },
+        { label: 'Throughput' },
+      );
+      return {
+        state: element.getAttribute('data-state'),
+        text: element.textContent,
+      };
+    };
+    try {
+      assert.deepEqual(render('ok'), render('measured'));
+    } finally {
+      uninstall();
+    }
+  });
+});
