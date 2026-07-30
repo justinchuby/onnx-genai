@@ -275,3 +275,172 @@ test('the catalogue keeps the server vocabulary for paged KV', () => {
     );
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AC196 — THE ACCESSIBLE DESCRIPTION IS A CAPTION SURFACE, AND IT HAD NO GUARD.
+//
+// Everything above audits `renderField` captions: the words a SIGHTED visitor
+// reads. `buildDescription` builds a second, parallel set of captions for the
+// screen-reader text, through
+//
+//     describeFieldText('<prose>', telemetryStore.field('<key>'))
+//
+// and NOTHING reconciled that prose against the catalogue. This is the same
+// generator as 'Batch limit' masking 'Effective batch capacity' — a hardcoded
+// string outranking the catalogue — except it is invisible to every reviewer
+// who looks at the page, because the divergence only exists in the audio.
+//
+// WHY THE OBVIOUS VERSION OF THIS RULE IS WORTHLESS, MEASURED BEFORE WRITING IT:
+// the first form I built joined "labels of absent catalogue keys" against
+// "string literals in the shipped corpus". It returned three hits and ZERO
+// defects — two were the SAME COMMENT LINE in kv-memory.js (the epitaph that
+// the test 'a caption named in a comment is not treated as a caption in use'
+// above exists to protect), and one was an acronym glossary DEFINING the term.
+// Shipping it would have filed a false positive against the exact file this
+// file already guards, one function below the guard that forbids it.
+//
+//   A CAPTION THAT NAMES A FIELD IS NOT A PROMISE. A CAPTION BOUND TO A FIELD
+//   IS. The binding is what makes it a claim, so the binding is what to parse.
+const ACCESSIBLE_CAPTION = /describeFieldText\(\s*'([^']*)'\s*,\s*[A-Za-z_$][\w$]*\.field\(\s*'([^']*)'/g;
+
+/**
+ * Every accessible-description caption bound to a telemetry key, at HEAD.
+ *
+ * @param {string} text
+ * @returns {Array<{prose: string, key: string}>}
+ */
+export function findAccessibleCaptions(text) {
+  const found = [];
+  for (const match of text.matchAll(ACCESSIBLE_CAPTION)) {
+    found.push({ prose: match[1], key: match[2] });
+  }
+  return found;
+}
+
+// Accessible captions whose prose deliberately differs from the catalogue
+// label, and why. An entry here is a DECLARATION, not an absolution: two of
+// these are open defects, recorded so they cannot grow silently and so the
+// next reader meets them beside the green rather than instead of it.
+const DECLARED_PROSE_DIVERGENCE = new Map([
+  [
+    'server.model_id',
+    "Prose says 'model', catalogue says 'Model id'. The sentence reads 'System: " +
+      "model is X' — 'Model id is X' is worse English in a spoken sentence. A " +
+      'register difference, not a meaning difference.',
+  ],
+  [
+    'resources.vram_limit_bytes',
+    "OPEN DEFECT, NOT A JUSTIFICATION. Prose says 'KV bytes reserved'; the " +
+      "catalogue says 'VRAM limit'. Those are DIFFERENT CONCEPTS — the VRAM " +
+      'ceiling is not the KV reservation — so a screen-reader user is told a ' +
+      'different fact than the page shows. This is exactly the `Batch limit` ' +
+      'defect in the audio channel. Pinned here so it cannot be joined by a ' +
+      'second one; it needs a product decision about which noun is true.',
+  ],
+]);
+
+// Keys named in accessible prose that the catalogue does not cover, and why.
+const DECLARED_UNCATALOGUED_KEYS = new Map([
+  [
+    'client.poll_rtt_ms',
+    'OPEN GAP, NOT A JUSTIFICATION. This is a CLIENT-side measurement — the ' +
+      'browser times its own poll — so it has no server evidence line and no ' +
+      'wire path, which is why it was never given a catalogue entry. But it is ' +
+      'spoken to a screen-reader user as a fact, and nothing classifies it. ' +
+      'A client measurement is still a measurement and should carry provenance.',
+  ],
+]);
+
+test('CAN RUN: the accessible-caption detector reaches real bound captions', () => {
+  const total = shippedSources().reduce(
+    (count, { text }) => count + findAccessibleCaptions(text).length,
+    0,
+  );
+  assert.ok(
+    total >= 3,
+    `CANNOT RUN: only ${total} bound accessible captions found at HEAD. Either ` +
+      'describeFieldText was renamed or the pattern is broken — and a green ' +
+      'result over an empty set is the failure this whole file exists to stop.',
+  );
+});
+
+test('the accessible-caption detector fires, and does not claim an unbound one', () => {
+  // Positive and negative in one test, because a detector that matches
+  // everything and one that matches nothing both make the audit below green.
+  const bound = `parts.push(\`\${describeFieldText('Execution provider', store.field('server.execution_provider'))}.\`);`;
+  assert.deepEqual(findAccessibleCaptions(bound), [
+    { prose: 'Execution provider', key: 'server.execution_provider' },
+  ]);
+
+  // A caption naming a field WITHOUT binding it is prose, not a promise. The
+  // acronym glossary in system.js is exactly this shape and must stay legal.
+  const unbound = `acronyms: { EP: 'Execution provider — the backend ONNX Runtime dispatches to' },`;
+  assert.deepEqual(findAccessibleCaptions(unbound), []);
+});
+
+test('an accessible caption inside a comment is not treated as one in use', () => {
+  // The specimen that nearly cost me a false positive: kv-memory.js:186 names
+  // two catalogue labels inside a comment explaining the captions it removed.
+  const commented = `
+    // The catalogue says 'KV pages in use' and 'KV pages total', and the
+    // dashboard used to say blocks. Do not reintroduce:
+    //   describeFieldText('KV blocks in use', telemetryStore.field('kv.pages_used'))
+    return null;
+  `;
+  const found = findAccessibleCaptions(commented);
+  assert.deepEqual(
+    found.map(({ key }) => key),
+    ['kv.pages_used'],
+    'the comment specimen changed shape; this test is no longer anchored',
+  );
+  // Documented limitation, asserted rather than claimed: this detector DOES
+  // see into comments. It is acceptable here only because a commented-out
+  // `describeFieldText` call is itself a thing worth deleting, whereas a
+  // commented LABEL (the kv-memory.js epitaph) is not — and the label-only
+  // form, which is the one that actually appears in our tree, is not matched.
+  assert.deepEqual(findAccessibleCaptions("// catalogue says 'KV pages in use'"), []);
+});
+
+test('every key spoken to a screen reader is in the provenance catalogue', () => {
+  const uncatalogued = [];
+  for (const { name, text } of shippedSources()) {
+    for (const { prose, key } of findAccessibleCaptions(text)) {
+      if (!PROVENANCE[key] && !DECLARED_UNCATALOGUED_KEYS.has(key)) {
+        uncatalogued.push(`${name} -> '${prose}' is bound to ${key}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    uncatalogued,
+    [],
+    'The accessible description states a field as fact, and the catalogue has no ' +
+      'entry for it — so nothing records where it came from or whether it is ' +
+      'measured:\n' +
+      uncatalogued.map((entry) => `  ${entry}`).join('\n') +
+      '\n\nThe screen-reader text is the one surface no sighted reviewer checks. ' +
+      'Give the key a catalogue entry, or declare it in ' +
+      'DECLARED_UNCATALOGUED_KEYS with the reason it cannot have one.',
+  );
+});
+
+test('accessible prose does not silently rename a catalogue entry', () => {
+  const drifted = [];
+  for (const { name, text } of shippedSources()) {
+    for (const { prose, key } of findAccessibleCaptions(text)) {
+      const label = PROVENANCE[key]?.label;
+      if (label && label !== prose && !DECLARED_PROSE_DIVERGENCE.has(key)) {
+        drifted.push(`${name} -> ${key}: spoken '${prose}', catalogue '${label}'`);
+      }
+    }
+  }
+  assert.deepEqual(
+    drifted,
+    [],
+    'The screen-reader text calls a field something the catalogue does not:\n' +
+      drifted.map((entry) => `  ${entry}`).join('\n') +
+      '\n\nThis is `Batch limit` in the audio channel: a hardcoded string ' +
+      'outranking the catalogue, on the one surface a reviewer cannot see. ' +
+      'Correcting the catalogue will NOT change what is spoken. Either drop the ' +
+      'hardcoded prose or declare it in DECLARED_PROSE_DIVERGENCE with a reason.',
+  );
+});
