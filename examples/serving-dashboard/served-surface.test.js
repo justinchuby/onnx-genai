@@ -217,7 +217,20 @@ const servedButNotNeeded = classified.filter(
 // still three files, still not mine, still red. If this raise had shrunk the
 // disclosure it would have been the ratchet being loosened rather than
 // accounted, which is the failure this constant exists to make impossible.
-const MAX_SERVED_BUT_NOT_NEEDED = 93;
+// 93 -> 94: +1, and exactly +1, for ONE file I added -- `unplumbed-registry.mjs`,
+// the single definition of the deferral inventory that NOT_YET_PUBLISHED,
+// UNPLUMBED_CLAIMS and a regex lift used to keep three copies of. Verified by
+// walking `git diff --diff-filter=A` over EVERY commit since the 92 -> 93 raise:
+// exactly one tracked file was added under this directory tree-wide, and it is
+// mine. A visitor may have it for the same reason they may have the guards --
+// it is a machine-readable statement of what the demo does NOT yet show, and
+// concealing that list would serve nobody.
+//
+// The residual is unchanged in size again: 96 against 93 became 97 against 94,
+// still three files, still not mine, still red. If this raise had shrunk the
+// disclosure it would have been the ratchet being loosened rather than
+// accounted, which is the failure this constant exists to make impossible.
+const MAX_SERVED_BUT_NOT_NEEDED = 94;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
