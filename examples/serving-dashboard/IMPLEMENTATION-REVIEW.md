@@ -1425,3 +1425,53 @@ roughly one full-suite run in three, and a lock could not fix it because the oth
 mutators would have to volunteer to take it. It then names the deterministic test
 that proves the property at the arithmetic seam instead. A flaky assertion
 correctly retired, with its replacement cited. That is the standard.
+
+---
+
+## F20 (MAJOR, new) — the canonical suite is defined by a phrase that resolves two ways
+
+Measured in one pinned clean worktree at `ac7c7412`, `--porcelain` 0, node
+v25.6.1, both numbers taken in the same invocation:
+
+| scope | result |
+| --- | --- |
+| `examples/serving-dashboard/dashboard` | 289 pass / 0 fail |
+| `examples/serving-dashboard` | 532 pass / 0 fail |
+| **delta** | **243 tests across 25 files** |
+
+The canon is currently stated as "the full dashboard directory". That phrase
+resolves to either scope, and both are honest readings — so two careful people
+will run two different suites and both will correctly report "canonical, green."
+The published count being stale is benign; the suite has grown all session
+(435 → 463 → 507 → 520 → 532). The ambiguity is the defect.
+
+It is not pedantry, because of what falls in the 243:
+
+```
+telemetry-store.test.js          60   <- the gate's last red lived here
+check-source-citations.test.js    5   <- gate item 5 is certified on this file
+check-perf-claims.test.js         7       page-claims.test.js             10
+check-readme-claims.test.js       4       prefix-counters-forbidden.js     3
+denominator-binding.test.js       3   <- F15's guard
+provenance-expiry.test.js         5       register-completeness.test.js    8
+check-docstring-drift.test.js     5       never-bind.test.js               3
+```
+
+Every test enforcing the honesty bar lives outside `dashboard/`. Under the
+narrower reading, the single failure that held gate item 2 red would have been
+invisible and item 2 would have been certified green throughout.
+
+**Fix:** state the canon as a command, not a place —
+`cd examples/serving-dashboard && node --test`, 532 green at `ac7c7412`, node
+v25.6.1. A command cannot resolve two ways. The node version is load-bearing and
+not optional: v25 recurses into subdirectories and older releases do not, so on an
+older runtime the *same command* silently collapses to roughly the 289 subset.
+**The scope is decided by the runtime as well as by the path.**
+
+### Fourth specimen of one class, now reaching the gate
+
+`page-claims`' coverage list (F-class, another reviewer), F16's corpus glob, F17's
+key matcher, and now the canon's own directory. None is wrong; all are narrow. A
+narrow scope does not fail — it passes, credibly, and certifies the territory it
+cannot see. A test's assertion is checked by its suite; its scope is checked by
+nothing, and the gate was the last place that was still true of.
