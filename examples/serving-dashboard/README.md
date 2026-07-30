@@ -235,7 +235,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8124/demo/
 
 | Flag | Why |
 |---|---|
-| `--model` | The server takes a model **directory**, not a config file. Unlike the CLI it does not normalise the path for you — but as of `cli.rs:145` it now detects the mistake up front and tells you the exact directory to use instead, rather than failing deep in the loader. |
+| `--model` | The server takes a model **directory**, not a config file. Unlike the CLI it does not normalise the path for you — but `crates/onnx-genai-server/src/cli.rs::run_serve` detects the mistake up front and tells you the exact directory to use instead, rather than failing deep in the loader. |
 | `--demo-assets-dir` | Where the dashboard's static files live. Without it the server looks for `./examples/serving-dashboard` **relative to its working directory**, so a server started from anywhere else serves an explanatory error at `/demo` instead of the page. `run-demo.sh` always passes it, so it works from any directory. |
 | `--models-dir` | **Never used, and worth knowing why.** It loads *every* valid model directory it finds, eagerly. `models/` holds twenty-odd of them, so this means many gigabytes and a very long startup before the demo can serve anything. Each server is pointed at one model with `--model`. |
 | `--max-loaded-models` | **Never set.** The default is unlimited; setting it risks evicting a model mid-demo, which presents as a scenario mysteriously going dead. |
@@ -531,7 +531,7 @@ and the engine's true batch size as **unavailable**, because nothing exposes it.
 genuine measurement — `current_batch_size / effective_batch_capacity()`, where
 the capacity is `max_batch.min(max_queue_depth)` (`crates/onnx-genai-server/src/state.rs`), which is
 correctly *tighter* than `max_batch` alone. But it is **clamped to `1.0`** by
-`batch_utilization` (`admin.rs:80`). The clamp is well-reasoned for a multi-model node, where
+`crates/onnx-genai-server/src/routes/admin.rs::batch_utilization`. The clamp is well-reasoned for a multi-model node, where
 in-flight work legitimately exceeds any single batch. It also means the value
 saturates at exactly the moment queueing begins, and the overflow — the entire
 queueing signal — is discarded before it reaches the wire. `max(0, in_flight -
@@ -551,7 +551,7 @@ come from the same scope.*
 | `effective_batch_capacity()` (denominator) | **one config's** batch ceiling (`crates/onnx-genai-server/src/state.rs`) |
 
 **The numerator can therefore legitimately exceed the denominator**, which is
-exactly what the clamp in `batch_utilization` (`admin.rs:80`) exists to absorb. Rendered as `n of m`
+exactly what the clamp in `crates/onnx-genai-server/src/routes/admin.rs::batch_utilization` exists to absorb. Rendered as `n of m`
 that produces **`7 of 4`** — visibly absurd — where the percentage form silently
 shows `100 %`. **The clamp is not hiding a bug; it is hiding a scope mismatch,
 and `n of m` un-hides it.** Both forms are wrong here for the same underlying
