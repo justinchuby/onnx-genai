@@ -958,3 +958,139 @@ instrument with the missing corpus is mine.
 
 Neither layer may be removed on the grounds that the other covers it. Removing
 either leaves zero margin, the full suite green, and the browser green.
+
+## §12 — End-to-end QA plan run, and a P1 in the flagship number
+
+Binary pinned: built from **`35b0ad48`** in a detached worktree, launched through the
+**shipping `run-demo.sh`** via `CARGO_TARGET_DIR`, ports 9611/9612. HEAD moved twice
+during this work (`eca213ec -> 8df58c11 -> 35b0ad48`, roughly a commit a minute), which
+is why every number below cites a pinned SHA rather than "HEAD".
+
+### §12.1 Pre-flight and launch — PASS
+
+| QA-PLAN | check | result |
+|---|---|---|
+| 2.5a | `GET /demo/` on **both** origins | 200 / 200 |
+| 2.5b | bare `/demo` redirects | **307** -> `/demo/` |
+| 2.5e | ports overridable, nothing hardcodes 8123/8124 | ran entirely on 9611/9612 |
+
+### §12.2 The end-to-end pass — PASS
+
+Three live scenarios (`continuous-batching` on scatter, `paged-kv` and `memory-pressure`
+on dynamic):
+
+| check | result |
+|---|---|
+| white screen | **none** — bodyH 7008–7208 px, innerText 11,498–11,633 chars |
+| panels mounted | **8** on every scenario |
+| telemetry cells | **58** `[data-state]` on both profiles |
+| console errors | **0** |
+| failed requests | **0** (267 requests per page load — polling live) |
+
+### §12.3 Two instrument errors of my own, caught before publishing
+
+**(a) I re-used the selector I had already documented as broken.** `[data-field]` matched
+**3** cells — the model-card identity fields. The telemetry cells carry `class="value"` +
+`data-state` + `aria-label` and **no `data-field`**. Correct selector is `[data-state]`:
+**58** cells. This is artifact #1 from §10, walked into again by copying an old expression.
+
+**(b) "NUMBERS FROZEN" was my sampling window, not the product.** My load generator
+alternated origins *sequentially*, so the page I was sampling was idle while the other
+origin was under load. With load pinned to the origin being sampled:
+
+```
+BATCHING page (:9611)  4 of 8 numeric cells move
+DYNAMIC  page (:9612)  5 of 7 numeric cells move
+  Aggregate output tokens per second   0 -> 0.687 -> 0.932 tok/s
+  Sequences in the current batch       6 -> 5 -> 4 requests
+  Batch occupancy                      6 of 4 -> 5 of 4 -> 4 of 4
+```
+
+An idle server rendering a static `0` is the honest reading, not a defect. **A "numbers
+do not move" report is worthless without load pinned to the origin under observation.**
+
+### §12.4 🔴 P1 — `Batch occupancy` renders above 100 %, on the flagship scenario
+
+**Symptom.** Under load the continuous-batching panel renders
+**`Batch occupancy: 12 of 4`** and **`Sequences in the current batch: 12 requests`**
+against **`Effective batch capacity: 4`**. A ratio that cannot exceed 100 % is drawn at
+300 %.
+
+**Proof it is not a sampling skew.** DOM and server read in the *same instant*, by taking
+the DOM snapshot inside the `fetch('/v1/status')` callback. 5 of 5 samples:
+
+```
+DOM seq="12 requests"  occ="12 of 4"  |  SERVER in_flight=4 cap=4 queued=8
+DOM seq="10 requests"  occ="10 of 4"  |  SERVER in_flight=4 cap=4 queued=6
+                                            12 = 4 + 8      10 = 4 + 6
+```
+
+**Root cause — a cross-endpoint composition, each half individually correct.**
+
+| half | key | source | meaning |
+|---|---|---|---|
+| numerator | `batch.active_size` | `/v1/debug/kv.active_batch_size` | running **+ queued** |
+| denominator | `batch.capacity` | `/v1/status.batch_capacity` | running slots, `min(max_batch, max_queue_depth)` |
+
+Confirmed at the server, both endpoints back-to-back under load:
+`active_batch_size=5` while `in_flight=4, queued=1, capacity=4`. **The numerator counts
+sequences the scheduler knows about; the denominator counts slots that can run. Pairing
+them is invalid, and the error appears exactly when `queued > 0` — i.e. whenever the demo
+is doing the thing it is demoing.** `ratioField` (`dashboard/field-state.js:412`) computes
+`(top / bottom) * 100` with **no clamp**.
+
+**Why 665 green tests miss it.** `dashboard/scheduling.test.js` exists specifically for
+"the batch occupancy denominator" cases. Its one fixture with a large numerator,
+`'batch.active_size': measured(6)`, pairs it with `'batch.capacity': unavailable(...)` —
+**so the ratio never renders and the `>100 %` path is never exercised.** No fixture
+supplies a numerator above a *measured* denominator, and no test asserts an upper bound.
+This is the lesson `model-path-disclosure.test.js` already wrote down: *a fixture cannot
+contain the one thing the defect is made of.*
+
+**Fix (client-side; the server is not wrong).** The server already publishes the correct
+ratio: `batch_utilization` = `in_flight / capacity`, observed as 0.5 / 0.75 / 1.0 and
+never above 1. Either take the numerator from **`/v1/status.batch_in_flight`** so both
+halves come from one endpoint with one meaning, or render the server's `batch_utilization`
+directly. A clamp alone would be wrong — it would hide a mislabelled quantity behind a
+correct-looking number. `Sequences in the current batch` also needs renaming or
+re-sourcing: today it is *sequences admitted or waiting*.
+
+### §12.5 Exit criteria 6 and 7 — DISCHARGED
+
+**EC7, the cut, verified as ruled (confirm the cut; do NOT re-run the protocol).**
+`CUT_SCENARIOS` contains `'prefix-cache'` keyed with **no `id:`**; the live ids are exactly
+`continuous-batching`, `paged-kv`, `memory-pressure`. Behaviour, by executing
+`resolveScenario`:
+
+```
+?scenario=prefix-cache   -> id=continuous-batching  substitution kind=CUT
+                            '"prefix-cache" is not a scenario on this build — it was cut.'
+?scenario=prefx-cache    -> id=continuous-batching  substitution kind=UNKNOWN
+?scenario=never-existed  -> id=continuous-batching  substitution kind=UNKNOWN
+?scenario=paged-kv       -> id=paged-kv             substitution=none
+```
+
+**The app distinguishes *deliberately withdrawn* from *never existed* from *misspelled*,
+and substitutes rather than white-screening.** The launcher's runtime output says so too:
+*"There is deliberately no prefix-caching link: the scenario was cut rather than shipped
+as a tab."*
+
+**EC6, the panel.** The panel ships on both profiles and renders the null result **as
+evidence with citations** (`engine/runtime.rs`), not as a number. Neither
+`prefix_cache_hits` nor `prefix_cache_hit_rate` is rendered at all on either profile. The
+single prefix data cell is `prefix evictions`, state **`unavailable`**, reason *No field
+named `kv.prefix_evictions`*.
+⚠️ **One deviation for the owner, reported rather than judged:** EC6's wording expects
+`not-applicable` on the batching profile; the observed state on **both** profiles is
+`unavailable`. The wording may refer to a different field than the one that renders, so I
+am flagging the mismatch rather than filing it.
+
+### §12.6 Closing an item reported seven times with no owner
+
+The `run-demo.sh` prose that named prefix caching as a live capability is **gone at
+`35b0ad48`** — and I checked the terminal output, not just the file. The file now contains
+two occurrences: a comment about `--enable-debug-endpoints` carrying prefix-cache debug
+fields (accurate, never printed), and the sentence announcing the cut (accurate, printed).
+Fixed by **`cd5c8394` "demo: scan the launcher's prose, not just what it launches"**, which
+also landed the guard — `check-launcher.test.js` reads `CUT_SCENARIOS`. **The crew is
+carrying this as open; it is closed.**
