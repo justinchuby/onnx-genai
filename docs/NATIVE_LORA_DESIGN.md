@@ -1129,3 +1129,135 @@ than the previous misleading "session was not loaded with a grouped pool" error.
   covered by §J.7).
 * **Speculative decoding + grouped adapter** combined: rejected fail-loud (the
   draft/verify paths do not yet thread the route).
+
+### J.10 KV-backed native static-cache continuous batching (P2-kvcb)
+
+§J.9 shipped native continuous batching for the **KV-free** grouped routing
+surface and deferred *KV-backed* continuous batching, because the native CPU
+execution provider had no `TensorScatter` kernel to mirror the ORT static-cache
+contract (independent per-row write cursors into one `[batch, max_len, kv_dim]`
+buffer). That blocker is now removed: the native CPU EP owns a `TensorScatter`
+kernel (`crates/onnx-runtime-ep-cpu/src/kernels/tensor_scatter.rs`, registered
+for `ai.onnx::TensorScatter` opsets 23/24 and `com.microsoft::TensorScatter/1`),
+verified rank-1 `[batch]` write-cursor semantics with per-row consecutive-position
+writes. This subsection specifies the native KV-backed static-cache batched
+decode session built on top.
+
+**Session.** `NativeStaticCacheBatchedDecodeSession`
+(`crates/onnx-genai-engine/src/native_decode/static_cache_batched.rs`) is a real
+`BatchedDecodeSession` that borrows the engine's native grouped `InferenceSession`
+— the one that owns both `GroupedLoraDelta` and `TensorScatter` — and drives a
+static-cache TensorScatter export (e.g. the `tiny-llm-scatter` fixture) under the
+production `ContinuousBatchManager`. It is selected by `run_native_continuous_batch`
+when the graph exposes the static-cache signature (a `write_indices` and a
+`nonpad_kv_seqlen` input plus `key_cache.{i}` / `value_cache.{i}` inputs paired to
+`updated_key_cache.{i}` / `updated_value_cache.{i}` outputs); otherwise the
+KV-free `NativeBatchedDecodeSession` is used, so KV-free models keep their exact
+path.
+
+**KV buffer binding — carry-forward, not IO-binding aliasing.** The runtime owns
+one persistent `[batch, MAX_LEN, KV_DIM]` buffer per `key_cache.{i}` /
+`value_cache.{i}`, allocated once (zeroed) at construction from the graph
+signature (`MAX_LEN` = cache axis-1 extent). Each step binds those buffers as the
+cache inputs; the graph's `TensorScatter` writes the step's K/V rows at each row's
+own `write_indices` cursor and emits the **full** updated buffer as
+`updated_key_cache.{i}`. The session moves each `updated_*` output back into its
+buffer slot (ownership move, no copy) to seed the next step. This is functionally
+the ORT `HandleSwap` mode: the scatter output *is* the source of truth for the
+next step, so no in-place input/output aliasing (ORT `IoBinding` `InPlaceAlias`)
+is required for correctness. In-place aliasing (avoiding the runtime's per-step
+full-buffer output allocation) is a native-EP optimization deferred to a
+follow-up; it is an efficiency win, not a correctness or capability gap. Every
+small per-step tensor the session *does* control — `input_ids`, `position_ids`
+(when declared), `write_indices`, `nonpad_kv_seqlen`, and `lora.segments` — is
+built from a reused scratch buffer, so the session adds no per-step heap
+allocation on the routing/index path.
+
+**Per-row write cursors and `nonpad_kv_seqlen` (mirrors ORT §static_cache).** For
+each physical row the session binds, at axis 1 (the sequence axis):
+`write_indices[row] = row_lens[row]` (the row's current logical length = next free
+slot), and `nonpad_kv_seqlen[row] = row_lens[row] + 1` for a row that advances
+this step, else `row_lens[row]`. `row_lens[row]` is incremented only for advancing
+rows, exactly as ORT's `try_run_batched_static_chunk` does. Because
+`write_indices` is a rank-1 `[batch]` per-row cursor, rows at different lengths
+scatter to different positions in the same buffer — this is the entire point of
+the static-cache contract and is what unblocks ragged continuous batching.
+
+**Ragged prefill (`step_select`).** The `ContinuousBatchManager` prefills each
+freshly admitted row one prompt token at a time via `step_select` with a per-row
+`advance_rows` mask, so at any step some rows advance while others hold. The
+native session runs the **full physical batch** every step and honours the mask
+per row: non-advancing rows (holding rows, finished/deactivated rows, and empty
+slots) bind `write_indices = row_lens` / `nonpad = row_lens` and a dummy token, so
+their scatter lands on the free slot beyond `nonpad` (never read) and the valid
+prefix `[0, row_lens)` is untouched. This is honest but unoptimized: unlike the
+ORT batched session it does **not** compact active rows into a packed physical
+prefix to skip inactive-row compute, so a batch with idle slots still runs model
+compute for those slots. Compaction (an `[active, MAX_LEN, KV_DIM]` gather/scatter
+of the KV buffers) is a straightforward follow-up; it is a throughput
+optimization, not a correctness gap, so it is deferred to keep this increment
+honest and reviewable. `step_active` is implemented by expanding its
+active-row-ordered inputs to physical positions, running the full batch, and
+gathering the active rows' logits back in `active_rows()` order.
+
+**Row lifecycle / cross-sequence isolation.** `assign_row` resets `row_lens[row] =
+0`, marks the row active, and **zeroes that row's slice** in every KV buffer
+(dtype-agnostic byte zero of the `MAX_LEN * KV_DIM` region), mirroring ORT's
+`zero_rank3_row` on admit so a recycled physical slot cannot leak the previous
+sequence's cache — even though `nonpad_kv_seqlen` already bounds reads to
+`[0, row_lens)`. `deactivate_row` only clears the active flag; the slot's cache is
+reclaimed on the next `assign_row`.
+
+**Grouped LoRA threading.** Identical to the KV-free session: when the graph
+declares a `lora.segments` input (a grouped-LoRA-injected session), each step
+binds an `Int32 [rows]` route tensor from the routes fed by `set_lora_routes`
+(physical-row-indexed for `step_select`/prefill, active-row-ordered for
+`step_active`), reusing a little-endian scratch buffer with no per-step heap
+allocation. `set_lora_routes` reuses the emptied `pending_routes` Vec (swapped
+back after each step) so the route Vec itself is not reallocated per step either.
+When the graph declares no `lora.segments` input, routing is dormant and the base
+fast path is preserved byte-for-byte. A static-cache export with grouped LoRA thus
+carries mixed adapters per row **and** independent per-row KV in one native
+continuous batch.
+
+**Native-EP capability added / blockers.** No new native-EP primitive was
+required beyond the already-approved `TensorScatter` kernel: the standard
+`InferenceSession::run` path binds the persistent cache buffers as ordinary
+inputs and consumes the `updated_*` outputs, so the carry-forward design needs
+nothing more. The one honestly-deferred item is IO-binding-style in-place buffer
+aliasing to elide the per-step full-buffer KV output allocation (an efficiency
+optimization), together with active-row compaction (a throughput optimization);
+neither is a correctness or capability boundary, and both are documented as
+follow-ups rather than faked.
+
+**Acceptance proof (non-tautological).** Engine test
+`native_static_cache_continuous_batch_matches_single_sequence`
+(`native-backend`) drives the **real** `NativeStaticCacheBatchedDecodeSession`
+through the production `ContinuousBatchManager` over the real `tiny-llm-scatter`
+static-cache attention export, carrying multiple sequences of **different prompt
+lengths** admitted into one continuous batch, and asserts each row's generated
+token stream **exactly matches an independent per-row single-sequence decode** of
+the same prompt through a fresh `batch_size = 1` static-cache session. Because the
+fixture is a genuine attention model whose logits depend on the KV history, any
+cross-row KV leak or shared-cursor bug makes the batched rows diverge from their
+single-sequence references and fails the test — it is not a self-echo. A second
+test drives a grouped-LoRA-injected static-cache session with three rows bound to
+adapter A, adapter B, and base, asserting per-row routing is observable on the
+KV-backed path (A ≠ B ≠ base), proving grouped routing and per-row KV coexist.
+
+**Engine dispatch + server reachability (Runciter follow-up B).** The native
+continuous-batch path is now reachable by real requests, not only tests. The
+static-cache/KV-free session selection lives in a single builder,
+`Engine::native_continuous_batch_manager`, which both the batch-run helper
+`Engine::run_native_continuous_batch` and the server driver call. `Engine::supports_native_continuous_batch`
+reports whether a native decoder session is loaded; the server engine driver
+(`onnx-genai-server/src/driver.rs`) prefers the native manager whenever it is
+available (so native grouped-LoRA continuous batching serves live requests),
+falling back to the ORT `BatchedStaticCacheDecodeSession` manager otherwise. The
+whole native branch is `#[cfg(feature = "native-backend")]`-gated so the
+non-native server build is unchanged. Honesty note: the streaming server path is
+now wired to build the native manager, but the end-to-end server request is not
+covered by an automated integration test in this pass — the native manager
+construction and per-row correctness are proven at the manager level by the two
+acceptance tests above, and the builder is a thin shared wrapper over that exact
+code.

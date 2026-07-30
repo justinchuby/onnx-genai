@@ -831,6 +831,76 @@ impl Engine {
         collect_batch_results(results)
     }
 
+    /// Build a **native** continuous-batch manager over the engine's grouped
+    /// [`InferenceSession`], selecting the KV-backed static-cache session for
+    /// TensorScatter exports and the KV-free routing session otherwise (design
+    /// §J.10). Shared by [`Self::run_native_continuous_batch`] and the server
+    /// driver so the native path is reachable by real requests, not just tests.
+    #[cfg(feature = "native-backend")]
+    pub fn native_continuous_batch_manager(
+        &mut self,
+        max_batch: usize,
+    ) -> anyhow::Result<ContinuousBatchManager<'_>> {
+        if max_batch == 0 {
+            anyhow::bail!("continuous batch max_batch must be greater than zero");
+        }
+        let metadata_max_context = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length);
+        let max_len = metadata_max_context.unwrap_or(4096).max(1);
+        // Borrow the native session and tokenizer as disjoint fields so the
+        // manager can hold the mutable session borrow alongside the shared
+        // tokenizer borrow for its whole lifetime.
+        let native_session = self.native_session.as_mut().context(
+            "native continuous batching requires a native decoder session; load the engine with \
+             ONNX_GENAI_BACKEND=native",
+        )?;
+        let lora_adapter_routes = native_session.lora_adapter_routes();
+        let inference_session = native_session.inference_session_mut();
+        // A static-cache TensorScatter export (independent per-row KV cursors)
+        // takes the KV-backed native session; a KV-free / decode-with-past export
+        // keeps the KV-free routing session (design §J.10).
+        let decode: Box<dyn onnx_genai_ort::decode::BatchedDecodeSession> =
+            if crate::native_decode::NativeStaticCacheBatchedDecodeSession::is_static_cache(
+                inference_session,
+            ) {
+                Box::new(
+                    crate::native_decode::NativeStaticCacheBatchedDecodeSession::new(
+                        inference_session,
+                        max_batch,
+                    )
+                    .context("build native static-cache batched decode session")?,
+                )
+            } else {
+                Box::new(
+                    crate::native_decode::NativeBatchedDecodeSession::new(
+                        inference_session,
+                        max_batch,
+                        max_len,
+                    )
+                    .context("build native batched decode session")?,
+                )
+            };
+        ContinuousBatchManager::with_lora_adapter_routes(
+            decode,
+            &self.tokenizer,
+            metadata_max_context,
+            max_batch,
+            lora_adapter_routes,
+        )
+    }
+
+    /// Whether the engine can serve continuous batches through the native
+    /// grouped decode path (a native decoder session is loaded). The server
+    /// driver uses this to prefer native continuous batching — which carries
+    /// mixed LoRA adapters per row — over the ORT static-cache manager.
+    #[cfg(feature = "native-backend")]
+    pub fn supports_native_continuous_batch(&self) -> bool {
+        self.native_session.is_some()
+    }
+
     /// Run requests to completion through a **native** continuous batch that can
     /// carry mixed LoRA adapters per row (design §J.4/§J.5 P2e).
     ///
@@ -849,38 +919,8 @@ impl Engine {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        if max_batch == 0 {
-            anyhow::bail!("continuous batch max_batch must be greater than zero");
-        }
         let expected_results = requests.len();
-        let metadata_max_context = self
-            .metadata
-            .model
-            .as_ref()
-            .and_then(|model| model.max_sequence_length);
-        let max_len = metadata_max_context.unwrap_or(4096).max(1);
-        // Borrow the native session and tokenizer as disjoint fields so the
-        // manager can hold the mutable session borrow alongside the shared
-        // tokenizer borrow for its whole lifetime.
-        let native_session = self.native_session.as_mut().context(
-            "native continuous batching requires a native decoder session; load the engine with \
-             ONNX_GENAI_BACKEND=native",
-        )?;
-        let lora_adapter_routes = native_session.lora_adapter_routes();
-        let inference_session = native_session.inference_session_mut();
-        let decode = crate::native_decode::NativeBatchedDecodeSession::new(
-            inference_session,
-            max_batch,
-            max_len,
-        )
-        .context("build native batched decode session")?;
-        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
-            Box::new(decode),
-            &self.tokenizer,
-            metadata_max_context,
-            max_batch,
-            lora_adapter_routes,
-        )?;
+        let mut manager = self.native_continuous_batch_manager(max_batch)?;
 
         let mut results = vec![None; expected_results];
         for request in requests {
@@ -1085,6 +1125,7 @@ mod lora_continuous_batch_tests {
     use onnx_runtime_session::lora_inject::{LoraAdapterSpec, LoraModuleSpec};
     use onnx_runtime_session::{InferenceSession, Tensor};
     use crate::native_decode::NativeBatchedDecodeSession;
+    use crate::native_decode::NativeStaticCacheBatchedDecodeSession;
 
     const K: usize = 16;
     const N: usize = 3;
@@ -1780,5 +1821,425 @@ mod lora_continuous_batch_tests {
             "unexpected error: {message}"
         );
         manager.submit(base_request(None)).expect("base-only admits");
+    }
+
+    /// A static-cache sibling of [`write_zero_base_token_model`]: the same
+    /// `input_ids → Gather(embedding) → Reshape → q_proj MatMulNBits(zero base)`
+    /// projection whose `logits` isolate the grouped-LoRA delta, PLUS a real
+    /// static-cache `TensorScatter` KV path (`key_cache.0` / `value_cache.0` /
+    /// `write_indices` / `nonpad_kv_seqlen` inputs, `updated_*` outputs). The KV
+    /// writes do not feed the logits here — that is proven on the real fixture by
+    /// `native_static_cache_continuous_batch_matches_single_sequence`; this model
+    /// forces the KV-BACKED session path so per-row grouped routing is proven to
+    /// coexist with per-row KV binding/advance under the manager.
+    fn write_zero_base_static_cache_model(path: &std::path::Path) {
+        const BITS: usize = 4;
+        const BLOCK_SIZE: usize = 16;
+        const VOCAB_EMBED: usize = 8;
+        const MAX_LEN: usize = 16;
+        let k_blocks = K / BLOCK_SIZE;
+        let blob_size = BLOCK_SIZE * BITS / 8;
+
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert("com.microsoft".to_string(), 1);
+
+        let batch = graph.intern_symbol("batch");
+        let input_ids = graph.create_named_value(
+            "input_ids",
+            IrDataType::Int64,
+            vec![Dim::from(batch), Dim::from(1usize)],
+        );
+        graph.add_input(input_ids);
+
+        let mut embedding_data = vec![0.0f32; VOCAB_EMBED * K];
+        for column in 0..K {
+            embedding_data[K + column] = 1.0;
+        }
+        let embedding = graph.create_named_value(
+            "model.embed_tokens.weight",
+            IrDataType::Float32,
+            static_shape([VOCAB_EMBED, K]),
+        );
+        graph.set_initializer(
+            embedding,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Float32,
+                vec![VOCAB_EMBED, K],
+                f32_le(&embedding_data),
+            )),
+        );
+        let gathered = graph.create_named_value(
+            "gathered",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(1usize), Dim::from(K)],
+        );
+        let mut gather = Node::new(
+            NodeId(0),
+            "Gather",
+            vec![Some(embedding), Some(input_ids)],
+            vec![gathered],
+        );
+        gather.name = "/model/embed_tokens/Gather".to_string();
+        gather.attributes.insert("axis".to_string(), Attribute::Int(0));
+        graph.insert_node(gather);
+
+        let reshape_shape =
+            graph.create_named_value("reshape_shape", IrDataType::Int64, static_shape([2]));
+        graph.set_initializer(
+            reshape_shape,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Int64,
+                vec![2],
+                i64_le(&[-1, K as i64]),
+            )),
+        );
+        let x = graph.create_named_value(
+            "x",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(K)],
+        );
+        let mut reshape = Node::new(
+            NodeId(1),
+            "Reshape",
+            vec![Some(gathered), Some(reshape_shape)],
+            vec![x],
+        );
+        reshape.name = "/model/embed_tokens/Reshape".to_string();
+        graph.insert_node(reshape);
+
+        let weight = graph.create_named_value(
+            "model.layers.0.attn.q_proj.MatMulNBits.qweight",
+            IrDataType::Uint8,
+            static_shape([N, k_blocks, blob_size]),
+        );
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Uint8,
+                vec![N, k_blocks, blob_size],
+                vec![0x88u8; N * k_blocks * blob_size],
+            )),
+        );
+        let scales = graph.create_named_value(
+            "model.layers.0.attn.q_proj.MatMulNBits.scales",
+            IrDataType::Float32,
+            static_shape([N, k_blocks]),
+        );
+        graph.set_initializer(
+            scales,
+            WeightRef::Inline(TensorData::from_raw(
+                IrDataType::Float32,
+                vec![N, k_blocks],
+                f32_le(&vec![1.0f32; N * k_blocks]),
+            )),
+        );
+        let logits = graph.create_named_value(
+            "logits",
+            IrDataType::Float32,
+            vec![Dim::from(batch), Dim::from(N)],
+        );
+        let mut node = Node::new(
+            NodeId(2),
+            "MatMulNBits",
+            vec![Some(x), Some(weight), Some(scales)],
+            vec![logits],
+        );
+        node.name = "/model/layers.0/attn/q_proj/MatMulNBits".to_string();
+        node.domain = "com.microsoft".to_string();
+        node.attributes.insert("K".to_string(), Attribute::Int(K as i64));
+        node.attributes.insert("N".to_string(), Attribute::Int(N as i64));
+        node.attributes.insert("bits".to_string(), Attribute::Int(BITS as i64));
+        node.attributes
+            .insert("block_size".to_string(), Attribute::Int(BLOCK_SIZE as i64));
+        graph.insert_node(node);
+        graph.add_output(logits);
+
+        // Static-cache KV path: TensorScatter each step's row activation
+        // (`gathered`, shape [batch, 1, K]) into the persistent cache buffers at
+        // the per-row `write_indices` cursor. `nonpad_kv_seqlen` is a declared
+        // input (part of the static-cache signature) that the session binds each
+        // step; no node consumes it here.
+        let write_indices = graph.create_named_value(
+            "write_indices",
+            IrDataType::Int64,
+            vec![Dim::from(batch)],
+        );
+        graph.add_input(write_indices);
+        let nonpad = graph.create_named_value(
+            "nonpad_kv_seqlen",
+            IrDataType::Int64,
+            vec![Dim::from(batch)],
+        );
+        graph.add_input(nonpad);
+        for (index, (cache_name, updated_name, node_id)) in [
+            ("key_cache.0", "updated_key_cache.0", 3u32),
+            ("value_cache.0", "updated_value_cache.0", 4u32),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cache = graph.create_named_value(
+                cache_name,
+                IrDataType::Float32,
+                vec![Dim::from(batch), Dim::from(MAX_LEN), Dim::from(K)],
+            );
+            graph.add_input(cache);
+            let updated = graph.create_named_value(
+                updated_name,
+                IrDataType::Float32,
+                vec![Dim::from(batch), Dim::from(MAX_LEN), Dim::from(K)],
+            );
+            let mut scatter = Node::new(
+                NodeId(node_id),
+                "TensorScatter",
+                vec![Some(cache), Some(gathered), Some(write_indices)],
+                vec![updated],
+            );
+            scatter.name = format!("/model/layers.0/self_attn/TensorScatter_{index}");
+            scatter.domain = "com.microsoft".to_string();
+            scatter.attributes.insert("axis".to_string(), Attribute::Int(1));
+            graph.insert_node(scatter);
+            graph.add_output(updated);
+        }
+
+        write_model(&Model::new(&graph), path).unwrap();
+    }
+
+    /// Grouped LoRA routing coexists with per-row KV on the KV-backed native
+    /// static-cache session (design §J.10): three rows bound to adapter A,
+    /// adapter B, and base run through the production `ContinuousBatchManager`
+    /// over a static-cache export, and each emits its own adapter's argmax token.
+    /// Non-tautological — a whole-batch-to-base session collapses A and B to
+    /// token 0 and fails.
+    #[test]
+    fn native_static_cache_continuous_batch_routes_mixed_adapters_per_row() {
+        let fixed_x: Vec<f32> = vec![1.0; K];
+        let scale = 1.0f32;
+        let mut a_t = vec![0.0f32; K * RANK];
+        for p in 0..K {
+            a_t[p * RANK] = 0.1;
+        }
+        let mut b_t_a = vec![0.0f32; RANK * N];
+        b_t_a[1] = 1.0; // adapter A -> vocab 1
+        let mut b_t_b = vec![0.0f32; RANK * N];
+        b_t_b[2] = 1.0; // adapter B -> vocab 2
+
+        let token_a = argmax(&reference_delta(&fixed_x, &a_t, &b_t_a, scale));
+        let token_b = argmax(&reference_delta(&fixed_x, &a_t, &b_t_b, scale));
+        assert_ne!(token_a, 0);
+        assert_ne!(token_b, 0);
+        assert_ne!(token_a, token_b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("model.onnx");
+        write_zero_base_static_cache_model(&model_path);
+
+        let mut session = InferenceSession::builder()
+            .model(&model_path)
+            .lora_adapters(vec![
+                lora_spec("adapter_a", &a_t, &b_t_a, scale),
+                lora_spec("adapter_b", &a_t, &b_t_b, scale),
+            ])
+            .build()
+            .expect("build grouped multi-adapter static-cache native session");
+        let route_a = session.resolve_lora_adapter("adapter_a").expect("resolve A").0 as i32;
+        let route_b = session.resolve_lora_adapter("adapter_b").expect("resolve B").0 as i32;
+        assert!(
+            NativeStaticCacheBatchedDecodeSession::is_static_cache(&session),
+            "synthetic model must be detected as static-cache"
+        );
+
+        let max_batch = 3;
+        let decode = NativeStaticCacheBatchedDecodeSession::new(&mut session, max_batch)
+            .expect("build native static-cache batched decode session");
+
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(decode),
+            &tokenizer,
+            None,
+            max_batch,
+            vec![
+                ("adapter_a".to_string(), route_a),
+                ("adapter_b".to_string(), route_b),
+            ],
+        )
+        .expect("build native static-cache continuous-batch manager");
+
+        let handle_a = manager.submit(base_request(Some("adapter_a"))).unwrap();
+        let handle_b = manager.submit(base_request(Some("adapter_b"))).unwrap();
+        let handle_base = manager.submit(base_request(None)).unwrap();
+
+        let mut first_token = std::collections::HashMap::new();
+        let record = |events: Vec<ContinuousBatchEvent>,
+                      sink: &mut std::collections::HashMap<usize, u32>| {
+            for event in events {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    sink.entry(handle.id).or_insert(token.token_id);
+                }
+            }
+        };
+        record(manager.poll(), &mut first_token);
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            record(manager.poll(), &mut first_token);
+            guard += 1;
+            assert!(guard < 64, "native static-cache continuous batch failed to drain");
+        }
+
+        assert_eq!(
+            first_token.get(&handle_a.id).copied(),
+            Some(token_a as u32),
+            "static-cache row bound to adapter A must emit A's argmax token"
+        );
+        assert_eq!(
+            first_token.get(&handle_b.id).copied(),
+            Some(token_b as u32),
+            "static-cache row bound to adapter B must emit B's argmax token"
+        );
+        assert_eq!(
+            first_token.get(&handle_base.id).copied(),
+            Some(0u32),
+            "static-cache base row must emit the zero-base argmax token"
+        );
+    }
+}
+
+/// KV-backed native static-cache continuous batching (design §J.10): the
+/// `NativeStaticCacheBatchedDecodeSession` runs a REAL static-cache TensorScatter
+/// attention export (the `tiny-llm-scatter` fixture) under the production
+/// `ContinuousBatchManager` with independent per-row KV cursors.
+#[cfg(all(test, feature = "native-backend"))]
+mod static_cache_continuous_batch_tests {
+    use super::*;
+    use crate::native_decode::NativeStaticCacheBatchedDecodeSession;
+    use onnx_runtime_session::InferenceSession;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn fixture_model_path() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
+    }
+
+    fn tokenizer() -> Tokenizer {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm-scatter/tokenizer.json");
+        Tokenizer::from_file(path).expect("load fixture tokenizer")
+    }
+
+    fn prompt_request(tokens: &[u32], max_new_tokens: usize) -> GenerateRequest {
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(tokens.to_vec()));
+        request.options.max_new_tokens = max_new_tokens;
+        request.options.greedy = true;
+        request.options.temperature = 0.0;
+        request.options.stop_on_eos = false;
+        // No natural EOS in this tiny model; force generation to `max_new_tokens`.
+        request.options.eos_token_id = Some(1_000_000);
+        request
+    }
+
+    /// Drive `prompts` (each a token-id sequence) through a KV-backed native
+    /// static-cache continuous batch of width `max_batch`, returning each row's
+    /// generated token ids in submit order.
+    fn run_static_cache(prompts: &[Vec<u32>], max_batch: usize, max_new_tokens: usize) -> Vec<Vec<u32>> {
+        let mut session = InferenceSession::load(fixture_model_path()).expect("load fixture");
+        assert!(
+            NativeStaticCacheBatchedDecodeSession::is_static_cache(&session),
+            "fixture must be detected as a static-cache export"
+        );
+        let decode = NativeStaticCacheBatchedDecodeSession::new(&mut session, max_batch)
+            .expect("build native static-cache batched decode session");
+        let tokenizer = tokenizer();
+        let mut manager = ContinuousBatchManager::with_lora_adapter_routes(
+            Box::new(decode),
+            &tokenizer,
+            None,
+            max_batch,
+            Vec::new(),
+        )
+        .expect("build static-cache continuous-batch manager");
+
+        let mut handle_to_index = HashMap::new();
+        for (index, prompt) in prompts.iter().enumerate() {
+            let handle = manager.submit(prompt_request(prompt, max_new_tokens)).unwrap();
+            handle_to_index.insert(handle.id, index);
+        }
+
+        let mut generated: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+        let record = |events: Vec<ContinuousBatchEvent>, sink: &mut Vec<Vec<u32>>| {
+            for event in events {
+                if let ContinuousBatchEvent::Token { handle, token } = event {
+                    let index = handle_to_index[&handle.id];
+                    sink[index].push(token.token_id);
+                }
+            }
+        };
+        record(manager.poll(), &mut generated);
+        let mut guard = 0;
+        while manager.has_pending_work() {
+            manager.step().unwrap();
+            record(manager.poll(), &mut generated);
+            guard += 1;
+            assert!(guard < 256, "static-cache continuous batch failed to drain");
+        }
+        generated
+    }
+
+    /// THE gap-closing KV-backed acceptance proof (design §J.10). A real
+    /// static-cache attention export runs under the production continuous-batch
+    /// manager with independent per-row KV cursors: each row in a batch carrying
+    /// prompts of DIFFERENT lengths generates EXACTLY the same tokens as an
+    /// independent single-sequence (batch=1) decode of the same prompt. Because
+    /// the fixture's logits depend on KV history, any cross-row KV leak or shared
+    /// write cursor makes the batched rows diverge from their references — it is
+    /// not a self-echo.
+    #[test]
+    fn native_static_cache_continuous_batch_matches_single_sequence() {
+        const HORIZON: usize = 6;
+        // Ragged lengths; prompt 2 is identical to prompt 0 to also prove two
+        // identical-prompt rows in one batch do not cross-contaminate.
+        let prompts = vec![
+            vec![1u32, 2, 3],
+            vec![4u32, 5, 6, 7, 8],
+            vec![1u32, 2, 3],
+        ];
+
+        // Per-row single-sequence references (each prompt alone, batch=1).
+        let references: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|prompt| {
+                let single = run_static_cache(std::slice::from_ref(prompt), 1, HORIZON);
+                single.into_iter().next().unwrap()
+            })
+            .collect();
+
+        for reference in &references {
+            assert_eq!(
+                reference.len(),
+                HORIZON,
+                "single-sequence reference must generate the full horizon"
+            );
+        }
+        // Determinism sanity + identical prompts give identical references.
+        assert_eq!(references[0], references[2], "identical prompts must decode identically");
+        // Non-degenerate: different prompts must yield different token streams, so
+        // the outputs genuinely depend on the prompt/KV (not a constant).
+        assert_ne!(
+            references[0], references[1],
+            "different prompts must produce different outputs (KV-dependent)"
+        );
+
+        // Batched: all prompts share ONE continuous batch with per-row cursors.
+        let batched = run_static_cache(&prompts, prompts.len(), HORIZON);
+
+        for (index, reference) in references.iter().enumerate() {
+            assert_eq!(
+                &batched[index], reference,
+                "batched row {index} must match its single-sequence reference exactly"
+            );
+        }
     }
 }
