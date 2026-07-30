@@ -360,8 +360,12 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     # (`cli/src/lib.rs`) that match no tracked path at all, and one basename
     # (`governor.rs`) that matches two different crates. Resolve them too: a
     # citation the tool cannot follow must never be counted as one it checked.
+    unverifiable: list[Citation] = []
+    positional_samples: list[str] = []
+    line_cache: dict[str, list[str]] = {}
     for c in positional:
-        if resolve_path(repo, tracked, c.path) is None:
+        real = resolve_path(repo, tracked, c.path)
+        if real is None:
             failures.append(
                 Failure(
                     "UNANCHORED_UNRESOLVABLE",
@@ -371,6 +375,75 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                     f"path that does not exist; re-anchor as `path::symbol`.",
                 )
             )
+            continue
+
+        # EVERY resolvable positional citation is UNVERIFIABLE, and that is a
+        # statement about the FORM, not about this particular citation. There
+        # is nothing in `path:NNN` to check the line against: the coordinate
+        # carries no claim about what lives there, so no amount of reading the
+        # file can confirm or refute it.
+        #
+        # This is the exit-2 doctrine applied to citations. "I checked it and
+        # it holds" and "I could not check it" must not share an output, and
+        # until now they did -- these were COUNTED and never CHECKED, which
+        # reads as verified to anybody looking at the total.
+        #
+        # THE CASE THAT FORCED THIS, and it is worth stating because it is not
+        # hypothetical: `state.rs:25` is cited ELEVEN times across these docs
+        # for a batch-size claim. Line 25 is DEFAULT_MAX_OUTPUT_TOKENS = 4096.
+        # The prose means line 28, DEFAULT_MAX_BATCH = 4. All eleven are wrong
+        # by 1024x, and ALL ELEVEN RESOLVE CLEANLY, because 25 <= 467.
+        unverifiable.append(c)
+        if real not in line_cache:
+            line_cache[real] = source_text(repo, real).splitlines()
+        lines = line_cache[real]
+        m = POSITIONAL.match(c.raw)
+        cited_line = int(m.group(2)) if m else None
+        if cited_line is None:
+            continue
+
+        # A RANGE CHECK CATCHES ROT PAST EOF AND IS STRUCTURALLY BLIND TO ROT
+        # INTO THE MIDDLE OF A FILE -- which is the common case, because files
+        # GROW. A citation that rots past the end is the only kind that
+        # announces itself; every other kind lands on a real, innocent line.
+        #
+        # Reported, never failed. Making this fatal would redden documents
+        # nobody has time to convert tonight, and a guard that cannot be
+        # satisfied is deleted within a day -- at which point the check that
+        # would have caught the next `state.rs:25` is gone too.
+        if cited_line > len(lines):
+            reports.append(
+                Failure(
+                    "POSITIONAL_OUT_OF_RANGE",
+                    c,
+                    f"positional citation '{c.raw}' names line {cited_line}, "
+                    f"but '{real}' has only {len(lines)} lines. This one rotted "
+                    f"far enough to announce itself; the ones that rotted less "
+                    f"are indistinguishable from correct.",
+                )
+            )
+            continue
+
+        # The one content signal available without an anchor, and it has
+        # essentially no false-positive mode: NOBODY DELIBERATELY CITES A BLANK
+        # LINE OR A LONE CLOSING BRACE. When a citation lands on one, the file
+        # moved underneath it. This does not catch the state.rs:25 class -- that
+        # one lands on a real declaration -- and it is not offered as if it did.
+        body = lines[cited_line - 1].strip()
+        if body == "" or body in {"}", ")", "};", "});", "]", "*/"}:
+            reports.append(
+                Failure(
+                    "POSITIONAL_LANDS_ON_NOTHING",
+                    c,
+                    f"positional citation '{c.raw}' lands on "
+                    f"{'a blank line' if body == '' else repr(body)} in '{real}'. "
+                    f"A citation pointing at nothing is rot that happens to be "
+                    f"visible; treat every OTHER positional citation in this "
+                    f"document as equally likely to have moved.",
+                )
+            )
+        elif len(positional_samples) < 5:
+            positional_samples.append(f"{c.raw} -> {body[:70]}")
 
     # A continuation citation is checked as far as it CAN be checked and no
     # further. Where the antecedent is known we assert the line is inside the
@@ -409,6 +482,8 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     stats = {
         "anchored": len(anchored),
         "unanchored": len(positional),
+        "unverifiable": len(unverifiable),
+        "positional_samples": positional_samples,
         "doc_mentions": len(mentions),
         "continuations": len(continuations),
         "reports": reports,
@@ -575,6 +650,34 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     print(f"citations in {doc}: anchored {stats['anchored']} | "
           f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']} "
           f"| line-anchored continuations {stats['continuations']}")
+
+    # DECLARE THE UNVERIFIABLE COUNT, ALWAYS, INCLUDING WHEN IT IS ZERO.
+    #
+    # The anchored figure has been quoted as if it were the total -- in a gate
+    # reading, among other places -- and nothing in the old output contradicted
+    # that. A category count reads as inventory, not as a warning: "positional
+    # 150" tells you how many there are and says nothing about whether anyone
+    # checked them. Nobody has. Nobody CAN.
+    #
+    # Printed at zero on purpose. A line that only appears when the news is bad
+    # is a line whose ABSENCE means "not measured" and "all clear" at the same
+    # time, and those must never share a rendering.
+    unver = stats.get("unverifiable", 0)
+    if unver:
+        print(f"  UNVERIFIABLE: {unver} positional citation(s) resolve to a real "
+              f"file and CANNOT BE CONTENT-CHECKED AT ALL. `path:NNN` carries no "
+              f"claim about what lives at that line, so nothing can confirm or "
+              f"refute it. These are NOT included in any verified total.")
+        print(f"    A resolving citation is not a correct one: `state.rs:25` is "
+              f"cited 11 times in this repository for a batch-size claim and is "
+              f"DEFAULT_MAX_OUTPUT_TOKENS = 4096. The prose means line 28, "
+              f"DEFAULT_MAX_BATCH = 4. All eleven resolve cleanly.")
+        for s in stats.get("positional_samples") or []:
+            print(f"    e.g. {s}")
+    else:
+        print(f"  UNVERIFIABLE: 0 positional citations "
+              f"(every citation in this document carries a symbol anchor and "
+              f"was checked against file CONTENT, not against a line number).")
     if stats.get("unanchored"):
         census = container_census(doc)
         if census["blockquoted"] or census["fenced"]:
@@ -982,6 +1085,50 @@ def self_test() -> int:
     exit_code_case(
         "present document with a real defect must still be a finding",
         "see `src/zz_definitely_not_tracked_ZZ.rs:1` for detail.\n", 1,
+    )
+
+    # 21-23. POSITIONAL ROT. Three arms, and the THIRD is the one that gives
+    #     the other two meaning: a detector that fired on every positional
+    #     citation would pass both positive arms and be worthless, because
+    #     ~600 of these ship today and a signal that includes all of them
+    #     carries no information.
+    #
+    #     All of these must be REPORTED and must NOT FAIL. Making positional
+    #     rot fatal would redden documents nobody can convert tonight, and an
+    #     unsatisfiable guard is deleted within a day -- taking with it the
+    #     check that would have caught the next one.
+    def positional_case(name: str, citation: str, expect_kind: str | None):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "src").mkdir()
+            (repo / "docs").mkdir()
+            (repo / "src" / "sample.rs").write_text(SAMPLE_SRC)
+            (repo / "docs" / "d.md").write_text(f"See {citation} for the mapping.\n")
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "src/sample.rs", "docs/d.md"], cwd=repo, check=True)
+            failures, stats = check(repo, repo / "docs" / "d.md", {})
+            kinds = {f.kind for f in stats["reports"]}
+            fatal = {f.kind for f in failures}
+            ok = (expect_kind in kinds if expect_kind else not kinds) and not fatal
+            results.append((
+                name, ok,
+                f"reported {kinds or 'nothing'}, fatal {fatal or 'none'}"
+                if ok else
+                f"expected report {expect_kind or 'nothing'} and NO fatal; "
+                f"got reports {kinds or 'nothing'}, fatal {fatal or 'none'}",
+            ))
+
+    positional_case(
+        "positional past EOF is REPORTED, never fatal",
+        "`src/sample.rs:999`", "POSITIONAL_OUT_OF_RANGE",
+    )
+    positional_case(
+        "positional landing on a bare brace is REPORTED, never fatal",
+        "`src/sample.rs:4`", "POSITIONAL_LANDS_ON_NOTHING",
+    )
+    positional_case(
+        "positional landing on real code is SILENT (anti-vacuity)",
+        "`src/sample.rs:2`", None,
     )
 
     for name, ok, detail in results:
