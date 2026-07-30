@@ -397,6 +397,12 @@ python3 harness/qa_baseline_harness.py /tmp/rerun.json
 
 ### 5.0 ⛔ MANDATORY PROTOCOL CHANGE — do NOT compare against the numbers in §1
 
+> 🔻 **RETRACTED — SEE §13.1. THE PRESERVED BINARY DOES NOT EXIST.** It was never tracked in
+> git on any branch, is not gitignored (so it was only ever an untracked local artifact), and
+> is absent from an exhaustive filesystem search. `d49d3c8` is a **SHA-256 content hash, not a
+> commit**. Everything below in §5.0 that depends on re-running the BEFORE arm is unexecutable.
+> Do not spend a window looking for this file.
+
 **The clean-tree binary has been preserved.** This changes the correct protocol entirely,
 and supersedes any instruction to "match conditions" against the numbers in §1.
 
@@ -671,6 +677,13 @@ periodically-refreshed cached snapshot rather than round-tripping the driver.
 
 Archived next to this file:
 
+> 🔴 **NONE OF THE FILES BELOW EXIST — SEE §13.1.** Every path in this table (`raw/*`,
+> `clean-binary/*`, `harness/*`) is absent from disk *and* was never added in any commit on
+> any branch (`git log --all --diff-filter=A` → 0 hits for all three prefixes). "Archived next
+> to this file" is false: these were untracked local artifacts in a working directory that no
+> longer exists. **This document's entire evidence appendix is unavailable for audit.** The
+> numbers in §1–§7 cannot be re-derived from source data; they can only be re-measured.
+
 | file | contents |
 |---|---|
 | `raw/qa-baseline-primary.json` | **primary** — single-512 n=15, concurrent-512 n=4 |
@@ -704,6 +717,8 @@ Archived next to this file:
   raw per-run numbers published (§1, §2, §8), conditions recorded as a first-class
   deliverable (§4), and the inconclusive-result rule plus 4 Hz polling condition folded
   into the acceptance spec (§5, §6b).
+- 🔻 **RETRACTED — SEE §13.1.** The binary is gone; the "unrecoverable measurement" premise is
+  **not** defused. The BEFORE arm cannot be re-run on demand or at all.
 - 🔒 **The clean-tree binary is preserved and validated** (§5.0). This largely defuses the
   "unrecoverable measurement" premise of this task: the BEFORE arm can now be re-run on
   demand, at any time, against the telemetry build in the same session. That is a strictly
@@ -1673,3 +1688,142 @@ exclusive window, announced, with every other timing lane held — not merely a 
 - The null is on one model (`qwen-scatter`) at 120 max tokens on one server. I did not sweep.
 - `loadavg` is a coarse proxy for contention; I did not attribute the load to specific agents.
 - 8 pairs is enough to establish the envelope is large. It is not enough to characterise its shape.
+
+---
+
+## 13. 🔴 AC33 IS UNRUNNABLE AS SPECIFIED — and the quiet window made the box *worse*, not better
+
+@12e42da8 told me the machine was finally quiet (four orphaned servers reaped, load 85 → under 10)
+and to take the throughput window before it closed. **I took it. This section is what the window
+produced, and it is not a hero number.** Every claim here is measured on a pinned SHA and carries
+`loadavg` per sample, per my standing constraint.
+
+### 13.1 The BEFORE arm does not exist, and neither does the evidence appendix
+
+Three artifact classes this document treats as archived are **absent from disk and were never
+tracked in git on any branch**:
+
+| cited artifact | cited at | on disk | ever added in any commit, any branch |
+|---|---|---|---|
+| `clean-binary/onnx-genai-server-clean-d49d3c8` | §5.0 (`:400`), §8, §9 (`:707`) | ❌ | ❌ 0 |
+| `harness/qa_baseline_harness.py` | §5 (`:374`), §7 (`:620`), §8 | ❌ | ❌ 0 |
+| `raw/*.json` — **the whole appendix**, 10 files | §8 | ❌ | ❌ 0 |
+
+```
+git log --all --oneline --name-only --diff-filter=A | grep -c 'clean-binary/'        -> 0
+git log --all --oneline --name-only --diff-filter=A | grep -c 'qa_baseline_harness'  -> 0
+git log --all --oneline --name-only --diff-filter=A | grep -c 'serving-dashboard/raw/' -> 0
+```
+
+They are **not gitignored either** — so they were never protected and never promoted; they were
+untracked scratch files in a working directory that is gone. **`d49d3c8` is a SHA-256 content
+hash, not a commit**, so it cannot be checked out. No binary on this box matches that digest.
+
+This matters beyond AC33: §5.0 designated the preserved binary as *the sole mitigation* for the
+clean tree being unrecoverable (`:555` already concedes the tree itself is gone). **Both halves of
+the mitigation are now void, and §5.0/§8/§9 asserted the opposite in three places** — corrected
+in-place above, because a document that promises a preserved artifact sends the next agent
+hunting a file that has never existed in the repository. I spent a window doing exactly that.
+
+### 13.2 AC33's fallback reading cannot be built at any SHA either
+
+AC33 says *"matched A/B on the same binary and machine: telemetry-collecting vs not."* That reading
+is attractive because it needs no preserved artifact. **It is still unbuildable.** `metrics` is a
+default-on cargo feature, but in `metrics.rs` the feature gates **only the Prometheus text
+formatter and the `/metrics` endpoint**. The `AtomicU64` registry and every `fetch_add` recording
+site are **ungated**. Built both ways at the same SHA:
+
+```
+metrics ON vs metrics OFF  ->  binaries differ by 24,352 bytes (0.08 %)
+```
+
+**There is no build configuration of this tree in which telemetry collection is off.** An ON/OFF
+A/B is a null *by construction* and would report instrument noise as instrumentation cost.
+
+I also built the merge-base `f55e459b` (540 commits back) as a candidate BEFORE arm and **rejected
+it**: it has neither `--max-batch` nor `--demo-assets-dir`, while §5.0 records the §1 binary
+logging `continuous batch driver enabled max_batch=4`. That A/B would measure 540 commits of
+feature work, not instrumentation cost.
+
+### 13.3 The measurement that actually answers the question: can this box resolve 2 %?
+
+The gate in §5.1 is **≥ 98 % of the BEFORE median** — a 2 % discrimination. §12 nulled the box at
+**120** max tokens under load 28–212 and found a ±58 % envelope. The open question was whether a
+*quiet* box at the protocol's real generation length could do better. It cannot.
+
+**Protocol.** Same server (`:9611`), same pinned binary, same prompt, `temperature=0`,
+`max_tokens=512`, one warmup discarded, requests interleaved A,B,A,B… — **both arms are the same
+binary, so the true effect is exactly zero.** Every sample returned `finish_reason=length` and
+exactly 512 tokens, so no arm is short-changed. Decode rate excludes TTFT.
+
+| pair | arm A tok/s | arm B tok/s | paired delta | load1 |
+|---|---|---|---|---|
+| 0 | 25.151 | 25.545 | +1.6 % | 12.6–13.4 |
+| 1 | 20.573 | 30.079 | **+46.2 %** | 17.5–18.2 |
+| 2 | 24.480 | 30.316 | +23.8 % | 17.0–18.0 |
+| 3 | 19.144 | 6.338 | **−66.9 %** | 17.2–25.3 |
+| 4 | 17.151 | 31.716 | **+84.9 %** | 18.5–20.3 |
+| 5 | 32.813 | 27.003 | −17.7 % | 15.3–16.1 |
+| 6 | 30.882 | 32.294 | +4.6 % | 12.9–14.1 |
+| 7 | 27.038 | 25.631 | −5.2 % | 13.3–13.6 |
+
+```
+n = 16 samples, 8 interleaved pairs, 512 tokens each, TRUE EFFECT = 0
+  MEDIAN of arm A   24.816 tok/s      MEDIAN of arm B   28.541 tok/s
+  MEDIAN delta      +15.01 %     <- a true zero, reported as a 15 % win
+  WORST-CASE pair   +84.92 %     <- the honest number
+  CV pooled          26.40 %     (clean-tree reference in §1: 1.98 %)
+  min / max          6.338 / 32.813 tok/s   (spread 100.6 % of the median)
+  95 % CI of mean   25.385 +/- 3.284 tok/s  (+/-12.94 %)
+  loadavg1 min/median/max   12.64 / 16.54 / 25.26
+```
+
+### 13.4 The result that matters: quieting the box did not help
+
+| | §12 null | §13 null | change |
+|---|---|---|---|
+| max tokens | 120 | **512** | 4.3× longer averaging window |
+| loadavg range | 28 – 212 | **12.6 – 25.3** | **~8× quieter** |
+| CV | 19.83 % | **26.40 %** | ⬆️ **worse** |
+| worst-case pair | +58.41 % | **+84.92 %** | ⬆️ **worse** |
+
+**Load fell roughly eightfold, the averaging window got 4.3× longer, and the null envelope got
+*wider*.** Both changes should have tightened it. That rules out the comfortable explanation —
+"it was just noisy neighbours, wait for a quiet window" — which is the premise the throughput
+re-take was scheduled on. Longer runs give a burst *more* opportunity to land inside a sample,
+not less; and `loadavg` at 12 is not the same as an idle box (13 `onnx-genai` listeners belonging
+to other agents were still resident, and my own run drove load from 12.6 to 25.3).
+
+Pair 3 is the mechanism in one row: **6.338 tok/s, a 5× slowdown, at `finish_reason=length` with
+all 512 tokens delivered.** Nothing is wrong with that sample except that something else on the
+box ran during it. A single such burst landing on one arm is indistinguishable from an effect.
+
+**Conclusion — the 2 % gate in §5.1 is not merely unmet, it is unmeasurable here: the gate is 2 %
+and the instrument's zero-point wanders by up to 85 %.** Any AC33 pass/fail produced on this box
+today would be a coin flip wearing three significant figures. **I decline the throughput arms on
+measured grounds, as §9.4 and §12 declined before, and this is now the third independent
+confirmation under progressively better conditions.**
+
+### 13.5 What would actually unblock this
+
+In priority order, none of which I can do alone:
+
+1. **An exclusive window** — every other timing lane held, announced, verified by listener count,
+   not merely "load looks low". §4 pins the shape at exactly **1 server**; the box has 13.
+2. **Commit the harness and the raw data.** The reason this section had to be rebuilt from
+   scratch is that the binding harness was never tracked. I hand-wrote a replacement
+   (`/tmp/qa_perf.py`, stdlib only, streaming SSE, per-sample loadavg) — **that is a deviation
+   from the protocol's named instrument and I am disclosing it rather than pretending
+   equivalence.** Its numbers should not be compared to §1's digit-for-digit.
+3. **Re-baseline from scratch on a quiet box, and commit the binary this time**, rather than
+   trying to reconstruct a BEFORE arm that no longer exists in any form.
+
+### What this section does NOT claim
+
+- It does **not** claim telemetry is free, or that it is costly. **It claims the cost is currently
+  unmeasurable on this hardware** — the effect being probed is ~2 % and the noise floor is ~85 %.
+- It does **not** claim the batching speedup is absent (see §12.3, unchanged).
+- One model (`qwen-scatter`), one server, one generation length. I did not sweep.
+- 8 pairs establishes the envelope is large. It does not characterise its shape.
+- I did not attribute the load bursts to specific processes in this run; §12.4 records why
+  `ps %cpu` is not adequate for that and what is.
