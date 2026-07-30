@@ -571,3 +571,154 @@ denominator cannot make that claim.** `X of 4 requests` states a ratio and names
 - One rendered occurrence of the string is consistent with the catalogue being read; I did not
   prove the panel *sources* its caption from the catalogue rather than coinciding with it.
 - Measured at `664b3721`. The tree moves at roughly a commit a minute; this is a snapshot.
+
+---
+
+## 10. The full browser pass on the committed launcher
+
+Assigned as the last gate item: four agents independently closed their reports with the same
+sentence — *nobody has opened this dashboard in a browser* — and all three reviewers refused to
+let their sign-off substitute for it. This section is that pass. Observations, not verdicts.
+
+### 10.0 The stale-binary trap is real, and the launcher cannot see it
+
+`run-demo.sh:207` builds **only if the binary is missing**. It never checks whether the binary is
+older than the source:
+
+```sh
+SERVER_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/release/onnx-genai-server"
+```
+
+Two release binaries existed, 36 minutes and 44 KB apart. The one the launcher resolves was built
+at 03:31; **six Rust commits landed after it**, including `1e1b2a82` (disclose which decode driver
+is running) and `4a059a93` (publish the pool size) — both change served fields. A stale binary
+launches, binds, and answers `200` while omitting fields entirely, which is indistinguishable from
+a front-end bug. I rebuilt (24.2 s) before measuring anything; every number below is from a binary
+timestamped 04:10:57 with zero commits after it.
+
+**P2, and it belongs to the launcher, not the dashboard:** the freshness check should be
+`-nt` against the source tree, not `-f` against the binary path.
+
+### 10.1 Both servers, dashboard not 404
+
+Launched via the committed `run-demo.sh` with `SCATTER_PORT=9123 DYNAMIC_PORT=9124`.
+Both `/demo/` and `/v1/status` return `200`. Dashboard renders on both; **not** the 404 page.
+
+The distinction the Lead asked for: a *mistyped asset directory* and *not-configured* both return
+404, and they look identical. They are separable on the wire — the not-configured arm returns
+`404` with **`content-length: 0`** (verified on `:8151`, launched without `--demo-assets-dir`).
+A mistyped directory returns a 404 with a body. Neither occurred here.
+
+### 10.2 The five-state model renders as three
+
+This is the item @0837fdf9 could not close without a browser, and it is the most consequential
+thing in this section.
+
+| state | elements rendered | CSS rule exists |
+|---|---|---|
+| `measured` | 2 | yes |
+| `unavailable` | 42 | yes |
+| `pending` | 6 (transient, gone by ~2 s) | yes |
+| `not-applicable` | **0** | **yes** |
+| `bypass*` | **0** | **yes** |
+
+Across all three scenarios, `not-applicable` and `structurally-bypassed` are **styled but never
+emitted**. The five-state model we ruled on nine times is a three-state model on screen. I cannot
+tell from the browser whether this is dead vocabulary or merely unreachable in these three
+scenarios — that is a ruling, not an observation, and it is the Lead's to make. **No test we own
+can see this**, which is exactly why it survived nine rulings.
+
+### 10.3 Two absence states are distinguished by glyph only, not by colour
+
+| state | glyph | colour |
+|---|---|---|
+| `pending` | `···` | `rgb(120,140,162)` |
+| `unavailable` | `—` | `rgb(114,134,157)` |
+
+**The colour delta is 6/255 on each channel — imperceptible.** The entire distinction rests on the
+glyph. This is not a bug; it is a design fact nobody had seen, and it means any future change that
+normalises the glyph silently collapses two states into one. `pending` is also transient (gone by
+~2 s), so in practice a viewer sees one absence glyph.
+
+### 10.4 Numbers move — and it took three broken instruments to establish it
+
+Under four concurrent 300-token generations, with the wire at `inflight=4 util=1.0`:
+
+```
+-  "256"      +  "252"     free KV blocks
+-  "0"        +  "4"       in-flight
+-  "0"        +  "4"       batch occupancy
+```
+
+The page polls hard and correctly: **131 non-asset requests in a 15 s window**
+(`/v1/status`, `/health`, `/v1/debug/kv` at ~4 Hz). Panels mount, values track the wire,
+nothing white-screens.
+
+**⚠️ The methodology warning, which is the most useful thing I learned tonight.** I reached
+"the dashboard is frozen — P1" three separate times, on three different instruments:
+
+1. `[data-field]` selector — matched **3** elements, all static server-identity fields that
+   *should* never move. `CHANGED=0`.
+2. In-page `fetch()` load — never reached the server; wire stayed `inflight=0`. `CHANGED=0`.
+3. `[data-state]` selector, 51 cells, **with a positive control that passed** — I injected a
+   sentinel into a cell and the sampler reported exactly 1 change. `CHANGED=0/51` at `util=1.0`.
+
+The third is the dangerous one. **The positive control proved the sampler could detect a change in
+a cell it had already selected. It did not prove the sampler selected the cells that carry live
+values.** A positive control validates the *detector*; it says nothing about the *corpus*. Passing
+it made me more confident in a conclusion that was still wrong.
+
+What broke the tie was abandoning selectors entirely and diffing `document.body.innerText` — a
+measurement with no corpus assumption at all. **If I had filed at any of the three stops, I would
+have reported a P0 against a working dashboard**, and the fix would have gone to @c8d9a40e or
+@bb2ee824 for a defect that does not exist.
+
+### 10.5 Scenario switching by clicking the real tabs
+
+Following actual `href`s (not URLs I construct — that is the R15 error that gave me a false green
+in §8):
+
+| tab | origin | panels | body |
+|---|---|---|---|
+| Continuous batching | `:9123` | ✅ | 11,920 chars |
+| Paged KV block table | `:9124` (cross-origin) | ✅ | 11,811 chars |
+| Memory pressure | `:9124` (cross-origin) | ✅ | 11,811 chars |
+
+3/3 render. 2 of 3 are genuinely cross-origin — the case that fails when only one server is up.
+
+### 10.6 Console and network
+
+**0 console errors, 0 failed requests** on all three scenarios, across every probe in this section.
+No refused module, no unknown-state warning, no 404 on an asset.
+
+### 10.7 The `file://` fallback is correctly hidden
+
+`display: none`, bounding rect `0×0`, on both instances. It does **not** leak onto an HTTP-served
+page. One cosmetic note: the fallback's `<h1>` is **first in DOM order**, so
+`document.querySelector('h1')` returns *"This page has to be served by the onnx-genai server"*
+rather than the visible *"onnx-genai"*. Hidden from users and from screen readers
+(`display:none` is not announced), but it will mislead any tooling that reads the first `h1`.
+**P3.**
+
+### 10.8 Continuous batching is inactive, and the engine now says why
+
+The launcher log states the cause directly, rather than leaving it to be inferred from the model's
+name as I had to in `perf-baseline.md` §11:
+
+```
+continuous batching is INACTIVE ... The engine refused it: continuous batching
+requires a STATIC-CACHE or shared-buffer past/present model
+```
+
+This closes the causal half I explicitly declined to assert there.
+
+### What this section does NOT claim
+
+- Rendered on one engine (Chrome/CDP) at one viewport. No cross-browser or responsive check.
+- `not-applicable` and `bypass` are shown **unreached in these three scenarios**. I did not prove
+  they are unreachable in principle, and I did not read the emitter to find out.
+- The colour delta is measured from computed style, not from a screenshot; I did not test against
+  any contrast standard.
+- Numbers were verified to *move and track the wire*, not to be *arithmetically correct*.
+- Idle steady state is ~42 em-dashes to ~6 measured values. Whether that is the intended density
+  for a demo is a design question, not a defect I can assert.
