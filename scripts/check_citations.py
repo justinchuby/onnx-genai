@@ -62,6 +62,21 @@ ANCHORED = re.compile(r"`([\w./\-]+\.(?:rs|py|js|css|html|toml|md|sh))::([^`]+)`
 # `path/to/file.ext:123` -- the legacy positional form we are ratcheting out.
 POSITIONAL = re.compile(r"`([\w./\-]+\.(?:rs|py|js|css|html|toml|md|sh)):(\d+)(?:-\d+)?`")
 
+# `<!-- cite: path/to/file.ext:123 = "expected text" -->` -- the CONTENT-CARRYING
+# positional form. It is invisible to POSITIONAL above, which requires inline-code
+# backticks, and an HTML comment has none. That invisibility printed a FALSE
+# UNIVERSAL on this repository's own architecture document for hours: "every
+# citation in this document carries a symbol anchor", said of a file holding six
+# markers of which five pointed at a blank line, `);` and `}`.
+#
+# It is the one positional form that CAN be checked, because it states what it
+# expects to find. A bare `path:NNN` records no claim and is unrecoverable once
+# the file moves; this records the claim, so drift is DECIDABLE and the repair is
+# COMPUTABLE from the marker itself.
+CITE_MARKER = re.compile(
+    r'<!--\s*cite:\s*([\w./\-]+):(\d+)\s*=\s*"([^"]*)"\s*-->'
+)
+
 # A bare mention of a markdown document in prose, e.g. "§4 of perf-baseline.md".
 # Catches citations to documents that do not exist, which carry no line number
 # and so evade every positional checker.
@@ -260,6 +275,61 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
     # reported failure names the file the author most plausibly meant.
     non_test = [c for c in candidates if "/tests/" not in c and not c.endswith("tests.rs")]
     return (non_test or candidates)[0]
+
+
+def check_cite_markers(repo: Path, doc: Path) -> list[Failure]:
+    """Verify every `<!-- cite: path:LINE = "text" -->` marker against its own claim.
+
+    NON-FATAL BY CONSTRUCTION. This cannot redden a tree. It was added during a
+    freeze, and a new detector that can block is a detector nobody enables.
+
+    The marker carries the text it expects, so this asks the only question that
+    matters -- IS THE CLAIM TRUE -- rather than the question a range check asks,
+    which is whether the number is small enough to be plausible. A range check is
+    blind to mid-file rot: every rotten marker this was written for resolved
+    cleanly and landed on a real, innocent line.
+    """
+    out: list[Failure] = []
+    try:
+        text = doc.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for m in CITE_MARKER.finditer(text):
+        path, lineno, want = m.group(1), int(m.group(2)), m.group(3)
+        doc_line = text[: m.start()].count("\n") + 1
+        cit = Citation(doc, doc_line, path, None, m.group(0))
+        target = repo / path
+        if not target.is_file():
+            out.append(Failure(
+                "CITE_MARKER_UNRESOLVABLE", cit,
+                f"'{path}' is not a file in this tree. The marker cannot be "
+                f"checked and cannot be repaired from its own content."))
+            continue
+        try:
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if lineno < 1 or lineno > len(lines):
+            out.append(Failure(
+                "CITE_MARKER_OUT_OF_RANGE", cit,
+                f"names line {lineno} of '{path}', which has {len(lines)} lines. "
+                f"Rot past EOF is the ONLY kind that announces itself."))
+            continue
+        actual = lines[lineno - 1]
+        if want and want not in actual:
+            # The repair is computable, so offer it rather than only complaining.
+            hits = [i + 1 for i, ln in enumerate(lines) if want in ln]
+            if len(hits) == 1:
+                fix = f" The text is at line {hits[0]}; rewrite the marker to {path}:{hits[0]}."
+            elif len(hits) > 1:
+                fix = f" The text appears on {len(hits)} lines ({hits[:5]}); pick one by hand."
+            else:
+                fix = " The text is nowhere in the file; the claim itself may be stale."
+            out.append(Failure(
+                "CITE_MARKER_ROTTEN", cit,
+                f"{path}:{lineno} does not contain its own expected text. "
+                f"expected {want!r}, found {actual.strip()[:60]!r}.{fix}"))
+    return out
 
 
 def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
@@ -479,6 +549,11 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                 )
             )
 
+    # Content-carrying markers, checked LAST so a rotten one is reported beside
+    # the citations it sits among rather than in a separate pass nobody reads.
+    marker_reports = check_cite_markers(repo, doc)
+    reports.extend(marker_reports)
+
     stats = {
         "anchored": len(anchored),
         "unanchored": len(positional),
@@ -486,6 +561,8 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
         "positional_samples": positional_samples,
         "doc_mentions": len(mentions),
         "continuations": len(continuations),
+        "cite_markers": len(CITE_MARKER.findall(doc.read_text(encoding="utf-8"))) if doc.is_file() else 0,
+        "cite_markers_bad": len(marker_reports),
         "reports": reports,
     }
 
@@ -675,9 +752,28 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
         for s in stats.get("positional_samples") or []:
             print(f"    e.g. {s}")
     else:
-        print(f"  UNVERIFIABLE: 0 positional citations "
-              f"(every citation in this document carries a symbol anchor and "
-              f"was checked against file CONTENT, not against a line number).")
+        # THE ZERO-FORM IS A UNIVERSAL CLAIM, SO IT MUST NAME WHAT IT DID NOT
+        # COUNT. For hours this said "every citation in this document carries a
+        # symbol anchor" about a file holding six `<!-- cite: -->` markers, five
+        # of which pointed at a blank line, `);` and `}`. The sentence was
+        # produced by the very declaration built to stop false universals: the
+        # regex above requires inline-code backticks, an HTML comment has none,
+        # so the markers were not unchecked -- they were INVISIBLE, and
+        # invisibility rendered identically to absence.
+        markers = stats.get("cite_markers", 0)
+        bad = stats.get("cite_markers_bad", 0)
+        if markers:
+            state = (f"{bad} of them do NOT hold the text they claim (listed below)"
+                     if bad else
+                     "all of them were checked against the text they claim and hold it")
+            print(f"  UNVERIFIABLE: 0 backticked positional citations. "
+                  f"NOT a claim that every citation is anchored -- this document "
+                  f"also carries {markers} `<!-- cite: path:LINE = \"text\" -->` "
+                  f"marker(s), and {state}.")
+        else:
+            print(f"  UNVERIFIABLE: 0 positional citations and 0 cite-markers "
+                  f"(every citation in this document carries a symbol anchor and "
+                  f"was checked against file CONTENT, not against a line number).")
     if stats.get("unanchored"):
         census = container_census(doc)
         if census["blockquoted"] or census["fenced"]:
@@ -729,13 +825,18 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
             "AMBIGUOUS_SYMBOL": "citations whose symbol name is defined in more than one "
                                 "tracked file -- each RESOLVES CORRECTLY, and the prose "
                                 "beside it can still name the wrong owner",
+            "CITE_MARKER_ROTTEN": "content-carrying markers whose named line does NOT hold "
+                                  "the text they claim -- each RESOLVES to a real line, "
+                                  "which is why no range check has ever seen them",
+            "CITE_MARKER_OUT_OF_RANGE": "markers naming a line past the end of the file",
+            "CITE_MARKER_UNRESOLVABLE": "markers naming a path that is not a file in this tree",
         }
         for kind, items in sorted(groups.items()):
             print(f"\n--- {len(items)} non-fatal [{kind}]: "
                   f"{headers.get(kind, 'see detail')} ---")
             for f in items[:5]:
                 print(f"  {f.citation.doc}:{f.citation.line_no}  {f.citation.raw}")
-                if kind == "AMBIGUOUS_SYMBOL":
+                if kind == "AMBIGUOUS_SYMBOL" or kind.startswith("CITE_MARKER"):
                     print(f"      {f.detail}")
             if len(items) > 5:
                 print(f"  ... and {len(items) - 5} more")
@@ -822,6 +923,64 @@ def self_test() -> int:
                 ok = expect_kind in kinds
                 detail = f"raised {kinds}" if ok else f"DID NOT RAISE {expect_kind}; got {kinds or 'nothing'}"
             results.append((name, ok, detail))
+
+    def run_report_case(name: str, doc_text: str, src_text: str, expect_kind: str | None):
+        """Self-test for NON-FATAL kinds.
+
+        run_case() above inspects only `failures`, and cite-marker findings are
+        deliberately non-fatal, so they never appear there. A self-test that
+        cannot observe a kind reports 'behaved as specified' for a detector that
+        does nothing -- the exact vacuity this file exists to refuse.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "src").mkdir()
+            (repo / "docs").mkdir()
+            (repo / "src" / "sample.rs").write_text(src_text)
+            (repo / "docs" / "d.md").write_text(doc_text)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "src/sample.rs", "docs/d.md"], cwd=repo, check=True)
+            _, stats = check(repo, repo / "docs" / "d.md", {})
+            kinds = {f.kind for f in stats["reports"] if f.kind.startswith("CITE_MARKER")}
+            if expect_kind is None:
+                ok = not kinds
+                detail = "no marker complaint, as required" if ok else f"unexpectedly raised {kinds}"
+            else:
+                ok = expect_kind in kinds
+                detail = f"raised {kinds}" if ok else f"DID NOT RAISE {expect_kind}; got {kinds or 'nothing'}"
+            results.append((name, ok, detail))
+
+    # CITE-MARKER ARM. The defect that motivated it resolved cleanly, landed on a
+    # real line, and was invisible to every check in this file for hours.
+    _MARK_SRC = "// header\npub fn cited_symbol(x: usize) -> usize {\n    x + 1\n}\n"
+
+    # A. POSITIVE CONTROL. A correct marker must stay silent, or the three cases
+    #    below prove only that the detector complains about everything.
+    run_report_case(
+        "cite-marker naming the right line is SILENT (anti-vacuity)",
+        SAMPLE_DOC + '<!-- cite: src/sample.rs:2 = "pub fn cited_symbol" -->\n',
+        _MARK_SRC, None)
+
+    # B. THE REAL DEFECT, reproduced: the file grows, the marker does not move,
+    #    and the line it now names is innocent and real.
+    run_report_case(
+        "cite-marker left behind when the file grows is CAUGHT",
+        SAMPLE_DOC + '<!-- cite: src/sample.rs:2 = "pub fn cited_symbol" -->\n',
+        "\n" * 20 + _MARK_SRC, "CITE_MARKER_ROTTEN")
+
+    # C. Rot past EOF -- the only kind a range check can already see.
+    run_report_case(
+        "cite-marker past end of file is CAUGHT",
+        SAMPLE_DOC + '<!-- cite: src/sample.rs:9999 = "pub fn cited_symbol" -->\n',
+        _MARK_SRC, "CITE_MARKER_OUT_OF_RANGE")
+
+    # D. A path that does not exist must NOT be reported as a content mismatch:
+    #    "the claim is false" and "I could not check the claim" are different
+    #    findings and must never share a rendering.
+    run_report_case(
+        "cite-marker naming a missing file is CAUGHT as UNRESOLVABLE",
+        SAMPLE_DOC + '<!-- cite: src/nope.rs:1 = "anything" -->\n',
+        _MARK_SRC, "CITE_MARKER_UNRESOLVABLE")
 
     # 0. Control: unmutated tree must be green, or every later case is vacuous.
     run_case("control (unmutated)", lambda r: None, None)
