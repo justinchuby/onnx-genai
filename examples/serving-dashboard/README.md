@@ -148,24 +148,46 @@ the command that actually works.
 Under the hood it runs, per server:
 
 ```bash
-# Asset paths are relative to THIS checkout, so start at its root.
-cd "$(git rev-parse --show-toplevel)"
+# Resolve BOTH roots to absolute paths up front, then never rely on the
+# working directory again. `run-demo.sh` does exactly this; the two variables
+# below are the only things you should have to edit.
 
-# Models are NOT. `models/` is gitignored, so it is empty in a fresh clone and
-# in every git worktree -- the models usually live in one primary checkout.
-# Point this at whichever directory actually holds them.
+# 1. Assets: they live in THIS checkout, always.
+ASSETS_DIR="$(cd "$(git rev-parse --show-toplevel)/examples/serving-dashboard" && pwd)"
+
+# 2. Models: they do NOT. `models/` is gitignored, so it is empty in a fresh
+#    clone and in every git worktree -- the models usually live in one primary
+#    checkout. Point this at whichever directory actually holds them.
 MODELS_DIR=/path/to/onnx-genai/models
 
+# Scatter server (static cache) -- continuous batching scenario.
 ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
   --model "${MODELS_DIR}/qwen2.5-0.5b-scatter-v2" \
   --model-id qwen-scatter \
   --addr 127.0.0.1:8123 \
-  --demo-assets-dir examples/serving-dashboard \
-  --enable-debug-endpoints
+  --demo-assets-dir "${ASSETS_DIR}" \
+  --enable-debug-endpoints &
+
+# Dynamic server -- paged KV scenario. SAME asset directory, different model.
+ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
+  --model "${MODELS_DIR}/qwen2.5-0.5b" \
+  --model-id qwen-dynamic \
+  --addr 127.0.0.1:8124 \
+  --demo-assets-dir "${ASSETS_DIR}" \
+  --enable-debug-endpoints &
 ```
 
-> **The two paths in that command have opposite roots, which is why the `cd`
-> alone is not enough.** `--demo-assets-dir` must resolve inside *this* checkout,
+> **`--demo-assets-dir` is required on BOTH launches, not just the one you open
+> first.** Switching scenario *navigates* to the other server's own `/demo`, so
+> a server started without the flag does not degrade some panel — it serves the
+> missing-assets page instead of the dashboard. That failure is **silent at
+> launch and appears on the first scenario switch**, which is to say while
+> somebody is watching. Starting one server correctly proves nothing about the
+> other.
+
+> **The two paths in that command have opposite roots, which is why no single
+> working directory makes both correct.** `--demo-assets-dir` must resolve inside
+> *this* checkout,
 > because that is where the assets are. `--model` must resolve inside whichever
 > checkout holds the (gitignored, unshared) models. In a plain clone those are
 > the same directory and a bare `models/…` works; in a worktree they are not,
@@ -175,15 +197,17 @@ ONNX_GENAI_EP=cpu ./target/release/onnx-genai-server \
 > **contains** the model — not merely that `models/` exists, which is always true
 > and would defeat the fallback.
 
-Run it from anywhere else and you get the demo's most confusing failure mode:
-**the API works perfectly and only `/demo` is broken.** `--model` and
+Pass either path **relative** instead — the tempting shortcut, and what earlier
+versions of this README showed — and you get the demo's most confusing failure
+mode: **the API works perfectly and only `/demo` is broken.** `--model` and
 `--demo-assets-dir` are both resolved against the working directory, and
 `resolve_demo_assets_dir` (`demo_assets.rs:54-59`) treats a directory that isn't
 there as *no assets configured* rather than as an error — so the server boots
 happily, `/v1/status` answers, and `/demo` serves an explanatory 404. Nothing in
 the log says the word "directory". `run-demo.sh` sidesteps this entirely by
 passing an **absolute** path derived from its own location, which is why it
-works from any directory.
+works from any directory, and why the command above resolves both roots before
+using either.
 
 This also means **`/demo` working on one server is not evidence it works on the
 other.** The two are separate processes and can be started from different
@@ -1255,6 +1279,15 @@ node --test 'examples/serving-dashboard/*.test.js' 'examples/serving-dashboard/d
 ```
 
 Node's built-in runner. No dependencies, consistent with having no build step.
+
+> **The single quotes are load-bearing.** They hand the patterns to Node, which
+> expands them itself. Drop them and the *shell* expands them first — and
+> because the shell resolves each glob against the current directory rather
+> than recursing, the `dashboard/` pattern contributes nothing. You get **243
+> tests instead of 532, and exit code 0**. A silently halved suite that reports
+> success is worse than one that errors, which is why the quoted form is the
+> only one written down here.
+
 The tests that matter most assert that documented zeros can never surface as
 measurements, that a genuine `0` still can, and that the launch command has not
 drifted between its four appearances.

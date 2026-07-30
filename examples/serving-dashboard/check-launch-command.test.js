@@ -220,8 +220,69 @@ test('every copy-pasteable command passes --demo-assets-dir', () => {
   }
 });
 
-test('run-demo.sh starts both servers, on distinct ports', () => {
-  const scatterPort = DEFAULT_SERVER_ADDRESS.split(':')[1];
+/**
+ * Every `onnx-genai-server` invocation in the README, as its own command.
+ *
+ * The test above asks whether the FILE mentions `--demo-assets-dir`. That is a
+ * broader question than the one that matters: a README showing two servers and
+ * flagging only the first passes it while shipping the exact defect. The two
+ * come apart because a flag is a property of an INVOCATION and the old check
+ * measured a DOCUMENT.
+ */
+function readmeServerInvocations() {
+  const lines = readme.split('\n');
+  const invocations = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/onnx-genai-server\b/.test(lines[i])) continue;
+    // Prose mentions and cargo build lines are not launches.
+    if (!/\\\s*$/.test(lines[i])) continue;
+    const command = [lines[i]];
+    while (/\\\s*$/.test(command[command.length - 1]) && i + 1 < lines.length) {
+      i += 1;
+      command.push(lines[i]);
+    }
+    invocations.push(command.join('\n'));
+  }
+  return invocations;
+}
+
+test('every README server invocation passes --demo-assets-dir, absolutely', () => {
+  const invocations = readmeServerInvocations();
+
+  // Empty-input floor. A regex that stops matching would otherwise make this
+  // test pass by finding nothing to check.
+  assert.equal(
+    invocations.length,
+    2,
+    'the README should show exactly two server launches (scatter and dynamic); ' +
+      'if that changed deliberately, update this count',
+  );
+
+  for (const command of invocations) {
+    const flag = /--demo-assets-dir\s+("?[^"\s\\]+"?)/.exec(command);
+
+    // Under our navigation model a scenario switch LOADS the other server's own
+    // /demo. A server started without this flag therefore serves the
+    // missing-assets page rather than the dashboard -- silently at launch, and
+    // visibly on the first scenario switch, which is while the demo is being
+    // watched. Flagging one server proves nothing about the other.
+    assert.ok(
+      flag,
+      `a README server invocation omits --demo-assets-dir:\n${command}`,
+    );
+
+    const value = flag[1].replace(/"/g, '');
+    assert.ok(
+      value.startsWith('/') || value.startsWith('${') || value.startsWith('$('),
+      `--demo-assets-dir must be absolute (or a variable resolved to one), got ` +
+        `"${value}". A relative value only works from one directory, and the ` +
+        `failure is a working API with a broken /demo -- which reads as a ` +
+        `corrupt build, not a wrong path.`,
+    );
+  }
+});
+
+test('run-demo.sh starts both servers, on distinct ports', () => {  const scatterPort = DEFAULT_SERVER_ADDRESS.split(':')[1];
   const dynamicPort = runDemoCode.match(/DYNAMIC_PORT:-(\d+)/)?.[1];
 
   assert.ok(dynamicPort, 'run-demo.sh must define a DYNAMIC_PORT default');
