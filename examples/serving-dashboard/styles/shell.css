@@ -144,11 +144,13 @@ body[data-blocked] .app {
 /*
  * THE MOST IMPORTANT RULES IN THIS FILE.
  *
- * These five selectors are what make an unmeasurable value visually
+ * These six selectors are what make an unmeasurable value visually
  * unmistakable from a measured one. Any element rendering a telemetry field
  * sets data-state, so panels inherit this treatment without reimplementing it —
- * and a panel that forgets to set data-state renders at measured contrast,
- * which is why the store never hands out a value for a field that has none.
+ * and a panel that forgets to set data-state no longer renders at measured
+ * contrast, because the BACKSTOP at the end of this section catches the absent
+ * and unrecognised cases. That used to be guaranteed only by the store's
+ * discipline, one call site away in another language.
  *
  * THE SELECTOR VALUES ARE THE FIELD_STATES WIRE VALUES, NOT THEIR CONSTANT
  * NAMES. They happen to read alike now — the constant is FIELD_STATES.MEASURED
@@ -221,6 +223,42 @@ body[data-blocked] .app {
   cursor: help;
   min-width: var(--og-value-slot);
   display: inline-block;
+}
+
+/*
+ * THE BACKSTOP — an absent or unrecognised state must render OBVIOUSLY WRONG.
+ *
+ * The five rules above are all POSITIVE: each names a state and styles it. That
+ * leaves the default — no `data-state` at all, or a value outside the ruled
+ * vocabulary — inheriting `--og-fg`, which is the treatment of a MEASURED
+ * value. So the honesty layer's default was its most confident rendering, and
+ * an unrecognised state degraded TOWARD trust rather than away from it.
+ *
+ * The comment above used to answer this with "the store never hands out a value
+ * for a field that has none". That is true today and it is the wrong KIND of
+ * answer: it makes the guarantee depend on a discipline maintained in another
+ * language, in another file, at one call site. `renderStateOf` does degrade
+ * correctly — em-dash in a browser, throw under `node --test` — but it is ONE
+ * line, and nothing here noticed if it changed. This rule makes the property
+ * structural on the CSS side too, so both layers have to fail to ship a lie.
+ *
+ * WAVY is deliberately the SIXTH underline treatment, joining solid (pending),
+ * dashed (stale), dotted (unavailable) and double (not-applicable), so it stays
+ * distinguishable with colour switched off — the projector-and-greyscale test
+ * the rest of this section is built around. It is `text-decoration` rather than
+ * `border-bottom` because those four already exhaust the border styles that
+ * read distinctly at 1px.
+ *
+ * SCOPED TO `.value` ON PURPOSE. `.connection-indicator` carries a DIFFERENT
+ * vocabulary on the same attribute (connected/connecting/no-model/unreachable);
+ * an unscoped catch-all would paint every one of them as broken.
+ */
+.value:not([data-state]),
+.value[data-state]:not([data-state='measured']):not([data-state='pending']):not([data-state='stale']):not([data-state='unavailable']):not([data-state='not-applicable']) {
+  color: var(--og-warn);
+  text-decoration: underline wavy var(--og-warn);
+  text-underline-offset: 2px;
+  cursor: help;
 }
 
 /* ---------------------------------------------------- connection indicator */

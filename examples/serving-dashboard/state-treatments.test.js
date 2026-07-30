@@ -21,9 +21,24 @@ import { ABSENT_TEXT, NOT_APPLICABLE_TEXT } from './format.js';
 
 const shellCss = readFileSync(new URL('./styles/shell.css', import.meta.url), 'utf8');
 
+/**
+ * `:not(...)` groups removed.
+ *
+ * LOAD-BEARING, AND IT IS A DEFECT THIS COMMIT WOULD OTHERWISE HAVE INTRODUCED.
+ * The backstop rule excludes the ruled states by name inside a `:not()` chain,
+ * so the raw text of shell.css now contains `[data-state='measured']` even in a
+ * world where the real `[data-state='measured'] { … }` rule has been deleted.
+ * Scraped naively, every state below would look styled forever and the test
+ * above would be permanently, silently vacuous — a check that cannot fail
+ * because the fix for a different problem fed it its own answer.
+ */
+function withoutNotGroups(css) {
+  return css.replace(/:not\([^)]*\)/g, '');
+}
+
 /** Every `[data-state='…']` value the stylesheet actually selects on. */
 function styledStates(css) {
-  return new Set([...css.matchAll(/\[data-state='([^']+)'\]/g)].map((m) => m[1]));
+  return new Set([...withoutNotGroups(css).matchAll(/\[data-state='([^']+)'\]/g)].map((m) => m[1]));
 }
 
 test('every field state has a visual treatment in shell.css', () => {
@@ -88,7 +103,9 @@ test('every non-measured state is distinguishable without colour', () => {
   );
 
   for (const state of covered) {
-    const block = shellCss.match(
+    // Stripped: the backstop's `:not()` chain names every ruled state, so an
+    // unstripped scan can match the exclusion list instead of the real rule.
+    const block = withoutNotGroups(shellCss).match(
       new RegExp(`\\[data-state='${state}'\\][^{]*\\{([^}]*)\\}`),
     );
     assert.ok(block, `${state} has no rule block`);
@@ -112,6 +129,96 @@ test('every non-measured state is distinguishable without colour', () => {
     new Set(Object.values(patterns)).size,
     Object.values(patterns).length,
     `these states share a border pattern and differ only by colour: ${JSON.stringify(patterns)}`,
+  );
+});
+
+/**
+ * The backstop rule: `{selector, body}`, or null if nobody wrote one.
+ *
+ * Anchored on `.value:not([data-state])` because that is the case with no
+ * possible alternative reading — an element that renders a field and carries no
+ * state at all.
+ */
+function backstopRule(css) {
+  const match = /(\.value:not\(\[data-state\]\)[^{]*)\{([^}]*)\}/.exec(css);
+  return match ? { selector: match[1], body: match[2] } : null;
+}
+
+test('an absent data-state renders obviously wrong, not as a measurement', () => {
+  // THE DEFAULT WAS THE MAXIMALLY DISHONEST ONE. Every other rule in this
+  // section is POSITIVE — it names a state and styles it — so an element with
+  // no `data-state`, or one outside the ruled vocabulary, inherited `--og-fg`
+  // and rendered EXACTLY as a trusted measurement. Screenshots of the unknown
+  // state, the absent-attribute case and a real measurement were byte-identical.
+  //
+  // `renderStateOf` does degrade correctly and always has. That is not enough
+  // on its own: it is one line in another language, and nothing in this file
+  // noticed if it changed. The honesty rule has to be structural on both sides.
+  const rule = backstopRule(shellCss);
+  assert.ok(
+    rule,
+    'shell.css has no backstop for `.value:not([data-state])`. An element that ' +
+      'renders a field but sets no state inherits measured contrast, so the ' +
+      "honesty layer's default is its most confident rendering.",
+  );
+  assert.ok(
+    /color:/.test(rule.body),
+    'the backstop sets no colour, so it does not visibly differ from a measurement',
+  );
+  assert.ok(
+    !/var\(--og-fg\)/.test(rule.body),
+    'the backstop paints itself with --og-fg, which IS the measured colour',
+  );
+});
+
+test('the backstop excludes exactly the ruled vocabulary', () => {
+  // THE RATCHET, AND THE REASON THIS TEST IS NOT DECORATIVE. The backstop works
+  // by excluding the five ruled states by name. That list is a hardcoded copy of
+  // the enum living in a stylesheet, which is the same cross-language gap that
+  // produced the 'measured'/'ok' defect this whole file exists to catch — with
+  // the failure inverted and worse: a sixth ruled state added to FIELD_STATES
+  // and given a proper rule above would ALSO match the backstop and render as
+  // broken, so a correct new state would ship looking like an error.
+  //
+  // Derived from the enum, never enumerated here.
+  const rule = backstopRule(shellCss);
+  assert.ok(rule, 'no backstop rule to check');
+  const excluded = [...rule.selector.matchAll(/:not\(\[data-state='([^']+)'\]\)/g)].map(
+    (m) => m[1],
+  );
+  assert.deepEqual(
+    [...new Set(excluded)].sort(),
+    [...new Set(Object.values(FIELD_STATES))].sort(),
+    'the backstop\'s exclusion list has drifted from FIELD_STATES. A ruled state ' +
+      'missing from it renders as an error; a stale name left in it lets a ' +
+      'retired state keep rendering as a measurement.',
+  );
+});
+
+test('the backstop is legible without colour, and its channel is unused', () => {
+  // Same requirement AC25 puts on every non-measured state: a projector and a
+  // greyscale screenshot must still show something is wrong. The four border
+  // styles that read distinctly at 1px are already spoken for, so the backstop
+  // takes a text-decoration line style instead of a fifth border.
+  const rule = backstopRule(shellCss);
+  assert.ok(rule, 'no backstop rule to check');
+  const decoration = /text-decoration:\s*([^;]+);/.exec(rule.body);
+  assert.ok(
+    decoration,
+    'the backstop is carried by colour alone, so it vanishes in greyscale and ' +
+      'for a colourblind reader — the readers this distinction matters most to',
+  );
+  const style = decoration[1]
+    .split(/\s+/)
+    .find((token) => /^(solid|dashed|dotted|double|wavy)$/.test(token));
+  assert.ok(style, `the backstop's text-decoration has no line style: ${decoration[1]}`);
+  // The four border styles belong to pending/stale/unavailable/not-applicable.
+  // Reusing one would make "we do not know what this is" look like a ruled
+  // absence, which is a different and much calmer claim.
+  assert.equal(
+    style,
+    'wavy',
+    `the backstop reuses '${style}', which a ruled absence state already owns`,
   );
 });
 
