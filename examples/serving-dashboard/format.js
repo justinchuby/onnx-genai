@@ -15,7 +15,7 @@
 // does not hover, and AC25 forbids encoding meaning in colour alone.
 
 import { FIELD_STATES, SOURCE_CLASSES, hasValue, describeField } from './telemetry-field.js';
-import { isAbsolutePathValue } from './absolute-path.mjs';
+import { isAbsolutePathValue, redactAbsolutePaths } from './absolute-path.mjs';
 
 export { describeField };
 
@@ -33,14 +33,35 @@ export const ABSOLUTE_PATH_REASON =
  * @returns {import('./telemetry-field.js').TelemetryField}
  */
 export function displaySafeField(field) {
-  if (!isAbsolutePathValue(field?.value)) return field;
-  return {
-    ...field,
-    value: null,
-    state: FIELD_STATES.UNAVAILABLE,
-    reason: ABSOLUTE_PATH_REASON,
-    provenanceWarning: null,
-  };
+  if (isAbsolutePathValue(field?.value)) {
+    return {
+      ...field,
+      value: null,
+      state: FIELD_STATES.UNAVAILABLE,
+      reason: ABSOLUTE_PATH_REASON,
+      provenanceWarning: null,
+    };
+  }
+
+  // THE WARNING IS NEUTRALISED WHATEVER THE VALUE LOOKS LIKE.
+  //
+  // This used to live inside the branch above, so a warning was cleaned only
+  // when the VALUE was already path-shaped. A warning naming
+  // /Users/operator/secret/provider beside a value of `42` took the early
+  // return and kept the path on every surface downstream.
+  //
+  // measuredField also redacts, at construction. That is not the same coverage
+  // and neither replaces the other: the constructor protects field METADATA for
+  // a field that is never rendered, and this protects RENDERED output for a
+  // field object that was assembled as a literal and never passed through the
+  // constructor. Two disjoint entry points, one invariant, and no caller has to
+  // know either exists.
+  //
+  // Returns the ORIGINAL object when nothing needed removing, so a clean field
+  // keeps its identity and this stays free for the overwhelmingly common case.
+  const provenanceWarning = redactAbsolutePaths(field?.provenanceWarning);
+  if (provenanceWarning === field?.provenanceWarning) return field;
+  return { ...field, provenanceWarning };
 }
 
 /**

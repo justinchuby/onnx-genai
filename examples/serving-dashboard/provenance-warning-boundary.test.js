@@ -187,3 +187,78 @@ describe('the provenanceWarning boundary neutralises paths intrinsically', () =>
     }
   });
 });
+
+describe('the display choke point neutralises paths on fields it did not construct', () => {
+  // WHY A SECOND BOUNDARY IS NOT A SECOND CLEANUP.
+  //
+  // The constructor fix above protects field METADATA -- what the store holds,
+  // what a log line quotes, what a test inspects -- even for a field that is
+  // never rendered. It cannot protect a field it never built.
+  //
+  // Those fields exist. format.js's own header states the rule: formatField is
+  // "exactly one function every panel must call to turn a field into text".
+  // That makes it the display CHOKE POINT, and a field object assembled as a
+  // literal reaches it without passing through measuredField at all. Measured
+  // before this fix, with a hand-built field: safeWarningHasPath=true,
+  // formattedWarningHasPath=true.
+  //
+  // So the two boundaries cover different populations and neither subsumes the
+  // other. Neither is caller-coordinated -- no author has to remember to call
+  // anything, which is the property that has failed review four times on this
+  // branch. Redacting at construction AND at render is not belt-and-braces; it
+  // is two disjoint entry points to one invariant.
+  //
+  // ORACLE NOTE: every assertion here reads the OUTPUT TEXT and asks whether an
+  // absolute path is present in it. It deliberately does not assert that
+  // displaySafeField ran, or that some flag was set -- those are proxies, and a
+  // proxy can hold while the property it stands for fails. Reachability is not
+  // observability.
+  const handBuilt = () =>
+    Object.freeze({
+      value: PLAIN_VALUE,
+      state: 'measured',
+      source: '/v1/status',
+      sourceClass: 'server',
+      origin: null,
+      originModelId: null,
+      label: 'provider',
+      reason: null,
+      unit: null,
+      observedAtMs: Date.now(),
+      derivedFrom: null,
+      provenanceWarning: `"server.execution_provider" disagreed: the server sent ${SECRET} instead.`,
+    });
+
+  it('the display-safe envelope carries no path for a field that bypassed the constructor', () => {
+    assertNoPath(
+      'displaySafeField(handBuilt).provenanceWarning',
+      displaySafeField(handBuilt()).provenanceWarning,
+    );
+  });
+
+  it('formatted output carries no path for a field that bypassed the constructor', () => {
+    assertNoPath(
+      'formatField(handBuilt).provenanceWarning',
+      formatField(handBuilt()).provenanceWarning,
+    );
+  });
+
+  it('the unknown-state branch carries no path for a bypassing field either', () => {
+    const originalError = console.error;
+    console.error = () => {};
+    let out;
+    try {
+      out = formatField({ ...handBuilt(), state: 'not-a-real-state' });
+    } finally {
+      console.error = originalError;
+    }
+    assert.equal(out.state, 'not-a-real-state', 'fixture did not reach the terminal branch');
+    assertNoPath('formatField(bypassing, unknown-state).provenanceWarning', out.provenanceWarning);
+  });
+
+  it('still says which field and why after redaction at the display boundary', () => {
+    const warning = formatField(handBuilt()).provenanceWarning;
+    assert.match(warning, /server\.execution_provider/, 'lost WHICH field disagreed');
+    assert.match(warning, /withheld/i, 'redaction must be visible, not a silent deletion');
+  });
+});
