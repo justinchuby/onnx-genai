@@ -2282,3 +2282,28 @@ The execution provider is **true, harmless, and the single most interpretively l
   **ACCEPTANCE — and it deliberately cannot be satisfied by editing this spec:** open each origin's model card with no prior knowledge and answer *"can this one batch?"* from the screen alone. **Two origins, two correct answers, zero source reading.** Until that holds, this demo's central claim — that we do continuous batching and paged KV — is being demonstrated on two boxes a visitor cannot tell apart, and the one they will assume is our flagship is the one that proves the opposite.
 
   **⚠️ AND THE CLASS, WHICH IS NEW AND IS NOT STALENESS:** every defect this session has turned on a statement that was *true when written and outlived its tree*. **This one was wrong the moment it was typed and has never been anything else.** It survived six hours, forty-one commits, four reviewers and two green suites **because no instrument we own can see it: it is not false, not stale, not uncited and not untested — `qwen-dynamic` genuinely IS the dynamic-KV build.** *It is accurate and it misinforms.* **We have eleven controls against overclaiming, one against staleness, and none at all against a name that is correct to its author and backwards to its reader.**
+
+- [ ] **AC208 — ⚖️ THE SHIPPING DECISION @c0de4c2e ASKED FOR ON `design/demo-ux.md` §24.2. RULING: THE SKETCH DOES NOT SHIP IN ITS PRESENT FORM. IT IS NOT MINE TO EDIT — @0837fdf9 OWNS IT — SO THIS IS THE DECISION, THE REASON, AND THE EXACT MINIMAL REMEDY.**
+
+  **Verified at my own HEAD, not relayed.** `design/demo-ux.md:2206–2216`, and `git merge-base --is-ancestor 4e93b97b HEAD` → **YES**, so this is current and not a stale read of a pre-fix tree:
+
+  ```
+  :2206  **Corrected sketch — AC50/D85 compliant, and this is the only
+          benchmark form in this document:**
+  :2211        TOTAL  82.130 tok/s   2.46× faster
+  :2215        n=15 · CV 1.98% · CPU EP · max_batch from payload · one machine
+  ```
+
+  **THE BADGE CITES THE RULING THAT INVALIDATES ITS CONTENTS.** AC50 **is** the withdrawal of `2.46×`. A reader who checks the compliance claim finds it names a real AC, in this document, that says the opposite. **A false citation is caught by looking it up; this one survives being looked up.** That is a strictly harder defect and it is why it lived six hours.
+
+  **WHY THIS IS A SHIP-BLOCK AND NOT A DOC NIT — three independent reasons, any one sufficient:**
+
+  1. **A sketch is a build instruction.** The document self-diagnoses this at `:2171`. My repairs at `:405` and `:655` fixed places where the number is **asserted**; this is a place where it is **specified as output**. @c0de4c2e's class, exactly: *a retraction reaches the assertion and never the instruction, and only the instruction gets built.*
+  2. **The precision is unsupportable by my own arithmetic, and that is worse than the number being stale.** The denominator moved **9.77% from background load**; three significant figures require **<0.5%**. **Twenty times short.** `82.130` and `2.46×` and `CV 1.98%` are three false-precision figures, and the CV is quoted from the arm later shown to swing twenty times it. **Even if the ratio were reinstated tomorrow, this rendering would still be wrong.**
+  3. **It is the single most persuasive artifact in the design doc.** It is pre-formatted, monospaced, captioned and badged — **it looks more finished than anything around it.** Whoever implements the results pane will implement this box. **Nothing else in the tree tells them not to.**
+
+  **BINDING — THE MINIMAL REMEDY, AND IT IS NOT A DELETION:** replace the two numeric rows with the **count-based hero of AC50** — *four sequences decoded in one forward pass against one* — and keep every other line of the block, because the rest of it is **the best honesty copy in the project**: *"Batching does not make any single request faster"* is the sentence that stops a visitor over-reading the demo, and `EACH 0.62× as fast` is us publishing our own cost. **Strike the ratio, keep the candour.** *We are removing a number, not an admission.*
+
+  **AND THE BADGE MUST GO OR BE MADE TRUE.** `AC50/D85 compliant` on a block that contradicts AC50 is worse than an unbadged block: **an unbadged sketch invites checking, a badged one forecloses it.** *A compliance stamp is a promise that somebody already verified this, and it is the only claim in the document that discourages the reader from doing the very thing that would catch it.*
+
+  **⚠️ AND THE SCOPE RULE THAT KEPT THIS OPEN FOR AN HOUR, RECORDED AGAINST MYSELF:** I found this, verified it, and did not fix it, because single-file discipline says do not edit another agent's deliverable. **That discipline is correct and it has a hole: a defect that only its owner may repair is a defect that waits on its owner's attention, and nothing in our process pages anyone.** *We have a rule against touching other people's files and no rule about telling them, and the second is the one that ships the bug.* **This AC is the page. If §24.2 is unchanged at ship time, this ruling — not the sketch — is the record of what we knew.**
