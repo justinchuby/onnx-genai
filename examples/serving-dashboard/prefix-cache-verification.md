@@ -8,10 +8,23 @@ the TTFT collapse Scenario B is built around?
 >
 > **Every timing number this document once carried is WITHDRAWN by its author
 > (me).** A warm interleaved re-run returned the **opposite sign**, and this
-> machine's ambient noise floor — a byte-identical binary swinging ~9.8% from
-> load alone — exceeds the effect either run claimed to see. The withdrawn
-> figures are not restated anywhere in this file in citable form, deliberately:
-> a retraction that quotes its own dead number just re-publishes it.
+> machine's ambient noise floor exceeds the effect either run claimed to see.
+> The floor is now measured rather than estimated: a **null A/B against a
+> byte-identical binary, where the true difference is zero by construction**,
+> produced single-pair deltas ranging **−40.17 % to +52.30 %** (§8 of
+> `perf-baseline.md`). An earlier draft of this banner put the floor at ~9.8 %.
+> **That understated it roughly fivefold and is itself corrected here** — the
+> effect of which is to make this withdrawal *stronger*, not weaker.
+>
+> **Correction to this banner, 02:54, reported by @732c7548.** It previously
+> claimed the withdrawn figures were "not restated anywhere in this file in
+> citable form." **That was false when written.** The figure was live at four
+> sites, including the verdict table twenty lines below this banner. A prior
+> sweep of mine struck four *other* occurrences and reported completion, so
+> this banner certified a cleanup that had not happened — **the banner was
+> load-bearing in exactly the way a status column is, and it was wrong.**
+> All four are struck as of this revision; the count is stated here so the
+> claim is falsifiable by `grep` instead of trusted.
 >
 > **The verdict below is UNCHANGED, because it never depended on the timings.**
 > It rests on the counter's own arithmetic: requests deliberately constructed to
@@ -32,7 +45,7 @@ stronger one anyway: it cannot be overturned by a quieter machine.)*
 |---|---|
 | `prefix_cache_hits` rises above 0 on dynamic | ✅ yes — 19 hits / 20 lookups (95 %) |
 | …but does it indicate genuine prefix **reuse**? | ❌ **no — it increments for every request, including controls that share nothing** |
-| Second identical request shows materially lower TTFT | ❌ **no — +7.0 %, i.e. no benefit at all** |
+| Second identical request shows materially lower TTFT | ❌ **no collapse of the predicted magnitude — and this document ships NO timing figure; see the retraction banner above** |
 | Scenario B's "TTFT collapse" payoff | ❌ **does not exist** |
 | Scenario B's "hit rate climbing off zero" payoff | ❌ **does not exist** — pins ~95–100 % from the first request and never moves |
 
@@ -105,8 +118,10 @@ This is why the naive procedure alone is insufficient, and why I ran a control.
 | req 5 (warm) | 1341.2 ms | | req 5 | 1446.4 ms |
 | **warm median** | **1341.2 ms** | | **median** | **1253.9 ms** |
 
-> **ARM A warm is +7.0 % SLOWER than the no-sharing control.**
-> Reusing a 900-token prefix confers **zero** measurable benefit.
+> **ARM A warm shows no advantage over the no-sharing control.** The measured
+> difference is WITHDRAWN and not restated: it is far inside the §8 noise floor,
+> where a known-zero truth produced swings several times its size.
+> Reusing a 900-token prefix confers **no benefit this instrument can resolve**.
 
 **Every one of the 12 requests incremented `prefix_cache_hits`** — including all six ARM B
 controls that share nothing. Final counter: **19 hits / 20 lookups = 95 %**.
@@ -125,9 +140,26 @@ Without this, "no effect observed" could just mean an insensitive test.
 **Prefill of the ~900-token body costs 1241 ms — 90 % of long-prompt TTFT.**
 
 A working prefix cache reusing that body would collapse TTFT from ~1380 ms toward ~140 ms,
-a **~90 % drop**. That is enormous and unmissable against the ~±10 % run-to-run noise.
+a **~90 % drop** — a factor of ten, not a percentage.
 
-**Observed: +7.0 %.** The effect is therefore **proven absent**, not merely unobserved.
+**The noise floor this must clear is now measured, not assumed.** An earlier draft of this
+section said the run-to-run noise was "~±10 %". That was an estimate and it was wrong: §8 of
+`perf-baseline.md` ran a **null A/B against a byte-identical binary, true difference zero by
+construction**, and single pairs still swung **−40.17 % to +52.30 %**. The floor is roughly
+five times what this section assumed.
+
+**The conclusion survives the correction, and this is the whole reason to state a predicted
+effect size in advance.** A ~90 % collapse is still **~1.7× larger than the worst excursion
+the floor produced**, so an effect of the promised magnitude could not have hidden in this
+noise. The observed difference, by contrast, sits well *inside* the floor — which is why it
+is withdrawn and not restated. **What is excluded is the ~90 % collapse Scenario B is built
+on. What is NOT excluded is some smaller real effect; this instrument cannot resolve one and
+does not claim to.**
+
+*(Caveat stated rather than buried: the ~1380 ms / ~140 ms prefill figures come from the same
+noisy instrument. They survive for the same reason — a ~10× ratio across prompt lengths is an
+order of magnitude outside a ±52 % floor, and each is a median of three. A claim is admissible
+here only when its size exceeds the floor, never because of where it was measured.)*
 
 ---
 
@@ -162,7 +194,7 @@ reused-tokens ÷ prompt-tokens — not a boolean hit count. Recon flagged
 ## 6. Impact and recommendation
 
 **Scenario B as designed cannot work.** Both halves of its payoff fail:
-- ❌ TTFT collapse — does not happen (+7.0 % vs control)
+- ❌ TTFT collapse — does not happen (no collapse of the predicted ~90 % magnitude; no timing figure shipped)
 - ❌ Hit rate climbing off zero — pins near 100 % immediately and never moves, meaninglessly
 
 **Recommendation:** re-scope or cut Scenario B now, while the panel is still cheap. Options:
@@ -446,6 +478,13 @@ Interleaved REPEAT/UNIQUE, n=15/arm, `max_tokens=4` so TTFT dominates, ~1500-tok
 The UNIQUE arm differs at the **first token** and is **matched in length** (same 120-word random
 preamble construction from the same vocabulary), so both arms do the same amount of prefill work.
 
+> ⚠️ **THE DELTAS IN THE TABLE BELOW ARE WITHDRAWN. Do not cite them.** They are retained
+> verbatim because this file is a **raw record** and deleting raw data to tidy a conclusion is
+> the failure mode this whole document exists to document. **Every delta below is smaller than
+> the §8 noise floor measured on a binary compared against itself**, so each is consistent with
+> zero. **The design of this run is still sound and worth reading — interleaved, length-matched,
+> differing at the first token; it is the machine underneath it that could not hold still.**
+
 | analysis | repeat | unique | delta | p |
 |---|---|---|---|---|
 | all data (n=15) | 4.283 s | 5.081 s | **−15.71%** | 0.052 |
@@ -455,9 +494,13 @@ preamble construction from the same vocabulary), so both arms do the same amount
 *(Dropping the first two pairs is declared post-hoc: they were 15.9 s / 15.5 s / 14.0 s / 6.9 s,
 plainly cold-start, and CV fell 63%→24% on their removal. Both analyses are reported.)*
 
-So there **is** a small repeat advantage, somewhere between 5% and 17% depending on the estimator,
-of marginal significance. **The question is not whether it is non-zero. It is whether it is the
-effect Scenario B promises.**
+So the re-run's point estimates all sit **inside the §8 noise floor** (single pairs on a
+known-zero truth swung −40.17 % to +52.30 %), and are therefore **withdrawn and not restated
+as citable figures**. Their marginal p-values do not rescue them: a p-value tests against
+chance under the model, not against a drifting machine, and §10 later showed load moving 12×
+*inside* a single twelve-minute experiment. **The question was never whether some small
+difference is non-zero. It is whether it is the effect Scenario B promises — and §4 shows
+that effect is ~90 %, which is the one magnitude this instrument CAN exclude.**
 
 ### §9.3 THE CONTROL THAT DECIDES IT — how big *should* the effect be?
 
