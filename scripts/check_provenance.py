@@ -145,6 +145,7 @@ def check_duplicate_keys(repo: Path, executed: dict) -> list[str]:
     it, because the defect is destroyed by execution.
     """
     problems: list[str] = []
+    SOURCES_READ.add(PROVENANCE_JS)
     source = (repo / PROVENANCE_JS).read_text()
     keys = TOP_LEVEL_KEY.findall(source)
     seen: dict[str, int] = {}
@@ -213,6 +214,7 @@ def check(repo: Path) -> tuple[list[str], dict]:
             failures.append(f"{key}: cites {rel}, which does not exist")
             continue
         if rel not in cache:
+            SOURCES_READ.add(rel)
             cache[rel] = normalise(path.read_text(errors="replace"))
         haystack = cache[rel]
 
@@ -261,6 +263,14 @@ def check(repo: Path) -> tuple[list[str], dict]:
     return failures, stats
 
 
+# Paths whose BYTES back a provenance verdict. Recorded so the run can say
+# which tree it actually measured -- see tree_context.divergence_report. This
+# checker enumerates from the committed index and reads from the desk, which
+# is the split that made a citation freeze rest on one agent's uncommitted
+# edits. The read stays on the desk; the silence about it does not.
+SOURCES_READ: set[str] = set()
+
+
 def main() -> int:
     try:
         repo = repo_root()
@@ -275,11 +285,24 @@ def main() -> int:
         f"{stats['quotes_checked']} quotations verified against source"
     )
     if failures:
+        for line in tree_context.divergence_report(repo, sorted(SOURCES_READ)):
+            print(f"  {line}")
         print(f"\n{len(failures)} FAILURE(S):")
         for f in failures:
             print(f"  - {f}")
         return 1
+    diverged = tree_context.divergence_report(repo, sorted(SOURCES_READ))
+    if diverged:
+        print(f"\n{len(diverged)} [WORKTREE_DIVERGENCE]:")
+        for line in diverged[:8]:
+            print(f"  {line}")
     print("all provenance quotations still occur in the source they cite")
+    if diverged:
+        print(
+            f"WARNING - {len(diverged)} of the file(s) those quotations were "
+            f"verified against differ from HEAD. This result describes one "
+            f"desk at one moment, not the branch."
+        )
     return 0
 
 
