@@ -698,7 +698,25 @@ broken that we already know is not built. Each item below is verified absent, wi
   old string will find nothing and must not read that as the grid having gained a source.
   `SequenceUsage` (`page_table.rs:867-875`) consumes `Vec<PageId>` into a length, and the raw map
   is behind a private `Engine.kv_cache`. **Test that the panel says so honestly; do not test the grid.**
-  *(Scenario B is NOT in this category — @376a0297 measured it working.)*
+  *(Scenario B is NOT in this category — its block table has its own source and IS in scope.
+  Do not take that on anyone's word; re-derive it, because a wrong exclusion here costs a defect
+  rather than a tester's time:*
+  `curl -s -o /tmp/b.json -w '%{http_code}\n' http://127.0.0.1:8124/v1/debug/kv/blocks && grep -o '"applicable":[a-z]*\|"code":"[a-z-]*"' /tmp/b.json`
+  *`200` + `"applicable":true` → this exclusion holds. `200` + `"applicable":false` with
+  `"code":"not-applicable"` → the exclusion is stale and 11.1 governs B too. `200` +
+  `"applicable":false` with `"code":"pending"` → the driver has not finished selecting a decode
+  path; poll again rather than concluding either way. **Both of those last two report
+  `applicable:false`, so that flag alone does not distinguish them** —   `pending` is built by mutating a `not_applicable` response
+  (`crates/onnx-genai-server/src/routes/mod.rs`, `impl BlockTableResponse`). `404` → the server was launched without
+  `--enable-debug-endpoints`, so the whole debug router is unregistered
+  (`crates/onnx-genai-server/src/lib.rs`, `enable_debug_endpoints`); that is the **instrument**
+  missing, not the data, and it answers nothing.*
+  ***Use `/blocks`.*** *Plain `/v1/debug/kv` cannot answer this — it is the nine-key response
+  described two lines above, carrying prefix counters and a `block_table_endpoint` pointer but no
+  page usage. It returns healthy-looking JSON and would read as a confirmation.)*
+  ***Use `/blocks`.*** *Plain `/v1/debug/kv` cannot answer this — it is the nine-key response
+  described two lines above, carrying prefix counters and a `block_table_endpoint` pointer but no
+  page usage. It returns healthy-looking JSON and would read as a confirmation.)*
 - **11.2 `tokens_per_second` and `batch_utilization` on `/v1/status` are stubs** — literal `0.0`.
   The dashboard derives tok/s client-side. A zero here is a stub, not a measurement.
 - **11.3 `/v1/debug/kv` returns the literal string `"unavailable"`** on the scatter profile.
