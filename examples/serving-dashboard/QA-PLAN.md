@@ -181,7 +181,7 @@ Failures here masquerade as application bugs. Check them first, every run.
       `scripts/build_qwen.sh:32` passing `--runtime ort-genai`, producing a model missing
       `model.io.static_*`. If you see a load failure, check the directory name before filing a bug.
 - [ ] **1.2 `--model` points at a DIRECTORY, never a config file.** The server has no equivalent
-      of the CLI's `resolve_model_dir` (`cli/src/lib.rs:674`). Passing a `.json` fails in a way
+      of the CLI's `resolve_model_dir` (`crates/onnx-genai-cli/src/lib.rs`, `fn resolve_model_dir`). Passing a `.json` fails in a way
       that reads like a corrupt model.
 - [ ] **1.3 Wrong-model silent-degradation check.** Loading plain `qwen2.5-0.5b` or `tiny-llm`
       does **not** error — it silently falls back to the per-request path, and the batching panel
@@ -218,7 +218,7 @@ Failures here masquerade as application bugs. Check them first, every run.
 ## 2.5 `GET /demo` — verify on BOTH origins, and know the THIRD gate
 
 The navigation ruling makes same-origin hosting load-bearing on *both* servers. Verified
-implemented (`lib.rs:92-99`, `run-demo.sh:159-169`); these tests keep it that way.
+implemented (`crates/onnx-genai-server/src/lib.rs`, `state.config.demo_assets_dir`; `run-demo.sh:159-169`); these tests keep it that way.
 
 - [ ] **2.5a `GET /demo/` returns the page on `:8123` AND on `:8124`.** Not one. There is no
       "demo server and a spare" — two peers, each hosting the page it talks to. If only one
@@ -227,7 +227,7 @@ implemented (`lib.rs:92-99`, `run-demo.sh:159-169`); these tests keep it that wa
       redirect via middleware, because `nest_service("/demo", ..)` already claims the bare path.
       Test the bare form — it is what a human types.
 - [ ] **2.5c 🔑 THIRD GATING MECHANISM — a CONFIG PATH, not a flag and not a feature.** Static
-      serving is gated on `state.config.demo_assets_dir` (`lib.rs:92`). We now have **three
+      serving is gated on `state.config.demo_assets_dir` (`crates/onnx-genai-server/src/lib.rs`, `state.config.demo_assets_dir`). We now have **three
       independent ways for an endpoint to be absent**, each with a different remediation:
       | Gate | Example | Fix |
       |---|---|---|
@@ -239,7 +239,7 @@ implemented (`lib.rs:92-99`, `run-demo.sh:159-169`); these tests keep it that wa
 - [ ] **2.5d Launch from the WRONG working directory** (without `--demo-assets-dir`).
       `resolve_demo_assets_dir` falls back to `./examples/serving-dashboard` **relative to the
       server's CWD**, so this is the likeliest real-world failure. It must serve the
-      `missing_assets` explainer (`lib.rs:98-99`), not a bare 404 and not a blank page.
+      `missing_assets` explainer (`crates/onnx-genai-server/src/lib.rs`, `demo_assets::missing_assets`), not a bare 404 and not a blank page.
 - [ ] **2.5e Ports must stay overridable.** `run-demo.sh:23-24` uses `${SCATTER_PORT:-8123}` /
       `${DYNAMIC_PORT:-8124}`. Run the whole demo on two non-default ports and confirm nothing
       in the page hardcodes 8123/8124.
@@ -263,10 +263,10 @@ how it behaves here more than on the happy path.
       Verified against the router (`lib.rs`), which endpoints the flag actually gates:
       | Endpoint | Demo call sites | Gated by `--enable-debug-endpoints`? |
       |---|---|---|
-      | `/v1/status` | 36 | **NO** — registered unconditionally (`lib.rs:67`) |
-      | `/v1/resources` | 7 | **NO** — registered unconditionally (`lib.rs:68`) |
-      | `/v1/debug/kv` | 6 | **YES** (`lib.rs:106`) |
-      | `/v1/debug/config` | 3 | **YES** (`lib.rs:104`) |
+      | `/v1/status` | 36 | **NO** — registered unconditionally (`crates/onnx-genai-server/src/lib.rs`, `routes::status`) |
+      | `/v1/resources` | 7 | **NO** — registered unconditionally (`crates/onnx-genai-server/src/lib.rs`, `routes::resources`) |
+      | `/v1/debug/kv` | 6 | **YES** (`crates/onnx-genai-server/src/lib.rs`, `routes::debug_kv`) |
+      | `/v1/debug/config` | 3 | **YES** (`crates/onnx-genai-server/src/lib.rs`, `routes::debug_config`) |
       So omitting the flag does **not** break the page. **Roughly 43 of 52 telemetry calls keep
       working**, the dashboard looks healthy, and *only the KV paging panels go dark* — i.e.
       **Pillar 2 silently disappears while the page still looks correct.** Test that the demo
@@ -323,14 +323,14 @@ how it behaves here more than on the happy path.
       previously sent each incremented `prefix_cache_hits` by exactly 1 — `15/16 → 16/17 → 17/18`.
       Across 12 requests (6 repeated prefix + 6 deliberately unique) the counter gained **+12 hits,
       `hit_rate` 0.9375**. **Every completed generation scores a hit.**
-      *Root cause in source:* `prepare_session_prefix` (`engine/runtime.rs:997`) forks on
+      *Root cause in source:* `prepare_session_prefix` (`crates/onnx-genai-engine/src/engine/runtime.rs`, `fn prepare_session_prefix`) forks on
       `uses_token_prefix_cache()` (`decode/state.rs:206`). The token-prefix branch
-      (`runtime.rs:1017-1024`) computes a hit length and **never sets `loaded_prompt_prefix`**, so
+      (`crates/onnx-genai-engine/src/engine/runtime.rs`, `loaded_prompt_prefix`) computes a hit length and **never sets `loaded_prompt_prefix`**, so
       twenty lines later the *full* prompt is queued and **prefill recomputes every token**. The
       value is `common_prefix_len(...).filter(|&len| len > 0).max()`, so **any single shared leading
       token scores a hit** — and every `/v1/chat/completions` request shares the chat-template
       preamble. The same file states the correct rule for the connector path 30 lines below:
-      *"never claiming a hit we can't serve"* (`runtime.rs:1097-1099`).
+      *"never claiming a hit we can't serve"* (`crates/onnx-genai-engine/src/engine/runtime.rs`, `loaded_prompt_prefix = materialized_len`).
       ⇒ **The counters are broken in OPPOSITE directions on the two profiles** — a hardcoded
       literal `0` on batching (§4.3), and always-hit on dynamic. **`(field, profile)` provenance is
       still the right mechanism; it just has to resolve to NOT-GENUINE on BOTH profiles.**
@@ -447,9 +447,9 @@ confident lie:
 | `vram.used` | KV **byte-budget accounting** — not GPU memory | Must not be labelled "VRAM" |
 | `host_ram.used` | **Whole machine**, every other process included | Must not be presented as our footprint |
 | `active_sessions` | Persistent `X-Session-Id` sessions, **not** concurrent requests | Relabel or remove |
-| `prefix_cache_lookups` | **Completed generations** — increments unconditionally, `metrics.rs:130-132` | Never label "cache lookups". Would read 5 with the cache deleted |
+| `prefix_cache_lookups` | **Completed generations** — increments unconditionally, `crates/onnx-genai-server/src/metrics.rs`, `prefix_cache_lookups` | Never label "cache lookups". Would read 5 with the cache deleted |
 | `prefix_cache_hits` (batching) | Hardcoded literal `0` | `not-applicable` |
-| `prefix_cache_hits` (**dynamic**) | **Increments on EVERY completed generation, including prompts sharing no prefix** — measured `+12 hits / 12 requests`, 6 of them deliberately unique. `runtime.rs:1017-1024` returns a hit length without ever setting `loaded_prompt_prefix`, so prefill still recomputes everything | **Not a hit counter. Unavailable on this profile too** — do not bind, do not cite as proof the cache works |
+| `prefix_cache_hits` (**dynamic**) | **Increments on EVERY completed generation, including prompts sharing no prefix** — measured `+12 hits / 12 requests`, 6 of them deliberately unique. `crates/onnx-genai-engine/src/engine/runtime.rs`, `loaded_prompt_prefix` returns a hit length without ever setting `loaded_prompt_prefix`, so prefill still recomputes everything | **Not a hit counter. Unavailable on this profile too** — do not bind, do not cite as proof the cache works |
 | `tokens_per_second` (`/v1/status`) | Hardcoded `0.0` | `unavailable` |
 
 - [ ] **7.1** `/v1/status` — **10 of 13 fields are hardcoded to zero** (`admin.rs:53-81`). Only
@@ -490,14 +490,14 @@ It is the single biggest honesty upgrade available. But:
         must be read from **shared atomics/snapshot state**, never by asking the decode driver.
         Ask QA to re-measure the moment the sink lands.
 
-- [ ] **7.5a `/metrics` is a COMPILE-TIME gate, not a runtime flag.** `lib.rs:128-129` is
+- [ ] **7.5a `/metrics` is a COMPILE-TIME gate, not a runtime flag.** `crates/onnx-genai-server/src/lib.rs`, `cfg(feature = "metrics")` is
       `#[cfg(feature = "metrics")]`. Default-on (`Cargo.toml: default = ["metrics"]`), so it
       normally works — but if it is ever missing, **no launch flag can fix it.** The remediation
       is *rebuild with the feature*, not *pass a flag*. The demo's error taxonomy currently only
       knows how to say "you're missing a flag." Confirm a 404 on `/metrics` is not reported as a
       flag problem. Distinct from §3.2 — same symptom, unrelated fix.
 - [ ] **7.5b 🔴 TTFT MUST NOT BE DERIVED AS `sum / count`.** The histogram is **monotonic and
-      never reset** (`metrics.rs:62-70` — `count.fetch_add`, `sum_ns.fetch_add`, no decay).
+      never reset** (`crates/onnx-genai-server/src/metrics.rs`, `fn observe` — `count.fetch_add`, `sum_ns.fetch_add`, no decay).
       So `sum/count` is the **all-time mean since process start**, not current TTFT. Two
       consequences, both fatal to a "live" panel:
       1. **It freezes.** After 200 requests, a new slow request moves the displayed value by
@@ -512,7 +512,7 @@ It is the single biggest honesty upgrade available. But:
       budges, it is the cumulative mean.
 - [ ] **7.5c Same defect applies to `onnx_genai_e2e_request_latency_seconds`** — identical
       cumulative structure, identical fix.
-- [ ] **7.5d `onnx_genai_batch_size_current` is NOT the engine's batch.** `metrics.rs:112`
+- [ ] **7.5d `onnx_genai_batch_size_current` is NOT the engine's batch.** `crates/onnx-genai-server/src/metrics.rs`, `onnx_genai_batch_size_current`
       `fetch_add(1)` in `start()`, decrement in `Drop` (`:145`) — it counts **HTTP generation
       requests in flight**, not `ContinuousBatchManager`'s batch. With max batch 4, firing 8
       concurrent requests makes this read **8** while the true engine batch is **4**. Must be
@@ -525,7 +525,7 @@ The class every provenance check is blind to: the value is measured, fresh, corr
 genuinely moves. Only the *name* is wrong. Nothing automated catches these.
 
 - [ ] **7.6a 🔴 `ttft` EXCLUDES QUEUE WAIT — and it biases in our favour exactly when the demo
-      makes its point.** `GenerationMetrics::start()` (`metrics.rs:110-116`) sets
+      makes its point.** `GenerationMetrics::start()` (`crates/onnx-genai-server/src/metrics.rs`, `pub(crate) fn start()`) sets
       `started: Instant::now()` **and decrements `REGISTRY.pending` in the same breath** — so the
       clock starts when a request is **admitted**, not when it **arrived**. On the batched path
       `start()` is called at batch admission (`crates/onnx-genai-server/src/driver.rs`,
@@ -549,7 +549,7 @@ genuinely moves. Only the *name* is wrong. Nothing automated catches these.
       **Scope, stated honestly: the demo never issues FIM requests, so this does NOT affect our
       numbers.** Recorded because it silently pollutes the shared histogram if anyone ever does.
 - [ ] **7.6c `prefix_cache_hit_rate` is hits ÷ COMPLETED GENERATIONS, not hits ÷ lookups.**
-      `metrics.rs:130-132` increments the denominator unconditionally on every completed
+      `crates/onnx-genai-server/src/metrics.rs`, `prefix_cache_lookups` increments the denominator unconditionally on every completed
       generation, with no predicate. Live, plausible, correctly typed, **and it moves when you
       exercise the cache** — so every check we own passes it. See §5.4.
       🔴 **AND THE NUMERATOR IS BROKEN TOO — so this field is not "a real number under a wrong
@@ -559,7 +559,7 @@ genuinely moves. Only the *name* is wrong. Nothing automated catches these.
       trends to 1.0 regardless of cache behaviour** — QA measured **0.9375**. It "moves when you
       exercise the cache" only because it moves when you do *anything*. See §5.1.
 - [ ] **7.6d `batch_size_current` is HTTP requests in flight, not the engine's batch.**
-      `fetch_add` in `start()` (`metrics.rs:112`), decrement in `Drop` (`:145`). See §7.5d.
+      `fetch_add` in `start()` (`crates/onnx-genai-server/src/metrics.rs`, `pub(crate) fn start()`), decrement in `Drop` (`crates/onnx-genai-server/src/metrics.rs`, `impl Drop for GenerationMetrics`). See §7.5d.
 
 ## 8. Five-state enum rendering
 

@@ -568,11 +568,11 @@ config flag is `--models-config`, which builds a *different* type
 `allow_runtime_override` is not a hardcode, and it is not "assigned from the
 YAML". **It is a `Default` impl value that no shipping code path can override,
 because the sole mechanism that could override it has no production caller.**
-The runtime-override refusal at `governor.rs:168`
+The runtime-override refusal at `crates/onnx-genai-engine/src/engine/governor.rs`, `allow_runtime_override`
 (`if !self.allow_runtime_override`) is therefore **unconditional in practice**.
 
 **Its error message offers two remedies and we quoted only the first when we
-first wrote this section. The full text at `governor.rs:191-192` reads:**
+first wrote this section. The full text at `crates/onnx-genai-engine/src/engine/governor.rs`, `serving.memory.limits.allow_runtime_override` reads:**
 
 > *"set `serving.memory.limits.allow_runtime_override: true` **or construct
 > `EngineConfig` with `allow_runtime_override = true` before calling

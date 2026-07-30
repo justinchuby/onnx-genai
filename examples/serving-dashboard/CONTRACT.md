@@ -249,7 +249,7 @@ was granted for.
 > ⚠️ **Do not build a "batch size" panel on `batch.in_flight`.**
 > `onnx_genai_batch_size_current` is documented "Current generation batch size"
 > but is `fetch_add(1)` in `GenerationMetrics::start()` and decremented in
-> `Drop` (`metrics.rs:112`, `:145`) — it counts **generation requests in
+> `Drop` (`crates/onnx-genai-server/src/metrics.rs`, `pub(crate) fn start()` and `impl Drop for GenerationMetrics`) — it counts **generation requests in
 > flight** at the HTTP layer and never consults the batch manager. With
 > `max_batch` pinned at 4, 8 concurrent requests make it read 8 while the engine
 > batches 4. The engine's real batch size is `batch.effective_size`, which is
