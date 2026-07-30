@@ -94,21 +94,34 @@ async function mountAgainstRealStore(origin, moduleName) {
 function syntheticBlockTable({
   pageSize = 16,
   pagesInUse,
+  pagesShared,
   refCounts,
   filledSlots,
   tiers = refCounts.map((value) => (value === null ? null : 0)),
   start = 0,
   total = pagesInUse,
   poolTotal = pagesInUse,
+  pagesFree = poolTotal - pagesInUse,
+  utilization = poolTotal > 0 ? pagesInUse / poolTotal : null,
   truncated = poolTotal > total,
 }) {
+  assert.equal(
+    pagesFree,
+    poolTotal - pagesInUse,
+    'synthetic whole-pool free pages must agree with pool total and pages in use',
+  );
+  assert.equal(
+    utilization,
+    poolTotal > 0 ? pagesInUse / poolTotal : null,
+    'synthetic whole-pool utilization must agree with pool total and pages in use',
+  );
   const scanned = refCounts.length;
   return {
     model_id: 'phi-3',
     applicable: true,
     page_size: pageSize,
     pages_in_use: pagesInUse,
-    pages_shared: refCounts.filter((value) => typeof value === 'number' && value > 1).length,
+    pages_shared: pagesShared,
     hot_capacity: poolTotal,
     hot_evictions: 0,
     allocation_failures: 0,
@@ -161,6 +174,7 @@ describe('KV block-window aggregation', () => {
     const poolPages = 300;
     const blockTable = syntheticBlockTable({
       pagesInUse: poolPages,
+      pagesShared: 0,
       refCounts: Array(poolPages).fill(1),
       filledSlots: Array(poolPages).fill(16),
     });
@@ -203,16 +217,46 @@ describe('KV block-window aggregation', () => {
 
   it('withholds both slot fields when only 256 of 300 pool pages were scanned', async () => {
     // SYNTHETIC: the reviewer's exact original failure shape. The first 256
-    // pages are full, but the response does not cover the whole 300-page pool.
+    // pages contain no shared pages, while the whole pool reports 280 pages in
+    // use, 37 shared, 20 free, and 93.3% utilization. The disagreement is
+    // deliberate: global scalars must not be recomputed from this partial scan.
     const scannedPages = 256;
+    const wholePoolPagesInUse = 280;
+    const wholePoolPagesShared = 37;
+    const wholePoolPagesFree = 20;
+    const wholePoolUtilization = 280 / 300;
     const blockTable = syntheticBlockTable({
-      pagesInUse: 300,
+      pagesInUse: wholePoolPagesInUse,
+      pagesShared: wholePoolPagesShared,
+      pagesFree: wholePoolPagesFree,
+      utilization: wholePoolUtilization,
       refCounts: Array(scannedPages).fill(1),
       filledSlots: Array(scannedPages).fill(16),
       total: 300,
       poolTotal: 300,
     });
+    assert.equal(
+      blockTable.blocks.ref_counts.filter((refCount) => refCount > 1).length,
+      0,
+      'fixture must make scanned shared pages disagree with the whole-pool scalar',
+    );
     const { store } = await pollBlockTable(blockTable);
+
+    for (const [key, expectedValue] of [
+      ['kv.pages_used', wholePoolPagesInUse],
+      ['kv.pages_total', wholePoolPagesInUse + wholePoolPagesFree],
+      ['kv.pages_shared', wholePoolPagesShared],
+      ['kv.usage', wholePoolUtilization],
+    ]) {
+      const field = store.field(key);
+      assert.equal(field.state, 'measured', `${key} must remain a whole-pool measurement`);
+      assert.equal(field.value, expectedValue, `${key} was recomputed from the partial window`);
+    }
+    assert.equal(
+      store.field('kv.pages_total').value - store.field('kv.pages_used').value,
+      wholePoolPagesFree,
+      'free pages must remain the whole-pool total minus whole-pool pages in use',
+    );
 
     for (const key of ['kv.slots_filled', 'kv.slot_capacity']) {
       const field = store.field(key);
@@ -228,6 +272,7 @@ describe('KV block-window aggregation', () => {
     const scannedPages = 256;
     const blockTable = syntheticBlockTable({
       pagesInUse: 400,
+      pagesShared: 0,
       refCounts: Array(scannedPages).fill(1),
       filledSlots: Array(scannedPages).fill(16),
       total: 1024,
@@ -248,6 +293,7 @@ describe('KV block-window aggregation', () => {
   it('withholds both slot fields when a full-length window starts after page zero', async () => {
     const blockTable = syntheticBlockTable({
       pagesInUse: 4,
+      pagesShared: 0,
       refCounts: [1, 1, 1, 1],
       filledSlots: [16, 16, 16, 16],
       start: 1,
@@ -270,6 +316,7 @@ describe('KV block-window aggregation', () => {
     const scannedPages = 1024;
     const blockTable = syntheticBlockTable({
       pagesInUse: 1200,
+      pagesShared: 0,
       refCounts: Array(scannedPages).fill(1),
       filledSlots: Array(scannedPages).fill(16),
       total: 1024,
@@ -289,6 +336,7 @@ describe('KV block-window aggregation', () => {
   it('withholds both slot fields when any dense block array is misaligned', async () => {
     const blockTable = syntheticBlockTable({
       pagesInUse: 4,
+      pagesShared: 0,
       refCounts: [1, 1, 1, 1],
       filledSlots: [16, 16, 16, 16],
       total: 4,
@@ -310,6 +358,7 @@ describe('KV block-window aggregation', () => {
     // null = never written, 0 = observed and released, positive = allocated.
     const blockTable = syntheticBlockTable({
       pagesInUse: 2,
+      pagesShared: 1,
       refCounts: [null, 0, 1, 2],
       filledSlots: [null, 0, 5, 16],
       tiers: [null, 0, 0, 1],
