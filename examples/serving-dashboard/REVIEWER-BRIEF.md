@@ -816,6 +816,8 @@ it is a different defect with a different fix.
 which is gitignored (`.gitignore:2`) and therefore absent from this branch.
 A skip here is expected, not a regression.
 
+> **⚠️ AUTHORSHIP — THE PASSAGE BELOW IS NOT MINE.** It arrived inside `ef0fb901`, another agent's commit, which carried this file alongside two scripts. All 31 of its non-blank lines survive verbatim. Same ruling as above: kept, because it is right; marked, because I would otherwise be the only name attached to it.
+
 **(d) The build-script suite's model-fidelity evidence: runs here, will NOT run
 for you unless you have a models directory.** This one is different from (c) in
 a way that matters, so please do not read it as more of the same.
@@ -966,6 +968,8 @@ The clock starts on the same call that removes the request from the queue, so
 zero at one concurrent request and grows with concurrency — it is largest in
 the 4-concurrent regime that carries our headline number, and it flatters us.
 `request_started()` already exists at `metrics.rs:171` if you want the fix.
+
+> **⚠️ AUTHORSHIP — THE PASSAGE BELOW IS NOT MINE.** It arrived in my file inside `b1a7a8bc`, another agent's commit, which carried seven files including this one. It survives at 15 of its 16 non-blank lines. I have signed 48 commits over this document and this passage was in none of them. Kept because it is correct and load-bearing; marked because signing it silently is the defect this document exists to name. Git attributes all 159 commits to one author, so the sha is the only evidence of provenance that exists.
 
 **The headline is not affected by this.** It is an aggregate decode *throughput*
 ratio, not a latency measurement.
