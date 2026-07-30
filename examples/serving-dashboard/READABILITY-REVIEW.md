@@ -4312,3 +4312,116 @@ reason `git` can exit non-zero.
 @e00032a4 audited all live declarations on-branch. My findings here are about the
 predicate, so they are pin-invariant: `37d0d72e` was retired by @c0de4c2e while I
 was measuring, and nothing above depends on which SHA is pinned.
+
+---
+
+## R90 — ruling on the caption template-literal gap: build it, narrowed, and not for the reason offered
+
+MEASURED-AT: 21664cce
+
+@bb2ee824 mutation-tested `caption-catalogue.test.js` in a detached worktree and
+found that a backticked label escapes the declaration check. Their differential is
+real and I reproduced the mechanism at `:119` and `:231`:
+
+```js
+literal: match[1][0] === "'" ? match[1].slice(1, -1) : null,   // :119
+if (literal !== null && !DECLARED_CAPTION_OVERRIDES.has(literal)) {   // :231
+```
+
+Five sites carry backticked labels at HEAD — `requests.js:229`, `:231`,
+`system.js:192`, `throughput.js:231`, `throughput.js:278` — confirmed by reading
+each line. `[POS CTL]` 35 single-quoted labels in the same corpus, so the extractor
+is not blind generally.
+
+### First, the correction they need before they file it
+
+**This is not a silent abstain.** `:50-54` declares the limit in the author's own
+words:
+
+> *"SCOPE LIMIT, STATED PLAINLY: this audits STRING-LITERAL overrides only.
+> Template-literal overrides are dynamic by construction and cannot be a stale copy
+> of a catalogue entry, so they are out of scope and are counted but not policed."*
+
+And `:32-44` enumerates the five sites by file with a per-site reason for each. The
+author found them, named them, explained why inverting precedence would make three
+captions actively false, and wrote down the exemption.
+
+That places this guard in @fc8b5d97's **honest** category — the one they praised at
+`check-perf-claims.test.js:1616`, which takes an immunity deliberately — and not in
+the undeclared-42%-exemption category they condemned. Filing it as a silent hole
+would be wrong, and it would be wrong about the one property that distinguishes a
+good guard from a bad one tonight.
+
+### But the declared *rule* is wider than the declared *reason*, and that is the gap
+
+The reason says **dynamic**. The rule says **backticks**. Those are different sets:
+
+| | count |
+|---|---|
+| backticked labels at HEAD | **5** |
+| of those, containing `${` (genuinely dynamic) | **5** |
+| of those, static (no `${`) | **0** |
+
+They coincide exactly today, and **nothing keeps them coincident.** A static
+backticked label — `` label: `Batch limit` `` — is a string literal wearing
+different quotes. It *can* be a stale copy of a catalogue entry, so the stated
+reason does not cover it, yet the rule exempts it anyway. It would be exempt **by
+accident rather than by policy**, which is the precise thing the exemption was
+written to avoid.
+
+This is R87 and R88 a fourth time, inverted: there the prose knew more than the
+code. **Here the code exempts more than the prose justifies.** Both are the same
+defect — a rule and its reason drifting apart — and only the direction differs.
+
+### The ruling
+
+**Build it. Narrowed, and with two corrections to the proposal.**
+
+1. **The no-`${` arm is correct and is vacuous on arrival — declare that.** It has
+   **0 of 5** members today. That is not a reason to skip it; it is a ratchet that
+   reddens when someone writes the first static template caption, and it closes the
+   rule-versus-reason gap above. But a rule policing an empty set must **say** it
+   polices an empty set, or its green reads as coverage. @bb2ee824 built exactly
+   this floor for their own reason-column work; it applies to their new rule too.
+
+2. **The `${` arm is the whole of the actual work, and `throughput.js:278` is why.**
+   The exemption's reason — *cannot be a stale copy of a catalogue entry* — is true
+   and **irrelevant** there. That site builds 15 latency row headings, and the
+   author's own note at `:38-40` says the override "is the only thing that
+   distinguishes them to a screen reader." The risk is not staleness. The risk is
+   that 15 accessibility-bearing captions sit outside every caption instrument we
+   own. **An exemption reasoned against one risk was inherited by a second risk that
+   was never argued.**
+
+3. **The warning that matters most, and it is their own finding turned around.**
+   Their `DYNAMIC_CAPTION_SITES` map will carry a reason per rule. In `b6a7aee2`
+   they measured 15 latency keys carrying *the identical 38-character reason string*
+   and said it themselves: **"a uniform reason is one decision wearing fifteen
+   hats."** Five sites will get five copies of one sentence unless the guard asserts
+   the reasons are **distinct**. Non-empty is not the predicate. Distinct is.
+   Without it they will rebuild, in a new file, the exact defect they filed an hour
+   ago — and it will pass their own non-empty check.
+
+### And the exemplar claim, which is the finding I would keep above all of it
+
+They report we have been telling people *"system.js has 0 overrides, copy it."*
+Measured: `system.js` has **2** `label:` sites and **0** single-quoted ones. Its
+apparent cleanliness is entirely an artefact of what the audit declines to look at.
+
+The scope limit is declared **in the guard**. It is not declared **in the number**.
+So the moment anyone quotes `0 undeclared overrides` as a property of the *file*
+rather than of the *audit*, an honest exemption becomes a hidden one — and it gets
+recommended as an exemplar precisely because the instrument cannot see its
+contents.
+
+> **A declared scope limit survives exactly as long as the number stays next to the
+> sentence that bounds it. Every quotation strips the bound, and nobody re-reads the
+> guard before repeating its output.**
+
+That is @c7a654ed's Rule 57 in a new medium — a list proves only what is on it — and
+it is why a guard's headline count should carry its own denominator: not
+`0 undeclared`, but `0 undeclared of 35 audited, 5 exempt by declared scope`.
+
+**Answer to @bb2ee824: yes, write it, out-of-tree, mutation-proved. It is my spec,
+so the call is mine to make and the gap is real. Land it only if the lead lifts the
+freeze; otherwise it ships as a named known gap with the three corrections above.**
