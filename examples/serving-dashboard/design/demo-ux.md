@@ -4602,3 +4602,54 @@ I ruled (D181) that **a ratio which can exceed 1 is not a dial** and banned a ut
 | D244 | No percentage dial from KV pages; two absolute counts at equal size | A ratio that can exceed 1 is not a dial — confirmed independently by a red test |
 | D245 | Pool pressure binds `hot_evictions`, never `allocation_failures` | A real counter answering the wrong question passes every provenance check we have |
 | D246 | `attach_kv_telemetry() -> bool` makes the not-applicable branch unskippable | The honesty state is in the signature, enforced by API shape, not discipline |
+
+---
+
+## 75. `available` IS A CONFIGURATION FACT WEARING A REACHABILITY NAME (D247–D250)
+
+AC103's navigation consequence lands on the switcher, which is my spec. I audited it and found the session's own pattern **in my own component.**
+
+### 75.1 🔴 D247 — FOURTH INSTANCE OF THE HONEST-FIELD-WRONG-QUESTION DEFECT, AND THIS ONE IS MINE
+
+`scenario-origins.js:286-297` computes `available` **entirely from whether an origin string was supplied**:
+```js
+const baseUrl = origins[scenario.serverClass] ?? null;
+if (!baseUrl) return { …, available: false, … }
+```
+and `resolveOrigins:251-265` fills that map from **the query string** — `?dynamic=http://127.0.0.1:8124` — falling back to `url.origin` only for this server's own class. Its comment is scrupulous: *"Never assume the peer is here."*
+
+> **D247 — THE CODE IS HONEST AND THE NAME IS NOT. `available` MEANS "SOMEONE TYPED THIS ADDRESS INTO A URL." IT DOES NOT MEAN THE SERVER IS UP, AND IT CANNOT** — under the navigation ruling the peer *"cannot be fetched; it can only be NAVIGATED to"* (`scenario-switcher.js:8-10`), **so reachability is UNOBSERVABLE BY CONSTRUCTION.** The switcher then branches on it to decide which tabs render as working links and which go into the unreachable note, **so the visitor reads a config echo as a liveness check.**
+>
+> **It passes every detector in this document: genuinely computed, correctly sourced, moves when the input moves, plausible.** That is `prefix_cache_hits`, `allocation_failures` and `active_sessions` for the fourth time in ninety minutes — **and I ruled on all three while shipping the same defect myself.** ⛔ **RENAME TO `configured`.** The tab already says *"changes servers"* (`:105-106`) — correct, and it must never be strengthened into an availability claim. **`configured` is unglamorous and it is exactly what we know.**
+
+### 75.2 🔴 D248 — PREDICTION IS ARCHITECTURALLY IMPOSSIBLE, SO EVERY DESIGN UNIT GOES INTO THE ARRIVAL
+
+We cannot probe the peer without the cross-origin fetch that navigation exists to eliminate. **A pre-flight check would re-introduce CORS to defend against a problem CORS creates.**
+
+> **D248 — WHEN A FAILURE CANNOT BE PREDICTED, DESIGNING THE DEPARTURE IS WASTED EFFORT AND DESIGNING THE ARRIVAL IS THE WHOLE JOB.** Three outcomes on click, and we control progressively less of each:
+> | Outcome | What the visitor sees | Who controls it |
+> |---|---|---|
+> | peer up, assets found | the dashboard | us |
+> | **peer up, assets missing** | **`missing_assets()` — a PLAIN-TEXT 404** | **us, and it is undesigned** |
+> | peer down | the browser's connection-error page | **nobody — this is a LAUNCHER problem, and no client design can reach it** |
+>
+> **The middle row is the one to invest in, because it is the one we own and the one AC103 says is likeliest.**
+
+### 75.3 🔴 D249 — THE MISSING-ASSETS PAGE IS THE ONLY PAGE GUARANTEED TO BE SEEN WHEN THINGS GO WRONG, AND THE ONLY PAGE WITH NO DESIGN
+
+`demo_assets.rs:37-63` returns `(StatusCode::NOT_FOUND, MISSING_ASSETS_MESSAGE)` — **`text/plain`.** Its *content* is genuinely good (names the flag, the env var, and the default directory; the comment even says *"a bare 404 gives the visitor nothing to act on"*). **But it renders as unstyled monospace, and — the part that matters on stage — IT HAS NO WAY BACK.**
+
+> **D249 — A VISITOR WHO CLICKS A SCENARIO TAB AND LANDS HERE IS STRANDED ON A DIFFERENT ORIGIN WITH NO LINK TO THE WORKING ONE, MID-DEMO, IN FRONT OF AN AUDIENCE. And the return address is already in flight:** `scenarioHref` builds the destination URL **carrying both origins in the query string**, so the failing server is *handed* the address of the server the visitor just left — **and currently discards it.** ⛔ **ASK (@d7cf9b84's file — reporting, not editing): `missing_assets()` should parse the `?scatter=` / `?dynamic=` parameter it already receives and end with a line naming the origin the visitor came from.** One line, and it converts a dead end into a recoverable state. **Per D207 every absence keeps its frame and states its reason; this absence is a whole PAGE, and the same rule applies to it.**
+
+### 75.4 ✅ D250 — AND THE LAUNCH TRAP IS THE SAME SHAPE AS `available`, ONE LAYER DOWN
+
+`demo_assets.rs:54-58`: `unwrap_or_else(|| PathBuf::from("examples/serving-dashboard"))` then `candidate.is_dir().then_some(candidate)` — **a relative path resolved against the CWD, silently collapsing to `None`.**
+
+> **D250 — IT WORKS FROM THE REPO ROOT, WHICH IS WHERE EVERY ONE OF US LAUNCHES IT, SO THE DEPENDENCY IS INVISIBLE IN THE COMMAND AND ABSENT FROM EVERY CHECK WE RUN.** @376a0297's binding — **both command lines carry an ABSOLUTE `--demo-assets-dir`** — is right for the reason that generalises: **it REMOVES the invisible state rather than documenting around it**, which is the same move as serving the denominator instead of banning the hardcode (D239). **And their QA step is the one I'd underline: starting both servers and curling each `/demo` PASSES WHILE THE DEMO IS BROKEN — only SWITCHING SCENARIOS exercises server two's assets through the path a visitor actually takes.** A status check standing in for a semantic one, one final time.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D247 | Rename `available` → `configured` | It measures that an address was supplied; reachability is unobservable by construction |
+| D248 | Design the arrival, not the departure | A pre-flight probe would reintroduce CORS to defend against a problem CORS creates |
+| D249 | `missing_assets()` must name the origin the visitor came from | The return address is already in the query string and is currently discarded |
+| D250 | Absolute `--demo-assets-dir` on both command lines | It removes the invisible CWD dependency instead of documenting around it |
