@@ -702,7 +702,16 @@ pub(crate) async fn debug_kv_blocks(
         .count
         .unwrap_or(BlockTableResponse::DEFAULT_WINDOW)
         .min(BlockTableResponse::MAX_WINDOW);
-    let states = telemetry.block_window(query.start, count);
+    // `None` means no per-page mirror exists at all, which is NOT an empty
+    // window. Rendering it as `live` with zero pages would draw a legitimately
+    // empty grid for a pool we cannot see, and an empty grid is what a fully
+    // unused pool also looks like.
+    let Some(states) = telemetry.block_window(query.start, count) else {
+        return Ok(Json(BlockTableResponse::pending(
+            model_id,
+            "the per-page block mirror has not been attached yet",
+        )));
+    };
     Ok(Json(BlockTableResponse::live(
         model_id,
         telemetry.snapshot(),

@@ -316,28 +316,39 @@ impl KvTelemetry {
     /// `ref_count: 0`, because that is a measurement -- we looked, and it was
     /// empty. Collapsing those two into one absence would make "we have never
     /// seen this page" indistinguishable from "this page is free right now".
-    pub fn block_window(&self, start: usize, count: usize) -> Vec<Option<BlockState>> {
-        let Some(blocks) = self.blocks.get() else {
-            return Vec::new();
-        };
-        blocks
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(count)
-            .map(|(page_id, slot)| {
-                let packed = slot.load(Ordering::Relaxed);
-                if packed & (1 << 40) == 0 {
-                    return None;
-                }
-                Some(BlockState {
-                    page_id: page_id as u32,
-                    ref_count: (packed & 0xFFFF) as u32,
-                    filled_slots: ((packed >> 16) & 0xFFFF) as usize,
-                    tier: ((packed >> 32) & 0xFF) as u8,
+    /// The OUTER `Option` separates "there is no mirror to read" from "the
+    /// mirror is real and this window selects no pages".
+    ///
+    /// Both used to return an empty `Vec`, so an absent mirror and a window
+    /// starting past the end of a real one were byte-identical to a caller.
+    /// They were recoverable only by ALSO reading `mirrored_block_capacity()`,
+    /// which is the same "two fields, one of which you must remember" shape
+    /// this module already rejected for `ref_count: 0` versus never-written.
+    /// Returning `None` makes the distinction impossible to drop rather than
+    /// merely documented: a renderer cannot paint an empty grid for an absent
+    /// mirror without first saying which case it is in.
+    pub fn block_window(&self, start: usize, count: usize) -> Option<Vec<Option<BlockState>>> {
+        let blocks = self.blocks.get()?;
+        Some(
+            blocks
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(count)
+                .map(|(page_id, slot)| {
+                    let packed = slot.load(Ordering::Relaxed);
+                    if packed & (1 << 40) == 0 {
+                        return None;
+                    }
+                    Some(BlockState {
+                        page_id: page_id as u32,
+                        ref_count: (packed & 0xFFFF) as u32,
+                        filled_slots: ((packed >> 16) & 0xFFFF) as usize,
+                        tier: ((packed >> 32) & 0xFF) as u8,
+                    })
                 })
-            })
-            .collect()
+                .collect(),
+        )
     }
 
     /// How many pages the mirror can describe.
@@ -840,7 +851,9 @@ mod tests {
         // The pool preallocates its pages, so a block table shows all eight
         // from the start, every one free. That is the correct picture: the
         // blocks exist, and seeing them fill is the point of the view.
-        let initial = telemetry.block_window(0, 8);
+        let initial = telemetry
+            .block_window(0, 8)
+            .expect("this fixture attaches a mirror");
         assert_eq!(initial.len(), 8);
         assert!(
             initial
@@ -853,7 +866,9 @@ mod tests {
         let second = table.allocate(GPU).expect("pool has capacity");
         table.retain(first);
 
-        let blocks = telemetry.block_window(0, 8);
+        let blocks = telemetry
+            .block_window(0, 8)
+            .expect("this fixture attaches a mirror");
         assert_eq!(blocks.len(), 8);
         assert_eq!(
             blocks
@@ -878,7 +893,9 @@ mod tests {
         let page = table.allocate(GPU).expect("pool has capacity");
         table.free(page);
 
-        let block = telemetry.block_window(0, 8)[page as usize]
+        let block = telemetry
+            .block_window(0, 8)
+            .expect("this fixture attaches a mirror")[page as usize]
             .expect("a freed page is still a real page, reported with zero refs");
         assert_eq!(block.ref_count, 0);
     }
@@ -895,9 +912,16 @@ mod tests {
         let ids = |w: Vec<Option<BlockState>>| -> Vec<Option<u32>> {
             w.iter().map(|b| b.map(|b| b.page_id)).collect()
         };
-        let first = ids(telemetry.block_window(0, 16));
+        let first = ids(telemetry
+            .block_window(0, 16)
+            .expect("this fixture attaches a mirror"));
         for _ in 0..5 {
-            assert_eq!(first, ids(telemetry.block_window(0, 16)));
+            assert_eq!(
+                first,
+                ids(telemetry
+                    .block_window(0, 16)
+                    .expect("this fixture attaches a mirror"))
+            );
         }
         // Position IS the page id, so the window is dense and ascending with
         // no ordering step that could get it wrong.
@@ -913,9 +937,58 @@ mod tests {
             table.allocate(GPU).expect("pool has capacity");
         }
         assert_eq!(telemetry.mirrored_block_capacity(), 16);
-        assert_eq!(telemetry.block_window(0, 5).len(), 5);
-        assert_eq!(telemetry.block_window(14, 5).len(), 2, "clamps at the end");
-        assert!(telemetry.block_window(100, 5).is_empty());
+        assert_eq!(
+            telemetry
+                .block_window(0, 5)
+                .expect("this fixture attaches a mirror")
+                .len(),
+            5
+        );
+        assert_eq!(
+            telemetry
+                .block_window(14, 5)
+                .expect("this fixture attaches a mirror")
+                .len(),
+            2,
+            "clamps at the end"
+        );
+        assert!(
+            telemetry
+                .block_window(100, 5)
+                .expect("this fixture attaches a mirror")
+                .is_empty()
+        );
+    }
+
+    /// An absent mirror and an empty window used to be the same empty `Vec`.
+    ///
+    /// This is the distinction the outer `Option` exists for, and it is the
+    /// `ref_count: 0` argument one layer up: a window past the end of a real
+    /// mirror is a MEASUREMENT (we looked at those page ids and there are
+    /// none), while an unattached mirror is an ABSENCE OF OBSERVATION. Painted
+    /// as a grid they are identical, and the honest one is the one that would
+    /// have been wrong.
+    #[test]
+    fn an_absent_mirror_is_not_an_empty_window() {
+        let unattached = KvTelemetry::default();
+        assert!(
+            unattached.block_window(0, 8).is_none(),
+            "no mirror has been attached, so there is nothing to report"
+        );
+        assert_eq!(unattached.mirrored_block_capacity(), 0);
+
+        let (mut table, telemetry) = pool(16);
+        for _ in 0..16 {
+            table.allocate(GPU).expect("pool has capacity");
+        }
+        let past_the_end = telemetry
+            .block_window(100, 5)
+            .expect("the mirror IS attached; this window simply selects nothing");
+        assert!(
+            past_the_end.is_empty(),
+            "a real mirror asked about page ids it does not hold reports an \
+             empty window, which is a measurement rather than an absence"
+        );
     }
 
     /// The mirror is capped so a pool that grows via cold-tier offload cannot
@@ -975,7 +1048,9 @@ mod tests {
         telemetry.note_block(0, u16::MAX as u32, u16::MAX as usize, 1);
         telemetry.note_block(1, 0, 0, 0);
 
-        let blocks = telemetry.block_window(0, 4);
+        let blocks = telemetry
+            .block_window(0, 4)
+            .expect("this fixture attaches a mirror");
         // DENSE: four page ids examined, four entries. Two are observed and
         // two have never been written. Before this was dense the same call
         // returned LENGTH 2, so `blocks[1]` was page 1 only by coincidence --
@@ -1020,14 +1095,18 @@ mod tests {
                 .expect("page is observed")
         };
 
-        let before = telemetry.block_window(0, 6);
+        let before = telemetry
+            .block_window(0, 6)
+            .expect("this fixture attaches a mirror");
         assert_eq!(position_of(&before, 3), 3);
         assert_eq!(position_of(&before, 5), 5);
 
         // A page EARLIER in the window is written for the first time. Under a
         // sparse window this inserts an element and pushes 3 and 5 along.
         telemetry.note_block(0, 1, 2, 0);
-        let after = telemetry.block_window(0, 6);
+        let after = telemetry
+            .block_window(0, 6)
+            .expect("this fixture attaches a mirror");
 
         assert_eq!(
             after.len(),
