@@ -123,6 +123,54 @@ def load_entries(repo: Path) -> dict:
     return json.loads(res.stdout)
 
 
+TOP_LEVEL_KEY = re.compile(r"^  '([^']+)': \{", re.M)
+
+
+def check_duplicate_keys(repo: Path, executed: dict) -> list[str]:
+    """Catch a key defined twice in the table's source.
+
+    Executing the module -- which is otherwise the right way to read it -- is
+    structurally blind to this: a duplicate key in a JS object literal is not
+    an error. No syntax error, no warning, no lint. The engine silently keeps
+    the LAST definition, so `Object.entries` returns a deduplicated set and
+    every count-based check we own, including this file's own MIN_ENTRIES
+    floor, is computed over a set that cannot contain the defect.
+
+    That happened: 'batch.capacity' was defined twice, and the surviving copy
+    was the LINE-anchored one while the dead copy was SYMBOL-anchored -- the
+    exact inverse of the citation rule this project ratified. A reader who
+    scrolled to the good entry and stopped would believe it was in force.
+
+    This is the one check here that must read the SOURCE rather than execute
+    it, because the defect is destroyed by execution.
+    """
+    problems: list[str] = []
+    source = (repo / PROVENANCE_JS).read_text()
+    keys = TOP_LEVEL_KEY.findall(source)
+    seen: dict[str, int] = {}
+    for k in keys:
+        seen[k] = seen.get(k, 0) + 1
+    for k, n in sorted(seen.items()):
+        if n > 1:
+            problems.append(
+                f"'{k}' is defined {n} times in {PROVENANCE_JS}. JS keeps the "
+                f"LAST definition and discards the rest silently; the earlier "
+                f"copy is dead code that still reads correctly in the file."
+            )
+    # Self-validation: if this regex ever stops matching the file's
+    # convention it would silently find zero keys and pass forever. Tying it
+    # to the executed count means the check goes red when it stops working,
+    # instead of going quiet.
+    if not problems and len(keys) != len(executed):
+        problems.append(
+            f"source scan found {len(keys)} top-level keys but executing the "
+            f"module yields {len(executed)}. Either a key is duplicated in a "
+            f"form this scan cannot see, or the file's formatting changed and "
+            f"this check has stopped reading it. Both are failures."
+        )
+    return problems
+
+
 def normalise(s: str) -> str:
     """Collapse whitespace so a quote survives rustfmt rewrapping a line.
 
@@ -139,6 +187,8 @@ def check(repo: Path) -> tuple[list[str], dict]:
     failures: list[str] = []
     stats = {"entries": len(entries), "quotes_checked": 0, "entries_with_source": 0}
     cache: dict[str, str] = {}
+
+    failures.extend(check_duplicate_keys(repo, entries))
 
     if len(entries) < MIN_ENTRIES:
         failures.append(
