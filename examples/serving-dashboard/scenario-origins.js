@@ -90,11 +90,17 @@ export const SCENARIOS = Object.freeze({
  *
  * ⚠️ THIS PARAGRAPH USED TO CITE A TIMING ARM — shared-prefix requests "7%
  * SLOWER" than a zero-sharing control. ITS OWN AUTHOR WITHDREW IT: the
- * interleaved warm re-run came back with the OPPOSITE SIGN, on a machine where
- * a byte-identical binary swung 9.8% from ambient load alone, so the effect was
- * smaller than the noise floor. We ship no prefix timing number. Do not
- * reintroduce one. The conclusion is unchanged because it never rested on the
- * stopwatch — which is why the counter argument is the one worth keeping.
+ * interleaved warm re-run came back with the OPPOSITE SIGN, and this box has
+ * no floor to measure a single-digit effect against. A null A/B — two arms
+ * whose true difference is ZERO BY CONSTRUCTION — measured between −40.17%
+ * and +52.30% against a ±2% acceptance band (see perf-baseline.md §8.1). The
+ * claimed effect is an order of magnitude below that. We ship no prefix timing
+ * number. Do not reintroduce one, and do not re-cite the earlier load-drift
+ * figure this paragraph used to carry: perf-baseline.md §6f withdrew it as
+ * evidence, because the run it came from straddled two CPU-heavy ONNX exports
+ * and the swing was attributable after all. The conclusion is unchanged
+ * because it never rested on the stopwatch — which is why the counter argument
+ * is the one worth keeping.
  *
  * The finding itself still ships — it is the most credible thing the demo has
  * to say — but it ships as evidence inside a panel, not as a capability tab.
