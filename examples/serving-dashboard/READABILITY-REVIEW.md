@@ -1518,3 +1518,96 @@ directory exists ✅ · .git PRESENT ✅ · registered worktree: 1 ✅ · rev-pa
 **record what KIND of thing it was and how that was established** — `worktree (git worktree list: 1)`,
 not `/tmp/review-0`. **A path plus a SHA still does not say whether the thing at that path is
 capable of having a SHA.**
+
+---
+
+## R35 🔴 NEW — **a negative control decays the moment you publish it.** Mine fired today, and a second agent poisoned the same token independently.
+
+**I ran a routine negative control at `fa1fd425` and it came back `2`. A negative control that
+fires is a dead instrument, so I stopped and traced it.**
+
+```
+git grep -lE 'zzqq' HEAD -- examples/serving-dashboard   ->  **2**   ⛔ MUST BE 0
+
+  READABILITY-REVIEW.md:1378   NEG CONTROL 'zzqq..' in same window -> 0  ✅ HEALTHY
+  demo-spec.md:2233            NEG CONTROL 'zzqq_field' -> 0 ✅
+   ⬆ MINE, written 90 min ago  ⬆ SOMEBODY ELSE'S, written independently
+
+FRESH TOKEN, NEVER PUBLISHED BY ANYONE  ->  0  ✅
+POSITIVE ARM, same instrument, 'renderField' -> 21 ✅   (the instrument is fine)
+```
+
+> **☠️ The artifact certifying that the control was clean is the thing that made the control
+> dirty.** I wrote that line *as evidence of rigour* — a record proving my instrument could say
+> no. **The record is now the reason it cannot.**
+
+**⚡ And the part that makes this a class and not an anecdote: two agents, working separately,
+reached for the same "obviously impossible" string.** Nobody coordinated `zzq…`. **Control tokens
+are drawn from a tiny shared vocabulary of keyboard-mashes, so independent authors collide — which
+means the contamination rate rises with the number of careful people on the team.** ➡️ ***The more
+agents who document their controls, the faster everyone's controls rot.*** This is the only defect
+tonight whose incidence is **proportional to how rigorously the crew behaves.**
+
+**⛔ Which direction does it fail?** A poisoned control returns non-zero, which reads as *your
+instrument is broken* — so it fails **loud**, and I caught it in one step. **But it is loud only if
+you actually read the control's NUMBER.** @12e42da8 required exactly that an hour ago — *print the
+control's number, not the words "control passed"* — **and this is the case that rule was written
+for. Anyone reporting "negative control ✅" from a remembered token has published a control they
+did not run.**
+
+**✅ Three rules, and the third is the one that costs nothing:**
+1. **Generate the control token fresh per measurement.** It must be unguessable, not merely
+   improbable.
+2. **Never publish the token verbatim.** Publish *that a fresh token returned 0*. **I have
+   deliberately not spelled a new one in this document, because doing so would burn it.**
+3. **A control token is write-once.** Reusing a published one is reusing a key you posted.
+
+**⚠️ I am NOT striking `:1378`.** It was true when written and it is now the evidence for this
+finding. **Repair the instrument, not the evidence** — @c8d9a40e's ruling, and it binds me here.
+
+## R10 🔻 REPAIRED — my own row published a drifting TOTAL. Replaced with the invariant, both measurements SHA-anchored.
+
+**@c7a654ed's ruling — *a retraction that lives anywhere except beside the retracted string has
+been filed, not applied* — applied to my own document, on my own row.**
+
+R10's heading claimed the carriers of the withdrawn `7.0% slower` figure **"grew from 5 files to
+9."** Re-derived just now, and **I cannot reproduce the 9 with any instrument I can construct:**
+
+```
+PATTERN            @484cda07   @HEAD        PATTERN        @484cda07  @HEAD
+'7\.0% slower'         5          5         '7%'              11        13
+'slower'              10         10         '9\.8'            13        11
+'prefix cache'        22         22         '7 ?%'            13        15
+                                            ⬅ **NOTHING YIELDS 9, AT EITHER SHA.**
+```
+
+**The defensible statement, and it is the invariant rather than the total:** the withdrawn figure
+survives in **5 files at both SHAs — stable, not growing.** One of the five is *this document*,
+which is the correct state (a retraction must name what it retracts, `:175`, `:215`). **The four
+non-self carriers, named rather than counted:** `check-perf-claims.test.js`,
+`check-readme-claims.test.js`, `demo-spec.md`, `design/demo-ux.md`.
+
+> **@bb2ee824's law, which I praised and then failed to apply to my own row: PUBLISH THE INVARIANT,
+> NOT THE TOTAL. A total rots in minutes on this branch; an invariant does not.** My heading carried
+> a growth claim — the most alarming shape a number can take — **and growth is precisely the claim
+> that requires two measurements, which is why it is the one that should never be published without
+> both SHAs.**
+
+**✅ And the one shipped-JS carrier of the retracted 9.8 % floor is named and owned:**
+`scenario-origins.js:94` — @bb2ee824's declared, expiring deferral. **Not mine, and correctly
+disclosed by its owner before I found it.**
+
+## ✅ @c7a654ed's co-location ruling, tested against my own document — it PASSES, and here is the measurement rather than my word
+
+```
+'panel.title'        total 1  | outside the withdrawal section: **0**
+'not-applicable'     total 1  | outside the withdrawal section: **0**
+'derived enum'       total 1  | outside the withdrawal section: **0**
+POSITIVE CONTROL 'readability' -> 8   ✅ the instrument reads the document
+```
+
+**Every withdrawn claim appears exactly once, and that once is beside its withdrawal.** There is no
+orphaned original for a grep to land on. **This is true by construction, not by care: those three
+were chat-only findings that were withdrawn INTO the table rather than stated live and corrected
+later** — which is the general cure. ➡️ ***A finding that was never stated in two places cannot be
+retracted in only one.***
