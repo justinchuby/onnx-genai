@@ -282,7 +282,7 @@ describe('prefix-cache panel', () => {
     handle.unmount();
   });
 
-  it('shows an unflattering real hit rate at full contrast rather than hiding the panel', () => {
+  it('refuses to report a rate built from two counters that each measure the wrong thing', () => {
     const store = prefixStore({
       fields: {
         'prefix_cache.hits': measured(0, { unit: 'count' }),
@@ -292,8 +292,10 @@ describe('prefix-cache panel', () => {
     const { root, handle } = mountPanel(prefixCache, store);
 
     const hero = root.findByClass('panel-prefix-cache__hero');
-    assert.equal(hero.findByClass('value').getAttribute('data-state'), 'ok');
-    assert.match(hero.textContent, /0/);
+    assert.equal(hero.findByClass('value').getAttribute('data-state'), 'unavailable');
+    // Refusing to compute must not become refusing to explain: the defect is
+    // the finding, so the panel has to say what it is.
+    assert.match(handle.describe(), /denominator|share no prefix|measure prefix reuse/i);
     handle.unmount();
   });
 
@@ -341,10 +343,12 @@ describe('prefix-cache — deriveHitRate in isolation', () => {
     assert.equal(rate.state, 'unavailable');
   });
 
-  it('computes a real rate and records what it was derived from', () => {
+  it('never emits a numeric rate, and names the defect in both terms', () => {
     const rate = deriveHitRate(measured(41), measured(47));
-    assert.equal(rate.state, 'ok');
-    assert.ok(Math.abs(rate.value - 87.234) < 0.01);
+    assert.equal(rate.state, 'unavailable');
+    assert.equal(rate.value, null, 'a rate from two broken counters must not be computed');
+    assert.match(rate.reason, /denominator/i);
+    assert.match(rate.reason, /share no prefix|no prefix at all/i, 'the numerator is broken too');
     assert.deepEqual(rate.derivedFrom, ['prefix_cache.hits', 'prefix_cache.lookups']);
   });
 

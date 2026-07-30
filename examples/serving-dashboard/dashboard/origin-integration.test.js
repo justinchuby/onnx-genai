@@ -232,14 +232,20 @@ describe('a structurally absent metric is explained, not apologised for', () => 
     store.stop();
   });
 
-  it('still renders a stark 0% on the paging server, with no apology at all', async () => {
-    // The opposite treatment of the same field. This is a REAL measurement and
-    // must not inherit any of the softening above.
+  it('gives the paging server a different explanation, not the scatter one', async () => {
+    // The opposite treatment of the same field. On scatter the capability is
+    // structurally absent; here it exists but its counters were disproved. Two
+    // distinct facts that must not collapse into one message — and neither is
+    // an apology.
     const panel = await mountAgainstRealStore('dynamic', 'prefix-cache');
 
-    assert.match(panel.text, /0\s*%/, 'a real zero must be shown starkly');
-    assert.doesNotMatch(panel.text, /n\/a/i, 'softened a measurement the server really made');
-    assert.doesNotMatch(panel.text, /NOT APPLICABLE/i);
+    assert.doesNotMatch(panel.text, /0\s*%/, 'a rate from broken counters must not be printed');
+    assert.doesNotMatch(panel.text, /NOT APPLICABLE/i, 'the capability is present on this path');
+    assert.match(
+      panel.text,
+      /denominator|share no prefix|measure prefix reuse/i,
+      'the panel must say why the rate is withheld',
+    );
     panel.release();
   });
 

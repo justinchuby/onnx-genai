@@ -54,9 +54,12 @@ const WINDOW_MS = 60_000;
 /** Reasons specific to this panel's known defects, shown verbatim on hover. */
 const PREFIX_REASONS = Object.freeze({
   RATE_FROM_MISNAMED_DENOMINATOR:
-    'The server computes hit rate as hits ÷ lookups, but its lookup counter increments on ' +
+    'The server computes hit rate as hits ÷ its lookup counter, but that counter increments on ' +
     'every completed generation rather than on every cache consultation, so the ratio has no ' +
-    'defensible denominator. The hit count beside it is real.',
+    'defensible denominator. The numerator is no better: a controlled A/B found the hit ' +
+    'counter rises on requests that share no prefix at all, while shared-prefix requests ran ' +
+    '7% slower than a zero-sharing control. Neither term measures prefix reuse, so no rate ' +
+    'computed from them is reportable.',
   NO_GENERATIONS_YET:
     'No generations have completed yet, so there is nothing to compute a rate from. ' +
     'Run a scenario.',
@@ -107,10 +110,18 @@ export default function mount(rootElement, telemetryStore) {
 
     const hitRate = deriveHitRate(hits, generations, capability);
 
-    replaceChildren(hero, [
-      renderField(hitRate, { label: 'Prefix cache hit rate' }),
-      element('span', { className: 'hero-figure__caption', text: 'hit rate' }),
-    ]);
+    // §31/D91: an absence glyph alone is scanned past. When the rate is
+    // withheld, the caption carries the reason into the visible layer rather
+    // than leaving it to a tooltip nobody hovers.
+    const heroCaption =
+      hitRate.state === 'unavailable' && hitRate.reason
+        ? element('span', {
+            className: 'hero-figure__caption hero-figure__caption--withheld',
+            text: `hit rate withheld — ${hitRate.reason}`,
+          })
+        : element('span', { className: 'hero-figure__caption', text: 'hit rate' });
+
+    replaceChildren(hero, [renderField(hitRate, { label: 'Prefix cache hit rate' }), heroCaption]);
 
     replaceChildren(counts, [
       metricRow('hits', annotateHits(hits, capability)),
@@ -239,16 +250,19 @@ export function deriveHitRate(hits, generations, capability = { available: true 
     };
   }
 
-  // The denominator is real arithmetic over a counter that counts the wrong
-  // noun. We show the number because it is the best available summary AND we
-  // name the defect on hover — the alternative, hiding it, tells the visitor
-  // less than telling them exactly what it is.
+  // Both terms of this ratio were disproved by QA's controlled A/B: the lookup
+  // denominator counts completed generations, and the hit numerator rises on
+  // requests that share nothing. A number derived from two counters that each
+  // measure the wrong thing is not "the best available summary" — rendering it
+  // as `ok` is the false-confidence failure this envelope exists to prevent.
+  // The defect is the finding; we name it instead of dressing it as a rate.
   return {
-    value: (hitCount / generationCount) * 100,
-    state: 'ok',
+    value: null,
+    state: 'unavailable',
     source: 'derived',
     unit: '%',
     label: 'Prefix cache hit rate',
+    reason: PREFIX_REASONS.RATE_FROM_MISNAMED_DENOMINATOR,
     derivedFrom: ['prefix_cache.hits', 'prefix_cache.lookups'],
   };
 }
@@ -288,7 +302,11 @@ function buildDescription(fields) {
     // "Not measurable yet" would imply the cache tried and we failed to observe.
     parts.push('there is no hit rate here because the cache is never consulted,');
   } else {
-    parts.push('hit rate is not measurable yet,');
+    // "Yet" belongs to `pending`. An unavailable rate is not late, it is
+    // withheld — and the reason is the whole content of the field, so dropping
+    // it here leaves a screen-reader user with strictly less than a sighted
+    // one, which is the failure this description exists to prevent.
+    parts.push(`hit rate is withheld: ${fields.hitRate.reason ?? 'no reason recorded'}`);
   }
 
   parts.push(`${describeFieldText('hits', fields.hits)}.`);

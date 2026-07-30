@@ -172,6 +172,15 @@
   font-size: var(--og-type-sm);
 }
 
+/* A withheld hero carries its reason in the caption rather than a tooltip, so
+   the caption becomes prose and must wrap and read as text (§31/D91). */
+.hero-figure__caption--withheld {
+  display: block;
+  max-width: 44ch;
+  text-align: left;
+  text-wrap: pretty;
+}
+
 .acronym {
   border-bottom: 1px dotted var(--og-fg-subtle);
   cursor: help;
