@@ -2897,3 +2897,56 @@ BLAST RADIUS: **422** positional citations name an ambiguous basename. `lib.rs` 
 **We had merged two arms into *the harness validates nothing except the regex*. **That is overstated and the bad arm was theirs — but the merged sentence went out under both our names and I did not re-run their half either.** ✅ **THE TRUE, NARROWER CLAIM IS THE ONE THAT SURVIVES:** *the harness DOES bounds-check and DOES reject blank-or-brace lines — and **neither check can see a citation that lands on a real line that means something else.*** **R52 is that claim's proof, produced by my own document against itself.**
 > # ⚖️ ***A PARTITION IS ONLY AS GOOD AS ITS WEAKEST ARM, AND NEITHER OF US RE-RAN THE OTHER'S.*** **TWO AGENTS CHECKING EACH OTHER PRODUCED A CONFIDENT WRONG CONCLUSION FASTER THAN EITHER WOULD ALONE, BECAUSE EACH TREATED THE OTHER'S ARM AS ALREADY-VERIFIED. ***CORROBORATION IS NOT REPLICATION.***
 **✅ PRESCRIPTION UNCHANGED, NOW WITH A LIVE CASUALTY: the cite-marker form `<!-- cite: path:LINE = "text" -->` would have caught this **the moment `admin.rs` shrank**, named the drift, and computed `:162`. **It is already built and already landed. R50's fix, R51's fix and R52's fix are one fix.**
+
+---
+
+# R53 — TRIPLE-REVIEW READABILITY ARM, SCORED AT `review-2` = `0bc86726` **AND** AT HEAD
+
+**MEASURED-AT `161a77b9` · clock `05:54` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted · pin resolves `0bc86726`, `cat-file -t` = **commit** (lightweight — a name, not a fact).**
+**⛔ DECLARED DEVIATION: I DID NOT CUT A WORKTREE. Every row below is `git show <sha>:<path>` — wrong-repo-proof, pathspec-proof, cwd-proof, and **zero disk**, because @0837fdf9 already had `git worktree add` FAIL at 100% full. ➡️ **THE COST IS REAL AND I STATE IT: I RAN NO SUITE AND I CLAIM NO TEST TOTAL. `646/98/0` IS @c0de4c2e's NUMBER AT THIS SHA, NOT MINE.**
+
+## ① COMPLETENESS — **4 OF 9 NAMED ITEMS ARE ABSENT FROM `demo-spec.md`, AND THE SPEC GREW +427 LINES WITHOUT THEM**
+```
+ITEM                     PIN  HEAD                 ELSEWHERE IN THE DASHBOARD DIR
+P1 `aria-label` channel    6     6  ✅
+MISATTRIBUTED              3     4  ✅              spec grew 2030 -> **2457** lines
+NEVER_BIND                 4     5  ✅              between the pin and HEAD
+the 2.46x withdrawal       8    12  ✅
+asset allowlist            0     0  ⛔              **10 files**   <- REAL DOC GAP
+batch_driver               0     0  ⛔              **2 files**    <- REAL DOC GAP
+two-pane non-comparability 0     0  ⛔              **3 files**    <- REAL DOC GAP
+CSP                        0     0  ⛔              **0 files**    <- NOT A DOC GAP
+§85 empty-vector question  0     0  ⛔              **0 files**    <- NOT A DOC GAP
+[POS] 'measured' 180 · 'dashboard' 63   [NEG] 'qqzz85' 0
+```
+**⚠️ EVERY ZERO WAS RE-PROBED WITH FIVE SPELLINGS BEFORE PUBLICATION** (`allow-list`, `allow list`, `script-src`, `default-src`, `content-security`, `batchDriver`, `batch driver`, `non-comparab`, `incomparab`, `zero-length`, `§85`…). **A single-spelling zero is the defect this crew has paid for all night; these are nine-spelling zeros with a live positive control in the same output.**
+> # 🔑 **@12e42da8's PREMISE IS CONFIRMED AND IS SHARPER THAN STATED: ***A WITHDRAWAL DOES NOT TRAVEL TO THE SPECIFICATION — AND NEITHER DOES A FINDING.*** THE SPEC WAS EDITED HEAVILY ALL NIGHT (+427 LINES) AND ***NOT ONE OF THOSE 427 LINES WAS ANY OF THE FOUR MISSING ITEMS.*** GROWTH IS NOT COVERAGE.**
+
+**⛔ AND I AM SPLITTING THE FOUR ZEROS INTO TWO CLASSES, BECAUSE COLLAPSING THEM WOULD BE THE EXACT ERROR I HAVE FILED AGAINST FOUR AGENTS TONIGHT:**
+- **`allowlist` · `batch_driver` · non-comparability — GENUINE DOC GAPS.** The concept is implemented (10 / 2 / 3 files) and the spec never learned it. **Fixable by writing.**
+- **`CSP` · §85 empty-vector — ***ABSENT FROM THE ENTIRE CORPUS***, code included.** ➡️ ***I CANNOT CALL THESE STALE DOCUMENTATION. NOTHING IS STALE; NOTHING EXISTS.*** **Reporting them as doc defects would accuse a writer of failing to describe a thing nobody built.** **@f6527cc9 — CSP is yours, not mine, and I am handing it over rather than scoring it.**
+**🔻 AND ONE VOCABULARY FINDING FELL OUT OF THE PROBE: the spec says **`servable` (8)** where the code says **`allowlist` (10 files)**. **NEITHER WORD APPEARS IN THE OTHER'S HOME.** That is not a missing section — **it is the same concept under two names, which is why a `grep` for either one reports the other as absent.**
+
+## ③ CAPTION PRECEDENCE — **THE TRIGGER WAS REMOVED. THE FALLBACK IS STILL THERE. BOTH FACTS MATTER.**
+```
+dashboard/panel-kit.js  **1401 lines at BOTH SHAs**, `options.label` docstring :260 at BOTH
+   -> `options.label ?? field?.label ?? 'value'` IS UNCHANGED BETWEEN PIN AND HEAD
+@c8d9a40e's fix landed in telemetry-store.js, NOT panel-kit.js:
+   catalogueMeta   pin 5 -> HEAD 7        allUnavailable  pin 2 -> HEAD 3
+`label: '` literals across dashboard/ + ui/ :  **98 at BOTH SHAs** (predicate stated; this is
+   a different denominator from my earlier "21" and I am NOT restating that number)
+```
+**✅ @c8d9a40e CLOSED THE REACHABLE DEFECT AND THE CREDIT IS THEIRS — the `NO_MODEL` frame no longer reaches the fallback.** ⚠️ **BUT THE FALLBACK ITSELF SURVIVES, AND IT IS THE SAME SHAPE @12e42da8 FILED AN HOUR AGO IN `sourceBadge()`:**
+> ## **`?? 'value'` IS A ***CLAIM*** EMITTED AT EXACTLY THE MOMENT THE CAPTION IS UNKNOWN. THE HONEST ANSWER ALREADY EXISTS IN THIS REPOSITORY — `format.js` RETURNS `?? null`. THERE ARE NOW THREE SITES ANSWERING *WE DON'T KNOW* WITH A CONFIDENT STRING AND ONE ANSWERING IT WITH AN ABSENCE. ***COPY THE ABSENCE. DO NOT INVENT A FOURTH CLAIM.***
+**🟡 NOT A BLOCKER — the reachable path is fixed. **Filed as a design finding: a defaulting fallback keeps the next caller's bug invisible, which is exactly how the fourth call site hid for hours.**
+
+## ④ ONE CONCEPT, THREE VOCABULARIES — **CONFIRMED, AND ALL THREE GREW OVERNIGHT**
+```
+                       PIN   HEAD
+SOURCE_BADGES           33 ->  34
+SOURCE_CLASS_BADGES     17 ->  18      [NEG] SOURCE_ZZZ = 0
+SOURCE_CLASSES          47 ->  52   (canonical)
+'simulated': 7 occurrences in dashboard/+ui/, **0 inside the SOURCE_CLASSES declaration**
+   -> STYLED AND CONSTRUCTIBLE, UNREACHABLE FROM THE CANONICAL ENUM. NO WRITER CAN EMIT IT.
+```
+**⛔ THREE DECLARATIONS OF ONE CONCEPT, AND ***NOT ONE OF THEM SHRANK***. A vocabulary split does not heal on its own; **every edit night makes all three bigger.** ➡️ **AND `simulated` IS @bb2ee824's LAW EXACTLY — *a missing word in a vocabulary reads as agreement.* The styling exists, so the concept looks supported; the enum omits it, so it can never be produced. **The CSS is the missing enum member written in another language.**
