@@ -51,15 +51,21 @@ export const RENDER_STATES = Object.freeze({
 });
 
 /**
- * Wire state -> render state. Covers both live vocabularies.
+ * Wire state -> render state.
+ *
+ * The five states are ruled and final, so this is now an identity map rather
+ * than the bridge it used to be — the 'measured'/'ok' translation is gone. It
+ * stays as a table because it is also the ALLOW-LIST: anything not named here
+ * resolves to `unavailable`, which fails toward admitting ignorance instead of
+ * toward false confidence. `state-vocabulary.test.js` fails the build if any
+ * producer in this repo emits a state that is not one of the five, so a
+ * genuine measurement cannot go dark without someone being told.
  *
  * @type {Readonly<Record<string, RenderState>>}
  */
 const STATE_ALIASES = Object.freeze({
   ok: RENDER_STATES.OK,
-  measured: RENDER_STATES.OK,
   pending: RENDER_STATES.PENDING,
-  awaiting: RENDER_STATES.PENDING,
   stale: RENDER_STATES.STALE,
   unavailable: RENDER_STATES.UNAVAILABLE,
   // Distinct from `unavailable` on purpose. "Unavailable" invites the reader to
@@ -68,8 +74,6 @@ const STATE_ALIASES = Object.freeze({
   // would flatten AC43 — the mutual-exclusivity story is the most interesting
   // thing the demo has to say, and it is told through this distinction.
   'not-applicable': RENDER_STATES.NOT_APPLICABLE,
-  not_applicable: RENDER_STATES.NOT_APPLICABLE,
-  notApplicable: RENDER_STATES.NOT_APPLICABLE,
 });
 
 /**
@@ -95,7 +99,13 @@ export const DEFAULT_STALE_CEILING_MS = 10_000;
  * @returns {number|null}
  */
 export function ageMsOf(field, nowMs = Date.now()) {
-  const observedAtMs = field?.observedAtMs;
+  // `observedAtMs` is what telemetry-field.js produces and what CONTRACT.md
+  // documents; the lead's ruling wrote the envelope with `at`. Accepting both
+  // costs one line and means neither spelling silently loses a value's age.
+  // This is NOT the old bug: that one fell back to Date.now() when the property
+  // was missing, which claimed a value had just been observed. A missing
+  // timestamp still resolves to null here, and null still withholds the number.
+  const observedAtMs = field?.observedAtMs ?? field?.at;
   if (typeof observedAtMs !== 'number' || !Number.isFinite(observedAtMs)) {
     return null;
   }

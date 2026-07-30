@@ -2796,3 +2796,43 @@ It is a **real, honestly-computed, live, responsive number** measuring a quantit
 | D109 | Scenario B = honest cold/warm TTFT pair; **no hit-rate field in any form** | Both counters are untrustworthy in opposite directions |
 | D110 | Scenario B **demoted from headline**; recommend, PM/Lead rule | A negative result is worth showing, not worth leading with |
 | D111 | **Suspicion tracks implausibility, not falsehood** — so a live plausible lie outranks a fabricated zero for danger | The zero got investigated; the 95% nearly shipped |
+
+---
+
+## 39. 🛑 STOP THE EVICTION EDIT — THE ALLOCATOR **DOES** EVICT. TWO MECHANISMS, BOTH TESTED.
+
+@12e42da8 has instructed @376a0297 to remove "eviction" from the AC43 honesty string, citing my framing. **I RETRACTED THAT OBJECTION IN §35 (D100) TWENTY MINUTES AGO AFTER VERIFYING IT WAS WRONG.** The correction did not propagate. Re-verified now, harder:
+
+**MECHANISM 1 — prefix LRU eviction, releases pages back to the pool:**
+```
+onnx-genai-kv/src/prefix_cache.rs:151   pub fn evict_lru(&mut self, target_pages, page_table) -> Vec<PageId>
+  ← engine/pipeline/paged_decode.rs:53  evict_until_free()
+  ← engine/pipeline/flat_autoregressive.rs:307
+  tests: prefix_cache.rs:329, :351, :356, :357
+```
+**MECHANISM 2 — hot-tier LRU demotion, GPU → CPU:**
+```
+onnx-genai-kv/src/page_table.rs:1068    pub fn evict_lru_hot(&mut self, exclude) -> Result<PageId, KvError>
+  selects min_by_key(last_access), sets victim.device = Device::Cpu,
+  increments self.stats.hot_evictions
+  ← page_table.rs:913, :1055
+```
+
+**The Lead's evidence — `eviction_order` / `overage_bytes` in `governor.rs` having zero consumers — is TRUE and is about a DIFFERENT SUBSYSTEM: the VRAM byte-budget governor behind `ByteBudget::reconfigure`.** That governor really does compute a plan and discard it. **The paged KV allocator, which is what AC43's sentence is about, evicts by LRU in two places with tests.** AC43 stands verbatim.
+
+### 39.1 The lesson, and it's about how this crew communicates rather than about eviction
+
+I made this exact conflation, held it for hours, verified it, and retracted it in a broadcast. **What propagated was not my finding and not my retraction — it was my PHRASE**, *"an overclaim inside our own honesty disclaimer is the most expensive error available on the page."* The Lead cited that framing while acting on the claim it was originally attached to.
+
+> **D112 — A MEMORABLE FRAMING OUTRUNS THE FACT IT WAS ATTACHED TO, AND OUTLIVES ITS RETRACTION.** The better the sentence, the further it travels beyond the evidence. **When you retract something you said well, retract the SENTENCE by name, not just the conclusion** — because the sentence is what people kept.
+
+This is the counterpart to D99. **D99: an honesty process that only ratchets toward understating is inversely biased. D112: the rhetoric that makes a correction persuasive is exactly what makes it survive being wrong.** Both failures point the same way — **toward confidently removing true claims** — and neither is caught by any check we have, because every check we built looks for fabricated *additions*.
+
+### 39.2 What must NOT happen
+
+**@376a0297 — do not edit the AC43 string. @e00032a4 — do not weaken ARCHITECTURE.md's eviction language.** If it had gone through: the demo's single most-scrutinised sentence would have been edited to **understate a capability the runtime genuinely has**, in a paragraph whose entire purpose is precision, **and we'd have called it an honesty fix.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D112 | Retract the **sentence by name**, not just the conclusion | The phrase is what propagated; it outlived the fact and the retraction |
+| D113 | AC43 "sharing and eviction" is **verified true**; the string is frozen | `prefix_cache.rs:151` and `page_table.rs:1068`, both wired, both tested |

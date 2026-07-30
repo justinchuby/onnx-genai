@@ -112,18 +112,21 @@ describe('renderField — a measured zero and an unmeasurable value must look di
     assert.match(node.getAttribute('aria-label'), /stale, 8s old/);
   });
 
-  it('will not date a value from any property but observedAtMs', () => {
+  it('will not date a value from an unrecognised property', () => {
     // This test exists because the original one did not. It asserted the age
-    // suffix appeared, using a fixture that carried `at` — the same wrong
-    // property name the renderer read. Both sides agreed and both were wrong,
-    // so every stale value in the real app would have rendered "0s ago":
-    // an actively false claim of freshness on the exact values AC45 protects.
+    // suffix appeared, using a fixture whose timestamp property the renderer
+    // did not actually read. Both sides agreed and both were wrong, so every
+    // stale value in the real app rendered "0s ago" — an actively false claim
+    // of freshness on the exact values AC45 protects.
+    //
+    // `observedAtMs` and `at` are both accepted now (the ruled envelope and the
+    // implemented one disagree). Anything else must still refuse to date it.
     const node = renderField({
       value: 42,
       state: 'stale',
       source: 'server',
       label: 'Queue depth',
-      at: Date.now() - 8000,
+      lastSeen: Date.now() - 8000,
     });
 
     assert.equal(
@@ -147,8 +150,11 @@ describe('renderField — AC7 provenance badges', () => {
     assert.equal(derived.findByClass('value__src').textContent, 'ᴰ');
   });
 
-  it('treats an endpoint path as a server source, so either Field vocabulary badges correctly', () => {
-    const node = renderField({ value: 7, state: 'measured', source: '/v1/status', label: 'Queue depth' });
+  it('treats an endpoint path as a server source, so a curl-able origin still badges', () => {
+    // The ruling splits source (badge class) from origin (endpoint string), but
+    // CONTRACT.md still puts '/v1/status' in `source`. Tolerating a path here
+    // means the badge is right under either shape.
+    const node = renderField({ value: 7, state: 'ok', source: '/v1/status', label: 'Queue depth' });
 
     assert.equal(node.findByClass('value__src').textContent, 'ˢ');
     assert.match(node.findByClass('value__src').getAttribute('title'), /\/v1\/status/);

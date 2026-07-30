@@ -21,9 +21,20 @@ import {
 } from './field-state.js';
 
 describe('renderStateOf', () => {
-  it('accepts both live vocabularies for a measured value', () => {
+  it('renders the five ruled states and nothing else', () => {
     assert.equal(renderStateOf({ state: 'ok', value: 5 }), RENDER_STATES.OK);
-    assert.equal(renderStateOf({ state: 'measured', value: 5 }), RENDER_STATES.OK);
+    assert.equal(renderStateOf({ state: 'pending' }), RENDER_STATES.PENDING);
+    assert.equal(renderStateOf({ state: 'stale', value: 5 }), RENDER_STATES.STALE);
+    assert.equal(renderStateOf({ state: 'unavailable' }), RENDER_STATES.UNAVAILABLE);
+    assert.equal(renderStateOf({ state: 'not-applicable' }), RENDER_STATES.NOT_APPLICABLE);
+  });
+
+  it('no longer bridges the retired "measured" spelling', () => {
+    // The vocabulary is ruled and 'ok' won, so the bridge is gone. A producer
+    // still emitting 'measured' now degrades to an em-dash rather than being
+    // silently translated — visible, and in the safe direction.
+    // state-vocabulary.test.js is what stops that degradation being silent.
+    assert.equal(renderStateOf({ state: 'measured', value: 5 }), RENDER_STATES.UNAVAILABLE);
   });
 
   it('resolves an unrecognised state to unavailable, never to renderable', () => {

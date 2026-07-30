@@ -34,7 +34,15 @@ export const meta = Object.freeze({
   title: 'KV memory',
   group: 'memory',
   span: 2,
-  cadence: 250,
+  // 1 Hz, deliberately NOT the 4 Hz the gauges run at. Block-table detail is
+  // served from its own endpoint at a lower cadence because a 4096-block grid
+  // at 4 Hz is roughly 1 MB/s of traffic to animate something that changes on
+  // allocation, not on every decode step. Asking for frames the server will not
+  // send would render as permanent staleness on a perfectly healthy panel.
+  // Nothing here interpolates between samples: the sparkline infers each
+  // series' own median interval, so a slower feed draws correctly rather than
+  // being shredded against a faster panel's assumed spacing.
+  cadence: 1000,
   // Block accounting moves with allocation, not with every decode step, so it stays meaningful longer.
   staleCeilingMs: 15000,
   defaultOpen: true,

@@ -91,6 +91,13 @@
   color: var(--og-fg-muted);
 }
 
+.value__sep {
+  /* Present so the value and its age never fuse in textContent; the flex gap
+     alone is a visual-only separation. */
+  color: var(--og-fg-faint);
+  font-size: var(--og-type-2xs);
+}
+
 .value__stale {
   color: var(--og-warn);
   font-size: var(--og-type-2xs);
@@ -902,7 +909,14 @@
    the meaning as well as colour, for the grayscale gate.
    ───────────────────────────────────────────────────────────────────────────*/
 
-.value[data-stale='expired'] .value__stale {
+.value[data-stale='expired'] .value__sep {
+  /* Present so the value and its age never fuse in textContent; the flex gap
+     alone is a visual-only separation. */
+  color: var(--og-fg-faint);
+  font-size: var(--og-type-2xs);
+}
+
+.value__stale {
   color: var(--og-unavail-fg);
   font-weight: var(--og-weight-medium);
   text-transform: uppercase;

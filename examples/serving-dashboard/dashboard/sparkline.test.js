@@ -57,11 +57,14 @@ describe('planSparkline — the honesty rules', () => {
     assert.deepEqual(plan.polylines, []);
   });
 
-  it('accepts both live state vocabularies for a measured series', () => {
-    for (const state of ['ok', 'measured']) {
-      const plan = planSparkline(seriesOf([[1000, 5], [500, 7]], { state }), GEOMETRY);
-      assert.equal(plan.mode, 'data', `state "${state}" should render as data`);
-    }
+  it('plots a series only for the ruled "ok" state', () => {
+    const plan = planSparkline(seriesOf([[1000, 5], [500, 7]], { state: 'ok' }), GEOMETRY);
+    assert.equal(plan.mode, 'data');
+
+    // The retired 'measured' spelling must not draw a line. Drawing one would
+    // mean a vocabulary drift renders as confident data.
+    const retired = planSparkline(seriesOf([[1000, 5], [500, 7]], { state: 'measured' }), GEOMETRY);
+    assert.notEqual(retired.mode, 'data');
   });
 
   it('distinguishes pending (no samples yet) from unavailable (never coming)', () => {

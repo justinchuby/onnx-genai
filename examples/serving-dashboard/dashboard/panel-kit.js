@@ -198,6 +198,24 @@ export function sourceBadge(sourceClass, detail) {
 }
 
 /**
+ * The separator between a value and its age suffix.
+ *
+ * The ruled treatment for a stale value is literally `41 · 12s old`, and the
+ * dot is not decoration. Without a real character the two spans are only held
+ * apart by a flex gap, which means textContent reads "4112s old" — so the table
+ * view, describe() and anyone who copies the number get a fused, wrong figure
+ * while the screen looks correct. aria-hidden because the accessible name is
+ * composed separately and should not contain "middle dot".
+ */
+function ageSeparator() {
+  return element('span', {
+    className: 'value__sep',
+    text: '·',
+    attrs: { 'aria-hidden': 'true' },
+  });
+}
+
+/**
  * Render a field as the §4.1 value element.
  *
  * THIS IS THE FUNCTION THAT MAKES THE HONESTY RULE MECHANICAL. It reads
@@ -271,6 +289,7 @@ export function renderField(field, options = {}) {
         text: '—',
         attrs: { 'aria-hidden': 'true' },
       }),
+      ageSeparator(),
       element('span', { className: 'value__stale', text: age }),
     );
     return wrapper;
@@ -335,6 +354,7 @@ export function renderField(field, options = {}) {
   if (staleAge !== null) {
     wrapper.setAttribute('data-stale', 'true');
     wrapper.append(
+      ageSeparator(),
       element('span', {
         className: 'value__stale',
         text: staleAge,
