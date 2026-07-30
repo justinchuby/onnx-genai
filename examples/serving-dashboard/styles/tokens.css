@@ -187,11 +187,21 @@
   --og-content-max: 1680px;
   --og-panel-min: 340px;
 
-  /* Reserved width for a value slot. An unavailable value must occupy the
-     same space its real value would, so that nothing reflows on the day the
-     server learns to measure it. Layout shift on data arrival makes a page
-     feel unreliable at exactly the moment it becomes more reliable. */
+  /* Reserved width for a value slot. A value must occupy the same space in
+     EVERY state — pending, stale, unavailable, not-applicable — so nothing
+     reflows on the day the server learns to measure it. Apply the min-width
+     to the slot itself, NOT to one state's selector: `···` is narrower than
+     a number, so a pending -> ok transition reflows just as badly as an
+     unavailable -> ok one. Layout shift on data arrival makes a page feel
+     unreliable at exactly the moment it becomes more reliable. */
   --og-value-slot: 5ch;
+
+  /* NOTE — there is deliberately NO --og-ok-fg / --og-measured-fg token.
+     `ok` is not a treatment, it is the ABSENCE of one: full-contrast
+     --og-fg, the page's default. Minting a token for it would frame `ok`
+     as one option among five rather than as the baseline the other four
+     depart from, and would invite someone to "style" a trustworthy value.
+     Use --og-fg. */
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -199,5 +209,21 @@
     --og-dur-fast: 0ms;
     --og-dur-base: 0ms;
     --og-dur-slow: 0ms;
+  }
+
+  /* Zeroing the duration tokens is correct for TRANSITIONS but is a trap for
+     ANIMATIONS: a 0ms animation with infinite iterations is a busy-loop that
+     burns CPU forever and would land in our own <2% overhead budget. Tokens
+     alone cannot defend against this, because the bug lives at the call site.
+     So durations are belt, and this is braces — it also catches any raw
+     duration a panel author writes without going through a token.
+     Found by @bb2ee824 on the reconnect-dot pulse. */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
   }
 }
