@@ -137,10 +137,47 @@ test('a well-formed origin on ANOTHER host is rejected', () => {
   // A hostname that merely CONTAINS ours must not pass either.
   assert.equal(parseOrigin('http://127.0.0.1.evil.example', HOST), null);
   assert.equal(parseOrigin('http://evil.example/?x=127.0.0.1', HOST), null);
-  // localhost and 127.0.0.1 name the same machine but are different hostnames.
-  // Rejecting is correct and costs nothing: run-demo.sh derives BOTH origins
-  // from one BIND_HOST, so a launcher-produced link can never disagree here.
-  assert.equal(parseOrigin('http://localhost:8124', HOST), null);
+  // A stranger that BEGINS with a loopback name is still a stranger. This is
+  // the arm the loopback widening below could plausibly have broken.
+  assert.equal(parseOrigin('http://localhost.evil.example', HOST), null);
+});
+
+test('loopback spellings name ONE machine, and the peer must survive all of them', () => {
+  // C13. The launcher prints 127.0.0.1 (BIND_HOST); operators type localhost.
+  // Comparing spellings as strings dropped the peer origin, and the failure
+  // was invisible: the panel rendered a correct, truthful `unavailable` for a
+  // server that was up and answering 200 on the same machine. A true statement
+  // concealing a broken system is the one defect our honesty layer certifies
+  // instead of catching -- nobody debugs a panel behaving as designed.
+  for (const page of ['127.0.0.1', 'localhost', '::1', '[::1]']) {
+    for (const raw of [
+      'http://127.0.0.1:8133',
+      'http://localhost:8133',
+      'http://[::1]:8133',
+    ]) {
+      assert.equal(
+        parseOrigin(raw, page),
+        new URL(raw).origin,
+        `loopback ${raw} must be reachable from a page at ${page}`,
+      );
+    }
+    // BOTH ARMS IN ONE TEST. Without this the widening is untested in the only
+    // direction that can hurt us: a third-party host is not loopback under any
+    // spelling, so it stays rejected from every loopback page.
+    assert.equal(parseOrigin('http://evil.example.com:8133', page), null);
+    assert.equal(parseOrigin('https://attacker.test/', page), null);
+    assert.equal(parseOrigin('javascript:alert(1)', page), null);
+  }
+});
+
+test('the widening does NOT make non-loopback hosts interchangeable', () => {
+  // Exact match is still the rule everywhere off loopback: two real hosts that
+  // happen to be the same machine are not our problem and must not be guessed.
+  assert.equal(parseOrigin('http://demo-b.internal:8133', 'demo-a.internal'), null);
+  assert.equal(
+    parseOrigin('http://demo-a.internal:8133', 'demo-a.internal'),
+    'http://demo-a.internal:8133',
+  );
 });
 
 test('a differing PORT on our own host is allowed -- that is the real topology', () => {

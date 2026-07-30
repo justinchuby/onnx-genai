@@ -237,6 +237,33 @@ function paramNameFor(serverClass) {
 }
 
 /**
+ * The loopback interface, spelled every way a browser can hand it to us.
+ *
+ * `URL` and `location.hostname` both render IPv6 loopback WITH brackets
+ * (`[::1]`), but a hand-written caller will pass the bare form, so both are
+ * listed rather than trusting one code path to normalise the other.
+ */
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/**
+ * Is `candidate` the same MACHINE as `page`?
+ *
+ * Exact match, or both ends on loopback. Deliberately not a substring or
+ * suffix test: `localhost.evil.example` is a third-party host that merely
+ * begins with a loopback name, and set membership cannot be fooled by it.
+ *
+ * @param {string} candidate
+ * @param {string} page
+ * @returns {boolean}
+ */
+function sameHost(candidate, page) {
+  const a = candidate.toLowerCase();
+  const b = page.toLowerCase();
+  if (a === b) return true;
+  return LOOPBACK_HOSTNAMES.has(a) && LOOPBACK_HOSTNAMES.has(b);
+}
+
+/**
  * Reject anything that is not a plain http(s) origin ON THIS HOST.
  *
  * The value arrives from the query string, so it is attacker-controllable in
@@ -257,8 +284,23 @@ function paramNameFor(serverClass) {
  *
  * So the hostname must equal the page's. PORTS MAY DIFFER, because that is our
  * real topology: run-demo.sh derives both origins from ONE `BIND_HOST` and
- * varies only the port, so a legitimate peer can never disagree on hostname and
- * a rejection here can never be a false positive on a launcher-produced link.
+ * varies only the port.
+ *
+ * The one widening, and it is not a courtesy: `localhost`, `127.0.0.1` and
+ * `::1` are ONE interface spelled three ways, and the operator does not use the
+ * launcher's spelling. run-demo.sh prints `127.0.0.1`; humans type `localhost`.
+ * Comparing the spellings as strings made that a rejection, and the rejection
+ * was INVISIBLE: the peer origin resolved to null, the paged-KV panel rendered
+ * a correct, truthful `unavailable`, and the page honestly reported that it
+ * could not reach a server that was up and answering 200 on the same machine.
+ * Nobody debugs a panel that is behaving as designed, which is why this
+ * outranked its size -- a TRUE statement concealing a broken system is worse
+ * than a false one, because every honesty mechanism we own certifies it.
+ *
+ * The widening cannot weaken the check it widens. Loopback is not a host an
+ * attacker can be: a third-party origin is by definition not this machine, so
+ * `evil.example` is rejected under every spelling. Matching is exact-or-
+ * loopback, never substring, so `localhost.evil.example` remains a stranger.
  *
  * `pageHostname` is REQUIRED rather than defaulted. A caller that forgot it
  * would otherwise silently get the old scheme-only behaviour back — a security
@@ -284,7 +326,7 @@ export function parseOrigin(raw, pageHostname) {
     return null;
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
-  if (url.hostname !== pageHostname) return null;
+  if (!sameHost(url.hostname, pageHostname)) return null;
   return url.origin;
 }
 
