@@ -4497,6 +4497,68 @@ fn every_field_state_the_server_can_emit_is_in_its_published_vocabulary() {
     );
 }
 
+/// The vocabulary must be discoverable BY READING, which no behavioural test
+/// can check -- so this one reads the source.
+///
+/// 🔴 THIS EXISTS BECAUSE A MUTATION CAME BACK GREEN. Reverting `pending` to
+/// its old patch-after-build form (`u.code = "pending"` on an already-built
+/// response) reddened NOTHING: the wire value is identical, so every
+/// behavioural assertion still passed. The regression is real and invisible to
+/// behaviour, because the property at stake is not what the server SENDS, it
+/// is whether a consumer can DISCOVER what the server can send -- and the
+/// dashboard's contract test derives exactly that by reading this crate.
+///
+/// So the guard is at the level the property lives at. Every published code
+/// must appear as a struct-literal field in a constructor, and no code may be
+/// assigned onto an already-built value. That is the same move as the
+/// enum-derived stylesheet test: derive the check from the vocabulary instead
+/// of hand-maintaining a copy of it.
+#[test]
+fn every_published_code_is_produced_by_a_constructor_not_a_later_assignment() {
+    use crate::routes::FieldUnavailable;
+    const SOURCE: &str = include_str!("routes/mod.rs");
+
+    for code in FieldUnavailable::CODES {
+        let constant = match code {
+            FieldUnavailable::UNAVAILABLE => "UNAVAILABLE",
+            FieldUnavailable::NOT_APPLICABLE => "NOT_APPLICABLE",
+            FieldUnavailable::PENDING => "PENDING",
+            other => panic!(
+                "{other:?} is published but this test has no constant name for \
+                 it; add it here so it is checked rather than skipped"
+            ),
+        };
+        let literal = format!("code: Self::{constant},");
+        assert!(
+            SOURCE.contains(&literal),
+            "{code:?} is published in CODES but `{literal}` appears in no \
+             constructor. A consumer deriving the vocabulary by reading this \
+             file cannot find it, so the state exists on the wire and not in \
+             the contract."
+        );
+    }
+
+    // Comments are excluded deliberately: the doc comment on `CODES` QUOTES
+    // the old `u.code = "pending"` form in order to explain why it was
+    // retired. Quoting a forbidden construct to document it is not committing
+    // it -- the same claim-versus-explanation split the citation checker uses.
+    // Without this the guard fires on its own rationale, which would have made
+    // the honest fix look like the violation.
+    let offending: Vec<_> = SOURCE
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with("//"))
+        .filter(|(_, line)| line.contains(".code = "))
+        .map(|(n, line)| format!("{}: {}", n + 1, line.trim()))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "a field-state code is assigned onto an already-built value at {offending:?}. \
+         The wire stays correct and the vocabulary stops being greppable, which \
+         is the exact regression that shipped `pending` invisibly."
+    );
+}
+
 /// Regression: `pending` must come from a constructor, not from patching a
 /// built response.
 ///
