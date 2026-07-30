@@ -426,6 +426,20 @@ Consequences, all verified by running the server:
 
 **A prefix-cache hit count of zero while continuous batching is enabled is correct behaviour, not a bug.** Likewise a preemption counter would be permanently zero on that path.
 
+#### 5.6.1 The three consequences of the split
+
+The batching/paged-KV split is not one limitation. It is a single structural fact that surfaces in three unrelated-looking places, and each was discovered independently before the common cause was recognised:
+
+| Feature | Where it dies on the batching path | Evidence |
+|---|---|---|
+| **Prefix cache reuse** | The batch never consults the prefix trie | `prefix_cache_hit_len` is a literal `0` at `batched.rs:262` and `:486`, so the `> 0` test at `metrics.rs:135` is never true |
+| **Preemption** | Disabled by construction, not by default | `scheduler_config.preemption_policy = PreemptionPolicy::Disabled` (`batched.rs:759`) |
+| **KV memory pressure / eviction** | Nothing to evict — rows are physical and pre-reserved | `batched.rs:713-718`: rows "cannot be swapped out and resumed in place" |
+
+The rationale at `batched.rs:713-718` is the common cause stated in the source itself: **the batch owns its KV in physical rows, and each row reserves its worst-case footprint up front.** Pre-reserved physical rows are what make the batching path fast and predictable, and they are *precisely* what removes the freedom that sharing, eviction and preemption all require. **Every one of the three is the same trade, seen from a different angle.**
+
+> **The practical rule.** Before adding any counter or panel for a KV-related behaviour, establish **which execution path it can fire on**. A metric can be correctly implemented, correctly plumbed, and permanently zero — and that is indistinguishable from a bug for anyone who does not know this invariant. Zero here means *structurally impossible*, not *not yet happening*, and the two must never be rendered the same way.
+
 ### 5.7 Preemption is disabled on the batched path — ENFORCED
 
 > `PreemptionPolicy::Disabled` is set unconditionally for scheduler-driven continuous batching.
