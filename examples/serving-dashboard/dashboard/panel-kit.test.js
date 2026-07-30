@@ -36,6 +36,26 @@ const {
   withAcronyms,
 } = await import('./panel-kit.js');
 
+const { PANELS } = await import('./index.js');
+const { createFakeStore, measured } = await import('./testing/fake-store.js');
+
+/**
+ * A store that answers every field and rate with a large measured value, so the
+ * panels that scale bytes and durations all take their formatted branch.
+ *
+ * It delegates to the shared `createFakeStore` rather than being hand-written:
+ * a bespoke fake diverged from the real store contract twice while this defect
+ * was being diagnosed, and a fake that throws on `rate()` mounts nothing and
+ * reports a clean page.
+ */
+function doubleUnitProbeStore() {
+  const store = Object.create(createFakeStore());
+  const unitFor = (path) => (/uptime|latency|duration|ttft|age|time/i.test(path) ? 'ms' : 'bytes');
+  store.field = (path) => measured(5.35 * 1024 ** 3, { unit: unitFor(path), label: path });
+  store.rate = (path) => measured(1234.5, { unit: unitFor(path), label: path });
+  return store;
+}
+
 describe('renderField — a measured zero and an unmeasurable value must look different', () => {
   it('renders a real zero as a full-contrast number, with no apology', () => {
     // demo-ux.md §4.1: "Measured. The value really is zero." `rejections: 0` is
@@ -499,5 +519,143 @@ describe('not-applicable copy — demo-ux.md §20.2', () => {
         `${key}: the visible sentence must say the path cannot ask, not merely that a value is absent`,
       );
     }
+  });
+});
+
+describe('the unit suffix belongs to whoever formatted the number', () => {
+  // This defect shipped to the served page: "5.35 GiB bytes" and "3 m 12 s ms".
+  // `formatBytes` and `formatDuration` SCALE a value, so they must emit the
+  // unit they scaled to — and `renderField` then appended the field's raw unit
+  // on top. Every one of the 282 tests passing at the time stayed green,
+  // because each checked the number OR the unit and never the assembled string.
+  //
+  // The rule these tests pin: a custom formatter owns its unit; the default
+  // formatter does not, so the suffix is derived from `options.format` and
+  // cannot be forgotten at a call site.
+  const formatGiB = (value) => `${(value / 1024 ** 3).toFixed(2)} GiB`;
+  const measuredBytes = (value = 5.35 * 1024 ** 3) => ({
+    value,
+    state: 'measured',
+    unit: 'bytes',
+    source: 'server',
+    observedAtMs: Date.now(),
+  });
+
+  it('does not append the raw unit when a custom formatter already scaled it', () => {
+    const node = renderField(measuredBytes(), { format: formatGiB, label: 'VRAM' });
+    const text = node.textContent.replace(/[ˢᵉᶜ]/g, '').trim();
+
+    assert.equal(text, '5.35 GiB');
+    assert.doesNotMatch(text, /GiB\s+bytes/, 'the scaled unit and the raw unit both rendered');
+  });
+
+  it('still appends the unit when the default formatter is used', () => {
+    // The complementary half. If the fix had simply stopped emitting the unit
+    // span, every unformatted number on the page would silently lose its unit
+    // and this suite would still be green.
+    const node = renderField(
+      { value: 41, state: 'measured', unit: 'req', source: 'server', observedAtMs: Date.now() },
+      { label: 'Queue depth' },
+    );
+
+    assert.match(node.textContent, /41 req/);
+  });
+
+  it('keeps the unit on the placeholder branches, which never run the formatter', () => {
+    // §4.1: WHICH thing is missing is itself information. "— bytes" says
+    // strictly more than "—", and there is no collision to avoid here because
+    // the formatter is never reached without a value.
+    for (const state of ['unavailable', 'pending']) {
+      const node = renderField(
+        { value: null, state, unit: 'bytes', reason: 'not plumbed' },
+        { format: formatGiB, label: 'VRAM' },
+      );
+
+      assert.match(
+        node.textContent,
+        /bytes/,
+        `${state} dropped its unit — the reader can no longer tell WHAT is missing`,
+      );
+    }
+  });
+
+  it('makes the same decision in the accessible name as on screen', () => {
+    // A screen reader announcing "VRAM: 5.35 GiB bytes" is the identical
+    // defect, heard instead of seen — and it was a separate code path.
+    const node = renderField(measuredBytes(), { format: formatGiB, label: 'VRAM' });
+
+    assert.equal(node.getAttribute('aria-label'), 'VRAM: 5.35 GiB');
+  });
+
+  it('does not double a percent sign in the accessible name', () => {
+    // `formatNumber` appends '%' itself, so the aria sentence was appending a
+    // second one while the visible text was correct. Found while fixing the
+    // scaled-unit case; the two share the suffix decision.
+    const node = renderField(
+      { value: 42.1, state: 'measured', unit: '%', source: 'server', observedAtMs: Date.now() },
+      { label: 'Utilisation' },
+    );
+
+    assert.equal(node.getAttribute('aria-label'), 'Utilisation: 42.1%');
+  });
+
+  it('applies the same rule to describeFieldText, the table-view route', () => {
+    assert.equal(
+      describeFieldText('VRAM', measuredBytes(), formatGiB),
+      'VRAM 5.35 GiB',
+      'the accessible table view re-appended the raw unit',
+    );
+    assert.equal(
+      describeFieldText('Queue', {
+        value: 41,
+        state: 'measured',
+        unit: 'req',
+        source: 'server',
+        observedAtMs: Date.now(),
+      }),
+      'Queue 41 req',
+      'the unformatted route must keep its unit',
+    );
+  });
+
+  it('renders no doubled unit anywhere in the real panel registry', () => {
+    // The acceptance that actually caught this. The unit tests above all pass
+    // against a field I hand-wrote; this one mounts every REGISTERED panel with
+    // its real bindings and reads the assembled text, which is the only artefact
+    // a visitor sees. It reported 19 doubled renders across 56 value nodes
+    // before the fix.
+    const seen = { mounted: 0, values: 0 };
+    const offenders = [];
+
+    for (const panel of PANELS) {
+      const root = document.createElement('div');
+      const handle = panel.module.mount(root, doubleUnitProbeStore());
+      seen.mounted += 1;
+      flushAnimationFrames();
+
+      const walk = (node) => {
+        if (node.classList?.contains?.('value')) {
+          seen.values += 1;
+          const text = node.textContent.replace(/[ˢᵉᶜ~·]/g, '').trim();
+          const aria = node.getAttribute?.('aria-label') ?? '';
+          if (/(GiB|MiB|KiB|TiB)\s+bytes$/.test(text) || /\bs\s+ms$/.test(text)) {
+            offenders.push(`${panel.id}: ${text}`);
+          }
+          if (/(GiB|MiB|KiB|TiB)\s+bytes|\bs\s+ms\b|%\s+%/.test(aria)) {
+            offenders.push(`${panel.id} (aria): ${aria}`);
+          }
+        }
+        (node.children ?? []).forEach(walk);
+      };
+      walk(root);
+      handle?.unmount?.();
+    }
+
+    // Anti-vacuity. A probe that mounts nothing reports zero offenders and is
+    // indistinguishable from a clean page — this exact false green cost me two
+    // iterations while diagnosing the defect.
+    assert.ok(seen.mounted >= 5, `only ${seen.mounted} panels mounted; the scan proves nothing`);
+    assert.ok(seen.values > 20, `only ${seen.values} value nodes scanned; the scan proves nothing`);
+    assert.deepEqual(offenders, [], 'a scaled unit and a raw unit rendered together');
   });
 });

@@ -268,7 +268,25 @@ export function renderField(field, options = {}) {
   const sourceClass = normaliseSourceClass(
     options.sourceClass ? { sourceClass: options.sourceClass } : field,
   );
-  const showUnit = options.showUnit !== false && Boolean(unit) && unit !== '%';
+  // '%' is excluded because `formatNumber` already appends it to the text.
+  const unitIsSuffixable = Boolean(unit) && unit !== '%';
+  const showUnit = options.showUnit !== false && unitIsSuffixable;
+
+  // A custom formatter OWNS its unit, so the suffix span must not be appended
+  // on top of it. `formatBytes` scales 5.35e9 to "5.35 GiB" and `formatDuration`
+  // scales 192000 to "3 m 12 s"; appending the field's raw unit produced
+  // "5.35 GiB bytes" and "3 m 12 s ms" on the served page.
+  //
+  // This is derived from `options.format` rather than left to each call site
+  // to pass `showUnit: false`, because a caller who writes `format: formatBytes`
+  // and forgets the flag reintroduces the defect silently — the number still
+  // renders, just wrong. Deriving it makes the pairing structural.
+  //
+  // It applies ONLY to the branch that has a value. The placeholder branches
+  // never run the formatter, so there is no unit to collide with, and they must
+  // keep theirs: WHICH thing is missing is itself information (§4.1), and
+  // "— bytes" says strictly more than "—".
+  const showUnitWithValue = (options.showUnit ?? !options.format) && unitIsSuffixable;
 
   const ceilingMs = options.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS;
   const nowMs = options.nowMs ?? Date.now();
@@ -390,7 +408,7 @@ export function renderField(field, options = {}) {
   const prefix = sourceClass === 'estimated' ? '~' : '';
 
   wrapper.append(element('span', { className: 'value__num', text: `${prefix}${rendered}` }));
-  if (showUnit) {
+  if (showUnitWithValue) {
     wrapper.append(element('span', { className: 'value__unit', text: ` ${unit}` }));
   }
   wrapper.append(sourceBadge(sourceClass, describeProvenance(field)));
@@ -419,7 +437,9 @@ export function renderField(field, options = {}) {
   // honest — AC6 failing for exactly the visitors AC45 was written to protect.
   wrapper.setAttribute(
     'aria-label',
-    `${label}: ${prefix}${rendered}${unit ? ` ${unit}` : ''}${staleAge ? `, stale, ${staleAge}` : ''}`,
+    // Same unit decision as the visual branch above. A screen reader announcing
+    // "VRAM in use: 5.35 GiB bytes" is the same defect, heard instead of seen.
+    `${label}: ${prefix}${rendered}${showUnitWithValue ? ` ${unit}` : ''}${staleAge ? `, stale, ${staleAge}` : ''}`,
   );
   return wrapper;
 }
@@ -1239,7 +1259,10 @@ export function describeFieldText(label, field, format) {
     }
     return `${label} is not measurable yet`;
   }
-  const unit = field.unit ? ` ${field.unit}` : '';
+  // Same rule as `renderField`: a custom formatter owns its unit. This sentence
+  // is the screen-reader and table-view route to the same number, so letting it
+  // drift would fix the defect only for people who can see it.
+  const unit = field.unit && !format ? ` ${field.unit}` : '';
   const value =
     typeof field.value === 'number'
       ? (format ?? ((raw) => formatNumber(raw, field.unit)))(field.value)
