@@ -14,7 +14,9 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { NEVER_BIND, PROVENANCE } from './telemetry-provenance.js';
+import { ENDPOINTS, NEVER_BIND, PROVENANCE } from './telemetry-provenance.js';
+import { createTelemetryStore } from './telemetry-store.js';
+import { FIELD_STATES } from './telemetry-field.js';
 
 const HERE = new URL('./', import.meta.url);
 
@@ -127,4 +129,108 @@ test('every never-bind exemption is justified and still earning its keep', () =>
         'the ban, granted for a reason nobody can check.',
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// THE RUNTIME HALF.
+//
+// Everything above this line is a file read plus a regular expression -- a
+// grep wearing a test's clothing. It answers "does any source contain this
+// string", and the question is "does any field a visitor can see carry this
+// value when the code RUNS". Those differ exactly where it matters: a computed
+// key, an alias, a spread, or an adapter mapping is invisible to source
+// reading, and nobody types a banned name on purpose. The `exemptions`
+// mechanism above makes the gap slightly wider, since it subtracts tokens
+// before matching.
+//
+// So this half never looks at source. It puts a unique sentinel into the
+// banned field on the wire, runs a real store, and asserts the sentinel does
+// not surface in any field. A binding assembled at runtime from two harmless
+// strings is caught here and cannot be caught above.
+//
+// Credit: @c8d9a40e, whose prefix-cache panel proves zero bindings by mounting
+// against a throwing Proxy rather than grepping for field names. Grep proves
+// the bindings you thought of are absent; execution proves all of them are.
+
+const BASE_URL = 'http://127.0.0.1:8123';
+
+function fetchReturning(routes) {
+  return async (url) => {
+    const route = routes[url.replace(BASE_URL, '')];
+    if (route === undefined) {
+      return {
+        ok: false,
+        status: 404,
+        async json() { return {}; },
+        async text() { return ''; },
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() { return route; },
+      async text() { return JSON.stringify(route); },
+    };
+  };
+}
+
+/** A models list whose entries carry a unique sentinel in every banned field. */
+function modelsBodyPoisonedWith(sentinel) {
+  const entry = { id: 'qwen-scatter', object: 'model', owned_by: 'demo', is_default: true };
+  for (const { endpoint, field } of NEVER_BIND) {
+    if (endpoint === ENDPOINTS.MODELS) entry[field] = `${sentinel}-${field}`;
+  }
+  return { object: 'list', data: [entry] };
+}
+
+async function pollWith(routes) {
+  const store = createTelemetryStore({ baseUrl: BASE_URL, fetchImpl: fetchReturning(routes) });
+  await store.pollOnce();
+  return store.getSnapshot().fields;
+}
+
+const carriers = (fields, needle) =>
+  Object.entries(fields)
+    .filter(([, f]) => typeof f.value === 'string' && f.value.includes(needle))
+    .map(([key]) => key);
+
+// THE POSITIVE CONTROL, AND IT IS NOT OPTIONAL HERE. After the model-directory
+// ban, NO provenance row reads /v1/models at all -- so "the sentinel did not
+// surface" is trivially true and would stay true if the sentinel never reached
+// the store, if the poll silently failed, or if the scan read nothing. This
+// proves the whole apparatus can find a value that IS bound, using the same
+// injection, the same poll and the same scan.
+test('the sentinel apparatus finds a value that IS bound', async () => {
+  const sentinel = 'CANARY-9f3a2b';
+  const fields = await pollWith({
+    [ENDPOINTS.HEALTH]: { status: 'ok', model: sentinel },
+  });
+
+  assert.deepEqual(
+    carriers(fields, sentinel),
+    ['server.model_id'],
+    'a sentinel placed on a BOUND wire field must be found, or this file proves nothing',
+  );
+});
+
+test('no never-bind field surfaces in any rendered field when the store runs', async () => {
+  const sentinel = 'POISON-4c81de';
+  const fields = await pollWith({
+    [ENDPOINTS.HEALTH]: { status: 'ok', model: 'qwen-scatter' },
+    [ENDPOINTS.MODELS]: modelsBodyPoisonedWith(sentinel),
+  });
+
+  // Anti-vacuity: a snapshot of nothing cannot leak anything.
+  assert.ok(
+    Object.keys(fields).length > 20,
+    `expected a populated snapshot, got ${Object.keys(fields).length} fields`,
+  );
+  assert.equal(fields['server.model_id'].state, FIELD_STATES.MEASURED, 'the poll must have worked');
+
+  assert.deepEqual(
+    carriers(fields, sentinel),
+    [],
+    'a banned wire field reached a rendered field. Source scanning cannot see this ' +
+      'if the key was computed, aliased or spread -- which is the direction that ships.',
+  );
 });
