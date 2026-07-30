@@ -248,3 +248,95 @@ def divergence_report(root: Path, paths, ref: str = "HEAD") -> list:
             f"{ref}. Any result about it describes a file that is going away."
         )
     return lines
+
+
+def divergence_summary(root: Path, paths, ref: str = "HEAD") -> str:
+    """One line: how many of the files this run READ disagree with `ref`.
+
+    The per-file lines above are correct and nobody counts them. An aggregate
+    is what a reader actually absorbs, and it must be printed on the GREEN run
+    too -- a divergence banner that only appears next to failures teaches
+    people that agreement is the silent case, which is the same reflex that let
+    a vacuous OK pass for a real one.
+
+    Says "0 of N" rather than staying silent when everything agrees, because a
+    missing banner is indistinguishable from a banner that could not be
+    computed.
+    """
+    paths = [str(p) for p in paths]
+    d = divergent_paths(root, paths, ref)
+    n = len(d["modified"]) + len(d["untracked"]) + len(d["deleted"])
+    return (
+        f"WORKTREE_DIVERGENCE tree and {ref} differ on {n} of {len(paths)} "
+        f"file(s) read by this run"
+    )
+
+
+class PartialWorktree(Exception):
+    """Files that `ref` says exist are missing from the desk.
+
+    Distinct from NoWorktree (there is no repository at all). This is the third
+    state, and until now it had no exit code: THE REPOSITORY IS REAL AND
+    INCOMPLETE. `git rev-parse` succeeds, the index is intact, every git
+    command answers confidently -- and the bytes are not on disk.
+    """
+
+
+def missing_from_disk(root: Path, paths, ref: str = "HEAD") -> list:
+    """Of `paths`, those present in `ref` but ABSENT from the working tree.
+
+    Deliberately NOT a threshold or a ratio. A heuristic like "more than half
+    the tree is missing, so the checkout must be broken" cannot tell a
+    half-written worktree from a big deletion, and would have to guess in
+    exactly the situation where guessing is what went wrong. This asks the only
+    question a checker actually needs: OF THE FILES I WAS TOLD TO READ, WHICH
+    ONES DOES THE SHIPPED TREE CLAIM EXIST WHILE THE DESK DOES NOT HAVE THEM.
+    """
+    out = []
+    for p in [str(x) for x in paths]:
+        if (root / p).exists():
+            continue
+        probe = subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}:{p}"],
+            cwd=root,
+            capture_output=True,
+        )
+        if probe.returncode == 0:
+            out.append(p)
+    return out
+
+
+def require_present_on_disk(root: Path, paths, ref: str = "HEAD") -> None:
+    """Refuse to report on inputs the working tree does not actually have.
+
+    THE CASE THIS EXISTS FOR, MEASURED RATHER THAN IMAGINED: a `git worktree
+    add` that dies partway -- at 99% disk, which is where this branch has spent
+    the night -- leaves a directory where every git command succeeds and the
+    files are simply not there. A checker then resolves its citations against
+    an empty desk, finds nothing to contradict it, and PRINTS A UNIVERSAL
+    GREEN: "every citation resolves to a definition that exists in that tree."
+    Nothing in that sentence is true, and its confidence scales with how much
+    of the tree is missing.
+
+    An empty corpus is the strongest possible evidence of a broken
+    environment and the weakest possible evidence of correct code, and before
+    this it produced the same exit code as the latter.
+    """
+    missing = missing_from_disk(root, paths, ref)
+    if not missing:
+        return
+    shown = ", ".join(sorted(missing)[:5])
+    more = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+    raise PartialWorktree(
+        f"{len(missing)} of {len(list(paths))} file(s) this check was asked to "
+        f"read are present in {ref} but MISSING from the working tree at "
+        f"{root}: {shown}{more}.\n"
+        f"This is not a defect in the documents and it must not be reported as "
+        f"one -- the checkout is incomplete. A half-created worktree answers "
+        f"every git query correctly and has no bytes to check, so a result "
+        f"from here would be green for the one reason that should never "
+        f"produce a green.\n"
+        f"Recreate the extract (`git worktree add --detach <sha>`) and confirm "
+        f"`git status --porcelain` is empty before re-running. Check free disk "
+        f"first: a silent partial checkout is what a full disk looks like."
+    )

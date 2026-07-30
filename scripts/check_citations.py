@@ -271,6 +271,30 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     tracked = tracked_files(repo)
     index = definition_index(repo, tracked)
     anchored, positional, mentions, continuations = extract(doc)
+
+    # STOP THE LINE BEFORE SCORING. Every citation below resolves against the
+    # working tree. If the tree is missing files that HEAD says exist, the
+    # resolutions are not wrong -- they are VACUOUS, and this harness reports a
+    # vacuous pass as a universal one ("every anchored citation resolves...").
+    # That sentence gets MORE confident as more of the tree goes missing, which
+    # is the exact inversion that makes a half-created worktree dangerous.
+    # Measured, not supposed: a checkout that died partway left this file
+    # printing OK/exit 0 over a document whose only cited source was absent.
+    #
+    # Guarded on every path the document CITES, not on the paths the harness
+    # managed to READ. Those differ, and the difference is the bug: positional
+    # citations are counted and never resolved, so the missing target that
+    # produced the false green never entered CITED_SOURCES_READ at all. A guard
+    # built from what the tool touched cannot see what the tool skipped.
+    cited_paths = {
+        real
+        for c in (*anchored, *positional, *continuations)
+        if c.path
+        for real in (resolve_path(repo, tracked, c.path, getattr(c, "symbol", None)),)
+        if real is not None
+    }
+    tree_context.require_present_on_disk(repo, sorted(cited_paths))
+
     failures: list[Failure] = []
     # Non-fatal observations. A deictic citation is a real defect but a slow
     # one, and turning 32 of them red on demo night would buy a developer
@@ -402,6 +426,13 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     except ValueError:
         pass
     stats["divergence"] = tree_context.divergence_report(
+        repo, sorted(CITED_SOURCES_READ | {str(doc_rel)})
+    )
+    # The aggregate goes out on EVERY run, green included. The per-file lines
+    # above are correct and nobody counts them; "0 of 7" is the form a reader
+    # absorbs, and printing it only beside failures would teach exactly the
+    # reflex this file exists to break -- that agreement is the silent case.
+    stats["divergence_summary"] = tree_context.divergence_summary(
         repo, sorted(CITED_SOURCES_READ | {str(doc_rel)})
     )
 
@@ -606,6 +637,12 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
             if len(items) > 5:
                 print(f"  ... and {len(items) - 5} more")
     diverged = stats.get("divergence") or []
+    summary = stats.get("divergence_summary")
+    if summary:
+        # Unconditional, and deliberately ABOVE the per-file block: on a clean
+        # run this is the only divergence output there is, and its absence
+        # would be indistinguishable from a run that never checked.
+        print(f"\n{summary}")
     if diverged:
         # BEFORE the verdict, and it applies to a red run exactly as much as a
         # green one. A failure measured against somebody else's uncommitted
@@ -868,6 +905,49 @@ def self_test() -> int:
     divergence_case("divergence: UNCITED source dirty (must stay silent)",
                     dirty_uncited, set())
 
+    # 16/17. THE HALF-CREATED WORKTREE. Both arms are required and the SECOND
+    #     one is the one that matters: a guard that raises unconditionally also
+    #     passes case 16, and would refuse to run on every healthy tree. These
+    #     two differ in exactly one respect -- whether a CITED, COMMITTED file
+    #     is present on the desk -- so nothing else can explain a divergence
+    #     between them.
+    def partial_case(name: str, mutate, expect_refusal: bool):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "src").mkdir()
+            (repo / "docs").mkdir()
+            (repo / "src" / "sample.rs").write_text(SAMPLE_SRC)
+            (repo / "docs" / "d.md").write_text(SAMPLE_DOC)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "base"], cwd=repo, check=True,
+            )
+            mutate(repo)
+            try:
+                check(repo, repo / "docs" / "d.md", {})
+                refused = False
+            except tree_context.PartialWorktree:
+                refused = True
+            ok = refused == expect_refusal
+            results.append((
+                name, ok,
+                ("refused (CANNOT_RUN)" if refused else "ran and scored")
+                if ok else
+                f"expected {'refusal' if expect_refusal else 'a normal run'}, "
+                f"got {'refusal' if refused else 'a normal run'}",
+            ))
+
+    partial_case(
+        "partial worktree: cited source missing from desk (must REFUSE)",
+        lambda r: (r / "src" / "sample.rs").unlink(), True,
+    )
+    partial_case(
+        "partial worktree: intact tree (must NOT refuse)",
+        lambda r: None, False,
+    )
+
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name.ljust(width)}  {detail}")
     bad = [r for r in results if not r[1]]
@@ -906,11 +986,31 @@ def main() -> int:
             return 1
     doc = Path(args.doc)
     if not doc.exists():
+        # Separate "this document is absent because the checkout is incomplete"
+        # from "you named a file that does not exist". Both used to exit 1,
+        # which is the code for A DEFECT WAS FOUND -- so a broken extract
+        # reported as a finding against the branch.
+        try:
+            rel = str(doc.resolve().relative_to(repo.resolve()))
+        except ValueError:
+            rel = None
+        if rel and tree_context.missing_from_disk(repo, [rel]):
+            print(
+                f"CANNOT RUN: {doc} is present in HEAD but missing from the "
+                f"working tree. The checkout is incomplete; this is not a "
+                f"finding about the document.",
+                file=sys.stderr,
+            )
+            return tree_context.CANNOT_RUN
         print(f"FILE_NOT_IN_GIT: {doc} does not exist", file=sys.stderr)
         return 1
     mpath = repo / args.manifest
     manifest = json.loads(mpath.read_text()) if mpath.exists() else {}
-    failures, stats = check(repo, doc, manifest)
+    try:
+        failures, stats = check(repo, doc, manifest)
+    except tree_context.PartialWorktree as exc:
+        print(f"CANNOT RUN: {exc}", file=sys.stderr)
+        return tree_context.CANNOT_RUN
     return report(failures, stats, doc)
 
 
