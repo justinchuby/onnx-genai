@@ -2228,7 +2228,9 @@ Given eviction has zero consumers and the vram knob 403s, @e00032a4 is right tha
 
 > 🔴 **STRUCK IN PLACE — THE DRIVING ACTION IS WRONG. `driver.rs:777` calls `run_fallback_generation` INLINE inside `handle_driver_command(engine: &mut Engine)`, so the dynamic server SERIALISES generations: concurrent requests QUEUE and never coexist, and the block grid never moves.** Superseded by **D82 — pressure is driven by PROMPT LENGTH**, plus D80's shared-prefix branching and D73's small pool. **This paragraph was already dead 60 lines below and I left it readable; @376a0297 read it live and spent a whole AC (AC76) re-deriving the correction I had already written. See §62.**
 
-The headline is **`allocations` / `allocation_failures` / `frees`** with `hot_evictions` and `prefix_evictions` beside them, all real today. The panel's one-line thesis: *"the pool stops accepting, it does not reclaim"* — true, verifiable, and more interesting than eviction because it shows backpressure reaching admission.
+The headline is **`allocations` / `allocation_failures` / `frees`** with `hot_evictions` and `prefix_evictions` beside them, all real today. ~~The panel's one-line thesis: *"the pool stops accepting, it does not reclaim"* — true, verifiable, and more interesting than eviction because it shows backpressure reaching admission.~~
+
+> 🔴 **STRUCK IN PLACE — THIS SENTENCE IS FALSE AND I WROTE IT. The pool DOES reclaim:** `paged_decode.rs:44 evict_until_free()` → `evict_lru()`, live-called at `flat_autoregressive.rs:307`, refcount-aware so it will not take a page a live sequence is borrowing. **What does not reclaim is the VRAM-CEILING knob** (`ByteBudget::reconfigure` moves `state.limit`, never `state.used`). **I generalised one subsystem to the whole allocator — and my own §55 records the correction 430 lines below this line, where nobody reading the panel thesis will meet it.** @376a0297 is quoting this sentence into the README verbatim. **Replacement thesis, two verifiable claims instead of one unverifiable adjective:** *"pages are reclaimed by refcount-aware LRU when the pool runs dry; changing the VRAM ceiling reclaims nothing — it refuses the next allocation."* See §64.
 
 `max_batch` renders `null` until `--max-batch` lands — **never `x/4`**, since 4 is a hardcoded constant (`state.rs:25`) and printing it as a denominator would be a fabricated ratio wearing a real numerator. Same shape as the `0/135` trap in §22.
 
@@ -4067,3 +4069,44 @@ Everything §21/§31/§48 specify — em-dash, dotted vs double underline, grays
 | D201 | A test validating the source certifies nothing about the consumer | `registry.test.js` proves the title exists while `index.js:179` reads the wrong path — green suite, empty label |
 | D202 | Absence states must lead the accessible name, never append it | Absence is conspicuous visually and silent in audio; a value announced with no state word reads as measured |
 | D203 | ARIA attributes carry the same provenance obligations as rendered numbers | `aria-valuenow` asserts a measurement to a consumer who cannot see any qualifier we drew |
+
+---
+
+## 64. THE UNDERCLAIM IS THE SAME BUG WITH THE SIGN FLIPPED (D204–D207)
+
+### 64.1 🔴 D204 — MY OWN PANEL THESIS IS FALSE, AND IT IS BEING COPIED INTO THE README RIGHT NOW
+
+@e00032a4 named the failure mode; **I then found an instance of it in my own document, in the sentence @376a0297 is quoting approvingly into the README.** §25 carried:
+
+> *"the pool stops accepting, it does not reclaim"*
+
+**Verified at source, and it is wrong.** `paged_decode.rs:44 evict_until_free()` calls `evict_lru()`, live-called at `flat_autoregressive.rs:307`, and its doc comment states the invariant: *"Only prefixes no live sequence is borrowing can go."* **Refcount-aware LRU eviction, running, on the dynamic path.** What does *not* reclaim is the **VRAM-ceiling knob** — `ByteBudget::reconfigure` moves `state.limit` and never `state.used`.
+
+> **D204 — CORRECTING AN OVERCLAIM BY INSTALLING THE OPPOSITE UNDERCLAIM IS NOT A FIX. IT IS THE SAME ERROR WITH THE SIGN FLIPPED, AND IT IS STRICTLY HARDER TO CATCH, BECAUSE IT SOUNDS MODEST.** Every reflex this crew built tonight fires on *claiming too much*. **We have built nothing that fires on disclaiming something true** — no test, no badge, no envelope. The provenance system is **structurally blind to it**: an underclaim renders as `unavailable` or `not-applicable`, which are the two states we have taught everyone to read as *honest*. **A false negative wears the costume of integrity.**
+
+**AND THE SPECIFIC DANGER IS THE AUDIENCE:** we invite the skeptical expert to check us. *"It does not reclaim"* is **disproved in thirty seconds by anyone who opens `paged_decode.rs`** — and it is sitting in the paragraph that underwrites every other claim on the page. **An underclaim in the honesty layer costs more credibility than an overclaim in a panel, because the honesty layer is the thing the reader is using to decide whether to trust the panels.**
+
+### 64.2 D205 — NAME THE MECHANISM, DON'T PICK A SIDE
+
+Both *"the allocator evicts"* and *"the allocator does not evict"* are wrong, because **"the allocator" is two subsystems on two axes.** The repair is not a better adjective:
+
+> **D205 — WHEN A CLAIM IS FALSE IN BOTH DIRECTIONS, THE WORD BEING ARGUED OVER IS AMBIGUOUS AND THE FIX IS TO REPLACE IT WITH THE MECHANISM.** Ship two verifiable claims instead of one unverifiable adjective: *"pages are reclaimed by refcount-aware LRU when the pool runs dry; changing the VRAM ceiling reclaims nothing — it refuses the next allocation."* **This keeps the genuinely impressive part (LRU that will not evict a live sequence) while surrendering the part we do not have (ceiling-driven reclamation)** — and it is checkable line by line, which a single adjective never is. **A sentence a reader can verify in halves is worth more than one they must accept whole.**
+
+### 64.3 🔴 D206 — THE CORRECTION WAS ALREADY IN MY DOCUMENT, 430 LINES AWAY
+
+§55 records my self-correction — *"eviction is real; I generalised from one component to the whole allocator and carried it for hours"* — **written before @e00032a4's broadcast, from independent verification.** And the false thesis stayed live at line 2231 the whole time.
+
+> **D206 — I FOUND THE TRUTH, WROTE IT DOWN, AND DID NOT GO BACK AND FIX WHAT IT FALSIFIED. This is D196 recurring inside a single author's own document within the hour** — my correction, my error, my file, and it still propagated to the PM and is now inbound to the README. **Learning a fact does not retract the things you said before you knew it; nothing does that automatically, and memory reliably reports the opposite.** **Standing rule for me: when I correct myself, `grep` my own document for what the old belief authorised — before writing the new section.**
+
+### 64.4 D207 — RESOLUTION BY OMISSION IS A UI FAILURE, NOT ONLY A PROCESS ONE
+
+@c7a654ed: *"the risk isn't someone deliberately deleting the panel; it's someone reading two correct messages, inferring a conflict, and resolving it by omission. That failure needs no bad intent and leaves no trace."*
+
+> **D207 — THAT IS ALSO THE DEFAULT BEHAVIOUR OF EVERY UI WE ARE BUILDING, AND IT IS WHY §31 MATTERS MORE THAN IT LOOKED.** When a panel cannot resolve what to show, the cheap outcome is to render nothing — and **a missing panel is indistinguishable from a panel that was never specified.** Omission is the one outcome that leaves no artifact to review: **there is no empty slot, no badge, no reason string, nothing to grep.** So the rule that `not-applicable` keeps its **header and frame** and replaces only the **body** is not a stylistic preference — **it is the mechanism that converts an omission into a visible, reviewable statement.** A panel that says *"this cannot exist here, and here is why"* can be checked; a panel that isn't there cannot. **Every absence must leave a trace, or absence becomes the safest place to hide a decision nobody made.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D204 | An underclaim is the same defect as an overclaim, and harder to catch | It renders as `unavailable`/`not-applicable` — the two states we taught everyone to read as honest |
+| D205 | When a claim is false in both directions, replace the adjective with the mechanism | Two claims a reader can verify in halves beat one they must accept whole |
+| D206 | On self-correction, grep your own document for what the old belief authorised | Learning a fact does not retract what you said before you knew it |
+| D207 | Every absence keeps its frame and states its reason | Omission is the only outcome that leaves nothing to review |
