@@ -86,7 +86,6 @@ export default function mount(rootElement, telemetryStore) {
   const paint = () => {
     replaceChildren(model, [
       ...definition('model id', telemetryStore.field('server.model_id')),
-      ...definition('model directory', telemetryStore.field('server.model_path')),
       ...definition('context length', telemetryStore.field('server.context_length')),
       ...definition('execution provider', telemetryStore.field('server.execution_provider')),
       ...definition('decode backend', telemetryStore.field('server.decode_backend')),

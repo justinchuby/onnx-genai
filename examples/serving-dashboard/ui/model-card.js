@@ -22,7 +22,6 @@ import { formatField } from '../format.js';
  */
 const CARD_FIELDS = Object.freeze([
   { key: 'server.model_id', label: 'Model' },
-  { key: 'server.model_path', label: 'Directory' },
   { key: 'server.context_length', label: 'Context', format: formatTokenCount },
   { key: 'server.execution_provider', label: 'Execution provider' },
 ]);
