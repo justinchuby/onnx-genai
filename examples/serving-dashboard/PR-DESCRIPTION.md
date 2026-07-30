@@ -184,13 +184,40 @@ RAW EXIT            0           <- captured with $?, never through a pipe
 ANTI-VACUITY        864 assertion lines, 0 'not ok'
 ```
 
-**Revision ruled as the review pin. Status: carried — not re-derived by
-this author.** Reproduced independently
-twice — two detached worktrees, two different hours, four matching numbers, one
-of them taken without reading the other first. This document does not re-run it
-because the machine is at 100% disk and creating a worktree currently fails
-part-way and silently, which is the exact condition that manufactures a
-plausible wrong number.
+**Revision ruled as the review pin. Status: re-derived by this author, at that
+revision, with the canonical command.** The earlier version of this paragraph
+said *carried, not re-derived*, and gave a reason: the machine was at 100% disk,
+and a worktree that fails part-way and silently is the exact condition that
+manufactures a plausible wrong number. That reason expired when someone reclaimed
+8.2 GB. The figures above are now execution, not testimony.
+
+```
+VEHICLE   git worktree add --detach 37d0d72e   (a commit has no untracked files,
+                                                so the hazard below is unreachable)
+CORPUS    node --test $(git ls-files '*.test.js')
+          56 files enumerated by git, not walked on disk
+          [vacuity guard] corpus > 0 asserted before running
+          [neg control]   git ls-files '*.zzq9x' -> 0
+RESULT    tests 749 · suites 115 · pass 749 · fail 0 · RAW EXIT 0
+```
+
+**Why the corpus is enumerated by `git` and not by the runner.** A bare
+`node --test` walks the directory, so it executes whatever is lying there —
+including files no one has committed. That defect landed four separate times on
+this branch and defeated two purpose-built canaries, because the countermeasure
+was *remember to check for untracked files* and remembering failed every time.
+Letting `git ls-files` name the corpus makes it unreachable instead of unlikely.
+**Every suite total in this document's history that was produced by a bare walk
+is withdrawn**, including ones that happened to be correct: a number that could
+not have detected the defect is not evidence merely because it escaped it.
+
+**And the instrument that nearly cost me this measurement.** My first read of the
+run reported a clean exit and an empty summary — I had grepped for `# tests`,
+which is TAP, and this runner emits `ℹ tests`. **The exit code was 0 and the
+summary was blank, which is indistinguishable from a suite that never loaded.**
+Had I published on the exit code I would have published a true number supported
+by a run I had not confirmed happened. A pass count cannot be produced by a file
+failing to import; an exit code can.
 
 ### What this file's freshness stamp does and does not mean
 
@@ -336,6 +363,51 @@ The allowlist was never designed for secrecy, is not reviewed as if it were, and
 nothing tells a future contributor that naming a file `.json` publishes it. The
 source comment already names the class for a different instance: *a refusal by
 coincidence*.
+
+### Two guards in this directory disagree about that allowlist, and the count in the failing one is not the exposure
+
+The exposure ratchet is the only failing test on this branch. Its message is
+exact, and its class breakdown is where the interesting part is:
+
+```
+94 tracked files are fetchable at /demo/ that the page never loads (was 91).
+BY CLASS: TEST 64 · DESIGN 3 · INTERNAL_DOC 14 · TOOLING 10 · FIXTURE 3
+```
+
+**`INTERNAL_DOC` is `/\.md$/`, and the server refuses `.md`.** Those fourteen
+files are counted as fetchable by a guard that sits four directories from a
+guard proving they are not. Both are committed, both run in the same suite, and
+the suite is green on the pair.
+
+The ratchet is not stale by accident — it records its own provenance, and the
+record is what dates it: *111 of 111 served, 0 refused … there is no allowlist,
+no extension check*. **That was true when it was written.** The allowlist landed
+afterwards. The comment is not a stale opinion, it is a **stale execution
+record**, which is the most credible kind of wrong thing in a repository,
+because it carries a measurement.
+
+**And the ratchet is still right, for a reason its own number does not express.**
+`.md` is refused by extension, so renaming one of those fourteen to `.json`
+serves it — demonstrated above. Its bytes are also in the repository regardless
+of what any route does, so a `git mv` out of the served directory turns this
+guard green without making a single byte private. **It counts the fetchable set;
+the exposure is the tracked set.** Those two are different, and only one of them
+has a test.
+
+So the number is not the exposure, in both directions at once: it counts
+fourteen files that are not currently served, and it stops counting a file the
+moment it moves — while the bytes stay exactly as public as they were.
+
+**The reason this is a gap and not a fix.** The honest repair is to give the
+ratchet the server's own allowlist rather than a private guess at it, so the two
+cannot drift again. That is an edit to a guard this author does not own, at the
+end of a freeze, and a wrong patch handed to an owner is worse than no patch —
+it arrives carrying the sender's authority. This author has already made that
+exact mistake once tonight, on a different file: a diagnosis that was correct
+and a remedy that was prose where the defect was a build instruction. It was
+caught by a third party, not by the sender or the forwarder. **A handed-over fix
+is a claim, and it needs a control like any other claim.** The census above is
+the control this one has; the patch is left to the owner.
 
 ### The percent-encoding bypass
 
