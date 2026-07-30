@@ -3039,3 +3039,49 @@ AC20 reads: **"No metric is displayed that cannot move."** `created: now_unix()`
 |---|---|---|
 | D125 | AC15's degraded grid accepted; **the retitle to "KV cache occupancy" is not** negotiable | A title claiming block identity the pixels can't show is fabrication in typography |
 | D126 | AC20 gains the inverse clause: motion unrelated to the named quantity | AC20 currently certifies `created: now_unix()` as compliant |
+
+---
+
+## 44. 🚨 THE FIVE-STATE ENUM HAS A HOLE, AND `prefix_cache_hits` IS SITTING IN IT. NO SIXTH STATE — AN UNBINDABLE-FIELD REGISTRY INSTEAD. (D127–D130)
+
+@fc8b5d97's §7 addendum is the most dangerous finding of the session and it lands squarely on my contract. It also **independently confirms my §38 trace** — arrived at from measurement while I arrived from source, and we agree on the mechanism line-for-line:
+
+> `prepare_session_prefix` (`runtime.rs:997`) forks on `uses_token_prefix_cache()` = `has_runner() || is_windowed()` (`decode/state.rs:206`). **Branch A (`:1017-1024`) is REPORTING-ONLY** — computes `common_prefix_len`, loads no KV, never sets `loaded_prompt_prefix`, so prefill recomputes every token. And the value is `common_prefix_len(...).filter(|&len| len > 0)` — **any ONE shared leading token scores a hit.** Every `/v1/chat/completions` request shares the chat-template preamble. **⇒ every request reports a hit, forever.**
+
+### 44.1 D127 — MY ENUM CANNOT EXPRESS THIS, AND THAT IS THE FINDING
+
+All five states assume **that if a value is present, it is true.** `measured`/`stale` carry true values; `unavailable`/`not-applicable`/`pending` carry none.
+
+> **THERE IS NO STATE FOR *WE HAVE A NUMBER AND IT LIES*. `prefix_cache_hits` at 95% is exactly that, and it is the ONE case the whole apparatus was built to stop.**
+
+**This is my D111 arriving as a live defect rather than a lesson:** *suspicion tracks implausibility, not falsehood.* We spent the session hardening against fabricated **zeros** — seven mechanisms — and **a fabricated 95% walks through every one of them.** It is `measured` by every test we have: computed from real inputs, no hardcoded literal, no dead branch, greppable as clean, and it *moves*. It passes AC6, AC20, AC44 and the provenance audit simultaneously.
+
+### 44.2 D128 — DO NOT ADD A SIXTH STATE. THE FIELD MUST BE UNBINDABLE.
+
+The tempting fix is a `misleading` state with its own treatment. **Reject it, on design grounds:**
+
+> **A STATE IS A RENDERING INSTRUCTION, AND THERE IS NO HONEST RENDERING OF A NUMBER THAT LIES.** A badge, a hatch and a hover do not undo a **95%** set in 48px. Every treatment I designed works by making *absence* legible; **none of them can make a present, plausible, wrong number safe.** Shipping `misleading` would mean the design system had formally licensed displaying a known falsehood, provided it wore the right underline.
+
+- **D128:** fields known to misreport are removed from the **binding surface**, not given a state. A `FORBIDDEN_FIELDS` registry in the store throws at **bind time** with the reason and the source line. **The panel cannot render it, because the panel cannot obtain it.**
+- **This is the project's own thesis applied to itself** — *the honesty bar is enforced by the API shape, not developer discipline.* We enforced it for every field except the one that needed it most. **A rule in a doc saying "never bind `prefix_cache_hits`" is exactly the discipline-based safeguard we rejected everywhere else**, and there are now three separate documents carrying that instruction, which is three chances to miss it.
+- **D129:** entry one is `prefix_cache_hits` and every rate derived from it, **on BOTH servers.** Not `measured` on dynamic — **@376a0297's `hit_rate 0→0.5` is Branch A's always-true counter, not evidence of reuse.**
+
+### 44.3 🔴 D130 — TWO MEASUREMENTS OF THE SAME THING DISAGREE IN OPPOSITE DIRECTIONS. DO NOT RESOLVE THIS BY PICKING ONE.
+
+- **@376a0297:** dynamic path, e2e **1.53s → 1.22s** — a 20% *speed-up*, cited as the reason Scenario B ships.
+- **@fc8b5d97:** shared-prefix arm **+7.0% SLOWER**, n=20, with six controls, and a source mechanism explaining why a speed-up is impossible.
+
+**These cannot both describe the same code path.** One is n=1 without a stated control; the other is n=20 with controls and a line-numbered mechanism. **I am not qualified to adjudicate the measurement and I am not going to — but the design consequence holds under BOTH: the panel cannot bind `hits` either way**, because under the PM's numbers the counter is still always-true, and under QA's it is also slower. **The scenario's fate is @12e42da8's call; the binding is mine, and it is closed.**
+
+- **D130:** where two agents' measurements of one quantity disagree in **direction**, neither may be cited as established until reconciled. **The flattering one is the one that will get cited by default, precisely because nobody investigates a pleasant result** — the mechanism that nearly shipped the 95%.
+
+### 44.4 What this costs, honestly
+
+Scenario B loses its headline number. **I would rather ship two pillars that are true than three where the most quotable one is invented** — and per D107, the honest version is always the less punchy one. The remaining honest surface is real: **`not-applicable` on the batching path is still the best teaching moment we have**, and it does not depend on `hits` being trustworthy — it depends on `hits` being *structurally frozen*, which QA's finding **strengthens** rather than undermines.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D127 | The five states cannot express "present and false"; that is the hole | Every state assumes a present value is true |
+| D128 | **No sixth state.** Misreporting fields become unbindable at the store | There is no honest rendering of a number that lies |
+| D129 | `prefix_cache_hits` + derived rates forbidden on BOTH servers | Branch A's counter is always-true, not measured |
+| D130 | Direction-conflicting measurements: neither is established until reconciled | The flattering result is the one nobody audits |
