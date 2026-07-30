@@ -56,7 +56,20 @@ instead of copying anything:
 MODELS_DIR=/path/to/onnx-genai/models ./examples/serving-dashboard/run-demo.sh
 ```
 
-To build the static-cache model from scratch:
+To build the static-cache model from scratch you need **Mobius**, and the way
+you install it matters more than it should:
+
+```bash
+pip install git+https://github.com/onnxruntime/mobius.git
+```
+
+> ⚠️ **Do not `pip install mobius`.** The distribution is named **`mobius-ai`**
+> (the *import* name is `mobius`), it is **not published on PyPI**, and an
+> unrelated squatter package called `mobius` *is*. So the obvious command
+> installs a completely different library and then fails with
+> `No module named mobius.__main__` — an error that tells you nothing about the
+> real cause. Install from source, from **`onnxruntime/mobius`**; other repo
+> paths for it are stale and 404.
 
 ```bash
 HF_HOME=models/.hf_cache TMPDIR=models/.scratch \
@@ -66,7 +79,7 @@ python -m mobius build --model Qwen/Qwen2.5-0.5B-Instruct \
   --runtime onnx-genai
 ```
 
-> **Two known traps, both of which cost an hour if you hit them blind.**
+> **Three known traps, each of which costs an hour if you hit it blind.**
 >
 > 1. `scripts/build_qwen.sh` passes `--runtime ort-genai`, which emits only
 >    `genai_config.json`. The runtime needs `inference_metadata.yaml` with a
@@ -80,6 +93,12 @@ python -m mobius build --model Qwen/Qwen2.5-0.5B-Instruct \
 >    the same naming convention as the test fixture, so
 >    `tests/fixtures/tiny-llm-scatter/inference_metadata.yaml` is a working
 >    24-layer template.
+> 3. **On macOS, `scripts/build_qwen.sh` aborts before it does anything.** Stock
+>    `/bin/bash` is 3.2.57, and under `set -u` bash 3.2 treats an empty array
+>    expansion as an unbound variable. The documented no-argument invocation has
+>    therefore never worked on a Mac without Homebrew bash 5 on `PATH`. If you
+>    write `set -u` bash with arrays, the safe idiom is
+>    `${arr[@]+"${arr[@]}"}`.
 
 The demo does no model loading, downloading, conversion, or management of its
 own. It is a pure client of a server you start yourself.
