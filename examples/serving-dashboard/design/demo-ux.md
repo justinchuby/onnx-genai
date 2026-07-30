@@ -2836,3 +2836,47 @@ This is the counterpart to D99. **D99: an honesty process that only ratchets tow
 |---|---|---|
 | D112 | Retract the **sentence by name**, not just the conclusion | The phrase is what propagated; it outlived the fact and the retraction |
 | D113 | AC43 "sharing and eviction" is **verified true**; the string is frozen | `prefix_cache.rs:151` and `page_table.rs:1068`, both wired, both tested |
+
+---
+
+## 40. `MEASURED: 'ok'` IS A LIVE BUG · `--max-batch` EXISTS · AND OCCUPANCY MUST NEVER BE A PERCENTAGE
+
+### 40.1 🔴 CONFIRMED — the constant's NAME and its VALUE disagree
+
+`telemetry-field.js:89-95` on disk:
+```js
+export const FIELD_STATES = Object.freeze({
+  MEASURED: 'ok',            // ← name says measured, wire value says ok
+  PENDING: 'pending', STALE: 'stale',
+  UNAVAILABLE: 'unavailable', NOT_APPLICABLE: 'not-applicable',
+});
+```
+@c0de4c2e found this and it's mine to settle, because I'm the one who conceded `ok` and then reversed. **The ratified wire value is `measured`.** Today `field.state === 'measured'` is `false` for **every measured field** — and because `formatFieldText` falls through, that field then **renders as a plain number anyway.** *The check fails silently while the output looks correct*, which is the worst pairing available: **a broken guard that produces a healthy-looking screen.**
+
+**D114: `MEASURED: 'measured'`.** One line. And **`:160-163` still emits `sourceClass` and `origin`** — both retired; three keys, `source`/`endpoint`/`server`.
+
+**Note the shape of how it got here:** the name was written when the value was right, the value changed, and the name kept vouching for it. **A constant's name is documentation with no test coverage** — which is the same defect class as `:20`'s stale JSDoc sitting directly above the constant it describes. @c0de4c2e's line on that is the best statement of it: **a doc comment inherits the authority of code while carrying none of the guarantees.**
+
+### 40.2 ✅ REVERSED: `--max-batch` DOES exist — but the denominator still shouldn't be used as one
+
+@c0de4c2e reports the flag is absent. **It landed:** `cli.rs:77 pub max_batch: usize`, plumbed at `:127`; `DEFAULT_MAX_BATCH = 4` at `state.rs:28`. So §5.3's missing denominator is **available**.
+
+**I am still ruling against a percentage, and now for a better reason than not having one.**
+
+### 40.3 🔴 D115 — BATCH OCCUPANCY RENDERS AS `3 of 4`, NEVER `75%`
+
+With `max_batch = 4`, the occupancy metric has exactly **five reachable values**: 0, 1, 2, 3, 4. Rendering that as a percentage produces `0% · 25% · 50% · 75% · 100%` — a scale whose **form implies 101 possible values when only 5 exist.**
+
+> **A PERCENTAGE OVER A SMALL INTEGER DENOMINATOR FABRICATES RESOLUTION. The number is correct; the PRECISION IS INVENTED.**
+
+This is D85's principle — *type size is a claim about which number matters* — one level down: **the FORMAT is a claim about how finely the quantity can be known.** `75%` invites a visitor to expect `76%`, and to read a jump from 50% to 75% as a smooth 25-point move rather than **one sequence entering the batch**.
+
+`3 of 4` is strictly better on every axis: it shows the numerator **and** the denominator (so `max_batch` never has to be hunted for), it makes the granularity self-evident, it can't imply absent precision, and **it stays honest if `--max-batch` changes** — `75%` silently means something different at `max_batch=8`. It also satisfies the Lead's *"a ratio invents a numerator — name both terms"* rule **by construction, because both terms are on screen.**
+
+**D116: this generalises — any ratio whose denominator is a small integer renders as `n of m`.** Batch occupancy, decode rows in use, sessions against a cap. **Percentages are for quantities with genuine continuum**, i.e. the block grid (~14,612 pages), never for counts of four.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D114 | `MEASURED: 'measured'`; drop `sourceClass`/`origin` for `source`/`endpoint`/`server` | Name and wire value disagree; the guard fails silently while output looks right |
+| D115 | Batch occupancy renders **`3 of 4`**, never a percentage | Five reachable values presented on a 101-point scale invents precision |
+| D116 | **Any ratio over a small integer denominator renders `n of m`** | The format is a claim about how finely a quantity can be known |
