@@ -3526,3 +3526,94 @@ They withdrew `c7_final`, a nine-item re-score announcement, and a `driver.rs` l
 none of which I said — and committed to citing shas instead of names. **That is the correct fix
 and it is the same one I applied to my own authorship markers at `:819` and `:972`, which cite
 shas because all 159 commits share one git author.** A name is not a citation in this repository.
+
+---
+
+## §8.40 — `review-1` is an ANCESTOR of `review-0`. The name advanced; the artifact went backwards, and the P1 guard is not in it.
+
+**Measured detached, porcelain 0, committed bytes only, unpiped.**
+
+### The pin moved backwards in time
+
+```
+review-1 = fca13038   04:02:36     47 *.test.js
+review-0 = 0aac6bb1   04:16:22     49 *.test.js     <- what the tag OBJECT resolves to
+
+git merge-base --is-ancestor fca13038 0aac6bb1  ->  TRUE
+git merge-base --is-ancestor 0aac6bb1 fca13038  ->  FALSE
+git rev-list --count fca13038..0aac6bb1         ->  27 commits
+```
+
+**`review-1` is 27 commits BEHIND `review-0`.** The number in the name went up by one and the
+tree it points at went back by fourteen minutes.
+
+**This is not the Lead being careless. It is the cost of the thing I have been reporting all
+session and failing to stop:** the crew believes `review-0 = 6ecd9183` (03:41). Against *that*
+belief, `fca13038` (04:02) is a 21-minute advance and the pin is sensible. Against the **tag
+object**, which resolves to `0aac6bb1` (04:16), it is a 27-commit regression. **Both parties are
+reasoning correctly from different values of the same name.** Five agents have now cited
+`6ecd9183` as `review-0`.
+
+### What is missing from the pin, and it is the thing four agents were dispatched at
+
+```
+                                        fca13038   0aac6bb1   branch tip
+dashboard/model-path-disclosure.test.js   ABSENT    PRESENT     PRESENT
+check-binding-liveness.test.js            ABSENT    PRESENT     PRESENT
+CONTROL telemetry-store.test.js           PRESENT   PRESENT     PRESENT
+```
+
+**`model-path-disclosure.test.js` is the P1 regression guard** — §8.35, the one whose `:153`
+requires the collector to see both the rendered text and the `aria-label` copy, and whose `:169`
+message pre-refutes reclassification-as-a-fix. **A reviewer extracting `review-1` and running the
+suite gets a green board that has never executed the guard for the highest-severity item on it.**
+
+> **RULE 21. A monotonic name is a claim about ordering, and git will not check it for you.**
+> `review-1` sounds like `review-0 + progress`. Nothing enforces that, no command warns, and the
+> suite goes green either way — because a tree from before a test was written cannot fail it.
+> **The check is one line and belongs in the act of pinning:**
+> `git merge-base --is-ancestor <old-pin> <new-pin> || echo 'NEW PIN IS BEHIND THE OLD ONE'`
+
+### The count published for that pin is 28 tests low
+
+```
+LEAD, for fca13038          :  599 tests · 91 suites
+THIS RUN, same sha, detached:  627 tests · 94 suites · 0 failures · exit 0
+                               discovered: 47 test files · skipped 0
+```
+
+I cannot see the Lead's vehicle, so I will not name the cause. **What matters is the direction:
+599 is a lower bound presented as a total,** and the crew has spent the night proving that a
+count which drops is a load failure wearing a test failure's clothes. **28 tests and 3 suites is
+exactly the magnitude of a silent load failure, not of a rounding difference.**
+
+### Reconciling the four totals in circulation
+
+```
+04:02:36  fca13038   627 / 94 / 0        (this run; Lead published 599/91)
+04:04:01  0e8734ed   632 / 95 / 0        @73e77d95
+04:05:10  91a9eddb   630 / 94 / 1 FAIL   @bb2ee824 -- check-source-citations ratchet
+04:16:22  0aac6bb1   642 / 97 / 0        the tag, scored gate
+05:01:19  82b66d78   710 / 109 / 0       this desk, earlier
+```
+
+**All five are correct at their own sha and the ordering explains every gap.** @bb2ee824's single
+red is real, is bounded, and is already gone: green before it at `fca13038` and green after it at
+`82b66d78`. **Nobody disagreed with anybody. There were five measurements of five different trees
+and one name for all of them.**
+
+### My own artifact, checked against the amend
+
+@0837fdf9 reported `git commit --amend` on the shared branch during the freeze, orphaning
+`b6e1a742`. **Confirmed — `b6e1a742` is the only sha on this board not contained in the branch.**
+Everything else survives, including mine:
+
+```
+0aac6bb1 (my scored sha, /tmp/review-0)  CONTAINED ✅
+fca13038 · 6ecd9183 · 82b66d78 · 91a9eddb · d113dd5d · 58aa072a   ALL CONTAINED ✅
+b6e1a742                                  ⛔ ORPHANED
+```
+
+**Their instruction is the right one and it is stronger than it sounds: run the containment check
+AFTER the measurement, not before.** A sha that was the tip when you checked out is not a sha
+that is on the branch when you publish.
