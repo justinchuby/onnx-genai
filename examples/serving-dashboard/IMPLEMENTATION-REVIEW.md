@@ -353,16 +353,28 @@ reports. The committed run is the branch. **@c7a654ed's practice of quoting the 
 beside the sha is the only reason I noticed — a sha does not identify what you tested, and this
 is the sharpest example of it anyone has produced tonight: same commit, 18 failures or 1.**
 
-### The five findings, re-verified line by line at committed `d6e57c63`
+### The five findings — RE-VERIFIED AT `b54437df`, not left where they were typed
 
-| Finding | Evidence at committed `d6e57c63` | Status |
+> **Every status in this table was re-derived by execution at `b54437df`.** The
+> `d6e57c63` column below is the *original* observation and is retained as history;
+> it is no longer a claim about the tree. A status without a SHA is not a status.
+>
+> **Search method:** `git grep -nF` (fixed-string). `-E` with `\b` returns a false
+> zero in `git grep` — it silently matches nothing and exits 0.
+
+| Finding | Evidence as first observed at `d6e57c63` | Status re-derived at `b54437df` |
 | --- | --- | --- |
-| **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **LIVE** |
-| **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE** |
-| **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **LIVE** |
-| **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **LIVE** |
-| **F11** MAJOR | `index.js:179` `createRovingGroup(root, { label: panel.title })`; `panel.title` is not a key of the frozen registry entry. | **LIVE** |
-| F2 | retracted — see #2 above. | **FIXED** |
+| **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **STRUCK @ `459c40c2`** — replaced by `classify_kv_applicability()`. The one surviving textual hit is `tests.rs:5009`, a doc comment *describing* the dead bug. **A grep cannot see tense: the hit and the proof-of-fix are byte-identical.** |
+| **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE — VERIFIED-AT `b54437df`** (both paths present in `git ls-tree`) |
+| **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **LIVE (as F4-REVISED) — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: the declaration is now `prefix-cache.js:88`, not `:77`. |
+| **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **STRUCK @ `1b4d76c6`** — `ROOT` now derives from `tree_context.repo_root()`; exits `CANNOT_RUN` with no worktree and exits 1 conditionally. Zero hits for the hardcoded path; positive control `repo_root` fires in 7 files. |
+| **F11** MAJOR | `index.js:179` `createRovingGroup(root, { label: panel.title })`; `panel.title` is not a key of the frozen registry entry. | **LIVE — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: now `dashboard/index.js:143`, not `:179`. See also the F11 count retraction below (five panels, not six) — that retraction is about the COUNT, not the defect. |
+| F2 | retracted — see #2 above. | **FIXED**, but its guard is not: `check-field-states.test.js:69` reads `FIELD_STATES.MEASURED ?? FIELD_STATES.OK`. The enum defines no `OK` key, so the fallback is dead code and the guard accepts either spelling — **it cannot fail on the very half-swept rename F2 filed.** |
+
+**Reader instruction, applying to this whole document:** every `file:NNN` here is a
+**hint, not an address**. Two of the five rows above drifted line numbers while their
+substance was unchanged, and this branch took ~1.4 commits/minute during the review.
+**Locate findings by symbol (`git grep -nF '<symbol>'`), never by line number.**
 
 **A green suite did not catch any of the five.** F1 has a red Rust test, so it is caught by the
 *other* suite; F3, F4, F5 and F11 have no test that could fail. That is the finding behind the
@@ -423,11 +435,11 @@ grepped**.
 
 | Finding | Status at `a721f033` |
 | --- | --- |
-| F1 `driver.rs:464` | **STILL LIVE.** `set_applicable(!continuous_batch_supported)`; `runtime.rs:263` still returns `()` |
+| F1 `driver.rs:464` | **STRUCK @ `459c40c2`** — re-verified at `b54437df`. Now `classify_kv_applicability()`; the negation is gone from shipped Rust |
 | **F2 `'ok'`→`'measured'`** | ✅ **RESOLVED — I RETRACT IT.** `format.test.js` swept; 18/18 green |
 | F3 dual render stacks | STILL LIVE |
 | F4 `null` ceiling | **STILL LIVE.** `panel-kit.js:273,454` both still `?? DEFAULT_STALE_CEILING_MS` |
-| F5 `audit_citation_targets.py:25` | **STILL LIVE** |
+| F5 `audit_citation_targets.py:25` | **STRUCK @ `1b4d76c6`** — re-verified at `b54437df`. `ROOT` derives from `tree_context.repo_root()`; exits `CANNOT_RUN` with no worktree, exits 1 conditionally |
 | F11 unnamed `role="group"` | **STILL LIVE.** `index.js:179` still `{ label: panel.title }` |
 
 ### 🔻 F2 RETRACTED — and the retraction matters more than the finding did
@@ -504,7 +516,13 @@ Note: `check-source-citations.test.js` fails only in my extracted tree because i
 
 ---
 
-## F1 — BLOCKER: applicability is inferred from an unrelated capability
+## F1 — ~~BLOCKER~~ **STRUCK @ `459c40c2`** (re-verified at `b54437df`): applicability is inferred from an unrelated capability
+
+> **THIS DEFECT IS FIXED. Do not act on this section.** `459c40c2` replaced the negation with
+> `classify_kv_applicability(paged, continuous_batch_supported)`, a total function over two bools.
+> The analysis below is retained because it explains *why* the fix is shaped the way it is.
+> **`git grep` for the defect string still hits `tests.rs:5009` — that is a doc comment quoting
+> the dead bug, not the bug.**
 
 `crates/onnx-genai-server/src/driver.rs:464`
 
@@ -635,7 +653,12 @@ now nothing anywhere exercises the `null` path through `bindPanel`.
 
 ---
 
-## F5 — MAJOR: `audit_citation_targets.py` is hardcoded to one machine and cannot fail
+## F5 — ~~MAJOR~~ **STRUCK @ `1b4d76c6`** (re-verified at `b54437df`): `audit_citation_targets.py` is hardcoded to one machine and cannot fail
+
+> **THIS DEFECT IS FIXED. Do not act on this section.** `1b4d76c6` ("make
+> `audit_citation_targets.py` capable of failing") derives `ROOT` from
+> `tree_context.repo_root()`, exits `CANNOT_RUN` when there is no worktree, and exits 1
+> conditionally. Verified by @732c7548 and independently by @e00032a4 by execution.
 
 `scripts/audit_citation_targets.py:25`
 
