@@ -4625,3 +4625,111 @@ confirm two of these phrases with `grep` and got **0** for both, because
 each **split across a comment line break**. I had already read them in full. That is
 my own R56 firing on me while I was writing up a finding about arguments that do not
 survive the trip to their reader.
+
+---
+
+## R93 — ruling on positional citations: NOT blocking, and "0 past EOF" is the finding, not the reassurance
+
+MEASURED-AT: 34ea441d
+
+@12e42da8 asked whether @1cb42f0e's citation-rot finding — **44 positional line
+citations across 12 documents, zero instrument coverage, and `driver.rs` having
+grown past its own broken citation so that 0 of 44 now point past EOF** — is
+blocking for readability.
+
+**Ruling: NOT blocking. Do not reopen it.** Reasons below, and I measured my own
+deliverable first because it is one of the twelve.
+
+### My own document, measured
+
+| | |
+|---|---|
+| positional `file:NNN` citations | **78** |
+| distinct files cited | **31** |
+| distinct citations resolving **past EOF** | **0** |
+| distinct citations in range | **51** |
+| **citations whose basename matches >1 tracked path** | **6** — `runtime.rs` ×4 (3 paths), `state.rs` ×2 (4 paths) |
+
+So @1cb42f0e's extinction result reproduces on a second, independent corpus: **0 of
+78 here, 0 of 44 there.**
+
+### Why "0 past EOF" is the finding rather than the comfort
+
+A citation pointing past EOF is a **loud** failure: it cannot be resolved, so nobody
+is misled by it. A citation pointing at the **wrong line** is a **silent** failure:
+it resolves, it looks deliberate, and the reader believes it.
+
+**A growing file converts every loud failure in it into a silent one.** `driver.rs`
+gained 139 lines and in doing so *repaired the symptom while deepening the defect*.
+
+> ***Zero-past-EOF is not the absence of citation rot. It is the moment citation rot
+> stopped being detectable. The only machine-checkable form was extinguished by
+> growth, and its extinction reads exactly like a fix.***
+
+That is the fourth instance tonight of the shape I have been filing all session, and
+the first where the instrument was retired **by the codebase rather than by an
+author**: R90 lost a scope limit, R91 lost a pin, R92 lost a remedy, **R93 loses the
+detector itself.**
+
+### But it is not blocking, and the reason is specific to my lane
+
+I checked the citations I made this session and the most-repeated ones in the
+document. **Every one resolves to the content claimed**, and more importantly:
+
+```
+caption-catalogue.test.js:50  -> // SCOPE LIMIT, STATED PLAINLY: this audits STRING-LITERAL…
+served-surface.test.js:204    -> const MAX_SERVED_BUT_NOT_NEEDED = 91;
+dashboard/throughput.js:278   -> label: `${definition.label} ${definition.suffix}…
+```
+
+In this document **every positional citation is paired with a quoted string or a
+named identifier.** The quote is the referent; the number is a *hint* for finding
+it. A reader whose line number is four lines stale still lands, because they are
+searching for `MAX_SERVED_BUT_NOT_NEEDED`, not for line 204.
+
+**Readability is blocked when a reader cannot recover the referent. Here they can,
+by construction.** A stale line number costs a reader seconds. That is a defect
+worth naming and not worth freezing a release over.
+
+### The fix is already proven in this tree, by someone else, and costs nothing
+
+@e00032a4 measured **116 of 893 Rust signatures wrapping across lines (13%)** and
+then measured that **0 of their 180 anchors broke** — because Rust puts the symbol
+name on the first line, so the arguments wrap and the *name* does not.
+
+> **Their anchors survived because they cite symbols, not positions. A symbol
+> citation is repaired by the same edit that would break a positional one.**
+
+That is the whole remedy, it is demonstrated at n=180 in this repository tonight,
+and it requires no instrument: **cite the symbol, and use the line number only as a
+courtesy.** Where no symbol exists, quote the line.
+
+### And the finding against my own document, which is worse than a stale number
+
+**Six of my citations name a file that does not exist uniquely:**
+
+```
+runtime.rs  -> engine/runtime.rs · ep-api/abi/runtime.rs · ep-cuda/runtime.rs   (3 paths, 4 cites)
+state.rs    -> decode/state.rs · router/state.rs · server/state.rs · executor/state.rs  (4 paths, 2 cites)
+```
+
+**A stale line number points at the wrong line in the right file. An ambiguous
+basename does not identify a file at all** — and it resolves *silently* to whichever
+one the reader happens to open first. This is @e00032a4's sibling-checkout trap
+arriving at the citation level, and it is in my own deliverable.
+
+**Fix, mine, and I am recording it rather than doing it under freeze:** those six
+should carry their crate-relative path. Not blocking, disclosed, and mine to correct
+when the freeze lifts.
+
+### Answer to the lead
+
+**Not blocking for readability.** Disclose it in the PR body as ruled, and add one
+clause to the disclosure that the raw finding does not carry:
+
+> *"0 of 44 point past EOF. This is not coverage — it is the loss of the only
+> automatic check, because file growth converts an unresolvable citation into a
+> plausible wrong one."*
+
+Without that clause, the disclosure reports the number and **the number reads as
+good news.**
