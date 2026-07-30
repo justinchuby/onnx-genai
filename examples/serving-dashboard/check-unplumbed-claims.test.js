@@ -360,6 +360,77 @@ describe('every claim of absence is evidenced and still true', () => {
 
   });
 
+  it('no test file imports another test file', () => {
+    // WHY THIS GUARD EXISTS, AND WHY IT IS IN THIS FILE.
+    //
+    // This file used to import NOT_YET_PUBLISHED from dashboard/field-keys.test.js
+    // to avoid keeping a second copy of the deferral inventory. Importing a
+    // .test.js runs THAT FILE'S ENTIRE SUITE inside the importer's process, so
+    // its tests were counted under the wrong file. The arithmetic, measured:
+    //
+    //     before  check-unplumbed-claims  24 tests
+    //     after   check-unplumbed-claims  11 tests   (its own)
+    //             dashboard/field-keys    13 tests   (borrowed, now counted here)
+    //             11 + 13 = 24, exactly.
+    //
+    // Nothing was deleted. Thirteen tests stopped being attributed to a file
+    // that did not contain them. That is worth guarding precisely because the
+    // symptom is a MOVING TOTAL, and a moving total is indistinguishable from a
+    // corpus quietly narrowing -- which is the failure this whole review cycle
+    // exists to prevent. run-tests.sh:378 ratchets on any DECREASE in discovered
+    // FILES, but nothing noticed 13 tests changing owner.
+    //
+    // The registry removed the need for the import. This stops the need from
+    // being reinvented: a plain .mjs has no tests, so borrowing from one costs
+    // nothing, and there is never a reason to reach into a .test.js.
+    const importsATestFile = (source) =>
+      /(?:from|require\()\s*['"][^'"]*\.test\.js['"]/.test(source);
+
+    // ANTI-VACUITY, BOTH DIRECTIONS, RUN BEFORE THE CORPUS ASSERTION.
+    //
+    // Zero cross-test imports is the GOAL state, not a defect, so there is no
+    // real positive occurrence to anchor on -- and anchoring a control on a real
+    // defect is the trap that broke the by-name guard the moment the defect was
+    // repaired. The control is therefore SYNTHETIC.
+    //
+    // And the sample is assembled by CONCATENATION so that this file's own
+    // source never contains a literal string the detector would match. This
+    // file is inside the corpus it scans; a fixture written out in full would be
+    // flagged as a real finding, which is a mistake I have already made once
+    // tonight. Test data must not be indistinguishable from the thing it samples.
+    const SYNTHETIC_VIOLATION = "import { X } from './some-module" + '.test' + '.js' + "';";
+    assert.ok(
+      importsATestFile(SYNTHETIC_VIOLATION),
+      'The detector does not recognise an import of a .test.js, so the corpus ' +
+        'scan below cannot find one either and its empty result means nothing.',
+    );
+    assert.ok(
+      !importsATestFile("import { UNPLUMBED } from './unplumbed-registry.mjs';"),
+      'The detector flags an ordinary .mjs import, so every correct consumer ' +
+        'would be reported and the guard would be deleted by whoever hit it.',
+    );
+
+    const testPaths = shippedPaths().filter((p) => p.endsWith('.test.js'));
+    assert.ok(
+      testPaths.length > 0,
+      'No .test.js files were found at the shipping ref, so this guard read an ' +
+        'empty corpus and would pass no matter what. Fail closed instead.',
+    );
+
+    const borrowers = testPaths.filter((path) => importsATestFile(stripRustComments(shipped(path))));
+
+    assert.deepEqual(
+      borrowers,
+      [],
+      'A test file imports another test file:\n' +
+        `${borrowers.map((b) => `  ${b}`).join('\n')}\n\n` +
+        'That runs the imported file\'s whole suite inside this one, so its tests ' +
+        'are counted under the wrong file and the suite total moves for a reason ' +
+        'nobody can attribute. Export the shared value from a plain .mjs instead ' +
+        '-- unplumbed-registry.mjs exists for exactly this.',
+    );
+  });
+
   it('every entry is classified, and the taxonomy is not decorative', () => {
     const valid = new Set(Object.values(CLASS));
     const unclassified = Object.entries(UNPLUMBED_CLAIMS)
