@@ -208,3 +208,46 @@ test('every fetch in shipped dashboard code carries a deadline', () => {
       `answers. Use fetchWithDeadline from request-deadline.js:\n  ${offenders.join('\n  ')}`,
   );
 });
+
+// The tests above prove the PRIMITIVE rejects. None of them proves the POLL
+// LOOP survives, and that is the defect @f6527cc9 actually measured: against a
+// stalling server the attempt count read 7,7,7,7,7 forever, while the control
+// (a server that refuses the socket) climbed 9,11,11,13,13. A dead loop and a
+// healthy one are indistinguishable from the rendered page -- it keeps showing
+// its last good numbers with their original timestamps.
+//
+// This drives the real store through repeated cycles and asserts the attempt
+// count GROWS. Deliberately not a threshold: a threshold encodes today's timing
+// and goes flaky on a loaded machine, and tonight's load average reached 121.
+// Growth is the property; any particular count is an accident of the box.
+test('the poll loop survives a stalling server — attempts GROW, they never freeze', async () => {
+  const { createTelemetryStore } = await import('./telemetry-store.js');
+
+  let requests = 0;
+  const store = createTelemetryStore({
+    baseUrl: 'http://stalled.invalid',
+    requestTimeoutMs: 20,
+    fetchImpl: stallingFetch({ onRequest: () => { requests += 1; } }),
+  });
+
+  /** @type {number[]} */
+  const ladder = [];
+  for (let cycle = 0; cycle < 4; cycle += 1) {
+    await store.pollOnce();
+    ladder.push(requests);
+  }
+
+  // Anti-vacuity: a loop that never issued a request would produce [0,0,0,0]
+  // and satisfy nothing below, but say so explicitly rather than relying on the
+  // growth check to imply it.
+  assert.ok(ladder[0] > 0, `the first cycle issued no requests at all (ladder ${ladder})`);
+
+  for (let index = 1; index < ladder.length; index += 1) {
+    assert.ok(
+      ladder[index] > ladder[index - 1],
+      `the poll loop stopped issuing requests after cycle ${index}: ${ladder}. ` +
+        'pollInFlight is stuck true, the finally never ran, and the page will show ' +
+        'its last good numbers forever while looking healthy.',
+    );
+  }
+});
