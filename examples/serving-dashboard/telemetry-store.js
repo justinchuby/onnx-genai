@@ -641,25 +641,6 @@ export function createTelemetryStore({
   }
 
   /**
-   * Build the field map for a healthy cycle.
-   *
-   * This is where the provenance table becomes enforcement: a DOCUMENTED_ZERO
-   * or NOT_PLUMBED field is emitted as `unavailable` even when the response
-   * carried a perfectly parseable number for it.
-   *
-   * @param {Record<string, SourceResult>} sources
-   * @param {number} timestampMs
-   */
-  /**
-   * The provenance metadata every field carries, regardless of its state.
-   *
-   * An unavailable field needs this just as much as a measured one: the audit
-   * table and the hover must be able to say WHICH server and WHICH endpoint a
-   * missing value would have come from, or "unavailable" is unfalsifiable.
-   *
-   * @param {object} entry A PROVENANCE entry.
-   */
-  /**
    * Read the loaded model set from whichever source answered.
    *
    * /v1/models is ungated (lib.rs:65 sits outside the admin gate) and lists
@@ -789,6 +770,15 @@ export function createTelemetryStore({
     );
   }
 
+  /**
+   * The provenance metadata every field carries, regardless of its state.
+   *
+   * An unavailable field needs this just as much as a measured one: the audit
+   * table and the hover must be able to say WHICH server and WHICH endpoint a
+   * missing value would have come from, or "unavailable" is unfalsifiable.
+   *
+   * @param {object} entry A PROVENANCE entry.
+   */
   function fieldMeta(entry) {
     return {
       source: entry.source,
@@ -803,6 +793,16 @@ export function createTelemetryStore({
     };
   }
 
+  /**
+   * Build the field map for a healthy cycle.
+   *
+   * This is where the provenance table becomes enforcement: a DOCUMENTED_ZERO
+   * or NOT_PLUMBED field is emitted as `unavailable` even when the response
+   * carried a perfectly parseable number for it.
+   *
+   * @param {Record<string, SourceResult>} sources
+   * @param {number} timestampMs
+   */
   function buildFields(sources, timestampMs) {
     // Resolved BEFORE the loop so every field in this snapshot carries the same
     // attribution, rather than some fields having it and others not.

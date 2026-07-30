@@ -19,7 +19,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -186,4 +186,243 @@ test('every shipped panel returns the teardown method the contract mandates', as
       `${file} exports mount() but never defines unmount(); the shell would leak its subscription`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// The checks above name the doc comments they guard, one at a time. That is
+// exactly as much coverage as somebody remembered to ask for, which makes this
+// file an instance of the defect it exists to catch: it went stale in its own
+// blind spots while looking directly at two known ones.
+//
+// The two checks below are structural instead. They do not know which comment
+// they are guarding, so a doc block added tomorrow is covered the moment it is
+// written, by nobody's decision.
+// ---------------------------------------------------------------------------
+
+/** Every shipping module (no tests, no fixtures), as [path, source] pairs. */
+function shippingModules() {
+
+  const out = [];
+  const walk = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name === 'testing') continue;
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(join(dir, entry.name), rel);
+      else if (entry.name.endsWith('.js') && !entry.name.includes('.test.')) {
+        out.push([rel, readFileSync(join(dir, entry.name), 'utf8')]);
+      }
+    }
+  };
+  walk(demoDir, '');
+  return out;
+}
+
+// A doc block is bound to its subject by ADJACENCY and nothing else. There is
+// no compiler to complain when that binding breaks, so when a function moves
+// and its comment does not, the comment does not become an error — it becomes
+// the documentation of whatever function happens to be underneath it now.
+//
+// This was live in four places, and one of them mattered a great deal: the
+// block describing `renderField` as "THE FUNCTION THAT MAKES THE HONESTY RULE
+// MECHANICAL", with its full @param list, had come to rest above
+// `headlineSentence`. Every editor tooltip, every reader scrolling past, and
+// every agent grepping for the honesty rule was reading that description
+// attached to a one-line string helper, while `renderField` itself — the choke
+// point the entire design rests on — carried no documentation at all.
+//
+// The signal is a doc block whose next non-blank line opens ANOTHER doc block.
+// Nothing legitimately sits between a comment and the thing it describes, so
+// this has no false positives by construction: it found four, all real.
+test('no doc block has drifted away from the thing it documents', () => {
+  const orphans = [];
+  let blocksScanned = 0;
+
+  for (const [path, src] of shippingModules()) {
+    const lines = src.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (!/^\s*\/\*\*\s*$/.test(lines[i])) continue;
+      let end = i;
+      while (end < lines.length && !/\*\//.test(lines[end])) end++;
+      const block = lines.slice(i, end + 1).join('\n');
+      // Only blocks that document an INTERFACE can be orphaned in a way that
+      // misleads. A free-standing prose block explaining a section is fine.
+      if (!/@(param|returns)/.test(block)) continue;
+      blocksScanned += 1;
+      let next = end + 1;
+      while (next < lines.length && lines[next].trim() === '') next++;
+      if (/^\s*\/\*\*/.test(lines[next] ?? '')) {
+        const subject = (block.split('\n')[1] ?? '').replace(/^\s*\*\s?/, '').trim();
+        orphans.push(`${path}:${i + 1} — "${subject.slice(0, 60)}"`);
+      }
+    }
+  }
+
+  assert.ok(
+    blocksScanned > 20,
+    `only ${blocksScanned} @param/@returns blocks found across the tree; this scan is broken, ` +
+      `not the tree clean`,
+  );
+  assert.deepEqual(
+    orphans,
+    [],
+    `these doc blocks are followed by another doc block, so they describe nothing and the ` +
+      `function below them is described by someone else's comment:\n  ${orphans.join('\n  ')}`,
+  );
+});
+
+/** Top-level keys of an object literal or a `{{...}}` type, braces balanced. */
+function topLevelKeys(inner) {
+  const cleaned = inner
+    .split('\n')
+    .map((l) => l.replace(/^\s*\*\s?/, ''))
+    .join('\n')
+    // Comments inside a return literal are prose, and prose contains commas.
+    // Without this the splitter reads an explanatory sentence as four more
+    // keys and reports the real key beneath it as missing -- a check that
+    // reddens correct code, which is worse than no check at all.
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  const parts = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of cleaned) {
+    if (ch === '{' || ch === '(' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ')' || ch === ']') depth -= 1;
+    if (depth === 0 && ch === ',') {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+  return parts
+    .map((p) => p.match(/^\s*(?:\.\.\.)?\s*(?:async\s+)?([A-Za-z_$][\w$]*)/))
+    .filter(Boolean)
+    .map((m) => m[1]);
+}
+
+/** Index of the `}` closing the `{` at `open`. */
+function matchBrace(src, open) {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth += 1;
+    else if (src[i] === '}' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+// A `@returns {{a, b}}` is the most load-bearing kind of doc comment we write:
+// it is the only description of a function's shape that a caller reads, and
+// destructuring a key that is not there yields `undefined` rather than an
+// error. A caller who follows a stale @returns gets a variable that is quietly
+// missing, at the call site, with no stack trace pointing anywhere near the
+// function whose comment lied.
+//
+// So every documented key must appear in the object the function actually
+// returns. Functions that return a variable rather than a literal are skipped
+// — the shape is not statically visible and a guess would be worse than
+// nothing — and the count of what was actually compared is asserted, because a
+// skip-everything scan and a clean tree look identical from here.
+test('a documented @returns shape names keys the function really returns', () => {
+  const drifted = [];
+  let compared = 0;
+
+  for (const [path, src] of shippingModules()) {
+    const pattern = /@returns \{\{([\s\S]*?)\}\}\s*\n\s*\*\/\s*\n(?:export )?(?:async )?function (\w+)/g;
+    let match;
+    while ((match = pattern.exec(src)) !== null) {
+      const [, shape, name] = match;
+      const documented = topLevelKeys(shape);
+      assert.ok(
+        documented.length > 0,
+        `${path}: parsed no keys out of ${name}'s documented return shape. The parser is ` +
+          `broken, which would silently pass this function forever.`,
+      );
+
+      const declaration = src.indexOf(`function ${name}`, match.index);
+      const bodyEnd = matchBrace(src, src.indexOf('{', declaration));
+      const body = src.slice(src.indexOf('{', declaration), bodyEnd);
+
+      // The last object literal returned: panels build their handle at the end.
+      let returned = null;
+      const returns = /return \{/g;
+      let hit;
+      while ((hit = returns.exec(body)) !== null) {
+        const open = body.indexOf('{', hit.index);
+        const close = matchBrace(body, open);
+        if (close > 0) returned = body.slice(open + 1, close);
+      }
+      if (returned === null) continue; // returns a variable; shape not visible
+
+      compared += 1;
+      const actual = topLevelKeys(returned);
+      const missing = documented.filter((k) => !actual.includes(k));
+      if (missing.length > 0) {
+        drifted.push(
+          `${path} ${name}(): documents ${JSON.stringify(missing)}, returns ${JSON.stringify(actual)}`,
+        );
+      }
+    }
+  }
+
+  assert.ok(
+    compared >= 5,
+    `only ${compared} return shapes were actually compared; the scan is finding nothing to ` +
+      `check rather than finding everything correct`,
+  );
+  assert.deepEqual(
+    drifted,
+    [],
+    `a caller destructuring these documented keys gets undefined, with no error:\n  ` +
+      `${drifted.join('\n  ')}`,
+  );
+});
+
+// CONTRACT.md tells panel authors where in the shell to look. A citation that
+// points past the end of the file it names is unambiguously wrong — there is
+// no line there to be right about — and it sends the one reader who tried to
+// verify the claim to nothing at all.
+//
+// Only CONTRACT.md is checked. Review records and verification logs cite code
+// AS IT WAS on the day they were written; holding those to today's line
+// numbers would demand we edit the evidence to match the conclusion.
+test('CONTRACT.md cites lines that exist in the files it names', () => {
+  const contract = readFileSync(join(demoDir, 'CONTRACT.md'), 'utf8');
+  const stale = [];
+  let checked = 0;
+
+  for (const [, path, line] of contract.matchAll(/`([\w./-]+\.(?:js|css|mjs)):(\d+)`/g)) {
+    let source;
+    try {
+      source = readFileSync(join(demoDir, path), 'utf8');
+    } catch {
+      stale.push(`${path}:${line} — no such file`);
+      continue;
+    }
+    checked += 1;
+    const total = source.split('\n').length;
+    if (Number(line) > total) stale.push(`${path}:${line} — that file has ${total} lines`);
+  }
+
+  assert.ok(checked > 0, 'found no file:line citations in CONTRACT.md; this scan is broken');
+  assert.deepEqual(
+    stale,
+    [],
+    `CONTRACT.md sends a panel author to a line that does not exist:\n  ${stale.join('\n  ')}`,
+  );
+
+  // Past-EOF is only the half of this that is decidable in general. The
+  // citation that matters most here is decidable exactly, because we know what
+  // it is supposed to be pointing AT: pin it to its content, not its number.
+  const cited = contract.match(/calls `handle\.unmount\(\)`\s*\n?\s*\(`dashboard\/index\.js:(\d+)`\)/);
+  assert.ok(cited, 'CONTRACT.md no longer cites where the shell calls handle.unmount()');
+  const shellLines = readFileSync(join(demoDir, 'dashboard/index.js'), 'utf8').split('\n');
+  assert.match(
+    shellLines[Number(cited[1]) - 1] ?? '',
+    /handle\.unmount\(\)/,
+    `CONTRACT.md points panel authors at dashboard/index.js:${cited[1]} for the teardown call, ` +
+      `but that line is something else now. The line the shell actually calls it on is ` +
+      `${shellLines.findIndex((l) => l.includes('handle.unmount()')) + 1}.`,
+  );
 });

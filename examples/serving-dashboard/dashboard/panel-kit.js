@@ -216,23 +216,6 @@ function ageSeparator() {
 }
 
 /**
- * Render a field as the §4.1 value element.
- *
- * THIS IS THE FUNCTION THAT MAKES THE HONESTY RULE MECHANICAL. It reads
- * `state` first and reaches `value` only on the branch where a value exists, so
- * a panel that renders through it cannot print a documented zero no matter how
- * carelessly it is written. Panels never format a value themselves.
- *
- * @param {{value?: unknown, state?: string, source?: string, unit?: string, label?: string, reason?: string, at?: number}|null|undefined} field
- * @param {object} [options]
- * @param {(value: any) => string} [options.format] Overrides the default formatter.
- * @param {boolean} [options.showUnit] Default true. The unit stays even when
- *   unavailable — WHICH thing is missing is itself information (§4.1).
- * @param {string} [options.label] Overrides `field.label` for the aria sentence.
- * @param {SourceClass} [options.sourceClass] Overrides `field.source`.
- * @returns {HTMLElement}
- */
-/**
  * First sentence of a reason, for the one caption that renders on screen.
  *
  * The full `reason` stays in `title` and `aria-label`, so nothing is lost for
@@ -261,6 +244,23 @@ function headlineSentence(reason) {
   return match ? match[1] : text;
 }
 
+/**
+ * Render a field as the §4.1 value element.
+ *
+ * THIS IS THE FUNCTION THAT MAKES THE HONESTY RULE MECHANICAL. It reads
+ * `state` first and reaches `value` only on the branch where a value exists, so
+ * a panel that renders through it cannot print a documented zero no matter how
+ * carelessly it is written. Panels never format a value themselves.
+ *
+ * @param {{value?: unknown, state?: string, source?: string, unit?: string, label?: string, reason?: string, at?: number}|null|undefined} field
+ * @param {object} [options]
+ * @param {(value: any) => string} [options.format] Overrides the default formatter.
+ * @param {boolean} [options.showUnit] Default true. The unit stays even when
+ *   unavailable — WHICH thing is missing is itself information (§4.1).
+ * @param {string} [options.label] Overrides `field.label` for the aria sentence.
+ * @param {SourceClass} [options.sourceClass] Overrides `field.source`.
+ * @returns {HTMLElement}
+ */
 export function renderField(field, options = {}) {
   const state = renderStateOf(field, { strict: options.strict });
   const label = options.label ?? field?.label ?? 'value';
@@ -684,20 +684,6 @@ export function withAcronyms(text, acronyms) {
 }
 
 /**
- * Coalesce repaint requests into a single `requestAnimationFrame`.
- *
- * demo-ux.md §3.3 rule 3: panels never set an interval and never paint per
- * event. At 32 concurrent streams, per-token DOM writes are thousands of layout
- * invalidations a second and AC23's 30 fps floor dies instantly.
- *
- * The returned scheduler also skips painting while the panel is hidden or
- * off-screen, which is most of AC23 on its own.
- *
- * @param {HTMLElement} rootElement
- * @param {() => void} paint
- * @returns {{request(): void, cancel(): void, setVisible(visible: boolean): void}}
- */
-/**
  * AC62. A debug-gated endpoint answers 404 when the server was launched without
  * `--enable-debug-endpoints`, and 404 is the cruellest status we could have been
  * given: 403 would say "you need permission" and diagnose itself, but 404 says
@@ -780,6 +766,20 @@ export function gatedRestartCommand() {
   return `onnx-genai-server --model <MODEL_DIR> --addr ${host} ${DEBUG_ENDPOINTS_FLAG}`;
 }
 
+/**
+ * Coalesce repaint requests into a single `requestAnimationFrame`.
+ *
+ * demo-ux.md §3.3 rule 3: panels never set an interval and never paint per
+ * event. At 32 concurrent streams, per-token DOM writes are thousands of layout
+ * invalidations a second and AC23's 30 fps floor dies instantly.
+ *
+ * The returned scheduler also skips painting while the panel is hidden or
+ * off-screen, which is most of AC23 on its own.
+ *
+ * @param {HTMLElement} rootElement
+ * @param {() => void} paint
+ * @returns {{request(): void, cancel(): void, setVisible(visible: boolean): void}}
+ */
 export function createRepaintScheduler(rootElement, paint, options = {}) {
   // A panel that forgets the store still paints perfectly and silently loses
   // its AC62 notice -- the failure would be invisible in exactly the situation
