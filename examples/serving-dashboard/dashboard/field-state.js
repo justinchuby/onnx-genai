@@ -449,6 +449,39 @@ export function ratioField(numerator, denominator, options = {}) {
     };
   }
 
+  // A numerator larger than its denominator is not a big ratio -- it is a
+  // statement that the two terms do not measure the same thing. `12 of 4`
+  // shipped to the flagship panel because every guard above this one passed:
+  // both inputs were genuinely MEASURED, neither was null, the denominator was
+  // non-zero. The contradiction lives in the RELATIONSHIP, and nothing was
+  // checking the relationship.
+  //
+  // The fix is not a clamp. Clamping to `4 of 4` would print a fabricated
+  // measurement, and clamping the geometry is precisely what hid this: the
+  // capacity bar has always drawn `Math.min(100, ...)`, so the picture looked
+  // ordinary while the text beside it said `12 of 4`. A clamp does not repair
+  // the contradiction, it conceals the louder half of it.
+  //
+  // Refusing is correct here because the terms really are incommensurable:
+  // `batch.capacity` is `min(max_batch, max_queue_depth)`, which is not a bound
+  // on `batch.active_size` at all. When this fires, the inputs disagree about
+  // what they describe, and no arithmetic over them yields a true sentence.
+  if (top > bottom) {
+    return {
+      value: null,
+      state: RENDER_STATES.UNAVAILABLE,
+      source: 'derived',
+      unit: '%',
+      label,
+      numerator: top,
+      denominator: bottom,
+      reason:
+        `This ratio is not being reported honestly: ${label} counted ${top} against a limit of ` +
+        `${bottom}. A part cannot exceed its whole, so the two numbers are not measuring the ` +
+        'same thing, and no percentage computed from them would be true.',
+    };
+  }
+
   const discrete = Number.isInteger(bottom) && bottom <= CONTINUUM_DENOMINATOR;
 
   return {

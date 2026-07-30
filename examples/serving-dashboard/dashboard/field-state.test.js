@@ -204,4 +204,70 @@ describe('ratioField — the batch-occupancy trap (demo-ux.md §5.3)', () => {
 
     assert.match(occupancy.reason, /max batch size/);
   });
+
+  it('refuses a ratio whose numerator exceeds its denominator', () => {
+    // The shipped `Batch occupancy: 12 of 4`. Every earlier guard passes here:
+    // both terms are MEASURED, neither is null, the denominator is non-zero.
+    // The contradiction is in the relationship between them, so it is only
+    // catchable by comparing them.
+    const occupancy = ratioField(measured(12), measured(4), { label: 'Batch occupancy' });
+
+    assert.equal(occupancy.state, RENDER_STATES.UNAVAILABLE);
+    assert.equal(occupancy.value, null, 'a contradictory ratio must not print a value');
+    assert.equal(occupancy.unit, '%', 'it must not offer an `of 4` form it just refused');
+  });
+
+  it('names both terms when it refuses, so the disagreement is diagnosable', () => {
+    // A bare "unavailable" would tell a maintainer nothing. The two numbers ARE
+    // the finding: they say which pair of fields disagree.
+    const occupancy = ratioField(measured(12), measured(4), { label: 'Batch occupancy' });
+
+    assert.equal(occupancy.numerator, 12);
+    assert.equal(occupancy.denominator, 4);
+    assert.match(occupancy.reason, /12/);
+    assert.match(occupancy.reason, /4/);
+  });
+
+  it('does not carry a fraction a bar could draw past full', () => {
+    // The capacity bar clamps with Math.min(100, ...), which is why this defect
+    // looked ordinary on screen while the text read `12 of 4`. With no fraction
+    // there is nothing for geometry to clamp, and nothing to hide.
+    const occupancy = ratioField(measured(12), measured(4));
+
+    assert.equal(occupancy.fraction, undefined);
+  });
+
+  it('still forms the ratio when the terms are merely equal', () => {
+    // A full batch is a real, honest state and the commonest one under load.
+    // A guard that reddened `4 of 4` would be refused by the next person to
+    // read the panel, and rightly.
+    const occupancy = ratioField(measured(4), measured(4));
+
+    assert.equal(occupancy.state, RENDER_STATES.OK);
+    assert.equal(occupancy.value, 4);
+    assert.equal(occupancy.unit, 'of 4');
+    assert.equal(occupancy.fraction, 1);
+  });
+
+  it('applies the same rule to continuum ratios, which cannot exceed 100%', () => {
+    // Not just an n-of-m rule: a utilization over a page count is the same
+    // claim about a part and a whole, and 120% is the same contradiction.
+    const utilization = ratioField(measured(20_000), measured(14_612));
+
+    assert.equal(utilization.state, RENDER_STATES.UNAVAILABLE);
+    assert.equal(utilization.value, null);
+  });
+
+  it('leaves an unavailable denominator reading as unavailable, not as a contradiction', () => {
+    // Ordering matters: a missing limit is a DIFFERENT finding from a limit
+    // that disagrees with its numerator, and the visitor-facing wording differs.
+    // If the new guard ran first it would mislabel every missing denominator.
+    const occupancy = ratioField(measured(12), { state: 'unavailable', value: null }, {
+      unavailableReason: "Occupancy needs the server's max batch size, which isn't surfaced.",
+    });
+
+    assert.equal(occupancy.state, RENDER_STATES.UNAVAILABLE);
+    assert.match(occupancy.reason, /max batch size/);
+    assert.doesNotMatch(occupancy.reason, /not measuring the same thing/);
+  });
 });
