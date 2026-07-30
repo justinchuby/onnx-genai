@@ -25,6 +25,15 @@ Files are taken from the local HuggingFace cache when present, so this normally
 performs no network I/O. Existing files are never overwritten: whatever the
 exporter wrote is authoritative.
 
+Because nothing is overwritten, *presence* of a file is not evidence that this
+build produced it. A ``tokenizer_config.json`` left behind by an earlier,
+different export satisfies any existence check while naming the wrong stop token
+- which is precisely how this repository's known-good scatter model came to be
+correct only by accident (see the FORCE guard in ``scripts/build_qwen.sh``). So
+this script finishes by resolving the stop token the *runtime* would resolve and
+failing when there is none, or when a file it did not write disagrees with the
+source model about what it is.
+
 Usage:
     write_tokenizer_assets.py MODEL_ID_OR_DIR OUTPUT_DIR
     write_tokenizer_assets.py MODEL_ID_OR_DIR OUTPUT_DIR --check
@@ -33,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -48,8 +58,52 @@ COMPANION_FILES = (
 )
 
 # Without this the model loads but will not stop generating, so its absence is
-# an error rather than a warning.
+# an error rather than a warning. Absence is not the only failure mode, though:
+# see stop_signal() for the stale-leftover case an existence check cannot see.
 REQUIRED_FILES = ("tokenizer_config.json",)
+
+
+def load_json(path: Path | None) -> object | None:
+    """Return parsed JSON, or None when the file is absent or unreadable."""
+    if path is None or not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def stop_signal(files: dict[str, Path]) -> tuple[str, str] | None:
+    """Return (stop token, filename) the runtime would resolve, or None.
+
+    Mirrors ``load_eos_token_ids`` in ``crates/onnx-genai-ort/src/tokenizer.rs``,
+    which reads ``generation_config.json`` first and falls back to
+    ``tokenizer_config.json``. Mirroring the real resolution order is the point:
+    a check that asks "does the file exist" answers a different question than
+    "will this model stop", and only the second one is what we ship.
+
+    None means nothing here declares a stop token, so generation would run to
+    the length cap on every request.
+    """
+    generation = load_json(files.get("generation_config.json"))
+    if isinstance(generation, dict):
+        eos_id = generation.get("eos_token_id")
+        # bool is a subclass of int; `"eos_token_id": true` is not a token id.
+        if (isinstance(eos_id, int) and not isinstance(eos_id, bool)) or (
+            isinstance(eos_id, list) and eos_id
+        ):
+            return str(eos_id), "generation_config.json"
+
+    tokenizer = load_json(files.get("tokenizer_config.json"))
+    if isinstance(tokenizer, dict):
+        eos = tokenizer.get("eos_token")
+        if isinstance(eos, dict):
+            eos = eos.get("content")
+        if isinstance(eos, str) and eos:
+            return eos, "tokenizer_config.json"
+
+    return None
 
 
 def resolve_source_dir(model_id: str) -> Path:
@@ -138,6 +192,56 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    # The files a real run leaves in place. Under --check nothing was written,
+    # so fall back to the source for what would have been copied - otherwise the
+    # dry run would report on a directory that no run ever produces.
+    effective: dict[str, Path] = {}
+    for name in COMPANION_FILES:
+        destination = args.output_dir / name
+        if destination.is_file():
+            effective[name] = destination
+        elif name in copied:
+            effective[name] = source_dir / name
+
+    resolved = stop_signal(effective)
+    if resolved is None:
+        print(
+            f"error: {args.output_dir} declares no stop token. The runtime reads "
+            "generation_config.json then tokenizer_config.json and neither names one "
+            "here, so this model would load, batch, and generate to the length cap on "
+            "every request.",
+            file=sys.stderr,
+        )
+        return 1
+
+    token, signal_file = resolved
+    print(f"stop token: {token} (from {signal_file})")
+
+    # A file that was already in place did not come from this build, and this
+    # script never overwrites it. If it disagrees with the source model about the
+    # stop token it is a leftover from a different export, and the model stops on
+    # the wrong token or not at all. Compare same-file signals only: a numeric id
+    # from generation_config.json and a literal from tokenizer_config.json are
+    # not comparable, and a false alarm here would train people to ignore it.
+    if signal_file in present:
+        source_resolved = stop_signal(
+            {name: source_dir / name for name in COMPANION_FILES}
+        )
+        if (
+            source_resolved is not None
+            and source_resolved[1] == signal_file
+            and source_resolved[0] != token
+        ):
+            print(
+                f"error: {signal_file} already in {args.output_dir} declares stop token "
+                f"{token!r}, but {args.model_id} declares {source_resolved[0]!r}. It was "
+                "kept because this script never overwrites, so it is a leftover from an "
+                "earlier, different export rather than a product of this build. Delete it "
+                "and re-run so this build writes its own.",
+                file=sys.stderr,
+            )
+            return 1
 
     return 0
 

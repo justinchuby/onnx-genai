@@ -499,6 +499,63 @@ if [ -n "$ASSETS_PYTHON" ]; then
     esac
   fi
 
+  # An existence check passes on a tokenizer_config.json left over from an
+  # earlier, different export - the exact accident that made this repository's
+  # scatter model correct by luck. The guard has to compare stop tokens, not
+  # count files. Verified against the pre-fix script: it exited 0 here.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  mkdir -p "$assets_tmp/stale_out"
+  printf '{"eos_token": "<|endoftext|>"}\n' >"$assets_tmp/stale_out/tokenizer_config.json"
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/stale_out" 2>&1)"; then
+    fail "a leftover tokenizer_config.json with the wrong stop token is an error" \
+      "it exited 0: $output"
+  else
+    case "$output" in
+      *"leftover from an earlier, different export"*)
+        pass "a leftover tokenizer_config.json with the wrong stop token is an error" ;;
+      *) fail "a leftover tokenizer_config.json with the wrong stop token is an error" \
+           "unhelpful error: $output" ;;
+    esac
+  fi
+
+  # The same comparison must stay quiet when the existing file agrees. A guard
+  # that cries wolf on a correct build gets ignored on a broken one.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  mkdir -p "$assets_tmp/agree_out"
+  printf '{"eos_token": "<|im_end|>"}\n' >"$assets_tmp/agree_out/tokenizer_config.json"
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/agree_out" 2>&1)"; then
+    pass "a pre-existing tokenizer_config.json that agrees is not flagged"
+  else
+    fail "a pre-existing tokenizer_config.json that agrees is not flagged" "$output"
+  fi
+
+  # Present but silent: the file exists, so every existence check passes, and
+  # the model still generates to the length cap on every request.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  mkdir -p "$assets_tmp/silent_out"
+  printf '{"chat_template": "x"}\n' >"$assets_tmp/silent_out/tokenizer_config.json"
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/silent_out" 2>&1)"; then
+    fail "a tokenizer_config.json declaring no stop token is an error" \
+      "it exited 0: $output"
+  else
+    case "$output" in
+      *"declares no stop token"*)
+        pass "a tokenizer_config.json declaring no stop token is an error" ;;
+      *) fail "a tokenizer_config.json declaring no stop token is an error" \
+           "unhelpful error: $output" ;;
+    esac
+  fi
+
+  # The guard must resolve the stop token the way load_eos_token_ids does -
+  # generation_config.json first - or it reports on a file the runtime never
+  # consults, which is a green light for a model that behaves differently.
+  mkdir -p "$assets_tmp/gen_out"
+  printf '{"chat_template": "x"}\n' >"$assets_tmp/gen_out/tokenizer_config.json"
+  printf '{"eos_token_id": 151645}\n' >"$assets_tmp/gen_out/generation_config.json"
+  gen_output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/gen_out" 2>&1 || true)"
+  assert_contains "generation_config.json resolves the stop token first, as the runtime does" \
+    "$gen_output" "from generation_config.json"
+
   rm -rf "$assets_tmp"
   trap - EXIT
 else
