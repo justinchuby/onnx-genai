@@ -1003,12 +1003,56 @@ coincidence*.
 
 ### Two guards in this directory disagree about that allowlist, and the count in the failing one is not the exposure
 
-The exposure ratchet is the only failing test on this branch. Its message is
-exact, and its class breakdown is where the interesting part is:
+**RETRACTED — DO NOT QUOTE THE TWO NUMBERS BELOW.** An earlier draft of this
+section opened *the exposure ratchet is the only failing test on this branch* and
+gave `94 fetchable, was 91`. **At the commit this document stamps, that is false
+in both parts**, and the author found it while verifying the stamp rather than
+while writing the claim:
 
 ```
-94 tracked files are fetchable at /demo/ that the page never loads (was 91).
-BY CLASS: TEST 64 · DESIGN 3 · INTERNAL_DOC 14 · TOOLING 10 · FIXTURE 3
+AT 37d0d72e — THE TREE THIS PR SHIPS
+  served-surface.test.js:155   MAX_SERVED_BUT_NOT_NEEDED = 85
+  full JS suite at that commit, one checkout    749 pass / 115 suites / EXIT 0
+  ⇒ THE RATCHET IS GREEN IN THE SHIPPED TREE. THERE IS NO FAILING TEST IN IT.
+
+LATER, AT ddef0391 — 73 COMMITS AHEAD, MEASURED BY ANOTHER AGENT
+  declared 88 · actual 91 · JS EXIT 1   ⇒ red, and correctly red
+```
+
+**`94` and `91` were measured at neither of those commits.** They were read once,
+written down, and never derived again while the branch moved underneath them —
+**the stored-value defect this document names three sections earlier, committed by
+its own author, inside the section that names it.** The two numbers are not a lie
+about the tree; they are a true reading of a moment, printed as a property of a
+branch.
+
+**What is true, and scoped to where it was measured.** At `ddef0391` the ratchet
+is red at 91 against a declared 88, and the largest class is **61 of our own test
+files, fetchable by any visitor to the demo**. That is a publishing decision
+nobody made. It is counted, it is falling — it was 96 — and **the guard that
+counts it is red on purpose**.
+
+**The declared number has moved again since that run**, which is the same lesson a
+second time: a figure quoted from this guard is only meaningful beside the commit
+it was read at, and this document has now got that wrong once itself.
+
+**And the author of that guard is the reason the red is worth shipping.** Faced
+with a one-character edit that would have turned the suite green, they refused it
+and wrote down why:
+
+> *"The count at that commit was 96, not 88. Nine of those are other people's
+> files that arrived while this number sat at 87. Absorbing them would cost one
+> character and would silently publish nine artefacts nobody declared. The
+> residual red is the correct output: it is not this guard failing, it is this
+> guard working."*
+
+**A declined keystroke, and a comment explaining the refusal so the next reader
+could not mistake the red for a breakage.** The class breakdown below is quoted
+from the `ddef0391` run and belongs to that commit, not to this one:
+
+```
+91 tracked files are fetchable at /demo/ that the page never loads (was 88).
+BY CLASS: TEST 61 · INTERNAL_DOC 14 · TOOLING 10 · DESIGN 3 · FIXTURE 3
 ```
 
 **`INTERNAL_DOC` is `/\.md$/`, and the server refuses `.md`.** Those fourteen
