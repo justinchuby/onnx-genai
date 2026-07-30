@@ -18,6 +18,7 @@ pub(super) struct ReasoningConfig {
     /// True when the template writes the opening delimiter itself, so the
     /// model's output begins inside the span and never emits an opener.
     pub(super) opened_by_template: bool,
+    marker_tokens: Vec<(u32, String)>,
 }
 
 /// Reasoning delimiters this model declares through its chat template, if any.
@@ -29,7 +30,26 @@ pub(super) fn detect_reasoning(template: Option<&ChatTemplate>) -> Option<Reason
     Some(ReasoningConfig {
         markers,
         opened_by_template,
+        marker_tokens: Vec::new(),
     })
+}
+
+impl ReasoningConfig {
+    pub(super) fn set_marker_token_ids(&mut self, start_id: Option<u32>, end_id: Option<u32>) {
+        self.marker_tokens.clear();
+        if let Some(id) = start_id {
+            self.marker_tokens.push((id, self.markers.start.clone()));
+        }
+        if let Some(id) = end_id {
+            self.marker_tokens.push((id, self.markers.end.clone()));
+        }
+    }
+
+    fn marker_text_for_token(&self, token_id: u32) -> Option<&str> {
+        self.marker_tokens
+            .iter()
+            .find_map(|(id, text)| (*id == token_id).then_some(text.as_str()))
+    }
 }
 
 fn template_opens_reasoning_for_generation(
@@ -186,6 +206,16 @@ fn emit_reasoning_segment(
     Ok(())
 }
 
+fn visible_token_text(token: &GenerateToken, reasoning: Option<&ReasoningConfig>) -> String {
+    if !token.text.is_empty() {
+        return token.text.clone();
+    }
+    reasoning
+        .and_then(|config| config.marker_text_for_token(token.token_id))
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn live_frame_due(draws: usize, last_draw: Instant, now: Instant) -> bool {
     draws == 0 || now.duration_since(last_draw) >= STATUS_REFRESH
 }
@@ -275,13 +305,14 @@ pub(super) fn run_generation_turn(
         // Timed here, at the point the token reaches the caller, because that
         // is the latency a user actually experiences.
         timings.token();
-        output.push_str(&token.text);
+        let token_text = visible_token_text(&token, reasoning);
+        output.push_str(&token_text);
         if stream {
             let segments = if let Some(tracker) = reasoning_stream.as_mut() {
-                tracker.push_segments(&token.text)
+                tracker.push_segments(&token_text)
             } else {
                 vec![ReasoningChunk {
-                    text: token.text.clone(),
+                    text: token_text,
                     is_reasoning: false,
                 }]
             };
@@ -467,6 +498,46 @@ mod tests {
 
         // Newline is not the last character even if one appears inside.
         assert!(needs_trailing_newline("line one\nno newline at end"));
+    }
+
+    #[test]
+    fn empty_reasoning_marker_token_text_is_restored_for_display() {
+        let mut config = ReasoningConfig {
+            markers: ReasoningMarkers::new("<think>", "</think>"),
+            opened_by_template: false,
+            marker_tokens: Vec::new(),
+        };
+        config.set_marker_token_ids(Some(151667), Some(151668));
+        let token = GenerateToken {
+            token_id: 151667,
+            text: String::new(),
+            finish_reason: None,
+        };
+
+        assert_eq!(visible_token_text(&token, Some(&config)), "<think>");
+
+        let mut stream = ReasoningStream::new(config.markers.clone(), config.opened_by_template);
+        let chunks = stream.push_segments(&visible_token_text(&token, Some(&config)));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "<think>");
+        assert!(chunks[0].is_reasoning);
+    }
+
+    #[test]
+    fn unrelated_empty_special_token_stays_hidden() {
+        let mut config = ReasoningConfig {
+            markers: ReasoningMarkers::new("<think>", "</think>"),
+            opened_by_template: false,
+            marker_tokens: Vec::new(),
+        };
+        config.set_marker_token_ids(Some(151667), Some(151668));
+        let eos = GenerateToken {
+            token_id: 151645,
+            text: String::new(),
+            finish_reason: None,
+        };
+
+        assert_eq!(visible_token_text(&eos, Some(&config)), "");
     }
 
     #[test]
