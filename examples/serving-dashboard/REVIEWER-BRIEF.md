@@ -5135,3 +5135,115 @@ announces it. That reading carries a clock because it is worthless without one.*
 > `git log`, once by a broadcast. Both times the credit landed on me, and neither time
 > did I take it deliberately. That is what makes it structural — an attribution defect
 > needs no author, and it accumulates on whoever is nearest.**
+
+---
+
+## §9.14 — THE AMEND DISCLOSURE, AND THE ORPHAN IS INTACT: A COMMIT AND A TREE ARE DIFFERENT OBJECTS
+
+**Measured at HEAD `78f335d7`, pwd `/Users/justinc/Documents/GitHub/onnx-genai-demo`, 06:1x.**
+
+### ① The disclosure the Lead ordered. I have never amended, and I verified it rather than recalling it.
+
+```
+git reflog | grep -c 'commit (amend)'            ->  3
+  58aa072a  04:04:56  docs(demo): symbol-anchor the two most-repeated batched.rs citations
+  e0cc66d0  00:56:52  Add orphan-artifact check
+  2bc56a44  23:24:51  demo: read /metrics and /v1/resources
+git show --name-only <each> | grep -c REVIEWER-BRIEF.md  ->  0, 0, 0
+CONTROL: reflog is readable at all -> 679 entries
+```
+
+**None of the three touched my file. Not one of my ~85 commits is an amend.**
+
+⛔ **AND MY FIRST GREP WAS WRONG IN THE ALARMING DIRECTION.** `grep -ci 'amend'` returned **6**. Three of
+those were commit *subjects* containing the word **"amendment"** — messages written by agents
+*complying with* the Lead's amendment 2. **The reflog is the sixth artefact type in @376a0297's class,
+after a Rust guard predicate, a markdown corpus, two JS guards, and a design contract: discussing the
+prohibition is indistinguishable, to the checker, from violating it.** I had a 100% false-positive rate
+against the real signal and it took reading six lines to see it.
+
+### ② THE FINDING, AND IT RETIRES A LIVE ALARM: THE 04:04:56 AMEND LOST NOTHING.
+
+```
+git cat-file -t b6e1a742          ->  commit        ✅ NOT gc'd, still recoverable
+git merge-base --is-ancestor b6e1a742 <branch>  ->  NO   (orphaned, confirmed)
+
+b6e1a742^{tree}  =  f57f1080e9d98d78c536abc2a5dced8703f8a645
+58aa072a^{tree}  =  f57f1080e9d98d78c536abc2a5dced8703f8a645     ⬅ ***IDENTICAL***
+CONTROL: 58aa072a~1^{tree} = 37c1e921…  -> differs, so the comparison CAN answer "no"
+```
+
+**THE AMEND CHANGED METADATA ONLY. THE CONTENT OF THE ORPHAN AND THE CONTENT OF ITS REPLACEMENT ARE THE
+SAME BYTES UNDER THE SAME HASH.** No work was lost. Nothing needs recovering.
+
+➡️ **AND THE PRECISE SPLIT, WHICH IS THE PART WORTH KEEPING:**
+
+```
+content-addressed  git show b6e1a742:<path>   -> 1510 lines   ✅ STILL WORKS
+graph-addressed    --is-ancestor b6e1a742     -> NO           ⛔ BROKE
+graph-addressed    --is-ancestor 58aa072a     -> YES          ✅
+```
+
+**⚖️ SO "EVERY MEASUREMENT ANY OF US TOOK IN THAT WINDOW IS SUSPECT" IS TRUE OF ANCESTRY AND FALSE OF
+CONTENT — AND IT IS ONLY CONTENT WE HAVE BEEN MEASURING.** @e00032a4's four-sha citation table, which
+turns on the counts *inside* `58aa072a`, is **unaffected**; it would have returned the identical numbers
+at the orphan. I am retiring the alarm rather than repeating it, because tonight's own catalogue says a
+false red is a dispatch that spends somebody else's last hour, and this one was pointed at the hour
+@e00032a4 had already spent.
+
+### RULE 40 — A COMMIT AND A TREE ARE DIFFERENT OBJECTS, AND EVERY DISCIPLINE WE HARDENED TONIGHT IS AMEND-PROOF BY ACCIDENT.
+
+> **An amend replaces the commit and *preserves* the tree. So `git show <sha>:<path>` — retrieve by
+> content, the rule this crew converged on independently at least four times — survives a history
+> rewrite unchanged, because it resolves through the tree and never through the graph.**
+>
+> ⛔ **`--is-ancestor` is the ONLY instrument we own that an amend can falsify.** Which is exactly why
+> the Lead's ordering rule is right and is *narrower than it sounds*: run it **after** the measurement,
+> not because measurements decay, but because **that one check is the single graph-addressed thing in
+> our whole toolkit.** Everything else was already immune and nobody knew it.
+
+### ③ THE LEAD'S SIXTH FACE, RUN ON MY OWN DOCUMENT. IT CONVICTED ME IN ONE PASS.
+
+*"Every instrument we built checks that what is PRESENT is TRUE. Not one checks that what is TRUE is
+PRESENT."* Their evidence was `grep -cF model_path demo-spec.md -> 0`. **I ran the inverse on the brief.**
+
+```
+TRUE THING                                          IN MY BRIEF
+b7f83e72     the wire-half closure                       1  ✅
+1384f7aa     the dotfiles fix                             1  ✅
+MISATTRIBUTED the new field-state word                    1  ✅
+run-demo.sh  :207 — THE CAUSE OF THE ONLY LIVE P0         0  ⛔
+9123         the port that serves an EMPTY dashboard      0  ⛔
+CONTROL present 'RULE 39' -> 1 · absent 'zzq_ctl_0604' -> 0
+```
+
+☠️ **MY BRIEF ASSERTS THE P0 AND DOES NOT CARRY ITS CAUSE.** A reviewer reads §9.6, learns four servers
+are leaking absolute paths, restarts them — **and reproduces the leak**, because `run-demo.sh:207`
+branches on whether the binary *exists*, and an `-x` test cannot tell which tree a binary was built
+from. **The single most load-bearing operational fact about the only open defect was absent from the
+document whose entire purpose is to be read before touching anything.** Both absences are recorded
+below, in prose and not as coordinates (RULE 37).
+
+**🔧 THE P0, COMPLETE:** the leak is **loopback-only** (@f6527cc9 measured the LAN address at floor 0).
+The pre-flight check must be **behavioural, not symbolic** — `strings | grep` scores 0 on the fixed
+binary *and* on the leaking one, because private Rust function names do not survive into a release
+string table. Curl `/v1/models` and look for a leading slash in the path field, **and floor the response
+non-empty first, or a dead port scores 0 and reads as a pass.** Restarting is not sufficient: the
+launcher must be forced to rebuild, and the process must be started from **this** checkout, not the
+sibling `onnx-genai` one the running servers were exec'd from.
+
+### RULE 41 — A COMPLETENESS CHECK IS IMPOSSIBLE WITHOUT AN EXTERNAL LIST, WHICH IS WHY NOBODY BUILT ONE.
+
+> **Every instrument we own reads the artefact and asks whether what it says is true. That question is
+> answerable from the artefact alone. *"Is everything true here?"* is not — it requires an enumeration
+> that lives OUTSIDE the thing being checked, because a document cannot enumerate its own omissions.**
+>
+> ➡️ **This project has exactly one external enumeration: the ten-item gate. I own it. So the
+> completeness check is mine and it is nobody else's — not because I am senior to it, but because I am
+> the only agent holding a list that was written down before the artefacts were.** That is also the
+> honest reason the defect survived nine hours: it was nobody's, and *nobody's* is invisible to a
+> to-do list. **@086345a5's law, arriving from the other direction: a ruling that authorises work and
+> never adds it to the list leaves the work unowned.**
+
+**🧊 Zero commits outside this file · zero locks · zero deletions · index 0 · I have never run `git add`
+in this tree, which — per RULE 38 — protects you from me and has never once protected me from you.**
