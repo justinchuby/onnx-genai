@@ -1596,3 +1596,59 @@ recurring subject arriving on the order to write this brief: **the ruling was
 correct when reasoned and stale when issued, and executing it verbatim would have
 published a closed finding as an open one.** Rule 5 says rulings decay. It does
 not exempt the ruling that tells you to write down a decayed ruling.
+
+### 8.13 The mtime signal that convicted the model will convict every correct model
+
+Gate item 9 ("the model is rebuildable") was closed twice, independently, and the
+second close is the stronger one: this brief closed it by **parsing** the
+companion files; `1cb42f0e` closed it by **executing** a clean scratch build into
+an empty `OUT_DIR` and running `scripts/verify_model.sh` to exit 0, with the
+generation terminating on its own (`finish_reason=stop`). *Parsing shows the file
+is well-formed. Executing shows the artefact it belongs to actually works.*
+
+**They then reported that the instrument used in the first close is about to
+invert, and they are right.** `shutil.copy2` preserves the source's mtime, so
+companion files copied into a model directory inherit dates from the upstream
+snapshot. The "July-12 companions beside a July-29 model" split -- which this
+brief cited as evidence of staleness -- **appears identically in a model built
+correctly minutes ago.** The signal that correctly convicted tonight's model will
+convict every correct model from now on. That is @086345a5's and @e00032a4's
+*guard shaped like the incident*, except it flips to false **positives**, which is
+the failure mode that gets an instrument deleted rather than merely distrusted.
+
+**Their remedy is right, and measuring it makes it righter than the reason given.
+Do not replace the mtime table with a written-vs-copied table.** Across all
+nineteen `qwen2.5-0.5b*` directories:
+
+```
+tokenizer_config.json   19 dirs   1 DISTINCT HASH   (5b5d4f65…)
+vocab.json              19 dirs   1 DISTINCT HASH
+merges.txt              19 dirs   1 DISTINCT HASH
+tokenizer.json          19 dirs   2 DISTINCT HASHES  -> c0382117 x18
+                                                        3fd16973 x1  (scatter-v2)
+```
+
+`tokenizer.json` was proposed as a member of the *written* set whose dates are
+therefore real. **It is genuinely per-build on one directory out of nineteen.** On
+the other eighteen it is byte-identical with an inherited July-12 date --
+indistinguishable, by any test, from a copy.
+
+> **Written-versus-copied is a property of the build run, not of the filename.**
+> The same file is written by one build and copied by the next. Any table that
+> classifies files by name is correct on one model here and wrong on eighteen.
+
+So the fix is not a better classification -- it is **not needing one**. Hash the
+companions against a fresh helper run. That removes the file-identity question
+entirely, and it is why the worry retires while the finding stands: the leftover
+companions are **byte-identical to what a build writes today**, so the provenance
+was accidental and the content was always correct. *No number measured tonight
+needs revisiting on account of the stop token.*
+
+And note the discipline in how that conclusion was reached, because it is the
+rarest move in this document: they found a mechanism that appeared to refute the
+staleness finding, and then **killed their own refutation with a date** -- the
+model was built at 22:39 and the helper that would explain its companions did not
+land until 23:42. *A mechanism that postdates the artefact cannot explain it.*
+One file survives all of this untouched: `inference_metadata.yaml` at 23:33 is
+uniquely hashed on that model, so its timestamp is real evidence and the flag on
+it stands.
