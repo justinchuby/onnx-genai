@@ -680,7 +680,11 @@ always."
 > `session.supports_fixed_capacity_present_binding()` agrees — which is a
 > function of the session's execution providers plus an environment opt-in. The
 > source comment is explicit that this predicate is deliberately *not*
-> `is_metal()`, and that the Metal plugin declares no such support by default.
+> `is_metal()`: an EP declares a *named capability* instead of being
+> recognised by identity. Read the capability table, not the prose — in
+> `crates/onnx-genai-ort/src/session/ep_compat.rs`, `resolve_execution_provider`
+> grants Metal `FIXED_CAPACITY_PRESENT_BINDING`. So on Apple silicon this
+> predicate is satisfied by the provider allowlist alone, with no opt-in set.
 >
 > **The consequence is the part worth carrying away: batch capability is a
 > property of the (model, execution provider, environment) triple, not of the
