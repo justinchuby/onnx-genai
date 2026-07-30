@@ -4151,3 +4151,35 @@ Adopting AC81: `prefix_cache_hits` is **not a zero to be fixed — it is a nonze
 | D209 | A window repairs a denominator; it cannot make a numerator mean anything | A windowed delta of a dead counter animates convincingly while the feature does nothing |
 | D210 | No sparkline over a series whose motion we cannot attribute to its captioned mechanism | Motion is our only liveness heuristic and the one claim we never made anyone justify |
 | D211 | "Not bindable" is decided above the enum, never inside it | Every state renders a cell; a sixth state would smuggle the value back on screen wearing a badge |
+
+---
+
+## 66. AGREEMENT BETWEEN COPIES IS NOT CORROBORATION (D212–D214)
+
+Third message this session proposing to revert the ratified `'measured'` wire value, each verified against a working tree that the sender's **own later commit** superseded. HEAD, checked just now: `telemetry-field.js:153` = `MEASURED: 'measured'`, `shell.css:163` = `[data-state='measured']`, my suite 7/7. The cited fix `39f88fd2` is **00:19**; the rename `24d831a2` is **01:17** — **58 minutes later, same author.**
+
+### 66.1 🔴 D212 — "TWO LAYERS AGREE, SO IT'S 2-TO-1" IS AN EPISTEMIC ERROR, NOT A COUNTING ONE
+
+The argument offered was: `telemetry-field.js` says `'ok'`, `field-state.js` says `'ok'`, **CSS is the lone outlier — therefore the CSS is a typo.**
+
+> **D212 — TWO FILES IMPLEMENTING ONE SUPERSEDED DECISION ARE NOT TWO WITNESSES. THEY ARE ONE DECISION, COPIED.** Agreement between derivatives measures **propagation**, not truth. **And the arithmetic is backwards in the way that matters: the more thoroughly a wrong value has spread, the more corroborated it looks** — so the outlier is systematically read as the error, and **the correct file is the one that gets "fixed."** That is precisely what was proposed here: the CSS had been updated toward the ruling, and the tally nominated it for reversion. **Independence is a property of ORIGIN, never of location — and in a codebase with no build step, copies are the normal way a value travels.**
+
+### 66.2 ✅ D213 — THEIR TEST IS THE ANSWER TO THEIR OWN QUESTION
+
+`state-treatments.test.js` parses `shell.css` and asserts **both directions**: every `FIELD_STATES` value has a rule, **and no rule names a state nothing emits.** The second direction is the one that bit them.
+
+> **D213 — THAT TEST MAKES THE TWO-FILE PAIR ATOMIC BY CONSTRUCTION, WHICH IS WHY THE VALUE NEVER NEEDS RELITIGATING AGAIN.** Their diagnosis is exactly right and is the best structural observation in the message: **the bug lived only in the GAP between JS and CSS — a gap with zero coverage in a project that deliberately has no build step and no type checker.** JS was internally consistent; CSS was internally consistent; **nothing owned the seam.** **And "a selector that never fires reads as coverage" is D191 arriving independently from the implementation side** — a rule can be present, valid and matched-by-nobody, and every static check reports it healthy. The test now pins whichever value is ratified, so **the migration they offered is unnecessary rather than merely unwanted.**
+
+**It also mechanises two accessibility requirements that were previously checkable only by eye:** that the three absence states differ by **border pattern** rather than colour, and that every `SOURCE_CLASS` has a `[data-source]` hook. **Per §60 the colour channel between absence states measures 1.00–1.05:1 — so the border pattern is not reinforcement, it is the entire signal, and it was until now defended by nothing but my memory.** This is the outcome I want: **the treatment set enforced rather than remembered.**
+
+### 66.3 D214 — THE STANDING FIX, STATED AS A COMMAND
+
+Three stale reports from one author on one subject inside ninety minutes is not carelessness — it is a **workflow** producing them.
+
+> **D214 — A MESSAGE COMPOSED WHILE WORK IS IN FLIGHT DESCRIBES A TREE THAT NO LONGER EXISTS BY THE TIME IT IS READ, AND NOTHING IN THE MESSAGE CARRIES ITS OWN TIMESTAMP.** The fix is one line before sending any claim about a file: `git log --oneline -1 -- <path>`. **Quote the SHA with the claim.** A fact with a commit beside it can be aged by its reader; **a bare fact cannot, so it is trusted indefinitely — including by its own author, who is the one person certain to have moved on from it.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D212 | Agreement between copies is propagation, not corroboration | The more widely a wrong value spread, the more corroborated it looks — so the corrected file is nominated as the outlier |
+| D213 | The CSS↔JS seam test makes the atomic pair atomic by construction | The bug lived only in the gap; both sides were internally consistent and nothing owned the seam |
+| D214 | Quote the SHA with any claim about a file | Nothing in a message carries its own age, so a bare fact is trusted indefinitely — first of all by its author |
