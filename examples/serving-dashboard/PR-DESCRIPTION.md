@@ -470,3 +470,67 @@ here.** Re-run rather than believe.
   since a clean clone does not have them.
 - **A green gate is not a satisfied reviewer**, and a red one is not an
   unsatisfied product. Different instruments measure different things.
+
+---
+
+## Known gap: two routes to one capability, one loud and one silent
+
+**This is the sharpest engineering finding of the review, it is not a
+regression, and nothing in this PR changes it. It is written down so the next
+person does not have to rediscover it.**
+
+Continuous batching can be reached two ways, and the two fail in opposite
+directions with nothing in the code marking them as different:
+
+| route | when the precondition is missing | posture |
+|---|---|---|
+| static cache | **refuses to boot, naming every missing key** (`reject_undeclared_static_cache`) | fails **closed and loud** ✅ |
+| shared buffer | **silently degrades to per-request** | fails **open and quiet** ⚠️ |
+
+**The loud one is genuinely excellent and should be the model.** A stale config
+cannot silently switch off the headline capability on that axis: the server
+declines to start and tells you exactly what it wanted. **That is the same
+three-state discipline this dashboard argues for, already implemented in the
+engine by someone who got there first.**
+
+**The quiet one carries a second, subtler defect: the reason it reports is
+mis-signed at birth.** Three independent preconditions are collapsed into a
+single boolean, and the boolean keeps no record of which one failed:
+
+```
+crates/onnx-genai-engine/src/decode/metadata.rs::shared_buffer
+    supports_present_binding
+ && session.past_present_share_buffer_supported()   <- a fact about the HOST
+ && metadata_max_context.is_some()                  <- a fact about the MODEL
+```
+
+Downstream, `crates/onnx-genai-engine/src/batched.rs` renders one sentence for
+all three: *"continuous batching requires a STATIC-CACHE or shared-buffer
+past/present model."* **That sentence blames the model file, and it is printed
+even when the model was fine and the execution provider declined.** No test
+pins the attribution — `past_present_share_buffer_supported` appears in **zero**
+test files.
+
+**So an operator whose execution provider declined is told to fix their model,
+at warn level, on the wire, and on this page.** ***This is the `MISATTRIBUTED`
+classification happening one floor below the layer that has a word for it — and
+the honesty layer cannot detect it, because it can only be as honest as the
+reason it is handed.*** **Every improvement we make to the disclosure surface
+makes the wrong attribution more visible and more authoritative.**
+
+**And the reason this one cannot be fixed by anything this project has learned
+tonight:** the capability is negotiated with the execution provider at load
+time, so **the same model bytes batch on one machine and refuse on another, and
+the refusal names the bytes.** The one artefact the operator can inspect, diff
+and re-download is the one the message accuses — **and it is identical on both
+machines.** ***Unfalsifiable from the operator's side.***
+
+> **We pinned SHAs, detached worktrees, hashed response bodies and stamped build
+> IDs. Here is a capability that identical bytes do not determine. You cannot
+> pin your way out of this one — it has to be read off the running process.**
+
+**The fix is small and keeps the existing plumbing, which is good:** return a
+reason rather than a boolean — `EpDeclined`, `SessionDeclined`, `NoMaxContext` —
+and let the renderer show the one it actually got. **The decision is correct;
+only its explanation is lossy.** ***A capability that turns on the host should be
+reported as a fact about the host.***
