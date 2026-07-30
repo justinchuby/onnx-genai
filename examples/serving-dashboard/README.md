@@ -245,7 +245,7 @@ places:
 | path | handler | borrow | behaviour |
 |---|---|---|---|
 | batching (`:8123`) | `driver.rs:773` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
-| dynamic (`:8124`) | `driver.rs:850` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
+| dynamic (`:8124`) | `driver.rs:977` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
 
 The shared-vs-exclusive borrow *is* the fix — nothing else differs.
 
@@ -302,7 +302,7 @@ you conclude that half the dashboard is broken.
 **Continuous batching and paged KV are mutually exclusive in this runtime
 today.** `ContinuousBatchManager` holds a batched decode session, a tokenizer
 and its rows — and never touches `engine.kv_cache`
-(`crates/onnx-genai-engine/src/engine/batched.rs:101-110`). Static-cache models
+(`crates/onnx-genai-engine/src/batched.rs:101-110`). Static-cache models
 use runtime-owned in-place KV buffers, which bypass the page table and the
 prefix trie entirely.
 
@@ -726,7 +726,7 @@ that demonstrably could have seen it**.
 rather than merely observed.** A null result tells you nothing about *why*.
 Reading the code supplies the why, and it predicts every number above. There
 are two prefix branches in `prepare_session_prefix`
-(`crates/onnx-genai-engine/src/engine/runtime.rs:1020`), and **only one of them
+(`crates/onnx-genai-engine/src/engine/runtime.rs:1046`), and **only one of them
 restores anything**:
 
 | | branch | what it does |
@@ -895,7 +895,7 @@ to stage, and every stall you see actually happened.
 
 > **Concurrency is not the lever here, and that is a fact about this runtime
 > rather than a staging preference.** The dynamic server runs generation
-> *inline* on the driver thread (`run_fallback_generation`, `driver.rs:956`), so concurrent requests
+> *inline* on the driver thread (`run_fallback_generation`, `driver.rs:1083`), so concurrent requests
 > **queue rather than overlap** — raising concurrency against the paged-KV
 > server adds waiting, not pressure. Concurrency drives Scenario A, on the
 > scatter server, which has no block table at all. Pressure on the pool comes
@@ -1318,7 +1318,7 @@ fix something that is not broken.
 | Gate | Example | What actually fixes it |
 |---|---|---|
 | **Runtime flag** | `/v1/debug/kv` | Pass `--enable-debug-endpoints`. |
-| **Compile-time feature** | `/metrics` — `#[cfg(feature = "metrics")]` at `crates/onnx-genai-server/src/lib.rs:128` | **Rebuild with the feature on. No flag can help**, and the server will not tell you the difference. (It is on by default, so this bites people who trimmed features.) |
+| **Compile-time feature** | `/metrics` — `#[cfg(feature = "metrics")]` at `crates/onnx-genai-server/src/lib.rs:129` | **Rebuild with the feature on. No flag can help**, and the server will not tell you the difference. (It is on by default, so this bites people who trimmed features.) |
 | **Config path** | `/demo/` — gated on `state.config.demo_assets_dir` at `crates/onnx-genai-server/src/lib.rs:92` | Pass `--demo-assets-dir`, or launch from the repo root. The path is resolved **relative to the current working directory**, and a missing directory is treated as *"no assets configured"* rather than as an error — so the server boots happily and only `/demo` is missing. |
 
 The last row is the nastiest, because it is the only one where the server had

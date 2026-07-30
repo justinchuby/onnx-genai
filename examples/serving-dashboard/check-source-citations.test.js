@@ -104,8 +104,18 @@ function citations() {
 // path, require the tracked file to end with it.
 function resolve({ path, file }) {
   if (path.includes('/')) {
-    const exact = trackedSourceFiles.filter((p) => p === path || p.endsWith('/' + path));
-    if (exact.length > 0) return exact;
+    // A citation that spells out a DIRECTORY is making a stronger claim than a
+    // bare filename, and it must be graded against that stronger claim. This
+    // deliberately does NOT fall through to the basename lookup below: doing so
+    // silently rescued `.../src/engine/batched.rs` -- a path with a directory
+    // segment that does not exist -- because a file named `batched.rs` lives
+    // elsewhere in the tree. The citation resolved, the test stayed green, and
+    // the reader following the path landed nowhere.
+    //
+    // A wrong full path is WORSE than a bare filename, not better: it looks
+    // authoritative, it is what a reader copies, and the basename fallback
+    // graded it as if it had claimed nothing.
+    return trackedSourceFiles.filter((p) => p === path || p.endsWith('/' + path));
   }
   return byBasename.get(file) ?? [];
 }
