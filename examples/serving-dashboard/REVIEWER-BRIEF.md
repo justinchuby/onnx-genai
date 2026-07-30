@@ -5,7 +5,15 @@ that landed on only one code path, the four fields whose captions are wrong, two
 ratios that behave oppositely on purpose, and what we refused to ship.
 
 ```
-MEASURED-AT: ef7c91b9          verified 07:33:25. Prior anchor was `0bc86726`, 326 commits
+MEASURED-AT: d5da0061          re-stamped 08:39 at review point `d5da0061`. SCOPE OF THIS
+                               RE-READ, STATED SO IT CANNOT BE OVERSOLD: item 10's acceptance
+                               cell, the three coordinate rows, and the citation paragraph at
+                               :218 were re-measured against HEAD today. THE REMAINDER OF THIS
+                               FILE WAS NOT RE-READ LINE BY LINE. A stamp is a claim about what
+                               I looked at, not a blessing on 6,000 lines.
+                               Prior anchor was `ef7c91b9` (07:33:25), which measured a strict
+                               ancestor of this review point and was therefore going red.
+                               Before that, `0bc86726`, 326 commits
                                stale and the same sha @c0de4c2e proved is 210 behind the
                                dual-green pin. An anchor is the tree I READ, not today's HEAD:
                                `3b701494` is an ancestor of `ef7c91b9` (three-state merge-base
@@ -214,11 +222,28 @@ sha 26c0b38a, node v25.6.1, the SAME commit both times
   detached worktree,    porcelain 0   ->  584 tests  583 pass  1 FAIL   FAIL
 ```
 
-The failure is real and it is in the branch: `check-source-citations.test.js`
-reports that `README.md` cites `driver.rs:1083` while that file has 1077 lines.
-The reason the shared tree hides it is one uncommitted edit — `driver.rs` is
-**1133 lines on a desk and 1076 lines in `HEAD`**. The citation is valid on
+The failure was real and it was in the branch: `check-source-citations.test.js`
+reported that `README.md` cites `driver.rs:1083` while that file had **1076 lines
+at `26c0b38a`** (the guard printed `1077`; it counts the trailing line
+differently — the disagreement is one line and does not change the verdict).
+The reason the shared tree hid it was one uncommitted edit — `driver.rs` was
+**1133 lines on a desk and 1076 lines at `26c0b38a`**. The citation was valid on
 exactly one machine in the world.
+
+> ⚠️ **RE-MEASURED AT `2634de58` (08:39): `driver.rs` IS NOW 1286 LINES, AND
+> `driver.rs:1083` RESOLVES TO A PLAUSIBLE LINE OF CODE (`permit,`). THE RED WENT
+> SILENT WITHOUT ANYONE FIXING THE CITATION — THE FILE GREW PAST ITS OWN BROKEN
+> ANCHOR.** ***GROWTH LAUNDERS A STALE CITATION.*** A citation past EOF is the one
+> form of this defect that cannot hide, because `1083 > 1076` is arithmetic. Once
+> the file grows, the arithmetic stops complaining and the citation is simply
+> wrong and quiet.
+>
+> Every line count in this paragraph is now stamped with the sha it was true at,
+> because the paragraph — *the one describing a stale-number defect* — had itself
+> gone stale by the exact mechanism it describes. It said `1077 lines` in the
+> present tense against a file that is now 1286. **Cite the symbol, or stamp the
+> number with the sha. A bare number in a reviewer-facing document is a claim with
+> no expiry and no owner.**
 
 This is the inverse of every staleness problem in this document. A stale
 measurement was true once and decayed. **This one was never true of the branch
