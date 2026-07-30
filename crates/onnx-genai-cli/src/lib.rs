@@ -143,6 +143,12 @@ struct SamplingArgs {
     /// template. Use for base (non-chat) models or to reproduce raw prompts.
     #[arg(long)]
     raw: bool,
+
+    /// Select which preloaded LoRA adapter (by the NAME given to `--adapters`)
+    /// applies to this request. Omit to run the base model. Requires two or more
+    /// adapters to have been preloaded with `--adapters` (native backend only).
+    #[arg(long = "select-adapter", value_name = "NAME")]
+    select_adapter: Option<String>,
 }
 
 /// Shared CPU resource controls for `generate` and `run`.
@@ -209,6 +215,7 @@ impl SamplingArgs {
             options.greedy = true;
         }
         options.stop_sequences = self.stop.iter().cloned().map(StopSequence::Text).collect();
+        options.adapter = self.select_adapter.clone();
         options
     }
 }
@@ -240,6 +247,31 @@ struct EngineArgs {
     /// adapter forces the native decode backend.
     #[arg(long, value_name = "PATH")]
     adapter: Option<std::path::PathBuf>,
+
+    /// A named PEFT LoRA adapter for the Phase-2 multi-adapter pool, as
+    /// `NAME=PATH` (repeatable). Provide this flag two or more times to preload
+    /// several adapters at once; a generation request then selects one by NAME
+    /// per request (native backend only, design §J). A single `--adapters`
+    /// entry collapses to the same always-on single-adapter fast path as
+    /// `--adapter`. Mutually exclusive with `--adapter`.
+    #[arg(long = "adapters", value_name = "NAME=PATH", value_parser = parse_named_adapter, conflicts_with = "adapter")]
+    adapters: Vec<(String, std::path::PathBuf)>,
+}
+
+/// Parse a `NAME=PATH` named-adapter argument. The identifier is the stable name
+/// a request selects the adapter by; an empty name or missing `=` is rejected.
+fn parse_named_adapter(value: &str) -> Result<(String, std::path::PathBuf), String> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=PATH, got {value:?}"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("adapter name must not be empty in {value:?}"));
+    }
+    if path.is_empty() {
+        return Err(format!("adapter path must not be empty in {value:?}"));
+    }
+    Ok((name.to_string(), std::path::PathBuf::from(path)))
 }
 
 impl EngineArgs {
@@ -258,6 +290,31 @@ impl EngineArgs {
             config.lora_adapter = Some(adapter.clone());
             // A LoRA adapter is a native-runtime feature; select the native
             // backend unless the user explicitly asked for a different one.
+            if matches!(self.backend, EngineDecodeBackend::Auto) {
+                config.decode_backend = EngineDecodeBackend::Native;
+            }
+        }
+        if !self.adapters.is_empty() {
+            // `--adapter` and `--adapters` are mutually exclusive; clap rejects
+            // the combination at parse time (`conflicts_with = "adapter"`), so
+            // this arm only runs when `--adapter` is absent. The engine also
+            // rejects both being set (defense in depth) for direct
+            // `EngineArgs`/`EngineConfig` construction that bypasses clap.
+            debug_assert!(
+                self.adapter.is_none(),
+                "clap must reject --adapter together with --adapters before to_config"
+            );
+            if self.adapters.len() == 1 {
+                // A single named adapter collapses to the always-on DIRECT fast
+                // path (the perf gate: never build the pool/segments machinery
+                // for ≤1 adapter). Preserve the user-facing NAME so a
+                // `--select-adapter NAME` request for this same adapter is a
+                // no-op instead of erroring as if nothing were loaded.
+                config.lora_adapter = Some(self.adapters[0].1.clone());
+                config.lora_adapter_name = Some(self.adapters[0].0.clone());
+            } else {
+                config.lora_adapters = self.adapters.clone();
+            }
             if matches!(self.backend, EngineDecodeBackend::Auto) {
                 config.decode_backend = EngineDecodeBackend::Native;
             }

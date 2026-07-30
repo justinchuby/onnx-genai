@@ -98,12 +98,17 @@ and `:643-651` describe `adapters/`, `support.lora`, and
 ## A. Adapter wire format
 
 ### Prior art (ORT GenAI `.onnx_adapter`)
-ORT GenAI ships adapters as a flatbuffer container of named LoRA tensors, keyed
-by the PEFT convention `<module>.lora_A.weight` / `<module>.lora_B.weight`, with
-rank and `alpha` carried alongside (`scale = alpha / rank`). We **borrow** the
-logical contract (naming scheme, A/B factorization, rank/alpha semantics and the
-"name == graph-input name" matching rule) but **do not** depend on their
-flatbuffer schema or reader.
+ORT GenAI delegates adapter loading to ONNX Runtime's version-1 FlatBuffers
+container (`adapter_schema.fbs`, file identifier `TORT`). The container carries
+format/adapter/model versions and named tensor parameters, but **does not carry
+rank, alpha, or scale metadata**. Parameter names equal graph-input names. The
+current ORT GenAI model builder emits names such as
+`model.layers.0.attn.q_proj.lora_A.MatMul.weight`, stores A/B already in
+`[K,r]`/`[r,N]` orientation, and multiplies B by the PEFT scale before export.
+Our interoperable reader therefore derives rank from the paired dimensions and
+records `scale = 1` (`alpha = rank`) without rescaling the already-scaled B
+tensor. Arbitrary graph-input naming and graphs that apply scale separately are
+not inferable from the container alone and are rejected rather than guessed.
 
 ### Recommendation: direct PEFT/safetensors ingestion (primary)
 Load stock PEFT adapters directly — `adapter_config.json`
@@ -555,3 +560,756 @@ names as **to confirm against that export**.)
 - **Top risks:** (1) OptionalOverride executor change correctness/byte-identity;
   (2) export-specific QKV layout (fused vs split vs linear-attn); (3) CUDA r=0
   zero-fill + capture (deferred). Close behind: int4+fp16 argmax accuracy.
+
+---
+
+## Changes from Phase 1 design (P2 addendum)
+
+Phase 1 (§A–§I) shipped on this branch (P1–P4 committed): a **single fixed
+adapter per session**, applied by feeding the injected `MatMul→MatMul→Mul→Add`
+delta branch's `A_t`/`B_t` through the executor `OptionalOverride` mechanism
+(`executor/state.rs:286`, `build_with_overrides`), with a fail-loud target
+manifest (`lora_inject.rs`). §J below adds **Phase 2: many adapters live at once
+in one batch**, executed by a dedicated **LoRA subsystem** — a paged A/B weight
+pool plus a grouped custom op (SGMV/BGMV) — reached as a **custom operator**
+injected into the base graph and run in the **single existing executor plan**.
+Nothing in §J re-litigates the settled §A–§I decisions; it changes only two
+things and unifies a third:
+
+1. **Injection target.** Phase 1 injects a 4-node delta subgraph per projection;
+   Phase 2 injects **one grouped custom op per target projection** (§J.1). The
+   4-node subgraph becomes the *degenerate pool-of-one* case of the same op
+   (§J.5) — the recommendation is to **unify**, not to keep two code paths.
+2. **Weight delivery.** Phase 1 feeds one adapter's `A_t`/`B_t` as override
+   inputs; Phase 2 delivers a **handle to a paged pool of many adapters** through
+   the existing lazy-weight seam (`ep-api/src/weight.rs:95`, dispatch at
+   `dispatch.rs:335-342`) plus a **per-batch-row segment descriptor** (§J.1,
+   §J.2). Per-request `adapter_id` threads scheduler→op (§J.4).
+3. **Manifest source.** Phase 1 derives the manifest from the graph (fail-loud);
+   Phase 2 makes the **exporter-declared manifest in `InferenceMetadata` the
+   primary source**, with graph discovery demoted to a fail-loud fallback (§J.6).
+
+---
+
+## J. Phase 2: multi-adapter subsystem (grouped LoRA op)
+
+**Settled architecture (do not re-litigate).** Multi-adapter LoRA execution is a
+**dedicated LoRA subsystem** — a paged A/B weight pool plus an SGMV/BGMV grouped
+kernel — exposed as a **custom operator injected into the base graph and executed
+in the one existing executor plan**. It is **not** separate per-adapter sessions
+and **not** per-layer session interleaving. Rationale: LoRA acts mid-layer on
+`q/k/v/o/gate/up/down` and feeds straight back into the forward pass, so an
+opaque per-adapter session would force a cross-session round-trip **per targeted
+projection per token** during decode — exactly the hot path. Keeping the delta
+inline as a graph op means the batched activations never leave the plan. This is
+the Punica ([2310.18547]) / S-LoRA ([2311.03285]) industrial pattern: one batched
+LoRA op + a paged adapter pool, with grouped GEMM (SGMV) for prefill and batched
+gather-GEMV (BGMV) for decode.
+
+### J.1 The custom batched-LoRA op
+
+**Contract (per targeted projection).** One op instance per target projection
+(`q`/`k`/`v`/`o`/`gate`/`up`/`down`), placed exactly where Phase 1 places its
+delta branch — reading the base projection's activation `x` and producing a delta
+that is **`Add`-ed onto the base `MatMulNBits` output**, reusing the **Phase-1
+`Add` wiring verbatim** (`lora_inject.rs` `inject`, the terminal
+`Y = Add(Y_base, scaled)`). The base int4 `MatMulNBits` is **never touched**.
+
+```
+// Illustrative op contract (NOT final Rust). Domain pkg.nxrt, op GroupedLoraDelta.
+GroupedLoraDelta(
+    x:        Tensor[tokens, K],       // slot 0: base projection activation (fp16/fp32)
+    segments: Tensor[tokens] (i32)     // slot 1: per-row adapter/segment routing descriptor
+                                       //         (row -> pool page id; see §J.2/§J.4)
+    pool:     WeightHandle (lazy)      // slot 2: handle/ref to the paged A/B pool (§J.2)
+) -> delta: Tensor[tokens, N]          // added onto the base projection output by the reused Add
+// Attributes (baked at injection, from the manifest §J.6):
+//   k, n                : this projection's dims (n = slice width for a fused qkv target)
+//   fused_slice         : Option<(offset,width)> — the qkv column range this op owns
+//   target_module_id    : selects which A/B factor within each adapter's page this op reads
+//   max_rank            : column budget for the intermediate [tokens, r] (capacity/padding)
+```
+
+- **Output is the delta only.** The op emits `[tokens, N]`; the existing `Add`
+  applies it. For a **fused `qkv_proj`** target we keep the Phase-1 decision: the
+  op owns one Q/K/V **column slice** (`fused_slice` from `FusedGroup`,
+  `lora_inject.rs:134` — `slices: [(role, offset, width); 3]`), so three op
+  instances (or one op with a per-role segment field) scatter into the fused
+  `[.., N]` output and a single `Add` folds them onto `Y_base`. MLP `gate/up/down`
+  and attention `o_proj` are standalone (`Placement::Direct`).
+- **`x` is the whole batch's rows for that projection**, already laid out
+  `[tokens, K]` by the plan; `segments[row]` says which adapter (which pool page)
+  row *r* uses. Mixed adapters in one batch is the entire point (§J.3, §J.4).
+
+**Where it plugs into our op-registration + dispatch (exact seam).**
+1. **Registration.** Add a factory in
+   **`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs`**, in `build_cpu_registry()`
+   (`mod.rs:250`), alongside the existing custom ops:
+   ```rust
+   reg.register(OpKey::new("GroupedLoraDelta", "pkg.nxrt", 1),
+                Box::new(grouped_lora::GroupedLoraDeltaFactory));
+   ```
+   This is byte-for-byte the same seam used for `BlockQuantizedMatMul`
+   (`mod.rs:260`), `IndexShare`, `SparseKvGather`, `CompressedSparseAttention`
+   (`mod.rs:312-319`). Custom ops live in the private **`pkg.nxrt`** domain by
+   convention. The kernel is a new `kernels/grouped_lora.rs` implementing
+   `KernelFactory::create` (`ep-api/src/registry.rs:39-40`) → `Box<dyn Kernel>`
+   (`ep-api/src/kernel.rs:448`).
+2. **Dispatch.** No change to the dispatch loop: `exec_kernel_node`
+   (`dispatch.rs:293`) resolves the op through `cache.get_or_create`
+   (`dispatch.rs:415`) by `(op_type, domain, opset)` and runs it via
+   `ctx.execute_kernel` (`dispatch.rs:499`). The op reads `x` and `segments` as
+   ordinary `TensorView`s.
+3. **Pool delivery through the lazy-weight seam.** The pool handle (slot 2) is
+   delivered exactly like the block-quantized-MoE offload weight: extend
+   **`LazyWeightBoundary`** (`ep-api/src/weight.rs:95`) with a `GroupedLora`
+   variant and its `matches("pkg.nxrt","GroupedLoraDelta")` (`weight.rs:101`).
+   The dispatch already gates lazy delivery on
+   `LazyWeightBoundary::_.matches(domain, op_type)` and routes lazy inputs to
+   `Kernel::execute_with_inputs(&[KernelInput], …)` (`dispatch.rs:335-342`,
+   `kernel.rs:466`). The kernel receives the pool as a `WeightHandle::Lazy`
+   (`weight.rs:166`) and indexes pages per row — **no per-token copy of adapter
+   weights into the plan**, and the pool is never materialized wholesale.
+4. **Overrides retire for the pool case.** `segments` is a fresh per-run input
+   (fed by name, like today's overrides). The pool handle is bound once per
+   session and rebound on eviction (§J.2). The Phase-1 `OptionalOverride` A_t/B_t
+   inputs are **not** used by the grouped op (§J.5).
+
+**Constant-input safety.** `segments` and the pool handle must be excluded from
+the per-dispatch `constant_inputs` set so the kernel never prepacks stale routing
+or weights — the same guard Phase 1 already applies to overrides
+(`dispatch.rs:360,400-412`). For the pool handle this is automatic (a lazy
+`WeightHandle` is delivered, not a constant initializer); for `segments`, register
+it like an override (feedable-by-name, non-constant).
+
+### J.2 Paged adapter weight pool
+
+**Layout.** One host arena holding many adapters' already-transposed factors
+(§A: `A_t[K,r]`, `B_t[r,N]`, contiguous, fp16/fp32). The natural unit is a
+**page = one (adapter, target_module) factor pair**, because ranks differ
+per-module (`rank_pattern`) and per-adapter:
+
+```
+Pool {
+  arena:  Vec<u8>,                        // one contiguous host allocation (aligned)
+  pages:  Slab<PageId, PagePlacement>,    // PagePlacement { adapter_id, module_id, kind: A|B,
+                                          //   byte_offset, k, r, n, dtype }
+  index:  HashMap<(AdapterId, ModuleId), (PageId /*A*/, PageId /*B*/)>,
+  lru:    IntrusiveLru<PageId>,           // eviction order
+  budget: ByteBudget,                     // scheduler/src/byte_budget.rs:84
+}
+```
+
+- **Adapter-major vs rank-major.** Store **adapter-major** (an adapter's A_t/B_t
+  factors are contiguous per module) so activating an adapter touches one
+  cache-warm region and BGMV decode gathers one page per row. Rank-major (all
+  A_t of equal rank co-located) only helps if we ever pad every adapter to a
+  single global rank, which the per-module `rank_pattern` forbids (§A). Keep
+  adapter-major; the grouped kernel indexes by `(page.byte_offset, r, n)`.
+- **Alignment / contiguity.** The kernel needs each `A_t`/`B_t` page **contiguous
+  and 64-byte aligned** (MLAS/AVX GEMM tile requirement; the CPU MatMul already
+  assumes contiguous inputs, §A "CUDA rejects strided views"). The loader already
+  produces contiguous transposed factors (`lora_inject.rs` `LoraModuleSpec.a_t`
+  is `[K,r]` contiguous `TensorData`); the pool copies each into an aligned arena
+  slot at load. A per-page 0-padding of `r` up to a small alignment (e.g. next
+  multiple of 8) simplifies the SGMV group stride without merging ranks.
+- **Load / evict.** LRU, **byte-budgeted through the existing `ByteBudget`**
+  (`byte_budget.rs:84` — `try_reserve`/`release`/`reconfigure`, saturating,
+  thread-safe, live-reconfigurable), the same primitive the KV scheduler uses.
+  Loading an adapter `try_reserve(a_bytes + b_bytes)`; on shortfall, evict LRU
+  cold pages (not the ones referenced by any live batch row — see §J.4 pinning)
+  until it fits, then `release` the evicted bytes. Reuse the `LoraManager` LRU
+  scaffolding (`onnx-genai-engine/src/lora/manager.rs`) — it already caches
+  decoded adapters under a byte budget; Phase 2 promotes that cache into the
+  arena-backed pool and adds the page index.
+- **Per-row indexing.** `segments[row] -> AdapterId` (or directly a `PageId`
+  pair) → `index[(adapter, this_op.module_id)]` → `(A_page, B_page)` →
+  `(byte_offset, r, n)`. The op computes `delta[row] = scale · (x[row] @ A_t) @
+  B_t` reading straight from the arena at those offsets. Decode gathers one
+  `(A,B)` pair per row (BGMV); prefill groups rows by page (SGMV).
+
+### J.3 SGMV (prefill) vs BGMV (decode) kernels
+
+Both are variants of the **same** `GroupedLoraDelta` kernel; the op picks by the
+batch's token/segment shape.
+
+- **BGMV — decode (M≈1 per sequence, one token each, many sequences).** Each row
+  is one token that may use a different adapter → a **batched gather + GEMV**:
+  for row *r*, gather `(A_t, B_t)` for `segments[r]`, compute
+  `x[r,K] @ A_t[K,r] -> t[1,r]`, then `t @ B_t[r,N] -> delta[1,N]`. This is the
+  Punica BGMV shape (bandwidth-bound; one page-pair per row). Rows are
+  independent → trivially parallel over the batch. This is the steady-state hot
+  path and must be allocation-free per token (reuse a `[batch, max_rank]`
+  intermediate scratch, sized by the `max_rank` attribute).
+- **SGMV — prefill (variable-length segments, one adapter per prompt).** A prompt
+  is a **contiguous segment** of many tokens sharing one adapter → a **segmented
+  GEMM**: sort/group rows by adapter, then per group do a dense
+  `X_g[m_g,K] @ A_t -> T_g[m_g,r]`, `T_g @ B_t -> D_g[m_g,N]`. This amortizes the
+  GEMM over the segment (compute-bound, tiles well). The **segment descriptor**
+  is a CSR-like `(group_ptr[num_groups+1], group_adapter[num_groups])` derived
+  from `segments` — Punica's SGMV layout.
+
+**Grouping / segment descriptor.** The op consumes `segments: [tokens]` (page/
+adapter id per row). SGMV builds group offsets from runs of equal id (prefill is
+already adapter-homogeneous per prompt, so runs are long); BGMV uses `segments`
+directly as a per-row gather index. The descriptor is produced by the scheduler
+(§J.4) and fed by name each run.
+
+**Numerics — fp32 accumulators are mandatory.** Accumulate both GEMMs in **fp32**
+even when `A_t`/`B_t` and `x` are fp16. This is the **flash-attention lesson from
+this codebase**: fp16 accumulation flips razor-thin greedy-argmax ties at
+realistic activation scale (§I item 5; CUDA flash-attention required fp32 accum,
+`docs/CUDA_FLASH_ATTENTION.md`). The delta rides on a wide-`N` int4 projection,
+so fp16 accum over `K` then `r` compounds error. **Contract: inputs/weights may
+be fp16; the two matmul accumulators and the `scale·` multiply are fp32; the
+delta is cast to the branch dtype only at the final store**, matching the §E
+golden tolerance. Reuse the existing golden test harness (§E) with mixed adapters.
+
+**Single-adapter fallback (must be cheap).** When a whole batch resolves to **one
+adapter** (`segments` is constant, the common single-tenant case), the op must
+**collapse to the Phase-1-equivalent dense path** — one `X[M,K] @ A_t @ B_t`, no
+grouping, no gather, no per-row indexing overhead — i.e. exactly the two dense
+MatMuls Phase 1 emits. Detect a constant `segments` (or a `num_groups==1` SGMV
+descriptor) and take the dense branch. This guarantees Phase 2 is never slower
+than Phase 1 for the dominant single-adapter workload (§J.5).
+
+### J.4 Scheduler routing / per-request `adapter_id`
+
+**Threading `adapter_id`.** Add `adapter_id: Option<AdapterId>` to
+`scheduler::Request` and `RunningSequence` (`scheduler/src/lib.rs:45,62`) and to
+the engine's `ContinuousBatchRow` (`batched.rs:72`). Each step, the batch builder
+emits the **segment descriptor** by reading each row's `adapter_id` → `PageId`
+(pool index, §J.2) and writing `segments[physical_row]`. That descriptor is the
+op's slot-1 input. `adapter_id == None` maps to a reserved **null page** whose
+factors are the `r=0` empty delta (the base-only row), so mixed base+adapter
+batches are free.
+
+- **Two batching modes, phased.**
+  - **P2c: adapter-homogeneous batching (simpler first step).** Group requests so
+    a batch shares one adapter (or base-only). `segments` is then constant and the
+    op takes the §J.3 dense fallback — correct, and it validates the whole
+    subsystem (pool, injection, manifest, descriptor plumbing) **without** needing
+    the grouped kernel to be fast. This is the safe on-ramp.
+  - **P2e: true mixed-adapter batch (the payoff).** Different rows carry different
+    adapters in one decode step; BGMV/SGMV do the grouped work. This is the whole
+    reason for grouped GEMM and is where throughput under many hot adapters wins.
+- **Resource pressure / admission.** When many adapters are hot, admission must
+  consider **pool bytes**, not just KV bytes. Gate adapter activation on the
+  pool's `ByteBudget` (§J.2); if a request's adapter cannot be paged in without
+  evicting a page **referenced by a live row in the current batch**, either defer
+  the request or evict a cold non-referenced adapter. **Pin** every page
+  referenced by a running row (a small refcount over `RunningSequence.adapter_id`)
+  so eviction never pulls weights out from under an in-flight step. Surface pool
+  pressure through the existing pressure protocol (`scheduler/src/pressure.rs`)
+  the same way KV pressure is surfaced.
+
+### J.5 Reconciliation with Phase 1 — **unify** (recommended)
+
+**Recommendation: the grouped op subsumes the 4-node subgraph; retire the
+override A/B path for LoRA.** The `GroupedLoraDelta` op handles the
+single-adapter case as a **pool-of-one** (§J.3 dense fallback), so Phase 1's
+`MatMul→MatMul→Mul→Add` becomes a strict special case with no behavioral
+difference (same math, same `Add`, same fp32 accumulation). Keeping two injection
+shapes doubles the surface that must stay numerically identical and byte-safe.
+
+- **What stays:** the injection *pass* (`lora_inject.rs`), the **manifest** and
+  `FusedGroup`/`Placement` types (`lora_inject.rs:134-160`), the **transpose-at-
+  load** factor format (§A), the reused terminal **`Add`** wiring, the
+  `LoraManager` LRU/`ByteBudget`, and every §E correctness test (they now target
+  the op). The `OptionalOverride` executor mechanism **stays as a general
+  executor capability** (it is not LoRA-specific — `state.rs:286` note) and is
+  still available; LoRA simply stops being its consumer.
+- **What changes:** `inject` emits **one `GroupedLoraDelta` per target** instead
+  of four nodes per target; A/B come from the **pool handle**, not override
+  inputs; `scale` folds into the op (fp32). The `OverrideFeed` type
+  (`lora_inject.rs`) is replaced by the `segments` descriptor + pool binding.
+- **Migration.** Land the op behind the manifest so P4's single-adapter path
+  keeps working through the **dense-fallback op** first (P2a/P2b), prove
+  bit-parity against the Phase-1 4-node subgraph on the §E golden (both must
+  produce identical output for one adapter), then delete the 4-node emission
+  (P2f). Retiring, not coexisting, avoids a permanent two-path numerics burden.
+  **If** the grouped op slips, the fallback is simply *not deleting* the 4-node
+  path — coexistence is the contingency, unification is the goal.
+
+### J.6 Manifest from `InferenceMetadata` (declared-primary)
+
+Phase 2 makes the **exporter-declared manifest the primary source**; graph
+discovery (Phase 1's `build_manifest`) becomes the **fail-loud fallback**.
+
+- **Schema.** Extend `LoraCapabilities`
+  (`crates/onnx-genai-metadata/src/schema/adapters.rs:17`) — today advisory only
+  (`available`/`default`/`target_module_policy`/`supports_hot_swap`) — with an
+  optional **declared target manifest**: per semantic module → `{ layer, node
+  name / value name, K, N, fused_slice: Option<(offset,width)>, role, per-module
+  rank/alpha policy }`. This is the machine form of §C's `TargetEntry`/
+  `FusedGroup`, authored by the exporter instead of rediscovered. Purely additive
+  → same schema major version (the module's existing forward-compat rule).
+- **How it drives injection.** When present, `lora_inject` builds its
+  `LoraManifest` **directly from the declared entries** (resolving node/value
+  names to `NodeId`/`ValueId`), skipping structural discovery. It still
+  **validates** declared dims/offsets against the actual graph (K/N from the base
+  `MatMulNBits` attrs, fused width sums to `N`) and **fails loud** on any mismatch
+  — the declaration is trusted for *intent* but verified for *correctness*, so a
+  stale export can never silently corrupt attention (§C invariant preserved).
+- **Absent-manifest behavior.** No declared manifest ⇒ fall back to Phase-1
+  structural discovery (`build_manifest`), which is already fail-loud on
+  unrecognized layouts (fused vs split vs linear-attn, §C/§H). So a model exported
+  before the Mobius change still works on the split/fused Qwen families and still
+  refuses the layouts it cannot prove.
+- **Cross-repo dependency (Mobius exporter).** Emitting the declared manifest is a
+  **Mobius exporter change** (write the target manifest into `InferenceMetadata`
+  at export time). Track it as an external dependency; Phase 2 does **not** block
+  on it because the graph-discovery fallback covers the known families. Flag it as
+  the recommended long-term source of truth (it removes the per-export structural
+  guessing risk entirely for linear-attention and future layouts).
+
+### J.7 CUDA sub-phase (wired dense grouped path)
+
+`pkg.nxrt::GroupedLoraDelta` is registered by the native CUDA EP and mirrors the
+CPU operator contract. The CUDA kernel reads `x` and the per-row Int32/Int64
+`segments` route, groups rows by adapter on the host, concatenates every group’s
+row indices into one persistent device table with a single upload, and launches
+one dense `X_group @ A_t @ B_t` computation per adapter using its table offset
+before scattering directly into `delta`. This avoids cross-stream reuse of a
+shared row table while groups are in flight. Referenced 64-byte-aligned factor
+pages are copied lazily into persistent device allocations. Base-only rows
+(`segments < 0`) remain zero. Float32, Float16, and BFloat16
+activations/factors are supported; **both dot products accumulate in fp32**, and
+narrowing occurs only at the final output store.
+
+The mixed route `[A,B,base,A]` is numerically verified on an NVIDIA H200 against
+both the CPU `GroupedLoraDelta` kernel and an independent closed-form reference.
+The CUDA implementation is deliberately an eager CUDA-graph seam: dynamic
+`segments` are copied to the host for grouping, and factor pages may be bound on
+first use. `capture_support()` therefore rejects capture with an actionable
+reason rather than risking stale routes or changing page pointers inside a
+captured graph.
+
+Still deferred within P2g+: device-side grouping/BGMV/SGMV, capture-safe fixed
+page tables and same-shape route updates, asynchronous page prefetch/eviction,
+and removal of the small per-run `segments` device-to-host transfer.
+
+### J.8 Phased plan (P2a…P2g)
+
+Ordered by dependency. P2a–P2f are CPU; P2g+ is CUDA.
+
+| Phase | Deliverable | Deps | Risk | Size |
+|---|---|---|---|---|
+| **P2a** | **Paged pool + `ByteBudget` + page index** (host arena, adapter-major, LRU, pin refcount). Promote `LoraManager` cache into the arena. | P4 | med | L |
+| **P2b** | **`GroupedLoraDelta` op — dense single-adapter path only** (the §J.3 fallback), registered at `mod.rs:250` in `pkg.nxrt`, pool delivered via a new `LazyWeightBoundary::GroupedLora`. Prove **bit-parity vs the Phase-1 4-node subgraph** on the §E golden. | P2a | **high** | L |
+| **P2c** | **Adapter-homogeneous batching**: `adapter_id` on `Request`/`RunningSequence`/`ContinuousBatchRow`, constant-`segments` descriptor, pool pinning + pressure admission. End-to-end many-adapters-one-at-a-time. | P2b | med | M |
+| **P2d** | **BGMV decode kernel** (per-row gather-GEMV, fp32 accum, allocation-free scratch) + **SGMV prefill kernel** (segmented GEMM, CSR descriptor). Numerics: mixed-adapter golden + on-model argmax check. | P2b | **high** | XL |
+| **P2e** | **True mixed-adapter batch**: variable `segments`, scheduler emits per-row descriptor, fused-QKV scatter across three slices. The throughput payoff. | P2c, P2d | med | L |
+| **P2f** | **Unify / retire Phase-1 4-node path** (§J.5) once P2b/P2e prove parity. Delete the 4-node emission; keep `OptionalOverride` as a general executor capability. | P2e | low | M |
+| **P2-mobius** | **Declared manifest in `InferenceMetadata`** (§J.6) + exporter emit (cross-repo). Runtime consumes declared-primary, graph-discovery fallback. Independent of P2d. | P2b | med | M (runtime) + external |
+| **P2g+** | **CUDA sub-phase** (§J.7): device pool, direct bindings, capture-safe null page, capture invalidation. | P2f | **high** | XL |
+
+**Biggest risk — the BGMV decode kernel's numerics-and-speed both at once (P2d).**
+It is on the steady-state per-token hot path, must be allocation-free, and must
+carry fp32 accumulators without regressing decode latency or flipping argmax ties
+on real models. A grouped gather-GEMV that is either too slow (worse than serial
+per-adapter) or too loose (fp16 accum) sinks the value proposition. Mitigation:
+land the dense fallback (P2b) and adapter-homogeneous mode (P2c) first so the
+subsystem is correct and useful **before** the grouped kernel exists, and gate
+P2d behind the §E golden **plus** an on-model argmax-parity check.
+
+**Biggest unknown — real mixed-adapter batch composition, and whether grouped
+GEMM actually beats group-by-adapter at our batch sizes.** Punica/S-LoRA numbers
+assume many concurrent adapters and large batches; our decode batches may be
+small and often single-adapter (§J.3 fallback covers that). If production traffic
+is mostly one-adapter-per-batch, P2e's grouped kernel is dead weight and P2c is
+the real product. We do **not** yet have workload traces to size this. **Honest
+recommendation: build P2a–P2c first, measure adapter-mixing in real traffic, and
+only then commit to P2d/P2e.** Do not build the grouped kernel on faith.
+
+**Where the decided architecture meets a real codebase constraint (owner should
+know):**
+1. **The lazy-weight seam is currently hard-coded to one boundary.**
+   `LazyWeightBoundary` is an enum with a single `BlockQuantizedMoe` variant and
+   `matches` is a `matches!(self, Self::BlockQuantizedMoe) && domain=="pkg.nxrt"
+   && op_type=="BlockQuantizedMoE"` literal (`ep-api/src/weight.rs:95-105`).
+   Delivering the pool handle this way needs a **new variant + a second `matches`
+   arm**, and the dispatch gate (`dispatch.rs:335-342`) generalizing from one
+   boundary to a set. Small, but it is a real API touch, not free.
+2. **`segments` must be a first-class per-run input, not an initializer.** It
+   changes every step and must be excluded from `constant_inputs`
+   (`dispatch.rs:360,400-412`) exactly like an override — otherwise a kernel could
+   prepack stale routing. Registering a non-constant, feedable-by-name **runtime**
+   input (not an override with a default) is a slightly different shape than the
+   P1 `OptionalOverride`; confirm the executor can carry a plain optional runtime
+   input alongside the override set.
+3. **Fused-QKV forces either three ops or a per-role segment.** A single op cannot
+   cleanly own three disjoint output slices with three independent ranks; the
+   clean encodings are (a) three op instances (one per Q/K/V slice, each with its
+   `fused_slice`) sharing one `Add`, or (b) one op with a per-role sub-descriptor.
+   (a) is simpler and reuses the Phase-1 slice logic (`FusedGroup.slices`); it
+   means up to 3× the op count on fused exports. Acceptable, but note it.
+
+### J.9 What is wired end-to-end today (multi-adapter reachability)
+
+*Status as of 2026-07-29 (branch `feat/native-lora-p2`, PR #374).* The grouped
+subsystem (§J.1 op, §J.2 pool, §J.6 declared-manifest resolution) was fully
+built and unit-tested but had **zero production callers** (notably the
+`BudgetedLoraPool` control plane); this revision wires the shared byte budget
+into grouped admission (see "Shared byte-budget governance" below). This section
+records what is now reachable end-to-end versus what remains deferred. Nothing
+here re-litigates §J.1–§J.8; it only states the current wiring.
+
+**User-facing surface (CPU, native backend).**
+
+* **CLI.** The existing `--adapter <PATH>` (single, always-on) is unchanged. A
+  new **repeatable** `--adapters <NAME=PATH>` preloads several named adapters at
+  once, and `--select-adapter <NAME>` on `generate`/`run` chooses which
+  preloaded adapter applies to that request (omit ⇒ base model). `--adapter` and
+  `--adapters` are mutually exclusive. A **single** `--adapters` entry collapses
+  to the same always-on single-adapter fast path as `--adapter` (see fast-path
+  note below) — the plural, per-request-selectable path engages only with **two
+  or more** adapters.
+* **Config.** `EngineConfig.lora_adapters: Vec<(String, PathBuf)>` (the plural,
+  grouped form) sits beside the existing `lora_adapter: Option<PathBuf>` (single,
+  DIRECT). `GenerateOptions.adapter: Option<String>` selects a preloaded adapter
+  by its identifier per request. The identifier is the explicit `NAME`, else the
+  file stem.
+
+**Fast-path preservation (the hard perf gate).** The grouped pool, the
+`GroupedLoraDelta` op, and the `lora.segments` feed are constructed **only when
+two or more adapters are configured**. Zero adapters and a single adapter both
+stay on the Phase-1 DIRECT 4-node path — the pool/registry/segments machinery is
+never built for ≤1 adapter, so the no-adapter and single-adapter paths are
+byte-for-byte the code they were before this change.
+
+**How an adapter identifier threads request → segments.**
+`GenerateOptions.adapter` (a name) → `NativeDecodeSession::select_lora_adapter`
+resolves it to an `AdapterId` via the session's name→id map (unknown name ⇒
+typed `UnknownLoraAdapter` error at admission, **never** a silent base
+fallback) → the resolved id is held as the session's *active route* → each
+decode step writes that route into a **reused** `lora.segments` Int32 buffer
+(cleared and refilled in place; capacity retained across steps, so there is no
+per-token heap allocation for the routing tensor after warmup) and binds it as
+the non-constant runtime input the grouped op reads. A `None` route (no adapter)
+writes `-1`, which the kernel treats as base-only.
+
+**Injection generalization.** `inject_grouped_multi` admits **N** adapters under
+distinct `AdapterId`s sharing one op set per target projection; adapter identity
+comes **only** from `segments`. All adapters in one grouped session must target
+an identical module set (same module name + layer index per position), enforced
+fail-loud via `AdapterModuleSetMismatch`; this is an honest constraint for this
+pass, not a silent truncation.
+
+**Shared byte-budget governance (now wired).** Grouped-adapter admission is
+routed through `BudgetedLoraPool` (engine `lora/pool.rs`) via a `LoraPoolSink`
+control-plane trait (`onnx-runtime-ep-api`). Before the data-plane
+`LoraWeightPool` admits each `(adapter, module)` factor pair, the pool reserves
+that pair's page-aligned resident bytes from the **shared** `ByteBudget` — the
+same instance the KV/device subsystem uses (`EngineResourceGovernor::byte_budget`,
+threaded from `engine/load.rs` through `NativeDecodeSession` into the session
+builder). An over-budget adapter set fails loud with a typed
+`LoraInjectError::PoolBudgetExceeded { requested, used, limit, available,
+shortfall }` instead of over-committing device memory. The reservation is
+attached to the finished pool as its residency owner, so it releases exactly
+once on session drop (preserving the RAII release). The ≤1-adapter DIRECT fast
+path never builds the pool, so it is not budgeted (and stays byte-for-byte
+Phase-1). NOTE: this is admission-time reservation + fail-loud only; the §J.2
+LRU **eviction/paging** of cold pages under budget pressure remains deferred
+(P2a). Regression coverage: engine `tests/lora_grouped_budget.rs`
+(over-budget admission fails loud and leaks nothing; a successful load reserves
+and then releases the shared budget to the exact prior level on drop).
+
+**Collapsed single adapter + `--select-adapter`.** When a single `--adapters
+NAME=PATH` collapses to the DIRECT fast path, the selectable `NAME` is retained
+(`EngineConfig.lora_adapter_name`). A request `--select-adapter NAME` for that
+same adapter is a **no-op** (it is already applied to every token); any other
+name fails loud with a message that NAMES the actually-loaded adapter, rather
+than the previous misleading "session was not loaded with a grouped pool" error.
+
+**Wired (reachable + tested).**
+
+* config → CLI → engine load of N adapters → grouped injection + `BudgetedLoraPool`
+  registration (RAII-owned for the session lifetime, so budget/registry release
+  on teardown — no reintroduced leaks) → session build → per-request selection →
+  decode-loop `segments` feed.
+* **Per-request adapter selection on the native single-session backend**: each
+  `generate` call runs under one selected adapter (or base). Because a single
+  generation is one sequence, every run hits the kernel's uniform-batch fast
+  path. This is the shipped product surface.
+* Tests: `onnx-runtime-session` `grouped_two_adapters_route_per_row` (per-row
+  routing `[A,B,base,A]` through the executor) and
+  `grouped_multi_adapter_module_mismatch_fails_loud`; engine
+  `engine_multi_adapter_grouped_selects_per_request` (builds one session
+  preloading two adapters via `SessionBuilder::lora_adapters`, then selects
+  adapter A vs B vs base per run and asserts each output equals that adapter's
+  delta, A ≠ B, and an unknown name fails loud). The single-adapter
+  `engine_lora_path_applies_and_reverts_adapter_delta` still passes unchanged.
+* **CUDA grouped LoRA (§J.7).** The native CUDA registry claims
+  `pkg.nxrt::GroupedLoraDelta`; referenced factor pages and the concatenated
+  per-run row table are device-resident, mixed adapters and base-only rows execute
+  on CUDA with fp32 accumulation, and GPU parity plus a repeated large
+  three-adapter routing stress test verify correct, stable routing. CUDA-graph
+  capture intentionally splits at this eager seam until device-side grouping and
+  fixed capture-safe page tables land.
+* **Mixed-adapter rows within ONE continuous batch** (§J.4/§J.5 P2e): the
+  `ContinuousBatchManager` now threads a per-row `adapter_id` end to end. Each
+  `PendingContinuousRequest` / `ContinuousBatchRow` carries the `lora_route`
+  (`i32` segment id, `-1` == base) it was admitted with; the route is resolved at
+  `submit` time from the request's `GenerateOptions.adapter` against the loaded
+  adapter→route map (`resolve_lora_route`), failing loud on an unknown name
+  (reusing the "unknown LoRA adapter" message that names the loaded adapters) and
+  on an explicit adapter when no grouped pool is configured — never a silent base
+  fallback. Before every decode call the manager builds the `lora.segments`
+  tensor per row into a **reused scratch buffer** (`lora_route_scratch`, cleared
+  and refilled in place with no per-step heap allocation after warmup) and feeds
+  it through the new `BatchedDecodeSession::set_lora_routes` trait method:
+  `feed_physical_lora_routes` fills physical-row-indexed segments (empty slots →
+  base) before `step_select` / prefill, and `feed_active_lora_routes` fills
+  active-row-ordered segments before `step_active`, matching how each call orders
+  its rows. `set_lora_routes` defaults to a no-op, and the whole path is skipped
+  when `lora_adapter_routes` is empty, so the ≤1-adapter / all-base fast path
+  stays byte-for-byte Phase-1 and the ORT `BatchedStaticCacheDecodeSession`
+  (which has no grouped op) is unaffected.
+* Test: engine `continuous_batch_routes_mixed_adapters_per_row`
+  (`native-backend`) drives the **real** `ContinuousBatchManager` with three
+  submitted requests — bound to adapter A, adapter B, and base — through a
+  decode-session double (`GroupedProbeSession`) that runs the **real** grouped
+  `GroupedLoraDelta` kernel via a native `InferenceSession`. The zero base model
+  makes each row's argmax depend solely on the per-row route: the A row emits A's
+  delta argmax, the B row emits B's, the base row emits token 0. It is
+  non-tautological — a whole-batch-to-base manager emits token 0 for every row
+  and fails (verified by temporarily forcing all routes to base).
+  `continuous_batch_unknown_adapter_fails_loud` covers the admission-time
+  fail-loud path.
+* **Native continuous-batch decode backend — mixed-adapter rows in one batch,
+  production-reachable** (§J.4/§J.5 P2e): `NativeBatchedDecodeSession`
+  (`crates/onnx-genai-engine/src/native_decode/batched.rs`) is a real
+  `BatchedDecodeSession` that borrows the engine's native grouped
+  `InferenceSession` — the one that actually owns the `GroupedLoraDelta` op — and
+  implements a genuine `set_lora_routes` that binds `lora.segments` (Int32, one
+  route per activation row, `-1` == base) into that session, reusing a
+  little-endian scratch buffer so the routing payload is not reallocated per
+  step. It builds step inputs (`input_ids` `[rows,1]`, optional
+  `attention_mask` / `position_ids`, optional batched past KV) and runs the
+  native `InferenceSession::run` path directly, reshaping logits to
+  `[rows,1,vocab]`. The engine entry point
+  `Engine::run_native_continuous_batch` (`crates/onnx-genai-engine/src/batched.rs`,
+  `native-backend`) constructs a `ContinuousBatchManager` over this session via
+  `with_lora_adapter_routes`, resolving the loaded adapter→route map from the
+  native session, so a native continuous batch carries mixed adapters end to end
+  from a production caller — not just a test double. The base / single-adapter
+  fast path is preserved: routing is dormant unless the graph declares a
+  `lora.segments` input and a caller feeds routes.
+* Test: engine `native_continuous_batch_routes_mixed_adapters_per_row`
+  (`native-backend`) is THE gap-closing acceptance proof. It drives the **real**
+  `NativeBatchedDecodeSession` (not `GroupedProbeSession`) through the production
+  `ContinuousBatchManager` over a token-driven zero-base grouped model
+  (`input_ids → Gather(embedding) → Reshape → q_proj MatMulNBits`, with
+  `GroupedLoraDelta` auto-injected by `SessionBuilder::lora_adapters`). Three
+  submitted requests bound to adapter A, adapter B, and base each emit their own
+  adapter's argmax token (A ≠ B ≠ base=0) — non-tautological, since a
+  whole-batch-to-base session collapses A and B to token 0 and fails.
+  `native_continuous_batch_unknown_adapter_fails_loud` covers admission-time
+  fail-loud on the production native path.
+
+**Deferred (honestly not done in this pass).**
+
+* **Native ragged / KV-cursor continuous batching**: `NativeBatchedDecodeSession`
+  fully supports the **KV-free** grouped routing surface (the acceptance proof
+  above) and **batched decode-with-past in strict lockstep** (all participating
+  rows at one sequence length). It does **not** support independent per-row KV
+  cursors, because the native CPU execution provider has no `TensorScatter`
+  kernel to mirror the ORT static-cache contract (independent write cursors into
+  one `[batch, max_len, kv_dim]` buffer). A ragged advance — a mid-flight prefill
+  that grows one row while others hold, at differing lengths — **fails loud**
+  rather than silently corrupting the cache. Because the `ContinuousBatchManager`
+  prefills rows one at a time (ragged), a *KV-cache* native continuous batch is
+  not yet driveable through the manager; the reachable, tested production surface
+  is the KV-free grouped routing path. Wiring a native static-cache scatter
+  (per-row write cursors) is the remaining step for KV-backed native continuous
+  batching.
+* **CUDA continuous-batch grouped path**: out of scope; the native CUDA batched
+  decode session is not built here (single-request CUDA grouped decode remains
+  covered by §J.7).
+* **Speculative decoding + grouped adapter** combined: rejected fail-loud (the
+  draft/verify paths do not yet thread the route).
+
+### J.10 KV-backed native static-cache continuous batching (P2-kvcb)
+
+§J.9 shipped native continuous batching for the **KV-free** grouped routing
+surface and deferred *KV-backed* continuous batching, because the native CPU
+execution provider had no `TensorScatter` kernel to mirror the ORT static-cache
+contract (independent per-row write cursors into one `[batch, max_len, kv_dim]`
+buffer). That blocker is now removed: the native CPU EP owns a `TensorScatter`
+kernel (`crates/onnx-runtime-ep-cpu/src/kernels/tensor_scatter.rs`, registered
+for `ai.onnx::TensorScatter` opsets 23/24 and `com.microsoft::TensorScatter/1`),
+verified rank-1 `[batch]` write-cursor semantics with per-row consecutive-position
+writes. This subsection specifies the native KV-backed static-cache batched
+decode session built on top.
+
+**Session.** `NativeStaticCacheBatchedDecodeSession`
+(`crates/onnx-genai-engine/src/native_decode/static_cache_batched.rs`) is a real
+`BatchedDecodeSession` that borrows the engine's native grouped `InferenceSession`
+— the one that owns both `GroupedLoraDelta` and `TensorScatter` — and drives a
+static-cache TensorScatter export (e.g. the `tiny-llm-scatter` fixture) under the
+production `ContinuousBatchManager`. It is selected by `run_native_continuous_batch`
+when the graph exposes the static-cache signature (a `write_indices` and a
+`nonpad_kv_seqlen` input plus `key_cache.{i}` / `value_cache.{i}` inputs paired to
+`updated_key_cache.{i}` / `updated_value_cache.{i}` outputs); otherwise the
+KV-free `NativeBatchedDecodeSession` is used, so KV-free models keep their exact
+path.
+
+**KV buffer binding — carry-forward, not IO-binding aliasing.** The runtime owns
+one persistent `[batch, MAX_LEN, KV_DIM]` buffer per `key_cache.{i}` /
+`value_cache.{i}`, allocated once (zeroed) at construction from the graph
+signature (`MAX_LEN` = cache axis-1 extent). Each step binds those buffers as the
+cache inputs; the graph's `TensorScatter` writes the step's K/V rows at each row's
+own `write_indices` cursor and emits the **full** updated buffer as
+`updated_key_cache.{i}`. The session moves each `updated_*` output back into its
+buffer slot (ownership move, no copy) to seed the next step. This is functionally
+the ORT `HandleSwap` mode: the scatter output *is* the source of truth for the
+next step, so no in-place input/output aliasing (ORT `IoBinding` `InPlaceAlias`)
+is required for correctness. In-place aliasing (avoiding the runtime's per-step
+full-buffer output allocation) is a native-EP optimization deferred to a
+follow-up; it is an efficiency win, not a correctness or capability gap. Every
+small per-step tensor the session *does* control — `input_ids`, `position_ids`
+(when declared), `write_indices`, `nonpad_kv_seqlen`, and `lora.segments` — is
+built from a reused scratch buffer, so the session adds no per-step heap
+allocation on the routing/index path.
+
+**Per-row write cursors and `nonpad_kv_seqlen` (mirrors ORT §static_cache).** For
+each physical row the session binds, at axis 1 (the sequence axis):
+`write_indices[row] = row_lens[row]` (the row's current logical length = next free
+slot), and `nonpad_kv_seqlen[row] = row_lens[row] + 1` for a row that advances
+this step, else `max(row_lens[row], 1)`. `row_lens[row]` is incremented only for advancing
+rows, exactly as ORT's `try_run_batched_static_chunk` does. Because
+`write_indices` is a rank-1 `[batch]` per-row cursor, rows at different lengths
+scatter to different positions in the same buffer — this is the entire point of
+the static-cache contract and is what unblocks ragged continuous batching.
+
+**Idle-slot `nonpad` flooring (defensive hardening).** A never-assigned / idle
+(non-advancing) row has `row_lens[row] == 0`, so a naive `nonpad = row_lens` would
+ask the attention kernel to softmax a **zero-length** KV window, which a
+production kernel can turn into `NaN`. Batch isolation confines that to the row's
+discarded output slice on the tiny fixture, but real-model/server E2E is deferred,
+so the non-advancing branch floors `nonpad` to `max(row_lens[row], 1)`: an idle
+row reads KV slot 0, which is always zeroed on `assign_row` and never gathered
+into a real output. This never changes an **active** row's window — an advancing
+row keeps `row_lens + 1`, and a live non-advancing row always has `row_lens >= 1`,
+so the floor is a no-op for it. The flooring lives in the pure helper
+`row_nonpad_kv_seqlen` and is unit-tested directly.
+
+**Ragged prefill (`step_select`).** The `ContinuousBatchManager` prefills each
+freshly admitted row one prompt token at a time via `step_select` with a per-row
+`advance_rows` mask, so at any step some rows advance while others hold. The
+native session runs the **full physical batch** every step and honours the mask
+per row: non-advancing rows (holding rows, finished/deactivated rows, and empty
+slots) bind `write_indices = row_lens` / `nonpad = max(row_lens, 1)` and a dummy token, so
+their scatter lands on the free slot beyond `nonpad` (never read) and the valid
+prefix `[0, row_lens)` is untouched. This is honest but unoptimized: unlike the
+ORT batched session it does **not** compact active rows into a packed physical
+prefix to skip inactive-row compute, so a batch with idle slots still runs model
+compute for those slots. Compaction (an `[active, MAX_LEN, KV_DIM]` gather/scatter
+of the KV buffers) is a straightforward follow-up; it is a throughput
+optimization, not a correctness gap, so it is deferred to keep this increment
+honest and reviewable. `step_active` is implemented by expanding its
+active-row-ordered inputs to physical positions, running the full batch, and
+gathering the active rows' logits back in `active_rows()` order.
+
+**Row lifecycle / cross-sequence isolation.** `assign_row` resets `row_lens[row] =
+0`, marks the row active, and **zeroes that row's slice** in every KV buffer
+(dtype-agnostic byte zero of the `MAX_LEN * KV_DIM` region), mirroring ORT's
+`zero_rank3_row` on admit so a recycled physical slot cannot leak the previous
+sequence's cache — even though `nonpad_kv_seqlen` already bounds reads to
+`[0, row_lens)`. The zeroing is done **in place** on each buffer's backing storage
+via `Tensor::as_bytes_mut` (only the target row's `[row*row_stride ..
+(row+1)*row_stride)` byte range is filled), so admission is `O(one row)` rather
+than cloning and rebuilding the full `batch * MAX_LEN * KV_DIM` buffer for every
+key/value tensor of every layer; this also preserves each buffer's allocation
+identity, so the `TensorScatter` carry-forward binding keeps observing the same
+tensor. `deactivate_row` only clears the active flag; the slot's cache is
+reclaimed on the next `assign_row`.
+
+**Grouped LoRA threading.** Identical to the KV-free session in spirit: when the
+graph declares a `lora.segments` input (a grouped-LoRA-injected session), each
+step binds an `Int32 [rows]` route tensor, reusing a little-endian scratch buffer
+with no per-step heap allocation. The routes fed by `set_lora_routes` are
+**physical-row-indexed** (length `batch_size`) for `step_select`/prefill and
+**active-row-ordered** (length `active_rows().len()`) for `step_active`
+(`ContinuousBatchManager::feed_active_lora_routes`). Because this KV-backed
+session always runs the **full physical batch** (`run_full_batch` binds all
+`batch_size` rows and `build_segments_tensor(batch_size)`), `step_active` must
+translate its active-row-ordered routes into physical-row order **before** the
+run: `expand_active_routes_to_physical` fills a reused length-`batch_size` buffer
+with `BASE_LORA_ROUTE` (-1) for every physical row that is not active this step
+and places each active row's route at its physical row index (buffers are cycled,
+so there is still no per-step heap allocation). Without this translation, a
+partial batch (`active_rows < batch_size` — the NORMAL condition of fewer
+concurrent requests than `max_batch`) fed `active_rows` routes would be rejected
+by `build_segments_tensor`'s `batch_size` length check and abort decode on the
+second token. `set_lora_routes` reuses the emptied `pending_routes` Vec (swapped
+back after each step) so the route Vec itself is not reallocated per step either.
+When the graph declares no `lora.segments` input, routing is dormant and the base
+fast path is preserved byte-for-byte. A static-cache export with grouped LoRA thus
+carries mixed adapters per row **and** independent per-row KV in one native
+continuous batch, at any active-row occupancy.
+
+**Full-capacity edge (partial disposition).** The always-full-batch run also
+scatters INACTIVE physical rows. A recycled slot's stale `row_lens[row]` can equal
+`MAX_LEN`, which would make `write_indices = MAX_LEN` — out of range for the
+`TensorScatter` bounds check, poisoning the whole step. `run_full_batch` now
+clamps the write index of an **inactive** row at capacity to the last in-range
+slot (`MAX_LEN - 1`): a harmless no-op into a discarded slice (an inactive row's KV
+is unused and re-zeroed on the next `assign_row`). Active rows are never clamped —
+an *advancing* row at capacity is still caught by the explicit
+`row_lens + 1 > MAX_LEN` guard, and an *active non-advancing* row at capacity
+(gated by manager deactivation timing) remains the deferred **active-row
+compaction** item below rather than being silently corrupted.
+
+**Native-EP capability added / blockers.** No new native-EP primitive was
+required beyond the already-approved `TensorScatter` kernel: the standard
+`InferenceSession::run` path binds the persistent cache buffers as ordinary
+inputs and consumes the `updated_*` outputs, so the carry-forward design needs
+nothing more. The one honestly-deferred item is IO-binding-style in-place buffer
+aliasing to elide the per-step full-buffer KV output allocation (an efficiency
+optimization), together with active-row compaction (a throughput optimization);
+neither is a correctness or capability boundary, and both are documented as
+follow-ups rather than faked.
+
+**Acceptance proof (non-tautological).** Engine test
+`native_static_cache_continuous_batch_matches_single_sequence`
+(`native-backend`) drives the **real** `NativeStaticCacheBatchedDecodeSession`
+through the production `ContinuousBatchManager` over the real `tiny-llm-scatter`
+static-cache attention export, carrying multiple sequences of **different prompt
+lengths** admitted into one continuous batch, and asserts each row's generated
+token stream **exactly matches an independent per-row single-sequence decode** of
+the same prompt through a fresh `batch_size = 1` static-cache session. Because the
+fixture is a genuine attention model whose logits depend on the KV history, any
+cross-row KV leak or shared-cursor bug makes the batched rows diverge from their
+single-sequence references and fails the test — it is not a self-echo. A second
+test drives a grouped-LoRA-injected static-cache session with three rows bound to
+adapter A, adapter B, and base, asserting per-row routing is observable on the
+KV-backed path (A ≠ B ≠ base), proving grouped routing and per-row KV coexist. A
+third test, `native_static_cache_continuous_batch_partial_batch_step_active_routes`,
+closes the partial-batch route gap: it submits an adapter-bound request into a
+width-3 batch (so `active_rows` (1) `< batch_size` (3)) and generates four tokens,
+asserting the row proceeds **past the second token** and its multi-token stream
+matches an independent single-sequence (`batch_size = 1`) decode of the same
+adapter + prompt; a two-active-of-three mixed (adapter + base, one idle slot) case
+is checked the same way. This test fails on the un-fixed session with
+`grouped-LoRA routes (1) do not match the 3 activation rows` and passes after the
+physical-row route expansion — the earlier single-token and full-capacity tests
+submit exactly `batch_size` requests and so miss this path.
+
+**Engine dispatch + server reachability (Runciter follow-up B).** The native
+continuous-batch path is now reachable by real requests, not only tests. The
+static-cache/KV-free session selection lives in a single builder,
+`Engine::native_continuous_batch_manager`, which both the batch-run helper
+`Engine::run_native_continuous_batch` and the server driver call. `Engine::supports_native_continuous_batch`
+reports whether a native decoder session is loaded; the server engine driver
+(`onnx-genai-server/src/driver.rs`) prefers the native manager whenever it is
+available (so native grouped-LoRA continuous batching serves live requests),
+falling back to the ORT `BatchedStaticCacheDecodeSession` manager otherwise. The
+whole native branch is `#[cfg(feature = "native-backend")]`-gated so the
+non-native server build is unchanged. Honesty note: the streaming server path is
+now wired to build the native manager, but the end-to-end server request is not
+covered by an automated integration test in this pass — the native manager
+construction and per-row correctness are proven at the manager level by the two
+acceptance tests above, and the builder is a thin shared wrapper over that exact
+code.

@@ -2,6 +2,76 @@
 
 use super::*;
 
+/// The grouped-LoRA route action for a request, decided at the single
+/// per-request choke point in [`Engine::generate_native_with_callback`]
+/// (design §J.4 route-bleed guard).
+#[cfg(feature = "native-backend")]
+#[derive(Debug, PartialEq, Eq)]
+enum RequestLoraRoute<'a> {
+    /// Reset the grouped session's route to this adapter (or base-only when
+    /// `None`) for THIS request. Always resolved, never inherited from a prior
+    /// request.
+    Select(Option<&'a str>),
+    /// The session has no grouped-LoRA pool (base-only or single-adapter DIRECT
+    /// fast path); there is no per-request route state to reset.
+    NoGroupedPool,
+}
+
+/// Decide the per-request grouped-LoRA route reset (design §J.4). Every request
+/// resolves its own route here so none can inherit a prior request's adapter
+/// (the route-bleed guard): a grouped session is ALWAYS reset — to the requested
+/// adapter, or to base-only (`None`) when no adapter is selected, INCLUDING on
+/// the speculative path (where `adapter` is required to be `None`). Fails loud
+/// when speculation is combined with an explicit adapter (deferred, §J) or when
+/// an adapter is requested without a grouped pool. This is the single decision
+/// both the plain and speculative entry points share, so neither can proceed on
+/// a stale route.
+#[cfg(feature = "native-backend")]
+fn resolve_request_lora_route<'a>(
+    has_grouped_lora: bool,
+    is_speculative: bool,
+    adapter: Option<&'a str>,
+    single_adapter_name: Option<&str>,
+) -> anyhow::Result<RequestLoraRoute<'a>> {
+    // Per-request adapter selection is wired for the plain decode path;
+    // combining it with native speculation is deferred (§J), so reject rather
+    // than silently ignoring the requested adapter.
+    if is_speculative && adapter.is_some() {
+        anyhow::bail!(
+            "per-request LoRA adapter selection is not yet supported together with native \
+             speculative decoding; disable speculation for adapter-selected requests"
+        );
+    }
+    if has_grouped_lora {
+        // Reset EVERY request's route — base-only when no adapter is selected —
+        // so a base-only request (plain OR speculative) can never inherit a
+        // prior request's adapter. This is the route-bleed fix.
+        Ok(RequestLoraRoute::Select(adapter))
+    } else if let Some(requested) = adapter {
+        // No grouped pool, but the session may have loaded exactly one adapter
+        // that collapsed to the always-on DIRECT fast path. In that case the
+        // adapter is already applied to every token, so selecting it by name is
+        // a no-op rather than an error. Any other name is genuinely unknown and
+        // fails loud, naming the adapter that WAS loaded so the message is
+        // actionable.
+        match single_adapter_name {
+            Some(loaded) if loaded == requested => Ok(RequestLoraRoute::NoGroupedPool),
+            Some(loaded) => anyhow::bail!(
+                "requested LoRA adapter {requested:?}, but this session loaded a single adapter \
+                 {loaded:?} on the DIRECT fast path; select {loaded:?} (already applied) or load \
+                 a multi-adapter set (EngineConfig::lora_adapters) to switch adapters per request"
+            ),
+            None => anyhow::bail!(
+                "a per-request LoRA adapter {requested:?} was requested, but this session was not \
+                 loaded with a multi-adapter grouped-LoRA pool (configure \
+                 EngineConfig::lora_adapters)"
+            ),
+        }
+    } else {
+        Ok(RequestLoraRoute::NoGroupedPool)
+    }
+}
+
 impl Engine {
     /// Effective context limit for a request, combining model metadata,
     /// per-request override, and decode-path capacity.
@@ -87,7 +157,43 @@ impl Engine {
         // Speculation ON (implemented greedy prompt-lookup) → the native
         // speculative driver. Every other request stays on the untouched plain
         // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
-        if let Some(plan) = native_speculation_plan(&options, &chain) {
+        let speculation_plan = native_speculation_plan(&options, &chain);
+
+        // Single per-request choke point for Phase-2 grouped-LoRA routing
+        // (design §J.4). EVERY decode entry point — plain, speculative base
+        // logits, and speculative verify — reads `LoraSegmentsState.active`, so
+        // resetting it here, before any driver runs, makes it structurally
+        // impossible for a request to inherit a prior request's route (the
+        // route-bleed guard). Base-only (`None`) unless an adapter is explicitly
+        // selected for THIS request. A no-op for base-only / single-adapter
+        // (DIRECT) sessions, keeping the ≤1-adapter fast path byte-for-byte.
+        {
+            let single_adapter_name = self.lora_single_adapter_name.clone();
+            let native_session = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            match resolve_request_lora_route(
+                native_session.has_grouped_lora(),
+                speculation_plan.is_some(),
+                options.adapter.as_deref(),
+                single_adapter_name.as_deref(),
+            )? {
+                RequestLoraRoute::Select(adapter) => {
+                    // Route every token of THIS request to the resolved adapter
+                    // (or base-only when `None`). Fails loud on an unknown name
+                    // at admission, never a silent base fallback.
+                    native_session
+                        .select_lora_adapter(adapter)
+                        .context("select per-request LoRA adapter")?;
+                }
+                // Base-only / single-adapter (DIRECT) session: no grouped route
+                // state exists, so the fast path is left untouched.
+                RequestLoraRoute::NoGroupedPool => {}
+            }
+        }
+
+        if let Some(plan) = speculation_plan {
             let mut stats = SpeculativeStats::default();
             let native_session = self
                 .native_session
@@ -1335,5 +1441,97 @@ impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
 
     fn sampled_fastpath_failed(&mut self) {
         self.state.sampled_fastpath_failed = true;
+    }
+}
+
+#[cfg(all(test, feature = "native-backend"))]
+mod lora_route_tests {
+    use super::{RequestLoraRoute, resolve_request_lora_route};
+
+    // Route-bleed regression guard (Issue 1, design §J.4). Drives the single
+    // per-request choke-point decision the engine now shares between the plain
+    // and speculative entry points. The critical case is a base-only
+    // SPECULATIVE request on a grouped session: it MUST resolve to `Select(None)`
+    // (base-only), never inherit a prior request's adapter. Before the fix the
+    // speculative branch never reset the route, so this case would have left the
+    // prior `Select(Some("A"))` route in place — the bug. The `speculative` case
+    // below fails-before / passes-after.
+    #[test]
+    fn grouped_speculative_base_only_resets_route_to_base() {
+        // Request A: plain, explicit adapter → route to A.
+        assert_eq!(
+            resolve_request_lora_route(true, false, Some("adapter_a"), None).unwrap(),
+            RequestLoraRoute::Select(Some("adapter_a")),
+        );
+        // Request B: SPECULATIVE, no adapter → MUST reset to base-only, not
+        // inherit A. This is the route-bleed regression guard.
+        assert_eq!(
+            resolve_request_lora_route(true, true, None, None).unwrap(),
+            RequestLoraRoute::Select(None),
+        );
+        // Request C: plain, no adapter → base-only.
+        assert_eq!(
+            resolve_request_lora_route(true, false, None, None).unwrap(),
+            RequestLoraRoute::Select(None),
+        );
+    }
+
+    #[test]
+    fn grouped_speculative_with_explicit_adapter_fails_loud() {
+        let error = resolve_request_lora_route(true, true, Some("adapter_a"), None)
+            .expect_err("speculative + explicit adapter must fail loud");
+        assert!(
+            error.to_string().contains("speculative"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn non_grouped_adapter_request_fails_loud() {
+        let error = resolve_request_lora_route(false, false, Some("adapter_a"), None)
+            .expect_err("adapter request without a grouped pool must fail loud");
+        assert!(
+            error.to_string().contains("multi-adapter grouped-LoRA pool"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // A single `--adapters NAME=PATH` collapses to the DIRECT fast path but keeps
+    // its selectable NAME. Selecting that same name must be a no-op (already
+    // applied), not an error.
+    #[test]
+    fn collapsed_single_adapter_matching_select_is_noop() {
+        assert_eq!(
+            resolve_request_lora_route(false, false, Some("writer"), Some("writer")).unwrap(),
+            RequestLoraRoute::NoGroupedPool,
+        );
+    }
+
+    // Selecting a DIFFERENT name on a collapsed single-adapter session fails
+    // loud, and the message NAMES the adapter that was actually loaded.
+    #[test]
+    fn collapsed_single_adapter_mismatched_select_names_loaded_adapter() {
+        let error = resolve_request_lora_route(false, false, Some("coder"), Some("writer"))
+            .expect_err("selecting an unloaded adapter must fail loud");
+        let message = error.to_string();
+        assert!(message.contains("coder"), "unexpected error: {message}");
+        assert!(
+            message.contains("writer"),
+            "error must name the loaded adapter: {message}"
+        );
+    }
+
+    #[test]
+    fn non_grouped_base_only_is_noop_fast_path() {
+        // ≤1-adapter / base-only sessions carry no grouped route state, so the
+        // fast path is left untouched.
+        assert_eq!(
+            resolve_request_lora_route(false, false, None, None).unwrap(),
+            RequestLoraRoute::NoGroupedPool,
+        );
+        assert_eq!(
+            resolve_request_lora_route(false, true, None, None).unwrap(),
+            RequestLoraRoute::NoGroupedPool,
+        );
     }
 }

@@ -35,6 +35,13 @@ impl Engine {
                  native LoRA adapters require the native decode backend (set the backend to native)"
             );
         }
+        if !config.lora_adapters.is_empty() {
+            anyhow::bail!(
+                "multi-adapter LoRA (lora_adapters) was configured but the resolved decode backend \
+                 is {decode_backend:?}; native LoRA adapters require the native decode backend (set \
+                 the backend to native)"
+            );
+        }
 
         // ORT CUDA graph capture is opt-in: it fails with unconstructed OrtValue
         // outputs on some Foundry exports. SessionOptions still honors an explicit
@@ -138,6 +145,8 @@ impl Engine {
             native_shared_kv_proposer: None,
             #[cfg(feature = "native-backend")]
             lora_manager: None,
+            #[cfg(feature = "native-backend")]
+            lora_single_adapter_name: None,
             draft,
             mtp,
             eagle3,
@@ -242,6 +251,41 @@ impl Engine {
         } else {
             None
         };
+        // Phase-2 multi-adapter grouped path (design §J): load every configured
+        // adapter through a shared manager and derive its injection spec, tagging
+        // each spec with the user-facing identifier a request selects it by. Empty
+        // when 0/1 adapters are configured, so the single/none DIRECT fast path is
+        // untouched (the grouped pool machinery is never built for ≤1 adapter).
+        let lora_specs: Vec<onnx_runtime_session::lora_inject::LoraAdapterSpec> =
+            if config.lora_adapters.is_empty() {
+                Vec::new()
+            } else {
+                if config.lora_adapter.is_some() {
+                    anyhow::bail!(
+                        "configure either a single LoRA adapter (lora_adapter) or a multi-adapter \
+                         set (lora_adapters), not both"
+                    );
+                }
+                let mut manager = crate::lora::manager::LoraManager::with_budget(0);
+                let mut specs = Vec::with_capacity(config.lora_adapters.len());
+                for (identifier, adapter_path) in &config.lora_adapters {
+                    let adapter_id = manager.load(adapter_path).with_context(|| {
+                        format!(
+                            "load LoRA adapter {identifier:?} from {}",
+                            adapter_path.display()
+                        )
+                    })?;
+                    let mut spec = manager.spec(&adapter_id).with_context(|| {
+                        format!("build LoRA adapter injection spec for {identifier:?}")
+                    })?;
+                    // The stable identifier the request selects this adapter by is
+                    // the configured name, not the loader's directory basename.
+                    spec.name = identifier.clone();
+                    specs.push(spec);
+                }
+                lora_manager = Some(manager);
+                specs
+            };
         let native_session = {
             let _span = onnx_genai_ort::prof_span!("engine.native_session_load");
             crate::native_decode::NativeDecodeSession::load_with_weight_offload_host_cache(
@@ -251,6 +295,16 @@ impl Engine {
                 metadata.model.as_ref().and_then(|model| model.io.as_ref()),
                 config.decode_precision,
                 lora_spec,
+                lora_specs,
+                metadata
+                    .adapters
+                    .as_ref()
+                    .and_then(|adapters| adapters.target_manifest.clone()),
+                // Share the engine's cross-session byte budget (the same instance
+                // the scheduler/KV subsystem uses) so grouped LoRA adapter
+                // residency is counted against — and boundable by — the device
+                // ceiling (design §J.2 control plane).
+                Some(governor.byte_budget()),
             )
             .map_err(|error| anyhow::anyhow!("Failed to load native decoder session: {error:#}"))?
         };
@@ -285,6 +339,7 @@ impl Engine {
             native_session: Some(native_session),
             native_shared_kv_proposer,
             lora_manager,
+            lora_single_adapter_name: config.lora_adapter_name.clone(),
             draft: None,
             mtp: None,
             eagle3: None,

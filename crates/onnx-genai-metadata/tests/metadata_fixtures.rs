@@ -871,6 +871,42 @@ pipeline:
 }
 
 #[test]
+fn lora_target_manifest_parses_and_validates() {
+    let yaml = r#"
+adapters:
+  available: [adapter]
+  target_manifest:
+    targets:
+      - module_name: self_attn.qkv_proj
+        layer_index: 0
+        node_name: /model/layers.0/attn/qkv_proj/MatMul_Q4
+        output_name: /model/layers.0/attn/qkv_proj/MatMul_Q4.out
+        k: 3584
+        n: 4608
+        slices:
+          q_proj: { offset: 0, width: 3584, rank: 16, alpha: 32.0 }
+          k_proj: { offset: 3584, width: 512 }
+          v_proj: { offset: 4096, width: 512 }
+"#;
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(yaml).expect("declared LoRA target manifest parses");
+    let manifest = metadata
+        .adapters
+        .as_ref()
+        .and_then(|adapters| adapters.target_manifest.as_ref())
+        .expect("target manifest");
+    assert_eq!(manifest.targets.len(), 1);
+    assert_eq!(manifest.targets[0].slices["q_proj"].offset, 0);
+    assert_eq!(manifest.targets[0].slices["q_proj"].rank, Some(16));
+
+    let instance: serde_json::Value =
+        serde_yaml::from_str(yaml).expect("LoRA manifest converts to JSON");
+    schema_validator()
+        .validate(&instance)
+        .expect("LoRA manifest validates against JSON schema");
+}
+
+#[test]
 fn multimodal_fixtures_report_precise_missing_capabilities() {
     let packed =
         load_metadata(&crate_fixture("vlm_packed_valid.yaml")).expect("packed fixture loads");

@@ -186,6 +186,25 @@ pub trait BatchedDecodeSession<'a> {
     /// Advance one token for every active row, returning `[active, 1, vocab]`
     /// logits ordered by [`Self::active_rows`].
     fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value>;
+    /// Feed the per-row grouped-LoRA route (`lora.segments`) for the NEXT
+    /// `step_*` / `prefill` call (design §J.4 P2e — mixed-adapter rows in one
+    /// continuous batch). Each `routes[i]` is the adapter id (`AdapterId`) the
+    /// corresponding activation row is bound to, or `-1` for a base-only row
+    /// (the kernel's null route). The routing order MUST match the ordering the
+    /// upcoming step consumes: physical-row indexed for `step_select` / `prefill`
+    /// (length `batch_size`), active-row ordered for `step_active` (length
+    /// `active_rows().len()`).
+    ///
+    /// The default is a no-op: a backend whose graph declares no `lora.segments`
+    /// input ignores routing entirely, so the base / single-adapter fast path is
+    /// preserved byte-for-byte (the grouped machinery is never engaged unless a
+    /// caller actually feeds routes). Implementations that own a `lora.segments`
+    /// input reuse an internal buffer (no per-step heap allocation for the
+    /// routing payload) and bind it on the next step.
+    fn set_lora_routes(&mut self, routes: &[i32]) -> Result<()> {
+        let _ = routes;
+        Ok(())
+    }
 }
 
 mod shared_batch;

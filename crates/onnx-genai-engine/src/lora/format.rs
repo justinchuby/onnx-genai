@@ -1,16 +1,22 @@
-//! HuggingFace PEFT LoRA adapter format support.
+//! LoRA adapter format support.
 
 use onnx_runtime_ir::{DataType, TensorData};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::adapter_schema_generated::onnxruntime::adapters::{
+    ADAPTER_IDENTIFIER, TensorDataType, root_as_adapter,
+};
+
 const CONFIG_FILE: &str = "adapter_config.json";
 const WEIGHTS_FILE: &str = "adapter_model.safetensors";
+const ONNX_ADAPTER_EXTENSION: &str = "onnx_adapter";
+const ONNX_ADAPTER_FORMAT_VERSION: i32 = 1;
 
-/// A PEFT adapter decoded into the contiguous tensor orientation used by ONNX `MatMul`.
+/// An adapter decoded into the contiguous tensor orientation used by ONNX `MatMul`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedAdapter {
     pub name: String,
@@ -44,7 +50,7 @@ pub enum PeftFactorLayout {
     MatMulReady,
 }
 
-/// Errors returned while reading or validating a PEFT adapter.
+/// Errors returned while reading or validating a LoRA adapter.
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterLoadError {
     #[error("failed to read PEFT adapter file {path}: {source}")]
@@ -65,6 +71,32 @@ pub enum AdapterLoadError {
         #[source]
         source: safetensors::SafeTensorError,
     },
+    #[error("adapter file {path} does not have the FlatBuffers `TORT` identifier")]
+    InvalidOnnxAdapterMagic { path: PathBuf },
+    #[error("malformed ONNX Runtime adapter FlatBuffer {path}: {source}")]
+    OnnxAdapterFlatbuffer {
+        path: PathBuf,
+        #[source]
+        source: flatbuffers::InvalidFlatbuffer,
+    },
+    #[error(
+        "ONNX Runtime adapter {path} uses unsupported format version {version}; only version 1 is supported"
+    )]
+    UnsupportedOnnxAdapterVersion { path: PathBuf, version: i32 },
+    #[error("ONNX Runtime adapter parameter {index} is missing its {field}")]
+    MissingOnnxAdapterField { index: usize, field: &'static str },
+    #[error(
+        "ONNX Runtime adapter parameter {key:?} has unsupported ONNX dtype {dtype}; only FLOAT and FLOAT16 are supported"
+    )]
+    UnsupportedOnnxAdapterDtype { key: String, dtype: i32 },
+    #[error("ONNX Runtime adapter parameter {key:?} has invalid dimensions {dims:?}: {reason}")]
+    InvalidOnnxAdapterDimensions {
+        key: String,
+        dims: Vec<i64>,
+        reason: String,
+    },
+    #[error("could not detect a supported adapter format at {path}")]
+    UnsupportedFormat { path: PathBuf },
     #[error("invalid PEFT configuration: {0}")]
     InvalidConfiguration(String),
     #[error("malformed LoRA tensor key {key:?}: {reason}")]
@@ -102,6 +134,12 @@ pub enum AdapterLoadError {
     },
     #[error("tensor geometry for {key:?} overflows the platform address space")]
     GeometryOverflow { key: String },
+    #[error(
+        "ONNX Runtime adapter parameter {key:?} carries LoRA scale/alpha metadata ({token:?}), \
+         which contradicts the assumption that the exporter pre-scales the B factor \
+         (scale = 1.0); refusing to load rather than silently mis-scale the delta"
+    )]
+    UnexpectedScaleParameter { key: String, token: &'static str },
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +186,249 @@ struct PendingModule {
     alpha: f32,
     a: Option<(String, TensorData)>,
     b: Option<(String, TensorData)>,
+}
+
+#[derive(Debug)]
+struct PendingOnnxModule {
+    module_name: String,
+    layer_index: usize,
+    a: Option<(String, TensorData)>,
+    b: Option<(String, TensorData)>,
+}
+
+/// Load either a PEFT adapter directory (or its `adapter_model.safetensors`
+/// path) or an ONNX Runtime `.onnx_adapter` file.
+///
+/// Directories are identified by the PEFT configuration and weights files.
+/// Files are identified by the FlatBuffers `TORT` identifier, with the
+/// `.onnx_adapter` extension used to produce a precise invalid-magic error.
+pub fn load_adapter(path: impl AsRef<Path>) -> Result<LoadedAdapter, AdapterLoadError> {
+    let path = path.as_ref();
+    if path.is_dir() {
+        if path.join(CONFIG_FILE).is_file() && path.join(WEIGHTS_FILE).is_file() {
+            return load_peft_adapter(path);
+        }
+        return Err(AdapterLoadError::UnsupportedFormat {
+            path: path.to_path_buf(),
+        });
+    }
+
+    if path.file_name().is_some_and(|name| name == WEIGHTS_FILE)
+        && let Some(parent) = path.parent()
+        && parent.join(CONFIG_FILE).is_file()
+    {
+        return load_peft_adapter(parent);
+    }
+
+    let bytes = fs::read(path).map_err(|source| AdapterLoadError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if has_onnx_adapter_identifier(&bytes) {
+        return load_onnx_adapter_bytes(path, &bytes);
+    }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(ONNX_ADAPTER_EXTENSION))
+    {
+        return Err(AdapterLoadError::InvalidOnnxAdapterMagic {
+            path: path.to_path_buf(),
+        });
+    }
+    Err(AdapterLoadError::UnsupportedFormat {
+        path: path.to_path_buf(),
+    })
+}
+
+/// Load an ONNX Runtime `.onnx_adapter` FlatBuffers container.
+///
+/// ONNX Runtime's current GenAI exporter writes graph-input tensors already in
+/// `[K, rank]` and `[rank, N]` orientation and multiplies the B factor by the
+/// PEFT scale before export. Therefore these tensors are retained as-is and the
+/// format-agnostic representation records `scale = 1` and `alpha = rank`.
+///
+/// This is not an assumption of convenience — it is the documented ORT
+/// convention, confirmed from two authoritative sources:
+///   * The adapter FlatBuffer schema
+///     (`onnxruntime/lora/adapter_format/adapter_schema.fbs`) has **no**
+///     alpha / scale / rank field. A `Parameter` is only
+///     `{name, dims, data_type, raw_data}` and an `Adapter` is
+///     `{format_version, adapter_version, model_version, parameters}`; there is
+///     nowhere in the container to carry a scale, so the scale must already be
+///     folded into the weights.
+///   * Olive's `extract_adapters.py` simply relocates the `lora_A` / `lora_B`
+///     initializers out of the ONNX model into the adapter file (matching the
+///     `lora_A -> MatMul` / `lora_B -> MatMul` pattern) and applies no scaling,
+///     i.e. whatever scale the PEFT→ONNX export baked in stays baked in.
+///
+/// Because the container cannot carry a scale, we keep `scale = 1.0`. As a
+/// guard against a future export that violates this convention,
+/// [`parse_onnx_parameter_name`] fails loud (via
+/// [`AdapterLoadError::UnexpectedScaleParameter`]) if it ever encounters a
+/// parameter that advertises a scale/alpha, rather than silently skipping it
+/// and mis-scaling the delta.
+pub fn load_onnx_adapter(path: impl AsRef<Path>) -> Result<LoadedAdapter, AdapterLoadError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|source| AdapterLoadError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !has_onnx_adapter_identifier(&bytes) {
+        return Err(AdapterLoadError::InvalidOnnxAdapterMagic {
+            path: path.to_path_buf(),
+        });
+    }
+    load_onnx_adapter_bytes(path, &bytes)
+}
+
+fn load_onnx_adapter_bytes(path: &Path, bytes: &[u8]) -> Result<LoadedAdapter, AdapterLoadError> {
+    let adapter =
+        root_as_adapter(bytes).map_err(|source| AdapterLoadError::OnnxAdapterFlatbuffer {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if adapter.format_version() != ONNX_ADAPTER_FORMAT_VERSION {
+        return Err(AdapterLoadError::UnsupportedOnnxAdapterVersion {
+            path: path.to_path_buf(),
+            version: adapter.format_version(),
+        });
+    }
+
+    let parameters = adapter
+        .parameters()
+        .ok_or(AdapterLoadError::MissingOnnxAdapterField {
+            index: 0,
+            field: "parameters vector",
+        })?;
+
+    let mut pending = BTreeMap::<String, PendingOnnxModule>::new();
+    for index in 0..parameters.len() {
+        let parameter = parameters.get(index);
+        let name = parameter
+            .name()
+            .ok_or(AdapterLoadError::MissingOnnxAdapterField {
+                index,
+                field: "name",
+            })?;
+        let Some(parsed) = parse_onnx_parameter_name(name)? else {
+            continue;
+        };
+        let dims = parameter
+            .dims()
+            .ok_or(AdapterLoadError::MissingOnnxAdapterField {
+                index,
+                field: "dimensions",
+            })?
+            .iter()
+            .collect::<Vec<_>>();
+        let dims = onnx_dimensions(name, dims)?;
+        let dtype = match parameter.data_type() {
+            TensorDataType::FLOAT => DataType::Float32,
+            TensorDataType::FLOAT16 => DataType::Float16,
+            dtype => {
+                return Err(AdapterLoadError::UnsupportedOnnxAdapterDtype {
+                    key: name.to_owned(),
+                    dtype: dtype.0,
+                });
+            }
+        };
+        let raw_data = parameter
+            .raw_data()
+            .ok_or(AdapterLoadError::MissingOnnxAdapterField {
+                index,
+                field: "raw_data",
+            })?;
+        let tensor = TensorData::from_raw(dtype, dims, raw_data.bytes().to_vec());
+        validate_dense_tensor(name, &tensor)?;
+
+        let entry = pending
+            .entry(parsed.module_key.clone())
+            .or_insert_with(|| PendingOnnxModule {
+                module_name: parsed.module_name.clone(),
+                layer_index: parsed.layer_index,
+                a: None,
+                b: None,
+            });
+        let slot = match parsed.factor {
+            Factor::A => &mut entry.a,
+            Factor::B => &mut entry.b,
+        };
+        if slot.replace((name.to_owned(), tensor)).is_some() {
+            return Err(AdapterLoadError::DuplicateFactor {
+                module_key: parsed.module_key,
+                factor: parsed.factor.name(),
+            });
+        }
+    }
+
+    if pending.is_empty() {
+        return Err(AdapterLoadError::InvalidConfiguration(
+            "ONNX Runtime adapter contains no recognizable LoRA A/B graph-input parameters"
+                .to_owned(),
+        ));
+    }
+
+    let mut target_modules = BTreeSet::new();
+    let mut modules = BTreeMap::new();
+    for (module_key, pending) in pending {
+        let (a_key, a) = pending.a.ok_or_else(|| AdapterLoadError::MissingFactor {
+            module_key: module_key.clone(),
+            factor: "A",
+        })?;
+        let (b_key, b) = pending.b.ok_or_else(|| AdapterLoadError::MissingFactor {
+            module_key: module_key.clone(),
+            factor: "B",
+        })?;
+        if a.dtype != b.dtype {
+            return Err(AdapterLoadError::DtypeMismatch {
+                module_key,
+                a: a.dtype,
+                b: b.dtype,
+            });
+        }
+        if a.dims.len() != 2 || b.dims.len() != 2 || a.dims[1] == 0 || a.dims[1] != b.dims[0] {
+            return Err(AdapterLoadError::InvalidShape {
+                key: format!("{module_key}: {a_key} / {b_key}"),
+                actual: a.dims.iter().chain(&b.dims).copied().collect(),
+                expected: "paired ONNX Runtime graph-input factors [K, rank]/[rank, N]",
+                rank: a.dims.get(1).copied().unwrap_or(0),
+            });
+        }
+        let rank = a.dims[1];
+        target_modules.insert(pending.module_name.clone());
+        modules.insert(
+            module_key.clone(),
+            LoadedAdapterModule {
+                module_key,
+                module_name: pending.module_name,
+                layer_index: pending.layer_index,
+                rank,
+                alpha: rank as f32,
+                scale: 1.0,
+                fan_in_fan_out: false,
+                source_layout: PeftFactorLayout::MatMulReady,
+                a_transposed: a,
+                b_transposed: b,
+            },
+        );
+    }
+
+    Ok(LoadedAdapter {
+        name: path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("adapter")
+            .to_owned(),
+        target_modules: target_modules.into_iter().collect(),
+        modules,
+    })
+}
+
+fn has_onnx_adapter_identifier(bytes: &[u8]) -> bool {
+    bytes
+        .get(4..8)
+        .is_some_and(|identifier| identifier == ADAPTER_IDENTIFIER.as_bytes())
 }
 
 /// Load a standard HuggingFace PEFT LoRA adapter directory.
@@ -387,6 +668,123 @@ fn parse_tensor_key(key: &str) -> Result<Option<ParsedKey>, AdapterLoadError> {
     }))
 }
 
+fn parse_onnx_parameter_name(key: &str) -> Result<Option<ParsedKey>, AdapterLoadError> {
+    let normalized = key.replace('/', ".");
+    let components: Vec<_> = normalized
+        .split('.')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let factor_position = components
+        .iter()
+        .position(|component| matches!(*component, "lora_A" | "lora_B"));
+    let Some(factor_position) = factor_position else {
+        // A non-factor parameter is normally metadata we can ignore, but if it
+        // advertises a per-adapter LoRA scale/alpha we must NOT silently skip
+        // it: our loader assumes the exporter has already baked the PEFT scale
+        // into the B factor (scale = 1.0). A scale-bearing parameter would mean
+        // that assumption is false for this container, so fail loud rather than
+        // apply a silently wrong delta.
+        for component in &components {
+            let lowered = component.to_ascii_lowercase();
+            for token in ["alpha", "scaling", "scale", "lora_rank"] {
+                if lowered.contains(token) {
+                    return Err(AdapterLoadError::UnexpectedScaleParameter {
+                        key: key.to_owned(),
+                        token,
+                    });
+                }
+            }
+        }
+        return Ok(None);
+    };
+    let factor = if components[factor_position] == "lora_A" {
+        Factor::A
+    } else {
+        Factor::B
+    };
+
+    let (layers_position, layer_index) = components
+        .windows(2)
+        .enumerate()
+        .find_map(|(position, pair)| {
+            (pair[0] == "layers")
+                .then(|| pair[1].parse::<usize>().ok().map(|index| (position, index)))
+                .flatten()
+        })
+        .ok_or_else(|| AdapterLoadError::MalformedKey {
+            key: key.to_owned(),
+            reason: "expected a `layers.<non-negative integer>` path segment".to_owned(),
+        })?;
+    if factor_position <= layers_position + 2 {
+        return Err(AdapterLoadError::MalformedKey {
+            key: key.to_owned(),
+            reason: "the semantic module name between the layer index and LoRA factor is empty"
+                .to_owned(),
+        });
+    }
+
+    let suffix = &components[(factor_position + 1)..];
+    if suffix != ["MatMul", "weight"] {
+        return Err(AdapterLoadError::MalformedKey {
+            key: key.to_owned(),
+            reason: "expected the ORT GenAI graph-input suffix `.MatMul.weight`".to_owned(),
+        });
+    }
+
+    let module_name = components[(layers_position + 2)..factor_position].join(".");
+    let module_key = components[..factor_position].join(".");
+    Ok(Some(ParsedKey {
+        module_key,
+        module_name,
+        layer_index,
+        factor,
+    }))
+}
+
+fn onnx_dimensions(key: &str, dims: Vec<i64>) -> Result<Vec<usize>, AdapterLoadError> {
+    if dims.is_empty() {
+        return Err(AdapterLoadError::InvalidOnnxAdapterDimensions {
+            key: key.to_owned(),
+            dims,
+            reason: "dimensions must not be empty".to_owned(),
+        });
+    }
+    dims.iter()
+        .map(|&dimension| {
+            usize::try_from(dimension).map_err(|_| AdapterLoadError::InvalidOnnxAdapterDimensions {
+                key: key.to_owned(),
+                dims: dims.clone(),
+                reason: "dimensions must be non-negative and fit the platform address space"
+                    .to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn validate_dense_tensor(key: &str, tensor: &TensorData) -> Result<(), AdapterLoadError> {
+    let element_count = tensor.dims.iter().try_fold(1_usize, |count, &dimension| {
+        count
+            .checked_mul(dimension)
+            .ok_or_else(|| AdapterLoadError::GeometryOverflow {
+                key: key.to_owned(),
+            })
+    })?;
+    let byte_count = element_count
+        .checked_mul(tensor.dtype.byte_size())
+        .ok_or_else(|| AdapterLoadError::GeometryOverflow {
+            key: key.to_owned(),
+        })?;
+    if tensor.data.len() != byte_count {
+        return Err(AdapterLoadError::InvalidShape {
+            key: key.to_owned(),
+            actual: tensor.dims.clone(),
+            expected: "densely packed tensor data matching its declared shape",
+            rank: tensor.dims.len(),
+        });
+    }
+    Ok(())
+}
+
 fn read_tensor(
     key: &str,
     view: &safetensors::tensor::TensorView<'_>,
@@ -507,6 +905,10 @@ fn transpose_rank_two(key: &str, tensor: TensorData) -> Result<TensorData, Adapt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lora::adapter_schema_generated::onnxruntime::adapters::{
+        Adapter, AdapterArgs, Parameter, ParameterArgs, TensorDataType, finish_adapter_buffer,
+    };
+    use flatbuffers::FlatBufferBuilder;
     use safetensors::tensor::{TensorView, serialize_to_file};
     use std::collections::HashMap;
 
@@ -542,6 +944,42 @@ mod tests {
             .collect();
         serialize_to_file(&views, None, &directory.path().join(WEIGHTS_FILE)).unwrap();
         directory
+    }
+
+    fn write_onnx_adapter(
+        parameters: Vec<(&str, TensorDataType, Vec<i64>, Vec<u8>)>,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.onnx_adapter");
+        let mut builder = FlatBufferBuilder::new();
+        let mut parameter_offsets = Vec::with_capacity(parameters.len());
+        for (name, data_type, dims, data) in parameters {
+            let name = builder.create_string(name);
+            let dims = builder.create_vector(&dims);
+            let raw_data = builder.create_vector(&data);
+            parameter_offsets.push(Parameter::create(
+                &mut builder,
+                &ParameterArgs {
+                    name: Some(name),
+                    dims: Some(dims),
+                    data_type,
+                    raw_data: Some(raw_data),
+                },
+            ));
+        }
+        let parameters = builder.create_vector(&parameter_offsets);
+        let adapter = Adapter::create(
+            &mut builder,
+            &AdapterArgs {
+                format_version: ONNX_ADAPTER_FORMAT_VERSION,
+                adapter_version: 1,
+                model_version: 1,
+                parameters: Some(parameters),
+            },
+        );
+        finish_adapter_buffer(&mut builder, adapter);
+        fs::write(&path, builder.finished_data()).unwrap();
+        (directory, path)
     }
 
     #[test]
@@ -719,5 +1157,237 @@ mod tests {
 
         let error = load_peft_adapter(directory.path()).unwrap_err();
         assert!(matches!(error, AdapterLoadError::InvalidShape { .. }));
+    }
+
+    #[test]
+    fn lora_auto_detects_peft_directory_and_weights_path() {
+        let directory = write_adapter(
+            r#"{
+                "r": 1,
+                "lora_alpha": 1.0,
+                "target_modules": ["q_proj"]
+            }"#,
+            vec![
+                (
+                    "model.layers.0.attn.q_proj.lora_A.weight",
+                    vec![1, 2],
+                    f32_bytes(&[1.0, 2.0]),
+                ),
+                (
+                    "model.layers.0.attn.q_proj.lora_B.weight",
+                    vec![3, 1],
+                    f32_bytes(&[3.0, 4.0, 5.0]),
+                ),
+            ],
+        );
+
+        assert_eq!(load_adapter(directory.path()).unwrap().modules.len(), 1);
+        assert_eq!(
+            load_adapter(directory.path().join(WEIGHTS_FILE))
+                .unwrap()
+                .modules
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lora_loads_onnx_adapter_graph_inputs_in_matmul_orientation() {
+        let (_directory, path) = write_onnx_adapter(vec![
+            (
+                "model.layers.2.attn.q_proj.lora_A.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![3, 2],
+                f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
+            (
+                "model.layers.2.attn.q_proj.lora_B.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![2, 4],
+                f32_bytes(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]),
+            ),
+            (
+                "unrelated_graph_input",
+                TensorDataType::FLOAT,
+                vec![1],
+                f32_bytes(&[99.0]),
+            ),
+        ]);
+
+        let adapter = load_adapter(&path).unwrap();
+        assert_eq!(adapter.name, "synthetic");
+        assert_eq!(adapter.target_modules, ["attn.q_proj"]);
+        assert_eq!(adapter.modules.len(), 1);
+        let module = adapter.modules.values().next().unwrap();
+        assert_eq!(module.module_key, "model.layers.2.attn.q_proj");
+        assert_eq!(module.module_name, "attn.q_proj");
+        assert_eq!(module.layer_index, 2);
+        assert_eq!(module.rank, 2);
+        assert_eq!(module.alpha, 2.0);
+        assert_eq!(module.scale, 1.0);
+        assert!(!module.fan_in_fan_out);
+        assert_eq!(module.source_layout, PeftFactorLayout::MatMulReady);
+        assert_eq!(module.a_transposed.dtype, DataType::Float32);
+        assert_eq!(module.a_transposed.dims, [3, 2]);
+        assert_eq!(module.b_transposed.dims, [2, 4]);
+        assert_eq!(
+            tensor_f32_values(&module.a_transposed),
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        assert_eq!(
+            tensor_f32_values(&module.b_transposed),
+            [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+        );
+    }
+
+    /// Row-major matmul of `a` [rows, inner] by `b` [inner, cols] -> [rows, cols].
+    fn matmul(a: &[f32], rows: usize, inner: usize, b: &[f32], cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                let mut acc = 0.0f32;
+                for k in 0..inner {
+                    acc += a[r * inner + k] * b[k * cols + c];
+                }
+                out[r * cols + c] = acc;
+            }
+        }
+        out
+    }
+
+    /// Golden test with a NON-TRIVIAL alpha (alpha != rank).
+    ///
+    /// The ORT `.onnx_adapter` container cannot carry a scale, so ORT bakes the
+    /// PEFT scale (`alpha / rank`) into the B factor at export time and we load
+    /// `scale = 1.0`. This test pins that contract numerically: it exports an
+    /// adapter whose intended alpha is 16 at rank 2 (PEFT scale = 8.0) by
+    /// pre-scaling B by 8.0, then asserts that applying the loaded delta
+    /// (`scale * (A @ B_stored)`) reproduces the intended `(alpha / rank) *
+    /// (A @ B_raw)` delta. A future non-pre-scaled export that instead relied on
+    /// the loader to apply `alpha / rank` would leave `scale = 1.0` and produce a
+    /// delta 8x too small, failing this assertion instead of silently
+    /// mis-scaling.
+    #[test]
+    fn lora_onnx_adapter_prescaled_b_reproduces_nontrivial_alpha_delta() {
+        let rank = 2usize;
+        let k = 3usize;
+        let n = 2usize;
+        let intended_alpha = 16.0f32;
+        let peft_scale = intended_alpha / rank as f32; // 8.0
+
+        // A is stored [K, rank]; B is stored [rank, N].
+        let a_values = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]; // [3, 2]
+        let b_raw = [1.0, 2.0, 3.0, 4.0]; // [2, 2], unscaled PEFT B
+        let b_prescaled: Vec<f32> = b_raw.iter().map(|value| value * peft_scale).collect();
+
+        let (_directory, path) = write_onnx_adapter(vec![
+            (
+                "model.layers.0.attn.q_proj.lora_A.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![k as i64, rank as i64],
+                f32_bytes(&a_values),
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_B.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![rank as i64, n as i64],
+                f32_bytes(&b_prescaled),
+            ),
+        ]);
+
+        let adapter = load_adapter(&path).unwrap();
+        let module = adapter.modules.values().next().unwrap();
+
+        assert_eq!(module.rank, rank);
+        assert_eq!(module.alpha, rank as f32, "alpha mirrors rank; no scale field");
+        assert_eq!(
+            module.scale, 1.0,
+            "ORT bakes the scale into B, so the loader must record scale = 1.0"
+        );
+
+        let a_loaded = tensor_f32_values(&module.a_transposed);
+        let b_loaded = tensor_f32_values(&module.b_transposed);
+
+        // Effective delta actually applied at inference: scale * (A @ B_stored).
+        let effective: Vec<f32> = matmul(&a_loaded, k, rank, &b_loaded, n)
+            .into_iter()
+            .map(|value| value * module.scale)
+            .collect();
+
+        // Intended PEFT delta with the non-trivial alpha: (alpha / rank) * (A @ B_raw).
+        let expected: Vec<f32> = matmul(&a_values, k, rank, &b_raw, n)
+            .into_iter()
+            .map(|value| value * peft_scale)
+            .collect();
+
+        assert_eq!(
+            effective, expected,
+            "pre-scaled B + scale=1.0 must reproduce the intended alpha/rank-scaled delta"
+        );
+    }
+
+    /// A parameter that advertises a per-adapter scale/alpha must fail loud
+    /// rather than be silently skipped, because our loader assumes the exporter
+    /// pre-scaled B (`scale = 1.0`); a scale-bearing container would violate that.
+    #[test]
+    fn lora_onnx_adapter_scale_parameter_fails_loud() {
+        let (_directory, path) = write_onnx_adapter(vec![
+            (
+                "model.layers.0.attn.q_proj.lora_A.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![2, 1],
+                f32_bytes(&[1.0, 2.0]),
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_B.MatMul.weight",
+                TensorDataType::FLOAT,
+                vec![1, 2],
+                f32_bytes(&[3.0, 4.0]),
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_alpha",
+                TensorDataType::FLOAT,
+                vec![1],
+                f32_bytes(&[16.0]),
+            ),
+        ]);
+
+        assert!(matches!(
+            load_adapter(&path).unwrap_err(),
+            AdapterLoadError::UnexpectedScaleParameter { token: "alpha", .. }
+        ));
+    }
+
+    #[test]
+    fn lora_reports_onnx_adapter_invalid_magic_and_truncation_as_typed_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let bad_magic_path = directory.path().join("bad.onnx_adapter");
+        fs::write(&bad_magic_path, b"not a flatbuffer").unwrap();
+        assert!(matches!(
+            load_onnx_adapter(&bad_magic_path).unwrap_err(),
+            AdapterLoadError::InvalidOnnxAdapterMagic { .. }
+        ));
+
+        let (_valid_directory, valid_path) = write_onnx_adapter(vec![
+            (
+                "model.layers.0.attn.q_proj.lora_A.MatMul.weight",
+                TensorDataType::FLOAT16,
+                vec![2, 1],
+                vec![0, 0, 0, 0],
+            ),
+            (
+                "model.layers.0.attn.q_proj.lora_B.MatMul.weight",
+                TensorDataType::FLOAT16,
+                vec![1, 2],
+                vec![0, 0, 0, 0],
+            ),
+        ]);
+        let bytes = fs::read(&valid_path).unwrap();
+        let truncated_path = directory.path().join("truncated.onnx_adapter");
+        fs::write(&truncated_path, &bytes[..12]).unwrap();
+        assert!(matches!(
+            load_onnx_adapter(&truncated_path).unwrap_err(),
+            AdapterLoadError::OnnxAdapterFlatbuffer { .. }
+        ));
     }
 }

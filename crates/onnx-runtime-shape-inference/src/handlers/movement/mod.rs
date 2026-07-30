@@ -105,6 +105,8 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "ScatterND", 13, scatter_nd);
     reg.register("", "ScatterND", 16, scatter_nd);
     reg.register("", "ScatterND", 18, scatter_nd);
+    reg.register("", "TensorScatter", 24, tensor_scatter);
+    reg.register("com.microsoft", "TensorScatter", 1, tensor_scatter);
     reg.register("", "Trilu", 14, trilu);
     reg.register("", "DepthToSpace", 1, depth_to_space);
     reg.register("", "DepthToSpace", 11, depth_to_space);

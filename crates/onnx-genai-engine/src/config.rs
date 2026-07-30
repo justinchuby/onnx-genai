@@ -494,6 +494,23 @@ pub struct EngineConfig {
     /// Only the native backend consumes this; selecting an adapter with the ORT
     /// backend is rejected at load time. `None` is base-only (no adapter).
     pub lora_adapter: Option<PathBuf>,
+    /// Optional set of named PEFT LoRA adapters to preload as one Phase-2
+    /// grouped multi-adapter pool (design §J). Each entry is
+    /// `(identifier, directory)`; the `identifier` is the stable name a
+    /// generation request selects the adapter by (see
+    /// [`GenerateOptions::adapter`]). When this holds 2+ adapters the native
+    /// session injects them as one paged pool reached through the grouped
+    /// `GroupedLoraDelta` op and routed per request; 0/1 adapters stay on the
+    /// single/none DIRECT fast path. Only the native backend consumes this, and
+    /// it is mutually exclusive with [`Self::lora_adapter`].
+    pub lora_adapters: Vec<(String, PathBuf)>,
+    /// User-facing name of a single `--adapters NAME=PATH` that collapsed onto
+    /// the DIRECT single-adapter fast path. Carries the selectable identifier
+    /// (which [`Self::lora_adapter`] alone discards, being only a path) so a
+    /// `--select-adapter NAME` request for the already-applied adapter is a
+    /// no-op rather than a misleading "not a grouped pool" error. `None` for
+    /// base-only, grouped, or path-only (`--adapter`) sessions.
+    pub lora_adapter_name: Option<String>,
     /// Number of GPU pages for KV cache.
     pub num_gpu_pages: usize,
     /// Tokens per KV page.
@@ -538,6 +555,8 @@ impl Default for EngineConfig {
             #[cfg(feature = "native-backend")]
             decode_precision: onnx_runtime_session::DecodePrecision::Model,
             lora_adapter: None,
+            lora_adapters: Vec::new(),
+            lora_adapter_name: None,
             num_gpu_pages: 1024,
             page_size: 16,
             scheduler: SchedulerConfig::default(),
@@ -823,6 +842,13 @@ pub struct GenerateOptions {
     /// The chosen token is always included in `TokenLogprob::top`, in addition to the
     /// requested alternatives when it is not already among them.
     pub top_logprobs: Option<usize>,
+    /// Optional Phase-2 multi-adapter LoRA selection (design §J.4). Names one of
+    /// the adapters preloaded through [`EngineConfig::lora_adapters`]; every token
+    /// of this request routes to that adapter's pool pages. `None` decodes
+    /// base-only (no adapter). An unknown name is rejected at request admission
+    /// (fail loud), never silently falling back to base. Ignored when the session
+    /// has no grouped adapters.
+    pub adapter: Option<String>,
 }
 
 impl Default for GenerateOptions {
@@ -852,6 +878,7 @@ impl Default for GenerateOptions {
             speculative_mode: None,
             constraint: None,
             top_logprobs: None,
+            adapter: None,
         }
     }
 }

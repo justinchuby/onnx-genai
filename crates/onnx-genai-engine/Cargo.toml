@@ -23,6 +23,7 @@ native-backend = [
     "onnx-runtime-ep-cpu/tracing",
     "dep:onnx-runtime-session",
     "dep:onnx-runtime-tracer",
+    "dep:onnx-runtime-ep-api",
 ]
 mlas = [
     "native-backend",
@@ -77,6 +78,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 safetensors = { workspace = true }
+flatbuffers = { workspace = true }
 tokenizers = { workspace = true }
 rand = "0.9.5"
 half = { workspace = true, features = ["use-intrinsics"] }

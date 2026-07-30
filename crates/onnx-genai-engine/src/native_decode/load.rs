@@ -8,6 +8,9 @@ impl NativeDecodeSession {
         io: Option<&ModelIoSpec>,
         decode_precision: DecodePrecision,
         lora_adapter: Option<onnx_runtime_session::lora_inject::LoraAdapterSpec>,
+        lora_adapters: Vec<onnx_runtime_session::lora_inject::LoraAdapterSpec>,
+        lora_target_manifest: Option<onnx_genai_metadata::LoraTargetManifest>,
+        lora_byte_budget: Option<onnx_genai_scheduler::ByteBudget>,
     ) -> anyhow::Result<Self> {
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -15,20 +18,41 @@ impl NativeDecodeSession {
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
         let has_lora_adapter = lora_adapter.is_some();
+        let has_grouped_lora = !lora_adapters.is_empty();
+        // Native LoRA (single DIRECT or grouped multi-adapter) is CPU-only in
+        // this phase (design §J.7 defers CUDA). Reject a GPU device up front
+        // rather than silently injecting an inert branch.
+        if (has_lora_adapter || has_grouped_lora) && !matches!(device, NativeDecodeDevice::Cpu) {
+            anyhow::bail!(
+                "native LoRA adapters are only supported on the CPU device in this phase \
+                 (CUDA is deferred to P5/§J.7)"
+            );
+        }
         let mut builder = InferenceSession::builder()
             .model(path)
             .device(preference)
             .decode_precision(decode_precision);
         if let Some(adapter) = lora_adapter {
-            // CUDA phase (P5): native LoRA is CPU-only for Phase 1. Reject a GPU
-            // device up front rather than silently injecting an inert branch.
-            if !matches!(device, NativeDecodeDevice::Cpu) {
-                anyhow::bail!(
-                    "native LoRA adapters are only supported on the CPU device in this phase \
-                     (CUDA is deferred to P5)"
-                );
-            }
             builder = builder.lora_adapter(adapter);
+        }
+        if has_grouped_lora {
+            // Phase-2 multi-adapter grouped path (design §J): all adapters share
+            // one paged pool, selected per request through the `segments` input.
+            builder = builder.lora_adapters(lora_adapters);
+            // Wire the shared cross-session byte budget (the same instance the
+            // KV/device subsystem accounts against) so grouped adapter residency
+            // is reserved from it before admission and an over-budget set fails
+            // loud instead of over-committing device memory (design §J.2 control
+            // plane). Without a budget the pool falls back to its own capacity
+            // ceiling (unbounded by the device budget).
+            if let Some(budget) = lora_byte_budget {
+                builder = builder.lora_pool_sink(Box::new(
+                    crate::lora::pool::BudgetedLoraPool::new(budget),
+                ));
+            }
+        }
+        if let Some(manifest) = lora_target_manifest {
+            builder = builder.lora_target_manifest(manifest);
         }
         if device == NativeDecodeDevice::Cpu {
             let ep =
@@ -340,7 +364,7 @@ impl NativeDecodeSession {
                 );
             }
         }
-        let step_inputs = input_names
+        let mut step_inputs = input_names
             .iter()
             .filter(|name| !kv_inputs.contains(name))
             .map(|name| NativeStepInputBinding {
@@ -351,6 +375,33 @@ impl NativeDecodeSession {
                     .unwrap_or(NativeStepInputSource::Routed),
             })
             .collect::<Vec<_>>();
+
+        // Phase-2 grouped-LoRA routing (design §J): the injected `segments` graph
+        // input is generated internally each step from the session's selected
+        // adapter (not routed by the pipeline), so reclassify its binding away
+        // from the generic `Routed` handling that would demand a supplied tensor.
+        let lora_segments = if let Some(segments_name) = session.lora_segments_input() {
+            let segments_name = segments_name.to_string();
+            let adapter_ids = session.lora_adapter_ids().to_vec();
+            for binding in step_inputs.iter_mut() {
+                if binding.name == segments_name {
+                    binding.source = NativeStepInputSource::LoraSegments;
+                }
+            }
+            Some(LoraSegmentsState {
+                input_name: segments_name,
+                adapter_ids,
+                active: None,
+                buffer: Vec::new(),
+            })
+        } else {
+            None
+        };
+        if lora_segments.is_some() && session.device_id().device_type == DeviceType::Cuda {
+            bail!(
+                "Phase-2 grouped multi-adapter LoRA is CPU-only in this phase (design §J.7, CUDA deferred)"
+            );
+        }
         let required_sequence_source = match sequence_source {
             SequenceInputKind::TokenIds => NativeStepInputSource::TokenIds,
             SequenceInputKind::InputsEmbeds => NativeStepInputSource::InputsEmbeds,
@@ -460,6 +511,7 @@ impl NativeDecodeSession {
             last_hidden: None,
             uses_decode_pool,
             has_plugin_fused,
+            lora_segments,
         })
     }
 }

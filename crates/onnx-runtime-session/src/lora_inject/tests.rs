@@ -24,15 +24,19 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, Node, NodeId, TensorData, ValueId, WeightRef,
     static_shape,
 };
+use onnx_genai_metadata::{LoraTargetDescriptor, LoraTargetManifest, LoraTargetSlice};
 use onnx_runtime_loader::WeightStore;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use super::{
-    build_manifest, inject, FusedGroup, LoraAdapterSpec, LoraInjectError, LoraManifest,
-    LoraModuleSpec, LoraTarget, Placement, QkvRole, TargetEntry,
+    build_manifest, inject, inject_grouped, inject_grouped_lora_adapter, inject_grouped_multi,
+    FusedGroup, LoraAdapterSpec, LoraInjectError, LoraManifest, LoraModuleSpec, LoraTarget,
+    Placement, QkvRole, TargetEntry,
 };
 use crate::Tensor;
 use crate::executor::{auto_detect_cpu_ep, Executor};
+use onnx_runtime_ep_api::{AdapterId, LoraPoolRegistry};
 
 const F32: DataType = DataType::Float32;
 
@@ -108,6 +112,33 @@ fn add_activation(graph: &mut Graph, k: usize) -> ValueId {
     x
 }
 
+fn declared_fused_qkv(node_name: &str, k: usize, n: usize) -> LoraTargetManifest {
+    let slices = BTreeMap::from([
+        ("q_proj".to_string(), LoraTargetSlice {
+            offset: 0, width: 3584, rank: None, alpha: None,
+        }),
+        ("k_proj".to_string(), LoraTargetSlice {
+            offset: 3584, width: 512, rank: None, alpha: None,
+        }),
+        ("v_proj".to_string(), LoraTargetSlice {
+            offset: 4096, width: 512, rank: None, alpha: None,
+        }),
+    ]);
+    LoraTargetManifest {
+        targets: vec![LoraTargetDescriptor {
+            module_name: "self_attn.qkv_proj".to_string(),
+            layer_index: 0,
+            node_name: node_name.to_string(),
+            output_name: format!("{node_name}.out"),
+            k,
+            n,
+            slices,
+            rank: None,
+            alpha: None,
+        }],
+    }
+}
+
 // ===========================================================================
 // P3 — discovery / manifest tests (structural, no execution).
 // ===========================================================================
@@ -161,7 +192,7 @@ fn discovery_split_qwen3_resolves_direct() {
         LoraTarget { module_name: "self_attn.v_proj".into(), layer_index: 0 },
         LoraTarget { module_name: "self_attn.o_proj".into(), layer_index: 0 },
     ];
-    let manifest = build_manifest(&graph, &targets).expect("split layout resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("split layout resolves");
     assert_eq!(manifest.entries.len(), 4);
     for (entry, expected_n) in manifest.entries.iter().zip([2048, 1024, 1024, 2048]) {
         assert!(
@@ -208,7 +239,7 @@ fn discovery_fused_qwen25_resolves_slices() {
         LoraTarget { module_name: "self_attn.k_proj".into(), layer_index: 0 },
         LoraTarget { module_name: "self_attn.v_proj".into(), layer_index: 0 },
     ];
-    let manifest = build_manifest(&graph, &targets).expect("fused layout resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("fused layout resolves");
 
     let expected = [
         (QkvRole::Q, 0usize, 3584usize),
@@ -237,6 +268,107 @@ fn discovery_fused_qwen25_resolves_slices() {
     }
 }
 
+#[test]
+fn declared_manifest_matches_graph_discovery_for_fused_qkv() {
+    let mut graph = Graph::new();
+    let k = 3584;
+    let node_name = "/model/layers.0/attn/qkv_proj/MatMul_Q4";
+    let x = add_activation(&mut graph, k);
+    add_matmulnbits(
+        &mut graph, node_name,
+        "model.layers.0.attn.qkv_proj.MatMul.weight_Q4", x, k, 4608,
+    );
+    add_gqa(&mut graph, "/model/layers.0/attn/GroupQueryAttention", 28, 4);
+    let targets = vec![
+        LoraTarget { module_name: "self_attn.q_proj".into(), layer_index: 0 },
+        LoraTarget { module_name: "self_attn.k_proj".into(), layer_index: 0 },
+        LoraTarget { module_name: "self_attn.v_proj".into(), layer_index: 0 },
+    ];
+
+    let discovered = build_manifest(&graph, &targets, None).expect("graph discovery");
+    let declaration = declared_fused_qkv(node_name, k, 4608);
+    let declared =
+        build_manifest(&graph, &targets, Some(&declaration)).expect("declared manifest");
+
+    assert_eq!(declared.entries.len(), discovered.entries.len());
+    for (declared, discovered) in declared.entries.iter().zip(&discovered.entries) {
+        assert_eq!(declared.semantic, discovered.semantic);
+        assert_eq!(declared.node_id, discovered.node_id);
+        assert_eq!(declared.base_output, discovered.base_output);
+        assert_eq!(declared.activation, discovered.activation);
+        assert_eq!(declared.k, discovered.k);
+        assert_eq!(declared.n, discovered.n);
+        assert_eq!(declared.dtype, discovered.dtype);
+        assert_eq!(declared.placement, discovered.placement);
+    }
+}
+
+#[test]
+fn declared_manifest_missing_node_returns_typed_error() {
+    let mut graph = Graph::new();
+    let x = add_activation(&mut graph, 3584);
+    add_matmulnbits(
+        &mut graph, "/model/layers.0/attn/qkv_proj/MatMul_Q4",
+        "model.layers.0.attn.qkv_proj.MatMul.weight_Q4", x, 3584, 4608,
+    );
+    let declaration =
+        declared_fused_qkv("/model/layers.0/attn/missing/MatMul_Q4", 3584, 4608);
+    let targets = [LoraTarget {
+        module_name: "self_attn.q_proj".into(),
+        layer_index: 0,
+    }];
+
+    let error = build_manifest(&graph, &targets, Some(&declaration))
+        .expect_err("missing declared node must fail");
+    assert!(matches!(error, LoraInjectError::DeclaredNodeMissing { .. }));
+}
+
+#[test]
+fn declared_manifest_dimension_mismatch_returns_typed_error() {
+    let mut graph = Graph::new();
+    let node_name = "/model/layers.0/attn/qkv_proj/MatMul_Q4";
+    let x = add_activation(&mut graph, 3584);
+    add_matmulnbits(
+        &mut graph, node_name,
+        "model.layers.0.attn.qkv_proj.MatMul.weight_Q4", x, 3584, 4608,
+    );
+    let declaration = declared_fused_qkv(node_name, 4096, 4608);
+    let targets = [LoraTarget {
+        module_name: "self_attn.q_proj".into(),
+        layer_index: 0,
+    }];
+
+    let error = build_manifest(&graph, &targets, Some(&declaration))
+        .expect_err("declared K mismatch must fail");
+    assert!(matches!(
+        error,
+        LoraInjectError::DeclaredDimensionMismatch {
+            dimension: "K",
+            declared: 4096,
+            actual: 3584,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn absent_declared_manifest_falls_back_to_graph_discovery() {
+    let mut graph = Graph::new();
+    let x = add_activation(&mut graph, 2048);
+    add_matmulnbits(
+        &mut graph, "/model/layers.0/attn/q_proj/MatMulNBits",
+        "model.layers.0.attn.q_proj.MatMulNBits.qweight", x, 2048, 2048,
+    );
+    let targets = [LoraTarget {
+        module_name: "self_attn.q_proj".into(),
+        layer_index: 0,
+    }];
+
+    let manifest = build_manifest(&graph, &targets, None).expect("fallback discovery");
+    assert_eq!(manifest.entries.len(), 1);
+    assert!(matches!(manifest.entries[0].placement, Placement::Direct));
+}
+
 // Qwen3.5-style LINEAR attention: the projection is `in_proj_qkv`, a token the
 // pass does not recognize as q/k/v or as a fused `qkv_proj`. A q_proj target
 // must FAIL LOUD (UnresolvedModule) rather than silently mapping onto the
@@ -259,7 +391,7 @@ fn discovery_linear_attn_fails_loud() {
         module_name: "self_attn.q_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("q_proj must not resolve");
+    let err = build_manifest(&graph, &targets, None).expect_err("q_proj must not resolve");
     match err {
         LoraInjectError::UnresolvedModule { module, layer } => {
             assert_eq!(module, "self_attn.q_proj");
@@ -290,7 +422,7 @@ fn discovery_linear_attn_direct_token_resolves() {
         module_name: "linear_attn.in_proj_qkv".into(),
         layer_index: 0,
     }];
-    let manifest = build_manifest(&graph, &targets).expect("direct token resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("direct token resolves");
     assert!(matches!(manifest.entries[0].placement, Placement::Direct));
     assert_eq!(manifest.entries[0].n, 4096);
 }
@@ -316,7 +448,7 @@ fn discovery_fused_missing_attention_fails_loud() {
         module_name: "self_attn.q_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("no GQA => cannot slice");
+    let err = build_manifest(&graph, &targets, None).expect_err("no GQA => cannot slice");
     match err {
         LoraInjectError::MissingAttention { fused_n, layer, .. } => {
             assert_eq!(fused_n, 4608);
@@ -348,7 +480,7 @@ fn discovery_fused_geometry_mismatch_fails_loud() {
         module_name: "self_attn.q_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("bad geometry must fail");
+    let err = build_manifest(&graph, &targets, None).expect_err("bad geometry must fail");
     assert!(
         matches!(err, LoraInjectError::FusedGeometry { .. }),
         "expected FusedGeometry, got {err:?}"
@@ -382,7 +514,7 @@ fn discovery_missing_attribute_fails_loud() {
         module_name: "mlp.gate_proj".into(),
         layer_index: 0,
     }];
-    let err = build_manifest(&graph, &targets).expect_err("missing K must fail");
+    let err = build_manifest(&graph, &targets, None).expect_err("missing K must fail");
     match err {
         LoraInjectError::MissingAttribute { attr, .. } => assert_eq!(attr, "K"),
         other => panic!("expected MissingAttribute, got {other:?}"),
@@ -415,7 +547,7 @@ fn discovery_mlp_projections_resolve_direct() {
         LoraTarget { module_name: "mlp.gate_proj".into(), layer_index: 0 },
         LoraTarget { module_name: "mlp.down_proj".into(), layer_index: 0 },
     ];
-    let manifest = build_manifest(&graph, &targets).expect("mlp resolves");
+    let manifest = build_manifest(&graph, &targets, None).expect("mlp resolves");
     assert!(matches!(manifest.entries[0].placement, Placement::Direct));
     assert_eq!(manifest.entries[0].n, 18944);
     assert!(matches!(manifest.entries[1].placement, Placement::Direct));
@@ -970,4 +1102,578 @@ fn injected_branch_survives_optimization() {
         let outputs = exec.run(&[("x", &x_t)]).unwrap();
         assert_eq!(outputs[0].to_vec_f32(), base, "{level:?}: unfed must be base-only");
     }
+}
+
+// ===========================================================================
+// P2c — grouped injection (GroupedLoraDelta) single-adapter parity (§J.5).
+// ===========================================================================
+
+/// Build an `Int32` routing tensor.
+fn i32_segments(len: usize, data: &[i32]) -> Tensor {
+    assert_eq!(data.len(), len);
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    Tensor::from_raw(DataType::Int32, vec![len], &bytes).unwrap()
+}
+
+/// Run the Phase-1 4-node direct injection and return the output row-major f32.
+fn run_phase1_direct(
+    m: usize,
+    k: usize,
+    n: usize,
+    r: usize,
+    scale: f32,
+    w: &[f32],
+    x: &[f32],
+    a: &[f32],
+    b: &[f32],
+) -> Vec<f32> {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale, a, b, k, n)],
+    };
+    let overrides = inject(&mut graph, &manifest, &adapter).expect("inject");
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &overrides,
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], x).unwrap();
+    let a_t = Tensor::from_f32(&[k, r], a).unwrap();
+    let b_t = Tensor::from_f32(&[r, n], b).unwrap();
+    exec.run(&[
+        ("x", &x_t),
+        ("lora.adapter.layers.0.q_proj.A_t", &a_t),
+        ("lora.adapter.layers.0.q_proj.B_t", &b_t),
+    ])
+    .unwrap()[0]
+        .to_vec_f32()
+}
+
+// §E golden parity: the grouped GroupedLoraDelta op, run as a pool-of-one with
+// every row routed to adapter 0, is bit-parity with the Phase-1 4-node subgraph.
+#[test]
+fn grouped_injection_drop_removes_registry_entry() {
+    let (m, k, n, r) = (2, 4, 3, 2);
+    let w = vec![0.0f32; k * n];
+    let a = vec![0.0f32; k * r];
+    let b = vec![0.0f32; r * n];
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, 1.0, &a, &b, k, n)],
+    };
+    let pool_id = {
+        let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped");
+        assert!(LoraPoolRegistry::global().get(injection.pool_id).is_some());
+        injection.pool_id
+    };
+    assert!(LoraPoolRegistry::global().get(pool_id).is_none());
+}
+
+#[test]
+fn grouped_single_adapter_matches_phase1_subgraph() {
+    let (m, k, n, r) = (2, 4, 3, 2);
+    let scale = 0.5f32;
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    let x: Vec<f32> = vec![1.0, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 0.3).collect();
+    let b: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.2).collect();
+
+    let phase1 = run_phase1_direct(m, k, n, r, scale, &w, &x, &a, &b);
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale, &a, &b, k, n)],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped");
+    let pool_id = injection.pool_id;
+
+    // One custom op, one Add, one shared segments input, no A_t/B_t inputs.
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 1);
+    assert_eq!(count_op(&graph, "Add"), 1);
+    assert_eq!(count_op(&graph, "MatMul"), 1, "only the base MatMul remains");
+    assert!(has_input_named(&graph, "lora.segments"));
+    assert!(!has_input_named(&graph, "lora.adapter.layers.0.q_proj.A_t"));
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![0i32; m]);
+    let grouped = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    assert_eq!(phase1.len(), grouped.len());
+    for (p, g) in phase1.iter().zip(&grouped) {
+        assert!(
+            (p - g).abs() < 1e-6,
+            "grouped {grouped:?} must match Phase-1 {phase1:?}"
+        );
+    }
+}
+
+// A null route (negative segment id) collapses the grouped delta to base-only,
+// the batched analogue of the Phase-1 unfed no-op.
+#[test]
+fn grouped_null_route_is_base_only() {
+    let (m, k, n, r) = (2, 4, 3, 2);
+    let scale = 0.5f32;
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    let x: Vec<f32> = vec![1.0, 0.5, -1.0, 2.0, 3.0, 1.0, 0.0, -2.0];
+    let a: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 0.3).collect();
+    let b: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.2).collect();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale, &a, &b, k, n)],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped");
+    let pool_id = injection.pool_id;
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![-1i32; m]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    let base = reference_base(m, k, n, &x, &w);
+    for (g, e) in got.iter().zip(&base) {
+        assert!((g - e).abs() < 1e-6, "null route must be base-only");
+    }
+}
+
+// Multi-adapter grouped injection (design §J.3/§J.4): two adapters live in one
+// pool, and the per-row `segments` routing input selects, per token, which
+// adapter's delta the shared GroupedLoraDelta op applies. This is the
+// end-to-end proof of per-request adapter selection at the injection layer:
+// rows routed to adapter A get A's delta, rows routed to adapter B get B's, and
+// a base-only row (-1) gets no delta — all in a single mixed batch.
+#[test]
+fn grouped_two_adapters_route_per_row() {
+    let (k, n, r) = (4usize, 3usize, 2usize);
+    let (scale_a, scale_b) = (0.5f32, 1.25f32);
+    let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    // Adapter A and adapter B factors differ, so their deltas are distinct.
+    let a_a: Vec<f32> = (0..k * r).map(|i| (i as f32) * 0.1 - 0.3).collect();
+    let b_a: Vec<f32> = (0..r * n).map(|i| (i as f32) * -0.05 + 0.2).collect();
+    let a_b: Vec<f32> = (0..k * r).map(|i| (i as f32) * -0.2 + 0.4).collect();
+    let b_b: Vec<f32> = (0..r * n).map(|i| (i as f32) * 0.15 - 0.1).collect();
+
+    // Four rows: row 0 -> adapter A, row 1 -> adapter B, row 2 -> base (-1),
+    // row 3 -> adapter A again (proves grouping is per-row, not contiguous).
+    let m = 4usize;
+    let x: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.13 - 1.0).collect();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter_a = LoraAdapterSpec {
+        name: "alpha".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale_a, &a_a, &b_a, k, n)],
+    };
+    let adapter_b = LoraAdapterSpec {
+        name: "beta".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, scale_b, &a_b, &b_b, k, n)],
+    };
+    let injection = inject_grouped_multi(
+        &mut graph,
+        &manifest,
+        &[(AdapterId(0), &adapter_a), (AdapterId(1), &adapter_b)],
+        None,
+    )
+    .expect("inject_grouped_multi");
+    let pool_id = injection.pool_id;
+
+    // Both adapters are name-addressable through the injection's map.
+    assert_eq!(
+        injection.adapters,
+        vec![
+            ("alpha".to_string(), AdapterId(0)),
+            ("beta".to_string(), AdapterId(1)),
+        ]
+    );
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 1);
+    assert!(has_input_named(&graph, "lora.segments"));
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    // Row routing: adapter A (0), adapter B (1), base (-1), adapter A (0).
+    let seg = i32_segments(m, &[0, 1, -1, 0]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    // Reference: base + the per-row adapter delta (or base only for row 2).
+    let base = reference_base(m, k, n, &x, &w);
+    let delta_a = reference_delta(m, k, r, n, scale_a, &x, &a_a, &b_a);
+    let delta_b = reference_delta(m, k, r, n, scale_b, &x, &a_b, &b_b);
+    let mut expected = base.clone();
+    for j in 0..n {
+        expected[0 * n + j] += delta_a[0 * n + j]; // row 0 -> A
+        expected[1 * n + j] += delta_b[1 * n + j]; // row 1 -> B
+        // row 2 -> base only (no delta)
+        expected[3 * n + j] += delta_a[3 * n + j]; // row 3 -> A
+    }
+    assert_eq!(got.len(), expected.len());
+    for (idx, (g, e)) in got.iter().zip(&expected).enumerate() {
+        assert!(
+            (g - e).abs() < 1e-5,
+            "row {}/col — grouped multi-adapter got {got:?} expected {expected:?}",
+            idx / n
+        );
+    }
+    // Adapter A and B deltas must actually differ, or the test proves nothing.
+    assert!(
+        (0..n).any(|j| (delta_a[j] - delta_b[j]).abs() > 1e-4),
+        "adapter A and B deltas must be distinct for a meaningful selection test"
+    );
+}
+
+// A divergent module set across adapters is a fail-loud injection error.
+#[test]
+fn grouped_multi_adapter_module_mismatch_fails_loud() {
+    let (k, n, r) = (4usize, 3usize, 2usize);
+    let w = vec![0.0f32; k * n];
+    let a = vec![0.0f32; k * r];
+    let b = vec![0.0f32; r * n];
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, 2, k, n, &w);
+    let manifest = LoraManifest {
+        entries: vec![direct_entry(node_id, base_v, x_v, k, n)],
+    };
+    let adapter_a = LoraAdapterSpec {
+        name: "alpha".into(),
+        modules: vec![f32_module("self_attn.q_proj", r, 1.0, &a, &b, k, n)],
+    };
+    let adapter_b = LoraAdapterSpec {
+        name: "beta".into(),
+        modules: vec![f32_module("self_attn.k_proj", r, 1.0, &a, &b, k, n)],
+    };
+    let error = inject_grouped_multi(
+        &mut graph,
+        &manifest,
+        &[(AdapterId(0), &adapter_a), (AdapterId(1), &adapter_b)],
+        None,
+    );
+    assert!(matches!(
+        error,
+        Err(LoraInjectError::AdapterModuleSetMismatch { .. })
+    ));
+}
+
+// Grouped fused-QKV: three GroupedLoraDelta ops share one Concat + Add (§J's
+// simpler option). Full-adapter numerics match the per-slice reference.
+#[test]
+fn grouped_fused_qkv_matches_reference() {
+    let (m, k) = (2, 3);
+    let fused_n = 8;
+    let w: Vec<f32> = (0..k * fused_n).map(|i| (i as f32) * 0.05 - 0.5).collect();
+    let x: Vec<f32> = vec![0.5, -1.0, 2.0, 1.5, 0.0, -0.5];
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, fused_n, &w);
+    let group = tiny_fused_group(node_id);
+
+    let (rq, rk, rv) = (2usize, 3usize, 1usize);
+    let (sq, sk, sv) = (0.5f32, 1.0f32, 2.0f32);
+    let aq: Vec<f32> = (0..k * rq).map(|i| (i as f32) * 0.1 - 0.2).collect();
+    let bq: Vec<f32> = (0..rq * 4).map(|i| (i as f32) * 0.05).collect();
+    let ak: Vec<f32> = (0..k * rk).map(|i| (i as f32) * -0.1 + 0.3).collect();
+    let bk: Vec<f32> = (0..rk * 2).map(|i| (i as f32) * 0.07).collect();
+    let av: Vec<f32> = (0..k * rv).map(|i| (i as f32) * 0.2).collect();
+    let bv: Vec<f32> = (0..rv * 2).map(|i| (i as f32) * -0.1 + 0.4).collect();
+
+    let manifest = LoraManifest {
+        entries: vec![
+            fused_entry(node_id, base_v, x_v, k, QkvRole::Q, 4, &group),
+            fused_entry(node_id, base_v, x_v, k, QkvRole::K, 2, &group),
+            fused_entry(node_id, base_v, x_v, k, QkvRole::V, 2, &group),
+        ],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![
+            f32_module("self_attn.q_proj", rq, sq, &aq, &bq, k, 4),
+            f32_module("self_attn.k_proj", rk, sk, &ak, &bk, k, 2),
+            f32_module("self_attn.v_proj", rv, sv, &av, &bv, k, 2),
+        ],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped fused");
+    let pool_id = injection.pool_id;
+
+    // Three ops, one Concat, one Add.
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 3);
+    assert_eq!(count_op(&graph, "Concat"), 1);
+    assert_eq!(count_op(&graph, "Add"), 1);
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![0i32; m]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    let base = reference_base(m, k, fused_n, &x, &w);
+    let dq = reference_delta(m, k, rq, 4, sq, &x, &aq, &bq);
+    let dk = reference_delta(m, k, rk, 2, sk, &x, &ak, &bk);
+    let dv = reference_delta(m, k, rv, 2, sv, &x, &av, &bv);
+    let mut expected = base.clone();
+    for i in 0..m {
+        for j in 0..4 {
+            expected[i * fused_n + j] += dq[i * 4 + j];
+        }
+        for j in 0..2 {
+            expected[i * fused_n + 4 + j] += dk[i * 2 + j];
+        }
+        for j in 0..2 {
+            expected[i * fused_n + 6 + j] += dv[i * 2 + j];
+        }
+    }
+    for (g, e) in got.iter().zip(&expected) {
+        assert!((g - e).abs() < 1e-4, "grouped fused got {got:?} expected {expected:?}");
+    }
+}
+
+// Grouped partial fused-QKV: only q targeted; the untargeted K/V slices admit
+// zero-rank pages and contribute nothing, so those columns equal the base.
+#[test]
+fn grouped_fused_qkv_partial_is_zero_on_untargeted() {
+    let (m, k) = (2, 3);
+    let fused_n = 8;
+    let w: Vec<f32> = (0..k * fused_n).map(|i| (i as f32) * 0.05 - 0.5).collect();
+    let x: Vec<f32> = vec![0.5, -1.0, 2.0, 1.5, 0.0, -0.5];
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let (node_id, x_v, base_v) = add_base_matmul(&mut graph, m, k, fused_n, &w);
+    let group = tiny_fused_group(node_id);
+
+    let (rq, sq) = (2usize, 0.5f32);
+    let aq: Vec<f32> = (0..k * rq).map(|i| (i as f32) * 0.1 - 0.2).collect();
+    let bq: Vec<f32> = (0..rq * 4).map(|i| (i as f32) * 0.05).collect();
+
+    let manifest = LoraManifest {
+        entries: vec![fused_entry(node_id, base_v, x_v, k, QkvRole::Q, 4, &group)],
+    };
+    let adapter = LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", rq, sq, &aq, &bq, k, 4)],
+    };
+    let injection = inject_grouped(&mut graph, &manifest, &adapter).expect("inject_grouped partial");
+    let pool_id = injection.pool_id;
+
+    // Still three ops (q real, k/v zero-rank), one Concat, one Add.
+    assert_eq!(count_op(&graph, "GroupedLoraDelta"), 3);
+
+    let mut exec = Executor::build_with_overrides(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    let x_t = Tensor::from_f32(&[m, k], &x).unwrap();
+    let seg = i32_segments(m, &vec![0i32; m]);
+    let got = exec
+        .run(&[("x", &x_t), ("lora.segments", &seg)])
+        .unwrap()[0]
+        .to_vec_f32();
+
+    LoraPoolRegistry::global().unregister(pool_id);
+
+    let base = reference_base(m, k, fused_n, &x, &w);
+    let dq = reference_delta(m, k, rq, 4, sq, &x, &aq, &bq);
+    let mut expected = base.clone();
+    for i in 0..m {
+        for j in 0..4 {
+            expected[i * fused_n + j] += dq[i * 4 + j];
+        }
+    }
+    for (g, e) in got.iter().zip(&expected) {
+        assert!((g - e).abs() < 1e-4, "partial fused mismatch");
+    }
+    // K/V columns are exactly the base (zero-rank contributes nothing).
+    for i in 0..m {
+        for j in 4..8 {
+            assert_eq!(got[i * fused_n + j], base[i * fused_n + j]);
+        }
+    }
+}
+
+// ===========================================================================
+// Integration — declared metadata manifest drives grouped injection (§J + §C).
+// ===========================================================================
+
+/// A single-target declared manifest for a Direct (non-fused) projection: the
+/// authoritative analogue of the graph-discovery path for the split layout.
+fn declared_direct_q(node_name: &str, k: usize, n: usize) -> LoraTargetManifest {
+    LoraTargetManifest {
+        targets: vec![LoraTargetDescriptor {
+            module_name: "self_attn.q_proj".to_string(),
+            layer_index: 0,
+            node_name: node_name.to_string(),
+            output_name: format!("{node_name}.out"),
+            k,
+            n,
+            slices: BTreeMap::new(),
+            rank: None,
+            alpha: None,
+        }],
+    }
+}
+
+/// Build a fresh split-Qwen3-style discovery graph with one targetable q_proj
+/// `MatMulNBits` node, resolvable both by graph discovery and by an explicit
+/// declared manifest.
+fn split_q_proj_graph(node_name: &str, k: usize, n: usize) -> Graph {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let x = add_activation(&mut graph, k);
+    add_matmulnbits(
+        &mut graph,
+        node_name,
+        "model.layers.0.attn.q_proj.MatMulNBits.qweight",
+        x,
+        k,
+        n,
+    );
+    add_gqa(&mut graph, "/model/layers.0/attn/GroupQueryAttention", 16, 8);
+    graph
+}
+
+fn q_proj_adapter(k: usize, n: usize) -> LoraAdapterSpec {
+    let rank = 4usize;
+    let a: Vec<f32> = (0..k * rank).map(|i| (i as f32) * 0.01 - 0.1).collect();
+    let b: Vec<f32> = (0..rank * n).map(|i| (i as f32) * -0.02 + 0.05).collect();
+    LoraAdapterSpec {
+        name: "adapter".into(),
+        modules: vec![f32_module("self_attn.q_proj", rank, 0.75, &a, &b, k, n)],
+    }
+}
+
+/// The critical composition test: the declared-metadata manifest (authoritative)
+/// is the SOURCE that feeds Edgemar's grouped `GroupedLoraDelta` emission. Both
+/// resolution orders — declared-metadata-manifest (validated against the graph)
+/// and graph-derived discovery — must resolve to the SAME manifest and drive the
+/// SAME grouped op emission. This proves the two paths are not parallel/dead:
+/// `inject_grouped_lora_adapter` threads `declared` straight into `build_manifest`
+/// whose single result drives `inject_grouped`.
+#[test]
+fn grouped_injection_declared_manifest_matches_graph_discovery() {
+    let node_name = "/model/layers.0/attn/q_proj/MatMulNBits";
+    let (k, n) = (2048usize, 2048usize);
+
+    let mut discovered_graph = split_q_proj_graph(node_name, k, n);
+    let discovered = inject_grouped_lora_adapter(&mut discovered_graph, &q_proj_adapter(k, n), None)
+        .expect("graph-discovery grouped injection");
+
+    let declaration = declared_direct_q(node_name, k, n);
+    let mut declared_graph = split_q_proj_graph(node_name, k, n);
+    let declared = inject_grouped_lora_adapter(
+        &mut declared_graph,
+        &q_proj_adapter(k, n),
+        Some(&declaration),
+    )
+    .expect("declared-manifest grouped injection");
+
+    // 1. The resolved manifest that drives grouped emission is identical.
+    assert_eq!(
+        declared.manifest.entries.len(),
+        discovered.manifest.entries.len(),
+        "declared and discovered manifests must have the same arity"
+    );
+    for (d, g) in declared
+        .manifest
+        .entries
+        .iter()
+        .zip(&discovered.manifest.entries)
+    {
+        assert_eq!(d.semantic, g.semantic);
+        assert_eq!(d.node_id, g.node_id);
+        assert_eq!(d.base_output, g.base_output);
+        assert_eq!(d.activation, g.activation);
+        assert_eq!(d.k, g.k);
+        assert_eq!(d.n, g.n);
+        assert_eq!(d.dtype, g.dtype);
+        assert_eq!(d.placement, g.placement);
+    }
+
+    // 2. The grouped emission the manifest drove is structurally identical.
+    assert_eq!(
+        count_op(&declared_graph, "GroupedLoraDelta"),
+        count_op(&discovered_graph, "GroupedLoraDelta"),
+        "declared path must emit the same GroupedLoraDelta ops as discovery"
+    );
+    assert_eq!(count_op(&declared_graph, "GroupedLoraDelta"), 1);
+    assert!(has_input_named(&declared_graph, "lora.segments"));
+    assert_eq!(declared.segments_input, discovered.segments_input);
+
+    LoraPoolRegistry::global().unregister(discovered.pool_id);
+    LoraPoolRegistry::global().unregister(declared.pool_id);
 }

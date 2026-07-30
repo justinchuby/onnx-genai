@@ -256,3 +256,111 @@ fn engine_lora_path_applies_and_reverts_adapter_delta() {
         "re-activation must reproduce the delta bit-for-bit"
     );
 }
+
+/// Little-endian `i32` bytes for a `lora.segments` routing tensor.
+fn i32_bytes(values: &[i32]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+/// End-to-end proof of the Phase-2 **multi-adapter** grouped path (design §J):
+/// build one session that preloads TWO adapters through
+/// [`SessionBuilder::lora_adapters`], then select which adapter applies per run
+/// via the `lora.segments` routing input. Because the base projection is the
+/// exact zero vector (see [`write_zero_base_model`]), each run's output isolates
+/// the selected adapter's delta, so we can assert per-request selection:
+///
+///   * segments `[id_a]` ⇒ adapter A's delta,
+///   * segments `[id_b]` ⇒ adapter B's delta (distinct from A),
+///   * segments `[-1]`   ⇒ base only (exact zero), i.e. no adapter.
+#[test]
+fn engine_multi_adapter_grouped_selects_per_request() {
+    let (k, n, r) = (16usize, 4usize, 2usize);
+    let alpha = 2 * r; // scale = alpha / r = 2.0
+
+    // Two adapters with clearly different factors ⇒ clearly different deltas.
+    let a_values_a: Vec<f32> = (0..r * k).map(|i| (i as f32) * 0.03 - 0.2).collect();
+    let b_values_a: Vec<f32> = (0..n * r).map(|i| (i as f32) * -0.05 + 0.15).collect();
+    let a_values_b: Vec<f32> = (0..r * k).map(|i| (i as f32) * -0.04 + 0.1).collect();
+    let b_values_b: Vec<f32> = (0..n * r).map(|i| (i as f32) * 0.06 - 0.12).collect();
+
+    let root = tempfile::tempdir().unwrap();
+    let directory_a =
+        write_peft_adapter(root.path(), "adapter_a", r, k, n, &a_values_a, &b_values_a, alpha);
+    let directory_b =
+        write_peft_adapter(root.path(), "adapter_b", r, k, n, &a_values_b, &b_values_b, alpha);
+    let model_path = root.path().join("model.onnx");
+    write_zero_base_model(&model_path, k, n);
+
+    // Load both adapters through the manager, exactly as the engine does.
+    let mut manager = LoraManager::with_budget(0);
+    let id_a = manager.load(&directory_a).expect("load adapter A");
+    let id_b = manager.load(&directory_b).expect("load adapter B");
+    let spec_a = manager.spec(&id_a).expect("spec A");
+    let spec_b = manager.spec(&id_b).expect("spec B");
+
+    // Authoritative per-adapter deltas from the loader-produced factors.
+    let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1 - 0.5).collect();
+    let module_a = &spec_a.modules[0];
+    let delta_a = reference_delta(
+        &x,
+        &f32_from_bytes(&module_a.a_t.data),
+        &f32_from_bytes(&module_a.b_t.data),
+        k,
+        r,
+        n,
+        module_a.scale,
+    );
+    let module_b = &spec_b.modules[0];
+    let delta_b = reference_delta(
+        &x,
+        &f32_from_bytes(&module_b.a_t.data),
+        &f32_from_bytes(&module_b.b_t.data),
+        k,
+        r,
+        n,
+        module_b.scale,
+    );
+    assert!(
+        delta_a.iter().zip(&delta_b).any(|(a, b)| (a - b).abs() > 1e-3),
+        "the two adapters must produce distinct deltas: {delta_a:?} vs {delta_b:?}"
+    );
+
+    // Build ONE session preloading both adapters ⇒ grouped injection + pool.
+    let mut session = InferenceSession::builder()
+        .model(&model_path)
+        .lora_adapters(vec![spec_a, spec_b])
+        .build()
+        .expect("build grouped multi-adapter session");
+
+    let segments_input = session
+        .lora_segments_input()
+        .expect("grouped session exposes a segments input")
+        .to_string();
+    let route_a = session.resolve_lora_adapter("adapter_a").expect("resolve A");
+    let route_b = session.resolve_lora_adapter("adapter_b").expect("resolve B");
+    assert!(
+        session.resolve_lora_adapter("missing").is_err(),
+        "an unknown adapter name must fail loud, not fall back to base"
+    );
+
+    let x_tensor = Tensor::from_f32(&[1, k], &x).unwrap();
+    let run_with = |session: &mut InferenceSession, route: i32| -> Vec<f32> {
+        let seg = Tensor::from_raw(DataType::Int32, vec![1], &i32_bytes(&[route])).unwrap();
+        session.run(&[("x", &x_tensor), (segments_input.as_str(), &seg)]).unwrap()[0]
+            .to_vec_f32()
+    };
+
+    // Select adapter A ⇒ A's delta.
+    let out_a = run_with(&mut session, route_a.0 as i32);
+    for (got, expected) in out_a.iter().zip(&delta_a) {
+        assert!((got - expected).abs() < 1e-3, "adapter A: {out_a:?} vs {delta_a:?}");
+    }
+    // Select adapter B ⇒ B's delta.
+    let out_b = run_with(&mut session, route_b.0 as i32);
+    for (got, expected) in out_b.iter().zip(&delta_b) {
+        assert!((got - expected).abs() < 1e-3, "adapter B: {out_b:?} vs {delta_b:?}");
+    }
+    // Select base (-1) ⇒ exact zero, no adapter applied.
+    let out_base = run_with(&mut session, -1);
+    assert_eq!(out_base, vec![0.0f32; n], "base route must apply no adapter");
+}

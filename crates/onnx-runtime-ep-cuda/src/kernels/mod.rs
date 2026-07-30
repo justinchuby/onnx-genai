@@ -45,6 +45,7 @@ pub mod gemm;
 mod gqa_decode;
 mod gqa_decode_fp16;
 pub mod group_query_attention;
+pub mod grouped_lora;
 pub mod hardmax;
 pub mod index_share;
 pub mod indexing;
@@ -140,6 +141,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
     "MatMulNBits",
     "QMoE",
+    "GroupedLoraDelta",
     "BlockQuantizedMatMul",
     "BlockQuantizedMoE",
     "SparseKvGather",
@@ -466,6 +468,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("GroupedLoraDelta", "pkg.nxrt", 1),
+        Box::new(grouped_lora::GroupedLoraDeltaFactory {
             runtime: runtime.clone(),
         }),
     );

@@ -35,6 +35,7 @@
 pub mod abi;
 pub mod epcontext;
 pub mod kernel;
+pub mod lora_pool;
 pub mod provider;
 pub mod registry;
 pub mod tensor;
@@ -55,6 +56,11 @@ pub use provider::{
     OrtPluginExport, StructuralCaptureDecline,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
+pub use lora_pool::{
+    AdapterId, LoraFactorInput, LoraFactorKind, LoraFactorView, LoraModuleId, LoraPagePair,
+    LoraPoolAdmitError, LoraPoolError, LoraPoolId, LoraPoolRegistration, LoraPoolRegistry,
+    LoraPoolSink, LoraWeightPool, LoraWeightPoolSink, LORA_PAGE_ALIGNMENT,
+};
 pub use tensor::{
     DevicePtr, DevicePtrMut, ExternalMmapRegion, TensorBacking, TensorMut, TensorView,
 };

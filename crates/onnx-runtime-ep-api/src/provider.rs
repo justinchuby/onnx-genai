@@ -203,6 +203,16 @@ impl DeviceBuffer {
         matches!(self.owner, BufferOwner::Borrowed | BufferOwner::BorrowedMut)
     }
 
+    /// Whether this handle borrows **read-only** foreign memory (e.g. an mmap'd
+    /// weight file) that must never be written through. Unlike [`Self::is_borrowed`]
+    /// this excludes [`BufferOwner::BorrowedMut`], which is an exclusively
+    /// *writable* alias. Callers that hand out a writable host pointer (for
+    /// example `Tensor::as_bytes_mut`) must reject a buffer for which this returns
+    /// `true`, since writing through a read-only alias is undefined behaviour.
+    pub fn is_read_only_borrow(&self) -> bool {
+        matches!(self.owner, BufferOwner::Borrowed)
+    }
+
     /// The device this allocation lives on (and whose EP must free it).
     pub fn device(&self) -> DeviceId {
         self.device

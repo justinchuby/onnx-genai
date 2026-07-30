@@ -163,6 +163,11 @@ mod error {
         #[error("no model source: set a path or bytes on the builder")]
         NoModelSource,
 
+        #[error(
+            "unknown LoRA adapter {name:?}; this session was loaded with adapters: [{available}]"
+        )]
+        UnknownLoraAdapter { name: String, available: String },
+
         #[error("execution provider unavailable: {0}")]
         ExecutionProviderUnavailable(String),
 
@@ -469,6 +474,22 @@ pub struct SessionBuilder {
     /// `A_t`/`B_t` feeds on the built session (active by default). `None` leaves
     /// the graph and run path byte-identical to a non-LoRA session.
     lora_adapter: Option<lora_inject::LoraAdapterSpec>,
+    /// Phase-2 multi-adapter set (design §J). When non-empty, [`Self::build`]
+    /// injects all of these adapters as one shared grouped-LoRA op set backed by
+    /// a single paged pool, assigning each adapter the [`AdapterId`] equal to its
+    /// index here. A per-request `segments` routing input then selects one
+    /// adapter per token row. Mutually exclusive with [`Self::lora_adapter`]
+    /// (the single-adapter DIRECT fast path); setting both fails at build.
+    lora_adapters: Vec<lora_inject::LoraAdapterSpec>,
+    /// Authoritative metadata-declared LoRA target manifest. When absent, target
+    /// resolution falls back to graph discovery.
+    lora_target_manifest: Option<onnx_genai_metadata::LoraTargetManifest>,
+    /// Optional control-plane pool sink for the grouped multi-adapter path
+    /// (design §J.2). `None` uses the default budget-free pool; the engine sets a
+    /// `ByteBudget`-governed sink so grouped adapter residency is reserved from
+    /// the shared device budget and an over-budget set fails loud at build. Only
+    /// consulted when `lora_adapters` drives the grouped path.
+    lora_pool_sink: Option<Box<dyn onnx_runtime_ep_api::LoraPoolSink>>,
     options: HashMap<String, String>,
 }
 
@@ -535,6 +556,42 @@ impl SessionBuilder {
     /// the graph (fail-loud, design §C).
     pub fn lora_adapter(mut self, adapter: lora_inject::LoraAdapterSpec) -> Self {
         self.lora_adapter = Some(adapter);
+        self
+    }
+
+    /// Inject multiple native-LoRA adapters as one shared Phase-2 grouped-LoRA
+    /// op set (design §J), backed by a single paged pool. Each adapter is
+    /// assigned the [`AdapterId`] equal to its index in `adapters` (the segment
+    /// id a request selects), and the grouped injection admits every adapter
+    /// under its own pool pages before optimization. The built session exposes
+    /// [`InferenceSession::resolve_lora_adapter`] to map a name to its id and
+    /// [`InferenceSession::lora_segments_input`] to name the per-run routing
+    /// input the caller feeds. Mutually exclusive with
+    /// [`Self::lora_adapter`]; setting both fails at [`Self::build`].
+    pub fn lora_adapters(mut self, adapters: Vec<lora_inject::LoraAdapterSpec>) -> Self {
+        self.lora_adapters = adapters;
+        self
+    }
+
+    /// Use the model metadata's authoritative LoRA target manifest.
+    pub fn lora_target_manifest(
+        mut self,
+        manifest: onnx_genai_metadata::LoraTargetManifest,
+    ) -> Self {
+        self.lora_target_manifest = Some(manifest);
+        self
+    }
+
+    /// Set the control-plane pool sink for the grouped multi-adapter path (design
+    /// §J.2). The engine supplies a `ByteBudget`-governed sink so grouped adapter
+    /// residency is reserved from the shared device budget before admission and
+    /// an over-budget set fails loud at [`Self::build`]. No effect on the
+    /// single/none DIRECT fast path.
+    pub fn lora_pool_sink(
+        mut self,
+        sink: Box<dyn onnx_runtime_ep_api::LoraPoolSink>,
+    ) -> Self {
+        self.lora_pool_sink = Some(sink);
         self
     }
 
@@ -636,7 +693,7 @@ impl SessionBuilder {
     /// Device selection keeps CPU as the default and selects CUDA only when
     /// explicitly requested in a CUDA-enabled build. "Compile" resolves a
     /// kernel per node into the shape-keyed cache.
-    pub fn build(self) -> Result<InferenceSession> {
+    pub fn build(mut self) -> Result<InferenceSession> {
         let (level, ep_context_config) = Self::parse_options(&self.options)?;
 
         // Memory limits and profiling remain reserved builder intents.
@@ -714,16 +771,58 @@ impl SessionBuilder {
             }
         }
 
-        // Native-LoRA injection (design §B/§C/§D, P4). Runs here — after the
-        // precision rewrite and *before* optimization — so the overridable
-        // `A_t`/`B_t` inputs exist on the graph the executor compiles, and the
-        // optimizer sees (and preserves) the delta branches. The resolved feeds
-        // are installed on the built session below. A `None` adapter leaves the
-        // graph untouched and the override set empty, so the executor builds
-        // byte-identically to a non-LoRA session.
+        // Native-LoRA injection (design §B/§C/§D/§J). Runs here — after the
+        // precision rewrite and *before* optimization — so the injected branches
+        // exist on the graph the executor compiles and the optimizer preserves
+        // them. A `None`/empty adapter set leaves the graph untouched, so the
+        // executor builds byte-identically to a non-LoRA session (fast path).
+        //
+        // Two mutually exclusive shapes:
+        //   * `lora_adapter`  (single, DIRECT P1): overridable `A_t`/`B_t` feeds.
+        //   * `lora_adapters` (many, grouped §J):  one paged pool + `segments`.
+        if self.lora_adapter.is_some() && !self.lora_adapters.is_empty() {
+            return Err(SessionError::Internal(
+                "a session cannot combine the single-adapter DIRECT path (lora_adapter) with the \
+                 multi-adapter grouped path (lora_adapters); choose one"
+                    .to_string(),
+            ));
+        }
+        let grouped_injection = if self.lora_adapters.is_empty() {
+            None
+        } else {
+            let mut span = trace_span("session.lora_inject_grouped", "session");
+            let pool_sink = self.lora_pool_sink.take();
+            let adapters: Vec<(onnx_runtime_ep_api::AdapterId, &lora_inject::LoraAdapterSpec)> =
+                self.lora_adapters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, adapter)| {
+                        (onnx_runtime_ep_api::AdapterId(index as u64), adapter)
+                    })
+                    .collect();
+            let injection = lora_inject::inject_grouped_lora_adapters(
+                &mut graph,
+                &adapters,
+                self.lora_target_manifest.as_ref(),
+                pool_sink,
+            )?;
+            if let Some(span) = span.as_mut() {
+                span.set_args(
+                    Args::new()
+                        .with("adapters", self.lora_adapters.len() as u64)
+                        .with("pool_id", injection.pool_id.0),
+                );
+            }
+            Some(injection)
+        };
+
         let lora_feeds = if let Some(adapter) = &self.lora_adapter {
             let mut span = trace_span("session.lora_inject", "session");
-            let injection = lora_inject::inject_lora_adapter(&mut graph, adapter)?;
+            let injection = lora_inject::inject_lora_adapter(
+                &mut graph,
+                adapter,
+                self.lora_target_manifest.as_ref(),
+            )?;
             let feeds = injection
                 .feeds
                 .into_iter()
@@ -777,6 +876,7 @@ impl SessionBuilder {
         if !lora_feeds.is_empty() {
             session.install_lora_feeds(lora_feeds)?;
         }
+        session.grouped_lora = grouped_injection;
         if !self.warmup_shapes.is_empty() {
             let mut span = trace_span("session.warmup", "session");
             session.warmup(&self.warmup_shapes)?;
@@ -952,6 +1052,13 @@ pub struct InferenceSession {
     /// (§21.4). Drives [`InferenceSession::export_ep_context`]; disabled by
     /// default so an ordinary session never touches the dump path.
     ep_context_config: EpContextDumpConfig,
+    /// The Phase-2 multi-adapter grouped-LoRA injection (design §J), when this
+    /// session was built with [`SessionBuilder::lora_adapters`]. It owns the
+    /// process [`LoraPoolRegistry`] registration for the paged adapter pool, so
+    /// the pool stays live for the session's whole lifetime and is released on
+    /// drop (no leak). `None` for a base-only or single-adapter (DIRECT, P1)
+    /// session, so the fast path carries no grouped state.
+    grouped_lora: Option<lora_inject::GroupedLoraInjection>,
 }
 
 fn io_meta(graph: &onnx_runtime_ir::Graph, values: &[onnx_runtime_ir::ValueId]) -> Vec<IoMeta> {
@@ -1098,6 +1205,7 @@ impl InferenceSession {
             model_metadata,
             exec,
             ep_context_config,
+            grouped_lora: None,
         })
     }
 
@@ -1133,6 +1241,47 @@ impl InferenceSession {
     /// path.
     pub fn lora_active(&self) -> bool {
         self.exec.overrides_active()
+    }
+
+    /// The name of the per-run `segments` routing input for a Phase-2
+    /// multi-adapter grouped-LoRA session (design §J), or `None` when this
+    /// session has no grouped adapters. The caller must feed an `Int32`
+    /// `[tokens]` tensor of this name each run, where `segments[row]` is the
+    /// [`AdapterId`] the row routes to (or a negative value for a base-only row).
+    pub fn lora_segments_input(&self) -> Option<&str> {
+        self.grouped_lora
+            .as_ref()
+            .map(|injection| injection.segments_input.as_str())
+    }
+
+    /// The stable name → [`AdapterId`] map for a Phase-2 grouped-LoRA session, in
+    /// admission order. Empty when this session has no grouped adapters.
+    pub fn lora_adapter_ids(&self) -> &[(String, onnx_runtime_ep_api::AdapterId)] {
+        self.grouped_lora
+            .as_ref()
+            .map(|injection| injection.adapters.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Resolve a requested adapter name to the [`AdapterId`] it feeds into the
+    /// `segments` routing input. Fails loud with
+    /// [`SessionError::UnknownLoraAdapter`] for an unregistered name — the
+    /// per-request admission point that rejects a bad selection rather than
+    /// silently falling back to base-only.
+    pub fn resolve_lora_adapter(&self, name: &str) -> Result<onnx_runtime_ep_api::AdapterId> {
+        self.lora_adapter_ids()
+            .iter()
+            .find(|(adapter_name, _)| adapter_name == name)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| SessionError::UnknownLoraAdapter {
+                name: name.to_string(),
+                available: self
+                    .lora_adapter_ids()
+                    .iter()
+                    .map(|(adapter_name, _)| adapter_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })
     }
 
     /// Attach the shared runtime trace context. When enabled, the executor opens

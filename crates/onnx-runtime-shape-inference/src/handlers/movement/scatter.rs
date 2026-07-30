@@ -108,6 +108,60 @@ pub fn scatter_nd(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     Ok(())
 }
 
+/// `TensorScatter`: fixed-capacity cache updates preserve the cache type and shape.
+pub fn tensor_scatter(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(cache) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    let rank = cache.rank();
+    if rank < 2 {
+        return Err(ShapeInferError::InvalidRank {
+            op: "TensorScatter".into(),
+            index: 0,
+            rank,
+            detail: "cache must have rank at least 2".into(),
+        });
+    }
+    let axis = ctx
+        .node
+        .attr("axis")
+        .and_then(Attribute::as_int)
+        .unwrap_or(-2);
+    let normalized_axis = checked_axis(axis, rank).ok_or_else(|| ShapeInferError::Invalid {
+        op: "TensorScatter".into(),
+        detail: format!("axis {axis} is out of range for rank {rank}"),
+    })?;
+    if normalized_axis == 0 {
+        return Err(ShapeInferError::Invalid {
+            op: "TensorScatter".into(),
+            detail: "axis 0 is the batch dimension and cannot be scattered".into(),
+        });
+    }
+    if let Some(updates_rank) = ctx.input_rank(1)
+        && updates_rank != rank
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "TensorScatter".into(),
+            index: 1,
+            rank: updates_rank,
+            detail: format!("updates must have the same rank {rank} as cache"),
+        });
+    }
+    if ctx.has_input(2)
+        && let Some(write_indices_rank) = ctx.input_rank(2)
+        && write_indices_rank != 1
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "TensorScatter".into(),
+            index: 2,
+            rank: write_indices_rank,
+            detail: "write_indices must be a 1-D tensor".into(),
+        });
+    }
+    ctx.set_output_type(0, cache);
+    Ok(())
+}
+
 /// `Trilu`: selecting a triangular region does not change the input type.
 pub fn trilu(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let Some(input) = ctx.input_type(0).cloned() else {

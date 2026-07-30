@@ -137,9 +137,8 @@ pub struct InferenceMetadata {
     /// Author-declared LoRA adapter capabilities (native LoRA design §G).
     ///
     /// Purely additive: declares which PEFT adapters ship with the model, an
-    /// optional default, the target-module policy, and hot-swap support. Absent
-    /// means the model declares no bundled adapters. The runtime still validates
-    /// every adapter against the actual graph before applying it.
+    /// optional default, an authoritative target manifest, target-module policy,
+    /// and hot-swap support. Absent means the model declares no bundled adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapters: Option<LoraCapabilities>,
 }

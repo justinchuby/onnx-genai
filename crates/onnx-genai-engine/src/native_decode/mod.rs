@@ -22,16 +22,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 mod backend;
+mod batched;
 mod cpu;
 mod cuda;
 mod io;
 mod load;
 mod proposer;
+mod static_cache_batched;
 mod tensor;
 #[cfg(test)]
 mod tests;
 
 use backend::*;
+pub use batched::NativeBatchedDecodeSession;
 use cpu::DecodeCpuKvState;
 use cpu::*;
 use cuda::DecodeCudaState;
@@ -39,6 +42,7 @@ use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
 use io::*;
 pub(crate) use proposer::NativeProposerSession;
+pub use static_cache_batched::NativeStaticCacheBatchedDecodeSession;
 use tensor::*;
 
 /// Device requested for a native decode session.
@@ -78,6 +82,90 @@ pub struct NativeDecodeSession {
     last_hidden: Option<Vec<f32>>,
     uses_decode_pool: bool,
     has_plugin_fused: bool,
+    /// Phase-2 multi-adapter grouped-LoRA routing (design §J). `None` for a
+    /// base-only or single-adapter (DIRECT) session, so the fast path carries no
+    /// grouped state. When set it names the `segments` graph input, the loaded
+    /// adapter name → id map, the currently selected adapter (per request), and
+    /// a reused `Int32` buffer for the per-step routing tensor payload. The
+    /// routing byte buffer is refilled in place (no per-step payload
+    /// reallocation), but building the `segments` tensor each step still
+    /// allocates its shape vector and clones the input name, so the grouped path
+    /// is not fully allocation-free in the decode loop.
+    lora_segments: Option<LoraSegmentsState>,
+}
+
+/// Per-run routing state for a Phase-2 grouped-LoRA native session (design §J).
+struct LoraSegmentsState {
+    /// The `segments` graph input name the routing tensor is fed under.
+    input_name: String,
+    /// The loaded adapters' name → [`AdapterId`] map (admission order).
+    adapter_ids: Vec<(String, onnx_runtime_ep_api::AdapterId)>,
+    /// The adapter every token row currently routes to, or `None` for base-only
+    /// (routing id `-1`). Updated per request by [`NativeDecodeSession::select_lora_adapter`].
+    active: Option<onnx_runtime_ep_api::AdapterId>,
+    /// Reused little-endian `Int32` routing bytes, refilled in place each step so
+    /// the routing payload is not reallocated per step (design perf gate). Holds
+    /// `tokens` repeated copies of the active adapter's routing id. Note the
+    /// `segments` tensor built from it still allocates its shape vector and
+    /// clones the input name each step, so the grouped path is not entirely
+    /// allocation-free.
+    buffer: Vec<u8>,
+}
+
+impl LoraSegmentsState {
+    /// The `i32` routing id for the active adapter (or `-1` for base-only).
+    fn active_route(&self) -> i32 {
+        match self.active {
+            Some(id) => id.0 as i32,
+            None => -1,
+        }
+    }
+
+    /// Reset the active route to `name` (or base-only when `None`) for the
+    /// CURRENT request (design §J.4 per-request selection). Fails loud with a
+    /// typed error when `name` is not a loaded adapter — never a silent base
+    /// fallback. Callers reset this on EVERY request at the single per-request
+    /// choke point so no request can inherit a prior request's route.
+    fn select(&mut self, name: Option<&str>) -> anyhow::Result<()> {
+        match name {
+            None => {
+                self.active = None;
+                Ok(())
+            }
+            Some(name) => {
+                let id = self
+                    .adapter_ids
+                    .iter()
+                    .find(|(adapter_name, _)| adapter_name == name)
+                    .map(|(_, id)| *id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown LoRA adapter {name:?}; loaded adapters: [{}]",
+                            self.adapter_ids
+                                .iter()
+                                .map(|(adapter_name, _)| adapter_name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                self.active = Some(id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Refill the reused little-endian `Int32` routing buffer in place with
+    /// `tokens` copies of the active route id and return the payload. Refilling
+    /// in place avoids reallocating the routing payload per step.
+    fn route_bytes(&mut self, tokens: usize) -> &[u8] {
+        let route_bytes = self.active_route().to_le_bytes();
+        self.buffer.clear();
+        self.buffer.reserve(tokens * 4);
+        for _ in 0..tokens {
+            self.buffer.extend_from_slice(&route_bytes);
+        }
+        &self.buffer
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +175,10 @@ enum NativeStepInputSource {
     AttentionMask,
     PositionIds,
     Routed,
+    /// The Phase-2 grouped-LoRA `segments` routing input (design §J). Generated
+    /// internally each step from the session's selected adapter, not routed by
+    /// the pipeline, so it is excluded from the generic `Routed` handling.
+    LoraSegments,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,6 +314,60 @@ impl NativeDecodeSession {
     /// Whether the injected LoRA adapter is currently active.
     pub fn lora_active(&self) -> bool {
         self.session.lora_active()
+    }
+
+    /// Whether this session was built with a Phase-2 multi-adapter grouped-LoRA
+    /// pool (design §J), so per-request adapter selection is available.
+    pub fn has_grouped_lora(&self) -> bool {
+        self.lora_segments.is_some()
+    }
+
+    /// The loaded grouped-LoRA adapter names, in admission order (empty when the
+    /// session has no grouped adapters).
+    pub fn lora_adapter_names(&self) -> Vec<&str> {
+        self.lora_segments
+            .as_ref()
+            .map(|state| state.adapter_ids.iter().map(|(name, _)| name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The grouped-LoRA adapter routes (`name` → `lora.segments` id) this session
+    /// admits, in admission order (design §J.4 P2e). Empty for a base-only /
+    /// non-grouped session. Used to build a
+    /// [`NativeBatchedDecodeSession`](batched::NativeBatchedDecodeSession) whose
+    /// continuous-batch manager resolves per-request adapters to these ids.
+    pub(crate) fn lora_adapter_routes(&self) -> Vec<(String, i32)> {
+        self.lora_segments
+            .as_ref()
+            .map(|state| {
+                state
+                    .adapter_ids
+                    .iter()
+                    .map(|(name, id)| (name.clone(), id.0 as i32))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Borrow the underlying native [`InferenceSession`] mutably so a native
+    /// continuous-batch decode session can drive per-row grouped-LoRA routing on
+    /// the same graph (which owns the `GroupedLoraDelta` op).
+    pub(crate) fn inference_session_mut(&mut self) -> &mut InferenceSession {
+        &mut self.session
+    }
+
+    /// Select the grouped-LoRA adapter that subsequent decode steps route every
+    /// token row to (design §J.4 per-request selection). `Some(name)` resolves to
+    /// its [`AdapterId`]; `None` routes to base-only (no delta). Fails loud with a
+    /// typed error when `name` is not a loaded adapter — the request-admission
+    /// point, never a silent base fallback. A no-op-eligible error when the
+    /// session has no grouped adapters at all.
+    pub fn select_lora_adapter(&mut self, name: Option<&str>) -> anyhow::Result<()> {
+        let state = self.lora_segments.as_mut().context(
+            "native decode session was not built with a multi-adapter grouped-LoRA pool; \
+             per-request adapter selection is unavailable",
+        )?;
+        state.select(name)
     }
 
     /// Dormant option (c) bring-up control (WP4): arm the padded single M=maxK
