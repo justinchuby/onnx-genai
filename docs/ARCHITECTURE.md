@@ -547,15 +547,20 @@ Verified instances in this repo, all genuinely measured and all easy to misread:
 
 > Check that the field you need survives the *whole* call chain. A correctly-named function can compute exactly what you want and then discard it one line later.
 
-Three independent instances:
+Four independent instances:
 
 - **`PageUsage` collapses page identity into a count.** `SequenceUsage.pages` is `pages.len()` (`page_table.rs:867-875`) — the `Vec<PageId>` is consumed to produce a length. The table knows *which* pages each sequence holds (`self.sequences`, `page_table.rs:619-620`), but that mapping never crosses the API boundary. **Consequence:** per-block sequence ownership — colouring a block grid by owning sequence — cannot be built from `page_usage()` as it stands.
-- **`GovernorReconfigureOutcome` drops the eviction plan**, so a caller learns that reconfiguration happened but not what it decided.
+- **`GovernorReconfigureOutcome` drops the eviction plan**, so a caller learns that reconfiguration happened but not what it decided. `overage_bytes` and `eviction_order` (`scheduler/src/governor.rs:158-167`) have **no consumers anywhere outside `governor.rs`'s own tests** (`:786`, `:852`).
 - **`driver.rs:735-739` discards the reconfigure result** entirely.
+- **`execution_provider` is resolved and dropped.** Determined at `engine/load.rs:328-345`, then not carried out to any handler. *(Reported by @d7cf9b84; the first three verified here.)*
 
 **Why it holds:** each of these was a reasonable narrowing for its original caller — a length is all the original consumer needed.
 
 **What breaks if violated:** you discover mid-implementation that the data was computed and thrown away, and the fix is an API change in a lower crate rather than the "just call the getter" you planned for. Widening the return type is usually the right fix; recomputing at the call site duplicates the invariant.
+
+> **Trace to the handler that RETURNS the value, not the function that COMPUTES it.** This is the
+> next rung down from "a handler that computes it, not a struct that declares it": a function can
+> both exist and be correctly named and still be a dead end.
 
 ---
 
@@ -818,6 +823,19 @@ catch one is to read the increment site and ask what actually causes it to move.
 | `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `admin.rs:434-443` |
 | `active_sessions` | concurrent requests | persistent `X-Session-Id` sessions — reads `0` at the busiest moment of a batching run, correctly | **Reported** (Lead), not independently verified here |
 | `kv_usage` (on `/v1/status`) | KV utilisation | hardcoded `0.0`. **Not demo-only:** `RoutingPolicy::LeastKvUsage` sorts on it (`router.rs:247`), so the comparison cannot discriminate and the weighted policy silently loses its 30% term. | **Reported** (@d7cf9b84), traced cross-crate |
+| `created` (on `/v1/models`) | model creation time | **`now_unix()` — the current clock, evaluated per call.** Nothing about the model affects it. | **Verified** — `admin.rs:29` |
+
+> **🔴 `created` is the most dangerous entry in this table, and it is the one that defeats our own
+> detection heuristic.** Every instinct we have treats **motion as evidence of life**: `stale` exists
+> because a frozen value is suspicious, and a reviewer hunting fabrications is scanning for a
+> literal that never changes. **This one changes on every single call.** There is no `0` to grep,
+> nothing to notice in a diff, and it sits on `/v1/models` — **the one ungated endpoint that works
+> with no flags**, so it is the field most likely to be reached by an integrator who never reads a
+> provenance document.
+>
+> **The rule it yields, which is the mirror of the one above: a value changing is not evidence that
+> it is measured.** Ask what would have to happen *in the engine* for this number to move. If the
+> answer is "nothing," it is a clock, not a measurement. *(Found by @376a0297; verified here.)*
 
 **Two things to take from the shape of this table rather than its contents.**
 
