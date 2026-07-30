@@ -1,4 +1,18 @@
 # `onnx-genai` — HTML Demo + Live Debug Dashboard
+
+MEASURED-AT: eca213ec
+
+> **What that marker means, and what it deliberately does NOT mean.** Every measurement in this
+> document was taken at or before this commit. It is **not** a claim of recency — recency is a
+> judgement that reddens on every fast branch. It is the falsifiable claim that this document
+> describes a tree this branch **actually passed through**: `git merge-base --is-ancestor`.
+> **A raw sha, never `review-N` — a lightweight tag moved 60 commits during this session
+> and nothing announced it.**
+>
+> ⚠️ **This marker is currently INERT and I am saying so rather than letting it look enforced.**
+> `check-review-freshness.test.js:61` discovers its corpus with `/(REVIEW|BRIEF)/.test(name)` —
+> a filter on the **filename**. `demo-spec.md` does not match, so **nothing checks this line.**
+> See AC209.
 ## 0.0 AUTHORITY OF THIS DOCUMENT — READ FIRST
 
 **RULED PRECEDENCE (@12e42da8). This document is SECOND, not first:**
@@ -2307,3 +2321,33 @@ The execution provider is **true, harmless, and the single most interpretively l
   **AND THE BADGE MUST GO OR BE MADE TRUE.** `AC50/D85 compliant` on a block that contradicts AC50 is worse than an unbadged block: **an unbadged sketch invites checking, a badged one forecloses it.** *A compliance stamp is a promise that somebody already verified this, and it is the only claim in the document that discourages the reader from doing the very thing that would catch it.*
 
   **⚠️ AND THE SCOPE RULE THAT KEPT THIS OPEN FOR AN HOUR, RECORDED AGAINST MYSELF:** I found this, verified it, and did not fix it, because single-file discipline says do not edit another agent's deliverable. **That discipline is correct and it has a hole: a defect that only its owner may repair is a defect that waits on its owner's attention, and nothing in our process pages anyone.** *We have a rule against touching other people's files and no rule about telling them, and the second is the one that ships the bug.* **This AC is the page. If §24.2 is unchanged at ship time, this ruling — not the sketch — is the record of what we knew.**
+
+- [ ] **AC209 — 🔴 THE REVIEW-FRESHNESS GUARD DISCOVERS ITS CORPUS BY *FILENAME*, AND EVERY DOCUMENT THAT ACTUALLY CARRIES A NUMBER IS INVISIBLE TO IT. 8 INVISIBLE vs 5 SEEN. THIS SPEC — 205 ACs — IS ONE OF THE INVISIBLE ONES.**
+
+  **@e00032a4 reported `check-review-freshness.test.js` green at 3/3 and flagged the real gap as adoption — 1 of 4 documents carrying a `MEASURED-AT` marker. That is true and it understates the problem by one level.** The adoption gap is three lines of typing. **The corpus gap cannot be closed by typing at all, because the guard will never open the file.**
+
+  ```
+  check-review-freshness.test.js:61
+    .filter((name) => /(REVIEW|BRIEF)/.test(name) && name.endsWith('.md'))
+
+  ✅ SEEN (5)      ARCHITECTURE-SECURITY-REVIEW · IMPLEMENTATION-REVIEW
+                   READABILITY-REVIEW · REVIEWER-BRIEF · REVIEW-POINT
+  ⛔ INVISIBLE (8)  demo-spec.md ......... 205 ACs, THE BUILD CONTRACT
+                   perf-baseline.md ..... THE SOURCE OF EVERY NUMBER CITED ABOVE
+                   browser-render-verification.md · prefix-cache-verification.md
+                   CONTRACT.md · FIELD-MEANING-AUDIT.md · QA-PLAN.md · PR-DESCRIPTION.md
+  ```
+
+  **THE REVIEWS ARE DATED. THE EVIDENCE THE REVIEWS CITE IS NOT.** A review document declaring `MEASURED-AT: <sha>` and quoting a figure from `perf-baseline.md` inherits that figure's staleness **while displaying a valid freshness stamp of its own.** ➡️ **A dated document that cites an undated one is not dated. It is a fresh wrapper around an unknown.** And this is precisely the two-hop propagation failure already recorded in `AC208`: **the guard reaches the citation and never the source.**
+
+  **THE TWO SHARPEST CASES ARE NOT HYPOTHETICAL — BOTH ARE ON THE INVISIBLE LIST AND BOTH ARE ALREADY IMPLICATED:**
+  - **`perf-baseline.md`** is where `9.8 %` was retracted by its own author. A hardcoded guard elsewhere then *mandated* the retracted figure. **The retraction lived in a file the freshness guard cannot see.**
+  - **`browser-render-verification.md` / `prefix-cache-verification.md`** are the pair that cost an hour: same directory, same suffix, same withdrawn number, same owner, and a correct fix landed on the wrong one. **Neither is datable by the guard, so nothing can tell a reader which one was re-measured.**
+
+  **BINDING — TWO CHANGES, AND THE SECOND MATTERS MORE THAN THE FIRST:**
+  1. **Widen the corpus from a name pattern to a marker search.** *Discover every `.md` that carries a `MEASURED-AT:` line, rather than every `.md` whose name looks like a review.* **A document opts in by making a dateable claim, not by being christened correctly.** This inverts the failure: today a file must be *named* right to be checked; after the change it must be *marked* right, and marking is the thing we actually want.
+  2. **Keep the abstainer note and make it a count, not a list.** `note: N have not adopted` is the right instinct — **it is the only line in our toolchain that declares what it did not examine** — but it currently reports abstainers **within** the corpus and is silent about documents **outside** it. **An absent document and a compliant document render identically, which is @c0de4c2e's law arriving in a guard written to prevent exactly that.**
+
+  **ADOPTED HERE, AT THE TOP OF THIS FILE, AND DECLARED INERT IN THE SAME BREATH.** This spec now carries `MEASURED-AT: eca213ec`. **Nothing checks it** — the filename does not match — and the header says so out loud rather than letting the marker imply an enforcement that does not exist. *A stamp nobody verifies is a claim, and a claim that looks like a check is worse than no stamp at all.* **When the corpus widens, this file is already compliant and the line becomes load-bearing without further edit.**
+
+  **⚖️ AND THE CREDIT, BECAUSE IT IS THE SHAPE WE SHOULD COPY: @e00032a4 came to argue the guard was self-defeating, found it already contained both refinements they meant to propose, and published *that* instead. They also refused to add three lines to three colleagues' documents to close their own reported gap, on the ground that `every word in it is mine and so is every gap` is worth more than the ten seconds saved.** ➡️ **That is the same refusal I made on `demo-ux.md` §24.2 and it has the same hole: the discipline is right and nothing in our process pages the owner. Two of us have now hit it within the hour. It is not a habit — it is a missing mechanism.**
