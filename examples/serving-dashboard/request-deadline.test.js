@@ -135,6 +135,101 @@ test('the caller options reach the underlying fetch untouched', async () => {
   assert.equal(seen.timeoutMs, undefined);
 });
 
+// F22. The test above asserts `ok(seen.signal)` and passed throughout the
+// entire life of the defect, because PRESENCE IS EXACTLY WHAT AN OVERWRITE
+// PRESERVES: the key it inspected was the one key being destroyed, and it
+// checked that key for existence rather than identity. A test named
+// "untouched" certified the promise while exercising only the two arguments
+// that happened to survive.
+//
+// So these assert on IDENTITY and on BEHAVIOUR, which an overwrite cannot fake.
+test("a caller's own signal is not silently discarded (F22)", async () => {
+  const caller = new AbortController();
+  let seen = null;
+
+  await fetchWithDeadline('http://healthy.invalid/health', {
+    fetchImpl: async (_input, init) => {
+      seen = init;
+      return { ok: true };
+    },
+    signal: caller.signal,
+  });
+
+  assert.ok(seen.signal, 'no signal reached fetch at all');
+  // NOT the caller's signal object: it is composed with the deadline, so a
+  // pass-through would be just as wrong as an overwrite. Identity is asserted
+  // through behaviour below rather than by reference.
+  assert.notEqual(seen.signal, caller.signal, 'deadline signal was dropped');
+  assert.equal(seen.signal.aborted, false);
+});
+
+test("aborting the caller's signal aborts the request", async () => {
+  const caller = new AbortController();
+  let seen = null;
+
+  await fetchWithDeadline('http://healthy.invalid/health', {
+    fetchImpl: async (_input, init) => {
+      seen = init;
+      return { ok: true };
+    },
+    signal: caller.signal,
+  });
+
+  assert.equal(seen.signal.aborted, false, 'aborted before the caller asked');
+  caller.abort();
+  assert.equal(
+    seen.signal.aborted,
+    true,
+    'the caller aborted and the request did not notice — F22 regression',
+  );
+});
+
+test('a caller abort is NOT relabelled as a server timeout', async () => {
+  const caller = new AbortController();
+
+  // The distinction this whole module exists to make: "the server went quiet"
+  // and "the caller stopped caring" are different sentences to a visitor, and
+  // only the first one is RequestTimeoutError.
+  await assert.rejects(
+    fetchWithDeadline('http://healthy.invalid/health', {
+      fetchImpl: async (_input, init) => {
+        caller.abort();
+        init.signal.throwIfAborted();
+        return { ok: true };
+      },
+      signal: caller.signal,
+      timeoutMs: 50_000,
+    }),
+    (error) => {
+      assert.ok(
+        !(error instanceof RequestTimeoutError),
+        'a caller abort was blamed on the server',
+      );
+      return true;
+    },
+  );
+});
+
+test('an already-aborted caller signal aborts immediately', async () => {
+  const caller = new AbortController();
+  caller.abort();
+  let seen = null;
+
+  await fetchWithDeadline('http://healthy.invalid/health', {
+    fetchImpl: async (_input, init) => {
+      seen = init;
+      return { ok: true };
+    },
+    signal: caller.signal,
+  });
+
+  assert.equal(
+    seen.signal.aborted,
+    true,
+    'a signal that was already aborted arrived un-aborted',
+  );
+});
+
 test('there is exactly one deadline value in the product', () => {
   // Two constants of the same name in two modules is how a duplicate
   // provenance key silently shipped a misnomer on this branch: JS raises no

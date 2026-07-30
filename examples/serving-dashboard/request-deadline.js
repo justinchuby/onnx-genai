@@ -63,16 +63,33 @@ export class RequestTimeoutError extends Error {
  * @param {{
  *   fetchImpl?: typeof fetch,
  *   timeoutMs?: number,
+ *   signal?: AbortSignal,
  *   headers?: Record<string, string>,
  *   cache?: RequestCache,
  * }} [options] `fetchImpl` and `timeoutMs` are consumed here; everything else
- *   is passed through to the underlying fetch untouched.
+ *   is passed through to the underlying fetch untouched — EXCEPT `signal`,
+ *   which is COMPOSED rather than forwarded or replaced. A caller's signal and
+ *   this function's deadline both remain able to abort the request, and
+ *   whichever fires first wins. Cancelling via your own signal raises the
+ *   underlying abort error; only the deadline produces RequestTimeoutError.
+ *
+ *   Composition, not replacement, because the two signals answer different
+ *   questions -- "the server went quiet" and "the caller stopped caring" --
+ *   and a request can be subject to both at once. Dropping either one loses a
+ *   guarantee somebody is relying on, silently and only under load.
+ *
+ *   Requires `AbortSignal.any` (Node 20+, current browsers), and only on the
+ *   path where a caller actually passes a signal. An unsupporting runtime
+ *   throws immediately and by name rather than degrading to the old behaviour,
+ *   because the old behaviour was to discard the caller's signal without
+ *   saying so, which is the defect this documents.
  * @returns {Promise<Response>}
  */
 export async function fetchWithDeadline(input, options = {}) {
   const {
     fetchImpl = globalThis.fetch,
     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal: callerSignal,
     ...init
   } = options;
 
@@ -86,8 +103,19 @@ export async function fetchWithDeadline(input, options = {}) {
     controller.abort();
   }, timeoutMs);
 
+  // Composed, never replaced. `{ ...init, signal: controller.signal }` reads as
+  // correct and silently discards a caller's signal, because a spread whose
+  // last writer is us wins every key we happen to name.
+  //
+  // `timedOut` is set ONLY by our own timer above, so a caller-initiated abort
+  // still surfaces as the runtime's abort error rather than being relabelled a
+  // server timeout. Attribution follows whoever actually fired.
+  const signal = callerSignal
+    ? AbortSignal.any([callerSignal, controller.signal])
+    : controller.signal;
+
   try {
-    return await fetchImpl(input, { ...init, signal: controller.signal });
+    return await fetchImpl(input, { ...init, signal });
   } catch (error) {
     if (timedOut) throw new RequestTimeoutError(timeoutMs);
     throw error;
