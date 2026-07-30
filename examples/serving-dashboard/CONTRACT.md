@@ -527,8 +527,8 @@ exists rather than as a second copy of it.
 >   595 of 600 at `10537446`** -- the totals drift with every commit and the
 >   *gap* does not. Any absolute count written here is false within the hour,
 >   which is why the runner asserts a floor and prints its own numbers instead
->   of this paragraph promising them. Four reviewers independently proposed exactly that
->   two-glob fix and **all four missed `ui/`** — so the script *discovers* test
+>   of this paragraph promising them. Four reviewers independently proposed
+>   exactly that two-glob fix and **all four missed `ui/`** — so the script *discovers* test
 >   files instead of listing them. A hardcoded list stops covering whatever was
 >   added last, which is always the thing most likely to be wrong.
 > - **Unquoted globs.** The shell expands them first, and shell expansion does
