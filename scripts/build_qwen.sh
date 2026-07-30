@@ -96,7 +96,7 @@ if truthy "$STATIC_CACHE"; then
   # `ort-genai` writes genai_config.json, which cannot express it, and the
   # resulting model fails to load. See scripts/lib/write_static_cache_metadata.py.
   RUNTIME_TARGET="onnx-genai"
-  REQUIRED_ARTIFACTS="inference_metadata.yaml model.onnx tokenizer.json"
+  REQUIRED_ARTIFACTS="inference_metadata.yaml model.onnx tokenizer.json tokenizer_config.json"
 
   case "$MAX_SEQ_LEN" in
     ''|*[!0-9]*)
@@ -107,7 +107,7 @@ if truthy "$STATIC_CACHE"; then
 else
   OUT_DIR="${OUT_DIR:-$ROOT/models/qwen2.5-0.5b}"
   RUNTIME_TARGET="ort-genai"
-  REQUIRED_ARTIFACTS="genai_config.json model.onnx tokenizer.json"
+  REQUIRED_ARTIFACTS="genai_config.json model.onnx tokenizer.json tokenizer_config.json"
 fi
 
 # Locate an interpreter that can import Mobius. Prints install instructions
@@ -139,6 +139,8 @@ if truthy "$DRY_RUN"; then
   if truthy "$STATIC_CACHE"; then
     printf '%s %s %s\n' \
       "$MOBIUS_PYTHON" "$ROOT/scripts/lib/write_static_cache_metadata.py" "$OUT_DIR"
+    printf '%s %s %s %s\n' \
+      "$MOBIUS_PYTHON" "$ROOT/scripts/lib/write_tokenizer_assets.py" "$MODEL_ID" "$OUT_DIR"
   fi
   exit 0
 fi
@@ -161,9 +163,15 @@ PYTHONPATH="$MOBIUS_PYTHONPATH" \
 
 # Mobius does not emit the `io:` block for static-cache exports, so the model
 # it just wrote cannot be loaded yet. Derive the declaration from the graph.
+# The onnx-genai runtime target also writes only tokenizer.json, dropping the
+# tokenizer_config.json that carries this model's stop token and chat template.
 if truthy "$STATIC_CACHE"; then
   PYTHONPATH="$MOBIUS_PYTHONPATH" \
   "$MOBIUS_PYTHON" "$ROOT/scripts/lib/write_static_cache_metadata.py" "$OUT_DIR"
+
+  HF_HOME="${HF_HOME:-$ROOT/models/.hf_cache}" \
+  PYTHONPATH="$MOBIUS_PYTHONPATH" \
+  "$MOBIUS_PYTHON" "$ROOT/scripts/lib/write_tokenizer_assets.py" "$MODEL_ID" "$OUT_DIR"
 fi
 
 # A partial export is worse than a failed one: the runtime would load it and

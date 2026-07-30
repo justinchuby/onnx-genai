@@ -129,6 +129,12 @@ assert_not_contains "STATIC_CACHE=1 does not use the ort-genai runtime" \
 assert_contains "STATIC_CACHE=1 writes the static_cache declaration" \
   "$output" "write_static_cache_metadata.py"
 
+# The onnx-genai target writes only tokenizer.json. tokenizer_config.json
+# carries Qwen's real stop token (<|im_end|>) and its chat template; without it
+# the model loads but never stops generating.
+assert_contains "STATIC_CACHE=1 restores the tokenizer companion files" \
+  "$output" "write_tokenizer_assets.py"
+
 # The dynamic path is a different contract: genai_config.json is what the
 # runtime loads there, and it is known to work.
 output="$(run_build /bin/bash)"
@@ -136,6 +142,9 @@ assert_contains "dynamic build targets the ort-genai runtime" \
   "$output" "--runtime ort-genai"
 assert_not_contains "dynamic build does not write a static_cache declaration" \
   "$output" "write_static_cache_metadata.py"
+# ort-genai already copies the tokenizer companions itself.
+assert_not_contains "dynamic build does not re-copy tokenizer assets" \
+  "$output" "write_tokenizer_assets.py"
 
 # Legacy alias kept for existing docs and benchmark scripts.
 output="$(run_build /bin/bash SCATTER_CACHE=1)"
@@ -346,6 +355,99 @@ sys.exit(0 if indices == list(range(len(indices))) else 1)
   fi
 else
   printf 'skip  static_cache generator checks (onnx/pyyaml unavailable)\n'
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/lib/write_tokenizer_assets.py
+#
+# Mobius's onnx-genai runtime target writes only tokenizer.json. These cases
+# use a local source directory so they are hermetic and need no network.
+# ---------------------------------------------------------------------------
+TOKENIZER_ASSETS="$ROOT/scripts/lib/write_tokenizer_assets.py"
+ASSETS_PYTHON="${GENERATOR_PYTHON:-}"
+[ -n "$ASSETS_PYTHON" ] || ASSETS_PYTHON="$(command -v python3 || true)"
+
+if [ -n "$ASSETS_PYTHON" ]; then
+  assets_tmp="$(mktemp -d)"
+  trap 'rm -rf "$assets_tmp"' EXIT
+  mkdir -p "$assets_tmp/src" "$assets_tmp/out"
+  printf '{"eos_token": "<|im_end|>", "chat_template": "x"}\n' \
+    >"$assets_tmp/src/tokenizer_config.json"
+  printf '{}\n' >"$assets_tmp/src/vocab.json"
+  printf 'a b\n' >"$assets_tmp/src/merges.txt"
+  # The exporter already wrote this one; it must not be replaced.
+  printf 'EXPORTER\n' >"$assets_tmp/out/merges.txt"
+
+  # --check must never write. An earlier revision of the sibling generator's
+  # test dropped this flag and mutated a shared model directory.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  check_output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/out" --check 2>&1)"
+  if [ -f "$assets_tmp/out/tokenizer_config.json" ]; then
+    fail "--check writes nothing" "it created tokenizer_config.json"
+  else
+    pass "--check writes nothing"
+  fi
+  assert_contains "--check reports what it would copy" "$check_output" "would copy"
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if copy_output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/out" 2>&1)"; then
+    pass "copies missing tokenizer companions"
+  else
+    fail "copies missing tokenizer companions" "$copy_output"
+  fi
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [ -f "$assets_tmp/out/tokenizer_config.json" ] && [ -f "$assets_tmp/out/vocab.json" ]; then
+    pass "tokenizer_config.json and vocab.json land in the output dir"
+  else
+    fail "tokenizer_config.json and vocab.json land in the output dir"
+  fi
+
+  # Whatever the exporter wrote is authoritative.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [ "$(cat "$assets_tmp/out/merges.txt")" = "EXPORTER" ]; then
+    pass "existing exporter output is never overwritten"
+  else
+    fail "existing exporter output is never overwritten"
+  fi
+
+  # tokenizer.json is the exporter's own fast-format copy and is referenced by
+  # inference_metadata.yaml; copying the source one over it would be wrong.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [ -f "$assets_tmp/out/tokenizer.json" ]; then
+    fail "does not copy tokenizer.json" "the exporter owns that file"
+  else
+    pass "does not copy tokenizer.json"
+  fi
+
+  # A source without tokenizer_config.json yields a model that loads but never
+  # stops generating, so it must fail loudly rather than silently.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  mkdir -p "$assets_tmp/empty_src" "$assets_tmp/empty_out"
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/empty_src" "$assets_tmp/empty_out" 2>&1)"; then
+    fail "missing tokenizer_config.json is an error"
+  else
+    case "$output" in
+      *"never stopping"*|*"never stop generating"*)
+        pass "missing tokenizer_config.json is an error" ;;
+      *) fail "missing tokenizer_config.json is an error" "unhelpful error: $output" ;;
+    esac
+  fi
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/nonexistent" 2>&1)"; then
+    fail "a missing output directory is an error"
+  else
+    case "$output" in
+      *"no such directory"*) pass "a missing output directory is an error" ;;
+      *) fail "a missing output directory is an error" "unhelpful error: $output" ;;
+    esac
+  fi
+
+  rm -rf "$assets_tmp"
+  trap - EXIT
+else
+  printf 'skip  tokenizer asset checks (no python3)\n'
 fi
 
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
