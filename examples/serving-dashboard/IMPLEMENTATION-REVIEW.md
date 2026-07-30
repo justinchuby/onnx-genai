@@ -74,9 +74,23 @@ admit `null`, so the contract and the code still disagree about a value the code
 export const PANELS = Object.freeze([throughput, scheduling, kvMemory, requests, system]...)
 ```
 
-The defect is unchanged and still live (`index.js:188` passes the non-existent `panel.title`); only
-my count was stale. @c7a654ed retracted `PANELS.length === 6` as a proxy that outlived the thing it
-proxied — I was still quoting the proxied number.
+⛔ **RETRACTED — F11 IS DEAD, AND THIS PARAGRAPH WAS WRONG TWICE.** I wrote that the defect was
+"unchanged and still live" and that "only my count was stale." Both halves are false.
+
+`panel.title` **resolves.** `dashboard/index.js:91-95` freezes `{ id, title: module.meta.title,
+module }` for each panel, and `:143` reads `panel.title` off that object. Executed against all six
+panel modules: `Throughput & latency`, `Scheduling & batching`, `KV memory`, `Prefix cache`,
+`Requests`, `System` — **6 of 6 resolve to a non-empty string, 0 undefined**, negative control clean.
+
+The comment at `:85-90` is the fix's own record: *"`title` is lifted out of `meta` deliberately.
+The shell naturally reaches for `panel.title`, and it **silently read `undefined` for a while**."*
+Past tense. I read a comment describing a repaired defect and reported it as the defect.
+
+The citation I used (index.js, line 188 — deliberately written in prose here, not as a
+backtick-and-colon citation, so this retraction cannot be re-harvested as a live reference) was
+also past-EOF — the file is 187 lines and the call site is `:143`.
+**The correct repair is retraction, not renumbering: pointing a false finding at a real line makes
+it cite-checkable, and every range-checker on this branch would then pass it.**
 
 **F11's landing-order caveat is WITHDRAWN.** `panel-kit.js:1049` gates the throw on
 `IS_DEVELOPMENT` and otherwise `console.error`s and keeps building, with the reason in the comment
@@ -910,10 +924,16 @@ attach or handle resize explicitly rather than discarding the `Result`.
    `scheduler.waiting` and `kv.allocation_failures`; **no client module publishes any of them.**
    The server emits the denominator as `batch_capacity`, which nothing client-side reads. Fix the
    binding, then add the registry test that fails on `"No field named"` for any panel-requested key.
-4. **F11 (major)** — `index.js:188` passes `panel.title`, which does not exist; all **five** panels
-   ship an unnamed `role="group"` plus a console error at every mount. Fix by deriving the label the
-   way `id` is already derived, not by hoisting a second copy of the title into the registry — that
-   would contradict the derive-don't-duplicate lesson this same file documents at `:58-80`. And fix
+4. ~~**F11 (major)**~~ — ⛔ **RETRACTED. NOT A DEFECT.** I claimed index.js line 188 (prose, not a citation) passes a
+   non-existent `panel.title` and that "all **five**" panels ship an unnamed `role="group"`.
+   Wrong on the line (the call is `:143`; the file has 187 lines), wrong on the count (there are
+   **six** panels), and wrong on the finding: `:91-95` carries `title` onto the panel object and
+   **6 of 6 resolve**, verified by execution. My prescription — *"derive the label the way `id` is
+   already derived, not by hoisting a second copy of the title into the registry"* — argued against
+   the shape the code already uses, and `:85-90` explains why that shape was chosen: carrying the
+   field callers actually reach for is cheaper than expecting every caller to remember the hop
+   through `.module.meta`. **The `accessibility.test.js` hardcoded `{ label: 'KV cache' }` in all
+   7 calls is a separate, still-open observation and is listed on its own below.**
    `accessibility.test.js`, which hardcodes `{ label: 'KV cache' }` in all 7 calls and therefore
    **cannot** catch this class of defect. **No landing-order constraint** — the `createRovingGroup`
    throw at `panel-kit.js:1049` is gated on `IS_DEVELOPMENT`, so this fix can land alone.
