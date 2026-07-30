@@ -208,16 +208,42 @@ test('wrong JSON wire types are rejected as unavailable across the full census',
   const rows = jsonPathRows();
   assert.equal(rows.length, 30, 'the store enforcement census drifted from the declaration guard');
 
+  // The no-leak assertion at the bottom of this loop is only worth anything if a
+  // path-bearing value actually REACHED the rejection path. Until now that was
+  // true by coincidence: the sentinel lands on a numeric row only where the
+  // census index happens to satisfy index % numericSentinels.length === 1, which
+  // is four rows today and could be zero after any reordering of the census or
+  // any change to this list's length. At zero the negative assertion would still
+  // pass — because nothing sensitive was ever injected, not because nothing
+  // leaked. Absence and cleanliness are opposite facts that a negative assertion
+  // cannot distinguish. So one numeric row carries the sentinel DETERMINISTICALLY,
+  // and the number of path-bearing rejections is asserted, making vacuity fail
+  // closed rather than read green.
+  const PATH_SENTINEL = '/Users/operator/models/qwen';
   const numericSentinels = [
     '',
-    '/Users/operator/models/qwen',
+    PATH_SENTINEL,
     'node-operator',
     { unexpected: true },
     ['unexpected'],
     'NaN',
   ];
+  // Ordered before the loop deliberately: if the census ever stops declaring a
+  // numeric field, the failure must name THAT, rather than surfacing later as a
+  // confusing count of zero whose cause the next reader has to reconstruct.
+  const firstNumericIndex = rows.findIndex(([, entry]) => entry.wireType === 'number');
+  assert.notEqual(
+    firstNumericIndex,
+    -1,
+    'the census declares no numeric field, so no path-bearing value can reach the rejection path at all',
+  );
+  let pathBearingRejections = 0;
   const wrongValueFor = (key, wireType, index) => {
-    if (wireType === 'number') return numericSentinels[index % numericSentinels.length];
+    if (wireType === 'number') {
+      return index === firstNumericIndex
+        ? PATH_SENTINEL
+        : numericSentinels[index % numericSentinels.length];
+    }
     if (wireType === 'boolean') return key === 'server.healthy' ? 'false' : 1;
     if (key === 'server.model_id') return 17;
     if (key === 'server.node_id') return ['node-0'];
@@ -259,7 +285,37 @@ test('wrong JSON wire types are rejected as unavailable across the full census',
       !warnings.some((warning) => warning.includes('/Users/operator')),
       `${key} echoed a rejected sensitive value into the warning`,
     );
+
+    if (wrongValue === PATH_SENTINEL) {
+      pathBearingRejections += 1;
+      // Assert the warning EXISTS and is a string before asking what it
+      // contains. A containment check over an absent or coerced output cannot
+      // fail, so it would report a sanitised channel and an unwired one
+      // identically — and those are opposite facts.
+      const mismatchWarnings = warnings.filter(
+        (warning) => typeof warning === 'string' && warning.includes('wire type mismatch'),
+      );
+      assert.ok(
+        mismatchWarnings.length > 0,
+        `${key} was given a path-bearing value and rejected it without emitting any wire-type warning, so no channel exists to check for a leak`,
+      );
+      assert.ok(
+        !mismatchWarnings.some((warning) => warning.includes('/Users/operator')),
+        `${key} echoed a path-bearing rejected value into its wire-type warning`,
+      );
+      assert.ok(
+        !Object.values(store.provenanceWarnings()).some(
+          (warning) => typeof warning === 'string' && warning.includes('/Users/operator'),
+        ),
+        `${key} echoed a path-bearing rejected value into a stored provenance warning`,
+      );
+    }
   }
+
+  assert.ok(
+    pathBearingRejections > 0,
+    'no path-bearing value reached the rejection path, so every no-leak assertion in this test passed vacuously',
+  );
 });
 
 test('a missing wireType declaration fails closed instead of permitting the value', async () => {
