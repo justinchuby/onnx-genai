@@ -790,3 +790,82 @@ condition you think you created actually exists on the wire.*
 **Net effect on the gate: the dashboard is in better shape than my first report said.** One state
 (`not-applicable`) is unobserved and uninducible by me; four of five are exercised; the disconnect
 path is genuinely good.
+
+---
+
+## 10.10 Re-run on a re-armed binary, with identity asserted — and the definitive state-appearance answer
+
+The Lead re-issued the browser order with a guardrail I had **not** satisfied: *assert an identity
+marker in the payload before trusting any reading*. Re-running the whole pass exposed that
+**guardrail 1 had re-armed while I worked**.
+
+### The binary went stale underneath a passing result
+
+My §10 measurements ran on a binary built at `04:10:57`. While I was writing them up,
+`f110647c` landed at `04:36:36` — *"kv: separate an absent block mirror from an empty block
+window"*, i.e. **precisely a field-state distinction, which is what §10 reports on**. Two binaries
+again differed: `04:10:57 / 29,495,696 B` in the demo tree and `04:26:15 / 29,521,056 B` in the
+sibling checkout. Everything below is on `04:38:39 / 29,520,576 B`, which post-dates every
+`crates/` commit.
+
+**The lesson is not "rebuild". It is that a passing browser result has a shelf life measured in
+minutes on this branch, and nothing in the harness announces its expiry.**
+
+### Identity, asserted rather than assumed
+
+A port answering `200` proves *a* server is there, not *which*. Chain now closed:
+
+| | `:9611` | `:9612` |
+|---|---|---|
+| LISTEN pid | 89947 | 89948 |
+| executing | `…/onnx-genai-demo/target/release/onnx-genai-server` | same |
+| same inode as my build (`-ef`) | ✅ | ✅ |
+| `node_id` | `node-3c7e9f3fbadc991a` | `node-591ce8fb5f4f237d` |
+| `model_id` | `qwen-scatter` | `qwen-dynamic` |
+
+Distinct `node_id`s and distinct models — so this is not one server measured twice, and not
+someone else's. Ports moved to 9611/9612 to stay clear of @c8d9a40e.
+
+**Guardrail 3 reproduced exactly:** `/status` → **404**, `/models` → **404**;
+`/v1/status`, `/v1/models`, `/v1/resources` → **200**. The reviewer's near-miss is real: an
+unversioned path 404s in a way that looks like "this server has no API".
+
+### 🔑 Do the five states look different on screen? Four do, and by TEXT — not by colour.
+
+Forced-rendered under the real stylesheet, then confirmed against naturally-occurring elements:
+
+| state | rendered as | colour |
+|---|---|---|
+| `measured` | the value — `qwen-dynamic` | `rgb(230,237,243)` |
+| `stale` | **`qwen-dynamic · 12s old`** — keeps the value, appends age | `rgb(127,145,166)` |
+| `pending` | `···` | `rgb(120,140,162)` |
+| `unavailable` | `—` | `rgb(114,134,157)` |
+| `not-applicable` | **never rendered in any scenario** | `rgb(133,151,171)` |
+
+**The four observable states are genuinely distinguishable, and well designed for it.** `stale` is
+the best of them: it does not blank the value, it keeps it and timestamps it, plus a page banner
+*"Disconnected — last reading 12s ago"*. A reader can tell all four apart at a glance.
+
+**⚠️ But the discrimination is carried entirely by text. Colour does almost nothing:** the four
+absence states span `rgb(114–133, 134–151, 157–171)` — adjacent pairs differ by as little as
+**4–7/255**. `pending` vs `stale` is 7/5/4. **Any future change that normalises the glyph or drops
+the age suffix collapses three states into one indistinguishable grey**, and
+`state-vocabulary.test.js` would stay green, because it asserts the five renderings are *distinct
+values*, not that they are *perceptible*. That is the gap the Lead asked me to look for — it is
+real, but it is latent, not present.
+
+**So: the model is five in the vocabulary and four on screen — not because two look alike, but
+because `not-applicable` never renders.** I could not induce it; the source calls it *"an
+intentional gap"*.
+
+### Everything else, re-confirmed on the current binary
+
+| check | result |
+|---|---|
+| Dashboard, not 404 | ✅ title `onnx-genai — serving dashboard`, visible `h1` `onnx-genai`, 11,920 chars |
+| Scenario tabs (clicked via real `href`) | ✅ 3/3 mount, 2 cross-origin to `:9612`, **0 white-screens** |
+| Numbers move | ✅ `256→252` free KV, `0→4` in-flight, `0→4` occupancy at `util=1.0` |
+| Console | ✅ **0 errors** |
+| Network | ✅ **0 failed requests** |
+
+No refused module, no unknown-state warning, no asset 404.
