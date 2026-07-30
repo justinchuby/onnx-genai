@@ -45,8 +45,36 @@ cd "$(dirname "$0")" || exit 1
 # This is the `fetchImpl` seam again: injectable for a test, unchanged in
 # production. An override is only reachable by someone who typed it, and the
 # banner prints the values in force, so a lowered floor cannot pass unnoticed.
+# THE FIXTURE SEAM, CAPTURED BEFORE THE DEFAULTS FILL IT IN.
+#
+# The ratchet below needs to know whether a HUMAN set these, and after the two
+# `:-` assignments that is unknowable -- the variables are always set by then.
+# A throwaway four-test fixture repository must not trip the ratchet either,
+# for exactly the reason the floors have a seam: a fixture that fails for the
+# wrong reason proves nothing.
+fixture_mode=0
+[[ -n ${MIN_TESTS:-} || -n ${MIN_FILES:-} ]] && fixture_mode=1
+
 MIN_TESTS=${MIN_TESTS:-500}
 MIN_FILES=${MIN_FILES:-40}
+
+# THE FLOOR ABOVE IS FOR VACUITY. THE RATCHET BELOW IS FOR COMPLETENESS.
+# They are different guards and neither can do the other's job.
+#
+#   MIN_TESTS=500 PASSES AT 595 WHEN THE TRUE COUNT IS 600.
+#
+# That is not a tuning mistake, it is structural: a floor low enough to be
+# stable while the suite grows is BY CONSTRUCTION unable to see a one-suite
+# loss. And a whole suite that silently fails to load looks precisely like a
+# smaller number. This cost 588 -> 435 tonight without a single red.
+#
+# A DROPPING TEST COUNT IS A LOAD FAILURE WEARING A TEST FAILURE'S CLOTHES.
+#
+# The floor is NOT replaced by the ratchet, deliberately: on a fresh clone the
+# baseline file may be absent, and a ratchet with no baseline guards nothing at
+# all. The floor covers the ratchet's cold start; the ratchet covers the
+# floor's slack. Deleting either one reopens a hole the other cannot see.
+BASELINE_FILE=test-count.baseline
 
 # Local iteration writes test files before committing them. Verification runs
 # must not. Default is the shipping claim; the escape hatch is loud on purpose.
@@ -69,6 +97,7 @@ echo "head:   $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')
 echo "dirty:  $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted file(s) in this tree"
 echo "node:   $(node --version)"
 echo "floors: ${MIN_TESTS} tests / ${MIN_FILES} files (defaults 500/40; an override is printed here so a lowered floor cannot pass unnoticed)"
+echo "ratchet: $( [[ $fixture_mode -eq 1 ]] && echo 'DISABLED (fixture mode: floors were overridden)' || { [[ -f $BASELINE_FILE ]] && echo "baseline $(tr -cd '0-9' < "$BASELINE_FILE") from ${BASELINE_FILE}" || echo "no baseline yet (${BASELINE_FILE} absent; will be seeded)"; } )"
 
 # Discover, never enumerate.
 test_files=()
@@ -314,6 +343,76 @@ if [[ $tests -lt $MIN_TESTS ]]; then
   echo "      shrank or the runner stopped finding files. A check that stopped" >&2
   echo "      looking and a check that found nothing print the same green." >&2
   status=1
+fi
+
+# THE RATCHET. Fails on ANY decrease, not just a decrease past the floor.
+#
+# DETECTION AND ADVANCEMENT ARE SPLIT ON PURPOSE, AND THE FIRST VERSION OF THIS
+# BLOCK GOT IT WRONG. It skipped everything unless `failed -eq 0`, reasoning
+# that a red run's count measures how far the run got rather than how big the
+# suite is. That is true of ADVANCING and false of DETECTING, and on this tree
+# the difference is everything: the shared worktree is red most of the time
+# (2 pre-existing failures as of this writing), so a ratchet gated on green
+# WOULD NEVER HAVE RUN AT ALL -- correct, and vacuous, which is the exact
+# failure this suite exists to catch.
+#
+# So: a DROP is reported whenever it is seen, red or green. The baseline only
+# ADVANCES on a clean run, because a high-water mark banked from a partial run
+# is a number nobody can reproduce.
+#
+# The two facts are also different diagnoses and both matter:
+#   "2 tests failed"        -> a test broke
+#   "40 tests never ran"    -> a suite failed to LOAD
+# The second is the one nothing else here can see.
+if [[ $fixture_mode -eq 0 ]]; then
+  if [[ -f $BASELINE_FILE ]]; then
+    baseline=$(tr -cd '0-9' < "$BASELINE_FILE")
+    if [[ -z $baseline ]]; then
+      echo "FAIL: ${BASELINE_FILE} exists but holds no number. A ratchet that" >&2
+      echo "      cannot read its baseline must not silently become no ratchet." >&2
+      status=1
+    elif [[ $tests -lt $baseline ]]; then
+      # THE OVERRIDE MUST NAME THE EXACT NEW COUNT, not merely assert consent.
+      # `ALLOW_TEST_COUNT_DROP=1` would be typed once, forgotten in a shell,
+      # and would then wave through every later drop -- which is how a ratchet
+      # decays into the floor it was meant to replace. Naming the count makes
+      # the permission expire on its own the next time the number moves.
+      dropped=$((baseline - tests))
+      if [[ ${ALLOW_TEST_COUNT_DROP:-} == "$tests" ]]; then
+        echo "note: test count dropped ${baseline} -> ${tests}, allowed by" >&2
+        echo "      ALLOW_TEST_COUNT_DROP=${tests}." >&2
+        [[ $failed -eq 0 ]] && echo "$tests" > "$BASELINE_FILE"
+      else
+        echo "FAIL: test count DROPPED ${baseline} -> ${tests} (${dropped} fewer)." >&2
+        if [[ $failed -eq 0 ]]; then
+          echo "      NO TEST FAILED, so this is not a broken test -- it is tests" >&2
+          echo "      that never ran. Look for a suite that failed to LOAD before" >&2
+          echo "      you look for a suite that failed." >&2
+        else
+          echo "      ${failed} test(s) also failed. Do not assume one explains the" >&2
+          echo "      other: a suite that aborts on load removes its whole count," >&2
+          echo "      and ${dropped} missing is not the same fact as ${failed} failing." >&2
+        fi
+        echo "      If the removal is deliberate, re-run with:" >&2
+        echo "        ALLOW_TEST_COUNT_DROP=${tests} $0" >&2
+        status=1
+      fi
+    elif [[ $tests -gt $baseline && $failed -eq 0 ]]; then
+      # Advance automatically. A ratchet that only PRINTS its new high-water
+      # mark is a suggestion, and the next drop is measured against whatever
+      # stale number nobody got around to committing.
+      echo "$tests" > "$BASELINE_FILE"
+      echo "ratchet: test count ${baseline} -> ${tests}; ${BASELINE_FILE} advanced (commit it)."
+    fi
+  elif [[ $failed -eq 0 ]]; then
+    echo "$tests" > "$BASELINE_FILE"
+    echo "ratchet: no baseline yet; seeded ${BASELINE_FILE} at ${tests} (commit it)."
+  else
+    # Say so out loud. A guard that declined to arm itself must not be
+    # indistinguishable from a guard that armed and was satisfied.
+    echo "ratchet: NOT seeded -- ${failed} test(s) failed, and a baseline banked" >&2
+    echo "         from a red run is a number nobody can reproduce." >&2
+  fi
 fi
 
 if [[ $failed -ne 0 ]]; then
