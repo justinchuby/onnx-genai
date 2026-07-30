@@ -45,27 +45,40 @@ test('every state the README names exists in FIELD_STATES', () => {
 
 test('the README states the CURRENT wire value of the measured state', () => {
   // This is the drift guard. When the ratified rename to 'measured' lands,
-  // FIELD_STATES.OK becomes 'measured', this test goes red, and the README's
-  // warning block must be updated in the SAME commit. That is the intent:
-  // the doc cannot quietly outlive the landmine it warns about.
+  // This test deliberately does NOT hardcode a spelling. The value has been
+  // 'ok' and is being renamed to 'measured'; hardcoding either one makes this
+  // test wrong in the other world, and the point is that the README tracks the
+  // CODE rather than tracking a ruling about the code.
   //
-  // MUTATION: changed the asserted literal to 'measured' -> red today, which
-  // is exactly the state of the world this test encodes.
-  const wire = FIELD_STATES.OK;
-
-  assert.equal(
-    wire,
-    'ok',
-    'FIELD_STATES.OK is no longer \'ok\'. If the ratified rename has landed, ' +
-      'delete the warning block in README.md that says the wire value is \'ok\' ' +
-      'and says the rename has not landed — it is now false.',
-  );
+  // So: read the wire value from the constant, then require the README to name
+  // that exact value. Whenever the rename lands, this goes red until the README
+  // is updated in the same commit.
+  //
+  // MUTATION: pointed the README sentence at the other spelling while leaving
+  // the constant alone -> red, naming both sides.
+  const wire = FIELD_STATES.MEASURED ?? FIELD_STATES.OK;
 
   assert.ok(
-    /wire value is the string `'ok'`, not `'measured'`/.test(README),
-    'README no longer carries the warning that the measured state is on the wire ' +
-      "as 'ok'. The code still emits 'ok', so removing the warning strands every " +
-      "reader who compares against 'measured'.",
+    typeof wire === 'string' && wire.length > 0,
+    'Neither FIELD_STATES.MEASURED nor FIELD_STATES.OK exists. The measured ' +
+      'state was renamed again and this test can no longer find it.',
+  );
+
+  const declared = README.match(/measured state's wire value is the string `'([^']+)'`/);
+  assert.ok(
+    declared,
+    "README.md no longer contains the sentence declaring the measured state's " +
+      'wire value. That sentence is what stops a reader comparing field.state ' +
+      'against a literal that is false for every field on the page.',
+  );
+
+  assert.equal(
+    declared[1],
+    wire,
+    `README.md says the measured state is on the wire as '${declared[1]}', but ` +
+      `the constant emits '${wire}'. Update the README in the same commit as ` +
+      `the rename -- a stale spelling here is worse than none, because it is ` +
+      `precise and wrong.`,
   );
 });
 

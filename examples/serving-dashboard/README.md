@@ -301,15 +301,58 @@ server's `/v1/status` could only report one engine's numbers or blend two,
 leaving you unable to tell which model you were looking at. Two origins make the
 attribution unambiguous by construction, and require no additional server code.
 
+**And it is not one endpoint — it is the whole metrics layer.** `Registry`
+(`crates/onnx-genai-server/src/metrics.rs:74-89`) is a single `static` struct of
+**thirteen** counters and histograms with **no model dimension at all**: a search
+for `with_label_values`, `const_label` or any labelling construct in that file
+returns **zero**. `ttft`, `e2e`, `completion_tokens`, `pending`, `rejections`,
+`batch_size` — every one is process-wide.
+
+> **Two processes mean two registries, so cross-model blending does not get
+> mitigated — it ceases to exist.** Every counter acquires a model dimension for
+> free, enforced by the operating system rather than by anyone remembering. That
+> matters most for the fields we lean on hardest: the headline throughput
+> comparison is computed from `ttft` and `completion_tokens`, and on a single
+> server those histograms would be **fed by both models at once** — not a slow
+> measurement but a blend of two populations with no physical referent.
+>
+> **The dangerous version of that bug is the one where you fix the labelling.**
+> Echo the resolved model id onto each response and a panel can show a correct,
+> accurate `model:` badge **beside a number that still sums both models** — the
+> request really did go to that model, so a reviewer who checks the provenance
+> finds it sound and stops looking. **Provenance that certifies a contaminated
+> quantity is worse than no provenance**, because it spends the credibility we
+> built the provenance layer to earn.
+
 **This is a current property of the runtime, not a permanent law.** Nothing in
 the design prevents the continuous-batch path from using the paged KV manager;
 it simply does not today. Stated as a design tradeoff rather than a defect:
 
 > Continuous batching buys throughput by taking KV out of the pageable pool and
 > putting it in fixed in-place rows. Paged KV buys sharing and tiering by keeping
-> KV in a managed page table — it also *computes* an eviction order, but nothing
-> consumes it yet, so no eviction occurs. This runtime implements both paths,
-> and today they are alternatives rather than a composition.
+> KV in a managed page table — **and it does evict**, by two independent LRU
+> mechanisms: `PrefixCache::evict_lru`
+> (`crates/onnx-genai-kv/src/prefix_cache.rs:151`), called from
+> `crates/onnx-genai-engine/src/pipeline/paged_decode.rs:53`, releases pages back
+> to the pool; and `PageTable::evict_lru_hot`
+> (`crates/onnx-genai-kv/src/page_table.rs:1254`), called at `:1078`, `:1241` and
+> `crates/onnx-genai-kv/src/paged_cache.rs:497`, demotes the least-recently-used
+> page from GPU to CPU. This runtime implements both paths, and today they are
+> alternatives rather than a composition.
+
+> **This paragraph previously claimed the allocator "computes an eviction order
+> but nothing consumes it", and that was wrong.** The claim is true of a
+> *different* subsystem — the VRAM byte-budget governor, whose `eviction_order`
+> (`crates/onnx-genai-scheduler/src/governor.rs:166`) really is produced and
+> then read by nothing outside its own tests. **Two subsystems, both with an
+> "eviction order", and the dead one lent its deadness to the live one.**
+>
+> It is recorded here rather than quietly corrected because of the direction of
+> the error. **Every check in this project guards against claiming a capability
+> we lack; not one guards against deleting a capability we have.** Understating
+> reads as scrupulous, so it attracts no challenge — which makes it the cheaper
+> mistake to make and the more expensive one to find. This one entered as an
+> honesty fix.
 
 That sentence sounds abstract until you watch it collect victims. It is one
 architectural fact, and this project met it **three separate times, from three
@@ -669,11 +712,13 @@ Blocks render **partially filled**, because the last block of a sequence usually
 is. That gap is the actual cost of paging, and hiding it would make the picture
 prettier and less true.
 
-**The payoff is admission backpressure, not eviction.** The pool *stops
-accepting*; it is never *reclaimed*. Under pressure `queue.depth` climbs,
-`admission.slots_available` falls to zero and `admission.rejections` increments —
-all server-measured, no privileged endpoint, no engine changes. Nothing is
-evicted, and the demo does not claim otherwise.
+**The payoff is admission backpressure, not budget reclamation.** The pool
+*stops accepting*; the VRAM budget is never *reclaimed*. Under pressure
+`queue.depth` climbs, `admission.slots_available` falls to zero and
+`admission.rejections` increments — all server-measured, no privileged endpoint,
+no engine changes. **No budget-driven eviction occurs, and the demo does not
+claim otherwise** — the allocator's own LRU eviction is a separate mechanism and
+is live.
 
 That distinction is worth more than it sounds. Eviction is internal housekeeping:
 a visitor has to **take our word** for what the animation means. Backpressure is
@@ -703,9 +748,20 @@ three independent points, any one of which is sufficient:
    of models.)
 
 And even past all three, the code says so itself: `set_vram_limit` carries a
-`TODO` noting that the returned eviction order is never executed. The allocator
-computes a plan and discards it — which is why the repository's own test is
-named `reconfigure_lower_reports_overage_without_evicting`.
+`TODO` noting that the returned eviction order is never executed. **The
+*governor* computes a plan and discards it** — its `eviction_order`
+(`crates/onnx-genai-scheduler/src/governor.rs:166`) is read by nothing outside
+its own tests — which is why the repository's own test is named
+`reconfigure_lower_reports_overage_without_evicting`.
+
+> **Say "governor", not "allocator", and the distinction survives being
+> repeated.** The paged KV allocator *does* evict, by two live LRU mechanisms
+> (see *Why two servers*). It is the VRAM byte-budget governor, a different
+> subsystem, whose eviction plan goes unexecuted. **Both own something called an
+> "eviction order", and this README has already once let the dead one's
+> reputation attach to the live one.** Whenever two subsystems share a noun, the
+> defect that follows is not a wrong fact but a true fact filed under the wrong
+> owner — and it survives review, because every individual sentence checks out.
 
 So the slider would have been a **fabricated interaction** — the same failure as
 a fabricated number, wearing a costume you can drag. Instead the demo fills the
@@ -752,13 +808,17 @@ field arrives as:
 where `state` is one of five: **measured**, `pending`, `stale`, `unavailable` or
 `not-applicable`. Panels branch on `state` before reading `value`.
 
-> ⚠️ **The measured state's wire value is the string `'ok'`, not `'measured'`.**
-> The constant is `FIELD_STATES.OK` (`telemetry-field.js:119`). A rename to
-> `'measured'` has been ratified but **has not landed**, so a comparison written
-> as `field.state === 'measured'` is `false` for every measured field on the page
-> today. Compare against the constant, never against a string literal. This
-> README says *measured* because that is the concept; the wire says `'ok'`, and
-> `check-field-states.test.js` fails the moment those two stop matching.
+> ⚠️ **The measured state's wire value is the string `'measured'`.** Compare
+> against the constant `FIELD_STATES.MEASURED`
+> (`examples/serving-dashboard/telemetry-field.js`), never against a literal.
+> **That constant spelled its value `'ok'` until very recently** — a constant
+> named `MEASURED` whose value was `'ok'` — so any code or documentation you
+> find comparing `field.state === 'measured'` may predate the rename and may
+> have been silently false for every measured field on the page. **A constant's
+> name is documentation with no test coverage**: the name was written when the
+> value matched, the value changed, and the name kept vouching for it.
+> `check-field-states.test.js` reads the value out of the constant and fails if
+> this sentence disagrees, so the two cannot drift apart again.
 `telemetry-provenance.js` holds the classification of every field and emits
 documented zeros as `unavailable` **even when the response carried a parseable
 number**, so a panel cannot accidentally bind to a placeholder.
