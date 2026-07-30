@@ -95,6 +95,22 @@ pub struct NativeStaticCacheBatchedDecodeSession<'session> {
     physical_route_scratch: Vec<i32>,
 }
 
+/// The `nonpad_kv_seqlen` a static-cache row advertises to attention this step.
+///
+/// An advancing row exposes its current length plus the token it is about to
+/// write (`row_len + 1`). A non-advancing row exposes its current length, but is
+/// floored to at least 1 (§J.10 idle-slot flooring): a never-assigned / idle row
+/// has `row_len == 0`, which would ask an attention kernel to softmax a
+/// zero-length KV window and can emit NaN. Batch isolation confines that to the
+/// row's discarded output slice on the tiny fixture, but real-model/server E2E is
+/// deferred, so we harden defensively and let the kernel read KV slot 0 — always
+/// zeroed on `assign_row` and never gathered into a real output — instead of an
+/// empty set. A live non-advancing (active) row always has `row_len >= 1`, so the
+/// floor is a no-op for it and its true length is preserved.
+fn row_nonpad_kv_seqlen(row_len: usize, advancing: bool) -> usize {
+    if advancing { row_len + 1 } else { row_len.max(1) }
+}
+
 impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
     /// Detect whether a native `InferenceSession` exposes the static-cache
     /// `TensorScatter` signature (a `write_indices` and `nonpad_kv_seqlen` input
@@ -305,16 +321,19 @@ impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
 
     /// Zero one physical row's slice in every KV buffer, so a recycled slot does
     /// not leak the previous sequence's cache (mirrors ORT `zero_rank3_row`).
+    ///
+    /// Zeroes only the target row's byte range in place on each buffer's backing
+    /// storage. This keeps the work O(one row) instead of cloning the full
+    /// `batch * max_len * kv_dim` buffer per key/value tensor of every layer, and
+    /// preserves each buffer's allocation identity so the `TensorScatter`
+    /// carry-forward binding keeps observing the same tensor.
     fn zero_row(&mut self, row: usize) -> anyhow::Result<()> {
         let row_elements = self.max_len * self.kv_dim;
         let elem_size = self.dtype.storage_bytes(1);
         let start = row * row_elements * elem_size;
         let len = row_elements * elem_size;
         for buffer in self.kv_buffers.values_mut() {
-            let mut bytes = buffer.as_bytes().to_vec();
-            bytes[start..start + len].fill(0);
-            *buffer = Tensor::from_raw(self.dtype, buffer.shape.clone(), &bytes)
-                .context("rebuild zeroed native static-cache KV row")?;
+            buffer.as_bytes_mut()[start..start + len].fill(0);
         }
         Ok(())
     }
@@ -444,11 +463,7 @@ impl<'session> NativeStaticCacheBatchedDecodeSession<'session> {
                 self.row_lens[row]
             };
             self.write_indices_scratch.push(write_index as i64);
-            let nonpad = if advances[row] {
-                self.row_lens[row] + 1
-            } else {
-                self.row_lens[row]
-            };
+            let nonpad = row_nonpad_kv_seqlen(self.row_lens[row], advances[row]);
             self.nonpad_scratch.push(nonpad as i64);
         }
 
@@ -777,4 +792,67 @@ fn zeroed_kv_buffer(
     let bytes = vec![0_u8; dtype.storage_bytes(numel).max(1)];
     Tensor::from_raw(dtype, vec![batch, max_len, kv_dim], &bytes)
         .context("allocate zeroed native static-cache KV buffer")
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_model_path() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm-scatter/model.onnx.textproto")
+    }
+
+    // S1: no row ever advertises a zero-length KV window. An idle / never-assigned
+    // (non-advancing) row's `nonpad_kv_seqlen` is floored to 1, while active rows
+    // keep their true length: an advancing row exposes `row_len + 1` and a live
+    // non-advancing row (which always has `row_len >= 1`) exposes `row_len`.
+    #[test]
+    fn idle_slot_nonpad_is_floored_while_active_rows_keep_true_length() {
+        // Idle / never-assigned row: len 0, non-advancing -> floored to 1.
+        assert_eq!(row_nonpad_kv_seqlen(0, false), 1);
+        // Just-assigned row that has not advanced yet: len 0 -> also floored to 1.
+        assert_eq!(row_nonpad_kv_seqlen(0, true), 1);
+        // Advancing active rows keep their true length plus the pending token.
+        assert_eq!(row_nonpad_kv_seqlen(3, true), 4);
+        // Live non-advancing active rows (len >= 1) keep their true length: the
+        // floor is a no-op and never inflates a real row's window.
+        assert_eq!(row_nonpad_kv_seqlen(1, false), 1);
+        assert_eq!(row_nonpad_kv_seqlen(5, false), 5);
+    }
+
+    // N1: zeroing one physical row touches ONLY that row's byte slice in every KV
+    // buffer and leaves its neighbours untouched (no full-buffer clone/rebuild).
+    #[test]
+    fn zero_row_zeroes_only_the_target_row() {
+        let mut session = InferenceSession::load(fixture_model_path()).expect("load fixture");
+        assert!(NativeStaticCacheBatchedDecodeSession::is_static_cache(&session));
+        let mut decode = NativeStaticCacheBatchedDecodeSession::new(&mut session, 3)
+            .expect("build native static-cache batched decode session");
+
+        let row_bytes = decode.max_len * decode.kv_dim * decode.dtype.storage_bytes(1);
+        // Poison every KV buffer so a cleared row is unambiguously observable.
+        for buffer in decode.kv_buffers.values_mut() {
+            buffer.as_bytes_mut().fill(0xFF);
+        }
+
+        decode.zero_row(1).expect("zero row 1 in place");
+
+        for buffer in decode.kv_buffers.values() {
+            let bytes = buffer.as_bytes();
+            assert!(
+                bytes[..row_bytes].iter().all(|&b| b == 0xFF),
+                "row 0 must be untouched"
+            );
+            assert!(
+                bytes[row_bytes..2 * row_bytes].iter().all(|&b| b == 0),
+                "row 1 must be fully zeroed"
+            );
+            assert!(
+                bytes[2 * row_bytes..3 * row_bytes].iter().all(|&b| b == 0xFF),
+                "row 2 must be untouched"
+            );
+        }
+    }
 }
