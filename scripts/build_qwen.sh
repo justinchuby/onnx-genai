@@ -114,6 +114,52 @@ fi
 # and exits non-zero if it cannot find one.
 mobius_resolve "$ROOT"
 
+# A directory whose name ends in .ortpackage or .nxpackage is treated as a
+# PACKAGE rather than a plain model directory (onnx-model-package/src/lib.rs:538
+# matches on the extension), which routes loading down a different code path
+# entirely. Refuse the name rather than emit a package-shaped directory that
+# isn't one.
+case "$(basename "$OUT_DIR")" in
+  *.ortpackage|*.nxpackage)
+    printf 'error: OUT_DIR must not end in .ortpackage or .nxpackage: %s\n' \
+      "$OUT_DIR" >&2
+    printf '       That suffix makes the runtime load it as a PACKAGE rather\n' >&2
+    printf '       than a model directory. Choose a plain directory name.\n' >&2
+    exit 2
+    ;;
+esac
+
+# Building into a directory that already has contents is the root cause of two
+# separate defects, so it is refused rather than warned about:
+#
+#   1. resolve_model_path (onnx-genai-ort/src/loader.rs:405-410) HARD-ERRORS on
+#      multiple .onnx files. A leftover export plus a fresh one is unloadable,
+#      and the error names the loader rather than the stale file.
+#   2. Leftovers SATISFY the post-build completeness check, so a build that
+#      failed to emit an artifact still passes. That is exactly how the
+#      known-good scatter model came to be correct only by accident: its
+#      tokenizer files were leftovers from an earlier, different export.
+#
+# A dirty directory does not merely risk staleness - it HIDES MISSING OUTPUTS.
+if [ -d "$OUT_DIR" ] && [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
+  if truthy "${FORCE:-0}"; then
+    printf 'warning: %s is not empty; FORCE=1 given, building anyway.\n' \
+      "$OUT_DIR" >&2
+  elif truthy "$DRY_RUN"; then
+    printf 'warning: %s is not empty; a real build would refuse it (FORCE=1 overrides).\n' \
+      "$OUT_DIR" >&2
+  else
+    printf 'error: %s already exists and is not empty.\n' "$OUT_DIR" >&2
+    printf '       Building into it can produce a model that does not load, and\n' >&2
+    printf '       leftovers can make an incomplete build look complete.\n' >&2
+    printf '       If this is a model you still need - a perf baseline, say -\n' >&2
+    printf '       build somewhere else. Otherwise:\n' >&2
+    printf '           rm -rf %s\n' "$OUT_DIR" >&2
+    printf '       or re-run with FORCE=1 to build into it anyway.\n' >&2
+    exit 2
+  fi
+fi
+
 mkdir -p "$ROOT/models/.hf_cache" "$ROOT/models/.scratch" "$(dirname "$OUT_DIR")"
 
 printf 'Building %s\n' "$MODEL_ID"

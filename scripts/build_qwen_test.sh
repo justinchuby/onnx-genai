@@ -601,5 +601,78 @@ else
   printf 'skip  synthetic static-cache detection checks (onnx/pyyaml unavailable)\n'
 fi
 
+# ---------------------------------------------------------------------------
+# OUT_DIR safety (D4/D5).
+#
+# The motivating case is real: the demo README's copy-pasteable build command
+# targets models/qwen2.5-0.5b-scatter-v2, which is the perf-baseline model. A
+# build there would overwrite 2 GB of reference weights in place, with no
+# confirmation and no backup.
+# ---------------------------------------------------------------------------
+outdir_tmp="$(mktemp -d)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+mkdir -p "$outdir_tmp/occupied"
+printf 'pretend weights\n' >"$outdir_tmp/occupied/model.onnx"
+if output="$(OUT_DIR="$outdir_tmp/occupied" STATIC_CACHE=1 \
+  "$SCRIPT" 2>&1)"; then
+  fail "refuses to build into a non-empty OUT_DIR"
+else
+  case "$output" in
+    *"already exists and is not empty"*)
+      pass "refuses to build into a non-empty OUT_DIR" ;;
+    *) fail "refuses to build into a non-empty OUT_DIR" "unhelpful error: $output" ;;
+  esac
+fi
+
+# The refusal must say what to do next, not merely say no.
+assert_contains "the non-empty refusal names a way forward" \
+  "$(OUT_DIR="$outdir_tmp/occupied" STATIC_CACHE=1 "$SCRIPT" 2>&1 || true)" \
+  "FORCE=1"
+
+# A model you still need must be nameable as such, or the message reads as
+# bureaucracy and gets overridden reflexively.
+assert_contains "the non-empty refusal warns about overwriting a real model" \
+  "$(OUT_DIR="$outdir_tmp/occupied" STATIC_CACHE=1 "$SCRIPT" 2>&1 || true)" \
+  "perf baseline"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if output="$(OUT_DIR="$outdir_tmp/occupied" STATIC_CACHE=1 FORCE=1 DRY_RUN=1 \
+  "$SCRIPT" 2>&1)"; then
+  case "$output" in
+    *"FORCE=1 given, building anyway"*)
+      pass "FORCE=1 overrides the non-empty refusal" ;;
+    *) fail "FORCE=1 overrides the non-empty refusal" "no override notice: $output" ;;
+  esac
+else
+  fail "FORCE=1 overrides the non-empty refusal" "still refused: $output"
+fi
+
+# An EMPTY directory is fine - the guard must not block the ordinary re-run.
+TESTS_RUN=$((TESTS_RUN + 1))
+mkdir -p "$outdir_tmp/empty"
+if output="$(OUT_DIR="$outdir_tmp/empty" STATIC_CACHE=1 DRY_RUN=1 "$SCRIPT" 2>&1)"; then
+  pass "an empty OUT_DIR is accepted"
+else
+  fail "an empty OUT_DIR is accepted" "refused an empty directory: $output"
+fi
+
+# D5: the package suffixes route loading down a different code path.
+for suffix in ortpackage nxpackage; do
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if output="$(OUT_DIR="$outdir_tmp/model.$suffix" STATIC_CACHE=1 DRY_RUN=1 \
+    "$SCRIPT" 2>&1)"; then
+    fail "rejects an OUT_DIR named .$suffix"
+  else
+    case "$output" in
+      *"must not end in .ortpackage"*)
+        pass "rejects an OUT_DIR named .$suffix" ;;
+      *) fail "rejects an OUT_DIR named .$suffix" "unhelpful error: $output" ;;
+    esac
+  fi
+done
+
+rm -rf "$outdir_tmp"
+
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 [ "$TESTS_FAILED" -eq 0 ]
