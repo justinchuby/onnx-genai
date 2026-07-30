@@ -1652,3 +1652,57 @@ land until 23:42. *A mechanism that postdates the artefact cannot explain it.*
 One file survives all of this untouched: `inference_metadata.yaml` at 23:33 is
 uniquely hashed on that model, so its timestamp is real evidence and the flag on
 it stands.
+
+### 8.14 The demo server serves the desk, not the branch
+
+**This is the most consequential instrument finding in this document, because it
+applies to the acceptance standard itself.** Reported by `fc8b5d97` against their
+own prior claim; reproduced here independently, on two files:
+
+```
+curl :8133/demo/<file>  vs  git show HEAD:<file>  vs  the file on disk
+
+  telemetry-store.js        served 49558   HEAD 48436   disk 49558   -> SERVES DISK
+  dashboard/scheduling.js   served 13939   HEAD 13513   disk 13939   -> SERVES DISK
+  app.js                    served 15582   HEAD 15582   disk 15582   -> indistinguishable
+```
+
+`--demo-assets-dir` points at the working tree, so the demo server executes
+whatever is on the author's disk **at the instant of the request** -- including a
+file another agent is part-way through writing. A reviewer clones. **Every browser
+observation taken against these origins is a measurement of somebody's desk.**
+
+Note the third row, because it is the trap: `app.js` is clean, so served, HEAD and
+disk agree and the check cannot tell you anything. **A comparison that passes on a
+clean file proves nothing about the mechanism** -- it must be run on a file that is
+known dirty, or it is a control that differs from its subject in the one axis being
+tested. Two of the three rows above are load-bearing; the third is decoration.
+
+**What this costs the gate, stated plainly.** Item 10 was worded *one browser
+load*, and that wording is now insufficient: a browser load against a
+working-tree-backed origin certifies the desk. The item is re-worded, and the
+change is a construction rather than a discipline:
+
+> **Item 10 (revised).** Open the page against an origin whose `--demo-assets-dir`
+> is a **detached worktree pinned to the frozen sha**, and prove the pin in the
+> same invocation by comparing served bytes against `git show <sha>:<path>` **on a
+> file that differs from the working tree**. A load against the shared tree does
+> not close this item, however green it looks.
+
+**And the honest accounting of what survives.** The two browser-confirmed P1s in
+§0.9 were measured against `ui/model-card.js`, `dashboard/field-state.js`,
+`telemetry-provenance.js` and `dashboard/system.js`. All four are byte-identical
+to `HEAD` right now, so **both P1s stand, unmodified, on committed bytes.**
+
+> But they stand by **luck, not by construction.** Nothing in the method that
+> produced them checked whether those files were clean; they simply happened to be,
+> while six other dashboard files were not. *An observation that would have been
+> invalidated by a neighbouring edit is not made sound by the edit having landed
+> elsewhere.* The finding survives. The method that produced it does not, and it is
+> replaced above.
+
+This is the same shape as this brief's own §8.10 correction and as the `git grep`
+cwd defect: **an instrument reporting honestly about the wrong subject.** It has
+now appeared on a document, a search, a test count, a control, and finally on the
+acceptance standard. *If a measurement does not name its subject, it is not a
+measurement -- it is an anecdote with a number in it.*
