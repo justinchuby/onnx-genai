@@ -35,6 +35,7 @@ import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
 import { createFakeStore } from './testing/fake-store.js';
 import { FIELD_STATES } from '../telemetry-field.js';
 import { allFieldKeys, PROVENANCE } from '../telemetry-provenance.js';
+import { findAbsolutePaths } from '../absolute-path.mjs';
 
 // Built here rather than with fake-store's `measured()` helper ON PURPOSE: that
 // helper still emits the retired `state: 'ok'`, which format.js refuses to
@@ -123,7 +124,11 @@ describe('the model directory never reaches a rendered surface', () => {
     assert.ok(text.includes('qwen-scatter'), 'control: the model id must still render');
 
     assert.ok(!text.includes(HOME_PATH), 'the system panel rendered the absolute model path');
-    assert.ok(!text.includes('/Users/'), 'the system panel rendered a home directory');
+    assert.deepEqual(
+      findAbsolutePaths(text),
+      [],
+      'the system panel rendered an absolute filesystem path',
+    );
   });
 
   it('the model card does not render the absolute model path', async () => {
@@ -134,7 +139,11 @@ describe('the model directory never reaches a rendered surface', () => {
     assert.ok(text.includes('qwen-scatter'), 'control: the model id must still render');
 
     assert.ok(!text.includes(HOME_PATH), 'the model card rendered the absolute model path');
-    assert.ok(!text.includes('/Users/'), 'the model card rendered a home directory');
+    assert.deepEqual(
+      findAbsolutePaths(text),
+      [],
+      'the model card rendered an absolute filesystem path',
+    );
   });
 
   it('the detector can actually fire, so a clean run means something', async () => {
@@ -152,7 +161,27 @@ describe('the model directory never reaches a rendered surface', () => {
     const strings = visibleStrings(root);
     const found = strings.filter((value) => value.includes(HOME_PATH));
     assert.equal(found.length, 2, 'the collector must see BOTH the text and the attribute copy');
-    assert.ok(strings.join(' ').includes('/Users/'), 'the /Users/ predicate must be able to match');
+
+    // And the detector must fire on paths from operating systems other than the
+    // one this file was written on. The previous predicate was the literal
+    // `/Users/`, and it was certified by a mutation injecting HOME_PATH -- a
+    // constant defined in this file. The probe came from the detector's own
+    // literal, so it could only ever pass. Measured at b63f0a82, a /home, a
+    // C:\ and a /var disclosure all rendered with this suite at 5/5 green.
+    for (const foreign of [
+      '/home/presenter/models/qwen2.5-0.5b',
+      'C:\\Users\\presenter\\models\\qwen',
+      '/var/lib/onnx-genai/models/qwen',
+    ]) {
+      const alien = document.createElement('dd');
+      alien.setAttribute('aria-label', `Directory ${foreign}`);
+      const host = document.createElement('div');
+      host.append(alien);
+      assert.ok(
+        findAbsolutePaths(visibleStrings(host).join(' ')).length > 0,
+        `the detector cannot see ${foreign} -- it is shaped like this desk, not like a filesystem`,
+      );
+    }
   });
 
   it('no shipped render path asks the store for server.model_path', () => {
@@ -269,7 +298,7 @@ describe('no field can put an absolute home path on screen, whatever its name', 
         mounted?.unmount?.();
 
         if (text.includes('qwen-scatter')) mountsObserved += 1;
-        if (text.includes(HOME_PATH) || text.includes('/Users/')) {
+        if (text.includes(HOME_PATH) || findAbsolutePaths(text).length > 0) {
           offenders.add(key);
           undeclaredDetail.set(key, label);
         }
