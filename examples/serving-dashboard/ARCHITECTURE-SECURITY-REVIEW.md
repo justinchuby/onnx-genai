@@ -2,6 +2,14 @@
 
 MEASURED-AT: 1e809173
 
+MEASURED-AT: 2634de58 — my most recent measurement. This is deliberately **not**
+the review point pasted back into my own file. The guard asks "is this document
+current?" and the cheapest way to answer it green is to copy the boundary SHA,
+which asserts a measurement that never happened. `2634de58` is a commit I made
+and read; my last wire readings against it (C19 on `:8123`) were taken at
+08:28:10. If the review point moves ahead of this line, the correct response is
+to re-measure, not to re-copy.
+
 **What that header does and does not promise.** It is the SHA of my most recent
 measurement, so the freshness guard can prove this document describes a tree this
 branch actually passed through. It is **not** a claim that every section was
