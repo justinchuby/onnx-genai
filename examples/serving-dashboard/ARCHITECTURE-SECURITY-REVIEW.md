@@ -1813,3 +1813,75 @@ A ban is a *reduction* in the number of things that must agree.
 encoding (`REVIEWER-BRIEF%2Emd` has no `.`, so no extension, so refused). The
 dotfile rule fails OPEN. **Same file, same request, two directions** — which is
 the asymmetry worth remembering, not the individual verdicts.
+
+---
+
+## §27 — THE LEAD'S INVERSION APPLIED TO MY OWN LANE, AND C21
+
+*"Every instrument checks that what is present is true. Not one checks that what
+is true is present."* Measured at `ffe9ca85`.
+
+### 🆕 C21 — the traversal test cannot fail for the reason it claims (🔴 non-blocking)
+
+`tests/demo_dashboard.rs:152` asserts `/demo/%2e%2e/escape-target.txt` is refused.
+
+**`.txt` is not in `SERVABLE_EXTENSIONS`** (html js mjs css json svg png ico
+woff2). So that request is refused by the **extension allowlist**, and the
+assertion would pass **with zero traversal defence and zero percent handling in
+the process.**
+
+    '%' literal in demo_assets.rs : 0
+    'percent'                     : 0
+    CONTROL, dotfile rule present : 4      (instrument reaches the file)
+
+> **THE TEST CANNOT DISTINGUISH "PERCENT-ENCODED TRAVERSAL IS BLOCKED" FROM
+> "`.txt` IS NOT SERVABLE." IT IS SATISFIED BY THE WRONG RULE.**
+
+I am **not** claiming traversal is exploitable — tower-http normalises and
+rejects `..`, so the defence probably exists in `ServeDir`. The finding is that
+**the test supplies no evidence either way**, while reading as the one test that
+covers encoding. Change the fixture to `escape-target.js` and it tests something.
+
+**And this is the file whose own comment warns that `.env` and `.git/config`
+are "refused only incidentally, because their extensions are not on the list."**
+The author diagnosed refusal-by-coincidence in prose and then wrote a test that
+depends on it. *Knowing the class by name did not prevent committing it.*
+
+### The sharper half: the author knew about percent-encoding
+
+`%2e%2e` in a test proves encoding was on the author's mind. **C19 is therefore
+not an oversight about encoding — the awareness was applied to the traversal rule
+and not to the dotfile rule beside it, in the same function.** That is worse than
+ignorance and it is an argument for the ban over the decoder: *encoding awareness
+does not compose; a single choke point does.*
+
+### C19 is invisible to every reader who is not reading this file
+
+    files containing '%2E' tree-wide : 1   <- THIS DOCUMENT, and nothing else
+    in source : 0 · in tests : 0 · in demo-spec.md : 0
+    CONTROL 'model_path' : 58 files · 'prefix_cache' : 88 files
+
+Combined with §25 — **seven of my eight commits are outside every review tag** —
+a live security bypass exists in exactly one file that no tag reader will open.
+**The Lead's inversion, landing on the most serious finding in my lane.**
+
+### ⚠️ Correction: the Lead's `model_path -> 0` in `demo-spec.md` is a false zero
+
+    repo root:                 ls demo-spec.md -> No such file or directory
+    the only tracked copy:     examples/serving-dashboard/demo-spec.md
+    from that directory:       grep -cF 'model_path' -> 20   (18 since 04:56)
+    CONTROL 'dashboard' -> 60  (the file is real and was read)
+
+The spec **does** contain the P1 — 20 lines, plus `percent` 15 and `demo_assets`
+10. The probe ran from the repository root against a path that only exists one
+directory down: **@0837fdf9's CWD defect and @12e42da8's own phantom-path class,
+combined.**
+
+> **AND NOTE WHY IT SURVIVED: IT WAS A CONFESSION. THE CREW HAS SPENT ALL NIGHT
+> AUDITING EACH OTHER'S CLAIMS AND NOBODY FACT-CHECKS AN AGENT ACCUSING
+> THEMSELVES. A FALSE ZERO INSIDE AN ADMISSION OF FAULT IS THE LEAST-AUDITED
+> CLAIM AVAILABLE — the exact mirror of the Lead's own ruling that a confident
+> 95% invites no scrutiny.**
+
+The real finding underneath survives and I am not weakening it: **`dotfile` in
+the spec is genuinely 0**, and C19, C20 and C21 are 0 there too.
