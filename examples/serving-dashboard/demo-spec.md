@@ -2150,3 +2150,30 @@ So `client.poll_interval_ms` renders correctly while it has no data and renders 
 **Scope discipline, recorded because it nearly became a false alarm.** `store-adapter.js` contains **three** `state` vocabularies. Series objects (`t`/`v`/`gaps`) and capability objects (`available`/`reason`) use `'ok'` legitimately. Only the **field-shaped** object — `value`/`state`/`source`/`unit`/`label` — is defective. The shipped blast radius is **one site, not six**. *The discriminator is the sibling keys, not the matched value* — and only reading the object shows them.
 
 **And the reason the suite could not see it:** `dashboard/testing/fake-store.js:26` emits the same retired `'ok'`. The fixture and the code under test **share the bug**, so the tests corroborate nothing. Two instruments that share a component do not corroborate each other; they only confirm the component.
+
+### AC202-CORRECTION — the exemplar predicate in AC202 was itself defective
+
+**Filed against myself. Caught by @c8d9a40e at `13fb70c3`, confirmed by execution at `608de6c2`.**
+
+AC202 published this as its model of a good completion criterion:
+
+```
+server.model_path in shipped .js, tests+catalogue excluded → MUST REACH 0. NOW: 2.
+```
+
+It now returns **1**, and the hit is a *tombstone comment* at `telemetry-store.js:684` recording why the row was deleted. The predicate reports a regression **caused by the fix**.
+
+Worse: that comment exists because the crew ruled *record why, or the next reviewer re-derives the deletion as a regression*. **We obeyed the ruling and the ruling tripped the guard.** A well-written fix quotes the bug it killed, so the hit and the proof-of-fix are byte-identical — and that law has now claimed its own author's predicate.
+
+**A comment-stripping arm (`grep -v '//'`) is not the repair.** It handles one comment syntax; the class has at least four (`//`, `/* */`, a string literal, a Markdown fence).
+
+**The correct form is outcome-tied: anchor on the BINDER, not the key.** A comment can contain the key; it cannot contain a binding.
+
+```
+SUBJECT  (key: |field\()['"]server\.model_path   →  0   ✅ no binding exists
+CONTROL  (key: |field\()['"]server\.model_id     →  3   ✅ instrument reaches the tree
+```
+
+**The rule this adds to AC202, and it is the one that generalises:** a predicate must key on **what the defect DOES**, never on **what the defect is CALLED**. A name survives its own deletion — in prose, in an obituary, in a test title, in a changelog. **Only the mechanism disappears when the mechanism is removed.**
+
+**And the reason this correction belongs in the document rather than in chat:** AC202 requires every completion to carry a re-runnable predicate. Shipping that rule with a broken exemplar would have propagated the defect into every completion written against it. *A rule is only as good as the example attached to it, and the example is the part people copy.*
