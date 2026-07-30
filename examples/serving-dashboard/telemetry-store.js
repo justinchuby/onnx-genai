@@ -22,6 +22,7 @@ import {
   pendingField,
   staleField,
   FIELD_STATES,
+  SOURCE_CLASSES,
 } from './telemetry-field.js';
 import {
   ENDPOINTS,
@@ -111,6 +112,11 @@ const ENDPOINT_ERROR_RETRY_MS = 10_000;
  */
 export function createTelemetryStore({
   baseUrl = typeof location !== 'undefined' ? location.origin : 'http://127.0.0.1:8123',
+  // Which server this store polls. The demo runs TWO — a scatter server that
+  // batches and a dynamic server that pages KV — because those two features are
+  // mutually exclusive in this runtime. Every field carries this, so a number
+  // can never be shown without saying which server produced it.
+  origin = 'scatter',
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   fetchImpl = typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined,
   now = () => Date.now(),
@@ -493,6 +499,25 @@ export function createTelemetryStore({
    * @param {Record<string, SourceResult>} sources
    * @param {number} timestampMs
    */
+  /**
+   * The provenance metadata every field carries, regardless of its state.
+   *
+   * An unavailable field needs this just as much as a measured one: the audit
+   * table and the hover must be able to say WHICH server and WHICH endpoint a
+   * missing value would have come from, or "unavailable" is unfalsifiable.
+   *
+   * @param {object} entry A PROVENANCE entry.
+   */
+  function fieldMeta(entry) {
+    return {
+      source: entry.source,
+      sourceClass: entry.derived ? SOURCE_CLASSES.DERIVED : SOURCE_CLASSES.SERVER,
+      origin,
+      label: entry.label,
+      unit: entry.unit,
+    };
+  }
+
   function buildFields(sources, timestampMs) {
     /** @type {Record<string, import('./telemetry-field.js').TelemetryField>} */
     const fields = {};
@@ -503,24 +528,18 @@ export function createTelemetryStore({
       if (entry.derived) continue;
 
       if (NEVER_MEASURED_CLASSIFICATIONS.includes(entry.classification)) {
-        fields[key] = unavailableField(entry.reason, { source: entry.source, unit: entry.unit });
+        fields[key] = unavailableField(entry.reason, fieldMeta(entry));
         continue;
       }
 
       const source = sources[entry.source];
       if (!source) {
-        fields[key] = unavailableField(
-          `This demo does not poll ${entry.source} yet.`,
-          { source: entry.source, unit: entry.unit },
-        );
+        fields[key] = unavailableField(`This demo does not poll ${entry.source} yet.`, fieldMeta(entry));
         continue;
       }
 
       if (!source.ok) {
-        fields[key] = unavailableField(describeSourceFailure(entry.source, source), {
-          source: entry.source,
-          unit: entry.unit,
-        });
+        fields[key] = unavailableField(describeSourceFailure(entry.source, source), fieldMeta(entry));
         continue;
       }
 
@@ -529,16 +548,12 @@ export function createTelemetryStore({
         fields[key] = unavailableField(
           `${entry.source} responded, but carried no "${entry.metric ?? entry.path}" value. ` +
             'This server build may predate it.',
-          { source: entry.source, unit: entry.unit },
+          fieldMeta(entry),
         );
         continue;
       }
 
-      fields[key] = measuredField(rawValue, {
-        source: entry.source,
-        unit: entry.unit,
-        observedAtMs: timestampMs,
-      });
+      fields[key] = measuredField(rawValue, { ...fieldMeta(entry), observedAtMs: timestampMs });
     }
     addDerivedThroughput(fields, timestampMs);
     return Object.freeze(fields);
@@ -562,7 +577,13 @@ export function createTelemetryStore({
    */
   function addDerivedThroughput(fields, timestampMs) {
     const total = fields['metrics.tokens_generated_total'];
-    const options = { source: ENDPOINTS.METRICS, unit: 'tokens/s' };
+    const options = {
+      source: ENDPOINTS.METRICS,
+      sourceClass: SOURCE_CLASSES.DERIVED,
+      origin,
+      label: PROVENANCE['throughput.observed'].label,
+      unit: 'tokens/s',
+    };
 
     if (!total || total.state !== FIELD_STATES.MEASURED) {
       lastTokenSample = null;

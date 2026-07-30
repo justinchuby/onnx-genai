@@ -63,8 +63,31 @@
  */
 
 /** Legal values of `TelemetryField.state`. */
+/**
+ * WHERE a value came from — a provenance CLASS, and a different axis from
+ * `source`, which names the ENDPOINT.
+ *
+ * Both are needed and neither substitutes for the other: the class is what a
+ * viewer needs on hover ("did you measure this or work it out?"), while the
+ * endpoint is what makes a claim auditable ("`/v1/status`, and here is the
+ * file:line where it is hardcoded"). Collapsing them would cost one of those.
+ *
+ * @typedef {'server' | 'client' | 'derived' | 'estimated'} SourceClass
+ *
+ * - `server`    — read verbatim off a server response.
+ * - `client`    — measured in the browser (e.g. wall-clock time to first token).
+ * - `derived`   — computed by us from other fields. Real, but owes its inputs.
+ * - `estimated` — approximated, with error bounds. Must be labelled as such.
+ */
+export const SOURCE_CLASSES = Object.freeze({
+  SERVER: 'server',
+  CLIENT: 'client',
+  DERIVED: 'derived',
+  ESTIMATED: 'estimated',
+});
+
 export const FIELD_STATES = Object.freeze({
-  MEASURED: 'measured',
+  MEASURED: 'ok',
   PENDING: 'pending',
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',
@@ -83,7 +106,18 @@ export const FIELD_STATES = Object.freeze({
  * @param {number} [options.observedAtMs] Defaults to now.
  * @returns {TelemetryField}
  */
-export function measuredField(value, { source, unit = null, observedAtMs = Date.now(), derivedFrom = null }) {
+export function measuredField(
+  value,
+  {
+    source,
+    sourceClass = SOURCE_CLASSES.SERVER,
+    origin = null,
+    label = null,
+    unit = null,
+    observedAtMs = Date.now(),
+    derivedFrom = null,
+  },
+) {
   if (value === null || value === undefined) {
     throw new TypeError(
       'measuredField() was given a null/undefined value. A missing value is not a ' +
@@ -97,6 +131,9 @@ export function measuredField(value, { source, unit = null, observedAtMs = Date.
     value,
     state: FIELD_STATES.MEASURED,
     source,
+    sourceClass,
+    origin,
+    label,
     reason: null,
     unit,
     observedAtMs,
@@ -118,7 +155,10 @@ export function measuredField(value, { source, unit = null, observedAtMs = Date.
  * @param {string|null} [options.unit]
  * @returns {TelemetryField}
  */
-export function unavailableField(reason, { source = 'unavailable', unit = null } = {}) {
+export function unavailableField(
+  reason,
+  { source = 'unavailable', sourceClass = SOURCE_CLASSES.SERVER, origin = null, label = null, unit = null } = {},
+) {
   if (!reason) {
     throw new TypeError(
       'unavailableField() requires a reason. "No data" with no explanation reads as a bug; ' +
@@ -129,6 +169,9 @@ export function unavailableField(reason, { source = 'unavailable', unit = null }
     value: null,
     state: FIELD_STATES.UNAVAILABLE,
     source,
+    sourceClass,
+    origin,
+    label,
     reason,
     unit,
     observedAtMs: null,
@@ -150,7 +193,10 @@ export function unavailableField(reason, { source = 'unavailable', unit = null }
  * @param {string|null} [options.unit]
  * @returns {TelemetryField}
  */
-export function pendingField(reason, { source = 'unknown', unit = null } = {}) {
+export function pendingField(
+  reason,
+  { source = 'unknown', sourceClass = SOURCE_CLASSES.SERVER, origin = null, label = null, unit = null } = {},
+) {
   if (!reason) {
     throw new TypeError('pendingField() requires a reason explaining what is being waited on.');
   }
@@ -158,6 +204,9 @@ export function pendingField(reason, { source = 'unknown', unit = null } = {}) {
     value: null,
     state: FIELD_STATES.PENDING,
     source,
+    sourceClass,
+    origin,
+    label,
     reason,
     unit,
     observedAtMs: null,
@@ -205,7 +254,7 @@ export function staleField(field, reason) {
  * @param {string} [options.undefinedReason] Reason used when `compute` returns null.
  * @returns {TelemetryField}
  */
-export function derivedField(inputs, compute, { unit = null, undefinedReason } = {}) {
+export function derivedField(inputs, compute, { unit = null, label = null, undefinedReason } = {}) {
   const keys = Object.keys(inputs);
   const blocking = keys.filter((key) => inputs[key].state === FIELD_STATES.UNAVAILABLE);
   if (blocking.length > 0) {
@@ -213,7 +262,7 @@ export function derivedField(inputs, compute, { unit = null, undefinedReason } =
       `Cannot be derived because ${blocking.join(', ')} ${
         blocking.length === 1 ? 'is' : 'are'
       } unavailable: ${inputs[blocking[0]].reason}`,
-      { source: 'derived', unit },
+      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -223,7 +272,7 @@ export function derivedField(inputs, compute, { unit = null, undefinedReason } =
   if (waiting.length > 0) {
     return pendingField(
       `Waiting on ${waiting.join(', ')} before this can be derived.`,
-      { source: 'derived', unit },
+      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -235,7 +284,7 @@ export function derivedField(inputs, compute, { unit = null, undefinedReason } =
   if (result === null || result === undefined || Number.isNaN(result)) {
     return unavailableField(
       undefinedReason ?? 'The inputs are measured but the derived value is undefined for them.',
-      { source: 'derived', unit },
+      { source: 'derived', sourceClass: SOURCE_CLASSES.DERIVED, label, unit },
     );
   }
 
@@ -245,6 +294,13 @@ export function derivedField(inputs, compute, { unit = null, undefinedReason } =
     value: result,
     state: anyStale ? FIELD_STATES.STALE : FIELD_STATES.MEASURED,
     source: 'derived',
+    sourceClass: SOURCE_CLASSES.DERIVED,
+    // All inputs must share an origin for the result to be attributable to one
+    // server; mixing two servers into one number would make it unattributable.
+    origin: keys.every((key) => inputs[key].origin === inputs[keys[0]].origin)
+      ? inputs[keys[0]].origin
+      : null,
+    label,
     reason: anyStale ? 'Derived from at least one stale input.' : null,
     unit,
     observedAtMs,

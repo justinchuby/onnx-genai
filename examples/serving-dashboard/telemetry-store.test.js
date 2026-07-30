@@ -724,3 +724,89 @@ test('every provenance entry appears in the snapshot, including derived ones', (
 
   assert.deepEqual(keys, allFieldKeys().sort());
 });
+
+// ── provenance axes and two-server attribution ─────────────────────────────
+
+test('source CLASS and source ENDPOINT are separate, independent axes', async () => {
+  // The designer's contract needs a provenance class for the hover; the spec
+  // needs the endpoint so a claim can be audited against file:line evidence.
+  // Collapsing them into one string would lose one of those uses.
+  const store = createTelemetryStore({ baseUrl: BASE_URL, fetchImpl: fakeFetch(healthyRoutes()) });
+  await store.pollOnce();
+  const { fields } = store.getSnapshot();
+
+  const readOffServer = fields['queue.depth'];
+  assert.equal(readOffServer.sourceClass, 'server');
+  assert.equal(readOffServer.source, ENDPOINTS.STATUS);
+
+  // Same endpoint family, but WE computed this one -- different class.
+  await new Promise((r) => setTimeout(r, 5));
+  await store.pollOnce();
+  const computed = store.getSnapshot().fields['throughput.observed'];
+  assert.equal(computed.sourceClass, 'derived');
+  assert.equal(computed.source, ENDPOINTS.METRICS);
+});
+
+test('an unavailable field still states which endpoint and server it would come from', async () => {
+  // Without this, "unavailable" is unfalsifiable -- the audit table could not
+  // tell a reader where to go and check.
+  const store = createTelemetryStore({ baseUrl: BASE_URL, fetchImpl: fakeFetch(healthyRoutes()) });
+  await store.pollOnce();
+
+  const field = store.getSnapshot().fields['kv.usage'];
+  assert.equal(field.state, FIELD_STATES.UNAVAILABLE);
+  assert.equal(field.source, ENDPOINTS.STATUS);
+  assert.equal(field.sourceClass, 'server');
+  assert.ok(field.label, 'an unavailable field still needs a human label');
+});
+
+test('every field is attributed to the server it came from', async () => {
+  // The demo runs two servers because batching and paged KV are mutually
+  // exclusive. A number shown without saying which server produced it is its
+  // own kind of fabrication.
+  const scatter = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'scatter',
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  const dynamic = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'dynamic',
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  await Promise.all([scatter.pollOnce(), dynamic.pollOnce()]);
+
+  const a = scatter.getSnapshot().fields;
+  const b = dynamic.getSnapshot().fields;
+  assert.equal(a['queue.depth'].origin, 'scatter');
+  assert.equal(b['queue.depth'].origin, 'dynamic');
+  // Including values that are absent -- attribution is not only for numbers.
+  assert.equal(a['kv.usage'].origin, 'scatter');
+  assert.equal(b['kv.usage'].origin, 'dynamic');
+
+  // Two stores must not share state; that would silently mix the servers.
+  assert.notEqual(a, b);
+});
+
+test('the two stores poll independently and do not share a snapshot', async () => {
+  const scatter = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'scatter',
+    fetchImpl: fakeFetch(healthyRoutes()),
+  });
+  const dynamic = createTelemetryStore({
+    baseUrl: BASE_URL,
+    origin: 'dynamic',
+    // The whole server is down, not just one endpoint: the store only reports
+    // UNREACHABLE when no ungated endpoint answers.
+    fetchImpl: async () => {
+      throw new Error('offline');
+    },
+  });
+  await Promise.all([scatter.pollOnce(), dynamic.pollOnce()]);
+
+  // One server going down must not blank the other's panels.
+  assert.equal(scatter.getSnapshot().connection.state, CONNECTION_STATES.CONNECTED);
+  assert.equal(dynamic.getSnapshot().connection.state, CONNECTION_STATES.UNREACHABLE);
+  assert.equal(scatter.getSnapshot().fields['queue.depth'].state, FIELD_STATES.MEASURED);
+});
