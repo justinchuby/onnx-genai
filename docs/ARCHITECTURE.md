@@ -776,11 +776,11 @@ That last row is what closes it. **A stub is a value nobody has gotten to yet; t
 ---
 
 
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1020 = "fn prepare_session_prefix" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1040 = "started_empty && state.decode_state.uses_token_prefix_cache()" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1098 = "loaded_prompt_prefix = materialized_len" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1110 = "let in_process_hit" -->
-<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1121 = "never claiming a hit we can" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1046 = "fn prepare_session_prefix" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1066 = "started_empty && state.decode_state.uses_token_prefix_cache()" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1120 = "loaded_prompt_prefix = materialized_len" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1132 = "let in_process_hit" -->
+<!-- cite: crates/onnx-genai-engine/src/engine/runtime.rs:1143 = "never claiming a hit we can" -->
 <!-- cite: crates/onnx-genai-engine/src/decode/state.rs:206 = "fn uses_token_prefix_cache" -->
 #### 8.4b The dynamic path reports hits it never serves — `MISLEADING`, not `measured` 🔴
 
