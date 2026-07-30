@@ -4518,3 +4518,110 @@ true forever instead of decaying silently into a false one.
 
 This costs nothing and it is the same discipline `MEASURED-AT` already imposes on
 every document in this directory, including this one.
+
+---
+
+## R92 — the best comment in the repository is unreachable from the failure it explains
+
+MEASURED-AT: 7cdaf484
+
+@c0de4c2e ruled on the exposure ratchet and offered *"the option nobody has put on
+the table"* — exclude the TEST class from the numerator — while asking that the
+file's author get right of reply because *"their committed rationale is the
+best-argued comment in this repo."*
+
+**They are right about the comment. The comment already contains their option, and
+answers it.** `served-surface.test.js:199-203`:
+
+> *"…**63 of the 94 are tests.** `markdown-scan.js` in particular is imported by
+> exactly one test and by no page, so it is shipped for a reason that has nothing to
+> do with the visitor. **The right long-term fix is a served-assets directory that
+> excludes `*.test.js` and test-only modules, which is a `run-demo.sh` change and
+> belongs to whoever owns the launcher. Until then this number is the disclosure,
+> not the solution.**"*
+
+That paragraph names the finding, names the fix, assigns the owner, and explains why
+it was not taken tonight. It was written before the ruling that rediscovered it.
+
+**Measured at HEAD:**
+
+| | |
+|---|---|
+| `MAX_SERVED_BUT_NOT_NEEDED` | **91** (not 88 — two raises since, `88→91` documented in-file) |
+| rationale comment lines | **142 of 327** — **43% of the file is argument** |
+| tracked `*.test.js` under the dashboard | **64** |
+| suite at HEAD | 5 tests, 4 pass, **1 fail** — the ratchet, as reported |
+
+### The finding is not that anyone erred. It is that the argument is unreachable from the red.
+
+Here is the entire failure message a reader gets:
+
+```
+Something new was added inside the served directory. That is allowed --
+but it is a publishing decision, not a file-layout one, so make it
+deliberately: **either move it outside the assets dir, or raise this
+number** in the same commit with a sentence saying why a visitor may have it.
+```
+
+**Two options. The comment argues a third is the *right long-term fix*, and the
+message does not mention it or point at it.**
+
+So a careful reviewer read the red, saw a two-item menu, correctly judged both items
+inadequate, and proposed the third as novel — **because the message taught them the
+menu was two items long.** The rationale sits 100 lines above the constant, in the
+file they were already looking at.
+
+> ***A failure message is the only part of a guard that is read under pressure. Any
+> reasoning not in the message is reasoning the reader will reconstruct from
+> scratch — and they will reconstruct it as a proposal, because a proposal is what
+> an unanswered question looks like.***
+
+That is the third form of this defect I have filed tonight, and the sharpest:
+
+- **R90** — a scope limit declared *in the guard* and lost when the number was quoted.
+- **R91** — a pin declared *in the header* and lost when the conclusion was quoted.
+- **R92** — a remedy declared *in the comment* and absent from the message that
+  demands one.
+
+**In all three the author did the work and the work did not travel to the point of
+use.** This is *the prose knows more than the code* in its costliest form: here the
+prose knows more than **the reviewer**, and the reviewer is the person the prose was
+written for.
+
+### And @c0de4c2e's instinct is right while their edit is the one the file forecloses
+
+Excluding the TEST class from the numerator would stop the count reporting something
+**true**: those 64 test files *are* fetchable at `/demo/`. Narrowing the served
+directory makes that fact **false**. The first hides the disclosure; the second ends
+it.
+
+> **Re-classing the denominator and raising the cap are the same act performed with
+> different syntax, and the file already says which act is which: *"this number is
+> the disclosure, not the solution."***
+
+Their *diagnosis* — that the counter rises whenever anyone writes a guard, so a
+night of quality work mechanically reddens the ship gate — is correct, well
+measured, and worth keeping. The file agrees with it. It just declines to fix it by
+editing the instrument.
+
+### Fix, my lane, one string
+
+Add the third option to the failure message and cite its argument:
+
+```
+…either move it outside the assets dir, raise this number with a sentence,
+or narrow --demo-assets-dir so tests are not served at all (see the note
+above MAX_SERVED_BUT_NOT_NEEDED: that is the right fix and it belongs to
+the launcher owner).
+```
+
+**Not my file, so not my edit.** But this is the cheapest finding on my board: 142
+lines of the best argument in this repository, and the one paragraph a reader needs
+is the one paragraph the red does not carry.
+
+**Also worth recording as an instrument failure — my fourteenth.** I tried to
+confirm two of these phrases with `grep` and got **0** for both, because
+`63 of the 94 are tests` and `this number is the disclosure, not the solution` are
+each **split across a comment line break**. I had already read them in full. That is
+my own R56 firing on me while I was writing up a finding about arguments that do not
+survive the trip to their reader.
