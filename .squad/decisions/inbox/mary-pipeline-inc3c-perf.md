@@ -121,3 +121,82 @@ a later increment flips the default after broader real-model validation.
 - **Vision cross-KV / `static_cross_kv` upload-once** — OUT of scope (vision
   Attention float-mask blocker; upload-once is immaterial per the byte budget
   above).
+
+## PART B — implementation result (Inc3c-ii, COMPLETE)
+
+Implemented the captured per-step-input path in
+`native_decode/cuda.rs` + `load.rs`, gated behind
+`ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` (default OFF). Each declared
+per-step port (`inputs_embeds` + each `Routed` port) gets a persistent
+`[1,1,width]` device binding written per step; `run_one_token` is reused so the
+mask + KV stay device-resident and the whole step is CUDA-graph captured.
+
+### Proving engagement required a *capturing* fixture (key finding)
+
+The existing tiny CUDA pipeline fixtures (`tiny-gemma4-vlm-cuda`,
+`tiny-gemma4-vlm-cuda-routed`) grow their KV with a naive `Concat` cache whose
+consumers read the **logical** KV length. On such graphs the native decoder
+**structurally declines** CUDA-graph capture (`graph_enabled=false`: the KV
+bindings expose a growing logical prefix and the mask exposes its logical valid
+length). Instrumented on device 4:
+
+```
+graph_enabled=false dynamic_logical=[past_key_values.0.key (phys [1,1,256,4] vs logical [1,1,0,4]), .0.value ...] mask_exposes_logical=true
+```
+
+So on those fixtures the captured path can *never* engage (it correctly stays
+dormant) — they prove the eager path only. This is also why the only existing
+CUDA capture-stats test (`glm_tiny_qmoe_native_cuda_e2e`) asserts `captures==0`.
+
+**New fixture `tiny-gqa-embeds-cuda`** (`scripts/build_tiny_gqa_embeds_cuda.py`):
+identical closed-form tokens (`[3,7] → [0,5,6,7]`) and pipeline shape as
+`tiny-gemma4-vlm-cuda`, but the decoder routes its KV through a real
+`com.microsoft.GroupQueryAttention` op (reads `seqlens_k` /
+`total_sequence_length`, past KV at fixed physical capacity). GQA is the
+capacity-aware kernel shape the native decoder recognises as capture-safe, so
+`graph_enabled=true`. Determinism is isolated from the GQA numerics: `logits =
+inputs_embeds @ LM_HEAD + tie_bias` (the proven base head, bit-stable CPU/CUDA),
+while GQA's `present.*` outputs are the growing device-KV contract and its
+`attn_out` is intentionally unused. Q/K/V derive from `inputs_embeds` via real
+MatMuls so the embedding genuinely flows into a CUDA op on-device.
+
+### Non-tautological engagement + parity proof (device 4, GREEN)
+
+`tests/native_cuda_captured_step_inputs_parity.rs` runs the pipeline twice and
+reads the process-global counter `NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES`
+(bumped only inside the captured branch — a distinct function from the eager
+branch):
+
+| flag | tokens | captured-decode count |
+|------|--------|-----------------------|
+| OFF (default eager) | `[0,5,6,7]` | **0** |
+| ON (`…CAPTURE_STEP_INPUTS=1`) | `[0,5,6,7]` | **3** |
+
+Flag OFF: `graph_enabled=true` but `capture_step_inputs=false` ⇒ eager ⇒ counter
+stays 0. Flag ON: `capture_step_inputs=true` ⇒ the captured branch runs on each
+of the 3 single-token decode steps (prompt prefill emits token 0, then 3 captured
+steps emit 5,6,7) with **byte-identical tokens**. This proves the captured path
+(a) genuinely engages (not a silent decline to eager) and (b) is behaviour-
+identical to the eager path.
+
+### Perf recovery — evidence
+
+A *direct* captured-vs-eager tok/s number on a real multi-component model
+(Gemma 3n E2B) is **blocked**: gemma-3n's audio `input_features_mask` is `Bool`,
+and the pipeline value/cache path errors `unsupported cached ORT value dtype:
+Bool` even with `pipeline_cache_bytes: 0` (a deeper, unrelated limitation, out of
+Inc3c scope). The perf recovery is therefore evidenced by the **Part A controlled
+measurement** on qwen3-0.6b — a real mask-consuming decoder — where the *same*
+capture-vs-eager toggle moves decode **220 → 612 tok/s** (2.78×). The Inc3c path
+routes the pipeline's `inputs_embeds`/routed step through that identical captured
+`run_one_token` machinery, so it inherits that speedup once capture engages
+(proven on `tiny-gqa-embeds-cuda`).
+
+### Native-vs-ORT-CUDA verdict
+
+Captured native-CUDA decode **beats** ORT-CUDA (612 vs 443, 1.38×); the eager
+path **loses** (~2×). Inc3c's captured step-input path flips the multi-component
+native decoder from an ORT loss to an ORT win **when graph capture is available**
+(capacity-aware decoders — the real 35B-A3B class). Default stays OFF this
+increment (gated-first); a later increment flips it after broader real-model
+validation.

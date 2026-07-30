@@ -45,6 +45,15 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tensor::*;
 
 /// Counter proving the incremental-prefill fast path fires.
+/// Process-global count of decode steps that took the Inc3c captured
+/// per-step-input branch (as opposed to the eager owned branch). This is a test
+/// instrumentation seam only: it lets a parity test prove *non-tautologically*
+/// that enabling the flag genuinely routes the `inputs_embeds`/routed decode
+/// step through the captured graph path instead of silently declining to eager.
+/// The captured and eager branches are distinct functions, so a non-zero delta
+/// here after a run with the flag on — and a zero delta with it off — is direct
+/// evidence the intended path executed.
+pub static NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES: AtomicU64 = AtomicU64::new(0);
 pub static NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Device requested for a native decode session.

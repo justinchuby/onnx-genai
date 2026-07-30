@@ -124,6 +124,16 @@ pub(crate) struct DecodeCudaState {
     pub(crate) auxiliary_binding_range: std::ops::Range<usize>,
     pub(crate) input_ids_binding: usize,
     pub(crate) position_ids_binding: Option<usize>,
+    /// Persistent per-step input bindings (embeds + routed ports) written each
+    /// step then replayed by the captured decode graph (Inc3c). Empty unless the
+    /// capture-step-inputs path is active.
+    captured_step_inputs: Vec<CapturedStepInputBinding>,
+    /// When `true`, single-token decode with `inputs_embeds`/routed ports writes
+    /// those ports into their persistent bindings and drives the captured
+    /// `run_one_token` state machine (Inc3c) instead of the eager owned path.
+    /// Gated by `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS` (default off) and
+    /// only enabled when graph capture is structurally available.
+    capture_step_inputs: bool,
     logits_binding: usize,
     logits_shape: Vec<usize>,
     logits_dtype: DataType,
@@ -182,6 +192,11 @@ pub(crate) struct DecodeCudaIo<'a> {
     pub(crate) attention_mask: &'a str,
     pub(crate) position_ids: Option<&'a str>,
     pub(crate) logits: &'a str,
+    /// Routed non-KV step-input ports (Inc3c). Empty for a pure token-id or
+    /// embeds-only decoder. Each becomes a persistent device binding so the
+    /// Inc3c capture path can replay the step; the eager path (default) ignores
+    /// these and re-binds owned inputs instead.
+    pub(crate) routed: Vec<CudaRoutedBinding<'a>>,
 }
 
 /// Metadata for a CUDA `inputs_embeds` sequence input (Inc3a). The native CUDA
@@ -191,6 +206,43 @@ pub(crate) struct CudaEmbedsBinding<'a> {
     pub(crate) name: &'a str,
     pub(crate) dtype: DataType,
     pub(crate) hidden: usize,
+}
+
+/// Metadata for a persistent CUDA routed step-input binding (Inc3c capture). A
+/// routed port (e.g. Gemma 3n's `per_layer_inputs`) that the decoder consumes
+/// each step. The Inc3c capture path allocates a fixed `[1, 1, width]` device
+/// binding (dynamic batch/sequence dims collapsed to 1) and writes the one-token
+/// bytes into it each step — instead of re-binding a fresh owned input — so the
+/// decode graph can be CUDA-graph captured and replayed.
+pub(crate) struct CudaRoutedBinding<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) dtype: DataType,
+    /// Fixed device shape for a single decode step (dynamic dims collapsed to 1).
+    pub(crate) shape: Vec<usize>,
+}
+
+/// A per-step input port with a persistent device binding written each step then
+/// replayed by the captured decode graph (Inc3c): the `inputs_embeds` sequence
+/// binding plus any routed ports. Position/token ids are generated (written via
+/// [`DecodeCudaState::write_decode_inputs`]), not listed here.
+struct CapturedStepInputBinding {
+    name: String,
+    binding_index: usize,
+    byte_len: usize,
+}
+
+/// Whether the Inc3c captured per-step-input path is opted in via
+/// `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`. Default off keeps the eager
+/// owned path byte-identical; truthy (`1`/`true`/`yes`/`on`) enables capture of
+/// the `inputs_embeds`/routed decode step.
+fn capture_step_inputs_enabled() -> bool {
+    match std::env::var("ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDeclineReport) {
@@ -331,6 +383,24 @@ impl NativeDecodeSession {
         // keeps that byte-identical path. Inc3a introduced this for embeds; Inc3b
         // generalizes it to arbitrary routed ports via one shared owned build.
         if self.has_eager_step_inputs() {
+            // Inc3c: when opted in and this is a single-token decode step, drive
+            // the per-step ports through their persistent device bindings + the
+            // captured `run_one_token` state machine (recovering the graph-capture
+            // fast path lost to the eager owned uploads). Otherwise (default, or
+            // multi-token prefill) use the eager owned path.
+            let capture = token_ids.len() == 1
+                && self
+                    .cuda
+                    .as_ref()
+                    .is_some_and(|state| state.capture_step_inputs);
+            if capture {
+                return self.decode_cuda_captured_step_inputs(
+                    token_ids,
+                    past_len,
+                    total_len,
+                    step_inputs,
+                );
+            }
             return self.decode_cuda_eager_step_inputs(token_ids, past_len, total_len, step_inputs);
         }
         if let Some((name, _)) = step_inputs.first() {
@@ -414,6 +484,76 @@ impl NativeDecodeSession {
             || self
                 .step_input_name(NativeStepInputSource::Routed)
                 .is_some()
+    }
+
+    /// Inc3c captured single-token decode for decoders with `inputs_embeds`
+    /// and/or routed ports. Instead of re-binding fresh owned inputs (the eager
+    /// path), it writes the one-token embedding + routed bytes into their
+    /// **persistent** device bindings — mirroring how the token path writes the
+    /// token id via [`DecodeCudaState::write_decode_inputs`] — then drives the
+    /// CUDA-graph warmup/capture/replay state machine (`run_one_token`). The mask
+    /// is frozen to the physical bucket (capture-eligible) and the KV cache stays
+    /// device-resident and is advanced inside the captured graph, exactly like
+    /// the token-id captured path. This is the Inc3c perf lever: it recovers the
+    /// graph-capture fast path the eager per-step uploads forfeited.
+    fn decode_cuda_captured_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        total_len: usize,
+        supplied: &[(String, Tensor)],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        debug_assert_eq!(
+            token_ids.len(),
+            1,
+            "captured step-input path is single-token"
+        );
+        super::NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES
+            .fetch_add(1, super::AtomicOrdering::Relaxed);
+        let position = past_len;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        // Freeze the mask to the physical bucket so the step stays capture
+        // eligible (identical to the token-id captured path); bucket growth
+        // re-captures against the new buffers.
+        let mask_expose = state.decode_mask_expose_len(total_len);
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
+        state.write_captured_step_inputs(supplied, position)?;
+
+        if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+            let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+        }
+        let logits = state.read_logits()?;
+        // Detection-before-consumption: piggyback on the single logits sync to
+        // poll the shared capture-error word (mirrors the token captured path).
+        let capture_error = self.session.check_device_capture_error()?;
+        if capture_error != 0 {
+            let _ = self
+                .cuda
+                .as_mut()
+                .context("CUDA decode state is not initialized")?
+                .invalidate_graph(&mut self.session);
+            bail!(
+                "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay of a per-step-input decode; the produced token was rejected before consumption and the decode graph was invalidated"
+            );
+        }
+        if logits.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native decoder produced non-finite logits");
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(logits)
     }
 
     /// Generic eager CUDA decode step for decoders with `inputs_embeds` and/or
@@ -1148,6 +1288,35 @@ impl DecodeCudaState {
         } else {
             None
         };
+        // Inc3c capture: record the per-step supplied ports that get a persistent
+        // device binding — the `inputs_embeds` sequence binding (already allocated
+        // above as `input_ids_binding`) plus each routed port (allocated here).
+        // The Inc3c capture path writes these each step then replays the captured
+        // graph; the default eager path leaves them untouched.
+        let mut captured_step_inputs = Vec::with_capacity(io.routed.len() + 1);
+        if let Some(embeds) = &io.inputs_embeds {
+            captured_step_inputs.push(CapturedStepInputBinding {
+                name: embeds.name.to_string(),
+                binding_index: input_ids_binding,
+                byte_len: embeds.dtype.storage_bytes(embeds.hidden),
+            });
+        }
+        for routed in &io.routed {
+            let index = bindings.len();
+            let elems: usize = routed.shape.iter().product();
+            bindings.push(session.allocate_device_binding(
+                routed.name,
+                None::<String>,
+                routed.dtype,
+                routed.shape.clone(),
+                routed.shape.clone(),
+            )?);
+            captured_step_inputs.push(CapturedStepInputBinding {
+                name: routed.name.to_string(),
+                binding_index: index,
+                byte_len: routed.dtype.storage_bytes(elems),
+            });
+        }
         let logits_binding = bindings.len();
         bindings.push(logits_device_binding);
 
@@ -1212,6 +1381,14 @@ impl DecodeCudaState {
         }
         let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
 
+        // Inc3c: enable the captured per-step-input path only when (a) the
+        // operator opted in via `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`,
+        // (b) the decoder actually has per-step supplied ports (embeds/routed),
+        // and (c) graph capture is structurally available. Off by default keeps
+        // the eager owned path byte-identical.
+        let capture_step_inputs =
+            graph_enabled && !captured_step_inputs.is_empty() && capture_step_inputs_enabled();
+
         Ok(Self {
             logical_len: 0,
             max_len,
@@ -1221,6 +1398,8 @@ impl DecodeCudaState {
             auxiliary_binding_range: auxiliary_start..auxiliary_end,
             input_ids_binding,
             position_ids_binding,
+            captured_step_inputs,
+            capture_step_inputs,
             logits_binding,
             logits_shape,
             logits_dtype,
@@ -1303,6 +1482,55 @@ impl DecodeCudaState {
 
     fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {
         self.bindings[self.input_ids_binding].write_bytes(0, &i64::from(token_id).to_le_bytes())?;
+        if let Some(index) = self.position_ids_binding {
+            let position = i64::try_from(position).context("position id exceeds i64 range")?;
+            self.bindings[index].write_bytes(0, &position.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Inc3c: write the one-token `inputs_embeds`/routed bytes into their
+    /// persistent device bindings (and the generated position id), so the
+    /// captured decode graph can be replayed. Each supplied tensor must map by
+    /// exact port name to a declared persistent binding and match its byte
+    /// capacity; any unmapped supplied tensor or unfilled port is an error — the
+    /// same strict contract the eager owned build applies.
+    fn write_captured_step_inputs(
+        &mut self,
+        supplied: &[(String, Tensor)],
+        position: usize,
+    ) -> anyhow::Result<()> {
+        let mut supplied_map = HashMap::with_capacity(supplied.len());
+        for (name, tensor) in supplied {
+            if supplied_map.insert(name.as_str(), tensor).is_some() {
+                bail!("native CUDA decode received duplicate routed step input '{name}'");
+            }
+        }
+        for captured in &self.captured_step_inputs {
+            let tensor = supplied_map.remove(captured.name.as_str()).with_context(|| {
+                format!(
+                    "declared per-step input '{}' was not supplied to the captured native CUDA decode step; route the producing component output to this exact decoder port",
+                    captured.name
+                )
+            })?;
+            let bytes = tensor.as_bytes();
+            if bytes.len() != captured.byte_len {
+                bail!(
+                    "captured native CUDA decode step input '{}' has {} bytes but its persistent device binding holds {} — the per-step port geometry is not fixed to one token",
+                    captured.name,
+                    bytes.len(),
+                    captured.byte_len
+                );
+            }
+            self.bindings[captured.binding_index].write_bytes(0, bytes)?;
+        }
+        if !supplied_map.is_empty() {
+            let mut unknown = supplied_map.keys().copied().collect::<Vec<_>>();
+            unknown.sort_unstable();
+            bail!(
+                "captured native CUDA decode received routed step inputs that are not declared graph ports: {unknown:?}"
+            );
+        }
         if let Some(index) = self.position_ids_binding {
             let position = i64::try_from(position).context("position id exceeds i64 range")?;
             self.bindings[index].write_bytes(0, &position.to_le_bytes())?;
