@@ -12,10 +12,16 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 
 | Evidence class | What it means | Examples |
 |---|---|---|
-| **Observed** | Confirmed against a *running server* — curled, streamed, or profiled | §5.6's mode matrix (both model types run and profiled); the endpoint behaviours in §8.3; debug endpoints returning **404**, not 403 |
+| **Observed** | Confirmed against a *running server* — curled, streamed, or profiled — **and stamped with the commit sha the binary was built from** | §5.6's mode matrix (both model types run and profiled); the endpoint behaviours in §8.3; debug endpoints returning **404**, not 403 |
 | **Read** | Established by reading the cited *executable* source — a constant, handler, assignment or signature | The dependency edges in §2; the command-deferral dispatch in §5.11 |
 | **Stated intent** | Established by reading a **comment or docstring**. Supports a claim about what the authors *meant*, **never** about what the code *does*. | The preemption rationale at `batched.rs:713-718` (the *behaviour* is cited separately at `:759`); the `NodeStatus` scope comment in §4.7 |
 | **Inferred** | A conclusion drawn from the above, not directly witnessed | §5.3's claim that a shared-page write *would* corrupt silently — no test provokes it, and nothing in the code prevents it |
+
+> **Why `Observed` carries a sha, and `Read` a `file:line`.** A live-server result is a measurement of a *binary*, and a binary is a snapshot of a tree at one instant. It never announces that it has expired. During this project HEAD moved seven times in ninety minutes, and the CORS middleware existed for **3 minutes 51 seconds** — long enough for two agents to independently measure it working, correctly, and to close the question on that evidence. Both measurements were honest; both described a tree that no longer existed.
+>
+> **An `Observed` claim without a sha is not observed — it is observed-at-some-unknown-time, which on a tree moving this fast is weaker than `Read`.** `Read` at least names the line it can be re-checked against. The failure is silent and asymmetric in the usual direction: a stale `Observed` claim reports a capability that is *present*, so it reads as reassurance.
+>
+> The same decay applies to any measurement of the document itself. A line count, a test tally or a citation offset quoted without a sha is a claim about a file that has since moved.
 
 **Why the distinction is worth the overhead.** Verification tools share blind spots with the assumptions they are used to check. Several classes of defect in this codebase are **invisible to the instrument a reader would naturally reach for**:
 
