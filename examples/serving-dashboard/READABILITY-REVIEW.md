@@ -3431,3 +3431,57 @@ about a reaped extract. **I removed what discloses and kept what informs, rather
 regex over both and calling the difference cleanup.**
 
 MEASURED-AT: 8a8c4b69
+
+---
+
+## 🟠 R75 — THE OBVIOUS FIX FOR R74 WOULD DISARM THE GUARD THAT DETECTS R74
+
+I re-ran the Designer's census across **all 125 tracked files** under the served root, from
+committed bytes, and split it by a question their instrument did not ask: **is this the operator's
+real home directory, or a deliberately invented test fixture?**
+
+```
+'/Users/'          across the served root ....... 73
+  of which REAL operator home (the live username)   38   in 8 files, all .md
+  of which INVENTED FIXTURES ..................... 35   in 6 files
+                                                        ('/Users/presenter', '/Users/someone')
+
+REAL HOME INSIDE A SERVABLE-EXTENSION FILE ....... 0    <- the risk question, answered
+[POS] my file before the fix / after ............. 11 / 0
+[NEG] fabricated token ........................... 0
+```
+
+**FIRST, A HYPOTHESIS OF MINE THAT DIED BEFORE I PUBLISHED IT.** Five of the files carrying
+`/Users/` are `.js`/`.mjs` — **which are on the servable allowlist**, unlike `.md`. I believed for
+several minutes that I had found HTTP-reachable disclosures the Designer's `.md`-shaped census had
+missed, which would have inverted their conclusion. **Every one of those 11 occurrences is
+invented.** Real-home count in servable files is **0**. Their conclusion stands exactly as
+written, and `model-path-disclosure.test.js:475` *says so in a comment* — I could have read it
+before I got excited.
+
+> ### ***A CENSUS THAT COUNTS A PATTERN CANNOT DISTINGUISH THE DISCLOSURE FROM THE FIXTURE THAT PROVES THE DISCLOSURE IS DETECTED. BOTH ARE SPELLED THE SAME WAY, AND THE SAFETY TEST IS THE FILE MOST DENSELY FULL OF THE DANGEROUS-LOOKING STRING.***
+
+**AND THAT IS NOT A TIDINESS POINT — IT IS A LOADED GUN AIMED AT THE NEXT PERSON TO FIX R74:**
+
+```
+A BLANKET REDACTION OF '/Users/' OVER THE SERVED ROOT WOULD:
+  remove  38 real disclosures                                    ✅ intended
+  destroy 35 deliberate fixtures                                 ⛔ NOT intended
+     including dashboard/model-path-disclosure.test.js, whose HOME_PATH
+     constant is the ONLY input that certifies the home-path detector.
+
+RESULT: the detector for this exact defect keeps passing, against nothing.
+        A green light, permanently, on the class we are trying to close.
+```
+
+**The fix is to redact by *meaning*, not by *shape*: target the real home, leave the fixtures, and
+state which you did.** That is what I did in R74 — I redacted 11 real occurrences and explicitly
+kept 8 `/private/tmp` lines that disclose nothing. **A regex over both would have been faster and
+would have made this document worse.**
+
+**REMAINING, BY OWNER, SO NOBODY HAS TO RE-DERIVE IT:** REVIEWER-BRIEF.md **16** ·
+perf-baseline.md **6** · demo-spec.md **5** · ARCHITECTURE-SECURITY-REVIEW.md **4** ·
+IMPLEMENTATION-REVIEW.md **2** · QA-PLAN.md **2** · browser-render-verification.md **2** ·
+prefix-cache-verification.md **1**. **None of these are mine and I have not touched them.**
+
+MEASURED-AT: 92cc7935
