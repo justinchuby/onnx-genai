@@ -35,6 +35,7 @@
 //! acceptable at a 4 Hz refresh, and paying for stronger ordering on a decode
 //! hot path to make a dashboard's two numbers agree would be a bad trade.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Live, lock-free view of a page pool.
@@ -52,6 +53,41 @@ pub struct KvTelemetry {
     frees: AtomicU64,
     hot_evictions: AtomicU64,
     prefix_evictions: AtomicU64,
+    /// Per-page mirror, one packed `AtomicU64` per page.
+    ///
+    /// A block table needs per-page detail, but the page table lives inside the
+    /// engine on the driver thread and is unreachable from an HTTP handler.
+    /// Copying it out would need either a command round-trip (impossible during
+    /// an inline generation) or a lock on the decode path. Instead each page
+    /// gets one atomic word, written O(1) at the exact site that changed it, so
+    /// a reader always sees live per-page state without any coordination.
+    ///
+    /// Sized once, on attach, because the pool's capacity is not known when the
+    /// telemetry is constructed.
+    blocks: OnceLock<Box<[AtomicU64]>>,
+}
+
+/// Packs a page's mutable state into one atomic word so a reader gets a
+/// self-consistent view of a single page without a lock.
+///
+/// Layout: `ref_count` in bits 0..16, `filled_slots` in 16..32, `tier` in
+/// 32..40, and a present flag in bit 40. Saturating rather than wrapping: a
+/// page with more than 65,535 references would be a bug, and displaying a
+/// wrapped 0 would hide it.
+fn pack_block(ref_count: u32, filled_slots: usize, tier: u8) -> u64 {
+    let ref_count = ref_count.min(u32::from(u16::MAX)) as u64;
+    let filled = (filled_slots.min(u16::MAX as usize)) as u64;
+    ref_count | (filled << 16) | ((tier as u64) << 32) | (1 << 40)
+}
+
+/// One page's live state, as read from the mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockState {
+    pub page_id: u32,
+    pub ref_count: u32,
+    pub filled_slots: usize,
+    /// `0` = hot tier, `1` = cold tier.
+    pub tier: u8,
 }
 
 /// A plain-data read of [`KvTelemetry`], safe to serialise.
@@ -85,6 +121,75 @@ impl KvTelemetry {
     pub(crate) fn set_geometry(&self, hot_capacity: usize, page_size: usize) {
         self.hot_capacity.store(hot_capacity, Ordering::Relaxed);
         self.page_size.store(page_size, Ordering::Relaxed);
+    }
+
+    /// Sizes the per-page mirror. Called once, on attach.
+    ///
+    /// Capped so a pool that grows via cold-tier offload cannot make this
+    /// allocation unbounded; pages beyond the cap are simply not mirrored,
+    /// which a reader detects as an absent block rather than a wrong one.
+    pub(crate) fn size_blocks(&self, pages: usize) {
+        let capped = pages.min(Self::MAX_MIRRORED_BLOCKS);
+        let _ = self.blocks.set(
+            (0..capped)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+    }
+
+    /// Upper bound on mirrored pages.
+    ///
+    /// A block table of more than this many cells is a texture rather than a
+    /// visualisation, so there is nothing to gain from mirroring further.
+    pub const MAX_MIRRORED_BLOCKS: usize = 4096;
+
+    /// Publishes one page's state. `O(1)`, one relaxed store, no allocation.
+    pub(crate) fn note_block(&self, page_id: u32, ref_count: u32, filled_slots: usize, tier: u8) {
+        let Some(blocks) = self.blocks.get() else {
+            return;
+        };
+        let Some(slot) = blocks.get(page_id as usize) else {
+            return;
+        };
+        slot.store(pack_block(ref_count, filled_slots, tier), Ordering::Relaxed);
+    }
+
+    /// Reads a window of the block mirror, ordered by page id.
+    ///
+    /// Ordering is inherent rather than sorted: the mirror is indexed by page
+    /// id, so a block never moves between polls. That matters because a block
+    /// table that reshuffles shows motion that did not happen.
+    ///
+    /// Pages never written are skipped via the present flag, so a freshly sized
+    /// mirror reports nothing rather than a wall of empty blocks.
+    pub fn block_window(&self, start: usize, count: usize) -> Vec<BlockState> {
+        let Some(blocks) = self.blocks.get() else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(count)
+            .filter_map(|(page_id, slot)| {
+                let packed = slot.load(Ordering::Relaxed);
+                if packed & (1 << 40) == 0 {
+                    return None;
+                }
+                Some(BlockState {
+                    page_id: page_id as u32,
+                    ref_count: (packed & 0xFFFF) as u32,
+                    filled_slots: ((packed >> 16) & 0xFFFF) as usize,
+                    tier: ((packed >> 32) & 0xFF) as u8,
+                })
+            })
+            .collect()
+    }
+
+    /// How many pages the mirror can describe.
+    pub fn mirrored_block_capacity(&self) -> usize {
+        self.blocks.get().map_or(0, |blocks| blocks.len())
     }
 
     /// Seeds the live gauges from a directly-computed count.
@@ -513,6 +618,127 @@ mod tests {
 
         assert_eq!(shared_block.ref_count, 2);
         assert_eq!(solo_block.ref_count, 1);
+    }
+
+    /// The block mirror is what makes a per-page view readable from an HTTP
+    /// handler at all: the page table itself is owned by the driver thread and
+    /// mutably borrowed for the whole of a generation.
+    #[test]
+    fn block_mirror_reflects_allocation_and_sharing() {
+        let (mut table, telemetry) = pool(8);
+        // The pool preallocates its pages, so a block table shows all eight
+        // from the start, every one free. That is the correct picture: the
+        // blocks exist, and seeing them fill is the point of the view.
+        let initial = telemetry.block_window(0, 8);
+        assert_eq!(initial.len(), 8);
+        assert!(
+            initial.iter().all(|b| b.ref_count == 0),
+            "an untouched pool holds no references"
+        );
+
+        let first = table.allocate(GPU).expect("pool has capacity");
+        let second = table.allocate(GPU).expect("pool has capacity");
+        table.retain(first);
+
+        let blocks = telemetry.block_window(0, 8);
+        assert_eq!(blocks.len(), 8);
+        assert_eq!(
+            blocks.iter().filter(|b| b.ref_count > 0).count(),
+            2,
+            "exactly the two allocated pages are in use"
+        );
+
+        let a = blocks.iter().find(|b| b.page_id == first).expect("present");
+        let b = blocks
+            .iter()
+            .find(|b| b.page_id == second)
+            .expect("present");
+        assert_eq!(a.ref_count, 2, "retained page is shared");
+        assert_eq!(b.ref_count, 1);
+        assert_eq!(a.tier, 0, "freshly allocated pages are hot");
+    }
+
+    /// A freed page must report as free, not linger as occupied.
+    #[test]
+    fn block_mirror_follows_a_page_back_to_zero_references() {
+        let (mut table, telemetry) = pool(8);
+        let page = table.allocate(GPU).expect("pool has capacity");
+        table.free(page);
+
+        let block = telemetry
+            .block_window(0, 8)
+            .into_iter()
+            .find(|b| b.page_id == page)
+            .expect("a freed page is still a real page");
+        assert_eq!(block.ref_count, 0);
+    }
+
+    /// Block ids are the mirror's indices, so a block cannot move between
+    /// polls. This is stronger than sorting: there is no ordering step to get
+    /// wrong.
+    #[test]
+    fn block_mirror_ordering_is_positional_and_stable() {
+        let (mut table, telemetry) = pool(16);
+        for _ in 0..10 {
+            table.allocate(GPU).expect("pool has capacity");
+        }
+        let first: Vec<_> = telemetry
+            .block_window(0, 16)
+            .iter()
+            .map(|b| b.page_id)
+            .collect();
+        for _ in 0..5 {
+            let again: Vec<_> = telemetry
+                .block_window(0, 16)
+                .iter()
+                .map(|b| b.page_id)
+                .collect();
+            assert_eq!(first, again);
+        }
+        assert!(first.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn block_window_is_bounded_and_pages_cleanly() {
+        let (mut table, telemetry) = pool(16);
+        for _ in 0..16 {
+            table.allocate(GPU).expect("pool has capacity");
+        }
+        assert_eq!(telemetry.mirrored_block_capacity(), 16);
+        assert_eq!(telemetry.block_window(0, 5).len(), 5);
+        assert_eq!(telemetry.block_window(14, 5).len(), 2, "clamps at the end");
+        assert!(telemetry.block_window(100, 5).is_empty());
+    }
+
+    /// The mirror is capped so a pool that grows via cold-tier offload cannot
+    /// make the allocation unbounded.
+    #[test]
+    fn block_mirror_is_capped() {
+        let telemetry = KvTelemetry::default();
+        telemetry.size_blocks(KvTelemetry::MAX_MIRRORED_BLOCKS * 4);
+        assert_eq!(
+            telemetry.mirrored_block_capacity(),
+            KvTelemetry::MAX_MIRRORED_BLOCKS
+        );
+    }
+
+    /// Packing must round-trip, including the boundary values that would
+    /// corrupt neighbouring fields if a shift or mask were wrong.
+    #[test]
+    fn packed_block_fields_do_not_bleed_into_each_other() {
+        let telemetry = KvTelemetry::default();
+        telemetry.size_blocks(4);
+        telemetry.note_block(0, u16::MAX as u32, u16::MAX as usize, 1);
+        telemetry.note_block(1, 0, 0, 0);
+
+        let blocks = telemetry.block_window(0, 4);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].ref_count, u16::MAX as u32);
+        assert_eq!(blocks[0].filled_slots, u16::MAX as usize);
+        assert_eq!(blocks[0].tier, 1);
+        assert_eq!(blocks[1].ref_count, 0);
+        assert_eq!(blocks[1].filled_slots, 0);
+        assert_eq!(blocks[1].tier, 0);
     }
 
     #[test]

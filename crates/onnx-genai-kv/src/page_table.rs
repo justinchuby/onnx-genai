@@ -630,6 +630,14 @@ impl Clone for TelemetryHandle {
     }
 }
 
+/// Tier index used by the telemetry mirror: `0` hot, `1` cold.
+fn tier_of(device: Device) -> u8 {
+    match device {
+        Device::Gpu(_) => 0,
+        _ => 1,
+    }
+}
+
 /// One physical page as seen by a block-table view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageBlock {
@@ -877,11 +885,15 @@ impl PageTable {
     /// it opt-in keeps the cost at one `Option` check for everyone else.
     pub fn attach_telemetry(&mut self, telemetry: Arc<KvTelemetry>) {
         telemetry.set_geometry(self.hot_capacity, self.page_size);
+        telemetry.size_blocks(self.hot_capacity);
         telemetry.publish_counters(&self.stats);
         // Adopt the pool's current occupancy so attaching to a warm pool does
         // not start the gauges from a false zero.
         let (in_use, shared) = self.live_page_counts();
         telemetry.set_live_gauges(in_use, shared);
+        for (id, page) in &self.pages {
+            telemetry.note_block(*id, page.ref_count, page.filled, tier_of(page.device));
+        }
         self.telemetry = TelemetryHandle(Some(telemetry));
     }
 
@@ -940,6 +952,19 @@ impl PageTable {
             }
         }
         owners
+    }
+
+    /// Publishes one page's current state to the telemetry mirror.
+    ///
+    /// Public because `filled` is advanced by the paged cache rather than here,
+    /// and a block table that showed stale fill levels would misreport
+    /// fragmentation -- the main thing the block view exists to show.
+    /// A no-op when no telemetry is attached.
+    pub fn publish_block(&self, page_id: PageId) {
+        let (Some(telemetry), Some(page)) = (&self.telemetry.0, self.pages.get(&page_id)) else {
+            return;
+        };
+        telemetry.note_block(page_id, page.ref_count, page.filled, tier_of(page.device));
     }
 
     /// `(pages_in_use, pages_shared)`, computed directly from the pages.
@@ -1066,6 +1091,7 @@ impl PageTable {
             if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(0, 1);
             }
+            self.publish_block(page_id);
             return Some(page_id);
         }
         if matches!(device, Device::Gpu(_)) && self.hot_used_count() < self.hot_capacity {
@@ -1085,6 +1111,7 @@ impl PageTable {
             if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(0, 1);
             }
+            self.publish_block(page_id);
             return Some(page_id);
         }
         None
@@ -1106,6 +1133,7 @@ impl PageTable {
                 telemetry.note_ref_count_change(previous, current);
                 telemetry.publish_counters(&self.stats);
             }
+            self.publish_block(page_id);
         }
     }
 
@@ -1120,6 +1148,7 @@ impl PageTable {
             if let Some(telemetry) = &self.telemetry.0 {
                 telemetry.note_ref_count_change(previous, current);
             }
+            self.publish_block(page_id);
             true
         } else {
             false

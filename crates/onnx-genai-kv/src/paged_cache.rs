@@ -238,6 +238,7 @@ impl PagedKvCache {
             }
             page.filled = page.filled.max(token_offset + 1);
         }
+        self.page_table.publish_block(page_id);
         self.page_table.touch(page_id);
 
         if position == len {
@@ -653,6 +654,7 @@ impl PagedKvCache {
                 new_page.quant_scales = old_storage.3;
                 new_page.filled = old_storage.4;
             }
+            self.page_table.publish_block(new_page_id);
             self.page_table.replace_page(seq, page_index, new_page_id);
             self.page_table.free(page_id);
             return Ok(new_page_id);
@@ -829,6 +831,7 @@ impl KvCacheOps for PagedKvCache {
                 && let Some(page) = self.page_table.pages.get_mut(&last_page_id)
             {
                 page.filled = last_offset;
+                self.page_table.publish_block(last_page_id);
             }
         }
         self.page_table.set_sequence_len(seq, position);
@@ -917,6 +920,7 @@ impl KvCacheOps for PagedKvCache {
             if let Some(page) = self.page_table.pages.get_mut(&page_id) {
                 page.filled = page.filled.max(token_offset + 1);
             }
+            self.page_table.publish_block(page_id);
         }
         self.page_table.set_sequence_len(seq, length + num_tokens);
         Ok(())
