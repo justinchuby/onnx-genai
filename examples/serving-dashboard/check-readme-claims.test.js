@@ -25,6 +25,12 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { assertShippingTree } from './shipping-tree.mjs';
+
+// Provenance before content. Every path below is resolved from import.meta.url,
+// so this file would read a parked worktree self-consistently and pass. Assert
+// which tree we are in BEFORE asserting anything about what is in it.
+assertShippingTree();
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
 const readme = readFileSync(join(demoDir, 'README.md'), 'utf8');

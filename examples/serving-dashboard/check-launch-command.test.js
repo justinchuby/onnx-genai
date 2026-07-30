@@ -29,6 +29,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
+import { assertShippingTree } from './shipping-tree.mjs';
+
 import {
   DEFAULT_SERVER_ADDRESS,
   RECOMMENDED_MODEL_DIR,
@@ -37,6 +39,11 @@ import {
   SERVERS,
   launchCommandFor,
 } from './ui/launch-command.js';
+
+// Provenance before content. Every path below is resolved from import.meta.url,
+// so this file would read a parked worktree self-consistently and pass. Assert
+// which tree we are in BEFORE asserting anything about what is in it.
+assertShippingTree();
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
 const read = (relativePath) => readFileSync(join(demoDir, relativePath), 'utf8');
