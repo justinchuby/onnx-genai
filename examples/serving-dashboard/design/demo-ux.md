@@ -5789,3 +5789,65 @@ the mirror is absent and when the window starts beyond it. `mirrored_block_capac
 returns `0` in the first case and non-zero in the second, **so the two ARE recoverable —
 but only if the renderer reads both.** An empty array alone is `absent` and `zero` wearing
 the same coat, one layer below where D286 just fixed it.
+
+## 86. The absence ramp, and the annotation that certified a failure
+
+**D291 — A HAND-WRITTEN CONTRAST RATIO IS A CLAIM, AND THIS FILE WAS FULL OF CLAIMS IT
+COULD NOT CHECK.** `tokens.css` opened with `Contrast against --og-bg-raised (#151b23):
+--og-fg 17.4:1 --og-fg-muted 8.1:1 --og-fg-subtle 4.6:1 / All clear WCAG AA.` **Measured on
+the background the comment itself names, those are 14.65, 7.06 and 4.10.** Not rounding —
+the figures are true against no background in the file.
+
+**⚠️ AND THE CONSEQUENCE WAS A REAL ACCESSIBILITY FAILURE THE COMMENT ACTIVELY CONCEALED:
+`--og-fg-subtle` at 4.10:1 FAILS WCAG AA 1.4.3, it is used 25 times, and three of those uses
+are `.value__src--server`, `.value__src--client` and `.value__src--derived` — THE PROVENANCE
+BADGES. The element whose entire job is to certify where a number came from was the least
+legible text on the panel, under an annotation asserting it passed.** Raised to `#768493`
+(4.53:1).
+
+**🔑 THE MECHANISM MATTERS MORE THAN THE FIX. D270 and D273 each found a token whose comment
+asserted the property its value failed. Both were fixed by hand. BOTH LEFT THIS HEADER BLOCK
+UNTOUCHED — because a comment is not reachable from the thing it describes, so fixing one
+teaches you nothing about the next.** Contrast annotations are now PARSED AND RECOMPUTED by
+`asset-graph.test.js`; a written ratio that disagrees with its own hex is red. The guard
+found its first gap on the first run: `--og-na-rule` was annotated `3.01:1` while naming no
+background at all — **unfalsifiable as written, and therefore never a check.**
+
+**D292 — THE FOUR ABSENCE STATES WERE ONE COLOUR.** `--og-unavail-fg: #758493` and
+`--og-pending-fg: #748494` differ by a **transposition of two hex digits** and measure
+**1.0014:1** against each other. Four states meaning four different things — *we have no
+number* / *we are waiting* / *we had one and it aged out* / *this cannot apply here* — were
+rendering as one grey. Now a fixed ramp (hue 212, saturation 18%, **only lightness varies**)
+ordered by how much we actually know: `unavailable < pending < stale < not-applicable`.
+Worst pair **1.0014:1 → 1.0711:1**, ~51×, all still ≥ AA 4.5:1.
+
+**➡️ THIS IS DEFENCE IN DEPTH AND NOTHING MORE. Colour is NEVER the primary signal for state
+and must never become one — the glyph and the words are primary, and the border grammar is
+the second channel.** With @bb2ee824's pending underline landed, `shell.css` now spends all
+five border styles (none / solid / dashed / dotted / double), so the five states survive
+with colour switched off entirely. The ramp only raises the floor for a visitor with reduced
+colour discrimination, on a conference projector with crushed blacks, in a lit room — **which
+is this demo's actual viewing condition, not a hypothetical.**
+
+**🔻 THE HONEST LIMIT, RECORDED SO NOBODY RE-DERIVES IT: LUMINANCE ALONE CANNOT CARRY FOUR
+STATES IN THIS PALETTE.** The corridor is bounded below by AA (4.5:1) and above by
+`--og-fg-muted` (7.06:1) — and that ceiling is not theoretical: `.request-state--sent` is
+`--og-fg-muted` and `.request-state--unknown` is `--og-unavail-fg`, **five lines apart in the
+same widget in `panels.css`.** That leaves 1.57:1 of room for four steps plus clearance at
+both ends. Widening requires re-architecting the greys, not retuning these four.
+
+**⛔ AND THE PART I NEARLY SHIPPED, WHICH IS THE REASON THERE ARE TWO SEPARATION GUARDS AND
+NOT ONE. My first solve was a "proper" 1.20:1 ramp. It cleared ALL SIX in-family pairs and
+put `--og-na-fg` at 1.0359:1 against `--og-fg-muted` — IT MOVED THE COLLISION INSTEAD OF
+FIXING IT, and an in-family-only test would have certified it green.** A separation guard
+that only looks inside the family it is tuning has the same blind spot as a coverage list
+that only names the files it already knows about. **Mutation M3 proves the pair: drifting
+`na` into `fg-muted` with family spacing left intact fires the clearance test and leaves the
+in-family test GREEN.**
+
+> **⚖️ THE GENERAL RULE, AND IT IS THE LEAD'S: A TEST THAT COMPARES COLOUR LITERALS GUARDS
+> THE SPELLING OF A VALUE, NOT THE PROPERTY ANYONE CARES ABOUT — it passes when someone
+> swaps two indistinguishable greys and fails when someone makes an improvement. COMPUTE THE
+> RATIO AND ASSERT THAT. And a test never seen to fail is an untested test: all four
+> mutations here were proven red, and each was proven to have LANDED before its red was
+> believed.**

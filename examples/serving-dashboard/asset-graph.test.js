@@ -228,6 +228,155 @@ describe('every design token reaches the screen', () => {
       );
     });
 
+    /**
+     * D291. THE HEADER BLOCK CLAIMED "17.4 / 8.1 / 4.6 -- All clear WCAG AA"
+     * against a background it NAMED, and all three figures were wrong on that
+     * background. One of them, --og-fg-subtle, was really 4.10:1 and FAILED
+     * AA while its own annotation certified it passed -- across 25 usages
+     * including the provenance badges. Two earlier fixes (D270, D273) each
+     * corrected a token whose comment asserted the property its value failed,
+     * and BOTH LEFT THIS BLOCK UNTOUCHED, because a comment is not reachable
+     * from the thing it describes.
+     *
+     * So the annotations are now parsed and recomputed. This deliberately
+     * guards the PROPERTY, not the spelling: a test that compared hex
+     * literals would pass when someone swapped two indistinguishable greys
+     * and fail when someone made an improvement.
+     */
+    it('proves every written contrast annotation is arithmetically true', () => {
+      const background = hexOf('--og-bg-raised');
+      // `--token: #hex;  /* N:1 on --og-bg-raised ... */` on one line.
+      const annotated =
+        /(--og-[a-z0-9-]+):\s*(#[0-9a-fA-F]{6});\s*\/\*[^*]*?([0-9]+(?:\.[0-9]+)?):1 on --og-bg-raised/g;
+
+      const checked = [];
+      const failures = [];
+      for (const [, token, hex, claimed] of css['tokens.css'].matchAll(annotated)) {
+        const measured = ratio(hex, background);
+        checked.push(token);
+        // 0.05 absorbs the rounding of a 2-decimal annotation, nothing more.
+        if (Math.abs(measured - Number(claimed)) > 0.05) {
+          failures.push(
+            `${token} ${hex} is annotated ${claimed}:1 but measures ${measured.toFixed(2)}:1`,
+          );
+        }
+      }
+
+      // ANTI-VACUITY, and it is the assertion that matters most here: if the
+      // regex ever stops matching -- a reformat, a moved comment, a second
+      // line -- the loop above runs zero times and reports a confident green
+      // while checking nothing. That is the exact failure this whole file
+      // exists to catch, so the checker must prove it still has subjects.
+      // Pinned to the count observed when this landed. It caught its first
+      // real gap immediately: --og-na-rule was annotated "3.01:1" while
+      // naming NO background, so the claim was unfalsifiable as written and
+      // the parser could not see it. An annotation without a reference
+      // surface is not a weak check, it is not a check.
+      assert.ok(
+        checked.length >= 9,
+        `only ${checked.length} annotated tokens found; the parser has lost ` +
+          'its subjects and is now certifying an empty set.',
+      );
+
+      assert.deepEqual(
+        failures,
+        [],
+        'A contrast annotation in tokens.css states a ratio its own colour ' +
+          'does not have. These annotations are load-bearing: they are what ' +
+          'a reader trusts instead of re-measuring, and a wrong one hid a ' +
+          'real WCAG AA failure on the provenance badge for the whole ' +
+          `session.\nFAILING:\n  ${failures.join('\n  ')}`,
+      );
+    });
+
+    /**
+     * D292. unavailable and pending were #758493 and #748494 -- a two-digit
+     * transposition, 1.0014:1 apart. Colour is NOT the primary signal for
+     * state (the glyph and the words are, and the border grammar is the
+     * second channel), so this floor is deliberately modest: it is defence
+     * in depth for a projector with crushed blacks, which is this demo's
+     * actual viewing condition. It sits below the shipped separation so that
+     * tuning stays possible, and far above the transposition that prompted
+     * it so the collapse cannot silently return.
+     */
+    it('keeps the four absence states distinguishable from one another', () => {
+      const family = ['--og-unavail-fg', '--og-pending-fg', '--og-stale-fg', '--og-na-fg'];
+      const MIN_SEPARATION = 1.05;
+
+      const hexes = family.map((t) => [t, hexOf(t)]);
+      for (const [token, hex] of hexes) {
+        assert.ok(hex, `${token} is missing; the ramp cannot be measured`);
+      }
+
+      const failures = [];
+      let pairs = 0;
+      for (let i = 0; i < hexes.length; i += 1) {
+        for (let j = i + 1; j < hexes.length; j += 1) {
+          pairs += 1;
+          const separation = ratio(hexes[i][1], hexes[j][1]);
+          if (separation < MIN_SEPARATION) {
+            failures.push(`${hexes[i][0]} vs ${hexes[j][0]} = ${separation.toFixed(4)}:1`);
+          }
+        }
+      }
+
+      assert.equal(pairs, 6, 'expected all six pairs of a four-state family');
+      assert.deepEqual(
+        failures,
+        [],
+        'Two absence states render as the same colour. They mean different ' +
+          'things -- we have no number / we are waiting / we had one and it ' +
+          'aged out / this cannot apply here -- and a visitor who cannot ' +
+          'separate them reads four different admissions as one.\nFAILING:\n  ' +
+          failures.join('\n  '),
+      );
+    });
+
+    /**
+     * D292, and this is the assertion the previous one CANNOT make. A first
+     * attempt at a wider 1.20:1 absence ramp cleared all six in-family pairs
+     * and put --og-na-fg at 1.0359:1 against --og-fg-muted -- which is a
+     * sibling in the same widget (.request-state--sent is --og-fg-muted,
+     * .request-state--unknown is --og-unavail-fg, five lines apart in
+     * panels.css). It would have MOVED the collision, not fixed it, and an
+     * in-family-only test would have certified it green.
+     *
+     * A separation guard that only looks inside the family it is tuning has
+     * the same blind spot as a coverage list that only names the files it
+     * already knows about.
+     */
+    it('keeps absence states clear of the general-purpose text tokens', () => {
+      const family = ['--og-unavail-fg', '--og-pending-fg', '--og-stale-fg', '--og-na-fg'];
+      const neighbours = ['--og-fg', '--og-fg-muted'];
+      const MIN_CLEARANCE = 1.15;
+
+      const failures = [];
+      let compared = 0;
+      for (const token of family) {
+        for (const neighbour of neighbours) {
+          const a = hexOf(token);
+          const b = hexOf(neighbour);
+          assert.ok(a && b, `${token} or ${neighbour} is missing`);
+          compared += 1;
+          const clearance = ratio(a, b);
+          if (clearance < MIN_CLEARANCE) {
+            failures.push(`${token} vs ${neighbour} = ${clearance.toFixed(4)}:1`);
+          }
+        }
+      }
+
+      assert.equal(compared, 8, 'expected every absence state against every neighbour');
+      assert.deepEqual(
+        failures,
+        [],
+        'An absence colour has drifted into a general-purpose text token. ' +
+          'That makes "we could not measure this" look identical to ordinary ' +
+          'secondary text sitting beside it, which is worse than the ' +
+          'in-family collapse: it does not blur two admissions together, it ' +
+          `disguises an admission as a fact.\nFAILING:\n  ${failures.join('\n  ')}`,
+      );
+    });
+
     // The block map is the first surface with no text to underline, so the
     // dashed/dotted/double grammar cannot reach it. Its channel is hollow-vs-
     // filled, and these two assertions are what stop that channel decaying

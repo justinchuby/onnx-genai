@@ -43,13 +43,35 @@
   --og-border-subtle: #1e242c;
 
   /* ── FOREGROUND ────────────────────────────────────────────────────────
-     Contrast against --og-bg-raised (#151b23):
-       --og-fg 17.4:1   --og-fg-muted 8.1:1   --og-fg-subtle 4.6:1
-     All clear WCAG AA. --og-fg-faint is 1.9:1 and is DECORATIVE ONLY:
-     hairlines, grid texture, hatch. Text in --og-fg-faint is a bug.       */
+     Contrast against --og-bg-raised (#151b23), COMPUTED, not asserted:
+       --og-fg 14.65:1   --og-fg-muted 7.06:1   --og-fg-subtle 4.53:1
+     --og-fg-faint is 1.86:1 and is DECORATIVE ONLY: hairlines, grid
+     texture, hatch. Text in --og-fg-faint is a bug.
+
+     D291. EVERY NUMBER ON THE THREE LINES ABOVE USED TO BE WRONG, AND THE
+     ERROR WAS NOT ROUNDING: the block read "17.4 / 8.1 / 4.6 / 1.9 — All
+     clear WCAG AA" while naming --og-bg-raised as the reference. Those
+     figures are true against no background in this file; the real values on
+     the surface the comment NAMES are 14.65 / 7.06 / 4.10 / 1.86. The
+     divergence was not cosmetic: --og-fg-subtle is used 25 times, INCLUDING
+     .value__src--server/client/derived (panels.css:71-73) -- the provenance
+     badges themselves -- and at 4.10:1 it FAILED WCAG AA 1.4.3 while the
+     comment directly above it certified that it passed. The badge whose
+     whole job is to certify a number's honesty was the least legible text
+     on the panel, and the annotation is what kept anyone from re-measuring.
+     Raised to #768493 = 4.53:1.
+
+     THE RULE THIS COST US: a hand-written ratio is a CLAIM, and this file
+     was full of claims and had no way to check one. D270 and D273 each
+     found a token whose comment asserted the property its value failed;
+     both were fixed by hand, and BOTH FIXES LEFT THE HEADER BLOCK ALONE.
+     Contrast is now COMPUTED from the declarations by asset-graph.test.js,
+     which parses every "N:1 on --og-bg-raised" annotation in this file and
+     fails if the arithmetic disagrees. Annotations are load-bearing here,
+     so they are now mechanically true or the suite is red.                */
   --og-fg: #e6edf3;
   --og-fg-muted: #9aa7b4;
-  --og-fg-subtle: #6e7d8c;
+  --og-fg-subtle: #768493;  /* 4.53:1 on --og-bg-raised, WCAG AA 1.4.3 */
   --og-fg-faint: #3d4855;
 
   /* ── SEMANTIC ──────────────────────────────────────────────────────────
@@ -66,8 +88,39 @@
      The server returns documented zeros for metrics it cannot yet measure.
      Rendering one as a measurement is a silent, plausible lie. These tokens
      give "not measurable yet" a consistent, dignified treatment that is
-     instantly distinguishable from a real measured zero.                  */
-  --og-unavail-fg: #758493;  /* AA 4.52:1 on --og-bg-raised */
+     instantly distinguishable from a real measured zero.
+
+     D292 — THE ABSENCE RAMP. These four foregrounds were #758493, #748494,
+     #7a8794, #7e8fa0: unavailable and pending differed by a TRANSPOSITION
+     of two hex digits and measured 1.0014:1 against each other. Four states
+     that mean four different things (we have no number / we are waiting /
+     we had one and it aged out / this cannot apply here) rendered as one
+     colour. They are now a fixed ramp -- hue 212, saturation 18%, ONLY
+     lightness varies -- ordered by how much we actually know:
+       unavailable < pending < stale < not-applicable
+     worst pair 1.0014:1 -> 1.0711:1, ~51x, every one still >= AA 4.5:1.
+
+     THIS IS DEFENCE IN DEPTH AND NOTHING MORE. Colour is NEVER the primary
+     signal for state and must never become one: the glyph and the words are
+     primary, and the border grammar is the second channel (shell.css now
+     spends all five styles -- none/solid/dashed/dotted/double -- so the
+     states survive a greyscale screenshot with colour switched off). This
+     ramp only raises the floor for a visitor with reduced colour
+     discrimination, on a conference projector with crushed blacks, in a lit
+     room. That is the ACTUAL viewing condition for this demo.
+
+     ⚠️ AND THE HONEST LIMIT, RECORDED SO NOBODY RE-DERIVES IT: LUMINANCE
+     ALONE CANNOT CARRY FOUR STATES IN THIS PALETTE. The usable corridor is
+     bounded below by AA (4.5:1) and above by --og-fg-muted (7.06:1), which
+     is a sibling in the SAME widget -- .request-state--sent is --og-fg-muted
+     and .request-state--unknown is --og-unavail-fg, five lines apart in
+     panels.css. That is 1.57:1 of room for four steps plus clearance at
+     both ends. A first attempt at a "proper" 1.20:1 ramp cleared every
+     in-family pair and put not-applicable at 1.0359:1 against --og-fg-muted
+     -- IT WOULD HAVE MOVED THE COLLISION RATHER THAN FIXED IT, and an
+     in-family-only test would have passed it. Widening further requires
+     re-architecting the greys, not retuning these four.                   */
+  --og-unavail-fg: #72869d;  /* 4.63:1 on --og-bg-raised, WCAG AA 1.4.3 */
   /* D270. WAS #3d4855, WHICH MEASURED 1.86:1 AND FAILED WCAG 1.4.11 (3:1 for
      non-text). This underline is not decoration -- shell.css:179-181 calls it
      "the second channel: absence is legible in greyscale, in a compressed
@@ -79,7 +132,7 @@
   --og-unavail-hatch: #212932;
   --og-unavail-bg: #131920;
   --og-unavail-label: #6e7d8c;
-  --og-pending-fg: #748494;  /* AA 4.51:1 on --og-bg-raised */
+  --og-pending-fg: #788ca2;  /* 5.01:1 on --og-bg-raised, WCAG AA 1.4.3 */
   /* `not-applicable` — DELIBERATELY BRIGHTER THAN `unavailable`, and this is
      the one place where "more visible" is the honest choice rather than the
      flattering one. `unavailable` is our gap and is apologetic. THIS is an
@@ -91,9 +144,9 @@
      explanation renders ON SCREEN rather than in a hover, because a fact
      nobody hovers over is a fact nobody learns. `-fg` is the em-dash,
      `-note` the always-visible caption, `-rule` its left border. */
-  --og-na-fg: #7e8fa0;
+  --og-na-fg: #8597ab;       /* 5.78:1 on --og-bg-raised, WCAG AA 1.4.3 */
   --og-na-note: #93a3b4;
-  --og-na-rule: #53687e;     /* 3.01:1 — WCAG 1.4.11 non-text */
+  --og-na-rule: #53687e;     /* 3.01:1 on --og-bg-raised, WCAG 1.4.11 */
   --og-na-bg: #161d26;
   /* `stale` — a value that WAS genuinely measured but which the latest poll
      did not refresh. It is not fabricated and not absent, so it gets neither
@@ -101,7 +154,7 @@
      SUFFIX as well as this colour: rendering a 12-second-old number as
      current is the same class of error as rendering a fabricated one, and
      colour alone fails grayscale and colourblindness. */
-  --og-stale-fg: #7a8794;
+  --og-stale-fg: #7f91a6;    /* 5.36:1 on --og-bg-raised, WCAG AA 1.4.3 */
   /* D273. WAS #4a5560 = 2.28:1, failing WCAG 1.4.11 (3:1 non-text) exactly as
      --og-unavail-rule did at 1.86:1. Found by generalising D270's check across
      every state colour instead of fixing the one token that prompted it: the
