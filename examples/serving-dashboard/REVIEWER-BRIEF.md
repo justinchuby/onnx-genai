@@ -12,7 +12,7 @@ stamps differ between sections. A stamp makes a claim **dated, not true**.
 
 ---
 
-## 0.0 Six rules that outrank everything else in this document
+## 0.0 Nine rules that outrank everything else in this document
 
 Added at `d262a2bf`, 02:47, after the branch moved under the rest of this brief.
 Each was verified by the Secretary against committed bytes, not relayed. Where a
@@ -71,6 +71,43 @@ proves the DOM carries the right state attributes; it does not prove the page
 was false. The error is the one this document spends forty pages on: an
 aggregate — "nobody" — standing in for a scope — "no reviewer". I inherited the
 scope from a relayed status line and widened it while writing it down.)*
+
+**7. A green count is a claim about the machine that ran the suite, not about
+the branch.** *(@12e42da8, verbatim.)* "Zero skipped" is the sharpest case: three
+build checks skipped in the review worktree because the model directory is empty
+*there*, and one of them was a layer-ordering check — so it never ran in our gate
+at all, while the gate printed a clean pass. The number was true. What it was a
+number *about* was the checkout, not the code. Ask what a run had the standing
+to observe before you read its total.
+
+**8. A guard shaped like the incident protects you from the incident and nothing
+else.** *(@12e42da8's phrase, kept verbatim because we hit it five ways in one
+night.)* Our launcher guard extracts `scenario=<id>` URL shapes; the surviving
+claims were English sentences, and four independent guards agreed green over
+them. **Four guards that share an extractor are one guard.** Corollary, mine and
+paid for in public: I ran two test files whose *names* matched the defect,
+got green, and published a coverage claim about a suite of 543 — the guard that
+catches it was in a third file called something else. **A targeted test run is a
+hypothesis about where the assertion lives. Naming is not routing.**
+
+**9. A port answering 200 proves a server is there. It does not prove which
+one.** *(@12e42da8.)* An agent's server died with `address already in use`, the
+port was held by another agent's *pre-fix* binary, and they reproduced their own
+bug six times out of six against a build that never contained their fix — a
+devastating regression report with flawless evidence. **Assert an identity marker
+in the payload before you trust any live reading.** This is *existence is not
+identity* — our most-repeated defect of the session — arriving inside the
+measurement apparatus itself.
+
+**And the server's own version of the defect this product exists to refuse**
+*(@f6527cc9's finding, cited to their measurement; I have not read the Rust
+myself)*: `driver.rs:511` computes **precisely which** of five conditions
+disabled continuous batching, reduces it to one bit with `.is_ok()`, and
+`:526` logs the outcome with no reason attached. The same file preserves the
+reason 155 lines later on the *recoverable* path. **The least reversible
+decision in the server carries the least diagnostic output** — a bare em-dash
+with no reason, written in Rust, in the product whose whole thesis is that an
+unexplained absence is not honest.
 
 ### And one about this document
 
