@@ -634,6 +634,50 @@ fn reduction_f32(op: &'static str) -> Vec<Case> {
         .collect()
 }
 
+/// Extended floating-point reductions widen every input dtype to f32 for the
+/// accumulator and post-op, then narrow once to the output dtype.
+fn extended_reduction_float(op: &'static str) -> Vec<Case> {
+    let in_shape = vec![2usize, 3, 4];
+    let count: usize = in_shape.iter().product();
+    let positive_only = matches!(op, "ReduceLogSum" | "ReduceProd");
+    let values: Vec<f32> = (0..count)
+        .map(|index| {
+            if positive_only {
+                0.25 + (index % 7) as f32 * 0.08
+            } else {
+                (index as f32 * 0.13) - 1.25 + (index % 3) as f32 * 0.07
+            }
+        })
+        .collect();
+    let axes_cases: &[(&[i64], bool)] =
+        &[(&[1], true), (&[1], false), (&[0, 2], false), (&[-1], true)];
+
+    FLOAT_DTYPES
+        .into_iter()
+        .flat_map(|dtype| {
+            axes_cases.iter().map({
+                let in_shape = in_shape.clone();
+                let values = values.clone();
+                move |&(axes, keepdims)| Case {
+                    label: format!("{op}[{dtype:?}](axes={axes:?},keepdims={keepdims})"),
+                    op,
+                    domain: "",
+                    opset: 17,
+                    inputs: vec![float_input(dtype, &in_shape, &values)],
+                    outputs: vec![(dtype, reduce_out_shape(&in_shape, axes, keepdims))],
+                    attrs: vec![
+                        ("axes", Attribute::Ints(axes.to_vec())),
+                        ("keepdims", Attribute::Int(keepdims as i64)),
+                    ],
+                    compare: Compare::Float {
+                        tol: float_tol(dtype) * 2.0,
+                    },
+                }
+            })
+        })
+        .collect()
+}
+
 /// `Cast` from f32 to `to`, comparing bytes exactly (CUDA mirrors the CPU
 /// truncate-and-saturate / round-to-nearest numerics).
 fn cast_case(to: DataType) -> Case {
@@ -2174,11 +2218,10 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "ReduceLogSum",
         "ReduceLogSumExp",
     ] {
-        p.push(dedicated(
+        p.push(ProfileEntry {
             op,
-            "op_coverage_batch_gpu.rs",
-            "extended reduction",
-        ));
+            coverage: Coverage::Sweep(extended_reduction_float(op)),
+        });
     }
     p.push(dedicated(
         "Swish",

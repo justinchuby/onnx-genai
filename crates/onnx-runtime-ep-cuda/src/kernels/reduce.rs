@@ -35,7 +35,7 @@
 //!
 //! ## Limits (actionable errors — RULES.md #1)
 //!
-//! * dtype other than f32 (input/output) → deferred, naming the dtype.
+//! * unsupported input/output dtype → deferred, naming the dtype.
 //! * an axes-**input** dtype other than int32/int64 → rejected, naming it.
 //! * an axis out of `[-rank, rank)` → rejected, naming the axis.
 
@@ -58,6 +58,42 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// `op`: 0 = sum, 1 = max, 2 = min. `is_mean` divides a sum by the group size.
 /// `Max`/`Min` propagate NaN (numpy / CPU-EP semantics).
 const REDUCE_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+template <typename T>
+__device__ __forceinline__ float reduce_load(const T* data, size_t index);
+template <>
+__device__ __forceinline__ float reduce_load<float>(const float* data, size_t index) {
+    return data[index];
+}
+template <>
+__device__ __forceinline__ float reduce_load<__half>(const __half* data, size_t index) {
+    return __half2float(data[index]);
+}
+template <>
+__device__ __forceinline__ float reduce_load<__nv_bfloat16>(
+    const __nv_bfloat16* data, size_t index) {
+    return __bfloat162float(data[index]);
+}
+
+template <typename T>
+__device__ __forceinline__ void reduce_store(T* data, size_t index, float value);
+template <>
+__device__ __forceinline__ void reduce_store<float>(float* data, size_t index, float value) {
+    data[index] = value;
+}
+template <>
+__device__ __forceinline__ void reduce_store<__half>(
+    __half* data, size_t index, float value) {
+    data[index] = __float2half_rn(value);
+}
+template <>
+__device__ __forceinline__ void reduce_store<__nv_bfloat16>(
+    __nv_bfloat16* data, size_t index, float value) {
+    data[index] = __float2bfloat16_rn(value);
+}
+
 extern "C" __global__ void validate_reduce_axes_i64(
     const long long* actual,
     const long long* expected,
@@ -119,9 +155,10 @@ extern "C" __global__ void reduce_f32(
     }
 }
 
-extern "C" __global__ void reduce_ext_f32(
-    const float*     x,
-    float*           y,
+template <typename T>
+__device__ void reduce_ext(
+    const T*         x,
+    T*               y,
     const long long* base_off,     // [out_count]
     const long long* delta_off,    // [reduce_count]
     const int        out_count,
@@ -142,7 +179,7 @@ extern "C" __global__ void reduce_ext_f32(
 
     float acc = (combine == 1) ? 1.0f : 0.0f;
     for (int r = tid; r < reduce_count; r += nt) {
-        float v = x[base + (size_t)delta_off[r]];
+        float v = reduce_load(x, base + (size_t)delta_off[r]);
         if (pre == 1)      v = fabsf(v);
         else if (pre == 2) v = v * v;
         else if (pre == 3) v = expf(v);
@@ -162,13 +199,14 @@ extern "C" __global__ void reduce_ext_f32(
         float out = red[0];
         if (post == 1)      out = sqrtf(out);
         else if (post == 2) out = logf(out);
-        y[o] = out;
+        reduce_store(y, o, out);
     }
 }
 
-extern "C" __global__ void reduce_logsumexp_f32(
-    const float*     x,
-    float*           y,
+template <typename T>
+__device__ void reduce_logsumexp(
+    const T*         x,
+    T*               y,
     const long long* base_off,     // [out_count]
     const long long* delta_off,    // [reduce_count]
     const int        out_count,
@@ -192,7 +230,7 @@ extern "C" __global__ void reduce_logsumexp_f32(
     // CPU EP's max-subtraction (reduce_ops.rs:179-226).
     float m = NEG_INF;
     for (int r = tid; r < reduce_count; r += nt) {
-        const float v = x[base + (size_t)delta_off[r]];
+        const float v = reduce_load(x, base + (size_t)delta_off[r]);
         m = (isnan(m) || isnan(v)) ? QNAN : fmaxf(m, v);
     }
     red[tid] = m;
@@ -211,14 +249,14 @@ extern "C" __global__ void reduce_logsumexp_f32(
     // group yields `-inf`, any `+inf` yields `+inf`, any NaN yields NaN. This
     // also avoids the `inf - inf = NaN` that a blind `exp(v - m)` would produce.
     if (!isfinite(gmax)) {
-        if (tid == 0) y[o] = gmax;
+        if (tid == 0) reduce_store(y, o, gmax);
         return;
     }
 
     // Pass 2 — sum of exp(v - gmax) in the shifted frame.
     float acc = 0.0f;
     for (int r = tid; r < reduce_count; r += nt) {
-        const float v = x[base + (size_t)delta_off[r]];
+        const float v = reduce_load(x, base + (size_t)delta_off[r]);
         acc += expf(v - gmax);
     }
     red[tid] = acc;
@@ -227,8 +265,28 @@ extern "C" __global__ void reduce_logsumexp_f32(
         if (tid < off) red[tid] += red[tid + off];
         __syncthreads();
     }
-    if (tid == 0) y[o] = gmax + logf(red[0]);
+    if (tid == 0) reduce_store(y, o, gmax + logf(red[0]));
 }
+
+#define DEFINE_REDUCE_EXT(T, suffix) \
+extern "C" __global__ void reduce_ext_##suffix( \
+    const T* x, T* y, const long long* base_off, const long long* delta_off, \
+    const int out_count, const int reduce_count, const int pre, \
+    const int combine, const int post, const unsigned int* capture_error) { \
+    reduce_ext<T>(x, y, base_off, delta_off, out_count, reduce_count, pre, \
+                  combine, post, capture_error); \
+} \
+extern "C" __global__ void reduce_logsumexp_##suffix( \
+    const T* x, T* y, const long long* base_off, const long long* delta_off, \
+    const int out_count, const int reduce_count, \
+    const unsigned int* capture_error) { \
+    reduce_logsumexp<T>(x, y, base_off, delta_off, out_count, reduce_count, \
+                        capture_error); \
+}
+
+DEFINE_REDUCE_EXT(float, f32)
+DEFINE_REDUCE_EXT(__half, f16)
+DEFINE_REDUCE_EXT(__nv_bfloat16, bf16)
 
 extern "C" __global__ void reduce_i64_sum(
     const long long* x,
@@ -264,8 +322,12 @@ extern "C" __global__ void reduce_i64_sum(
 
 const REDUCE_MODULE: &str = "reduce_f32";
 const REDUCE_ENTRY: &str = "reduce_f32";
-const REDUCE_EXT_ENTRY: &str = "reduce_ext_f32";
-const REDUCE_LOGSUMEXP_ENTRY: &str = "reduce_logsumexp_f32";
+const REDUCE_EXT_F32_ENTRY: &str = "reduce_ext_f32";
+const REDUCE_EXT_F16_ENTRY: &str = "reduce_ext_f16";
+const REDUCE_EXT_BF16_ENTRY: &str = "reduce_ext_bf16";
+const REDUCE_LOGSUMEXP_F32_ENTRY: &str = "reduce_logsumexp_f32";
+const REDUCE_LOGSUMEXP_F16_ENTRY: &str = "reduce_logsumexp_f16";
+const REDUCE_LOGSUMEXP_BF16_ENTRY: &str = "reduce_logsumexp_bf16";
 const REDUCE_I64_SUM_ENTRY: &str = "reduce_i64_sum";
 const REDUCE_VALIDATE_AXES_ENTRY: &str = "validate_reduce_axes_i64";
 pub const REDUCE_CAPTURE_ERROR_AXES: u32 = 128;
@@ -293,7 +355,8 @@ pub enum ReduceOp {
     /// `log(sum(exp(x)))`, evaluated with max-subtraction stabilization to
     /// match the CPU EP (`reduce_ops.rs:179-226`): `m + log(sum(exp(x - m)))`
     /// where `m` is the group max. Routed through a dedicated two-pass kernel
-    /// (`reduce_logsumexp_f32`) rather than the generic `(pre,combine,post)`
+    /// (`reduce_logsumexp_{f32,f16,bf16}`) rather than the generic
+    /// `(pre,combine,post)`
     /// pipeline, since the max must be known before the exp-sum (`ReduceLogSumExp`).
     LogSumExp,
 }
@@ -326,14 +389,14 @@ impl ReduceOp {
         }
     }
 
-    /// `(pre, combine, post)` tags for the extended `reduce_ext_f32` kernel:
+    /// `(pre, combine, post)` tags for the typed extended-reduce kernels:
     /// `pre` transforms each element (0 id, 1 abs, 2 square, 3 exp), `combine`
     /// folds the group (0 add, 1 mul), and `post` maps the accumulator (0 none,
     /// 1 sqrt, 2 ln). Returns `None` for the four base reductions.
     ///
     /// `LogSumExp` returns `Some(..)` only so it routes past the cudnn/identity
-    /// paths; its numerics use the dedicated two-pass `reduce_logsumexp_f32`
-    /// kernel, so the tag values themselves are inert for that op.
+    /// paths; its numerics use the dedicated typed two-pass LogSumExp kernel, so
+    /// the tag values themselves are inert for that op.
     fn ext_tags(self) -> Option<(i32, i32, i32)> {
         match self {
             ReduceOp::Prod => Some((0, 1, 0)),
@@ -768,13 +831,18 @@ impl ReduceKernel {
                 x.dtype,
                 DataType::Float32 | DataType::Float16 | DataType::BFloat16
             )
+        } else if self.op.ext_tags().is_some() {
+            matches!(
+                x.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            )
         } else {
             x.dtype == DataType::Float32
         };
         if !supported_dtype {
             return Err(not_implemented(format!(
-                "{op} with input dtype {:?} (sum supports i64/f32/f16/bf16; mean supports \
-                 f32/f16/bf16; max/min are f32)",
+                "{op} with input dtype {:?} (sum supports i64/f32/f16/bf16; mean and \
+                 extended reductions support f32/f16/bf16; max/min are f32)",
                 x.dtype
             )));
         }
@@ -1003,9 +1071,19 @@ impl ReduceKernel {
         let entry = if x.dtype == DataType::Int64 {
             REDUCE_I64_SUM_ENTRY
         } else if is_logsumexp {
-            REDUCE_LOGSUMEXP_ENTRY
+            match x.dtype {
+                DataType::Float32 => REDUCE_LOGSUMEXP_F32_ENTRY,
+                DataType::Float16 => REDUCE_LOGSUMEXP_F16_ENTRY,
+                DataType::BFloat16 => REDUCE_LOGSUMEXP_BF16_ENTRY,
+                _ => unreachable!("validated extended-reduce dtype {:?}", x.dtype),
+            }
         } else if ext_tags.is_some() {
-            REDUCE_EXT_ENTRY
+            match x.dtype {
+                DataType::Float32 => REDUCE_EXT_F32_ENTRY,
+                DataType::Float16 => REDUCE_EXT_F16_ENTRY,
+                DataType::BFloat16 => REDUCE_EXT_BF16_ENTRY,
+                _ => unreachable!("validated extended-reduce dtype {:?}", x.dtype),
+            }
         } else {
             REDUCE_ENTRY
         };
@@ -1161,8 +1239,16 @@ mod tests {
 
     #[test]
     fn ext_tags_map_extended_ops_and_entry_present() {
-        assert!(REDUCE_SRC.contains(REDUCE_EXT_ENTRY));
-        assert!(REDUCE_SRC.contains(REDUCE_LOGSUMEXP_ENTRY));
+        for definition in [
+            "DEFINE_REDUCE_EXT(float, f32)",
+            "DEFINE_REDUCE_EXT(__half, f16)",
+            "DEFINE_REDUCE_EXT(__nv_bfloat16, bf16)",
+        ] {
+            assert!(
+                REDUCE_SRC.contains(definition),
+                "missing NVRTC definition {definition}"
+            );
+        }
         // Base reductions do not route through the extended kernel.
         for op in [ReduceOp::Sum, ReduceOp::Mean, ReduceOp::Max, ReduceOp::Min] {
             assert_eq!(op.ext_tags(), None);
@@ -1175,7 +1261,7 @@ mod tests {
         assert_eq!(ReduceOp::L2.ext_tags(), Some((2, 0, 1)));
         assert_eq!(ReduceOp::LogSum.ext_tags(), Some((0, 0, 2)));
         // LogSumExp keeps a Some(..) tag only to route past cudnn/identity; its
-        // actual math lives in the dedicated two-pass `reduce_logsumexp_f32`.
+        // actual math lives in the dedicated typed two-pass LogSumExp kernel.
         assert_eq!(ReduceOp::LogSumExp.ext_tags(), Some((3, 0, 2)));
         for op in [
             ReduceOp::Prod,
