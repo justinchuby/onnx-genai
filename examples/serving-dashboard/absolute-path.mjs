@@ -84,6 +84,38 @@ export function findAbsolutePaths(text) {
 }
 
 /**
+ * The stand-in left where an absolute path was removed.
+ *
+ * Deliberately says something. An empty replacement leaves a sentence that
+ * reads as though the server sent nothing at all, which is a different and
+ * equally false claim; a truncated prefix leaks the interesting half. Naming
+ * the CLASS of the removed thing keeps the sentence diagnostic without keeping
+ * any of its bytes.
+ */
+export const WITHHELD_PATH_TEXT = '[absolute path withheld]';
+
+/**
+ * Remove every absolute path from a block of text, preserving the prose.
+ *
+ * For diagnostics that quote what a server sent. A provenance warning has to
+ * explain WHICH field disagreed with the table and WHY; it never needs the
+ * operator's directory layout to do that, and a warning is a string that gets
+ * logged, stored, rendered and put into aria-labels, so any path inside one is
+ * disclosed on several surfaces at once.
+ *
+ * Uses the same two patterns as {@link findAbsolutePaths}, deliberately: a
+ * redactor with its own copy of the path vocabulary drifts from the detector,
+ * and the direction it drifts is redacting less than the guard flags.
+ *
+ * @param {unknown} text
+ * @returns {unknown} the redacted string, or the input unchanged if not a string.
+ */
+export function redactAbsolutePaths(text) {
+  if (typeof text !== 'string' || text === '') return text;
+  return text.replace(POSIX_IN_TEXT, WITHHELD_PATH_TEXT).replace(WINDOWS_IN_TEXT, WITHHELD_PATH_TEXT);
+}
+
+/**
  * The roots this scanner knows about, so a test can prove the list is non-empty
  * and report it rather than trusting it.
  *

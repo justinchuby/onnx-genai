@@ -99,6 +99,8 @@
  * - `derived`   — computed by us from other fields. Real, but owes its inputs.
  * - `estimated` — approximated, with error bounds. Must be labelled as such.
  */
+import { redactAbsolutePaths } from './absolute-path.mjs';
+
 export const SOURCE_CLASSES = Object.freeze({
   SERVER: 'server',
   CLIENT: 'client',
@@ -260,7 +262,25 @@ export function measuredField(
     // Set when the provenance table said this field should be a placeholder
     // but the server sent something else. The value IS shown -- hiding a real
     // number is the exact failure this warns about -- but never silently.
-    provenanceWarning,
+    //
+    // REDACTED HERE, at the boundary, and not at the display boundary. A
+    // warning quotes what a server sent, so it is the one piece of field
+    // metadata that routinely carries foreign bytes, and it reaches several
+    // surfaces at once: field metadata, the formatter's two return paths, the
+    // display-safe envelope, logs and aria-labels.
+    //
+    // `displaySafeField` used to clear it, but only from inside the branch it
+    // takes when the VALUE is path-shaped -- so a warning naming a path beside
+    // a value of `42` walked straight through the early return. Cleaning it
+    // there was always the wrong altitude: it made the warning's safety
+    // conditional on an unrelated property of the value, and on the display
+    // boundary having been called at all.
+    //
+    // Doing it in the constructor makes the unsafe state unrepresentable
+    // instead of merely detectable. No caller has to know the rule exists,
+    // which matters because the caller who does not know is the one who
+    // introduces the leak.
+    provenanceWarning: redactAbsolutePaths(provenanceWarning),
   });
 }
 
