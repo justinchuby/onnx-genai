@@ -34,6 +34,7 @@ import { after, before, describe, it } from 'node:test';
 import { flushAnimationFrames, installFakeDom } from './testing/fake-dom.js';
 import { createFakeStore } from './testing/fake-store.js';
 import { FIELD_STATES } from '../telemetry-field.js';
+import { allFieldKeys, PROVENANCE } from '../telemetry-provenance.js';
 
 // Built here rather than with fake-store's `measured()` helper ON PURPOSE: that
 // helper still emits the retired `state: 'ok'`, which format.js refuses to
@@ -170,5 +171,135 @@ describe('the model directory never reaches a rendered surface', () => {
         `${label} binds server.model_path again. The store will hand back the absolute path with state='measured' -- reclassifying the catalogue entry does NOT suppress it, so the binding is the only thing standing between a home directory and a projector.`,
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE CLASS, not the field. Everything above pins `server.model_path` by name,
+// which closes the instance a browser found and leaves the mechanism that
+// produced it fully armed. @73e77d95 traced that mechanism: telemetry-store's
+// stale-provenance branch shows ANY value the catalogue did not expect, and its
+// stated reason -- "hiding a real number is the exact failure this branch
+// exists to catch" -- is a rule written for GAUGES being applied to STRINGS.
+// It fires precisely when our documentation is wrong about a field, which is
+// precisely when nobody has reviewed that field. So the one branch guaranteed
+// to render an unreviewed value is the one that renders it unreviewed.
+//
+// A per-field tripwire cannot cover that: the next disclosure will arrive under
+// a key nobody has written down yet. This sweeps EVERY key the register knows.
+
+// WHICH FIELDS CAN REACH THIS, decided by the wire and not by my judgement.
+// Injecting a path into `sessions.active` proves nothing: the server types that
+// as an integer, so no response can carry a string there and a red from it is a
+// fixture artefact. But the opposite exclusion is the trap that would gut this
+// guard -- `server.model_path`, the field that actually reached a projector,
+// was classified NOT_PLUMBED and rendered anyway. Filtering to "string on the
+// wire today" would therefore be blind to precisely the defect that started
+// this file, because arrival is exactly when the catalogue is stale.
+//
+// So the rule fails closed: a key is exempt ONLY if a capture has PROVEN it
+// numeric or boolean. Never observed, absent, null, unplumbed -- all stay in.
+const CAPTURES = ['scatter', 'dynamic'].map((name) =>
+  JSON.parse(readFileSync(new URL(`../fixtures/captures/${name}.json`, import.meta.url), 'utf8')),
+);
+
+function digPath(body, path) {
+  return String(path).split('.').reduce((node, part) => (node == null ? node : node[part]), body);
+}
+
+/** Keys a real response has been observed to type as a number or boolean. */
+function provenNonString(key) {
+  const entry = PROVENANCE[key];
+  if (!entry || typeof entry.path !== 'string') return false;
+  return CAPTURES.some((capture) => {
+    const endpoint = capture.endpoints?.[entry.source];
+    if (!endpoint) return false;
+    const value = digPath(endpoint.body ?? endpoint.json ?? endpoint, entry.path);
+    return typeof value === 'number' || typeof value === 'boolean';
+  });
+}
+
+// A string-typed field that is NOT_PLUMBED today and IS bound to a surface.
+// It is the model_path profile exactly: the wire does not carry it, so nothing
+// proves it numeric, and if the server starts echoing it the store's stale-
+// provenance branch promotes it to state='measured' and paints it. Declared
+// rather than fixed because removing a field a visitor can see is a product
+// call under freeze, not a developer's. Listed alone, and the anti-rot check
+// below deletes this entry the moment it stops offending.
+const DECLARED_STRING_DISCLOSURE = Object.freeze(['server.execution_provider']);
+
+const undeclaredDetail = new Map();
+
+describe('no field can put an absolute home path on screen, whatever its name', () => {
+  it('renders no absolute path for any key the wire has not proven numeric', async () => {
+    const { mount } = await import('./system.js');
+    const { mountModelCard } = await import('../ui/model-card.js');
+    const PANEL_MOUNTS = [
+      ['dashboard/system.js', mount],
+      ['ui/model-card.js', mountModelCard],
+    ];
+
+    const all = allFieldKeys();
+    assert.ok(all.length > 20, `Only ${all.length} keys enumerated; the register did not load.`);
+    const swept = all.filter((key) => !provenNonString(key));
+    assert.ok(
+      swept.length > 5,
+      `Only ${swept.length} keys survived the numeric filter; it is over-excluding and this sweep is hollow.`,
+    );
+
+    const offenders = new Set();
+    let mountsObserved = 0;
+
+    for (const key of swept) {
+      for (const [label, mountPanel] of PANEL_MOUNTS) {
+        const root = document.createElement('div');
+        const store = createFakeStore({
+          fields: {
+            [key]: measuredField(HOME_PATH, { source: 'server' }),
+            // The identifier stays real so a panel that rendered NOTHING cannot
+            // be mistaken for a panel that refused the path. @73e77d95's
+            // positive control, applied on every iteration rather than once.
+            'server.model_id': measuredField('qwen-scatter', { source: 'server' }),
+          },
+        });
+        const mounted = mountPanel(root, store);
+        store.tick();
+        await flushAnimationFrames();
+        const text = visibleStrings(root).join(' ');
+        mounted?.unmount?.();
+
+        if (text.includes('qwen-scatter')) mountsObserved += 1;
+        if (text.includes(HOME_PATH) || text.includes('/Users/')) {
+          offenders.add(key);
+          undeclaredDetail.set(key, label);
+        }
+      }
+    }
+
+    assert.ok(
+      mountsObserved > 10,
+      `The control string rendered in only ${mountsObserved} mounts; this sweep would pass vacuously.`,
+    );
+
+    const undeclared = [...offenders].filter((key) => !DECLARED_STRING_DISCLOSURE.includes(key));
+    assert.deepEqual(
+      undeclared,
+      [],
+      `${undeclared.map((k) => `${k} (${undeclaredDetail.get(k)})`).join(', ')}\n\n` +
+        'A panel painted a filesystem path from a field that is not server.model_path. ' +
+        'The per-field guard above cannot see this: the store promotes any unexpected ' +
+        'value to state="measured", so the next disclosure arrives under whichever key ' +
+        'the catalogue is stale about next. Either stop binding the field or declare it.',
+    );
+
+    // Anti-rot, and the half that is usually omitted: a declaration that has
+    // stopped being true is a permanent hole with a comment on it.
+    const stale = DECLARED_STRING_DISCLOSURE.filter((key) => !offenders.has(key));
+    assert.deepEqual(
+      stale,
+      [],
+      `${stale.join(', ')} no longer discloses. Delete the declaration -- an exemption ` +
+        'outliving its defect silently exempts whatever inherits that key.',
+    );
   });
 });
