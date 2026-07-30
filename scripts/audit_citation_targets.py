@@ -22,7 +22,12 @@ MUTATION PROVING IT FAILS: point any citation at a `///` line -- e.g. change a
 """
 import re, os, sys
 from collections import defaultdict
-ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"
+# ROOT is derived, never hardcoded. It was an absolute home-directory path
+# until a reviewer caught it: that makes the script silently inert for every
+# other person and every CI runner, while still printing a confident report.
+import subprocess
+ROOT = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                      capture_output=True, text=True, check=True).stdout.strip()
 # argv[1] lets the mutation test run against a COPY. Never mutate the live
 # tree to test a checker -- another agent is almost certainly editing it.
 DOC=sys.argv[1] if len(sys.argv)>1 else os.path.join(ROOT,"docs/ARCHITECTURE.md")
@@ -86,3 +91,16 @@ for p,a,b,t in blank: print(f"  {p}:{a}")
 print(f"### BARE DELIMITER: {len(delim)}")
 for p,a,b,t in delim: print(f"  {p}:{a}{'-'+b if b else ''}  ->  {t!r}")
 if missing: print("### UNRESOLVED:", sorted(missing)[:10])
+
+# A checker that cannot fail is not a checker. This script printed its findings
+# and exited 0 unconditionally, so every caller -- a hook, CI, another agent --
+# read success no matter how many citations had rotted. It was a safeguard
+# pointed at nothing, which is the most expensive kind, because its output
+# looks identical to a safeguard that is working.
+drifted = len(blank) + len(delim) + len(missing)
+if drifted:
+    print(f"\nFAIL: {drifted} citation(s) resolve to a blank line, a bare "
+          f"delimiter, or nothing at all. None can support a claim.")
+    sys.exit(1)
+print("\nOK: every resolved citation lands on code or on a comment.")
+sys.exit(0)

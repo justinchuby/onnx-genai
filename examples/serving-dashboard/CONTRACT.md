@@ -362,7 +362,7 @@ export const meta = {
 /**
  * @param {HTMLElement} rootElement   Empty element the panel owns entirely.
  * @param {TelemetryStore} telemetryStore
- * @returns {{ destroy: () => void, describe: () => string }}
+ * @returns {{ unmount: () => void, describe: () => string }}
  */
 export function mount(rootElement, telemetryStore) { /* … */ }
 ```
@@ -378,10 +378,20 @@ so phrasing cannot drift between panels.
    `rootElement` and call `telemetryStore.subscribe(...)`.
 2. **update** — there is no `update()` function. Your subscriber callback *is*
    the update path. It fires immediately on subscribe and once per poll.
-3. **`destroy()`** — you **must** return this and it **must** call your
+3. **`unmount()`** — you **must** return this and it **must** call your
    `unsubscribe`, cancel any `requestAnimationFrame`/timer, and release canvas
    references. A panel that leaks a subscription fails AC22 (no memory growth
    over a 60 s run).
+
+   The name is `unmount`, not `destroy`. The shell calls `handle.unmount()`
+   (`dashboard/index.js:209`); a handle returning `destroy` gets `undefined()`
+   — except it never throws, because the shell wraps each teardown in a
+   try/catch so one bad panel cannot strand the others' subscriptions. The
+   leak is therefore **completely silent**, which is why this contract text
+   being wrong sent four separate agents to build the wrong thing. Note that
+   `destroy()` IS correct on two neighbouring objects — `roving.destroy()` and
+   `adapter.destroy()` — so grepping `destroy` in the shell falsely confirms
+   it.
 
 ### What a panel may rely on
 

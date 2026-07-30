@@ -114,3 +114,70 @@ test('README staleness-ceiling claim is backed by shipping code', () => {
       'README promises cannot happen.',
   );
 });
+
+// ---------------------------------------------------------------------------
+// CONTRACT.md is a doc comment with a bigger blast radius: panel authors follow
+// it INSTEAD of reading the shell. So the same rule applies -- the normative
+// method name it mandates must be the one the shell actually calls.
+//
+// It was wrong, and it cost four separate agents a wrong implementation.
+// CONTRACT.md mandated `destroy()` in bolded "must" text citing AC22 by number,
+// while dashboard/index.js:209 calls `handle.unmount()`. A conforming panel
+// returned `{destroy}`, the shell invoked `undefined()`, and the shell's
+// per-panel try/catch -- which exists for the good reason that one bad panel
+// must not strand everyone else's subscriptions -- swallowed the TypeError.
+// Every subscription leaked, silently, which is an AC22 failure that only
+// appears as memory growth over a 60s run.
+//
+// What made it survive four reports: `destroy()` is CORRECT on two neighbouring
+// objects in the same file (`roving.destroy()`, `adapter.destroy()`), so anyone
+// grepping `destroy` in the shell got confirmation the contract was right.
+// ---------------------------------------------------------------------------
+
+test('the panel-handle teardown method in CONTRACT.md is the one the shell calls', async () => {
+  const { readFileSync } = await import('node:fs');
+  const contract = readFileSync(new URL('./CONTRACT.md', import.meta.url), 'utf8');
+  const shell = readFileSync(new URL('./dashboard/index.js', import.meta.url), 'utf8');
+
+  // What the shell invokes on a PANEL handle. Deliberately anchored to
+  // `handle.` so the sibling roving/adapter `.destroy()` calls cannot answer
+  // for it -- those are different objects and they are why grepping lies here.
+  const called = [...shell.matchAll(/\bhandle\.(\w+)\(/g)].map((m) => m[1]);
+  assert.ok(called.length > 0, 'found no `handle.<method>()` call in the shell; this scan is broken');
+  const teardown = called[0];
+  assert.equal(teardown, 'unmount', 'the shell changed its teardown call; CONTRACT.md must follow');
+
+  // The contract's normative lifecycle clause must name that method.
+  const lifecycle = contract.slice(contract.indexOf('### Lifecycle'));
+  assert.ok(
+    lifecycle.includes(`\`${teardown}()\`** — you **must** return this`),
+    `CONTRACT.md's lifecycle section does not mandate \`${teardown}()\`, which is what ` +
+      `the shell calls. A panel following the contract literally would leak every ` +
+      `subscription, silently, and fail AC22.`,
+  );
+
+  // And the @returns signature must agree with the prose beside it.
+  assert.ok(
+    contract.includes(`@returns {{ ${teardown}: () => void, describe: () => string }}`),
+    `CONTRACT.md's mount() @returns signature disagrees with its own lifecycle prose ` +
+      `about the teardown method name.`,
+  );
+});
+
+test('every shipped panel returns the teardown method the contract mandates', async () => {
+  const { readdirSync, readFileSync } = await import('node:fs');
+  const dir = new URL('./dashboard/', import.meta.url);
+  const panelFiles = readdirSync(dir).filter(
+    (f) => f.endsWith('.js') && !f.includes('.test.') && !['index.js', 'panel-kit.js', 'field-state.js', 'store-adapter.js', 'sparkline.js'].includes(f),
+  );
+  assert.ok(panelFiles.length >= 4, `expected several panel modules, found ${panelFiles.length}; scan is broken`);
+
+  for (const file of panelFiles) {
+    const src = readFileSync(new URL(file, dir), 'utf8');
+    if (!/export function mount/.test(src)) continue;
+    assert.ok(
+      /\bunmount\s*\(\)\s*\{/.test(src),
+      `${file} exports mount() but never defines unmount(); the shell would leak its subscription`,
+    );
+  }
+});
