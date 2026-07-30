@@ -25,7 +25,12 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { assertShippingTree, SHIPPING_REF, announceShippingRef } from './shipping-tree.mjs';
+import {
+  assertShippingTree,
+  SHIPPING_REF,
+  announceShippingRef,
+  shippedPaths,
+} from './shipping-tree.mjs';
 
 announceShippingRef();
 
@@ -237,9 +242,7 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
     'demo-spec.md': 'owned by the product manager; states the figure as the SUBJECT of a retraction, which no pattern here can tell from an assertion',
   });
 
-  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
-    .toString()
-    .split('\n')
+  const docs = shippedPaths()
     .filter((f) => f.endsWith('.md'));
 
   // ---------------------------------------------------------------------
@@ -282,7 +285,15 @@ test('no shipping document reintroduces the withdrawn throughput ratio', () => {
   // direction, which is the only direction nobody re-checks. `--full-tree`
   // makes the listing independent of where it is called from, which is the
   // same property this whole module exists to guarantee.
-  const repoMd = execFileSync('git', ['ls-tree', '-r', '--full-tree', 'HEAD', '--name-only'], { cwd: HERE })
+  const repoMd = execFileSync(
+    'git',
+    // `shippedPaths()` is directory-scoped and this arm needs the whole
+    // repository, so it stays a direct call -- but it is pinned to the same
+    // SHIPPING_REF as every read it feeds. Literal `HEAD` here would let the
+    // corpus and the contents come from different commits.
+    ['ls-tree', '-r', '--full-tree', SHIPPING_REF, '--name-only'],
+    { cwd: HERE, maxBuffer: 64 * 1024 * 1024 },
+  )
     .toString()
     .split('\n')
     .filter((f) => f.endsWith('.md'));
@@ -492,9 +503,7 @@ test('no document presents a withdrawn prefix timing figure without its noise fl
   // and a percentage delta actually co-occur. A bare "7 %" anywhere in the
   // repo is not evidence of anything -- a checker that fired on that would be
   // reworded away within a day and would teach everyone to ignore it.
-  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
-    .toString()
-    .split('\n')
+  const docs = shippedPaths()
     .filter((f) => f.endsWith('.md'))
     .filter((f) => !/^(perf-baseline|demo-spec)\.md$/.test(f))
     // EXEMPTION RETIRED by @0837fdf9. It was written as an explicit promise to
@@ -625,9 +634,7 @@ function statementUnits(source) {
 test('no source file states the withdrawn prefix timing result as a live finding', () => {
   assertShippingTree();
 
-  const sources = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
-    .toString()
-    .split('\n')
+  const sources = shippedPaths()
     .filter((f) => /\.(js|mjs)$/.test(f));
   assert.ok(
     sources.length > 0,
@@ -984,9 +991,7 @@ test('no counter reading is labelled as a baseline when it is a mid-run snapshot
 });
 
 test('no document attributes a hit RATE to the twelve-request block', () => {
-  const docs = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
-    .toString()
-    .split('\n')
+  const docs = shippedPaths()
     .filter((f) => f.endsWith('.md'))
     // The raw measurement records legitimately carry every reading, including
     // the mid-block ones. They are where the arithmetic above was RECOVERED
@@ -1694,9 +1699,7 @@ test('the retracted 9.8 % floor is not stated as live fact outside markdown', ()
       'Reported to them; not mine to edit under freeze.',
   });
 
-  const corpus = execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only', '--', '.'], { cwd: HERE })
-    .toString()
-    .split('\n')
+  const corpus = shippedPaths()
     .filter(Boolean)
     .filter((f) => !f.endsWith('.md'))
     .filter((f) => f !== SELF)
