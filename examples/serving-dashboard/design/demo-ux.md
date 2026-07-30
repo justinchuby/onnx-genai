@@ -6373,3 +6373,287 @@ telling the fixer to shrink the list; blinding the matcher trips the anti-vacuit
 | D309 | Attribute selectors are qualified by the class they are for | A bare `[data-state]` is an unstated universal claim; `data-state` here carries two different concepts |
 | D310 | A coincidental colour match is camouflage | Both paths resolved to `--og-na-fg`, so the channel humans check agreed and the defect read as intentional |
 | D311 | A selector is a claim about a set — enumerate the set before narrowing it | Qualifying to `.value` alone would strip absence styling from 3 model-card fields, 2 of them `unavailable` |
+
+## 92. THE RETRACTED `'ok'` RULING HAS A SOURCE, IT IS TRACKED, AND IT IS NOT WHERE ANYONE LOOKED (D312–D315)
+
+The Lead's ruling was that the `OK: 'ok'` order *"has now regenerated nine times from
+stale prose, not from anyone's carelessness."* That is the correct diagnosis and it
+names no file. This section names the file, by bytes at HEAD.
+
+I have challenged this ruling four times. Each time I measured the **code** and each
+time the code was already correct, so each time I concluded the ruling was simply
+being misremembered. **That was the wrong conclusion for four rounds. A belief that
+regenerates on a schedule is being *read*, not misremembered — and I never looked for
+what people were reading.**
+
+### 92.1 THE CENSUS, DENOMINATOR FIRST
+
+Instrument: `git grep -nF` against `HEAD`, never `-E` and never `\b`
+(@73e77d95's finding: `git grep -E`'s `\b` silently matches nothing and exits `0`).
+
+```
+`FIELD_STATES.OK` at HEAD, examples/ ........... 15 occurrences / 6 files
+   IMPLEMENTATION-REVIEW.md  8   review prose, all retracting or quoting
+   REVIEWER-BRIEF.md         2   review prose, both stating it is undefined
+   check-field-states.test.js 2  the `??` arm + its assert message
+   demo-ux.md (mine)         3   two in my own withdrawal, one in a table
+   demo-spec.md              1   <-- THE ONLY PRESENT-TENSE ARGUMENT *FOR* IT
+
+CONTROL, same instrument, same corpus: `FIELD_STATES.MEASURED` -> 20 files.
+   The instrument finds things. A zero from it would have been a real zero.
+```
+
+**Fourteen of the fifteen are people saying the constant does not exist. One is a
+document telling you to create it.**
+
+### 92.2 THE SOURCE, QUOTED
+
+`demo-spec.md:1168` — the product specification, tracked, present tense:
+
+> *"The safety property was never in the wire string: **a developer types
+> `FIELD_STATES.OK` and never the literal.** `OK: 'ok'` delivers the whole guarantee
+> at **zero edits, zero migration, zero risk.**"*
+
+That is not a record of a past decision. It is a **standing recommendation with a cost
+argument attached**, and the cost argument is the most persuasive part. Anyone who
+reads the spec to find out what to build finds an unqualified instruction to add a key
+the enum deliberately does not have.
+
+Three sibling claims in the same document, tested at HEAD:
+
+```
+CLAIM (demo-spec.md:1281)  "styles/shell.css:163  [data-state='ok'] { … }  <-- 'ok', matching the DOM"
+CLAIM (demo-spec.md:1339)  "FOR THE THIRD TIME: … styles/shell.css:163 is [data-state='ok']"
+CLAIM (demo-spec.md:1290)  "TWO-FILE ATOMIC EDIT: the wire constant and the [data-state='ok'] selector"
+
+MEASURED, shell.css at HEAD (783 lines):
+  line 163 is  ->  a COMMENT, mid-sentence, explaining this exact history:
+                   "They drifted once: the constant was spelled MEASURED while its
+                    value stayed 'ok', so this selector said 'measured' and therefore
+                    matched NOTHING."
+  [data-state='ok']       in styles/*.css  ->  0 files    <- the claim is false
+  [data-state='measured'] in styles/*.css  ->  1 file     <- CONTROL: the grep works
+```
+
+**The line the spec cites as the thing to change is now the comment explaining why it
+was already changed.** The fix landed *and documented itself in place*, and the
+document that ordered the fix never learned that.
+
+> **D312 — A retracted ruling does not survive in memory. It survives in the
+> highest-authority document that still argues for it.** Nine regenerations is not
+> nine lapses; it is one file being read nine times. **Stop correcting the people who
+> repeat a stale ruling and go find what they are reading.** The repeaters are a
+> symptom; the tracked prose is the cause.
+
+### 92.3 THE SENTENCE THAT WARNS ABOUT ITSELF
+
+`demo-spec.md:1339` is addressed to me by name. In full, it says the citation is wrong
+"FOR THE THIRD TIME", and then:
+
+> *"@0837fdf9 — YOUR STRUCTURAL ARGUMENT IS RIGHT AND DOES NOT NEED THIS CITE; IT IS
+> WEAKER WITH IT, **because the first person who checks it will discount the rest.**"*
+
+That warning is completely correct. It is also **the carrier of a citation that is
+false at HEAD** — `shell.css:163`. The sentence telling me a bad cite would discredit
+my sound argument is now a bad cite discrediting its own sound argument. I am the
+first person to check it, and the prediction came true against its author.
+
+> **D313 — A warning about citation rot is itself a citation and rots at the same
+> rate.** Prose that says *"verify this"* earns more trust than prose that does not,
+> which means it **costs more when it expires**. Meta-advice is not exempt from the
+> rule it states.
+
+### 92.4 THE STATUS OF `demo-spec.md` MAKES THIS WORSE, NOT BETTER
+
+`demo-spec.md` is **HELD** — ruled a floor, not to be edited. That ruling is right for
+a *record*: you do not rewrite history to make yourself look consistent. But this file
+is not only a record. **It contains imperatives in the present tense**, and a held
+imperative is an active instruction with the tree's authority behind it and no owner
+willing to touch it.
+
+> **D314 — "Held as a historical floor" and "contains live instructions" cannot both
+> be true of one file.** A frozen record must be *inert*. If freezing a document
+> preserves an order, the freeze has not archived the order — **it has protected it
+> from correction.** Either the imperatives get struck, or the file gets a header
+> saying its imperatives are void. **Doing neither is the only option that keeps the
+> order live, and it is the one currently in force.**
+
+**I am not editing `demo-spec.md`.** It is not my file and it is under an explicit
+hold. This is a finding for its owner, with the exact byte offsets above. The
+one-line, non-reflowing fix that discharges it without touching a single existing
+sentence is a header at the top of the file:
+
+```
+> ⚠️ HISTORICAL RECORD. Imperatives in this document are NOT live orders and its
+>    line-number citations are NOT valid at HEAD. Verify against code before acting.
+```
+
+That is strictly better than striking the fifteen sites individually: a header cannot
+rot, it fixes every imperative at once, and it changes no existing byte.
+
+### 92.5 THE TEST FILE IS NOT THE SOURCE, AND ITS AUTHOR ALREADY PROVED THAT
+
+`check-field-states.test.js:69`'s `FIELD_STATES.MEASURED ?? FIELD_STATES.OK` was filed
+this session as a guard that *"is structurally incapable of catching F2."* Measured at
+HEAD, that claim is **already retracted in tracked bytes, by the agent who filed it**:
+
+```
+IMPLEMENTATION-REVIEW.md:372  "FIXED, and so is its guard — I withdraw the claim that
+  stood here. … Mutation-proven false at 1bca52a8 … point the README sentence at the
+  retired spelling 'ok' -> FIRES; delete the sentence entirely -> FIRES; unmutated
+  control -> silent. It is a working, non-vacuous drift guard. The only true residue
+  is cosmetic … a retired spelling surviving in the guard's own prose."
+```
+
+The narrow half — `:73`'s assert message names a key the enum no longer defines — is
+**true, already filed as cosmetic by its author, and worth fixing**. The broad half —
+the guard cannot fail — is false and was proven false with a mutation.
+
+**I am recording this without any satisfaction, because it is my own failure mode with
+the serial numbers filed off.** I spent four rounds re-litigating a ruling whose source
+I never looked for; the F2 replay is one round of the same thing. And the finding
+credited *me* with being right four times, which is exactly when a claim is least
+likely to get checked.
+
+> **D315 — A finding replayed by its own author is indistinguishable from a new one,
+> and is trusted more.** Author agreement is the signal we use for triage, so a
+> self-replay defeats it precisely. **The retraction must live where the finding lives
+> — the same file, not a later broadcast** — because the finding gets re-read and the
+> broadcast does not. `IMPLEMENTATION-REVIEW.md:372` did this correctly and the replay
+> happened anyway, which sets the honest ceiling on this decision: **co-located
+> retraction is necessary and it is not sufficient.**
+
+### 92.6 WHAT THIS COSTS ME
+
+My §53.2 note says D160's ruling "refers to a different proposition." **True, and
+incomplete in the way that mattered.** I established that the *code* was correct and
+stopped. I never asked why a corrected belief kept coming back, and the answer was one
+`grep -F` away for four rounds. **Measuring the artifact tells you whether a claim is
+true today. It tells you nothing about whether the claim will be back tomorrow, and
+only the second question explains a nine-time regeneration.**
+
+### 92.7 I AM DELIBERATELY BUILDING NO GUARD FOR THIS
+
+The safety property — `'ok'` cannot reach the stylesheet — is **already mechanically
+pinned** by `state-channel.test.js:249` (`assert(!shellCss.includes("[data-state='ok']"))`),
+which is not my file and is green. A second guard asserting the same property would be
+**D303's duplicate-vocabulary defect**, committed by me, immediately after writing a
+section about beliefs that regenerate from redundant sources.
+
+The part that is *not* pinned — a held document containing a live imperative — is not
+mechanically fixable by me, because **any guard I write against `demo-spec.md` is red
+on commit and stays red**, since the file may not be edited. A permanently-red guard
+is not enforcement; it is an alarm nobody can silence, and it trains people to ignore
+the suite. **That gap belongs to `demo-spec.md`'s owner and is stated here as a gap.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D312 | A retracted ruling regenerates from the document that still argues for it | 14 of 15 `FIELD_STATES.OK` sites deny it; 1 recommends it, in the product spec, present tense |
+| D313 | A warning about citation rot rots at the same rate as any other citation | The sentence warning me a bad cite discredits a sound argument carries `shell.css:163`, false at HEAD |
+| D314 | "Frozen record" and "contains imperatives" cannot both hold | A freeze that preserves an order has not archived it, it has protected it from correction |
+| D315 | A finding replayed by its own author is trusted more and checked less | Co-located retraction at `IMPLEMENTATION-REVIEW.md:372` was correct and still did not prevent the replay |
+
+## 93. A GUARD IS RED AT HEAD BECAUSE THE REPOSITORY GOT MORE HONEST (D316–D318)
+
+`check-source-citations.test.js` is **RED at HEAD: 4 pass / 2 fail.** It is not my file.
+It was 6/6 earlier this session. It is red **correctly** — this is not a false alarm,
+and the two failing tests are the two anti-vacuity floors, which is the failure the
+author explicitly built them to produce.
+
+**This does not touch my documents.** The guard reads `git show HEAD:` on
+`examples/serving-dashboard/README.md`. My working-tree edits cannot reach it — checked
+before I looked at anything else, because "my last edit broke it" is the cheapest
+hypothesis and would have been wrong.
+
+### 93.1 THE MEASUREMENT
+
+```
+README.md, per revision            line-anchored   symbol-anchored   total checked
+  20d76358                              45                0               45
+  fca13038  "give every citation a full path"   35       0               35   (-10)
+  58aa072a  "symbol-anchor the two most-repeated"  30     5               35   ( 0)
+  38605db2  "anchor the three that provably land on nothing"  27  5       32   ( -3)
+
+FLOOR AS COMMITTED: 36.   ACTUAL AT HEAD: 28 anchor-checked / 19 distinct paths.
+```
+
+`58aa072a` was **net zero** — seven `batched.rs:LINE` citations became two lines plus
+five symbol anchors. Symbol anchors *are* counted (`checked += 1`). The conversion
+practice is not the cause.
+
+**The cause is deletion, and the deletions were correct.** `38605db2` removed three
+citations *because they provably landed on nothing* — they were false, and fixing them
+meant removing them. `fca13038` dropped ten more while giving the survivors full paths.
+
+> **D316 — A coverage floor denominated in COUNT scores honesty as regression.**
+> Deleting a false citation is strictly an improvement and *always* lowers the count.
+> A floor set just under the actual number is excellent at catching a matcher that
+> silently narrows — the fault it was shaped for — and it is **structurally unable to
+> distinguish that from a document that removed its own falsehoods.** The units are
+> the defect: the thing worth flooring is *unresolved* citations (ceiling: zero) or the
+> resolved *ratio*, neither of which a truthful deletion can move.
+
+The author anticipated this exactly and wrote the protocol into the guard:
+
+> *"If prose edits legitimately drop a few citations, lower it in the same commit and
+> say why — **a floor you have to touch is a floor you have to think about.**"*
+
+**Three consecutive commits dropped citations and none lowered the floor.**
+
+> **D317 — A ceremony that lives only in a comment is not a step in the process.** The
+> instruction was correct, well-argued, and sat inside the file the committer was not
+> editing. Its cost is paid by **whoever runs the suite next**, which was me, on work
+> unrelated to all three commits. **A guard whose upkeep is documented where only its
+> maintainer reads it will go red in someone else's hands, and they will debug it from
+> zero.** I spent four measurements reconstructing a protocol that was written down.
+
+### 93.2 I PRODUCED TWO CONFIDENT WRONG MECHANISMS FIRST, AND BOTH HAD CLEAN CONTROLS
+
+This is the part worth more than the finding.
+
+**Wrong mechanism #1 — "the `continue` silently skips uncounted anchors."** I measured
+6 symbol anchors, all resolving to **0 candidates**, all skipped. It was coherent,
+it named a real line of code, and it was **entirely an artifact of my own instrument**:
+I ran `git ls-files` with the process CWD at `examples/serving-dashboard`, so it
+returned only that subtree, **relative** — `crates/…/batched.rs` was never in the list
+I was matching against. Re-anchored to the toplevel: **6 counted, 0 skipped, 0
+unresolved.** The file exists and always has.
+
+**Wrong mechanism #2 — "conversion is many-to-one, so quality rises as count falls."**
+Also coherent, also supported by the commit message's word *"most-repeated"*. Measured:
+`58aa072a` went 7 line-refs → 2 lines + 5 anchors. **Exactly 1:1. Net zero.** Wrong.
+
+> **D318 — A control proves the instrument runs; it cannot prove the instrument is
+> pointed at the right thing.** My synthetic control (`` `driver.rs`, `symbol` `` →
+> 1 match) passed on both wrong runs, because the regex was never the broken part —
+> **the corpus was.** A control shares the harness with the finding, so it inherits
+> every defect in the harness's *frame of reference*: CWD, tree, revision, corpus.
+> **The control and the finding fail together, silently, and agree.** The only thing
+> that caught it was a claim so strong it was cheap to falsify independently — "this
+> file has never existed" — against `git log --all`. **State your finding in its most
+> falsifiable form and then attack that form, because a control will not do it for you.**
+
+I am the agent who has spent this session ruling on other people's expired findings.
+**I generated two of my own inside ten minutes, and the first one would have been a
+public accusation that a working guard silently discards its inputs.** The CWD defect
+is the one this crew has documented more than any other tonight. Knowing the defect
+by name did not stop me committing it; **only re-running from an asserted absolute path
+did**, which is the mechanism-not-discipline rule landing on its author.
+
+### 93.3 WHAT THE OWNER NEEDS, AND WHAT I AM NOT DOING
+
+`check-source-citations.test.js` is not mine and I am not editing it. The fix is the
+author's own documented step, one line plus a sentence:
+
+```
+floor 36 -> 28 (or 32), in a commit that says: three false citations were REMOVED by
+38605db2 and ten paths consolidated by fca13038; coverage did not narrow, the corpus
+did. Better still, add a second assertion the deletions cannot move:
+    unresolved citations === 0        <- a ceiling, not a floor
+```
+
+| # | Decision | Rationale |
+|---|---|---|
+| D316 | A count-based coverage floor scores truthful deletion as regression | Removing a false citation always lowers the count; floor the *unresolved* count instead — a ceiling of zero |
+| D317 | Upkeep documented inside the guard is not part of the process | Three commits skipped it; the red surfaced in an unrelated agent's run, debugged from zero |
+| D318 | A control shares the finding's frame of reference and fails with it silently | My control passed on two wrong corpora; only an independently falsifiable claim caught the CWD defect |
