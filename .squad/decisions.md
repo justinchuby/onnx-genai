@@ -1,6 +1,6 @@
 # Decisions — live standing directives
 
-Last consolidated: 2026-07-30T13:36:00Z (Scribe consolidation round 3 — inbox merged, dated entries archived)
+Last consolidated: 2026-07-30T15:20:00Z (Scribe consolidation round 4 — native-pipeline + CUDA-hybrid wave; dated design/assessment drops routed straight to archive per the round-3 Task-D policy, standing kernels distilled below)
 
 Standing governance rules and constraints maintained by Squad. Dated wave records, narrative entry trails, and historical ledger updates archived to `.squad/decisions-archive/2026-07.md`.
 
@@ -379,34 +379,80 @@ The full review narrative is archived (round-2 compaction). These are the bindin
   generation did is a latent bug; resolve once via a shared helper both paths call, reading
   the live backend on demand (no cache, no staleness across `/reload`/`/ep`/`/backend`).
 
-## 2026-07-30 — Scribe tidy round 3: what to check next
+## CUDA EP op-coverage scope — standing directive
 
-**By:** Scribe (tidy round 2, post-merge)
+**By:** Cohaagen (issue #67; PR #480). Data-driven placement audit (production loader +
+per-node `supports_op`, recursing subgraph bodies) over the real decode models.
 
-Round 2 compacted `decisions.md` from 40,477 → ~30 KB and then had to **merge a concurrent
-compaction**: PR #427 ("consolidate CUDA parity 161 state") rewrote the same file down to
-14,913 bytes in the same minutes, while I was pushing. Both were merged by property (union of
-standing rules live; disagreements resolved live). **The concurrent-Scribe collision is now
-observed, not predicted — the window was minutes, not days.** Two conflicting resolutions of a
-single hand-merged file is exactly the failure the tracked inbox was meant to remove but does
-not: the inbox stopped drop-loss, not the hand-merge rewrite. For round 3:
+- **Classic transformer decode is 100% covered on CUDA** (qwen2.5-0.5b/1.5b/7b, Phi-4-mini,
+  Qwen3.6-27B, Qwen3.5-35B-A3B int4): every covered-type node places, zero dtype/shape
+  claim-gate silent fallbacks.
+- **Control-flow ops (`If`/`Loop`/`Scan`) are executor-handled recursively and MUST NOT be
+  added to the CUDA EP.** Their subgraph bodies are already placed on CUDA; they are not EP
+  ops. Do not re-propose adding them as coverage gaps.
+- **Remaining genuine gaps = the Qwen3.5 hybrid (Mamba + linear-attention) family**:
+  `CausalConvWithState` (landed #480) and `LinearAttention` (in flight); both landed ⇒ full
+  CUDA coverage of the three Qwen3.5 text decoders. `GatherBlockQuantized` is registered +
+  covered as of #480 (was a registered-but-undeclared coverage-of-coverage hole); GBQ
+  `bits=4` odd-blocks-per-row is a documented safe-to-defer, fail-closed follow-up.
+- **Numerics rule for these hybrid kernels:** accumulate in f32 (matching the ORT/CPU EP
+  oracle); widen f16/bf16 on read, narrow on write ⇒ dtype-invariant (RULES.md §2); the claim
+  gate must reject configs the kernel cannot run (e.g. `d_k > 256`). Full design archived under
+  round-4 consolidation.
 
-- **Adopt the round-2 Task-D recommendation.** The cheap fix is structural: keep the live file
-  for **standing rules only** (rarely edited, low collision) and route **all dated wave/
-  changelog records** through inbox drops that Scribe files **straight into the monthly
-  archive, never into the live file**. #427 kept four CUDA wave records live; round 2 archived
-  the equivalents — that divergence *is* the collision. If wave records never enter the live
-  file, two Scribes cannot disagree about them.
-- **`decisions.md` size / dedup.** Re-measure against tip first. When two compactions race,
-  reconcile by property, keep every rule either side kept live, and dedupe the archive —
-  build it as `base + one clean appendix`, never by concatenating two rewritten tails.
-- **Inbox.** Still tracked. Merge every `*.md` except `README.md`; dedupe against **both** the
-  live file and the archive — another team's Scribe may have merged the same drop on another
-  machine (this round #427 merged `kuato-cuda-parity-4.md` live while I archived it; I had to
-  match prose because drops carry no team/machine attribution). Add attribution to drops.
-- **Histories.** Sweep all `.squad/agents/*/history.md` against the chronicle gate (>8 dated
-  entries, or oldest live entry predating the previous wave measured against that file's newest
-  entry — never against today). deckard/roy re-accumulate fastest.
-- **Do not archive agent directories.** Fail-closed; with three teams active elsewhere,
-  absence of local commits/drops/history proves nothing.
+## Native multi-component pipeline decoder seam — standing directive
+
+**By:** Mary (issue #384; PRs #478 Inc2a, #479 Inc2b). The pipeline decode loop is made
+backend-agnostic via a **stateful** seam, distinct from Inc1's stateless `ComponentSession`.
+
+- **`trait PipelineDecoderComponent`** drives the decoder: `step(input_tokens, past_len,
+  extras)` advances internal KV and **retains the step's outputs internally**;
+  `next_token_logits()` / `mirror_last_present_kv(...)` / KV-window queries follow. Because the
+  impl owns its per-step outputs, the loop never touches ORT `Value`/nxrt tensors and stays
+  backend-agnostic. `PipelineDecodeLoopBackend` holds one `Box<dyn PipelineDecoderComponent>`
+  instead of `&Session` + `&mut DecodeState`.
+- **Do NOT drive a stateful decoder through a stateless host seam** — it drops native
+  device-KV continuity and re-stages the whole KV cache across the host boundary every step,
+  destroying decode throughput. KV is the large per-layer per-token-growing tensor and must
+  stay device-resident.
+- **Impls:** `OrtPipelineDecoder` (behaviour-identical, host KV, #478);
+  `NativePipelineDecoder` (device-resident KV, #479 — routed per-step inputs like
+  `inputs_embeds`/positions are one-token uploads per step; static cross-KV uploaded once;
+  token parity vs ORT proven). In flight: Inc3 = device-KV paged mirroring + cross-component/
+  vision handoff, full 35B-A3B on native. Full design archived under round-4 consolidation.
+
+## 2026-07-30 — Scribe consolidation round 4 (native-pipeline + CUDA-hybrid wave)
+
+**By:** Scribe (round 4)
+
+Executed the round-3 "what to check next" checklist (now archived under
+`.squad/decisions-archive/2026-07.md` → round-4 consolidation). This round applied the
+adopted **Task-D policy**: dated wave/design/assessment drops are filed **straight into the
+monthly archive, never into the live file**; only their distilled standing kernels enter this
+ledger (the two directives above). Four inbox drops processed
+(cohaagen-67-coverage-assessment, cohaagen-87-prefetch-plan, cohaagen-linear-attention-design,
+mary-pipeline-inc2-design) and deleted. Merged this wave: #477 (Harry, shape-inference IR
+container-type + Sequence foundation), #478/#479 (Mary, native pipeline Inc2a/Inc2b), #480
+(Cohaagen, CUDA CausalConvWithState + GBQ coverage). In flight: Mary Inc3, Cohaagen
+LinearAttention.
+
+Standing carry-forward for the next Scribe round:
+- **Keep dated records out of the live file.** Route wave/design/assessment drops to the
+  archive; distil only standing rules here. This is the structural fix for the concurrent-Scribe
+  hand-merge collision.
+- **Dedupe against both the live file and the archive** — another team's Scribe may have merged
+  the same drop on another machine; drops carry no team/machine attribution, so match prose.
+- **Histories:** sweep `.squad/agents/*/history.md` against the chronicle gate (>8 dated entries,
+  or oldest live entry predating the previous wave measured against that file's newest entry —
+  never against today). deckard/roy re-accumulate fastest.
+- **Do not archive agent directories.** Fail-closed; with teams active elsewhere, absence of
+  local commits/drops/history proves nothing.
+- **Size note (honest):** this live file is ~28 KB, above the 20 KB soft gate, and grew ~3 KB
+  this round from the two distilled directives above (offset only partly by dropping the round-3
+  checklist). Its content is standing-directive-dense, not a chronicle — rounds 1–3 already
+  archived the per-PR narrative and this round added no dated records. Per charter, standing
+  directives stay live and a directive-dense file is not compacted merely for bytes; but the
+  next round should evaluate whether the older 2026-07-29 standing entries can be distilled
+  further to bring the ledger back under the gate.
+
 
