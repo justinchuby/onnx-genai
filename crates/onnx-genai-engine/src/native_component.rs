@@ -149,6 +149,18 @@ fn to_native_tensor(
     })
 }
 
+/// Convert a backend-neutral [`ComponentTensor`] into a native
+/// [`Tensor`](onnx_runtime_session::Tensor), for routing pipeline pool tensors
+/// (e.g. an every_step component's `inputs_embeds` output) into the native
+/// decoder's per-step inputs. Shares the exact dtype/shape mapping the neutral
+/// component seam uses, so the value-type conversion is identical to Inc1's.
+pub(crate) fn component_tensor_to_native_tensor(
+    name: &str,
+    tensor: &ComponentTensor,
+) -> anyhow::Result<Tensor> {
+    to_native_tensor("<native-pipeline-decoder>", name, tensor).map_err(anyhow::Error::from)
+}
+
 fn from_native_tensor(component: &str, tensor: &Tensor) -> Result<ComponentTensor, ComponentError> {
     let dtype = ir_dtype_to_component(tensor.dtype)?;
     let shape: Vec<i64> = tensor.shape.iter().map(|&dim| dim as i64).collect();
