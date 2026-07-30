@@ -1621,3 +1621,72 @@ blocking set since pass 2, and nothing measured since has moved it. Every findin
 above is fixed in committed bytes, bounded to loopback, or non-blocking by
 severity. **The two things I would not ship without are neither of them commits:**
 restart the four origins, and close C19 or accept it explicitly in writing.
+
+---
+
+## §24 — P1 WIRE HALF: CLOSED AT `a755ede5`, AND A NEW ZERO-READING HAZARD
+
+Measured in a detached worktree at `a755ede5`, toplevel asserted, porcelain 0.
+
+### The finding is closed by deletion, which is the strongest available form
+
+`b7f83e72` — *"the model directory does not leave the process"*, **05:16:23**,
+ancestor of HEAD — **removes the `path` field from `ModelObject` entirely.**
+
+    path field on the models response : 0    CONTROL `id:` fields : 6
+    loopback              in routes/mod.rs : 0
+    may_disclose          in routes/mod.rs : 0
+    model_path_for_display in routes/mod.rs : 0
+    CONTROL `fn `          in routes/mod.rs : 22   (instrument reaches the file)
+
+**No field, no `flatten`, no manual `Serialize`.** Serde cannot emit a key that
+has no field, so this is not a redaction that a future caller can forget to
+apply — *the value has no route to the wire at all.* That is structural
+enforcement rather than disciplined behaviour, and it is what I have been asking
+for all night.
+
+The epitaph left behind is the best security reasoning on the branch and it went
+**further than any of us asked**: we asked for the basename; the author rejected
+the basename too, on the grounds that *a basename is the last segment of an
+operator-chosen path and its contents are therefore unbounded* — safe here "by
+luck, not by construction" — and published `id` instead precisely because it is
+**authored at launch via `--model-id` rather than salvaged from the filesystem**.
+It also names the inversion nobody else did: **the ungated endpoint was
+disclosing strictly more than the admin-gated one.**
+
+### 🆕 C20 — the absence is correct but UNLOCKED (🟡, non-blocking)
+
+    tests asserting /v1/models carries no path : 0
+    CONTROL 'models' in tests/http.rs         : 2   (the file does test this route)
+
+Nothing goes red if the field returns. The property currently rests on the
+epitaph being read. **A comment is a request; a test is a constraint.** One
+assertion that the `/v1/models` body has no `path` key converts this from a fix
+into an invariant. This is the same shape as the Lead's ratified *"the caveat
+expires"* guard, applied to a deletion instead of a caveat.
+
+### ⚠️ The instrument hazard, and it is a new class
+
+The wire half was reported live at HEAD on two pieces of evidence, and **both
+were sound instruments pointed at a moving subject** — the fix landed at 05:16,
+mid-discussion.
+
+**① A doc comment was quoted as runtime behaviour.** The cited
+`/// Absolute on loopback; the basename otherwise` is the exact text I deleted at
+`fa1fd425` as *stale prose describing a conditional that no longer existed*. It
+described the code's past, not its present, and it was read as the present.
+That is §13/§19 exactly, now claiming a third victim.
+
+**② And the sharp one — `model_path_for_display in routes/mod.rs = 0` was read
+as "this file rolls its own conditional instead of using the shared helper."
+At `a755ede5` that same zero means "there is no path here to display."**
+
+> **A zero on a helper-usage count cannot distinguish REIMPLEMENTED from
+> ELIMINATED — and those are opposite verdicts. One is a divergence risk worth
+> filing; the other is the fix you were looking for. The control that separates
+> them is not "does the instrument reach the file" — mine did, 22 functions —
+> it is "does the SUBJECT of the helper still exist."**
+
+I had filed the two-mechanism divergence risk myself and I would have re-filed it
+tonight on this same zero. The divergence is closed the only way a divergence can
+truly close: **one of the two mechanisms no longer exists.**
