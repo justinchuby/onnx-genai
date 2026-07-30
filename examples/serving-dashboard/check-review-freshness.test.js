@@ -102,7 +102,7 @@ test('every review document that declares a measurement SHA declares a real one'
   // adopting the marker makes this red until the name is removed, and a NEW
   // abstainer makes it red immediately. Green means the drain has not widened,
   // never that the corpus is complete.
-  const KNOWN_ABSTAINERS = ['IMPLEMENTATION-REVIEW.md', 'REVIEWER-BRIEF.md'];
+  const KNOWN_ABSTAINERS = ['REVIEWER-BRIEF.md'];
   const unexpected = abstainers.filter((d) => !KNOWN_ABSTAINERS.includes(d));
   assert.deepEqual(
     unexpected,
