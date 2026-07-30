@@ -30,6 +30,28 @@ struct Paths {
 }
 
 fn main() {
+    // The vendored MLAS subset is compiled with GCC/Clang-style flags
+    // (`-include`, `-mavx512f`), GNU-as `.S` kernels, and links `stdc++`, so it
+    // only builds on x86-64 Linux — the scope this crate documents.
+    //
+    // `mlas-sys` is nonetheless a workspace member, so a plain
+    // `cargo check --workspace` on any other host would fail here even though
+    // the `mlas` feature is opt-in and off by default. On MSVC, for example,
+    // `cl.exe` rejects `-include` and `gelu.cpp` then fails on the undeclared
+    // `M_SQRT1_2`. Skip the native build on unsupported targets — loudly, so the
+    // skip is inspectable rather than a silent fallback — instead of breaking
+    // the whole workspace for every non-Linux contributor.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_os != "linux" || target_arch != "x86_64" {
+        println!(
+            "cargo:warning=mlas-sys: the vendored MLAS build supports x86_64-linux only; \
+             skipping the native build for {target_arch}-{target_os}. The `mlas` feature is \
+             unavailable on this target and linking `mlas_*` symbols will fail."
+        );
+        return;
+    }
+
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vendor = root.join("vendor/mlas/onnxruntime");
     let lib = vendor.join("core/mlas/lib");
