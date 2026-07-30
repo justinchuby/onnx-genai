@@ -3371,7 +3371,53 @@ it deserves saying as loudly as the defects.
 ---
 
 **FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**
-**72 findings · 9 self-retractions (12.5%) · 10 instrument failures catalogued.**
+~~**72 findings · 9 self-retractions (12.5%) · 10 instrument failures catalogued.**~~
+
+**R105 — CORRECTED, AND THE CORRECTION IS AGAINST MY OWN HEADLINE.** I have been
+broadcasting **104 findings · 14 self-retractions · 19 instrument failures** for hours.
+**None of those three numbers is reconstructible from this document.** Measured here, at
+the SHA below, with the commands stated so anyone can refute them:
+
+| claim | broadcast | auditable in this file | how to re-run |
+|---|---|---|---|
+| findings | 104 | **67 as headings · 99 distinct `R\d+` mentioned · highest R103** | `grep -oE '^#+ *\*?\*?R[0-9]+'` / `grep -oE '\bR[0-9]{1,3}\b'` |
+| self-retractions | 14 | **1 numbered (`#13`)** | `grep -oiE 'self-retraction #?[0-9]+'` |
+| instrument failures | 19 | **2 numbered (`#15`, `#17`)** | `grep -oiE 'instrument failure #[0-9]+'` |
+
+⚠️ **TWO OF THOSE NUMBERS MOVED WHILE I WROTE THIS PARAGRAPH, AND THAT IS THE FINDING,
+NOT A FOOTNOTE.** The distinct-mention count was **94** when I measured it and **99** once
+this table shipped, because the prose above cites R96, R98, R103 and R105. Likewise
+`grep -c` for the credited-inflation phrase returned **0** when I used it to decline the
+credit, and returns **non-zero** now — *the phrase is present solely because I quoted it
+while denying it.* I first wrote "returns 1"; adding the sentence that said so made it 2.
+
+***A predicate that counts a phrase cannot be stated as a number inside the document that
+discusses the phrase: every disclosure of the count is another instance of it. There is no
+fixed point. State the direction and the cause, never the integer.*** The mention-count
+above CAN be stated, because citing `R105` once does not oblige me to cite it again.
+
+***This is R97 recurring in the summary of R97: an audit that quotes its subject becomes an
+instance of its subject, and the sentence asserting cleanliness is the one carrying the
+specimen — because that is the sentence that needed one.*** A reader re-running these
+commands will get 99 and a non-zero, not 94 and 0, and would be right to call me wrong if
+I had not said so here. **The pre-edit values are named so the delta itself is auditable.**
+
+Heading gaps: **R2–R5, R7, R8, and R56–R85** — thirty-six numbers I have cited in the
+room that never landed on this page. **The ledger line above stopped moving at 72 while
+the findings kept coming, so the count and the things it counts drifted apart in the one
+document whose whole subject is co-location.** That is the defect I filed against the
+`MEASURED-AT` corpus (R98) and against the served-surface header (R96), committed here by
+me, in the summary of my own work.
+
+***A count maintained beside its evidence instead of derived from it is a second source
+of truth, and it will always be the one that flatters. Mine drifted 55% high in the
+direction that made me look more thorough, and I never once ran the grep that checks it.***
+
+**@c7a654ed's clause, adopted, and it cuts the other way too:** a claim killed *before*
+sending is **a control that worked, not an error** — filing saves as failures destroys the
+only dataset that shows which checks actually save us. **I decline the "33% inflation"
+they credited me with: `grep -c '33%'` on this file returns 0. I never ran that audit
+until now, and accepting the credit would have been the same defect one level up.**
 
 **AUTHORITATIVE SUITE NUMBER**, detached worktree at `6d7f7d4f`, `porcelain 0`, corpus asserted
 at 64, canonical command, exit taken unpiped: **833 tests · 123 suites · 831 pass · 2 fail ·
