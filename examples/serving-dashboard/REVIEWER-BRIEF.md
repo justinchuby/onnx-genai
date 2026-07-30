@@ -118,13 +118,34 @@ measurement apparatus itself.
 
 **And the server's own version of the defect this product exists to refuse**
 *(@f6527cc9's finding, cited to their measurement; I have not read the Rust
-myself)*: `driver.rs:511` computes **precisely which** of five conditions
+myself)*: the `ResourceLimit` decision (`grep -n 'enum ResourceLimit' `crates/onnx-genai-server/src/driver.rs`) computes **precisely which** of five conditions
 disabled continuous batching, reduces it to one bit with `.is_ok()`, and
 `:526` logs the outcome with no reason attached. The same file preserves the
 reason 155 lines later on the *recoverable* path. **The least reversible
 decision in the server carries the least diagnostic output** — a bare em-dash
 with no reason, written in Rust, in the product whose whole thesis is that an
 unexplained absence is not honest.
+
+**10. A line number is a citation with an expiry date, and nothing warns you
+when it expires.** This is not a theory. Four of us — the Lead, the Architect,
+the Critical Reviewer and me — independently cited the *same* KV-applicability
+defect as `driver.rs:511`, `:520`, `:526` and `:511` again. **All four are wrong,
+by different amounts, at the same moment.** The real statement is
+`kv_telemetry.set_applicable(!continuous_batch_supported)` and its correct
+sibling is `set_applicable(paged)`; in a 1076-line file under active edit they
+move every commit. A reviewer who follows any of our four citations lands on a
+struct field or a bare `} => {`, concludes the reviewer was confused, and
+**dismisses a live blocker because the pointer rotted.**
+
+> The failure is silent in the worst possible way: a stale line number still
+> resolves. It shows you *a* line, confidently, and nothing anywhere says
+> "this is not the line that was meant."
+
+**So this document no longer cites a line number for anything in a file it does
+not own.** Every reference above is a `grep` you can run, which re-derives the
+answer at read time and cannot be stale by construction. *(This is
+@086345a5's and @c0de4c2e's rule — publish the predicate, not the conclusion —
+and my brief was the largest single violator of it on the branch.)*
 
 ### And one about this document
 
@@ -332,20 +353,25 @@ path (`d6e57c63`, symbols re-resolved at `2582f5fb`).
 > ```
 
 ```
-driver.rs:491  let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
-driver.rs:500  kv_telemetry.set_applicable(!continuous_batch_supported);
-driver.rs:502  if continuous_batch_supported { ... }
+# LOCATE THEM YOURSELF -- do not trust a line number in this file:
+grep -nE 'set_applicable|continuous_batch_manager' crates/onnx-genai-server/src/driver.rs
 
-run_pipeline_driver          driver.rs:511
-run_fallback_engine_driver   driver.rs:580   <- still stalls behind &mut Engine
-run_static_engine_driver     driver.rs:586   <- fixed
+  set_applicable(paged)                        <- the SIBLING, done RIGHT: reads a
+                                                  returned boolean from the pipeline
+  continuous_batch_manager(max_batch).is_ok()  <- the probe, discards the reason
+  set_applicable(!continuous_batch_supported)  <- THE DEFECT: applicability INFERRED
+                                                  from the absence of a capability
+
+run_pipeline_driver          (grep -n 'fn run_pipeline_driver')
+run_fallback_engine_driver   (grep -n 'fn run_fallback_engine_driver')   <- still stalls behind &mut Engine
+run_static_engine_driver     (grep -n 'fn run_static_engine_driver')     <- fixed
 ```
 
 > **The origin that now responds fast is the one whose prefix numbers are
 > structurally zero. The origin that still stalls is the one hosting paged KV
 > and the block table.** The fix and the value are on opposite servers.
 
-Note `driver.rs:464`: KV telemetry is marked applicable when continuous batch
+Note (`grep -n 'set_applicable' crates/onnx-genai-server/src/driver.rs`): KV telemetry is marked applicable when continuous batch
 is **not** supported — the negation is deliberate, not a typo.
 
 Consequence for review: panels for the paged-KV scenarios must bind to the
