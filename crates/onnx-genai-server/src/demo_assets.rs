@@ -63,6 +63,164 @@ pub(crate) async fn missing_assets() -> Response {
     (StatusCode::NOT_FOUND, MISSING_ASSETS_MESSAGE).into_response()
 }
 
+/// File extensions the demo dashboard actually loads in a browser.
+///
+/// An allowlist rather than a denylist because the asset directory is a
+/// working source tree, not a build output: it gains files continuously and a
+/// denylist would have to be updated by whoever adds the next kind, which is
+/// the person least likely to be thinking about disclosure.
+const SERVABLE_EXTENSIONS: [&str; 9] = [
+    "html", "js", "mjs", "css", "json", "svg", "png", "ico", "woff2",
+];
+
+/// Whether `ServeDir` should be allowed to answer for this `/demo` path.
+///
+/// Returns true for paths outside `/demo` so this predicate can be used from a
+/// router-wide layer without opinion on the rest of the API.
+fn demo_path_is_servable(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/demo/") else {
+        return true;
+    };
+    // A directory request; `ServeDir` resolves it to `index.html`, which is on
+    // the list.
+    if rest.is_empty() || rest.ends_with('/') {
+        return true;
+    }
+    let name = rest.rsplit('/').next().unwrap_or(rest);
+    // Test files are `.js` and would pass the extension check. They are not
+    // secret, but they are the largest source of confusing 200s for anyone
+    // poking at the demo, and nothing in the page loads them.
+    if name.ends_with(".test.js") || name.ends_with(".test.mjs") {
+        return false;
+    }
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    SERVABLE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+/// Serves only what the page loads, out of a directory that is a source tree.
+///
+/// The asset directory is `examples/serving-dashboard`, which at the time of
+/// writing held 101 files: 15 markdown documents including an unpublished
+/// architecture and security review, two shell scripts, three Python scripts,
+/// and 47 test files. Every one of them answered `200` on the demo origin. The
+/// review document alone was 21KB of our own findings, served to any visitor
+/// of a machine running the demo.
+///
+/// This is not a traversal bug -- `ServeDir` handles traversal correctly and
+/// these files are genuinely inside the directory it was pointed at. The defect
+/// is that "the directory the assets live in" and "the set of files the demo
+/// should publish" were assumed to be the same set, and they are not.
+pub(crate) async fn restrict_demo_assets(request: Request<Body>, next: Next) -> Response {
+    if !demo_path_is_servable(request.uri().path()) {
+        // A plain 404, identical to a path that does not exist: distinguishing
+        // "refused" from "absent" would confirm the file is there.
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
+
+/// The parts of the demo policy that do not depend on where the server is bound.
+///
+/// `script-src` needs no `'unsafe-inline'`: the page loads exactly one external
+/// module and has no inline script, which was verified rather than assumed.
+///
+/// `style-src` keeps `'unsafe-inline'` as a stated concession. The markup
+/// carries no inline styles today, but the dashboard is another agent's tree
+/// under a change freeze, and a policy that blanks a panel on stage would be
+/// far worse than the risk it removes. Narrow it when the freeze lifts.
+const DEMO_CSP_PREFIX: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self'; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "img-src 'self' data:; ",
+    "object-src 'none'; ",
+    "base-uri 'self'; ",
+    "frame-ancestors 'none'; ",
+    "connect-src 'self'",
+);
+
+/// Builds the demo policy for the host the page was actually requested from.
+///
+/// `connect-src` is the directive doing the security work, and it is a
+/// browser-layer mitigation for the origin-injection defect: the dashboard
+/// takes its server origins from a query parameter, so a crafted link can aim
+/// our page at a third party and render fabricated numbers under our own
+/// provenance badges. Confining fetches to the page's own host means the
+/// parser AND the browser must both be defeated, not just the parser.
+///
+/// **Same host, any port** -- which is the topology, not laxity. The demo runs
+/// two servers on one host and the page served by one legitimately polls the
+/// other. CSP treats a differing port as a differing origin, so a bare
+/// `'self'` here would break the demo rather than secure it.
+///
+/// Derived from the request rather than from a configured bind address for two
+/// reasons: the bind address was deleted along with the path-disclosure
+/// conditional it existed to feed, and a hardcoded loopback literal silently
+/// breaks the dashboard the first time anyone overrides `BIND_HOST` -- failing
+/// closed, on stage, with a console error as the only symptom.
+///
+/// The `Host` header is client-controlled, so it is validated to a bare
+/// hostname before use; anything else falls back to `'self'` alone. This
+/// widens the policy only to the host family the user already navigated to,
+/// and it can never inject a second directive.
+fn demo_csp_for_host(host: Option<&str>) -> String {
+    let Some(host) = host.and_then(sanitised_host) else {
+        return DEMO_CSP_PREFIX.to_string();
+    };
+    format!("{DEMO_CSP_PREFIX} http://{host}:* https://{host}:*")
+}
+
+/// Strips any port and rejects anything that is not a bare hostname or IP.
+///
+/// The rejection is what keeps a header value from carrying a `;` and adding a
+/// directive of the attacker's choosing.
+fn sanitised_host(host: &str) -> Option<&str> {
+    // IPv6 literals are bracketed and would need their own escaping rules to
+    // embed safely; loopback IPv6 is already covered by `'self'`.
+    if host.starts_with('[') {
+        return None;
+    }
+    let name = host.split(':').next()?;
+    let valid = !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    valid.then_some(name)
+}
+
+/// Attaches the demo policy and `nosniff` to demo responses.
+///
+/// Scoped to `/demo` rather than applied router-wide because a policy on a JSON
+/// API response is inert, and a header that does nothing invites the belief
+/// that the whole surface is covered.
+pub(crate) async fn demo_security_headers(request: Request<Body>, next: Next) -> Response {
+    let is_demo = request.uri().path().starts_with("/demo");
+    let policy = is_demo.then(|| {
+        demo_csp_for_host(
+            request
+                .headers()
+                .get(axum::http::header::HOST)
+                .and_then(|host| host.to_str().ok()),
+        )
+    });
+    let mut response = next.run(request).await;
+    if let Some(policy) = policy {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&policy) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_SECURITY_POLICY, value);
+        }
+        response.headers_mut().insert(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        );
+    }
+    response
+}
+
 /// Redirects exactly `/demo` to `/demo/`.
 ///
 /// The trailing slash is not cosmetic. Without it the browser resolves the
@@ -86,6 +244,135 @@ pub(crate) async fn redirect_bare_demo(request: Request<Body>, next: Next) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The files that made this a real disclosure rather than tidiness.
+    #[test]
+    fn the_demo_refuses_to_serve_the_source_tree_it_lives_in() {
+        for path in [
+            "/demo/ARCHITECTURE-SECURITY-REVIEW.md",
+            "/demo/REVIEWER-BRIEF.md",
+            "/demo/README.md",
+            "/demo/run-demo.sh",
+            "/demo/design/notes.md",
+            "/demo/scripts/build.py",
+        ] {
+            assert!(
+                !demo_path_is_servable(path),
+                "{path} would be published to any visitor of the demo origin"
+            );
+        }
+    }
+
+    /// Test files are `.js` and pass the extension check, so they need their
+    /// own rule -- and nothing on the page loads them.
+    #[test]
+    fn the_demo_refuses_to_serve_its_own_tests() {
+        assert!(!demo_path_is_servable("/demo/format.test.js"));
+        assert!(!demo_path_is_servable("/demo/dashboard/honesty.test.js"));
+    }
+
+    /// The half that matters more: a restriction that breaks the demo is worse
+    /// than the disclosure it prevents. These are the paths the page actually
+    /// loads, taken from `index.html` and its module graph.
+    #[test]
+    fn the_demo_still_serves_everything_the_page_loads() {
+        for path in [
+            "/demo/",
+            "/demo/index.html",
+            "/demo/app.js",
+            "/demo/format.js",
+            "/demo/dashboard/scheduling.js",
+            "/demo/styles/tokens.css",
+            "/demo/styles/shell.css",
+            "/demo/styles/panels.css",
+            "/demo/telemetry-provenance.js",
+            "/demo/assets/icon.svg",
+        ] {
+            assert!(
+                demo_path_is_servable(path),
+                "{path} is loaded by the page and must still be served"
+            );
+        }
+    }
+
+    /// The predicate is mounted router-wide, so it must have no opinion about
+    /// the API. Without this, one over-broad edit here takes out `/v1`.
+    #[test]
+    fn the_restriction_has_no_opinion_about_the_api() {
+        for path in ["/v1/status", "/v1/debug/kv/blocks", "/metrics", "/demo"] {
+            assert!(demo_path_is_servable(path));
+        }
+    }
+
+    /// Case is not a bypass: `ServeDir` will happily open `NOTES.MD`.
+    #[test]
+    fn extension_matching_is_case_insensitive() {
+        assert!(!demo_path_is_servable("/demo/NOTES.MD"));
+        assert!(!demo_path_is_servable("/demo/RUN-DEMO.SH"));
+        assert!(demo_path_is_servable("/demo/APP.JS"));
+    }
+
+    /// An extensionless file is a source-tree artefact (LICENSE, Makefile,
+    /// Dockerfile); nothing the page loads lacks an extension.
+    #[test]
+    fn extensionless_paths_are_not_served() {
+        assert!(!demo_path_is_servable("/demo/LICENSE"));
+        assert!(!demo_path_is_servable("/demo/Dockerfile"));
+    }
+
+    /// Same host, any port: the demo runs two servers on one host and the page
+    /// served by one legitimately polls the other. CSP treats a differing port
+    /// as a differing origin, so a bare `'self'` would break the demo.
+    #[test]
+    fn the_demo_policy_permits_the_sibling_server_on_another_port() {
+        let policy = demo_csp_for_host(Some("127.0.0.1:8123"));
+        assert!(
+            policy.contains("connect-src 'self' http://127.0.0.1:* https://127.0.0.1:*"),
+            "got: {policy}"
+        );
+    }
+
+    /// The policy must follow the host the page was served from, not a
+    /// hardcoded loopback literal -- otherwise overriding `BIND_HOST` breaks
+    /// the dashboard on stage with a console error as the only symptom.
+    #[test]
+    fn the_demo_policy_follows_the_host_the_page_was_served_from() {
+        assert!(demo_csp_for_host(Some("demo.internal:8124")).contains("http://demo.internal:*"));
+        assert!(!demo_csp_for_host(Some("demo.internal:8124")).contains("127.0.0.1"));
+    }
+
+    /// The `Host` header is client-controlled. A value carrying a `;` would
+    /// append a directive of the attacker's choosing to our own policy.
+    #[test]
+    fn a_crafted_host_header_cannot_inject_a_directive() {
+        for host in [
+            "evil.com; script-src *",
+            "host with spaces",
+            "a\r\nX-Injected: 1",
+            "",
+            "[::1]:8123",
+        ] {
+            let policy = demo_csp_for_host(Some(host));
+            assert_eq!(
+                policy, DEMO_CSP_PREFIX,
+                "a host that is not a bare hostname must fall back to 'self' \
+                 alone; got: {policy}"
+            );
+        }
+    }
+
+    /// The concessions must stay where they were reasoned about.
+    #[test]
+    fn the_demo_policy_forbids_inline_script_and_framing() {
+        assert!(DEMO_CSP_PREFIX.contains("script-src 'self';"));
+        assert!(
+            !DEMO_CSP_PREFIX.contains("script-src 'self' 'unsafe-inline'"),
+            "the page has no inline script, so this concession is not needed \
+             and would forfeit the policy's main protection"
+        );
+        assert!(DEMO_CSP_PREFIX.contains("frame-ancestors 'none'"));
+        assert!(DEMO_CSP_PREFIX.contains("object-src 'none'"));
+    }
 
     #[test]
     fn missing_directory_resolves_to_none_rather_than_failing() {

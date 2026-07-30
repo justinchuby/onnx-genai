@@ -135,6 +135,10 @@ pub fn app(state: AppState) -> Router {
         // Outside routing: `nest_service("/demo", ..)` already claims the bare
         // `/demo` path, so the trailing-slash redirect cannot be a route.
         .layer(middleware::from_fn(demo_assets::redirect_bare_demo))
+        // Outside routing for the same reason as the redirect: the mount owns
+        // `/demo/{*path}`, so the refusal cannot be expressed as a route.
+        .layer(middleware::from_fn(demo_assets::restrict_demo_assets))
+        .layer(middleware::from_fn(demo_assets::demo_security_headers))
 }
 
 async fn trace_request(request: Request, next: Next) -> Response {
