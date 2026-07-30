@@ -354,7 +354,7 @@ For each boundary: what the **caller** must guarantee, what the **callee** guara
 
 ### 4.5 Model directory boundary
 
-- **`ModelDirectory::load`** (`crates/onnx-runtime-loader/tests/loader.rs::tensor_type`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
+- **`ModelDirectory::load`** (`crates/onnx-genai-ort/src/loader.rs::load`) is the validation gate. It requires the root to be a directory (`:36-42`), then resolves `decoder.onnx` or exactly one `.onnx` (`:391`, `:412`) plus `tokenizer.json` (`:65-69`).
 - **Canonical errors:** `model directory does not exist: {}` (`crates/onnx-genai-ort/src/loader.rs::load`), `tokenizer.json not found in {}` (`crates/onnx-genai-ort/src/loader.rs::load_flat`).
 - ✅ **Duplication removed:** the server's `--models-dir` fan-out previously ran a *second, laxer* filter that accepted `tokenizer.json` **OR** `model.onnx` **OR** `genai_config.json`, so a directory could pass admission and then fail at load. It now delegates to the loader (`crates/onnx-genai-server/src/models_config.rs::from_models_dir`). See §5.12 and §8.6.
 
