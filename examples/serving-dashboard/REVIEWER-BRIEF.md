@@ -4,6 +4,22 @@ Read this before running anything. It lists the reds that are not ours, the fix
 that landed on only one code path, the four fields whose captions are wrong, two
 ratios that behave oppositely on purpose, and what we refused to ship.
 
+```
+MEASURED-AT: 0bc86726
+BOTH DENOMINATORS — THERE ARE TWO SUITES AND ONE WORD FOR THEM:
+  JS    run-tests.sh                            646 tests / 98 suites / 0 fail / raw exit 0
+        at 0bc86726 (review-2), detached, porcelain 0
+  RUST  cargo test -p onnx-genai-server --no-fail-fast
+                                                264 passed / 0 failed / 4 IGNORED / raw exit 0
+        at crates/ tree e613bf7a, ACROSS 6 TEST BINARIES (cargo never prints the sum)
+  THE 4 SKIPS ARE ALL MISSING-FIXTURE GATES, EACH NAMED IN ITS OWN `#[ignore]` STRING.
+  NOT ONE IS A SECURITY TEST. There is no red on clone.
+SCOPE OF THIS BRIEF'S GATE: BUILD-AND-EVIDENCE ONLY. IT EXCLUDES ALL RUNTIME.
+  One live P0 sits OUTSIDE it: the demo origins run a binary from a DIFFERENT
+  REPOSITORY (`GitHub/onnx-genai`), started 2h+ before every fix. No commit here
+  closes it. See §9.6.
+```
+
 Every claim below is stamped with the short HEAD it was verified at, read via
 `git rev-parse --short HEAD` in the same shell invocation as the observation.
 The tree moved under us repeatedly while this was written, which is why the
@@ -4563,3 +4579,86 @@ words:** *the desk is not the commit, the commit is not the process, and a true
 measurement of any of the three expires.* **We built thirteen instruments to catch false
 claims, and almost nothing tonight was ever false. It was true, and then it wasn't, and
 nothing told us.**
+
+---
+
+## §9.7 — @12e42da8's `block_window` gap: PLACED, not declined. And my one "hit" was a false coverage twice over.
+
+**@0837fdf9 found that a grep certifies this brief as covering the `block_window`
+ambiguity. It does not.** I opened my own match rather than counting it:
+
+```
+MY ONLY HIT, :935 →  "kv/telemetry.rs:226  pub fn block_window(&self, ..) -> Vec<BlockState>"
+  ⛔ WRONG SUBJECT — it is evidence in my BORROW-CHECKER argument (&self vs &mut).
+  ⛔ WRONG LOCATION — block_window is at page_table.rs:913. telemetry.rs:226 is `}`.
+```
+
+**My single citation lands on a lone closing brace** — which is precisely the signal
+@e00032a4 shipped a detector for one hour ago (*rot into the middle of a file, which a
+range check is structurally blind to because files grow*). **Their guard would have
+caught my line. It fires on my file, and I am recording that rather than quietly fixing
+the number.**
+
+> **RULE 33. A hit is not a coverage. Counting matches measures whether a token appears;
+> only opening them measures whether the subject is discussed. Every "is it covered?"
+> question answered with `grep -c` tonight has been answered with the wrong instrument —
+> and the answer it gives is always the reassuring one.**
+
+### The ambiguity, stated WITH its discriminator — verified in source, not relayed
+
+```
+page_table.rs:913  pub fn block_window(&self, start, count) -> Vec<PageBlock>
+    ids.iter().skip(start).take(count).filter_map(..).collect()
+
+  RETURNS AN EMPTY VEC IN TWO DISTINCT CASES:
+    (a) the mirror/page set is ABSENT or empty
+    (b) the window STARTS BEYOND the pages that exist
+  ⬅ `[]` ON THE WIRE IS **ABSENT** AND **ZERO** WEARING THE SAME COAT.
+
+telemetry.rs:355   pub fn mirrored_block_capacity(&self) -> usize {
+                       self.blocks.get().map_or(0, |blocks| blocks.len())
+                   }
+  ⬅ **0 IFF THE MIRROR IS ABSENT**, NON-ZERO WHEN IT EXISTS BUT THE WINDOW OVERSHOT.
+    THIS IS THE DISCRIMINATOR. THE TWO CASES **ARE** RECOVERABLE.
+```
+
+**@12e42da8's warning about brevity is the load-bearing half and I am obeying it: stating
+the ambiguity without `mirrored_block_capacity()` would tell a reader the cases are
+*unrecoverable*, which is false, and which argues for collapsing them — the exact merge
+D286 exists to prevent. A half-stated ambiguity is worse than an unstated one: it argues
+for the wrong fix with the authority of a disclosure.**
+
+### And the fact I add to it, measured, which strengthens their item rather than softening it
+
+**Their formulation says the two are recoverable *"only if the renderer reads both."* I
+measured whether it can:**
+
+```
+mirrored_block_capacity  in ANY shipped .js  ->  **0**
+block_window             in ANY shipped .js  ->  **0**
+CONTROL server.model_id  in shipped .js      ->   9   ✅ instrument reaches .js
+```
+
+> **The discriminator exists in Rust and is invisible to the client. The renderer reads
+> NEITHER symbol. So the recovery is real in principle and unavailable in practice
+> today — and any renderer that starts drawing `block_window` before it reads
+> `mirrored_block_capacity` inherits the ambiguity in full.**
+
+**That is the ordering constraint @bb2ee824 wrote into the `NEVER_BIND` ban and
+@c0de4c2e drew on the router's `Option<T>`, appearing a third time in a third subsystem:
+two correct things whose safety depends on which is wired first.** The prerequisite:
+**never bind `block_window` without binding `mirrored_block_capacity` in the same
+commit.**
+
+**And the codebase already documents the sibling defect one field over**, at
+`telemetry.rs:359-364`, in its author's own words: *a client handed only the mirror
+length can compute an occupancy greater than one and be unable to tell whether that is
+overload or truncation.* **The pattern was known, written down, and the adjacent
+instance still shipped unstated.**
+
+### Header
+
+The brief now **leads** with `MEASURED-AT`, both denominators, and its own scope
+exclusion — per the same order. **The cargo half is no longer a pending red: the
+`#[ignore]` landed, and I ran the suite. 264/0/4, raw exit 0. A reviewer will not
+discover a red on clone.**
