@@ -35,6 +35,19 @@ import { createTelemetryStore } from '../telemetry-store.js';
 
 const DASHBOARD_DIR = fileURLToPath(new URL('./', import.meta.url));
 
+// `ui/` requests field keys too. It was outside this audit's corpus until
+// 2026-07-30, which is the failure mode this file exists to prevent, one level
+// up: not a vacuous ASSERTION but a vacuous CORPUS. Every reconciliation below
+// was green over a directory it never opened, and a directory nobody reads is
+// indistinguishable from a directory with nothing to say.
+const UI_DIR = fileURLToPath(new URL('../ui/', import.meta.url));
+const PACKAGE_DIR = fileURLToPath(new URL('../', import.meta.url));
+
+const SOURCE_DIRS = [
+  ['dashboard/', DASHBOARD_DIR],
+  ['ui/', UI_DIR],
+];
+
 /**
  * Keys the panels are known to request before anything publishes them, each
  * with the reason it is not a typo. Anything here renders an em-dash today.
@@ -128,10 +141,39 @@ const LATENCY_PERCENTILES = ['p50', 'p95', 'max'];
 // "nothing wrong here" and "I could not look here" with the identical green.
 const DYNAMIC_KEY_SITES = new Map([
   [
-    'throughput.js',
-    'latency rows build `${definition.prefix}_${percentile}`; reconstructed here ' +
-      'from each `prefix:` crossed with LATENCY_PERCENTILES',
+    'dashboard/throughput.js',
+    {
+      rule:
+        'latency rows build `${definition.prefix}_${percentile}`; reconstructed here ' +
+        'from each `prefix:` crossed with LATENCY_PERCENTILES',
+      extract: (source) => {
+        const built = [];
+        for (const match of source.matchAll(/prefix: '([A-Za-z0-9_.-]+)'/g)) {
+          for (const percentile of LATENCY_PERCENTILES) built.push(`${match[1]}_${percentile}`);
+        }
+        return built;
+      },
+    },
   ],
+  [
+    'ui/model-card.js',
+    {
+      rule:
+        'CARD_FIELDS rows are forwarded to `field(key)` by the render loop; ' +
+        'reconstructed here from each `key:` entry in the table',
+      extract: (source) => [...source.matchAll(/key: '([A-Za-z0-9_.-]+)'/g)].map((m) => m[1]),
+    },
+  ],
+]);
+
+// A FORWARDER takes a key from its caller and hands it to the store unchanged.
+// It originates no key, so there is nothing here for this audit to enumerate --
+// the keys it passes are written as literals at the CALL sites, which are in the
+// corpus. This is a genuinely different category from a site that BUILDS a key,
+// and collapsing the two would redden a file that is behaving correctly. A guard
+// that reddens on correct work is a guard somebody switches off.
+const KEY_FORWARDERS = new Map([
+  ['dashboard/store-adapter.js', 'generic adapter; every `key` is a parameter supplied by a panel'],
 ]);
 
 // DELIBERATELY WIDER THAN THE KEYS WE SHIP. A narrow `[a-z0-9_.]` does not
@@ -140,11 +182,47 @@ const DYNAMIC_KEY_SITES = new Map([
 // exists to catch, and it was the one input invisible to it.
 const KEY_LITERAL = /\.(?:field|series)\(\s*'([A-Za-z0-9_.-]+)'/g;
 
-/** Panel sources, excluding tests. */
+/** Panel sources, excluding tests. Names in `ui/` carry their directory. */
 function panelSources() {
-  return readdirSync(DASHBOARD_DIR)
-    .filter((name) => name.endsWith('.js') && !name.endsWith('.test.js'))
-    .map((name) => [name, stripComments(readFileSync(`${DASHBOARD_DIR}${name}`, 'utf8'))]);
+  const sources = [];
+  for (const [prefix, dir] of SOURCE_DIRS) {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.js') || name.endsWith('.test.js')) continue;
+      sources.push([`${prefix}${name}`, stripComments(readFileSync(`${dir}${name}`, 'utf8'))]);
+    }
+  }
+  return sources;
+}
+
+// Files that call field()/series() but request no key from the real store. Each
+// needs a REASON, because "outside the corpus" and "audited and found clean" are
+// otherwise written down identically.
+const CORPUS_EXEMPT = new Map([
+  [
+    'dashboard/testing/fake-store.js',
+    'test double; `this.series(...)` is a call into its own implementation, ' +
+      'not a request for a published key',
+  ],
+]);
+
+/** Every non-test source in the package, comment-stripped, for corpus checks. */
+function packageSources() {
+  const sources = [];
+  const walk = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      if (entry.isDirectory()) {
+        walk(`${dir}${entry.name}/`, `${prefix}${entry.name}/`);
+      } else if (entry.name.endsWith('.js') && !entry.name.endsWith('.test.js')) {
+        sources.push([
+          `${prefix}${entry.name}`,
+          stripComments(readFileSync(`${dir}${entry.name}`, 'utf8')),
+        ]);
+      }
+    }
+  };
+  walk(PACKAGE_DIR, '');
+  return sources;
 }
 
 /** Every field/series key any panel actually requests. */
@@ -157,12 +235,10 @@ function requestedKeys() {
     }
 
     // Reconstruct the keys this file builds rather than writes.
-    if (!DYNAMIC_KEY_SITES.has(name)) continue;
-    for (const match of source.matchAll(/prefix: '([A-Za-z0-9_.-]+)'/g)) {
-      for (const percentile of LATENCY_PERCENTILES) {
-        const key = `${match[1]}_${percentile}`;
-        if (!keys.has(key)) keys.set(key, name);
-      }
+    const site = DYNAMIC_KEY_SITES.get(name);
+    if (!site) continue;
+    for (const key of site.extract(source)) {
+      if (!keys.has(key)) keys.set(key, name);
     }
   }
   return keys;
@@ -267,19 +343,49 @@ describe('the audit can see what it claims to audit', () => {
     // a key the scanner cannot parse must never be silently skipped. If a new
     // panel starts composing keys, this goes red until someone teaches the
     // extractor the rule -- rather than quietly auditing a smaller dashboard.
+    //
+    // This tests for ANY non-literal argument, not just a template literal. A
+    // bare `field(key)` is exactly as opaque to a literal-scanner as `field(`${x}`)`
+    // is, and for the same reason; testing only for a backtick would have caught
+    // the one opaque shape somebody happened to think of.
     const unexplained = [];
     for (const [name, source] of panelSources()) {
-      if (DYNAMIC_KEY_SITES.has(name)) continue;
-      if (/\.(?:field|series)\(\s*`/.test(source)) {
-        unexplained.push(name);
-      }
+      if (DYNAMIC_KEY_SITES.has(name) || KEY_FORWARDERS.has(name)) continue;
+      const opaque = [...source.matchAll(/\.(?:field|series)\(\s*([^'"\s)][^,)]*)/g)];
+      if (opaque.length > 0) unexplained.push(`${name} (${opaque[0][1].trim()})`);
     }
     assert.deepEqual(
       unexplained,
       [],
-      `${unexplained.join(', ')} build field keys from a template literal, which this ` +
-        'audit cannot read. Add the file to DYNAMIC_KEY_SITES with the rule that ' +
-        'reconstructs its keys, or those keys are audited by nothing.',
+      `${unexplained.join(', ')} pass a non-literal argument to field()/series(), which ` +
+        'this audit cannot read. Enumerate the generated keys: add the file to ' +
+        'DYNAMIC_KEY_SITES with the rule that reconstructs them, or to KEY_FORWARDERS ' +
+        'if it only relays a caller-supplied key. Otherwise those keys are audited by nothing.',
+    );
+  });
+
+  // ANTI-VACUITY, ONE LEVEL UP. The assertions above are only as wide as the
+  // corpus panelSources() returns. `ui/` sat outside it and every one of them
+  // was green over a directory it never opened.
+  //
+  // This requirement is derived from the CODE, never from SOURCE_DIRS. A corpus
+  // checked against its own definition is a mirror, not an inventory: deleting a
+  // directory from SOURCE_DIRS would delete the assertion that notices. The
+  // first version of this test did exactly that and passed its own mutation.
+  it('reads every file that calls field() or series()', () => {
+    const inCorpus = new Set(panelSources().map(([name]) => name));
+    const unread = [];
+    for (const [rel, source] of packageSources()) {
+      if (!/\.(?:field|series)\(/.test(source)) continue;
+      if (inCorpus.has(rel) || CORPUS_EXEMPT.has(rel)) continue;
+      unread.push(rel);
+    }
+    assert.deepEqual(
+      unread,
+      [],
+      `${unread.join(', ')} call field()/series() but are outside this audit's corpus, ` +
+        'so the keys they request are reconciled by nothing. Add the directory to ' +
+        'SOURCE_DIRS, or the file to CORPUS_EXEMPT with the reason it requests no key.',
     );
   });
 });
