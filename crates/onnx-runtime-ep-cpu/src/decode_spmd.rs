@@ -171,10 +171,12 @@ fn decode_blocktime() -> Duration {
 const DISPATCHER_SPIN_BEFORE_YIELD: u32 = 1 << 12;
 
 /// Default number of dynamic tiles per resident worker in work-stealing mode.
-/// Two tiles per worker gives an idle worker something meaningful to steal when
-/// a peer is delayed, without multiplying MLAS SQNBit shard calls enough to
-/// recreate the per-node dispatch overhead the SPMD pool removed.
-const DEFAULT_STEAL_TILES_PER_WORKER: usize = 2;
+/// One tile per worker preserves the coarse MLAS QNBit shard size that made
+/// fixed-SPMD fast, while Deckard's pool can still steal a not-yet-claimed tile
+/// from a delayed worker. Finer 2x/3x tiling improved theoretical steal
+/// opportunities but split Qwen3 projection shards too narrowly and regressed
+/// measured throughput.
+const DEFAULT_STEAL_TILES_PER_WORKER: usize = 1;
 /// Minimum output columns in one dynamic tile. Keeps MLAS/KAI/hand GEMV calls
 /// coarse enough that the extra atomic `fetch_add` scheduling is amortized.
 const MIN_STEAL_OUTPUTS_PER_TASK: usize = 32;
@@ -347,12 +349,18 @@ impl SharedState {
 /// A persistent SPMD decode pool: hot worker threads plus the shared barrier
 /// state that drives them.
 pub struct SpmdDecodePools {
-    shared: Arc<SharedState>,
+    shared: Option<Arc<SharedState>>,
     /// Owned join handles, held behind a `Mutex` so [`SpmdDecodePools::shutdown`]
     /// can join the workers through a shared `&self` (the pool is reached as a
     /// `&'static` through [`pools`]). Only touched at teardown, never on the hot
     /// path. Drained on the first shutdown so the operation is idempotent.
     join_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Deckard's Eigen-style persistent work-stealing pool. In `Steal` mode this
+    /// is the only resident worker set: decode ops publish coarse MLAS/KAI tiles
+    /// directly to this pool so delayed workers do not strand a static SPMD
+    /// shard behind a hard barrier.
+    #[cfg(feature = "mlas")]
+    work_stealing_pool: Option<mlas_sys::WorkStealingThreadPool>,
     /// Workers assigned to each node, node-major, matching global worker index
     /// order (workers `0..counts[0]` are node 0, and so on).
     node_worker_counts: Vec<usize>,
@@ -368,7 +376,11 @@ enum DecodeSchedule {
 
 fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
     match raw.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
+        Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
+        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
+        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
         _ => DecodeSchedule::Fixed,
     }
@@ -413,6 +425,21 @@ impl SpmdDecodePools {
         }
         let total_workers = assignment.len();
 
+        #[cfg(feature = "mlas")]
+        if schedule == DecodeSchedule::Steal {
+            return Self {
+                shared: None,
+                join_handles: Mutex::new(Vec::new()),
+                work_stealing_pool: Some(
+                    mlas_sys::WorkStealingThreadPool::new(total_workers)
+                        .expect("spawn persistent work-stealing decode pool"),
+                ),
+                node_worker_counts,
+                total_workers,
+                schedule,
+            };
+        }
+
         let shared = Arc::new(SharedState {
             node_sense: (0..node_count).map(|_| Padded(AtomicU32::new(0))).collect(),
             job: UnsafeCell::new(None),
@@ -456,8 +483,10 @@ impl SpmdDecodePools {
         // Snapshot the worker `Thread`s for teardown join only; the hot dispatch
         // path wakes workers via the per-node futex, not per-thread `unpark`.
         Self {
-            shared,
+            shared: Some(shared),
             join_handles: Mutex::new(handles),
+            #[cfg(feature = "mlas")]
+            work_stealing_pool: None,
             node_worker_counts,
             total_workers,
             schedule,
@@ -488,6 +517,12 @@ impl SpmdDecodePools {
     /// must not race a live decode dispatch -- after it returns the workers are
     /// gone and the pool must not be dispatched to again.
     pub fn shutdown(&self) {
+        if self.shared.is_none() {
+            return;
+        }
+        let Some(shared) = self.shared.as_ref() else {
+            return;
+        };
         // Take the handles first so concurrent callers can't double-join; if
         // another thread already drained them, there is nothing to do.
         let handles: Vec<JoinHandle<()>> = {
@@ -505,8 +540,8 @@ impl SpmdDecodePools {
         // worker so it leaves the park. The bump-then-wake ordering (mirroring the
         // dispatch path) wakes a worker that raced into parking: it either sees
         // the advanced sense under the futex guard or is woken by `wake_all`.
-        self.shared.shutdown.store(true, Ordering::SeqCst);
-        for sense in &self.shared.node_sense {
+        shared.shutdown.store(true, Ordering::SeqCst);
+        for sense in &shared.node_sense {
             sense.0.fetch_add(1, Ordering::Release);
             atomic_wait::wake_all(&sense.0);
         }
@@ -524,7 +559,20 @@ impl SpmdDecodePools {
     where
         F: Fn(usize) + Sync,
     {
-        self.shared.panic_if_poisoned();
+        #[cfg(feature = "mlas")]
+        if let Some(pool) = &self.work_stealing_pool {
+            pool.parallel_for(0, self.total_workers, 1, |begin, end| {
+                for global_index in begin..end {
+                    job(global_index);
+                }
+            });
+            return;
+        }
+        let shared = self
+            .shared
+            .as_ref()
+            .expect("fixed SPMD dispatch requires shared worker state");
+        shared.panic_if_poisoned();
         unsafe fn call<F>(data: *const (), global_index: usize)
         where
             F: Fn(usize) + Sync,
@@ -538,9 +586,9 @@ impl SpmdDecodePools {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
         };
-        self.shared.publish(job, &self.node_worker_counts);
-        self.shared.wait();
-        self.shared.panic_if_poisoned();
+        shared.publish(job, &self.node_worker_counts);
+        shared.wait();
+        shared.panic_if_poisoned();
     }
 
     /// Split `n` output rows across the node groups proportionally to their
@@ -731,6 +779,24 @@ impl SpmdDecodePools {
         if self.uses_work_stealing() {
             let next = AtomicUsize::new(0);
             let next = &next;
+            #[cfg(feature = "mlas")]
+            if let Some(pool) = &self.work_stealing_pool {
+                pool.parallel_for(0, segments.len(), 1, |begin, end| {
+                    for task_index in begin..end {
+                        let (start, len) = table.segments[task_index];
+                        if len == 0 {
+                            continue;
+                        }
+                        // SAFETY: dynamic segments are disjoint, in-bounds
+                        // column ranges; each task index is claimed once by
+                        // exactly one work-stealing chunk.
+                        let outputs =
+                            unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+                        compute(task_index, start, outputs);
+                    }
+                });
+                return;
+            }
             let job = move |_global_index: usize| loop {
                 let task_index = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&(start, len)) = table.segments.get(task_index) else {
@@ -888,6 +954,24 @@ impl SpmdDecodePools {
             segments: &segments,
         };
         let table = &table;
+        #[cfg(feature = "mlas")]
+        if let Some(pool) = &self.work_stealing_pool {
+            pool.parallel_for(0, segments.len(), 1, |begin, end| {
+                for task_index in begin..end {
+                    let (start, len) = table.segments[task_index];
+                    if len == 0 {
+                        continue;
+                    }
+                    // SAFETY: each dynamic tile is a disjoint, in-bounds row
+                    // range, and the work-stealing pool hands every tile chunk
+                    // to exactly one worker.
+                    let outputs =
+                        unsafe { std::slice::from_raw_parts_mut(table.base.add(start), len) };
+                    compute(start, outputs);
+                }
+            });
+            return;
+        }
         let next = AtomicUsize::new(0);
         let next = &next;
         let job = move |_global_index: usize| loop {
@@ -1366,7 +1450,7 @@ fn report_spmd_fallback(message: &str) {
 /// otherwise. See `docs/ERROR_AND_LOGGING_CONVENTIONS.md` for level guidance.
 fn report_pool_built(mode: PersistenceMode) {
     let label = match mode {
-        PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "spmd-pool-steal",
+        PersistenceMode::On if decode_schedule() == DecodeSchedule::Steal => "work-stealing-pool",
         PersistenceMode::On => "spmd-pool",
         PersistenceMode::Adaptive => "adaptive",
         PersistenceMode::Off => "flat",
@@ -1912,12 +1996,12 @@ mod tests {
     }
 
     #[test]
-    fn work_stealing_segments_create_coarse_extra_tiles() {
+    fn work_stealing_segments_preserve_coarse_default_tiles() {
         let pool = single_group_pool_with_schedule(4, DecodeSchedule::Steal);
         let segments = pool.output_column_segments(2048, 16);
         assert!(
-            segments.len() > pool.total_workers(),
-            "work-stealing mode should expose more tiles than workers"
+            segments.len() >= pool.total_workers(),
+            "work-stealing mode must expose at least one stealable tile per worker"
         );
         let mut expected_start = 0;
         for (start, len) in segments {

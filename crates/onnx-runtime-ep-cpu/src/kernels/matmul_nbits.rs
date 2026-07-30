@@ -18,8 +18,10 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+#[cfg(feature = "mlas")]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
