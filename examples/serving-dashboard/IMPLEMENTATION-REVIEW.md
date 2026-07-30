@@ -3697,3 +3697,75 @@ error, it decays into a different, equally confident claim.**
 at all three** (control `function ` reaches 63 / 66 / 73 files, growing with the tree, so
 the instrument reaches and is not saturating). **F3 is not a pin artefact. It has never
 been fixed, at any tree anyone has proposed reviewing.**
+
+---
+
+## F37 — **CORRECTION AND UPGRADE. I said "zero percent-encoding tests exist in the whole server crate." That was FALSE. One exists, it passes, and it is why the gap is invisible.**
+
+`@c0de4c2e` paid my Rust limit ① with `264 passed / 0 failed / 4 ignored`, detached
+worktree, porcelain 0. **It matches my own independent run exactly** (I measured 264/0/4 in
+the warm main tree). Two runs, two postures, same number — limit ① is genuinely paid.
+
+**So I asked the question that green invites: does it cover F37?** My rule says a rising
+grep count is a prompt to READ, and `%2[eE]` had gone 0 → 1 since I filed. It is not a fix:
+
+```
+crates/onnx-genai-server/tests/demo_dashboard.rs:152
+
+  /// `ServeDir` owns traversal safety; this asserts we actually mounted it and
+  /// have not accidentally routed around it.
+  async fn demo_refuses_path_traversal() {
+      for attempt in [
+          "/demo/../escape-target.txt",
+          "/demo/styles/../../escape-target.txt",
+          "/demo/%2e%2e/escape-target.txt",        ⬅ PERCENT-ENCODED. DELIBERATE.
+      ] {
+          assert_ne!(response.status(), StatusCode::OK);
+          assert!(!body_string(response).await.contains("secret"));
+      }
+  }
+```
+
+**This is a good test** — it plants a real secret, asserts status *and* body, and uses its
+own tempdir rather than a shared name. **And it includes the percent-encoded variant, which
+means the authors knew percent-encoding was an attack surface on this exact route.**
+
+### 🔴 Which makes F37 worse, not better
+
+**The two guards on one request disagree about what the path is, and only the guard someone
+else wrote does the decoding:**
+
+| axis | who decodes | reads | result |
+|---|---|---|---|
+| traversal (`%2e%2e`) | **`ServeDir`** (tower-http, `serve_dir/mod.rs:462`) | decoded bytes | ✅ refused, **and tested** |
+| dotfile (`%2Evscode`) | **our own check**, `demo_assets.rs:167` | **raw `request.uri().path()`** | ⛔ bypassed, **untested** |
+
+➡️ **The axis that is safe is safe because a third-party crate decodes before deciding. The
+axis that is unsafe is ours, and it decides on the undecoded string.** The doc comment says
+it outright — *"`ServeDir` owns traversal safety"* — and that sentence is the whole finding:
+**we correctly delegated the axis we tested, and hand-rolled the axis we did not.**
+
+### 🔑 The methodological point, and it is why I am correcting myself loudly
+
+**My "zero percent-encoding tests" claim would have been a stronger-sounding finding and a
+weaker true one.** The reality is more damning: **the suite contains a passing
+percent-encoding test on this exact route.** Any auditor asking *"does this crate handle
+percent-encoding?"* gets **YES, with a green test to prove it** — and the answer is
+yes-for-traversal, no-for-dotfiles.
+
+**That is `@d7cf9b84`'s extension allowlist exactly — *green and correct and blind* — and
+`@12e42da8`'s hardest false green: a correct measurement of the wrong subject, where every
+field of the verification standard passes.** The 264-green does **not** refute F37; it is
+the reason nobody found it.
+
+**Fix unchanged and now cheaper to justify: decode once, hand both consumers the same bytes.
+Acceptance test: add `"/demo/%2Evscode/settings.json"` to the loop that already exists at
+`:148` — the test is written, it just does not carry the case.**
+
+### ⚖️ Limits ledger, updated honestly
+
+- **Limit ① (Rust unexecuted / wrong posture): PAID.** Two independent runs agree, one on a
+  detached porcelain-0 tree.
+- **Limit ② (scope) STANDS, and I re-derived it: `39` crates present, `1` executed by
+  `-p onnx-genai-server`. 38 unexecuted.** F37 lives inside the one crate that *was* run —
+  **which is the point: being inside the executed crate did not make it visible.**
