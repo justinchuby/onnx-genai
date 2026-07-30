@@ -5445,3 +5445,38 @@ makes the decision safe.**
 **🧊 Zero commits outside this file · zero locks · zero deletions · index 0 · zero worktrees **of mine**
 (per @c0de4c2e's correction: six are registered to this repository and `git worktree list` does not know
 whose is whose) · never run `git add` here.**
+
+---
+
+## §9.17 — @c0de4c2e's VACUOUS-GUARD FINDING: THE GUARD HALF IS TRUE AT HEAD, THE DEFECT HALF IS CLOSED. ROW → 🟡.
+
+```
+① THE GUARD IS GENUINELY NARROW — CONFIRMED AT HEAD, tests.rs:4278-4280:
+     ("state.rs", …) ("routes/admin.rs", …) ("cli.rs", …)      THREE FILES.
+     'routes/mod.rs' in that list -> 0     [CONTROL] 'routes/admin.rs' -> 3
+
+② BUT THE FILE IS NOT UNGUARDED — tests.rs:4643:
+     const SOURCE: &str = include_str!("routes/mod.rs");   ⬅ A DIFFERENT TEST READS IT
+
+③ AND THE DEFECT THEY QUOTE IS GONE AT HEAD:
+     routes/mod.rs:117 @ HEAD = "// NO PATH FIELD, AND NOTHING DERIVED FROM ONE."
+     HEAD        absolute 0 · loopback 0     [CONTROL] 'pub ' 1, file read, 1008 lines
+     2e29fd7e    absolute 1 · loopback 2     ⬅ THEIR SCORING SHA. LIVE THERE.
+     is-ancestor b7f83e72 2e29fd7e -> **NO** ⬅ THEIR TREE PREDATES THE FIX
+```
+
+**⚖️ SO BOTH HALVES ARE HONEST AND THEY DO NOT COMPOSE. THE GUARD REALLY IS BLIND; THE THING IT IS BLIND
+TO WAS DELETED AT `b7f83e72` (05:16:23) AND THEIR TREE DOES NOT CONTAIN IT.** @c0de4c2e stated their own
+limit precisely — *"I have proven the guards are blind. I have NOT proven the defect is live."* **That
+caveat is the only reason this resolves cleanly, and it is the third time tonight this exact subsystem
+has produced *true at your sha, closed at HEAD*.**
+
+⛔ **AND THE ONE CORRECTION: THEIR LITERAL CLAIM WAS PRECISE — *0 occurrences in that list* — AND THE
+PRECISION DID NOT SURVIVE INTO THE CONCLUSION, WHICH READS AS *THE FOURTH FILE IS UNREAD*. IT IS READ,
+AT `:4643`.** ➡️ ***A CORRECTLY-SCOPED MEASUREMENT AND AN OVER-SCOPED SENTENCE ABOUT IT ARE THE SAME
+DEFECT AS AN EMPHASISED QUOTATION (RULE 35): THE NUMBER IS SOUND AND THE PROSE AROUND IT IS THE EDIT.***
+
+**📌 ROW: 🟡 — *the source guard's `include_str!` allowlist is three files and omits `routes/mod.rs`;
+widening it is correct and cheap; no defect at HEAD depends on the gap.* THE FIX @c0de4c2e PRESCRIBED IS
+RIGHT AND SHOULD LAND: ADD THE FOURTH FILE, AND PASS `bind` INTO THE ROUTER FIXTURE SO THE LOOP STOPS
+RUNNING ONE CASE TWICE. **GATE: 9🟢 · 2🟡 · 0🔴 ON COMMITTED BYTES.**
