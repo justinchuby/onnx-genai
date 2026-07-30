@@ -819,7 +819,8 @@ Source analysis says the reuse cannot happen. QA measured whether it does. **Evi
 
 **The two arms differed by less than the noise floor, so the timing result is inconclusive** — a
 later re-run of this same comparison flipped the sign, and a repeat measurement on a byte-identical
-binary varied by 9.8%, which is larger than the gap between these two arms. No timing claim survives
+binary varied by **+52.30% / −40.17%** (the null-A/B floor, true delta zero by
+construction), far larger than the gap between these two arms. No timing claim survives
 that. **What does survive is not a timing at all: every one of the six ARM B controls incremented
 the hit counter**, which is the counter's
 indictment: it fires when sharing is arithmetically impossible.
@@ -829,9 +830,17 @@ methodological point worth carrying forward.** A null result normally cannot dis
 effect is absent"* from *"the instrument could not see it."* So the magnitude of a working cache was
 established independently first: prefill is **~90% of TTFT** (140 ms for a short prompt vs 1380 ms
 for a long one), meaning genuine reuse would collapse TTFT from ~1380 ms to ~140 ms — **a 90% drop,
-impossible to miss.** Observed: **a difference within the 9.8% noise floor** — inconclusive as to
-sign, but bounded well below the effect being looked for. That effect is more than an order of
-magnitude larger than the noise, so **the instrument would unquestionably have seen it.**
+impossible to miss.** Observed: **a difference deep below the ~52% noise floor** — inconclusive as to
+sign, but bounded well below the effect being looked for. That effect is **1.7× the floor** (`90 / 52.30`), so
+**a collapse of the predicted magnitude could not have hidden under it.**
+
+> ⚠️ **This paragraph read "9.8% noise floor" and "more than an order of magnitude" until this
+> correction.** The 9.8% figure was retracted (`examples/serving-dashboard/README.md`, *Why this is no
+> longer a prefix-caching scenario*): that window overlapped two CPU-heavy ONNX exports, so the swing
+> had a **cause** and was not ambient. The honest floor is the null-A/B excursion, which is about five
+> times larger — and it **shrinks this argument's headroom from ~9× to 1.7×.** The conclusion survives;
+> the margin does not. **What is excluded is a collapse of the predicted ~90% magnitude. A *smaller*
+> real prefix effect is NOT excluded by anything here, and this section must not be read as excluding one.**
 
 > **🔒 Ruled: no prefix-cache hit-rate panel ships, in any form, on any server** — not `measured`,
 > not `not-applicable`, not a stark `0%`. The field is removed from the demo, enforced by two
