@@ -607,6 +607,41 @@ describe('AC59 — "batch size" never appears in UI copy', () => {
   // checks our claim. Copy is banned; citations are not.
   const STORE_BANNED = /batch\s+size/i;
 
+  it('has a store layer to check, so a passing store-layer run means something', () => {
+    // The control one screen up covers sourceFiles() only. When this file grew a
+    // SECOND corpus, that control silently kept covering the first, and every
+    // lint over the store layer was born vacuous while the suite stayed green.
+    // Measured, not argued: emptying sourceFiles() reds 1 of 18, emptying
+    // storeLayerFiles() reds nothing at all — the store scan below would report
+    // a confident green having read no files.
+    //
+    // A fail-closed control protects a CORPUS, not a FILE.
+    const files = storeLayerFiles();
+    assert.ok(
+      files.length >= 6,
+      `expected to lint the store layer, found ${files.length} files`,
+    );
+    // Anchored on a file that must exist for this lint to have a reason to
+    // exist: the store-layer ban is here because labels written in the
+    // provenance catalogue become the accessible name on screen. The day this
+    // file is gone, the check below is moot anyway, so the anchor cannot rot
+    // into a false red.
+    assert.ok(
+      files.includes('telemetry-provenance.js'),
+      `the store scan no longer reaches telemetry-provenance.js, the file whose labels reach the screen; found ${files.join(', ')}`,
+    );
+    // Reading files is not the same fact as having material to inspect: if
+    // stringLiteralsOf stopped extracting, every offender list below would be
+    // empty for a reason that has nothing to do with the copy being clean.
+    const literals = files.flatMap((file) =>
+      stringLiteralsOf(readFileSync(`${STORE_DIR}${file}`, 'utf8')),
+    );
+    assert.ok(
+      literals.length > 0,
+      'no string literals extracted from the store layer — the store lint is inspecting nothing',
+    );
+  });
+
   it('no store-layer label or reason says "batch size"', () => {
     const offenders = [];
     for (const file of storeLayerFiles()) {
