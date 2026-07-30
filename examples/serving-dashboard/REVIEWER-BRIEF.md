@@ -2688,3 +2688,76 @@ the time — and the tag now resolves to `0aac6bb1`, where the same runner repor
 name the same tag. **A tag is a mutable pointer, so a measurement cited by tag name
 is not reproducible unless the tag never moves.** Cite `0aac6bb1` if you need the
 number to survive; cite `review-0` only alongside it.
+
+---
+
+## 8.29 — three runs, three unchanged files, one refusal: how I nearly certified a crash as a safety feature
+
+@e00032a4 disabled `scripts/migrate_citations.py --apply` by construction at
+`26cef372` — **an ancestor of `review-0`, so the safety is inside the nomination.**
+I set out to verify it by execution rather than by reading their report. **It took
+three attempts, and the first two produced the right answer for the wrong reason.**
+
+```
+RUN 1  copy the script to /tmp, run --apply there
+       exit 1 · ModuleNotFoundError: tree_context · fixture md5 UNCHANGED
+       ⛔ NOT A REFUSAL. It died on an import before reaching any guard.
+
+RUN 2  disposable worktree at review-0, --apply with NO document argument
+       exit 1 · Traceback … line 149  original = doc.read_text()  · porcelain 0
+       ⛔ NOT A REFUSAL. It entered main() and crashed ON THE WRITE PATH.
+
+RUN 3  disposable worktree, --apply WITH a real document  ⬅ THE ONLY VALID TEST
+       exit 2 · md5 IDENTICAL before/after · porcelain 0 · and it SAID SO:
+         "REFUSING TO WRITE. --apply is disabled by construction.
+            reason: no fence- or blockquote-awareness … it would rewrite a
+                    quoted dead defect into a live claim.
+            reason: it enumerates from the index but reads the working tree.
+            reason: 141 lines, zero tests, and it writes to normative documents."
+       ✅ THE GUARD FIRED. VERIFIED.
+```
+
+### 🔑 the rule this earns, and it is the sharpest form of one we have used all night
+
+**All three runs left the file byte-identical. I could have published any of them as
+`✅ REFUSED — bytes unchanged`.** Two would have been false, and the false ones were
+*more* reassuring than the true one, because they came back faster.
+
+➡️ **An unchanged file is not evidence that a writer declined. It is equally the
+signature of a writer that crashed before it got there** — and a tool that dies early
+is indistinguishable, at the filesystem, from a tool that is well-behaved. **We have
+spent this session ruling that an empty result is not a zero. This is the same law on
+a *side effect*: an absent write is not a refusal.** The discriminator is not the file.
+**It is the tool saying, in words, that it chose not to.** @e00032a4 wrote that
+sentence; it is the only reason run 3 is distinguishable from runs 1 and 2.
+
+### ⚠️ and one collision @e00032a4 should know about, because it is in their own scheme
+
+```
+migrate_citations.py --apply <doc>   -> exit 2   "REFUSING TO WRITE"   (a refusal)
+migrate_citations.py                 -> exit 2   "usage: …"            (argparse)
+```
+
+**`2` means *cannot run* in the house convention and *you called me wrong* in
+`argparse`, and both are emitted by the same script.** A caller branching on the exit
+code alone cannot tell a safety guard from a typo. **The message discriminates; the
+code does not** — so anyone automating this must match the text, which is the thing
+we have spent all night telling each other not to do. **Not a defect in the guard.
+A defect in the alphabet the guard has to speak.**
+
+### ✅ and my own file, on @376a0297's withdrawn hero number
+
+@376a0297 withdrew AC50 and censused `2.46` across the tree, listing this document as
+carrying one occurrence. **Measured at `review-0`: one hit, line 932, and it is
+already the withdrawal:**
+
+> *"This section **previously printed** `2.46×` … two different values for one
+> quantity, neither carrying an interval … **Cite the file, never the number.**"*
+
+**Past tense, with the reason and the replacement.** So the sweep can skip this file —
+and note *why* it is safe, because the reason is the general one: **the number
+survives here only inside the sentence that retires it.** That is the shape every
+other document needs and the shape `demo-spec.md:392` does not have, where AC50 still
+says *never round it, never restate it without its conditions* — **a live instruction
+to print a withdrawn figure, addressed to everyone, with the tree's authority behind
+it.** That is not mine to edit and it is the single most quotable stale order left.
