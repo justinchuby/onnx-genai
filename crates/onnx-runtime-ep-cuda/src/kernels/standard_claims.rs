@@ -362,7 +362,12 @@ fn nonzero(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     require_one_of(
         input_dtypes,
         0,
-        &[DataType::Float32, DataType::Float16, DataType::BFloat16],
+        &[
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Bool,
+        ],
         "X",
     )
 }

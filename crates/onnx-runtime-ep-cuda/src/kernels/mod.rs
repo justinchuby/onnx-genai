@@ -948,6 +948,12 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("RotaryEmbedding", "com.microsoft", 1),
+        Box::new(rotary_embedding::RotaryEmbeddingContribFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
             runtime: runtime.clone(),

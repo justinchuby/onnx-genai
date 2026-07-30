@@ -242,3 +242,73 @@ fn claim_gates_reject_attributes_cuda_would_otherwise_silently_coerce() {
         );
     }
 }
+
+/// `com.microsoft::GatherBlockQuantized` with sub-byte zero points only matches
+/// CPU/ORT numerics for an EVEN number of blocks per row (the CUDA kernel uses
+/// global nibble addressing for zero points; CPU/ORT pack per row). The claim
+/// gate must decline an ODD blocks-per-row layout explicitly, and must still
+/// claim the even layout.
+#[test]
+fn gather_block_quantized_odd_blocks_per_row_with_zero_points_declines() {
+    let Ok(ep) = CudaExecutionProvider::new_default() else {
+        eprintln!("skip: no CUDA GPU available");
+        return;
+    };
+
+    // Build a GBQ node: data, indices, scales, zero_points (bits=4, block_size=16).
+    let build = |data_last: usize| -> (Graph, NodeId, Vec<onnx_runtime_ir::Shape>) {
+        let mut graph = Graph::new();
+        let data = graph.create_named_value("data", DataType::Uint8, static_shape([4, data_last]));
+        let indices = graph.create_named_value("indices", DataType::Int64, static_shape([2usize]));
+        let scales = graph.create_named_value("scales", DataType::Float32, static_shape([1usize]));
+        let zero_points =
+            graph.create_named_value("zero_points", DataType::Uint8, static_shape([1usize]));
+        for v in [data, indices, scales, zero_points] {
+            graph.add_input(v);
+        }
+        let out = graph.create_named_value("out", DataType::Float32, static_shape([1usize]));
+        let mut n = Node::new(
+            NodeId(0),
+            "GatherBlockQuantized",
+            vec![Some(data), Some(indices), Some(scales), Some(zero_points)],
+            vec![out],
+        );
+        n.domain = "com.microsoft".into();
+        n.attributes.insert("bits".into(), Attribute::Int(4));
+        n.attributes.insert("block_size".into(), Attribute::Int(16));
+        n.attributes.insert("gather_axis".into(), Attribute::Int(0));
+        n.attributes
+            .insert("quantize_axis".into(), Attribute::Int(1));
+        let id = graph.insert_node(n);
+        let shapes = vec![
+            static_shape([4usize, data_last]),
+            static_shape([2usize]),
+            static_shape([1usize]),
+            static_shape([1usize]),
+        ];
+        (graph, id, shapes)
+    };
+
+    let dtypes = [
+        DataType::Uint8,
+        DataType::Int64,
+        DataType::Float32,
+        DataType::Uint8,
+    ];
+
+    // data_last=8 → after_gather_dim = 8*2 = 16, block_size 16 → 1 block/row (ODD).
+    let (odd_graph, odd_id, odd_shapes) = build(8);
+    let odd = ep.supports_op(odd_graph.node(odd_id), 1, &odd_shapes, &dtypes, &[]);
+    assert!(
+        matches!(&odd, KernelMatch::Unsupported { reason } if reason.contains("blocks per row")),
+        "odd blocks-per-row GBQ with zero points must decline loudly"
+    );
+
+    // data_last=16 → after_gather_dim = 16*2 = 32, block_size 16 → 2 blocks/row (EVEN).
+    let (even_graph, even_id, even_shapes) = build(16);
+    assert!(
+        ep.supports_op(even_graph.node(even_id), 1, &even_shapes, &dtypes, &[])
+            .is_supported(),
+        "even blocks-per-row GBQ with zero points must still be claimed"
+    );
+}

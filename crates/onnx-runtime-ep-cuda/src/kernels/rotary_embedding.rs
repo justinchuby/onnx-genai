@@ -267,8 +267,24 @@ extern "C" __global__ void rotary_embedding_bf16(
 }
 "#;
 
-/// Return the claim-time dtype denial for RoPE's floating-point inputs.
-pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'static, str>> {
+/// Resolve the `(cos_cache, sin_cache, position_ids?)` input indices for the
+/// standard `ai.onnx` op (`X, cos, sin, position_ids?`) and the
+/// `com.microsoft` contrib op (`X, position_ids, cos, sin`).
+fn resolve_input_order(contrib: bool, num_inputs: usize) -> (usize, usize, Option<usize>) {
+    if contrib {
+        (2, 3, Some(1))
+    } else {
+        (1, 2, if num_inputs == 4 { Some(3) } else { None })
+    }
+}
+
+/// Return the claim-time dtype denial for RoPE's floating-point inputs. The
+/// `contrib` flag selects the `com.microsoft` input ordering so the float dtype
+/// check targets `X`/`cos_cache`/`sin_cache` and skips the int64 `position_ids`.
+pub(crate) fn unsupported_reason(
+    contrib: bool,
+    input_dtypes: &[DataType],
+) -> Option<Cow<'static, str>> {
     let &dtype = input_dtypes.first()?;
     if !matches!(
         dtype,
@@ -282,9 +298,10 @@ pub(crate) fn unsupported_reason(input_dtypes: &[DataType]) -> Option<Cow<'stati
             "RotaryEmbedding: dtype {dtype} not supported on CUDA (expected f16, bf16, or f32)"
         )));
     }
-    if input_dtypes
-        .iter()
-        .take(3)
+    let (cos_i, sin_i, _) = resolve_input_order(contrib, input_dtypes.len());
+    if [cos_i, sin_i]
+        .into_iter()
+        .filter_map(|i| input_dtypes.get(i))
         .any(|&input_dtype| input_dtype != dtype)
     {
         return Some(Cow::Borrowed(
@@ -325,6 +342,10 @@ pub struct RotaryEmbeddingKernel {
     interleaved: bool,
     num_heads: usize,
     rotary_embedding_dim: usize,
+    /// `com.microsoft::RotaryEmbedding` orders inputs as
+    /// `(X, position_ids, cos_cache, sin_cache)`; the standard `ai.onnx` op uses
+    /// `(X, cos_cache, sin_cache, position_ids?)`. The rotation math is identical.
+    contrib: bool,
     warmed_signature: Mutex<Option<RotaryCaptureSignature>>,
     last_call_capture_safe: AtomicBool,
 }
@@ -339,45 +360,67 @@ struct RotaryCaptureSignature {
     output_shape: Vec<usize>,
 }
 
-/// Factory reading `interleaved` (0), `num_heads` (0), `rotary_embedding_dim` (0).
+/// Factory reading `interleaved` (0), `num_heads` (0), `rotary_embedding_dim` (0)
+/// for the standard `ai.onnx::RotaryEmbedding` op.
 pub struct RotaryEmbeddingFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
+/// Factory for the `com.microsoft::RotaryEmbedding` contrib op, which orders its
+/// inputs as `(X, position_ids, cos_cache, sin_cache)`.
+pub struct RotaryEmbeddingContribFactory {
+    pub runtime: Arc<CudaRuntime>,
+}
+
+fn rotary_kernel_from_node(
+    runtime: Arc<CudaRuntime>,
+    node: &Node,
+    contrib: bool,
+) -> Result<Box<dyn Kernel>> {
+    let interleaved = match node.attr("interleaved") {
+        None | Some(onnx_runtime_ir::Attribute::Int(0)) => false,
+        Some(onnx_runtime_ir::Attribute::Int(1)) => true,
+        Some(_) => {
+            return Err(EpError::KernelFailed(
+                "RotaryEmbedding: interleaved must be 0 or 1".into(),
+            ));
+        }
+    };
+    let non_negative = |name: &str| -> Result<usize> {
+        match node.attr(name) {
+            None => Ok(0),
+            Some(attribute) => attribute
+                .as_int()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "RotaryEmbedding: {name} must be a non-negative integer"
+                    ))
+                }),
+        }
+    };
+    let num_heads = non_negative("num_heads")?;
+    let rotary_embedding_dim = non_negative("rotary_embedding_dim")?;
+    Ok(Box::new(RotaryEmbeddingKernel {
+        runtime,
+        interleaved,
+        num_heads,
+        rotary_embedding_dim,
+        contrib,
+        warmed_signature: Mutex::new(None),
+        last_call_capture_safe: AtomicBool::new(false),
+    }))
+}
+
 impl KernelFactory for RotaryEmbeddingFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let interleaved = match node.attr("interleaved") {
-            None | Some(onnx_runtime_ir::Attribute::Int(0)) => false,
-            Some(onnx_runtime_ir::Attribute::Int(1)) => true,
-            Some(_) => {
-                return Err(EpError::KernelFailed(
-                    "RotaryEmbedding: interleaved must be 0 or 1".into(),
-                ));
-            }
-        };
-        let non_negative = |name: &str| -> Result<usize> {
-            match node.attr(name) {
-                None => Ok(0),
-                Some(attribute) => attribute
-                    .as_int()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| {
-                        EpError::KernelFailed(format!(
-                            "RotaryEmbedding: {name} must be a non-negative integer"
-                        ))
-                    }),
-            }
-        };
-        let num_heads = non_negative("num_heads")?;
-        let rotary_embedding_dim = non_negative("rotary_embedding_dim")?;
-        Ok(Box::new(RotaryEmbeddingKernel {
-            runtime: self.runtime.clone(),
-            interleaved,
-            num_heads,
-            rotary_embedding_dim,
-            warmed_signature: Mutex::new(None),
-            last_call_capture_safe: AtomicBool::new(false),
-        }))
+        rotary_kernel_from_node(self.runtime.clone(), node, false)
+    }
+}
+
+impl KernelFactory for RotaryEmbeddingContribFactory {
+    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        rotary_kernel_from_node(self.runtime.clone(), node, true)
     }
 }
 
@@ -385,11 +428,21 @@ impl Kernel for RotaryEmbeddingKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         check_arity("RotaryEmbedding", inputs, outputs, 3, 4, 1)?;
+        let (cos_i, sin_i, pos_i) = resolve_input_order(self.contrib, inputs.len());
+        if self.contrib && inputs.len() < 4 {
+            return Err(EpError::KernelFailed(
+                "RotaryEmbedding (com.microsoft): expected 4 inputs \
+                 (X, position_ids, cos_cache, sin_cache)"
+                    .into(),
+            ));
+        }
         let dtype = inputs[0].dtype;
         if !matches!(
             dtype,
             DataType::Float16 | DataType::Float32 | DataType::BFloat16
-        ) || inputs[..3].iter().any(|input| input.dtype != dtype)
+        ) || [0, cos_i, sin_i]
+            .into_iter()
+            .any(|i| inputs[i].dtype != dtype)
         {
             return Err(EpError::KernelFailed(
                 "RotaryEmbedding: X/cos_cache/sin_cache must have the same f16, bf16, or f32 dtype"
@@ -406,8 +459,10 @@ impl Kernel for RotaryEmbeddingKernel {
                 "RotaryEmbedding: output dtype/shape must match X".into(),
             ));
         }
-        let has_position_ids = inputs.len() == 4;
-        if has_position_ids && inputs[3].dtype != DataType::Int64 {
+        let has_position_ids = pos_i.is_some();
+        if let Some(pos_i) = pos_i
+            && inputs[pos_i].dtype != DataType::Int64
+        {
             return Err(EpError::KernelFailed(
                 "RotaryEmbedding: position_ids must be int64".into(),
             ));
@@ -467,19 +522,19 @@ impl Kernel for RotaryEmbeddingKernel {
         }
 
         // With `position_ids` present, validate its shape matches [batch, seq].
-        if has_position_ids {
-            let pos_shape = inputs[3].shape;
+        if let Some(pos_i) = pos_i {
+            let pos_shape = inputs[pos_i].shape;
             let expected = batch * seq;
-            if inputs[3].numel() != expected {
+            if inputs[pos_i].numel() != expected {
                 return Err(EpError::KernelFailed(format!(
                     "RotaryEmbedding: position_ids has {} elements, expected {expected} ([batch={batch}, seq={seq}]); shape {pos_shape:?}",
-                    inputs[3].numel()
+                    inputs[pos_i].numel()
                 )));
             }
         }
 
-        let cache_rows = inputs[1].numel() / half;
-        if inputs[2].numel() / half != cache_rows
+        let cache_rows = inputs[cos_i].numel() / half;
+        if inputs[sin_i].numel() / half != cache_rows
             || (!has_position_ids && cache_rows < batch.saturating_mul(seq))
         {
             return Err(EpError::KernelFailed(format!(
@@ -487,18 +542,19 @@ impl Kernel for RotaryEmbeddingKernel {
             )));
         }
 
-        let position_ids_ptr = inputs
-            .get(3)
-            .map(|input| cuptr(input.data_ptr::<i64>().cast()))
+        let position_ids_ptr = pos_i
+            .map(|i| cuptr(inputs[i].data_ptr::<i64>().cast()))
             .unwrap_or(0);
         let capturing = self.runtime.is_capturing()?;
-        if has_position_ids && !capturing {
+        if let Some(pos_i) = pos_i
+            && !capturing
+        {
             let mut host_positions = vec![0u8; batch * seq * std::mem::size_of::<i64>()];
             // SAFETY: position_ids is contiguous and the host buffer has its exact byte size.
             unsafe {
                 self.runtime.dtoh(
                     &mut host_positions,
-                    cuptr(inputs[3].data_ptr::<u8>() as *const c_void),
+                    cuptr(inputs[pos_i].data_ptr::<u8>() as *const c_void),
                 )?
             };
             if host_positions.chunks_exact(8).any(|bytes| {
@@ -515,9 +571,9 @@ impl Kernel for RotaryEmbeddingKernel {
         let signature = RotaryCaptureSignature {
             dtype,
             x_shape: inputs[0].shape.to_vec(),
-            cos_shape: inputs[1].shape.to_vec(),
-            sin_shape: inputs[2].shape.to_vec(),
-            position_shape: inputs.get(3).map(|input| input.shape.to_vec()),
+            cos_shape: inputs[cos_i].shape.to_vec(),
+            sin_shape: inputs[sin_i].shape.to_vec(),
+            position_shape: pos_i.map(|i| inputs[i].shape.to_vec()),
             output_shape: outputs[0].shape.to_vec(),
         };
         let mut warmed_signature = self
@@ -536,8 +592,8 @@ impl Kernel for RotaryEmbeddingKernel {
             self.runtime
                 .nvrtc_function(ROTARY_EMBEDDING_MODULE, ROTARY_EMBEDDING_SOURCE, entry)?;
         let x_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
-        let cos_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
-        let sin_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
+        let cos_ptr = cuptr(inputs[cos_i].data_ptr::<u8>() as *const c_void);
+        let sin_ptr = cuptr(inputs[sin_i].data_ptr::<u8>() as *const c_void);
         let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
         let batch = batch as u64;
         let seq = seq as u64;
@@ -689,6 +745,7 @@ mod tests {
             interleaved,
             num_heads: 0,
             rotary_embedding_dim: 6,
+            contrib: false,
             warmed_signature: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }

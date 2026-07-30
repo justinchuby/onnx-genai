@@ -282,6 +282,14 @@ pub fn to_dense_float<T: FloatElem>(view: &TensorView) -> Result<Vec<T>> {
     read_strided::<T>(view, T::DTYPE)
 }
 
+/// Materialize a `Bool` view into a dense `Vec<u8>` of `0`/`1` bytes, applying
+/// strides. `Bool` is stored one byte per element and is outside the numeric
+/// [`NumericElem`] dispatch, so ops that accept a boolean mask (e.g. `NonZero`)
+/// read it through this helper.
+pub fn to_dense_bool(view: &TensorView) -> Result<Vec<u8>> {
+    read_strided::<u8>(view, DataType::Bool)
+}
+
 fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
     view.validate()?;
     debug_assert_eq!(
