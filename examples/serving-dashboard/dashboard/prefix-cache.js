@@ -2,332 +2,199 @@
 //
 // Panel 4 — Prefix cache. demo-ux.md §5.5.
 //
-// THIS PANEL SHIPS UNCONDITIONALLY, whatever the numbers say. If the cache
-// genuinely reports few hits, this panel renders that at full contrast. A real
-// measurement of a real system in an unflattering state is worth more to this
-// project's reputation than a hidden panel. The SCENARIO is cuttable; the panel
-// is not.
+// 🔴 THIS PANEL DELIBERATELY BINDS NO TELEMETRY. THAT IS THE POINT OF IT.
 //
-// ⚠️ BOUND AGAINST THE PROVENANCE AUDIT, NOT AGAINST WHAT LOOKS AVAILABLE.
-// @d7cf9b84's provenance-audit.md §2 classifies the wire fields as follows, and
-// this panel follows the audit rather than the field names:
+// Every counter this panel used to read has been ruled unshippable, and the
+// reason is stronger than "unmeasured": @fc8b5d97 ran a controlled A/B and
+// found prefix reuse is PROVEN ABSENT on both execution paths.
 //
-//   • `prefix_cache_hits` — the counter mechanism is REAL (metrics.rs:135-137,
-//     incremented only when prefix_cache_hit_len > 0), but it is PATH-DEPENDENT:
-//     on the continuous-batch (static-cache) path it is structurally pinned at
-//     zero, because batched.rs:262 and :486 construct DecodeLoopState with a
-//     hardcoded literal 0. So a zero here can mean "no reuse" OR "this code path
-//     cannot report reuse" — and those must not look the same.
+//   ARM A   one identical ~900-token prefix, fired 6x   warm TTFT 1341 ms
+//   ARM B   six prefixes differing FROM TOKEN 0         warm TTFT 1254 ms
 //
-//   • `prefix_cache_lookups` — MISNAMED. metrics.rs:130-132 does fetch_add(1) on
-//     EVERY completed generation, whether or not any cache was consulted. It is
-//     a genuine counter of the wrong noun. This panel therefore labels it
-//     "completed generations", NOT "lookups". Labelling it correctly costs us a
-//     nicer-looking headline and buys the only thing that matters here.
+// The shared-prefix arm was 7.0% SLOWER than the arm that shared nothing. And
+// the result is PROVEN ABSENT rather than merely unobserved because the same
+// run carried a sensitivity control: prefill is ~90% of TTFT (140 ms for a
+// ~10-token prompt vs 1380 ms for a ~900-token one), so a working cache would
+// have collapsed TTFT from ~1380 ms to ~140 ms. An effect that large cannot
+// hide. Observed: +7.0%.
 //
-//   • `prefix_cache_hit_rate` — DERIVED FROM THE MISNAMED DENOMINATOR, and it
-//     emits a literal 0.0 when the denominator is zero, so "no data" and "0%
-//     hit rate" are the same six characters on the wire. This panel does NOT
-//     render the server's hit_rate field. It shows the hit COUNT, which is real,
-//     and em-dashes the rate with a reason naming the defect.
+// ☠️ WHY THE COUNTER MUST NOT BE SHOWN EVEN AS A CURIOSITY. It reported 19/20
+// = 95%. It increments on ANY nonzero token match, and every chat-completions
+// request shares the chat-template preamble, so it reads ~95% from the first
+// request and never moves. It fired on all six ARM B controls, which share
+// nothing. That is not a stub and not a misnamed-but-real number — it is a
+// precisely-computed, beautifully-behaved, entirely FALSE value.
 //
-// If that reads as an unusually loud comment for a small panel: this is the one
-// panel where the field names actively mislead, and the next person to touch it
-// will otherwise "fix" it back to a fabricated number in good faith.
+// Every other safeguard in this tree hunts fabricated ZEROS, because a zero
+// looks broken and invites scrutiny. A confident 95% invites none. That is
+// exactly why it needed a ruling rather than a guard.
+//
+// ROOT CAUSE, in the engine, so the next person does not "fix" this by wiring
+// the counter back up: engine/runtime.rs:997 forks on uses_token_prefix_cache().
+// The token-cache branch (runtime.rs:1017-1024) is REPORTING-ONLY — it loads no
+// KV state and never sets `loaded_prompt_prefix`, so the very next statement
+// queues the FULL prompt and prefill recomputes every token. The number it
+// returns has no compute saving behind it. Thirty lines below, the connector
+// path states the correct rule for itself: "never claiming a hit we can't
+// serve" (runtime.rs:1097-1099). The reporting branch violates the rule its own
+// neighbour states.
+//
+// So this is a FUNCTIONAL gap in the engine, not a reporting gap. No telemetry
+// work will incidentally fix it, and there is no client-side substitute: a TTFT
+// delta computed in the browser would measure the same absent effect and land
+// at ~0% with a noise band straddling zero.
+//
+// WHAT SHIPS INSTEAD: the finding itself, with its citations and no live
+// numbers. A panel that renders an honest, well-evidenced absence teaches more
+// than a panel showing 95% — and vastly more than no panel at all, which would
+// leave a visitor to assume the feature works.
 
-import { isRenderable, numericValueOf } from './field-state.js';
 import {
-  createRepaintScheduler,
-  bindPanel,
-  createSparklineSlot,
-  renderSparkline,
-  describeFieldText,
   element,
-  formatDuration,
   observeVisibility,
   replaceChildren,
   sectionLabel,
 } from './panel-kit.js';
 
-const WINDOW_MS = 60_000;
-
-/** Reasons specific to this panel's known defects, shown verbatim on hover. */
-const PREFIX_REASONS = Object.freeze({
-  RATE_FROM_MISNAMED_DENOMINATOR:
-    'The server computes hit rate as hits ÷ its lookup counter, but that counter increments on ' +
-    'every completed generation rather than on every cache consultation, so the ratio has no ' +
-    'defensible denominator. The numerator is no better: a controlled A/B found the hit ' +
-    'counter rises on requests that share no prefix at all, while shared-prefix requests ran ' +
-    '7% slower than a zero-sharing control. Neither term measures prefix reuse, so no rate ' +
-    'computed from them is reportable.',
-  NO_GENERATIONS_YET:
-    'No generations have completed yet, so there is nothing to compute a rate from. ' +
-    'Run a scenario.',
-  PATH_PINNED_AT_ZERO:
-    'This model runs on the continuous-batch (static cache) path, where the decode loop is ' +
-    'constructed with a prefix-cache hit length of zero, so the counter cannot rise here. ' +
-    'Run a scenario on the dynamic-cache model to exercise the prefix cache.',
-});
-
 export const meta = Object.freeze({
-  // Deliberately null. This panel SHIPS UNCONDITIONALLY and shows whatever is
-  // true, including a stark 0%. Hiding it where the story is weak would be the
-  // one genuinely dishonest move available here. On the static-cache profile
-  // the cache is never consulted, so the honest rendering is not-applicable
-  // with the reason -- not a 0% that falsely implies a lookup that missed.
+  // Null, and for a NEW reason since the counters were cut. This is no longer
+  // "applicable on one profile, structural n/a on the other" — the gap is real
+  // on BOTH paths, for two different architectural reasons, and that pairing is
+  // the most teachable thing on the page:
+  //   • continuous-batch path — the batch never consults the trie at all
+  //     (batched.rs:262 and :486 pass a hardcoded literal 0).
+  //   • paged path — the cache IS consulted, but the branch that reports a hit
+  //     serves nothing (runtime.rs:1017-1024).
+  // Hiding the panel on either profile would conceal half of that.
   requires: null,
   id: 'prefix-cache',
   title: 'Prefix cache',
   group: 'cache',
   span: 1,
-  cadence: 250,
-  // Cache counters are cumulative; a slightly old count still describes the same run.
-  staleCeilingMs: 15000,
+  // Static content. Nothing here polls, so cadence describes a panel that never
+  // repaints from telemetry — it is present because the contract requires it.
+  cadence: 0,
+  staleCeilingMs: null,
   defaultOpen: true,
   acronyms: {
     prefix: 'A leading run of tokens shared by several prompts, whose KV state can be reused',
     prefill: 'The forward pass that computes KV state for the prompt before decoding begins',
-    eviction: 'Reclaiming cached prefix state so its memory can serve another sequence',
+    TTFT: 'Time to first token — dominated by prefill, so it is where prefix reuse would show',
   },
 });
 
-/** Panel-scoped renderers carrying this panel's stale ceiling (AC45(c)). */
-const { metricRow, renderField } = bindPanel(meta);
+/**
+ * The recorded experiment. These are NOT live telemetry and are never presented
+ * as such — they are a cited measurement shown with its conditions, per D72, so
+ * a reader can judge it rather than take it on faith.
+ */
+const EVIDENCE = Object.freeze([
+  Object.freeze({
+    arm: 'Shared prefix',
+    detail: 'one identical ~900-token prefix, 6 requests',
+    ttft: '1341 ms',
+  }),
+  Object.freeze({
+    arm: 'Control',
+    detail: 'six prefixes differing from token 0 — no sharing possible',
+    ttft: '1254 ms',
+  }),
+  Object.freeze({
+    arm: 'Sensitivity',
+    detail: '~10-token prompt vs ~900-token prompt — prefill is ~90% of TTFT',
+    ttft: '140 ms vs 1380 ms',
+  }),
+]);
+
+const HEADLINE =
+  'Prefix reuse is not happening on either execution path. This panel reports that ' +
+  'finding instead of a hit rate, because the hit counter is measurably false.';
+
+const EXPLANATION =
+  'A controlled A/B found requests sharing a long prefix ran 7.0% slower than requests ' +
+  'sharing nothing at all. The same run proved the test could detect reuse if it existed: ' +
+  'prefill is about 90% of time-to-first-token, so a working cache would have collapsed ' +
+  'TTFT from roughly 1380 ms to 140 ms. Nothing of the sort occurred.';
+
+const COUNTER_WARNING =
+  'The engine\u2019s own hit counter reported 95% throughout, including on every control ' +
+  'request that shared no prefix. It rises on any single matching token, and every chat ' +
+  'request shares the template preamble, so it reads ~95% from the first request and never ' +
+  'moves. Showing it would have been the most convincing false number on this dashboard.';
+
+const CITATIONS = Object.freeze([
+  'engine/runtime.rs:1017-1024 — the reporting-only branch: no KV loaded, `loaded_prompt_prefix` never set, so prefill recomputes the whole prompt',
+  'engine/runtime.rs:1097-1099 — the correct rule, stated for the neighbouring path: "never claiming a hit we can\u2019t serve"',
+  'batched.rs:262, :486 — the continuous-batch path passes a hardcoded literal 0, so it never consults the trie',
+  'metrics.rs:130-135 — the lookup counter increments on every completed generation, not on every cache consultation',
+]);
 
 /**
  * @param {HTMLElement} rootElement
- * @param {any} telemetryStore
- * @returns {{destroy(): void, describe(): string}}
+ * @returns {{unmount(): void, describe(): string}}
  */
-export default function mount(rootElement, telemetryStore) {
-  const hero = element('div', { className: 'panel-prefix-cache__hero' });
-  const counts = element('div', { className: 'panel-prefix-cache__counts' });
-  const savings = element('div', { className: 'panel-prefix-cache__savings' });
-  const spark = createSparklineSlot({ label: 'Prefix cache hits', width: 220, height: 30 });
+export default function mount(rootElement) {
+  const finding = element('div', { className: 'panel-prefix-cache__finding' });
+  const evidence = element('div', { className: 'panel-prefix-cache__evidence' });
+  const citations = element('ul', { className: 'panel-prefix-cache__citations' });
 
-  rootElement.append(hero, spark.root, counts, sectionLabel('savings'), savings);
+  replaceChildren(finding, [
+    element('p', { className: 'panel-prefix-cache__headline', text: HEADLINE }),
+    element('p', { className: 'panel-prefix-cache__body', text: EXPLANATION }),
+    element('p', { className: 'panel-prefix-cache__body', text: COUNTER_WARNING }),
+  ]);
 
-  let description = 'Prefix cache: waiting for the first sample.';
+  replaceChildren(
+    evidence,
+    EVIDENCE.map((row) => {
+      const line = element('div', { className: 'panel-prefix-cache__arm' });
+      line.append(
+        element('span', { className: 'panel-prefix-cache__arm-name', text: row.arm }),
+        element('span', { className: 'panel-prefix-cache__arm-detail', text: row.detail }),
+        element('span', { className: 'panel-prefix-cache__arm-value', text: row.ttft }),
+      );
+      return line;
+    }),
+  );
 
-  const paint = () => {
-    const hits = telemetryStore.field('prefix_cache.hits');
-    const generations = telemetryStore.field('prefix_cache.lookups');
-    const capability = telemetryStore.capability?.('prefix-cache') ?? { available: true };
+  replaceChildren(
+    citations,
+    CITATIONS.map((text) => element('li', { className: 'panel-prefix-cache__citation', text })),
+  );
 
-    const hitRate = deriveHitRate(hits, generations, capability);
+  rootElement.append(
+    finding,
+    sectionLabel('recorded measurement — not live telemetry'),
+    evidence,
+    sectionLabel('verify in source'),
+    citations,
+    element('p', {
+      className: 'panel-prefix-cache__provenance',
+      text:
+        'Measured by QA on the dynamic model. Recorded once, not polled \u2014 these numbers ' +
+        'do not change while you watch, and are not claimed to.',
+    }),
+  );
 
-    // §31/D91: an absence glyph alone is scanned past. When the rate is
-    // withheld, the caption carries the reason into the visible layer rather
-    // than leaving it to a tooltip nobody hovers.
-    const heroCaption =
-      hitRate.state === 'unavailable' && hitRate.reason
-        ? element('span', {
-            className: 'hero-figure__caption hero-figure__caption--withheld',
-            text: `hit rate withheld — ${hitRate.reason}`,
-          })
-        : element('span', { className: 'hero-figure__caption', text: 'hit rate' });
-
-    replaceChildren(hero, [renderField(hitRate, { label: 'Prefix cache hit rate' }), heroCaption]);
-
-    replaceChildren(counts, [
-      metricRow('hits', annotateHits(hits, capability)),
-      // NOT "lookups". See the file header: the server's counter of that name
-      // counts completed generations, and calling it a lookup count here would
-      // launder a real counter of the wrong noun into a plausible-looking one.
-      metricRow('completed generations', generations, {
-        label: 'Completed generations (the server\u2019s "lookups" counter)',
-      }),
-    ]);
-
-    replaceChildren(savings, [
-      metricRow('tokens reused', telemetryStore.field('prefix_cache.tokens_reused')),
-      metricRow('prefill skipped', telemetryStore.field('prefix_cache.prefill_tokens_skipped')),
-      metricRow('time saved', telemetryStore.field('prefix_cache.time_saved_ms'), {
-        format: (value) => formatDuration(value),
-      }),
-      metricRow('evictions', telemetryStore.field('prefix_cache.evictions')),
-    ]);
-
-    const hitSeries = telemetryStore.series('prefix_cache.hits', WINDOW_MS);
-    renderSparkline(spark, hitSeries, {
-      width: 220,
-      height: 30,
-      windowMs: WINDOW_MS,
-      nowMs: Date.now(),
-      label: 'Prefix cache hits',
-      unit: 'hits',
-    });
-
-    description = buildDescription({ hitRate, hits, generations, capability });
-  };
-
-  const scheduler = createRepaintScheduler(rootElement, paint);
-  const stopObserving = observeVisibility(rootElement, (visible) => scheduler.setVisible(visible));
-  const unsubscribe = telemetryStore.subscribe(() => scheduler.request());
-  scheduler.request();
+  const stopObserving = observeVisibility(rootElement, () => {});
 
   return {
     unmount() {
-      unsubscribe();
       stopObserving();
-      scheduler.cancel();
       rootElement.replaceChildren();
     },
     describe() {
-      return description;
+      return (
+        'Prefix cache: no hit rate is shown, because prefix reuse was measured and found ' +
+        'absent on both execution paths. Requests sharing a 900-token prefix took 1341 ' +
+        'milliseconds to first token, while control requests sharing nothing took 1254 ' +
+        'milliseconds \u2014 7 percent faster. A sensitivity check showed prefill is about 90 ' +
+        'percent of time to first token, so working reuse would have been unmistakable. The ' +
+        'engine\u2019s hit counter reports 95 percent regardless, including on the controls, so ' +
+        'it is not shown. These are recorded measurements, not live telemetry.'
+      );
     },
   };
-}
-
-// ── deriving ─────────────────────────────────────────────────────────────────
-
-/**
- * Derive a hit rate, or decline to.
- *
- * Deliberately NOT `telemetryStore.field('prefix.hit_rate')`: the server's own
- * hit_rate is hits ÷ completed-generations and emits a literal 0.0 when the
- * denominator is zero. Computing it here instead of reading it lets the panel
- * distinguish the three cases the wire value collapses into one — no data,
- * a genuine zero, and a code path that structurally cannot report hits.
- *
- * @param {any} hits
- * @param {any} generations
- * @param {{available: boolean, reason?: string}} capability
- * @returns {object}
- */
-export function deriveHitRate(hits, generations, capability = { available: true }) {
-  // Not-applicability outranks unavailability and is contagious: a rate whose
-  // inputs are meaningless on this execution path is itself meaningless, not
-  // "not measured yet". Getting this backwards is what made the headline number
-  // on this panel apologise on the scatter server while its own supporting rows
-  // correctly said n/a.
-  const structural =
-    capability.state === 'not-applicable' ||
-    hits?.state === 'not-applicable' ||
-    generations?.state === 'not-applicable';
-
-  if (structural) {
-    return {
-      value: null,
-      state: 'not-applicable',
-      source: 'derived',
-      unit: '%',
-      label: 'Prefix cache hit rate',
-      reason: capability.reason ?? hits?.reason ?? PREFIX_REASONS.PATH_PINNED_AT_ZERO,
-    };
-  }
-
-  if (!capability.available) {
-    return {
-      value: null,
-      state: 'unavailable',
-      source: 'derived',
-      unit: '%',
-      label: 'Prefix cache hit rate',
-      reason: capability.reason ?? PREFIX_REASONS.PATH_PINNED_AT_ZERO,
-    };
-  }
-
-  const hitCount = numericValueOf(hits);
-  const generationCount = numericValueOf(generations);
-
-  if (hitCount === null || generationCount === null) {
-    return {
-      value: null,
-      state: 'unavailable',
-      source: 'derived',
-      unit: '%',
-      label: 'Prefix cache hit rate',
-      reason: PREFIX_REASONS.RATE_FROM_MISNAMED_DENOMINATOR,
-    };
-  }
-
-  if (generationCount === 0) {
-    // "No generations yet" is PENDING, not unavailable: it resolves itself the
-    // moment a scenario runs. Rendering 0% here would be the exact fabrication
-    // the server already commits at metrics.rs:301-309.
-    return {
-      value: null,
-      state: 'pending',
-      source: 'derived',
-      unit: '%',
-      label: 'Prefix cache hit rate',
-      reason: PREFIX_REASONS.NO_GENERATIONS_YET,
-    };
-  }
-
-  // Both terms of this ratio were disproved by QA's controlled A/B: the lookup
-  // denominator counts completed generations, and the hit numerator rises on
-  // requests that share nothing. A number derived from two counters that each
-  // measure the wrong thing is not "the best available summary" — rendering it
-  // as `ok` is the false-confidence failure this envelope exists to prevent.
-  // The defect is the finding; we name it instead of dressing it as a rate.
-  return {
-    value: null,
-    state: 'unavailable',
-    source: 'derived',
-    unit: '%',
-    label: 'Prefix cache hit rate',
-    reason: PREFIX_REASONS.RATE_FROM_MISNAMED_DENOMINATOR,
-    derivedFrom: ['prefix_cache.hits', 'prefix_cache.lookups'],
-  };
-}
-
-/**
- * Attach the path-dependence caveat to a zero hit count.
- *
- * A zero here has two very different meanings — "nothing was reused" and "this
- * code path cannot report reuse" — and only the second one is a caveat the
- * visitor needs. The value stays a real, rendered zero either way; the hover
- * gains a sentence.
- *
- * @param {any} hits
- * @param {{available: boolean, reason?: string}} capability
- * @returns {any}
- */
-function annotateHits(hits, capability) {
-  if (!isRenderable(hits) || numericValueOf(hits) !== 0 || capability.available !== false) {
-    return hits;
-  }
-  return { ...hits, reason: capability.reason ?? PREFIX_REASONS.PATH_PINNED_AT_ZERO };
-}
-
-/**
- * @param {Record<string, any>} fields
- * @returns {string}
- */
-function buildDescription(fields) {
-  const parts = ['Prefix cache:'];
-
-  if (isRenderable(fields.hitRate)) {
-    parts.push(`hit rate ${Number(fields.hitRate.value).toFixed(1)} percent,`);
-  } else if (fields.hitRate.state === 'pending') {
-    parts.push('no generations have completed yet, so there is no hit rate to report,');
-  } else if (fields.hitRate.state === 'not-applicable') {
-    // The cache is never consulted on this path, so there is no rate to have.
-    // "Not measurable yet" would imply the cache tried and we failed to observe.
-    parts.push('there is no hit rate here because the cache is never consulted,');
-  } else {
-    // "Yet" belongs to `pending`. An unavailable rate is not late, it is
-    // withheld — and the reason is the whole content of the field, so dropping
-    // it here leaves a screen-reader user with strictly less than a sighted
-    // one, which is the failure this description exists to prevent.
-    parts.push(`hit rate is withheld: ${fields.hitRate.reason ?? 'no reason recorded'}`);
-  }
-
-  parts.push(`${describeFieldText('hits', fields.hits)}.`);
-  parts.push(
-    `${describeFieldText('Completed generations', fields.generations)} ` +
-      "(this is the server's lookup counter, which counts generations rather than cache consultations).",
-  );
-
-  if (fields.capability.available === false) {
-    parts.push(fields.capability.reason ?? PREFIX_REASONS.PATH_PINNED_AT_ZERO);
-  }
-  // The panel ships unconditionally on every engine. It is never hidden to make
-  // a demo look stronger, so the description always ends up saying something
-  // true rather than nothing at all.
-  return parts.join(' ');
 }
 
 export { mount };

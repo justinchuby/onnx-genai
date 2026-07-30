@@ -235,126 +235,97 @@ describe('kv-memory panel', () => {
   });
 });
 
-describe('prefix-cache panel', () => {
-  const prefixStore = (overrides = {}) =>
-    createFakeStore({
-      fields: {
-        'prefix_cache.hits': measured(41, { unit: 'count' }),
-        'prefix_cache.lookups': measured(47, { unit: 'count' }),
-        'prefix_cache.tokens_reused': measured(81_344, { unit: 'tokens' }),
-        'prefix_cache.prefill_tokens_skipped': measured(81_344, { unit: 'tokens' }),
-        'prefix_cache.time_saved_ms': measured(340, { source: 'estimated', unit: 'ms' }),
-        'prefix_cache.evictions': measured(2, { unit: 'count' }),
-        ...overrides.fields,
-      },
-      series: { 'prefix_cache.hits': series([[Date.now() - 1000, 41]]) },
-      capabilities: overrides.capabilities,
-    });
+describe('prefix-cache panel — the finding, not a metric', () => {
+  // This panel binds NO telemetry. The counters it used to read were ruled
+  // unshippable after a controlled A/B proved prefix reuse absent on both
+  // execution paths while the engine's hit counter reported ~95% regardless.
+  // These tests pin the two properties that matter: it reads nothing from the
+  // store, and it still says something true when the server is unreachable.
 
-  it('labels the server\u2019s "lookups" counter as completed generations, because that is what it counts', () => {
-    // metrics.rs:130-132 increments on every completed generation, whether or
-    // not a cache was consulted. It is a genuine counter of the wrong noun.
-    const { root, handle } = mountPanel(prefixCache, prefixStore());
-
-    assert.match(root.textContent, /completed generations/);
-    assert.doesNotMatch(
-      root.textContent,
-      /\blookups\b/,
-      'calling it "lookups" would launder a real counter of the wrong noun into a plausible one',
-    );
-    handle.unmount();
-  });
-
-  it('renders "no data" as pending, not as a 0% hit rate', () => {
-    // The server emits a literal 0.0 when the denominator is zero, collapsing
-    // "no data" and "0% hit rate" into the same wire value. The panel must not.
-    const store = prefixStore({
-      fields: {
-        'prefix_cache.hits': measured(0, { unit: 'count' }),
-        'prefix_cache.lookups': measured(0, { unit: 'count' }),
-      },
-    });
-    const { root, handle } = mountPanel(prefixCache, store);
-
-    const hero = root.findByClass('panel-prefix-cache__hero');
-    assert.equal(hero.findByClass('value').getAttribute('data-state'), 'pending');
-    assert.doesNotMatch(hero.textContent, /0\.0%|0%/);
-    handle.unmount();
-  });
-
-  it('refuses to report a rate built from two counters that each measure the wrong thing', () => {
-    const store = prefixStore({
-      fields: {
-        'prefix_cache.hits': measured(0, { unit: 'count' }),
-        'prefix_cache.lookups': measured(5, { unit: 'count' }),
-      },
-    });
-    const { root, handle } = mountPanel(prefixCache, store);
-
-    const hero = root.findByClass('panel-prefix-cache__hero');
-    assert.equal(hero.findByClass('value').getAttribute('data-state'), 'unavailable');
-    // Refusing to compute must not become refusing to explain: the defect is
-    // the finding, so the panel has to say what it is.
-    assert.match(handle.describe(), /denominator|share no prefix|measure prefix reuse/i);
-    handle.unmount();
-  });
-
-  it('explains a structurally-pinned zero instead of letting it read as "no reuse happened"', () => {
-    const store = prefixStore({
-      fields: { 'prefix_cache.hits': measured(0, { unit: 'count' }) },
-      capabilities: {
-        'prefix-cache': {
-          available: false,
-          reason:
-            'This model runs on the continuous-batch path, where the decode loop is constructed ' +
-            'with a prefix-cache hit length of zero.',
+  it('mounts and renders the finding without touching the store at all', () => {
+    // A store that THROWS on every access. If the panel reads any field, this
+    // test fails loudly rather than quietly succeeding against a stub that
+    // happens to return undefined.
+    const hostileStore = new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          if (prop === 'subscribe') {
+            throw new Error('prefix-cache must not subscribe: it renders static content');
+          }
+          throw new Error(`prefix-cache must not read the store (attempted: ${String(prop)})`);
         },
       },
-    });
-    const { root, handle } = mountPanel(prefixCache, store);
+    );
 
-    assert.match(root.textContent, /—/, 'the rate is unavailable, not zero, on this path');
-    assert.match(handle.describe(), /hit length of zero/);
+    const { root, handle } = mountPanel(prefixCache, hostileStore);
+
+    assert.match(root.textContent, /not happening on either execution path/i);
     handle.unmount();
   });
 
-  it('marks the estimated time saved with a tilde and the estimated badge', () => {
-    const { root, handle } = mountPanel(prefixCache, prefixStore());
+  it('renders no telemetry field element at all — there is no value to be wrong', () => {
+    const { root, handle } = mountPanel(prefixCache, {});
 
-    const savings = root.findByClass('panel-prefix-cache__savings');
-    const timeSaved = savings.children.find((row) => row.textContent.includes('time saved'));
-    assert.match(timeSaved.findByClass('value__num').textContent, /^~/);
-    assert.equal(timeSaved.findByClass('value__src').textContent, 'ᴱ');
+    // The structural property, not a string match: a bound field always
+    // renders a `.value` node carrying a `data-state`. No such node means
+    // there is nothing on this panel that could render a fabricated number,
+    // in any state. Prose ABOUT the hit rate is fine and necessary; a rendered
+    // hit rate is what was ruled out.
+    assert.equal(root.findByClass('value'), null, 'panel must render no telemetry field');
+    assert.doesNotMatch(root.textContent, /\d+(\.\d+)?\s*%\s*hit/i);
     handle.unmount();
   });
-});
 
-describe('prefix-cache — deriveHitRate in isolation', () => {
-  const { deriveHitRate } = prefixCache;
+  it('shows the control arm, because the control is what makes it a finding', () => {
+    const { root, handle } = mountPanel(prefixCache, {});
 
-  it('is pending, not zero, with no completed generations', () => {
-    const rate = deriveHitRate(measured(0), measured(0));
-    assert.equal(rate.state, 'pending');
-    assert.equal(rate.value, null);
+    // Without the control, "1341 ms" is just a number. The control is the
+    // evidence, so it must be on screen and not buried in a hover.
+    assert.match(root.textContent, /1341 ms/);
+    assert.match(root.textContent, /1254 ms/);
+    assert.match(root.textContent, /differing from token 0/i);
+    handle.unmount();
   });
 
-  it('is unavailable when the capability is off, whatever the counters say', () => {
-    const rate = deriveHitRate(measured(0), measured(5), { available: false, reason: 'path' });
-    assert.equal(rate.state, 'unavailable');
+  it('states the sensitivity control, so absence reads as PROVEN rather than merely unobserved', () => {
+    const { root, handle } = mountPanel(prefixCache, {});
+
+    assert.match(root.textContent, /90%|90 percent/i);
+    handle.unmount();
   });
 
-  it('never emits a numeric rate, and names the defect in both terms', () => {
-    const rate = deriveHitRate(measured(41), measured(47));
-    assert.equal(rate.state, 'unavailable');
-    assert.equal(rate.value, null, 'a rate from two broken counters must not be computed');
-    assert.match(rate.reason, /denominator/i);
-    assert.match(rate.reason, /share no prefix|no prefix at all/i, 'the numerator is broken too');
-    assert.deepEqual(rate.derivedFrom, ['prefix_cache.hits', 'prefix_cache.lookups']);
+  it('labels the evidence as recorded rather than live, so it cannot read as stale telemetry', () => {
+    const { root, handle } = mountPanel(prefixCache, {});
+
+    // A fixed number with no age, sitting on a live dashboard, otherwise reads
+    // as a metric that stopped updating.
+    assert.match(root.textContent, /not live telemetry|recorded once, not polled/i);
+    handle.unmount();
   });
 
-  it('is unavailable when either counter is unavailable', () => {
-    assert.equal(deriveHitRate(unavailable('no'), measured(5)).state, 'unavailable');
-    assert.equal(deriveHitRate(measured(5), unavailable('no')).state, 'unavailable');
+  it('cites the engine line that makes the counter false', () => {
+    const { root, handle } = mountPanel(prefixCache, {});
+
+    assert.match(root.textContent, /runtime\.rs:1017-1024/);
+    handle.unmount();
+  });
+
+  it('describe() carries the finding AND the control for a screen-reader user', () => {
+    const { handle } = mountPanel(prefixCache, {});
+
+    const described = handle.describe();
+    assert.match(described, /absent/i);
+    assert.match(described, /1341/);
+    assert.match(described, /1254/);
+    // The counter warning is the part most likely to be dropped from a summary,
+    // and it is the part that stops someone re-adding the panel later.
+    assert.match(described, /95 percent/i);
+    handle.unmount();
+  });
+
+  it('is mode-agnostic: the gap is real on BOTH paths, for two different reasons', () => {
+    assert.equal(prefixCache.meta.requires, null);
   });
 });
 

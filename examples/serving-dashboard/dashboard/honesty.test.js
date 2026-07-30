@@ -379,14 +379,33 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
   // measured or read out of the server source.
   const FORBIDDEN = [
     {
-      pattern: /\.(?:field|series|rate)\(\s*['"`](?:prefix_cache[._]hit_rate)['"`]/,
-      what: 'prefix_cache.hit_rate',
+      // DELIBERATELY THE WHOLE NAMESPACE, NOT THE THREE NAMED COUNTERS.
+      //
+      // The ruling named prefix_cache_hits, _lookups and _hit_rate. Banning
+      // exactly those three would still admit `prefix_cache.tokens_reused`,
+      // `prefill_tokens_skipped` and `time_saved_ms` — and those are WORSE,
+      // not better. They derive from `prefix_cache_hit_len`, which QA proved
+      // counts tokens that merely MATCHED rather than prefill that was
+      // actually skipped: engine/runtime.rs:1017-1024 never sets
+      // `loaded_prompt_prefix`, so the full prompt is re-prefilled anyway. A
+      // "prefill skipped: 812 tokens" row would assert saved work that the
+      // measured TTFT proves did not happen.
+      //
+      // A guard shaped like the incident catches only the incident. The
+      // architectural fact is that NO number in this namespace is backed by
+      // observed reuse on either execution path, so the namespace is the
+      // correct unit to ban.
+      pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*prefix[_.]?cache[._][\w.]+['"`]/i,
+      what: 'any prefix_cache.* value',
       why:
-        'its denominator counts COMPLETED GENERATIONS, not cache lookups ' +
-        '(metrics.rs:130-132), and QA disproved the numerator too — hits rise on requests ' +
-        'that share no prefix. Both terms measure the wrong thing, so the ratio is not a ' +
-        'hit rate at all.',
-      instead: 'show hits_total, plus the client-side TTFT delta, and name the defect.',
+        'a controlled A/B (n=6 per arm, with a sensitivity control proving the instrument ' +
+        'could resolve a 90% effect) found shared-prefix requests ran 7.0% SLOWER than a ' +
+        'zero-sharing control, while the hit counter fired on every request including all ' +
+        'six controls. The reuse is PROVEN ABSENT, not merely unmeasured — so every counter ' +
+        'in this namespace describes work that never happened.',
+      instead:
+        'render the verified gap itself, with citations and no numbers. There is no ' +
+        'client-side substitute either: the TTFT delta measures the same absent effect.',
     },
     {
       pattern: /\.(?:field|series|rate)\(\s*['"`][\w.]*tokens_per_second['"`]/,
@@ -429,8 +448,17 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
 
   it('MUTATION TEST — the tripwire fires on a real binding', () => {
     const wouldBind = [
+      // The three counters named in the ruling.
       "const rate = telemetryStore.field('prefix_cache.hit_rate');",
       'const rate = store.field(`prefix_cache_hit_rate`);',
+      "const hits = telemetryStore.field('prefix_cache.hits');",
+      "const gens = telemetryStore.field('prefix_cache.lookups');",
+      // The derived savings fields the three-name version of this lint would
+      // have let through. These are the dangerous ones: they assert saved work.
+      "telemetryStore.field('prefix_cache.tokens_reused')",
+      "telemetryStore.field('prefix_cache.prefill_tokens_skipped')",
+      "telemetryStore.field('prefix_cache.time_saved_ms')",
+      "telemetryStore.series('prefix_cache.hits', WINDOW_MS)",
       "const tps = telemetryStore.field('status.tokens_per_second');",
     ];
     for (const line of wouldBind) {
@@ -440,11 +468,13 @@ describe('honesty lint — poisoned server fields must never be bound', () => {
       );
     }
 
-    // Must NOT fire on the counters that ARE real and SHOULD be bound.
+    // Must NOT fire on prose, labels, or unrelated namespaces. The panel still
+    // EXPLAINS the prefix cache at length; only reading a value is forbidden.
     const legitimate = [
-      "telemetryStore.field('prefix_cache.hits')",
       "telemetryStore.rate('metrics.tokens_generated_total')",
       "const label = 'Prefix cache hit rate';",
+      "telemetryStore.field('kv.pages_allocated')",
+      "telemetryStore.capability('prefix-cache')",
     ];
     for (const line of legitimate) {
       assert.ok(

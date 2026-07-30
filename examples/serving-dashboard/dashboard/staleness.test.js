@@ -152,26 +152,35 @@ describe('AC45(c) — the ceiling is per-panel, not global', () => {
 
   it('gives every panel an explicit ceiling rather than inheriting the default', async () => {
     const { PANELS } = await import('./index.js');
-    for (const panel of PANELS) {
-      const { staleCeilingMs, cadence } = panel.module.meta;
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const dir = fileURLToPath(new URL('.', import.meta.url));
 
-      // A panel that polls nothing has no ceiling to declare — staleness is a
-      // property of a value that stopped arriving, and this panel has no
-      // values. `null` is the explicit, honest declaration for that case;
-      // inventing a number would imply a freshness contract it does not have.
-      // The escape hatch is gated on `cadence === 0` so it cannot be used to
-      // silently drop the ceiling from a panel that DOES poll.
-      if (cadence === 0) {
-        assert.equal(
-          staleCeilingMs,
-          null,
-          `${panel.id} polls nothing, so its ceiling must be explicitly null`,
+    for (const panel of PANELS) {
+      const { meta } = panel.module;
+
+      assert.ok(
+        'staleCeilingMs' in meta,
+        `${panel.id} inherits the default ceiling instead of declaring one`,
+      );
+
+      if (meta.staleCeilingMs === null) {
+        // `null` is legitimate ONLY for a panel that reads no telemetry:
+        // staleness is a property of a value that stopped arriving, and such a
+        // panel has no values. Verified against the module's SOURCE rather
+        // than trusted from meta, so a panel cannot opt out of staleness by
+        // declaring null while still binding fields.
+        const source = readFileSync(`${dir}${panel.id}.js`, 'utf8');
+        assert.doesNotMatch(
+          source,
+          /\.(?:field|series|rate)\(/,
+          `${panel.id} declares a null ceiling but still reads telemetry`,
         );
         continue;
       }
 
       assert.equal(
-        typeof staleCeilingMs,
+        typeof meta.staleCeilingMs,
         'number',
         `${panel.id} has no declared stale ceiling`,
       );

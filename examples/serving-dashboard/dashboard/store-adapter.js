@@ -434,7 +434,12 @@ export function adaptStore(telemetryStore, options = {}) {
  */
 const CAPABILITY_KEYS = Object.freeze({
   'kv-pages': ['kv.pages_used', 'kv.pages_total', 'kv.introspection'],
-  'prefix-cache': ['prefix_cache.hits', 'prefix_cache.lookups'],
+  // 'prefix-cache' is DELIBERATELY ABSENT. Its panel binds no telemetry at all
+  // — the counters were ruled unshippable after a controlled A/B proved prefix
+  // reuse absent on both paths — so there is no capability to detect. Listing
+  // it here would gate a static, always-true finding behind a live probe, and
+  // the panel would vanish exactly when the server is unreachable, which is
+  // when its explanation is most useful.
   'batch-occupancy': ['batch.utilization', 'batch.active_size'],
   throughput: ['throughput.tokens_per_second', 'metrics.tokens_generated_total'],
 });

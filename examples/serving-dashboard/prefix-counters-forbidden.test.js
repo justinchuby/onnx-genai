@@ -59,10 +59,7 @@ const ALLOWLIST = new Map([
   ['telemetry-provenance.js', 'permanent: the register that forbids them'],
   // DEBT — owned by the panel authors, must reach zero before release.
   ['telemetry-store.js', 'debt: store still projects the field'],
-  ['dashboard/prefix-cache.js', 'debt: the panel itself is being removed'],
   ['app.js', 'debt: audit-view wiring'],
-  // DEBT — surfaced only once the dotted spelling was added to FORBIDDEN.
-  ['dashboard/store-adapter.js', 'debt: CAPABILITY_KEYS still maps the panel'],
 ]);
 
 /** @returns {string[]} every .js file in the demo, excluding tests and deps */
@@ -111,7 +108,14 @@ describe('the prefix-cache counters are unnameable', () => {
       // A ratchet may rise exactly once for this reason, and the reason must be
       // written down -- otherwise "it only shrinks" is enforced by a number
       // anyone can edit with a plausible excuse. Resumes shrink-only from 5.
-      5,
+      //
+      // 5 -> 3 by @c8d9a40e: both dashboard entries are PAID, not excused.
+      // `dashboard/prefix-cache.js` no longer binds or names any of these
+      // fields -- the panel now renders the finding itself (the control arm,
+      // the sensitivity check and the engine citations) with no telemetry
+      // binding at all. `dashboard/store-adapter.js` lost its CAPABILITY_KEYS
+      // entry, since a panel that reads nothing needs no capability probe.
+      3,
       'The allowlist changed size. It may only SHRINK -- if you removed a ' +
         "binding, drop its entry and lower this number. If you added one, don't.",
     );

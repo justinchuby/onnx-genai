@@ -92,7 +92,9 @@ describe('a structurally bypassed counter never renders as a measurement', () =>
     // whatever the server says, no percentage reaches the screen.
     const panel = await mountAgainstRealStore('scatter', 'prefix-cache');
 
-    assert.doesNotMatch(panel.text, /\b0(\.0)?\s*%/, 'rendered a hit rate the server never measured');
+    // Anchored so it cannot match the `0%` inside a legitimate figure like
+    // "7.0% slower" — which is exactly what the looser \b version did.
+    assert.doesNotMatch(panel.text, /(?<![\d.])0(\.0)?\s*%/, 'rendered a hit rate the server never measured');
     assert.match(panel.text, /not happening on either execution path/i);
     panel.release();
   });
@@ -199,22 +201,24 @@ describe('a structurally absent metric is explained, not apologised for', () => 
   // measurable yet" concludes the demo is half broken, which is exactly the
   // misreading the fifth state exists to prevent.
 
-  it('says not-applicable, never "not measurable yet", on the batching server', async () => {
+  it('never apologises, on either server', async () => {
     const panel = await mountAgainstRealStore('scatter', 'prefix-cache');
 
-    assert.match(panel.text, /n\/a/i);
+    // "Not measurable yet" promises a number that is coming. Nothing is
+    // coming: reuse is absent by construction on this path and unserved on the
+    // other. The panel states a finding rather than deferring one.
     assert.doesNotMatch(
       panel.text,
       /NOT MEASURABLE YET/i,
       'apologised for a metric that is absent by design, not by omission',
     );
-    assert.match(panel.text, /NOT APPLICABLE HERE/i, 'the chart well lost its explanation');
+    assert.match(panel.text, /proven|found absent|not happening/i);
     panel.release();
   });
 
   it('explains WHY in the accessible description, not only on hover', async () => {
-    // For not-applicable the explanation IS the information. A tooltip-only
-    // reason is unreachable by keyboard, by touch and by screen reader.
+    // The explanation IS the information on this panel, and a <canvas>-free
+    // wall of prose is still useless to a screen reader if describe() omits it.
     const store = createTelemetryStore({ origin: 'scatter', fetchImpl: respondingServer() });
     await store.pollOnce();
     const adapter = adaptStore(store);
@@ -224,7 +228,7 @@ describe('a structurally absent metric is explained, not apologised for', () => 
     flushAnimationFrames();
 
     const description = handle.describe();
-    assert.match(description, /not applicable|never consulted/i);
+    assert.match(description, /absent/i);
     assert.doesNotMatch(description, /not measurable yet/i);
 
     handle.unmount();
@@ -232,32 +236,31 @@ describe('a structurally absent metric is explained, not apologised for', () => 
     store.stop();
   });
 
-  it('gives the paging server a different explanation, not the scatter one', async () => {
-    // The opposite treatment of the same field. On scatter the capability is
-    // structurally absent; here it exists but its counters were disproved. Two
-    // distinct facts that must not collapse into one message — and neither is
-    // an apology.
+  it('gives both servers the SAME explanation, because both fail for real reasons', async () => {
+    // Previously these diverged. They must not any more: on dynamic the
+    // counters are not merely suspect, the reuse they claim was measured and
+    // found absent. Printing a rate on either origin is the failure.
     const panel = await mountAgainstRealStore('dynamic', 'prefix-cache');
 
-    assert.doesNotMatch(panel.text, /0\s*%/, 'a rate from broken counters must not be printed');
-    assert.doesNotMatch(panel.text, /NOT APPLICABLE/i, 'the capability is present on this path');
+    assert.doesNotMatch(panel.text, /\d+(\.\d+)?\s*%\s*hit/i, 'a rate from disproved counters must not be printed');
     assert.match(
       panel.text,
-      /denominator|share no prefix|measure prefix reuse/i,
-      'the panel must say why the rate is withheld',
+      /share|control|absent|not happening/i,
+      'the panel must say why there is no rate',
     );
     panel.release();
   });
 
-  it('reports the capability as structurally absent rather than unplumbed', async () => {
+  it('needs no capability probe: the finding is true even with the server down', async () => {
+    // The panel deliberately has no entry in CAPABILITY_KEYS. Gating a static,
+    // always-true finding behind a live probe would hide it exactly when the
+    // server is unreachable — which is when the explanation is most useful.
     const store = createTelemetryStore({ origin: 'scatter', fetchImpl: respondingServer() });
     await store.pollOnce();
     const adapter = adaptStore(store);
 
     const capability = adapter.capability('prefix-cache');
-    assert.equal(capability.available, false);
-    assert.equal(capability.state, 'not-applicable');
-    assert.ok(capability.reason, 'a not-applicable capability must carry its explanation');
+    assert.equal(capability.available, true, 'an unregistered capability must not hide the panel');
 
     adapter.destroy();
     store.stop();
