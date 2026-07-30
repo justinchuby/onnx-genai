@@ -528,19 +528,23 @@ genuinely moves. Only the *name* is wrong. Nothing automated catches these.
       makes its point.** `GenerationMetrics::start()` (`metrics.rs:110-116`) sets
       `started: Instant::now()` **and decrements `REGISTRY.pending` in the same breath** — so the
       clock starts when a request is **admitted**, not when it **arrived**. On the batched path
-      `start()` is called at batch admission (`driver.rs:625`). **Time spent queueing is
+      `start()` is called at batch admission (`crates/onnx-genai-server/src/driver.rs`,
+      `GenerationMetrics::start`). **Time spent queueing is
       therefore invisible to `ttft`.** Under the 4-concurrent scenario — the one that carried
       the now-withdrawn throughput headline — requests queue, so the reported TTFT is **better than the latency a user
       actually experiences**, and the gap *widens* as concurrency rises. This sits directly
       against the ratified rule that the per-stream cost ships beside the aggregate gain.
       **Either label it `time to first token (from admission)` or add the queue wait.** Do not
       ship it as unqualified "TTFT".
-      *Confidence: mechanism verified at `metrics.rs:111` + `driver.rs:625`. Confirm the exact
+      *Confidence: mechanism verified at `crates/onnx-genai-server/src/metrics.rs`,
+      `impl GenerationMetrics` + `crates/onnx-genai-server/src/driver.rs`,
+      `GenerationMetrics::start`. Confirm the exact
       enqueue point before quoting a magnitude.*
 - [ ] **7.6b 🟡 On the FIM path, `ttft` records TOTAL GENERATION TIME, not TTFT.**
-      `run_fim_generation` (`driver.rs:820-823`) calls `start()` then `result()` and **never
+      `run_fim_generation` (`crates/onnx-genai-server/src/driver.rs`, `run_fim_generation`)
+      calls `start()` then `result()` and **never
       calls `token()`**. `result()` back-fills the missing observation
-      (`metrics.rs:126-128`: `if completion_tokens > 0 { self.token(); }`), so `ttft.observe()`
+      (`crates/onnx-genai-server/src/metrics.rs`, `fn result` — `if completion_tokens > 0 { self.token(); }`), so `ttft.observe()`
       fires at the **end** of generation — making TTFT equal e2e latency for those requests.
       **Scope, stated honestly: the demo never issues FIM requests, so this does NOT affect our
       numbers.** Recorded because it silently pollutes the shared histogram if anyone ever does.
