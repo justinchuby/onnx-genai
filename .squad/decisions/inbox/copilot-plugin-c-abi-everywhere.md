@@ -1,47 +1,47 @@
-# 决策：每个扩展 seam 都必须提供稳定 C ABI，支持动态库加载
+# Decision: every extension seam must expose a stable C ABI with dynamic loading
 
-**日期**：2026-07-30
-**决策人**：@justinchuby（owner）
-**来源**：#524 Q1（契约审计提出的元决策）
-**状态**：已拍板，standing directive
+**Date**: 2026-07-30
+**Decided by**: @justinchuby (owner)
+**Source**: #524 Q1 (meta-decision raised by the contract audit)
+**Status**: settled, standing directive
 
-## 决策内容
+## Decision
 
-第三方出树扩展的目标形态是：**每个扩展 seam 都要有稳定 C ABI，全面支持 `.dll` / `.so` 动态加载。**
+The target form of out-of-tree extension is: **every extension seam gets a stable C ABI with full `.dll` / `.so` dynamic loading support.**
 
-不接受「只提供编译期 Rust trait、要求第三方链接本 workspace」的形态。
+Providing only a compile-time Rust trait that requires third parties to link this workspace is not acceptable.
 
-## 适用范围
+## Scope
 
-所有扩展点，包括但不限于：
+All extension points, including but not limited to:
 
-- Execution Provider（native EP，不只是现有的 legacy plugin EP）
-- `DeviceAllocator`（自带内存管理）
-- `MemoryPlanner`（激活/workspace 规划）
-- `KvCacheStore` 与 `KvCacheConnector`
+- Execution Providers (native EPs, not only the existing legacy plugin EPs)
+- `DeviceAllocator` (bring your own memory management)
+- `MemoryPlanner` (activation / workspace planning)
+- `KvCacheStore` and `KvCacheConnector`
 - `Sampler` / `LogitProcessor` / `SpeculativeProposer`
 - `SchedulingPolicy`
-- `OptimizationPass`（fusion / 图优化）
-- `Kernel`（为已有 EP 增加或替换单个 kernel）
-- `PlacementCostModel`、`WeightEvictionPolicy`、`ReclaimPolicy`
-- `Communicator`（跨设备传输）
+- `OptimizationPass` (fusion / graph optimization)
+- `Kernel` (adding or replacing a single kernel for an existing EP)
+- `PlacementCostModel`, `WeightEvictionPolicy`, `ReclaimPolicy`
+- `Communicator` (cross-device transport)
 
-## 直接推论
+## Direct implications
 
-1. **Rust trait 仍然需要**，但它是**进程内实现层**，不是边界。每个 seam 需要 trait + C vtable 双向 shim（host→plugin 与 plugin→host）。
-2. **ABI 基座成为所有 seam 的前置**：版本协商、错误传播、panic fencing、跨边界所有权约定必须先统一，否则每个 seam 各造一套。
-3. **稳定性策略从 P2 升为 P0**（原 #512）。既然对外承诺 ABI，就必须同时给出稳定性等级与版本化机制。
-4. **现有插件 EP 的 C ABI 是唯一已验证的样板**（`crates/onnx-runtime-ep-api/src/abi/runtime.rs:33-132`，含 `ort_version_supported` 版本协商，`registry.rs:220-226` 的 `libloading` + `CreateEpFactories` 加载）。应将其提炼为所有 seam 复用的模式。
-5. **RULES.md §1 的 FFI 要求成为硬约束**：C ABI 调用必须返回机器可解析的错误码 + 可取回的富文本消息；绝不丢弃 Rust cause；绝不跨 FFI unwind。
-6. **DLPack 的定位大概率随之确定**（#524 Q3）：既然边界是 C ABI，DLPack 作为跨实现零拷贝 tensor 交换的现成 C ABI 标准，是自然选择。待 owner 在 #524 确认。
-7. **Q2 的紧迫性上升**：EP ABI 是对齐上游 ORT plugin ABI 还是定义 nxrt 自有 ABI —— 这个选择现在会成为其余所有 seam ABI 的模板。
+1. **Rust traits are still required**, but they are the **in-process implementation layer, not the boundary**. Each seam needs a trait plus a C vtable shim in both directions (host→plugin and plugin→host).
+2. **An ABI foundation becomes a prerequisite for every seam**: version negotiation, error propagation, panic fencing, and cross-boundary ownership must be unified first, or each seam will invent its own rules.
+3. **The stability policy is raised from P2 to P0.** Committing to an ABI externally requires publishing stability tiers and a versioning mechanism at the same time.
+4. **The existing plugin EP C ABI is the only validated exemplar** (`crates/onnx-runtime-ep-api/src/abi/runtime.rs:33-132`, with `ort_version_supported` negotiation; `registry.rs:220-226` for `libloading` + `CreateEpFactories` loading). It should be extracted into a pattern all seams reuse.
+5. **The FFI requirements in RULES.md §1 become hard constraints**: C ABI calls must return a machine-parseable error code plus a retrievable rich message; never discard the Rust cause; never unwind across FFI.
+6. **DLPack's role is likely settled by implication** (#524 Q3): with the boundary being a C ABI, DLPack is the natural choice as an existing C ABI standard for zero-copy cross-implementation tensor exchange. Pending explicit owner confirmation.
+7. **Q2 becomes more urgent**: whether the EP ABI matches upstream ORT's plugin ABI or defines a native nxrt ABI now becomes the template for every other seam's ABI.
 
-## 影响的 issue
+## Affected issues
 
-- 新增：插件 ABI 基座（版本协商 / 错误传播 / panic fence / 所有权约定 / 一致性测试）
-- 升级：#512 稳定性策略 P2 → P0
-- 形态变更：#506、#508、#509、#510、#511、#513、#514、#515、#516、#517、#518、#519、#520 —— 每个都从「加 Rust trait」变为「Rust trait + C ABI vtable + 版本化」
+- New: plugin ABI foundation (version negotiation / error propagation / panic fencing / ownership conventions / conformance tests)
+- Raised: #512 stability policy, P2 → P0
+- Shape change: #506, #508, #509, #510, #511, #513, #514, #515, #516, #517, #518, #519, #520 — each moves from "add a Rust trait" to "Rust trait + C ABI vtable + versioning"
 
-## 备注
+## Note
 
-此决策显著提高了每个 seam 的工作量，但符合项目「第三方可针对性优化、无需 fork」的核心目标。建议按 seam 分批冻结 ABI，而非一次性全部设计。
+This decision raises the effort for every seam substantially, but it is what the project's core goal requires: third parties optimizing for their own hardware without forking. Recommend freezing ABIs seam by seam rather than designing them all at once.
