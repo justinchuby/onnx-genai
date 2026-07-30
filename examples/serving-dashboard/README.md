@@ -1492,6 +1492,10 @@ Two seams keep this navigable:
 ./examples/serving-dashboard/run-tests.sh
 ```
 
+Before adding or repairing a guard, read [`TESTING.md`](TESTING.md). Its red-first
+self-check exists because a green test can be structurally incapable of detecting
+the defect it claims to cover.
+
 Node's built-in runner, wrapped. No dependencies, consistent with having no
 build step. Run it from the repository root — the path above is relative to
 there. The script resolves its own directory internally, so it does not care
