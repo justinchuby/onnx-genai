@@ -18,8 +18,8 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
@@ -276,7 +276,7 @@ pub struct MatMulNBitsKernel {
     #[cfg(feature = "mlas")]
     mlas_shards: OnceLock<Option<Vec<Option<MlasShard>>>>,
     #[cfg(feature = "mlas")]
-    mlas_packed: OnceLock<Option<mlas_sys::SQNBitPackedB>>,
+    mlas_packed: OnceLock<Option<MlasPreparedPacked>>,
 }
 
 /// One contiguous output-column shard of an MLAS SQNBit-packed weight: columns
@@ -286,7 +286,25 @@ pub struct MatMulNBitsKernel {
 struct MlasShard {
     start: usize,
     len: usize,
+    prepared: MlasPreparedPacked,
+}
+
+#[cfg(feature = "mlas")]
+struct MlasPreparedPacked {
     packed: mlas_sys::SQNBitPackedB,
+    workspace: Mutex<mlas_sys::SQNBitGemmWorkspace>,
+}
+
+#[cfg(feature = "mlas")]
+impl MlasPreparedPacked {
+    fn new(packed: mlas_sys::SQNBitPackedB) -> Self {
+        let mut workspace = mlas_sys::SQNBitGemmWorkspace::new();
+        workspace.reserve_for(&packed, 1);
+        Self {
+            packed,
+            workspace: Mutex::new(workspace),
+        }
+    }
 }
 
 /// N-tile alignment for the persistent-pool MLAS SQNBit decode shards.
@@ -692,7 +710,6 @@ impl Kernel for MatMulNBitsKernel {
             owned_result = vec![0.0f32; result_len];
             &mut owned_result
         };
-        let dot_kernel = selected_dot_kernel();
         #[cfg(feature = "mlas")]
         {
             if let Some(()) = self.try_mlas_sqnbit(
@@ -715,6 +732,7 @@ impl Kernel for MatMulNBitsKernel {
                 return out;
             }
         }
+        let dot_kernel = selected_dot_kernel();
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -1200,8 +1218,9 @@ impl MatMulNBitsKernel {
             return Ok(None);
         }
 
+        let comp = self.mlas_compute_type();
+
         if self.weight_prepacked {
-            let comp = self.mlas_compute_type();
             if matches!(comp, mlas_sys::SQNBitComputeType::Int8)
                 && m == 1
                 && zero_points.is_some()
@@ -1236,9 +1255,32 @@ impl MatMulNBitsKernel {
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                with_mlas_qnbit_pool(|| {
-                    mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-                })
+                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
+            })?;
+            return Ok(Some(()));
+        }
+
+        if can_prepack
+            && !mlas_no_shard()
+            && let Some(shards) = self.mlas_shards.get()
+        {
+            let Some(shards) = shards.as_ref() else {
+                return Ok(None);
+            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| self.run_mlas_shards(shards, activations, m, bias, result));
+            return Ok(Some(()));
+        }
+
+        if can_prepack && let Some(cached) = self.mlas_packed.get() {
+            let Some(packed_weight) = cached.as_ref() else {
+                return Ok(None);
+            };
+            #[cfg(all(test, feature = "mlas"))]
+            MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            mm_profile::time_gemv(|| {
+                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
             })?;
             return Ok(Some(()));
         }
@@ -1278,8 +1320,6 @@ impl MatMulNBitsKernel {
         if !supports_bits || group_indices.is_some() || !use_mlas {
             return Ok(None);
         }
-
-        let comp = self.mlas_compute_type();
 
         // Cross-CPU correctness guard: MLAS's AVX2 M=1 CompInt8 SQNBit kernel
         // with a zero point (`SQ4BitGemmM1Kernel_CompInt8_avx2`, all block sizes)
@@ -1350,9 +1390,7 @@ impl MatMulNBitsKernel {
             #[cfg(all(test, feature = "mlas"))]
             MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
             mm_profile::time_gemv(|| {
-                with_mlas_qnbit_pool(|| {
-                    mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-                })
+                self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
             })?;
             return Ok(Some(()));
         }
@@ -1364,9 +1402,7 @@ impl MatMulNBitsKernel {
         #[cfg(all(test, feature = "mlas"))]
         MLAS_SQNBIT_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
         mm_profile::time_gemv(|| {
-            with_mlas_qnbit_pool(|| {
-                mlas_sys::sqnbit_gemm(packed_weight, m, activations, bias, result, true)
-            })
+            self.run_mlas_prepared(packed_weight, m, activations, bias, result, true)
         })?;
         Ok(Some(()))
     }
@@ -1506,7 +1542,8 @@ impl MatMulNBitsKernel {
                     debug_assert_eq!(shard.len, outputs.len());
                     let bias = bias.map(|bias| &bias[start..start + outputs.len()]);
                     // m == 1: `outputs` is this shard's contiguous output row.
-                    mlas_sys::sqnbit_gemm(&shard.packed, 1, activations, bias, outputs, false);
+                    self.run_mlas_prepared(&shard.prepared, 1, activations, bias, outputs, false)
+                        .expect("MLAS SQNBit shard GEMV must not fail");
                 },
             );
             return;
@@ -1578,7 +1615,7 @@ impl MatMulNBitsKernel {
                     let dst = unsafe { out.0.add(row_start * n + shard.start) };
                     unsafe {
                         mlas_sys::sqnbit_gemm_into(
-                            &shard.packed,
+                            &shard.prepared.packed,
                             rows,
                             activations,
                             bias,
@@ -1603,17 +1640,82 @@ impl MatMulNBitsKernel {
             // element of this shard's columns and `(m - 1) * self.n + shard.len`
             // stays within `result` (shard.start + shard.len <= self.n).
             unsafe {
-                mlas_sys::sqnbit_gemm_into(
-                    &shard.packed,
+                self.run_mlas_prepared_into(
+                    &shard.prepared,
                     m,
                     activations,
                     bias,
                     base.add(shard.start),
                     self.n,
                     true,
-                );
+                )
+                .expect("MLAS SQNBit shard GEMM must not fail");
             }
         }
+    }
+
+    #[cfg(feature = "mlas")]
+    fn run_mlas_prepared(
+        &self,
+        prepared: &MlasPreparedPacked,
+        m: usize,
+        activations: &[f32],
+        bias: Option<&[f32]>,
+        result: &mut [f32],
+        multithread: bool,
+    ) -> Result<()> {
+        let mut run = || {
+            let mut workspace = prepared
+                .workspace
+                .lock()
+                .expect("MLAS SQNBit workspace lock poisoned");
+            mlas_sys::sqnbit_gemm_with_workspace(
+                &prepared.packed,
+                m,
+                activations,
+                bias,
+                result,
+                &mut workspace,
+                multithread,
+            );
+        };
+        if multithread {
+            with_mlas_qnbit_pool(run)?;
+        } else {
+            run();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "mlas")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_mlas_prepared_into(
+        &self,
+        prepared: &MlasPreparedPacked,
+        m: usize,
+        activations: &[f32],
+        bias: Option<&[f32]>,
+        result: *mut f32,
+        ldc: usize,
+        multithread: bool,
+    ) -> Result<()> {
+        let mut workspace = prepared
+            .workspace
+            .lock()
+            .expect("MLAS SQNBit workspace lock poisoned");
+        unsafe {
+            mlas_sys::sqnbit_gemm_into_with_workspace(
+                &prepared.packed,
+                m,
+                activations,
+                bias,
+                result,
+                ldc,
+                &mut workspace,
+                multithread,
+            );
+        }
+        Ok(())
     }
 
     /// The contiguous output-column shards `self.n` is split into for the MLAS
@@ -1671,7 +1773,11 @@ impl MatMulNBitsKernel {
                 scales_shard,
                 zero_points_shard,
             ) {
-                Some(packed) => shards.push(Some(MlasShard { start, len, packed })),
+                Some(packed) => shards.push(Some(MlasShard {
+                    start,
+                    len,
+                    prepared: MlasPreparedPacked::new(packed),
+                })),
                 None => return Ok(None),
             }
         }
@@ -1689,7 +1795,7 @@ impl MatMulNBitsKernel {
         scales: &TensorView,
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
-    ) -> Result<Option<mlas_sys::SQNBitPackedB>> {
+    ) -> Result<Option<MlasPreparedPacked>> {
         let packed = to_dense_bytes(packed)?;
         let scales = to_dense_compute_f32(scales)?;
         let zero_points = zero_points.map(to_dense_bytes).transpose()?;
@@ -1702,7 +1808,8 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        ))
+        )
+        .map(MlasPreparedPacked::new))
     }
 
     #[cfg(feature = "mlas")]
@@ -1724,7 +1831,7 @@ impl MatMulNBitsKernel {
         scales: &TensorView,
         zero_points: Option<&TensorView>,
         comp: mlas_sys::SQNBitComputeType,
-    ) -> Result<Option<mlas_sys::SQNBitPackedB>> {
+    ) -> Result<Option<MlasPreparedPacked>> {
         let packed = to_dense_bytes(packed)?;
         let scales = to_dense_compute_f32(scales)?;
         let zero_points = zero_points.map(to_dense_bytes).transpose()?;
@@ -1737,7 +1844,8 @@ impl MatMulNBitsKernel {
             &packed,
             &scales,
             zero_points.as_deref(),
-        ))
+        )
+        .map(MlasPreparedPacked::new))
     }
 
     fn prepack_int8_weight(
@@ -10736,7 +10844,7 @@ mod tests {
                         for bias in [None, Some(pseudo(n, 0.1))] {
                             let mut out = vec![0.0f32; m * n];
                             mlas_sys::sqnbit_gemm(
-                                &packed_weight,
+                                &packed_weight.packed,
                                 m,
                                 &a,
                                 bias.as_deref(),
