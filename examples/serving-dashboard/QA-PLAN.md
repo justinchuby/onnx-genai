@@ -52,6 +52,40 @@ Every `file:line` citation in our docs is ambiguous unless it names the checkout
 - [ ] **0.1c Cite by symbol where possible** (`GenerationMetrics::start`,
       `prometheus_metrics`) rather than by line. Symbols survive both divergence and drift.
 
+## 0.2 🔴 CAPABILITY GATING IS MODEL-ID INFERENCE, AND IT FAILS OPEN
+
+The ruling preserves "`meta.requires` gating, re-evaluated on origin switch." **There is no
+`meta.requires` on disk** — no panel `meta` declares it (the six metas carry `id, title, group,
+span, cadence, staleCeilingMs, defaultOpen, acronyms`). The real mechanism is
+`panel.modes` in `dashboard/index.js` (`PANELS`), filtered against a `mode` derived from
+`SERVER_MODE_BY_CLASS[serverClass]`, where `serverClass` comes from
+`selfClassesFromModelId(modelId)` in `scenario-origins.js`.
+
+- [ ] **0.2a The gate keys on WHICH MODEL, not WHAT THE SERVER SUPPORTS.** These are different
+      questions and they come apart in one verifiable case: **`--enable-debug-endpoints`.**
+      Two servers running the *identical* model differ in real capability depending on that
+      flag — with it off, `/v1/debug/kv` and `/v1/debug/config` are gated and the KV,
+      prefix-cache and context-length fields cannot be fed. **A model ID cannot observe a
+      command-line flag.**
+- [ ] **0.2b The unknown-server fallback mounts EVERYTHING.** `dashboard/index.js` returns the
+      full `PANELS` list when `mode` is falsy, and `mode` is `undefined` whenever
+      `selfClassesFromModelId` doesn't recognise the model ID. So a visitor pointing the page
+      at their own server — the exact case the ruling names — **gets every panel, including
+      ones their build cannot feed.** `dashboard/prefix-cache.js` has the same default:
+      `telemetryStore.capability?.('prefix-cache') ?? { available: true }`.
+      **Both fail open, and failing open is indistinguishable from working.**
+- [ ] **0.2c Fail CLOSED: absence of a positive capability signal is `unavailable`, not
+      assumed-supported.** Detect from what the server actually answers (probe the endpoints /
+      read the config response), not from what its model is called.
+- [ ] **0.2d The lifecycle half of the ruling is already satisfied for free.** Because the
+      switch is a **navigation**, a full page load re-runs detection by construction — there is
+      no "re-evaluate on origin switch" code to write, and no stale-capability path to defend.
+
+**Already built and correct — do not re-request:** `scenario-origins.js` implements the whole
+navigation switcher (`resolveOrigins`, `planScenario` → `requiresNavigation`, `scenarioHref`,
+`currentScenarioId`), consumed by `app.js`. Per-panel `staleCeilingMs` (AC45(c)) ships in every
+panel meta.
+
 ## 0. Blocking unknowns — resolve before executing §3 onward
 
 These are open as of drafting. Each one changes the expected result of a test, so a tester who
