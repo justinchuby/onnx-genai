@@ -78,17 +78,17 @@ The upstream C++ `onnxruntime-genai` is a generation library. This project targe
    HTTP client
         │  POST /v1/chat/completions  (SSE stream)
 ┌───────▼─────────────────────────────────────────────┐
-│ onnx-genai-server        axum router, crates/onnx-genai-server/src/lib.rs:62-135 │
+│ onnx-genai-server        axum router, crates/onnx-genai-server/src/lib.rs        │
 │   AppState → ModelRegistry → ModelHandle            │
 └───────┬─────────────────────────────────────────────┘
         │  mpsc DriverCommand  +  oneshot / mpsc replies
 ┌───────▼─────────────────────────────────────────────┐
-│ EngineDriver     dedicated OS thread, driver.rs:113 │
+│ EngineDriver     dedicated OS thread, driver.rs     │
 │                                                     │
 │   ┌── continuous batch path ──┐  ┌── per-request ─┐ │
 │   │ ContinuousBatchManager    │  │ Engine::generate│ │
 │   │ static-cache models only  │  │ paged KV +      │ │
-│   │ batched.rs:101            │  │ prefix cache    │ │
+│   │ batched.rs                │  │ prefix cache    │ │
 │   └───────────────────────────┘  └─────────────────┘ │
 │              ▲ mutually exclusive — see §5.6         │
 └───────┬─────────────────────────────────────────────┘
@@ -259,13 +259,13 @@ The fork, and everything downstream of it:
 
 ```mermaid
 flowchart TD
-    A["run_engine_driver()<br/>driver.rs:576"] --> B{"engine.continuous_batch_manager(max_batch).is_ok()<br/>driver.rs:407-421"}
+    A["run_engine_driver()<br/>driver.rs"] --> B{"engine.continuous_batch_manager(max_batch).is_ok()<br/>driver.rs"}
 
-    B -- "Ok — STATIC-CACHE model" --> C["run_static_engine_driver()<br/>driver.rs:419"]
-    B -- "Err — DYNAMIC-cache model<br/>⚠ the else-branch at driver.rs:420" --> D["run_fallback_engine_driver()<br/>driver.rs:421"]
+    B -- "Ok — STATIC-CACHE model" --> C["run_static_engine_driver()<br/>driver.rs"]
+    B -- "Err — DYNAMIC-cache model<br/>⚠ the else-branch of that match" --> D["run_fallback_engine_driver()<br/>driver.rs"]
 
-    C --> C1["run_static_batch_until_idle()<br/>driver.rs:546"]
-    C1 --> C2["manager.step() — ONE batched<br/>forward pass over all rows<br/>driver.rs:596"]
+    C --> C1["run_static_batch_until_idle()<br/>driver.rs"]
+    C1 --> C2["manager.step() — ONE batched<br/>forward pass over all rows<br/>driver.rs"]
     C2 --> C1
 
     D --> D1["one request at a time<br/>engine owns kv_cache directly"]
@@ -273,7 +273,7 @@ flowchart TD
     C1 -.->|"NEVER touches"| K["engine.kv_cache<br/>engine.prefix_cache"]
     D1 --> K
 
-    K --> K1["PageTable::allocate()<br/>page_table.rs:836"]
+    K --> K1["PageTable::allocate()<br/>page_table.rs"]
     K --> K2["prefix trie<br/>reuse + CoW sharing"]
 
     style B fill:#fff3cd,stroke:#856404
