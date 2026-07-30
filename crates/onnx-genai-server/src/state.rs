@@ -155,13 +155,6 @@ pub struct ServerConfig {
     /// Directory served at `GET /demo`. `None` disables the demo (the route
     /// still responds, explaining how to point the server at the assets).
     pub demo_assets_dir: Option<PathBuf>,
-    /// Address the server is bound to, when it is known.
-    ///
-    /// Used only to decide how much of a model's filesystem path may be
-    /// disclosed on the ungated `/v1/models`. `None` means "assume not
-    /// loopback" so the cautious behaviour is what happens by default and by
-    /// omission, rather than something a caller has to remember to ask for.
-    pub bind_addr: Option<std::net::SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -178,23 +171,11 @@ impl Default for ServerConfig {
             eviction_policy: EvictionPolicy::Lru,
             engine_config: EngineConfig::default(),
             demo_assets_dir: None,
-            bind_addr: None,
         }
     }
 }
 
 impl ServerConfig {
-    /// Whether a model's full filesystem path may be disclosed on the ungated
-    /// `/v1/models`.
-    ///
-    /// An absolute path leaks the operator's username and directory layout to
-    /// anyone who can reach the endpoint, and no authentication stands in front
-    /// of it. On loopback the only reachable caller is already on the host and
-    /// learns nothing new, so the demo's model card stays fully informative.
-    pub(crate) fn may_disclose_model_paths(&self) -> bool {
-        self.bind_addr.is_some_and(|addr| addr.ip().is_loopback())
-    }
-
     /// The largest batch this server can actually assemble, and the only honest
     /// denominator for batch occupancy.
     ///

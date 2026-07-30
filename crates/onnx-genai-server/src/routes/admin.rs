@@ -24,14 +24,16 @@ fn directory_mtime_secs(path: &std::path::Path) -> Option<u64> {
     Some(since_epoch.as_secs())
 }
 
-/// How much of a model's path to disclose on the ungated `/v1/models`.
+/// The part of a model's path that may appear on the ungated `/v1/models`.
 ///
-/// The basename still identifies the model usefully while withholding the
-/// operator's home directory and username.
-fn model_path_for_display(path: &std::path::Path, disclose_full_path: bool) -> String {
-    if disclose_full_path {
-        return path.display().to_string();
-    }
+/// The basename identifies the model usefully while withholding the operator's
+/// home directory and username. Unconditional: this used to depend on whether
+/// the server was bound to loopback, which keyed on the BIND address rather
+/// than the PEER and therefore leaked full paths to every remote caller behind
+/// a reverse proxy. The basename branch was already the shipped answer for
+/// non-loopback and nobody found it insufficient, so the conditional was the
+/// only part that could be wrong.
+fn model_path_for_display(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -40,7 +42,6 @@ fn model_path_for_display(path: &std::path::Path, disclose_full_path: bool) -> S
 pub(crate) async fn models(
     State(state): State<AppState>,
 ) -> Result<Json<ModelsResponse>, ApiError> {
-    let disclose_paths = state.config.may_disclose_model_paths();
     Ok(Json(ModelsResponse {
         object: "list",
         // Built from `statuses()`, not `ids()`. `ids()` lists only *loaded*
@@ -59,7 +60,7 @@ pub(crate) async fn models(
                 owned_by: "onnx-genai",
                 loaded: status.loaded,
                 is_default: status.is_default,
-                path: model_path_for_display(&status.path, disclose_paths),
+                path: model_path_for_display(&status.path),
             })
             .collect(),
     }))

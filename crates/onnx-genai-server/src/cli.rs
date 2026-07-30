@@ -71,8 +71,13 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_MAX_QUEUE_DEPTH", default_value_t = 256)]
     pub max_queue_depth: usize,
 
-    /// Maximum concurrent generations per decode batch, and the denominator of
-    /// the batch occupancy reported by /v1/status. Falls back to ONNX_GENAI_MAX_BATCH.
+    /// Maximum concurrent generations per decode batch. Falls back to ONNX_GENAI_MAX_BATCH.
+    ///
+    /// NOT the denominator of the batch occupancy reported by /v1/status. That
+    /// denominator is `min(max_batch, max_queue_depth)`, because admission is
+    /// often the tighter constraint: with `--max-batch 4 --max-queue-depth 1`
+    /// the batch can never hold more than one generation, and dividing by 4
+    /// would draw a fully saturated server as three-quarters idle.
     #[arg(long, env = "ONNX_GENAI_MAX_BATCH", default_value_t = 4)]
     pub max_batch: usize,
 
@@ -124,7 +129,6 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         max_output_tokens: args.max_output_tokens,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
-        bind_addr: Some(args.addr),
         max_batch: args.max_batch,
         enable_debug_endpoints: args.enable_debug_endpoints,
         enable_admin_endpoints: args.enable_admin_endpoints,
