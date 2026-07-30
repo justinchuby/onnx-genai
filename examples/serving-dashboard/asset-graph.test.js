@@ -772,3 +772,123 @@ describe('one provenance concept has one vocabulary', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// D309 -- the field-state grammar must not leak onto non-field elements.
+//
+// FOUND IN A REAL BROWSER, NOT IN THIS SUITE. `[data-state='not-applicable']`
+// was declared UNQUALIFIED in shell.css, so it matched every element carrying
+// the attribute -- including `<aside class="scenario-switcher__note">`, a
+// multi-paragraph explanatory panel. Measured with getComputedStyle against the
+// SERVED stylesheets, with a paired control element that omitted the attribute:
+//
+//   property             with data-state     without (control)
+//   display              inline-block        block        <- layout change
+//   min-width            40.94px             0px          <- a VALUE SLOT
+//   border-bottom        3px double          none
+//   cursor               help                auto
+//   color                rgb(133,151,171)    rgb(133,151,171)   <- IDENTICAL
+//   border-left-width    3px                 3px               <- IDENTICAL
+//
+// The two identical rows are why this survived every review: `.scenario-
+// switcher__note` and the not-applicable state BOTH resolve to --og-na-fg, so
+// the one channel a human eye checks agreed exactly. THE DEFECT WAS HIDDEN
+// BEHIND A COINCIDENTAL COLOUR MATCH, and only `display` and `min-width`
+// disclosed it.
+//
+// The correct form already exists in the same file -- `.value[data-state=...]`
+// -- so this is not a new convention, it is an unenforced one.
+//
+// MUTATION PROOF (run, not assumed):
+//   remove the `.value` qualifier from any qualified rule  -> RED, names it
+//   set ALLOWED_UNQUALIFIED to []                          -> RED, lists 5
+//   delete every [data-state] rule from the corpus         -> RED via the
+//                                                             anti-vacuity arm
+describe('the field-state grammar stays on fields', () => {
+  // DATED EXEMPTION, 04:29. These five are the CURRENT unqualified rules. They
+  // are recorded rather than fixed here because the fix is NOT the obvious one
+  // and belongs to whoever owns shell.css.
+  //
+  // ⛔ DO NOT "FIX" THESE BY QUALIFYING THEM TO `.value[data-state=...]`.
+  // I nearly did. A census of the RENDERED DOM says that would be a regression
+  // of exactly the kind this project exists to prevent:
+  //
+  //    53  <span class="value">            .value   ✅ covered
+  //     3  <dd   class="model-card__value"> NOT .value  ⛔ WOULD LOSE STYLING
+  //     1  <div  class="connection-indicator">  has its own qualified rules ✅
+  //     1  <aside class="scenario-switcher__note">  THE DEFECT ⛔
+  //
+  // Two of those three <dd> are `unavailable` and one is `measured`. Qualifying
+  // to `.value` alone would strip the absence grammar from the model card, so
+  // an UNAVAILABLE value would render as confident plain text. THE NAIVE FIX
+  // CONVERTS A COSMETIC LEAK INTO AN HONESTY DEFECT.
+  //
+  // ✅ THE SAFE FIX, VERIFIED AGAINST THE DOM -- name both value classes:
+  //      .value[data-state='X'], .model-card__value[data-state='X'] { ... }
+  //    which covers all 56 genuine field values and excludes the <aside>.
+  //
+  // This list must SHRINK. Adding to it requires the same DOM census.
+  const ALLOWED_UNQUALIFIED = [
+    "[data-state='measured']",
+    "[data-state='pending']",
+    "[data-state='stale']",
+    "[data-state='unavailable']",
+    "[data-state='not-applicable']",
+  ];
+
+  const stateRules = Object.entries(css).flatMap(([file, text]) =>
+    [...text.matchAll(/^([^\n{}]*\[data-state=[^\]]+\][^\n{}]*)\{/gm)].map((m) => ({
+      file,
+      selector: m[1].trim(),
+    })),
+  );
+
+  it('found [data-state] rules at all (anti-vacuity)', () => {
+    assert.ok(
+      stateRules.length >= 5,
+      `Only ${stateRules.length} [data-state] rules found across ${
+        Object.keys(css).length
+      } stylesheets. The matcher has stopped seeing the state grammar, so every ` +
+        'assertion below is vacuously green. Fix the pattern, not this number.',
+    );
+  });
+
+  it('no [data-state] rule is unqualified', () => {
+    const unqualified = stateRules
+      .filter(({ selector }) => /^\[data-state=/.test(selector))
+      .filter(({ selector }) => !ALLOWED_UNQUALIFIED.includes(selector))
+      .map(({ file, selector }) => `${file}: ${selector}`);
+
+    assert.deepEqual(
+      unqualified,
+      [],
+      'These [data-state] rules are unqualified, so they style ANY element ' +
+        'carrying the attribute -- not just field values:\n  ' +
+        unqualified.join('\n  ') +
+        '\n\nThis is not hypothetical: <aside class="scenario-switcher__note" ' +
+        'data-state="not-applicable"> renders as display:inline-block with a ' +
+        'numeric value-slot min-width because of exactly this. Qualify each ' +
+        'rule with BOTH value classes -- `.value[data-state=X], ' +
+        '.model-card__value[data-state=X]` -- and read the comment above ' +
+        'before using `.value` alone, which strips the model card.',
+    );
+  });
+
+  it('the exemption list has not become fiction', () => {
+    const stillBare = stateRules
+      .filter(({ selector }) => /^\[data-state=/.test(selector))
+      .map(({ selector }) => selector);
+    const retired = ALLOWED_UNQUALIFIED.filter((s) => !stillBare.includes(s));
+
+    assert.deepEqual(
+      retired,
+      [],
+      `These selectors are exempted as unqualified but are no longer bare in ` +
+        `the stylesheets:\n  ${retired.join('\n  ')}\n\n` +
+        'Somebody fixed them -- thank you. DELETE THEM FROM ALLOWED_UNQUALIFIED ' +
+        'in the same commit. An exemption that has stopped describing the tree ' +
+        'is a standing invitation to re-investigate a corpse, and it makes the ' +
+        'remaining entries look equally stale.',
+    );
+  });
+});

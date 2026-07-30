@@ -6296,3 +6296,80 @@ INTO AN ERROR — IT DECAYS INTO A DIFFERENT, EQUALLY CONFIDENT CLAIM.** An erro
 check. A confident claim about the wrong subject does not. **That is why the repair is
 `symbol`, never `symbol + line`, and why "the line is still roughly right" is not a
 defence.**
+
+---
+
+## 91. THE STATE GRAMMAR LEAKED OFF THE FIELDS, AND ONLY A BROWSER SAW IT (D309–D311)
+
+**608 green tests, a nine-item gate and ~30 review findings did not see this. One headless
+Chrome load did, in about ninety seconds.**
+
+`shell.css` declares five **unqualified** `[data-state='…']` rules. An unqualified
+attribute selector is a claim that *every element carrying this attribute is a field
+value*, and the rendered DOM disproves it. `<aside class="scenario-switcher__note"
+data-state="not-applicable">` — a panel with an `<h3>`, a `<ul>`, two `<p>` and a `<pre>` —
+is styled by the grammar reserved for **absent numeric readings**.
+
+Measured with `getComputedStyle` against the **served** stylesheets, with a paired control
+element identical but for the attribute:
+
+| property | with `data-state` | control | |
+|---|---|---|---|
+| `display` | **`inline-block`** | `block` | ⛔ a block container relaid out |
+| `min-width` | **`40.94px`** | `0px` | ⛔ a *numeric value slot* |
+| `border-bottom` | **`3px double`** | `none` | ⛔ atop its intended left border |
+| `cursor` | **`help`** | `auto` | ⛔ over an entire explanatory panel |
+| `color` | `rgb(133,151,171)` | `rgb(133,151,171)` | ✅ **IDENTICAL** |
+| `border-left-width` | `3px` | `3px` | ✅ **IDENTICAL** |
+
+- **D309:** **AN ATTRIBUTE SELECTOR MUST BE QUALIFIED BY THE CLASS IT IS MEANT FOR.** A bare
+  `[data-state]` rule is an unstated universal claim about every element in the document,
+  and `data-state` is used for **two different concepts** here — field state on values, and
+  applicability on a note. **One attribute name, two vocabularies: §88/D303 with the arity
+  reversed.**
+- **D310:** **THE TWO IDENTICAL ROWS ARE WHY THIS SURVIVED EVERY REVIEW, AND THEY ARE THE
+  REAL LESSON.** `.scenario-switcher__note` and the not-applicable state both resolve to
+  `--og-na-fg`. **The one channel a human eye checks agreed exactly.** The defect was
+  invisible to inspection precisely *because* the palette was coherent — **a coincidental
+  colour match is camouflage, and design-system consistency is what supplied it.**
+  Only `display` and `min-width` disclosed it, and neither is visible in a screenshot of a
+  correctly-sized panel.
+
+### 91.1 D311 — THE OBVIOUS FIX IS A REGRESSION, AND I ALMOST SHIPPED IT
+
+The natural repair is to qualify each rule to `.value[data-state=…]`, which **already
+exists in the same stylesheet**, so it looks like restoring an established convention.
+**I ran a census of the rendered DOM before writing it, and it is wrong:**
+
+```
+ 53  <span class="value">              .value  ✅ covered
+  3  <dd class="model-card__value">    NOT .value  ⛔ WOULD LOSE ALL STATE STYLING
+  1  <div class="connection-indicator">  has its own qualified rules ✅
+  1  <aside class="scenario-switcher__note">  THE DEFECT ⛔
+```
+
+**Two of those three `<dd>` are `unavailable` and one is `measured`.** Qualifying to
+`.value` alone strips the absence grammar from the model card, so **an unavailable value
+renders as confident plain text.**
+
+- **D311:** ⛔ **THE NAIVE FIX CONVERTS A COSMETIC LEAK INTO AN HONESTY DEFECT — IT TRADES A
+  MIS-STYLED NOTE FOR A MISSING ABSENCE INDICATOR, WHICH IS THE ONE FAILURE THIS ENTIRE
+  DOCUMENT EXISTS TO PREVENT.** ✅ The safe form names both value classes:
+  `.value[data-state='X'], .model-card__value[data-state='X']` — 56 genuine field values
+  covered, the `<aside>` excluded. **A selector is a claim about a SET. You cannot verify it
+  from the stylesheet; you have to go and enumerate the set.**
+
+### 91.2 WHAT I DID AND DID NOT TOUCH
+
+`shell.css` is not my exclusive file and is under active edit, so **I did not change it.**
+`asset-graph.test.js` now carries the five current rules as a **dated, self-expiring
+exemption** with the DOM census and the safe fix in the failure message. Mutation-proved:
+a new unqualified rule goes red **and is named**; qualifying an exempted rule goes red
+telling the fixer to shrink the list; blinding the matcher trips the anti-vacuity arm at
+`Only 0 [data-state] rules found`.
+
+| # | Decision | Rationale |
+|---|---|---|
+| D309 | Attribute selectors are qualified by the class they are for | A bare `[data-state]` is an unstated universal claim; `data-state` here carries two different concepts |
+| D310 | A coincidental colour match is camouflage | Both paths resolved to `--og-na-fg`, so the channel humans check agreed and the defect read as intentional |
+| D311 | A selector is a claim about a set — enumerate the set before narrowing it | Qualifying to `.value` alone would strip absence styling from 3 model-card fields, 2 of them `unavailable` |
