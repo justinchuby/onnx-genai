@@ -193,13 +193,12 @@ pre-batch counts retained in the historical wave notes below.
 |---------|------:|
 | CPU registry `(domain, op_type)` pairs | **173** |
 | CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **164** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **159** |
-| CPU pairs implemented by CUDA in the same domain | **162 / 173** |
-| CPU standard-domain op types implemented by CUDA | **141 / 145** |
+| CUDA registry `(domain, op_type)` pairs | **167** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **161** |
+| CPU pairs implemented by CUDA in the same domain | **165 / 173** |
+| CPU standard-domain op types implemented by CUDA | **143 / 145** |
 
-The **4 remaining CPU `ai.onnx` gaps** are `ConvTranspose`, `GridSample`,
-`NonMaxSuppression`, and `Unique`.
+The **2 remaining CPU `ai.onnx` gaps** are `NonMaxSuppression` and `Unique`.
 
 The decode/transformer-oriented priority set from issue #67 is already covered:
 `LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
@@ -219,7 +218,7 @@ currently registered by the CPU EP include `Conv` (cuDNN).
 |---------|------------------------------|-----------|
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
-| **deferred heavy operators** | `ConvTranspose`, `GridSample`, `NonMaxSuppression` | Larger numerical/geometry surfaces deserve dedicated follow-up waves and focused review. |
+| **deferred heavy operators** | `NonMaxSuppression` | Data-dependent selection deserves a dedicated follow-up wave and focused review. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
@@ -374,6 +373,17 @@ covers quantized signed/unsigned and batched per-axis cases plus nearest/linear
 upsampling and downsampling across the supported coordinate and control modes.
 Current source-derived coverage is **159** advertised CUDA op names, **164**
 CUDA `(domain, op_type)` pairs, and **141 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 14 adds `ConvTranspose` and `GridSample`.
+`ConvTranspose` covers 1-D/2-D f32/f16/bf16 overlap-add with strides, asymmetric
+pads, dilations, output padding, bias, groups, and depthwise geometry.
+`GridSample` covers 4-D bilinear/nearest sampling for zeros, border, and
+reflection padding with either `align_corners` setting. ConvTranspose
+`SAME_UPPER`/`SAME_LOWER` and output-shape-driven padding, plus cubic/bicubic and
+volumetric GridSample, remain explicitly fail-closed. GPU parity covers the
+supported narrow storage types and out-of-bounds sampling. Current source-derived
+coverage is **161** advertised CUDA op names, **167** CUDA `(domain, op_type)`
+pairs, and **143 / 145** CPU standard-domain op types.
 
 ---
 
