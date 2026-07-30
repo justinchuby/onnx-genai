@@ -94,7 +94,7 @@ retraction reached the discussion four times and the tree zero times.
 scenario-origins.js · telemetry-provenance.js ×2 · registry.test.js ×2
 prefix-counters-forbidden.test.js ×3   (one is an assertion string)
 dashboard/honesty.test.js              (assertion string)
-check-readme-claims.test.js            (assertion string — SEE BELOW)
+check-readme-claims.test.js            (assertion string — EXEMPT, see next paragraph)
 ```
 
 Search `1341` and `1254`, not only `7.0%`, or a sweep misses two sites.
@@ -107,6 +107,58 @@ become. A blind substitution breaks the only site that was already right.
 The replacement claim needs no timing at all and no machine can perturb it: twelve requests with
 six deliberately unique prompts produced twelve hits and a 0.9375 rate, so the counter cannot
 distinguish reuse from no-reuse.
+
+### R11 — the design record describes the enum in the present tense, and it is the regeneration source
+
+`design/demo-ux.md` §53 (D159/D160) still reads, as statements about the code *now*:
+
+```
+"FIELD_STATES currently exports OK: 'ok' AND MEASURED: 'ok'"
+"Twelve modules and every [data-state='ok'] selector already agree"
+```
+
+Both were true when written. Neither is true at HEAD, and one is actively forbidden:
+
+```
+telemetry-field.js       MEASURED: 'measured'            <- the alias is gone
+[data-state='ok']        ZERO occurrences in styles/     <- control: 9 data-state
+                                                            selectors found, incl.
+                                                            'measured'
+state-channel.test.js    assert !shellCss.includes("[data-state='ok']")
+                         "A selector matching nothing is the half-migration this
+                          assertion exists to make impossible."
+```
+
+**This is the same defect as R6, one level up, and it is why the enum question kept
+reopening for two hours.** A reader consulting the design record to decide the question
+correctly derives that `'ok'` is the current value and that the cost ledger favours keeping
+it. The ledger actually runs the other way — the selectors agree on `measured`, zero say
+`ok`, so `'ok'` is the direction requiring CSS, writer and test edits. The document is not
+wrong about the *decision* it recorded; it is wrong about the *tense*.
+
+**The fix is not to rewrite the ruling — it is to date it.** And the repository already
+contains the correct pattern, three times, for this exact fact:
+
+| where the same fact appears | how it is marked |
+|---|---|
+| `telemetry-field.js` | "disagreed **once**" — past |
+| `dashboard/state-vocabulary.test.js` | "has **flipped between** … more than once tonight" — past |
+| `state-channel.test.js` | an executable guard forbidding the old value |
+| `design/demo-ux.md` §53 | "**currently** exports", "**already** agree" — **present** |
+
+Three code sites narrate it as history. The one prose site asserts it as current — and the
+prose site is the one people read before deciding.
+
+> A decision record written in the present tense stops being a record and becomes a claim.
+> Records need dates; claims need checkers. §53 has neither.
+
+**Related, smaller, same root:** 11 deictic references — *"see above"*, *"see below"*, *"the
+line above"* — across 7 tracked documents. A deictic is a citation with no resolvable target:
+`file:line` can be checked by a script, "above" cannot, and it silently breaks whenever
+anything is inserted between pointer and referent. Notably **zero** appear in 6,390 lines of
+JS doc comments — code comments sit beside their referent and never need to point. The
+unowned prose surface is *cleaner* on this axis than every owned document, including this one,
+which shipped with one.
 
 ---
 
