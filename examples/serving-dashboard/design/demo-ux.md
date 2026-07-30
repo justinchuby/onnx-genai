@@ -6915,3 +6915,93 @@ merge-base --is-ancestor          -> review-0 is NOT an ancestor of 6ecd9183
 | D323 | A guard reading one side of a boundary cannot fail on the boundary | Mutation testing inherits the blind spot of what it mutates; state the layer in the guard |
 | D324 | Knowing a defect class does not confer immunity; only a mechanism does | Three tombstone-as-corpse errors by me in one hour, after publishing three sections on it |
 | D325 | A lightweight tag cannot be immutable | No tagger, no date, movable by `git tag -f` without trace; three instruments say `0aac6bb1` |
+
+---
+
+## §96 — Which way does a catch-all rot? The direction decides the fix
+
+The Lead ordered two things on `styles/shell.css`: **invert the trust default**
+(`.value` renders untrusted; `[data-state='measured']` explicitly asserts full
+brightness) and **write the complement guard** (a garbage state must render
+distinctly from `measured`). The premise was that the `:not()` chain enumerating
+five known states "IS A SECOND COVERAGE LIST, and it rots the day a sixth state
+lands."
+
+**The premise is right about the list and wrong about the direction, and the
+direction is the whole ruling.** The guard landed. The inversion did not, and
+this section is the measurement that decides it.
+
+### A fall-through fails CLOSED. An exemption fails OPEN.
+
+A sixth state `ghost` lands and nobody touches the CSS. It falls **through** the
+`:not()` chain and collects the warn colour, the wavy underline, and the
+`NO STATE` chip. It does not render as confidently measured — it renders as an
+alarm. **The chain rots toward FALSE ALARM, which is the safe direction.**
+
+The direction that fails open is the one nobody named. Add
+`:not([data-state='ghost'])` to the chain **without** adding a
+`[data-state='ghost']` treatment rule, and `ghost` now matches *nothing at all*:
+a bare `.value`, inheriting `--og-fg`, **pixel-identical to `measured`**, with
+nothing red anywhere. The chain is an **exemption list, and every exemption must
+be paid for by a treatment.** Nothing checked that. It was one line of CSS away
+all night.
+
+### Why the ordered inversion is not what landed
+
+Two measurements, both taken before writing anything:
+
+1. **It is inert where it counts.** `panels.css:41` sets
+   `.value__num { color: var(--og-fg) }` — unconditionally, directly on the
+   child, in the **later** stylesheet. A direct rule beats inheritance, so a
+   colour asserted on the `.value` wrapper never reaches the number, *the one
+   glyph a reader actually looks at.* An inversion on wrapper colour is a
+   correct-looking fix on a channel the number does not read. **That is the same
+   failure I self-reported an hour ago, offered back to me as the remedy.**
+2. **Written in the obvious place, it inverts the page.** `.value` is defined in
+   `panels.css` at specificity (0,1,0); `[data-state='measured']` lives in
+   `shell.css` at (0,1,0). **Equal** — so source order decides, and `panels.css`
+   loads second. An untrusted base written beside `.value` would have **beaten
+   the measured override and muted every measured value on the dashboard.**
+
+The trust inversion is therefore carried where it already works: by the chip,
+which declares **both** its background and its foreground, inherits nothing, and
+spells a **word**. `NO STATE` survives a projector, greyscale and colour
+blindness with no encoding at all, and says *what* is wrong rather than only
+that something is. **What was missing was never the CSS. It was the guard.**
+
+### What landed — `asset-graph.test.js`, 32 → 40
+
+Eight arms, each mutation-proven, each mutation verified to have actually
+changed the file before it was scored:
+
+| mutation | caught by |
+|---|---|
+| chip word emptied | the chip carries a word |
+| chip `background` removed | the chip is closed |
+| unpaid exemption added | **every exemption is paid for** |
+| one channel's exemption list drifts | all channels exempt the identical set |
+| catch-all unscoped from `.value` | scoping (it would paint `.connection-indicator`) |
+| sixth state added to `FIELD_STATES` | the exemption set equals the enum |
+| chip rule deleted | non-zero floor (3 arms) |
+| **both catch-alls deleted** | **non-zero floor (5 arms) — cannot go green by absence** |
+
+### The guard found its own bug first, in the reassuring direction
+
+Its first run failed: a garbage state resolved to declarations **identical** to
+`measured`. The CSS was fine. My matcher tested
+`selector.includes("[data-state='measured']")` — and a catch-all selector
+*literally contains that substring for every state it EXEMPTS*. So `measured`
+matched the rule written to skip it. I had stripped the `:not()` groups
+correctly **eleven lines earlier** for the treatment set and forgot to here.
+
+Had the CSS been broken, that bug would have produced a **green** run. Substring
+matching against structured syntax is the `\b`/windowed-`grep` defect wearing a
+third costume, and knowing the class did not stop me writing it twice in one
+file.
+
+| ID | Decision | Rationale |
+|---|---|---|
+| D326 | Name a rot's DIRECTION before fixing it; a list that fails closed is not the same defect as one that fails open | The `:not()` chain rots toward false alarm; the unguarded direction was the unpaid exemption, which renders as `measured` |
+| D327 | Every exemption from a blanket rule must be paid for by a treatment rule | An exempted state with no rule matches nothing and inherits full confidence, silently |
+| D328 | A CSS default cannot be inverted without measuring specificity AND load order | `.value` (0,1,0) in the later sheet vs `[data-state='measured']` (0,1,0) — the obvious edit mutes every measured value |
+| D329 | Colour asserted on a wrapper is not asserted on the value | `panels.css:41` sets `.value__num` colour directly; a direct rule beats inheritance, so the number never receives it |

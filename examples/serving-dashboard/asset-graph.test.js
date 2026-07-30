@@ -1105,3 +1105,259 @@ describe('every state selector consumes the token family named for it', () => {
     );
   });
 });
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════════
+ * AN UNKNOWN STATE CANNOT RENDER AS A MEASURED ONE
+ *
+ * `state-channel.test.js` pins EVERY ENUM VALUE HAS A SELECTOR. That is a
+ * bijection over the enum, and a bijection guard is blind to the COMPLEMENT of
+ * its own domain -- which is infinite. Nothing in this repository has ever
+ * asked what renders for a value OUTSIDE the enum: a typo, a renamed constant,
+ * a state from a newer server, an attribute that never got stamped.
+ *
+ * WHICH WAY DOES THE CATCH-ALL ROT? This was ordered on the premise that the
+ * `:not()` chain at `shell.css` "rots the day a sixth state lands." It does,
+ * but NOT in the direction the order assumed, and the difference decides the
+ * fix. A sixth state falls THROUGH the chain and collects the warn colour, the
+ * wavy underline and the `NO STATE` chip -- it fails CLOSED, loudly. The chain
+ * rots toward FALSE ALARM, which is the safe direction and the opposite of
+ * rendering as confidently measured.
+ *
+ * THE DIRECTION THAT FAILS OPEN IS THE EXEMPTION, NOT THE FALL-THROUGH. Adding
+ * `:not([data-state='foo'])` to the chain WITHOUT adding a `[data-state='foo']`
+ * treatment rule leaves `foo` matching no rule at all -- a bare `.value`,
+ * inheriting `--og-fg`, PIXEL-IDENTICAL TO MEASURED. The chain is an exemption
+ * list, and every exemption must be PAID FOR by a treatment. Nothing checked
+ * that, and it is one line of CSS away at any moment.
+ *
+ * THIS IS ALSO WHY THE ORDERED CSS INVERSION IS NOT WHAT LANDED. Making
+ * `.value` untrusted-by-default and having `[data-state='measured']` assert
+ * trust is the right principle, and it is already how this section behaves --
+ * but as a COLOUR rule it is inert where it counts: `panels.css:41` sets
+ * `.value__num { color: var(--og-fg) }` directly on the child, in the LATER
+ * stylesheet, so the wrapper's colour never reaches the number. Worse, `.value`
+ * is defined in `panels.css` at (0,1,0) and `[data-state='measured']` lives in
+ * `shell.css` at (0,1,0) -- EQUAL specificity, and panels.css loads second, so
+ * an untrusted base written beside `.value` would have beaten the measured
+ * override on source order and muted EVERY MEASURED VALUE ON THE PAGE.
+ *
+ * So the trust inversion is carried by the chip, which declares its own
+ * background AND foreground, inherits nothing, and spells a WORD. What was
+ * missing was never the CSS. It was this file.
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+describe('an unknown state cannot render as a measured one', () => {
+  const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '');
+  const shell = strip(css['shell.css']);
+
+  const rules = [...shell.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({
+    sel: m[1].trim().replace(/\s+/g, ' '),
+    body: m[2],
+  }));
+
+  // A catch-all is any rule that exempts named states from a blanket treatment.
+  const catchAlls = rules.filter((r) => r.sel.includes(":not([data-state="));
+  const exemptedBy = (r) =>
+    [...r.sel.matchAll(/:not\(\[data-state='([a-z-]+)'\]\)/g)].map((m) => m[1]);
+
+  // A treatment rule names a state OUTSIDE any :not(). Strip the :not() groups
+  // first, or every exemption would read as its own treatment and this guard
+  // would certify the exact defect it exists to catch.
+  const treated = new Set(
+    rules
+      .flatMap((r) => [...r.sel.replace(/:not\([^)]*\)/g, '').matchAll(/\[data-state='([a-z-]+)'\]/g)])
+      .map((m) => m[1]),
+  );
+
+  const tf = read('./telemetry-field.js');
+  const frozen = tf.slice(tf.indexOf('FIELD_STATES = Object.freeze({'));
+  const enumValues = [...frozen.slice(0, frozen.indexOf('\n});')).matchAll(/^\s{2}[A-Z_]+:\s*'([a-z-]+)'/gm)].map(
+    (m) => m[1],
+  );
+
+  it('found the catch-all rules at all (non-zero floor)', () => {
+    // Without this arm, DELETING the catch-all makes every assertion below
+    // pass over an empty set. A guard that goes green when its subject is
+    // removed is worse than no guard: it reports safety caused by absence.
+    assert.ok(
+      catchAlls.length >= 2,
+      `Only ${catchAlls.length} catch-all rule(s) found in shell.css; expected ` +
+        `at least 2 (the colour/underline rule and the chip). If the scan ` +
+        `matched nothing, an unknown state now renders as a bare .value -- ` +
+        `which is to say, as a measured one.`,
+    );
+  });
+
+  it('parsed a non-empty exemption set and a non-empty enum (anti-vacuity)', () => {
+    for (const r of catchAlls) {
+      assert.ok(
+        exemptedBy(r).length > 0,
+        `A catch-all was found but zero exemptions parsed out of it:\n  ${r.sel}\n` +
+          `The :not() matcher has drifted from the selector syntax, and every ` +
+          `set comparison below is comparing empty sets to empty sets.`,
+      );
+    }
+    assert.ok(
+      enumValues.length >= 5,
+      `Parsed only ${enumValues.length} FIELD_STATES value(s) from ` +
+        `telemetry-field.js. The enum matcher has drifted; the bijection arm ` +
+        `below is vacuous.`,
+    );
+  });
+
+  it('pays for every exemption with a treatment rule', () => {
+    // THE ARM THAT MATTERS. An exempted state with no treatment matches no
+    // rule at all and renders as an unstyled .value -- indistinguishable from
+    // measured, with nothing red anywhere.
+    //
+    // `measured` is exempt from THIS check by ruling, not by oversight:
+    // tokens.css states there is deliberately NO `--og-measured-fg`, because
+    // measured is the one state whose treatment is ADD NOTHING.
+    const unpaid = [];
+    for (const r of catchAlls) {
+      for (const state of exemptedBy(r)) {
+        if (state === 'measured') continue;
+        if (!treated.has(state)) unpaid.push(state);
+      }
+    }
+    assert.deepEqual(
+      [...new Set(unpaid)],
+      [],
+      `State(s) exempted from the catch-all with no treatment rule of their ` +
+        `own: ${[...new Set(unpaid)].join(', ')}. Such a state matches NOTHING ` +
+        `-- it renders as a bare .value inheriting --og-fg, which is pixel- ` +
+        `identical to measured. This is the only direction in which the ` +
+        `catch-all fails OPEN, and it is one line of CSS away at any time.`,
+    );
+  });
+
+  it('exempts the identical set on every channel', () => {
+    // The exemption list is duplicated across the colour rule and the chip. If
+    // they drift, a state collects one channel and not the other -- e.g. the
+    // chip without the underline, or the underline with no word to explain it.
+    // Two lists that must agree and nothing checking that they do is the defect
+    // class that has bitten this branch all night.
+    const sets = catchAlls.map((r) => [...new Set(exemptedBy(r))].sort().join(','));
+    assert.equal(
+      new Set(sets).size,
+      1,
+      `The catch-all channels exempt DIFFERENT state sets:\n  ` +
+        sets.map((s, i) => `${i}: ${s}`).join('\n  ') +
+        `\nA state exempted on one channel and not the other renders half- ` +
+        `qualified: the reader gets a signal with no word, or a word with no ` +
+        `signal.`,
+    );
+  });
+
+  it('exempts exactly the enum -- no more, no less', () => {
+    // Catches the sixth state landing on EITHER side: a new FIELD_STATES value
+    // whose CSS was never written (it will scream NO STATE at a legitimate
+    // field), and a stale exemption for a state the enum has dropped.
+    const exempt = [...new Set(catchAlls.flatMap(exemptedBy))].sort();
+    assert.deepEqual(
+      exempt,
+      [...enumValues].sort(),
+      `The catch-all's exemption list and FIELD_STATES have diverged.\n  ` +
+        `CSS exempts : ${exempt.join(', ')}\n  ` +
+        `enum defines: ${[...enumValues].sort().join(', ')}\n` +
+        `A state in the enum but not the CSS renders as NO STATE though it is ` +
+        `perfectly legitimate; a state in the CSS but not the enum is a dead ` +
+        `exemption that will silently adopt any future state given that name.`,
+    );
+  });
+
+  it('distinguishes a garbage state from measured on a NON-COLOUR channel', () => {
+    // Simulate the cascade for one value inside the enum and one outside it,
+    // then require the difference to survive colour being switched off --
+    // greyscale, a projector, colour-blindness -- and to survive
+    // `panels.css:41`, which sets .value__num's colour directly on the child
+    // and therefore eats any colour the wrapper tries to assert.
+    // The :not() groups MUST come off before looking for a positive match. A
+    // catch-all selector literally contains the substring `[data-state='X']`
+    // for every state it EXEMPTS, so a naive includes() reports that 'measured'
+    // matches the rule that exists to skip it -- and the two declaration sets
+    // come back identical for the most reassuring possible reason. This guard
+    // failed exactly that way on its first run.
+    const matches = (r, state) => {
+      if (!r.sel.includes('.value')) return false;
+      const positive = r.sel.replace(/:not\([^)]*\)/g, '');
+      if (positive.includes(`[data-state='${state}']`)) return true;
+      return r.sel.includes(':not([data-state=') && !exemptedBy(r).includes(state);
+    };
+
+    const declsFor = (state) =>
+      rules
+        .filter((r) => matches(r, state))
+        .flatMap((r) => [...r.body.matchAll(/([a-z-]+)\s*:/g)].map((m) => m[1]));
+
+    const garbage = declsFor('__not_a_real_state__');
+    const measured = declsFor('measured');
+
+    assert.notDeepEqual(
+      [...new Set(garbage)].sort(),
+      [...new Set(measured)].sort(),
+      `A state outside the enum resolves to the SAME declarations as ` +
+        `'measured'. An unknown value is rendering with the page's full ` +
+        `confidence.`,
+    );
+    assert.ok(
+      garbage.includes('content'),
+      `A garbage state gains no 'content' declaration, so it gets no chip. ` +
+        `Colour cannot carry this on its own: panels.css sets .value__num's ` +
+        `colour directly on the child, which beats inheritance from the ` +
+        `wrapper, so the number -- the one glyph a reader actually looks at -- ` +
+        `stays full brightness. The word is the channel.`,
+    );
+    assert.ok(
+      !measured.includes('content'),
+      `'measured' gains a 'content' declaration, meaning the chip is being ` +
+        `drawn on correctly-measured values. That inverts the signal: the ` +
+        `warning becomes the background condition and stops meaning anything.`,
+    );
+  });
+
+  it('keeps the chip closed and worded', () => {
+    const chip = catchAlls.find((r) => /content\s*:/.test(r.body));
+    assert.ok(chip, 'No catch-all declares `content`; the chip is gone.');
+    const word = chip.body.match(/content\s*:\s*'([^']*)'/);
+    assert.ok(
+      word && word[1].trim().length > 0,
+      `The chip's content is empty or non-literal. It must spell a WORD: ` +
+        `a word survives a projector, greyscale and colour-blindness with no ` +
+        `encoding at all, and tells the reader WHAT is wrong rather than only ` +
+        `that something is.`,
+    );
+    // The chip must inherit nothing. There are eighteen unconditional colour
+    // rules on .value descendants; a chip that inherits is one new child rule
+    // away from being unreadable, and nothing would go red.
+    for (const prop of ['background', 'color']) {
+      assert.ok(
+        new RegExp(`(^|[;{\\s])${prop}\\s*:`).test(chip.body),
+        `The chip does not declare its own \`${prop}\`. A treatment every ` +
+          `future sibling rule must know about is a debt, not a design.`,
+      );
+    }
+  });
+
+  it('scopes the catch-all to .value, so it cannot paint other vocabularies', () => {
+    // `.connection-indicator` carries a DIFFERENT vocabulary on the same
+    // attribute (connected/connecting/no-model/unreachable). An unscoped
+    // catch-all would stamp NO STATE on every one of them -- four false alarms
+    // on the one widget whose job is to report trustworthiness.
+    const unscoped = catchAlls.flatMap((r) =>
+      r.sel
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.includes(':not([data-state=') && !s.startsWith('.value')),
+    );
+    assert.deepEqual(
+      unscoped,
+      [],
+      `Unscoped catch-all selector(s): ${unscoped.join(' | ')}. These match ` +
+        `every element carrying data-state, including .connection-indicator, ` +
+        `whose four states are all legitimate and none of which are in ` +
+        `FIELD_STATES.`,
+    );
+  });
+});
