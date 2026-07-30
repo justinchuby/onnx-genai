@@ -1,6 +1,6 @@
 # Implementation Review — `feat/genai-demo-dashboard`
 
-MEASURED-AT: 090e68ea2f3c19c7836315c8c91de1e1acf31f9f
+MEASURED-AT: 37d0d72e192d4fdbfab48f12761007e470cb670f
 
 Reviewer: Code Reviewer, agent id `agent:73e77d95` (lane: correctness, readability, patterns,
 test coverage, code quality). **That is an AGENT ID, not a commit.** It is prefixed `agent:`
@@ -517,18 +517,33 @@ not exist and is not referenced anywhere in this review.
 
 ## Method
 
-The branch worktree `/Users/justinc/Documents/GitHub/onnx-genai-demo` is dirty — four agents
+The branch worktree `$HOME/Documents/GitHub/onnx-genai-demo` is dirty — four agents
 are mid-edit and the Rust crate **does not currently compile** there
 (`admin.rs:146`, missing field `batch_in_flight` in `NodeStatus`). To review the *shipping*
 state rather than in-flight churn I extracted `git archive HEAD` to a clean tree and ran
 everything there.
 
-## VERDICT: REQUEST CHANGES — the branch is red at HEAD
+> ⛔ **EXPIRED OBSERVATION, retained as evidence.** Every clause above describes a working tree
+> that no longer exists: the crate compiles, the tree is clean (porcelain 0), and `git archive`
+> was later rejected in favour of `git worktree --detach` because an archive cannot answer
+> `rev-parse HEAD` from inside itself — it discards the provenance that makes the run checkable.
+> **An undated claim about a mutable working tree has no truth value once the minute passes.**
+
+## ⛔ SUPERSEDED PASS-0 VERDICT — DO NOT ACTION — read "PASS 1 VERDICT" below · CURRENT VERDICT IS **APPROVE, BLOCKING SET EMPTY**, measured at `37d0d72e` (749/115/0, raw exit 0, clean detached worktree)
+
+> **This heading formerly read `VERDICT: REQUEST CHANGES — the branch is red at HEAD` and is retained
+> as evidence, not as a finding.** It was true when written and is false now. Two reasons it must not be
+> quoted: **(1)** `HEAD` is a mutable pointer — like a tag name, it re-resolves silently for every reader
+> and never errors, except it re-points on *every commit* rather than only when someone moves it, so
+> "red at HEAD" is unfalsifiable prose that ages into a lie without any byte changing. **(2)** the numbers
+> below were produced by **two instruments this crew has since retired** — `git archive` (superseded by
+> `git worktree --detach`) and the pathspec `'**/*.test.js'`, which silently under-matches top-level files
+> and is the single most expensive defect of the session. **They are unreproducible by construction.**
 
 | Suite | Result |
 | --- | --- |
-| `node --test '**/*.test.js'` (dashboard) | **460 pass, 6 fail** (+1 false failure, see note) |
-| `cargo test -p onnx-genai-server -p onnx-genai-kv` | **162 pass, 2 fail** |
+| `node --test '**/*.test.js'` (dashboard) | ⛔ SUPERSEDED — **460 pass, 6 fail** was measured with a pathspec that silently drops every top-level file; superseded by **749 pass / 115 suites / 0 fail** at `37d0d72e` |
+| `cargo test -p onnx-genai-server -p onnx-genai-kv` | ⛔ SUPERSEDED — **162 pass, 2 fail**; superseded by **264 pass / 0 fail / 4 skipped**, exit 0 |
 
 Note: `check-source-citations.test.js` fails only in my extracted tree because it shells out to
 `git rev-parse --show-toplevel`. Not a branch defect — but see F7, it fails in the worktree too.
@@ -1953,7 +1968,7 @@ repairer is a document that is deliberately imprecise and says so.
 
 ## 🛑 Review-anchor #1 — the `review-0` tag MOVED, and `/tmp/review-0` is now the banned vehicle
 
-**Measured 04:26 from `/Users/justinc/Documents/GitHub/onnx-genai-demo`, HEAD `f7116dbe`.**
+**Measured 04:26 from `$HOME/Documents/GitHub/onnx-genai-demo`, HEAD `f7116dbe`.**
 **Two independent failures of the review anchor, both landed in the last ten minutes.**
 
 ### ① The tag moved 60 commits
