@@ -114,9 +114,14 @@ struct ModelObject {
     loaded: bool,
     /// Whether this is the model that an empty/omitted `model` field resolves to.
     is_default: bool,
-    /// Configured directory. Absolute on loopback; the basename otherwise, so a
-    /// non-loopback deployment does not leak the operator's username and
-    /// filesystem layout on an endpoint with no authentication in front of it.
+    /// Configured directory, reduced to its basename UNCONDITIONALLY, so that
+    /// this unauthenticated endpoint withholds the operator's username and
+    /// filesystem layout from every caller regardless of bind address.
+    ///
+    /// The loopback conditional this once described was deleted at `2da3e851`;
+    /// it keyed on the BIND address rather than the PEER. See
+    /// `admin::model_path_for_display`, the only writer of this field, which
+    /// carries the full reason.
     path: String,
 }
 
