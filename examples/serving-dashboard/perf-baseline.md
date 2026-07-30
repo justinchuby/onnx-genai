@@ -970,3 +970,187 @@ AC33 lists `≥32.75 tok/s single`. The preserved **clean** binary, unmodified, 
 **The baseline binary cannot pass the threshold derived from itself.** An absolute threshold silently
 encodes the machine conditions of the ten minutes in which the baseline was captured. Had telemetry
 been A/B'd against it tonight, the PR would have been charged with a ~12% regression it did not cause.
+
+---
+
+## 6f. THE −9.8% SWING HAS A NAME. I AM RETRACTING IT AS EVIDENCE — AND THE CONCLUSION SURVIVES ON BETTER EVIDENCE
+
+@1cb42f0e disclosed two CPU-heavy Mobius ONNX exports at **~23:21** and **~23:25**. I reconstructed
+each run's window from the embedded server-log timestamps (logged in UTC; local = UTC−7) rather than
+from file mtimes, which only record when I archived the artifact:
+
+| run | server start (local) | archived | verdict |
+|---|---|---|---|
+| primary baseline | **22:46:13** | 23:08:04 | ✅ **CLEAN** — ends 13 min before the first export |
+| 4 Hz polling arm | **23:10:32** | 23:20:28 | ✅ **CLEAN** — ends ~30–90 s before the first export |
+| **preserved-binary re-run (30.151 tok/s)** | **23:22:30** | 23:26:44 | 🔴 **TAINTED** |
+| run-level null test | 00:32 | 01:11 | ✅ **CLEAN** — 67 min after |
+
+The preserved-binary re-run loaded its model for ~55 s and generated from **≈23:23:25 to 23:26:44**.
+That window **straddles the ~23:25 export outright** and sits immediately downstream of the ~23:21 one.
+
+### 6f.1 What I retract
+
+**I cited 33.415 → 30.151 tok/s (−9.8%) on a byte-identical binary as proof that the perturbing
+variable is unattributable ambient load. That specific claim is withdrawn.** It was attributable, it
+has now been attributed, and I attributed it to `mediaanalysisd` and Time Machine on the strength of
+a `loadavg` reading — which is precisely the inference I had *already demonstrated to be worthless*
+(§6c: `loadavg` vs throughput, ρ = +0.079, p = 0.785). **I used a proxy I had personally disproven,
+because it pointed the way I already believed.** The number was real; the story I attached to it was
+not evidence.
+
+### 6f.2 What does not change, and why it is now on firmer ground
+
+The conclusion — *a cross-session before/after comparison cannot resolve 2%* — never depended on that
+run, and the **run-level null test is the load-bearing evidence.** It ran **00:32–01:11**, more than
+an hour clear of any disclosed heavy job, on one binary against itself:
+
+| between-run CV | **12.98%** |
+|---|---|
+| phantom delta of run means | +6.23% |
+| max pairwise run difference | 66.77% |
+| ratified procedure's false ≥2% verdict rate | **64.5%** |
+
+**None of that is explained by the exports.** Had the −9.8% been the only evidence, this disclosure
+would have overturned the finding. It is not, and it does not.
+
+### 6f.3 The sharper version of the argument
+
+The naive reading is *"so it wasn't mysterious after all — announce heavy jobs and cross-session
+comparison works."* That fails on two counts:
+
+1. **The disclosure was voluntary, retrospective, and human.** It arrived ~2 h later because an agent
+   remembered. No lock table, DAG edge, or `loadavg` sample surfaced it — I sampled `loadavg`
+   *during* the contaminated run and it told me a story about Spotlight.
+2. **Attribution is not reinstatement.** To compare a future after-run against 23:26:44's number I
+   would have to re-run two multi-GB exports at the same phase offset. **Knowing the cause explains
+   the damage; it does not restore comparability.** This is exactly what the back-to-back
+   both-arms protocol makes moot, because the contamination lands on both arms.
+
+**And the general lesson is the one that keeps recurring: a named cause for an anomaly is not the
+same as a validated instrument.** I had a real number, a plausible culprit, and a confirming proxy
+reading, and the culprit was wrong. Only the null test — same binary, no hypothesis, measured
+dispersion — could settle it.
+
+# §7 — P0 VERIFIED FIXED (`/v1/resources` and `/metrics` under sustained load)
+
+Fix-verification run. I opened this P0; I am closing it on a measurement.
+
+**Build provenance.** Branch `feat/genai-demo-dashboard` (asserted, not assumed),
+`git status --porcelain -uall -- crates/` = 0 entries, HEAD **`1d9a5515`**.
+Binary rebuilt from that tree; 0 `.rs` files newer than the binary.
+Behavioural fingerprint: `--max-batch` ✅, `--max-queue-depth` ✅,
+`--demo-assets-dir` ✅, `--cors-allow-origin` **absent** ✅ (post-fix shape).
+Launched via `run-demo.sh` on non-default ports 9231/9232 — never a bare binary.
+
+**Identity check, by behaviour rather than path.** `/v1/models` on the new build
+carries `loaded`, `is_default`, `path` — the post-fix key set — and `created` is
+**stable across two curls 2 s apart**, which is the discriminator that matters
+(the pre-fix binary's `created` moves, because it was `now_unix()`).
+
+> ⚠️ **And the trap the lead warned of cannot fire, for a reason worth recording:
+> I ran the discriminator on ALL FOUR listening servers — 9231, 9232, 8123, 8124 —
+> and every one is post-fix (7-key payload, `created` stable). There is no
+> preserved-baseline binary listening anywhere. The warning was correct in its
+> reasoning and inapplicable in fact, and I could only establish that by probing
+> every port rather than the two I launched.**
+
+## 7.1 The result
+
+Method unchanged from §6b.2: concurrent probe threads against a sustained 1024-token
+generation. Worst-case reported, never the mean.
+
+    /v1/resources           BEFORE (HEAD~)      AFTER (1d9a5515)
+    probes completed        1  (blocked)        195
+    median                  --                  2.2 ms
+    WORST                   51,010 ms           69.5 ms
+                                                -> 734x worst-case improvement
+
+    /metrics                51,010 ms worst     47.3 ms worst    n=195, median 2.3 ms
+    /v1/debug/kv                                80.9 ms worst    n=195, median 2.3 ms
+    /health                                     80.2 ms worst    n=195, median 2.2 ms
+    generation              53.0 s
+
+**CONTROL ARM — the batched server, which was never broken:**
+
+    :9231 scatter, 51.6 s generation
+    /metrics       n=190  median 2.1 ms  worst 63.4 ms
+    /v1/resources  n=190  median 2.2 ms  worst 58.1 ms
+
+**The two servers are now statistically indistinguishable under load.** That is
+the correct post-fix shape: the defect was that the non-batched path answered
+`ResourceSnapshot` only between commands while `Generate` decoded inline, so the
+endpoint was readable *only when there was nothing to report*. Both paths now
+answer mid-generation.
+
+## 7.2 Why load cannot corrupt this verdict
+
+Load average was **10.5 → 39.6** across the dynamic arm and **34.2 → 27.8**
+across the control — genuinely bad conditions, and I would refuse to publish a
+throughput number from them. **This verdict is immune for a reason I should
+state rather than assume: the effect is ~734×, and the largest load-induced
+swing ever observed on this box is 9.8%.** Contention cannot manufacture three
+orders of magnitude. Equally decisive and not a timing quantity at all: **the
+probe COUNT went from 1 to 195.** Under the old build the endpoint could not be
+sampled during a generation at all; now it can be sampled 195 times. That is a
+counting result, and counting results do not have a coefficient of variation.
+
+**Verdict: 🟢 P0 CLOSED. The fix is real, it is present on both profiles, and
+the previously-broken path now matches the control.**
+
+## 7.3 A LIVE BEFORE-ARM — and a correction to my own §7 claim
+
+**First, the correction.** In §7 I wrote that all four listening servers were
+"post-fix", on the strength of the `/v1/models` key set and a stable `created`.
+**That claim was too strong and @1cb42f0e was right to narrow it.** Their probe
+is sharper than mine:
+
+    onnxgenai_resource_governor_available in /metrics
+      :9231  3 occurrences   NEW image (1d9a5515-era)
+      :9232  3 occurrences   NEW image
+      :8123  0 occurrences   OLDER image
+      :8124  0 occurrences   OLDER image
+
+`created`-stability tests **one** fix; it cannot date a binary in general. My
+statement was true of the property I measured and false as the general claim I
+made from it — **the exact "wrong noun" failure I have flagged in others twice
+tonight.** The narrow version stands: no *preserved AC33 baseline* is listening.
+
+**Second, and it is a gift: the older image turns :8124 into a genuine BEFORE
+arm, running concurrently, on the same machine, under the same kernel.**
+
+    DYNAMIC PROFILE          :8124 OLD image        :9232 NEW image
+    generation                37.5 s                 53.0 s
+    /metrics       n              1                    195
+                   worst    35,456.6 ms              47.3 ms
+    /v1/resources  n              1                    195
+                   worst    35,456.2 ms              69.5 ms
+    ---- within-run controls, same harness, same instant ----
+    /health        n            136                    195
+                   median       2.4 ms                2.2 ms
+    /v1/debug/kv   n            136                    195
+                   median       2.5 ms                2.3 ms
+    loadavg              52.93 -> 74.90        10.54 -> 39.61
+
+**This is the strongest evidence class available for a fix, and it is stronger
+than the sequential before/after I published in §7.1.**
+
+1. **The before and after are simultaneous.** No rebuild, no reboot, no elapsed
+   hours between arms — the two binaries were serving at the same time.
+2. **The old arm ran under HEAVIER load** (52.9→74.9 vs 10.5→39.6) — so if
+   contention were the explanation, it would push the *old* arm's `/health` up
+   too.
+3. **It doesn't.** `/health` and `/v1/debug/kv` on the OLD server returned **136
+   probes at 2.4 ms median** during the same generation in which `/metrics`
+   returned **one probe after 35 seconds**. The machine was responsive, the
+   harness was working, the process was answering — **only the two endpoints
+   that call `resource_snapshot()` stalled.**
+
+**That within-run control is what makes this dispositive.** A confound that
+explains a 35-second stall on `/metrics` while leaving `/health` at 2.4 ms on the
+same process, in the same second, does not exist. **The fix caused the change.**
+
+🟢 **P0 CLOSED, on a same-machine, same-instant, load-adversarial before/after
+with an internal control.** No timing claim here depends on the absolute
+numbers — it depends on 1-vs-195 and on a within-run control, both of which are
+counts.
