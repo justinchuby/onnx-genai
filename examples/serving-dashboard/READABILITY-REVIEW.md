@@ -2072,3 +2072,94 @@ inaccuracy. **@c0de4c2e's specimen is that argument's proof: a citation that rot
 is not detectably wrong at all — it is confidently, verifiably wrong about a different thing.**
 ➡️ **My 7 anchors carry their symbol text, so had they drifted onto `server.context_length` they
 would announce the mismatch instead of authorising the deletion.**
+
+---
+
+## R41 🔴 **R9 IS HIDDEN, NOT CLOSED — and I can name which raw write is live. Plus: the order re-dispatching me is stale, and its scope ruling was refuted by its own author.**
+
+**MEASURED-AT `2f631e13` · clock `05:19:08` · toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted.**
+
+### ✅ THE ORDER ASKED THE SHARPEST QUESTION OF THE NIGHT AND THE ANSWER IS THE BAD ONE
+
+**@12e42da8 asked: *does the sixth `[data-state]` backstop MASK R9 rather than fix it — is your row
+hidden or closed? Those are different and only one is acceptable.* **IT IS HIDDEN.** Census of every
+raw `dataset.state` write at HEAD:**
+```
+ui/model-card.js:90        element.dataset.state = field.state      ✅ LEGITIMATE
+     -- imports FIELD_STATES, compares against it at :97, and the element IS a field.
+
+ui/scenario-switcher.js:113   notice.dataset.state = 'stale'            🔴 LIVE
+ui/scenario-switcher.js:202   note.dataset.state = 'not-applicable'    🔴 LIVE
+     -- THIS FILE IMPORTS NEITHER `FIELD_STATES` NOR `normalise`. NOT ONCE.
+        Its imports are scenario-origins and launch-command. IT HAS NO ACCESS
+        TO THE ENUM IT IS WRITING VALUES FROM.
+CONTROL: 26 files import field-state ⬅ the module is reachable; this one declines it
+NEG CONTROL zzy6-unwritten -> 0
+```
+**⛔ AND `:202` IS @0837fdf9's ASIDE — THE SAME ELEMENT, FOUND FROM THE OTHER END.** They measured
+the *stylesheet* claiming an explanatory panel is an absent number. **This is the *writer* that put
+it there.** Its own neighbouring comment reads *"Informational, not an alert: nothing is broken"* —
+**the author knew it was not a field and reached for the field vocabulary anyway, because it was the
+only absence vocabulary in the building.**
+
+> **🔑 THE DISTINCTION THE ORDER ASKED FOR, ANSWERED PRECISELY: @0837fdf9 REPAIRED THE *SELECTOR*, SO
+> THE PANEL NOW RENDERS CORRECTLY. **THE WRITE IS UNCHANGED. THE ELEMENT STILL ASSERTS, IN THE
+> SHIPPED DOM, THAT IT IS AN ABSENT NUMERIC READING.*** ➡️ **The pixels are fixed and the *claim* is
+> not. Any future selector, any assistive technology, and any test querying
+> `[data-state='not-applicable']` still finds a panel and is still entitled to believe it.**
+
+**⚖️ AND THIS IS R39 ARRIVING A FOURTH TIME, IN AN *ATTRIBUTE NAMESPACE* RATHER THAN IN CODE:
+`data-state` carries TWO POPULATIONS — field readings and panel moods — under ONE attribute name
+and ONE vocabulary, **with nothing anywhere stating that they are different kinds.** That is why
+@0837fdf9's obvious fix would have stripped the absence grammar from three real `<dd>` values, and
+why the safe fix took a DOM census: **you cannot tell the two populations apart from the source.**
+
+**✅ CONCRETE, AND IT IS SMALLER THAN THE SELECTOR FIX: give the non-field population its own
+attribute — `note.dataset.noteKind = 'not-applicable'` — and the selector question dissolves,
+because `[data-state]` becomes what it always claimed to be: *field readings only.* **A separate
+attribute is cheaper than a qualified selector AND it cannot be defeated by the next new element.**
+Not editing it: `ui/scenario-switcher.js` is not my file and we are in freeze.
+
+### ✅ R10 RE-COUNTED AS ORDERED — STILL EXACTLY 5, AND MY WIDE PREDICATE LIED FIRST
+
+```
+MY FIRST PREDICATE '7\.0'      -> 36 FILES.  ⛔ GARBAGE: matched version numbers,
+                                    0.7.0, 17.0, timings. I nearly published it.
+TIGHT PREDICATE '\+?7\.0 ?%'   -> **5 FILES**, the invariant unchanged:
+   READABILITY-REVIEW.md 3  ⬅ MINE, the finding itself (R37's class again)
+   check-perf-claims.test.js 8 · registry.test.js 1 · demo-spec.md 12 · demo-ux.md 7
+   CONTROL 'shared-prefix' -> 8 files      NEG -> 0
+➡️ NON-SELF CARRIERS: **4**.  THE ORDER SAID 'SOME ARE FIXED'. MEASURED: NONE ARE.
+```
+**⚖️ And @c8d9a40e's **zero** is also correct — they measured *the restored prefix panel and its
+test*, a different population. **Two true numbers, two denominators, no conflict.** Sixth
+reconciliation tonight of a shape that is never a disagreement and always a missing predicate.**
+
+### 🛑 THE ORDER ITSELF IS STALE, AND THE MEASUREMENT IS ONE LINE
+
+```
+ORDER SAYS:  "your pass 1 was taken at review-0 = 6ecd9183 -- re-score at the pin"
+MEASURED:    review-0 resolves NOW  -> **0aac6bb1**   (60 commits from 6ecd9183)
+             review-2 resolves NOW  -> **0bc86726**
+             MY DOCUMENT DECLARES   -> REVIEW-POINT-SHA: **0bc86726**
+```
+**⛔ I have already run pass 2 and pass 3 against `review-2`. The tree this order sends me to is one
+my own `REVIEW-POINT.md` abandoned two passes ago, and the tag it names has since moved.** ➡️ **This
+is @e00032a4's two-direction rule arriving on an *order* instead of a finding: *the tag strands
+findings behind it and hides fixes ahead of it* — and a dispatch written against a moved tag strands
+the reviewer in both directions at once.**
+
+**⚠️ AND THE SCOPE RULING BINDING MY DOCUMENT WAS REFUTED BY ITS OWN AUTHOR'S TOOL WHILE THE ORDER
+WAS IN FLIGHT.** The ruling rests on `ARCHITECTURE.md: 180 ANCHORED / 0 POSITIONAL`. **@e00032a4 has
+now found their harness's `positional` regex requires inline backticks, which the `<!-- cite: -->`
+markers lack — so it printed *"0 positional, every citation carries a symbol anchor"* about a
+document with **6 positional citations, 5 of them rotten**, three landing on a blank line, a `);`
+and a `}`.**
+> **⛔ THE `180` WAS A PROPERTY OF A REGEX. My independent measurement was 6; @73e77d95's was 6.
+> Three agents, three predicates, one document.** ✅ **AND I STILL DECLINED THE EXEMPTION IN R38 AND
+> REPAIRED MY 11 ANYWAY — which was the right call for a reason I did not have at the time: *the
+> exemption was computed from a number that did not exist.***
+
+**📋 R1 — the order asks me to re-cite it by content. **ALREADY DONE AT R38**, verified at
+`35b0ad48`: `dashboard/index.js:59` (`@property {(root: HTMLElement`), with a negative control that
+misses. **9 anchored in this document, 0 unanchored positional citations remaining.**
