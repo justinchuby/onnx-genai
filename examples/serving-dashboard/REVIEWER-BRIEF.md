@@ -12,7 +12,7 @@ stamps differ between sections. A stamp makes a claim **dated, not true**.
 
 ---
 
-## 0.0 Nine rules that outrank everything else in this document
+## 0.0 The rules that outrank everything else in this document
 
 Added at `d262a2bf`, 02:47, after the branch moved under the rest of this brief.
 Each was verified by the Secretary against committed bytes, not relayed. Where a
@@ -56,21 +56,38 @@ every measurement on the page **while keeping every test green**. The enum is
 five states, long spelling; `telemetry-field.js` carries the incident in its own
 doc comment. **If a ruling contradicts the disk, the disk wins.**
 
-**6. The page HAS been opened in a real browser; no *reviewer* has opened it.**
-These are different claims and this brief asserted the stronger one for
-twenty minutes. `browser-render-verification.md` is in HEAD (18,242 bytes):
-**real Chrome 150 over CDP, `GET /demo/` on both origins**, with a live
-`[data-state]` census of 59 and 50 nodes. That is a genuine browser measurement
-by the QA tester. What remains open is narrower and still real: all three code
-reviewers independently refused to let their sign-off be read as browser
-verification, and **no human has looked at the rendered page**. A CDP census
-proves the DOM carries the right state attributes; it does not prove the page
-*looks* right. Ask which of the two you need before you call this closed.
+**6. The page has been rendered, screenshotted and compared at the pixel
+level. No human has watched it live.** *(This rule has now been wrong twice, in
+opposite directions. Both errors are recorded below because the sequence is the
+lesson.)* `browser-render-verification.md` (18,242 bytes, in HEAD) is a real
+Chrome 150 / CDP run against `GET /demo/` on both origins, and it goes far past
+a DOM census:
 
-*(This rule was written here as "nothing has been opened in a browser" and that
-was false. The error is the one this document spends forty pages on: an
-aggregate — "nobody" — standing in for a scope — "no reviewer". I inherited the
-scope from a relayed status line and widened it while writing it down.)*
+- §1.1 — **137 rules live in the document's own CSSOM.** Chosen deliberately over
+  a 404 check: a never-referenced stylesheet is never requested, so a 404 sweep
+  could not have caught the original orphaned-sheet bug. A rule count can only be
+  non-zero if the sheet was fetched, parsed *and* attached. **Pick the instrument
+  that cannot be satisfied by the failure.**
+- §1.2 — **all ten pairs of the five ruled states are visually distinct.**
+- §2 — and the finding that justifies the whole exercise: a field whose state is
+  a typo, a renamed constant, or simply never set renders **byte-for-byte
+  identically to a trusted measurement — 2219 bytes, three screenshots, same
+  box.** The honesty layer's own default is the maximally dishonest one, and
+  **it degrades toward confidence, not toward caution.**
+- §3.3 — the distinctions survive JPEG q40, which is the closest thing to a
+  projector anyone has tested.
+
+**What is actually left is one line, not a category: nobody has sat and watched
+it run.** Eleven hundred assertions and this document still cannot tell you
+whether the demo *feels* broken.
+
+*(Error 1: I wrote "nothing on this branch has been opened in a browser" — an
+aggregate standing in for a scope. Error 2: I corrected it to "the DOM is
+measured, the pixels are not," having read this file's method line and not its
+body. The pixel work was in the file, byte-identical, the entire time. I cited a
+document's headline while writing a rule about verification — and the second
+error is the worse one, because the first was inherited and this one was mine
+with the evidence open in front of me.)*
 
 **7. A green count is a claim about the machine that ran the suite, not about
 the branch.** *(@12e42da8, verbatim.)* "Zero skipped" is the sharpest case: three
