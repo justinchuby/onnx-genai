@@ -102,7 +102,12 @@
      current is the same class of error as rendering a fabricated one, and
      colour alone fails grayscale and colourblindness. */
   --og-stale-fg: #7a8794;
-  --og-stale-rule: #4a5560;
+  /* D273. WAS #4a5560 = 2.28:1, failing WCAG 1.4.11 (3:1 non-text) exactly as
+     --og-unavail-rule did at 1.86:1. Found by generalising D270's check across
+     every state colour instead of fixing the one token that prompted it: the
+     first failure was a defect, two is a class. Both unannotated, both the
+     dashed/dotted SECOND CHANNEL that the greyscale gate depends on entirely. */
+  --og-stale-rule: #5e6a76;  /* 3.13:1 on --og-bg-raised, WCAG 1.4.11 */
   --og-simulated-fg: #e69f00;
   --og-simulated-rule: #e69f00;
   --og-estimated-fg: #9aa7b4;

@@ -155,4 +155,77 @@ describe('every design token reaches the screen', () => {
         `would be silently absent.\nUNCONSUMED: ${unused.join(', ')}`,
     );
   });
+
+  /**
+   * D273 — CONTRAST IS A MEASUREMENT, AND NOTHING WAS MEASURING IT.
+   *
+   * `--og-unavail-rule` sat at 1.86:1 against a 3:1 requirement for the entire
+   * session, underneath a comment in shell.css calling it "legible in greyscale,
+   * in a compressed screenshot, and on a projector". `--og-stale-rule` sat at
+   * 2.28:1. Both are the SECOND CHANNEL -- the dashed/dotted/double underline
+   * that lets the four absence states stay distinguishable when colour is taken
+   * away. A second channel nobody can see is not a second channel.
+   *
+   * Neither token carried a contrast annotation; their siblings all did. An
+   * unannotated token is an unchecked one, so this stops relying on annotation
+   * and computes the ratio from the shipped hex values.
+   */
+  describe('every state colour meets its contrast floor', () => {
+    /** WCAG 2.2: 4.5:1 for body text, 3:1 for non-text (1.4.11) such as a rule. */
+    const TEXT_MIN = 4.5;
+    const NON_TEXT_MIN = 3.0;
+
+    const relativeLuminance = (hex) =>
+      [1, 3, 5]
+        .map((i) => parseInt(hex.substr(i, 2), 16) / 255)
+        .map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4))
+        .reduce((sum, v, i) => sum + [0.2126, 0.7152, 0.0722][i] * v, 0);
+
+    const ratio = (a, b) => {
+      const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+
+    const hexOf = (token) => {
+      const match = css['tokens.css'].match(new RegExp(`${token}:\\s*(#[0-9a-fA-F]{6})`));
+      return match && match[1];
+    };
+
+    it('computes a known ratio correctly', () => {
+      // ANTI-VACUITY, and the control D264 demands: an implementation that
+      // returned a large number for everything would pass every assertion below
+      // while measuring nothing. White on black is 21:1 by definition.
+      assert.ok(Math.abs(ratio('#ffffff', '#000000') - 21) < 0.01, 'ratio() is wrong');
+      assert.ok(Math.abs(ratio('#151b23', '#151b23') - 1) < 0.01, 'ratio() is wrong');
+    });
+
+    it('gives every absence state a legible foreground and rule', () => {
+      const background = hexOf('--og-bg-raised');
+      assert.ok(background, 'no --og-bg-raised to measure against');
+
+      const failures = [];
+      for (const token of definitions) {
+        if (!/^--og-(unavail|na|pending|stale)-(fg|note|rule)$/.test(token)) continue;
+        const hex = hexOf(token);
+        if (!hex) continue;
+
+        const isRule = token.endsWith('-rule');
+        const floor = isRule ? NON_TEXT_MIN : TEXT_MIN;
+        const measured = ratio(hex, background);
+        if (measured < floor) {
+          failures.push(`${token} ${hex} = ${measured.toFixed(2)}:1, needs ${floor}:1`);
+        }
+      }
+
+      assert.deepEqual(
+        failures,
+        [],
+        'A state colour is below its WCAG floor on the shipped background. The ' +
+          'rule tokens are the second channel that carries absence when colour ' +
+          'is removed -- on a projector, in greyscale, for a colourblind ' +
+          'viewer -- so an invisible rule collapses four distinct admissions ' +
+          `into one indistinguishable grey.\nFAILING:\n  ${failures.join('\n  ')}`,
+      );
+    });
+  });
 });

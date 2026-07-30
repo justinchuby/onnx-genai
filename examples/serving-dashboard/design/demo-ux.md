@@ -5258,3 +5258,106 @@ file.** So the guard was correct and the situation is structural, not accidental
 **`solid` is the fifth distinct border style** (`stale` dashed, `unavailable` dotted,
 `not-applicable` double, `measured` none) — **so all five states stay mutually
 distinguishable with the colour channel switched off entirely.**
+
+---
+
+## 81. I was ordered to revert a green test, and the order was the stale premise D253 predicted
+
+**@12e42da8 sent a PRIORITY interrupt: revert `92daff39`, my tests are *"deliberately
+RED"*, the wire value is `'ok'`, and a committed test already asserts the opposite.
+I did not comply, and this section is the evidence, because a revert is the one
+action that cannot be undone by a later correction.**
+
+### 81.1 D272 — every factual claim in the order is false at HEAD, and the tree is green
+
+Measured at 02:16, in this order, before touching anything:
+
+```
+node -e import('./telemetry-field.js') -> {"MEASURED":"measured", … }   RUNTIME, 02:16
+git log -- telemetry-field.js         -> 50d412be 01:30 · 5ffa85b4 01:27 · 24d831a2 01:17
+state-channel.test.js                 -> 7 pass, 0 fail        NOT RED
+dashboard/store-adapter.test.js       -> 22 pass, 0 fail       NOT RED
+dashboard/state-vocabulary.test.js    -> 14 pass, 0 fail       NOT RED
+check-field-states.test.js            -> 5 pass, 0 fail        NOT RED
+92daff39                              -> 01:09, EIGHT MINUTES BEFORE the rename landed
+```
+
+**Nothing is red. No committed test opposes mine.** The single `assert.equal(result.state,
+'ok')` at `dashboard/store-adapter.test.js:210` is a **rate-series** result — a fourth
+vocabulary, alongside `status: 'ok'` (health) and `[data-state='connected']`, exactly
+as the contract warns. **It is not a FIELD_STATE and it passes.**
+
+**This is D253 arriving, twelve minutes after I wrote it, in the exact shape
+predicted:** *"paired with the belief that the wire value IS `'ok'`, the next agent to
+enforce the ruling will not leave the code alone — they will CORRECT THE CODE TO
+`'ok'`, believing they are restoring the frozen state."* **It arrived as an urgent
+revert order carrying the Lead's name and a false emergency attached to it.**
+
+> **D272. AN ORDER TO REVERT IS THE ONE INSTRUCTION THAT MUST BE VERIFIED BEFORE
+> COMPLIANCE, BECAUSE IT IS THE ONLY ONE WHOSE ERROR IS UNRECOVERABLE BY A LATER
+> RULING.** Every other stale instruction tonight cost a re-read. **This one would have
+> deleted a landed rename, reddened a green suite, and produced exactly the false
+> emergency it was sent to prevent** — and the compliance would have looked like
+> teamwork. **@0837fdf9's own D-rule applies to me here: DEFERENCE IS A FAILURE MODE
+> TOO.** The Lead was gracious about my complying earlier; **the correct response is
+> not to comply faster, it is to check first.** Their own precedence order — committed
+> code above every document and every ruling — **is what authorises the refusal.**
+
+**⚠️ AND THE PORTS IN THE SAME MESSAGE WERE ALSO STALE, WHICH IS THE CORROBORATION:**
+`:8141` and `:8293` **do not answer** (`000`, connection refused). The servers are on
+**`:8123` and `:8124`, both `200` on `/demo/`.** **A message can be right about the
+world and wrong about every address in it** — and the *"I sent this once and suspect it
+misrouted"* is itself evidence the tracker is replaying an older state.
+
+### 81.2 D273 — the render checks found a second contrast failure, so it is a class
+
+The Lead is right that the render checks are the only questions arithmetic cannot
+answer, so I took them against **served bytes** from `:8123`. My D270 fix is on the
+wire (`--og-unavail-rule: #566a7b`, 3.09:1). **Then I generalised the check instead of
+stopping at the token that prompted it:**
+
+| token | served | ratio | floor |
+|---|---|---|---|
+| `--og-unavail-rule` | `#566a7b` | 3.09:1 | 3.0 ✅ (was 1.86:1) |
+| **`--og-stale-rule`** | **`#4a5560`** | **2.28:1** | **3.0 ❌** |
+| `--og-na-rule` | `#53687e` | 3.01:1 | 3.0 ✅ |
+| all four `-fg` | — | 4.51 – 5.21:1 | 4.5 ✅ |
+
+**Two of the three rule tokens failed. Both were the ones carrying no contrast
+annotation; every compliant sibling carried its measured ratio in a comment.** Fixed:
+`--og-stale-rule: #5e6a76`, **3.13:1**.
+
+> **D273. ONE FAILURE IS A DEFECT; TWO OF THE SAME SHAPE IS A CLASS, AND A CLASS GETS
+> A TEST RATHER THAN A FIX.** `asset-graph.test.js` now **computes** WCAG ratios from
+> the shipped hex values — 4.5:1 text, 3:1 non-text — with a `#ffffff`/`#000000` = 21:1
+> control so it cannot pass by returning large numbers. **Mutation proven: restoring
+> `#4a5560` turns it red.** The rule tokens are the second channel that carries absence
+> **when colour is removed** — on a projector, in greyscale, for a colourblind viewer —
+> **so an invisible rule collapses four distinct admissions into one indistinguishable
+> grey.** That is @12e42da8's own standing-hazard argument, arriving from measurement
+> rather than from review.
+
+### 81.3 D274 — the typedef fix, ruled in and landing under either spelling
+
+**Accepted exactly as ruled, and it is correct under BOTH spellings, which is why it
+is the part of that message I act on immediately:** the healthy state must be defined
+as **A CURRENT READING EXISTS**, never as *this number was obtained by measurement*.
+
+> **D274. `state` AND `source` ARE ORTHOGONAL AXES, AND NO STATE VALUE MAY CLAIM WHAT
+> `source` ALREADY OWNS.** A derived field is genuinely `measured`-state and genuinely
+> derived-source **at the same time, on every poll**, and a reader who can parse those
+> two keys as contradictory will distrust the honesty layer **precisely where it is
+> working.** This is the same failure as two hole-glyphs reading as inconsistency
+> (§4.7.2): **honesty that looks like malfunction fails at its only job.**
+
+**STANDING HAZARD, recorded as the Lead asked — for any future state-token change:**
+an enum landing without its matching selector is **invisible in review because the
+page still looks right.** The healthy state inherits default styling; **only the four
+ABSENCE treatments break**, they sit within a hair of each other in greyscale, **and
+the non-colour channel is therefore the entire signal.** A half-migration collapses
+four distinguishable states into one undifferentiated grey **on the exact mechanism by
+which this page admits it does not know something.** And the global-replace trap is
+permanent: **three unrelated vocabularies share `'ok'`, one of them the HTTP health
+payload, where renaming it fakes an unreachable server.**
+
+**Suites: 10 + 7 + 7 + 3 + 3 + 3 = 33 green.**
