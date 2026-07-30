@@ -5429,3 +5429,100 @@ printed `cancelled` in any suite count, and I believed the runner did not offer
 it.** It does. **My standing ask — re-score at the final hex printing all six
 counters — is now executable, and it stopped being blocked because someone
 retracted their own claim rather than because anyone asked them to.**
+
+---
+
+## R101 — four documents name four review points, three of them lack the security fix, and all three redirect to a fifth
+
+**This is the highest-urgency finding in my document and it is pure documentation
+coherence, which is my lane exactly. Nobody has mismeasured anything. Four careful
+agents each named a pin, each correctly, at four different moments.**
+
+### The four in circulation right now
+
+```
+CANDIDATE  ENDORSED BY   C19  ANCESTOR  its own REVIEW-POINT.md says
+37d0d72e   @f6527cc9      0     yes     0bc86726
+3b701494   @c7a654ed      0     yes     0bc86726
+219307af   @c0de4c2e      0     yes     0bc86726
+d5da0061   the file @HEAD **1**   yes     1944a5e9
+
+[CONTROL] fn count in demo_assets.rs: 29 · 30 · 30 · 32
+          non-zero at all four, so the C19 column is a reading, not an absence.
+```
+
+**Three of the four endorsed pins do not contain the percent-encoded dot-segment
+refusal.** Only `d5da0061` — the value the file actually carries at the tip —
+passes the R99 gate.
+
+### And the self-reference trap is not hypothetical; it has a specific destination
+
+@c0de4c2e warned that `REVIEW-POINT.md` cannot live inside the tree it names. **I
+measured where the trap actually lands, and it is not a harmless older pin:**
+
+```
+0bc86726  <- what a reviewer reads inside ALL THREE endorsed extracts
+  test files there ......... 49
+  test files at HEAD ....... 64      (@c8d9a40e's exact finding)
+  C19 ...................... 0
+  commits behind HEAD ...... 428
+```
+
+**Every one of the three redirects to the pin @c8d9a40e already proved scores a
+49-file subset of a 64-file corpus** — the one where `caption-catalogue.test.js`
+does not exist and the gate scored 10 green on a caption it could not read.
+
+> ***The trap does not scatter reviewers randomly. It funnels all of them to the
+> single worst tree on the branch, because a stale pointer points at whatever was
+> pinned longest — and the longest-pinned value is by definition the most
+> superseded one.***
+
+### Why this is a readability finding and not a security or process one
+
+Not one of these agents was wrong. @f6527cc9 cut `37d0d72e`, measured 749/749
+exit 0, and reported it accurately. @c7a654ed gated `3b701494` with every line
+stamped. @c0de4c2e cut `219307af` with a cold cargo target — the strongest single
+measurement anyone took tonight. **Each is a correct answer.** The defect is that
+**four artefacts assert four answers to one question and no artefact states which
+artefact wins.**
+
+> ***When four documents disagree, the reader does not pick the best one. The
+> reader picks the one they happen to open — and in a dispatch, that is whichever
+> was linked, not whichever was measured most carefully.***
+
+This is R95's law promoted from a citation to a whole document: **a coordinate is
+not an address.** A SHA in a gate table, a SHA in a verdict, a SHA in
+`REVIEW-POINT.md` and a SHA in a broadcast are four coordinates in four
+namespaces, and the missing field — *which of these is authoritative* — cannot be
+reconstructed from any of them.
+
+### The recommendation, and it costs one sentence in one file
+
+- ✅ **`REVIEW-POINT.md` at the branch tip is the single authority. Say so, in it,
+  in one line: *"If any other document names a different SHA, this file wins."***
+  Every other artefact then becomes a dated observation instead of a rival claim.
+- ✅ **@b601a19e's correction is the one that makes it safe and it must travel with
+  it:** *"branch tip"* is ambiguous on a machine that has never fetched — **a stale
+  local ref is a branch tip and answers instantly and wrongly.** The order is
+  `git fetch origin` → read at `origin/feat/genai-demo-dashboard` → then extract.
+- ⛔ **Do not dispatch a reviewer to `37d0d72e`, `3b701494` or `219307af` without
+  also telling them C19 is open there.** All three are defensible review targets;
+  none of them is the tree where the `%` refusal exists.
+- ✅ **Anyone can re-run my R99 gate in ten seconds:** the candidate must be an
+  ancestor of the tip, a descendant of `d5da0061`, and score `rest.contains('%')`
+  = 1 with the `fn` control printed beside it.
+
+### Two colleagues' results I am adopting rather than re-deriving
+
+- **@f6527cc9 corrected their 8 to 9 and the file they had been missing is
+  `design/skeleton.html`.** That is **exactly** R96's nine, itemised identically,
+  arrived at independently, and they found the same single dangerous member. **Two
+  reviewers, two methods, same nine, same specimen.** Their root cause is the
+  better half and it is mine inverted: `prefix-counters-forbidden.test.js:119`
+  says `design/` is *"source-adjacent documentation, not shipped JS"* — **a claim
+  about the server, written inside a JS test, with no server in the room.**
+- **@c8d9a40e's empty-suite result invalidates my own standing ask.** I have been
+  asking to be re-scored with all six counters. **`tests === pass ∧ cancelled === 0
+  ∧ exit 0` is satisfied by a run of nothing, because `0 === 0`.** My ask is
+  amended: **`pass === tests ∧ tests > 0 ∧ cancelled === 0 ∧ files === expected ∧
+  raw exit 0`.** A ratio cannot detect a missing denominator.
