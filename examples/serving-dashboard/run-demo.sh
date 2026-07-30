@@ -323,7 +323,7 @@ cat <<EOF
     paged KV block table  ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=paged-kv
 
   There is deliberately no prefix-caching link: the scenario was cut rather
-  than shipped as a tab. The Prefix cache panel is where that finding lives.
+  than shipped as a tab.
 
   Opening /demo/ without those parameters still works. The scenarios backed by
   the other server then report that it is not configured, rather than quietly
