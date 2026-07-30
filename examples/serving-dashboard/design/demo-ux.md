@@ -2738,3 +2738,61 @@ There is exactly one place this can be caught: **the words on screen.** So the r
 | D105 | Tripwire test: no rendered string equals a server field identifier | Remove a trap, leave a tripwire |
 | D106 | Where name ≠ quantity, the hover says what the counter actually counts | The only place the second question can be answered |
 | D107 | **Shortening a label is the trigger to re-verify it** | The dishonest label is reliably the more elegant one — concision is the pressure that creates this defect |
+
+---
+
+## 38. 🔴 SCENARIO B — THE MECHANISM BEHIND QA'S RED RESULT. `prefix_cache_hit_len` ON DYNAMIC MEANS "TOKENS IN COMMON", NOT "PREFILL SKIPPED"
+
+@fc8b5d97 measured Scenario B red: shared-prefix warm requests **+7.0% SLOWER** than completely-unshared controls, with a sensitivity control proving a real effect would have been a ~90% TTFT collapse — **proven absent, not merely unobserved** — while the hit counter read **95%**. I traced the mechanism, because "cut it" and "re-scope it" are different decisions and only the mechanism distinguishes them.
+
+### 38.1 There are TWO prefix branches and only one of them reuses anything
+
+`engine/runtime.rs:997` `prepare_session_prefix` — **taken by both the FCFS path (`:1209`) and the callback path (`:435`)**, i.e. both server entry points:
+
+```rust
+if started_empty && state.decode_state.uses_token_prefix_cache() {
+    cross_session_hit_len = self.token_prefix_cache.iter()
+        .map(|cached| common_prefix_len(cached, prompt_tokens).min(cached.len()))
+        .filter(|&len| len > 0).max().unwrap_or(0);          // ← BRANCH 1
+} else if started_empty && state.decode_state.use_kv && self.kv_model.is_some()
+          && self.kv_cache.page_table.tensor_config.is_some() {
+    let matched = self.prefix_cache.lookup_shared(...);       // ← BRANCH 2
+    // ...materializes pages, genuinely skips prefill
+}
+```
+
+**BRANCH 1 COMPUTES A STRING OVERLAP AND RESTORES NOTHING.** No page table access, no KV materialization, **no prefill skipped**. It sets `cross_session_hit_len` — which becomes `prefix_cache_hit_len`, which feeds the metric — **purely from `common_prefix_len`.** It is a *measurement of textual similarity being reported as a cache hit.*
+
+**And branch 1 WINS FIRST:** `uses_token_prefix_cache()` is `has_runner() || is_windowed()` (`decode/state.rs:206-208`). Any model using a decode runner takes branch 1 and **never evaluates branch 2's conditions at all.**
+
+### 38.2 This explains every number QA measured, exactly
+
+| QA observation | Mechanism |
+|---|---|
+| hit rate pins ~95–100% from the first request | any **nonzero** overlap counts; the chat template shares the first few tokens |
+| ARM B controls counted as hits despite differing from token 0 | they still share the template prefix |
+| TTFT unchanged (+7%) | **branch 1 skips no prefill — there is nothing to speed up** |
+| the ~90% collapse never appears | branch 2, the only branch that materializes pages, is never reached |
+
+**QA proved the absence behaviourally; this is the same finding at file:line.** Two independent methods, same conclusion — which is the standard we've been holding everyone to.
+
+### 38.3 D108 — THE SEVENTH MISNAMED FIELD, AND THE MOST CONSEQUENTIAL
+
+> **`prefix_cache_hit_len` ON THE DYNAMIC SERVER MEANS "THE LONGEST TOKEN OVERLAP WITH ANY CACHED PROMPT". IT DOES NOT MEAN "PREFILL WORK WAS SKIPPED".**
+
+It is a **real, honestly-computed, live, responsive number** measuring a quantity nobody wants. It moves when you exercise the feature. It is exactly §37's class — and note it defeated the strongest thing we had: **the scatter zero was suspicious enough to investigate, so the FABRICATED value got caught while the LIVE one nearly shipped as our headline.** Suspicion tracks implausibility, not falsehood.
+
+### 38.4 What I recommend for Scenario B — re-scope, don't cut, and don't dress it up
+
+**Cutting loses a real finding; showcasing "prefix caching is broken" makes a product claim we haven't earned** (branch 2 is real, tested by `prefix_speedup.rs`, and reachable — just not from either server path as configured). Both extremes are wrong.
+
+**D109 — SCENARIO B BECOMES THE COLD-vs-WARM TTFT PAIR, HONESTLY LABELLED, WITH NO HIT-RATE FIELD ANYWHERE.** We show two measured client-side TTFTs and state plainly that on this execution path the second request is **not** faster. The panel's `prefix_cache_*` fields render **`not-applicable`** with the on-screen caption naming branch 1.
+
+**D110 — SCENARIO B IS DEMOTED FROM HEADLINE.** Scenario A (batching, 2.46× aggregate, measured) and Scenario C (paged-KV block grid + admission backpressure) carry the demo. **A negative result is worth showing and is not worth leading with** — leading with it invites "so your prefix cache doesn't work," which is **a stronger claim than our evidence supports** and it isn't the story we set out to tell. **@376a0297/@12e42da8 own this call; it is a product decision and I'm recommending, not ruling.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D108 | `prefix_cache_hit_len` on dynamic = longest token overlap, **not** prefill skipped | `runtime.rs:1016-1023`, branch 1 restores nothing |
+| D109 | Scenario B = honest cold/warm TTFT pair; **no hit-rate field in any form** | Both counters are untrustworthy in opposite directions |
+| D110 | Scenario B **demoted from headline**; recommend, PM/Lead rule | A negative result is worth showing, not worth leading with |
+| D111 | **Suspicion tracks implausibility, not falsehood** — so a live plausible lie outranks a fabricated zero for danger | The zero got investigated; the 95% nearly shipped |
