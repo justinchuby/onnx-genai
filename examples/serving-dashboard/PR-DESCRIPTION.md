@@ -305,6 +305,61 @@ has been re-derived at the stamped revision, and one of them changed when it was
 a count taken on a working desk read 112 where the shipping tree holds 98. Both
 readings were honest and only one describes what a reader will check out.
 
+### The two anchors this document is written against
+
+**The code and the suites are pinned at `37d0d72e`. The review documents are
+current to a later commit.** Those are different anchors and stating both is
+cheaper than reconciling them later.
+
+This matters concretely rather than pedantically: at least one reviewer confirmed
+findings that are **live in the code at the pin** while the **write-up of those
+findings is not in the pinned document**, because their review file grew 256 lines
+after the cut. A reviewer scoring that arm at `37d0d72e` reads a review that does
+not mention two things that are demonstrably there.
+
+**That is not an argument to move the pin, and nobody involved made it one.** The
+pin is the only revision carrying a dual denominator, which is worth more than any
+amount of review prose. It is an argument for naming two anchors instead of
+implying one — the same correction this document already makes about itself.
+
+### Auditing the zeros, and the phantom the audit produced
+
+A colleague drew the sharpest bound of the session on wrong-tree measurement:
+
+> *It can only ever corrupt a zero. You cannot obtain 125 dashboard files from a
+> tree that has none — a non-zero count is self-authenticating, a zero is not.
+> So audit your zeros and leave your counts alone.*
+
+**They also separated two species of control we had been conflating.** Every
+control built here asks *is my instrument alive* — and in the wrong tree the
+instrument is perfectly alive. The missing kind asks *am I pointed at the right
+body*, and it is one line: assert the corpus is non-empty before counting in it.
+
+**I ran it against this document. Five published zeros; corpus check first
+(125 dashboard files, so: right tree); all five hold**, including one whose
+positive control fires on the two files the guard was built for.
+
+**And the audit manufactured a fresh false zero inside thirty seconds**, which is
+the part worth recording:
+
+```
+git show <sha>:…/review-freshness.test.js       -> ZERO MATCHES
+git show <sha>:…/check-review-freshness.test.js -> the file that exists
+```
+
+I probed a filename that does not exist. **The command printed
+`fatal: path … does not exist` and I never saw it, because I had written
+`2>/dev/null` to keep the output tidy.** A missing path and an empty result then
+render identically.
+
+> **Suppressing stderr converts *this question is malformed* into *the answer is
+> zero*.** It is the vacuous-guard defect with a redirect operator instead of a
+> filter, and it is one keystroke.
+
+The published zero survived when re-run against the real path. **The instruction
+that saved it was not "be careful" — it was "check the corpus exists before you
+count in it", which is mechanical, and which caught this in one step.**
+
 ### Where the variance lives
 
 We do not claim this suite is deterministic. We claim something more specific
