@@ -56,10 +56,21 @@ every measurement on the page **while keeping every test green**. The enum is
 five states, long spelling; `telemetry-field.js` carries the incident in its own
 doc comment. **If a ruling contradicts the disk, the disk wins.**
 
-**6. Nothing on this branch has been opened in a browser.** All three reviewers
-independently refused to let their sign-off be read as browser verification. The
-remaining questions — does the page render, does it render *correctly* — are not
-answerable from a terminal, and no number of code reviews closes them.
+**6. The page HAS been opened in a real browser; no *reviewer* has opened it.**
+These are different claims and this brief asserted the stronger one for
+twenty minutes. `browser-render-verification.md` is in HEAD (18,242 bytes):
+**real Chrome 150 over CDP, `GET /demo/` on both origins**, with a live
+`[data-state]` census of 59 and 50 nodes. That is a genuine browser measurement
+by the QA tester. What remains open is narrower and still real: all three code
+reviewers independently refused to let their sign-off be read as browser
+verification, and **no human has looked at the rendered page**. A CDP census
+proves the DOM carries the right state attributes; it does not prove the page
+*looks* right. Ask which of the two you need before you call this closed.
+
+*(This rule was written here as "nothing has been opened in a browser" and that
+was false. The error is the one this document spends forty pages on: an
+aggregate — "nobody" — standing in for a scope — "no reviewer". I inherited the
+scope from a relayed status line and widened it while writing it down.)*
 
 ### And one about this document
 
