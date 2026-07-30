@@ -49,7 +49,43 @@ count at the earlier candidates is lower and that is exactly the trap: `d1c8fff0
 **Two runs, two trees, same eight failures by name.** That is deliberate. A test result is a
 sample and not a property of a commit — the Rust package produced exit 101 once and exit 0
 twice at a single SHA earlier tonight — so a number quoted from one run should say `once`.
-This one does not have to.
+
+### …and the repetition then caught a flake in this suite too, on run five
+
+Two runs was not enough, and this is the correction rather than the boast. Three further runs
+were taken at the pin in one clean worktree, with the count predicted before each:
+
+    PREDICTED, all three:  tests 868 · pass 860 · fail 8 · cancelled 0 · exit 1
+      run 3 ....... 868 · 860 · 8 · exit 1     as predicted
+      run 4 ....... 868 · **859 · 9** · exit 1     ⬅ PREDICTION MISSED
+      run 5 ....... 868 · 860 · 8 · exit 1     as predicted
+
+**One failure in five observations at one SHA.** The extra red is named, because a count
+cannot identify it:
+
+    ✖ preserves the original observation time through the downgrade
+        dashboard/staleness.test.js:292
+        actual 1785424964707 - expected 1785424964706      ⬅ ONE MILLISECOND
+
+**It is a fixture defect, not a product defect, and the test's intent is correct.** The
+fixture returns a fresh reading on every call:
+
+    field: () => ({ …, observedAtMs: Date.now() - 500 })
+
+The test calls `field()` twice — once to capture the expected value, once through the adapter
+— and asserts strict equality. Whenever a millisecond boundary falls between the two calls,
+they differ by exactly 1. The repair is to hoist the timestamp into a constant so both reads
+return the same number. **Do not delete or relax the assertion:** what it guards is real, and
+its own comment says so — re-dating a field on stall would restart its age at zero, which is
+the precise lie the acceptance criterion exists to prevent.
+
+**This is a third flake mechanism and neither existing remedy touches it.** An environmental
+git race is cured by a detached worktree. An intrinsic product concurrency race is cured only
+by repetition. **This one is a clock race in test scaffolding: it survives a clean detached
+worktree, it is invisible to a single run, and it is not evidence of anything wrong with the
+product at all.** A rule that says *detached worktree implies trustworthy* would have shipped
+straight past it, and so would *repeat it and take the agreeing pair* — the two agreeing runs
+came first and the disagreement came fifth.
 
 **Eight failures, and the split is five false to three true.** The five are one defect:
 `run-demo.sh:329` is English prose inside a quoted `fail "..."` string, and the line-based
@@ -206,6 +242,19 @@ Checking whether this document already recorded these findings, `grep -c` report
 `856`, `848` and `94`. All three were coincidental substrings **inside SHAs** (`818856ab`,
 `15848a4`, `3b701494`). A substring match is not a citation, and a bare count cannot tell the
 difference.
+
+**And the worst of them, retracted in full: I manufactured a corroboration.** I published a
+JS suite figure as having been reached by two people independently — *"two secretaries reached
+710/109 from different SHAs and different worktrees without coordinating; that agreement is
+worth more than either run alone."* **The second party never ran it.** The SHA I credited them
+with is not even their commit; it touches a file they do not own. The figure had exactly one
+source, which was me, and I dressed a sample of one as a replication and then leaned on it.
+
+The failure is not arithmetic. Both numbers were real; the *agreement* was not. **Two matching
+figures feel like independent confirmation and are the cheapest false positive available.**
+Before citing agreement, name the other party's command, SHA, worktree and clock — and if you
+cannot name all four, you are citing your own number twice. The other agent was on the channel
+the whole time and nobody asked them whether they had run it.
 
 ## Why this SHA and not the branch tip
 
