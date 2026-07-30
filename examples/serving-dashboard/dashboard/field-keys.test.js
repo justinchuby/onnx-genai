@@ -26,6 +26,8 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+
+import { declaredKeys as scanKeys, duplicatesAmong, findLiteralOpener } from './testing/object-keys.js';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
@@ -424,12 +426,21 @@ describe('the provenance catalogue defines every field exactly once', () => {
   /** Top-level catalogue keys as WRITTEN, duplicates preserved. */
   function declaredKeys() {
     const source = readFileSync(PROVENANCE_PATH, 'utf8');
-    // Digits are in the character class deliberately. The first version of this
-    // parser used [a-z_.] and silently skipped `metrics.e2e_latency` -- the one
-    // key containing a digit. A duplicate of THAT key would have been invisible
-    // to the duplicate detector, which is the same class of defect the detector
-    // exists to catch. The reconciliation test below is what caught it.
-    return [...source.matchAll(/^ {2}'([A-Za-z0-9_.]+)': \{/gm)].map((match) => match[1]);
+    // Was a regex: /^ {2}'([A-Za-z0-9_.]+)': \{/gm. It matched the shape this
+    // file happens to use rather than the syntax JavaScript defines, and it was
+    // BLIND to `"batch.capacity"` -- the identical key, double quoted. Proven by
+    // mutation: injecting that form left this suite fully green while the
+    // catalogue silently lost an entry, which is the exact defect this check
+    // exists to catch, surviving inside the check itself. The reconciliation
+    // control below could not catch it either, because a line the regex does
+    // not match never enters the count being reconciled: both halves agreed,
+    // and both were reading the same blind spot.
+    //
+    // The character-class history is kept because it is the same lesson one
+    // size smaller: an earlier version used [a-z_.] and skipped
+    // `metrics.e2e_latency`, the one key containing a digit. Each fix taught
+    // the pattern one more shape. The scanner reads the grammar instead.
+    return scanKeys(source, findLiteralOpener(source, 'export const PROVENANCE')).map((key) => key.name);
   }
 
   it('parses exactly the key set the module actually exports', async () => {
@@ -450,13 +461,9 @@ describe('the provenance catalogue defines every field exactly once', () => {
   });
 
   it('declares no field key twice', () => {
-    const declared = declaredKeys();
-    const seen = new Set();
-    const duplicates = [];
-    for (const key of declared) {
-      if (seen.has(key)) duplicates.push(key);
-      seen.add(key);
-    }
+    const source = readFileSync(PROVENANCE_PATH, 'utf8');
+    const keys = scanKeys(source, findLiteralOpener(source, 'export const PROVENANCE'));
+    const duplicates = duplicatesAmong(keys).map((d) => `${d.name} (lines ${d.lines.join(' and ')})`);
 
     assert.deepEqual(
       duplicates,
