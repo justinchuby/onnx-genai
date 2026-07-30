@@ -31,8 +31,9 @@ different export satisfies any existence check while naming the wrong stop token
 - which is precisely how this repository's known-good scatter model came to be
 correct only by accident (see the FORCE guard in ``scripts/build_qwen.sh``). So
 this script finishes by resolving the stop token the *runtime* would resolve and
-failing when there is none, or when a file it did not write disagrees with the
-source model about what it is.
+failing when there is none, when a declared token is absent from the tokenizer's
+vocabulary (the runtime drops those silently), or when a file it did not write
+disagrees with the source model about what the stop token is.
 
 Usage:
     write_tokenizer_assets.py MODEL_ID_OR_DIR OUTPUT_DIR
@@ -59,7 +60,8 @@ COMPANION_FILES = (
 
 # Without this the model loads but will not stop generating, so its absence is
 # an error rather than a warning. Absence is not the only failure mode, though:
-# see stop_signal() for the stale-leftover case an existence check cannot see.
+# see runtime_stop_ids() for the stale-leftover and unresolvable-token cases an
+# existence check cannot see.
 REQUIRED_FILES = ("tokenizer_config.json",)
 
 
@@ -74,36 +76,118 @@ def load_json(path: Path | None) -> object | None:
         return None
 
 
-def stop_signal(files: dict[str, Path]) -> tuple[str, str] | None:
-    """Return (stop token, filename) the runtime would resolve, or None.
+def token_to_id(tokenizer_json: object | None, token: str) -> int | None:
+    """Resolve a token literal to its id, as ``tokenizers::token_to_id`` does.
 
-    Mirrors ``load_eos_token_ids`` in ``crates/onnx-genai-ort/src/tokenizer.rs``,
-    which reads ``generation_config.json`` first and falls back to
-    ``tokenizer_config.json``. Mirroring the real resolution order is the point:
-    a check that asks "does the file exist" answers a different question than
-    "will this model stop", and only the second one is what we ship.
-
-    None means nothing here declares a stop token, so generation would run to
-    the length cap on every request.
+    Added tokens are checked first and that ordering is load-bearing:
+    Qwen2.5-Instruct's ``<|im_end|>`` lives ONLY in ``added_tokens`` and is
+    absent from ``model.vocab``, so a lookup that consults the vocabulary alone
+    would report the one stop token we care about as unresolvable.
     """
-    generation = load_json(files.get("generation_config.json"))
-    if isinstance(generation, dict):
-        eos_id = generation.get("eos_token_id")
-        # bool is a subclass of int; `"eos_token_id": true` is not a token id.
-        if (isinstance(eos_id, int) and not isinstance(eos_id, bool)) or (
-            isinstance(eos_id, list) and eos_id
-        ):
-            return str(eos_id), "generation_config.json"
+    if not isinstance(tokenizer_json, dict):
+        return None
 
-    tokenizer = load_json(files.get("tokenizer_config.json"))
-    if isinstance(tokenizer, dict):
-        eos = tokenizer.get("eos_token")
-        if isinstance(eos, dict):
-            eos = eos.get("content")
-        if isinstance(eos, str) and eos:
-            return eos, "tokenizer_config.json"
+    for entry in tokenizer_json.get("added_tokens") or ():
+        if isinstance(entry, dict) and entry.get("content") == token:
+            ident = entry.get("id")
+            if isinstance(ident, int) and not isinstance(ident, bool):
+                return ident
+
+    model = tokenizer_json.get("model")
+    vocab = model.get("vocab") if isinstance(model, dict) else None
+    if isinstance(vocab, dict):
+        ident = vocab.get(token)
+        if isinstance(ident, int) and not isinstance(ident, bool):
+            return ident
 
     return None
+
+
+def collect_generation_eos_ids(value: object, ids: list[int]) -> None:
+    """Mirror ``collect_generation_eos_ids``: a number, or arrays of numbers."""
+    # bool is a subclass of int; `"eos_token_id": true` is not a token id.
+    if isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if value not in ids:
+            ids.append(value)
+    elif isinstance(value, list):
+        for item in value:
+            collect_generation_eos_ids(item, ids)
+
+
+def eos_token_string(value: object) -> str | None:
+    """Mirror ``eos_token_string``: a string, or an object with ``content``."""
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, str) and content:
+            return content
+    return None
+
+
+def declared_stop_tokens(files: dict[str, Path]) -> list[tuple[str, str]]:
+    """Return [(filename, declaration)] for every stop token the model declares.
+
+    This is what the config files SAY. It is not what the runtime can USE - see
+    runtime_stop_ids for that, and do not confuse the two.
+    """
+    declared: list[tuple[str, str]] = []
+
+    generation = load_json(files.get("generation_config.json"))
+    if isinstance(generation, dict):
+        ids: list[int] = []
+        collect_generation_eos_ids(generation.get("eos_token_id"), ids)
+        if ids:
+            declared.append(("generation_config.json", str(ids)))
+
+    tokenizer_config = load_json(files.get("tokenizer_config.json"))
+    if isinstance(tokenizer_config, dict):
+        token = eos_token_string(tokenizer_config.get("eos_token"))
+        if token is not None:
+            declared.append(("tokenizer_config.json", token))
+
+    return declared
+
+
+def runtime_stop_ids(files: dict[str, Path]) -> tuple[list[int], list[str]]:
+    """Return (ids the runtime will collect, token literals it silently drops).
+
+    Faithful mirror of ``load_eos_token_ids`` in
+    ``crates/onnx-genai-ort/src/tokenizer.rs``. Two properties of that function
+    are easy to get wrong, and getting either wrong produces a FALSE PASS:
+
+    * It **unions** generation_config.json and tokenizer_config.json into one
+      id list. It does not prefer one and stop. A checker that returns on the
+      first hit never inspects the second file - and since every current build
+      writes generation_config.json, such a checker would skip
+      tokenizer_config.json entirely, which is the file this script exists for.
+    * A token literal absent from the tokenizer's vocabulary is **silently
+      dropped** by ``token_to_id``. Reading a plausible literal out of JSON is
+      NOT evidence the runtime can use it.
+
+    An empty id list means the runtime falls back to its hardcoded guesses, so
+    the model does not declare a stop token it can actually resolve.
+    """
+    ids: list[int] = []
+    dropped: list[str] = []
+
+    generation = load_json(files.get("generation_config.json"))
+    if isinstance(generation, dict):
+        collect_generation_eos_ids(generation.get("eos_token_id"), ids)
+
+    tokenizer_config = load_json(files.get("tokenizer_config.json"))
+    if isinstance(tokenizer_config, dict):
+        token = eos_token_string(tokenizer_config.get("eos_token"))
+        if token is not None:
+            ident = token_to_id(load_json(files.get("tokenizer.json")), token)
+            if ident is None:
+                dropped.append(token)
+            elif ident not in ids:
+                ids.append(ident)
+
+    return ids, dropped
 
 
 def resolve_source_dir(model_id: str) -> Path:
@@ -204,44 +288,80 @@ def main() -> int:
         elif name in copied:
             effective[name] = source_dir / name
 
-    resolved = stop_signal(effective)
-    if resolved is None:
+    # tokenizer.json belongs to the exporter, not to this script, but the
+    # runtime needs it to turn a token literal into an id - so the check needs
+    # to read it too, or it cannot tell a usable declaration from a decorative
+    # one.
+    tokenizer_json = args.output_dir / "tokenizer.json"
+    if tokenizer_json.is_file():
+        effective["tokenizer.json"] = tokenizer_json
+
+    declared = declared_stop_tokens(effective)
+    if not declared:
         print(
             f"error: {args.output_dir} declares no stop token. The runtime reads "
-            "generation_config.json then tokenizer_config.json and neither names one "
+            "generation_config.json and tokenizer_config.json and neither names one "
             "here, so this model would load, batch, and generate to the length cap on "
             "every request.",
             file=sys.stderr,
         )
         return 1
 
-    token, signal_file = resolved
-    print(f"stop token: {token} (from {signal_file})")
+    for source_file, declaration in declared:
+        print(f"stop token: {declaration} (declared in {source_file})")
 
-    # A file that was already in place did not come from this build, and this
-    # script never overwrites it. If it disagrees with the source model about the
-    # stop token it is a leftover from a different export, and the model stops on
-    # the wrong token or not at all. Compare same-file signals only: a numeric id
-    # from generation_config.json and a literal from tokenizer_config.json are
-    # not comparable, and a false alarm here would train people to ignore it.
-    if signal_file in present:
-        source_resolved = stop_signal(
-            {name: source_dir / name for name in COMPANION_FILES}
-        )
-        if (
-            source_resolved is not None
-            and source_resolved[1] == signal_file
-            and source_resolved[0] != token
-        ):
+    if tokenizer_json.is_file():
+        ids, dropped = runtime_stop_ids(effective)
+        if dropped:
             print(
-                f"error: {signal_file} already in {args.output_dir} declares stop token "
-                f"{token!r}, but {args.model_id} declares {source_resolved[0]!r}. It was "
-                "kept because this script never overwrites, so it is a leftover from an "
-                "earlier, different export rather than a product of this build. Delete it "
-                "and re-run so this build writes its own.",
+                "error: tokenizer_config.json declares stop token "
+                f"{', '.join(repr(token) for token in dropped)}, which is not in this "
+                "model's tokenizer.json. The runtime resolves literals through the "
+                "tokenizer and SILENTLY DROPS what it cannot find, so this declaration "
+                "has no effect and generation would fall back to a guess.",
                 file=sys.stderr,
             )
             return 1
+        if not ids:
+            print(
+                f"error: nothing in {args.output_dir} resolves to a stop token id, so "
+                "the runtime would fall back to its hardcoded guesses.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"runtime stop ids: {ids}")
+    else:
+        # Counted and loud: a narrow pass has to announce its own narrowness.
+        print(
+            "note: no tokenizer.json here, so the stop token was checked as DECLARED "
+            "but NOT as resolvable against the vocabulary."
+        )
+
+    # A companion already in place did not come from this build, and this script
+    # never overwrites it. Check EVERY such file against the source, not just
+    # the first that declared something: the runtime UNIONS these files, so a
+    # stale one is still live even when another file also declares a token.
+    if present:
+        source_declared = dict(
+            declared_stop_tokens({name: source_dir / name for name in COMPANION_FILES})
+        )
+        for source_file, declaration in declared:
+            if source_file not in present:
+                continue
+            expected = source_declared.get(source_file)
+            # Same-file comparison only: a numeric id from generation_config.json
+            # and a literal from tokenizer_config.json are not comparable, and a
+            # false alarm would train people to ignore this.
+            if expected is not None and expected != declaration:
+                print(
+                    f"error: {source_file} already in {args.output_dir} declares stop "
+                    f"token {declaration!r}, but {args.model_id} declares {expected!r}. "
+                    "It was kept because this script never overwrites, so it is a "
+                    "leftover from an earlier, different export rather than a product "
+                    "of this build. Delete it and re-run so this build writes its own.",
+                    file=sys.stderr,
+                )
+                return 1
 
     return 0
 

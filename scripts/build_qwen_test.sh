@@ -421,6 +421,9 @@ fi
 TOKENIZER_ASSETS="$ROOT/scripts/lib/write_tokenizer_assets.py"
 ASSETS_PYTHON="${GENERATOR_PYTHON:-}"
 [ -n "$ASSETS_PYTHON" ] || ASSETS_PYTHON="$(command -v python3 || true)"
+# Qwen2.5's <|im_end|> lives only in added_tokens, never in model.vocab, so this
+# fixture must exercise both lookups the runtime performs.
+TOKENIZER_JSON='{"added_tokens":[{"id":151645,"content":"<|im_end|>"},{"id":151643,"content":"<|endoftext|>"}],"model":{"vocab":{"a":1}}}'
 
 if [ -n "$ASSETS_PYTHON" ]; then
   assets_tmp="$(mktemp -d)"
@@ -546,15 +549,57 @@ if [ -n "$ASSETS_PYTHON" ]; then
     esac
   fi
 
-  # The guard must resolve the stop token the way load_eos_token_ids does -
-  # generation_config.json first - or it reports on a file the runtime never
-  # consults, which is a green light for a model that behaves differently.
+  # The runtime UNIONS generation_config.json and tokenizer_config.json rather
+  # than preferring one, so both must be reported. An earlier revision of this
+  # script returned on the first hit and never inspected the second file.
   mkdir -p "$assets_tmp/gen_out"
-  printf '{"chat_template": "x"}\n' >"$assets_tmp/gen_out/tokenizer_config.json"
+  printf '{"eos_token": "<|im_end|>"}\n' >"$assets_tmp/gen_out/tokenizer_config.json"
   printf '{"eos_token_id": 151645}\n' >"$assets_tmp/gen_out/generation_config.json"
+  printf '%s\n' "$TOKENIZER_JSON" >"$assets_tmp/gen_out/tokenizer.json"
   gen_output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/gen_out" 2>&1 || true)"
-  assert_contains "generation_config.json resolves the stop token first, as the runtime does" \
-    "$gen_output" "from generation_config.json"
+  assert_contains "generation_config.json is reported as a stop-token source" \
+    "$gen_output" "declared in generation_config.json"
+  assert_contains "tokenizer_config.json is reported too, not skipped" \
+    "$gen_output" "declared in tokenizer_config.json"
+  assert_contains "the ids the runtime will actually collect are printed" \
+    "$gen_output" "runtime stop ids"
+
+  # A valid generation_config.json must not hide a stale tokenizer_config.json.
+  # The runtime reads BOTH, so a checker that stops at the first hit certifies
+  # the leftover as correct. Verified against 5cb6b52f: it exited 0 here.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  mkdir -p "$assets_tmp/union_out"
+  printf '{"eos_token": "<|endoftext|>"}\n' >"$assets_tmp/union_out/tokenizer_config.json"
+  printf '{"eos_token_id": 151645}\n' >"$assets_tmp/union_out/generation_config.json"
+  printf '%s\n' "$TOKENIZER_JSON" >"$assets_tmp/union_out/tokenizer.json"
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/union_out" 2>&1)"; then
+    fail "a stale tokenizer_config.json is caught behind a valid generation_config.json" \
+      "it exited 0: $output"
+  else
+    case "$output" in
+      *"leftover from an earlier, different export"*)
+        pass "a stale tokenizer_config.json is caught behind a valid generation_config.json" ;;
+      *) fail "a stale tokenizer_config.json is caught behind a valid generation_config.json" \
+           "unhelpful error: $output" ;;
+    esac
+  fi
+
+  # token_to_id silently drops literals it cannot find, so a declared token that
+  # is absent from tokenizer.json has NO effect at runtime and generation falls
+  # back to a guess. Reading the literal out of JSON is not evidence.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  mkdir -p "$assets_tmp/vocab_out"
+  printf '{"eos_token": "<|nonexistent|>"}\n' >"$assets_tmp/vocab_out/tokenizer_config.json"
+  printf '%s\n' "$TOKENIZER_JSON" >"$assets_tmp/vocab_out/tokenizer.json"
+  if output="$("$ASSETS_PYTHON" "$TOKENIZER_ASSETS" "$assets_tmp/src" "$assets_tmp/vocab_out" 2>&1)"; then
+    fail "a stop token absent from tokenizer.json is an error" "it exited 0: $output"
+  else
+    case "$output" in
+      *"not in this model's tokenizer.json"*)
+        pass "a stop token absent from tokenizer.json is an error" ;;
+      *) fail "a stop token absent from tokenizer.json is an error" "unhelpful error: $output" ;;
+    esac
+  fi
 
   rm -rf "$assets_tmp"
   trap - EXIT
