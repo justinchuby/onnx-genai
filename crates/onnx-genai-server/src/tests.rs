@@ -1106,11 +1106,18 @@ async fn image_decode_and_preprocessing_use_pipeline_tensor_shape() {
 }
 
 #[tokio::test]
-#[ignore = "requires a real vision encoder at \
-            crates/onnx-genai-genai-config/tests/fixtures/vlm-executable/vision.onnx, \
-            which .gitignore (*.onnx) excludes from every clone. Unlike models/tiny-vlm \
-            there is no generator for this fixture, so this test cannot pass on a clean \
-            checkout -- supply the encoder by hand before running with --ignored."]
+#[ignore = "needs crates/onnx-genai-genai-config/tests/fixtures/vlm-executable/vision.onnx, \
+            which is absent from the tree: `.gitignore` (*.onnx) skips it by DEFAULT and \
+            nobody has force-added one. This is a MISSING FIXTURE, not an impossible one -- \
+            15 *.onnx files are tracked despite that rule, three of them the sibling \
+            vlm-complete/{vision,text,embedding}.onnx, and vlm-complete/vision.onnx is only \
+            190 bytes. TO RESTORE THIS COVERAGE: generate a tiny synthetic encoder emitting \
+            flat [num_image_tokens, hidden] features (scripts/build_tiny_vlm*.py are four \
+            working precedents) and `git add -f` it, as its 15 neighbours were added. \
+            The *.onnx.textproto convention that carries 57 other fixtures past this rule \
+            does NOT apply here: genai_config.json names `vision.onnx` literally and \
+            onnx-genai-genai-config has no textproto reader, so that route needs a code \
+            change first. Run with --ignored once the encoder exists."]
 async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image() {
     // `vlm-complete` is deliberately rank-mismatched: it exists so
     // `pipeline_genai_fallback` can assert admission rejects it. This test needs
