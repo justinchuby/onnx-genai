@@ -290,6 +290,91 @@ describe('every design token reaches the screen', () => {
     });
 
     /**
+     * D291, SECOND HALF -- AND I CREATED THIS GAP MYSELF, IN THE COMMIT
+     * DIRECTLY ABOVE THIS ONE.
+     *
+     * The checker above only sees a ratio written in DECLARATION form:
+     *   `--token: #hex;` followed by an inline comment reading
+     *   `N:1 on --og-bg-raised`.
+     * Its regex requires the `--token: #hex;` prefix. I then committed a
+     * PROSE margin table into tokens.css -- four tokens, their ratios,
+     * their floors and their margins to three decimals -- sitting in a
+     * comment block with no declaration in front of it. Every number in it
+     * was unguarded the moment I wrote it, in the file whose own header
+     * says "a hand-written ratio is a CLAIM, and this file was full of
+     * claims and had no way to check one".
+     *
+     * THE RULE: the guard was scoped to a SYNTAX when the property is about
+     * a KIND OF SENTENCE. Anywhere a ratio is written down, a reader trusts
+     * it instead of re-measuring -- that is what makes it load-bearing, and
+     * the surrounding punctuation has nothing to do with it. A checker
+     * pinned to one spelling leaves every other spelling free, and the next
+     * author writes the other spelling because it reads better in prose.
+     */
+    it('proves every prose margin claim is arithmetically true', () => {
+      const background = hexOf('--og-bg-raised');
+      // `--token   N:1  vs FLOOR <label>   +MARGIN` inside any comment.
+      const prose =
+        /(--og-[a-z0-9-]+)\s+([0-9]+\.[0-9]+):1\s+vs\s+([0-9]+\.[0-9]+)[^\n]*?([+-][0-9]+\.[0-9]+)/g;
+
+      const checked = [];
+      const failures = [];
+      for (const [, token, claimed, floor, margin] of css['tokens.css'].matchAll(prose)) {
+        const hex = hexOf(token);
+        if (!hex) {
+          failures.push(`${token} is quoted in a margin table but is not declared in this file`);
+          continue;
+        }
+        const measured = ratio(hex, background);
+        // A rule or a stroke is non-text (WCAG 1.4.11); everything else here
+        // is read as text (1.4.3). Getting this backwards is the whole point
+        // of checking it: it is how a 3.0 floor gets applied to body copy.
+        const expectedFloor = /-(rule|stroke)$/.test(token) ? 3.0 : 4.5;
+        checked.push(token);
+
+        if (Math.abs(measured - Number(claimed)) > 0.005) {
+          failures.push(
+            `${token} is quoted at ${claimed}:1 but measures ${measured.toFixed(3)}:1`,
+          );
+        }
+        if (Number(floor) !== expectedFloor) {
+          failures.push(
+            `${token} is quoted against a ${floor} floor; a ${
+              /-(rule|stroke)$/.test(token) ? 'rule/stroke is non-text (3.0)' : 'text token is 4.5'
+            }`,
+          );
+        }
+        if (Math.abs(measured - Number(floor) - Number(margin)) > 0.005) {
+          failures.push(
+            `${token} is quoted with margin ${margin} but ${measured.toFixed(3)} - ${floor} = ` +
+              `${(measured - Number(floor)).toFixed(3)}`,
+          );
+        }
+      }
+
+      // ANTI-VACUITY. The prose table is the only subject this checker has,
+      // and prose is far easier to reformat than a declaration -- rewrap the
+      // paragraph and the regex silently matches nothing. A zero here must
+      // be a failure, never a pass.
+      assert.ok(
+        checked.length >= 4,
+        `only ${checked.length} prose margin claims found; the table was ` +
+          'reformatted or removed and this checker is now certifying an ' +
+          'empty set. Re-anchor it or delete it -- do not leave it green.',
+      );
+
+      assert.deepEqual(
+        failures,
+        [],
+        'A margin table in tokens.css states a ratio, a floor or a margin ' +
+          'that its own declared colour does not have. This table exists to ' +
+          'tell the next author which token fails FIRST when the reference ' +
+          'surface moves; a wrong row sends them to the wrong token.\n' +
+          `FAILING:\n  ${failures.join('\n  ')}`,
+      );
+    });
+
+    /**
      * D292. unavailable and pending were #758493 and #748494 -- a two-digit
      * transposition, 1.0014:1 apart. Colour is NOT the primary signal for
      * state (the glyph and the words are, and the border grammar is the
