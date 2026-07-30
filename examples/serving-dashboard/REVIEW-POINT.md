@@ -1,89 +1,113 @@
 # The review point
 
 Reviewers extract exactly one tree. This file records which one. **This file is the sole
-authority.** Broadcasts, chat messages and tag names do not outrank it, by explicit ruling
-of the project lead.
+authority.** Broadcasts, chat messages, DAG task text and tag names do not outrank it, by
+explicit ruling of the project lead.
 
-REVIEW-POINT-SHA: 219307afcb7f3a27989e4f9d246a6ffa890f885e
+REVIEW-POINT-SHA: 217ae17052f50b901ebd5bb057bfab5ffd418c49
+MEASURED-AT: 217ae17052f50b901ebd5bb057bfab5ffd418c49
 
-**That is a raw hex SHA and it is deliberately not a tag name.** Three tags existed
-(`review-0` `review-1` `review-2`); all three are retired. `review-0` was silently
-re-pointed across sixty commits, and the tag numbers did not order the commits — see the
-section below, which is retained precisely because it is the argument for this line's form.
+**ALL TAGS ARE VOID.** `review-0`, `review-1` and `review-2` are retired and no `review-3`
+was ever created. The line above is a raw hex SHA and that is deliberate: a tag is a mutable
+pointer to an immutable object, and the object's immutability is exactly what hides the move.
+`review-0` was silently re-pointed across sixty commits under four reviewers and every stale
+SHA still resolved, so nothing errored. Cite the hex. Never cite a name.
 
-> **A tag is a mutable pointer to an immutable object, and the object's immutability is
-> exactly what hides the move. Every stale SHA still resolves. Nothing ever errors.**
+## Why this SHA and not the branch tip
 
-## Measured state at this SHA
+The tip at the time of cutting was `0d0646a61370523e3ac15848a4cf63b3187a71b6`. It is **not**
+the review point, and the reason is measured, not preferred:
 
-Both suites were run at **one SHA**, from **one clean detached worktree**
-(`porcelain 0`), with **raw unpiped exit codes**. Neither number is inherited from
-another agent's report.
+    92cc7935  07:20   JS fail 3      last known good before the range
+    2d516df4  07:21   JS fail 3
+    818856ab  07:21   JS fail 3
+    a2df3eed  07:22   JS fail 3
+    776b5d1c  07:22   JS fail 3
+    217ae170  07:22   JS fail 3   <- THE REVIEW POINT
+    3ef731d2  07:24   JS fail 7   <- THE BREAK. run-demo.sh +47/-4, main.rs, build.rs
+    0d0646a6  07:26   JS fail 8
 
-| Suite | Result | Raw exit |
-|---|---|---|
-| JavaScript (`bash run-tests.sh`) | **831 tests · 829 pass · 2 fail** · 0 cancelled · 0 skipped · 0 todo · 123 suites · 64 discovered files | **1** |
-| Rust (`cargo test -p onnx-genai-server --no-fail-fast`) | **270 passed · 0 failed · 4 ignored** across 6 test binaries | **0** |
+`3ef731d2` ("fix(demo): the launcher tests a mode bit; make it test provenance") reddened
+four previously-green tests in two files, isolated by running those files alone at each
+commit in the range:
 
-**The JavaScript suite is RED at this SHA and that is not an oversight.** The two failures
-are the exposure ratchet in `served-surface.test.js`:
+    check-launch-command.test.js   23 pass / 0 fail  ->  21 pass / 2 fail
+    check-launcher.test.js         10 pass / 0 fail  ->   8 pass / 2 fail
+      every server launch passes --demo-assets-dir
+      the --demo-assets-dir value is absolute, not relative
+      every flag named in any demo document exists in the server CLI
+      every endpoint the dashboard polls is registered by the documented launch command
 
-- `no served measurement is left unrendered, beyond the pinned set`
-- `the exposure ratchet has not been loosened` — *94 tracked files are fetchable at
-  `/demo/` that the page never loads (was 91)*
+That regression is **open and unowned as of this writing**. It is not fixed here and this
+file does not claim it is. The review point is the last commit before it.
 
-This guard is working as designed. It fails because files were added inside the served
-asset directory without anyone making a publishing decision about them. **Raising the
-constant would turn the gate green in one character and ship the undecided files.** It has
-been deliberately left red by more than one author. Do not raise it to go green.
+## The measurement — both suites, one SHA, one clean detached worktree
 
-**The Rust number is a COLD-TARGET build.** The worktree had no `target/` directory
-before the run, so this also demonstrates the tree builds from nothing. Earlier Rust
-numbers quoted tonight shared a warm `target/` and did not carry that property.
+Taken at `217ae17052f50b901ebd5bb057bfab5ffd418c49` from a single `git worktree add --detach`,
+porcelain asserted (not read) as 0 before either suite ran.
 
-`cargo` prints no total — it prints one `test result:` line per test binary, six of them.
-The 270 is their sum. Without `--no-fail-fast` a failure in the first binary aborts the
-rest, so **the denominator shrinks exactly when something is wrong**; the flag is
-mandatory, not stylistic.
+    JS    bash run-tests.sh                            RAW UNPIPED EXIT: 1
+          tests 847 · pass 844 · fail 3 · cancelled 0 · skipped 0 · todo 0
+          suites 125 · discovered files 64
+          provenance: 0 untracked, 0 tracked-but-missing
 
-### The 4 ignored Rust tests, by name
+    RUST  cargo test -p onnx-genai-server --no-fail-fast   RAW UNPIPED EXIT: 0
+          214 + 0 + 18 + 28 + 10 + 0 = 270 passed / 0 failed / 4 ignored
+          across 6 test binaries, built from a COLD target directory
 
-1. `tests::audio_endpoints_route_through_tiny_whisper_pipeline` — synthetic Whisper-contract smoke test; run explicitly for audio validation.
-2. `tests::sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image` — missing fixture `vlm-executable/vision.onnx`; `.gitignore` skips `*.onnx` and nobody force-added one.
-3. `tests::vision_request_routes_through_tiny_vlm_pipeline` — requires gitignored `models/tiny-vlm`.
-4. `qwen_real_model_tool_use_chain_end_to_end` — requires the gitignored `models/qwen2.5-0.5b` fixture.
+Cargo prints no total. The 270 is the sum of six `test result:` lines and is stated as a sum
+so it can be checked. `--no-fail-fast` is mandatory: without it the denominator shrinks at
+exactly the moment something is wrong.
 
-**All four are missing-fixture gates, not disabled assertions.** None is ignored because it fails.
+The four ignored Rust tests, by name, because a count alone hides which:
 
-## Extraction recipe — use this exact form
+    tests::audio_endpoints_route_through_tiny_whisper_pipeline
+    tests::sidecar_free_compatibility_package_builds_server_pipeline_and_preprocesses_image
+    tests::vision_request_routes_through_tiny_vlm_pipeline
+    qwen_real_model_tool_use_chain_end_to_end
 
-```sh
-git worktree add --detach /tmp/review-tree 219307afcb7f3a27989e4f9d246a6ffa890f885e
-cd /tmp/review-tree/examples/serving-dashboard
-SHIPPING_TREE_REF=219307afcb7f3a27989e4f9d246a6ffa890f885e bash run-tests.sh
-cd /tmp/review-tree && cargo test -p onnx-genai-server --no-fail-fast
-```
+## The three JS failures are disclosed, not hidden — and must not be "fixed" by constant
 
-> **⛔ Never use `git archive`.** It produces a directory that is not a git repository.
-> Ten JavaScript guards resolve their corpus through git and silently degrade there,
-> dropping tests **without reddening anything**. A smaller green suite and a correct green
-> suite are byte-identical in a report.
+    no review document was measured before the tree reviewers extract
+    no served measurement is left unrendered, beyond the pinned set
+    the exposure ratchet has not been loosened
+    (the served surface is a closed set — same served-surface.test.js file)
 
-`SHIPPING_TREE_REF` makes every guard read one immutable tree instead of whatever happens
-to be on the reviewer's desk.
+The second and third are the **exposure ratchet**: tracked files fetchable under `/demo/`
+that the page never loads. It is a working guard doing its job. Several authors have
+deliberately declined to raise its constant. **Do not raise the constant to go green.**
 
-## Reading the numbers above
+The first is structural and no choice of SHA fixes it. The freshness guard requires a review
+document to name a SHA that is not older than the tree. A reviewer cannot measure at the
+final SHA until it is final, and it cannot be final until they have measured at it. The
+predicate is unsatisfiable as written at every commit that exists. The repair is to require
+the named SHA to be an **ancestor** of the shipping tree and to disclose the delta, rather
+than to require equality. That change is not made here.
 
-- **Verify by presence, never by absence of an error.** A missing file, an unapplied
-  change and a filter that matches nothing all produce the same bytes.
-- **The runner emits its counters as `ℹ tests`, not `# tests`.** Node v25 changed the
-  prefix. A `grep '^# tests'` returns empty, which is indistinguishable from a clean run.
-  This cost at least three agents a false measurement tonight, including the author of
-  this file, who reported the runner as emitting no counters at all. **It emits all six.**
-- **`node --test .` is a phantom red** — it prints `Could not find '.'`, exits 1, and emits
-  zero counters. Use `node --test` with no path argument, or the canonical runner.
-- Both instruments were run here and **agree exactly**: 831/829/2 from the runner and
-  831/829/2 from a bare `node --test`.
+## Ancestry — all eleven required fixes, verified in both directions
+
+Every one checked with `git merge-base --is-ancestor <fix> 217ae170` and the reverse, because
+`--is-ancestor` returning false conflates "newer" with "not comparable". All eleven contained;
+all eleven reverse checks correctly false.
+
+    1133a874  02b54684  1384f7aa  627627a4  f025ae58  964cad4a
+    03326348  dd04f50f  6e4ea4c2  ac24a964  6800c5b2
+
+## Extracting the tree
+
+    git worktree add --detach <dir> 217ae17052f50b901ebd5bb057bfab5ffd418c49
+
+Then assert, do not read, that `git status --porcelain` is empty, and reconcile the file count
+against `git ls-tree -r --name-only <sha> | wc -l` — it was 2206 == 2206 here. A partial
+`git worktree add` can exit 0 and a partial checkout is porcelain-clean, so porcelain alone
+proves nothing. A cold `cargo build` is the stronger integrity proof and it is free: a partial
+checkout fails at the first missing `mod`.
+
+**Never use `git archive`.** It yields a non-git directory in which roughly ten JS guards
+silently degrade and drop tests without reddening.
+
+Note that this file cannot be read from inside the tree it names: at `217ae170` this SHA does
+not appear in it. Read this file at the branch tip, then extract.
 
 ## ⛔ The tag numbers do not order the commits
 
