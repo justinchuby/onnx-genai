@@ -250,7 +250,116 @@ into the suite: a check that repairs its own subject can never fail.
   the gate does not encode. These are different instruments measuring different
   things, and reporting the gate alone would be the *all-clear-terminates-inquiry*
   failure this PR spends its length arguing against.
-- **`demo-spec.md` is committed as a snapshot** at 159 acceptance criteria. Its
-  authoritative count lives in the file's own header and is machine-generated;
-  do not quote a total from anywhere else.
+- **`demo-spec.md` is committed as a snapshot.** Do not quote a total from
+  anywhere else, **including from this sentence** — which said `159` until
+  `05:38` and was wrong by fifty-one, having been true when written. Count it
+  yourself: `grep -cE '^- \[[ x]\] \*\*AC' demo-spec.md`. **A number in prose is
+  a copy of a fact, and copies rot; this bullet rotted inside the section that
+  warns that documentation rots.**
 - **Prefix caching is demonstrated, not proven beneficial.** See above.
+
+---
+
+## What we do not claim
+
+**This section is not a disclaimer. It is the product.**
+
+This is a dashboard about honest measurement, built by a crew that spent a
+session discovering its own instruments failed in exactly the way the product's
+worst bug did. That rhyme is the story, so it belongs here rather than in a
+postmortem nobody reads.
+
+**The one diagnosis behind almost every defect we found: we could not tell *no
+data* from *data*.** An em-dash drawn over live observations. A `git archive`
+extract that disarmed ten guards and dropped sixty-six tests **while the suite
+count stayed identical**. A citation harness that printed *"OK — every anchored
+citation resolves"* at exit 0 when the sources were missing, **its confidence
+scaling with how much of the checkout was absent**, because a universal claim
+over an empty set is vacuously true and reads as thorough. A guard *refusing to
+run* rendering identically to a guard *finding a defect*. A launcher testing
+that a binary **exists** to answer a question about which **source tree** built
+it.
+
+> **Every instrument we built checks that what is present is true. Not one
+> checked that what is true is present.**
+
+The product now has a third state, and so do the tools: `0 = clean`,
+`1 = a defect was found`, `2 = cannot run`. **Two-state thinking was the root
+defect of this work — in the tools, in the reviews, and in the page.**
+
+**And the law we would most like carried elsewhere, because no guard we own can
+enforce it:**
+
+> ### A layout is a claim.
+> Putting two series on one locked axis asserts *these are commensurable* as
+> loudly as a sentence would — and every checker we have reads strings. **A
+> confound expressed in geometry is invisible to all of them.** It was caught
+> with a stopwatch and four arms, not a grep.
+
+### The specific things this PR does not assert
+
+- **The throughput ratio is withdrawn, not softened.** It is absent from this
+  document as a live figure and must stay absent. The model it was measured
+  against cannot be rebuilt, so **the claim is immune to re-running** — which is
+  worse than unreproducible. Full reasoning in *Performance* above.
+- **The two panes are NOT comparable, and this is by construction.** Same
+  request stream, two cache strategies, **two different capabilities** — never
+  *"A vs B"*. Static/scatter cache lets rows share one buffer so continuous
+  batching runs; a dynamic cache grows per sequence, so paged KV and batching
+  cannot coexist. **Four rows on one side and one row on the other is the
+  architecture, not an artefact.** No caption, legend, header or footer may
+  present a cross-pane delta: **any number derived from both panes is a defect
+  by construction.**
+- **Some fields are `MISATTRIBUTED`, and the word is new because we lacked it.**
+  Our vocabulary had `DOCUMENTED_ZERO` (a constant), `NOT_PLUMBED` (absent) and
+  `STRUCTURALLY_BYPASSED` (never asked) — and **no word at all for *asked,
+  answered, answering something else.*** `MEASURED` was the only remaining
+  option, so three fields were classified `MEASURED` **by the shape of the enum
+  rather than by anyone's judgement.** `prefix_cache_hits` is the case: it
+  increments off a shared chat preamble, so it **reads the same with and without
+  the reuse it purports to measure.** *When you cannot find the right label,
+  that is a finding — not a prompt to pick the nearest one.*
+- **Two designed behaviours ship SPECIFIED-NOT-BUILT** — the provenance-unknown
+  badge (D298) and panel-header attribution (D300). They are disclosed in-file
+  where a reader meets them, rather than implied by a design document that says
+  they exist.
+- **L5, L8 and L9 ship unmeasured.** In those words. No predicate arrived for
+  them, and *"shipped unmeasured"* is the accurate phrase; anything softer would
+  be the euphemism this document exists to refuse.
+- **We cannot fully say which code was running.** The demo servers observed
+  during this work were started from a sibling checkout and **can name no
+  commit**, so a fixed source tree and a leaking process coexisted for hours.
+  **The code is fixed; a running process is not the code, and that distinction
+  is a restart, not a commit.**
+
+### Verification, at one revision, with denominators
+
+**Every number here carries its revision and its denominator, or it is not
+here.** Re-run rather than believe.
+
+- **JavaScript: 744 tests / 114 suites / 743 pass / 1 fail — raw unpiped exit
+  `1`** at `8a309ce0`. **The tree is red at that revision and we are not
+  rounding that off.**
+- **That single failure is a guard working correctly**, and it is this PR's
+  thesis in miniature: `check-perf-claims.test.js` reports that the refusing
+  match arm is no longer `PastPresent { .. } | Legacy => bail!` while the README
+  still tells the reader the unresolved question is *exactly two ways wide.* Its
+  own message names the direction of the error — **the stated width would be
+  wrong toward claiming more certainty than we have.** The guard is defending a
+  *width*, not a value.
+- **⚠️ Read those two bullets as a snapshot, and here is the proof they must
+  be.** Four minutes earlier, the same suite at `090e68ea` reported **740 / 113 /
+  1 fail** — and **the failing test was a different one**
+  (`check-review-freshness.test.js`, whose stale `KNOWN_ABSTAINERS` entry was
+  retired in between). **The count moved, the denominator moved, and the
+  identity of the red moved, inside four minutes, with nobody doing anything
+  wrong.** ***A test result is a measurement of a revision, not a property of a
+  project*** — which is why every figure here carries a SHA, and why *"the suite
+  is green"* is not a sentence anyone should write without one.
+- **Rust: not re-measured at this revision.** An older figure of 136 server-crate
+  tests is carried in *Tests* above and is labelled as the older claim it is.
+  **The JavaScript suite reaches no Rust code**, so a green JS run is not
+  evidence about the engine — and reporting one combined total would imply a
+  coverage that does not exist.
+- **A green gate is not a satisfied reviewer**, and a red one is not an
+  unsatisfied product. Different instruments measure different things.
