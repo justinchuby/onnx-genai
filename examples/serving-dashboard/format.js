@@ -59,9 +59,14 @@ export function displaySafeField(field) {
   //
   // Returns the ORIGINAL object when nothing needed removing, so a clean field
   // keeps its identity and this stays free for the overwhelmingly common case.
+  // `reason` gets the same treatment for the same reason: it is free-form text
+  // attached to a field, it is rendered into the tooltip via formatField's
+  // `title`, and a field assembled as a literal never passed through the
+  // constructor that sanitises it.
   const provenanceWarning = redactAbsolutePaths(field?.provenanceWarning);
-  if (provenanceWarning === field?.provenanceWarning) return field;
-  return { ...field, provenanceWarning };
+  const reason = redactAbsolutePaths(field?.reason);
+  if (provenanceWarning === field?.provenanceWarning && reason === field?.reason) return field;
+  return { ...field, provenanceWarning, reason };
 }
 
 /**

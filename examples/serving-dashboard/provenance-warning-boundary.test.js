@@ -53,7 +53,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { measuredField } from './telemetry-field.js';
+import {
+  measuredField,
+  notApplicableField,
+  pendingField,
+  unavailableField,
+} from './telemetry-field.js';
 import { displaySafeField, formatField } from './format.js';
 import { findAbsolutePaths } from './absolute-path.mjs';
 
@@ -260,5 +265,98 @@ describe('the display choke point neutralises paths on fields it did not constru
     const warning = formatField(handBuilt()).provenanceWarning;
     assert.match(warning, /server\.execution_provider/, 'lost WHICH field disagreed');
     assert.match(warning, /withheld/i, 'redaction must be visible, not a silent deletion');
+  });
+});
+
+describe('the reason channel obeys the same boundary as the warning channel', () => {
+  // FOUND BY THE COUPLING AUDIT, not by the blocker.
+  //
+  // `reason` is the OTHER free-form text channel on a field, and it is rendered
+  // into the tooltip. It was sanitised for SOURCE CITATIONS only -- the regex in
+  // withoutSourceCitations() strips a trailing `:232-237` from a file name and
+  // deliberately leaves the file name itself, so a developer keeps the pointer.
+  // It never considered absolute paths. Measured before this fix:
+  //
+  //     unavailableField(`... ${SECRET}`).reason           -> keeps the path
+  //     displaySafeField(that).reason                      -> keeps the path
+  //     formatField(that).title                            -> keeps the path
+  //
+  // The last one is a USER-VISIBLE tooltip, so this was a live disclosure and
+  // not a latent one. It is the same defect class as the provenanceWarning
+  // bypass -- free-form text attached to a field, trusted because the value
+  // beside it looked benign -- in a sibling channel one line away in the same
+  // function. Redacting one and not the other would have been an incoherent
+  // boundary that the next reader could only explain as an oversight.
+  //
+  // A NOTE ON MY OWN FIRST PROBE, because it nearly buried this. I measured
+  // `formatField(field).reason` and read `false`, and briefly recorded the
+  // channel as safe. formatField returns no `reason` key at all, so I was
+  // reading `String(undefined).includes(...)`. Absence and cleanliness are not
+  // the same observation. Every assertion below names the key it reads and the
+  // block afterwards proves the key exists.
+  const dirtyReason = `the counter is wrong, see ${SECRET}`;
+
+  const builders = {
+    unavailableField: () => unavailableField(dirtyReason),
+    notApplicableField: () => notApplicableField(dirtyReason),
+    pendingField: () => pendingField(dirtyReason),
+  };
+
+  for (const [name, build] of Object.entries(builders)) {
+    it(`${name} strips the path from field metadata`, () => {
+      assertNoPath(`${name}().reason`, build().reason);
+    });
+
+    it(`${name} strips the path from the display-safe envelope`, () => {
+      assertNoPath(`displaySafeField(${name}()).reason`, displaySafeField(build()).reason);
+    });
+
+    it(`${name} strips the path from the rendered title`, () => {
+      const out = formatField(build());
+      assert.equal(typeof out.title, 'string', 'title is not a string, so the assertion below reads nothing');
+      assertNoPath(`formatField(${name}()).title`, out.title);
+    });
+  }
+
+  it('a RELATIVE citation still survives, so the reason still says why', () => {
+    // withoutSourceCitations exists to keep this. Redacting absolute paths must
+    // not become a blunt instrument that removes the developer's pointer too.
+    const reason = unavailableField(
+      'the counter is wrong, see crates/onnx-genai-server/src/metrics.rs:232-237',
+    ).reason;
+    assert.match(reason, /metrics\.rs/, 'relative citation was destroyed by path redaction');
+    assert.doesNotMatch(reason, /232-237/, 'the line number should still be trimmed');
+  });
+
+  it('the redaction is visible rather than a silent deletion', () => {
+    assert.match(unavailableField(dirtyReason).reason, /withheld/i);
+  });
+
+  it('a reason on a field the constructor never built is still neutralised', () => {
+    // The constructor sanitiser cannot reach a field assembled as a literal,
+    // exactly as it could not for provenanceWarning. Without the display
+    // boundary this reaches the tooltip verbatim. I only wrote this case
+    // because mutating the display boundary away changed NOTHING -- the block
+    // above routes every fixture through a constructor, so it could not observe
+    // that half of the fix. Untested code that looks defensive is worse than no
+    // code, because the next reader trusts it.
+    const handBuilt = Object.freeze({
+      value: PLAIN_VALUE,
+      state: 'unavailable',
+      source: '/v1/status',
+      sourceClass: 'server',
+      origin: null,
+      originModelId: null,
+      label: 'provider',
+      reason: dirtyReason,
+      unit: null,
+      observedAtMs: Date.now(),
+      derivedFrom: null,
+      provenanceWarning: null,
+    });
+    assertNoPath('displaySafeField(handBuilt).reason', displaySafeField(handBuilt).reason);
+    const out = formatField(handBuilt);
+    assert.equal(typeof out.title, 'string', 'title is not a string, so the next assertion reads nothing');
+    assertNoPath('formatField(handBuilt).title', out.title);
   });
 });

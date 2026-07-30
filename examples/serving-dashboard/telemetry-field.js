@@ -126,6 +126,32 @@ export function withoutSourceCitations(text) {
 }
 
 /**
+ * The single sanitiser every reason-bearing constructor runs.
+ *
+ * Two independent rules, deliberately composed in one place rather than called
+ * separately at four construction sites:
+ *
+ *  1. Trim SOURCE CITATIONS to the file, keeping the pointer and dropping the
+ *     line number, which is the part that rots.
+ *  2. Withhold ABSOLUTE PATHS, which are operator filesystem bytes and belong
+ *     on no rendered surface.
+ *
+ * Rule 2 was missing. `reason` is free-form text attached to a field exactly as
+ * `provenanceWarning` is, and it reaches the tooltip through formatField's
+ * `title`, so an absolute path in a reason was a live disclosure rather than a
+ * latent one. The two rules do not overlap: a citation is relative by
+ * convention, so trimming one never removes a path and withholding a path never
+ * removes a citation. The test for that pairing is in
+ * provenance-warning-boundary.test.js.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function sanitiseReason(text) {
+  return redactAbsolutePaths(withoutSourceCitations(text));
+}
+
+/**
  * Guard the `reason` argument of every absence builder.
  *
  * Checks the TYPE, not just truthiness. `if (!reason)` accepts an object, and
@@ -318,7 +344,7 @@ export function notApplicableField(
   // visitor through format.js, telemetry-field.js and model-card.js, and a rule
   // that each renderer must remember is discipline; doing it once here is
   // construction. Shadows the parameter so every use below is covered.
-  reason = withoutSourceCitations(reason);
+  reason = sanitiseReason(reason);
   return Object.freeze({
     value: null,
     state: FIELD_STATES.NOT_APPLICABLE,
@@ -366,7 +392,7 @@ export function unavailableField(
   // visitor through format.js, telemetry-field.js and model-card.js, and a rule
   // that each renderer must remember is discipline; doing it once here is
   // construction. Shadows the parameter so every use below is covered.
-  reason = withoutSourceCitations(reason);
+  reason = sanitiseReason(reason);
   return Object.freeze({
     value: null,
     state: FIELD_STATES.UNAVAILABLE,
@@ -410,7 +436,7 @@ export function pendingField(
   requireReason(reason, 'pendingField', 'It must explain what is being waited on.');
   // Same fan-in sanitisation as the sibling constructors -- this one takes the
   // single-line requireReason form and was missed by the first sweep.
-  reason = withoutSourceCitations(reason);
+  reason = sanitiseReason(reason);
   return Object.freeze({
     value: null,
     state: FIELD_STATES.PENDING,
@@ -453,7 +479,7 @@ export function staleField(field, reason) {
     state: FIELD_STATES.STALE,
     // The fourth entry point. staleField takes its reason positionally and
     // never reaches requireReason, so a sweep of the constructors alone misses it.
-    reason: withoutSourceCitations(reason),
+    reason: sanitiseReason(reason),
   });
 }
 
