@@ -49,6 +49,52 @@ function git(...args) {
 }
 
 /**
+ * Build the Error for a condition that stops this module MEASURING ANYTHING,
+ * and label it on the way out. Call as `throw cannotRun(...)`.
+ *
+ * WHY A LABEL, AND WHY IT IS NOT AN EXIT CODE
+ * -------------------------------------------
+ * Every refusal in this file is the same class: NOT "a check found a defect"
+ * but "a check could not run". Those two outcomes were rendered identically --
+ * a stack trace and a non-zero exit -- and a reader who sees red next to a
+ * guard's name reads "the guard found something". An absence of CAPABILITY was
+ * displayed as an absence of COMPLIANCE, which inverts the meaning entirely.
+ *
+ * The house convention for that distinction is `exit 2`, and it CANNOT be used
+ * here. Measured on node v25.6.1, three arms plus a control:
+ *
+ *   node --test <file that exits 2>  ->  1   the runner flattens it
+ *   node        <same file>          ->  2   the file is correct
+ *   node --test <file that exits 0>  ->  0   control: success propagates exactly
+ *
+ * `node --test` collapses every non-zero child exit to 1, and `run-tests.sh`
+ * runs all suites in ONE invocation, so a per-file exit code does not survive
+ * to the caller even in principle. The exit code is not an available channel.
+ * The TEXT is, so the text carries the distinction.
+ *
+ * It goes to STDERR, beside the message it qualifies, rather than into a
+ * summary. A qualifier that is not adjacent to the claim is not attached to
+ * it: readers paste tails, and a banner printed at the top is a banner nobody
+ * quotes. Under `node --test` the child's stderr is relayed onto the parent's
+ * stdout, so it reaches the reader on either path.
+ *
+ * The Error is still THROWN, not swallowed into `process.exit`. A refusal that
+ * exits is untestable in-process, and `shipping-tree.test.js` proves these
+ * refusals reach stderr by reading exactly that.
+ */
+function cannotRun(message) {
+  process.stderr.write(
+    `\nCANNOT_RUN: ${message}\n\n` +
+      `THIS IS NOT A FINDING ABOUT ANY DOCUMENT OR ANY SOURCE FILE.\n` +
+      `No check below this point ran, so nothing below is evidence either way.\n` +
+      `Fix the condition above and re-run; do not read this as a defect report.\n\n`,
+  );
+  const err = new Error(message);
+  err.cannotRun = true;
+  return err;
+}
+
+/**
  * The commit every `shipped()` read resolves against, fixed for this process.
  *
  * WHY THIS IS RESOLVED ONCE INSTEAD OF PER CALL
@@ -107,7 +153,7 @@ export const SHIPPING_REF = (() => {
     try {
       return git('rev-parse', `${ref}^{commit}`);
     } catch {
-      throw new Error(
+      throw cannotRun(
         `${name} is set to '${ref}', which this repository cannot resolve to a ` +
           `commit.\n` +
           `  Checks read their inputs from that commit, so there is nothing to ` +
@@ -122,7 +168,7 @@ export const SHIPPING_REF = (() => {
     const a = resolve(fromTreeRef, 'SHIPPING_TREE_REF');
     const b = resolve(fromReviewSha, 'REVIEW_SHA');
     if (a !== b) {
-      throw new Error(
+      throw cannotRun(
         `SHIPPING_TREE_REF='${fromTreeRef}' and REVIEW_SHA='${fromReviewSha}' name ` +
           `different commits (${a.slice(0, 8)} vs ${b.slice(0, 8)}).\n` +
           `  They are two spellings of one setting, so there is no correct way to ` +
@@ -412,7 +458,7 @@ export function assertShippingTree() {
     }
     const branches = containing.split('\n').map((s) => s.trim()).filter(Boolean);
     if (!branches.includes(SHIPPING_BRANCH)) {
-      throw new Error(
+      throw cannotRun(
         `SHIPPING_TREE_REF resolves to ${tree.ref}, which is not contained in ` +
           `'${SHIPPING_BRANCH}'.\n  ${where}\n  contained in: ${branches.join(', ') || '(no local branch)'}\n\n` +
           `Pinning to a review tag is the right way to score this repo, but the ` +
@@ -432,7 +478,7 @@ export function assertShippingTree() {
     }
     const branches = containing.split('\n').map((s) => s.trim()).filter(Boolean);
     if (!branches.includes(SHIPPING_BRANCH)) {
-      throw new Error(
+      throw cannotRun(
         `This check is running from a DETACHED HEAD that is not contained in ` +
           `'${SHIPPING_BRANCH}'.\n  ${where}\n  contained in: ${branches.join(', ') || '(no local branch)'}\n\n` +
           `A detached worktree at a named SHA is a legitimate way to review this ` +
@@ -444,7 +490,7 @@ export function assertShippingTree() {
   }
 
   if (tree.branch !== SHIPPING_BRANCH) {
-    throw new Error(
+    throw cannotRun(
       `This check is running from the wrong tree.\n  ${where}\n  expected branch '${SHIPPING_BRANCH}'\n\n` +
         `Every path in this suite is resolved from import.meta.url, so this file ` +
         `read its inputs from the worktree named above and would have reported on ` +
