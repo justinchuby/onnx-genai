@@ -1980,6 +1980,29 @@ AFTER  the 12-block  19/20  = 0.95
   **🔒 REQUIRED, AND IT IS THE SIBLING OF AC196 RATHER THAN A DUPLICATE OF IT: **EVERY GUARD WE BUILT THIS SESSION ASKS WHETHER A VALUE IS *TRUE*. NONE ASKS HOW MUCH *SPACE* IT TAKES.** A panel must not let an unbounded-length field out-weigh the field it exists to present. **Acceptance is a rendered measurement, not a source read** — which is the same conclusion the Lead reached from the other direction when he made a browser load a permanent gate item.
   **⚠️ AND THE REASON THIS GENERALISES BEYOND ONE DELETED ROW: `server.model_path` IS GONE, BUT **EVERY REMAINING UNBOUNDED-LENGTH FIELD INHERITS THIS PROPERTY** — an error `reason`, a `provenanceWarning`, a stale-field explanation. **The honesty layer's own prose is the longest text on most panels, so the most emphatic thing on screen is frequently our apology for not having a number.**
 
+- [ ] **AC200 — 🔴 THE CAPTION DEFECT HAS ONE ARCHITECTURAL CAUSE, NOT THREE AUTHORS' MISTAKES — AND THE OVERRIDES ARE CONCENTRATED IN THE ONE PANEL THAT RENDERS THE FEATURE THIS DEMO EXISTS TO PROVE. @c7a654ed FOUND THE LINE BY READING THE RENDERER, WHICH IS WHERE NOBODY LOOKED ALL NIGHT.**
+```
+  dashboard/panel-kit.js:266
+      const label = options.label ?? field?.label ?? 'value';
+                    ^^^^^^^^^^^^^    ^^^^^^^^^^^^
+                    THE CALLER       THE CATALOGUE IS ONLY THE FALLBACK
+  :260  /** @param {string} [options.label] Overrides `field.label` */   <- deliberate, documented
+
+  TRUE OVERRIDE SITES AT HEAD  (label: passed as an option TO renderField):
+      kv-memory.js   5     <- ⬅ THE LARGEST. NOBODY NAMED THIS PANEL ALL SESSION.
+      scheduling.js  3
+      throughput.js  1
+      ------------------
+      TOTAL          9      of 20 renderField( sites; the other 11 let the catalogue win
+      system.js      0      <- the clean panel. THE GOOD PATTERN ALREADY EXISTS HERE.
+      model-card.js  0      <- ⬅ ZERO. the panel we all prosecuted has no override at all.
+  CONTROLS: renderField( floor = 20 (>9 ✅) · impossible string = 0 ✅ · multiline arm = 0 hidden ✅
+```
+  **🔑 THE PRODUCT RULING: THIS IS NOT A DISCONNECTED FIELD, AND THAT IS WHY IT IS SERIOUS. A DISCONNECTED CAPTION RENDERS `undefined` AND SOMEBODY FIXES IT IN A MINUTE. **A CAPTION THAT LOSES A `??` PRECEDENCE FIGHT RENDERS A PERFECTLY GOOD SENTENCE — THE WRONG ONE — AND NOTHING ANYWHERE REPORTS A CONFLICT.** ⛔ ***"WE RENAMED IT IN THE CATALOGUE" IS A CLAIM ABOUT THE FALLBACK. IT IS NEVER A CLAIM ABOUT THE SCREEN.***
+  **⚡ AND THE DISTRIBUTION IS THE PRODUCT FINDING, NOT THE MECHANISM: **`kv-memory.js` CARRIES MORE HARDCODED CAPTIONS THAN ANY OTHER PANEL — AND KV CACHE PAGING IS ONE OF THE TWO CAPABILITIES THIS ENTIRE DEMO EXISTS TO DEMONSTRATE.** ➡️ **THE PANEL MOST LIKELY TO DRIFT FROM ITS OWN HONESTY CATALOGUE IS THE PANEL A VISITOR CAME TO SEE. THAT IS NOT A COINCIDENCE — IT IS THE PANEL AUTHORS CARED MOST ABOUT, SO IT IS THE PANEL WHOSE CAPTIONS THEY HAND-WROTE.** **CARE PRODUCED THE OVERRIDE. THE OVERRIDE PRODUCED THE DRIFT RISK.**
+  **🔒 REQUIRED: A CAPTION OVERRIDE MUST BE AN EXCEPTION THAT SAYS WHY, NOT THE DEFAULT WINNER.** Guard denominator is **9**, measured, with a positive control and a floor — **and it must assert its own non-vacuity, because the honest number moved 21 -> 46 -> 9 across three instruments in ten minutes.**
+  **⛔ DO NOT FIX ONE CALL SITE. Fixing `scheduling.js` alone leaves 8 and the next catalogue rename is invisible again — @732c7548's law: *a guard that specifies the fix cannot detect that the fix was too small.*
+
 - [ ] **AC196 — 🔒 THE CAPTION RULE, STATED AS BINDING RATHER THAN AS ADVICE, BECAUSE I HAVE ISSUED IT FIVE TIMES AND NEVER ONCE WRITTEN IT DOWN.** **A caption MAY name what is missing. A caption MAY NOT promise what is absent.** *"KV pages — not yet plumbed"* is honest and useful. *"KV pages, updated live"* over a field the catalogue marks `NOT_PLUMBED` is a lie told by the layer we built to prevent lies.
   **🔒 MECHANISABLE, AND THIS IS THE POINT — NO PANEL CAPTION, HEADER, LEGEND, TOOLTIP OR EMPTY-STATE MAY REFER TO A FIELD THE CATALOGUE DOES NOT MARK `MEASURED`, UNLESS THE SAME SENTENCE ALSO STATES THE FIELD'S STATE.** The catalogue is already a machine-readable list of every field and its provenance; the captions are already static strings in the source. **The join is a test, not a review, and it catches all five instances found by hand this session.**
   **⛔ AND THE REASON THIS OUTRANKS THE INDIVIDUAL FIXES: A CAPTION IS WRITTEN ONCE, WHEN THE FEATURE IS INTENDED, AND IS NEVER REVISITED WHEN THE FEATURE SLIPS. It is the artifact most likely to describe the product we meant to build rather than the one in the room — which is exactly the failure mode of every stale review document on this branch, expressed in the UI where a visitor rather than a colleague will read it.**
