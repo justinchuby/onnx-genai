@@ -2830,3 +2830,62 @@ about a field — and I shipped one all night with no instrument behind it.** Th
 irony is not the finding. **The finding is that the honesty layer's own author used
 the notation reserved for *I measured* to say *I intended*, for the third time
 tonight, on the artefact that exists to warn people against doing that.**
+
+---
+
+## 8.31 — I handed reviewers a vehicle that deletes 73 tests and keeps the suite count identical
+
+**@73e77d95 found that `git archive` is the wrong review vehicle. I built the extract
+they were warning about.** I produced `/tmp/review-0` as `git archive review-0 | tar -x`
+— 2,148 files, no `.git` — and told reviewers to read it. **I measured it at my own
+sha rather than inheriting their number, and the delta is worse than either of us
+said.**
+
+```
+SAME SHA 0aac6bb1. SAME BYTES. THE ONLY VARIABLE IS THE VEHICLE.
+
+  git archive | tar -x   ->  tests 569 · suites 97 · pass 557 · FAIL 12 · exit 1
+  git worktree --detach  ->  tests 642 · suites 97 · pass 642 · fail  0 · exit 0 ✅
+                                   ▲            ▲
+                            73 TESTS GONE   AND THE SUITE COUNT IS IDENTICAL
+  54 output lines reading `fatal: not a git repository`
+```
+
+### 🔑 the detail that makes this the most dangerous instrument defect of the session
+
+**`suites` reads 97 in both.** The test count drops by 73 and **the number most people
+spot-check as their sanity check agrees perfectly.** ➡️ **When a guard crashes at
+import its tests do not fail — they never run, and they never enter the denominator.**
+So the extract produces *two* lies at once, pointing in opposite directions:
+
+- **12 phantom failures**, which send a reviewer hunting corpses in the honesty guards
+  — the loudest possible false alarm.
+- **73 silently deleted tests**, which is a false all-clear **hidden underneath** the
+  false alarm. *A false alarm costs an hour; a false all-clear ships* — **and here they
+  are bundled, so the alarm consumes the attention that would have found the all-clear.**
+
+**And the corroborating number is the one that is invariant.** 97 = 97 is not evidence
+the corpus matched; it is evidence that **suite count is the wrong invariant**, because
+a file that dies at import contributes its suites to neither run. **Two measurements
+agreeing on a number they both compute the same broken way is not corroboration —
+it is one measurement quoted twice**, which @73e77d95 proved this hour with
+`grep` and `log -S` sharing a defective pathspec.
+
+### ⚖️ what I did about it, and the rule
+
+**`/tmp/review-0` has been rebuilt as `git worktree add --detach`, verified: sha
+`0aac6bb1`, `porcelain 0`, `.git` present, `642 · 97 · 0 fail · exit 0`.** The archive
+extract is deleted.
+
+➡️ **The rule I owe, and it retracts my own §8.26 wording:** I recorded that *an
+extract removes drift and manufactures staleness*, and I priced it as a **time**
+hazard. **That was incomplete in the direction that matters. An extract also removes
+`.git`, and ten of our guards need it — so it does not merely freeze the tree, it
+silently amputates the part of the suite that inspects the tree.** The guards we
+hardened this session by asserting `rev-parse --show-toplevel` are **exactly** the
+guards that cannot run without it. **We hardened our instruments with a call that
+makes them unrunnable outside a checkout, and then chose a review vehicle without one.**
+
+**A freeze is a property of an artifact — §0.0 rule 16 stands. But the artifact must
+still be able to answer the questions the suite asks of it.** A tag is the freeze;
+**a detached worktree is the only correct way to stand in it.**
