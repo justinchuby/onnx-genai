@@ -242,7 +242,7 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
     if symbol:
         defining = [
             c for c in candidates
-            if find_definition((repo / c).read_text(errors="replace"), symbol) is not None
+            if find_definition(source_text(repo, c), symbol) is not None
         ]
         if len(defining) == 1:
             return defining[0]
@@ -263,6 +263,11 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
 
 
 def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
+    # Cleared per run. The self-test invokes check() repeatedly against
+    # different throwaway repositories, and a set that survived between them
+    # would carry one repo's paths into another's divergence report -- a
+    # checker leaking state into its own evidence.
+    CITED_SOURCES_READ.clear()
     tracked = tracked_files(repo)
     index = definition_index(repo, tracked)
     anchored, positional, mentions, continuations = extract(doc)
@@ -288,7 +293,7 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                 )
             )
             continue
-        where = find_definition((repo / real).read_text(errors="replace"), c.symbol)
+        where = find_definition(source_text(repo, real), c.symbol)
         if where is None:
             failures.append(
                 Failure(
@@ -365,7 +370,7 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
         real = resolve_path(repo, tracked, c.path)
         if real is None:
             continue  # the antecedent itself is already reported above
-        n_lines = len((repo / real).read_text(errors="replace").splitlines())
+        n_lines = len(source_text(repo, real).splitlines())
         cited_line = int(CONTINUATION.match(c.raw).group(1))
         if cited_line > n_lines:
             failures.append(
@@ -384,6 +389,21 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
         "continuations": len(continuations),
         "reports": reports,
     }
+
+    # Reconcile the bytes this verdict rests on against what we ship. The
+    # document is included alongside the sources: a citation check is a claim
+    # about a RELATION between two files, and either one being a draft makes
+    # the relation a draft. Scoped to the inputs actually read -- a global
+    # "N files uncommitted" banner on a fourteen-agent branch is never zero and
+    # has stopped carrying information.
+    doc_rel = doc
+    try:
+        doc_rel = doc.resolve().relative_to(repo.resolve())
+    except ValueError:
+        pass
+    stats["divergence"] = tree_context.divergence_report(
+        repo, sorted(CITED_SOURCES_READ | {str(doc_rel)})
+    )
 
     # Anti-shrink anchors. A harness that enumerates citations from the artefact
     # it checks gets GREENER when citations are deleted. These floors are the
@@ -434,6 +454,31 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     return failures, stats
 
 
+# Paths whose BYTES were used to justify a citation verdict. Deliberately not
+# every file this script opens: `definition_index` reads the whole tracked tree,
+# but its output can only ADD ambiguity reports and is never consulted to
+# suppress a failure, so divergence there can make the run noisier and never
+# quieter. These paths are different -- a citation lives or dies on them.
+CITED_SOURCES_READ: set[str] = set()
+
+
+def source_text(repo: Path, rel: str) -> str:
+    """Read a cited source file, RECORDING that a verdict now depends on it.
+
+    This still reads the working tree, and that is a deliberate choice rather
+    than an oversight. Reading HEAD instead would go red on the entirely normal
+    commit that adds a symbol and cites it in the same change, and a guard that
+    fails on correct work is a guard that gets switched off within a day.
+
+    What was actually wrong was never WHICH tree got read -- it was that the
+    result never said. So the read is unchanged and the DISCLOSURE is the fix:
+    every path that backed a verdict is remembered here and reconciled against
+    HEAD before the verdict prints.
+    """
+    CITED_SOURCES_READ.add(rel)
+    return (repo / rel).read_text(errors="replace")
+
+
 def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     print(f"citations in {doc}: anchored {stats['anchored']} | "
           f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']} "
@@ -468,8 +513,24 @@ def report(failures: list[Failure], stats: dict, doc: Path) -> int:
                     print(f"      {f.detail}")
             if len(items) > 5:
                 print(f"  ... and {len(items) - 5} more")
+    diverged = stats.get("divergence") or []
+    if diverged:
+        # BEFORE the verdict, and it applies to a red run exactly as much as a
+        # green one. A failure measured against somebody else's uncommitted
+        # draft is not a finding either.
+        print(f"\n--- {len(diverged)} [WORKTREE_DIVERGENCE]: cited sources whose bytes "
+              f"are NOT the bytes we ship ---")
+        for line in diverged[:8]:
+            print(f"  {line}")
+        if len(diverged) > 8:
+            print(f"  ... and {len(diverged) - 8} more")
     if not failures:
         print("OK - every anchored citation resolves to a definition that exists.")
+        if diverged:
+            print(f"WARNING - this OK was computed from the WORKING TREE, and "
+                  f"{len(diverged)} cited source file(s) above differ from HEAD. "
+                  f"It is a statement about one desk at one moment, NOT about the "
+                  f"branch. Re-run once those files are committed before quoting it.")
         if pending:
             print(f"NOTE - this OK covers {stats['anchored']} anchored citations, and it "
                   f"means ONLY that each pointer lands on something real. It does NOT "
@@ -649,6 +710,67 @@ def self_test() -> int:
 
     width = max(len(n) for n, _, _ in results)
     print("MUTATION SELF-TEST")
+    # 13-15. WORKTREE_DIVERGENCE. These run against COMMITTED throwaway repos
+    #     because the property under test is precisely "does the desk differ
+    #     from what is committed", and a repo with no commit at all cannot
+    #     express it. Every earlier case above skips the commit, which is fine
+    #     for them and would silently make all three of these vacuous.
+    def divergence_case(name: str, mutate, expect: set[str]):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            (repo / "src").mkdir()
+            (repo / "docs").mkdir()
+            (repo / "src" / "sample.rs").write_text(SAMPLE_SRC)
+            # Tracked, committed, and NEVER cited by the document. This file is
+            # the entire point of case 15.
+            (repo / "src" / "unrelated.rs").write_text("fn untouched_by_docs() {}\n")
+            (repo / "docs" / "d.md").write_text(SAMPLE_DOC)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-q", "-m", "base"], cwd=repo, check=True,
+            )
+            mutate(repo)
+            _, stats = check(repo, repo / "docs" / "d.md", {})
+            got = {
+                line.split()[1].rstrip(":")
+                for line in stats.get("divergence") or []
+            }
+            ok = got == expect
+            results.append((
+                name, ok,
+                f"reported {got or 'nothing'}" if ok
+                else f"expected {expect or 'nothing'}, reported {got or 'nothing'}",
+            ))
+
+    # 13. Control. A committed, untouched tree must report NO divergence, or
+    #     cases 14 and 15 are both unreadable.
+    divergence_case("divergence: clean committed tree (must be silent)",
+                    lambda r: None, set())
+
+    # 14. The cited source is edited on the desk. MUST be disclosed -- this is
+    #     the live defect: a citation verdict computed from bytes nobody ships.
+    def dirty_cited(repo: Path):
+        p = repo / "src" / "sample.rs"
+        p.write_text(p.read_text() + "\n// edited on one desk only\n")
+    divergence_case("divergence: CITED source dirty (must disclose)",
+                    dirty_cited, {"src/sample.rs"})
+
+    # 15. THE CASE THAT DECIDES WHETHER THIS INSTRUMENT IS WORTH ANYTHING.
+    #     A tracked file that the document does not cite is edited. It must be
+    #     SILENT. Without this arm, an implementation that simply printed
+    #     `git status` would pass case 14 perfectly -- and would then cry wolf
+    #     on every unrelated edit on a fourteen-agent branch until somebody
+    #     switched it off. The claim is not "the tree is dirty". It is "the
+    #     bytes THIS VERDICT RESTS ON are not the bytes we ship", and only a
+    #     failing case 15 can tell those two apart.
+    def dirty_uncited(repo: Path):
+        p = repo / "src" / "unrelated.rs"
+        p.write_text(p.read_text() + "\n// noise from another agent\n")
+    divergence_case("divergence: UNCITED source dirty (must stay silent)",
+                    dirty_uncited, set())
+
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name.ljust(width)}  {detail}")
     bad = [r for r in results if not r[1]]
