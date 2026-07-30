@@ -1,0 +1,1200 @@
+# Implementation Review — `feat/genai-demo-dashboard`
+
+Reviewer: Code Reviewer @73e77d95 (lane: correctness, readability, patterns, test coverage, code quality)
+Originally reviewed at: `24d831a2`
+**FINAL RE-VERIFICATION AT: `6c979fa2`** — see "Re-verification #6" immediately below.
+Prior: `9e31a7c7` (#5), `d6e57c63` (#3 full-suite baseline).
+Scope: 119 files, +35,869 / −143
+
+## ⚠️ Two limits on this review, stated up front
+
+1. **This review cannot discharge AC52.** @c0de4c2e is correct that `demo-spec.md:407` makes
+   *"I verified it in a real browser"* the acceptance standard for every visitor-facing panel,
+   and that reading code satisfies no criterion in §5. My `review-code` node was released over a
+   `qa` node that is BLOCKED and has never run. **Nothing on this branch has been opened in a
+   browser.** Everything below is static analysis plus two automated suites. Treat it as
+   necessary-but-not-sufficient; it does not substitute for QA.
+2. The branch moves ~1 commit/minute. Every finding below is pinned to a SHA and was re-checked
+   against `f45d7228` immediately before filing.
+
+## 📐 Citation form (adopted 02:00, per @12e42da8's symbol rule)
+
+**Every finding below names its symbol and quotes its text. Line numbers are a convenience and are
+never the identity.** They were correct when written and this branch moves ~1 commit/minute; if a
+number has rotted, the symbol and the quoted text still locate the defect.
+
+I adopt the rule, with one correction to its stated premise. *"Not one symbol name has decayed all
+night"* is falsifiable and I have the counterexample — **`formatFieldText` was named in a work order
+twice tonight and had already been deleted** (verified absent at `852f7789`). The rule survives for
+a better reason:
+
+| | decays when | failure when stale |
+|---|---|---|
+| line number | the file **changes** (constantly) | **SILENT** — points at different code that looks plausible |
+| symbol name | the symbol is **deleted/renamed** (rare) | **LOUD** — points at nothing; unexecutable |
+
+`lib.rs:26` decayed into `mod demo_assets;` and executing that order would have killed `/demo`.
+`formatFieldText` decayed into nothing and simply stopped the work. **Symbols are not durable, they
+are fail-closed** — the same doctrine behind `renderStateOf`'s throw and `modesFor`'s `default:`
+branch. Operational form: **name the symbol, quote the text, the line may accompany and never
+substitute.**
+
+## 🔻 Re-verification #6 — TWO OF MY OWN FINDINGS DECAYED (`6c979fa2`)
+
+Clean detached worktree, `--porcelain = 0`, 01:56:58. **`dashboard/prefix-cache.js` was deleted at
+`45c1103d`**, and it was load-bearing for two of my findings. Recording the decay before anyone
+else finds it.
+
+### F4 downgraded MAJOR → MINOR: the live trigger is gone
+
+`prefix-cache.js:77` shipping `staleCeilingMs: null` was the one caller that made the `??` bug
+observable. Every remaining caller passes an explicit positive integer:
+
+```
+system.js:53 30000 · throughput.js:51 3000 · requests.js:61 10000
+kv-memory.js:56 15000 · scheduling.js:60 3000
+callers passing null:  ZERO
+```
+
+With no `null` caller, `??` and `=== undefined` behave identically. **The bug is latent.** Still
+worth fixing — the JSDoc at `panel-kit.js:449` types it `{staleCeilingMs?: number}`, which does not
+admit `null`, so the contract and the code still disagree about a value the code silently absorbs —
+**but it is not a merge blocker and I was wrong to keep listing it as one.**
+
+### F11 count corrected: FIVE panels, not six
+
+```js
+export const PANELS = Object.freeze([throughput, scheduling, kvMemory, requests, system]...)
+```
+
+The defect is unchanged and still live (`index.js:188` passes the non-existent `panel.title`); only
+my count was stale. @c7a654ed retracted `PANELS.length === 6` as a proxy that outlived the thing it
+proxied — I was still quoting the proxied number.
+
+**F11's landing-order caveat is WITHDRAWN.** `panel-kit.js:1049` gates the throw on
+`IS_DEVELOPMENT` and otherwise `console.error`s and keeps building, with the reason in the comment
+(*"dropping a panel in front of a room is worse than an unnamed one"*). Loud where a developer sees
+it, survivable where a visitor does. **The label-derivation fix can now land alone, in any order.**
+This is better than the sequencing constraint @086345a5 and I agreed on: a gate is a property,
+ordering is only a promise.
+
+### `case 'paged-kv'` is dead — keep it, but it is untested
+
+Confirmed zero producers (`requires: null` ×4, `'continuous-batch'` ×1). **Deleting the case would
+convert "returns the correct answer if used" into "throws at mount"**, because `modesFor`'s
+`default:` branch correctly refuses to guess. Keep it; it completes the capability vocabulary.
+
+But no test exercises it, and the `paged-kv` hits in the suite are a **different vocabulary**:
+
+```
+scenario-origins.test.js       planScenario('paged-kv', ...)      <- a SCENARIO ID
+check-launch-command.test.js:444  'paged-kv-block-table'          <- URL KEYS
+registry.test.js:142           modesFor({requires:'paged-kv-v2'}) <- tests the THROW, not the case
+```
+
+Anyone grepping `paged-kv` in tests concludes the branch is covered. It is not. **Third instance on
+this branch of one string carrying several vocabularies** (after `'ok'` = field state vs HTTP health
+payload, and `RENDER_STATES`/`FIELD_STATES`), and each time the grep that should have caught it
+confirmed the wrong answer instead.
+
+### F13 — MINOR (new, DRY): the `requires` vocabulary is defined twice
+
+```js
+dashboard/honesty.test.js:257   const VALID = new Set(['continuous-batch', 'paged-kv', null]);
+dashboard/index.js:85-98        switch (module.meta.requires) { case ... }
+```
+
+A hardcoded allowlist duplicating the switch it polices. Add a case and the test still rejects it;
+delete one and the test still blesses it. Export the vocabulary from `index.js` and derive the Set.
+**The file whose docblock spends twenty lines teaching derive-don't-duplicate has a hand-maintained
+copy of its own vocabulary sitting in its test.**
+
+## 🔑 Re-verification #5 — F3 PROVEN BEHAVIOURALLY; F12 FILED; TWO ORDERS INTERCEPTED
+
+Measured in clean detached worktrees (`git worktree add --detach`, `--porcelain = 0` each time),
+at `59eff0ce`, `d5c16fde`, `bbba34ac`, `9e31a7c7`, between 01:44 and 01:53.
+
+### The single red, NAMED (nobody had named it; three different counts were circulating)
+
+```
+59eff0ce   482 tests · 481 pass · 1 fail
+  check-source-citations.test.js › "a cited line still sits beside the symbol the prose names"
+  5 README.md citations name a symbol no longer at the cited line.
+```
+
+It is **not** the enum. Four enum tests pass **by name** in the same run:
+`ok 21 - the README states the CURRENT wire value of the measured state`,
+`ok 74 - honesty lint — the measured state is never compared as a literal`,
+`ok 115`, `ok 140`. The circulating instruction to "revert the assertion to `'ok'` and the suite
+goes green" would not touch the actual red **and** would break `ok 21` — one failure becomes two.
+(@086345a5 independently applied the edit in an isolated worktree and measured exactly that:
+`481/1 → 480/2`.)
+
+Note also: the consumer audit ordered by the Lead **already exists as `ok 74` and is green.**
+
+### F12 — MAJOR (new): `repair-citations.mjs` computes from the dirty tree, and has no tests
+
+Commit `bb649cbc` — *"compute citation line numbers from source instead of maintaining them by
+hand"* — took the suite from **1 red to 2**, breaking a previously-green test:
+
+```
+not ok 60 - every line the README cites still exists in the file
+  "README.md cites driver.rs:956, but that file has only 912 lines."
+```
+
+Root cause, proven arithmetically:
+
+```
+repair-citations.mjs:111   readFileSync(join(REPO, file))          <- the WORKING tree
+
+git status --porcelain crates/onnx-genai-server/src/driver.rs  ->  " M "  DIRTY
+  committed (git show HEAD:)   911 lines   run_fallback_generation at :861
+  working tree (readFileSync) 1006 lines   run_fallback_generation at :956   <- README says 956
+```
+
+**The number is not wrong; it is correct for a tree that was never committed and exists only in
+one agent's uncommitted edit.** The checker reads committed state, the repairer reads the dirty
+tree — producer and consumer read different trees, so they cannot agree while anyone is mid-edit.
+
+Fix: read via `git show HEAD:<file>`, **and** refuse to run when the target path is dirty.
+Refusing is the more important half — a repair tool that runs against a dirty tree cannot produce
+a correct answer, and this tool already declines loudly on ambiguous paths while never applying
+that standard to itself.
+
+**Test coverage (my lane):** `git ls-files | grep repair-citation` returns the `.mjs` only. It is
+referenced by `PR-DESCRIPTION.md` and itself — not wired into any test, script, or CI. **194 lines
+of new logic whose output is committed documentation, with zero tests, whose first and only
+production run regressed a green test and shipped a past-EOF citation into the README.** The commit
+trailer reads *"My suite: 59/59, deterministic over five consecutive runs"* — true, and not
+evidence, because none of the 59 point at this tool.
+
+To be fair to the author, the tool is **well designed**: it declines loudly rather than skipping
+silently, never invents a file, only rewrites on exactly one definition-shaped match, and carries a
+regex specifically guarding a struct-field false positive 342 lines from the real definition.
+Its header states our doctrine better than we have — *"A line number in prose is a copy of …
+COMPUTED FROM THE ARTIFACT OR DELETED."* **The doctrine is right; the artifact selection is wrong.**
+This is the crew's signature error — measuring one tree and writing into another — automated, and
+handed the authority of the word "computed."
+
+### F3 proven from both ends by execution (was: argued about for ~90 minutes)
+
+Seven shipping producers emit the raw string `'ok'`; **zero** emit `'measured'`:
+
+```
+dashboard/store-adapter.js:226 232 338 370 381 518
+dashboard/testing/fake-store.js:26                  <- a test fixture teaching the retired spelling
+CONTROL — raw state:'measured' in shipping JS:  0
+```
+
+The two consumers disagree about that exact value:
+
+```
+DASHBOARD  renderStateOf({state:'ok'})  -> 'measured'   ACCEPTS, renders the number
+ROOT       formatField({state:'ok'})    -> em-dash, hasValue:false, console warning — REFUSES
+```
+
+**Same value, opposite outcomes, both modules individually correct and individually tested.** Route
+any store-adapter field through `format.js` and every one blanks — silently, because refusal renders
+as an em-dash, a legitimate absence glyph. This is why no experiment settled the argument: the
+system was built to answer "fine" to both hypotheses.
+
+The seven literals are a **latent hazard, not a live defect** — normalisation at the render boundary
+absorbs them. The claim that `state-vocabulary.test.js` "would reject every one" is falsified by the
+suite itself: the literals are in the tree *and* the suite is green, therefore no test rejects them.
+Proof by contradiction; no extra run needed. Minimal fix remains @086345a5's: rename the **key**
+`OK → MEASURED` in `field-state.js:53` (2 call sites, wire-neutral).
+
+### Two destructive orders intercepted
+
+**(a) `shell.css:163`.** Ordered changed on the premise that `[data-state='measured']` "has matched
+nothing all session." The DOM writes the enum **value**:
+
+```
+ui/model-card.js:91         element.dataset.state = field.state;
+dashboard/panel-kit.js:277  attrs: { 'data-state': state, ... }   (state = renderStateOf(field))
+renderStateOf({state:'ok'}) -> 'measured'    <- BOTH stacks converge on 'measured'
+```
+
+The selector is **live on every path that exists**. Changing it to `'ok'` would *manufacture* the
+dead selector, and would redden two currently-green guards —
+`state-channel.test.js:249` (`assert(!shellCss.includes("[data-state='ok']"))`) and
+`state-treatments.test.js` (`shell.css does not style a state that cannot occur`).
+I deliberately tried to break my own finding here: had the dashboard stack written its raw `'ok'`
+straight through, the selector *would* have been dead for six panels and the ruling right by a route
+nobody had identified. It normalises first. **There is no stack for which the edit is correct.**
+
+**(b) The bidirectional selector-vs-enum guard ordered built already exists and passes:**
+
+```
+node --test state-treatments.test.js state-channel.test.js  ->  13 tests, 13 pass, 0 fail
+  ✔ every field state has a visual treatment in shell.css   (enum -> CSS)
+  ✔ shell.css does not style a state that cannot occur      (CSS -> enum)
+```
+
+Also note `shell.css:158-162` — the comment directly above the line — already describes the ordered
+edit's failure mode ("silently fell back to inherited styling … only a cross-language check finds
+it"), and `state-channel.test.js:224` records the migration direction `[data-state='ok'] ->
+[data-state='measured']`. The migration already ran; the order asks us to run it backwards.
+
+### A rule this session earned
+
+A destructive instruction that names a **symbol** is still not idempotent when it is a
+**substitution**: `measured -> ok` run twice, or run after the migration already ran, silently
+reverses a completed change. The idempotent form of a substitution is a **predicate** — *"shell.css
+must select exactly the values the enum emits"* — which is a test, and that test exists and is green.
+**Ship the predicate, not the edit.**
+
+## 🔑 Re-verification #4 — F3 IS THE ROOT CAUSE OF THE ENUM SAGA
+
+Verified in a **clean detached worktree** at `bd31e32f`, `git status --porcelain` = **0 lines**
+(instrument switched to `git worktree add --detach` on @086345a5's correction — `git archive`
+has no `.git` and breaks every self-inspecting test in this suite). Control:
+`grep -c export dashboard/index.js` → 6, so the root resolves.
+
+**Executed, both stacks, side by side:**
+
+```
+RENDER_STATES  (dashboard/field-state.js)  = {"OK":"measured", "PENDING":"pending", …}
+FIELD_STATES   (telemetry-field.js)        = {"MEASURED":"measured", "PENDING":"pending", …}
+                                                ^^^^^^^^          ^^^^^^^^^^
+                                              KEYS DIFFER        VALUES IDENTICAL
+```
+
+**Both stacks emit `'measured'`. They disagree only on the KEY NAME.** One calls the symbol
+`OK`, the other calls it `MEASURED`, and both hold the string `'measured'`.
+
+### This explains nine rulings, four agents, and two reversals — with nobody stale
+
+| who read | what they saw | what they reported | correct? |
+| --- | --- | --- | --- |
+| dashboard stack | `RENDER_STATES.OK` | "there is an `OK` key" → *the wire value is `'ok'`* | **key: yes. value: no.** |
+| root stack | `FIELD_STATES.MEASURED`, no `OK` key | *the wire value is `'measured'`* | **yes** |
+
+@12e42da8's tie-break sentence — *"`FIELD_STATES.MEASURED` IS THE SYMBOL; `'ok'` IS THE WIRE
+VALUE"* — is an exact description of `RENDER_STATES.OK` **with its two halves swapped**. There
+the symbol is `OK` and the value is `'measured'`. It is the most understandable error of the
+night and it was **unavoidable given F3**: the branch ships two vocabularies for one concept,
+so "read the enum" has two correct answers.
+
+⚠️ **The diagnosis everyone reached for was the clock, and the clock was never the explanation.**
+@12e42da8's rule — *"a disagreement between two honest readers of a hot file is evidence of time
+passing"* — is right, and it was applied to a case where the readers were in **different files**.
+Adding to it, from this instance: **when two honest readers disagree, the first hypothesis is
+the clock, and the second is that they are not reading the same file.** No amount of re-reading
+at a fresh sha would ever have converged these two, because both were current.
+
+### The authority was quoted backwards
+
+```
+dashboard/state-vocabulary.test.js:28
+const RULED_STATES = Object.freeze(['measured', 'pending', 'stale', 'unavailable', 'not-applicable']);
+```
+
+The ruling cited this file as freezing `['ok', …]`. **It freezes `'measured'`.** The test passes
+**12/12** at `bd31e32f`. So the ruling's *method* was exactly right — @12e42da8's own new binding
+rule, *"if a test freezes the current value, the current value is a decision, not a defect"* —
+applied to a value that was misread. **The rule works; it was fed the wrong string.**
+
+### A false statement inside that test's own failure message
+
+```
+state-vocabulary.test.js:39   "field-state.js no longer bridges spellings, so …"
+
+executed:  normaliseState('ok')       -> 'measured'
+           normaliseState('measured') -> 'measured'
+```
+
+**The bridge is still live.** The claim that it was deleted survives only in the error message of
+the test that would print it — a message a reader sees *precisely when they are already
+confused about spellings*. This is my F3 `STATE_ALIASES` finding, confirmed by execution, and it
+is the third artifact in this saga that says the opposite of what the code does.
+
+### The comment the ruling ordered deleted does not exist
+
+`grep -rn "see :90|emits ok|named MEASURED"` over the clean tree → **no match anywhere.**
+The deletion assigned to @c8d9a40e is a no-op. **The replacement text is the hazard:** a new
+comment reading *"`'ok'` is deliberate"* would be **false**, would sit in the canonical file, and
+would manufacture report #5 — the exact failure mode the ruling was written to prevent.
+
+### ✅ The safe conclusion: NO ENUM EDIT IS NEEDED, BY ANYONE
+
+Every value comparison on the branch is correct today; both stacks already agree on `'measured'`;
+the suite is green because the agreement is real. **The defect is entirely in the SYMBOL names
+and in the rulings written about them, not in behaviour.** Per @12e42da8's own standing rule —
+*seven mechanisms guard against fabricated additions and zero against removing something
+correct* — the highest-risk action available right now is an edit, not the absence of one.
+
+**This is what F3 costs.** I filed it as "two parallel render stacks disagree," which reads like
+a tidiness complaint. It is not. **It consumed nine rulings, four agents, two reversals, and a
+stand-down order, and the crew's best diagnostic instrument — re-read at a fresh sha — cannot
+resolve it, because both readings are current.** Collapsing the stacks is the fix; until then,
+any statement about "the enum" must name the file.
+
+
+**Headline: the JS suite is GREEN and five of my findings are still live. Those two facts are
+not in tension, and the gap between them is the most useful thing in this report.**
+
+### The suite number, and why I am quoting two of them
+
+| tree | tests | pass | fail |
+| --- | --- | --- | --- |
+| **working tree** at `d6e57c63`, `git status --porcelain` = **9 files** | 430 | 412 | **18** |
+| **committed** `d6e57c63`, `git archive HEAD` full extract, no pathspec | 485 | **484** | 1 |
+
+The single failure in the committed run is `check-source-citations.test.js`, which shells out to
+`git rev-parse --show-toplevel` and therefore **cannot pass in an extract that has no `.git`**.
+Confirmed by running it alone: `fatal: not a git repository`. **Discount it: the committed branch
+is 484/484 green.**
+
+⚠️ **The two rows differ by 55 tests and 17 failures at ONE sha.** I am publishing both because
+either alone is misleading. The dirty run is other agents' in-flight work (the capability-probe
+and provenance-column edits) and filing those 17 as branch defects would have been 17 false
+reports. The committed run is the branch. **@c7a654ed's practice of quoting the tree state
+beside the sha is the only reason I noticed — a sha does not identify what you tested, and this
+is the sharpest example of it anyone has produced tonight: same commit, 18 failures or 1.**
+
+### The five findings, re-verified line by line at committed `d6e57c63`
+
+| Finding | Evidence at committed `d6e57c63` | Status |
+| --- | --- | --- |
+| **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **LIVE** |
+| **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE** |
+| **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **LIVE** |
+| **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **LIVE** |
+| **F11** MAJOR | `index.js:179` `createRovingGroup(root, { label: panel.title })`; `panel.title` is not a key of the frozen registry entry. | **LIVE** |
+| F2 | retracted — see #2 above. | **FIXED** |
+
+**A green suite did not catch any of the five.** F1 has a red Rust test, so it is caught by the
+*other* suite; F3, F4, F5 and F11 have no test that could fail. That is the finding behind the
+findings: **484 green JS tests coexist with an unnamed `role="group"` on every panel, a silently
+ignored null ceiling, a linter that cannot fail, and two render stacks that disagree.**
+
+### The enum: the ordered audit comes back CLEAN, and the premise it rested on is stale
+
+@12e42da8 ruled: *"the one genuine, severe bug is `FIELD_STATES.MEASURED` holding the value
+`'ok'` … `'ok'` IS THE CORRECT WIRE VALUE … audit that every consumer compares against the
+CONSTANT and never against a string literal. Three consumers use it."*
+
+**Executed at `d6e57c63`, not grepped:**
+
+```
+FIELD_STATES.MEASURED === 'measured'   ->  true
+FIELD_STATES.OK                        ->  undefined
+```
+
+**So the premise is inverted** — the constant and its value already agree, and `FIELD_STATES.OK`
+does not exist. **But I ran the ordered audit anyway, because the ACTION is correct whichever
+spelling wins**, and it is the half of the ruling that survives:
+
+```
+literal comparisons against a field state in shipping (non-test) JS:  ZERO
+control: literal 'measured' in non-test JS -> 14 hits, so the search resolves
+```
+
+✅ **No consumer is broken. Nobody needs to be assigned this.** The only two hits are doc
+comments. Reporting a clean audit as loudly as a dirty one, because "we checked and there is
+nothing to do" is a result, and an unanswered audit request gets re-issued.
+
+### The stale comment IS real — @12e42da8 predicted it exactly, in the opposite direction
+
+The ruling's closing point — *"there is a comment documenting the bug that survives the fix and
+re-opens it for the next reader; a stale comment about a fixed bug is a bug generator"* — is
+**correct, and it lands on a file nobody has fixed.** Both flagged independently by @376a0297:
+
+```
+state-treatments.test.js:7   "while `FIELD_STATES.MEASURED` is the string `'ok'`"
+                             ^^ PRESENT TENSE, FALSE at d6e57c63
+```
+
+Compare its sibling, which is **exemplary and should be the model for the fix** —
+`telemetry-field.js:133-152` says the same thing in the **past tense** (*"the constant and its
+value disagreed once — `MEASURED: 'ok'`"*), then explains the silent-failure mode, then warns
+against the global replace, then names the test that enforces the atomic pair. **One is a
+historical record; the other is a false statement about current behaviour.** The fix is a tense
+change on one line, and it belongs in the one file a maintainer opens to learn what the states
+mean.
+
+
+Method per the crew's standing rules: SHA from `git rev-parse` in the same invocation,
+`git rev-parse --show-toplevel` confirmed to end in `onnx-genai-demo`,
+`git status --porcelain` on every cited path **empty** (so committed == working), evidence read
+via `git show HEAD:<path>` (the artifact that ships) — and for the enum, **executed rather than
+grepped**.
+
+| Finding | Status at `a721f033` |
+| --- | --- |
+| F1 `driver.rs:464` | **STILL LIVE.** `set_applicable(!continuous_batch_supported)`; `runtime.rs:263` still returns `()` |
+| **F2 `'ok'`→`'measured'`** | ✅ **RESOLVED — I RETRACT IT.** `format.test.js` swept; 18/18 green |
+| F3 dual render stacks | STILL LIVE |
+| F4 `null` ceiling | **STILL LIVE.** `panel-kit.js:273,454` both still `?? DEFAULT_STALE_CEILING_MS` |
+| F5 `audit_citation_targets.py:25` | **STILL LIVE** |
+| F11 unnamed `role="group"` | **STILL LIVE.** `index.js:179` still `{ label: panel.title }` |
+
+### 🔻 F2 RETRACTED — and the retraction matters more than the finding did
+
+F2 is fixed. `format.test.js` is 18/18 green. I am striking it, loudly, because a stale red that
+nobody re-runs is exactly the failure mode @12e42da8 named ("a red you did not re-run is a
+rumour") and I do not get an exemption for being the reviewer.
+
+### ⚠️ But the enum ruling in circulation is inverted, and it is dangerous in the write direction
+
+@12e42da8 broadcast, "FOR THE NINTH AND ABSOLUTELY FINAL TIME: THE WIRE VALUE IS `'ok'`.
+FIELD_STATES.OK, MEASURED alias DELETED in f19fdb63 (D160)." That was true at `f19fdb63` and was
+**reverted at `24d831a2`** ("land the ratified 'measured' rename as one atomic pair"). Executed
+at `a721f033`, not grepped:
+
+```
+FIELD_STATES = {"MEASURED":"measured","PENDING":"pending","STALE":"stale",
+                "UNAVAILABLE":"unavailable","NOT_APPLICABLE":"not-applicable"}
+FIELD_STATES.MEASURED === 'ok'        -> false
+FIELD_STATES.MEASURED === 'measured'  -> true
+FIELD_STATES.OK                       -> undefined      <-- THE RULING NAMES A CONSTANT THAT DOES NOT EXIST
+```
+
+Both halves of the atomic pair are consistent on disk: `telemetry-field.js:153`
+`MEASURED: 'measured'` and `shell.css:163` `[data-state='measured']` (control: 11 `data-state`
+hits in that file, so the grep resolves).
+
+**Why this is a live hazard and not a debating point.** `FIELD_STATES.OK` is `undefined`.
+Anyone who writes to the circulating ruling produces `field.state === FIELD_STATES.OK`, which
+compares against `undefined` and is **never true** — no error, no warning, no test failure,
+and every genuine measurement silently falls through to the unknown-state path. That is
+precisely the defect @732c7548 was praised for documenting ("a comparison that is NEVER TRUE,
+with no error and no warning") — the ruling now recreates it in the opposite direction.
+
+@376a0297, @c7a654ed and @0837fdf9 have independently reported `'measured'`; the disk agrees
+with them. This needs one correction from @12e42da8 so nobody writes `FIELD_STATES.OK`.
+I hold no view on which spelling *should* win — only on what the shipping artifact does.
+
+## Re-verification #1 at `f45d7228` (superseded by #2 above)
+
+| Finding | Status at `f45d7228` |
+| --- | --- |
+| F1 `driver.rs:464` applicability inference | **UNCHANGED — still live.** `set_applicable(!continuous_batch_supported)`; `runtime.rs:263` still returns `()` |
+| F2 `'ok'`→`'measured'` half-sweep | **UNCHANGED — still red.** `format.test.js:211` still feeds `'measured'` as the *unknown* state; `:270` still enumerates `'ok'` |
+| F3 dual render stacks | **UNCHANGED.** `format.js`, `telemetry-field.js`, `dashboard/field-state.js` all still ship; `ui/model-card.js:17` still imports the root stack; `field-state.js:101` still aliases `ok` |
+| F4 `staleCeilingMs: null` | **CHANGED SHAPE — see F4-revised.** Test was rewritten in `45c1103d`; the implementation is byte-identical |
+| F5 `audit_citation_targets.py:25` hardcoded ROOT | **UNCHANGED — still live** |
+
+Suite at `f45d7228`: **462 pass / 4 fail** (was 460/6). Of the 4, one
+(`check-source-citations.test.js`) is an artifact of my `git archive` extract having no `.git`;
+**3 are real**, two of them F2.
+
+Correctly discounted per @c0de4c2e: `sidecar_free_compatibility_package` is a permanent red
+(needs a `.gitignore`-excluded `*.onnx` fixture) — it was never in my findings. `cors.rs` does
+not exist and is not referenced anywhere in this review.
+
+## Method
+
+The branch worktree `/Users/justinc/Documents/GitHub/onnx-genai-demo` is dirty — four agents
+are mid-edit and the Rust crate **does not currently compile** there
+(`admin.rs:146`, missing field `batch_in_flight` in `NodeStatus`). To review the *shipping*
+state rather than in-flight churn I extracted `git archive HEAD` to a clean tree and ran
+everything there.
+
+## VERDICT: REQUEST CHANGES — the branch is red at HEAD
+
+| Suite | Result |
+| --- | --- |
+| `node --test '**/*.test.js'` (dashboard) | **460 pass, 6 fail** (+1 false failure, see note) |
+| `cargo test -p onnx-genai-server -p onnx-genai-kv` | **162 pass, 2 fail** |
+
+Note: `check-source-citations.test.js` fails only in my extracted tree because it shells out to
+`git rev-parse --show-toplevel`. Not a branch defect — but see F7, it fails in the worktree too.
+
+---
+
+## F1 — BLOCKER: applicability is inferred from an unrelated capability
+
+`crates/onnx-genai-server/src/driver.rs:464`
+
+```rust
+let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
+engine.attach_kv_telemetry(Arc::clone(&kv_telemetry));
+kv_telemetry.set_applicable(!continuous_batch_supported);
+```
+
+"This engine does not support continuous batching" does **not** imply "this engine's decoder
+pages through the KV page table." It only implies the fallback per-request path was taken.
+The branch's own test proves the inference is wrong:
+
+```
+tests::kv_blocks_renders_no_numbers_until_paged_kv_is_known_to_be_in_use
+  crates/onnx-genai-server/src/tests.rs:4058
+  assertion `left == right` failed
+    left: Bool(true)     <- body["applicable"]
+   right: false
+```
+
+So `/v1/debug/kv/blocks` serves live `page_size` / `pages_in_use` / `hot_capacity` for the
+`tiny-llm` fixture — numbers describing a pool the decoder never consults. That is precisely
+the failure mode this entire feature was built to prevent, and the doc comment three lines
+above it (`admin.rs:587-591`) describes the danger correctly while the code walks into it.
+
+**This is a design bug, not just a wrong boolean.** `set_applicable` is being *handed an
+inference* when it could be *handed a fact*. The sibling code path already does it right:
+
+- `pipeline/mod.rs:868` — `attach_kv_telemetry(...) -> bool`, returns whether a paged cache
+  actually exists; `driver.rs:450` uses that return value. Correct.
+- `engine/runtime.rs:263` — `attach_kv_telemetry(...)` returns `()`. The caller has nothing to
+  go on, so it guesses.
+
+**Fix:** make `Engine::attach_kv_telemetry` return `bool` (whether the decode path it will
+actually run routes through `kv_cache.page_table`), mirroring the pipeline API, then:
+
+```rust
+let paged = engine.attach_kv_telemetry(Arc::clone(&kv_telemetry));
+kv_telemetry.set_applicable(paged && !continuous_batch_supported);
+```
+
+Two functions with the same name on two engine types should not have different signatures and
+different honesty guarantees. Unifying them also removes the guess.
+
+---
+
+## F2 — BLOCKER: the `'ok'` → `'measured'` rename shipped half-swept
+
+Commit `24d831a2` is titled *"land the ratified 'measured' rename **as one atomic pair**"*. It
+is not atomic. `telemetry-field.js:122` now reads `MEASURED: 'measured'`, and
+`format.js` refuses any state not in `FIELD_STATES` — but `format.test.js` was never swept:
+
+- `format.test.js:198` — *"an unknown state is refused"* feeds `state: 'measured'` and asserts
+  it is **rejected**. It is now the ratified value. Test fails: `'999 requests' !== '—'`.
+- `format.test.js:269` — *"all five states render distinct text"* enumerates
+  `['ok', 'pending', 'stale', 'unavailable', 'not-applicable']`. `'ok'` is no longer a state,
+  so it falls through the unknown-state branch to `—` and collides with `unavailable`.
+  Test fails: `4 !== 5`.
+
+The CSS half **was** swept correctly (`styles/shell.css:163` is `[data-state='measured']`), and
+`state-channel.test.js:223-250` documents the atomic pair properly. Credit where due — the
+sweep was 90% disciplined. But a commit that names itself atomic and leaves its own test file
+asserting the opposite of the ruling is the exact drift the tripwires exist to catch.
+
+Also stale: `design/skeleton.html:391,394` still emit `data-state="ok"`, which no longer
+matches any selector in `shell.css`.
+
+---
+
+## F3 — BLOCKER: two parallel render stacks disagree about the same field
+
+Both ship on the same page (`app.js:28` → `ui/model-card.js` → root `format.js`; `app.js:18` →
+`dashboard/index.js` → `dashboard/panel-kit.js` → `dashboard/field-state.js`).
+
+`dashboard/field-state.js:8-22` says so itself and asks to be deleted. It is not merely
+duplication — the two stacks give **different answers to the same input**:
+
+| Input | root `format.js` | `dashboard/` stack |
+| --- | --- | --- |
+| `state: 'ok'` (old wire spelling) | unknown → `—`, page blanks | accepted via `STATE_ALIASES` (`field-state.js:101`) |
+| stale field with no `observedAtMs` | renders `41 reqs · age unknown` (value **shown**) | `isPastStaleCeiling` → `ageMs === null` is **past the ceiling** → value **withheld** |
+
+Both behaviours are defended in careful comments in their own file. They cannot both be right.
+Two vocabularies for "what is a measurement" on one honesty-focused dashboard is the highest
+drift risk on the branch. Pick one; `dashboard/field-state.js` is the more defensive of the two.
+
+---
+
+## F4-REVISED — MAJOR (was blocker): the null ceiling is now live, and silently becomes 10s
+
+**Status changed at `f45d7228`.** Commit `45c1103d` rewrote `staleness.test.js` rather than the
+code. The old rule (*`cadence === 0` ⇒ ceiling MUST be `null`*) was replaced by a rule that
+allows any number and permits `null` only if the panel's source binds no telemetry. That
+resolves the test-vs-`requests.js` contradiction, and the new test is better in one real way:
+it asserts `'staleCeilingMs' in meta` (no silent inheritance) and verifies `null` against module
+**source** rather than trusting `meta`. Good instinct.
+
+**But the implementation defect it was masking is untouched, and is now completely unguarded:**
+
+- `dashboard/prefix-cache.js:77` declares `staleCeilingMs: null` — this is **live in a shipping
+  panel**, not hypothetical.
+- `dashboard/panel-kit.js:452` — `panelMeta?.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS`
+- `dashboard/panel-kit.js:271` — `options.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS`
+- `DEFAULT_STALE_CEILING_MS = 10_000` (`field-state.js:122`)
+
+So a panel declaring *"I have no freshness contract"* is silently given a **10-second** one.
+`??` does not fire on `null`… it fires on `null` **and** `undefined` — which is exactly the
+problem: the contract needs to distinguish "unset" (use default) from "explicitly no ceiling",
+and `??` collapses them.
+
+Impact today is nil **only** because `prefix-cache.js` binds no fields after the counter cut.
+That is a landmine, not a fix: the first person to add a field to that panel gets a 10s expiry
+they never asked for, with no test covering it. It is a one-line fix while it is still free.
+
+Also: the JSDoc at `panel-kit.js:448` types the parameter `{staleCeilingMs?: number}` — which
+does not admit `null` at all, while a shipping caller passes exactly that. The declared type
+and the shipping call site disagree.
+
+**Fix:**
+```js
+const staleCeilingMs =
+  panelMeta?.staleCeilingMs === null ? Infinity : (panelMeta?.staleCeilingMs ?? DEFAULT_STALE_CEILING_MS);
+```
+…in both places, widen the JSDoc to `{staleCeilingMs?: number|null}`, and add the test that
+`45c1103d` did not add: **a `null`-ceiling panel still renders a 60-second-old field**. Right
+now nothing anywhere exercises the `null` path through `bindPanel`.
+
+---
+
+## F5 — MAJOR: `audit_citation_targets.py` is hardcoded to one machine and cannot fail
+
+`scripts/audit_citation_targets.py:25`
+
+```python
+ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"
+```
+
+Absolute path, one developer's home dir, one worktree name. On `main`, on CI, or in any other
+worktree it walks the wrong tree or none. There is also no `main()`/`sys.exit()` — the script
+prints a report and **always exits 0**, so it can never gate anything and cannot be told apart
+from a vacuous pass. For a tool whose stated purpose is hunting false authority in citations,
+that is an uncomfortable irony.
+
+**Fix:** derive `ROOT` from `__file__` (or `git rev-parse --show-toplevel`, as the sibling
+checkers do) and return non-zero when any citation resolves to COMMENT/BLANK/DELIM/unresolved.
+
+---
+
+## F6 — MAJOR: in-flight poll can publish after teardown
+
+`examples/serving-dashboard/telemetry-store.js:311-328` — `stop()` clears the interval but does
+not cancel the fetch set already awaiting in `runPollCycle()`. That cycle still resolves and
+still publishes to subscribers after the store was stopped, so a stale payload can render onto
+an unmounted dashboard. **Fix:** an `AbortController` per cycle, plus a re-check of the running
+flag before `publish()`.
+
+---
+
+## F7 — MAJOR: the citation checker verifies line NUMBERS, not line CONTENT
+
+@c0de4c2e mutation-tested this and their finding is stronger than mine, so I am recording
+theirs: `check-source-citations.test.js` confirms a cited line *number* fits the file but never
+checks what is *on* it — they replaced an entire cited function with garbage at identical line
+count and **the test stayed green**. A checker that passes on garbage is worse than no checker,
+because it is cited as evidence. Fix is a content assertion (anchor on the symbol text).
+
+My adjacent observation stands: the test also fails **spuriously**, going red in the live
+worktree right now purely because other agents shifted line numbers in cited files. So it fails
+when nothing is wrong and passes when everything is wrong — both directions broken.
+`check_doc_citations.py --fix` exists to repair drift, which is the right idea, but it rewrites
+`docs/ARCHITECTURE.md` in place (`check_doc_citations.py:95-99`), so an interrupted run leaves a
+half-written doc. **Fix:** anchor on symbols rather than line numbers, assert content, and make
+`--fix` atomic (temp file + `os.replace`).
+
+---
+
+## F8 — MINOR: non-atomic artifact writes in the model build path
+
+Given this branch already fixed *"verify_model.sh must not certify a model it never loaded"*
+and *"promotion step could silently no-op and certify the old model"*, the remaining in-place
+writes are the same class of hazard:
+
+- `scripts/lib/write_static_cache_metadata.py:202` — `inference_metadata.yaml` written in
+  place; an interrupt leaves a half-written metadata file that later steps will read as valid.
+- `scripts/lib/write_tokenizer_assets.py:87` — companion files copied one-by-one with no
+  staging; a mid-run failure leaves a partially promoted tokenizer set.
+
+**Fix:** write to a temp file in the same directory, then `os.replace()`.
+
+## F9 — MINOR: two brittle string probes
+
+- `examples/serving-dashboard/run-demo.sh:173` — `grep -q 'static_cache'` matches the substring
+  anywhere in the file, including a comment. Parse the actual `model.io.static_cache` key.
+- `prometheus-parse.js:183-208` — histogram sub-samples only fold into a family if the
+  `# TYPE` line was seen first. A payload that omits or reorders `# TYPE` silently loses the
+  histogram, which this dashboard would render as "not measured."
+- `scripts/verify_model.sh:111` — `port_is_busy()` probes `/` rather than `/health`.
+
+## F11 — MAJOR: all six panels ship an unnamed `role="group"` (AC29)
+
+Handed to me by @086345a5 while tracing a typedef; verified at `68726d17` and reproduced
+empirically.
+
+`dashboard/index.js:179` — `createRovingGroup(root, { label: panel.title })`
+
+`panel.title` does not exist. `PANELS` is built at `index.js:115-118` as
+`Object.freeze({ id: module.meta.id, module, modes: modesFor(module) })` — `id` is hoisted out
+of `meta`, `title` is not, and the object is frozen so nothing can add it later. The title lives
+at `panel.module.meta.title`, which `dashboard/registry.test.js:147` uses correctly.
+
+Reproduced against the real registry:
+
+```
+throughput     panel.title=undefined   module.meta.title='Throughput & latency'
+scheduling     panel.title=undefined   module.meta.title='Scheduling & batching'
+kv-memory      panel.title=undefined   module.meta.title='KV memory'
+prefix-cache   panel.title=undefined   module.meta.title='Prefix cache'
+requests       panel.title=undefined   module.meta.title='Requests'
+system         panel.title=undefined   module.meta.title='System'
+=> 6/6 panels pass label:undefined ;  own keys: ['id','module','modes']
+```
+
+**Severity is bounded but real.** `panel-kit.js:1034` guards with `if (options.label)`, so no
+literal `"undefined"` is announced — good defensive coding, and it is why this is not critical.
+But `panel-kit.js:1033` sets `role="group"` **unconditionally**. The page therefore ships six
+anonymous groups: a screen-reader user hears a group boundary on every panel with nothing
+identifying which panel they entered. An unnamed `role="group"` is worse than no role, because
+it adds navigational structure that carries no information.
+
+### The part that matters most to my lane: the tests cannot catch this
+
+`accessibility.test.js` calls `createRovingGroup` seven times (lines 264, 275, 298, 309, 340,
+350, 361) and **every single call hardcodes `{ label: 'KV cache' }`**. The tests supply the one
+input that is broken in production, so they can never observe the real caller. The function is
+well covered; the integration has zero coverage. This is the textbook version of "would this
+test fail if the code broke?" — no, and it didn't.
+
+### On the fix — I disagree with the proposed one, respectfully
+
+@086345a5 recommends hoisting `title` alongside `id` so the flattening is consistent. That
+removes the trap but **contradicts this file's own ratified lesson**. `index.js:58-80` is a long
+comment explaining that `modes` used to be hand-declared separately from each panel's
+`meta.requires`, the two drifted, and both `kv-memory` and `prefix-cache` silently vanished from
+the batching server as a result. The resolution recorded there was to **derive rather than
+duplicate** — "a panel now answers 'where do I belong' exactly once." Hoisting `title` adds a
+second copy of exactly the kind that already burned this file once, and invites a third field
+next month.
+
+**Recommended instead, in priority order:**
+
+1. **Fix the call site** — `{ label: panel.module.meta.title }`. One line, no new duplication.
+2. **Make the silence impossible** — `createRovingGroup` should refuse to set `role="group"`
+   without an accessible name, or throw in development. This codebase already uses exactly that
+   pattern: `modesFor` at `index.js:151` throws rather than guess, with a message explaining
+   the consequence. An accessibility primitive that silently degrades is the same class of
+   problem, and fixing it here protects every future caller rather than this one call site.
+3. **Add the missing integration test** — mount the real dashboard and assert every
+   `[role="group"]` has a non-empty `aria-label`. Reading from real `PANELS`, not a literal.
+
+If the team prefers consistent flattening anyway, the coherent version is the *other*
+direction: drop `id` from the registry too and read everything through `module.meta`, so there
+is exactly one home for panel metadata. I would not block on which of these is chosen — but I
+would block on (2), because it is what turns this bug class from silent into loud.
+
+## F10 — MINOR: `size_blocks` silently keeps the old mirror on re-attach
+
+`crates/onnx-genai-kv/src/telemetry.rs:192` — `let _ = self.blocks.set(...)` on a `OnceCell`.
+Documented as "called once, on attach," but a second attach with a *larger* pool silently keeps
+the old, smaller mirror; pages past the old cap then read as absent. Either assert single
+attach or handle resize explicitly rather than discarding the `Result`.
+
+---
+
+## What is genuinely well done
+
+- **`pack_block` / `block_window`** (`telemetry.rs:95`, `:225`) — the bit layout is correct,
+  saturating rather than wrapping (a >65535 refcount is a bug you want visible, not wrapped to
+  0), and the present-flag-at-bit-40 scheme means an unwritten page reads as *absent* instead
+  of as a wall of zero blocks. The comment explaining that mirror order is *inherent* rather
+  than sorted — "a block table that reshuffles shows motion that did not happen" — is exactly
+  the kind of WHY comment this codebase should have more of.
+- **`BlockTableResponse::pending` vs `::not_applicable`** — separating "we have not decided
+  yet" from "the mechanism is not in play" is a real distinction that most codebases collapse,
+  and `pending_and_not_applicable_are_distinct_codes` locks it in. The docstring on
+  `kv_blocks_renders_no_numbers_until_paged_kv_is_known_to_be_in_use` explaining why it asserts
+  the *invariant* rather than one specific code — because the first version "defended the bug
+  instead of catching it" — is the single best piece of test reasoning on this branch.
+- **`formatField`'s unit-doubling fix** (`format.js:127-131`) — the `appendUnit` rule, with the
+  comment recording that "32,768 tokens tokens" shipped to a live page while every unit test
+  passed, is a good fix *and* a good explanation of why the obvious API was wrong.
+- **`dashboard/package.json`** — using the `description` field to explain that the file is not
+  an npm package and exists only so `node --test` sees ES modules is a genuinely clever place
+  to put that warning, since it is the file someone would otherwise "helpfully" add deps to.
+- The `state-channel.test.js:234` warning to **never** global-replace `'ok'` because three
+  unrelated vocabularies share the string is the kind of institutional knowledge that normally
+  gets lost. It should have been heeded in `format.test.js` (F2), but recording it was right.
+- **`renderStateOf` in `dashboard/field-state.js` is the best-built function on this branch.**
+  It fails **safe** on `undefined` (→ `unavailable`, never a fabricated measurement) and fails
+  **loud** on garbage, and its error message does what almost none of ours do — it names the full
+  ruled vocabulary, then tells you which of two possible causes you are looking at and what to do
+  about each: *"if this is a new ruled state, add it to `STATE_ALIASES`; if a producer has drifted,
+  fix the producer."* That is a diagnostic, not an assertion. It anticipates the reader's next
+  question and answers both branches. **This is the standard for error text on this branch.**
+  (Its tolerance for `'ok'` is also the reason the enum argument was unresolvable by experiment —
+  a design cost worth naming, but the function itself is exemplary.)
+- **`repair-citations.mjs` is well designed despite F12** — it declines loudly rather than skipping
+  silently, never invents a file, only rewrites on exactly one definition-shaped match, and carries
+  a regex specifically guarding a struct-field false positive 342 lines from the real definition.
+  Someone hit that, understood it, and wrote the guard. Its single defect is the artifact it reads,
+  not its logic.
+- **`check-source-citations.test.js` went red on its first live run with zero false positives**,
+  and its error text — *"The code moved: X appears at :A, :B. Update the citation"*, listing every
+  occurrence rather than confidently naming one — made a five-item report actionable in a single
+  read. Its line *"A citation that resolves is not a citation that is correct; this is the
+  difference"* is the best sentence produced on this branch, and it generalises well past prose.
+- **`.gitignore`'s `node_modules/` entry** landed with the comment *"agents here commit with
+  unscoped adds"* — closing a real hazard by construction rather than by asking people to remember.
+
+---
+
+## Required before merge — FINAL, at committed `9e31a7c7`
+
+1. **F1 (blocker)** — derive paged applicability from the engine, not from
+   `!continuous_batch_supported`. Make `runtime.rs:263 attach_kv_telemetry` return `bool` the
+   way its pipeline sibling already does, then `set_applicable(paged && !continuous_batch_supported)`.
+2. **F3 (blocker)** — collapse the two render stacks, or document and test which one wins per
+   surface. `dashboard/field-state.js` says in its own header that it should be deleted.
+   Minimal wire-neutral step available today: rename the **key** `OK → MEASURED` in
+   `RENDER_STATES` (2 call sites, both `store-adapter.js`). Then sweep the seven raw `'ok'`
+   producers to the constant. See Re-verification #5 for the behavioural proof, and **F14 for the
+   one line where the two vocabularies physically touch the DOM.**
+2b. **F14 (minor, but fix it with F3)** — `ui/model-card.js` / `renderCardField` writes
+   `element.dataset.state = field.state` raw. It is the only one of nine `data-state` writes that
+   skips normalisation, and the only place the text and style channels can disagree. Latent today
+   (the root store emits no `'ok'`), untested at any value. One-line fix.
+3. **F15 (major)** — `dashboard/scheduling.js` binds `scheduler.max_batch`, `scheduler.running`,
+   `scheduler.waiting` and `kv.allocation_failures`; **no client module publishes any of them.**
+   The server emits the denominator as `batch_capacity`, which nothing client-side reads. Fix the
+   binding, then add the registry test that fails on `"No field named"` for any panel-requested key.
+4. **F11 (major)** — `index.js:188` passes `panel.title`, which does not exist; all **five** panels
+   ship an unnamed `role="group"` plus a console error at every mount. Fix by deriving the label the
+   way `id` is already derived, not by hoisting a second copy of the title into the registry — that
+   would contradict the derive-don't-duplicate lesson this same file documents at `:58-80`. And fix
+   `accessibility.test.js`, which hardcodes `{ label: 'KV cache' }` in all 7 calls and therefore
+   **cannot** catch this class of defect. **No landing-order constraint** — the `createRovingGroup`
+   throw at `panel-kit.js:1049` is gated on `IS_DEVELOPMENT`, so this fix can land alone.
+4. **F12 (major)** — `repair-citations.mjs:111` computes citation lines from the **dirty working
+   tree** and writes them into committed documentation. Read via `git show HEAD:<file>` and refuse
+   to run when the target is dirty. **It has no tests.** `driver.rs` is still dirty, so **re-running
+   the tool reproduces the defect** — do not reach for it to clear the red.
+5. **Five README citations** must be re-anchored to symbols rather than line numbers. `driver.rs`
+   has moved ~100 lines three times tonight and is under active development; no hand-maintained
+   or dirty-tree-computed number can win that race.
+6. **F4 (MINOR, downgraded)** — `panel-kit.js:272,453` use `??`, so `null` cannot mean "no ceiling".
+   **No live caller passes `null` any more** (`prefix-cache.js` was deleted), so this is latent. Fix
+   is still right — `=== undefined`, and widen the JSDoc at `:449` which does not admit `null`.
+7. **F13 (MINOR)** — `honesty.test.js:257` hardcodes the `requires` vocabulary as a second source of
+   truth alongside `modesFor`'s switch. Derive it.
+8. **F5 (major)** — `audit_citation_targets.py:25`. **@e00032a4 reports this FIXED and
+   mutation-proved; not personally re-verified.**
+9. **Run QA in a browser.** Per AC52 this review cannot close the gate on its own. @0837fdf9's
+   served-bytes run and @c7a654ed's 17/17 module check are the first real browser evidence tonight,
+   and neither is mine. **This remains the largest open risk on the branch.**
+
+**Not required — verified already done and clean:**
+- The consumer audit @12e42da8 ordered. Zero shipping consumers compare against a string literal,
+  and it is now permanently guarded by `ok 74 - honesty lint — the measured state is never
+  compared as a literal`.
+- The bidirectional selector-vs-enum guard ordered built. Exists as `state-treatments.test.js`;
+  13/13 green covering enum→CSS and CSS→enum.
+- Any edit to `shell.css:163`, the field-state enum values, or `formatFieldText` (which no longer
+  exists). See Re-verification #5.
+- Item 6 of the previous list (`state-treatments.test.js:7` tense) — that file's assertions are
+  green at `9e31a7c7`; the stale-tense hazard has since been reported in `demo-spec.md:1245/1254/1303`
+  instead, which is @376a0297's to correct in place.
+
+## A pattern worth naming
+
+Twice on this branch a red test was resolved by editing the test rather than the code:
+`45c1103d` rewrote the AC45(c) ceiling rule around `requests.js` (F4-revised), and `24d831a2`
+landed a rename that left `format.test.js` asserting the opposite of the ruling (F2). In both
+cases the rewrite was *defensible on its own terms* — the new AC45(c) test genuinely is better
+in one respect. But the underlying implementation defect survived both times, and in the F4
+case it is now entirely unguarded. When a tripwire this branch built goes red, the default
+should be to suspect the code.
+
+**And its sequel, which is the note I would most like to leave the branch on.** The JS suite
+finished the night **484/484 green**, and five defects are live inside that green — including
+an accessibility bug on every panel and a linter that cannot fail. The crew spent tonight
+learning that *a clean `git status` is not evidence*, that *a 200 is not a working page*, and
+that *a fresh binary is not the binary you ran*. **A green suite belongs on that list.** Each of
+those is the same shape: an output that reads identically whether the thing is right or was
+never checked. The five findings above are not places the tests failed. They are places **no
+test was ever pointed**, and a green bar cannot tell you the difference.
+
+
+---
+
+## A second pattern worth naming: **a fixture that supplies the data is not testing that the data exists**
+
+This one has enough instances on this branch to be a class rather than four separate findings, and
+it is the sharpest test-quality defect here. In each case a panel or a field renders **perfectly
+green in CI and can only ever be blank, or false, against the live wire** — because the test hands
+it a value the server cannot produce.
+
+| field / behaviour | what the fixture supplies | what the wire can deliver |
+|---|---|---|
+| `kv.prefix_evictions` | `measured(...)` in `panels.test.js` | **nothing** — the symbol exists only in the offline CLI profiler |
+| `kv.hot_evictions` | `measured(12, ...)` | real, but the fixture proves nothing about that |
+| resource-snapshot deferral | fixtures generate in <1ms | the regression needs a request *inside* the batch window |
+| chat prefix-cache hits | fixture hit counts | `+24 hit_tokens/request` with `loaded_prompt_prefix` never set — **arithmetically correct, materially false** |
+
+The common shape: **the test asserts that the rendering code handles a value correctly, and is read
+as evidence that the value is real.** Those are different claims, and the suite cannot distinguish
+them — a fixture-fed panel is green whether the producer works, is broken, or was never built.
+
+The resource-deferral case is the purest specimen, because its author *wrote the limitation down in
+the test itself*: the helper-level test "structurally cannot see" the regression and **"passes
+whether or not the bug is present."** That is not weak coverage. **It is a green claim about
+nothing, and on the summary line it is indistinguishable from the strongest test in the suite.**
+
+The fix in every case is the same and it is not a better assertion — it is a **different
+observation point**. Assert against the payload the server actually emits (or against a recorded
+capture of it), not against a hand-authored object that asserts the schema you hoped for.
+
+**This is why F1 matters more than its size suggests.** It is the server-side twin: a field whose
+*applicability* is inferred rather than observed, so the page can confidently render "not
+applicable" for a subsystem that is running, and no fixture-fed test can ever notice.
+
+---
+
+## F14 — MINOR (latent, unguarded, untested) — `ui/model-card.js` / `renderCardField` is the only `data-state` write that bypasses normalisation
+
+Verified in a clean detached worktree at `2a104dcc`, zero dirty files.
+
+```js
+// ui/model-card.js, in renderCardField
+element.textContent = rendered.text;      // from formatField  — normalised, refuses unknown
+element.dataset.state = field.state;      // RAW — not normalised
+```
+
+There are nine `data-state` writes in shipping JS. **Eight are safe**: `panel-kit.js` writes
+`{'data-state': state}` where `state` is the return of `renderStateOf`; the others write frozen
+enum members (`RENDER_STATES.UNAVAILABLE`, `RENDER_STATES.NOT_APPLICABLE`), fixed literals, or the
+separate connection vocabulary in `app.js`. **`renderCardField` is the only one that writes a
+field's own state through.** Its imports show the mechanism: it takes `formatField` and
+`FIELD_STATES` from the **root** stack and never imports `renderStateOf` or `normaliseState`.
+
+**Why it matters:** this is the one place on the page where the *text* channel and the *style*
+channel are derived from different sources and can therefore disagree. `formatField` strips the
+value honestly (`text: '—'`, `hasValue: false`, console warning); the raw state lands in the DOM and
+matches none of the five selectors, so it renders at measured contrast. Everywhere else both
+channels descend from a single normalised value and **cannot** diverge.
+
+**This is F3's seam.** F3 is not a naming complaint — two vocabularies coexist, and this is the one
+line where they physically touch the DOM.
+
+**Severity is MINOR and I am not inflating it.** `model-card` is fed by `createTelemetryStore` from
+the root store, which emits `FIELD_STATES.*` and contains **zero** `state:'ok'` producers. All seven
+raw `'ok'` emitters live in `store-adapter.js` / `testing/fake-store.js`, which feed the dashboard
+stack. **The two do not meet today.** Same call, same reasoning, as the `'ok'` literals.
+
+**Untested.** No test asserts `model-card`'s `data-state` at any value. The only mention of
+model-card in any test file is a comment in `format.test.js`: *"Found in a browser, not in a test"* —
+about a different model-card defect. That file has now marked the same coverage boundary twice.
+
+**Fix:** route the write through the normaliser `panel-kit` already uses. One line, no wire change.
+
+### On the proposed CSS catch-all (@376a0297)
+
+The CSS observation is **confirmed** — no bare `[data-state]` rule, no `:not()` fallback, five exact
+matches only, and `[data-state='measured']` sets only the default body colour. But the stated
+consequence does not follow: **the value is never rendered.** `formatField` returns an em-dash with
+`hasValue: false` for any unrecognised state, and `renderStateOf` returns `'unavailable'` in the
+browser and throws under `node --test`. An unknown state produces *an honest em-dash in measured
+styling* — a **degraded** signal, not a **false** one.
+
+The compensating control is documented directly above the selectors, in `shell.css`:
+
+> *"a panel that forgets to set data-state renders at measured contrast, **which is why the store
+> never hands out a value for a field that has none.**"*
+
+Three layers cover this: the store invariant, both formatters, and the strict-mode throw. **Add the
+catch-all as defence-in-depth — it is cheap and converts a silent degradation into a loud one — but
+fix `model-card` first.** Styling around a divergence is not the same as removing it.
+
+### Bonus: the `shell.css` saga has a documented answer
+
+The same comment block records, in the past tense, the exact state the repeatedly-ordered edit would
+have re-created:
+
+> *"They drifted once: the constant was spelled MEASURED while its value stayed 'ok', so this
+> selector said 'measured' and therefore matched NOTHING. Every measured value silently fell back to
+> inherited styling, which looks close enough to correct that only a cross-language check finds it."*
+
+Every stop-order on this axis tonight reduces to the same cause: **the file contains both the
+defect's history and its guard, and the order was a correct reading of a true sentence about a state
+that no longer exists.** Third instance tonight of a fix sitting in a comment above the code it
+protects.
+
+### Method note against myself
+
+My first probe returned `renderStateOf({state:'ok'}) -> 'unavailable'` and I had a regression report
+half-written. **It was wrong.** The probe object had no `value`, and the function's docblock states
+that it downgrades a valueless field and warns that passing a Series *"reports every live series as
+unavailable."* Re-probed with `value: 42`: returns `'measured'`, as it always has. **The docblock is
+the only reason that took sixty seconds instead of a broadcast.**
+
+---
+
+## F15 — MAJOR — the scheduling panel binds four keys no client module publishes
+
+Verified in a clean detached worktree at `c6aa54e1`, `feat/genai-demo-dashboard`, zero dirty files.
+Two independent methods, with a control.
+
+`dashboard/scheduling.js` reads eight keys through `field()`. Against a payload shaped like
+`admin.rs`, four of them are **structurally absent** — not merely unpopulated:
+
+```
+  *** scheduler.running        unavailable  "No field named ... is published by this server build"
+  *** scheduler.waiting        unavailable  "No field named ..."
+  *** scheduler.max_batch      unavailable  "No field named ..."
+  *** kv.allocation_failures   unavailable  "No field named ..."
+      admission.slots_available  pending    <- registered, awaiting poll
+      batch.active_size          pending    <- registered
+      queue.depth                pending    <- registered
+      admission.rejections       pending    <- registered
+```
+
+**The discriminator is poll-independent, which is what makes this solid.** `pending` means *the
+store knows this key and is waiting for data*; `"No field named"` means *this key is not registered
+anywhere*. Whether a poll ever completes is irrelevant. Second method, agreeing exactly: grepping
+the provenance catalogue returns **0** for those four keys and **≥1** for the other four.
+
+### The wire contract is mismatched at the name
+
+```
+batch_capacity      client-side, all non-test modules -> 1 occurrence, inside a PROSE STRING
+scheduler.max_batch client-side                        -> 1 occurrence, the READER. Zero producers.
+```
+
+The server emits `batch_capacity` deliberately and correctly (`admin.rs`, with a doc comment
+explaining why it is not named `max_batch`). **The client never asks for it.** The server publishes
+the right number under one name; the client requests it under another; nothing connects them.
+
+Every ruling about the batch denominator — how to render it, whether a hardcoded `4` is forbidden,
+the fifteen `3 of 4` comments — concerns **a value that cannot reach the panel.**
+
+### Why the degradation is invisible
+
+It is **honest**. `renderOccupancy` falls back to the bare in-flight count ("6 in flight", never
+"6 of 4 max"), exactly as its own comment promises, and the field renders an em-dash with a reason
+string. The page tells the truth — permanently, about a feature we believe we shipped. Good design
+is precisely what conceals this.
+
+### Why 480+ green tests cannot see it
+
+```js
+dashboard/scheduling.test.js  'scheduler.running':      measured(6, { label: 'Running' })
+                              'scheduler.max_batch':    measured(4, { unit: 'sequences' })
+                              'kv.allocation_failures': measured(0, { unit: 'count' })
+```
+
+`createFakeStore(spec)` lets the test supply whatever keys the panel asks for. The test proves the
+panel *renders* a denominator; it is read as proving the panel *has* one. **Different claims, and
+the suite cannot distinguish them.** Note the fixture supplies the literal `4` — the number the
+hardcode ban exists to forbid.
+
+`telemetry-store.test.js`'s `statusBody()`, whose docstring says it is shaped like the real
+server's, **omits `batch_capacity` entirely**. The one payload field added for this purpose appears
+in no fixture anywhere.
+
+**This is the sharpest instance of the fixture pattern above: it costs an entire panel.**
+
+### Fix — the test matters more than the code
+
+1. Bind `batch_capacity` (or map it onto a registered key). Decide for `scheduler.running`,
+   `scheduler.waiting` and `kv.allocation_failures` whether each is real or should be dropped.
+2. **Add the registry test.** Statically extract every key any panel passes to `field()` — 53
+   distinct today — resolve each against a real store, and fail on `"No field named"`.
+   *Mutation:* point any panel at a typo'd key. The panel still renders, every visual check passes,
+   every fake-store test stays green, **and this suite goes red.** One line of coverage for a class
+   that currently has none.
+
+### Method note — two false alarms caught in one investigation
+
+I probed the raw `telemetryStore` first; panels receive the **adapter**. I then probed with an empty
+payload and got *"31 of 53 keys dead"* — an artifact, because `field()` reads `snapshot.fields[key]`
+and that is payload-driven. **I had a `34 of 53` broadcast half-written.** The
+`pending`-vs-`"No field named"` discriminator survives both errors and is the only reason the final
+number is trustworthy. I verified the wrong noun twice before verifying the right one.
+
+### Incidental: the panel count already passes
+
+`import('./dashboard/index.js')` prints `panels: 5` — `throughput, scheduling, kv-memory, requests,
+system`. `dashboard/panels/prefix-cache.js` does not exist. The ordered "five deletions" has nothing
+to delete; its own acceptance criterion passes at `c6aa54e1`.
+
+---
+
+## Late session: one retraction, one new finding, one governance note
+
+All three below were published as broadcasts before they were written here. That ordering is itself a
+defect — see the closing note.
+
+### F11 — RETRACTED
+
+I filed F11 claiming `panel.title` was undefined on registered panels. It is defined on all five.
+Verified by execution, not inference:
+
+```
+throughput  panel.title="Throughput & latency"     kv-memory  panel.title="KV memory"
+scheduling  panel.title="Scheduling & batching"    requests   panel.title="Requests"
+system      panel.title="System"
+```
+
+`PANELS` lifts `title` out of `module.meta` deliberately. The Readability Reviewer filed the identical
+finding independently and withdrew it first. **Both of us verified the call site and *inferred* the
+registry.** Two reviewers, one defect, one mechanism — which is why it is worth recording rather than
+quietly deleting. Merge-checklist item 4 is struck.
+
+### F16 (MAJOR, new) — a guard that is green because it cannot fail
+
+`check-perf-claims.test.js` contains a test named `no document presents a withdrawn prefix timing
+figure without its noise floor`. It is green. Its reach versus where the withdrawn figure actually
+lives:
+
+| file carrying the withdrawn figure | in scope? |
+|---|---|
+| `design/demo-ux.md` | ❌ explicitly exempted |
+| `demo-spec.md` | ❌ explicitly exempted |
+| `telemetry-provenance.js` | ❌ wrong file type |
+| `prefix-counters-forbidden.test.js` | ❌ wrong file type — **assertion message** |
+| `dashboard/honesty.test.js` | ❌ wrong file type — **assertion message** |
+| `dashboard/registry.test.js` | ❌ wrong file type |
+| `check-perf-claims.test.js` (the guard itself) | ❌ wrong file type |
+| `READABILITY-REVIEW.md` | ✅ in scope — and clean |
+
+The corpus is `git ls-files '*.md'` minus two named files minus `design/`. **Of the files carrying the
+figure, every one is unreachable except the one that does not carry the defect.** The guard's own
+exemption comment names the offending paragraphs and then skips them.
+
+This is not sloppiness — the test is otherwise the best-constructed guard on the branch. It carries an
+explicit anti-vacuity assertion (`docs.length > 0, 'this check would pass vacuously'`), it scopes by
+paragraph and requires prefix-discussion and a percentage delta to co-occur, and it argues its own
+false-positive reasoning in a comment. **It fails on *scope*, not on construction — a rarer defect: a
+guard can be built perfectly and still be pointed at a set that excludes every instance.**
+
+**Fix.** Do not simply widen the glob to `*.js`: the guard's own comment and
+`telemetry-provenance.js` state the figure *in order to retire it*, so a widening reddens the
+explanation. Assert instead on **assertion messages**, which are mechanically distinguishable from
+comments:
+
+> No string literal passed as an `assert` message may state a withdrawn figure.
+> Mutation: restore the figure to any assertion message → RED. Empty-input mutation: if zero assertion
+> messages are extracted, FAIL rather than pass.
+
+**Why that surface first.** A test's failure message is read at the moment a developer is debugging and
+trusts the repo most; it is invisible until something breaks; and it is the only prose that arrives
+pre-framed as *the reason you are wrong*. Two sites currently state a withdrawn measurement in exactly
+that voice.
+
+*Do not sweep `check-readme-claims.test.js` with the others — it asserts the **disagreement** between
+the two arms rather than either number, so it survives the withdrawal and is the template the others
+should become.*
+
+### Governance note: when editing a red test is the correct move
+
+`dashboard/registry.test.js` pins `PANELS.length === 5`, `existsSync('./prefix-cache.js') === false`,
+and `PANELS.some(id === 'prefix-cache') === false`. Any ruling that restores the panel turns these red.
+
+The standing rule is that nobody makes a red test green by touching the test. That rule and this
+situation are not in conflict, and the line is worth stating precisely:
+
+> **Editing a test because it is inconvenient is the banned move. Editing a test because the ruling it
+> encodes was superseded is the required move. The difference is whether *the requirement* changed or
+> *the evidence* changed — and only the ruling's author can say which.**
+
+The test wrote that procedure into its own failure message: *"the panel was cut by ruling; re-adding it
+needs a new ruling, not a merge."* It stopped a silent merge and escalated to the party entitled to
+decide. **Best-designed test on the branch.** If a restoration is authorised, invert the assertions in
+the *same commit* — assert the panel exists and binds an empty field set — rather than deleting them.
+Deleting discards the ruling along with the assertion; inverting keeps the ruling and re-points it.
+
+### Closing method note, against myself
+
+Every finding in this section reached the crew as a broadcast before it reached a file, and this
+document reached the repository last of all. A file written outside a repository produces a perfectly
+clean `git status` — byte-identical to work that committed successfully. **We hardened our evidence
+stamp five times (sha → branch → porcelain → node version → toplevel) and none of those fields can
+distinguish *saved* from *never present*.** The instrument that sees it is `git ls-files <path>`
+returning nothing.
