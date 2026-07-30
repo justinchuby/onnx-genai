@@ -121,6 +121,19 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
     pub max_queue_depth: usize,
+    /// Maximum concurrent generations in a single decode batch.
+    ///
+    /// Configurable rather than a constant because reporting an occupancy ratio
+    /// against an unexposed hardcoded number gives a figure nobody can check,
+    /// and because a demo that shows a batch filling up needs a ceiling it can
+    /// actually reach.
+    ///
+    /// This is deliberately allowed to exceed `max_queue_depth`: it is a
+    /// ceiling, not a requirement, and admitting fewer requests than the batch
+    /// can hold is a valid way to run the server. Occupancy must therefore be
+    /// reported against [`Self::effective_batch_capacity`] rather than this
+    /// value directly, or the denominator is one the server cannot reach.
+    pub max_batch: usize,
     /// Enable the /v1/debug/* introspection endpoints. Off by default; enable with
     /// `--enable-debug-endpoints` or `ONNX_GENAI_DEBUG_ENDPOINTS=1`. These endpoints
     /// expose server internals and should only be used on loopback-bound instances or
@@ -151,6 +164,7 @@ impl Default for ServerConfig {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+            max_batch: DEFAULT_MAX_BATCH,
             enable_debug_endpoints: false,
             enable_admin_endpoints: false,
             max_loaded_models: None,
@@ -162,7 +176,18 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    fn validate(self) -> anyhow::Result<Self> {
+    /// The largest batch this server can actually assemble, and the only honest
+    /// denominator for batch occupancy.
+    ///
+    /// `max_batch` alone overstates it whenever admission is the tighter
+    /// constraint: with `max_batch = 4` and `max_queue_depth = 1` the batch can
+    /// never hold more than one generation, so reporting `1/4 = 25%` would show
+    /// a fully saturated server as three-quarters idle.
+    pub(crate) fn effective_batch_capacity(&self) -> usize {
+        self.max_batch.min(self.max_queue_depth)
+    }
+
+    pub(crate) fn validate(self) -> anyhow::Result<Self> {
         if self.node_id.trim().is_empty() {
             anyhow::bail!("node_id must not be empty");
         }
@@ -174,6 +199,9 @@ impl ServerConfig {
         }
         if self.max_queue_depth == 0 {
             anyhow::bail!("max_queue_depth must be greater than zero");
+        }
+        if self.max_batch == 0 {
+            anyhow::bail!("max_batch must be greater than zero");
         }
         if self.max_loaded_models == Some(0) {
             anyhow::bail!("max_loaded_models must be greater than zero when set");
@@ -261,7 +289,7 @@ impl AppState {
     ) -> Self {
         let config = config.validate().expect("validated server config");
         let fim_config = engine.fim_config().cloned();
-        let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+        let engine_driver = EngineDriver::start(engine, config.max_batch, config.max_queue_depth);
         let handle = ModelHandle::new(ModelHandleParts {
             id: model_id,
             // Test-only constructor: the model was handed in already loaded, so
@@ -380,7 +408,7 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
     // is moved into the driver, so every request built for this handle can honor
     // a model that ships `do_sample: true` instead of forcing greedy.
     let generation_defaults = engine.metadata().generation.clone();
-    let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
+    let engine_driver = EngineDriver::start(engine, config.max_batch, config.max_queue_depth);
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),

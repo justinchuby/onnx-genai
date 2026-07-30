@@ -51,7 +51,7 @@ use crate::{
     },
 };
 
-mod admin;
+pub(crate) mod admin;
 mod completions;
 mod multimodal;
 mod sessions;

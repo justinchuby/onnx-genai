@@ -71,6 +71,11 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_MAX_QUEUE_DEPTH", default_value_t = 256)]
     pub max_queue_depth: usize,
 
+    /// Maximum concurrent generations per decode batch, and the denominator of
+    /// the batch occupancy reported by /v1/status. Falls back to ONNX_GENAI_MAX_BATCH.
+    #[arg(long, env = "ONNX_GENAI_MAX_BATCH", default_value_t = 4)]
+    pub max_batch: usize,
+
     /// Enable /v1/debug/* introspection endpoints. Off by default. Use only on loopback-bound
     /// servers or behind an authenticated proxy. Falls back to ONNX_GENAI_DEBUG_ENDPOINTS=1.
     #[arg(long, env = "ONNX_GENAI_DEBUG_ENDPOINTS")]
@@ -119,6 +124,7 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         max_output_tokens: args.max_output_tokens,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
+        max_batch: args.max_batch,
         enable_debug_endpoints: args.enable_debug_endpoints,
         enable_admin_endpoints: args.enable_admin_endpoints,
         max_loaded_models: args.max_loaded_models,

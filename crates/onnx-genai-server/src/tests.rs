@@ -3544,3 +3544,87 @@ async fn commands_needing_mutable_engine_access_are_still_deferred() {
         "a command requiring &mut Engine must stay deferred"
     );
 }
+
+/// `max_batch` is the denominator of the batch occupancy on `/v1/status`. A zero
+/// denominator would make the ratio undefined rather than merely wrong.
+#[test]
+fn a_zero_max_batch_is_rejected() {
+    let err = ServerConfig {
+        max_batch: 0,
+        ..ServerConfig::default()
+    }
+    .validate()
+    .expect_err("max_batch of zero must not be accepted");
+    assert!(
+        err.to_string().contains("max_batch"),
+        "the error must name the offending setting; got: {err}"
+    );
+}
+
+/// `max_batch` is a ceiling, not a requirement. Admitting fewer requests than
+/// the batch can hold is a valid way to run the server, so this must not be
+/// rejected -- an earlier version of this guard did reject it and broke two
+/// existing tests that legitimately pair a deep batch with `max_queue_depth: 1`.
+#[test]
+fn a_max_batch_larger_than_the_queue_depth_is_allowed() {
+    ServerConfig {
+        max_batch: 8,
+        max_queue_depth: 1,
+        ..ServerConfig::default()
+    }
+    .validate()
+    .expect("a batch ceiling above the admission limit is a valid configuration");
+}
+
+/// ...but occupancy must not be reported against a denominator the server
+/// cannot reach. With admission capped at 1, a single running generation is
+/// full saturation; dividing by `max_batch` would render that as 12.5% idle.
+#[test]
+fn effective_batch_capacity_is_bounded_by_admission() {
+    let config = ServerConfig {
+        max_batch: 8,
+        max_queue_depth: 1,
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        config.effective_batch_capacity(),
+        1,
+        "occupancy must be reported against the batch the server can actually assemble"
+    );
+}
+
+/// The ordinary case: admission is generous, so the batch ceiling governs.
+#[test]
+fn effective_batch_capacity_is_the_batch_ceiling_when_admission_is_generous() {
+    let config = ServerConfig {
+        max_batch: 4,
+        max_queue_depth: 256,
+        ..ServerConfig::default()
+    };
+    assert_eq!(config.effective_batch_capacity(), 4);
+}
+
+#[test]
+fn batch_utilization_is_in_flight_over_capacity() {
+    assert_eq!(crate::routes::admin::batch_utilization(0, 4), 0.0);
+    assert_eq!(crate::routes::admin::batch_utilization(1, 4), 0.25);
+    assert_eq!(crate::routes::admin::batch_utilization(4, 4), 1.0);
+}
+
+/// The numerator counts in-flight generations node-wide, so with several models
+/// loaded it can exceed one batch's capacity. A gauge reading 240% is faithful
+/// arithmetic and an unreadable dial.
+#[test]
+fn batch_utilization_is_clamped_to_full() {
+    assert_eq!(crate::routes::admin::batch_utilization(10, 4), 1.0);
+}
+
+/// Guards against emitting `NaN`/`inf` into the status payload, which would
+/// serialise as JSON `null` and be read downstream as "unavailable" rather than
+/// "misconfigured".
+#[test]
+fn batch_utilization_of_a_zero_capacity_is_zero_not_nan() {
+    let value = crate::routes::admin::batch_utilization(3, 0);
+    assert!(value.is_finite(), "got {value}");
+    assert_eq!(value, 0.0);
+}

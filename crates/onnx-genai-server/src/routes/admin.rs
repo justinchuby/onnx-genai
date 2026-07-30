@@ -38,6 +38,21 @@ pub(crate) async fn models(
 /// Real values: `queue_depth` (admission queue), `active_sessions` (session
 /// registry), `healthy`, `node_id`. Everything else is a documented placeholder
 /// because the underlying getter does not exist yet — see per-field comments.
+/// Fraction of the assemblable batch that is currently generating.
+///
+/// Clamped to 1.0 rather than allowed to exceed it. The numerator counts
+/// in-flight generations across the whole node, so with several models loaded
+/// -- each with its own driver and its own batch -- the sum can legitimately
+/// exceed any single batch's capacity. Reporting 240% occupancy would be
+/// arithmetically faithful and completely unreadable as a gauge; the honest
+/// rendering of "more work in flight than one batch holds" is "full".
+pub(crate) fn batch_utilization(in_flight: u64, capacity: usize) -> f32 {
+    if capacity == 0 {
+        return 0.0;
+    }
+    (in_flight as f32 / capacity as f32).min(1.0)
+}
+
 pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeStatus>, ApiError> {
     let snapshot = crate::metrics::snapshot();
     Ok(Json(NodeStatus {
@@ -61,7 +76,14 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
         active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
         paused_sessions: 0, // not yet tracked (no preemption/pause state exposed)
         tokens_per_second: 0.0, // not yet tracked (only cumulative token totals recorded)
-        batch_utilization: 0.0, // not yet tracked (max batch size not surfaced to the server)
+        // Real: in-flight generations over the batch the server can actually
+        // assemble. Both terms are measured or configured, not assumed --
+        // `current_batch_size` is a gauge incremented when a generation starts
+        // and decremented when it is dropped.
+        batch_utilization: batch_utilization(
+            snapshot.current_batch_size,
+            state.config.effective_batch_capacity(),
+        ),
         // Per-session detail: session ids are real (redacted, since full ids are
         // bearer tokens — see session.rs). priority/kv_pages/state are not yet
         // tracked, so they carry documented placeholders rather than invented values.
