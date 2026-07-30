@@ -449,5 +449,24 @@ here.** Re-run rather than believe.
   tests out of 270 and it blocks nothing — **but the honest form of a number
   you cannot reconcile is to print it with its denominator and say so, not to
   round it to the figure you prefer.**
+- **⛔ We cannot certify the suite is deterministic. 66 green runs and two
+  unexplained reds.** **Do not read a passing total as proof of stability. Read
+  it as proof of the tree at one moment.** The instrument that would have named
+  those two reds did not exist when they happened — a piped run showed the word
+  `FAIL` and discarded the only copy of the diagnosis. **The runner now re-prints
+  the failing names as its final lines, so the next red names itself.** We are
+  shipping a dashboard whose thesis is *claim only what you measured*; **we do
+  not get to round 66-green-and-2-unexplained up to "stable" in our own PR.**
+- **⚠️ And the totals in this section come from more than one invocation, which
+  is a defect in the reporting, not in the tree.** A bare `node --test` glob and
+  the project's own `run-tests.sh` discover different file sets, so their
+  denominators are **not addable** — the same tree scored `744/114` one way and
+  `710/109` another. **Two scoreboards for one suite is the same failure as the
+  two citation dialects and the two path-disclosure guards: two descriptions of
+  one thing, and nothing saying which wins.** `run-tests.sh` is the canonical
+  one, because **it is the only instrument here that reports its own tree, its
+  own dirtiness, and its own discovered-vs-executed reconciliation without being
+  asked** — and it refuses to score a total that includes uncommitted files,
+  since a clean clone does not have them.
 - **A green gate is not a satisfied reviewer**, and a red one is not an
   unsatisfied product. Different instruments measure different things.
