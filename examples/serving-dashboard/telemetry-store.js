@@ -833,7 +833,7 @@ export function createTelemetryStore({
       ? `"${entry.wireType}"`
       : 'a required wireType declaration that is missing';
     const warning =
-      `"${key}" expects ${expected} at ${entry.source} path "${entry.path}", but the server ` +
+      `"${key}" expects ${expected} at ${entry.source} path "${entry.metric ?? entry.path}", but the server ` +
       `sent ${describeWireValue(value)}. The value was rejected as unavailable; update the ` +
       'server response type or telemetry-provenance.js before displaying it.';
     if (!provenanceWarnings.has(key)) {
@@ -926,7 +926,7 @@ export function createTelemetryStore({
         const source = sources[entry.source];
         const observed = source?.ok ? readEntryValue(source.body, entry) : undefined;
         const hasWireValue = observed !== undefined && observed !== null;
-        if (source?.ok && hasWireValue && entry.path && !matchesWireType(entry, observed)) {
+        if (source?.ok && hasWireValue && !entry.metric && !matchesWireType(entry, observed)) {
           fields[key] = rejectWireType(key, entry, observed);
           continue;
         }
@@ -1008,14 +1008,14 @@ export function createTelemetryStore({
         continue;
       }
 
-      if (entry.path && !matchesWireType(entry, rawValue)) {
+      if (!entry.metric && !matchesWireType(entry, rawValue)) {
         fields[key] = rejectWireType(key, entry, rawValue);
         continue;
       }
 
       if (rawValue === '') {
         fields[key] = unavailableField(
-          `${entry.source} responded, but carried no "${entry.path}" value. ` +
+          `${entry.source} responded, but carried no "${entry.metric ?? entry.path}" value. ` +
             'This server build may predate it.',
           fieldMeta(entry),
         );
