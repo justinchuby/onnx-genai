@@ -591,10 +591,26 @@ export function describeField(field, nowMs = Date.now()) {
     return `Waiting for the first measurement — ${field.reason}${waitingFrom}`;
   }
   const unitSuffix = field.unit ? ` ${field.unit}` : '';
-  const ageSeconds = Math.round((nowMs - (field.observedAtMs ?? nowMs)) / 1000);
   if (field.state === FIELD_STATES.STALE) {
     const lastFrom = field.source ? ` from ${field.source}` : '';
-    return `${field.value}${unitSuffix} — STALE, last measured ${ageSeconds}s ago${lastFrom}. ${field.reason}`;
+    // NO `?? nowMs` FALLBACK HERE, AND THAT ABSENCE IS THE WHOLE POINT.
+    //
+    // This line used to read `nowMs - (field.observedAtMs ?? nowMs)`, which
+    // renders an UNDATED stale field as "last measured 0s ago" — the field
+    // asserting perfect freshness at the exact moment we know it is not fresh.
+    // That is a stronger false claim than the one the staleness treatment
+    // exists to prevent, and it is stated in `format.js` nine lines above the
+    // call that lands here, which is how the two came apart: the visible text
+    // said "age unknown" while the tooltip and the screen-reader sentence for
+    // THE SAME FIELD said it had just been measured. The sighted reader got the
+    // honest channel; the screen-reader user got the fabricated one, with no
+    // second channel to contradict it.
+    const observedAtMs = field.observedAtMs;
+    const dated = typeof observedAtMs === 'number' && Number.isFinite(observedAtMs);
+    const when = dated
+      ? `last measured ${Math.round(Math.max(0, nowMs - observedAtMs) / 1000)}s ago`
+      : 'age unknown';
+    return `${field.value}${unitSuffix} — STALE, ${when}${lastFrom}. ${field.reason}`;
   }
   const provenance = field.derivedFrom
     ? `derived from ${field.derivedFrom.join(', ')}`

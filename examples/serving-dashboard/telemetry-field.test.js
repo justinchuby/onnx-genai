@@ -159,3 +159,72 @@ test('a derivation over healthy inputs is unaffected by the precedence rule', ()
   assert.equal(derived.state, FIELD_STATES.MEASURED);
   assert.equal(derived.value, 5);
 });
+
+test('an undated stale field is never described as freshly measured', () => {
+  // F3. `describeField` used to compute its age as `nowMs - (observedAtMs ??
+  // nowMs)`, so a field with NO timestamp rendered as "last measured 0s ago" --
+  // perfect freshness asserted at the exact moment we know the field is stale.
+  const field = {
+    state: FIELD_STATES.STALE,
+    value: 42,
+    unit: 'req/s',
+    reason: 'poll failed',
+    observedAtMs: null,
+    source: '/v1/status',
+  };
+
+  const text = describeField(field, 1_000_000);
+
+  assert.match(text, /age unknown/, 'an undateable field must say its age is unknown');
+  assert.doesNotMatch(
+    text,
+    /0s ago/,
+    'an undated stale field is being spoken as if it had just been measured',
+  );
+});
+
+test('a dated stale field still reports its real age', () => {
+  // The anti-vacuity control. Deleting the age arithmetic entirely would
+  // satisfy the assertion above perfectly.
+  const field = {
+    state: FIELD_STATES.STALE,
+    value: 42,
+    unit: 'req/s',
+    reason: 'poll failed',
+    observedAtMs: 1_000_000 - 12_000,
+    source: '/v1/status',
+  };
+
+  assert.match(describeField(field, 1_000_000), /last measured 12s ago/);
+});
+
+test('the spoken and the visible channel agree about age', async () => {
+  // THE GUARD THAT WAS MISSING. Both stacks were individually tested and
+  // neither test could see the other channel, so they disagreed for as long as
+  // they both existed. This asserts the PAIR, which is the only level at which
+  // the defect was visible.
+  const { formatField } = await import('./format.js');
+  const nowMs = 1_000_000;
+
+  for (const observedAtMs of [null, undefined, nowMs - 30_000]) {
+    const field = {
+      state: FIELD_STATES.STALE,
+      value: 7,
+      unit: 'req/s',
+      reason: 'poll failed',
+      observedAtMs,
+      source: '/v1/status',
+    };
+    const spoken = describeField(field, nowMs);
+    const visible = formatField(field, { nowMs }).text;
+    const visibleSaysUnknown = visible.includes('age unknown');
+    const spokenSaysUnknown = spoken.includes('age unknown');
+
+    assert.equal(
+      spokenSaysUnknown,
+      visibleSaysUnknown,
+      `the two channels disagree for observedAtMs=${String(observedAtMs)}: ` +
+        `visible ${JSON.stringify(visible)} vs spoken ${JSON.stringify(spoken)}`,
+    );
+  }
+});
