@@ -511,6 +511,16 @@ export const PROVENANCE = Object.freeze({
     // denominator that overstates capacity is the one error direction that
     // makes our headline look WORSE than reality, which is why the server
     // clamps it and why the client must not "helpfully" un-clamp it.
+    //
+    // ⚠️ THIS KEY WAS DECLARED TWICE, and the duplicate is why the label reads
+    // the way it does. Two commits added it independently; JS keeps the LAST
+    // definition and discards the first with no error, so the surviving entry
+    // was the terse one labelled "Batch limit" -- and "batch limit" is the name
+    // of max_batch, the RAW value, not of the clamped minimum actually served.
+    // The paragraph above warning against exactly that confusion was sitting in
+    // the DISCARDED half. A duplicate key does not merely make provenance
+    // ambiguous; it picks a winner silently, and here it picked the misnomer.
+    // provenance-expiry.test.js now fails on any duplicate key.
     label: 'Effective batch capacity',
   },
   'batch.active_size': {
@@ -634,16 +644,6 @@ export const PROVENANCE = Object.freeze({
   // would never reach. A panel previously bound `scheduler.max_batch`, which no
   // server has ever emitted -- four test fixtures supplied it, so the suite was
   // green while the panel was permanently degraded live.
-  'batch.capacity': {
-    source: ENDPOINTS.STATUS,
-    path: 'batch_capacity',
-    classification: 'MEASURED',
-    unit: 'requests',
-    evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:178 ' +
-      '(batch_capacity, from state.config.effective_batch_capacity()).',
-    label: 'Batch limit',
-  },
   // The number a viewer actually wants — how many sequences the engine stepped
   // together — is not exposed by anything. ContinuousBatchManager does not
   // report its batch, so it must stay unavailable rather than be approximated

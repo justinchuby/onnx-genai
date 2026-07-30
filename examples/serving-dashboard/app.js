@@ -27,7 +27,7 @@ import {
 import { mountFailureStates } from './ui/failure-state.js';
 import { mountModelCard } from './ui/model-card.js';
 import { mountScenarioSwitcher } from './ui/scenario-switcher.js';
-import { PROVENANCE, allFieldKeys } from './telemetry-provenance.js';
+import { PROVENANCE, allFieldKeys, resolveForOrigin } from './telemetry-provenance.js';
 import { FIELD_STATES } from './telemetry-field.js';
 
 /** Poll cadence. The spec fixes the dashboard between 250 and 500 ms. */
@@ -41,11 +41,35 @@ const CONNECTION_GLYPHS = Object.freeze({
   [CONNECTION_STATES.NO_MODEL]: '○',
 });
 
+// One entry per Classification. There is no fallback branch on purpose: a
+// missing entry used to render the raw constant -- a visitor saw the literal
+// token STRUCTURALLY_BYPASSED sitting beside nine sentences of English. A
+// fallback that prints the token is the failure mode that looks like it worked,
+// so classificationText() throws instead and register-completeness.test.js
+// derives the required keys from the provenance table rather than restating
+// them here. A new classification cannot reach a visitor unlabelled.
 const CLASSIFICATION_TEXT = Object.freeze({
   MEASURED: 'Measured by the server',
   DOCUMENTED_ZERO: 'Server sends a documented zero — shown as unavailable',
   NOT_PLUMBED: 'Exists in the process, not yet exposed over HTTP',
+  STRUCTURALLY_BYPASSED:
+    'This server never runs the code path that would produce it — see the evidence',
 });
+
+/**
+ * @param {string} classification
+ * @returns {string} the visitor-facing sentence for a classification
+ */
+function classificationText(classification) {
+  const text = CLASSIFICATION_TEXT[classification];
+  if (!text) {
+    throw new Error(
+      `No visitor-facing text for classification '${classification}'. Add one to ` +
+        'CLASSIFICATION_TEXT in app.js. The register must never render a raw constant.',
+    );
+  }
+  return text;
+}
 
 async function main() {
   const fileGuard = document.getElementById('file-protocol-guard');
@@ -101,7 +125,15 @@ async function main() {
     contradiction: detection.contradiction,
   });
   mountConnectionIndicator(requireElement('connection-indicator'), telemetryStore);
-  renderProvenanceFooter(requireElement('provenance-table'));
+  // The register is per-origin for the same reason the panels are: a field is
+  // MEASURED on one server and STRUCTURALLY_BYPASSED on the other from
+  // identical bytes. Passing serverClass here was the missing argument -- the
+  // register was the ONE consumer of the provenance table that read the base
+  // entry, so on the batching server it certified the three prefix-cache rows
+  // as "Measured by the server" while the panels beside it correctly showed
+  // them bypassed. The register is what a sceptical visitor consults BECAUSE
+  // they distrust the panels, so it was the worst possible place to disagree.
+  renderProvenanceFooter(requireElement('provenance-table'), serverClass);
 
   const dashboard = mountPanels(telemetryStore, serverClass);
 
@@ -253,8 +285,9 @@ function formatAge(ageMs) {
  * treat it that way.
  *
  * @param {HTMLElement} rootElement
+ * @param {string|null} origin the server class that served this page
  */
-function renderProvenanceFooter(rootElement) {
+function renderProvenanceFooter(rootElement, origin) {
   const table = document.createElement('table');
   table.className = 'provenance-table';
 
@@ -270,11 +303,11 @@ function renderProvenanceFooter(rootElement) {
 
   const body = document.createElement('tbody');
   for (const key of allFieldKeys()) {
-    const entry = PROVENANCE[key];
+    const entry = resolveForOrigin(PROVENANCE[key], origin);
     const row = tableRow('td', [
       entry.label,
       entry.source,
-      CLASSIFICATION_TEXT[entry.classification] ?? entry.classification,
+      classificationText(entry.classification),
       entry.evidence,
     ]);
     row.dataset.classification = entry.classification;
