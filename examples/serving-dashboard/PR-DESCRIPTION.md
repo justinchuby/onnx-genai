@@ -568,10 +568,26 @@ config flag is `--models-config`, which builds a *different* type
 `allow_runtime_override` is not a hardcode, and it is not "assigned from the
 YAML". **It is a `Default` impl value that no shipping code path can override,
 because the sole mechanism that could override it has no production caller.**
-The runtime-override refusal at `governor.rs:168` is therefore
-**unconditional in practice**, and its error message tells the operator to
-*"set `serving.memory.limits.allow_runtime_override: true`"* — **advice that
-cannot be taken by any binary we ship.**
+The runtime-override refusal at `governor.rs:168`
+(`if !self.allow_runtime_override`) is therefore **unconditional in practice**.
+
+**Its error message offers two remedies and we quoted only the first when we
+first wrote this section. The full text at `governor.rs:191-192` reads:**
+
+> *"set `serving.memory.limits.allow_runtime_override: true` **or construct
+> `EngineConfig` with `allow_runtime_override = true` before calling
+> `set_vram_limit`**"*
+
+**Stating it in full makes the gap sharper, not softer.** The first remedy is a
+YAML key that no shipping binary reads. **The second is real — and it is a
+*recompile*.** So an operator who hits this error at runtime is offered one
+instruction that does nothing and one that requires them to be a developer with
+a build environment. ***Neither is an operator remedy, and the message is
+addressed to an operator.***
+
+**We record the truncation deliberately:** quoting the first clause made the
+message look simply wrong, when what it actually is, is *correct and addressed
+to the wrong audience* — a worse defect and a harder one to notice.
 
 > **An error message that names a remedy the product cannot perform is worse
 > than a bare refusal. The bare refusal sends you to the maintainers; the
