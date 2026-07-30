@@ -3,13 +3,18 @@
 Reviewers extract exactly one tree. This file records which one, because until now that
 designation existed only in chat.
 
-REVIEW-POINT: review-0
-REVIEW-POINT-SHA: 0aac6bb1
+REVIEW-POINT: review-2
+REVIEW-POINT-SHA: 0bc86726
 
-Re-declared by the gate secretary at 04:19, superseding the lead's 04:30 declaration of
-`review-1` = `fca13038`. **The earlier declaration was not wrong — it was spent.**
-`fca13038` (04:02:36) is a strict ancestor of `0aac6bb1` (04:16:22), so every finding
-measured at it is re-derivable, not void.
+Re-declared by the project lead at 04:51 and pinned as *"the scoring and review artifact"*,
+superseding `review-0` = `0aac6bb1` (04:19) which itself superseded `review-1` = `fca13038`
+(04:30). **Three declarations in thirty-one minutes.** Each earlier one was not wrong — each
+was spent. All are strict ancestors, so no finding is void; every one is re-derivable.
+
+> **⛔ This file has now been re-pointed three times, and that is the argument for its
+> existence rather than an embarrassment to it.** The declaration lives in one place, under
+> version control, with a test that reads it. **The alternative was three coordinates living
+> in chat, which is where they lived when four agents held four different answers.**
 
 > **⛔ Re-extraction is mandatory, not cosmetic, and the reason is the reverse of the one we
 > built extracts for.** Both P1 render sites are *present* in the older tree and *absent* in

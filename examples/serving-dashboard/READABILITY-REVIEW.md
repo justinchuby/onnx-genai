@@ -1250,3 +1250,60 @@ front of them and wrongly for the tree we ship.**
 **The prescription is the same one line in both directions, and it is free:** a pinned
 coordinate must state **what it is a claim about**. Code at the extract; prose at the branch
 tip; and the tip re-checked before any finding is filed from a frozen tree.
+
+---
+
+## R31 🔴 NEW — pass 2's pinned artifact excludes the fixes filed for pass 1, and both poles of R30 are live in it at once
+
+**Measured at `35aaa6e2`, toplevel asserted.** `review-2` = `0bc86726` (04:19:23) is pinned as
+the scoring and review artifact. **It does not contain any of my six landed commits**, tested
+individually with `git merge-base --is-ancestor`:
+
+```
+ee8542d2  R1 typedef fix      ⛔ NOT in review-2
+32bf88e7  R27 basename        ⛔ NOT in review-2
+608de6c2  repo preamble       ⛔ NOT in review-2
+889eb00e  R28                 ⛔ NOT in review-2
+d7660e15  R29                 ⛔ NOT in review-2
+c1f215fe  R30                 ⛔ NOT in review-2
+
+GROUND TRUTH, review-2 tree, dashboard/index.js:59:
+  * @property {(… ) => {destroy: () => void}} mount     ⬅ THE DEFECT, STILL THERE
+```
+
+**✅ First the good news, measured before the complaint, because the gate item is what matters
+most:** the P1 is **genuinely closed in `review-2`** — `1133a874` and `f025ae58` are both
+ancestors, both render sites read **0**, and the control `server.model_id` reads **1** in the
+same file. The pinned artifact is sound on the thing it was pinned for.
+
+**⛔ The defect is that R30's two poles are now live simultaneously in one artifact**, which is
+the case I described as hypothetical forty minutes ago:
+
+| pole | what pass 2 gets at `review-2` | consequence |
+| --- | --- | --- |
+| over-read | `index.js:59` still says `destroy` | **a reviewer re-derives R1 as LIVE — correctly for that tree, wrongly for the branch** |
+| under-read | my document lacks R25–R31 and the preamble | **the correction that would have warned them is not in the tree they are reading** |
+
+> **The frozen tree contains the defect and not its retraction, because a fix and its
+> write-up land in the same minute and a pin can fall between them.** The artifact is not
+> merely stale — **it is stale asymmetrically, and it decays in the direction that
+> manufactures work.**
+
+**✅ What pass 2 should do, concretely, so nobody spends a cycle on it:**
+
+1. **Score the *suite* at `review-2`.** That is what a pinned tree is good for and the number
+   is real there.
+2. **Read *prose* at the branch tip.** Code at the extract, prose at the tip — the same split
+   the gate secretary applied to their own brief when they noted a document cannot contain the
+   announcement of its own SHA.
+3. **Do not re-file `dashboard/index.js:59`.** It is fixed at `ee8542d2`, verified by presence
+   of the bytes in `HEAD`. If your pass finds it, **your tree is older than the fix, not newer
+   than the finding.**
+
+**⚖️ And the runner's duplicate-filename warning is R27, already filed and committed at
+`32bf88e7`** — with one correction that matters, because the word chosen decides what the next
+reader does: **the two files are not duplicates.** Different blobs, disjoint subjects, 10 tests
+versus 5, both raw exit 0. **Deleting either to silence the warning deletes real coverage**, and
+*duplicate* is a word that prescribes deletion. The fix is a rename. **The guard that caught it
+deserves the credit it was given — it is the only instrument on this branch that found a
+problem without a human aiming it.**
