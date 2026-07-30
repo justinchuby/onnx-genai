@@ -35,8 +35,18 @@ set -uo pipefail
 
 cd "$(dirname "$0")" || exit 1
 
-MIN_TESTS=500
-MIN_FILES=40
+# THE FLOORS ARE ENV-OVERRIDABLE SO THIS SCRIPT CAN BE TESTED, AND THE DEFAULTS
+# ARE THE SHIPPING CLAIM. `run-tests-guards.test.js` drives every check below
+# against throwaway repositories holding four-test suites; without a seam, the
+# floors alone would fail those fixtures and mask whichever guard was under test
+# -- a fixture that fails for the wrong reason proves nothing, which is the
+# error this suite exists to catch.
+#
+# This is the `fetchImpl` seam again: injectable for a test, unchanged in
+# production. An override is only reachable by someone who typed it, and the
+# banner prints the values in force, so a lowered floor cannot pass unnoticed.
+MIN_TESTS=${MIN_TESTS:-500}
+MIN_FILES=${MIN_FILES:-40}
 
 # Local iteration writes test files before committing them. Verification runs
 # must not. Default is the shipping claim; the escape hatch is loud on purpose.
@@ -58,6 +68,7 @@ echo "branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'not a git t
 echo "head:   $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
 echo "dirty:  $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommitted file(s) in this tree"
 echo "node:   $(node --version)"
+echo "floors: ${MIN_TESTS} tests / ${MIN_FILES} files (defaults 500/40; an override is printed here so a lowered floor cannot pass unnoticed)"
 
 # Discover, never enumerate.
 test_files=()
@@ -193,9 +204,21 @@ fi
 
 
 if (( ${#absent[@]} > 0 )); then
+  # UNREACHABLE IN A GIT TREE, AND DELIBERATELY LEFT THAT WAY RATHER THAN
+  # DELETED WITH ITS DATA. A test file tracked at HEAD and missing from disk is
+  # BY DEFINITION an incomplete checkout, and the check above -- added later,
+  # scoped to every tracked file in the repository, and aborting BEFORE Node
+  # runs -- catches it first with a better message. Proved by
+  # `run-tests-guards.test.js`: deleting a committed test file produces
+  # "this checkout is INCOMPLETE", never this branch.
+  #
+  # It survives for the one case the broader check cannot serve: a tree where
+  # `git rev-parse` succeeds but the toplevel scan is skipped. If you ever see
+  # this message, the fail-fast abort above did not run, and THAT is the finding.
   echo "FAIL: ${#absent[@]} test file(s) are tracked at HEAD but missing from disk:" >&2
   printf '      %s\n' "${absent[@]}" >&2
   echo "      This run skipped them entirely and still exited green." >&2
+  echo "      NOTE: the incomplete-checkout abort should have caught this first." >&2
   status=1
 fi
 
