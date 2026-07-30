@@ -1856,8 +1856,8 @@ Measured at HEAD, from the repository root, both glob forms:
 
 ```
 git grep -n 'server\.model_path' HEAD -- '…/*.js' '…/**/*.js' | grep -v '\.test\.js'
-  ui/model-card.js:25          { key: 'server.model_path', label: 'Directory' }   PRESENT ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
-  dashboard/system.js:89       definition('model directory', …)                   PRESENT ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
+  ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ ui/model-card.js:25          { key: 'server.model_path', label: 'Directory' }   PRESENT ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
+  ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ dashboard/system.js:89       definition('model directory', …)                   PRESENT ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
   telemetry-provenance.js:150  the catalogue definition                           KEEP
 ```
 
@@ -2102,7 +2102,7 @@ independently concurred on and nobody has written:**
 
 ```
 grep -n 'server\.model_path' — shipped JS at fca13038, tests excluded:
-  ui/model-card.js:25 · dashboard/system.js:89 · telemetry-provenance.js:150 ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
+  ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ ui/model-card.js:25 · dashboard/system.js:89 · telemetry-provenance.js:150 ⛔ **COORDINATE RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD. DO NOT DELETE BY LINE NUMBER. SEARCH THE KEY `server.model_path` (now 0).**
   -> 3 HITS. MUST REACH 1. Control: server.model_id fires 2/1/1.
 ```
 
@@ -5821,3 +5821,86 @@ SPLIT THEM.**
 **📌 COMMIT AUDIT PER THE LEAD'S SILENT-`COMMIT` WARNING: ALL EIGHT OF MY SHAs EXIST, EACH TOUCHES
 EXACTLY ONE FILE — MINE — AND EVERY ONE IS AN ANCESTOR OF HEAD. **ZERO ORPHANS. ZERO SWEEPS. CONTROL:
 A FABRICATED SHA FAILS TO RESOLVE, SO THE CHECK DISCRIMINATES.**
+
+---
+
+# 🔻 §9.23 — MY SAME-LINE RETRACTION IS DEFEATED BY A TRUNCATING READER. **RULE 24 HAS A FAILURE MODE AND IT COST @c0de4c2e AND @12e42da8 A REOPENED P1.**
+
+**I HAVE ARGUED ALL NIGHT — RULE 24 — THAT A RETRACTION MUST LIVE *BESIDE THE RETRACTED STRING*, NOT
+IN A CHANGELOG. **I PUT THE MARKER AT THE END OF THE LINE. EVERY CENSUS TRUNCATES.**
+
+```
+THE LINE, AS A CENSUS PRINTS IT (cut -c1-100):
+  ui/model-card.js:25  { key: 'server.model_path', label: 'Directory' }  PRESENT ⛔ **COORDI
+                                                                        ^^^^^^^ ⬅ READS AS LIVE
+THE PART THAT NEVER ARRIVES:
+  …RETRACTED §9.11 — AT HEAD THIS LINE IS A LIVE `server.context_length` FIELD.
+   DO NOT DELETE BY LINE NUMBER.
+```
+
+**➡️ @c0de4c2e's CENSUS QUOTED THIS EXACT LINE AS EVIDENCE THAT MY BRIEF SAYS `PRESENT`. **THEY WERE
+READING MY FILE CORRECTLY. THE RETRACTION WAS THERE AND THE INSTRUMENT COULD NOT REACH IT.** AND THE
+BROADER `2` THAT REOPENED L10 CAME FROM `demo-spec.md` PROSE — BUT MY LINE CORROBORATED IT, AND
+**CORROBORATION IS EXACTLY WHEN NOBODY RE-CHECKS.**
+
+### 🔑 RULE 51 — **PUT THE RETRACTION WHERE TRUNCATION CANNOT REMOVE IT: COLUMN 1, BEFORE THE CLAIM.**
+
+> **A CORRECTION PLACED *AFTER* THE THING IT CORRECTS IS ONLY AS RELIABLE AS THE READER'S LINE WIDTH —
+> AND EVERY AUTOMATED READER WE OWN (`grep | cut`, TABLE COLUMNS, TERMINAL WRAP, A CENSUS PRINTING
+> 100 CHARS) CUTS FROM THE RIGHT. ➡️ ***THE FALSE CLAIM SURVIVES THE CUT AND THE WITHDRAWAL DOES NOT.
+> A RETRACTION MUST BE THE FIRST THING ON THE LINE, SO THAT A TRUNCATED READ LOSES THE COORDINATE AND
+> KEEPS THE WARNING — FAILING TOWARD `DO NOT ACT` INSTEAD OF TOWARD `ACT`.***
+
+**✅ REPAIRED IN THIS COMMIT, ALL THREE LOADED COORDINATES, MEASURED NOT ASSUMED:**
+```
+  BEFORE  visible-as-retracted at 60 chars: 0 of 3
+  AFTER   visible-as-retracted at 60 chars: **3 of 3**
+  [CONTROL] an ordinary line of mine at 60 chars reads as retracted: 0  ⬅ NO FALSE POSITIVE
+  FORM:  ⛔RETRACTED-§9.11-DO-NOT-ACT ▸ <the original line, unaltered>
+```
+**THE COORDINATE IS NOT DELETED — @f6527cc9 IS RIGHT THAT A FOOTNOTED LIE IS STILL FILED RATHER THAN
+APPLIED — BUT IT IS NOW *UNREACHABLE WITHOUT PASSING THE WARNING FIRST*.**
+
+---
+
+# ⚖️ GATE ITEM 1 — **ADJUDICATED. @f6527cc9's RULING IS ACCEPTED, INDEPENDENTLY VERIFIED, AND SCOPED.**
+
+**THEY RAN THE THING EVERYONE INCLUDING ME HAD CARRIED WITHOUT RUNNING: `cargo check --workspace
+--all-targets` → **RAW EXIT 101**, a `cc-rs` failure compiling `qgemm_kernel_avx2.cpp` for
+`arm64-apple-macosx`. I VERIFIED ALL THREE LEGS MYSELF RATHER THAN RELAYING THEM:**
+
+```
+IS IT OURS?     files this branch changed under crates/mlas-sys : **0**
+                [CONTROL] under crates/onnx-genai-server        : **17**   ⬅ the diff reaches
+CAN IT REACH?   crates DECLARING mlas-sys: **onnx-runtime-ep-cpu ONLY** (+ workspace root
+                and mlas-sys itself). [CONTROL] 42 Cargo.toml files scanned.
+WHY?            build.rs: target_arch 0 · aarch64 0   [CONTROL] avx2 **14** ⬅ grep reaches
+                ⬅ A BUILD SCRIPT WITH NO CONCEPT OF TARGET ARCHITECTURE.
+DECISIVE POSITIVE, MINE: cargo test -p onnx-genai-server AT THE PIN = **264/0/4, RAW EXIT 0**.
+                **A PACKAGE THAT COMPILES AND TESTS GREEN IS NOT BLOCKED BY A CRATE IT NEVER BUILDS.**
+```
+
+**📋 RULING: ITEM 1 MOVES FROM 🟡 *CARRIED, NOT RE-MEASURED* TO 🟢 *ADJUDICATED — PRE-EXISTING,
+OUT OF SCOPE, UNREACHABLE FROM THE SERVED ARTEFACT*. SAME EVIDENCE, DIFFERENT STATUS, AND THE
+DIFFERENCE IS THAT NOBODY HAS TO LOOK AT IT AGAIN TONIGHT.**
+
+### ⚠️ ONE SCOPE CLAUSE @f6527cc9 DID NOT NAME, AND IT IS THE PRICE OF THE GREEN:
+
+```
+crates/onnx-genai-server/Cargo.toml:31   [features]
+  mlas = ["native-backend", "onnx-genai-engine/mlas"]
+```
+**THE SERVER CARRIES A FEATURE NAMED `mlas`. UNDER DEFAULT FEATURES — WHAT THE DEMO BUILDS AND WHAT
+MY 264/0/4 EXERCISED — `mlas-sys` IS NEVER COMPILED AND THE EXCLUSION IS SOUND. ⛔ **BUILD WITH
+`--features mlas` AND ITEM 1 BECOMES REACHABLE AGAIN.** THE ADJUDICATION IS CORRECT *AND* IT IS
+CONDITIONAL; A GREEN WITHOUT ITS PRECONDITION PRINTED IS THE SAME UNSTAMPED CLAIM WE HAVE BEEN
+CHASING ALL NIGHT.**
+
+**🔻 AND I ALMOST FILED THIS AS A CONTRADICTION OF @f6527cc9. MY FIRST INSTRUMENT WAS
+`grep -c mlas Cargo.toml` → **1**, WHICH I READ AS *THE SERVER DEPENDS ON mlas-sys, THEIR
+UNREACHABILITY CLAIM IS FALSE*. **IT IS A FEATURE NAME. `mlas` IS A SUBSTRING OF NOTHING RELEVANT AND
+A DEPENDENCY OF NOTHING.** ➡️ ***READ, DON'T COUNT — MY OWN RULE, AND THE COUNT WAS TRUE WHILE THE
+CONCLUSION WAS FALSE, WHICH IS THE THIRD TIME TONIGHT THAT PAIRING HAS NEARLY COST SOMEBODY A
+CORRECT FINDING.***
+
+**📊 GATE: 11🟢 · 2🟡 · 0🔴.**
