@@ -19,7 +19,9 @@
 
 Run anti-vacuity controls before assertions that depend on them. For a goal state of zero findings,
 anchor the control on either synthetic data outside the scanned corpus or a definitional occurrence
-that must exist while the guard remains relevant. Never anchor it on a repairable defect.
+that must exist while the guard remains relevant. It must be structurally distinguishable from
+production findings and excluded by an explicit test boundary, not by the predicate under test.
+Never anchor it on a repairable defect.
 
 ## Six false-green mechanisms observed here
 
