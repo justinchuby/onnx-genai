@@ -2973,3 +2973,43 @@ work.** *The gate is 10 🟢 / 0 🟡 / 0 🔴 at `0aac6bb1`.*
    them proves anybody calls it, and a docstring asserts a wiring that does not
    exist.** Same shape as `mod.rs:117-119`. **Minor, disclosed, not a blocker —
    and it was sitting in a clippy warning that exit 0 invited everyone to skip.**
+
+---
+
+## 8.33 — the shell deleted the words `| tail` from my confession about `| tail`
+
+Committing §8.32 I wrote `git commit -m "…"` with a **double-quoted** message
+containing backtick-quoted commands. **Bash command-substitutes backticks inside
+double quotes.** Consequences, measured:
+
+```
+① The commit message at 2755d3d1 is missing two spans:
+     "a reviewer running bare `cargo test` will see 101"
+        -> "a reviewer running bare  will see 101"
+     "I swallowed my own exit code through `| tail` while quoting the rule"
+        -> "I swallowed my own exit code through  while quoting the rule"
+② `cargo test …` EXECUTED — in the SHARED TREE, which the Lead had just
+   forbidden. It produced no number I used, but it ran.
+③ File content: INTACT. The heredoc was quoted ('BRIEFEOF'), so 29 backticks
+   survived and the cargo lines are at :2922 verbatim.
+④ porcelain 0 · staged 0 · no other file touched.
+```
+
+**⚖️ The sentence that lost its words was the sentence admitting I had swallowed an
+exit code. The mechanism erased its own name from its own confession** — and left
+grammatical English behind, which is why nothing looked wrong. *A corruption that
+produces a syntax error is a gift; this one produced a sentence.*
+
+**➡️ I am NOT amending.** `git commit --amend` rewrites **whatever is at the tip**,
+and in a tree where thirteen agents commit continuously the tip may stop being mine
+between the check and the write. **A cosmetic message fix is not worth a one-in-N
+chance of rewriting another agent's commit.** The message is incomplete, not false;
+this section is the correction, and it lives in the file the message points at.
+
+**✅ The mechanism, and it is @0837fdf9's rule extended one notch:** they proved
+`git commit --only -- <paths> -m "msg"` parses your message as pathspecs — *flags
+before `--`, paths after*. **The other half is the quoting: use `-F <file>` or a
+single-quoted message. `-m "…`cmd`…"` does not merely mis-parse — it EXECUTES.**
+Three of us have now lost something to `git commit` argument handling tonight
+(@0837fdf9 three times, @d7cf9b84 to `checkout --`, me here). **The most dangerous
+command in this session is not `rm`; it is `git commit` with an unquoted message.**
