@@ -226,17 +226,22 @@ impl Bhsd {
         }
         let dim = hidden / heads;
         let src = to_dense_f32_widen("GroupQueryAttention", view)?;
-        let mut data = vec![0.0; src.len()];
-        for b in 0..batch {
-            for s in 0..seq {
-                for h in 0..heads {
-                    for d in 0..dim {
-                        data[((b * heads + h) * seq + s) * dim + d] =
-                            src[((b * seq + s) * heads + h) * dim + d];
+        let data = if seq == 1 {
+            src.into_owned()
+        } else {
+            let mut data = vec![0.0; src.len()];
+            for b in 0..batch {
+                for s in 0..seq {
+                    for h in 0..heads {
+                        for d in 0..dim {
+                            data[((b * heads + h) * seq + s) * dim + d] =
+                                src[((b * seq + s) * heads + h) * dim + d];
+                        }
                     }
                 }
             }
-        }
+            data
+        };
         Ok(Self {
             data,
             batch,
@@ -274,6 +279,42 @@ impl Bhsd {
         let src = to_dense_f32_widen("GroupQueryAttention", view)?;
         let q_hidden = num_heads * dim;
         let kv_hidden = kv_num_heads * dim;
+        if seq == 1 {
+            let mut q = Vec::with_capacity(batch * q_hidden);
+            let mut k = Vec::with_capacity(batch * kv_hidden);
+            let mut v = Vec::with_capacity(batch * kv_hidden);
+            for b in 0..batch {
+                let src_base = b * hidden;
+                q.extend_from_slice(&src[src_base..src_base + q_hidden]);
+                k.extend_from_slice(&src[src_base + q_hidden..src_base + q_hidden + kv_hidden]);
+                v.extend_from_slice(
+                    &src[src_base + q_hidden + kv_hidden..src_base + q_hidden + 2 * kv_hidden],
+                );
+            }
+            return Ok((
+                Self {
+                    data: q,
+                    batch,
+                    heads: num_heads,
+                    seq,
+                    dim,
+                },
+                Self {
+                    data: k,
+                    batch,
+                    heads: kv_num_heads,
+                    seq,
+                    dim,
+                },
+                Self {
+                    data: v,
+                    batch,
+                    heads: kv_num_heads,
+                    seq,
+                    dim,
+                },
+            ));
+        }
         let mut q = vec![0.0; batch * num_heads * seq * dim];
         let mut k = vec![0.0; batch * kv_num_heads * seq * dim];
         let mut v = vec![0.0; k.len()];
@@ -1154,27 +1195,27 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
             }
         }
-        let mut output = vec![0.0; y_bhsd.len()];
         #[cfg(feature = "gqa_phase_profile")]
         {
             drop(_attn_phase);
         }
         #[cfg(feature = "gqa_phase_profile")]
         let _out_phase = phase_prof::Phase::start(&phase_prof::OUT_NS);
-        for b in 0..q.batch {
-            for s in 0..q.seq {
-                for h in 0..self.num_heads {
-                    for d in 0..v.dim {
-                        output[((b * q.seq + s) * self.num_heads + h) * v.dim + d] =
-                            y_bhsd[((b * self.num_heads + h) * q.seq + s) * v.dim + d];
+        let decode_fast_write = q.seq == 1 && k.seq == 1;
+        if decode_fast_write {
+            write_decode_output(&mut outputs[0], &y_bhsd)?;
+        } else {
+            let mut output = vec![0.0; y_bhsd.len()];
+            for b in 0..q.batch {
+                for s in 0..q.seq {
+                    for h in 0..self.num_heads {
+                        for d in 0..v.dim {
+                            output[((b * q.seq + s) * self.num_heads + h) * v.dim + d] =
+                                y_bhsd[((b * self.num_heads + h) * q.seq + s) * v.dim + d];
+                        }
                     }
                 }
             }
-        }
-        let decode_fast_write = q.seq == 1 && k.seq == 1;
-        if decode_fast_write {
-            write_decode_output(&mut outputs[0], &output)?;
-        } else {
             write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
         }
         // In the in-place fast path the present outputs ARE the past buffer and
@@ -1249,6 +1290,36 @@ mod tests {
 
     fn absent() -> TensorView<'static> {
         TensorView::absent(DataType::Float32)
+    }
+
+    #[test]
+    fn bhsd_seq1_bsh_layout_is_already_head_major() {
+        let values: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let tensor = Owned::f32(&[2, 1, 12], &values);
+        let bhsd = Bhsd::from_bsh(&tensor.view(), 3, "query").unwrap();
+        assert_eq!(bhsd.batch, 2);
+        assert_eq!(bhsd.seq, 1);
+        assert_eq!(bhsd.heads, 3);
+        assert_eq!(bhsd.dim, 4);
+        assert_eq!(
+            bhsd.data, values,
+            "for S=1, [B,S,H*D] and [B,H,S,D] are the same contiguous layout"
+        );
+    }
+
+    #[test]
+    fn packed_qkv_seq1_splits_contiguous_head_blocks() {
+        let values: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let tensor = Owned::f32(&[2, 1, 16], &values);
+        let (q, k, v) = Bhsd::from_packed_qkv(&tensor.view(), 2, 1).unwrap();
+        assert_eq!(
+            q.data,
+            [
+                0., 1., 2., 3., 4., 5., 6., 7., 16., 17., 18., 19., 20., 21., 22., 23.
+            ]
+        );
+        assert_eq!(k.data, [8., 9., 10., 11., 24., 25., 26., 27.]);
+        assert_eq!(v.data, [12., 13., 14., 15., 28., 29., 30., 31.]);
     }
 
     fn kernel(attrs: &[(&str, Attribute)]) -> Box<dyn Kernel> {

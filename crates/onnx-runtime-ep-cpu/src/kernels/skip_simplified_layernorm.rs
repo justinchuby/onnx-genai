@@ -93,6 +93,47 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         let writes_inv_std = outputs
             .get(2)
             .is_some_and(|output| is_stats_shape(output.shape, shape));
+        if outputs.len() == 1
+            && inputs[1].shape == shape
+            && inputs[0].is_contiguous()
+            && inputs[1].is_contiguous()
+            && inputs[2].is_contiguous()
+            && inputs
+                .get(3)
+                .is_none_or(|input| input.is_absent() || input.is_contiguous())
+            && outputs[0].shape == shape
+            && outputs[0].dtype == DataType::Float32
+            && outputs[0].is_contiguous()
+        {
+            outputs[0].validate()?;
+            // SAFETY: validated contiguous f32 output view describes exactly
+            // `input.len()` writable elements and is the only requested output.
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), input.len())
+            };
+            let mut sum_row = vec![0.0f32; hidden];
+            for ((input_row, skip_row), normalized) in input
+                .chunks_exact(hidden)
+                .zip(skip.chunks_exact(hidden))
+                .zip(output.chunks_exact_mut(hidden))
+            {
+                let square_sum = crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
+                    input_row,
+                    skip_row,
+                    bias.as_deref(),
+                    &mut sum_row,
+                );
+                let variance = square_sum / hidden as f32;
+                let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
+                crate::kernels::simd_normalize::normalize_and_scale(
+                    &sum_row,
+                    normalized,
+                    inv_std_var,
+                    &gamma,
+                );
+            }
+            return Ok(());
+        }
         if inputs[1].shape == shape
             && inputs[0].is_contiguous()
             && inputs[1].is_contiguous()

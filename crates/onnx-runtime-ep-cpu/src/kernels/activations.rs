@@ -1,8 +1,9 @@
 //! Attribute-driven float activation kernels.
 
-use onnx_runtime_ep_api::{Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use super::add::require_same_dtype;
 use super::check_arity;
 use crate::dtype::{to_dense_f32_widen, to_dense_float, write_dense_f32_narrow, write_dense_float};
 
@@ -169,6 +170,7 @@ pub struct SeluFactory;
 pub struct ThresholdedReluFactory;
 pub struct SwishFactory;
 pub struct SiluFactory;
+pub struct FusedSiluMulFactory;
 
 impl KernelFactory for EluFactory {
     fn create(&self, node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
@@ -253,6 +255,12 @@ impl KernelFactory for SiluFactory {
     }
 }
 
+impl KernelFactory for FusedSiluMulFactory {
+    fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(FusedSiluMulKernel))
+    }
+}
+
 impl Kernel for ActivationKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.activation.name(), inputs, outputs, 1, 1, 1)?;
@@ -287,6 +295,41 @@ impl Kernel for ActivationKernel {
     }
 }
 
+pub struct FusedSiluMulKernel;
+
+impl Kernel for FusedSiluMulKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        check_arity("FusedSiluMul", inputs, outputs, 2, 2, 1)?;
+        if inputs[0].shape != inputs[1].shape || inputs[0].shape != outputs[0].shape {
+            return Err(EpError::KernelFailed(
+                "FusedSiluMul: inputs and output must have the same shape".into(),
+            ));
+        }
+        require_same_dtype("FusedSiluMul", &inputs[1], inputs[0].dtype)?;
+        if outputs[0].dtype != inputs[0].dtype {
+            return Err(EpError::KernelFailed(
+                "FusedSiluMul: output dtype must match inputs".into(),
+            ));
+        }
+        if fused_silu_mul_contiguous_f32(&inputs[0], &inputs[1], &mut outputs[0]) {
+            return Ok(());
+        }
+
+        let x = to_dense_f32_widen("FusedSiluMul", &inputs[0])?;
+        let rhs = to_dense_f32_widen("FusedSiluMul", &inputs[1])?;
+        let mut y = vec![0.0; x.len()];
+        silu_f32_slice(&x, &mut y);
+        for (y, rhs) in y.iter_mut().zip(rhs.iter()) {
+            *y *= *rhs;
+        }
+        write_dense_f32_narrow("FusedSiluMul", &mut outputs[0], &y)
+    }
+
+    fn supports_strided_input(&self, _input_idx: usize) -> bool {
+        true
+    }
+}
+
 fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
     if input.dtype != DataType::Float32
         || output.dtype != DataType::Float32
@@ -312,6 +355,47 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
     let input = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), n) };
     let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
     silu_f32_slice(input, output);
+    true
+}
+
+fn fused_silu_mul_contiguous_f32(
+    input: &TensorView,
+    rhs: &TensorView,
+    output: &mut TensorMut,
+) -> bool {
+    if input.dtype != DataType::Float32
+        || rhs.dtype != DataType::Float32
+        || output.dtype != DataType::Float32
+        || input.shape != output.shape
+        || rhs.shape != output.shape
+        || !input.is_contiguous()
+        || !rhs.is_contiguous()
+        || !output.is_contiguous()
+    {
+        return false;
+    }
+
+    let n = output.numel();
+    let bytes = n.saturating_mul(std::mem::size_of::<f32>());
+    let output_start = output.data_ptr_mut::<f32>() as usize;
+    let output_end = output_start.saturating_add(bytes);
+    for input in [input, rhs] {
+        let input_start = input.data_ptr::<f32>() as usize;
+        let input_end = input_start.saturating_add(bytes);
+        if output_start < input_end && input_start < output_end {
+            return false;
+        }
+    }
+
+    // SAFETY: equal contiguous f32 shapes prove all three pointers span n
+    // elements; the overlap checks prove output does not alias either input.
+    let input = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), n) };
+    let rhs = unsafe { std::slice::from_raw_parts(rhs.data_ptr::<f32>(), n) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), n) };
+    silu_f32_slice(input, output);
+    for (output, &rhs) in output.iter_mut().zip(rhs) {
+        *output *= rhs;
+    }
     true
 }
 
@@ -466,6 +550,31 @@ mod tests {
         .execute(&[x.view()], &mut [out.view_mut()])
         .unwrap();
         assert_eq!(out.to_f32(), vec![0.3, 0.5, 0.7]);
+    }
+
+    #[test]
+    fn fused_silu_mul_matches_standalone_ops() {
+        let x = Owned::f32(&[4], &[-2.0, -0.5, 0.0, 3.0]);
+        let rhs = Owned::f32(&[4], &[4.0, -2.0, 0.5, 0.25]);
+        let mut silu_out = Owned::zeros_f32(&[4]);
+        let mut fused = Owned::zeros_f32(&[4]);
+
+        ActivationKernel {
+            activation: Activation::Silu,
+        }
+        .execute(&[x.view()], &mut [silu_out.view_mut()])
+        .unwrap();
+        FusedSiluMulKernel
+            .execute(&[x.view(), rhs.view()], &mut [fused.view_mut()])
+            .unwrap();
+        let expected = silu_out
+            .to_f32()
+            .iter()
+            .zip(rhs.to_f32().iter())
+            .map(|(&lhs, &rhs)| lhs * rhs)
+            .collect::<Vec<_>>();
+
+        assert_eq!(fused.to_f32(), expected);
     }
 
     #[test]

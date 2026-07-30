@@ -303,6 +303,50 @@ impl Kernel for SimplifiedLayerNormKernel {
         check_arity(OP, inputs, outputs, 2, 2, 1)?;
         let x = to_dense_f32_widen(OP, &inputs[0])?;
         let scale = to_dense_f32_widen(OP, &inputs[1])?;
+        let rank = inputs[0].shape.len();
+        let axis_i64 = if self.axis < 0 {
+            self.axis + rank as i64
+        } else {
+            self.axis
+        };
+        if axis_i64 >= 0 && (axis_i64 as usize) < rank {
+            let axis = axis_i64 as usize;
+            let norm_size: usize = inputs[0].shape[axis..].iter().product();
+            let num_groups: usize = inputs[0].shape[..axis].iter().product();
+            if outputs.len() == 1
+                && norm_size != 0
+                && outputs[0].dtype == DataType::Float32
+                && outputs[0].shape == inputs[0].shape
+                && outputs[0].is_contiguous()
+                && crate::kernels::simd_normalize::scale_shape_is_exact_identity(
+                    inputs[0].shape,
+                    axis,
+                    inputs[1].shape,
+                )
+                && scale.len() == norm_size
+            {
+                outputs[0].validate()?;
+                // SAFETY: validation plus contiguous Float32 output proves the
+                // buffer spans exactly `x.len()` writable f32 elements.
+                let out = unsafe {
+                    std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), x.len())
+                };
+                for g in 0..num_groups {
+                    let base = g * norm_size;
+                    let row = &x[base..base + norm_size];
+                    let mean_sq =
+                        crate::kernels::simd_sumsq::sum_of_squares(row) / norm_size as f32;
+                    let inv_rms = 1.0 / (mean_sq + self.epsilon).sqrt();
+                    crate::kernels::simd_normalize::normalize_and_scale(
+                        row,
+                        &mut out[base..base + norm_size],
+                        inv_rms,
+                        &scale,
+                    );
+                }
+                return Ok(());
+            }
+        }
         // Reuse the shared RMSNorm core, honouring `axis` (default -1) so the
         // group spans dims `[axis..rank)` and `scale` broadcasts over it.
         let y = rms_norm_dense(

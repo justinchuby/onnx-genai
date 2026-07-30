@@ -42,6 +42,7 @@ pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     if projection_fusion.enabled() {
         passes.push(Box::new(projection_fusion));
     }
+    passes.push(Box::new(CpuSiluMulFusion));
     // The generic fusion machinery emits contrib/private fused ops that the CPU
     // EP registers kernels for. Keeping it EP-scoped prevents those rewrites from
     // shrinking another provider's chance to claim the original standard ops.
@@ -147,6 +148,88 @@ impl OptimizationPass for CpuSiluFusion {
         }
         Ok(())
     }
+}
+
+struct CpuSiluMulFusion;
+
+impl OptimizationPass for CpuSiluMulFusion {
+    fn name(&self) -> &str {
+        "CpuSiluMulFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        let activation_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (is_silu_like_activation(node) && node.inputs.len() == 1 && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+        let mut changed = false;
+
+        for activation_id in activation_ids {
+            let Some(activation) = graph.try_node(activation_id) else {
+                continue;
+            };
+            let Some(x) = activation.inputs[0] else {
+                continue;
+            };
+            let activation_output = activation.outputs[0];
+            if graph.outputs.contains(&activation_output) {
+                continue;
+            }
+            let consumers = graph.consumers(activation_output);
+            if consumers.len() != 1 {
+                continue;
+            }
+            let mul_id = consumers[0];
+            let mul = graph.node(mul_id);
+            if mul.op_type != "Mul"
+                || !mul.is_default_domain()
+                || mul.inputs.len() != 2
+                || mul.outputs.len() != 1
+            {
+                continue;
+            }
+            let Some(other) = mul.inputs.iter().find_map(|input| match input {
+                Some(value) if *value != activation_output => Some(*value),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let mul_output = mul.outputs[0];
+            if !same_float_shape(graph, x, other, mul_output) {
+                continue;
+            }
+
+            let mut fused = mul.clone();
+            fused.op_type = "FusedSiluMul".to_string();
+            fused.domain = MICROSOFT_DOMAIN.to_string();
+            fused.version = Some(1);
+            fused.inputs = vec![Some(x), Some(other)];
+            fused.attributes.clear();
+            graph.replace_node(mul_id, fused);
+            graph.remove_node(activation_id);
+            changed = true;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+fn same_float_shape(graph: &Graph, x: ValueId, rhs: ValueId, output: ValueId) -> bool {
+    let x = graph.value(x);
+    let rhs = graph.value(rhs);
+    let output = graph.value(output);
+    x.dtype == DataType::Float32
+        && x.dtype == rhs.dtype
+        && x.dtype == output.dtype
+        && x.shape == rhs.shape
+        && x.shape == output.shape
 }
 
 impl OptimizationPass for ProjectionFusion {
@@ -1390,7 +1473,7 @@ fn apply_sibling_merge(graph: &mut Graph, group: &SiblingGroup, ctx: &PassContex
 #[cfg(test)]
 mod tests {
     use super::checked_combined_initializer_len;
-    use super::{CpuSiluFusion, MICROSOFT_DOMAIN, MatMulNBitsBiasFusion};
+    use super::{CpuSiluFusion, CpuSiluMulFusion, MICROSOFT_DOMAIN, MatMulNBitsBiasFusion};
     use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, Node, NodeId, ValueId, static_shape};
     use onnx_runtime_optimizer::{OptimizationPass, PassContext};
 
@@ -1495,6 +1578,80 @@ mod tests {
                 .nodes
                 .values()
                 .filter(|node| node.op_type == "Sigmoid")
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Mul")
+                .count(),
+            1
+        );
+    }
+
+    fn silu_mul_graph(mismatched_rhs_shape: bool) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 24);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.to_string(), 1);
+        let shape = static_shape([2]);
+        let rhs_shape = if mismatched_rhs_shape {
+            static_shape([1])
+        } else {
+            shape.clone()
+        };
+        let x = graph.create_named_value("x", DataType::Float32, shape.clone());
+        let rhs = graph.create_named_value("rhs", DataType::Float32, rhs_shape);
+        let silu_out = graph.create_named_value("silu", DataType::Float32, shape.clone());
+        let output = graph.create_named_value("output", DataType::Float32, shape);
+        graph.add_input(x);
+        graph.add_input(rhs);
+        graph.add_output(output);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Swish",
+            vec![Some(x)],
+            vec![silu_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(rhs), Some(silu_out)],
+            vec![output],
+        ));
+        (graph, x, rhs)
+    }
+
+    #[test]
+    fn cpu_silu_mul_fusion_folds_private_silu_gate() {
+        let (mut graph, x, rhs) = silu_mul_graph(false);
+
+        CpuSiluMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 1);
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "FusedSiluMul");
+        assert_eq!(fused.domain, MICROSOFT_DOMAIN);
+        assert_eq!(fused.version, Some(1));
+        assert_eq!(fused.inputs, vec![Some(x), Some(rhs)]);
+    }
+
+    #[test]
+    fn cpu_silu_mul_fusion_requires_equal_shapes() {
+        let (mut graph, _, _) = silu_mul_graph(true);
+
+        CpuSiluMulFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Swish")
                 .count(),
             1
         );

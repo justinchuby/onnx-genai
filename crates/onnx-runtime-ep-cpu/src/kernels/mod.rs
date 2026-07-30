@@ -557,6 +557,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         Box::new(activations::SiluFactory),
     );
     reg.register(
+        OpKey::new("FusedSiluMul", "com.microsoft", 1),
+        Box::new(activations::FusedSiluMulFactory),
+    );
+    reg.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
