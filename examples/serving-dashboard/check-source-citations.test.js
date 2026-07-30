@@ -364,6 +364,7 @@ test('a cited line still sits beside the symbol the prose names', () => {
   let checked = 0;
 
   const failures = [];
+  const drifted = [];
   for (const citation of citations()) {
     const candidates = resolve(citation);
     if (candidates.length === 0) continue; // reported by an earlier test
@@ -383,23 +384,68 @@ test('a cited line still sits beside the symbol the prose names', () => {
     const wideAnchors = anchorsFor(citation, { tight: false });
     if (wideAnchors.length === 0) continue;
 
-    const from = Math.max(0, citation.line - 1 - ANCHOR_WINDOW);
     const perFile = candidates.map((c) => {
       const lines = readFileSync(join(repoRoot, c), 'utf8').split('\n');
-      return { c, lines, near: lines.slice(from, citation.line + ANCHOR_WINDOW).join('\n') };
+      return { c, lines };
     });
 
-    // Decide on the wide set, report on the tight one.
-    if (perFile.some(({ near }) => wideAnchors.some((a) => near.includes(a)))) {
+    // THE GATE IS IDENTITY, NOT PROXIMITY.
+    //
+    // This previously required the symbol to appear within ANCHOR_WINDOW lines
+    // of the cited number, which made it a line checker wearing a symbol's
+    // name. @1cb42f0e disproved it with the acceptance criterion this check was
+    // commissioned under: insert twenty blank lines above a cited symbol,
+    // change nothing else, and it went RED. Nothing moved, nothing was renamed,
+    // no claim in the README became false -- and the check failed. That is the
+    // failure mode we are supposed to be eliminating, not reproducing: a
+    // position-addressed assertion about an artefact that is still moving.
+    //
+    // So the pass/fail question is now the one that actually maps to a false
+    // claim in the document: DOES THE SYMBOL THE PROSE NAMES EXIST IN THE FILE
+    // THE CITATION NAMES? If it does, the reader can find it and the sentence
+    // is true. If it does not, the citation is stale in the only way that
+    // misleads -- it points at something that is not there.
+    //
+    // Line drift is still reported, with the exact current line numbers, but it
+    // DOES NOT FAIL. Per the ruling: name the symbol, quote the text; the line
+    // number may accompany both and may never substitute for either. A stale
+    // line number is a stale hint next to a true statement. A stale symbol is a
+    // false statement.
+    const found = perFile.some(({ lines }) =>
+      wideAnchors.some((a) => lines.some((l) => l.includes(a))),
+    );
+
+    if (found) {
       checked += 1;
+
+      // Report drift without failing, so citations can be repaired in a batch
+      // rather than blocking the suite on a number nobody reads.
+      const from = Math.max(0, citation.line - 1 - ANCHOR_WINDOW);
+      const near = perFile[0].lines
+        .slice(from, citation.line + ANCHOR_WINDOW)
+        .join('\n');
+      if (!wideAnchors.some((a) => near.includes(a))) {
+        const anchors = tightAnchors.length > 0 ? tightAnchors : wideAnchors;
+        for (const anchor of anchors) {
+          const at = [];
+          perFile[0].lines.forEach((l, i) => {
+            if (l.includes(anchor)) at.push(i + 1);
+          });
+          if (at.length > 0) {
+            drifted.push(
+              `${citation.text} -> \`${anchor}\` now at :${at.join(', :')} in ${perFile[0].c}`,
+            );
+          }
+        }
+      }
       continue;
     }
 
     const { c: reportFile, lines } = perFile[0];
 
     const anchors = tightAnchors.length > 0 ? tightAnchors : wideAnchors;
-    // Not near the cited line. Where else does the symbol appear? Report every
-    // occurrence, not the first.
+    // The symbol is in NO candidate file. Report where it does live, if
+    // anywhere, rather than asserting what the citation should have said.
     //
     // The first draft named only `findIndex`'s hit and phrased it as "the code
     // moved: X is now at :N". On its first real failure that sentence pointed at
@@ -425,14 +471,23 @@ test('a cited line still sits beside the symbol the prose names', () => {
     failures.push(
       `README.md cites ${citation.text} while the surrounding prose names ` +
         `${anchors.map((a) => '`' + a + '`').join(', ')} — but no such symbol ` +
-        `appears within ${ANCHOR_WINDOW} lines of :${citation.line} in ` +
-        `${reportFile}${candidates.length > 1 ? ` (and ${candidates.length - 1} other file(s) of that name)` : ''}.\n` +
+        `appears ANYWHERE in ` +
+        `${reportFile}${candidates.length > 1 ? ` (or ${candidates.length - 1} other file(s) of that name)` : ''}.\n` +
         (elsewhere.length > 0
           ? `  The code moved: ${elsewhere.join('; ')}. Update the citation.\n`
           : `  The symbol is not in that file at all — the citation may name ` +
             `the wrong file.\n`) +
         `  A citation that resolves is not a citation that is correct; this is ` +
         `the difference.`,
+    );
+  }
+
+  if (drifted.length > 0) {
+    console.log(
+      `\n  note: ${drifted.length} citation line number(s) have drifted. The ` +
+        `symbols still exist, so no claim is false; repair at leisure:\n    ` +
+        drifted.join('\n    ') +
+        '\n',
     );
   }
 
