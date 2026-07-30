@@ -172,7 +172,15 @@ const servedButNotNeeded = classified.filter(
 // Raising it is therefore a NORMAL and expected part of adding a guard, and it
 // is not the same act as raising it to accommodate a new document or fixture.
 // The diff shows which one you did.
-const MAX_SERVED_BUT_NOT_NEEDED = 87;
+//
+// 87 -> 88 (068a509a): +1, and exactly +1. The count at that commit was 96,
+// not 88. Nine of those are other people's files that arrived while this
+// number sat at 87 -- three since the 85 -> 87 raise alone. Absorbing them
+// would cost one character and would silently publish nine artefacts nobody
+// declared. The residual red of 96 vs 88 is the correct output: it is not
+// this guard failing, it is this guard working, and it is still pointing at
+// the people who own the other nine.
+const MAX_SERVED_BUT_NOT_NEEDED = 88;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
