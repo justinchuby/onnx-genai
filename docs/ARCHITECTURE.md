@@ -346,6 +346,22 @@ Adding a model dimension is possible but is a **breaking change to a contract an
 
 ---
 
+### 4.9 Session ids on the wire are credentials — redaction is structural ⚠️ SECURITY
+
+`/v1/status` returns `sessions[].id` (`admin.rs:69`), and unlike most of that struct it is **genuinely populated** — which makes it the field most likely to be bound by a consumer looking for something real to show. **A full session id is a bearer token**: possession of it is what authorises requests against that session. What appears on the wire is deliberately truncated — `sess-` plus the first 8 hex characters, then `…` (`session.rs:161-172`).
+
+**The redaction is enforced by the shape of the API, not by remembering to call it.** Three properties do that, and they are worth preserving deliberately:
+
+1. **There is exactly one id-listing accessor, and it redacts.** `client_ids_redacted()` (`session.rs:117`) is the *only* method that yields client ids. No unredacted sibling exists to reach for by mistake.
+2. **Redaction happens inside the registry lock**, at `:125`, before the values escape. A caller never holds a full id, so it cannot leak one by accident.
+3. **It fails closed.** An id not matching the expected `sess-<32 hex>` shape is replaced wholesale with `[redacted]` (`:170-171`) rather than passed through. An unrecognised format degrades to *less* disclosure, not more.
+
+> **The consequence for anyone changing this.** Widening the redaction — showing more characters, or adding an unredacted accessor "just for debugging" — **leaks credentials into whatever consumes this endpoint**, and dashboards are exactly the kind of consumer that logs, screenshots and screen-shares its inputs. Truncated ids remain perfectly adequate for correlating rows in a UI, which is the only thing a consumer legitimately needs them for.
+>
+> **Contrast with §5.3.** This is what an *enforced* invariant looks like: violating it requires deliberately adding a new API, not merely forgetting a step. §5.3's copy-on-write rule protects something arguably more valuable and is enforced by nothing at all. **The difference is not importance — it is whether the type system was given the chance to help.**
+
+---
+
 ### 4.8 The metrics registry is process-wide and has no model dimension
 
 `metrics.rs:89` declares `static REGISTRY: Registry` — a single, process-global instance. Every counter it holds is flat (`metrics.rs:74-87`): `prefix_cache_hits`, `prefix_cache_lookups`, `batch_size`, `pending`, `active_sessions`, `rejections`, and the `ttft` / `e2e` histograms. **None is keyed by model.**
