@@ -184,7 +184,8 @@ RAW EXIT            0           <- captured with $?, never through a pipe
 ANTI-VACUITY        864 assertion lines, 0 'not ok'
 ```
 
-**Status: carried, not re-derived by this author.** Reproduced independently
+**Revision ruled as the review pin. Status: carried — not re-derived by
+this author.** Reproduced independently
 twice — two detached worktrees, two different hours, four matching numbers, one
 of them taken without reading the other first. This document does not re-run it
 because the machine is at 100% disk and creating a worktree currently fails
@@ -202,7 +203,8 @@ IGNORED             4
 RAW EXIT            0
 ```
 
-**Status: carried.** Note the structural limit honestly: `cargo test` prints one
+**Revision ruled as the review pin. Status: carried, and reproduced three
+times independently across six binaries.** Note the structural limit honestly: `cargo test` prints one
 `test result:` line per test binary and never sums them, so any total is an
 addition someone performed. Without `--no-fail-fast` the denominator shrinks
 precisely when something is wrong.
@@ -328,6 +330,30 @@ was not, and it is the one that matters for telling them apart. The design
 compensates with distinct glyphs, so the information is not colour-dependent —
 but a reader scanning for "which of these is stale" is working from the glyph
 alone, and that was never a deliberate decision.
+
+### The server-side model path field was deleted, not redacted — do not re-add one
+
+Stated here because this document is where someone will land, and because the
+weaker design is written in the present tense in an internal review that has not
+been corrected yet.
+
+```
+fn model_path_for_display   -> 0   [control] fn resolve_model -> 6
+file_name() in admin.rs     -> 0
+```
+
+An earlier design returned the path's last segment instead of the whole path.
+**That was tried and rejected, and the code says why in its own comment: a
+basename is the final segment of an operator-chosen path, so its contents are
+unbounded — safe on this machine by luck, not by construction.** The field was
+removed outright, which is strictly stronger.
+
+The hazard worth naming is not the stale sentence, it is its grammatical mood.
+**A stale fact gets corrected; a stale instruction gets executed.** Prose that
+describes a defensive mechanism in the present tense reads as a specification to
+restore it. I read exactly such a line earlier and proposed putting a basename
+back; the engineer who owned the file refused, correctly. The next reader might
+not, so the refusal belongs here rather than in a conversation.
 
 ### The model path can still reach a client through the error channel
 
