@@ -4256,3 +4256,89 @@ what produced that false finding, and the repair to the catalogue has now reprod
 false claim inside the field meant to disclose it. Three authors have now read this pair and
 described it wrongly, in three different files, in the same direction. The two gauges are not
 hard to tell apart once the Rust is open; the catalogue is what stops people opening it.
+
+---
+
+## F45 — Two findings closed in code, not in prose (self-audit, 08:36)
+
+`@086345a5`'s self-audit, run against this document with **word** tokens rather
+than numbers (`@c0de4c2e` proved a bare numeric `grep -c` against a SHA-dense
+file returns coincidental hex substrings, all in the reassuring direction):
+
+```
+map_model_load_error ......... 0      api_paths_carrying_percent ... 0
+[POS CTL] demo_path_is_servable  2    [NEG CTL] zzq_never_written .. 0
+FLOOR: 4258 lines reachable
+```
+
+Both zeros were real. I landed two fixes and wrote neither of them down here.
+A clean working tree cannot distinguish *I committed everything* from *I never
+recorded it*, and mine read as the former for twenty-five minutes.
+
+### #468 — CLOSED IN CODE at `81fcbb0f`
+
+`the_restriction_has_no_opinion_about_the_api` tests four API paths and **none
+contains a `%`**, so it cannot fail if the percent-ban is hoisted above the
+`/demo/` prefix test. Three agents independently proposed that hoist; it 404s
+all 27 routes, and the four `{id}` routes are the ones that must carry `%2F`
+because `Qwen/Qwen3-8B` is a real model id.
+
+Added `api_paths_carrying_percent_escapes_are_still_not_this_predicate_s_business`
+with real subjects, plus a control that a permissive predicate cannot satisfy:
+`/demo/absolute-path%2Etest.js` must still be refused.
+
+```
+BASELINE 23/0 exit 0 · MUTANT 22/1 exit 101, mine by name · RESTORED hash-equal
+```
+
+**The 22 is the finding, not the 1.** Twenty-two tests sat green through a
+change that 404s the entire API.
+
+### F2 — CLOSED IN CODE at `d23c80a4`
+
+`routes/mod.rs:772` and `routes/admin.rs:510` both built their response body
+with `format!("failed to load model '{id}': {err}")`. That `{err}` is the chain
+`registry.rs:283` assembles with `with_context(|| ... from '{}'", spec.path.display())`
+— the operator-configured model directory. The **ungated** endpoint was
+therefore disclosing strictly more than the admin-gated one beside it, which is
+the same inversion `routes/mod.rs:120` already argues against in prose.
+
+The correct helper existed and is called nineteen times in this crate.
+**Both sites bypassed it because `ModelRegistry::load` returns `anyhow::Error`,
+not `RegistryError` — `map_registry_error` was unreachable by type.** That type
+mismatch is the defect; the `format!` was the symptom, and it recurred twice
+independently because the type system offered no third option.
+
+Added `map_model_load_error` beside its sibling and routed both call sites.
+The id is kept — the caller supplied it and the adjacent 404 at `:766` already
+echoes it — and the chain goes to `tracing::error!` where operators keep it.
+
+Two tests, built from the chain `registry.rs` actually produces, with a control
+asserting the fixture genuinely carries `/Users/presenter` so they cannot pass
+by being harmless. Restoring either `format!` takes the module from 2/0 exit 0
+to **0/2 exit 101, failing both by name**.
+
+Crate after both: **6 binaries · 275 passed · 0 failed · raw exit 0 ·
+`--no-fail-fast`**. `@d7cf9b84`'s 272 at `34ea441d` plus my three, reconciled by
+name — their number was correct when published and is now a floor.
+
+### Consequence for the pin
+
+```
+37d0d72e — C19 0 · #468 0 · F2 0   [POS CTL] map_registry_error 1
+1f9fc70b(53) ⊂ 37d0d72e(56) ⊂ 3b701494(63) ⊂ 217ae170(64)
+           ⊂ f359363a(+C19) ⊂ 81fcbb0f(+#468) ⊂ d23c80a4(+F2)
+```
+
+Every candidate is a strict subset of the last. There is no trade-off anywhere
+in this decision, and the only argument offered for an earlier pin — a green
+ratchet at 85 — buys one green JS guard whose own author committed the sentence
+*"this number is the disclosure, not the solution."* **Ship the red and the
+sentence; do not ship three missing fixes to buy a colour.**
+
+### Not mine, still open
+
+`block_mirror_is_truncated()` has zero callers anywhere, including in its own
+crate. `@f6527cc9` is right that an uncalled function is worse than a missing
+one: a missing function is an admitted gap, an uncalled one reads to every
+reviewer and every grep as a closed item. It needs a wire edge, not a design.
