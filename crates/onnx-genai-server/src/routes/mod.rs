@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -123,37 +124,101 @@ pub(crate) struct HealthResponse {
     model: String,
 }
 
+/// Why a field is absent from [`NodeStatus`].
+///
+/// A field is omitted rather than sent as `null` or `0`, and this map says why.
+/// The distinction matters: `not-applicable` means the mechanism is not in play
+/// on this node's model at all, while `unavailable` means it is in play but not
+/// yet measurable. Rendering either as a zero would claim a measurement.
+#[derive(Debug, Serialize)]
+pub(crate) struct FieldUnavailable {
+    /// One of `unavailable` or `not-applicable`.
+    pub(crate) code: &'static str,
+    /// Human-readable explanation, safe to show in a UI.
+    pub(crate) detail: &'static str,
+}
+
+impl FieldUnavailable {
+    pub(crate) const fn unavailable(detail: &'static str) -> Self {
+        Self {
+            code: "unavailable",
+            detail,
+        }
+    }
+
+    pub(crate) const fn not_applicable(detail: &'static str) -> Self {
+        Self {
+            code: "not-applicable",
+            detail,
+        }
+    }
+}
+
 /// Node-status contract polled by the cluster router (§34.8) every 1-2s.
 ///
-/// Field honesty: values are populated from generic runtime state where a getter
-/// exists (`queue_depth`, `active_sessions`, `healthy`, `node_id`). Metrics the
-/// server cannot yet measure are reported as documented zeros/empties rather than
-/// fabricated — see the per-field comments in [`status`]. All values are
-/// model-agnostic; `node_id` names this node, never a model.
+/// **Unmeasurable fields are omitted, never zeroed.** A zero is a measurement
+/// claim: `kv_pages_used: 0` asserts an empty pool, which is a different and
+/// stronger statement than "this node cannot tell you". Every omission is
+/// explained in [`NodeStatus::unavailable`], so a client can render "not
+/// applicable" with a reason instead of drawing a flat line at zero.
+///
+/// Omission specifically, rather than `null`: the router's deserialization
+/// mirror (`onnx-genai-router/src/node.rs`) fills missing keys via
+/// `#[serde(default)]` but **rejects an explicit `null` into a bare `f32`**,
+/// which would fail the parse and mark this node unhealthy.
+///
+/// **Caveat for the router, which is why the omission is not cost-free:**
+/// `kv_usage` feeds load-balancing, and a missing value defaults to `0.0`,
+/// i.e. "this node's KV is empty" — biasing traffic *toward* a node that
+/// simply cannot report. That was equally true of the hardcoded `0.0` this
+/// replaces, so it is not a regression, but the router needs to distinguish
+/// unknown from empty before it can route on this field honestly.
+///
+/// All values are model-agnostic except `model_id`, which echoes the model this
+/// node serves so a captured payload is self-describing.
 #[derive(Debug, Serialize)]
 pub(crate) struct NodeStatus {
     node_id: String,
+    /// The model this node serves, echoed so a saved response identifies itself
+    /// without depending on which origin it came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
     healthy: bool,
-    kv_usage: f32,
-    kv_pages_used: u32,
-    kv_pages_total: u32,
-    kv_pages_shared: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_usage: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_pages_used: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_pages_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_pages_shared: Option<u32>,
     queue_depth: u32,
     active_sessions: u32,
-    paused_sessions: u32,
-    tokens_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paused_sessions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_per_second: Option<f64>,
     batch_utilization: f32,
     sessions: Vec<SessionStatus>,
-    prefix_hashes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_hashes: Option<Vec<String>>,
+    /// Explanations for every field omitted above, keyed by field name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    unavailable: BTreeMap<&'static str, FieldUnavailable>,
 }
 
 /// Per-session detail entry in [`NodeStatus::sessions`] (§34.8).
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionStatus {
     id: String,
-    priority: String,
-    kv_pages: u32,
-    state: String,
+    /// Omitted rather than `"unknown"`: a literal "unknown" string still
+    /// occupies the field as if it were a value, and UIs render it as one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_pages: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

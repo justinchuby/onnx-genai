@@ -87,27 +87,86 @@ pub(crate) fn batch_utilization(in_flight: u64, capacity: usize) -> f32 {
 
 pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeStatus>, ApiError> {
     let snapshot = crate::metrics::snapshot();
+    let default_id = state.registry.default_id().map_err(map_registry_error)?;
+
+    // Every field this node cannot honestly measure, with the reason. Built
+    // alongside the omissions so a field can never be dropped silently.
+    let mut unavailable = BTreeMap::new();
+
+    // Paged-KV introspection is per-engine and this handler holds no engine
+    // reference. The four KV fields travel together: reporting any one of them
+    // while the others are absent would imply the pool is partially known.
+    //
+    // `kv_pages_total` is the trap here. It reads a real structure, so it
+    // survives any "is this hardcoded?" audit -- but on a continuous-batching
+    // model it describes a pool the decoder never uses, and it is *non-zero*,
+    // which makes it invisible to every check built to catch fabricated zeros.
+    // A non-zero value is not evidence that a mechanism is in play.
+    const KV_DETAIL: &str = "paged-KV telemetry is served by the KV block-table \
+                             endpoint; this node-status contract is model-agnostic \
+                             and carries no engine reference";
+    for field in [
+        "kv_usage",
+        "kv_pages_used",
+        "kv_pages_total",
+        "kv_pages_shared",
+    ] {
+        unavailable.insert(field, FieldUnavailable::unavailable(KV_DETAIL));
+    }
+
+    // Preemption exists nowhere in the driver: generation runs inline to
+    // completion, so no session is ever in a paused state to count. This is
+    // not-applicable rather than unavailable -- the number isn't missing, the
+    // concept doesn't apply to this scheduler.
+    unavailable.insert(
+        "paused_sessions",
+        FieldUnavailable::not_applicable(
+            "the driver runs generations to completion without preemption, \
+             so no session can be paused",
+        ),
+    );
+
+    // Only a cumulative token total is recorded. Dividing it by uptime yields a
+    // lifetime average, which on a live panel would be read as the current
+    // rate -- lowest exactly when the node has been idle longest, and slowest
+    // to move exactly when throughput changes most. Per-request latency
+    // histograms on /metrics are the measured throughput signal.
+    unavailable.insert(
+        "tokens_per_second",
+        FieldUnavailable::unavailable(
+            "only a cumulative token count is recorded; a lifetime average \
+             would misreport as a current rate -- see the latency histograms \
+             on /metrics",
+        ),
+    );
+
+    unavailable.insert(
+        "prefix_hashes",
+        FieldUnavailable::unavailable(
+            "the engine does not surface system-prompt prefix hashes; an empty \
+             list would claim none are cached",
+        ),
+    );
+
     Ok(Json(NodeStatus {
         // Node-level id from server config; independent of any loaded model.
         node_id: state.config.node_id.clone(),
+        // Echoed so a captured payload is self-describing. Under the two-server
+        // demo topology attribution is by origin, but a saved response should
+        // not depend on remembering which port produced it.
+        model_id: default_id.clone(),
         // Healthy while the node has a default model registered to serve.
-        healthy: state
-            .registry
-            .default_id()
-            .map_err(map_registry_error)?
-            .is_some(),
-        // KV page statistics: the engine does not yet expose paged-KV
-        // introspection (see /v1/debug/kv), so these stay 0 until a getter exists.
-        kv_usage: 0.0,      // not yet tracked
-        kv_pages_used: 0,   // not yet tracked
-        kv_pages_total: 0,  // not yet tracked
-        kv_pages_shared: 0, // not yet tracked
+        healthy: default_id.is_some(),
+        kv_usage: None,
+        kv_pages_used: None,
+        kv_pages_total: None,
+        kv_pages_shared: None,
         // Real: admission/backpressure queue depth (§36).
         queue_depth: u32::try_from(snapshot.pending_requests).unwrap_or(u32::MAX),
         // Real: aggregate active sessions across the node.
         active_sessions: u32::try_from(snapshot.active_sessions).unwrap_or(u32::MAX),
-        paused_sessions: 0, // not yet tracked (no preemption/pause state exposed)
-        tokens_per_second: 0.0, // not yet tracked (only cumulative token totals recorded)
+        paused_sessions: None,
+        tokens_per_second: None,
         // Real: in-flight generations over the batch the server can actually
         // assemble. Both terms are measured or configured, not assumed --
         // `current_batch_size` is a gauge incremented when a generation starts
@@ -116,9 +175,9 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
             snapshot.current_batch_size,
             state.config.effective_batch_capacity(),
         ),
-        // Per-session detail: session ids are real (redacted, since full ids are
-        // bearer tokens — see session.rs). priority/kv_pages/state are not yet
-        // tracked, so they carry documented placeholders rather than invented values.
+        // Session ids are real, and redacted because full ids are bearer
+        // tokens (see session.rs). The per-session detail fields are omitted
+        // rather than filled with "unknown".
         sessions: state
             .sessions
             .client_ids_redacted()
@@ -126,13 +185,13 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
             .into_iter()
             .map(|id| SessionStatus {
                 id,
-                priority: "unknown".to_string(), // not yet tracked
-                kv_pages: 0,                     // not yet tracked
-                state: "unknown".to_string(),    // not yet tracked
+                priority: None,
+                kv_pages: None,
+                state: None,
             })
             .collect(),
-        // System-prompt prefix hashes are not yet surfaced by the engine.
-        prefix_hashes: Vec::new(),
+        prefix_hashes: None,
+        unavailable,
     }))
 }
 

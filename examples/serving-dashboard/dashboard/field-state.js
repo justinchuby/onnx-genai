@@ -241,6 +241,30 @@ export function numericValueOf(field) {
 }
 
 /**
+ * Above this denominator a ratio is treated as a genuine continuum and renders
+ * as a percentage. At or below it, the quantity moves in visible discrete
+ * steps and renders `n of m`.
+ *
+ * The boundary is a judgement, not a measurement, so it is named rather than
+ * inlined: the block grid (~14,612 pages) is plainly continuous, `max_batch=4`
+ * plainly is not, and nothing this dashboard renders lives near the line. It
+ * is set generously so that raising `--max-batch` to 8 or 16 does not silently
+ * flip a panel back into fabricating resolution.
+ */
+export const CONTINUUM_DENOMINATOR = 32;
+
+/**
+ * Format a ratio field's own preferred text: `3 of 4`, or a percentage.
+ *
+ * @param {{value: number|null, numerator?: number|null, denominator?: number|null}} field
+ * @returns {string|null}
+ */
+export function ratioText(field) {
+  if (field?.numerator == null || field?.denominator == null) return null;
+  return `${field.numerator} of ${field.denominator}`;
+}
+
+/**
  * Divide two fields into a ratio field-like object, refusing to invent one.
  *
  * This exists because of the specific trap named in demo-ux.md §5.3: batch
@@ -250,12 +274,21 @@ export function numericValueOf(field) {
  * sign. A ratio is unavailable unless BOTH inputs are renderable, and it is
  * unavailable — not zero, not infinity — when the denominator is zero.
  *
+ * D116 is enforced HERE rather than in each panel, because it is a rule about
+ * every ratio and a rule applied per-panel is a rule that will be forgotten by
+ * the seventh panel. A percentage over a small integer denominator FABRICATES
+ * RESOLUTION: the number is right, the precision is invented. `75%` invites a
+ * reader to expect `76%` and reads a 50→75 jump as a smooth 25-point move
+ * rather than as ONE sequence entering the batch. `3 of 4` shows both terms,
+ * makes the granularity self-evident, and stays honest when `--max-batch`
+ * changes — whereas `75%` silently means something different at `max_batch=8`.
+ *
  * @param {{state?: string, value?: unknown}|null|undefined} numerator
  * @param {{state?: string, value?: unknown}|null|undefined} denominator
  * @param {object} [options]
  * @param {string} [options.unavailableReason] Shown when the ratio cannot be formed.
  * @param {string} [options.label]
- * @returns {{value: number|null, state: RenderState, source: string, unit: string, label: string, reason?: string}}
+ * @returns {{value: number|null, state: RenderState, source: string, unit: string, label: string, reason?: string, numerator?: number|null, denominator?: number|null}}
  */
 export function ratioField(numerator, denominator, options = {}) {
   const {
@@ -297,12 +330,24 @@ export function ratioField(numerator, denominator, options = {}) {
     };
   }
 
+  const discrete = Number.isInteger(bottom) && bottom <= CONTINUUM_DENOMINATOR;
+
   return {
-    value: (top / bottom) * 100,
+    value: discrete ? top : (top / bottom) * 100,
+    // Geometry always needs a true 0..1 fraction, whatever the TEXT does. A bar
+    // that read `value` would draw a 3%-wide bar for `3 of 4` the moment this
+    // ratio switched representation — the number would be honest and the
+    // picture would be a lie, which is the harder half to notice.
+    fraction: top / bottom,
+    // Carried so the renderer can show BOTH terms. This also satisfies the
+    // "a ratio invents a numerator — name both terms" rule by construction,
+    // because both terms end up on screen rather than in a tooltip.
+    numerator: discrete ? top : null,
+    denominator: discrete ? bottom : null,
     // Staleness is contagious: a ratio is only as fresh as its stalest input.
     state: isStale(numerator) || isStale(denominator) ? RENDER_STATES.STALE : RENDER_STATES.OK,
     source: 'derived',
-    unit: '%',
+    unit: discrete ? `of ${bottom}` : '%',
     label,
   };
 }

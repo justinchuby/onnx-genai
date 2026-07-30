@@ -1203,18 +1203,20 @@ async fn status_reports_node_status_contract() {
     assert_ne!(node_id, "tiny-llm", "node_id must not be the model id");
 
     assert_eq!(body["healthy"], true);
-    // Real metrics serialize with the right JSON types.
+
+    // Only the genuinely measured fields are type-asserted here.
+    //
+    // This test used to assert `is_u64()` on the KV fields, `paused_sessions`
+    // and `tokens_per_second` as well. Those assertions passed against the
+    // hardcoded zeros, which is the problem: a shape check cannot tell a
+    // measurement from a fabrication, so it made the stubs look tested and
+    // guarded them against removal. Whether those fields are honestly absent is
+    // covered by `status_omits_kv_fields_rather_than_reporting_an_empty_pool`
+    // and the reason-code tests, which assert meaning rather than type.
     assert!(body["queue_depth"].is_u64());
     assert!(body["active_sessions"].is_u64());
-    assert!(body["paused_sessions"].is_u64());
-    assert!(body["kv_usage"].is_number());
-    assert!(body["kv_pages_used"].is_u64());
-    assert!(body["kv_pages_total"].is_u64());
-    assert!(body["kv_pages_shared"].is_u64());
-    assert!(body["tokens_per_second"].is_number());
     assert!(body["batch_utilization"].is_number());
     assert!(body["sessions"].is_array());
-    assert!(body["prefix_hashes"].is_array());
 }
 
 #[tokio::test]
@@ -3833,4 +3835,149 @@ fn an_unknown_bind_address_does_not_disclose_paths() {
         !ServerConfig::default().may_disclose_model_paths(),
         "an unknown bind address must be treated as non-loopback"
     );
+}
+
+/// Walks a JSON value and collects the paths of every `null`.
+fn null_paths(value: &Value, path: &str, found: &mut Vec<String>) {
+    match value {
+        Value::Null => found.push(path.to_string()),
+        Value::Object(map) => {
+            for (key, child) in map {
+                null_paths(child, &format!("{path}.{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                null_paths(child, &format!("{path}[{index}]"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `null` is not a neutral "no value" on this contract -- it is a parse error
+/// downstream. The router's deserialization mirror fills a **missing** key via
+/// `#[serde(default)]` but rejects an explicit `null` into a bare `f32`, which
+/// fails the whole response and marks this node unhealthy. Absent means absent.
+#[tokio::test]
+async fn status_never_emits_null_for_an_unmeasurable_field() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+    let mut nulls = Vec::new();
+    null_paths(&body, "status", &mut nulls);
+    assert!(
+        nulls.is_empty(),
+        "null breaks the router's parse; these fields must be omitted instead: {nulls:?}"
+    );
+}
+
+/// A zero is a measurement claim. `kv_pages_used: 0` asserts an empty pool,
+/// which is a stronger and different statement than "this node cannot tell you".
+#[tokio::test]
+async fn status_omits_kv_fields_rather_than_reporting_an_empty_pool() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+    for field in [
+        "kv_usage",
+        "kv_pages_used",
+        "kv_pages_total",
+        "kv_pages_shared",
+        "paused_sessions",
+        "tokens_per_second",
+        "prefix_hashes",
+    ] {
+        assert!(
+            body.get(field).is_none(),
+            "{field} must be omitted, not reported as a value: {:?}",
+            body.get(field)
+        );
+    }
+}
+
+/// The omissions and their explanations must stay in lockstep. Without this,
+/// a field could be dropped with no reason given (invisible to a UI) or listed
+/// as unavailable while still being sent (contradicting itself).
+#[tokio::test]
+async fn every_omitted_status_field_is_explained_and_every_explained_field_is_omitted() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+    let explained = body
+        .get("unavailable")
+        .and_then(Value::as_object)
+        .expect("omissions must be explained");
+    assert!(!explained.is_empty());
+
+    for (field, reason) in explained {
+        assert!(
+            body.get(field).is_none(),
+            "{field} is explained as unavailable but was still sent"
+        );
+        let code = reason.get("code").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            matches!(code, "unavailable" | "not-applicable"),
+            "{field} has an unrecognised reason code {code:?}"
+        );
+        let detail = reason.get("detail").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            detail.len() > 20,
+            "{field} needs an explanation a visitor can act on, got {detail:?}"
+        );
+    }
+}
+
+/// Preemption does not exist in the driver, so paused sessions are not a
+/// missing measurement -- the concept does not apply. The distinction is what
+/// lets a UI say "not applicable" instead of "temporarily unavailable".
+#[tokio::test]
+async fn status_distinguishes_not_applicable_from_merely_unavailable() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+    let explained = body.get("unavailable").unwrap();
+    assert_eq!(
+        explained
+            .get("paused_sessions")
+            .and_then(|r| r.get("code"))
+            .and_then(Value::as_str),
+        Some("not-applicable"),
+    );
+    assert_eq!(
+        explained
+            .get("tokens_per_second")
+            .and_then(|r| r.get("code"))
+            .and_then(Value::as_str),
+        Some("unavailable"),
+    );
+}
+
+/// A captured payload should identify the model it describes without relying on
+/// the reader remembering which origin served it.
+#[tokio::test]
+async fn status_echoes_the_model_it_describes() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+    let model_id = body
+        .get("model_id")
+        .and_then(Value::as_str)
+        .expect("status must name the model it describes");
+    assert!(!model_id.is_empty());
+    assert_ne!(
+        Some(model_id),
+        body.get("node_id").and_then(Value::as_str),
+        "model_id must name the model, not repeat the node id"
+    );
+}
+
+/// The fields that ARE measured must survive the change to omission -- the
+/// point is to remove fabrications, not to stop reporting.
+#[tokio::test]
+async fn status_still_reports_the_fields_it_genuinely_measures() {
+    let body = get_json(app(tiny_state()), "/v1/status").await;
+    for field in [
+        "node_id",
+        "healthy",
+        "queue_depth",
+        "active_sessions",
+        "batch_utilization",
+        "sessions",
+    ] {
+        assert!(
+            body.get(field).is_some(),
+            "{field} is measured and must be sent"
+        );
+    }
 }

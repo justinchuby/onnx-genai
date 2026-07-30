@@ -65,7 +65,12 @@ describe('renderField — a measured zero and an unmeasurable value must look di
       reason: 'The browser can only observe sent to first token.',
     });
 
-    assert.equal(node.findByClass('value__unit').textContent, 'ms');
+    // Trimmed: the span carries a leading space so that a value and its unit
+    // do not fuse into "12ms" in textContent, which the table view and a
+    // clipboard copy both read. What this test cares about is that the unit
+    // SURVIVES an absent value -- knowing which of the two is missing is itself
+    // information -- not how it is padded.
+    assert.equal(node.findByClass('value__unit').textContent.trim(), 'ms');
   });
 
   it('makes the reason reachable by keyboard and screen reader, not hover only', () => {
@@ -340,5 +345,45 @@ describe('describeFieldText — the sentence panels build describe() from', () =
       describeFieldText('Queue depth', { value: 3, state: 'ok', unit: 'requests' }),
       'Queue depth 3 requests',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// textContent is a PRODUCT SURFACE, not a test convenience.
+//
+// This has now been the root cause of two separate defects: a stale value
+// fusing with its age into "4112s old", and a value fusing with its unit into
+// "3sequences". Both looked perfect in a browser, because the spacing was
+// supplied by a CSS `gap` that exists only in layout.
+//
+// The reason it matters is that the rendered text is read by things that never
+// see the CSS: the "view as table" rendering, `describe()` (which becomes the
+// chart's accessible name), a screen reader's flat traversal, and anyone who
+// selects the number and copies it. So this is pinned rather than left to be
+// rediscovered a third time.
+// ---------------------------------------------------------------------------
+
+describe('rendered text is legible without stylesheets', () => {
+  it('separates a value from its unit in textContent, not merely with a CSS gap', () => {
+    const rendered = renderField(
+      { value: 3, state: 'ok', unit: 'sequences', label: 'active batch', source: 'server' },
+      { label: 'active batch' },
+    );
+
+    assert.match(rendered.textContent, /3 sequences/);
+    assert.doesNotMatch(
+      rendered.textContent,
+      /3sequences/,
+      'the space is supplied by CSS only; a table view or clipboard copy loses it',
+    );
+  });
+
+  it('separates both terms of an n-of-m ratio', () => {
+    const rendered = renderField(
+      { value: 3, state: 'ok', unit: 'of 4', label: 'occupancy', source: 'derived' },
+      { label: 'occupancy' },
+    );
+
+    assert.match(rendered.textContent, /3 of 4/);
   });
 });

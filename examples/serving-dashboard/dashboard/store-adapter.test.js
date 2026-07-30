@@ -151,7 +151,7 @@ describe('store adapter — rate', () => {
     // value is still being settled between CONTRACT.md and telemetry-field.js,
     // and a test that pins the spelling would break on a rename that changes
     // nothing about the behaviour it is checking.
-    assert.equal(rate.state, FIELD_STATES.MEASURED);
+    assert.equal(rate.state, FIELD_STATES.OK);
     assert.equal(rate.value, 50);
     assert.equal(rate.source, 'derived');
     assert.deepEqual(rate.derivedFrom, ['metrics.tokens_generated_total']);

@@ -179,7 +179,14 @@ test('no state falls through to a blank or an undefined', () => {
     pendingField('r'),
     staleField(measuredField(1, { source: '/x' }), 'r'),
   ];
-  assert.equal(fields.length, Object.keys(FIELD_STATES).length, 'one sample per declared state');
+  // Counted against DISTINCT wire values, not key count: `MEASURED` is a
+  // transitional alias for `OK` and is the same state, so a key-count check
+  // would demand a sixth sample that does not exist.
+  assert.equal(
+    fields.length,
+    new Set(Object.values(FIELD_STATES)).size,
+    'one sample per declared state',
+  );
   for (const field of fields) {
     const out = formatField(field, { nowMs: NOW });
     assert.ok(out.text && out.text.trim().length > 0, `${field.state} rendered blank`);

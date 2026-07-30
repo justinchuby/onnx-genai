@@ -21,7 +21,7 @@
  *
  * These are the WIRE VALUES, which is what `field.state` is actually compared
  * against. Note that the measured state's value is `'ok'`, not `'measured'` --
- * the constant is named `FIELD_STATES.MEASURED` but emits `'ok'` (see :90).
+ * the constant is named `FIELD_STATES.OK` but emits `'ok'` (see :90).
  * This typedef previously read `'measured'`, which meant a reader following the
  * documentation would write `field.state === 'measured'` and get a comparison
  * that is NEVER true, with no error to explain why. Always compare against
@@ -100,11 +100,42 @@ export const SOURCE_CLASSES = Object.freeze({
 });
 
 export const FIELD_STATES = Object.freeze({
-  MEASURED: 'ok',
+  /**
+   * The canonical name. `OK` and `'ok'` agree, which is the whole point.
+   *
+   * Two rulings collided here and this is the shape that satisfies both. The
+   * wire value must stay `'ok'`: a field carrying `state: 'measured'` beside
+   * `sourceClass: 'estimated'` contradicts itself, because STATE answers "can
+   * I trust this" and SOURCE answers "where did it come from" — a derived
+   * value is not measured and an estimate certainly is not. But a constant
+   * named `MEASURED` whose value is `'ok'` is a landmine with no symptom:
+   * `field.state === 'measured'` is false for every measured field on the
+   * page, and the comparison fails SILENTLY while the output still looks
+   * right.
+   *
+   * Renaming the constant fixes the landmine without touching the wire, so no
+   * `[data-state='ok']` selector, stored snapshot or panel binding moves.
+   */
+  OK: 'ok',
   PENDING: 'pending',
   STALE: 'stale',
   UNAVAILABLE: 'unavailable',
   NOT_APPLICABLE: 'not-applicable',
+
+  /**
+   * @deprecated Use `FIELD_STATES.OK`.
+   *
+   * A transitional alias, not a sixth state — it is the same string. It exists
+   * so the rename did not have to be a flag-day edit landing atomically across
+   * every consumer, which matters here because several of those consumers are
+   * being edited concurrently. Delete it once no `FIELD_STATES.MEASURED`
+   * reference remains; the test below fails if it ever becomes a distinct
+   * value rather than an alias.
+   *
+   * Never global-replace the string `ok` to remove it: `status: 'ok'` is the
+   * HTTP health payload, and renaming that fakes an unreachable server.
+   */
+  MEASURED: 'ok',
 });
 
 /**
@@ -170,7 +201,7 @@ export function measuredField(
   }
   return Object.freeze({
     value,
-    state: FIELD_STATES.MEASURED,
+    state: FIELD_STATES.OK,
     source,
     sourceClass,
     origin,
@@ -404,7 +435,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
   const observedAtMs = Math.min(...keys.map((key) => inputs[key].observedAtMs ?? Date.now()));
   return Object.freeze({
     value: result,
-    state: anyStale ? FIELD_STATES.STALE : FIELD_STATES.MEASURED,
+    state: anyStale ? FIELD_STATES.STALE : FIELD_STATES.OK,
     source: 'derived',
     sourceClass: SOURCE_CLASSES.DERIVED,
     // All inputs must share an origin for the result to be attributable to one
@@ -434,7 +465,7 @@ export function derivedField(inputs, compute, { unit = null, label = null, undef
  * @returns {boolean}
  */
 export function hasValue(field) {
-  return field.state === FIELD_STATES.MEASURED || field.state === FIELD_STATES.STALE;
+  return field.state === FIELD_STATES.OK || field.state === FIELD_STATES.STALE;
 }
 
 /**

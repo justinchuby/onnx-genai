@@ -126,20 +126,43 @@ describe('ratioField — the batch-occupancy trap (demo-ux.md §5.3)', () => {
     assert.equal(occupancy.value, null);
   });
 
-  it('computes the percentage when both inputs are real', () => {
+  it('renders a small-denominator ratio as n of m, never as a percentage', () => {
+    // D116. `75%` is arithmetically correct and epistemically false: it invents
+    // resolution the quantity does not have. It invites the reader to expect
+    // `76%`, and makes 50->75 read as a smooth 25-point move rather than as ONE
+    // sequence entering the batch. It also silently means something different
+    // if `--max-batch` changes, while `3 of 4` stays honest.
     const occupancy = ratioField(measured(3), measured(4));
 
     assert.equal(occupancy.state, RENDER_STATES.OK);
-    assert.equal(occupancy.value, 75);
-    assert.equal(occupancy.unit, '%');
+    assert.equal(occupancy.value, 3);
+    assert.equal(occupancy.numerator, 3);
+    assert.equal(occupancy.denominator, 4);
+    assert.equal(occupancy.unit, 'of 4');
+    assert.notEqual(occupancy.value, 75);
     assert.equal(occupancy.source, 'derived', 'a computed ratio must be badged as derived, not server');
+
+    // Geometry still gets a true fraction, so a bar drawn from this ratio
+    // cannot contradict the text printed beside it.
+    assert.equal(occupancy.fraction, 0.75);
+  });
+
+  it('still uses a percentage where the denominator is a genuine continuum', () => {
+    // The block grid is ~14,612 pages: there, a percentage is the honest
+    // format and `9137 of 14612` is the unreadable one.
+    const utilization = ratioField(measured(7306), measured(14_612));
+
+    assert.equal(utilization.unit, '%');
+    assert.equal(utilization.value, 50);
+    assert.equal(utilization.numerator, null, 'a continuum ratio has no n-of-m form');
   });
 
   it('propagates staleness, because a ratio is only as fresh as its stalest input', () => {
     const occupancy = ratioField({ state: 'stale', value: 2 }, measured(4));
 
     assert.equal(occupancy.state, RENDER_STATES.STALE);
-    assert.equal(occupancy.value, 50);
+    assert.equal(occupancy.value, 2);
+    assert.equal(occupancy.denominator, 4);
   });
 
   it('carries a reason a visitor can act on when it declines', () => {

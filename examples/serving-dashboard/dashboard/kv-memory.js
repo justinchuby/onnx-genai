@@ -192,7 +192,11 @@ function renderBlockFraction(blocksUsed, blocksTotal) {
  * @returns {HTMLElement}
  */
 function renderUtilizationBar(utilization, blocksUsed, blocksTotal) {
-  const percentage = numericValueOf(utilization);
+  // `fraction`, not `value`: a discrete ratio carries its NUMERATOR in `value`
+  // (`3 of 4`), so measuring the bar from `value` would draw 3% and quietly
+  // contradict the text beside it.
+  const percentage =
+    typeof utilization?.fraction === 'number' ? utilization.fraction * 100 : numericValueOf(utilization);
   if (percentage === null) {
     return element('div', {
       className: ['utilization-bar', 'utilization-bar--unavailable'],

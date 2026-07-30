@@ -259,7 +259,7 @@ function renderProvenanceFooter(rootElement) {
     ]);
     row.dataset.classification = entry.classification;
     row.dataset.renderState =
-      entry.classification === 'MEASURED' ? FIELD_STATES.MEASURED : FIELD_STATES.UNAVAILABLE;
+      entry.classification === 'MEASURED' ? FIELD_STATES.OK : FIELD_STATES.UNAVAILABLE;
     body.append(row);
   }
   table.append(body);

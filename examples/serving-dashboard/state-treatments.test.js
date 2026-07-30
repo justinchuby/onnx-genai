@@ -4,7 +4,7 @@
 // visual treatment in the CSS that receives it.
 //
 // WHY THIS FILE EXISTS. `styles/shell.css` styled `[data-state='measured']`
-// while `FIELD_STATES.MEASURED` is the string `'ok'`, so the rule for the most
+// while `FIELD_STATES.OK` is the string `'ok'`, so the rule for the most
 // common state on the page matched nothing at all. Every measured value fell
 // back to inherited styling — which looks close enough to correct that it
 // survived a browser check. Nothing in JS could catch it: the JS was right.

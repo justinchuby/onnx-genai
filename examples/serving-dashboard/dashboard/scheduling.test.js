@@ -110,7 +110,15 @@ describe('scheduling panel — the batch occupancy denominator', () => {
     );
 
     const occupancy = root.findByClass('occupancy');
-    assert.match(occupancy.textContent, /75/, 'a real denominator yields a real percentage');
+    // D116: `n of m`, never a percentage over a count of four. Both terms are
+    // on screen, so `max_batch` never has to be hunted for and the reader can
+    // see that this quantity moves one whole sequence at a time.
+    assert.match(occupancy.textContent, /3 of 4/);
+    assert.doesNotMatch(
+      occupancy.textContent,
+      /75\s*%/,
+      'a percentage here invents resolution the quantity does not have',
+    );
 
     const bar = root.findByClass('capacity-bar');
     assert.equal(bar.getAttribute('aria-valuemax'), '4');

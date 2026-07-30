@@ -314,7 +314,7 @@ export function renderField(field, options = {}) {
       }),
     );
     if (showUnit) {
-      wrapper.append(element('span', { className: 'value__unit', text: unit }));
+      wrapper.append(element('span', { className: 'value__unit', text: ` ${unit}` }));
     }
     return wrapper;
   }
@@ -333,7 +333,7 @@ export function renderField(field, options = {}) {
       }),
     );
     if (showUnit) {
-      wrapper.append(element('span', { className: 'value__unit', text: unit }));
+      wrapper.append(element('span', { className: 'value__unit', text: ` ${unit}` }));
     }
     return wrapper;
   }
@@ -345,7 +345,7 @@ export function renderField(field, options = {}) {
 
   wrapper.append(element('span', { className: 'value__num', text: `${prefix}${rendered}` }));
   if (showUnit) {
-    wrapper.append(element('span', { className: 'value__unit', text: unit }));
+    wrapper.append(element('span', { className: 'value__unit', text: ` ${unit}` }));
   }
   wrapper.append(sourceBadge(sourceClass, describeProvenance(field)));
 

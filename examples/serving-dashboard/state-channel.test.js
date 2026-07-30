@@ -35,7 +35,7 @@ const css = readFileSync(SHELL_CSS, 'utf8');
 // `measured` is styled as the inherited default. Reading the enum from its
 // source of truth means a rename lands here as a red test instead of as a
 // silent loss of every absence treatment on the page.
-const DEFAULT_STATE = FIELD_STATES.MEASURED;
+const DEFAULT_STATE = FIELD_STATES.OK;
 const ABSENCE_STATES = Object.freeze(
   Object.values(FIELD_STATES).filter((state) => state !== DEFAULT_STATE),
 );
@@ -159,9 +159,15 @@ describe('field states are legible without colour', () => {
 // states, and MEASURED's wire value is its own name.
 describe('the ruled field-state vocabulary', () => {
   it('is exactly five states', () => {
+    // Asserted on the WIRE VALUES rather than on the key count, because the
+    // invariant that matters is how many distinct states can reach a panel or
+    // a `[data-state=...]` selector. A deprecated alias pointing at an
+    // existing value adds a key but no state, and forbidding that would force
+    // the OK rename to land atomically across files other agents are editing
+    // right now. A genuinely new or a collapsed state still fails here.
     assert.deepEqual(
-      Object.keys(FIELD_STATES).sort(),
-      ['MEASURED', 'NOT_APPLICABLE', 'PENDING', 'STALE', 'UNAVAILABLE'],
+      [...new Set(Object.values(FIELD_STATES))].sort(),
+      ['not-applicable', 'ok', 'pending', 'stale', 'unavailable'],
       'FIELD_STATES must carry exactly the five ruled states. NOT_APPLICABLE is ' +
         'not interchangeable with UNAVAILABLE: `unavailable` is a PROMISE (the ' +
         'number could exist once someone plumbs it), `not-applicable` is an ' +
@@ -173,10 +179,18 @@ describe('the ruled field-state vocabulary', () => {
     );
   });
 
-  it('gives MEASURED a wire value equal to its own name', () => {
+  it('gives the measured state a constant whose name equals its wire value', () => {
+    // Reconciles two rulings that pointed in opposite directions. Both agreed
+    // the name/value mismatch was a real landmine; they disagreed on which
+    // side to move. Moving the WIRE to 'measured' would have made the field
+    // contradict itself -- `state: 'measured'` beside `sourceClass:
+    // 'estimated'` is a claim and its own refutation -- and would have touched
+    // every [data-state='ok'] selector, twelve modules and the static
+    // skeleton. Renaming the CONSTANT costs none of that and removes the same
+    // landmine, so that is the direction taken: FIELD_STATES.OK === 'ok'.
     assert.equal(
-      FIELD_STATES.MEASURED,
-      'measured',
+      FIELD_STATES.OK,
+      'ok',
       "A constant named MEASURED whose value is 'ok' is a landmine with no " +
         "symptom: `field.state === 'measured'` returns false for every measured " +
         'field on the dashboard, and the field then renders as a plain number ' +
@@ -188,5 +202,11 @@ describe('the ruled field-state vocabulary', () => {
         "`status: 'ok'` is the HTTP health payload and renaming it fakes an " +
         'unreachable server.',
     );
+
+    // The old spelling stays valid as a transitional alias, but it must never
+    // become a SECOND state on the wire -- a sixth string that no stylesheet
+    // renders and no panel branches on would fail silently in exactly the way
+    // this rename exists to stop.
+    assert.equal(FIELD_STATES.MEASURED, FIELD_STATES.OK);
   });
 });
