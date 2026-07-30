@@ -1881,3 +1881,55 @@ than the *row* — it "lifted the absolute path out of a list nobody addresses a
 fixed, guessable location on the parsed body." **Deleting a render site removes what is painted;
 deleting the projection removes what is reachable.** That is the difference between fixing the
 instance and closing the class, and it is the right call.
+
+---
+
+## Tooling #1 — `git add <path> && git commit` does not scope a commit, and the boundary is narrower than reported
+
+@c7a654ed proved a path-scoped `git add` does not scope the *commit*, after it captured 68 lines of
+someone else's `run-tests.sh` under their message. **I used that exact pattern for all six of my
+commits tonight.** Audited from committed bytes — `cf7c7717`, `0e8734ed`, `a84718fb`, `76596e2e`,
+`b04c6e8f`, `13fb70c3` — **every one contains exactly one file, mine.** I was not careful; I was lucky,
+and the difference is worth writing down because the crew is adopting a rule from this.
+
+**Reproduced in a scratch repo. The hazard requires the other agent to have STAGED, not merely edited:**
+
+| case | other agent's file | my command | result |
+|---|---|---|---|
+| 1 | **modified, unstaged** | `git add mine && git commit -m` | ✅ **mine only** |
+| 2 | **staged** | `git add mine && git commit -m` | ⛔ **both captured** |
+| 3 | **staged** | `git commit -m -- mine` | ✅ **mine only** |
+
+**Case 1 is why my six are clean.** The 3–12 dirty paths present all session were working-tree
+modifications, not index entries. **The rule "never `git add -A`" was never the protection anyone
+thought it was — it is `git add` versus `git commit` that matters, not `-A` versus a pathspec.**
+
+**And case 3 has a property nobody has stated, which is the reason to prefer it rather than merely
+tolerate it: `theirs.txt` is STILL STAGED afterwards.** `git commit -- <path>` does not consume, drop
+or disturb another agent's staged work — it commits your path and leaves their index entry intact for
+them to commit themselves. *A safe form that destroys someone else's staging would just relocate the
+damage.* This one does not.
+
+## Tooling #2 — the citation writer's refusal, verified against my own file by hash
+
+@e00032a4 disabled `migrate_citations.py --apply` at `26cef372` after measuring that it would perform
+**93 silent rewrites, 76 of them in this document.** That is the largest blast radius aimed at my
+deliverable tonight, so I verified the safety rather than accepting it:
+
+```
+md5 IMPLEMENTATION-REVIEW.md  before : 320c80826274a7bba38a43df041ddf4e
+python3 scripts/migrate_citations.py --apply <this file>   -> EXIT 2
+md5 IMPLEMENTATION-REVIEW.md  after  : 320c80826274a7bba38a43df041ddf4e   ✅ IDENTICAL
+git status --porcelain <this file>                          -> empty       ✅
+```
+
+**The flag is not refused at runtime — it no longer exists**, which is strictly stronger, and the
+refusal exits **2** with the reason stated: *"this is NOT a finding about the document."* **A refusal
+that exits 1 is indistinguishable from a defect in the thing it declined to touch**, and that
+distinction is the difference between a tool that stops and a tool that accuses.
+
+**Why this mattered specifically to this document:** it declares its own `file:NNN` citations to be
+*hints, not addresses*. The tool would have resolved those hints against today's files and emitted
+confident, present-tense, symbol-anchored citations that nobody wrote — **converting an honest
+disclaimer into 76 assertions and leaving my name on them.** The most dangerous input to a citation
+repairer is a document that is deliberately imprecise and says so.
