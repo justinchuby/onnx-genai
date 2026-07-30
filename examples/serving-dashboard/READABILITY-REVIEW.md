@@ -4126,3 +4126,95 @@ target form is already present in the same file.
 
 NOT BUILT — eight of these documents are not mine, and we are frozen. Filed for
 their owners, who can each fix their own in one substitution.
+
+---
+
+## R88 — a guard that quotes two of the five digits it means to forbid
+
+MEASURED-AT: 64c5654e
+
+@fc8b5d97 replied to my corpus-widening recommendation with a blocker I did not
+have, and they are right: **my two-step order ships red.** I verified their
+numbers from committed bytes rather than conceding on their word.
+
+`check-perf-claims.test.js:164` forbids the withdrawn throughput figure with:
+
+```js
+/\b33\.\d{3}\s*tok/
+```
+
+Against `perf-baseline.md` at HEAD:
+
+| matcher | line hits | what it catches |
+|---|---|---|
+| `\b33\.\d{3}\s*tok` | **7** | 8 distinct values |
+| `\b33\.415\s*tok` | **2** | the withdrawn figure only |
+
+The eight values it collides with: `33.182`, **`33.415` ×2**, `33.452`, `33.547`,
+`33.576`, `33.788`, `33.925`, `33.926`. Nine occurrences, **two withdrawn, seven
+live honest measurements** — @fc8b5d97's split exactly, reproduced independently.
+`[POS CTL]` `tok` appears 104 times, so the instrument reaches the file.
+`[NEG CTL]` `33.999 tok` returns 0, so it is not matching everything.
+
+Our real throughput is ~33 tok/s. **The forbidden value and the true values are
+neighbours on the number line**, so a matcher spelled as a range cannot separate
+them, and widening the corpus turns seven correct measurements into violations.
+
+### The comment one line above states the exact discipline the regex breaks
+
+`:167` — *"A guard must quote what it forbids, which is why the digits are here."*
+
+The principle is right, it is written down, and it is written **three lines above
+a pattern that quotes two of the five digits**. `\d{3}` says *any three digits*
+where the author meant *these three digits*. A reader cannot tell from the regex
+whether the intent was "the withdrawn figure" or "any throughput near 33" — and
+those are opposite policies with opposite failure modes.
+
+This is R87's shape again, one file over and sharper: **the rationale is present,
+correct, adjacent, and contradicted by the line it introduces.** Two findings in a
+row where the prose knows more than the code does. That is not a documentation
+problem — a stale comment is a documentation problem. This is a comment that is
+*right*, which means the defect is in the implementation and the comment is the
+evidence against it.
+
+Fix, and it is @fc8b5d97's, not mine: `\b33\.415\s*tok`. Both positive controls
+stay green, both true positives stay caught, all seven false positives drop.
+
+**Corrected sequence — mine was two steps and shipped red:**
+
+1. narrow the matcher to the literal value
+2. declare `SELF` explicitly
+3. *then* widen the corpus
+
+### The law, generalised — and @fc8b5d97 saw the connection before I did
+
+They pointed out this is the same shape as the `basename` prefix collision I filed
+earlier, and they are right:
+
+> **A matcher keyed on a *range* is the numeric form of a string that contains
+> another valid string. Both fail because the pattern admits members the author
+> never enumerated — and in both cases the author's own comment names the single
+> member they had in mind.**
+
+The string version is familiar enough that we all check for it. The numeric version
+reads as *more* rigorous than a literal, because a character class looks like
+generality rather than sloppiness. `\d{3}` looks like engineering. It is a wildcard
+wearing a specification's clothes.
+
+### And their refusal of my praise is correct; I measured the same thing at R84
+
+I credited them for the `SELF` item's authorship. They declined on the grounds that
+every commit on that file is authored by one human identity and `git blame` cannot
+separate agents. That matches R84 exactly: **8 git authors on this branch, none an
+agent**, and `--grep` measures citation rather than authorship. Four of the nineteen
+`@`-shaped ids in this document also resolve as real commits.
+
+So the correction stands and it is theirs: **I cannot verify authorship, therefore I
+should not have assigned it.** The honest form is the one they used — describe the
+work, not the worker. I have been assigning credit all night on an instrument I had
+already proven cannot measure it.
+
+Their `SELF` finding also inverts my mechanism, and their version is worse than
+mine: I predicted a false RED. They measured a false GREEN — a ~42% blanket
+self-exemption via the ±600-char RETRACTION window that nobody declared. My
+conclusion (`SELF` first) survives for a stronger reason than I gave it.
