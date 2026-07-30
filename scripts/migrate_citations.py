@@ -18,12 +18,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Mirrors tree_context.CANNOT_RUN. Deliberately duplicated rather than
-# imported: this file predates the shared helper and still carries its own
-# repo_root() at :39. Adopting tree_context here is the correct change and it
-# is NOT this change -- rewiring an untested writer's tree resolution while
-# disabling its write path would mix two edits with opposite risk profiles.
-CANNOT_RUN = 2
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tree_context  # noqa: E402
+
+# Was a local mirror of tree_context.CANNOT_RUN alongside a private repo_root().
+# The duplication was disclosed and deferred as scope creep, which was the right
+# call for that commit and became the wrong state to leave behind: MEASURED IN A
+# REAL ARCHIVE EXTRACT, this file exited 1 WITH A RAW TRACEBACK while its three
+# siblings exited 2. The crew has been told, and is repeating to reviewers, that
+# "four python instruments exit 2". Three did.
+#
+# That is the exact failure tree_context.repo_root's own docstring forbids -- "a
+# crash and a finding must never print the same thing" -- so the sentence was
+# written in this directory and contradicted two files away. A reviewer in an
+# extract would have read a traceback as a defect in the branch.
+CANNOT_RUN = tree_context.CANNOT_RUN
 
 POSITIONAL = re.compile(r"`([\w./\-]+\.(?:rs|py|js|css|html|toml|md|sh)):(\d+)(?:-(\d+))?`")
 
@@ -41,12 +50,6 @@ ENCLOSING = [
     re.compile(r"^\s*def\s+([A-Za-z_]\w*)"),
     re.compile(r"^#+\s+(.+?)\s*$"),
 ]
-
-
-def repo_root() -> Path:
-    return Path(subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, check=True).stdout.strip())
 
 
 def tracked(repo: Path) -> set[str]:
@@ -106,7 +109,20 @@ def main() -> int:
         return 2
     doc = Path(sys.argv[1])
     apply = "--apply" in sys.argv
-    repo = repo_root()
+    # tree_context.repo_root() derives the tree from THIS SCRIPT'S location and
+    # never from the caller's cwd. That is a real behaviour change from the
+    # deleted private copy, which used cwd, and it is the intended one: it is
+    # what all four siblings already do, so the four instruments now agree on
+    # which tree they are talking about. The property is a known sharp edge and
+    # is documented at tree_context.repo_root; it is not rediscovered here.
+    try:
+        repo = tree_context.repo_root()
+    except tree_context.NoWorktree as exc:
+        print(f"CANNOT RUN: {exc}", file=sys.stderr)
+        print("  This is NOT a finding about the document. The tool could not "
+              "locate a git worktree, so it never read anything to have an "
+              "opinion about.", file=sys.stderr)
+        return CANNOT_RUN
     paths = tracked(repo)
     cache: dict[str, list[str]] = {}
 
