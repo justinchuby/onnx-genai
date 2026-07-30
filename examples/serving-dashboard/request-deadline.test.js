@@ -115,7 +115,24 @@ test('a real rejection passes through unchanged, not relabelled as a timeout', a
   assert.ok(!(error instanceof RequestTimeoutError));
 });
 
-test('the caller options reach the underlying fetch untouched', async () => {
+test("caller options are forwarded, and this module's own two are not", async () => {
+  // TITLE SCOPE, STATED DELIBERATELY. This was called "the caller options reach
+  // the underlying fetch untouched" and that claim was false in two directions.
+  //
+  // It claimed too much: `untouched` is a universal over every option, and the
+  // body exercises `headers` and `cache`. The one option with interesting
+  // behaviour is `signal`, and the assertion on it below cannot distinguish a
+  // composed signal from a caller signal that was silently thrown away --
+  // presence is precisely what an overwrite preserves. See F22 immediately
+  // below, which is where that defect actually lived.
+  //
+  // And it claimed the wrong thing: `signal` is deliberately NOT untouched. It
+  // is COMPOSED with the deadline, so a title promising it arrives unmodified
+  // describes the bug rather than the contract.
+  //
+  // A test name is read as a specification and verified by nobody, so this one
+  // now names only the two things its body proves: options in, module options
+  // out.
   let seen = null;
   await fetchWithDeadline('http://healthy.invalid/health', {
     fetchImpl: async (_input, init) => {
@@ -128,11 +145,62 @@ test('the caller options reach the underlying fetch untouched', async () => {
 
   assert.deepEqual(seen.headers, { accept: 'application/json' });
   assert.equal(seen.cache, 'no-store');
-  assert.ok(seen.signal, 'no signal was attached');
+  // A FLOOR, NOT A PROOF: this says a signal was attached at all. It cannot say
+  // WHICH, and it must not be read as covering the composition contract.
+  assert.ok(seen.signal instanceof AbortSignal, 'no signal was attached');
   // The two options this module consumes must NOT be forwarded — `fetch`
   // ignores unknown keys silently, so a leak here would never be noticed.
   assert.equal(seen.fetchImpl, undefined);
   assert.equal(seen.timeoutMs, undefined);
+});
+
+test('the forwarded signal is neither the caller\'s own nor the caller\'s absence', async () => {
+  // The distinction the test above CANNOT make, made here on identity.
+  //
+  // Three outcomes are possible when a caller passes a signal, and `ok(signal)`
+  // scores all three identical:
+  //   forwarded raw   seen.signal === callerSignal   -> the deadline is lost
+  //   overwritten     seen.signal === the deadline's -> the caller is lost
+  //   composed        neither                        -> the contract
+  // Only the third is correct, and it is the only one stating BOTH inequalities
+  // proves. F22 below proves the composed signal behaves correctly; this proves
+  // the object handed to fetch is the composed one in the first place.
+  const caller = new AbortController();
+  let withCaller = null;
+  await fetchWithDeadline('http://healthy.invalid/health', {
+    fetchImpl: async (_input, init) => {
+      withCaller = init;
+      return { ok: true };
+    },
+    signal: caller.signal,
+  });
+
+  let withoutCaller = null;
+  await fetchWithDeadline('http://healthy.invalid/health', {
+    fetchImpl: async (_input, init) => {
+      withoutCaller = init;
+      return { ok: true };
+    },
+  });
+
+  assert.notEqual(
+    withCaller.signal,
+    caller.signal,
+    "the caller's signal was forwarded as-is, so the deadline is no longer armed " +
+      'on this request',
+  );
+  assert.ok(
+    withCaller.signal instanceof AbortSignal,
+    'a caller signal was passed and nothing arrived at fetch',
+  );
+  // The negative control for the assertion above: with NO caller signal the
+  // module forwards its own deadline signal directly, so `notEqual` there is
+  // reporting composition rather than reporting that any two AbortSignals from
+  // separate calls are different objects.
+  assert.ok(
+    withoutCaller.signal instanceof AbortSignal,
+    'with no caller signal the deadline signal should still be attached',
+  );
 });
 
 // F22. The test above asserts `ok(seen.signal)` and passed throughout the
