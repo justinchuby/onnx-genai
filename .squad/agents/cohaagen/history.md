@@ -20,3 +20,10 @@
 - PR #480 merged (Melina APPROVED): NVRTC `CausalConvWithState` kernel (fp32/fp16/bf16, f32-accum to match ORT/CPU) + `GatherBlockQuantized` coverage declaration (#67). Oracle chain CUDA->CPU EP->ORT; advertised ops 161 -> 163. Closed the registered-but-undeclared GBQ coverage-of-coverage hole.
 - Empirical #67 audit: classic transformer decode is 100% covered on CUDA; control-flow (If/Loop/Scan) is executor-handled and must NOT be added to the EP; remaining real gaps are the Qwen3.5 hybrid family (CausalConvWithState landed, LinearAttention next).
 - Follow-up (safe-to-defer, fail-closed): GBQ bits=4 odd-blocks-per-row. In flight: LinearAttention (rank-2 gap), PR pending.
+
+## 2026-07-30T21:15:00Z — PR #484 + #525 merged (CUDA LinearAttention; #67 coverage-polish)
+
+- PR #484 merged: CUDA LinearAttention (Gated DeltaNet) kernel — per-thread f32-register-column state; 4/4 parity; qwen3.5 hybrid node placement 0→18/18/24. Coordinator resolved a merge conflict with #480 in kernels/mod.rs/provider.rs/docs (union of ops).
+- PR #525 merged (Melina APPROVED): #67 coverage-polish — RotaryEmbedding com.microsoft + fixed dtype-check bug (Int64 position_ids compared vs float); Bool NonZero on both EPs via `to_dense_bool`; GatherBlockQuantized odd-blocks-per-row LOUD fail-closed gate + honest doc softening. Op counts unchanged (no new op names).
+- Qwen3.5 hybrid recurrent op set now fully CUDA-covered (CausalConvWithState #480 + LinearAttention #484 + RoPE-contrib/NonZero #525).
+- In flight: hybrid-e2e.

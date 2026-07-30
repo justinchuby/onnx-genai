@@ -32,3 +32,10 @@
 - PR #478 merged (Melina APPROVED): Inc2a pure refactor — stateful `PipelineDecoderComponent` trait + `OrtPipelineDecoder`; `PipelineDecodeLoopBackend` drives the decoder through the trait. Behaviour-identical (e2e token output unchanged + explicit equivalence assertion).
 - PR #479 merged (Lori APPROVED, instrumented proof): Inc2b `NativePipelineDecoder` device-KV decoder — KV stays device-resident, one embedding uploaded/step, static cross-KV uploaded once. Token parity `[0,5,6,7] == ORT` on a small CPU model. Native step extended for routed/`inputs_embeds` inputs.
 - In flight: Inc3 (CUDA native decoder — device-KV paged mirroring + cross-component/vision, full 35B-A3B on native), PR pending.
+
+## 2026-07-30T21:15:00Z — Native pipeline Inc3a + Inc3b merged (#485, #487)
+
+- PR #485 merged: Inc3a — CUDA native decoder via `inputs_embeds`; on-GPU token parity at positions [0,5,6,7].
+- PR #487 merged (Lori APPROVED): Inc3b — generic routed CUDA ports; `decode_cuda_eager_step_inputs`/`prepare_cuda_owned_step_inputs` metadata-driven; removed `load.rs` CUDA Routed refusal; captured fast path byte-identical; KV device-resident. mask/ReduceSum finding = ARTIFACT not blocker, proven by real qwen3-0.6b native-CUDA e2e locking 32 tokens to ORT-CUDA on a mask-consuming decoder.
+- MILESTONE: native multi-component pipeline CUDA decode path (Inc2a→Inc3b) fully on main; real qwen3-0.6b native-CUDA matches ORT-CUDA for 32 tokens.
+- In flight: Inc3c (perf).
