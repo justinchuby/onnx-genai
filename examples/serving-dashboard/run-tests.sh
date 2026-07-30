@@ -185,6 +185,35 @@ fi
 
 if [[ $failed -ne 0 ]]; then
   echo "FAIL: ${failed} failing test(s)." >&2
+  # RE-EMIT THE DIAGNOSIS LAST, ON PURPOSE.
+  #
+  # Node prints its `✖ failing tests:` section BEFORE this reconciliation block,
+  # so `run-tests.sh | tail -12` -- the obvious thing an operator types -- shows
+  # the word FAIL and destroys the only copy of WHICH test failed. That is not
+  # hypothetical: two intermittent reds were observed and lost exactly this way,
+  # and eighteen subsequent runs were green, so the failing test could never be
+  # named. AN UNIDENTIFIABLE RED IS WORSE THAN A GREEN; it makes every later run
+  # unfalsifiable evidence.
+  #
+  # The runner already holds the whole run in `$output`. Printing the section
+  # again costs nothing and makes the diagnosis survive any pipeline.
+  detail=$(echo "$output" | awk '/^✖ failing tests:/{f=1} f')
+  if [[ -n ${detail} ]]; then
+    echo "      --- failing tests, re-printed so a piped run keeps them ---" >&2
+    echo "${detail}" | sed 's/^/      /' >&2
+    # And the NAMES again, last. The detail block above is ~20 lines per
+    # failure, so `| tail` lands inside a stack trace and still cannot tell you
+    # what broke. The last line of this script's output must be the answer.
+    names=$(echo "${detail}" | grep '✖' | grep -v '^✖ failing tests:')
+    if [[ -n ${names} ]]; then
+      echo "      --- the ${failed} failing test(s), by name ---" >&2
+      echo "${names}" | sed 's/^ *//; s/^/      /' >&2
+    fi
+  else
+    echo "      Node reported ${failed} failure(s) but this script could not" >&2
+    echo "      locate its failure section to re-print. Re-run WITHOUT piping" >&2
+    echo "      and read Node's own output; do not treat this as diagnosed." >&2
+  fi
   status=1
 fi
 
