@@ -21,13 +21,25 @@ MUTATION PROVING IT FAILS: point any citation at a `///` line -- e.g. change a
 `batched.rs:759` reference to `batched.rs:758` -- and it reports COMMENT.
 """
 import re, os, sys
+from pathlib import Path
 from collections import defaultdict
-# ROOT is derived, never hardcoded. It was an absolute home-directory path
-# until a reviewer caught it: that makes the script silently inert for every
-# other person and every CI runner, while still printing a confident report.
-import subprocess
-ROOT = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                      capture_output=True, text=True, check=True).stdout.strip()
+
+# ROOT WAS an absolute home-directory path until a reviewer caught it, which
+# made the script silently inert for every other person and every CI runner
+# while still printing a confident report. That was fixed by deriving it from
+# `git rev-parse --show-toplevel`.
+#
+# BUT A BARE `rev-parse` RESOLVES AGAINST THE CALLER'S CWD, NOT THE SCRIPT'S.
+# This machine carries SEVEN checkouts of this repository, four of which do not
+# contain the demo at all. Run from the wrong one, the old line audited a
+# DIFFERENT TREE and reported on it with total confidence -- a hardcoded path
+# that had merely become someone else's hardcoded path. tree_context.repo_root()
+# anchors on Path(__file__), so this script always audits the worktree it is
+# part of, whatever directory it is invoked from.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tree_context  # noqa: E402
+
+ROOT = str(tree_context.repo_root())
 # argv[1] lets the mutation test run against a COPY. Never mutate the live
 # tree to test a checker -- another agent is almost certainly editing it.
 DOC=sys.argv[1] if len(sys.argv)>1 else os.path.join(ROOT,"docs/ARCHITECTURE.md")
@@ -98,6 +110,28 @@ if missing: print("### UNRESOLVED:", sorted(missing)[:10])
 # pointed at nothing, which is the most expensive kind, because its output
 # looks identical to a safeguard that is working.
 drifted = len(blank) + len(delim) + len(missing)
+
+# EMPTY INPUT IS A FAILURE, NOT A PASS. This script audits `file:line`
+# citations. docs/ARCHITECTURE.md was converted entirely to `path::symbol`
+# anchors, so this script now resolves ZERO citations there and printed
+# "OK: every resolved citation lands on code" over an EMPTY SET -- a green
+# that got MORE reassuring as its coverage fell to nothing.
+#
+# Note how it happened, because it is not neglect: the vacuity was MANUFACTURED
+# BY THE SUCCESSFUL FIX. Symbol-anchoring is strictly better than line-anchoring
+# and it deleted this auditor's entire subject as a side effect. Nothing
+# re-aims an instrument when the defect it hunts is cured in one file and still
+# live in another -- README.md carries 45 positional citations this script
+# resolves and judges correctly, including one path that does not exist.
+if ok + len(comment_hits) + drifted == 0:
+    print(f"\nFAIL: resolved ZERO file:line citations in {DOC}.\n"
+          f"This script can only report on citations of the form `path.rs:123`.\n"
+          f"Either the document uses `path::symbol` anchors -- in which case use\n"
+          f"scripts/check_citations.py, and point THIS script at a document that\n"
+          f"still has positional citations -- or the extractor has stopped\n"
+          f"matching. Both are failures; neither is an OK.")
+    sys.exit(1)
+
 if drifted:
     print(f"\nFAIL: {drifted} citation(s) resolve to a blank line, a bare "
           f"delimiter, or nothing at all. None can support a claim.")
