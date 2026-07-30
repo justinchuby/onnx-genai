@@ -48,9 +48,36 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
         kv_ownership: KvOwnership::Owned,
     };
     assert!(structural.is_capture_safe());
-    // Env unset, no programmatic override -> auto-enable from structure.
+    // Env unset, no programmatic override, offload disabled -> auto-enable from
+    // structure.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, structural
+        None, false, false, structural, false
+    ));
+}
+
+#[test]
+fn weight_offload_forces_graph_capture_off() {
+    let safe = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Owned,
+    };
+    // Offload wins over every other signal: auto-safe structure, an explicit
+    // env=1, and an explicit programmatic request all still resolve to OFF.
+    assert!(!resolve_graph_capture_enabled(
+        None, false, false, safe, true
+    ));
+    assert!(!resolve_graph_capture_enabled(None, true, true, safe, true));
+    assert!(!resolve_graph_capture_enabled(
+        Some(true),
+        true,
+        true,
+        safe,
+        true
+    ));
+    // Sanity: with offload disabled the same safe structure enables capture, so
+    // the exclusion above is genuinely caused by offload.
+    assert!(resolve_graph_capture_enabled(
+        None, false, false, safe, false
     ));
 }
 
@@ -158,7 +185,9 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
         kv_ownership: KvOwnership::Shared,
     };
     assert!(!shared.is_capture_safe());
-    assert!(!resolve_graph_capture_enabled(None, false, false, shared));
+    assert!(!resolve_graph_capture_enabled(
+        None, false, false, shared, false
+    ));
 
     let cpu_owned = GraphCaptureStructuralSafety {
         device_is_cuda: false,
@@ -166,7 +195,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!cpu_owned.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, cpu_owned
+        None, false, false, cpu_owned, false
     ));
 }
 
@@ -181,14 +210,17 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
         kv_ownership: KvOwnership::Shared,
     };
     // ONNX_GENAI_CUDA_GRAPH=0 forces OFF even when structurally safe.
-    assert!(!resolve_graph_capture_enabled(None, true, false, safe));
+    assert!(!resolve_graph_capture_enabled(
+        None, true, false, safe, false
+    ));
     // ONNX_GENAI_CUDA_GRAPH=1 forces ON even when structure would decline
     // (the runtime decline machinery is still the final safety net).
     assert!(resolve_graph_capture_enabled(
         None,
         true,
         true,
-        unsafe_structural
+        unsafe_structural,
+        false
     ));
 }
 
@@ -203,10 +235,17 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         Some(false),
         true,
         true,
-        safe
+        safe,
+        false
     ));
     // Programmatic Some(true) beats explicit env=0.
-    assert!(resolve_graph_capture_enabled(Some(true), true, false, safe));
+    assert!(resolve_graph_capture_enabled(
+        Some(true),
+        true,
+        false,
+        safe,
+        false
+    ));
 }
 
 #[test]
