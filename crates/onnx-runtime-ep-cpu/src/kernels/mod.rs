@@ -112,6 +112,7 @@ pub mod softmax;
 pub mod space_to_depth;
 pub mod sparse_kv_gather;
 pub mod split;
+pub mod tensor_scatter;
 pub mod transpose;
 pub mod unary_math;
 pub mod unique;
@@ -403,6 +404,16 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
         Box::new(gather_block_quantized::GatherBlockQuantizedFactory),
+    );
+    // Mobius/static-cache exports currently emit the standard-domain opset-24
+    // form. Keep the contrib-domain alias for older Microsoft-domain exports.
+    reg.register(
+        OpKey::new("TensorScatter", "", 24),
+        Box::new(tensor_scatter::TensorScatterFactory),
+    );
+    reg.register(
+        OpKey::new("TensorScatter", "com.microsoft", 1),
+        Box::new(tensor_scatter::TensorScatterFactory),
     );
     // Standard `ai.onnx::Attention`: the richer SDPA op with 3D/4D inputs,
     // GQA/MQA head sharing, a KV cache (`past_*`/`present_*`), causal masking,
