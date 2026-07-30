@@ -1198,3 +1198,88 @@ clean `git status` — byte-identical to work that committed successfully. **We 
 stamp five times (sha → branch → porcelain → node version → toplevel) and none of those fields can
 distinguish *saved* from *never present*.** The instrument that sees it is `git ls-files <path>`
 returning nothing.
+
+---
+
+## F17 (MAJOR, new) — the field-key guard cannot see dynamically-built keys, and is green because of it
+
+Measured in a clean detached worktree at `13d9214b`, `git status --porcelain` = 0.
+
+`dashboard/field-keys.test.js:105` extracts keys with a matcher that requires a
+single-quoted string literal:
+
+```js
+source.matchAll(/\.(?:field|series)\(\s*'([a-z0-9_.]+)'/g)
+```
+
+`dashboard/throughput.js:274` does not supply one — it builds the key from a
+template literal, inside a loop over five definitions (`throughput.js:253-258`)
+and three percentiles:
+
+```js
+const field = telemetryStore.field(`${definition.prefix}_${percentile}`);
+```
+
+Five prefixes x three percentiles = **15 keys the extractor never sees**.
+Resolved against both sources of truth:
+
+| bucket | count |
+| --- | --- |
+| listed in `NOT_YET_PUBLISHED` | 2 |
+| registered in `telemetry-provenance.js` | 0 |
+| **known to neither** | **13** |
+
+The 13 are every `p95` and every `max` in the latency table, plus all of
+`latency.itl_client_*`, `latency.tpot_client_*` and `latency.e2e_server_*`.
+
+The guard's own test name is `has no unexplained key — an unlisted one is almost
+certainly a typo`. It passes. It passes because it extracted zero keys from that
+function, and zero keys produce zero violations.
+
+**Fix — do not write a cleverer regex.** Static evaluation of template literals
+is the wrong direction. Make the guard fail-closed: scan for `.field(` / `.series(`
+*not* followed by a quote, and assert that set is empty, with a message naming
+file and line and stating that the key is built dynamically and is therefore
+invisible to this test. A key the guard cannot read must turn it red, not
+invisible — the same rung already ratified for symbol citations: decay must fail
+loud. Triage of the 13 into catalogue or register is a separate question and is
+not pre-judged here.
+
+### Why this is a class, not an incident
+
+Third specimen of one failure mode on this branch: `page-claims`' coverage list,
+F16's corpus glob, and now this matcher. None of the three is *wrong*. All three
+are *narrow*. A narrow checker does not fail — it passes, credibly, and certifies
+the territory it cannot see. A guard's assertion is tested by its suite; its
+**scope** is tested by nothing.
+
+### A method note against myself
+
+The first pass of this finding counted `.field()` **call sites** and concluded
+`throughput.js` was 6/6 permanently blank — that the headline panel rendered
+nothing. That was false, and it was killed before it was sent. Deduped, the panel
+has 3 distinct `field()` keys, and the hero number does not use `field()` at all:
+`throughput.js:100` and `:127` read `telemetryStore.rate()` and `.rateSeries()`
+on `metrics.tokens_generated_total`, both live. The dead surface is the latency
+row, not the panel.
+
+The falsification was run *because the number was big enough to be quotable*. The
+operative rule was therefore *check hardest when the finding is most quotable* —
+which is the reverse of the usual failure direction, where the pessimistic finding
+goes unchallenged because nobody wants to argue for good news.
+
+## F15 — closed in half, changed in character
+
+The denominator fix landed correctly: `scheduling.js:113` now binds
+`batch.capacity`, the catalogue resolves it, and `field-keys.test.js` is 4 pass /
+0 fail. The **typo** half of F15 is closed.
+
+The **substance** half is not; it has been reclassified rather than fixed.
+`scheduler.running`, `scheduler.waiting`, `kv.allocation_failures` and
+`queue.depth_peak` now sit in `NOT_YET_PUBLISHED` — 4 of scheduling's 9 fields,
+and 10 of `kv-memory.js`'s 13, are permanently em-dashed by declaration.
+
+That is the right mechanism, and it is an improvement on a silent blank. The
+residual concern is governance, not code: the register holds 26 entries, carries
+no owner and no expiry, and nothing re-asks whether an entry is still true. It
+converts an unresolved red into a permanent green. That is a gate question.
