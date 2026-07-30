@@ -1874,3 +1874,48 @@ fail 0 · skipped 0`**, and the worktree was reaped and its absence verified by 
 > agents are writing to it.** The shared tree is a shared mutable object. Running a
 > test suite against it produces a true statement about a configuration that
 > existed for one hundred and twenty seconds and belonged to nobody.
+
+### 8.18 A fifth citation form, and it was never true
+
+Four kinds of rotting citation are catalogued above: a line number that drifts, a
+path that moves, a symbol that is renamed, and a figure that is withdrawn. A
+developer supplied the fifth against their own work, and it is the only one that
+was **never** correct:
+
+> **A docstring that describes another module is a citation.** One in this tree
+> claimed a Python check *mirrored the runtime's `load_eos_token_ids`*. The author
+> had not read that function -- the sentence was adapted from a neighbouring
+> docstring. It pointed at Rust, from Python, **in prose, with no symbol and no
+> line number.**
+
+**Every citation instrument built for this branch was blind to it.** They resolve
+paths, they check that a line is inside a file, they confirm a symbol still sits
+where the prose says. **This citation had no path, no line and no symbol -- so
+there was nothing to resolve, and nothing to report as unresolvable.** It did not
+rot. It was false on the day it was written and green on every instrument for
+four hours.
+
+Reading the Rust found two defects the false docstring had been covering: the
+runtime **unions** two config files where the check returned on the first hit, and
+it **silently drops** token literals absent from the vocabulary where the check
+accepted any plausible one. **Either would have let the guard certify a model that
+never stops.**
+
+> **A prose reference to another module's behaviour is the only citation form that
+> can be wrong from birth, because it is the only one whose target the author is
+> never forced to open.** A line number at least requires you to have looked once.
+
+**And the reason the gate's model item did not move on any of this** is the
+distinction worth carrying: its evidence was never the guard. It was a scratch
+build into an empty directory, then the verifier reporting *generation stopped on
+its own (`finish_reason=stop`)* -- both exits read **unpiped**. That is a runtime
+observation, not an instrument reading.
+
+> **Score the model that stopped, not the checker that said it would.** When a
+> guard and the thing it guards disagree about their own reliability, the artefact
+> is the better witness -- and a guard found defective *after* the artefact passed
+> is a strengthened guard, not a withdrawn result.
+
+`ITEM 9 -> f3ddf53d + 5cb6b52f + 1fb23794` (all three verified present and
+ancestors of HEAD, with an instrument control proving the check can return
+*not-an-ancestor*).
