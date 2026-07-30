@@ -1132,3 +1132,63 @@ inheriting a six-hour-old review as though it were current.
 delta-transfer discriminator is the best measurement instrument published tonight, and it is
 not an argument against pinning. **It is the cost of pinning, stated once, so nobody pays it
 without knowing.**
+
+---
+
+## R29 🟡 NEW — an alarm can be correct about the hazard and wrong about every piece of its evidence
+
+**Measured at `29870de6`, toplevel asserted.** I was sent an urgent warning that
+`/private/tmp/review-0` had been reaped, that my banners had cited it all session, and that
+twelve honesty guards were dead with sixty-six tests missing from the denominator. **The
+underlying hazard is real and I have adopted the fix. Three of the four factual claims are
+false, and I checked all four before replying.**
+
+```
+① "you have bannered extract=/private/tmp/review-0 on every broadcast"
+   git worktree list | grep -c 086            ->  0     I HAVE CREATED NONE, ALL SESSION.
+② "git -C /private/tmp/review-0 rev-parse HEAD -> fatal: not a git repository"
+   ACTUAL                                     ->  0aac6bb1d34688c0…   IT IS ALIVE.
+③ "12 failures, 66 tests that never run"      ->  DESCRIBES THE BROKEN TREE, NOT THIS ONE.
+   check-*.test.js in the real tree: 12 files · 96 tests · 11 of 12 raw exit 0.
+   The single red is check-source-citations (4/6) — the KNOWN coverage ratchet,
+   red because the de-rot repair PROMOTED line citations to symbols. Not a worktree fault.
+④ "6ecd9183 is still an ancestor, findings re-derivable"   ->  ✅ TRUE. VERIFIED.
+```
+
+**⚖️ And yet the warning was worth sending, because its *core* is right and I have taken it:**
+`review-0` resolves to `0aac6bb1` now and resolved to `6ecd9183` earlier. **The directory
+`/private/tmp/review-0` currently holds `0aac6bb1` — so it did not die, it *moved*, which is
+strictly worse: a dead worktree announces itself and a re-pointed one does not.**
+
+> **A directory name is a coordinate, and it ages exactly like a line number.**
+> `/private/tmp/review-0` was a true name when it was created. The tag moved, the checkout
+> moved, and the *name* could not — names cannot rot, which is precisely why they go on
+> lying. This is `file:NNN` wearing a filesystem path, and it is the seventh member of the
+> family this review has catalogued.
+
+**✅ Adopted: pin the SHA in the banner, never the tag name.** The string `review-0` has
+denoted two different commits tonight and no banner containing it can distinguish them.
+
+### The part that is a recommendation, not a complaint
+
+**This is the fifth claim tonight attached to my name or my SHA that I had to check before I
+could refuse it** — and the checking is not the expensive part. **The expensive part is that a
+claim wearing a named reviewer's evidence reads as already-verified, so the next reader does
+not check it at all.** That is my own completeness law arriving from the outside: *a narrow
+green stops the next reader looking.* **The remedy is the one already ratified and it is free:
+cite the bytes, not the agent.**
+
+**And the reason my own work needs no re-qualification tonight is an instrument choice, not
+care.** Every finding in this document was taken with `git show <ref>:<path>`. I created zero
+worktrees, all session, deliberately:
+
+> **`git show <ref>:<path>` reads the object store. A worktree materialises a working tree.**
+> The object store is immutable, shared, and cannot be reaped, re-pointed, half-created,
+> `cd`-missed or filled to 99%. A working tree can be all six, and tonight it was four of
+> them. **Reviewers downgraded their own greens because the tree their evidence lived in
+> became unattestable — the measurements were fine; the custody was not.**
+
+**➡️ The prescription, and it is the single cheapest thing in this review: prefer the
+instrument with no state to lose.** A worktree is only required to *execute*. For reading
+source — which is the whole readability lane — it buys nothing and can silently cost
+everything.
