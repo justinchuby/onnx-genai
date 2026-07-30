@@ -1499,7 +1499,10 @@ Visually it is the block grid at small `capacity` — `max_batch` cells (4, or w
 
 §8.2's hero-fallback provision (`tokens per decode step`) was designed for the prefix cut and now does exactly this job unmodified. The cut-cleanly work paid for itself sooner than expected.
 
-**(f) Scenario tabs are filtered by profile**, using the same content-driven registry from §8.2. Profile S shows Batching + Free play; Profile D shows Paged KV + Prefix + Free play. A scenario is never shown disabled — an unclickable tab is an invitation to feel excluded. It is absent, and the profile banner already explains why.
+> ### ⛔ (f) IS SUPERSEDED — DO NOT BUILD IT. See §26 and §45.
+> **ALL THREE SCENARIO TABS ARE ALWAYS VISIBLE.** The switcher chooses the **origin**; detection then decides what **mounts** against whatever answers. **Filtering the tabs would hide the existence of half the product from every visitor** — I was wrong, @376a0297 adopted my wrong line, and @12e42da8 reversed it. This paragraph is kept rather than deleted so the reversal is legible, but **it is not the instruction.**
+
+**~~(f) Scenario tabs are filtered by profile~~**, using the same content-driven registry from §8.2. ~~Profile S shows Batching + Free play; Profile D shows Paged KV + Prefix + Free play. A scenario is never shown disabled — an unclickable tab is an invitation to feel excluded. It is absent, and the profile banner already explains why.~~
 
 ### 13.5 The ambitious version — worth one paragraph, not worth blocking v1
 
@@ -3085,3 +3088,58 @@ Scenario B loses its headline number. **I would rather ship two pillars that are
 | D128 | **No sixth state.** Misreporting fields become unbindable at the store | There is no honest rendering of a number that lies |
 | D129 | `prefix_cache_hits` + derived rates forbidden on BOTH servers | Branch A's counter is always-true, not measured |
 | D130 | Direction-conflicting measurements: neither is established until reconciled | The flattering result is the one nobody audits |
+
+---
+
+## 45. THE SWITCHER, CONSOLIDATED — AND WHY MY APPEND-ONLY DISCIPLINE JUST FAILED (D131–D134)
+
+@e00032a4 told @bb2ee824 and me to **build the switcher**. Before that could happen safely I had to fix my own document, because it was still issuing a superseded instruction.
+
+### 45.1 🔴 D131 — AN APPEND-ONLY DOCUMENT CANNOT CORRECT ITSELF
+
+All session I appended. Never edited. That kept the artifact and in-repo copies byte-identical and every reversal auditable, and I was pleased with the discipline. **It has a failure mode I walked straight into:**
+
+> **§13(f) — *"scenario tabs are filtered by profile… a scenario is never shown disabled"* — was still sitting there reading as live guidance. Its reversal is in §26, SEVEN HUNDRED LINES LATER.** A developer who greps `scenario tabs` hits the wrong instruction first and has no reason to keep reading.
+
+**I originated that line. @376a0297 adopted it. @12e42da8 reversed it. And the wrong version stayed authoritative in the contract the devs build from** — while I spent the session ruling that *a memorable framing outruns its retraction* (D112) and that *the gaps between owners are where defects live.* **Mine was a gap inside a single file I owned outright.**
+
+- **D131:** a reversal must be applied **at the point of use**, not only recorded at the point of decision. §13(f) is now struck in place with a pointer forward. **Append-only is right for the DECISION LOG and wrong for the INSTRUCTIONS** — the log is history, the instructions are executable, and history must never be executable.
+- **The struck text is kept, not deleted.** Deleting it would make the reversal invisible, which is @e00032a4's *"a gaps list that silently loses entries is indistinguishable from an abandoned document."*
+
+### 45.2 THE SWITCHER SPEC — ONE PLACE, SINCE IT IS CURRENTLY SPREAD ACROSS SIX BROADCASTS
+
+Consolidated so nobody reconstructs it from chat. Every line traces to a ruling already made:
+
+1. **All three scenario tabs are ALWAYS VISIBLE.** Never filtered, never hidden. (Lead, superseding §13(f).)
+2. **The tab is a NAVIGATION, not a fetch** — `http://127.0.0.1:<port>/demo/?scenario=<id>`, **trailing slash mandatory** (`/demo` redirects, and relative module imports resolved against `/` 404 every module → blank page, console-only error).
+3. **The scenario travels in the query string.** Without it the visitor lands on the destination's default view and **the click reads as having failed.** (@732c7548.)
+4. **The tab NAMES its destination** — `Scenario B · dynamic engine · :8124`. An unexplained navigation is a misclick; an announced one is a tour. Puts the curl-able port on screen for free. (D70.)
+5. **Capability is DETECTED from whatever answers, never assumed from the tab.** The tab picks the origin; the origin declares its own profile. **A visitor pointing this at their own server must not get a lying dashboard** — that, not our topology, is the real reason for detection. (@376a0297.)
+6. **Detect ONCE, on load. Build no re-evaluation lifecycle.** A navigation *is* a page load: fresh document, fresh JS context, heap destroyed. **There is no origin-switch event to subscribe to and no teardown that could ever fire.** (@e00032a4 — and this deletes work, not adds it.)
+7. **Probe both origins once on load; NEVER poll a foreign origin.** A tab whose server is down gets a dimmed-but-**focusable** treatment and says so *before* it is clicked. (§26.)
+8. **The URL bar is the label.** A full navigation to a visibly different origin is a stronger provenance signal than any in-page badge, because the browser renders it and we cannot get it wrong.
+
+### 45.3 D132 — THE DIMMED TAB MUST NOT USE THE FIELD-STATE TREATMENTS
+
+A tab pointing at a down server is **not** `unavailable` in the field sense. Reusing the dotted underline and `--og-unavail-fg` would be **a third vocabulary colliding with the first two** — and the connection indicator already owns a fourth (`connected`/`connecting`/`no-model`/`unreachable`).
+
+- **D132:** the down-tab treatment is **reduced opacity + an explicit `:8124 not responding` sublabel**, never the field-state palette. **Field states describe VALUES. A tab is not a value.** My new `state-channel.test.js` asserts the five field states are pairwise distinct **once colour is removed** — a tab borrowing that palette would be legible but would mean something entirely different, which is worse than illegible.
+
+### 45.4 D133 — THE SWITCHER IS THE ONE INTERACTION THAT MUST SURVIVE A DEAD SERVER
+
+Per AC52's non-negotiable path (kill the server mid-scenario, restart, full recovery, no manual refresh): **the switcher is the only control whose failure is unrecoverable in-page**, because a failed navigation replaces the document with the browser's own error page — **our error states never render, our recovery never runs, and the visitor is looking at Chrome's dinosaur.**
+
+- **D133:** **never navigate to an origin whose probe has not succeeded.** Clicking an unresponsive tab must keep the visitor on the current page and surface our own actionable error (`the dynamic server isn't running — start it with: …`), reusing @d7cf9b84's byte-identical launch command. **A navigation is irreversible from our side; the probe is the last moment we still control the page.**
+
+### 45.5 D134 — ACCESSIBILITY: THE TABS ARE NOT A TABLIST ANY MORE
+
+§8 specified `role="tablist"` with roving tabindex and arrow-key traversal. **That was correct when tabs swapped in-page panels. It is now WRONG and actively harmful:** ARIA tabs promise same-document panel switching, so a screen-reader user pressing → expects focus to move within the page — and instead **the document is destroyed and replaced.** Arrow keys must never trigger navigation.
+
+- **D134:** the switcher is a **`<nav>` containing ordinary links**, with `aria-current="page"` on the active scenario. Ordinary links because **that is what they are** — they navigate. This also gets middle-click, ⌘-click, "open in new tab" and the browser's own affordances for free, all of which a `role="tab"` div silently breaks. **The visual design does not change at all; only the semantics, and only because the semantics became a lie when the mechanism changed underneath them.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D131 | Reversals applied at the point of use; append-only for the log, not the instructions | History must never be executable |
+| D132 | Down-tab uses opacity + sublabel, never the field-state palette | Field states describe values; a tab is not a value |
+| D133 | Never navigate to an unprobed origin | A failed navigation replaces our document with the browser's error page |
+| D134 | `<nav>` + links + `aria-current`, not `role="tablist"` | ARIA tabs promise in-page panels; arrow-key navigation destroys the document |
