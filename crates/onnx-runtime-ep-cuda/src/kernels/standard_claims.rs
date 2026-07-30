@@ -27,7 +27,7 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "SpaceToDepth" => space_to_depth(node, input_dtypes),
         "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
-        | "ReduceLogSumExp" => reduce_f32_only(node, input_dtypes),
+        | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
         "Mod" => mod_op(node, input_dtypes),
@@ -610,9 +610,9 @@ fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
 }
 
 /// `ReduceProd`/`ReduceSumSquare`/`ReduceL1`/`ReduceL2`/`ReduceLogSum`/
-/// `ReduceLogSumExp`: the NVRTC block-reduction path is f32-only, with an
-/// optional opset-18 int32/int64 `axes` input.
-fn reduce_f32_only(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+/// `ReduceLogSumExp`: floating-point block reductions with f32 accumulation and
+/// an optional opset-18 int32/int64 `axes` input.
+fn reduce_float(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     if !(1..=2).contains(&node.inputs.len())
         || node.outputs.len() != 1
         || node.inputs.first().is_none_or(Option::is_none)
@@ -624,7 +624,12 @@ fn reduce_f32_only(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
         ));
     }
     metadata_arity(node, input_dtypes)?;
-    require_dtype(input_dtypes, 0, DataType::Float32, "data")?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float16, DataType::Float32, DataType::BFloat16],
+        "data",
+    )?;
     if node.inputs.get(1).is_some_and(Option::is_some) {
         require_one_of(input_dtypes, 1, &[DataType::Int32, DataType::Int64], "axes")?;
     }
