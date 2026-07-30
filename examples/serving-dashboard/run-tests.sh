@@ -38,6 +38,11 @@ cd "$(dirname "$0")" || exit 1
 MIN_TESTS=500
 MIN_FILES=40
 
+# Local iteration writes test files before committing them. Verification runs
+# must not. Default is the shipping claim; the escape hatch is loud on purpose.
+allow_untracked=0
+[[ ${1:-} == --allow-untracked ]] && allow_untracked=1
+
 # Every measurement prints the container it was taken in. A relative path is a
 # stale citation in space, exactly as a line number is a stale citation in time.
 echo "pwd:  $(pwd)"
@@ -59,6 +64,34 @@ if [[ $discovered -eq 0 ]]; then
   exit 1
 fi
 
+# PROVENANCE OF THE COUNT ITSELF.
+#
+# `find` reads the disk. A clean clone has only what HEAD tracks. Those are
+# different sets, and the difference is invisible in a total: an untracked
+# test file inflates the suite by tests that nobody else can run, and the
+# number is perfectly reproducible on this desk and nowhere else.
+#
+# We reconcile as a SET DIFFERENCE and print the offending paths. Two equal
+# counts are compatible with one untracked file and one deleted file
+# cancelling out, so a count comparison would certify exactly the state it
+# exists to catch.
+untracked=()
+absent=()
+provenance="unavailable (not a git tree)"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  head_list=$(git ls-tree -r HEAD --name-only -- . 2>/dev/null | grep '\.test\.js$' | sort)
+  disk_list=$(printf '%s\n' "${test_files[@]}" | sed 's|^\./||' | sort)
+  while IFS= read -r f; do [[ -n $f ]] && untracked+=("$f"); done \
+    < <(comm -23 <(echo "$disk_list") <(echo "$head_list"))
+  while IFS= read -r f; do [[ -n $f ]] && absent+=("$f"); done \
+    < <(comm -13 <(echo "$disk_list") <(echo "$head_list"))
+  provenance="${#untracked[@]} untracked, ${#absent[@]} tracked-but-missing"
+fi
+
+# Same basename in two directories: legal, and tonight it shipped twice with
+# DIFFERENT BYTES while one documented command reached only one of them.
+dupes=$(printf '%s\n' "${test_files[@]}" | sed 's|.*/||' | sort | uniq -d)
+
 output=$(node --test "${test_files[@]}" 2>&1)
 node_status=$?
 echo "$output"
@@ -75,8 +108,43 @@ echo "  discovered files : ${discovered}"
 echo "  suites executed  : ${suites:-<unparsed>}"
 echo "  tests            : ${tests:-<unparsed>}"
 echo "  failed           : ${failed:-<unparsed>}"
+echo "  provenance       : ${provenance}"
 
 status=0
+
+if [[ -n ${dupes} ]]; then
+  echo "WARN: the same test filename appears in more than one directory:" >&2
+  while IFS= read -r d; do
+    [[ -z $d ]] && continue
+    echo "      ${d}" >&2
+    printf '%s\n' "${test_files[@]}" | grep -- "/${d}$" | sed 's/^/        /' >&2
+  done <<< "${dupes}"
+  echo "      Not fatal. But a glob that reaches one copy and not the other" >&2
+  echo "      reports a stable total whose meaning silently differs." >&2
+fi
+
+if (( ${#absent[@]} > 0 )); then
+  echo "FAIL: ${#absent[@]} test file(s) are tracked at HEAD but missing from disk:" >&2
+  printf '      %s\n' "${absent[@]}" >&2
+  echo "      This run skipped them entirely and still exited green." >&2
+  status=1
+fi
+
+if (( ${#untracked[@]} > 0 )); then
+  if (( allow_untracked )); then
+    echo "WARN: ${#untracked[@]} untracked test file(s) were INCLUDED in this count:" >&2
+    printf '      %s\n' "${untracked[@]}" >&2
+    echo "      This total describes this working tree, NOT the branch. Do not" >&2
+    echo "      quote it as a property of the shipping tree." >&2
+  else
+    echo "FAIL: ${#untracked[@]} test file(s) ran here but are not committed:" >&2
+    printf '      %s\n' "${untracked[@]}" >&2
+    echo "      A clean clone does not have them, so this total is a claim about" >&2
+    echo "      this desk rather than about the branch. Commit them, or re-run" >&2
+    echo "      with --allow-untracked to accept a desk-scoped number knowingly." >&2
+    status=1
+  fi
+fi
 
 if [[ -z ${tests:-} || -z ${failed:-} || -z ${suites:-} ]]; then
   echo "FAIL: could not parse Node's summary. Refusing to report a result we" >&2

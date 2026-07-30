@@ -1378,10 +1378,21 @@ So the rule is narrower and sharper than "don't trust curl":
 
 A catch-all origin *cannot produce a 404*. So if an origin ever returns one, it
 has no fallback, and its other answers can be trusted. This is why the
-nine-way confirmation that `prefix-cache.js` is not served is sound: it was
-always `404` for the missing file and `200` for a sibling in the same directory
-in the same second. Compare bytes when the answer is *present*; a sibling
-control is sufficient when the answer is *absent*.
+nine-way confirmation used a `404` control soundly: it was always `404` for the
+missing file and `200` for a sibling in the same directory in the same second.
+
+> **Pick a control that no commit can repair.** That sweep used `prefix-cache.js`
+> as its missing file. The panel was *restored* at `42d9a3e5` and now returns
+> `200` on both origins, so all nine confirmations expired at once -- not wrong
+> when taken, invalidated by a feature landing that none of them could have
+> anticipated. A control that depends on a file being **absent** depends on a
+> product decision; a control that depends on an origin having **no catch-all**
+> depends on a mechanism. Use a path nobody can ever create --
+> `/demo/definitely-not-a-real-file-30685.js` -- which still `404`s on both
+> origins today and cannot be restored by anyone.
+
+Compare bytes when the answer is *present*; a sibling control is sufficient when
+the answer is *absent*.
 
 Note which way each error cut. The three false negatives cost one re-run each,
 because a "not found" makes you keep looking. The single false positive would
@@ -1519,3 +1530,69 @@ repair is evidence somebody *intended* one (§8.1); a design document written in
 the present tense is a claim, not a record, and it keeps asserting itself
 correctly about a moment that has passed. Records need dates. Claims need
 checkers.
+
+### 8.12 The latency table is empty, and the guard that would say so cannot see it
+
+Ruled into this brief by the Project Lead as a measured, named gap. **The
+mechanism he named is exact and permanent. The count in the ruling had already
+expired when it was issued, and both halves matter.**
+
+`dashboard/throughput.js:272-273` composes its field keys:
+
+```js
+for (const percentile of ['p50', 'p95', 'max']) {
+  const field = telemetryStore.field(`${definition.prefix}_${percentile}`);
+```
+
+Five prefixes are declared at `:253-257`, so this builds **fifteen** latency
+keys. Our field-key guard extracts keys by matching quoted string literals, and
+**no character class at any width matches a backtick** -- so the guard could
+never see any of the fifteen. The two it did know about were the two somebody
+happened to type by hand elsewhere in the same file. *A coincidence, recorded in
+the same notation as a decision.*
+
+Verify all of it from `$(git rev-parse --show-toplevel)`:
+
+```
+git grep -nE 'latency\.[a-z0-9_]+_(p50|p95|max)' HEAD -- examples/serving-dashboard
+  dashboard/field-keys.test.js   15 unique   <- the exemption list
+  dashboard/panels.test.js        2 unique
+  dashboard/throughput.js         2 unique   <- the only two typed in the panel
+
+git grep -lE 'latency\.' HEAD -- examples/serving-dashboard
+  -> throughput.js, three *.test.js, and four *.md.
+  -> telemetry-provenance.js  ABSENT.   telemetry-store.js  ABSENT.
+```
+
+**Two facts, and they point opposite ways. Read both before you score this.**
+
+**The exemption list is no longer two of fifteen -- it is fifteen of fifteen.**
+It was hand-written, with a reason per key and a note explaining that hand-listing
+is deliberate, and it landed at `59355c9c`, roughly twenty-five minutes before the
+ruling that describes it as two. Do not file this half. It is closed, and its
+author closed it while explicitly refusing the one-keystroke version that would
+have generated the list from the panel sources -- *an exemption list that
+maintains itself is not an inventory, it is a mirror; it would exempt whatever
+the panels ask for and could never go red.*
+
+**The product gap behind it is open and is larger than the guard defect.**
+Neither the catalogue nor the store mentions `latency.` at all: **fifteen keys
+declared, zero producers.** Every cell of the latency table renders as an em-dash.
+That is an *honest* absence and not a lie, so it is not a P1 -- but a reviewer who
+sees fifteen empty cells should know it is unplumbed by construction rather than
+broken at runtime, and no test we own distinguishes those two.
+
+The remedy the Lead attached is the durable one and it is worth more than fifteen
+allowlist lines: **make the extractor fail on any binding whose argument is not a
+string literal, so it declares what it cannot see.** The next dynamic binding is
+then caught too, without anyone remembering to list it.
+
+> **An exemption list derived from an instrument's output makes an unsurveyed gap
+> look surveyed.** If your allowlist was built from what your tool reported, it
+> documents your tool, not your code.
+
+And note what the ruling's own expiry demonstrates, because it is this brief's
+recurring subject arriving on the order to write this brief: **the ruling was
+correct when reasoned and stale when issued, and executing it verbatim would have
+published a closed finding as an open one.** Rule 5 says rulings decay. It does
+not exempt the ruling that tells you to write down a decayed ruling.
