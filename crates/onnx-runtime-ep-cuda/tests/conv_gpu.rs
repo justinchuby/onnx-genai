@@ -1,5 +1,7 @@
 //! GPU parity tests for the cuDNN-backed ONNX `Conv` kernel.
 
+mod common;
+
 use half::f16;
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -386,4 +388,90 @@ fn cudnn_conv_matches_cpu_for_dilation() {
     );
     assert_close(&got, &expected, 1e-4);
     println!("cuDNN Conv dilations=[2, 2] case passed");
+}
+
+#[test]
+fn cuda_conv1d_matches_cpu_for_standard_grouped_and_causal_geometry() {
+    let Some(ep) = common::cuda_ep() else {
+        return;
+    };
+    let cases = [
+        (
+            "basic",
+            DataType::Float32,
+            vec![1, 2, 7],
+            vec![3, 2, 3],
+            vec![1, 3, 5],
+            1,
+            [0, 0],
+            1,
+            1,
+            false,
+        ),
+        (
+            "depthwise-causal",
+            DataType::Float16,
+            vec![1, 4, 8],
+            vec![4, 1, 4],
+            vec![1, 4, 8],
+            1,
+            [3, 0],
+            1,
+            4,
+            true,
+        ),
+        (
+            "grouped-strided-dilated",
+            DataType::Float32,
+            vec![1, 4, 12],
+            vec![6, 2, 3],
+            vec![1, 6, 6],
+            2,
+            [2, 1],
+            2,
+            2,
+            true,
+        ),
+    ];
+
+    for (label, dtype, x_shape, w_shape, y_shape, stride, pads, dilation, group, with_bias) in cases
+    {
+        let x_values = (0..x_shape.iter().product::<usize>())
+            .map(|index| (index as f32 - 9.0) / 7.0)
+            .collect::<Vec<_>>();
+        let w_values = (0..w_shape.iter().product::<usize>())
+            .map(|index| ((index % 11) as f32 - 5.0) / 9.0)
+            .collect::<Vec<_>>();
+        let bias_values = (0..w_shape[0])
+            .map(|index| index as f32 / 13.0 - 0.2)
+            .collect::<Vec<_>>();
+        let mut inputs = vec![
+            common::float_input(dtype, &x_shape, &x_values),
+            common::float_input(dtype, &w_shape, &w_values),
+        ];
+        if with_bias {
+            inputs.push(common::float_input(dtype, &[w_shape[0]], &bias_values));
+        }
+        let attrs = [
+            ("strides", Attribute::Ints(vec![stride])),
+            ("pads", Attribute::Ints(vec![pads[0], pads[1]])),
+            ("dilations", Attribute::Ints(vec![dilation])),
+            ("group", Attribute::Int(group)),
+            ("kernel_shape", Attribute::Ints(vec![w_shape[2] as i64])),
+        ];
+        let outputs = [(dtype, y_shape)];
+        let expected = common::run_cpu("Conv", "", 17, &inputs, &outputs, &attrs);
+        let got = common::run_cuda(&ep, "Conv", "", 17, &inputs, &outputs, &attrs);
+        common::assert_close(
+            label,
+            dtype,
+            &common::decode_floats(&got[0], dtype),
+            &common::decode_floats(&expected[0], dtype),
+            if dtype == DataType::Float16 {
+                2e-2
+            } else {
+                1e-4
+            },
+        );
+    }
 }

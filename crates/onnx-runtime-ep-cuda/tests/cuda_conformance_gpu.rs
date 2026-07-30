@@ -2402,7 +2402,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
 
     // Convolution / pooling.
-    p.push(dedicated("Conv", "conv_gpu.rs", "cuDNN 2-D conv"));
+    p.push(dedicated(
+        "Conv",
+        "conv_gpu.rs",
+        "native 1-D / cuDNN 2-D conv",
+    ));
     p.push(dedicated("MaxPool", "pooling_gpu.rs", "cuDNN pooling"));
     p.push(dedicated("AveragePool", "pooling_gpu.rs", "cuDNN pooling"));
 
