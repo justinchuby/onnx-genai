@@ -3469,3 +3469,87 @@ convert a silent dead branch into the *only* thing that goes red if someone rest
 **Non-blocking, follow-up branch. Graded by the tree's own standard rather than my taste** — which is
 the better form of every review comment I have written tonight.
 
+
+---
+
+## F37 🟠 — **`demo_path_is_servable` inspects the path the client typed; `ServeDir` acts on the path after decoding. The dotfile defence the comment calls load-bearing is bypassed by `%2E`.**
+
+**MEASURED-AT `ec505e56`.** `demo_assets.rs` grew **122 → 566 lines** after the last declared green
+(`@c0de4c2e`'s finding), so this file is new shipped code that no implementation reviewer had read.
+It decides which files a browser can pull off this disk. **First review of it is this row.**
+
+### The two halves, both from committed/vendored bytes
+
+```
+GATE      demo_assets.rs:167   if !demo_path_is_servable(request.uri().path())
+                               ^ axum's uri().path() is the RAW target. NOT decoded.
+CONSUMER  tower-http 0.6.11, serve_dir/mod.rs:462
+                               let path_decoded = percent_decode(path.as_ref()).decode_utf8()
+                               ^ ServeDir DOES decode, then walks components.
+```
+
+**Two components, one string, two different values of it.**
+
+### Executed, with a control on my own transcription
+
+I transcribed the predicate and validated the transcription against **the crate's own assertions**
+before trusting a single result:
+
+```
+TRANSCRIPTION CONTROL: 7/7 agree with the crate's assertions
+  /demo/format.test.js -> false ✓   /demo/APP.JS -> true ✓   /demo/LICENSE -> false ✓
+  /demo/NOTES.MD -> false ✓  /demo/RUN-DEMO.SH -> false ✓  /demo/Dockerfile -> false ✓
+  /demo/dashboard/honesty.test.js -> false ✓
+
+THE PREDICATE ANSWERS OPPOSITELY FOR THE SAME FILE:
+  /demo/%2Evscode/settings.json  -> SERVABLE   |  /demo/.vscode/settings.json  -> refused
+  /demo/%2Esecret.json           -> SERVABLE   |  /demo/.secret.json           -> refused
+  /demo/%2Eenv.json              -> SERVABLE   |  /demo/.env.json              -> refused
+```
+
+**The comment at `:130` names exactly two things the segment check exists to stop —
+`.git/config` and `.vscode/settings.json` — and says *"the secret is the DIRECTORY."* One of those two
+survives percent-encoding.** (`.git/config` is refused anyway, by the extension rule, not by the
+dotfile rule it was credited to — **a refusal by coincidence, which is the precise failure the same
+comment warns about one sentence earlier.**)
+
+### Grading it honestly: 🟠 latent, NOT a live disclosure
+
+**Exposure under the asset root today is one file** — `node_modules/.vite/vitest/…/results.json`, a
+test cache, not a secret. Control: the finder sees 44 `.js` at the root, so it was not blind.
+**I am not inflating this into a P0.** But the file's own rationale is why it still matters:
+
+> *"the asset directory is a working source tree, not a build output: it gains files continuously"*
+
+**That argument is the whole reason the allowlist exists, and it applies to this hole verbatim.** The
+defence is one `.vscode/` or one `.squad/*.json` away from mattering, and nothing would announce it.
+
+### Test gap — the reason it shipped
+
+**Zero tests in the crate exercise percent-encoding.** `%2e`, `%2E`, `%2f`, `..` — none appear in any
+`.rs` test in the server crate. The 15 new asset tests cover extensions, case, dotfiles-by-segment and
+symlinks — **thoughtfully, including a dangling symlink and a symlink-to-real-page pair** — but every
+one of them asks the question in already-decoded form, which is the one form the gate never sees.
+
+### The fix, and it is the design question rather than a patch
+
+**Do not check one string and act on another. Derive the canonical form once and give both consumers
+the same bytes** — decode in the predicate, before the segment scan:
+
+```rust
+let decoded = percent_encoding::percent_decode_str(rest).decode_utf8().ok()?;  // reject invalid UTF-8
+// …then run the existing dotfile / .test.js / extension checks against `decoded`
+```
+
+This is the same principle as `b7f83e72` deleting `model_path` and `resolveStaleCeilingMs` replacing
+two inline `??` sites: **the bug lives in the gap between two copies of a value, so remove the gap.**
+Whoever owns this — a rejection of any `%` in the `/demo/` subtree would also close it and is even
+simpler to prove, at the cost of legal filenames nobody currently ships.
+
+**Acceptance test I would require:** assert that for every path in the existing dotfile refusal list,
+the **percent-encoded spelling is refused too** — a loop over the existing corpus, not new fixtures, so
+it cannot rot away from the list it guards.
+
+⚠️ **Handed to `@f6527cc9` (security lane) for severity; the defect itself — two components disagreeing
+about one value, plus an untested input class — is implementation, which is mine.**
+
