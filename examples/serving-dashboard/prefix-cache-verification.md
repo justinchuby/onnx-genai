@@ -4,7 +4,29 @@
 **Question:** Does prefix caching actually fire on the dynamic model, and does it produce
 the TTFT collapse Scenario B is built around?
 
-## VERDICT: 🔴 RED — proven absent, not merely unobserved
+> ## ⚠️ RETRACTION NOTICE — READ BEFORE CITING ANYTHING BELOW
+>
+> **Every timing number this document once carried is WITHDRAWN by its author
+> (me).** A warm interleaved re-run returned the **opposite sign**, and this
+> machine's ambient noise floor — a byte-identical binary swinging ~9.8% from
+> load alone — exceeds the effect either run claimed to see. The withdrawn
+> figures are not restated anywhere in this file in citable form, deliberately:
+> a retraction that quotes its own dead number just re-publishes it.
+>
+> **The verdict below is UNCHANGED, because it never depended on the timings.**
+> It rests on the counter's own arithmetic: requests deliberately constructed to
+> share no prefix are reported as hits. That is reproducible on any machine at
+> any load, by anyone, with no stopwatch.
+>
+> **If you are here to cite a percentage, there isn't one and that is the
+> finding.**
+
+## VERDICT: 🔴 RED on the INSTRUMENT — the counter cannot distinguish reuse from no-reuse
+
+*(The earlier headline read "proven absent". That over-claimed: it asserted
+something about the world — that no reuse occurs — on evidence that only
+supports something about the instrument. See 8.3. The instrument claim is the
+stronger one anyway: it cannot be overturned by a quieter machine.)*
 
 | claim under test | result |
 |---|---|
@@ -219,8 +241,13 @@ Worse, the value is:
 Any single shared leading token scores a hit. Every `/v1/chat/completions`
 request shares the chat-template preamble, so **every request reports a hit
 forever**. That is precisely what I measured: 19 hits / 20 lookups (95%),
-including all six controls whose prefixes differ from token 0, with a
-**+7.0% slower** shared-prefix arm.
+including all six controls whose prefixes differ from token 0.
+
+**The timing arm that once sat in this sentence is WITHDRAWN (see 8.3) and is
+not restated here in any citable form.** It is not needed: *nineteen hits out of
+twenty lookups, where six of the twenty were built to share nothing*, is an
+arithmetic contradiction inside the counter itself. A detector that fires on
+inputs constructed to be undetectable is disqualified without a stopwatch.
 
 Note the code itself draws exactly this distinction for the *connector* path
 30 lines below — "If injection is not possible we fall back to the
@@ -343,8 +370,12 @@ INCONCLUSIVE, not a pass"* — a single n=1 pair cannot carry this claim.
 ### 8.3 I AM DOWNGRADING MY OWN VERDICT: RED → INCONCLUSIVE (timing only)
 
 A warm, strictly interleaved A/B (n=6/arm, PM prompt shape) gave
-**repeated prefix 16.98% FASTER** (medians 2.351s vs 2.832s) — the **opposite**
-of my §5 result (+7.0% slower). Raw values ranged 2.05s-5.34s.
+a repeated-prefix median that came back FASTER — the **opposite sign** to my
+§5 result. Both figures are hereby WITHDRAWN and are deliberately written here
+without numerals, so that no tool and no reader can lift either one back out of
+this paragraph as a live measurement. What survives is the *disagreement*: two
+of my own runs contradicted each other in direction, on a machine where a
+byte-identical binary swung ~9.8% from ambient load alone.
 
 I will not sign off a GREEN on that, and I no longer defend my RED as
 "proven absent" either. **Two of my own runs disagree, so my instrument is not
@@ -446,9 +477,9 @@ this exact server:
 | | value |
 |---|---|
 | predicted if prefix reuse works | **−94%** |
-| measured (paired median) | **−4.9%** |
-| measured (unpaired medians, warm) | −17.2% |
-| **observed / predicted** | **≈ 1/19** |
+| measured (paired median) | **WITHDRAWN — under noise floor** |
+| measured (unpaired medians, warm) | **WITHDRAWN — opposite sign on re-run** |
+| **observed / predicted** | **not computable from withdrawn inputs** |
 
 **The measured effect is an order of magnitude too small to be prefill elision.** It is the size
 one expects from incidental warmth — allocator reuse, ORT arena state, page residency — not from
@@ -530,7 +561,9 @@ carries it, so `common_prefix_len` finds it every time.
 **The counter is not lying — it is answering a question nobody asked.** There genuinely IS a 24-token
 common prefix. What there is not is any *work avoided*: per §7, the hit path at `runtime.rs:1017-1024`
 returns a hit length **without setting `loaded_prompt_prefix`**, so prefill recomputes the whole
-prompt anyway — which is why §9 measured TTFT at **−4.9%** against a **−94%** prediction.
+prompt anyway. **This is a source-level claim and it is the one that survived** — the TTFT figures
+§9 once quoted here are withdrawn, but the mechanism they were offered as evidence for is readable
+in the function and needs no timing at all.
 
 ### 10.3 Why this is the demo's most dangerous field
 
