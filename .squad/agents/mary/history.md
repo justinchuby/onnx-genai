@@ -10,3 +10,7 @@
 - Established native-CUDA viability for DeepSeek-Coder and DeepSeek-V2-Lite with ORT token-exact greedy decode; GLM native CUDA is coherent but lacks an ORT-CUDA oracle because ORT rejects its authored GQA rotary attribute.
 - Confirmed DeepSeek-V2-Lite QMoE resident CUDA correctness, while documenting that advertised weight-offload knobs do not yet activate CUDA expert paging for this path.
 - Resolved the R1-Distill divergence as an ORT-CUDA fp16 near-tie outlier: native token 374 is correct/more accurate than ORT-CUDA token 315. Landed PR #430 (`5c49c891`) with GQA 6:1 non-interleaved-rotary decode regressions at head_dim 64 and 128.
+
+## 2026-07-30T07:20:00Z — Qwen3.6-27B persistent recurrent-state bindings
+
+- Confirmed the Qwen 27B Unsqueeze blocker was already resolved, then generalized native CUDA persistent state allocation so metadata-declared fixed rank-3 `conv_state`/recurrent state uses static replace semantics instead of rank-4 KV capacity growth. The graph now reaches the next blocker: unsupported rank-3/1-D CUDA Conv.
