@@ -77,12 +77,32 @@ The second and third are the **exposure ratchet**: tracked files fetchable under
 that the page never loads. It is a working guard doing its job. Several authors have
 deliberately declined to raise its constant. **Do not raise the constant to go green.**
 
-The first is structural and no choice of SHA fixes it. The freshness guard requires a review
-document to name a SHA that is not older than the tree. A reviewer cannot measure at the
-final SHA until it is final, and it cannot be final until they have measured at it. The
-predicate is unsatisfiable as written at every commit that exists. The repair is to require
-the named SHA to be an **ancestor** of the shipping tree and to disclose the delta, rather
-than to require equality. That change is not made here.
+The first is ~~structural, and no choice of SHA fixes it; the predicate is unsatisfiable as
+written at every commit that exists, and the repair is to require the named SHA to be an
+ancestor rather than an equal~~ — **RETRACTED BY ME, 07:40, having read the guard instead of
+inferring it. Every clause above is wrong and the correction is the opposite sign: the
+predicate ALREADY keys on ancestry, it is satisfiable today, and one document satisfies it
+right now.** `check-review-freshness.test.js:62` excludes `REVIEW-POINT.md` from its own
+corpus, and it fails a document only when *every* SHA that document declares is a **strict
+ancestor** of the boundary declared here. Measured against this review point:
+
+    ARCHITECTURE-SECURITY-REVIEW.md   1e809173 8a309ce0 9b06d922        ALL STRICT ANCESTORS -> STALE
+    IMPLEMENTATION-REVIEW.md          3b701494…                          ALL STRICT ANCESTORS -> STALE
+    READABILITY-REVIEW.md             8230060c … 92cc7935 37d0d72e       ALL STRICT ANCESTORS -> STALE
+    REVIEWER-BRIEF.md                 ef7c91b9 (07:33:22)                NOT an ancestor -> ALREADY GREEN
+
+`ef7c91b9` is a *descendant* of this review point, so the brief already satisfies the guard.
+That single row disproves the retracted claim outright: a predicate one document satisfies
+is not unsatisfiable. The red is three documents measured before this boundary, which is a
+true and useful thing for the guard to be saying.
+
+**REMEDY, AND IT IS ONE LINE PER DOCUMENT, NOT A CODE CHANGE:** the owners of the three
+stale documents write `MEASURED-AT: 217ae17052f50b901ebd5bb057bfab5ffd418c49` into their own
+file, raw hex, never a ref name. Do not modify the guard. Do not relax the predicate.
+
+Recorded here rather than only in chat, because the retracted claim was published twice and
+a broadcast expires while a committed file does not. The error was mine and its cause is the
+one this branch has paid for all night: **I described a predicate I had not read.**
 
 ## Ancestry — all eleven required fixes, verified in both directions
 
