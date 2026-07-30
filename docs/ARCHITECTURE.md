@@ -16,6 +16,20 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 | **Read** | Established by reading the cited source | The dependency edges in §2; the command-deferral dispatch in §5.11; the `NodeStatus` scope comment in §4.7 |
 | **Inferred** | A conclusion drawn from the above, not directly witnessed | §5.3's claim that a shared-page write *would* corrupt silently — no test provokes it, and nothing in the code prevents it |
 
+**Why the distinction is worth the overhead.** Verification tools share blind spots with the assumptions they are used to check. Several classes of defect in this codebase are **invisible to the instrument a reader would naturally reach for**:
+
+| The instrument | What it cannot see |
+|---|---|
+| `curl` against an endpoint | Anything enforced by the *caller* rather than the server. A same-origin-policy failure returns **200 OK** to `curl` and to the server log, and fails only inside a browser. |
+| Reading a handler | Whether the value survives the path to it (§5.14), or whether the field name means what it says (§5.13). |
+| A passing test | A behaviour that is *structurally impossible* rather than merely absent — the test and the stub agree (§5.6.1). |
+| A single measurement | Whether the instrument can resolve the effect at all. A run-to-run difference can exceed the threshold being tested for. |
+| A line citation | That the line moved. The claim stays true while the reference silently rots. |
+
+The common shape: **each tool inspects a *state*, while these defects live in a *transition* or a *relationship*.** None of them can express *"and then it changed"* or *"and it means something different over there."*
+
+The practical consequence for this document is that **a chain of individually-true statements can compose into a false one** — every step verifiable, the conclusion wrong. That is why claims here carry their evidence class rather than a uniform tone of authority: the reader needs to know which links were witnessed and which were reasoned, in order to check the composition rather than the steps.
+
 Where a claim is inferred, the text says so. The distinction matters most in §5: an **ASSUMED** invariant is precisely one where the code offers no evidence either way, so the reader is the last line of defence.
 
 **How to read §5.** Each invariant is tagged **ENFORCED** (the code prevents violation) or **ASSUMED** (nothing stops you; violation compiles, runs, and corrupts or degrades silently). The ASSUMED ones — §5.3, §5.8, §5.10 — are the highest-risk sections in this document. §5.12 is tagged **CURRENTLY VIOLATED**, because documenting it as true would be exactly the kind of intent-as-behaviour this document forbids.
