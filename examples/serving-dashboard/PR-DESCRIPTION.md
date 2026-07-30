@@ -329,6 +329,30 @@ compensates with distinct glyphs, so the information is not colour-dependent —
 but a reader scanning for "which of these is stale" is working from the glyph
 alone, and that was never a deliberate decision.
 
+### The path-ban guard's predicate is wrong in both directions
+
+One test inspects field *values* — not field names — and asserts none of them
+looks like a filesystem path. That design is right: renaming a row must not
+satisfy the ban. The predicate is not.
+
+```js
+.filter(([, field]) => typeof field.value === 'string' && field.value.includes('/'))
+```
+
+```
+Qwen/Qwen2.5-0.5B-Instruct   a legal model id     -> CONTAINS '/' -> BANNED    (false positive)
+C:\Users\someone\models      a Windows path       -> NO '/'      -> PERMITTED (false negative)
+```
+
+Both directions are provable from the predicate alone; neither needs a run. A
+related ban elsewhere keys on a `/Users/`-shaped string, which is blind on every
+Linux box and CI container this would ever run in.
+
+**A count of files that mention a property is not a count of guards over it.**
+Four files reference this property and two of them are comments; one is a
+styling fixture holding a relative path on purpose. The real guard is one file,
+and its predicate has a proven false negative.
+
 ### Specification debt
 
 The specification is 2,857 lines carrying 218 acceptance criteria. **9 of its
@@ -349,6 +373,21 @@ quarter of its corpus is a guard that passes by sampling.
 `AC196`, `AC199`, `AC200` and `AC201` are named, mechanisable, and unwritten.
 
 ### A label can be accurate and still misinform
+
+The name is not being changed in this PR, and that is a decision rather than an
+omission:
+
+```
+occurrences of the arm's directory name, tree-wide ....... 34
+of those, inside recorded JSON captures .................. 2
+[negative control, freshly generated] .................... 0
+```
+
+Renaming would edit two committed capture files whose entire evidentiary value
+is that they record what a real run emitted. **We would cure a comprehension
+defect by manufacturing a provenance one.** The remedy chosen instead is a
+caption at the point of display, where the reader actually is.
+
 
 The two model directories are named for their attention implementation. One of
 them is, as a consequence, the arm that structurally cannot batch — that is the
