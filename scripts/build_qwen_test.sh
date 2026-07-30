@@ -20,6 +20,7 @@ SCRIPT="$ROOT/scripts/build_qwen.sh"
 
 TESTS_RUN=0
 TESTS_FAILED=0
+TESTS_SKIPPED=0
 
 # A Python interpreter that cannot import Mobius, used to simulate a machine
 # where Mobius was never installed. Falls back to skipping those cases.
@@ -44,6 +45,16 @@ fail() {
 
 pass() {
   printf 'ok   %s\n' "$1"
+}
+
+# A skipped check is not a passing check, but "N tests, 0 failed" renders both
+# identically — so a run that verified less looks exactly as strong as one that
+# verified more, and the reader has no way to tell without reading every line.
+# Count skips and report them in the summary, so a weaker green is visible in
+# the same place a reader already looks.
+skip() {
+  TESTS_SKIPPED=$((TESTS_SKIPPED + 1))
+  printf 'skip %s\n' "$1"
 }
 
 # assert_contains <name> <haystack> <needle>
@@ -239,7 +250,7 @@ if [ -n "$PYTHON_WITHOUT_MOBIUS" ]; then
 
   rm -rf "$fresh_root" "$fresh_home"
 else
-  printf 'skip  fresh-clone cases (every interpreter here already has mobius)\n'
+  skip 'fresh-clone cases (every interpreter here already has mobius)'
 fi
 
 # ---------------------------------------------------------------------------
@@ -334,7 +345,7 @@ if [ -n "$GENERATOR_PYTHON" ] &&
     assert_derives_io "generator reproduces the 24-layer scatter model io block" \
       "$real_scatter" "$real_scatter/inference_metadata.yaml"
   else
-    printf 'skip  24-layer generator check (no local %s)\n' "$real_scatter"
+    skip "24-layer generator check (no local $real_scatter)"
   fi
 
   # Ordering is a correctness property, not a cosmetic one. Reuse the --check
@@ -355,7 +366,7 @@ sys.exit(0 if indices == list(range(len(indices))) else 1)
         "got: $(printf '%s' "$derived_block" | grep -c 'key_cache\.') entries out of order"
     fi
   else
-    printf 'skip  numeric layer ordering check (no local scatter model)\n'
+    skip 'numeric layer ordering check (no local scatter model)'
   fi
 
   # A dynamic-cache model has no scatter ABI; say so instead of emitting a
@@ -374,10 +385,10 @@ sys.exit(0 if indices == list(range(len(indices))) else 1)
     fi
   else
     TESTS_RUN=$((TESTS_RUN - 1))
-    printf 'skip  dynamic-model rejection check (no local %s)\n' "$dynamic_model"
+    skip "dynamic-model rejection check (no local $dynamic_model)"
   fi
 else
-  printf 'skip  static_cache generator checks (onnx/pyyaml unavailable)\n'
+  skip 'static_cache generator checks (onnx/pyyaml unavailable)'
 fi
 
 # ---------------------------------------------------------------------------
@@ -470,7 +481,7 @@ if [ -n "$ASSETS_PYTHON" ]; then
   rm -rf "$assets_tmp"
   trap - EXIT
 else
-  printf 'skip  tokenizer asset checks (no python3)\n'
+  skip 'tokenizer asset checks (no python3)'
 fi
 
 # ---------------------------------------------------------------------------
@@ -621,7 +632,7 @@ sys.exit(0 if ok else 1)
   rm -rf "$synth_tmp"
   trap - EXIT
 else
-  printf 'skip  synthetic static-cache detection checks (onnx/pyyaml unavailable)\n'
+  skip 'synthetic static-cache detection checks (onnx/pyyaml unavailable)'
 fi
 
 # ---------------------------------------------------------------------------
@@ -697,5 +708,34 @@ done
 
 rm -rf "$outdir_tmp"
 
-printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
+# A raw skip-printf bypasses the counter, so the summary would under-report and
+# the weaker green becomes invisible again. Comments are stripped before the
+# count: this guard is about code, and prose that merely discusses the pattern
+# must never be able to turn it red. (It did, twice, while being written.)
+TESTS_RUN=$((TESTS_RUN + 1))
+raw_skips="$(grep -v '^[[:space:]]*#' "$ROOT/scripts/build_qwen_test.sh" |
+  grep -c "printf 'ski[p]" || true)"
+if [ "$raw_skips" -eq 1 ]; then
+  pass "every skip goes through the counted skip() helper"
+else
+  fail "every skip goes through the counted skip() helper" \
+    "found $raw_skips raw skip-printf sites, expected exactly 1 (inside skip() itself); a raw skip is not counted and hides a narrower run"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+skip_body="$(sed -n '/^skip() {/,/^}/p' "$ROOT/scripts/build_qwen_test.sh")"
+case "$skip_body" in
+  *"TESTS_SKIPPED=\$((TESTS_SKIPPED + 1))"*)
+    pass "skip() actually increments the counter, not just prints" ;;
+  *)
+    fail "skip() actually increments the counter, not just prints" \
+      "skip() printed a skip line without counting it, so the summary would report 0 skipped while skips scrolled past" ;;
+esac
+
+printf '\n%d tests, %d failed, %d skipped\n' \
+  "$TESTS_RUN" "$TESTS_FAILED" "$TESTS_SKIPPED"
+if [ "$TESTS_SKIPPED" -gt 0 ]; then
+  printf 'note: %d check(s) did not run on this machine, so this pass is narrower than a full run. Read the skip lines before citing it as green.\n' \
+    "$TESTS_SKIPPED"
+fi
 [ "$TESTS_FAILED" -eq 0 ]
