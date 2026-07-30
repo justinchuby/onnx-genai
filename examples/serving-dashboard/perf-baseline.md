@@ -2053,3 +2053,135 @@ for any artifact recording real conditions, because conditions files record real
 until I COMMITTED it, and it caught me on the very next run.** A guard that reads committed state
 is the only kind that can audit what ships, and the price is that it cannot warn you beforehand.
 **I was saved by someone else's test, aimed at a class I had already declared myself expert in.**
+
+---
+
+## 16. 🔻 §15 RETRACTED IN ITS DIRECTION — I MEASURED A BINARY THAT DOES NOT SHIP
+
+**Author:** QA Tester (@fc8b5d97) · 06:20 PDT
+
+**§15 reported AC33 at 91.04 % and recommended the gate not certify it. That recommendation was
+built on an AFTER arm that was never the shipping build, and I could not have known it from the
+evidence §15 recorded.** Re-measured against the binary that actually ships, **the sign of the
+effect reverses.** This section retracts §15's direction, keeps its method, and states what is
+actually admissible tonight.
+
+### 16.1 The discriminator I used in §15 was wrong, and wrong in the direction that waves things through
+
+@1cb42f0e derived the `/v1/models` field-count probe and gave it to me; I used it in §15.1 as the
+arm-identity assertion. They then re-ran it across seven live arms and reported it agreeing with
+the truth on only 4 of 7, **with every disagreement in the same direction — zero false negatives,
+three false positives.** I re-measured independently and found the root cause is worse than a bad
+threshold: **the taxonomy has three values, not two, and the fix REMOVES a field.**
+
+```
+FIELDS  GOVERNOR  path value                        WHAT IT ACTUALLY IS
+  4        0      (no path field)                   predates the field entirely
+  7        0/3    /Users/<user>/…/models/…          🔴 HAS the field, DISCLOSES the path
+  6        3      (field deleted)                   ✅ THE REDACTION FIX -- what ships
+
+  measured live: :8123 :8124 :8133 :8134 -> 6   :8151 -> 4   :8152 :9241 :9242 -> 7
+```
+
+**⛔ SO `7` IS NOT "NEWER", IT IS "LEAKING".** The redaction fix deletes `path`, so the post-fix
+build has **fewer** fields than the defective one. A probe that reads 7 as post-fix does not merely
+mis-date a binary — **it certifies the exact build the fix exists to eliminate.** And `governor`
+does not rescue it: `:9241`/`:9242` carry `governor=3` **and** leak. Two independent fixes landed
+on this server and **no single scalar covers both**, which is why §16's harness asserts a *tuple*
+`(fields, governor lines, path-is-absolute)` and **aborts** rather than warns.
+
+### 16.2 Two apparatus errors of mine that this uncovered, both of the existence-vs-identity family
+
+**🔴 `git merge-base --is-ancestor <sha>` TESTS FOR A COMMIT, NOT FOR A CHANGE.** I found that
+`b7f83e72` (path redaction) and `2a104dcc` (governor) are *not* ancestors of `justinchu/demo`, and
+inferred that a binary built there would lack the fixes — **so I formed a live-P0 hypothesis that
+a rebuild had silently reverted the path fix.** I then built and ran both binaries: **both return
+6 fields and no path.** The hypothesis is **REFUTED and withdrawn.** A cherry-picked or rebased fix
+carries a *different SHA and identical content*, so the ancestry test returns NO while the code is
+fully present. **I tested the identity of a commit and concluded about the presence of a change.**
+
+**🔴 `ps` REPORTS A PATH, NOT THE BYTES EXECUTING.** `:8123` (clean) and `:9241` (leaking) show the
+*same* binary path in `ps`. They are not running the same code:
+
+```
+:9241 :9242  started 02:40:25      on-disk binary last written 05:59:51   -> 3h19m of drift
+:8152        started 01:15:44                    "                        -> 4h44m of drift
+```
+
+**A long-lived process keeps executing bytes that were overwritten underneath it.** Hashing the
+path in `ps` tells you about a file, not about a server. This is the third face of the same error
+the crew hit with port 8123 (a port answering proves *a* server, not *which*) and `git archive`.
+
+### 16.3 The live leak — real, reachable, and NOT a defect in shipping code
+
+`:9241`, `:9242` and `:8152` answer `/v1/models` **right now** with the operator's absolute model
+directory. **But no current source produces it:** I built and probed both on-disk binaries and both
+return 6 fields with `path` absent. **The leak exists only inside processes started before the fix
+landed.** Severity is therefore an *environment* hazard, not a shipping-code defect — it cannot be
+fixed by a commit and it cannot be caught by any test in this repository. **The mitigation is
+operational: restart long-lived demo servers after a fix lands, because a green suite says nothing
+about a process that has been up for four hours.**
+
+### 16.4 AC33 re-measured against the binary that actually ships
+
+Arms asserted on the wire **before the first generation, with an abort on mismatch**:
+
+```
+BEFORE  :9711  sha d49d3c8fe1b8a98e  (4, governor 0, path absent)  preserved clean-tree binary
+AFTER   :9712  sha b8184fae09213ef0  (6, governor 3, path absent)  the SHIPPING build
+BOTH    model qwen2.5-0.5b-scatter-v2 · "continuous batch driver enabled" in each arm's OWN log
+```
+
+⚠️ **The AFTER binary hashed `8d9c1c5a` when I located it and `b8184fae` twelve minutes later — it
+was rebuilt underneath me mid-session.** Identity must be captured *at measurement time*; a hash
+taken beforehand is a claim about a file that may no longer be the one you ran.
+
+| pair | BEFORE | AFTER | delta | | pair | BEFORE | AFTER | delta |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 16.080 | 23.549 | **+46.4 %** | | 6 | 22.919 | 27.595 | +20.4 % |
+| 1 | 26.243 | 28.807 | +9.8 % | | 7 | 22.374 | 20.281 | −9.4 % |
+| 2 | 21.162 | 31.127 | **+47.1 %** | | 8 | 21.966 | 25.911 | +18.0 % |
+| 3 | 27.940 | 23.578 | −15.6 % | | 9 | 22.273 | 27.953 | +25.5 % |
+| 4 | 26.379 | 22.417 | −15.0 % | | 10 | 25.165 | 8.992 | **−64.3 %** (load 35.6) |
+| 5 | 30.308 | 29.924 | −1.3 % | | 11 | 21.084 | 32.023 | **+51.9 %** |
+
+```
+BEFORE median 22.647 tok/s     AFTER median 26.753 tok/s     RATIO 118.13 %   (gate >= 98 %)
+median paired delta +13.86 %   negative 5/12   two-tailed sign p = 0.774
+CV BEFORE 15.93 %  CV AFTER 22.40 %   load1 13.16 - 35.56
+```
+
+**⛔ I AM NOT CLAIMING AC33 PASSES AT 118 %. THAT WOULD BE §15's ERROR WITH THE SIGN FLIPPED.**
+A sign split of 5/12 at **p = 0.774** is the signature of *no detectable difference*, in a window
+noisier than §15's (CV 16–22 % vs 6–14 %, load to 35.6 vs 17.0). **What this run establishes is
+narrow and it is enough: the −9 % in §15 is NOT reproducible against the shipping binary, and the
+point estimate moves 27 points in the opposite direction when the AFTER arm is correctly
+identified.** §15's "inconclusive-leaning-fail" therefore **loses its lean**, and my recommendation
+that the gate not certify AC33 **is withdrawn on that ground.**
+
+### 16.5 What IS admissible tonight — the floor, per @1cb42f0e
+
+@1cb42f0e's reframe is the instrument that survives this mess, and it needs no quiet box:
+**a delta is two-sided and noise pushes both ways; a floor is one-sided and noise can only push
+against you.** Load cannot make a server look *faster*, so a floor measured under contention is a
+*lower bound* on the quiet-box figure.
+
+```
+Even at loadavg 35.56 -- the worst contention measured all session, 12 neighbouring
+listeners -- the SHIPPING build sustained >= 20.3 tok/s on 11 of 12 samples,
+512 tokens each, every sample finish_reason=length with exactly 512 tokens.
+THE QUIET-BOX FIGURE CAN ONLY BE HIGHER.
+```
+
+**This is weaker-sounding than a headline percentage and it is the only throughput sentence on this
+branch that the load cannot falsify.** It needs no null A/B, no trough-hunting and no exclusive
+window, because **the thing that ruins a delta is the thing that certifies a floor.**
+
+### 16.6 My own harness was not reproducible, which is how I found all of this
+
+`qa_ac33_ab.py` — committed as evidence in §14.3 — begins `sys.path.insert(0,'/tmp'); from
+qa_perf import sample`. **`/tmp/qa_perf.py` was never committed, and I deleted it during cleanup.**
+The harness backing §15 cannot run from a clean checkout. `qa_ac33_ab_v2.py` replaces it: stdlib
+only, identity asserted as a tuple, aborts on mismatch. **A harness that cannot be re-run is not
+evidence, it is a transcript — and I would never have caught the misidentified arm if re-running
+it had been easy.**
