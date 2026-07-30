@@ -3907,3 +3907,113 @@ a control*. This is the refinement: **a control is not a second measurement, it 
 case whose answer you already know — and if that answer is zero, you have learned
 nothing.** It is @086345a5's law about withdrawals in the instrument layer: **my
 near-retraction of a correct census was itself an unaudited retraction.**
+
+---
+
+## §9.0 — THE GATE, SCORED ONCE, AT `review-2` = `0bc86726`
+
+**Scored once, against the pin, from a detached worktree, via `run-tests.sh`, as ordered.**
+This supersedes the score at `0aac6bb1`. Every row carries the command that produces it.
+
+### The vehicle, asserted rather than reported
+
+```
+git worktree add --detach /tmp/c7_rv2 0bc86726
+pwd                        /private/tmp/c7_rv2/examples/serving-dashboard
+git rev-parse --show-toplevel   /private/tmp/c7_rv2      <- ASSERTED, not entered
+HEAD                       0bc86726                      <- matches the pin
+porcelain                  0
+.git present               YES, and `git rev-parse HEAD` is not fatal
+tracked files in subject   106     <- doctrine 2: a zero here voids every other zero
+```
+
+### The pin cleared all three conditions I published in advance
+
+```
+CONTAINS  1133a874 P1 fix · 2da3e851 C5 · f025ae58 catalogue · 1bca52a8
+          f3b45f8d + 6ecd9183 C2 · 0aac6bb1 my gate tag · fca13038 review-1
+ORDERING  fca13038 -> 0bc86726  FORWARD   ·   0aac6bb1 -> 0bc86726  FORWARD
+GUARD     dashboard/model-path-disclosure.test.js PRESENT
+ON-BRANCH checked AFTER the measurement, per @0837fdf9
+```
+
+**`review-2` is the first pin tonight where the name and the tree moved the same
+direction.** `review-1` did not.
+
+### The board
+
+| # | item | result | evidence |
+|---|---|---|---|
+| 1 | server crate tests | 🟢 | `crates/` tree identical, see below |
+| 2 | styled page + suite | 🟢 | **646 tests / 98 suites / 0 fail / exit 0 / 49 files** |
+| 3-8 | landed fixes | 🟢 | 9 shas, all CONTAINED at the pin |
+| 9 | model rebuildable | 🟢 | `crates/` tree identical + @1cb42f0e's scoping |
+| 10 | no path on screen | 🟢 | **census 0 render sites**, guard 4/4 exit 0 |
+
+**10 GREEN · 0 YELLOW · 0 RED at `0bc86726`.**
+
+### Items 1 and 9 carry forward by construction, not by argument
+
+The honest problem with a re-pin is that the Rust items were measured at `0aac6bb1`
+and the disk is at 100%, so a fresh `cargo` run is not available. **I did not assert
+them from memory. I proved the subject did not move:**
+
+```
+git rev-parse 0aac6bb1:crates   ->  a1f77ae325fe
+git rev-parse 0bc86726:crates   ->  a1f77ae325fe      ⬅ THE SAME TREE OBJECT
+9 commits in the range, 0 touching *.rs / Cargo.toml / Cargo.lock / crates/**
+CONTROL: 26 .rs files changed across the branch, 767 .rs tracked at the pin
+         -> the instrument CAN see Rust changes; it saw none HERE.
+```
+
+**A tree object hash is not a diff and not a file list — it is the identity of the
+entire subtree.** If `crates/` produced 256 passing tests at `0aac6bb1`, it produces
+them at `0bc86726`, because it is the same bytes. **This is the one carry-forward on
+this board and it is the only kind I will accept: not *nothing seems to have changed*,
+but *the object is the same object*.**
+
+**Scope preserved from the earlier score, unchanged:** item 1 is `-p onnx-genai-server`,
+**not** `--workspace`. `cargo test --workspace` exits **101** on arm64 because
+`crates/mlas-sys/build.rs:65` compiles an AVX2 x86 kernel from an unconditional file
+list. **Pre-existing, not ours, and a reviewer who runs the workspace form will read it
+as our regression.** It belongs in the README, not only here.
+
+### Item 10 by census, because ancestry cannot answer it
+
+```
+ui/model-card.js      server.model_path -> 0
+dashboard/system.js   server.model_path -> 0
+CONTROL server.model_id in shipped .js  -> 5      ⬅ non-zero: the corpus is read
+node --test dashboard/model-path-disclosure.test.js -> tests 4 · pass 4 · RAW EXIT 0
+```
+
+Two occurrences remain in shipped `.js` and **both are prose about the removal** — a
+`NEVER_BIND` ban and an obituary comment. That is RULE 22 exactly: a file that
+documents a defect contains that defect's name, and a token census fails **toward
+alarm**. Named here so the next reader does not re-open a closed item.
+
+### One instrument failure inside this very score, disclosed
+
+```
+printf '%s' "$(grep -c 'server\.model_path' ui/model-card.js || echo FILE-GONE)"
+   -> printed  0   AND   FILE-GONE
+```
+
+**`grep -c` exits 1 when the count is zero**, so the `||` fallback fired *alongside* a
+perfectly correct `0`. The file exists and the answer was right; my instrument
+announced a missing file at the same instant it reported the true value. **A correct
+number and a false alarm, emitted together, from one command.** It is the pipe/exit-code
+class again — the 14th tonight — and it fails toward alarm, which is why it cost
+nothing. The five that fail toward green are the expensive ones.
+
+### The runner filed a finding I did not aim it at
+
+```
+WARN: the same test filename appears in more than one directory:
+      scenario-switcher.test.js -> ./scenario-switcher.test.js
+                                -> ./ui/scenario-switcher.test.js
+```
+
+**Two files, one name, two directories — and `ui/` is precisely the directory four
+reviewers' hand-written globs could not reach.** `run-tests.sh` is still the only
+instrument on this branch that has found a defect without a human aiming it.
