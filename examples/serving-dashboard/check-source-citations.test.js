@@ -357,6 +357,7 @@ function anchorsFor(citation, { tight }) {
 test('a cited line still sits beside the symbol the prose names', () => {
   let checked = 0;
 
+  const failures = [];
   for (const citation of citations()) {
     const candidates = resolve(citation);
     if (candidates.length === 0) continue; // reported by an earlier test
@@ -411,7 +412,11 @@ test('a cited line still sits beside the symbol the prose names', () => {
       if (at.length > 0) elsewhere.push(`${anchor} appears at ${at.join(', ')}`);
     }
 
-    assert.fail(
+    // Collected rather than thrown, so ONE run reports EVERY stale anchor.
+    // Failing on the first turns an n-defect report into a 1-defect report and
+    // sends the reader away believing they are done; on a branch where the
+    // tree moves under you, that costs a full edit-run cycle per citation.
+    failures.push(
       `README.md cites ${citation.text} while the surrounding prose names ` +
         `${anchors.map((a) => '`' + a + '`').join(', ')} — but no such symbol ` +
         `appears within ${ANCHOR_WINDOW} lines of :${citation.line} in ` +
@@ -424,6 +429,12 @@ test('a cited line still sits beside the symbol the prose names', () => {
         `the difference.`,
     );
   }
+
+  assert.ok(
+    failures.length === 0,
+    `${failures.length} citation(s) name a symbol that is no longer at the ` +
+      `cited line:\n\n${failures.join('\n\n')}`,
+  );
 
   // A coverage floor, because this check degrades silently in the one way that
   // matters: tighten the anchor rules or reword the prose and it starts

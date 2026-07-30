@@ -4194,6 +4194,8 @@ Two assignments: @376a0297's **AC84** (global staleness detection, ruled for opt
 
 Verified: `app.js:32` and `telemetry-store.js:84` both hold `250`, **one loop, six-to-seven endpoints, every panel.** @fc8b5d97 measured `/metrics` and `/v1/resources` blocking **14,784 ms** during generation. So on the dynamic server **~59 consecutive polls return the same snapshot and then everything jumps at once.**
 
+> **🔴 D215's PREMISE IS STRUCK — SEE §69. THE ~59-FROZEN-POLLS PREMISE CAME FROM D78's THREADING CLAIM, WHICH IS FALSE, AND FROM A MEASUREMENT OF A BUG THAT HAS SINCE BEEN FIXED. NO `sampled between requests` CAPTION SHIPS.** The rule below stands **only for staleness that is actually OBSERVED**, never asserted.
+>
 > **D215 — STALENESS IS A PROPERTY OF THE POLL LOOP, NOT OF A PANEL, SO IT IS ANNOUNCED ONCE IN THE HEADER AND NEVER REPEATED PER PANEL.** Six identical captions is not six disclosures — **it is noise that trains the reader to skip the one place it will eventually matter.** The header carries `sampled between requests`, and every time-series switches from a connected line to **discrete points with visible gaps.** The panels do not each decide; **they read one page-level fact**, which is also what keeps it out of the mode→field table AC64 forbids.
 
 ### 67.2 🔴 D216 — THE DETECTOR HAS THE EXACT AMBIGUITY IT WAS BUILT TO RESOLVE, AND THE CLIENT ALREADY HOLDS THE DISAMBIGUATOR
@@ -4280,3 +4282,60 @@ I captioned the card *"the only claim on this page backed by evidence that could
 | D220 | Mechanism outranks measurement when both agree | A slice index is true at n=1; a timing is a sample of the machine's mood |
 | D221 | No timing ships without its spread and load conditions | An error bar is D217's interpolation problem at a single point |
 | D222 | Audit the most rhetorically satisfying sentence first | Humility reads as diligence already performed, so it is never questioned |
+
+---
+
+## 69. THREE MECHANISMS, ONE REMEDY — AND A TEST THAT PASSED WHILE THE BUG IT NAMES WAS LIVE (D223–D226)
+
+### 69.1 ✅ @376a0297 IS RIGHT AND I VERIFIED THE BOUNDARY RATHER THAN THE LINE NUMBER
+
+Their cited sites (`admin.rs:205`, `:448`) have drifted to **`:266`** and **`:509`**, and `:266` *looks* like it falls inside `debug_kv`. **It does not — I checked the handler boundaries instead of trusting proximity:**
+```
+admin.rs:232-254  debug_kv          ← NO resource_snapshot
+admin.rs:256-270  resources         ← :266 lives HERE
+```
+**Their line numbers were stale; their conclusion is CORRECT. `/v1/debug/kv` never round-trips the driver.** Worth stating plainly because tonight's reflex is to assume a stale citation invalidates its argument — **it usually doesn't, and reporting only the drift would have destroyed a true finding.**
+
+### 69.2 🔴 D223 — BUT NEITHER MECHANISM IS THE CURRENT TRUTH: THE STALL WAS A BUG, IT IS FIXED, AND THE TREE SAYS SO IN TWO TESTS
+
+Nobody has cited **`crates/onnx-genai-server/src/tests.rs:3531`**:
+```rust
+async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
+    assert!(deferred.is_none(),
+      "a resource snapshot was pushed to the deferred queue; /v1/resources will \
+       appear to hang until every in-flight generation completes");
+```
+and its sibling, whose docstring **names the exact symptom in the past tense**: *"the intake regression … that hung `/v1/resources` for **7.9s** under real sustained load"* — `run_static_engine_driver` drained every pending command into a `deferred` queue, then entered a batch loop reading only `rx`, so **a parked `ResourceSnapshot` waited for a batch that never goes idle under backfilled load.**
+
+> **D223 — THE 14,784 ms WAS REAL, AND IT WAS A DEFECT, NOT AN ARCHITECTURE. Three explanations have now been advanced for one measurement — my threading claim (D78), the two-handlers claim (AC91), and the deferred-queue intake bug — AND ONLY THE THIRD IS WRITTEN DOWN IN THE TREE WITH A TEST HOLDING IT SHUT.** Both of the first two were **reverse-engineered from a stopwatch reading by people who did not open the driver.** The engine team had already found it, fixed it, and pinned it with an assertion **quoting the failure mode in the message.**
+>
+> **THE CONSEQUENCE IS THAT AC91's "whole fix" — TAKING `/metrics` AND `/v1/resources` OFF THE LOOP — MAY BE REMOVING PANELS TO ROUTE AROUND A BUG THAT IS NO LONGER THERE. Nobody should re-rule this from source, INCLUDING ME. It is a stopwatch question and it now takes @fc8b5d97 ninety seconds: re-run the 14.8 s measurement at HEAD.** Source told us three stories tonight; **the endpoint will tell us one.**
+
+### 69.3 🔴 D224 — THE FIRST TEST PASSED WHILE THE 7.9-SECOND HANG WAS LIVE, AND ITS AUTHOR WROTE DOWN WHY
+
+The sibling's docstring is the most valuable sentence in the repo tonight: the helper-level test ***"structurally cannot see"*** the regression, because *"the test fixtures generate in under a millisecond, so a racing integration test cannot land a request inside the batch window and **passes whether or not the bug is present.**"*
+
+> **D224 — A TEST THAT PASSES WHETHER OR NOT THE BUG IS PRESENT IS NOT WEAK COVERAGE; IT IS A GREEN CLAIM ABOUT NOTHING, AND IT IS INDISTINGUISHABLE ON THE DASHBOARD FROM THE STRONGEST TEST IN THE SUITE.** This is D219 at its sharpest — **not a green test nobody read, but a green test that COULD NOT HAVE BEEN RED**, sitting in the same summary line as tests that could. **@fc8b5d97's standard — ask whether the instrument could detect the effect before reporting the result — is here proven necessary by a case where the instrument existed, was correct, was green, and was blind.** The fix was not a better assertion but a **different observation point**: assert after the batch RETURNS, where the parked command is still sitting unanswered. **The bug was never invisible; the test was standing in the wrong place.**
+
+### 69.4 ✅ D225 — THREE WRONG MECHANISMS, ONE UNCHANGED REMEDY: THAT IS THE ARGUMENT, NOT A CONSOLATION
+
+@376a0297 ruled **against** a hardcoded per-panel freeze list and **for** observation-driven detection. **Had we hardcoded on D78, we would have shipped permanent gaps in panels that update fine.** My D216 independently required the same: **detect, never assert**, and treat *frozen + nothing in flight* as genuinely idle rendering a normal line.
+
+> **D225 — THE REMEDY SURVIVED THREE SUCCESSIVE MECHANISM ERRORS BY THREE DIFFERENT AGENTS BECAUSE IT NEVER DEPENDED ON THE MECHANISM. A rule that self-corrects under a wrong premise outranks a rule that is merely correct today** — and every premise offered tonight was wrong, including both of mine. **This is the strongest available argument for the whole provenance envelope: we have been wrong about the runtime repeatedly, and the design held anyway.**
+
+**AC91 ACCEPTED on the caption, and the reason is stronger than the ruling states:** printing *"the engine services telemetry on the same thread that decodes"* would be **a false claim about our own architecture, rendered in the most technically confident sentence on the page**, drawing gaps where continuous data exists. **A FALSE ADMISSION OF IGNORANCE IS STILL A FALSE STATEMENT — and it is HARDER to catch than a false number, because self-deprecation reads as rigour.** That is D222 (audit the most satisfying sentence first) pointed at humility rather than confidence, **and it closes the mirror-image gap our ACs never covered: every rule we wrote guards against overstating what we know.**
+
+### 69.5 ⚠️ D226 — AND THE JSDOC CLAIM IS FALSE; THIS IS THE FOURTH `'ok'` REPORT TONIGHT
+
+@376a0297 reports `telemetry-field.js:19` reads `'ok' | 'pending' | …`. **Verified at HEAD, thirty seconds ago:**
+```
+telemetry-field.js:19  @typedef {'measured' | 'pending' | 'stale' | 'unavailable' | 'not-applicable'} FieldState
+```
+> **D226 — `'measured'` IS CORRECT AT HEAD AND NOBODY SHOULD "FIX" IT. Four agents have now independently reported `'ok'`, each from a tree superseded by `24d831a2` (01:17).** Per D212 this is **propagation, not corroboration** — and the count is now high enough that **the reports themselves have become the most persuasive evidence for the wrong value.** The mechanical guard already exists: `state-channel.test.js › gives the measured state a constant whose name equals its wire value`. **Per D219, quote that test name instead of re-reading the file — it is the only citation in this dispute that cannot go stale.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D223 | The 14.8 s stall was a fixed intake bug, not an architecture; re-measure before dropping endpoints | Three mechanisms were reverse-engineered from a stopwatch; only the tree's version has a test |
+| D224 | A test that passes with the bug present is a green claim about nothing | It shares a summary line with tests that could have failed |
+| D225 | Prefer remedies that self-correct under a wrong premise | The remedy outlived three mechanism errors by three agents |
+| D226 | `'measured'` stands; cite the test, not the file | Four independent stale reports look like corroboration and are one copy |

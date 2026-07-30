@@ -220,8 +220,8 @@ places:
 
 | path | handler | borrow | behaviour |
 |---|---|---|---|
-| batching (`:8123`) | `driver.rs:717` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
-| dynamic (`:8124`) | `driver.rs:794` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
+| batching (`:8123`) | `driver.rs:753` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
+| dynamic (`:8124`) | `driver.rs:830` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
 
 The shared-vs-exclusive borrow *is* the fix — nothing else differs.
 
@@ -690,13 +690,13 @@ that demonstrably could have seen it**.
 rather than merely observed.** A null result tells you nothing about *why*.
 Reading the code supplies the why, and it predicts every number above. There
 are two prefix branches in `prepare_session_prefix`
-(`crates/onnx-genai-engine/src/engine/runtime.rs:1009`), and **only one of them
+(`crates/onnx-genai-engine/src/engine/runtime.rs:1020`), and **only one of them
 restores anything**:
 
 | | branch | what it does |
 |---|---|---|
-| **1** | `runtime.rs:1029` — taken when `uses_token_prefix_cache()` | Scans cached token sequences with `common_prefix_len` and keeps the longest overlap. **It never touches the page table and materialises no KV.** No prefill is skipped. |
-| **2** | `runtime.rs:1037` — the `else if` | `prefix_cache.lookup_shared(…, &mut page_table)` — the real one. Matches pages and materialises them, so prefill genuinely shrinks. |
+| **1** | `runtime.rs:1040` — taken when `uses_token_prefix_cache()` | Scans cached token sequences with `common_prefix_len` and keeps the longest overlap. **It never touches the page table and materialises no KV.** No prefill is skipped. |
+| **2** | `runtime.rs:1048` — the `else if` | `prefix_cache.lookup_shared(…, &mut page_table)` — the real one. Matches pages and materialises them, so prefill genuinely shrinks. |
 
 **Branch 1 wins first, and it wins for our models.**
 `uses_token_prefix_cache()` is `has_runner() || is_windowed()`
@@ -859,7 +859,7 @@ to stage, and every stall you see actually happened.
 
 > **Concurrency is not the lever here, and that is a fact about this runtime
 > rather than a staging preference.** The dynamic server runs generation
-> *inline* on the driver thread (`run_fallback_generation`, `driver.rs:816`), so concurrent requests
+> *inline* on the driver thread (`run_fallback_generation`, `driver.rs:852`), so concurrent requests
 > **queue rather than overlap** — raising concurrency against the paged-KV
 > server adds waiting, not pressure. Concurrency drives Scenario A, on the
 > scatter server, which has no block table at all. Pressure on the pool comes
