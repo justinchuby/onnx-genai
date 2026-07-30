@@ -1290,18 +1290,27 @@ Two seams keep this navigable:
 ## Tests
 
 ```bash
-node --test 'examples/serving-dashboard/*.test.js' 'examples/serving-dashboard/dashboard/*.test.js'
+./examples/serving-dashboard/run-tests.sh
 ```
 
-Node's built-in runner. No dependencies, consistent with having no build step.
+Node's built-in runner, wrapped. No dependencies, consistent with having no
+build step. The script resolves its own directory, so it runs from anywhere.
 
-> **The single quotes are load-bearing.** They hand the patterns to Node, which
-> expands them itself. Drop them and the *shell* expands them first — and
-> because the shell resolves each glob against the current directory rather
-> than recursing, the `dashboard/` pattern contributes nothing. You get **243
-> tests instead of 532, and exit code 0**. A silently halved suite that reports
-> success is worse than one that errors, which is why the quoted form is the
-> only one written down here.
+> **This is the only documented form, and the wrapper is the point.** This
+> section previously gave a two-glob `node --test` command directly. That
+> command was carefully quoted, correct about the thing it warned you of — and
+> still wrong: it named `*.test.js` and `dashboard/*.test.js`, so it silently
+> omitted **`ui/`**, running 589 tests where the suite has 594. Four reviewers
+> specified that same pair of globs and all four missed the same directory.
+>
+> **A hand-written file list stops covering whatever was added last, which is
+> the code most likely to be wrong.** The script *discovers* test files instead
+> of enumerating them, so a new directory is covered the moment it exists. It
+> also reconciles the discovered file count against the suite count Node
+> reports, because `node --test` treats *"no files matched"* as **success** —
+> a runner that silently executes a subset is the exact defect it exists to
+> catch. Read `run-tests.sh`; it documents each failure mode at the check that
+> prevents it.
 
 The tests that matter most assert that documented zeros can never surface as
 measurements, that a genuine `0` still can, and that the launch command has not
