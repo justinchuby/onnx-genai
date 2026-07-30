@@ -1,0 +1,4 @@
+### 2026-07-30: Register Microsoft Silu with unary shape inference
+**By:** Mary
+**What:** Added `com.microsoft::Silu` version 1 to the shared shape- and dtype-preserving unary inference catalog. Static, symbolic, rank-agnostic, unknown-rank, dtype, and since-version behavior are covered by unit tests. The Qwen3.6-27B source graph contains `com.microsoft::CausalConvWithState`; native lowering exposes its activation as `com.microsoft::Silu`, whose output previously remained untyped. With the rule registered, the real native CUDA probe clears the Silu shape failure and reaches the next blocker: `internal executor error: value#1414 not produced`.
+**Why:** SiLU is elementwise and must preserve its input tensor's complete symbolic geometry and dtype. Routing it through the existing generic unary rule fixes the whole contrib-op class without model-specific shape logic.
