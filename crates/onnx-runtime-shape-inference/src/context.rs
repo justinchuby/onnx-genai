@@ -404,6 +404,12 @@ impl<'a> InferenceContext<'a> {
         self.interner.fresh_dim()
     }
 
+    /// Mutable access to the symbol interner, for shared container-type
+    /// unification helpers that mint fresh dims.
+    pub(crate) fn interner_mut(&mut self) -> &mut SymbolInterner {
+        self.interner
+    }
+
     /// Broadcast two shapes under NumPy rules. Where two distinct symbolic dims
     /// must be unified, keeps a deterministic representative symbol (see
     /// [`broadcast_dim`](Self::broadcast_dim)) rather than minting a fresh one.
@@ -539,6 +545,102 @@ pub fn merge_shapes(
         out.push(merged);
     }
     Ok(out)
+}
+
+/// Per-dimension agreement of two container element shapes. Differing ranks
+/// yield `None` (unknown element rank); within a matching rank, structurally
+/// equal dims (including symbolic ones) are preserved and disagreements degrade
+/// to a fresh symbol.
+///
+/// Shared by every rule and control-flow reconciliation that unifies a sequence
+/// element shape (`SequenceConstruct`/`SequenceInsert`, `If` branch outputs).
+pub(crate) fn merge_element_shape(
+    interner: &mut SymbolInterner,
+    a: &[DimExpr],
+    b: &[DimExpr],
+) -> Option<TypedShape> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let merged = a
+        .iter()
+        .zip(b.iter())
+        .map(|(da, db)| {
+            if da == db {
+                da.clone()
+            } else {
+                interner.fresh_dim()
+            }
+        })
+        .collect();
+    Some(merged)
+}
+
+/// Unify two container element tensor types: dtypes must match (ONNX
+/// homogeneity), shapes agree per dimension via [`merge_element_shape`]. A
+/// missing shape on *either* side yields an unknown element shape — agreement
+/// cannot be confirmed. Shared by `SequenceConstruct`/`SequenceInsert` and the
+/// `If`/`Loop` container reconciliation.
+pub(crate) fn unify_tensor_type(
+    interner: &mut SymbolInterner,
+    op: &str,
+    acc: TensorType,
+    other: TensorType,
+) -> Result<TensorType, ShapeInferError> {
+    if acc.dtype != other.dtype {
+        return Err(ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!(
+                "sequence elements must share a dtype, found {:?} and {:?}",
+                acc.dtype, other.dtype
+            ),
+        });
+    }
+    let shape = match (acc.shape, other.shape) {
+        (Some(acc_shape), Some(other_shape)) => {
+            merge_element_shape(interner, &acc_shape, &other_shape)
+        }
+        _ => None,
+    };
+    Ok(TensorType {
+        dtype: acc.dtype,
+        shape,
+    })
+}
+
+/// Recursively unify two container [`ValueType`]s. Tensor leaves unify via
+/// [`unify_tensor_type`]; `Sequence`/`Optional` recurse into their element type;
+/// `Map` requires an equal key dtype and unifies its value type. Mismatched
+/// variants (e.g. a `Sequence` against a `Tensor`, or differing `Map` keys) are
+/// an error — the honest analogue of the tensor `If` branch dtype-mismatch.
+pub(crate) fn unify_value_type(
+    interner: &mut SymbolInterner,
+    op: &str,
+    a: &ValueType,
+    b: &ValueType,
+) -> Result<ValueType, ShapeInferError> {
+    match (a, b) {
+        (ValueType::Tensor(a), ValueType::Tensor(b)) => Ok(ValueType::Tensor(unify_tensor_type(
+            interner,
+            op,
+            a.clone(),
+            b.clone(),
+        )?)),
+        (ValueType::Sequence(a), ValueType::Sequence(b)) => {
+            Ok(ValueType::sequence(unify_value_type(interner, op, a, b)?))
+        }
+        (ValueType::Optional(a), ValueType::Optional(b)) => Ok(ValueType::Optional(Box::new(
+            unify_value_type(interner, op, a, b)?,
+        ))),
+        (ValueType::Map(ak, av), ValueType::Map(bk, bv)) if ak == bk => Ok(ValueType::Map(
+            *ak,
+            Box::new(unify_value_type(interner, op, av, bv)?),
+        )),
+        _ => Err(ShapeInferError::Invalid {
+            op: op.into(),
+            detail: format!("container types disagree: {a:?} vs {b:?}"),
+        }),
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 
 use onnx_runtime_ir::{Attribute, DataType};
 
-use crate::context::{InferenceContext, TensorType, TypedShape, ValueType};
+use crate::context::{InferenceContext, TensorType, ValueType, unify_tensor_type};
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
 use crate::handlers::checked_axis;
@@ -56,7 +56,9 @@ fn sequence_construct(ctx: &mut InferenceContext) -> Result<(), ShapeInferError>
         };
         element = Some(match element.take() {
             None => TensorType::from(input),
-            Some(acc) => merge_tensor(ctx, "SequenceConstruct", acc, TensorType::from(input))?,
+            Some(acc) => {
+                unify_tensor_type(ctx.interner_mut(), "SequenceConstruct", acc, input.into())?
+            }
         });
     }
     let Some(mut element) = element else {
@@ -68,57 +70,6 @@ fn sequence_construct(ctx: &mut InferenceContext) -> Result<(), ShapeInferError>
     }
     ctx.set_output_value_type(0, ValueType::sequence(ValueType::Tensor(element)));
     Ok(())
-}
-
-/// Merge two sequence element tensor types: dtypes must match (ONNX
-/// homogeneity), shapes agree per dimension. A missing shape on *either* side
-/// yields an unknown element shape — we cannot confirm agreement. Shared by
-/// every rule that unifies a sequence element with a tensor
-/// (`SequenceConstruct`, `SequenceInsert`).
-fn merge_tensor(
-    ctx: &mut InferenceContext,
-    op: &str,
-    acc: TensorType,
-    other: TensorType,
-) -> Result<TensorType, ShapeInferError> {
-    if acc.dtype != other.dtype {
-        return Err(ShapeInferError::Invalid {
-            op: op.into(),
-            detail: format!(
-                "sequence elements must share a dtype, found {:?} and {:?}",
-                acc.dtype, other.dtype
-            ),
-        });
-    }
-    let shape = match (acc.shape, other.shape) {
-        (Some(acc_shape), Some(other_shape)) => merge_shape(ctx, &acc_shape, &other_shape),
-        _ => None,
-    };
-    Ok(TensorType {
-        dtype: acc.dtype,
-        shape,
-    })
-}
-
-/// Per-dimension agreement of two element shapes. Differing ranks yield `None`
-/// (unknown); within a matching rank, structurally-equal dims (including
-/// symbolic ones) are preserved and disagreements degrade to a fresh symbol.
-fn merge_shape(ctx: &mut InferenceContext, a: &[DimExpr], b: &[DimExpr]) -> Option<TypedShape> {
-    if a.len() != b.len() {
-        return None;
-    }
-    let merged = a
-        .iter()
-        .zip(b.iter())
-        .map(|(da, db)| {
-            if da == db {
-                da.clone()
-            } else {
-                ctx.fresh_dim()
-            }
-        })
-        .collect();
-    Some(merged)
 }
 
 /// `SequenceLength` (opset 11): the number of elements in a sequence, an `i64`
@@ -165,7 +116,9 @@ fn sequence_insert(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     let existing = sequence_element_tensor(ctx, 0);
     let inserted = ctx.input_type(1).cloned().map(TensorType::from);
     let element = match (existing, inserted) {
-        (Some(acc), Some(ins)) => merge_tensor(ctx, "SequenceInsert", acc, ins)?,
+        (Some(acc), Some(ins)) => {
+            unify_tensor_type(ctx.interner_mut(), "SequenceInsert", acc, ins)?
+        }
         // Only one side is typed: keep its dtype but drop the shape, since we
         // cannot confirm the two element shapes agree.
         (Some(mut acc), None) => {

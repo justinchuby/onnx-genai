@@ -1,6 +1,10 @@
 //! The result summary returned by whole-graph inference.
 
+use std::collections::HashMap;
+
 use onnx_runtime_ir::ValueId;
+
+use crate::context::ValueType;
 
 /// A summary of what whole-graph inference resolved.
 ///
@@ -18,6 +22,12 @@ pub struct InferenceReport {
     pub unresolved: Vec<ValueId>,
     /// Number of fresh symbolic dimensions minted during inference.
     pub fresh_symbols: usize,
+    /// Container-typed values (`Sequence`/`Optional`/`Map`) and their inferred
+    /// element type. Empty for pure-tensor graphs (the tensor path never
+    /// materialises a [`ValueType`]), which keeps that path byte-identical.
+    /// Populated for `Sequence`-family producers and control-flow nodes whose
+    /// body outputs are containers.
+    pub containers: HashMap<ValueId, ValueType>,
 }
 
 impl InferenceReport {

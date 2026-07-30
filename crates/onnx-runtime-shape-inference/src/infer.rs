@@ -7,7 +7,8 @@ use onnx_runtime_ir::{
 };
 
 use crate::context::{
-    MergePolicy, NodeIo, SymbolInterner, TypeInfo, TypedShape, ValueType, merge_shapes,
+    MergePolicy, NodeIo, SymbolInterner, TensorType, TypeInfo, TypedShape, ValueType, merge_shapes,
+    unify_value_type,
 };
 use crate::dim_expr::DimExpr;
 use crate::error::ShapeInferError;
@@ -47,8 +48,14 @@ impl InferenceRegistry {
         opset_imports: &HashMap<String, u64>,
         policy: MergePolicy,
     ) -> Result<InferenceReport, ShapeInferError> {
-        self.infer_graph_scoped(graph, opset_imports, policy, &HashMap::new())
-            .map(|result| result.report)
+        self.infer_graph_scoped(
+            graph,
+            opset_imports,
+            policy,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .map(|result| result.report)
     }
 
     fn infer_graph_scoped(
@@ -57,8 +64,14 @@ impl InferenceRegistry {
         opset_imports: &HashMap<String, u64>,
         policy: MergePolicy,
         outer_scope: &ScopeBindings,
+        seed_containers: &HashMap<ValueId, ValueType>,
     ) -> Result<ScopedInference, ShapeInferError> {
-        let mut interner = SymbolInterner::new(seed_next_symbol(graph));
+        // The interner floor must clear every symbol already present in `graph`
+        // *and* every symbol carried by a seeded container element shape (which
+        // never lands on a body `Value`, so `seed_next_symbol` cannot see it) —
+        // otherwise a freshly-minted body symbol could alias a parent one.
+        let floor = seed_next_symbol(graph).max(next_container_symbol(seed_containers));
+        let mut interner = SymbolInterner::new(floor);
         let (imported_scope, parent_symbols) = import_scope(graph, outer_scope, &mut interner);
 
         let order = graph
@@ -69,8 +82,9 @@ impl InferenceRegistry {
         let mut shape_data: HashMap<ValueId, ShapeData> = HashMap::new();
         // Parallel container-type layer: only populated for values that are
         // actually `Sequence`/`Optional`/`Map`. Empty for pure-tensor graphs, so
-        // the tensor-only path is byte-identical.
-        let mut containers: HashMap<ValueId, ValueType> = HashMap::new();
+        // the tensor-only path is byte-identical. Seeded from the owning
+        // control-flow node's container operands (empty at the top level).
+        let mut containers: HashMap<ValueId, ValueType> = seed_containers.clone();
 
         seed_sources(graph, &mut types, &mut shape_data);
         bind_captures(graph, &imported_scope, &mut types, &mut shape_data);
@@ -103,6 +117,7 @@ impl InferenceRegistry {
                 &imported_scope,
                 &types,
                 &shape_data,
+                &containers,
                 &mut child_scope,
                 &mut scope_sources_added,
                 &mut pending_scope_values,
@@ -116,6 +131,7 @@ impl InferenceRegistry {
                 &subgraph_results,
                 &mut types,
                 &mut shape_data,
+                &mut containers,
                 &mut interner,
                 remaining_subgraph_nodes,
                 &mut pending_scope_values,
@@ -162,6 +178,7 @@ impl InferenceRegistry {
                 fresh_symbols: interner.fresh_symbols().len(),
                 resolved,
                 unresolved,
+                containers,
             },
             parent_symbols,
         })
@@ -177,6 +194,7 @@ impl InferenceRegistry {
         imported_scope: &ScopeBindings,
         types: &HashMap<ValueId, TypeInfo>,
         shape_data: &HashMap<ValueId, ShapeData>,
+        containers: &HashMap<ValueId, ValueType>,
         child_scope: &mut Option<ScopeBindings>,
         scope_sources_added: &mut bool,
         pending_scope_values: &mut Vec<ValueId>,
@@ -235,7 +253,19 @@ impl InferenceRegistry {
                 effective_version(node, opset_imports),
                 interner,
             );
-            let result = self.infer_graph_scoped(subgraph, opset_imports, policy, scope)?;
+            // A control-flow body's formal inputs may be seeded with *container*
+            // types (a Loop carrying a sequence), which the tensor seeding above
+            // cannot express on a `Value`; build those directly into the child's
+            // container map.
+            let seed_containers = body_container_seeds(
+                node,
+                &key.1,
+                subgraph,
+                containers,
+                effective_version(node, opset_imports),
+            );
+            let result =
+                self.infer_graph_scoped(subgraph, opset_imports, policy, scope, &seed_containers)?;
             subgraph_results.insert(key.1, result);
         }
         *remaining_subgraph_nodes -= 1;
@@ -304,6 +334,7 @@ fn infer_control_flow(
     subgraph_results: &HashMap<String, ScopedInference>,
     types: &mut HashMap<ValueId, TypeInfo>,
     shape_data: &mut HashMap<ValueId, ShapeData>,
+    containers: &mut HashMap<ValueId, ValueType>,
     interner: &mut SymbolInterner,
     remaining_subgraph_nodes: usize,
     pending_scope_values: &mut Vec<ValueId>,
@@ -324,7 +355,7 @@ fn infer_control_flow(
     };
 
     if let Some(outputs) = outputs {
-        apply_cf_outputs(graph, node, outputs, types, shape_data);
+        apply_cf_outputs(graph, node, outputs, types, shape_data, containers);
     }
     if remaining_subgraph_nodes > 0 {
         pending_scope_values.extend(node.outputs.iter().copied());
@@ -341,9 +372,18 @@ fn apply_cf_outputs(
     outputs: Vec<CfOutput>,
     types: &mut HashMap<ValueId, TypeInfo>,
     shape_data: &mut HashMap<ValueId, ShapeData>,
+    containers: &mut HashMap<ValueId, ValueType>,
 ) {
     for (slot, output) in node.outputs.iter().zip(outputs) {
         match output {
+            CfOutput::Container(value_type) => {
+                // A container CF output lives in the parallel container map, not
+                // in `types` (the IR `Value` has no container representation) —
+                // consistent with how a top-level `Sequence` producer is handled.
+                types.remove(slot);
+                shape_data.remove(slot);
+                containers.insert(*slot, value_type);
+            }
             CfOutput::Typed(type_info) => {
                 types.insert(*slot, type_info);
             }
@@ -402,9 +442,11 @@ fn is_standard_if(node: &Node) -> bool {
     node.op_type == "If" && node.is_default_domain()
 }
 
-/// One control-flow node output slot: a fully typed shape, a known dtype whose
-/// shape could not be reconciled (unknown rank), or nothing resolved.
+/// One control-flow node output slot: a container [`ValueType`], a fully typed
+/// tensor shape, a known dtype whose shape could not be reconciled (unknown
+/// rank), or nothing resolved.
 enum CfOutput {
+    Container(ValueType),
     Typed(TypeInfo),
     UnknownRank(DataType),
     Unresolved,
@@ -448,6 +490,30 @@ fn infer_if_outputs(
         .zip(&else_branch.outputs)
         .take(paired_outputs)
     {
+        // Container outputs (sequence/optional/map) live in the parallel
+        // container map, not the IR `Value`, so they are handled before the
+        // tensor read-back path.
+        let then_container = then_result.report.containers.get(&then_id);
+        let else_container = else_result.report.containers.get(&else_id);
+        match (then_container, else_container) {
+            (Some(then_vt), Some(else_vt)) => {
+                let unified = unify_value_type(interner, "If", then_vt, else_vt)?;
+                let mapped =
+                    map_container_to_parent(&unified, &then_result.parent_symbols, interner);
+                outputs.push(CfOutput::Container(mapped));
+                continue;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ShapeInferError::Invalid {
+                    op: "If".to_string(),
+                    detail:
+                        "one branch produces a container output while the other produces a tensor"
+                            .to_string(),
+                });
+            }
+            (None, None) => {}
+        }
+
         if !branch_output_is_resolved(then_branch, then_id, &then_resolved)
             || !branch_output_is_resolved(else_branch, else_id, &else_resolved)
         {
@@ -545,6 +611,132 @@ fn seed_control_flow_body(
         "Loop" => seed_loop_body(node, body, types, interner),
         "Scan" if version >= 9 => seed_scan_body(node, body, types, interner),
         _ => {}
+    }
+}
+
+/// Build container-typed seeds for a control-flow body's formal inputs from the
+/// owning node's *container* operands, keyed by body-input [`ValueId`]. Only
+/// `Loop` carried dependencies are threaded today: an `If` branch takes no
+/// formal inputs (it reads the outer scope by name), and `Scan` container state
+/// variables are a deferred #449 follow-up (inc3b). Empty when the node has no
+/// container operands, which keeps the tensor path byte-identical.
+fn body_container_seeds(
+    node: &Node,
+    attr_name: &str,
+    body: &Graph,
+    containers: &HashMap<ValueId, ValueType>,
+    version: u64,
+) -> HashMap<ValueId, ValueType> {
+    let _ = version;
+    let mut seeds = HashMap::new();
+    if !node.is_default_domain() || attr_name != "body" || node.op_type != "Loop" {
+        return seeds;
+    }
+    // Body inputs are (iter_num, cond_in, v_1..v_N); carried operand `2 + i`
+    // seeds carried body input `2 + i`.
+    let carried = body.inputs.len().saturating_sub(2);
+    for i in 0..carried {
+        let Some(src) = node_input(node, 2 + i) else {
+            continue;
+        };
+        let Some(value_type) = containers.get(&src) else {
+            continue;
+        };
+        if let Some(&dst) = body.inputs.get(2 + i) {
+            seeds.insert(dst, value_type.clone());
+        }
+    }
+    seeds
+}
+
+/// The first symbol id strictly above every symbol appearing in a seeded
+/// container's element shapes (`0` when there are none). Container element
+/// shapes never land on a body `Value`, so [`seed_next_symbol`] cannot see them;
+/// raising the child interner floor to this value stops a body-local fresh
+/// symbol from aliasing a parent symbol carried in only via a container seed.
+fn next_container_symbol(seed_containers: &HashMap<ValueId, ValueType>) -> u32 {
+    let mut next = 0u32;
+    for value_type in seed_containers.values() {
+        for_each_container_symbol(value_type, &mut |SymbolId(id)| {
+            next = next.max(id.saturating_add(1));
+        });
+    }
+    next
+}
+
+/// Visit every symbol id in a container [`ValueType`]'s tensor-leaf shapes.
+fn for_each_container_symbol(value_type: &ValueType, visit: &mut impl FnMut(SymbolId)) {
+    match value_type {
+        ValueType::Tensor(tensor) => {
+            if let Some(shape) = &tensor.shape {
+                for dim in shape {
+                    for symbol in dim.symbol_ids() {
+                        visit(symbol);
+                    }
+                }
+            }
+        }
+        ValueType::Sequence(inner) | ValueType::Optional(inner) | ValueType::Map(_, inner) => {
+            for_each_container_symbol(inner, visit)
+        }
+    }
+}
+
+/// Remap a container [`ValueType`]'s tensor-leaf shape symbols from a child body
+/// scope into the parent scope, mirroring the per-dim rule the tensor
+/// control-flow path uses: constants pass through, a parent-origin symbol
+/// (present in `child_to_parent`) passes through, and any body-local symbol
+/// degrades to a fresh parent symbol. Sound: a body-local symbol has no meaning
+/// outside the body.
+fn map_container_to_parent(
+    value_type: &ValueType,
+    child_to_parent: &HashMap<SymbolId, SymbolId>,
+    interner: &mut SymbolInterner,
+) -> ValueType {
+    match value_type {
+        ValueType::Tensor(tensor) => {
+            let shape = tensor.shape.as_ref().map(|shape| {
+                shape
+                    .iter()
+                    .map(|dim| map_container_dim(dim, child_to_parent, interner))
+                    .collect()
+            });
+            ValueType::Tensor(TensorType {
+                dtype: tensor.dtype,
+                shape,
+            })
+        }
+        ValueType::Sequence(inner) => {
+            ValueType::sequence(map_container_to_parent(inner, child_to_parent, interner))
+        }
+        ValueType::Optional(inner) => ValueType::Optional(Box::new(map_container_to_parent(
+            inner,
+            child_to_parent,
+            interner,
+        ))),
+        ValueType::Map(key, inner) => ValueType::Map(
+            *key,
+            Box::new(map_container_to_parent(inner, child_to_parent, interner)),
+        ),
+    }
+}
+
+/// Map a single container element dim into the parent scope (see
+/// [`map_container_to_parent`]).
+fn map_container_dim(
+    dim: &DimExpr,
+    child_to_parent: &HashMap<SymbolId, SymbolId>,
+    interner: &mut SymbolInterner,
+) -> DimExpr {
+    if dim.as_const().is_some() {
+        return dim.clone();
+    }
+    match dim.as_symbol() {
+        Some(symbol) => match child_to_parent.get(&symbol) {
+            Some(&parent) => DimExpr::symbol(parent),
+            None => interner.fresh_dim(),
+        },
+        None => interner.fresh_dim(),
     }
 }
 
@@ -759,6 +951,16 @@ fn infer_loop_outputs(
             outputs.push(CfOutput::Unresolved);
             continue;
         };
+        // A loop-carried dependency (slot < carried) can be a container: its
+        // body carried-output container type flows to the Loop output. Scan
+        // outputs stack tensors, so they are never containers.
+        if slot < carried
+            && let Some(value_type) = result.report.containers.get(&body_output)
+        {
+            let mapped = map_container_to_parent(value_type, &result.parent_symbols, interner);
+            outputs.push(CfOutput::Container(mapped));
+            continue;
+        }
         match read_body_output(body, body_output, &resolved, &parent_symbols, interner) {
             Ok((dtype, mut shape)) => {
                 if slot >= carried {
