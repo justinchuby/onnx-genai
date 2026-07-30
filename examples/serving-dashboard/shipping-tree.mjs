@@ -205,6 +205,23 @@ let announced = false;
  * train readers to skip the line that carries the whole provenance. Emitted on
  * stderr: TAP consumers parse stdout, and provenance is not a test result.
  */
+/**
+ * The repository's top level, resolved ONCE at module load.
+ *
+ * Eight test and tooling files each ran their own
+ * `execFileSync('git', ['rev-parse', '--show-toplevel'])` under four different
+ * local names (`repoRoot`, `REPO_ROOT`, `TOPLEVEL`, `REPO`), with three
+ * different maxBuffer ceilings and one at the 1 MiB default. Four spellings of
+ * one fact is four places for it to drift, and a reader grepping for any single
+ * spelling finds a quarter of them -- which is how the population was
+ * repeatedly counted as two.
+ *
+ * This is a constant for the life of a process, so resolving it per caller
+ * bought nothing. `describeTree()` below already computed it privately; this
+ * export is that same call, named and shared rather than duplicated.
+ */
+export const REPO_ROOT = git('rev-parse', '--show-toplevel');
+
 export function announceShippingRef() {
   if (announced) return SHIPPING_REF;
   announced = true;

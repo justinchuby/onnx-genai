@@ -21,7 +21,24 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
-import { assertShippingTree, SHIPPING_REF, announceShippingRef, shippedPaths } from './shipping-tree.mjs';
+import {
+  assertShippingTree,
+  SHIPPING_REF,
+  announceShippingRef,
+  shippedPaths,
+  // Aliased to the local name `repoRoot` deliberately. The DESK_READ ratchet
+  // further down bans desk reads rooted at that identifier BY ITS EXACT
+  // SPELLING, so renaming the binding here would retire the guard silently
+  // rather than satisfy it -- the ratchet would still pass, having lost its
+  // subject.
+  //
+  // The banned construct is NOT written out above. Doing so failed this suite:
+  // the scan reads this file too, matched the quotation, and reported the
+  // comment explaining the rule as a violation of it. That is the same reason
+  // SPECIMEN below is assembled from fragments, documented there before I
+  // arrived and rediscovered here the expensive way.
+  REPO_ROOT as repoRoot,
+} from './shipping-tree.mjs';
 
 announceShippingRef();
 
@@ -31,10 +48,7 @@ announceShippingRef();
 assertShippingTree();
 
 const demoDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-  cwd: demoDir,
-  encoding: 'utf8',
-}).trim();
+
 
 // Every claim here is a claim about WHAT SHIPS, so read the committed bytes.
 // This used to `readFileSync` the working tree, which reads correctly and means

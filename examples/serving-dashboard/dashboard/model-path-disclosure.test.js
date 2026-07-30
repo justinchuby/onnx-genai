@@ -39,6 +39,7 @@ import { createFakeStore } from './testing/fake-store.js';
 import { FIELD_STATES } from '../telemetry-field.js';
 import { allFieldKeys, PROVENANCE } from '../telemetry-provenance.js';
 import { findAbsolutePaths } from '../absolute-path.mjs';
+import { REPO_ROOT } from '../shipping-tree.mjs';
 
 // Built here rather than with fake-store's `measured()` helper ON PURPOSE: that
 // helper still emits the retired `state: 'ok'`, which format.js refuses to
@@ -82,10 +83,7 @@ const SOURCES = Object.freeze([
 // independent reviewers converged on a two-glob test command and all four
 // missed a third test directory. Agreement between readers of the same
 // incomplete map is not corroboration.
-const REPO_ROOT = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-  cwd: fileURLToPath(new URL('.', import.meta.url)),
-  encoding: 'utf8',
-}).trim();
+
 
 /**
  * Every shipped dashboard module, from the index rather than from the disk.
