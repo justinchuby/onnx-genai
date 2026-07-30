@@ -105,16 +105,6 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_DEMO_ASSETS_DIR")]
     pub demo_assets_dir: Option<PathBuf>,
 
-    /// Additional origin permitted to make cross-origin requests; repeatable.
-    /// Loopback origins are always permitted, so the two-server demo needs no
-    /// flag. Use this only when serving the dashboard from a non-loopback host.
-    #[arg(
-        long = "cors-allow-origin",
-        env = "ONNX_GENAI_CORS_ALLOW_ORIGIN",
-        value_delimiter = ','
-    )]
-    pub cors_allow_origins: Vec<String>,
-
     /// Device for native decoder execution: cpu, cuda, or cuda:<index>.
     /// Falls back to ONNX_GENAI_EP when omitted.
     #[cfg(feature = "native-backend")]
@@ -134,7 +124,6 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         max_loaded_models: args.max_loaded_models,
         eviction_policy: Default::default(),
         demo_assets_dir: crate::demo_assets::resolve_demo_assets_dir(args.demo_assets_dir),
-        cors_allow_origins: args.cors_allow_origins,
         engine_config: onnx_genai_engine::EngineConfig {
             kv_cache_dtype: args.kv_cache_dtype,
             #[cfg(feature = "native-backend")]

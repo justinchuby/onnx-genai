@@ -142,12 +142,6 @@ pub struct ServerConfig {
     /// Directory served at `GET /demo`. `None` disables the demo (the route
     /// still responds, explaining how to point the server at the assets).
     pub demo_assets_dir: Option<PathBuf>,
-    /// Additional origins permitted to make cross-origin requests. Loopback
-    /// origins are always permitted; this is for anything else.
-    ///
-    /// Needed because the demo dashboard is served from one origin but polls
-    /// both demo servers, so half its requests are cross-origin.
-    pub cors_allow_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -163,7 +157,6 @@ impl Default for ServerConfig {
             eviction_policy: EvictionPolicy::Lru,
             engine_config: EngineConfig::default(),
             demo_assets_dir: None,
-            cors_allow_origins: Vec::new(),
         }
     }
 }

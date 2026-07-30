@@ -23,7 +23,6 @@ use tracing::Instrument;
 
 mod audio_input;
 mod cli;
-mod cors;
 mod demo_assets;
 mod driver;
 mod image_input;
@@ -133,11 +132,6 @@ pub fn app(state: AppState) -> Router {
         // Outside routing: `nest_service("/demo", ..)` already claims the bare
         // `/demo` path, so the trailing-slash redirect cannot be a route.
         .layer(middleware::from_fn(demo_assets::redirect_bare_demo))
-        // Outermost, deliberately: preflights must be answered before routing
-        // (an `OPTIONS` never matches a `get`/`post` route and would otherwise
-        // become a header-less 405), and they must not be counted as API
-        // requests by `trace_request`.
-        .layer(middleware::from_fn_with_state(state, cors::cors_middleware))
 }
 
 async fn trace_request(request: Request, next: Next) -> Response {

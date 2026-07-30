@@ -1,18 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Route-level tests for the demo dashboard: static serving at `GET /demo` and
-//! the cross-origin policy that the two-server demo depends on.
+//! Route-level tests for the demo dashboard served at `GET /demo`.
 //!
-//! These sit at the router level on purpose. The unit tests in `demo_assets` and
-//! `cors` cover path safety and origin parsing; what can only be verified here is
-//! that the routes are wired, that the middleware is applied at a layer where it
-//! sees preflights, and that a preflight is answered rather than falling through
-//! to a header-less 405.
+//! These sit at the router level on purpose. The unit tests in `demo_assets`
+//! cover directory resolution; what can only be verified here is that the
+//! routes are wired, that the redirect layer is applied where it sees the bare
+//! `/demo` path, and that the mount is reachable with every gate disabled.
+//!
+//! There is no cross-origin coverage because there are no cross-origin
+//! requests: each demo server serves its own copy of the dashboard, and
+//! switching scenarios navigates the browser to the other server's `/demo`, so
+//! every fetch is same-origin with the server that served the page.
 
 use axum::{
     body::{Body, to_bytes},
-    http::{Method, Request, StatusCode, header},
+    http::{Request, StatusCode, header},
 };
 use onnx_genai_server::{AppState, ServerConfig, app};
 use std::path::{Path, PathBuf};
@@ -196,158 +199,4 @@ async fn demo_is_reachable_with_debug_and_admin_endpoints_disabled() {
 
     let response = app(state).oneshot(get("/demo/")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-// --------------------------------------------------------------------------
-// Cross-origin policy
-// --------------------------------------------------------------------------
-
-/// The dashboard is served by one server and polls both, so this header is what
-/// makes half the panels able to load at all.
-#[tokio::test]
-async fn loopback_origin_receives_allow_origin_header() {
-    let response = app_with_demo_dir(None)
-        .oneshot(
-            Request::get("/v1/models")
-                .header(header::ORIGIN, "http://localhost:8124")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-        "http://localhost:8124",
-        "the caller's origin must be echoed, not wildcarded"
-    );
-    assert_eq!(
-        response.headers()[header::VARY],
-        "Origin",
-        "caches must key on Origin or one origin's headers leak to another"
-    );
-}
-
-#[tokio::test]
-async fn non_loopback_origin_receives_no_allow_origin_header() {
-    let response = app_with_demo_dir(None)
-        .oneshot(
-            Request::get("/v1/models")
-                .header(header::ORIGIN, "http://evil.example")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        !response
-            .headers()
-            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-    );
-}
-
-#[tokio::test]
-async fn explicitly_allowed_origin_is_permitted() {
-    let config = ServerConfig {
-        cors_allow_origins: vec!["https://dashboard.example".to_string()],
-        ..Default::default()
-    };
-    let state =
-        AppState::load_with_config(&fixture_dir(), Some("tiny-llm".to_string()), config).unwrap();
-
-    let response = app(state)
-        .oneshot(
-            Request::get("/v1/models")
-                .header(header::ORIGIN, "https://dashboard.example")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-        "https://dashboard.example"
-    );
-}
-
-/// The demo drives load with `POST` + `Content-Type: application/json`, which is
-/// not CORS-safelisted, so the browser sends a preflight first. An `OPTIONS`
-/// matches no route, so without router-level middleware it becomes a 405 with no
-/// CORS headers and the real request never happens.
-#[tokio::test]
-async fn preflight_for_a_json_post_is_approved() {
-    let response = app_with_demo_dir(None)
-        .oneshot(
-            Request::builder()
-                .method(Method::OPTIONS)
-                .uri("/v1/completions")
-                .header(header::ORIGIN, "http://localhost:8123")
-                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
-        "http://localhost:8123"
-    );
-
-    let methods = response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
-        .to_str()
-        .unwrap();
-    assert!(methods.contains("POST"), "got: {methods}");
-
-    let headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
-        .to_str()
-        .unwrap();
-    assert!(
-        headers.contains("content-type"),
-        "content-type is the header that forces the preflight; got: {headers}"
-    );
-}
-
-#[tokio::test]
-async fn preflight_from_a_disallowed_origin_is_refused() {
-    let response = app_with_demo_dir(None)
-        .oneshot(
-            Request::builder()
-                .method(Method::OPTIONS)
-                .uri("/v1/completions")
-                .header(header::ORIGIN, "http://evil.example")
-                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert!(
-        !response
-            .headers()
-            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-    );
-}
-
-/// Same-origin traffic carries no `Origin`, and must be unaffected.
-#[tokio::test]
-async fn requests_without_an_origin_are_untouched() {
-    let response = app_with_demo_dir(None)
-        .oneshot(get("/v1/models"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        !response
-            .headers()
-            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-    );
 }
