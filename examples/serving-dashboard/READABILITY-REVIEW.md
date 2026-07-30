@@ -3290,11 +3290,92 @@ and not an `exit`.**
 
 ---
 
-**FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**
-**71 findings · 9 self-retractions (12.7%) · 10 instrument failures catalogued.**
+~~**FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**~~
+~~**71 findings · 9 self-retractions (12.7%) · 10 instrument failures catalogued.**~~
 
 **R71 IS A GUARD DEFECT, NOT A PRODUCT DEFECT — my approval is unchanged.** But the suite is
 **red at HEAD** until `served-surface.test.js`'s owner chooses between raising `91 → 94` and
 going per-class. **That is a publishing decision and it is not mine to take.**
 
 MEASURED-AT: ede2b742
+
+---
+
+## 🔴 R71 (UPGRADED) — THE RATCHET WAS **RED ON ARRIVAL** THREE TIMES, AND A `git mv` DISCHARGED A 31-FILE BREACH
+
+I audited my own seven-raise claim — all seven commits ancestor-verified, negative control a
+fabricated SHA returning `fatal` — and then asked the question I had not asked: **did each raise
+actually clear the guard?**
+
+```
+COMMIT     CEILING  ACTUAL   VERDICT
+75fd37ff   82       82       GREEN        4971e0f2   85     85    GREEN
+23f4da0d   83       83       GREEN        22dea83e   87    117    RED ON ARRIVAL (+30)
+4ee814f4   84       84       GREEN        69899be2   88    119    RED ON ARRIVAL (+31)
+                                          9b54d3a9   91     94    RED ON ARRIVAL (+3)
+```
+
+**Three of the seven raises left the guard red the instant they landed, and nobody knew — because
+nobody ever executed the full corpus.** Then the breach vanished without a decision being made:
+
+```
+481f7595  git mv 30 files (harness/*.py, raw/*) OUT of the served dir -> examples/qa-evidence/
+  non-page-asset count BEFORE 119  ->  AFTER 89      ceiling at that moment: 88
+```
+
+> ### ***A `git mv` DISCHARGED A THIRTY-ONE-FILE EXPOSURE BREACH AS A SIDE EFFECT OF A FILE REORGANISATION. THE GUARD IS NAMED FOR EXPOSURE AND IT COUNTS DIRECTORY MEMBERSHIP — SO IT CAN BE SATISFIED BY MOVING A FILE RATHER THAN BY PUBLISHING LESS. THAT IS THE CAPTION-VERSUS-VALUE DEFECT, IN A GUARD.***
+
+**REMEDY, UPGRADED.** Per-class ceilings remain right, and add one line: **the guard must print
+its count and its ceiling on every run, including when green.** *A ceiling printed only when it
+is breached cannot tell you it was breached for three hours and then quietly wasn't.*
+
+## 🔴 R72 — THE CANONICAL SUITE COMMAND DEGRADES INTO THE DEFECT IT WAS BUILT TO PREVENT
+
+The ruled command is `node --test $(git ls-files '*.test.js')`, adopted specifically so an
+untracked file could never be counted. **The pathspec is not anchored to the repository root:**
+
+```
+git ls-files '*.test.js'   from repo root ...................... 64
+                           from examples/serving-dashboard ..... 64
+                           from crates/ ........................  0
+```
+
+With zero arguments the command becomes a **bare `node --test`**, which walks the disk and picks
+up exactly the untracked files the construction was chosen to exclude — **at exit 0, under a
+normal-looking summary line.**
+
+> ### ***THE SAFEGUARD'S FAILURE MODE IS TO SILENTLY BECOME THE HAZARD. AND THIS IS NOT THEORETICAL: I EXECUTED IT MYSELF AN HOUR EARLIER, WHEN `mapfile` (ABSENT ON macOS bash 3.2) LEFT MY ARRAY EMPTY, MY OWN FLOOR PRINTED `REFUSE`, AND THE BARE RUN PROCEEDED AND PRODUCED A CONFIDENT NUMBER ANYWAY.***
+
+**FIX — one word, verified from four directories including `crates/`:**
+```
+node --test $(git ls-files ':(top)*.test.js')   2> run.err
+[ $(git ls-files ':(top)*.test.js' | wc -l) -gt 0 ] || exit 4
+```
+`git ls-files` removed the dependence on *remembering to check `git status`*. **`:(top)` removes
+the dependence on *remembering where you are standing*.** The floor matters independently:
+**an empty corpus must be a refusal, not a fallback.**
+
+### THE SECOND RED, AND IT IS THE SYSTEM WORKING
+
+`served-surface-rendered.test.js:254` — `build_sha` and `build_dirty` are **served and rendered
+by no pixel**. They entered via `0bf9a12a` *"server: the binary states which commit built it"*,
+which touched `crates/` only; occurrences in any shipped page asset: **0** (positive control
+`model_id` = 8, negative control = 0).
+
+**This is precisely the field a colleague asked for thirty minutes earlier** — a dashboard that
+names the serving binary's SHA would have made tonight's P0 self-evident at a glance. **The
+binary now states it; the page still does not, and the guard said so the moment the gap opened,
+naming both legitimate remedies.** That is good guard design catching a half-landed feature, and
+it deserves saying as loudly as the defects.
+
+---
+
+**FINAL VERDICT — READABILITY LANE: ✅ APPROVE. BLOCKING SET EMPTY.**
+**72 findings · 9 self-retractions (12.5%) · 10 instrument failures catalogued.**
+
+**AUTHORITATIVE SUITE NUMBER**, detached worktree at `6d7f7d4f`, `porcelain 0`, corpus asserted
+at 64, canonical command, exit taken unpiped: **833 tests · 123 suites · 831 pass · 2 fail ·
+raw exit 1.** Both failures are guard-accounting and half-landed-feature decisions owned by
+others. **Neither is a readability defect, and neither changes my approval.**
+
+MEASURED-AT: 6d7f7d4f
