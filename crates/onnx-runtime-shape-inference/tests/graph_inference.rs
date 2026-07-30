@@ -1856,3 +1856,366 @@ fn loop_passthrough_preserves_seeded_sequence_dtype() {
         "concrete element extent preserved"
     );
 }
+
+// ===========================================================================
+// #449 inc4 (closeout): SequenceMap, cross-subgraph container capture, and
+// Scan container state. All observed via `report.containers` on the outer node.
+// ===========================================================================
+
+/// A `SequenceMap` body with a single element input and one op applied to it.
+/// The body input is left type/shape-unknown so it is proven to be *seeded*
+/// from the input sequence's element type.
+fn unary_map_body(op: &str, out_dtype: DataType) -> Graph {
+    let mut body = Graph::new();
+    let elem = body.create_named_value("elem", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(elem);
+    body.mark_value_shape_unknown(elem);
+    body.add_input(elem);
+    let mapped = body.create_named_value("mapped", out_dtype, Shape::new());
+    body.mark_value_type_unknown(mapped);
+    body.mark_value_shape_unknown(mapped);
+    body.insert_node(node(0, op, vec![Some(elem)], vec![mapped]));
+    body.add_output(mapped);
+    body
+}
+
+/// Build a single-input-sequence `SequenceMap`: an outer tensor `elem` is wrapped
+/// by `SequenceConstruct`, then mapped through `body`. Returns `(map_output,
+/// report)`; the output sequence is observed via `report.containers`.
+fn run_unary_sequence_map(body: Graph, elem_shape: Vec<Dim>) -> (ValueId, InferenceReport) {
+    let mut graph = Graph::new();
+    let elem = graph.create_named_value("elem", DataType::Float32, elem_shape);
+    graph.add_input(elem);
+    let seq0 = graph.create_named_value("seq0", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(seq0);
+    graph.mark_value_shape_unknown(seq0);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(elem)], vec![seq0]));
+
+    let map_out = graph.create_named_value("map_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(map_out);
+    graph.mark_value_shape_unknown(map_out);
+    let map_node = graph.insert_node(node(1, "SequenceMap", vec![Some(seq0)], vec![map_out]));
+    graph.subgraphs.insert((map_node, "body".into()), body);
+    graph.add_output(map_out);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer SequenceMap");
+    (map_out, report)
+}
+
+#[test]
+fn sequence_map_identity_preserves_element_type() {
+    let (map_out, report) = run_unary_sequence_map(
+        unary_map_body("Identity", DataType::Float32),
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+
+    let tensor = sequence_tensor(report.containers.get(&map_out).expect("container output"));
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
+        "an identity body maps element type through unchanged"
+    );
+}
+
+#[test]
+fn sequence_map_body_transforms_element_type() {
+    // `Shape` turns each [2,3] element into an int64 [2] vector; the OUTPUT
+    // sequence element type must reflect that transform, proving the body was
+    // seeded and its output wrapped.
+    let (map_out, report) = run_unary_sequence_map(
+        unary_map_body("Shape", DataType::Int64),
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+
+    let tensor = sequence_tensor(report.containers.get(&map_out).expect("container output"));
+    assert_eq!(tensor.dtype, DataType::Int64, "Shape output is int64");
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2)]),
+        "Shape of a rank-2 element is a length-2 vector"
+    );
+}
+
+#[test]
+fn sequence_map_zips_two_input_sequences() {
+    // Two input sequences of [2,3] float elements; the body Adds the two
+    // per-element tensors. The output sequence element = [2,3] float32.
+    let mut graph = Graph::new();
+    let a = graph.create_named_value("a", DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]);
+    graph.add_input(a);
+    let b = graph.create_named_value("b", DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]);
+    graph.add_input(b);
+    let seq_a = graph.create_named_value("seq_a", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(seq_a);
+    graph.mark_value_shape_unknown(seq_a);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(a)], vec![seq_a]));
+    let seq_b = graph.create_named_value("seq_b", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(seq_b);
+    graph.mark_value_shape_unknown(seq_b);
+    graph.insert_node(node(1, "SequenceConstruct", vec![Some(b)], vec![seq_b]));
+
+    let mut body = Graph::new();
+    let ea = body.create_named_value("ea", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(ea);
+    body.mark_value_shape_unknown(ea);
+    body.add_input(ea);
+    let eb = body.create_named_value("eb", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(eb);
+    body.mark_value_shape_unknown(eb);
+    body.add_input(eb);
+    let sum = body.create_named_value("sum", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(sum);
+    body.mark_value_shape_unknown(sum);
+    body.insert_node(node(0, "Add", vec![Some(ea), Some(eb)], vec![sum]));
+    body.add_output(sum);
+
+    let map_out = graph.create_named_value("map_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(map_out);
+    graph.mark_value_shape_unknown(map_out);
+    let map_node = graph.insert_node(node(
+        2,
+        "SequenceMap",
+        vec![Some(seq_a), Some(seq_b)],
+        vec![map_out],
+    ));
+    graph.subgraphs.insert((map_node, "body".into()), body);
+    graph.add_output(map_out);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer SequenceMap zip");
+
+    let tensor = sequence_tensor(report.containers.get(&map_out).expect("container output"));
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
+        "zipping two sequences maps the element-wise body output type"
+    );
+}
+
+#[test]
+fn sequence_map_additional_tensor_input_is_broadcast() {
+    // One input sequence of [2,3] elements + one whole-tensor additional input
+    // [2,3]; the body Adds them. The extra input is seeded as a whole tensor
+    // (not an element), and the output sequence element = [2,3] float32.
+    let mut graph = Graph::new();
+    let a = graph.create_named_value("a", DataType::Float32, vec![Dim::Static(2), Dim::Static(3)]);
+    graph.add_input(a);
+    let bias = graph.create_named_value(
+        "bias",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+    graph.add_input(bias);
+    let seq_a = graph.create_named_value("seq_a", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(seq_a);
+    graph.mark_value_shape_unknown(seq_a);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(a)], vec![seq_a]));
+
+    let mut body = Graph::new();
+    let ea = body.create_named_value("ea", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(ea);
+    body.mark_value_shape_unknown(ea);
+    body.add_input(ea);
+    let eb = body.create_named_value("eb", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(eb);
+    body.mark_value_shape_unknown(eb);
+    body.add_input(eb);
+    let sum = body.create_named_value("sum", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(sum);
+    body.mark_value_shape_unknown(sum);
+    body.insert_node(node(0, "Add", vec![Some(ea), Some(eb)], vec![sum]));
+    body.add_output(sum);
+
+    let map_out = graph.create_named_value("map_out", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(map_out);
+    graph.mark_value_shape_unknown(map_out);
+    let map_node = graph.insert_node(node(
+        1,
+        "SequenceMap",
+        vec![Some(seq_a), Some(bias)],
+        vec![map_out],
+    ));
+    graph.subgraphs.insert((map_node, "body".into()), body);
+    graph.add_output(map_out);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer SequenceMap with additional tensor input");
+
+    let tensor = sequence_tensor(report.containers.get(&map_out).expect("container output"));
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
+        "a whole-tensor additional input broadcasts against each element"
+    );
+}
+
+/// A branch that simply returns a container captured by name from the outer
+/// scope (no formal inputs, no ops) — proving the capture threaded the
+/// container's `ValueType` into the body.
+fn captured_sequence_branch(name: &str) -> Graph {
+    let mut branch = Graph::new();
+    let capture = branch.create_named_value(name, DataType::Float32, Shape::new());
+    branch.mark_value_type_unknown(capture);
+    branch.mark_value_shape_unknown(capture);
+    branch.add_output(capture);
+    branch
+}
+
+#[test]
+fn if_branches_capture_outer_scope_sequence() {
+    // seq0 is built in the outer graph, then both If branches return it by
+    // lexical capture. Without the remap_node_io container fix, the captured
+    // value would lose its type; with it, the If output is a sequence.
+    let mut graph = Graph::new();
+    let condition = graph.create_named_value("condition", DataType::Bool, Shape::new());
+    graph.add_input(condition);
+    let elem = graph.create_named_value(
+        "elem",
+        DataType::Float32,
+        vec![Dim::Static(4), Dim::Static(5)],
+    );
+    graph.add_input(elem);
+    let seq0 = graph.create_named_value("seq0", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(seq0);
+    graph.mark_value_shape_unknown(seq0);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(elem)], vec![seq0]));
+
+    let output = graph.create_named_value("output", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(output);
+    graph.mark_value_shape_unknown(output);
+    let if_node = graph.insert_node(node(1, "If", vec![Some(condition)], vec![output]));
+    graph.subgraphs.insert(
+        (if_node, "then_branch".into()),
+        captured_sequence_branch("seq0"),
+    );
+    graph.subgraphs.insert(
+        (if_node, "else_branch".into()),
+        captured_sequence_branch("seq0"),
+    );
+    graph.add_output(output);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer If capturing an outer sequence");
+
+    let tensor = sequence_tensor(report.containers.get(&output).expect("container output"));
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(4), DimExpr::constant(5)]),
+        "the captured outer sequence's element type crosses the branch boundary"
+    );
+}
+
+#[test]
+fn scan_carries_sequence_state_variable() {
+    // A Scan with one container state var and one scan input. The body erases
+    // from the carried sequence (state) and passes a scan slice through. The
+    // final state output must be a sequence with the element type preserved.
+    let mut graph = Graph::new();
+    let elem = graph.create_named_value(
+        "elem",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+    graph.add_input(elem);
+    let seq0 = graph.create_named_value("seq0", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(seq0);
+    graph.mark_value_shape_unknown(seq0);
+    graph.insert_node(node(0, "SequenceConstruct", vec![Some(elem)], vec![seq0]));
+    // Scan input: [T, 4] tensor sliced per-iteration to [4].
+    let scan_in = graph.create_named_value(
+        "scan_in",
+        DataType::Float32,
+        vec![Dim::Static(6), Dim::Static(4)],
+    );
+    graph.add_input(scan_in);
+
+    // Body: (state_seq, scan_slice) -> (state_seq_out, scan_out).
+    let mut body = Graph::new();
+    let state_in = body.create_named_value("state_in", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(state_in);
+    body.mark_value_shape_unknown(state_in);
+    body.add_input(state_in);
+    let slice_in = body.create_named_value("slice_in", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(slice_in);
+    body.mark_value_shape_unknown(slice_in);
+    body.add_input(slice_in);
+    let state_out = body.create_named_value("state_out", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(state_out);
+    body.mark_value_shape_unknown(state_out);
+    body.insert_node(node(
+        0,
+        "SequenceErase",
+        vec![Some(state_in)],
+        vec![state_out],
+    ));
+    let scan_out = body.create_named_value("scan_out", DataType::Float32, Shape::new());
+    body.insert_node(node(1, "Identity", vec![Some(slice_in)], vec![scan_out]));
+    body.add_output(state_out);
+    body.add_output(scan_out);
+
+    let final_state = graph.create_named_value("final_state", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(final_state);
+    graph.mark_value_shape_unknown(final_state);
+    let scan_result = graph.create_named_value("scan_result", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(scan_result);
+    graph.mark_value_shape_unknown(scan_result);
+    let mut scan_node = node(
+        1,
+        "Scan",
+        vec![Some(seq0), Some(scan_in)],
+        vec![final_state, scan_result],
+    );
+    scan_node
+        .attributes
+        .insert("num_scan_inputs".into(), Attribute::Int(1));
+    let scan_id = graph.insert_node(scan_node);
+    graph.subgraphs.insert((scan_id, "body".into()), body);
+    graph.add_output(final_state);
+    graph.add_output(scan_result);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    let report = registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Scan with a sequence state var");
+
+    let tensor = sequence_tensor(
+        report
+            .containers
+            .get(&final_state)
+            .expect("state is a sequence"),
+    );
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(
+        tensor.shape,
+        Some(vec![DimExpr::constant(2), DimExpr::constant(3)]),
+        "the sequence state element type is preserved across the Scan"
+    );
+    // The scan output stays a plain stacked tensor (not a container).
+    assert!(
+        !report.containers.contains_key(&scan_result),
+        "a scan output stacks tensors and is never a container"
+    );
+}
