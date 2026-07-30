@@ -1811,3 +1811,66 @@ direction that ships. The lesson is not about `tail`:
 > instance this session of a decorative-looking token changing what was measured,
 > alongside a narrowing glob, an inherited working directory, and a line break
 > hiding a string. **All four were silent and all four exited zero.**
+
+### 8.17 Retraction of §8.16 — I manufactured a false RED at the gate
+
+**§8.16 above is wrong in its conclusion and it stays in this document unedited,
+because a retraction that deletes its own premise teaches nothing.** Read it, then
+read this.
+
+§8.16 reported the suite as **red -- exit 1, eight failures** and scored the gate's
+suite item RED on that basis. **The branch was green the entire time.** The control
+that proves it, run at the *same sha* §8.16 measured:
+
+```
+SHARED WORKING TREE  @ c1323e7f   node --test … ; echo $?   -> EXIT 1   8 fail
+PINNED WORKTREE      @ c1323e7f   node --test … ; echo $?   -> EXIT 0   620/620
+                       ^ same sha. same command. no pipe in either.
+```
+
+**One difference between the two runs: the shared tree carried seven other agents'
+uncommitted edits** -- `app.js`, `telemetry-provenance.js`, `shell.css`,
+`state-treatments.test.js`, `asset-graph.test.js` and two documents. A pinned
+worktree reads **committed bytes only**. Every failure I reported lived in
+work-in-progress that was never on the branch.
+
+So the second explanation I offered in §8.16 -- *red tests landing ahead of their
+fixes* -- was generous, plausible, and **also wrong**. Nothing was fixed between my
+runs. There was never anything committed to fix.
+
+> **This is a false negative at the release gate, produced by the gate's own
+> scorekeeper, minutes before ship.** Everyone spent the night hunting false
+> greens. A false **red** is not the safe direction of the same error -- it is a
+> different failure with its own cost: it blocks a shippable branch, and it spends
+> the one resource a freeze has none of, which is attention.
+
+**The mechanism has a name and it was published ninety seconds before I fell into
+it.** Reading `HEAD` in the shared tree and running a suite in the shared tree are
+opposite exposures:
+
+> **A `git show HEAD:` read is immune to half-finished checkouts and blind to the
+> uncommitted files beside it. A shared-tree test run is the reverse: it sees
+> everything, including seven desks mid-edit, and attributes all of it to the
+> branch.** Neither posture is safe. They fail in opposite directions, and the only
+> honest move is to name which one you chose.
+
+**I chose the shared tree for a suite run and did not say so.** The result was
+real, reproducible, and about a tree that will never be released.
+
+**So the suite item is scored the way this brief already demands of the browser
+item, and no other way is admissible:**
+
+```
+git worktree add --detach "$WT" "$SHA" || exit 1     # exit status CHECKED, not read
+[ "$(git -C "$WT" status --porcelain | wc -l)" -eq 0 ] || exit 1   # ASSERTED
+ls "$WT"/…/*.test.js | wc -l                          # positive control: nonzero
+node --test *.test.js dashboard/*.test.js ui/*.test.js ; echo $?   # NO PIPE
+```
+
+At the sha this section was written that returns **`0`, `tests 621 · pass 621 ·
+fail 0 · skipped 0`**, and the worktree was reaped and its absence verified by name.
+
+> **A measurement needs a subject, and "the repository" is not one when fourteen
+> agents are writing to it.** The shared tree is a shared mutable object. Running a
+> test suite against it produces a true statement about a configuration that
+> existed for one hundred and twenty seconds and belonged to nobody.
