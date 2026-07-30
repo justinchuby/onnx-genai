@@ -140,11 +140,21 @@ Overridable via environment: `MODELS_DIR`, `SCATTER_MODEL`, `DYNAMIC_MODEL`,
 `SCATTER_PORT`, `DYNAMIC_PORT`, `BIND_HOST`, `ONNX_GENAI_EP`,
 `READY_TIMEOUT_SECONDS`.
 
-**No CORS configuration is needed**, even though the page is served by one
-server and reads telemetry from two. Loopback origins are always permitted
-(`crates/onnx-genai-server/src/cors.rs`), so the two-server demo works out of
-the box. `--cors-allow-origin` exists for serving the dashboard from a
-non-loopback host; the demo does not use it.
+**There is no CORS configuration, and no CORS code in the server at all** — not
+a permissive default, not a flag. It is unnecessary by construction: each page
+only ever talks to the server that served it, and switching to a scenario on the
+other server *navigates* rather than fetching. A cross-origin request is never
+made, so there is nothing to authorise.
+
+That is worth stating plainly because the alternative design fails in a way
+almost nobody catches. A cross-origin `GET /v1/status` **is sent, is handled,
+and logs a clean `200 OK`** — the browser then discards the response before
+JavaScript can read it. A `POST /v1/completions` never leaves the browser at
+all: `application/json` plus the `X-Session-Id` header trigger a preflight
+`OPTIONS`, which no route answers. **Neither reproduces under `curl`**, which
+does not implement the same-origin policy, so every endpoint tests perfectly
+from a terminal while the page is dead in a browser. Avoiding the whole class
+structurally is cheaper than debugging one instance of it.
 
 `--enable-admin-endpoints` is **deliberately not used.** The demo never calls
 `/v1/admin/*`, and the server ships without authentication, so enabling an

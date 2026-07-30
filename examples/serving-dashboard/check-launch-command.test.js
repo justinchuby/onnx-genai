@@ -216,3 +216,89 @@ test('the README documents the deliberate divergence from diffusion-demo', () =>
     'README must explain why there is no bundler',
   );
 });
+
+// ---------------------------------------------------------------------------
+// Every flag we document must actually exist in the server's CLI.
+//
+// This is the check that catches the most expensive kind of documentation bug:
+// a flag that was real when it was written and has since been renamed or cut.
+// Prose describing a deleted flag reads exactly like prose describing a live
+// one, so nothing but a mechanical comparison against the CLI will find it.
+//
+// It is deliberately one-directional. Flags the server has and we do not
+// document are fine — most of them are irrelevant to the demo. Flags we
+// document and the server does not have are always a bug.
+// ---------------------------------------------------------------------------
+
+const repoRoot = join(demoDir, '..', '..');
+const cliSource = readFileSync(
+  join(repoRoot, 'crates/onnx-genai-server/src/cli.rs'),
+  'utf8',
+);
+
+/**
+ * clap names a flag after its field unless `long = "..."` overrides it. The two
+ * must not both be accepted: treating the field name as valid when an override
+ * exists would let a misspelled flag pass, which is precisely the drift this
+ * test is for.
+ */
+const cliFlags = new Set();
+for (const [, attr, field] of cliSource.matchAll(
+  /#\[arg\(([\s\S]*?)\)\]\s*pub\s+([a-z0-9_]+)\s*:/g,
+)) {
+  const override = attr.match(/long\s*=\s*"([a-z0-9-]+)"/);
+  cliFlags.add(`--${override ? override[1] : field.replaceAll('_', '-')}`);
+}
+
+/**
+ * Yields only the commands that invoke the server binary, joining shell line
+ * continuations first so a flag on its own line stays attached to its command.
+ *
+ * Scoping matters: the README also documents a Mobius model-build command whose
+ * flags belong to a different tool entirely. Checking those against the server's
+ * CLI would fail for a reason that has nothing to do with drift.
+ */
+function serverInvocations(text) {
+  return text
+    .replaceAll(/\\\n\s*/g, ' ')
+    .split('\n')
+    .filter((line) => /onnx-genai-server|SERVER_BIN|cargo run/.test(line))
+    // `cargo build -p onnx-genai-server` names the binary but runs none of it,
+    // so its flags belong to cargo rather than to the server.
+    .filter((line) => !/\bcargo\s+(build|install)\b/.test(line))
+    // `cargo run --release -p … -- --model …` carries cargo's own flags before
+    // the `--` separator. Only what follows it is passed to the server.
+    .map((line) => (line.includes(' -- ') ? line.slice(line.indexOf(' -- ') + 4) : line));
+}
+
+test('the CLI flag list was parsed at all', () => {
+  // Guards the assertions below: if cli.rs moves or its shape changes, the
+  // extraction would silently yield an empty set and every check would pass
+  // vacuously. A test that cannot fail is worse than no test.
+  assert.ok(
+    cliFlags.size > 5,
+    `expected to parse several flags from cli.rs, found ${cliFlags.size}`,
+  );
+  assert.ok(
+    cliFlags.has('--model'),
+    'expected --model among the parsed CLI flags; the extraction is wrong',
+  );
+});
+
+test('every flag in a copy-pasteable command exists in the server CLI', () => {
+  let checked = 0;
+  for (const [name, text] of Object.entries(copyPasteableCommands)) {
+    for (const invocation of serverInvocations(text)) {
+      for (const [, flag] of invocation.matchAll(/(?<![\w-])(--[a-z][a-z0-9-]+)/g)) {
+        checked += 1;
+        assert.ok(
+          cliFlags.has(flag),
+          `${name} documents ${flag}, which does not exist in ` +
+            'crates/onnx-genai-server/src/cli.rs. Either the flag was renamed ' +
+            'or removed, or the docs invented it.',
+        );
+      }
+    }
+  }
+  assert.ok(checked > 0, 'no server flags were checked; the extraction is wrong');
+});

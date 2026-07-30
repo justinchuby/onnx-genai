@@ -142,9 +142,10 @@ fi
 # /demo instead of the dashboard. Passing the script's own directory makes this
 # work from any cwd.
 #
-# No CORS flag is needed. The page is served from one server and polls both, but
-# loopback origins are always permitted (crates/onnx-genai-server/src/cors.rs),
-# so the two-server demo works with no cross-origin configuration.
+# No CORS flag is needed, and no CORS code exists in the server. Each page only
+# ever talks to the origin that served it: switching to a scenario hosted by the
+# other server NAVIGATES there rather than fetching across origins. A
+# cross-origin request is never made, so there is nothing to authorise.
 #
 # --enable-admin-endpoints is deliberately NOT passed. Nothing the demo does
 # calls /v1/admin/*, and the server has no authentication, so enabling it would
