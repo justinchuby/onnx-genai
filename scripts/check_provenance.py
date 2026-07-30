@@ -41,6 +41,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tree_context  # noqa: E402
+
 PROVENANCE_JS = "examples/serving-dashboard/telemetry-provenance.js"
 
 # Anti-shrink floor. A provenance table cannot get more honest by getting
@@ -89,11 +92,10 @@ SOURCE_REF = re.compile(r"((?:crates|examples|scripts)/[\w./-]+\.(?:rs|js|py))(?
 
 
 def repo_root() -> Path:
-    out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, check=True,
-    )
-    return Path(out.stdout.strip())
+    # Anchored on this script's location, NOT the caller's CWD -- see
+    # scripts/tree_context.py for why that distinction cost this project five
+    # false negatives from one parked checkout.
+    return tree_context.repo_root()
 
 
 def load_entries(repo: Path) -> dict:
@@ -211,6 +213,7 @@ def check(repo: Path) -> tuple[list[str], dict]:
 
 def main() -> int:
     repo = repo_root()
+    print(tree_context.banner(tree_context.tree_context(repo)), file=sys.stderr)
     failures, stats = check(repo)
     print(
         f"provenance: {stats['entries']} entries, "

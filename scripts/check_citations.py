@@ -41,6 +41,9 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tree_context  # noqa: E402
+
 MANIFEST = Path("docs/citations.manifest.json")
 
 # `path/to/file.ext::symbol` -- the anchored form.
@@ -380,6 +383,10 @@ def main() -> int:
     ap.add_argument("doc", nargs="?", help="markdown document to check")
     ap.add_argument("--self-test", action="store_true", help="mutation-prove the harness")
     ap.add_argument("--manifest", default=str(MANIFEST))
+    ap.add_argument(
+        "--require-branch",
+        help="fail unless the tree being checked is on this branch",
+    )
     args = ap.parse_args()
 
     if args.self_test:
@@ -387,12 +394,15 @@ def main() -> int:
     if not args.doc:
         ap.error("a document is required (or --self-test)")
 
-    repo = Path(
-        subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    )
+    repo = tree_context.repo_root()
+    ctx = tree_context.tree_context(repo)
+    print(tree_context.banner(ctx), file=sys.stderr)
+    if args.require_branch:
+        try:
+            tree_context.require_branch(args.require_branch, ctx)
+        except tree_context.WrongTree as e:
+            print(f"WRONG_TREE: {e}", file=sys.stderr)
+            return 1
     doc = Path(args.doc)
     if not doc.exists():
         print(f"FILE_NOT_IN_GIT: {doc} does not exist", file=sys.stderr)
