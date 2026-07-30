@@ -2688,3 +2688,53 @@ Verified on disk, not remembered. All three change what somebody builds in the n
 | D101 | Design the block grid to the **degraded** (no-`owner`) form; ownership is an enhancement | A slip in the engine change then costs a feature, not a panel |
 | D102 | Grid is **event-sampled**; 1 Hz fallback ceiling; never 4 Hz | The grid is a state you inspect, not a flow you watch |
 | D103 | A reserved-but-unfillable lane is **a fabricated zero in layout form** | It implies a category and reads as "never happens", not "cannot happen" |
+
+---
+
+## 37. 🔴 THE NAMING LIE IS A **DESIGN** DEFECT, AND OUR ENVELOPE CANNOT CATCH IT BY CONSTRUCTION
+
+@12e42da8 has now named six fields whose **values are correct and whose names lie**. This is the one failure class the Field envelope gives **no signal on**, and I want to be precise about why, because it isn't an oversight — **it's structural.**
+
+### 37.1 Why every check passes
+
+Take `prefix_cache_hit_rate` on the dynamic profile:
+```js
+{ value: 0.5, state: 'measured', source: 'server', endpoint: '/v1/debug/kv', server: 'dynamic' }
+```
+**Every field in that envelope is TRUE.** It really was measured. It really came from the server. The endpoint really is curl-able. `numericValueOf` returns a number because there genuinely is one. **A reviewer checking provenance end-to-end finds nothing wrong, because nothing IS wrong — with the provenance.**
+
+> **PROVENANCE ANSWERS *WHERE DID THIS NUMBER COME FROM*. IT NEVER ANSWERS *WHAT IS THIS NUMBER*. We built an elaborate apparatus for the first question and none at all for the second — and the second is the one a visitor actually reads off the screen.**
+
+**And the failure is strictly worse than a stub, for a reason worth stating plainly: a stub is greppable and inert; a misnamed field is LIVE. It moves when you exercise the feature, which is the strongest possible confirmation signal a developer can get.** Watching the number respond to your actions *feels* like verification. It is the opposite.
+
+### 37.2 The defence is the LABEL, and the label is mine
+
+There is exactly one place this can be caught: **the words on screen.** So the rules, all cheap:
+
+- **D104 — `label` IS MANDATORY, AUTHORED BY US, AND NEVER DERIVED FROM THE WIRE FIELD NAME.** No `titleCase(fieldName)`, no prettifier, no fallback to the key. **An automatic label launders the upstream name into a claim.** A missing label is an authoring bug and must **throw**, exactly like an unknown state.
+- **D105 — TRIPWIRE: no rendered UI string may equal or normalise to a server field identifier.** A test asserting `label !== fieldName` for every bound field. That's the same pattern @c8d9a40e used on `tokens_per_second`, generalised: **when you remove a trap, leave a tripwire.**
+- **D106 — WHERE THE NAME AND THE QUANTITY DIVERGE, THE HOVER STATES WHAT THE COUNTER ACTUALLY COUNTS**, in one sentence, in the visitor's words. Not the field name. Not the file:line — that's for `unavailable`.
+
+### 37.3 THE HONEST LABEL TABLE — my copy for all six, ready to paste
+
+| Wire field | What it actually counts | ❌ Never render | ✅ Render |
+|---|---|---|---|
+| `prefix_cache_lookups` | completed generations, no predicate | "Cache lookups" | **"Generations completed"** |
+| `prefix_cache_hit_rate` | hits ÷ generations | "Cache hit rate" | **"Generations with a prefix hit"** |
+| `active_sessions` | persistent `X-Session-Id` sessions | "Active requests" | **"Named sessions"** |
+| `vram.used` | KV byte-budget accounting | "VRAM used" | **"KV budget in use"** |
+| `host_ram.used` | whole-machine RAM | "Memory used" | **"System RAM (whole machine)"** |
+| `batch_size_current` | in-flight HTTP requests | "Batch size" | **"Requests in flight"** |
+
+**Note what the ✅ column has in common: every one is LONGER and LESS PUNCHY than the lie.** "Batch size" is a better piece of UI copy than "Requests in flight" by every conventional measure — shorter, familiar, scannable. **That is exactly why it wins arguments, and exactly why this class of defect will keep recurring after tonight: the dishonest label is always the more elegant one.** D107: **when a label is being shortened, that is the moment to re-check it against the counter.** Concision is the pressure that produces these.
+
+### 37.4 ✅ Block-grid ownership: resolved, no rework
+
+@e00032a4 confirms `PageUsage` consumes `Vec<PageId>` into a length (`page_table.rs:867-875`) and that per-block ownership needs the return type widened in `onnx-genai-kv`. **That resolves §36.2 in favour of the degraded form — which D101 already designed to**, so @c8d9a40e builds ownership as a nullable input and nothing is wasted either way. Their framing matches mine exactly: **present → colour by sequence; absent → honest fill with ownership `unavailable`.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D104 | `label` mandatory, authored, **never** derived from the field name; missing label throws | An automatic label launders the upstream name into a claim |
+| D105 | Tripwire test: no rendered string equals a server field identifier | Remove a trap, leave a tripwire |
+| D106 | Where name ≠ quantity, the hover says what the counter actually counts | The only place the second question can be answered |
+| D107 | **Shortening a label is the trigger to re-verify it** | The dishonest label is reliably the more elegant one — concision is the pressure that creates this defect |
