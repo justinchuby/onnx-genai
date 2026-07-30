@@ -1,6 +1,19 @@
 # Implementation Review — `feat/genai-demo-dashboard`
 
 MEASURED-AT: 3b70149438a4ce0b815f942fdd46a0663ecdd524
+MEASURED-AT: 217ae17052f50b901ebd5bb057bfab5ffd418c49
+
+The second stamp is narrower than the first and saying so is the point: a bare SHA on this line
+claims "I measured the tree here", and I measured only part of it. At `217ae170` I read this
+lane's entire delta from `3b701494` line by line. That delta is 40 commits wide but touches
+exactly two files in my lane -- `crates/onnx-genai-server/src/routes/admin.rs` (+5/-0) and
+`examples/serving-dashboard/telemetry-provenance.js` (+41/-4) -- and I re-read the three batch
+wire terms verbatim at the later SHA rather than carrying them forward. I did NOT re-execute
+either suite at `217ae170`. The execution number in this file (819 tests, 818 pass, 1 fail) was
+taken at `3b701494` in a detached worktree pinned to that SHA, and it stays attached to that SHA.
+Both halves are stated because the freshness guard checks only that a current SHA appears here,
+and a stamp that passes a guard while implying an unrun suite is the exact defect this file
+spends four thousand lines objecting to.
 
 Reviewer: Code Reviewer, agent id `agent:73e77d95` (lane: correctness, readability, patterns,
 test coverage, code quality). **That is an AGENT ID, not a commit.** It is prefixed `agent:`
@@ -4193,3 +4206,53 @@ made this closable by somebody else in five minutes.**
 **Fix is unchanged and is one line at `telemetry-store.test.js:1380`.** Non-blocking: no shipped
 code changes, and the false negative requires a Windows host, which the demo does not target
 tonight.
+
+## F44 — The `caveat` that was added to make `batch.active_size` honest asserts two things about the wire that are false, measured at `217ae170`
+
+`telemetry-provenance.js` `batch.active_size` gained a `caveat` field at `817f8aba`. The
+label fix in that commit is correct and I said so at the time: `Sequences in the current
+batch` claimed the engine steps these sequences together, the counter does not support that,
+and `Generations in flight (debug-KV)` is the honest replacement. Refusing to delete the
+field as a duplicate was also correct, and I had argued for that refusal before the commit
+landed.
+
+Two sentences inside the new `caveat` are wrong, and they are wrong about the one thing the
+`caveat` exists to be right about.
+
+> It reads the SAME gauge as batch.in_flight, whose evidence already says so.
+
+> Same Rust source, two endpoints, and scheduling.js binds THIS one.
+
+Read at `217ae170`, in `crates/onnx-genai-server/src/routes/admin.rs`:
+
+    :226  batch_in_flight:   occupancy.map(|o| o.active)
+    :229  batch_capacity:    occupancy.map(|o| o.capacity)
+    :306  active_batch_size: snapshot.current_batch_size
+
+They are not the same gauge and they are not the same Rust source. `active_batch_size` reads
+`snapshot.current_batch_size`, which `metrics.rs` ticks once per HTTP generation.
+`batch_in_flight` reads `occupancy.active`, which is rows the decoder is stepping. The two
+numbers answer different questions and can legitimately disagree at the same instant. That
+distinction is the entire subject of the Rust guard the caveat cites by name,
+`the_batch_numerator_is_never_read_from_the_http_generation_gauge`, whose assertion is that
+these two must never be sourced from one place.
+
+The `evidence` string on the same entry still reads `admin.rs:136 (snapshot.current_batch_size)`.
+At `217ae170`, `admin.rs:136` is a comment about paged-KV introspection. The variable is real
+but lives at `:306`.
+
+Neither of these blocks anything. Both are worth fixing because of where they sit: a `caveat`
+is the field a reader consults precisely when they have decided not to go read the Rust, and
+this one sends them away with a false model of the wire. Correcting it is three strings:
+drop the two same-gauge sentences, repoint `evidence` to `:306`, and repoint the still-untouched
+`batch.in_flight` entry to `:226 (occupancy.active)` while removing its `NOT the engine batch`
+note, which is false for that field and now duplicates the corrected label on its sibling.
+
+I want the shape recorded rather than the instance. I filed a blocking finding earlier tonight
+against this same pair of fields, and it was wrong — `batch_telemetry.rs` makes an over-unity
+ratio unrepresentable by sourcing both terms of the occupancy pair from one object, so the
+defect I reported could not exist. I retracted it. The catalogue entry I had been reading is
+what produced that false finding, and the repair to the catalogue has now reproduced the same
+false claim inside the field meant to disclose it. Three authors have now read this pair and
+described it wrongly, in three different files, in the same direction. The two gauges are not
+hard to tell apart once the Rust is open; the catalogue is what stops people opening it.
