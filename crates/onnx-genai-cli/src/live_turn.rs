@@ -123,8 +123,12 @@ impl LiveTurn {
         }
     }
 
-    /// Append generated text and redraw. `reasoning` marks the model's thinking,
-    /// which is dimmed to set it apart from the answer.
+    /// Append generated text. `reasoning` marks the model's thinking, which is
+    /// dimmed to set it apart from the answer.
+    ///
+    /// This intentionally does **not** redraw. The decode loop can produce
+    /// tokens far faster than a terminal can repaint; callers coalesce draws on
+    /// a frame timer and call [`draw`](Self::draw) when a frame is due.
     pub(crate) fn push(&mut self, text: &str, reasoning: bool) -> anyhow::Result<()> {
         match self.activate() {
             Some(active) => active.push(text, reasoning),
@@ -136,13 +140,24 @@ impl LiveTurn {
         }
     }
 
-    /// Replace the numbers shown beneath the reply and redraw.
+    /// Replace the numbers shown beneath the reply.
     pub(crate) fn set_status(&mut self, status: String) -> anyhow::Result<()> {
         // Never activates on its own: a status with no reply to sit under would
         // claim the terminal for nothing.
         match self {
             Self::Active(active) => {
                 active.status = status;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Redraw the coalesced reply/status frame if the viewport is active.
+    pub(crate) fn draw(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Active(active) => {
+                active.spill()?;
                 active.draw()
             }
             _ => Ok(()),
@@ -184,8 +199,7 @@ impl Active {
                 }),
             }
         }
-        self.spill()?;
-        self.draw()
+        Ok(())
     }
 
     /// Width available to the reply, never zero so the wrap arithmetic stays

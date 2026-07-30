@@ -186,6 +186,10 @@ fn emit_reasoning_segment(
     Ok(())
 }
 
+fn live_frame_due(draws: usize, last_draw: Instant, now: Instant) -> bool {
+    draws == 0 || now.duration_since(last_draw) >= STATUS_REFRESH
+}
+
 fn should_emit_stats_line(show_stats: bool, show_profile: bool) -> bool {
     show_stats && !show_profile
 }
@@ -262,8 +266,8 @@ pub(super) fn run_generation_turn(
     let mut live = live.filter(|live| stream && live.is_active());
     // Numbers move faster than a reader can follow, and every update costs a
     // frame, so the status is refreshed on a timer rather than per token.
-    let mut last_status = Instant::now();
-    let mut live_frames = 0usize;
+    let mut last_live_draw = Instant::now();
+    let mut live_draws = 0usize;
     let mut callback = |token: GenerateToken| -> anyhow::Result<()> {
         if INTERRUPT_REQUESTED.load(Ordering::SeqCst) {
             return Err(anyhow::Error::new(Interrupted));
@@ -284,32 +288,32 @@ pub(super) fn run_generation_turn(
             for segment in segments {
                 let using_live = live.is_some() && !segment.text.is_empty();
                 emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
-                if using_live {
-                    let first = live_frames == 0;
-                    live_frames += 1;
+                let now = Instant::now();
+                let draw_live_frame = using_live && live_frame_due(live_draws, last_live_draw, now);
+                if draw_live_frame {
+                    live_draws += 1;
+                    last_live_draw = now;
                     // The first token draws immediately so the line is never empty
                     // while a reply is on screen; after that the numbers are
                     // throttled, since they move faster than they can be read and
                     // every update costs a frame.
-                    if first || last_status.elapsed() >= STATUS_REFRESH {
-                        let mut status = timings.live_summary();
-                        if let (Some(prompt_tokens), Some(context_limit)) =
-                            (prompt_tokens, context_limit)
-                        {
-                            let context = profile::ContextUsage {
-                                used_tokens: prompt_tokens + timings.tokens(),
-                                max_tokens: context_limit,
-                            };
-                            if status.is_empty() {
-                                status = format!("ctx {context}");
-                            } else {
-                                status.push_str(&format!(" · ctx {context}"));
-                            }
+                    let mut status = timings.live_summary();
+                    if let (Some(prompt_tokens), Some(context_limit)) =
+                        (prompt_tokens, context_limit)
+                    {
+                        let context = profile::ContextUsage {
+                            used_tokens: prompt_tokens + timings.tokens(),
+                            max_tokens: context_limit,
+                        };
+                        if status.is_empty() {
+                            status = format!("ctx {context}");
+                        } else {
+                            status.push_str(&format!(" · ctx {context}"));
                         }
-                        if let Some(live) = live.as_deref_mut() {
-                            live.set_status(status)?;
-                        }
-                        last_status = Instant::now();
+                    }
+                    if let Some(live) = live.as_deref_mut() {
+                        live.set_status(status)?;
+                        live.draw()?;
                     }
                 }
             }
@@ -322,6 +326,9 @@ pub(super) fn run_generation_turn(
         for segment in tracker.finish() {
             emit_reasoning_segment(&segment, dim_reasoning, &mut dimmed, live.as_deref_mut())?;
         }
+    }
+    if let Some(live) = live.as_deref_mut() {
+        live.draw()?;
     }
     if dimmed {
         print!("\x1b[0m");
@@ -460,6 +467,26 @@ mod tests {
 
         // Newline is not the last character even if one appears inside.
         assert!(needs_trailing_newline("line one\nno newline at end"));
+    }
+
+    #[test]
+    fn live_frames_are_coalesced_over_a_token_burst() {
+        let start = Instant::now();
+        let mut last_draw = start;
+        let mut draws = 0usize;
+
+        for millisecond in 0..250 {
+            let now = start + std::time::Duration::from_millis(millisecond);
+            if live_frame_due(draws, last_draw, now) {
+                draws += 1;
+                last_draw = now;
+            }
+        }
+
+        assert_eq!(
+            draws, 3,
+            "250 token callbacks at 1 ms spacing should draw at t=0, 100, and 200 ms, not once per token"
+        );
     }
 
     /// The stats format is determined by stderr's terminal state, not stdout's.
