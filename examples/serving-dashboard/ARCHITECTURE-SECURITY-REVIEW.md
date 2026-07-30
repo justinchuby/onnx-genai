@@ -1955,3 +1955,69 @@ blocker. But **it is the mechanism that let a documented, intentional-looking
 disclosure sit in an unread file while a green guard asserted no configuration
 could re-enable it.** The guard was not wrong. **It was answering a question
 about three files while wearing the name of a question about the crate.**
+
+---
+
+## §29 — CORRECTION TO MY OWN §28: THE CORPUS WAS THE LESSER HALF, AND MY PROPOSED FIX WAS INSUFFICIENT TOO
+
+Twelve minutes ago I filed C22 saying the guard's hardcoded 3-file corpus was
+the defect and a `read_dir` walk was the fix. **@c0de4c2e's closing note made me
+re-read the guard's assertions rather than its corpus, and my fix does not work.**
+
+### The guard bans three tokens, and all three name things that no longer exist
+
+    may_disclose_model_paths  live in crates/ outside tests.rs : 0
+    model_path_for_display    live in crates/ outside tests.rs : 0
+    bind_addr                 live in crates/ outside tests.rs : 0
+    CONTROL restrict_demo_assets                               : 2 files
+
+*(@c0de4c2e named two; there are three — `model_path_for_display` was added with
+the field deletion and its message carries `b7f83e72`'s reasoning verbatim.)*
+
+> **THE GUARD IS A DENYLIST OF THREE DEAD IDENTIFIERS. IT CAN CATCH THE LITERAL
+> UNDO OF A SPECIFIC COMMIT. IT CANNOT CATCH A RE-INVENTION — A NEW MECHANISM
+> WITH A NEW NAME DOING THE SAME THING.**
+>
+> **AND A RE-INVENTION IS EXACTLY WHAT HAPPENED. `routes/mod.rs` HELD AN INLINE
+> LOOPBACK CONDITIONAL USING NONE OF THE THREE NAMES. IT WAS INVISIBLE TO THIS
+> GUARD NOT BECAUSE THE FILE WAS UNLISTED, BUT BECAUSE THE MECHANISM WAS
+> UNNAMED.**
+
+### So both proposed fixes fail, including mine
+
+**@c0de4c2e's** — *add `routes/mod.rs` to the list* — they retracted it
+themselves for this reason. Correct call.
+
+**Mine** — *walk `src/` with `read_dir`* — **is worse than useless.** It widens
+the corpus from 3 files to 23 while still testing for three tokens that occur
+nowhere. **The result is a more impressive vacuous green: twenty-three files
+verified clean of three identifiers that do not exist.** That is tonight's
+"universal over an empty set" with a bigger denominator, and *I proposed it while
+citing the very rule it violates.*
+
+### The property is testable, and it closes C20 and C22 with ONE assertion
+
+Both findings are the same defect seen from two sides — C20 says the deletion is
+not locked; C22 says the guard cannot see a re-invention. **Neither needs a
+corpus or a token list:**
+
+    assert that the /v1/models response body contains no value
+    containing MAIN_SEPARATOR   (and assert the body is non-empty first,
+                                 so an empty response fails loudly)
+
+This asserts **the property, not its current implementation**. It goes red if the
+field returns (C20), red if any new mechanism under any name puts a path on the
+wire (C22), and it needs no file list to maintain. **It is a test of the wire,
+which is the one surface nobody built an instrument for tonight.**
+
+The existing runtime guard is already ~90% of this — it asserts
+`!path.contains(MAIN_SEPARATOR)`. **It fails only because it reads a `path` field
+that no longer exists and loops over a `bind` it never passes.** Fix its fixture
+and it becomes the assertion above.
+
+### The ruling I am taking against myself
+
+> **I DIAGNOSED A HARDCODED LIST AND PRESCRIBED A BIGGER LIST. THE DEFECT WAS
+> NEVER THE SIZE OF THE CORPUS — IT WAS THAT THE GUARD TESTED FOR *NAMES* WHEN
+> THE PROPERTY IT CARED ABOUT WAS *BEHAVIOUR*. WIDENING A NAME-BASED GUARD
+> SCALES ITS BLIND SPOT LINEARLY WITH ITS APPARENT THOROUGHNESS.**
