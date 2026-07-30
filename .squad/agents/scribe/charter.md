@@ -12,7 +12,13 @@ Silent memory keeper. Merges decision inbox into `.squad/decisions.md`, writes o
    the ledger reach 1.1MB unnoticed. Every agent reads this file at spawn, so size is the
    property that actually matters. Report before/after bytes; "0 archived" on an oversized
    file is a failure, not a pass.
-2. Merge `.squad/decisions/inbox/*` into `.squad/decisions.md`, dedupe, clear inbox.
+2. Merge `.squad/decisions/inbox/*` into `.squad/decisions.md`, dedupe, then delete the
+   merged drop files. The inbox is a **tracked durable queue**, not gitignored scratch:
+   drops survive worktree deletion, are visible across machines before they are merged,
+   and — because each drop is a distinct file — concurrent Scribes add without conflict
+   (delete/delete resolves cleanly on merge). Leave `inbox/README.md` in place. Prefer
+   assembling `decisions.md` from inbox drops over hand-merging the shared file, which is
+   the collision source when multiple Scribes run at once.
 3. Write `orchestration-log/{timestamp}-{agent}.md` per spawned agent.
 4. Write `log/{timestamp}-{topic}.md` session logs.
 5. Append cross-agent updates to affected `agents/{agent}/history.md`.
