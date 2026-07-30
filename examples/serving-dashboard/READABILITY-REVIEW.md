@@ -297,6 +297,52 @@ The fix is one line of deletion and one line of coverage: drop the third URL and
 claims, and add `run-demo.sh` to the claim guard's path list so the operator-facing surface is
 scanned by the same rule as the visitor-facing one.
 
+### R14 — the silent substitution is not a policy choice; the signature makes honesty unrepresentable
+
+@376a0297 executed the shipping resolver on the launcher's own URL and found `prefix-cache`
+resolves to `paged-kv` with no notice. They asked whether an unrecognised `scenario=` should fall
+back silently at all, and routed the call here. **It should not — but the reason is structural, not
+a preference, and that is the finding.**
+
+```
+export function currentScenarioId(href, selfClasses = []) {
+  if (requested && Object.hasOwn(SCENARIOS, requested)) return requested;
+  ...falls through to the local default
+}
+```
+
+Two defects, both visible in the signature alone:
+
+**1. The name says accessor; the body is a decision.** `current…Id` reads as a read of existing
+state — the scenario we are on. It is really an adjudicator: it receives a *request* and may
+overrule it. The give-away is the vocabulary the file needs to explain itself — `requested`
+vs `current` — two adjectives on one noun, which is this review's recurring signal that the noun is
+doing two jobs. `requestedScenarioId` and `resolveScenarioId(href)` are two different functions and
+we have one name covering both.
+
+**2. The return type is `string`, so "I substituted" has nowhere to live.** This is the load-bearing
+half. Downstream, `ui/scenario-switcher.js` accepts `currentScenarioId` as a plain string
+parameter and renders it as the active tab. By the time the value reaches the UI, *the fact that a
+substitution occurred no longer exists in the program.* Not hidden — absent. No caller could
+disclose it however much it wanted to.
+
+> The Lead's rule is: if the signature implies something the design forbids, the signature is
+> misleading. This is the sharper inverse — **the signature forbids something the product
+> requires.** Our entire honesty layer is built on `{value, state, reason}`: never a bare number,
+> always the number plus what we know about it. This function returns a bare id. It is the one
+> place in the codebase where we went back to returning the value alone, and it is the place that
+> decides what the visitor is looking at before a single field is fetched.
+
+The fix follows the pattern the rest of the codebase already uses, and needs no new concept:
+return `{id, requested, substituted}` — the same shape as every telemetry field. The switcher then
+*can* say `prefix-cache is not a scenario on this build — showing paged-kv`, because the
+information finally exists at the point of rendering. Rename to `resolveScenarioId` so the name
+admits it decides.
+
+That is also why R13 and R14 must be fixed together: deleting the launcher URL removes today's
+one known bad link, but any typo, stale bookmark, or README edit re-creates a silent substitution
+tomorrow. R13 is the instance; R14 is the reason instances are silent.
+
 ---
 
 ## Withdrawn by me
