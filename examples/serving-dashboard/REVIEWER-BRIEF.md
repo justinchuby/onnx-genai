@@ -4222,3 +4222,86 @@ FOREIGN PATHS ACROSS ALL SIX:  **ZERO**
 **Nothing of mine is wider than I intended.** Method that made it true: `-F` never `-m`,
 explicit pathspec every time, and **never once running `git add`** — my index has been
 empty all session, so the shared-index hazard never had a way to arm against me.
+
+---
+
+## §9.3 — I was wrong about the crate. The `#[ignore]` has already landed. Its stated reason is false, and the false reason forecloses the cheap repair.
+
+### First, retracting my own §9.1 discrepancy
+
+I flagged that the failing fixture lives in `onnx-genai-genai-config` while @12e42da8
+ran `-p onnx-genai-server`, and suggested `-p` might not scope as its name implies.
+**That was wrong. @12e42da8's attribution was correct and mine was an inference.**
+
+```
+crates/onnx-genai-server/src/tests.rs:1122
+  .join("../onnx-genai-genai-config/tests/fixtures/vlm-executable");
+```
+
+**The test is in `onnx-genai-server`. It reaches into a sibling crate's fixture
+directory by a `..` relative path.** I inferred ownership from the fixture's *location*
+and location is not ownership.
+
+> **RULE 28. A test's crate is where its code lives, not where its data lives. A `..`
+> path in a fixture join silently moves the dependency across an ownership boundary
+> while leaving every signal — crate name, module path, `-p` flag — pointing at the
+> consumer.**
+
+**And that mislocation is the actual root cause of the missing blob.** The directory is
+maintained by `genai-config`'s authors, whose own tests need only the JSON; the single
+consumer that needs `vision.onnx` is in **another crate**. That is why `vlm-executable`
+carries 4 tracked files and 0 `.onnx` while both siblings carry 7 and 3 — **nobody owns
+the intersection.** The gap is not carelessness; it is a boundary with no owner on
+either side of it.
+
+### Second: the fix is already in the tree. The red is closed.
+
+```
+tests.rs:1108   #[tokio::test]
+       :1109   #[ignore = "requires a real vision encoder at
+       :1110      crates/onnx-genai-genai-config/tests/fixtures/vlm-executable/vision.onnx,
+       :1111      which .gitignore (*.onnx) excludes from every clone. Unlike models/tiny-vlm
+       :1112      there is no generator for this fixture, so this test cannot pass on a clean
+       :1113      checkout -- supply the encoder by hand before running with --ignored."]
+```
+
+**It names the file, the exclusion, the missing generator and the recovery command, and
+it follows the `:1775` convention exactly.** It is a better skip than the one that was
+promised. **Anyone still holding "1 cargo FAIL" is holding a measurement that predates
+this commit — check ancestry before re-filing it.**
+
+### Third, and the reason this section exists: the ignore reason states a mechanism I measured to be false
+
+> `which .gitignore (*.onnx) excludes from every clone`
+
+```
+TRACKED *.onnx BLOBS IN THIS REPOSITORY:  **15**
+  vlm-complete/vision.onnx      TRACKED     vlm-complete/embedding.onnx    TRACKED
+  vlm-incomplete/vision.onnx    TRACKED     vlm-complete/text.onnx         TRACKED
+```
+
+**A `.gitignore` rule does not exclude a file from a clone. It declines to *add* an
+untracked file. Fifteen `.onnx` blobs — including two named `vision.onnx`, in sibling
+directories of this very fixture — are in HEAD right now and arrive in every clone.**
+
+**This matters because the false mechanism forecloses the repair.** A reader who
+believes the ignore rule makes the file uncarryable will never try the thing that
+demonstrably works and that fifteen siblings already prove:
+
+```
+git add -f crates/onnx-genai-genai-config/tests/fixtures/vlm-executable/vision.onnx
+```
+
+> **The skip is not merely a skip — it is an argument that the test is unfixable, and
+> the argument is wrong. "There is no generator" is true and is the real obstacle.
+> "The ignore rule excludes it from every clone" is false and is the one a reader will
+> believe, because it is the concrete-sounding half.**
+
+This is RULE 24 at its most expensive: **a withdrawn-grade claim inside a shipping
+`#[ignore]` string, carrying the tree's authority, in a message specifically written to
+be read by whoever might one day fix it.** The correct reason is one clause shorter:
+*there is no generator for this fixture and no one has committed the blob.*
+
+**Gate status unchanged in substance but improved in fact: item 1's red is closed at
+HEAD by this `#[ignore]`. I still do not restore item 1 to GREEN — I have not run cargo
+and RULE 26 forbids me from carrying anyone's number, including a good one.**
