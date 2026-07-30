@@ -1457,7 +1457,10 @@ Two seams keep this navigable:
 ```
 
 Node's built-in runner, wrapped. No dependencies, consistent with having no
-build step. The script resolves its own directory, so it runs from anywhere.
+build step. Run it from the repository root — the path above is relative to
+there. The script resolves its own directory internally, so it does not care
+where you call it from, but the path that names it does. A wrong directory
+fails loudly (`No such file or directory`), never as a green run of zero tests.
 
 > **This is the only documented form, and the wrapper is the point.** This
 > section previously gave a two-glob `node --test` command directly. That
