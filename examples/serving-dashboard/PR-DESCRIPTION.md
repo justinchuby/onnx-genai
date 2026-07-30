@@ -1,6 +1,17 @@
 # Serving dashboard demo: an honest view of a live inference server
 
-> **MEASURED-AT: 37d0d72e**
+MEASURED-AT: 37d0d72e
+
+> The line above is deliberately undecorated: bare lowercase hex, column 1,
+> nothing before or after it. It carried blockquote and bold markup until the
+> convention's author published the grammar, at which point I ran their parser
+> against my own file. The capture group takes `\S+`, so the decorated form
+> yielded `37d0d72e**`, and `git cat-file -t` answers
+> `fatal: Not a valid object name`. **My freshness stamp was unreadable by the
+> tool that checks freshness stamps, and it was unreadable because I had made it
+> look important.** The most emphatic form of a machine-readable field is the one
+> the machine cannot read.
+>
 > Every number in this document was re-derived at that revision. Any claim you
 > cannot re-run from that revision alone is a defect in this document, not a
 > matter of trust. No tag names appear here: a tag is a mutable pointer to an
@@ -304,6 +315,111 @@ author's desk certifies the author, not the tree. Every figure in this document
 has been re-derived at the stamped revision, and one of them changed when it was:
 a count taken on a working desk read 112 where the shipping tree holds 98. Both
 readings were honest and only one describes what a reader will check out.
+
+## What ships
+
+**The headline is a count, not a ratio: four requests served concurrently by one
+model instance, against one at a time.** A count has no noise floor. You can see
+it happen, and you can re-run it.
+
+**The `2.46x` aggregate speedup is withdrawn and stays withdrawn.** An
+interleaved A/B/A/B run against a zero effect produced `+58.41%` in the worst
+case with a coefficient of variation of `19.83%`, against a `1.98%` clean
+baseline. **That rules out the precision, not the existence.** Roughly `1.6x` to
+`3.9x` survives the measurement; `2.46x` does not, and a demo that shows two
+decimal places is claiming a resolution this harness cannot deliver.
+
+**Two admissions stay on the page, because removing a number is not the same as
+removing a disclosure:**
+
+- **Batching does not make any single request faster.** The throughput gain is
+  aggregate, and any individual request is slower under load than it would be
+  alone.
+- **Each stream runs at roughly `0.62x` the speed it achieves by itself.** That
+  is the price of the aggregate win, and it belongs beside the aggregate win.
+
+**A big number with a small caveat is still the lie, told more quietly.** The
+per-stream cost is not a footnote to the speedup; it is the other half of the
+same measurement, and the panel never renders one without the other.
+
+## Open, and unowned
+
+**Nothing in this section is fixed. It is here because a release note that omits
+its own open set is a marketing document.**
+
+- **16 `latency.*` keys are unclassified**, deliberately. The reviewer who owned
+  that pass declined to label them and gave the reason in nine words:
+  **"I did not establish that, so I am not calling it anything."** That is the
+  correct answer and it is the project's character in one sentence — the
+  alternative was a confident `NOT_PLUMBED` that would have been right for
+  fourteen of them and a fabrication for the fifteenth.
+- **One latency field was measured, certified, and never wired to the panel that
+  promises latency.** Found while overturning a ruling of mine that rested on a
+  regex which could not match the key it was looking for.
+- **The exposure ratchet is red**, at 91 against an actual 94, and it was left
+  red on purpose rather than raised to green by an author who noticed it.
+- **A guard's corpus filter reads 4 of 15 documents**, so a document that
+  complied fully with the freshness convention has never been opened by the tool
+  that checks compliance. **An exemption ledger cannot record what the corpus
+  filter already excluded.**
+- **Two in-file duplicate symbols** are cited by name where the name is defined
+  more than once in its own file, which a file-qualified symbol anchor cannot
+  disambiguate.
+
+## The command channel had no guard
+
+**This is recorded at the project lead's explicit instruction, in their words,
+unsoftened, because the alternative is a release note in which only the code has
+faults.**
+
+Over one session the lead issued a regression as an order after reading a
+past-tense fix comment as a live defect; raised a false index emergency that
+invited precisely the destructive commands they had banned thirty minutes
+earlier, while an untracked test sat in zero commits; dispatched a one-hour-stale
+test count inside the order responding to a staleness finding; and sent two
+reviewers to a retired tag.
+
+**Four agents refused orders with evidence. All four refusals were correct.**
+
+> **Every deliverable on this branch has a guard, a reviewer, and a mutation
+> test. The command channel has none — and it is the one artefact nobody is
+> allowed to refuse on sight.**
+
+An instruction arrives with the authority of the person sending it and none of
+the verification we demand of a one-line code change. The routing protocol and
+the standing rule that an order may be refused with evidence exist because of
+that asymmetry, and they were written during the session that discovered it.
+
+**The generalisation is not about any individual.** Orders are built from
+measurements, measurements go stale in minutes at this commit rate, and **an
+order is the only artefact in the system that carries a measurement forward
+without carrying its clock.**
+
+## Authorship, disclosed
+
+**I wrote 14 of the acceptance criteria in the specification this demo is built
+against.** I did not write the rest, and the credit for the specification is not
+mine to take.
+
+**And the denominator moved while I was quoting it.** I have published this
+disclosure five times as *14 of 208*. Measured directly:
+
+```
+distinct ACs in demo-spec.md @ 37d0d72e (what ships) ... 213
+distinct ACs in demo-spec.md @ HEAD .................... 218
+the number I have been repeating ....................... 208
+```
+
+**All three were true when spoken.** The specification is append-only, so it grew
+underneath a figure I had verified once and then carried. **The correct form is
+`14 of 213 at 37d0d72e`** — a fraction with a revision attached, because without
+one it is not a fraction, it is a fraction-shaped claim about an unspecified
+document.
+
+**This is the append-only tension arriving inside my own disclosure of good
+faith**, which is where it was always most likely to land: the number I repeated
+most often is the number I re-checked least, precisely because repeating it felt
+like candour.
 
 ### A third species of control: shape, not just liveness
 
