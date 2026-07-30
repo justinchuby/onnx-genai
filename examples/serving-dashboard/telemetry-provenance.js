@@ -403,10 +403,24 @@ export const PROVENANCE = Object.freeze({
   // That is a ruling about which mechanism owns the field, not a refactor,
   // so it is recorded here rather than decided unilaterally.
   //
-  // CONTAINMENT TODAY: no panel binds these. dashboard/prefix-cache.js does
-  // not exist, and prefix-counters-forbidden.test.js fails any NEW module that
-  // names them, in either the underscored wire spelling or the dotted store
-  // key. The defect is latent, not on screen.
+  // CONTAINMENT TODAY: no panel binds these, and prefix-counters-forbidden.test.js
+  // fails any NEW module that names them, in either the underscored wire
+  // spelling or the dotted store key. That test is the executable half and is
+  // the only half worth citing -- an earlier version of this comment argued
+  // safety from "dashboard/prefix-cache.js does not exist", which was true when
+  // written and would silently have become a reassurance the moment anyone
+  // re-added that module. A safety argument premised on a file's absence rots
+  // into a false all-clear; one premised on a test goes red instead.
+  //
+  // ESCALATED, NOT DECIDED: on the DYNAMIC origin these stay MEASURED below,
+  // and that is very probably wrong -- metrics.rs `prefix_reuse_increments`
+  // scores a hit whenever prefix_cache_hit_len > 0, and every chat request
+  // shares the ~24-token chat-template preamble, so the counters report the
+  // same numbers whether or not a prompt was reused (twelve requests with six
+  // deliberately unique prompts gave twelve hits, 0.9375). Reclassifying them
+  // was MEASURED at a cost of 7 failing tests across three agents' files, so
+  // the mechanism is the Lead's call, not a unilateral edit. The defect is
+  // latent: no panel binds these and the ratchet blocks new ones.
   'prefix_cache.hits': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'prefix_cache_hits',
@@ -480,6 +494,25 @@ export const PROVENANCE = Object.freeze({
   },
 
   // ---------------------------------------------------------------- batching / admission
+  'batch.capacity': {
+    source: ENDPOINTS.STATUS,
+    path: 'batch_capacity',
+    classification: 'MEASURED',
+    unit: 'requests',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs — `batch_capacity` is serialised from ' +
+      'AppConfig::effective_batch_capacity(), which state.rs defines as ' +
+      'max_batch.min(max_queue_depth). Genuinely computed from configuration; no stub.',
+    // The denominator of the "N of M" the scheduling panel renders. It is
+    // deliberately NOT max_batch: state.rs documents that max_batch alone
+    // overstates the ceiling whenever admission is the tighter constraint --
+    // with max_batch 4 and max_queue_depth 1 the batch can never exceed one, so
+    // a max_batch denominator would draw a saturated server as 25% busy. A
+    // denominator that overstates capacity is the one error direction that
+    // makes our headline look WORSE than reality, which is why the server
+    // clamps it and why the client must not "helpfully" un-clamp it.
+    label: 'Effective batch capacity',
+  },
   'batch.active_size': {
     source: ENDPOINTS.DEBUG_KV,
     path: 'active_batch_size',

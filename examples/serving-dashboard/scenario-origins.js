@@ -30,7 +30,18 @@
 export const SERVER_CLASSES = Object.freeze({
   /** Static-cache model. Continuous batching engages; the page table does not. */
   SCATTER: 'scatter',
-  /** Dynamic model. Paged KV and the prefix cache engage; batching does not. */
+  /**
+   * Dynamic model. Paged KV engages; batching does not.
+   *
+   * Deliberately does NOT say the prefix cache engages here. The paged-KV
+   * manager does consult it, but consulting is not reuse: the counters fire on
+   * the chat-template preamble every request shares, so they report the same
+   * numbers whether or not a prompt was reused. The earlier wording claimed
+   * reuse, and a reader would correctly re-derive the MEASURED classification
+   * those counters still carry on this origin straight from that sentence --
+   * which is how a docstring becomes the cause of a data defect rather than a
+   * description of one. See the ESCALATED note in telemetry-provenance.js.
+   */
   DYNAMIC: 'dynamic',
 });
 
