@@ -93,15 +93,30 @@ guesses will record a false pass.
 
 - [x] **B1 — Does the page poll a second origin?** ✅ **RESOLVED — NAVIGATION.** Switching
       scenario navigates the browser to the other server's own `/demo`, carrying the scenario in
-      the URL (`http://127.0.0.1:8124/demo?scenario=prefix-cache`). Both servers serve the same
+      the URL (`http://127.0.0.1:8124/demo?scenario=paged-kv`). Both servers serve the same
       static demo via ServeDir, so **every page is always same-origin with the server it talks
       to**. Zero CORS code. Test consequences:
       - **AC42 (no cross-mode leakage) is now true BY CONSTRUCTION** — a full page load cannot
         carry a stale value. Still test it, but a failure here means something is persisting
         state deliberately (storage, URL, cache).
       - **Scenario state lives in the URL query string** → the URL is shareable and bookmarkable.
-        **Test deep-linking directly**: paste `?scenario=prefix-cache` into a fresh tab and confirm
+        **Test deep-linking directly**: paste `?scenario=paged-kv` into a fresh tab and confirm
         it opens on the right panel against the right origin.
+        ⚠️ **This step previously deep-linked the withdrawn `prefix-cache` id, and IT COULD NOT
+        FAIL.** That id was cut (it is in `CUT_SCENARIOS` with no `id:`), and `currentScenarioId`
+        silently falls back to the origin's own scenario rather than erroring. A tester pasting
+        it would have seen a flawless, correctly-labelled page and recorded a PASS — **the step's
+        success criterion was satisfied BY the defect it should have caught.** Deep-link a
+        registered id here; the withdrawn one has its own step below.
+      - **Deep-link the WITHDRAWN id** — set the `scenario` query parameter to `prefix-cache` by
+        hand and confirm the page does NOT present itself as prefix caching. Substitution is the
+        INTENDED behaviour for a link that outlived the cut (a bookmark, a chat log, the design
+        doc), so the pass condition is that nothing on screen claims prefix caching — **not**
+        that an error appears.
+        📌 Written as prose rather than as a pasteable URL on purpose: `scenario-routes.test.js`
+        scans this file for advertised routes and cannot distinguish a link we are OFFERING from
+        one we are TESTING AGAINST. Spelling the literal here would redden a guard for describing
+        the very thing it guards.
       - **Capability detection is RE-EVALUATED ON ORIGIN SWITCH**, not once at page load.
         `meta.requires` gating must re-run. Test switching A→B→A and confirm panels re-mount
         correctly each time, not just on first arrival.
