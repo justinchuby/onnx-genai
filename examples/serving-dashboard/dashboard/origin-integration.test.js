@@ -221,15 +221,11 @@ describe('KV block-window aggregation', () => {
     // use, 37 shared, 20 free, and 93.3% utilization. The disagreement is
     // deliberate: global scalars must not be recomputed from this partial scan.
     const scannedPages = 256;
-    const wholePoolPagesInUse = 280;
-    const wholePoolPagesShared = 37;
-    const wholePoolPagesFree = 20;
-    const wholePoolUtilization = 280 / 300;
     const blockTable = syntheticBlockTable({
-      pagesInUse: wholePoolPagesInUse,
-      pagesShared: wholePoolPagesShared,
-      pagesFree: wholePoolPagesFree,
-      utilization: wholePoolUtilization,
+      pagesInUse: 280,
+      pagesShared: 37,
+      pagesFree: 20,
+      utilization: 280 / 300,
       refCounts: Array(scannedPages).fill(1),
       filledSlots: Array(scannedPages).fill(16),
       total: 300,
@@ -243,10 +239,10 @@ describe('KV block-window aggregation', () => {
     const { store } = await pollBlockTable(blockTable);
 
     for (const [key, expectedValue] of [
-      ['kv.pages_used', wholePoolPagesInUse],
-      ['kv.pages_total', wholePoolPagesInUse + wholePoolPagesFree],
-      ['kv.pages_shared', wholePoolPagesShared],
-      ['kv.usage', wholePoolUtilization],
+      ['kv.pages_used', 280],
+      ['kv.pages_total', 300],
+      ['kv.pages_shared', 37],
+      ['kv.usage', 280 / 300],
     ]) {
       const field = store.field(key);
       assert.equal(field.state, 'measured', `${key} must remain a whole-pool measurement`);
@@ -254,7 +250,7 @@ describe('KV block-window aggregation', () => {
     }
     assert.equal(
       store.field('kv.pages_total').value - store.field('kv.pages_used').value,
-      wholePoolPagesFree,
+      20,
       'free pages must remain the whole-pool total minus whole-pool pages in use',
     );
 
