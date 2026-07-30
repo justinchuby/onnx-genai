@@ -736,3 +736,57 @@ the entire session while ten others were closed.
 attribution is a claim, so it carries the SHA and pathspec that establish it, or
 it names no one. **This document follows that rule — including in one place
 where following it meant deleting a name we could not verify.**
+
+---
+
+## Known gap: the specification says where assets come from and never what must not leave
+
+**Found by a reviewer auditing our specification rather than our code, and
+confirmed here with both controls firing.** In `demo-spec.md`, at HEAD:
+
+```
+dotfile              0        SERVABLE_EXTENSIONS   0
+percent-encoding     0        .env                  0
+allowlist            0        "must not be served"  0
+the three static-asset security findings, by id   **0 · 0 · 0**
+[POSITIVE CONTROL] "REQUIREMENT" 7 · "refuse" 17 · a known id resolves 1
+[NEGATIVE CONTROL] a nonsense id 0
+```
+
+**The one asset requirement we did write is about freshness:**
+
+> *"ASSETS ARE READ FROM DISK AT REQUEST TIME AND NEVER BAKED INTO THE BINARY."*
+
+**That is a requirement about where bytes come from. There is no requirement
+anywhere in the specification about which bytes must never leave.** Every
+static-asset boundary this project has — the extension allowlist, the dotfile
+rule, the traversal defence — **was invented during implementation and review,
+and none of it was ever asked for.**
+
+> **The acceptance criteria specify the happy path of asset serving in detail
+> and its boundary not at all. Everything that protects the boundary today
+> exists because an engineer thought of it, not because anyone required it.**
+
+**This is the most consequential thing on this list, and it is a product defect
+rather than an engineering one — it is mine.** The consequences were not
+hypothetical: at one point the server returned the contents of a dotfile with an
+allowlisted extension, and the three refusals that made it *look* safe were
+refusals by coincidence — the file names simply happened to end in extensions
+nobody had allowlisted. **A specification that never states a boundary cannot
+have that boundary reviewed, tested, or regression-guarded, and the absence
+looks exactly like agreement.**
+
+**What we would want from the next revision, stated as the requirement we should
+have written:** *the demo asset server serves an enumerated set and refuses
+everything else, the refusal is by rule rather than by coincidence, and the rule
+is stated in terms a reviewer can check without reading the implementation.*
+
+**One correction to the report that found this, offered because it is the same
+class as the finding:** the reviewer also measured 20 occurrences of the
+model-path symbol in the specification and read it as the specification carrying
+the defect. **Only 4 of those 20 are code; the rest are the record of the fix —
+closure notices, controls, and an explicit instruction not to reinstate the
+field.** *A document that records a defect's death contains that defect's name,
+and a token census cannot tell an epitaph from a body.* The reviewer's aim was
+right and their instance was not — which is the cheapest kind of error to fix
+and, on this branch, the most common.
