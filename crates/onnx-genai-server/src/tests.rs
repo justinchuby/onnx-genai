@@ -3650,3 +3650,87 @@ fn a_defined_ratio_is_computed_including_a_genuine_zero() {
     assert_eq!(crate::metrics::defined_ratio(1, 4), Some(0.25));
     assert_eq!(crate::metrics::defined_ratio(4, 4), Some(1.0));
 }
+
+/// Pins the capability split that decides whether the KV page fields on
+/// `/v1/status` are measurements or fabrications.
+///
+/// Continuous batching and paged KV are mutually exclusive, and this is where
+/// that stops being a design claim and becomes an executable one. On the
+/// continuous-batching path the page pool advertises a capacity of 1024 while
+/// `in_use`, `filled_slots` and `shared` stay at **peak zero across an entire
+/// batch** -- not zero at rest, zero at their maximum. Publishing `kv_usage`
+/// there would report a structural constant as a live measurement, and it would
+/// look exactly like a genuinely empty pool.
+///
+/// If this test ever fails because the peak went above zero, that is good news:
+/// paged KV reached the batching path, and these fields must be reclassified
+/// from not-applicable to measured for that capability profile.
+#[test]
+fn the_batching_path_never_populates_the_kv_page_pool() {
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let engine = Engine::from_dir(&dir, EngineConfig::default()).unwrap();
+    let mut manager = engine
+        .continuous_batch_manager(4)
+        .expect("the scatter fixture is the continuous-batching path");
+
+    for i in 0..3 {
+        manager
+            .submit(onnx_genai::GenerateRequest {
+                prompt: onnx_genai::GeneratePrompt::Text(format!("hello {i}")),
+                options: onnx_genai::GenerateOptions {
+                    max_new_tokens: 4,
+                    ..onnx_genai::GenerateOptions::default()
+                },
+            })
+            .expect("submit to the batch");
+    }
+
+    let mut peak_in_use = 0usize;
+    let mut peak_shared = 0usize;
+    let mut steps = 0;
+    while steps < 64 && manager.step().is_ok() {
+        steps += 1;
+        let _ = manager.poll();
+        let usage = engine.page_usage();
+        peak_in_use = peak_in_use.max(usage.in_use);
+        peak_shared = peak_shared.max(usage.shared);
+        if manager.is_idle() {
+            break;
+        }
+    }
+
+    assert!(
+        steps > 0,
+        "the batch never stepped, so nothing was observed"
+    );
+    assert_eq!(
+        (peak_in_use, peak_shared),
+        (0, 0),
+        "paged KV now reaches the continuous-batching path; kv_usage and \
+         kv_pages_* must be reclassified as measured for this capability profile"
+    );
+    assert!(
+        engine.page_usage().capacity > 0,
+        "the pool advertises capacity even though the batching path never uses \
+         it -- this is exactly why capacity must not be published as headroom here"
+    );
+}
+
+/// The other half of the same exclusivity: the paged/dynamic model cannot build
+/// a continuous batch manager at all. Recorded because the two capability
+/// profiles are the reason a field is honest on one server and fabricated on the
+/// other, and a flat provenance table keyed on field name cannot express it.
+#[test]
+fn the_paged_model_cannot_run_continuous_batching() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let engine = Engine::from_dir(&dir, EngineConfig::default()).unwrap();
+    let err = engine
+        .continuous_batch_manager(4)
+        .err()
+        .expect("continuous batching must be unavailable on the paged path");
+    assert!(
+        err.to_string().contains("continuous batching requires"),
+        "unexpected error: {err}"
+    );
+}
