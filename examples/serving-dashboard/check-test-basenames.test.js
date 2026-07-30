@@ -270,9 +270,37 @@ const SCANNER_EVIDENCE = /node:fs|node:child_process|shipping-tree|readFileSync|
  * EXACT SET, not a count. A count would let one file be renamed and another
  * added without notice, which is precisely the quiet drift this pins.
  *
- * RETIREMENT: rename `foo.test.js` -> `check-foo.test.js`, update any citation
- * in the review documents, and delete the line here in the SAME commit. The
+ * RETIREMENT: rename `foo.test.js` -> `check-foo.test.js`, update every
+ * consumer named below, and delete the line here in the SAME commit. The
  * self-expiry test below fails if an entry outlives the file it names.
+ *
+ * ⚠️ READ THE CONSUMER INVENTORY BEFORE RENAMING ANY OF THESE. It was measured
+ * across the whole tree, and the first version of this comment understated it
+ * badly by mentioning only the review documents:
+ *
+ *   all 33 are referenced BY NAME somewhere      33 / 33
+ *   code references (js/mjs/sh)                  ~79, between 1 and 8 per file
+ *   documentation references (md)                ~101, up to 7 per file
+ *
+ * Most are prose cross-references in comments, which cost a reader nothing at
+ * runtime and everything in trust. But at least one is a FUNCTIONAL dependency
+ * on the filename:
+ *
+ *   check-binding-liveness.test.js:531 does
+ *     readFileSync(join(HERE, 'dashboard', 'field-keys.test.js'))
+ *   to LIFT NOT_YET_PUBLISHED rather than keep a second copy of it.
+ *
+ * That call is deliberately unguarded, so a rename throws ENOENT and the suite
+ * fails loudly. That is the good case and it must STAY the good case: if you
+ * ever wrap a by-name read like that in a try/catch with a fallback, a rename
+ * would silently hand the guard an empty inventory and every suite would stay
+ * green while the check did nothing.
+ *
+ * Discovery itself is rename-safe and was verified: run-tests.sh:136 finds
+ * tests with `find . -name '*.test.js'`, which is recursive and matches on the
+ * suffix, and run-tests.sh:378 ratchets on ANY decrease in the discovered
+ * count. Nothing anywhere selects tests on the `check-` prefix. So a rename
+ * cannot drop a file out of the run — it can only break a reference, loudly.
  */
 const GRANDFATHERED_UNPREFIXED_SCANNERS = Object.freeze([
   'asset-graph.test.js',
@@ -394,6 +422,72 @@ describe('the check- test-file prefix', () => {
         'If you renamed one, delete its line here in the same commit. An ' +
         'exemption that outlives its subject silently exempts the next file ' +
         'that takes the name.',
+    );
+  });
+
+  it('every by-name reference to a test file resolves to a real file', () => {
+    // THE LEAD'S PRECONDITION, ENFORCED RATHER THAN DOCUMENTED.
+    //
+    // Some guards depend on another suite's FILENAME, not just its behaviour.
+    // The load-bearing example is check-binding-liveness.test.js, which lifts
+    // NOT_YET_PUBLISHED straight out of dashboard/field-keys.test.js instead of
+    // keeping a second copy that could drift.
+    //
+    // A rename would break that. Today it breaks LOUDLY, because the read is an
+    // unguarded readFileSync that throws ENOENT. But that is a property of the
+    // consumer's error handling, and the next author may wrap it in a try/catch
+    // with a fallback — at which point a rename silently hands the guard an
+    // empty inventory and every suite stays green while the check does nothing.
+    //
+    // So this does not inspect error handling, which would be fragile and would
+    // have to be re-tuned for every consumer. It asserts the target EXISTS.
+    // That holds however the consumer behaves when the file is missing, which
+    // makes it the stronger invariant of the two.
+    const dangling = [];
+    const seen = [];
+
+    for (const path of shippedPaths()) {
+      if (!/\.(?:js|mjs)$/.test(path)) continue;
+      const source = shipped(path);
+
+      for (const line of source.split('\n')) {
+        // Only lines that actually READ a file by name. A prose cross-reference
+        // in a comment is not a functional dependency and must not be policed
+        // here — comments are how this codebase explains itself.
+        if (!/readFileSync|readFile\(|createReadStream/.test(line)) continue;
+        if (/^\s*(?:\/\/|\*)/.test(line)) continue;
+
+        for (const [, name] of line.matchAll(/'([^']*\.test\.js)'/g)) {
+          seen.push(`${path} -> ${name}`);
+          const base = name.includes('/') ? name.slice(name.lastIndexOf('/') + 1) : name;
+          const exists = shippedPaths().some(
+            (p) => p === name || p.endsWith(`/${base}`) || p === base,
+          );
+          if (!exists) dangling.push(`${path} reads '${name}', which is not shipped`);
+        }
+      }
+    }
+
+    assert.deepEqual(
+      dangling,
+      [],
+      'A guard reads another test file BY NAME, and that file is not at the ' +
+        `shipping ref:\n${dangling.map((d) => `  ${d}`).join('\n')}\n\n` +
+        'Renaming a test that another guard reads disarms that guard. Update ' +
+        'the reader in the same commit as the rename. Do NOT make the read ' +
+        'tolerant of a missing file — a guard that falls back to an empty ' +
+        'inventory reports a confident green having checked nothing.',
+    );
+
+    // ANTI-VACUITY. If the line filter stopped matching, `dangling` is empty and
+    // this test passes while policing nothing. The known dependency must be seen.
+    assert.ok(
+      seen.some((s) => s.includes('field-keys.test.js')),
+      'The scan did not observe check-binding-liveness.test.js reading ' +
+        "dashboard/field-keys.test.js, which it does at line 531. The extractor " +
+        'is not reading the corpus it claims to read, so an empty result means ' +
+        'nothing.\n' +
+        `OBSERVED: ${seen.join(', ') || 'nothing at all'}`,
     );
   });
 
