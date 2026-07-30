@@ -2,7 +2,7 @@ use onnx_runtime_ir::{
     Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
-    OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
+    OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult, ShapeNoOpElimination,
 };
 
 pub(crate) const SILU_MUL_FUSION_ATTR: &str = "_cuda_silu_mul";
@@ -77,6 +77,7 @@ pub(crate) struct CudaSwiGluFusion;
 
 pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
+        Box::new(ShapeNoOpElimination),
         Box::new(CudaFoldConstantTranspose),
         // Runs before the fusions so they see the fp16-native normalization
         // form (no `Cast` wrappers) that the rest of the pipeline expects.

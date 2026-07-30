@@ -6,6 +6,13 @@ use onnx_runtime_ep_api::ExecutionProviderCapabilities;
 /// needed for that slot, `None` when the input was used in place.
 type MaterializedInputs = Vec<Option<(Vec<u8>, Vec<i64>)>>;
 
+fn dispatch_value_name(value: &onnx_runtime_ir::Value) -> String {
+    value
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("value#{}", value.id.0))
+}
+
 impl Executor {
     /// Dispatch one plan node to its execution path (control-flow, sequence, or
     /// leaf kernel). Shared by the eager loop and the segmented runner.
@@ -85,13 +92,127 @@ impl Executor {
             });
             (is_control_flow, is_sequence, span)
         };
-        if is_control_flow {
+        if self.plan[pi].static_view.is_some() {
+            self.exec_static_view_node(pi, resolved, external)
+        } else if is_control_flow {
             self.exec_control_flow(pi, resolved, outer_scope)
         } else if is_sequence {
             self.exec_sequence_node(pi, resolved, external)
         } else {
             self.exec_kernel_node(pi, resolved, external)
         }
+    }
+
+    fn exec_static_view_node(
+        &mut self,
+        pi: usize,
+        resolved: &mut HashMap<ValueId, Vec<usize>>,
+        external: &ExternalBindings,
+    ) -> Result<()> {
+        let node_id = self.plan[pi].node_id;
+        let kind = self.plan[pi]
+            .static_view
+            .expect("exec_static_view_node called for non-view node");
+        self.refill_input_shapes(pi, resolved);
+        let inputs = self.plan[pi].inputs.clone();
+        let outputs = self.plan[pi].outputs.clone();
+        let input_dtypes = self.plan[pi].input_dtypes.clone();
+        let output_dtypes = self.plan[pi].output_dtypes.clone();
+        let input_shapes = self.scratch_input_shapes.clone();
+        let node = self.graph.node(node_id);
+        let output_shapes = self.resolve_node_outputs(
+            node_id,
+            &inputs,
+            &outputs,
+            &input_dtypes,
+            &input_shapes,
+            resolved,
+            external,
+        )?;
+        if outputs.len() != 1 || inputs.is_empty() {
+            return Err(SessionError::Internal(format!(
+                "static view op '{}' must have one data input and one output",
+                node.op_type
+            )));
+        }
+        let output = outputs[0];
+        if external.outputs.contains_key(&output) {
+            return Err(SessionError::Internal(format!(
+                "op '{}' cannot bind a load-time zero-copy view output to external storage",
+                node.op_type
+            )));
+        }
+        let Some(input) = inputs[0] else {
+            return Err(SessionError::Internal(format!(
+                "static view op '{}' has absent data input",
+                node.op_type
+            )));
+        };
+        let capabilities = self.ep.capabilities();
+        let in_infos = self.build_input_bindings(
+            &inputs,
+            &input_dtypes,
+            &input_shapes,
+            external,
+            false,
+            &capabilities,
+        )?;
+        let info = &in_infos[0];
+        if !info.present {
+            return Err(SessionError::Internal(format!(
+                "static view op '{}' has no present data input",
+                node.op_type
+            )));
+        }
+        let input_numel =
+            checked_numel(&info.shape, || dispatch_value_name(self.graph.value(input)))?;
+        let output_numel = checked_numel(&output_shapes[0], || {
+            dispatch_value_name(self.graph.value(output))
+        })?;
+        if input_numel != output_numel {
+            return Err(SessionError::Internal(format!(
+                "load-time {} view for value#{} changes element count: {:?} ({}) -> {:?} ({})",
+                node.op_type, output.0, info.shape, input_numel, output_shapes[0], output_numel
+            )));
+        }
+        if !onnx_runtime_ir::is_contiguous(&info.shape, &info.strides) {
+            return Err(SessionError::Internal(format!(
+                "load-time {} view for value#{} requires a contiguous input; got shape {:?} \
+                 strides {:?}",
+                node.op_type, output.0, info.shape, info.strides
+            )));
+        }
+        let shape = match kind {
+            StaticViewKind::Reshape | StaticViewKind::Squeeze | StaticViewKind::Unsqueeze => {
+                output_shapes[0].clone()
+            }
+        };
+        let strides = compute_contiguous_strides(&shape);
+        view_bounds(
+            &shape,
+            &strides,
+            info.byte_offset,
+            output_dtypes[0],
+            info.root_len,
+        )?;
+        if let Some(old) = self.buffers.remove(&output) {
+            self.ep.deallocate(old)?;
+        }
+        self.shared_buffers.remove(&output);
+        self.buffer_shapes.remove(&output);
+        let root = self.root_of(input);
+        self.views.insert(
+            output,
+            ValueView {
+                source: root,
+                shape: shape.clone(),
+                strides,
+                byte_offset: info.byte_offset,
+            },
+        );
+        self.pinned.insert(root);
+        resolved.insert(output, shape);
+        Ok(())
     }
 
     /// Execute every plan node eagerly on the stream (no capture).
@@ -114,6 +235,16 @@ impl Executor {
             let mut timings: HashMap<String, (Duration, usize)> = HashMap::new();
             for pi in 0..self.plan.len() {
                 if elided.is_some_and(|set| set.contains(&pi)) {
+                    continue;
+                }
+                if self.plan[pi].static_view.is_some() {
+                    self.exec_plan_node(
+                        pi,
+                        resolved,
+                        outer_scope,
+                        external,
+                        OpCaptureTrace::Eager,
+                    )?;
                     continue;
                 }
                 let op_type = self.graph.node(self.plan[pi].node_id).op_type.clone();

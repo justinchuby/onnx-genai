@@ -324,6 +324,17 @@ pub(crate) struct NodePlan {
     /// Inputs consumed for the final time by this node and therefore eligible for
     /// a kernel-authorized in-place overwrite after additional runtime guards.
     pub inplace_dead_inputs: Vec<bool>,
+    /// Executor-owned pure metadata op. These nodes stay in the structural plan
+    /// so data-dependent output shapes are resolved at the right topological
+    /// point, but they never dispatch through `get_kernel`.
+    pub static_view: Option<StaticViewKind>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StaticViewKind {
+    Reshape,
+    Squeeze,
+    Unsqueeze,
 }
 
 /// Map a [`crate::sequence::SequenceError`] into an actionable `SessionError`.

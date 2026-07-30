@@ -3,6 +3,7 @@ use onnx_runtime_ir::{
 };
 use onnx_runtime_optimizer::{
     OpFusion, OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
+    ShapeNoOpElimination,
 };
 
 const PROJECTION_FUSION_ENV: &str = "ONNX_GENAI_PROJECTION_FUSION";
@@ -37,6 +38,7 @@ impl Default for ProjectionFusion {
 /// The ordered CPU EP optimization registry.
 pub fn cpu_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     let mut passes: Vec<Box<dyn OptimizationPass>> = Vec::new();
+    passes.push(Box::new(ShapeNoOpElimination));
     passes.push(Box::new(CpuSiluFusion));
     let projection_fusion = ProjectionFusion::new();
     if projection_fusion.enabled() {
@@ -1608,12 +1610,7 @@ mod tests {
         graph.add_input(x);
         graph.add_input(rhs);
         graph.add_output(output);
-        graph.insert_node(Node::new(
-            NodeId(0),
-            "Swish",
-            vec![Some(x)],
-            vec![silu_out],
-        ));
+        graph.insert_node(Node::new(NodeId(0), "Swish", vec![Some(x)], vec![silu_out]));
         graph.insert_node(Node::new(
             NodeId(0),
             "Mul",

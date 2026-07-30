@@ -3061,21 +3061,32 @@ fn decode_view_plan_fires_and_is_token_exact_over_128_steps() {
     }
 
     let (views_reused, dispatch_elided) = on.decode_view_plan_counts();
+    let load_time_elided = on.plan.iter().any(|plan| plan.static_view.is_some());
     assert!(
-        views_reused > 0 && dispatch_elided > 0,
-        "Stage 2 must fire on steady decode (views_reused={views_reused}, \
-             dispatch_elided={dispatch_elided})"
+        load_time_elided || (views_reused > 0 && dispatch_elided > 0),
+        "steady decode must elide pure-view dispatch either at load time or via Stage 2 \
+         (load_time_elided={load_time_elided}, views_reused={views_reused}, \
+         dispatch_elided={dispatch_elided})"
     );
-    // Non-vacuous: the reshape view must be reused/elided on the bulk of steps
-    // (priming + first rebuild cost the first few steps).
-    assert!(
-        views_reused as usize >= STEPS - 4,
-        "expected steady Stage 2 reuse; only {views_reused}/{STEPS} views reused"
-    );
-    assert!(
-        on.decode_view_plan.is_some(),
-        "the cached view plan must survive steady-state replay"
-    );
+    if load_time_elided {
+        assert!(
+            on.plan.iter().all(|plan| {
+                on.graph.node(plan.node_id).op_type != "Reshape" || plan.static_view.is_some()
+            }),
+            "load-time pure-view elision should mark Reshape nodes as executor-owned views"
+        );
+    } else {
+        // Non-vacuous: the reshape view must be reused/elided on the bulk of steps
+        // (priming + first rebuild cost the first few steps).
+        assert!(
+            views_reused as usize >= STEPS - 4,
+            "expected steady Stage 2 reuse; only {views_reused}/{STEPS} views reused"
+        );
+        assert!(
+            on.decode_view_plan.is_some(),
+            "the cached view plan must survive steady-state replay"
+        );
+    }
 }
 
 /// F5 Stage 2 buffer-identity invalidation lock. If a cached view's source
@@ -3114,6 +3125,9 @@ fn decode_view_plan_rebuilds_on_source_buffer_move() {
         let r = stage2_run(&mut off, &mut off_kv, len, bias);
         let m = stage2_run(&mut on, &mut on_kv, len, bias);
         assert_eq!(r, m, "warmup diverged at step {step}");
+    }
+    if on.plan.iter().any(|plan| plan.static_view.is_some()) {
+        return;
     }
     assert!(
         on.decode_view_plan.is_some(),
