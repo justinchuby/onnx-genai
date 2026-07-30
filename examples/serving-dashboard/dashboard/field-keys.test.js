@@ -293,3 +293,75 @@ describe('the fake server is reconciled against the Rust handler it imitates', (
     );
   });
 });
+
+describe('the provenance catalogue defines every field exactly once', () => {
+  // WHY THIS EXISTS.
+  //
+  // `'batch.capacity'` was defined TWICE in the catalogue. A duplicate key in a
+  // JS object literal is not an error: no syntax error, no warning, no lint.
+  // The last definition silently wins and the first becomes dead code that
+  // still reads perfectly in the file. The catalogue stated one field's
+  // provenance twice, the program believed one of them, and nothing anywhere
+  // said which.
+  //
+  // That is absent-vs-zero -- the defect this whole product refuses -- sitting
+  // inside the provenance table itself. And it is invisible to every check we
+  // already own, because `Object.keys()` DEDUPLICATES: each one sees a tidy 37
+  // and cannot distinguish it from a tidy 37 where two entries collided.
+  //
+  // Which survives is not neutral. The duplicate that won cited `admin.rs:178`;
+  // the one it silently killed cited the SYMBOL. So the catalogue preferred the
+  // fragile citation and discarded the durable one -- the exact inverse of the
+  // rule this repo runs on -- and a reader who scrolls to the good entry and
+  // stops reading believes it is in force. It is not.
+  //
+  // The only instrument that can see this is the SOURCE, not the object.
+  const PROVENANCE_PATH = fileURLToPath(new URL('../telemetry-provenance.js', import.meta.url));
+
+  /** Top-level catalogue keys as WRITTEN, duplicates preserved. */
+  function declaredKeys() {
+    const source = readFileSync(PROVENANCE_PATH, 'utf8');
+    // Digits are in the character class deliberately. The first version of this
+    // parser used [a-z_.] and silently skipped `metrics.e2e_latency` -- the one
+    // key containing a digit. A duplicate of THAT key would have been invisible
+    // to the duplicate detector, which is the same class of defect the detector
+    // exists to catch. The reconciliation test below is what caught it.
+    return [...source.matchAll(/^ {2}'([A-Za-z0-9_.]+)': \{/gm)].map((match) => match[1]);
+  }
+
+  it('parses exactly the key set the module actually exports', async () => {
+    // The anti-vacuity control, and it is not optional. A parser that matches
+    // nothing finds no duplicates and reports success, which is byte-identical
+    // to a clean catalogue. Reconciling against the runtime keys means the
+    // detector cannot go blind without going RED.
+    const { PROVENANCE } = await import('../telemetry-provenance.js');
+    const runtime = Object.keys(PROVENANCE).sort();
+    const declared = [...new Set(declaredKeys())].sort();
+
+    assert.deepEqual(
+      declared,
+      runtime,
+      'the source parser and the exported object disagree about which keys exist, so the '
+        + 'duplicate check below is scanning something other than the catalogue.',
+    );
+  });
+
+  it('declares no field key twice', () => {
+    const declared = declaredKeys();
+    const seen = new Set();
+    const duplicates = [];
+    for (const key of declared) {
+      if (seen.has(key)) duplicates.push(key);
+      seen.add(key);
+    }
+
+    assert.deepEqual(
+      duplicates,
+      [],
+      `${duplicates.join(', ')} is defined more than once in telemetry-provenance.js. `
+        + 'JS keeps the LAST definition and silently discards the earlier one, so the file '
+        + 'states a provenance the program does not use. Delete the duplicate, keeping the '
+        + 'entry whose evidence cites a SYMBOL rather than a line number.',
+    );
+  });
+});
