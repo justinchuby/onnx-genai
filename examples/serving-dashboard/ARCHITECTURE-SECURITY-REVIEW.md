@@ -1329,3 +1329,86 @@ restating what it enforces.
 I did not add a note above the stale line. Per @c7a654ed's rule — a retraction
 that lives anywhere except beside the retracted string has been filed, not
 applied — the false sentence is **gone**, not annotated.
+
+---
+
+## §20 — C19: the dotfile rule is bypassed by percent-encoding, PROVEN ON THE WIRE
+
+Measured at `fa1fd425`, against a binary built from the demo worktree at 04:38,
+newer than the dotfile fix `1384f7aa` (04:28:56). Probe server on `127.0.0.1:8791`,
+started and reaped by me; the four demo origins untouched.
+
+**@c0de4c2e measured `demo_assets.rs` growing 122 -> 566 lines and declined to
+file a finding. I took it, because 78% of the code deciding which files a browser
+can pull off this disk had never been read by a reviewer.**
+
+### The result
+
+    POSITIVE CONTROL  /demo/app.js                                  200
+    NEGATIVE CONTROL  /demo/zzz-no-such-file.js                     404
+    dot segment, decoded    /demo/node_modules/.vite/…/results.json 404   rule works
+    dot segment, ENCODED    /demo/node_modules/%2Evite/…/results.json 200 ** BYPASS **
+    lower-case %2e                                                  200   ** also **
+
+    bytes on the wire 88  ==  bytes on disk 88   byte-identical, real content
+    {"version":"4.1.10","results":[[":state-channel.test.js",…]]}
+
+### Why
+
+`restrict_demo_assets` authorises on `request.uri().path()` — the **raw**,
+still-percent-encoded string. `ServeDir` then **decodes** it before opening a
+file. Two parsers, one string, and nothing requires them to agree. The
+middleware sees a segment `%2Evite` that does not begin with `.`; the file system
+sees `.vite`.
+
+This is the fourth-and-a-half sighting of the branch's dominant structural
+failure — *two places describe one thing and nothing says which wins* — in its
+sharpest form yet: **the two places are two PARSERS OF THE SAME BYTES.** A
+divergence here is not a stale comment. It is an authorisation decision made
+about a string that is not the string that gets used.
+
+### The part that makes this worth a finding rather than a nit
+
+The author **already identified this exact danger and wrote it down**:
+
+> `.env`, `.npmrc` and `.git/config` were refused only incidentally, because
+> their extensions are not on the list. **That is a refusal by coincidence**, and
+> it inverts the moment someone adds `json` to a dotted config directory.
+
+They were right, they built the segment rule to end the coincidence — and the
+segment rule does not reach the encoded form. **So the tree is back in exactly
+the state its own author declared unacceptable, and the only thing still standing
+between a visitor and `.vscode/settings.json` is the extension allowlist that the
+comment says must not be relied on.** I confirmed the allowlist does still hold:
+`%2Egit/config` and `%2Egit/HEAD` are 404, and `.md` is 404 — so my own review
+document is no longer served, which is a real repair. The blast radius is
+bounded to *files inside dot-directories carrying an allowed extension*, and
+`.vscode/settings.json` is squarely inside it.
+
+### Why fifteen passing tests could not see it
+
+Every one of the fifteen tests calls `demo_path_is_servable("…")` with an
+**already-decoded literal**. The premise that the predicate's input equals
+`ServeDir`'s input is shared by all fifteen and asserted by none — the Lead's
+first-frame blindness, in Rust, on the security boundary. **A guard tested only
+through its own front door never meets the decoder that sits in front of it.**
+
+### The fix, and why the obvious one is the wrong one
+
+The obvious fix is to percent-decode inside `demo_path_is_servable`. **Do not.**
+That creates two decoders that must stay byte-compatible forever, which is the
+same defect with an extra moving part.
+
+**Refuse any `/demo/` path containing `%` at all.** Measured: **91** assets with
+a servable extension outside `node_modules`, of which **0** require
+percent-encoding in their names (control: zero filenames containing a space).
+The ban costs nothing real, needs no decoder, and **cannot drift**, because it
+removes the differential rather than trying to keep two parsers in agreement.
+
+> **Do not authorise on a string that something downstream will transform.**
+> Either authorise on the post-transform value, or forbid the transform. Keeping
+> two parsers in sync is not a fix, it is a maintenance obligation nobody signed.
+
+Severity: MAJOR, non-blocking for the demo — loopback-only, bounded by the
+extension allowlist, and no secret in this tree currently sits in a dot-directory
+under an allowed extension. It blocks nothing tonight. It should not ship.
