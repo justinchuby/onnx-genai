@@ -528,6 +528,10 @@ The engine holds no concurrent-reader path. Both driver paths take an **exclusiv
 
 **The shape that works** is to invert the direction. State written from *inside* the mutable borrow into shared, atomic storage (`Arc<...AtomicU64...>`) can be read from outside with **no borrow at all**: wait-free, no channel, no deferral, no borrow conflict — and cheaper in the decode loop than servicing a channel, since it is a relaxed store rather than a `try_recv` plus a reply.
 
+**The approved implementation** is an `Option<Arc<KvTelemetry>>` of atomics on the engine, updated after each decode step, with HTTP handlers reading it **without ever touching the driver thread**. Note what this fixes and how: it does not make the queue drain sooner, it removes the dependency on the queue draining at all. **The `/v1/resources` hang (§8.10) is closed structurally rather than by timing luck** — the difference between a race made less likely and a race made impossible.
+
+**One subtlety when placing the write.** `run_fallback_engine_driver` delegates to `handle_driver_command`, so instrumenting the shared handler covers the pipeline path too; there is no separate site to add for it. A redundant extra site would not be harmless — two writers to the same atomic publishing at different points in the step produce values that are individually valid and jointly inconsistent.
+
 > **Stated as a rule:** *observability must not traverse the command channel — publish, don't request.* Any telemetry modelled as a `DriverCommand` inherits this ceiling by construction and will read as **frozen under load and fine when idle**, which is the hardest failure mode to catch, because every test that does not hold load passes.
 
 ---
