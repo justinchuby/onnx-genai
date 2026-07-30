@@ -549,7 +549,7 @@ Verified instances in this repo, all genuinely measured and all easy to misread:
 |---|---|---|---|
 | `prefix_cache_lookups` | cache lookups | **completed generations** — incremented unconditionally, with no predicate | `crates/onnx-genai-server/src/metrics.rs::result` |
 | `active_sessions` | concurrent requests | **persistent `X-Session-Id` sessions** — 4 concurrent stateless requests report `0` | `crates/onnx-genai-server/src/session.rs::remove` |
-| `vram.used` | GPU memory in use | the scheduler's **KV byte-budget accounting** | `crates/onnx-genai-engine/src/engine/governor.rs::resolved_host_ram_budget`, `:554` |
+| `vram.used` | GPU memory in use | the scheduler's **KV byte-budget accounting** | `crates/onnx-genai-engine/src/engine/governor.rs::resolved_host_ram_budget`, `crates/onnx-genai-scheduler/src/governor.rs::snapshot` |
 | `host_ram.used` | this process's memory | **whole-machine** OS query, including every other process | `crates/onnx-genai-engine/src/engine/governor.rs::resolved_host_ram_budget` |
 
 **What breaks if violated:** the failure is silent and self-confirming. `prefix_cache_lookups` is the cautionary case — it would read `5` on a build with the prefix cache **deleted entirely**, so any hit-rate derived from it is a ratio against an unrelated denominator.

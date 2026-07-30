@@ -46,6 +46,16 @@ import tree_context  # noqa: E402
 
 MANIFEST = Path("docs/citations.manifest.json")
 
+# `:123` -- the CONTINUATION form: a bare line reference that inherits its file
+# from an earlier citation. This is a deictic: its meaning depends entirely on
+# what was written before it, so it breaks when the surrounding prose is
+# reordered, and neither ANCHORED nor POSITIONAL matches it. Until this pattern
+# existed the checker could not see these citations AT ALL -- they were not
+# counted, not ratcheted, and not resolved, so a green run reporting
+# "positional 0" was measuring a strict subset of the document's citations
+# while reading as if it had covered all of them.
+CONTINUATION = re.compile(r"`:(\d+)(?:-\d+)?`")
+
 # `path/to/file.ext::symbol` -- the anchored form.
 ANCHORED = re.compile(r"`([\w./\-]+\.(?:rs|py|js|css|html|toml|md|sh))::([^`]+)`")
 
@@ -115,11 +125,12 @@ def find_definition(text: str, symbol: str) -> int | None:
     return None
 
 
-def extract(doc: Path) -> tuple[list[Citation], list[Citation], list[Citation]]:
-    """Return (anchored, positional, doc_mentions)."""
+def extract(doc: Path) -> tuple[list[Citation], list[Citation], list[Citation], list[Citation]]:
+    """Return (anchored, positional, doc_mentions, continuations)."""
     anchored: list[Citation] = []
     positional: list[Citation] = []
     mentions: list[Citation] = []
+    continuations: list[Citation] = []
     seen_mentions: set[tuple[str, int]] = set()
     for n, line in enumerate(doc.read_text().splitlines(), start=1):
         for m in ANCHORED.finditer(line):
@@ -131,7 +142,21 @@ def extract(doc: Path) -> tuple[list[Citation], list[Citation], list[Citation]]:
             if key not in seen_mentions:
                 seen_mentions.add(key)
                 mentions.append(Citation(doc, n, m.group(1), None, m.group(0)))
-    return anchored, positional, mentions
+        # A continuation inherits its file from the nearest citation to its LEFT
+        # ON THE SAME LINE. That rule is deliberately local and conservative: a
+        # continuation whose antecedent is in another paragraph is REFUSED
+        # rather than attributed by proximity, because guessing an antecedent
+        # is how a checker starts fabricating the evidence it was built to
+        # audit. `path` carries the inherited file, or None when unattributable.
+        for m in CONTINUATION.finditer(line):
+            antecedents = [
+                (a.start(), a.group(1))
+                for a in list(ANCHORED.finditer(line)) + list(POSITIONAL.finditer(line))
+                if a.start() < m.start()
+            ]
+            inherited = max(antecedents)[1] if antecedents else None
+            continuations.append(Citation(doc, n, inherited, None, m.group(0)))
+    return anchored, positional, mentions, continuations
 
 
 def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None = None) -> str | None:
@@ -170,8 +195,14 @@ def resolve_path(repo: Path, tracked: set[str], cited: str, symbol: str | None =
 
 def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
     tracked = tracked_files(repo)
-    anchored, positional, mentions = extract(doc)
+    anchored, positional, mentions, continuations = extract(doc)
     failures: list[Failure] = []
+    # Non-fatal observations. A deictic citation is a real defect but a slow
+    # one, and turning 32 of them red on demo night would buy a developer
+    # nothing while blocking everyone. They are printed on every run and frozen
+    # by a ratchet so the count can only fall -- the same shape used for line
+    # drift: assert identity fatally, report drift non-fatally.
+    reports: list[Failure] = []
 
     for c in anchored:
         real = resolve_path(repo, tracked, c.path, c.symbol)
@@ -228,10 +259,46 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                 )
             )
 
+    # A continuation citation is checked as far as it CAN be checked and no
+    # further. Where the antecedent is known we assert the line is inside the
+    # file; where it is not, we refuse to attribute it and say so. Neither is a
+    # content check -- a line number that fits is not a line number that is
+    # right -- so these are reported honestly as line-anchored, never counted
+    # among the resolved citations.
+    for c in continuations:
+        if c.path is None:
+            reports.append(
+                Failure(
+                    "CONTINUATION_UNATTRIBUTABLE",
+                    c,
+                    f"continuation citation '{c.raw}' has no citation to its "
+                    f"left on the same line, so the file it refers to is "
+                    f"decided by surrounding prose. Reordering the paragraph "
+                    f"silently repoints it. Write the path and symbol in full.",
+                )
+            )
+            continue
+        real = resolve_path(repo, tracked, c.path)
+        if real is None:
+            continue  # the antecedent itself is already reported above
+        n_lines = len((repo / real).read_text(errors="replace").splitlines())
+        cited_line = int(CONTINUATION.match(c.raw).group(1))
+        if cited_line > n_lines:
+            failures.append(
+                Failure(
+                    "CONTINUATION_OUT_OF_RANGE",
+                    c,
+                    f"continuation citation '{c.raw}' inherits '{real}', which "
+                    f"has only {n_lines} lines. The line it names does not exist.",
+                )
+            )
+
     stats = {
         "anchored": len(anchored),
         "unanchored": len(positional),
         "doc_mentions": len(mentions),
+        "continuations": len(continuations),
+        "reports": reports,
     }
 
     # Anti-shrink anchors. A harness that enumerates citations from the artefact
@@ -259,6 +326,18 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
                 f"to `path::symbol` rather than raising the ceiling.",
             )
         )
+    cont_ceiling = manifest.get("max_continuation_citations")
+    if cont_ceiling is not None and len(continuations) > cont_ceiling:
+        failures.append(
+            Failure(
+                "CONTINUATION_RATCHET",
+                Citation(doc, 0, str(doc), None, ""),
+                f"{len(continuations)} line-anchored continuation citations, "
+                f"ratchet allows {cont_ceiling}. These inherit their file from "
+                f"neighbouring prose and rot when it is reordered; write the "
+                f"path and symbol in full rather than raising the ceiling.",
+            )
+        )
     for required in manifest.get("must_cite_symbols", []):
         if not any(c.symbol == required for c in anchored):
             failures.append(
@@ -273,9 +352,25 @@ def check(repo: Path, doc: Path, manifest: dict) -> tuple[list[Failure], dict]:
 
 def report(failures: list[Failure], stats: dict, doc: Path) -> int:
     print(f"citations in {doc}: anchored {stats['anchored']} | "
-          f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']}")
+          f"positional {stats['unanchored']} | doc-mentions {stats['doc_mentions']} "
+          f"| line-anchored continuations {stats['continuations']}")
+    pending = stats.get("reports") or []
+    if pending:
+        # Printed BEFORE the verdict, and printed even when the run is green.
+        # A known-unchecked citation that is never mentioned becomes an
+        # unknown-unchecked one within a day.
+        print(f"\n--- {len(pending)} non-fatal: deictic citations that inherit "
+              f"their file from neighbouring prose (frozen by ratchet, not yet repaired) ---")
+        for f in pending[:5]:
+            print(f"  {f.citation.doc}:{f.citation.line_no}  {f.citation.raw}")
+        if len(pending) > 5:
+            print(f"  ... and {len(pending) - 5} more")
     if not failures:
         print("OK - every anchored citation resolves to a definition that exists.")
+        if pending:
+            print(f"NOTE - this OK covers {stats['anchored']} anchored citations. "
+                  f"{len(pending)} deictic citations above are counted, frozen, "
+                  f"and NOT content-checked.")
         return 0
     by_kind: dict[str, list[Failure]] = {}
     for f in failures:
@@ -410,7 +505,28 @@ def self_test() -> int:
             "did not raise" if ok else f"falsely raised: {kinds}",
         ))
 
-    # 10. Anti-shrink: deleting the citation must NOT be a way to go green.
+    # 10. A continuation citation naming a line beyond the end of the file it
+    #     inherits is a provably broken citation and stays FATAL.
+    def continuation_out_of_range(repo: Path):
+        (repo / "docs" / "d.md").write_text(
+            "See `src/sample.rs::cited_symbol` and also `:999` for the mapping.\n"
+        )
+    run_case(
+        "continuation citation past end of inherited file",
+        continuation_out_of_range,
+        "CONTINUATION_OUT_OF_RANGE",
+    )
+
+    # 11. The negative control that makes case 10 mean something: an inherited,
+    #     in-range continuation must NOT raise. Without this, case 10 could pass
+    #     by flagging every continuation regardless of the line it names.
+    def continuation_in_range(repo: Path):
+        (repo / "docs" / "d.md").write_text(
+            "See `src/sample.rs::cited_symbol` and also `:2` for the mapping.\n"
+        )
+    run_case("continuation citation within the inherited file", continuation_in_range, None)
+
+    # 12. Anti-shrink: deleting all citations must NOT be a way to go green.
     def shrink(repo: Path):
         (repo / "docs" / "d.md").write_text("No citations at all here.\n")
     with tempfile.TemporaryDirectory() as td:

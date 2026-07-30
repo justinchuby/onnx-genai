@@ -7,5 +7,7 @@
     "handle_or_defer_during_batch",
     "batch_utilization",
     "GenerationMetrics"
-  ]
+  ],
+  "max_continuation_citations": 59,
+  "_why_continuations": "Deictic citations of the form `:123` inherit their file from neighbouring prose. They were invisible to this checker until 97159f1f+: not counted, not ratcheted, not resolved, so a green run reporting 'positional 0' measured a strict subset of the document. Frozen here so the count can only fall. Never raise it."
 }
