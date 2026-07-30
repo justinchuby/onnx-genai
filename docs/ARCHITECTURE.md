@@ -32,6 +32,8 @@ Line numbers are accurate as of the commit this document was added. Structure ch
 | A passing test | A behaviour that is *structurally impossible* rather than merely absent — the test and the stub agree (§5.6.1). |
 | A single measurement | Whether the instrument can resolve the effect at all. A run-to-run difference can exceed the threshold being tested for. |
 | A line citation | That the line moved. The claim stays true while the reference silently rots. |
+| `grep` returning nothing | Absence of a **spelling**, not of a **concept**. `grep -rn cors` reports zero on a tree containing `CorsLayer` and `CORS`, and the prefix-counter tripwire banned `prefix_cache_hits` while `prefix_cache.hits` shipped past it unnoticed (§8.4). An absence proof needs case-insensitive, multi-spelling coverage — and even then establishes only that nothing *names* the thing, not that nothing *does* it. |
+| A correction from a colleague | That the correction's own evidence has expired. Corrections arrive with more authority than the claims they overturn, are rarely re-checked, and on this project a correct finding was overturned by a confident wrong one more than once. **A correction needs a sha for the same reason the original did.** |
 
 The common shape: **each tool inspects a *state*, while these defects live in a *transition* or a *relationship*.** None of them can express *"and then it changed"* or *"and it means something different over there."*
 
