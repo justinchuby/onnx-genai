@@ -316,6 +316,7 @@ pub(super) fn dynamic_output_shapes(
                     Some(NodeIo {
                         type_info: Some(TypeInfo::new(dtype, shape)),
                         shape_data,
+                        value_type: None,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -430,6 +431,7 @@ pub(super) fn plugin_fused_output_shapes(
                             .collect::<Option<Vec<_>>>()?,
                     )),
                     shape_data: data,
+                    value_type: None,
                 })
             })
             .collect::<Option<Vec<_>>>()?;

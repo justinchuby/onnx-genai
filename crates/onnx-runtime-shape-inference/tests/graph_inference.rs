@@ -1486,3 +1486,52 @@ fn loop_body_with_nested_if_resolves_through_both_subgraph_levels() {
     );
     assert_eq!(shape[1..], [Dim::Static(2), Dim::Static(3)]);
 }
+
+/// Regression guard for the additive container-type model (#449): a pure-tensor
+/// graph must infer byte-identically after the `ValueType` layer was added. Any
+/// corruption of the tensor `TypeInfo` path by the new parallel container map
+/// would change one of these resolved dtypes/shapes.
+#[test]
+fn tensor_only_path_is_byte_identical_after_container_type_model() {
+    let mut graph = Graph::new();
+    let batch = graph.create_symbol(Some("batch".into()));
+
+    let x = graph.create_named_value(
+        "x",
+        DataType::Float32,
+        vec![Dim::Symbolic(batch), Dim::Static(4)],
+    );
+    graph.add_input(x);
+    let w = graph.create_named_value("w", DataType::Float32, vec![Dim::Static(4), Dim::Static(5)]);
+    graph.add_input(w);
+    let b = graph.create_named_value("b", DataType::Float32, vec![Dim::Static(5)]);
+    graph.add_input(b);
+
+    let mm = graph.create_named_value("mm", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(mm);
+    graph.mark_value_shape_unknown(mm);
+    let add = graph.create_named_value("add", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(add);
+    graph.mark_value_shape_unknown(add);
+    let y = graph.create_named_value("y", DataType::Float32, Shape::new());
+    graph.mark_value_type_unknown(y);
+    graph.mark_value_shape_unknown(y);
+
+    graph.insert_node(node(0, "MatMul", vec![Some(x), Some(w)], vec![mm]));
+    graph.insert_node(node(1, "Add", vec![Some(mm), Some(b)], vec![add]));
+    graph.insert_node(node(2, "Relu", vec![Some(add)], vec![y]));
+    graph.add_output(y);
+    graph.opset_imports.insert(String::new(), 21);
+
+    let mut opsets = std::collections::HashMap::new();
+    opsets.insert(String::new(), 21);
+    InferenceRegistry::default_registry()
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .unwrap();
+
+    let expected = vec![Dim::Symbolic(batch), Dim::Static(5)];
+    for value in [mm, add, y] {
+        assert_eq!(graph.value(value).dtype, DataType::Float32);
+        assert_eq!(graph.value(value).shape, expected, "value {value:?}");
+    }
+}
