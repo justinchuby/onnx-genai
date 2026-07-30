@@ -351,8 +351,22 @@ mod tests {
 
     const GPU: Device = Device::Gpu(0);
 
+    /// A page size this system never uses anywhere else, chosen deliberately.
+    ///
+    /// Every fixture in this module used to say `16`, which is precisely the
+    /// `page_size` a live demo server reports on `/v1/debug/kv/blocks`. A
+    /// fixture whose value equals the value production runs at cannot tell a
+    /// *published* geometry apart from a *hardcoded* one: both produce `16`.
+    /// That was not a hypothetical. Replacing the store in `set_geometry` with
+    /// a literal `16` — discarding the parameter outright — left all 126 tests
+    /// in this crate green, and the server suite green with it.
+    ///
+    /// `7` is a value no config, default, or model in this repository produces,
+    /// so a constant of any value now fails somewhere.
+    const FIXTURE_PAGE_SIZE: usize = 7;
+
     fn pool(pages: usize) -> (PageTable, Arc<KvTelemetry>) {
-        let mut table = PageTable::new(16, pages);
+        let mut table = PageTable::new(FIXTURE_PAGE_SIZE, pages);
         let telemetry = Arc::new(KvTelemetry::default());
         table.attach_telemetry(Arc::clone(&telemetry));
         (table, telemetry)
@@ -371,12 +385,41 @@ mod tests {
         );
     }
 
+    /// Geometry must be *carried* from the pool to the telemetry, not merely
+    /// present in it.
+    ///
+    /// Asserting a single pool reports the number that pool was built with is
+    /// weaker than it looks: it holds just as well if the publisher ignores its
+    /// argument and stores a constant that happens to match. The only way to
+    /// separate carrying from coincidence is to publish two different
+    /// geometries and require the two snapshots to disagree — no single
+    /// constant can satisfy both arms at once.
     #[test]
-    fn geometry_is_published_on_attach() {
-        let (_table, telemetry) = pool(8);
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.hot_capacity, 8);
-        assert_eq!(snapshot.page_size, 16);
+    fn geometry_is_carried_from_the_pool_and_not_a_constant() {
+        let (_small, small) = pool(8);
+        assert_eq!(small.snapshot().hot_capacity, 8);
+        assert_eq!(small.snapshot().page_size, FIXTURE_PAGE_SIZE);
+
+        let mut wide = PageTable::new(FIXTURE_PAGE_SIZE * 3, 5);
+        let wide_telemetry = Arc::new(KvTelemetry::default());
+        wide.attach_telemetry(Arc::clone(&wide_telemetry));
+
+        assert_eq!(wide_telemetry.snapshot().hot_capacity, 5);
+        assert_eq!(wide_telemetry.snapshot().page_size, FIXTURE_PAGE_SIZE * 3);
+
+        // The load-bearing half: two pools alive at once must not agree.
+        assert_ne!(
+            small.snapshot().page_size,
+            wide_telemetry.snapshot().page_size,
+            "both pools report the same page size, so the geometry is a \
+             constant rather than a measurement of the pool"
+        );
+        assert_ne!(
+            small.snapshot().hot_capacity,
+            wide_telemetry.snapshot().hot_capacity,
+            "both pools report the same capacity, so the capacity is a \
+             constant rather than a measurement of the pool"
+        );
     }
 
     #[test]
