@@ -106,6 +106,30 @@ export const SOURCE_CLASSES = Object.freeze({
   ESTIMATED: 'estimated',
 });
 
+/**
+ * Guard the `reason` argument of every absence builder.
+ *
+ * Checks the TYPE, not just truthiness. `if (!reason)` accepts an object, and
+ * every one of these builders takes `(reason, options)` positionally -- so
+ * `unavailableField({ reason })`, which is the shape used everywhere else in
+ * this codebase, sails through and renders the literal string
+ * "[object Object]" into the tooltip AND the accessible description. That is
+ * the one sentence a screen-reader user gets instead of the number, so it has
+ * to fail at the call site rather than on the screen.
+ *
+ * @param {unknown} reason
+ * @param {string} builder
+ * @param {string} rationale
+ */
+function requireReason(reason, builder, rationale) {
+  if (typeof reason === 'string' && reason.trim() !== '') return;
+  const got =
+    reason === undefined || reason === null
+      ? String(reason)
+      : `${typeof reason}${typeof reason === 'object' ? ' (did you pass an options object? `reason` is the FIRST positional argument)' : ''}`;
+  throw new TypeError(`${builder}() requires a non-empty string reason, got ${got}. ${rationale}`);
+}
+
 export const FIELD_STATES = Object.freeze({
   /**
    * The state of a field the server computed, just now. Includes a genuine
@@ -247,12 +271,12 @@ export function notApplicableField(
     unit = null,
   } = {},
 ) {
-  if (!reason) {
-    throw new TypeError(
-      'notApplicableField() requires a reason explaining why this path never consults the ' +
-        'subsystem. Without it the state is indistinguishable from a missing feature.',
-    );
-  }
+  requireReason(
+    reason,
+    'notApplicableField',
+    'It must explain why this path never consults the subsystem; without it the state is ' +
+      'indistinguishable from a missing feature.',
+  );
   return Object.freeze({
     value: null,
     state: FIELD_STATES.NOT_APPLICABLE,
@@ -291,12 +315,11 @@ export function unavailableField(
     unit = null,
   } = {},
 ) {
-  if (!reason) {
-    throw new TypeError(
-      'unavailableField() requires a reason. "No data" with no explanation reads as a bug; ' +
-        'an explained absence reads as honesty.',
-    );
-  }
+  requireReason(
+    reason,
+    'unavailableField',
+    '"No data" with no explanation reads as a bug; an explained absence reads as honesty.',
+  );
   return Object.freeze({
     value: null,
     state: FIELD_STATES.UNAVAILABLE,
@@ -337,9 +360,7 @@ export function pendingField(
     unit = null,
   } = {},
 ) {
-  if (!reason) {
-    throw new TypeError('pendingField() requires a reason explaining what is being waited on.');
-  }
+  requireReason(reason, 'pendingField', 'It must explain what is being waited on.');
   return Object.freeze({
     value: null,
     state: FIELD_STATES.PENDING,

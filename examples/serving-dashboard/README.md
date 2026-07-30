@@ -961,7 +961,29 @@ differs in each:
 | **`—`** *unavailable* | We cannot measure this here. Stubbed, not plumbed, or structurally fabricated on this profile. | The runtime may well do this; the telemetry does not report it. Hover for the specific reason. |
 | **greyed number + age** *stale* | We measured it, but the most recent poll did not refresh it. | The number is real but old. The age is shown **in words**, so you can judge it — and it stops being a number entirely once it is too old (below). |
 | **`···`** *pending* | Measurable; no sample has arrived yet. | Wait a moment. This one resolves on its own. |
-| **`—` + a visible caption** *not applicable* | Meaningless on this execution path — the question was never asked. | Not a gap in our work. This is the architecture, and the caption says which part. |
+| **`n/a` + an on-screen caption** *not applicable* | Meaningless on this execution path — the question was never asked. | Not a gap in our work. This is the architecture, and the caption says which part. |
+
+**`not-applicable` is the one state that is not just a different glyph — it
+changes scale.** When *every* field in a panel is not-applicable, the panel does
+not fill with markers: the header stays, **the body is replaced by the
+explanation** (`collapseNotApplicableBody`, `dashboard/panel-kit.js:597`). The
+field-level `n/a` survives only for a structurally-pinned field sitting inside
+an otherwise-live panel (`panel-kit.js:597`).
+
+That is worth a sentence of *why*, because the first design used an em-dash for
+both:
+
+- **An em-dash leads with "nothing here", and readers scan past absence
+  glyphs.** A panel of them reads as breakage. Under two servers this state is
+  the **normal** case rather than the exception, so a visitor's first run would
+  show a dashboard half-covered in apparent failure — rendering our single most
+  interesting finding as a bug.
+- **It also makes `unavailable` and `not-applicable` impossible to confuse by
+  construction rather than by contrast tuning.** One is a field-level marker
+  inside a live panel; the other replaces a panel body with prose. **They cannot
+  render identically because they do not render at the same scale** — which is a
+  far stronger guarantee than picking two glyphs that look sufficiently
+  different.
 
 #### Stale values stop being numbers
 
