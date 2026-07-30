@@ -250,6 +250,64 @@ export function shipped(rel) {
 }
 
 /**
+ * List the files that SHIP under this directory, as committed.
+ *
+ * The companion to `shipped()`. That function answers "what are this file's
+ * bytes"; this one answers "which files are there at all". A check that
+ * enumerates its own corpus from the working tree can be handed files nobody
+ * ships (another agent's untracked draft) or be silently denied files that do
+ * ship, and in both cases it reports a confident total for a corpus that no
+ * reviewer will ever see.
+ *
+ * WHY THIS TAKES NO PATHSPEC — FILTER THE RESULT INSTEAD
+ * -----------------------------------------------------
+ * The obvious signature is `shippedPaths('*.test.js')`. It is a trap, and it
+ * was this function's first implementation:
+ *
+ *   git ls-tree -r --name-only <ref> -- '*.test.js'   ->  0        SILENTLY
+ *   git ls-tree -r --name-only <ref> .                ->  114      correct
+ *
+ * `git ls-tree` does not glob-match a pathspec the way `git ls-files` does, so
+ * the filtered form returns an empty list and exits 0. A negative control does
+ * not catch it: the control returns 0 too, and 0 == 0 reads as agreement. This
+ * is the same class as `**\/*.js` reaching half the tree and `| tail` truncating
+ * a census — a decorative-looking token silently changes what was measured and
+ * nothing errors. So the pathspec is not offered at all: callers get everything
+ * and filter in JS, where a typo produces an empty array they can see rather
+ * than a query that quietly matches nothing.
+ *
+ * WHY `cwd: HERE` AND NO `--full-tree`
+ * ------------------------------------
+ * `git ls-tree` is cwd-relative: run from a subdirectory it restricts itself to
+ * that subdirectory AND prints paths relative to it. That behaviour cost an
+ * architect a corpus declaration that under-reported coverage 36x — it printed
+ * "not examined: 15" when the truth was 546 of 561 — and it under-reported in
+ * the FLATTERING direction, which is the direction nobody double-checks.
+ *
+ * Here that same behaviour is exactly what is wanted, so it is PINNED rather
+ * than inherited: `cwd` is hardcoded to this directory, so the result does not
+ * depend on where the caller stood. Paths come back relative to this directory,
+ * which is the same coordinate system `shipped()` takes. Mixing the two
+ * coordinate systems is the whole hazard, so the pair uses one.
+ *
+ * @returns {string[]} every shipped path under this directory, relative to it,
+ *   sorted. Never empty for a healthy tree — callers should assert a floor.
+ */
+export function shippedPaths() {
+  const out = execFileSync(
+    'git',
+    ['ls-tree', '-r', '--name-only', SHIPPING_REF, '.'],
+    { cwd: HERE, maxBuffer: 64 * 1024 * 1024 },
+  ).toString();
+
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .sort();
+}
+
+/**
  * Fail loudly unless this file lives in the tree we ship.
  *
  * Call this FIRST, before any other assertion in a check file. A check that
