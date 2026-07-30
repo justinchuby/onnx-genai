@@ -4,6 +4,10 @@
 //! Design: Model loaded once per backend, then N sequential turns with growing
 //! conversation context (as in real multi-turn chat). Reports per-turn TTFT,
 //! decode throughput, and cumulative wall-clock. Interleaved A/B in one process.
+//!
+//! Both native and ORT use their session APIs for KV reuse by default.
+//! Pass `--native-stateless` to measure the old stateless path (full re-prefill
+//! each turn) for comparison.
 
 use std::{
     fs,
@@ -74,6 +78,12 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     repetitions: usize,
 
+    /// Use the stateless native path (full re-prefill each turn, no KV reuse).
+    /// Default is to use create_native_session + generate_native_in_session
+    /// for KV persistence across turns, matching ORT's session API.
+    #[arg(long)]
+    native_stateless: bool,
+
     /// Write JSON results to this path. Use '-' for stdout.
     #[arg(long, value_name = "PATH")]
     profile_json: Option<PathBuf>,
@@ -135,12 +145,18 @@ fn run_multiturn(args: &Args) -> Result<()> {
 
     let load_avg = get_load_avg();
     eprintln!("host load: {load_avg}");
+    let native_mode = if args.native_stateless {
+        "stateless (full re-prefill)"
+    } else {
+        "session (KV reuse)"
+    };
     eprintln!(
-        "model: {} | turns: {} | tokens/turn: {} | repetitions: {}",
+        "model: {} | turns: {} | tokens/turn: {} | repetitions: {} | native: {}",
         model_dir.display(),
         args.turns,
         args.tokens_per_turn,
-        args.repetitions
+        args.repetitions,
+        native_mode,
     );
 
     // Resolve chat template for multi-turn rendering
@@ -154,8 +170,16 @@ fn run_multiturn(args: &Args) -> Result<()> {
     for rep in 1..=args.repetitions {
         eprintln!("\n--- repetition {rep}/{} ---", args.repetitions);
 
-        // Native: each turn re-prefills the full conversation (no persistent KV)
-        eprintln!("  native: running {}-turn session...", args.turns);
+        // Native: session API with KV reuse (default) or stateless re-prefill
+        eprintln!(
+            "  native ({}): running {}-turn session...",
+            if args.native_stateless {
+                "stateless"
+            } else {
+                "session"
+            },
+            args.turns
+        );
         let native = run_native_session(args, model_dir, &template)?;
         native_results.push(native);
 
@@ -254,6 +278,19 @@ fn run_native_session(
         );
     }
 
+    let backend_label = if args.native_stateless {
+        "native-stateless"
+    } else {
+        "native"
+    };
+
+    // Create a persistent native session for KV reuse (unless stateless mode)
+    let session_id = if args.native_stateless {
+        None
+    } else {
+        Some(engine.create_native_session()?)
+    };
+
     let session_start = Instant::now();
     let mut conversation: Vec<ChatMessage> = Vec::new();
     let mut turns = Vec::with_capacity(args.turns);
@@ -262,7 +299,6 @@ fn run_native_session(
         let prompt_text = TURN_PROMPTS[turn_idx % TURN_PROMPTS.len()];
         conversation.push(ChatMessage::new("user", prompt_text.to_string()));
 
-        // Render full conversation to prompt (native re-prefills everything)
         let rendered = template
             .render(&conversation, None, true)
             .with_context(|| format!("render template for turn {turn_idx}"))?;
@@ -283,9 +319,18 @@ fn run_native_session(
             token_times.push(turn_start.elapsed());
             Ok(())
         };
-        let result = engine
-            .generate_with_callback(request, Some(&mut callback))
-            .with_context(|| format!("native generate turn {turn_idx}"))?;
+
+        let result = if let Some(sid) = session_id {
+            // Session API: KV state persists across turns, only new tokens prefilled
+            engine
+                .generate_native_in_session_with_callback(sid, request, Some(&mut callback))
+                .with_context(|| format!("native session generate turn {turn_idx}"))?
+        } else {
+            // Stateless: full re-prefill each turn (legacy behaviour)
+            engine
+                .generate_with_callback(request, Some(&mut callback))
+                .with_context(|| format!("native stateless generate turn {turn_idx}"))?
+        };
         let total_turn = turn_start.elapsed();
 
         let ttft = token_times.first().copied().unwrap_or(total_turn);
@@ -304,6 +349,11 @@ fn run_native_session(
         });
     }
 
+    // Close native session if we created one
+    if let Some(sid) = session_id {
+        engine.close_native_session(sid)?;
+    }
+
     // Cache verification: check cache state after all turns
     let cache_after_turns = weight_transpose_cache_sizes();
     eprintln!(
@@ -315,7 +365,7 @@ fn run_native_session(
     );
 
     Ok(SessionResult {
-        backend: "native",
+        backend: backend_label,
         model_load,
         turns,
         total_session_wall_clock: session_start.elapsed(),
@@ -485,6 +535,15 @@ fn render_report(
         &args.tokens_per_turn.to_string(),
     );
     meta(&mut report, "repetitions", &args.repetitions.to_string());
+    meta(
+        &mut report,
+        "native mode",
+        if native.backend == "native-stateless" {
+            "stateless (full re-prefill each turn)"
+        } else {
+            "session (KV reuse via create_native_session)"
+        },
+    );
     meta(&mut report, "host load (before)", load_before);
     meta(&mut report, "host load (after)", load_after);
     meta(
@@ -713,12 +772,34 @@ fn render_report(
             "- Per-turn decode target: ≤ {ort_avg_decode:.1} ms (currently {native_avg_decode:.1} ms, need {:.0}% reduction)\n\n",
             ((native_avg_decode - ort_avg_decode) / native_avg_decode) * 100.0
         ));
-        report.push_str(
-            "**NOTE:** Native re-prefills the entire conversation each turn (no KV persistence \
-             across turns), while ORT incrementally extends its KV cache. This is the dominant \
-             factor — native TTFT grows O(context_length) while ORT TTFT stays ~constant. \
-             Pre-packing cannot fix this; session-persistent KV is the prerequisite.\n",
-        );
+
+        // Derive the KV narrative from the actual TTFT growth observed
+        let first_ttft_n = ms(native.turns[0].ttft);
+        let last_ttft_n = ms(native.turns[num_turns - 1].ttft);
+        let first_ttft_o = ms(ort.turns[0].ttft);
+        let last_ttft_o = ms(ort.turns[num_turns - 1].ttft);
+        let native_ttft_growth = last_ttft_n / first_ttft_n.max(0.001);
+        let ort_ttft_growth = last_ttft_o / first_ttft_o.max(0.001);
+        if native_ttft_growth > 2.0 && ort_ttft_growth < 1.5 {
+            report.push_str(
+                "**NOTE:** Native TTFT grows significantly with context length while ORT's stays \
+                 ~flat. This pattern indicates native is re-prefilling growing context each turn \
+                 (no KV persistence), while ORT incrementally extends its KV cache. \
+                 Session-persistent KV for the native backend would eliminate this growth.\n",
+            );
+        } else if native_ttft_growth < 1.5 && ort_ttft_growth < 1.5 {
+            report.push_str(
+                "**NOTE:** Both backends show ~flat TTFT across turns, consistent with \
+                 KV persistence (only new tokens are prefilled each turn). \
+                 The session API is active for both backends.\n",
+            );
+        } else {
+            report.push_str(&format!(
+                "**NOTE:** Native TTFT growth: {native_ttft_growth:.1}×, ORT TTFT growth: \
+                 {ort_ttft_growth:.1}×. Interpret per-turn cost differences in light of \
+                 whether each backend is using session-persistent KV.\n",
+            ));
+        }
     }
 
     report
@@ -739,6 +820,7 @@ fn build_json(
         "turns": args.turns,
         "tokens_per_turn": args.tokens_per_turn,
         "repetitions": args.repetitions,
+        "native_stateless": args.native_stateless,
         "host_load_before": load_before,
         "host_load_after": load_after,
         "break_even_turn": break_even,

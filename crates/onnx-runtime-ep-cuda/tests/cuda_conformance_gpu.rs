@@ -233,6 +233,329 @@ fn dequantize_linear_cases() -> Vec<Case> {
     ]
 }
 
+fn qlinear_matmul_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "QLinearMatMul[uint8,per-tensor]".into(),
+            op: "QLinearMatMul",
+            domain: "",
+            opset: 10,
+            inputs: vec![
+                input(DataType::Uint8, &[2, 3], &[120u8, 125, 131, 118, 129, 140]),
+                input(DataType::Float32, &[], &[0.25f32]),
+                input(DataType::Uint8, &[], &[123u8]),
+                input(DataType::Uint8, &[3, 2], &[126u8, 119, 130, 121, 124, 135]),
+                input(DataType::Float32, &[], &[0.5f32]),
+                input(DataType::Uint8, &[], &[127u8]),
+                input(DataType::Float32, &[], &[0.2f32]),
+                input(DataType::Uint8, &[], &[111u8]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![2, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "QLinearMatMul[int8,per-row-column,negative-zp]".into(),
+            op: "QLinearMatMul",
+            domain: "",
+            opset: 10,
+            inputs: vec![
+                input(DataType::Int8, &[2, 3], &[-9i8, 4, 17, -15, 3, 22]),
+                input(DataType::Float32, &[2], &[0.2f32, 0.35]),
+                input(DataType::Int8, &[2], &[-3i8, 5]),
+                input(DataType::Int8, &[3, 2], &[-7i8, 11, 9, -5, 18, 4]),
+                input(DataType::Float32, &[2], &[0.4f32, 0.15]),
+                input(DataType::Int8, &[2], &[-4i8, 6]),
+                input(DataType::Float32, &[], &[0.125f32]),
+                input(DataType::Int8, &[], &[-7i8]),
+            ],
+            outputs: vec![(DataType::Int8, vec![2, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "QLinearMatMul[batched-broadcast,per-axis]".into(),
+            op: "QLinearMatMul",
+            domain: "",
+            opset: 10,
+            inputs: vec![
+                input(
+                    DataType::Uint8,
+                    &[2, 2, 3],
+                    &[9u8, 11, 15, 7, 13, 20, 21, 17, 12, 18, 14, 10],
+                ),
+                input(DataType::Float32, &[2, 2, 1], &[0.2f32, 0.3, 0.4, 0.5]),
+                input(DataType::Uint8, &[2, 2, 1], &[10u8, 9, 15, 12]),
+                input(DataType::Int8, &[1, 3, 2], &[-4i8, 7, 5, -8, 11, 3]),
+                input(DataType::Float32, &[1, 1, 2], &[0.25f32, 0.45]),
+                input(DataType::Int8, &[1, 1, 2], &[-2i8, 4]),
+                input(DataType::Float32, &[1], &[0.1f32]),
+                input(DataType::Uint8, &[1], &[100u8]),
+            ],
+            outputs: vec![(DataType::Uint8, vec![2, 2, 2])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn resize_cases() -> Vec<Case> {
+    let image = [1.0, 2.0, 4.0, 8.0, 3.0, 5.0];
+    vec![
+        Case {
+            label: "Resize[nearest,asymmetric,scales,upsample]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 10,
+            inputs: vec![
+                float_input(DataType::Float32, &[1, 1, 2, 3], &image),
+                input(DataType::Float32, &[4], &[1.0f32, 1.0, 2.0, 2.0]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 1, 4, 6])],
+            attrs: vec![
+                ("mode", Attribute::String(b"nearest".to_vec())),
+                (
+                    "coordinate_transformation_mode",
+                    Attribute::String(b"asymmetric".to_vec()),
+                ),
+            ],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Resize[nearest,align-corners,sizes,downsample]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(
+                    DataType::Float16,
+                    &[1, 1, 4, 5],
+                    &(0..20).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Int64, &[4], &[1i64, 1, 2, 3]),
+            ],
+            outputs: vec![(DataType::Float16, vec![1, 1, 2, 3])],
+            attrs: vec![
+                ("mode", Attribute::String(b"nearest".to_vec())),
+                (
+                    "coordinate_transformation_mode",
+                    Attribute::String(b"align_corners".to_vec()),
+                ),
+                (
+                    "nearest_mode",
+                    Attribute::String(b"round_prefer_ceil".to_vec()),
+                ),
+            ],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Resize[nearest,half-pixel,floor]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(DataType::Float32, &[4], &[1.0, 2.0, 4.0, 8.0]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[1], &[1.5f32]),
+            ],
+            outputs: vec![(DataType::Float32, vec![6])],
+            attrs: vec![
+                ("mode", Attribute::String(b"nearest".to_vec())),
+                ("nearest_mode", Attribute::String(b"floor".to_vec())),
+            ],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Resize[nearest,half-pixel,ceil]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(DataType::Float32, &[4], &[1.0, 2.0, 4.0, 8.0]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[1], &[1.5f32]),
+            ],
+            outputs: vec![(DataType::Float32, vec![6])],
+            attrs: vec![
+                ("mode", Attribute::String(b"nearest".to_vec())),
+                ("nearest_mode", Attribute::String(b"ceil".to_vec())),
+            ],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "Resize[linear,half-pixel,scales,upsample]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(DataType::Float32, &[1, 1, 2, 3], &image),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[4], &[1.0f32, 1.0, 2.0, 2.0]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 1, 4, 6])],
+            attrs: vec![("mode", Attribute::String(b"linear".to_vec()))],
+            compare: Compare::Float { tol: 1e-5 },
+        },
+        Case {
+            label: "Resize[linear,align-corners,sizes,selected-axes]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(DataType::BFloat16, &[1, 1, 2, 3], &image),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Int64, &[2], &[5i64, 4]),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![1, 1, 5, 4])],
+            attrs: vec![
+                ("mode", Attribute::String(b"linear".to_vec())),
+                (
+                    "coordinate_transformation_mode",
+                    Attribute::String(b"align_corners".to_vec()),
+                ),
+                ("axes", Attribute::Ints(vec![2, 3])),
+            ],
+            compare: Compare::Float { tol: 3e-2 },
+        },
+        Case {
+            label: "Resize[linear,asymmetric,scales,multi-axis-downsample]".into(),
+            op: "Resize",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(
+                    DataType::Float16,
+                    &[1, 4, 4],
+                    &(0..16).map(|value| value as f32 / 3.0).collect::<Vec<_>>(),
+                ),
+                input(DataType::Float32, &[0], &[] as &[f32]),
+                input(DataType::Float32, &[2], &[0.5f32, 0.5]),
+            ],
+            outputs: vec![(DataType::Float16, vec![1, 2, 2])],
+            attrs: vec![
+                ("mode", Attribute::String(b"linear".to_vec())),
+                (
+                    "coordinate_transformation_mode",
+                    Attribute::String(b"asymmetric".to_vec()),
+                ),
+                ("axes", Attribute::Ints(vec![-2, -1])),
+            ],
+            compare: Compare::Float { tol: 3e-3 },
+        },
+    ]
+}
+
+fn conv_transpose_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "ConvTranspose[1d,stride,dilation,output-padding,asymmetric-pads]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(DataType::Float32, &[1, 1, 3], &[1.0, -2.0, 3.0]),
+                float_input(DataType::Float32, &[1, 1, 2], &[0.5, 2.0]),
+                float_input(DataType::Float32, &[1], &[0.25]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 1, 7])],
+            attrs: vec![
+                ("strides", Attribute::Ints(vec![2])),
+                ("dilations", Attribute::Ints(vec![2])),
+                ("pads", Attribute::Ints(vec![1, 0])),
+                ("output_padding", Attribute::Ints(vec![1])),
+            ],
+            compare: Compare::Float { tol: 1e-5 },
+        },
+        Case {
+            label: "ConvTranspose[2d,depthwise,stride,asymmetric-pads]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(
+                    DataType::Float16,
+                    &[1, 2, 2, 2],
+                    &[1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0],
+                ),
+                float_input(
+                    DataType::Float16,
+                    &[2, 1, 2, 2],
+                    &[1.0, 0.5, -1.0, 2.0, 0.25, -0.5, 1.5, 1.0],
+                ),
+            ],
+            outputs: vec![(DataType::Float16, vec![1, 2, 2, 3])],
+            attrs: vec![
+                ("group", Attribute::Int(2)),
+                ("strides", Attribute::Ints(vec![1, 2])),
+                ("pads", Attribute::Ints(vec![0, 1, 1, 0])),
+            ],
+            compare: Compare::Float { tol: 3e-3 },
+        },
+        Case {
+            label: "ConvTranspose[2d,grouped,multiple-output-channels]".into(),
+            op: "ConvTranspose",
+            domain: "",
+            opset: 11,
+            inputs: vec![
+                float_input(
+                    DataType::BFloat16,
+                    &[1, 4, 2, 1],
+                    &[1.0, 2.0, -1.0, 3.0, 0.5, -2.0, 4.0, 1.0],
+                ),
+                float_input(
+                    DataType::BFloat16,
+                    &[4, 2, 1, 2],
+                    &[
+                        1.0, 0.5, -1.0, 2.0, 0.25, 1.0, 1.5, -0.5, 2.0, 0.5, -0.5, 1.0, 0.75, -1.0,
+                        1.25, 0.25,
+                    ],
+                ),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![1, 4, 2, 2])],
+            attrs: vec![("group", Attribute::Int(2))],
+            compare: Compare::Float { tol: 3e-2 },
+        },
+    ]
+}
+
+fn grid_sample_cases() -> Vec<Case> {
+    let image = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let grid = [-1.4, -1.2, 0.0, 0.0, 1.3, 1.4, 0.6, -0.7];
+    [
+        ("bilinear", "zeros", 0, DataType::Float32, 1e-5),
+        ("bilinear", "border", 1, DataType::Float16, 3e-3),
+        ("bilinear", "reflection", 0, DataType::BFloat16, 3e-2),
+        ("nearest", "zeros", 1, DataType::Float32, 1e-5),
+        ("nearest", "border", 0, DataType::Float16, 3e-3),
+        ("nearest", "reflection", 1, DataType::BFloat16, 3e-2),
+    ]
+    .into_iter()
+    .map(|(mode, padding, align_corners, dtype, tolerance)| Case {
+        label: format!("GridSample[{mode},{padding},align-corners={align_corners},out-of-bounds]"),
+        op: "GridSample",
+        domain: "",
+        opset: 20,
+        inputs: vec![
+            float_input(dtype, &[1, 1, 2, 3], &image),
+            float_input(dtype, &[1, 2, 2, 2], &grid),
+        ],
+        outputs: vec![(dtype, vec![1, 1, 2, 2])],
+        attrs: vec![
+            ("mode", Attribute::String(mode.as_bytes().to_vec())),
+            (
+                "padding_mode",
+                Attribute::String(padding.as_bytes().to_vec()),
+            ),
+            ("align_corners", Attribute::Int(align_corners)),
+        ],
+        compare: Compare::Float { tol: tolerance },
+    })
+    .collect()
+}
+
 fn dropout_cases() -> Vec<Case> {
     vec![
         Case {
@@ -261,6 +584,264 @@ fn dropout_cases() -> Vec<Case> {
             outputs: vec![(DataType::Int32, vec![4])],
             attrs: vec![],
             compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn instance_normalization_cases() -> Vec<Case> {
+    let values = [-3.0, -1.0, 1.0, 3.0, 2.0, 4.0, 6.0, 8.0];
+    let mut cases = FLOAT_DTYPES
+        .into_iter()
+        .map(|dtype| Case {
+            label: format!("InstanceNormalization[{dtype:?}]"),
+            op: "InstanceNormalization",
+            domain: "",
+            opset: 6,
+            inputs: vec![
+                float_input(dtype, &[1, 4, 2], &values),
+                float_input(dtype, &[4], &[1.0, 0.5, 1.5, 2.0]),
+                float_input(dtype, &[4], &[0.0, 1.0, -1.0, 0.25]),
+            ],
+            outputs: vec![(dtype, vec![1, 4, 2])],
+            attrs: vec![("epsilon", Attribute::Float(1e-5))],
+            compare: Compare::Float {
+                tol: float_tol(dtype) * 2.0,
+            },
+        })
+        .collect::<Vec<_>>();
+    cases.push(Case {
+        label: "InstanceNormalization[f32,large-offset]".into(),
+        op: "InstanceNormalization",
+        domain: "",
+        opset: 6,
+        inputs: vec![
+            float_input(
+                DataType::Float32,
+                &[1, 1, 4],
+                &[10_000.0, 10_001.0, 9_999.0, 10_002.0],
+            ),
+            float_input(DataType::Float32, &[1], &[1.0]),
+            float_input(DataType::Float32, &[1], &[0.0]),
+        ],
+        outputs: vec![(DataType::Float32, vec![1, 1, 4])],
+        attrs: vec![("epsilon", Attribute::Float(1e-5))],
+        compare: Compare::Float { tol: 1e-4 },
+    });
+    cases
+}
+
+fn group_normalization_cases() -> Vec<Case> {
+    let values = [-3.0, -1.0, 1.0, 3.0, 2.0, 4.0, 6.0, 8.0];
+    let mut cases = Vec::new();
+    for dtype in FLOAT_DTYPES {
+        cases.push(Case {
+            label: format!("GroupNormalization-18[{dtype:?}]"),
+            op: "GroupNormalization",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(dtype, &[1, 4, 2], &values),
+                float_input(dtype, &[2], &[1.0, 0.5]),
+                float_input(dtype, &[2], &[0.25, -0.5]),
+            ],
+            outputs: vec![(dtype, vec![1, 4, 2])],
+            attrs: vec![
+                ("num_groups", Attribute::Int(2)),
+                ("epsilon", Attribute::Float(1e-5)),
+            ],
+            compare: Compare::Float {
+                tol: float_tol(dtype) * 2.0,
+            },
+        });
+        cases.push(Case {
+            label: format!("GroupNormalization-21[{dtype:?}]"),
+            op: "GroupNormalization",
+            domain: "",
+            opset: 21,
+            inputs: vec![
+                float_input(dtype, &[1, 4, 2], &values),
+                float_input(dtype, &[4], &[1.0, 0.5, 1.5, 2.0]),
+                float_input(dtype, &[4], &[0.0, 1.0, -1.0, 0.25]),
+            ],
+            outputs: vec![(dtype, vec![1, 4, 2])],
+            attrs: vec![
+                ("num_groups", Attribute::Int(2)),
+                ("epsilon", Attribute::Float(1e-5)),
+                ("stash_type", Attribute::Int(1)),
+            ],
+            compare: Compare::Float {
+                tol: float_tol(dtype) * 2.0,
+            },
+        });
+    }
+    cases
+}
+
+fn lp_pool_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "LpPool[p=1,pad]".into(),
+            op: "LpPool",
+            domain: "",
+            opset: 18,
+            inputs: vec![float_input(
+                DataType::Float32,
+                &[1, 1, 3, 4],
+                &[
+                    -1.0, 2.0, -3.0, 4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 10.0, -11.0, 12.0,
+                ],
+            )],
+            outputs: vec![(DataType::Float32, vec![1, 1, 3, 4])],
+            attrs: vec![
+                ("kernel_shape", Attribute::Ints(vec![2, 2])),
+                ("pads", Attribute::Ints(vec![1, 0, 0, 1])),
+                ("p", Attribute::Int(1)),
+            ],
+            compare: Compare::Float { tol: 1e-4 },
+        },
+        Case {
+            label: "LpPool[p=2,stride,ceil]".into(),
+            op: "LpPool",
+            domain: "",
+            opset: 18,
+            inputs: vec![float_input(
+                DataType::Float16,
+                &[1, 1, 4, 5],
+                &[
+                    1.0, -2.0, 3.0, -4.0, 5.0, 6.0, -7.0, 8.0, -9.0, 10.0, 11.0, -12.0, 13.0,
+                    -14.0, 15.0, 16.0, -17.0, 18.0, -19.0, 20.0,
+                ],
+            )],
+            outputs: vec![(DataType::Float16, vec![1, 1, 3, 3])],
+            attrs: vec![
+                ("kernel_shape", Attribute::Ints(vec![2, 3])),
+                ("strides", Attribute::Ints(vec![2, 2])),
+                ("pads", Attribute::Ints(vec![1, 0, 1, 1])),
+                ("ceil_mode", Attribute::Int(1)),
+                ("p", Attribute::Int(2)),
+            ],
+            compare: Compare::Float { tol: 6e-3 },
+        },
+        Case {
+            label: "LpPool[p=2,dilation,bf16]".into(),
+            op: "LpPool",
+            domain: "",
+            opset: 18,
+            inputs: vec![float_input(
+                DataType::BFloat16,
+                &[1, 1, 4, 4],
+                &[
+                    1.0, 2.0, 3.0, 4.0, -5.0, -6.0, -7.0, -8.0, 9.0, 10.0, 11.0, 12.0, -13.0,
+                    -14.0, -15.0, -16.0,
+                ],
+            )],
+            outputs: vec![(DataType::BFloat16, vec![1, 1, 2, 2])],
+            attrs: vec![
+                ("kernel_shape", Attribute::Ints(vec![2, 2])),
+                ("dilations", Attribute::Ints(vec![2, 2])),
+                ("p", Attribute::Int(2)),
+            ],
+            compare: Compare::Float { tol: 6e-2 },
+        },
+    ]
+}
+
+fn center_crop_pad_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "CenterCropPad[crop-pad-odd]".into(),
+            op: "CenterCropPad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(DataType::Int32, &[3, 2], &[1i32, 2, 3, 4, 5, 6]),
+                input(DataType::Int64, &[2], &[2i64, 5]),
+            ],
+            outputs: vec![(DataType::Int32, vec![2, 5])],
+            attrs: vec![],
+            compare: Compare::ExactBytes,
+        },
+        Case {
+            label: "CenterCropPad[selected-negative-axes]".into(),
+            op: "CenterCropPad",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                input(
+                    DataType::Int16,
+                    &[2, 3, 4],
+                    &(0..24).map(|value| value as i16).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[5i64, 3]),
+            ],
+            outputs: vec![(DataType::Int16, vec![2, 5, 3])],
+            attrs: vec![("axes", Attribute::Ints(vec![-2, -1]))],
+            compare: Compare::ExactBytes,
+        },
+    ]
+}
+
+fn col2im_cases() -> Vec<Case> {
+    vec![
+        Case {
+            label: "Col2Im[overlap]".into(),
+            op: "Col2Im",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(
+                    DataType::Float32,
+                    &[1, 4, 4],
+                    &(1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[3i64, 3]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            outputs: vec![(DataType::Float32, vec![1, 1, 3, 3])],
+            attrs: vec![],
+            compare: Compare::Float { tol: 1e-4 },
+        },
+        Case {
+            label: "Col2Im[padding-stride]".into(),
+            op: "Col2Im",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(
+                    DataType::Float16,
+                    &[1, 4, 4],
+                    &(1..=16).map(|value| value as f32).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[3i64, 3]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            outputs: vec![(DataType::Float16, vec![1, 1, 3, 3])],
+            attrs: vec![
+                ("pads", Attribute::Ints(vec![1, 1, 1, 1])),
+                ("strides", Attribute::Ints(vec![2, 2])),
+            ],
+            compare: Compare::Float { tol: 6e-3 },
+        },
+        Case {
+            label: "Col2Im[dilation-overlap]".into(),
+            op: "Col2Im",
+            domain: "",
+            opset: 18,
+            inputs: vec![
+                float_input(
+                    DataType::BFloat16,
+                    &[1, 4, 9],
+                    &(1..=36).map(|value| value as f32 / 4.0).collect::<Vec<_>>(),
+                ),
+                input(DataType::Int64, &[2], &[5i64, 5]),
+                input(DataType::Int64, &[2], &[2i64, 2]),
+            ],
+            outputs: vec![(DataType::BFloat16, vec![1, 1, 5, 5])],
+            attrs: vec![
+                ("dilations", Attribute::Ints(vec![2, 2])),
+                ("strides", Attribute::Ints(vec![1, 1])),
+            ],
+            compare: Compare::Float { tol: 6e-2 },
         },
     ]
 }
@@ -372,6 +953,50 @@ fn reduction_f32(op: &'static str) -> Vec<Case> {
                 ],
                 compare: Compare::Float { tol: 2e-2 },
             }
+        })
+        .collect()
+}
+
+/// Extended floating-point reductions widen every input dtype to f32 for the
+/// accumulator and post-op, then narrow once to the output dtype.
+fn extended_reduction_float(op: &'static str) -> Vec<Case> {
+    let in_shape = vec![2usize, 3, 4];
+    let count: usize = in_shape.iter().product();
+    let positive_only = matches!(op, "ReduceLogSum" | "ReduceProd");
+    let values: Vec<f32> = (0..count)
+        .map(|index| {
+            if positive_only {
+                0.25 + (index % 7) as f32 * 0.08
+            } else {
+                (index as f32 * 0.13) - 1.25 + (index % 3) as f32 * 0.07
+            }
+        })
+        .collect();
+    let axes_cases: &[(&[i64], bool)] =
+        &[(&[1], true), (&[1], false), (&[0, 2], false), (&[-1], true)];
+
+    FLOAT_DTYPES
+        .into_iter()
+        .flat_map(|dtype| {
+            axes_cases.iter().map({
+                let in_shape = in_shape.clone();
+                let values = values.clone();
+                move |&(axes, keepdims)| Case {
+                    label: format!("{op}[{dtype:?}](axes={axes:?},keepdims={keepdims})"),
+                    op,
+                    domain: "",
+                    opset: 17,
+                    inputs: vec![float_input(dtype, &in_shape, &values)],
+                    outputs: vec![(dtype, reduce_out_shape(&in_shape, axes, keepdims))],
+                    attrs: vec![
+                        ("axes", Attribute::Ints(axes.to_vec())),
+                        ("keepdims", Attribute::Int(keepdims as i64)),
+                    ],
+                    compare: Compare::Float {
+                        tol: float_tol(dtype) * 2.0,
+                    },
+                }
+            })
         })
         .collect()
 }
@@ -1704,10 +2329,41 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     // data-dependent coordinate extraction.
     p.push(sweep("QuantizeLinear", quantize_linear_cases()));
     p.push(sweep("DequantizeLinear", dequantize_linear_cases()));
+    p.push(sweep("QLinearMatMul", qlinear_matmul_cases()));
+    p.push(sweep("Resize", resize_cases()));
+    p.push(sweep("ConvTranspose", conv_transpose_cases()));
+    p.push(sweep("GridSample", grid_sample_cases()));
     p.push(sweep("Dropout", dropout_cases()));
     p.push(sweep("NonZero", nonzero_cases()));
+    p.push(sweep(
+        "InstanceNormalization",
+        instance_normalization_cases(),
+    ));
+    p.push(sweep("GroupNormalization", group_normalization_cases()));
+    p.push(sweep("LpPool", lp_pool_cases()));
+    p.push(sweep("CenterCropPad", center_crop_pad_cases()));
+    p.push(sweep("Col2Im", col2im_cases()));
 
     // ── Dedicated GPU parity suites (verified to name their op) ──────────────
+    // Batch 10 (issue #67): normalization, global reductions, quantization, and
+    // low-complexity data transforms.
+    for op in [
+        "AffineGrid",
+        "BatchNormalization",
+        "Compress",
+        "DynamicQuantizeLinear",
+        "GlobalAveragePool",
+        "GlobalLpPool",
+        "GlobalMaxPool",
+        "LpNormalization",
+    ] {
+        p.push(dedicated(
+            op,
+            "cuda_parity_batch10_gpu.rs",
+            "issue #67 CUDA coverage batch 10 CPU parity",
+        ));
+    }
+
     // GEMM / quantized-matmul family.
     p.push(dedicated(
         "MatMul",
@@ -1746,7 +2402,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
     ));
 
     // Convolution / pooling.
-    p.push(dedicated("Conv", "conv_gpu.rs", "cuDNN 2-D conv"));
+    p.push(dedicated(
+        "Conv",
+        "conv_gpu.rs",
+        "native 1-D / cuDNN 2-D conv",
+    ));
     p.push(dedicated("MaxPool", "pooling_gpu.rs", "cuDNN pooling"));
     p.push(dedicated("AveragePool", "pooling_gpu.rs", "cuDNN pooling"));
 
@@ -1889,11 +2549,10 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "ReduceLogSum",
         "ReduceLogSumExp",
     ] {
-        p.push(dedicated(
+        p.push(ProfileEntry {
             op,
-            "op_coverage_batch_gpu.rs",
-            "extended reduction",
-        ));
+            coverage: Coverage::Sweep(extended_reduction_float(op)),
+        });
     }
     p.push(dedicated(
         "Swish",

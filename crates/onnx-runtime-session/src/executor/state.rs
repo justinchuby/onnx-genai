@@ -542,6 +542,16 @@ pub(super) struct InInfo {
     pub(super) backing: TensorBacking,
     /// Length in bytes of the backing (root) allocation, for the bounds gate.
     pub(super) root_len: usize,
+    /// True for a lazy weight the EP declined to page into device memory (offload
+    /// disabled or no residency); such inputs stay absent and are routed to the
+    /// kernel as a lazy `KernelInput::Weight` instead of a bound view.
+    pub(super) lazy_unresolved: bool,
+    /// Keep-alive for a lazy weight the EP paged into device memory: pins the VRAM
+    /// page for the kernel's lifetime, then makes it evictable when the `InInfo`
+    /// is dropped after dispatch. When `Some`, `base_ptr`/`device` point at the
+    /// paged bytes and `present` is true. Held for its `Drop` side effect only.
+    #[allow(dead_code)]
+    pub(super) paged: Option<onnx_runtime_ep_api::PagedWeight>,
 }
 
 #[derive(Clone)]
@@ -579,6 +589,20 @@ impl ExternalValue {
             DeviceBuffer::from_borrowed_mut_parts(self.ptr, self.device, self.len, self.alignment)
         }
         .ok_or_else(|| SessionError::Internal("external output binding has a null pointer".into()))
+    }
+
+    pub(super) fn readable_buffer(&self) -> Result<DeviceBuffer> {
+        if self.ptr.is_null() {
+            return Err(SessionError::Internal(
+                "external input binding has a null pointer".into(),
+            ));
+        }
+        // SAFETY: `prepare_external_bindings` obtains this pointer from a live
+        // `DeviceIoBinding` borrowed for the complete run. This read-only alias
+        // neither owns nor mutates the binding's allocation.
+        Ok(unsafe {
+            DeviceBuffer::from_borrowed_parts(self.ptr, self.device, self.len, self.alignment)
+        })
     }
 }
 

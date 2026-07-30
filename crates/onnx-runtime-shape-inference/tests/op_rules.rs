@@ -279,8 +279,8 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 208);
-    assert_eq!(registry.entry_count(), 253);
+    assert_eq!(registry.operator_count(), 209);
+    assert_eq!(registry.entry_count(), 254);
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
@@ -434,6 +434,116 @@ fn recurrent_only_sets_declared_outputs() {
         assert!(outputs[1].type_info.is_some(), "{op} Y_h");
         assert!(outputs[2].type_info.is_none(), "{op} has no Y_c");
     }
+}
+
+#[test]
+fn recurrent_reverse_direction_is_unidirectional() {
+    // `reverse` runs a single pass backwards, so num_directions == 1 just like
+    // `forward` — only `bidirectional` yields 2.
+    for op in ["RNN", "GRU", "LSTM"] {
+        let output_count = if op == "LSTM" { 3 } else { 2 };
+        let outputs = run(
+            &recurrent_node(op, output_count, "reverse", 11),
+            vec![f32in(vec![sym(90), sym(91), c(7)])],
+            14,
+        );
+        assert_eq!(
+            out_shape(&outputs),
+            vec![sym(90), c(1), sym(91), c(11)],
+            "{op} reverse Y"
+        );
+        assert_eq!(
+            outputs[1].type_info.as_ref().unwrap().shape,
+            vec![c(1), sym(91), c(11)],
+            "{op} reverse Y_h"
+        );
+    }
+}
+
+#[test]
+fn recurrent_unknown_or_non_rank3_input_stays_permissive() {
+    // X absent, unknown-rank (represented by an absent type), or a rank other
+    // than 3 cannot pin Y/Y_h/Y_c: the rule must leave every output unresolved
+    // rather than fabricate a shape or panic.
+    for op in ["RNN", "GRU", "LSTM"] {
+        let output_count = if op == "LSTM" { 3 } else { 2 };
+
+        // No input type at all (unknown rank / absent producer).
+        let missing = run(
+            &recurrent_node(op, output_count, "forward", 11),
+            vec![NodeIo::default()],
+            14,
+        );
+        assert!(
+            missing.iter().all(|o| o.type_info.is_none()),
+            "{op} unknown X"
+        );
+
+        // Wrong rank (X must be rank 3: [seq, batch, input_size]).
+        for bad in [vec![sym(92), c(7)], vec![sym(92), sym(93), c(7), c(2)]] {
+            let outputs = run(
+                &recurrent_node(op, output_count, "forward", 11),
+                vec![f32in(bad.clone())],
+                14,
+            );
+            assert!(
+                outputs.iter().all(|o| o.type_info.is_none()),
+                "{op} rank-{} X",
+                bad.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn recurrent_invalid_direction_is_permissive() {
+    // An unrecognised `direction` string is not a hard error: leave outputs
+    // unresolved rather than guessing num_directions.
+    let outputs = run(
+        &recurrent_node("LSTM", 3, "sideways", 11),
+        vec![f32in(vec![c(5), c(3), c(7)])],
+        14,
+    );
+    assert!(outputs.iter().all(|o| o.type_info.is_none()));
+}
+
+#[test]
+fn recurrent_optional_inputs_do_not_change_output_shape() {
+    // Providing the optional W/R/B/sequence_lens/initial_h(/initial_c) inputs
+    // must not perturb the tensor-only output rule, which is driven purely by
+    // X's [seq, batch, *] and the hidden_size attr.
+    for op in ["RNN", "GRU", "LSTM"] {
+        let output_count = if op == "LSTM" { 3 } else { 2 };
+        // X plus five trailing optional inputs (contents irrelevant to shape).
+        let mut node = recurrent_node(op, output_count, "bidirectional", 13);
+        node.inputs = vec![Some(ValueId(0)); 6];
+        let mut inputs = vec![f32in(vec![sym(94), sym(95), c(7)])];
+        inputs.resize(6, f32in(vec![c(1)]));
+        let outputs = run(&node, inputs, 14);
+        assert_eq!(
+            out_shape(&outputs),
+            vec![sym(94), c(2), sym(95), c(13)],
+            "{op} Y with optional inputs"
+        );
+    }
+}
+
+#[test]
+fn recurrent_layout_attribute_is_inert_before_opset_14() {
+    // The `layout` attribute is only defined from opset 14. At the v1 rule
+    // boundary (opset 13) it must be ignored even when present, and honoured at
+    // exactly opset 14.
+    let batch_major = with_attr(
+        recurrent_node("LSTM", 3, "forward", 17),
+        "layout",
+        Attribute::Int(1),
+    );
+    // Opset 13: sequence-major regardless of layout=1.
+    let at_13 = run(&batch_major, vec![f32in(vec![sym(96), sym(97), c(7)])], 13);
+    assert_eq!(out_shape(&at_13), vec![sym(96), c(1), sym(97), c(17)]);
+    // Opset 14: layout=1 becomes batch-major.
+    let at_14 = run(&batch_major, vec![f32in(vec![sym(96), sym(97), c(7)])], 14);
+    assert_eq!(out_shape(&at_14), vec![sym(96), sym(97), c(1), c(17)]);
 }
 
 #[test]
@@ -1649,6 +1759,40 @@ fn relu_passthrough() {
     let outs = run(&n, vec![f32in(vec![sym(0), c(8), c(768)])], 13);
     assert_eq!(out_shape(&outs), vec![sym(0), c(8), c(768)]);
     assert_eq!(out_dtype(&outs), DataType::Float32);
+}
+
+#[test]
+fn microsoft_silu_uses_unary_shape_and_dtype_propagation() {
+    let n = with_version(with_domain(node("Silu", 1, 1), "com.microsoft"), 1);
+
+    let static_output = run(
+        &n,
+        vec![tin(DataType::Float16, vec![c(1), c(10240), c(4)])],
+        1,
+    );
+    assert_eq!(out_shape(&static_output), vec![c(1), c(10240), c(4)]);
+    assert_eq!(out_dtype(&static_output), DataType::Float16);
+
+    let symbolic_output = run(
+        &n,
+        vec![tin(DataType::Float32, vec![sym(0), sym(1), c(128), sym(2)])],
+        1,
+    );
+    assert_eq!(
+        out_shape(&symbolic_output),
+        vec![sym(0), sym(1), c(128), sym(2)]
+    );
+    assert_eq!(out_dtype(&symbolic_output), DataType::Float32);
+
+    let unknown_rank_output = run(&n, vec![NodeIo::default()], 1);
+    assert!(unknown_rank_output[0].type_info.is_none());
+}
+
+#[test]
+fn microsoft_silu_is_registered_from_version_one() {
+    let registry = InferenceRegistry::default_registry();
+    assert!(registry.get("com.microsoft", "Silu", 0).is_none());
+    assert!(registry.get("com.microsoft", "Silu", 1).is_some());
 }
 
 #[test]

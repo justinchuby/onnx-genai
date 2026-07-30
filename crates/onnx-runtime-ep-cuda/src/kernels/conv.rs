@@ -1,31 +1,113 @@
 //! ONNX `Conv` via cuDNN's forward-convolution API.
 //!
-//! This path covers dense 2-D NCHW f32/f16/bf16 convolution, including strides,
-//! dilations, groups, symmetric padding, and optional channel bias. cuDNN's
-//! legacy forward API only accepts symmetric padding; asymmetric ONNX padding is
-//! rejected explicitly rather than silently changing the result.
+//! Rank-4 NCHW convolution uses cuDNN. Rank-3 NCL convolution uses an
+//! output-owned CUDA kernel so ONNX's asymmetric (including causal) padding is
+//! supported without changing the established 2-D path.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::cudnn::{CudnnConvBuffers, CudnnConvSpec, CudnnTensorType};
-use crate::error::not_implemented;
+use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
+
+const BLOCK: u32 = 256;
+const CONV1D_SOURCE: &str = r#"
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+__device__ __forceinline__ float load_value(
+    const void* values, int dtype, unsigned long long index) {
+  if (dtype == 0) return ((const float*)values)[index];
+  if (dtype == 1) return __half2float(((const __half*)values)[index]);
+  return __bfloat162float(((const __nv_bfloat16*)values)[index]);
+}
+
+__device__ __forceinline__ void store_value(
+    void* values, int dtype, unsigned long long index, float value) {
+  if (dtype == 0) ((float*)values)[index] = value;
+  else if (dtype == 1) ((__half*)values)[index] = __float2half_rn(value);
+  else ((__nv_bfloat16*)values)[index] = __float2bfloat16_rn(value);
+}
+
+extern "C" __global__ void conv1d(
+    const void* x, const void* weights, const void* bias, void* output,
+    unsigned long long output_elements, unsigned long long input_channels,
+    unsigned long long input_length, unsigned long long output_channels,
+    unsigned long long output_length, unsigned long long filter_channels,
+    unsigned long long kernel_length, unsigned long long outputs_per_group,
+    unsigned long long stride, unsigned long long dilation,
+    unsigned long long pad_begin, int dtype, int has_bias) {
+  for (unsigned long long output_index =
+           blockIdx.x * blockDim.x + threadIdx.x;
+       output_index < output_elements;
+       output_index += (unsigned long long)gridDim.x * blockDim.x) {
+    const unsigned long long output_position = output_index % output_length;
+    const unsigned long long output_channel =
+        (output_index / output_length) % output_channels;
+    const unsigned long long batch =
+        output_index / (output_channels * output_length);
+    const unsigned long long group = output_channel / outputs_per_group;
+    float accumulated =
+        has_bias ? load_value(bias, dtype, output_channel) : 0.0f;
+
+    for (unsigned long long local_channel = 0;
+         local_channel < filter_channels; ++local_channel) {
+      const unsigned long long input_channel =
+          group * filter_channels + local_channel;
+      for (unsigned long long kernel = 0; kernel < kernel_length; ++kernel) {
+        const long long input_position =
+            (long long)(output_position * stride + kernel * dilation)
+            - (long long)pad_begin;
+        if (input_position < 0 ||
+            input_position >= (long long)input_length) continue;
+        const unsigned long long input_index =
+            (batch * input_channels + input_channel) * input_length
+            + (unsigned long long)input_position;
+        const unsigned long long weight_index =
+            (output_channel * filter_channels + local_channel) * kernel_length
+            + kernel;
+        accumulated += load_value(x, dtype, input_index)
+            * load_value(weights, dtype, weight_index);
+      }
+    }
+    store_value(output, dtype, output_index, accumulated);
+  }
+}
+"#;
 
 pub struct ConvFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
 impl KernelFactory for ConvFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let rank = input_shapes.first().map(Vec::len).unwrap_or(4);
+        let (default_strides, default_pads, default_dilations): (&[i64], &[i64], &[i64]) =
+            if rank == 3 {
+                (&[1], &[0, 0], &[1])
+            } else {
+                (&[1, 1], &[0, 0, 0, 0], &[1, 1])
+            };
         Ok(Box::new(ConvKernel {
             runtime: self.runtime.clone(),
-            strides: ints_attr(node, "strides", &[1, 1])?,
-            pads: ints_attr(node, "pads", &[0, 0, 0, 0])?,
-            dilations: ints_attr(node, "dilations", &[1, 1])?,
+            strides: ints_attr(node, "strides", default_strides)?,
+            pads: ints_attr(node, "pads", default_pads)?,
+            dilations: ints_attr(node, "dilations", default_dilations)?,
+            kernel_shape: node
+                .attr("kernel_shape")
+                .map(|value| {
+                    value.as_ints().map(ToOwned::to_owned).ok_or_else(|| {
+                        EpError::KernelFailed(
+                            "cuda_ep Conv: kernel_shape must be an integer list".into(),
+                        )
+                    })
+                })
+                .transpose()?,
             group: match node.attr("group") {
                 Some(value) => value.as_int().ok_or_else(|| {
                     EpError::KernelFailed("cuda_ep Conv: group must be an integer".into())
@@ -63,8 +145,18 @@ pub struct ConvKernel {
     strides: Vec<i64>,
     pads: Vec<i64>,
     dilations: Vec<i64>,
+    kernel_shape: Option<Vec<i64>>,
     group: i64,
     auto_pad: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Conv1dPlan {
+    output_shape: [usize; 3],
+    pad_begin: usize,
+    stride: usize,
+    dilation: usize,
+    groups: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,19 +169,93 @@ struct ConvPlan {
 }
 
 impl ConvKernel {
-    fn plan(&self, x: &[usize], w: &[usize]) -> Result<ConvPlan> {
-        if x.len() != 4 || w.len() != 4 {
+    fn plan_1d(&self, x: &[usize], w: &[usize]) -> Result<Conv1dPlan> {
+        if x.len() != 3 || w.len() != 3 {
             return Err(not_implemented(format!(
-                "Conv with input rank {} and filter rank {} (cuDNN path supports 2-D NCHW only)",
+                "Conv with input rank {} and filter rank {} (supported: 1-D NCL or 2-D NCHW)",
                 x.len(),
                 w.len()
             )));
         }
-        let strides = pair("strides", &self.strides, false)?;
-        let dilations = pair("dilations", &self.dilations, false)?;
+        let stride = single("strides", &self.strides, false)?;
+        let dilation = single("dilations", &self.dilations, false)?;
+        if let Some(kernel_shape) = &self.kernel_shape
+            && (kernel_shape.len() != 1 || usize::try_from(kernel_shape[0]).ok() != Some(w[2]))
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Conv: kernel_shape must match filter spatial shape [{}], got {kernel_shape:?}",
+                w[2]
+            )));
+        }
+        let groups = self.validate_groups(x, w)?;
+        let effective = dilation
+            .checked_mul(w[2].saturating_sub(1))
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| EpError::KernelFailed("cuda_ep Conv: kernel length overflow".into()))?;
+        let (pad_begin, pad_end) = match self.auto_pad.as_str() {
+            "" | "NOTSET" => {
+                if self.pads.len() != 2 {
+                    return Err(EpError::KernelFailed(format!(
+                        "cuda_ep Conv: pads must have 2 values [begin,end] for Conv1D, got {:?}",
+                        self.pads
+                    )));
+                }
+                let pads = self
+                    .pads
+                    .iter()
+                    .map(|&value| {
+                        usize::try_from(value).map_err(|_| {
+                            EpError::KernelFailed(format!(
+                                "cuda_ep Conv: pads must be non-negative, got {:?}",
+                                self.pads
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (pads[0], pads[1])
+            }
+            "VALID" => (0, 0),
+            "SAME_UPPER" | "SAME_LOWER" => {
+                let output = x[2].div_ceil(stride);
+                let total = output
+                    .saturating_sub(1)
+                    .saturating_mul(stride)
+                    .saturating_add(effective)
+                    .saturating_sub(x[2]);
+                if self.auto_pad == "SAME_LOWER" {
+                    (total.div_ceil(2), total / 2)
+                } else {
+                    (total / 2, total.div_ceil(2))
+                }
+            }
+            other => {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep Conv: unsupported auto_pad value {other:?}; expected NOTSET, VALID, SAME_UPPER, or SAME_LOWER"
+                )));
+            }
+        };
+        let padded = x[2]
+            .checked_add(pad_begin)
+            .and_then(|value| value.checked_add(pad_end))
+            .ok_or_else(|| EpError::KernelFailed("cuda_ep Conv: padded length overflow".into()))?;
+        if padded < effective {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Conv: effective kernel {effective} exceeds padded input {padded}"
+            )));
+        }
+        Ok(Conv1dPlan {
+            output_shape: [x[0], w[0], (padded - effective) / stride + 1],
+            pad_begin,
+            stride,
+            dilation,
+            groups,
+        })
+    }
+
+    fn validate_groups(&self, x: &[usize], w: &[usize]) -> Result<usize> {
         let groups = usize::try_from(self.group)
             .ok()
-            .filter(|&v| v > 0)
+            .filter(|&value| value > 0)
             .ok_or_else(|| {
                 EpError::KernelFailed(format!(
                     "cuda_ep Conv: group must be positive, got {}",
@@ -108,6 +274,20 @@ impl ConvKernel {
                 w[0]
             )));
         }
+        Ok(groups)
+    }
+
+    fn plan(&self, x: &[usize], w: &[usize]) -> Result<ConvPlan> {
+        if x.len() != 4 || w.len() != 4 {
+            return Err(not_implemented(format!(
+                "Conv with input rank {} and filter rank {} (cuDNN path supports 2-D NCHW only)",
+                x.len(),
+                w.len()
+            )));
+        }
+        let strides = pair("strides", &self.strides, false)?;
+        let dilations = pair("dilations", &self.dilations, false)?;
+        let groups = self.validate_groups(x, w)?;
 
         let effective = [
             dilations[0]
@@ -248,6 +428,9 @@ impl ConvKernel {
             ));
         }
 
+        if x.shape.len() == 3 || w.shape.len() == 3 {
+            return self.run_1d(x, w, bias, &mut outputs[0]);
+        }
         let plan = self.plan(x.shape, w.shape)?;
         if outputs[0].shape != plan.output_shape {
             return Err(EpError::KernelFailed(format!(
@@ -295,6 +478,115 @@ impl ConvKernel {
             .with_handle(|handle| handle.conv2d(&spec, buffers))?;
         self.runtime.synchronize()
     }
+
+    fn run_1d(
+        &self,
+        x: &TensorView,
+        w: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+    ) -> Result<()> {
+        let plan = self.plan_1d(x.shape, w.shape)?;
+        if output.shape != plan.output_shape {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Conv: output shape {:?}, expected {:?}",
+                output.shape, plan.output_shape
+            )));
+        }
+        if let Some(bias) = bias
+            && bias.shape != [w.shape[0]]
+        {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep Conv: bias shape {:?}, expected [{}]",
+                bias.shape, w.shape[0]
+            )));
+        }
+        if output.numel() == 0 {
+            return Ok(());
+        }
+        let dtype = dtype_code(x.dtype)?;
+        if dtype != 0 {
+            self.runtime.require_nvrtc_half_headers("Conv1D")?;
+        }
+        let function = self
+            .runtime
+            .nvrtc_function("conv1d_common_v1", CONV1D_SOURCE, "conv1d")?;
+        let x_pointer = cuptr(x.data_ptr::<u8>() as *const c_void);
+        let weight_pointer = cuptr(w.data_ptr::<u8>() as *const c_void);
+        let bias_pointer = bias
+            .map(|value| cuptr(value.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_pointer = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+        let output_elements = output.numel() as u64;
+        let dimensions = [
+            x.shape[1],
+            x.shape[2],
+            w.shape[0],
+            plan.output_shape[2],
+            w.shape[1],
+            w.shape[2],
+            w.shape[0] / plan.groups,
+            plan.stride,
+            plan.dilation,
+            plan.pad_begin,
+        ]
+        .map(|value| value as u64);
+        let has_bias = i32::from(bias.is_some());
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&x_pointer)
+            .arg(&weight_pointer)
+            .arg(&bias_pointer)
+            .arg(&output_pointer)
+            .arg(&output_elements);
+        for dimension in &dimensions {
+            builder.arg(dimension);
+        }
+        builder.arg(&dtype).arg(&has_bias);
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (
+                    output_elements.div_ceil(BLOCK as u64).clamp(1, 65_535) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|error| driver_err("launch Conv1D", error))?;
+        Ok(())
+    }
+}
+
+fn dtype_code(dtype: DataType) -> Result<i32> {
+    match dtype {
+        DataType::Float32 => Ok(0),
+        DataType::Float16 => Ok(1),
+        DataType::BFloat16 => Ok(2),
+        other => Err(not_implemented(format!(
+            "Conv dtype {other:?} (supported: Float32, Float16, BFloat16)"
+        ))),
+    }
+}
+
+fn single(name: &str, values: &[i64], allow_zero: bool) -> Result<usize> {
+    if values.len() != 1 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep Conv: {name} must have 1 value for Conv1D, got {values:?}"
+        )));
+    }
+    let value = usize::try_from(values[0]).map_err(|_| {
+        EpError::KernelFailed(format!(
+            "cuda_ep Conv: {name} values must be non-negative, got {values:?}"
+        ))
+    })?;
+    if !allow_zero && value == 0 {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep Conv: {name} values must be positive, got {values:?}"
+        )));
+    }
+    Ok(value)
 }
 
 fn pair(name: &str, values: &[i64], allow_zero: bool) -> Result<[usize; 2]> {

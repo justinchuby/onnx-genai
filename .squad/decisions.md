@@ -1,11 +1,8 @@
 # Decisions — live standing directives
 
-Last compacted: 2026-07-28T11:35:49Z
+Last consolidated: 2026-07-30T13:36:00Z (Scribe consolidation round 3 — inbox merged, dated entries archived)
 
-Full historical ledger archived to `.squad/decisions-archive/2026-07.md`. The original
-full snapshot is under "Full decisions snapshot archived by size gate — 2026-07-28T11:30:55Z";
-post-rebase additions are under "Post-rebase decisions archived by size gate — 2026-07-28T11:35:49Z".
-Older archives also live under `.squad/decisions/archive/`.
+Standing governance rules and constraints maintained by Squad. Dated wave records, narrative entry trails, and historical ledger updates archived to `.squad/decisions-archive/2026-07.md`.
 
 ## Ledger health rule
 
@@ -20,6 +17,14 @@ pointers to archived history.
 Size compaction of a shared append-only file is not rebase-safe: concurrent appends can
 silently reinflate the file without a conflict while leaving the compacted header intact.
 A compaction PR must be re-run against tip immediately before merge if main advanced.
+
+**Concurrent Scribe runs are a structural hazard.** Two Scribe runs merged the same file
+in the same window on 2026-07-29, producing divergent copies that git had to reconcile.
+The root fix is to assemble decisions.md from the inbox rather than hand-merge it: if the
+live file is only ever written by appending inbox drops, two runs produce no divergence
+in overlapping content — each run's drops are distinct files. Until that is built,
+the coordination rule is: Scribe checks `git log origin/main..HEAD` before committing;
+if main has moved, rebase or merge first, then apply the compaction on top.
 
 ## Performance claim discipline
 
@@ -83,6 +88,13 @@ non-contiguous weights, rescue block returning zeros, Conv macOS scalar/BNNS tie
 non-Conv CNN scalar paths, and 1x1 Conv's GEMM bypass existing but being intercepted by
 BNNS Conv.
 
+**Manifest lint reliability (PR #414):** A dispatch-manifest lint whose increment regex
+does not handle rustfmt-wrapped counter increments is blind to those increments. A lint
+without a `--self-test` mode that passes before the lint itself runs proves nothing when
+it goes silent — a real dead branch looks the same as a rustfmt-wrapped live one. Wire a
+self-test into CI before the lint check; the self-test must exercise both wrapped and
+single-line increment patterns plus genuine dead-counter cases.
+
 ## Minimal-build and shape-inference rules
 
 - Graph/layout transforms must be gated on both their infrastructure feature and the
@@ -111,6 +123,9 @@ BNNS Conv.
 - A fitted threshold is acceptable only when labeled as fitted and bracketed by measured
   data. A wrong rationale is worse than no rationale because future engineers will tune
   code to the false premise.
+- `BNNSFilterApplyBatch` is unreliable for `BNNSFilterCreateLayerConvolution` filters
+  (SIGSEGV inside libBNNS.dylib at batch>1, confirmed via AddressSanitizer on PR
+  squad/fix-batch-segfault). Use per-image `BNNSFilterApply` until migration to `BNNSGraph`.
 
 ## Model artifact hygiene
 
@@ -127,6 +142,14 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   snapshot archived by size gate — 2026-07-28T11:30:55Z".
 - Post-rebase additions: `.squad/decisions-archive/2026-07.md` → "Post-rebase decisions
   archived by size gate — 2026-07-28T11:35:49Z".
+- Narrative entries compacted 2026-07-29 (two runs): `.squad/decisions-archive/2026-07.md`
+  → "Narrative entries compacted by size gate — 2026-07-29T21:19:00Z" and
+  "Narrative entries compacted by size gate — 2026-07-29T23:30:00Z".
+- Round-2 compaction (2026-07-30): `.squad/decisions-archive/2026-07.md` → "Narrative
+  entries compacted by size gate — 2026-07-30T04:30:00Z (Scribe tidy round 2)".
+- Round-3 consolidation (2026-07-30): `.squad/decisions-archive/2026-07.md` → "Scribe
+  consolidation round 3: CUDA/native/MoE wave records, 35B-A3B blocker, #87 prefetch plan
+  — 2026-07-30T13:36:00Z".
 - Prior active-ledger archives: `.squad/decisions/archive/`.
 - Mac CPU EP load-bearing topics in the archive: PR #227 roofline lessons, load-adaptive
   opt-in, Apple Silicon portability directive, BNNS prefill/deprecation notes,
@@ -134,126 +157,6 @@ For detailed per-PR narrative, use the archive rather than expanding this live f
   Conv correction, Iran SDPA model-ratio correction, and negative-result GEMV notes.
 - Wave 8/9 topics in the archive: CUDA coverage batches 8/9, shape-inference catalog
   batches 3/4, NCHWc minimal-build gating, and strict reviewer-lockout correction cycle.
-
-## Latest campaign summary — Mac CPU EP pointwise Conv, SDPA, and wave-9 rebase
-
-- PR #342 merged: NEON depthwise, reviewed in the prior batch.
-- PR #345 merged documentation-only: inline NEON GEMV small-shape investigation was a
-  valid negative result; existing inline/cblas paths were already competitive.
-- PR #347 merged (`00081cac`): 1x1 Conv routing corrected with model-scoped claim;
-  documentation defects fixed before merge.
-- PR #349 merged (`dc1ae0c5`): inline NEON SDPA decode path approved; headline corrected
-  after TinyStories model-ratio confusion.
-- Wave 8/9 consolidation archived: CUDA ScatterND/window functions, QuantizeLinear,
-  DequantizeLinear, Dropout, NonZero, shape-inference batches 3/4, and NCHWc minimal-build
-  gating.
-- Chew approved PR #347 and PR #349 after numerics/reachability gates.
-
-<!-- History before 2026-07-28T11:35:49Z was archived by size. Keep this file small. -->
-
-## 2026-07-28T17:40:00+0000 — control flow, metadata, and QMoE offload wave
-
-- PR #362 (`5a079029`) completed #355's tensor control-flow work: `If`, `Loop`, and
-  `Scan` infer child graphs after formal body inputs are seeded from their owning
-  node; Loop scan dimensions stay symbolic because a constant trip count is only
-  an early-exit upper bound. Fully-static control-flow results whose byte size
-  overflows degrade to dtype-only rather than triggering eager-planning overflow.
-  Sequence, Optional, and Map propagation remains deliberately unresolved until
-  the tensor-only SSA `TypeInfo` gains a container-aware representation.
-- The cache roofline ceiling is informational when SLC covers at least 10% of a
-  model's decode set (`cache_assisted`); retain the DRAM ceiling only for larger
-  working sets and never report an unexplained roofline percentage above 100%.
-- PR #364 (`3b08c025`) established route-first CPU QMoE's one-ahead prefetch
-  strategy. It may engage only in eviction-neutral regimes: mmap streaming
-  (`budget == 0`) or a fully resident layer. Partial-cache budgets execute the
-  serial path. This preserves output, cache statistics, and `pipe_bytes <=
-  serial` while retaining a measured 36–47% streaming throughput gain. Unifying
-  this host path with GPU prefetch awaits Phase-3b live device binding; Granite's
-  unfused MatMul MoE cannot currently engage it.
-- PR #365 (`83f4c293`) made `onnx_runtime.*` metadata effective at engine load,
-  with explicit programmatic settings retaining priority. Metadata collection
-  recursively scans GRAPH/GRAPHS attributes. Every scanned node now uses a
-  uniform structural `NodePath` identity (including anonymous and duplicate-name
-  top-level nodes); names are diagnostic labels only. External name-addressed
-  hints resolve to a unique structural node or remain in a separate external-name
-  keyspace, so they cannot collide.
-- Large-model smoke status is a blocker, not an offload regression: the 27B
-  native path hits the Unsqueeze rank bug, ORT lacks
-  `past_key_values.*.recurrent_state`, and the needed Mobius #432 mapping remains
-  unmerged; all H200 capacity was occupied externally. Granite MoE runs on ORT
-  CUDA but exports unfused MatMuls, while the fused fixture verifies route-first
-  CPU paging independently.
-## 2026-07-28T13:50:00Z — MobileNetV2 remaining gap: Clip dispatch-miss (defect #14)
-
-Per-op profiling on MobileNetV2-12: Clip dominated at 76.8% of runtime. Fixed with
-`clip_contiguous_f32_fast()` — NEON-accelerated zero-copy path. Per-op: 34ms → 0.86ms
-(39.5x). Amdahl projected 3.93x; measured 3.75–3.91x model speedup. Residual gap (11.5ms
-vs ORT 6.3ms) is Conv-dominated, no single lever remaining. **PR #359.**
-
-## 2026-07-28 — NEON fast path for Relu (MLAS gate audit item #2)
-
-Relu was second HIGH-priority violation: only fast path behind `cfg(feature="mlas")`.
-ResNet-18: Relu 0.43 ms (5.17%) before → 0.094 ms (1.17%) after. Per-op: 4.6×. Model:
-1.044× (within Amdahl projection). Added `clip_contiguous_f32_fast()` pattern. Manifest
-row for `(Relu, contiguous_f32, all, tier2)` with `RELU_F32_FAST_TEST_HITS` counter.
-
-## 2026-07-28 — Standing Directive: Hardware-Rationale Accuracy in Dispatch Comments
-
-Source comments justifying dispatch thresholds with hardware figures must: (1) cite
-verified figure from specs/teardown/on-device; (2) state if constant is derived or fitted;
-(3) if fitted, state measured bracket and confirmed platforms. Wrong rationale is worse
-than no rationale — prevents future engineers from silently breaking working dispatch.
-
-## 2026-07-28 — Thin-M GEMM bypass for f32 prefill on Apple Silicon
-
-For small M (2-16) with large B (K×N > 4M), cblas only achieves ~25 GB/s; bypass to
-NEON column-parallel path for constant (pre-transposed) weights. M crossover at 16 measured
-on M1 Max, bracket [16,24]. TinyStories-33M TTFT: 17.7ms → 13.3ms (-25%). f32 weight
-transposes precomputed at model load. Counter: `THIN_M_GEMM_TEST_HITS`. **PR #351.**
-
-## 2026-07-28 — report time-to-first-token from process start
-
-`compare.rs` now reports process start → first token ms (model_load + TTFT) as derived
-column. TTFT alone favors runtimes that front-load work into model load (ORT pre-packs).
-Cold-start metric: native 55–57.5ms, ORT 150–165.5ms (2.6–2.7×). Updated
-`examples/profiles/README.md` with mechanism explanation.
-
-## 2026-07-28 — Republish profile figures with load context
-
-Measurements at load 2.5–3.7 show: qwen2.5-0.5b-f16: 1.72× decode, 1.68× e2e, 5.01×
-cold-start. TinyStories-33M: 0.91× decode (ORT wins), 0.82× e2e (ORT wins), 2.47×
-cold-start. Verified against Justin's independent measurement (< 2% agreement). Every
-number carries host load context. Unflattering numbers preserved in README.
-
-## 2026-07-28T00:00:00Z — probe the stream you are writing to
-
-`emit_stats_line` in PR #372: stats written to stderr but probed stdout TTY status, inverting
-decision under redirection. **Durable rule:** probe the stream you are writing to. Stats on
-stderr → test `stderr().is_terminal()`. Never cross-probe. Extracted `stats_text()` for pure
-testable logic; added `stats_format_follows_stderr_not_stdout` unit test covering all 4 cases.
-
-## 2026-07-28 — Feature Gate Coverage Lint
-
-Added `scripts/check_feature_gate_coverage.py` — sixth CI layer targeting blind spot:
-cfg-gated performance paths whose fallback is unmonitored. Audit findings: CRITICAL (Clip),
-HIGH (Relu), MEDIUM (GlobalPool) — double-copy allocations on macOS. No other feature flags
-guard kernel performance paths. Script catches missing *instrumentation* on fallback paths,
-not missing optimizations — manifest then makes tier visible for human review.
-
-## 2026-07-28 — Roofline ceiling: cache-assisted threshold for small models
-
-TinyStories-33M (107M params, 267.8 MB decode set) exceeds 100% because SLC (48 MiB = 18%
-coverage) provides inter-token reuse lift. Broadened check from "cache_resident" (entire model
-fits) to "cache_assisted" (SLC ≥ 10% of decode set). Roofline ceiling marked informational
-for cache-assisted models. No change to floor constants. **PR #354.**
-
-## 2026-07-28T04:30:00-07:00 — CLI improvement track durable lessons
-
-- Recurring verification defects are a durable review pattern: do not accept code that merely appears to verify, preserve, or clean up its claim. Empty-turn handling, flaky tests, speculative rewind placement, benchmark caps, cache keys, broad assertions, and stale fixture inventories were each caught by different review/automation layers; keep redundant review layers in place.
-- Bugs live where automation cannot reach. The CLI track widened automation coverage as first-class product work: CLI CI, cross-platform contract tests, visible ORT-library reporting, and Miri in CI all closed places where defects had been invisible.
-- PR #315 proved observability pays for itself: `cargo test -p onnx-genai-engine --lib` moved from 178 passed / 64 failed to 253 passed / 0 failed once agents could select a working ORT and see which ORT library was actually loaded.
-- Silent behavior is a bug class to eliminate. Ignored `--temperature`, silent CUDA fallback, empty turns on context exhaustion, requested-vs-resolved backend reporting, and invisible budget caps were fixed by making behavior observable, not just internally correct.
-- Coordinator merge and diagnosis discipline: distinguish allocator growth from scheduler worst-case reservation, and verify merges by building or equivalent validation; conflict markers and scratch files can survive if git output is trusted without inspection.
 
 ## CLI charter — standing directives
 
@@ -288,48 +191,224 @@ Phase 1 landed in #289. Remaining phases cover session/runtime interaction — `
 `docs/research/cli/04-runtime-capability-inventory.md` and `06-fork-rewind-api.md`.
 Fork is reserved behind a type gate and **not yet enabled on any backend**.
 
-## 2026-07-28 — Declarative, name-agnostic model I/O and shared-KV contracts
+## CI: run tests on every platform; instrument for coverage only where informative
 
-**PR #373 / issue #231 (Melina; reviewed by Richter; merged `61d3bdac`).** Decoder and
-proposer ports resolve first from exact `model.io` / `speculative.io` declarations, then
-from unique dtype/shape signals; legacy terminal-name matching remains compatibility-only.
-Declared KV lists pair positionally. Attention representation permissions are independent of
-attention implementation, and `io.kv_update: shared_buffer` declares operator-agnostic
-shared-buffer KV updates. Strict attention sequence-length validation rejects incompatible
-contracts early.
+**By:** Pris (2026-07-28)
 
-## 2026-07-28 — Honest route-first QMoE residency tests under coverage
+Full coverage required on PRs. A parallel uninstrumented Linux fast job (5–9 min
+warm/cold) offers early feedback but never substitutes for the full gate. Windows ARM64
+retains tests/clippy but not llvm-cov coverage (duplicates x64/macOS while owning the
+CI critical path — up to 26 min). Platform execution is the signal; instrumentation is
+the cost. Current critical path: `CLI ORT (Windows x86_64)` at ~18m50s.
 
-**PR #378 (Nandez; reviewed by Kuato; merged `ac75e146`).** Coverage-mode route-first QMoE
-offload assertions now reflect the scheduler contract: serial execution peaks at one resident
-expert; prefetch peaks in `[1, 2]` and remains below selected experts. The shared
-`hold_metrics_test_lock` helper is poison-recovering across 20 call sites, preventing a
-previous test panic from cascading into phantom residency regressions on unrelated PRs.
+## 2026-07-29 — Native multi-turn performance claims must use the session-persistent KV API
 
-## 2026-07-29 — Core decode ports must not depend on exporter names
+**By:** Pris (PR #408); kept live from PR #427's consolidation (merge round 2)
 
-**PR #380 / issue #377 (Melina; reviewed by Cohaagen; merged `47c3331d`).** The core decode
-path resolves roles only from explicit metadata or a unique tensor-shape match, and reports
-the required metadata key for ambiguity. Encoder-decoder Whisper/TTS fixtures declare
-component decoder I/O explicitly, rather than restoring decoder-name guessing.
+Native multi-turn performance claims must use the session-persistent KV API, not the old
+stateless path, unless explicitly labeled `--native-stateless`. The full benchmark record
+(Qwen2.5-0.5B-f16 and TinyStories-33M, M1 Max) is archived under the 2026-07-30 compaction
+entries.
 
-**Review rule:** metadata or I/O-detection changes must run the CLI ORT E2E suite in addition
-to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate successfully
-(23/23).
+## 2026-07-29 — Verification steps that warn instead of fail are not verification
 
-## 2026-07-29 — Shared-buffer decode must thread declared KV pairs
+**By:** Holden; recorded by Scribe; PR #401
 
-**PR #382 / issue #377 continuation (Benny; reviewed by Lori; regression test by Leon; merged `85b9ba15`).** ORT batched shared-buffer and static-cache decode adapters no longer guess exporter I/O names; they consume declared KV pairs. The repair also restores those pairs when constructing `BatchedSharedBufferDecodeSession`, fixing the latent #380 regression where passing `None` made construction always fail. A CPU engine-level continuous-batch test using `tiny-llm-sharedbuffer` now compares sequential generation and fails at construction if declared `model.io.kv_inputs` / `kv_outputs` stop reaching the session. This is deliberately CPU coverage because the previous CUDA-only E2E auto-skips without CUDA.
+A verification step that warns instead of failing is not verification. The ORT
+`osx-x86_64` download had no pinned checksum, so `verify_archive_checksum` warned and
+returned; `curl` exited 0 on a 404; three "successful" steps produced a corrupt input
+before `tar` objected.
 
-## 2026-07-29 — Recurrent shape geometry shares an opset-aware contract
+**Rules:** Check HTTP status explicitly (`curl -f` or `-w %{http_code}`); validate
+archive magic bytes (gzip `1f 8b` / zip `PK`) before extracting; every check that only
+warns on failure is a silent failure waiting for the worst moment.
 
-**PR #386 / issue #355 slice (Hauser; reviewed by Helm; merged `39c28b44`).** RNN, GRU, and LSTM shape inference share `recurrent()`, which propagates symbolic sequence and batch dimensions, derives direction count and hidden size, and emits only declared Y/Y_h/Y_c outputs (including LSTM Y_c). Registrations at opsets 1 and 14 enforce the layout boundary: pre-14 ignores a stray `layout`, while 14+ honors it. Missing or insufficient shape information remains permissive rather than panicking. Helm independently checked ONNX axis order for both layouts and ran the recurrent suite (238 tests) plus clean clippy.
+## 2026-07-29 — Model-declared generation defaults are canonical; our constants are fallback, not override
 
-## 2026-07-29 — OpenAI JSON Schema response format reaches engine constraints
+**By:** Leon; PRs #385, #392; closes issues #290, #296
 
-**PR #388 / issue #183 follow-up (Tony; reviewed by Harry; merged `804ba860`).** Chat completions accept OpenAI Structured Outputs `response_format: {type: "json_schema", json_schema: {name, schema, strict?}}` and map the schema object to `GenerateConstraint::JsonSchema`; malformed schema/name input produces a type-driven HTTP 400. `wants_json_object` became `wants_constrained_json`, so streaming buffering and incomplete-JSON retry apply to both constrained formats. Forced specific-tool choice retains its Lark-constraint precedence. Harry independently verified live llguidance consumption, targeted tests, and clean clippy; the two full HTTP-suite failures reproduce on origin/main from an unrelated tiny-fixture context limit.
+Model `do_sample`, `temperature`, `top_p`, `top_k` were parsed then discarded, forcing
+greedy — on models that ship explicit values precisely because greedy degenerates (e.g.,
+DeepSeek, Qwen). **Precedence is now strict:** explicit caller flag > model-declared value >
+greedy fallback. Enforcement is in the engine so CLI, server, and Python all inherit it.
 
-## 2026-07-29 — Tool-call parser handles Qwen, Llama, and Mistral formats
+## 2026-07-29 — The CUDA driver API ships with the display driver, not the toolkit
+
+**By:** Leon; clears PR #395 misconception
+
+`nvcuda.dll` is present whenever the GPU driver is installed. Both `cust` and `cudarc`
+fall back `*_13` → `*_12` cleanly.
+
+**Rule:** An inferred capability claim that turns out to be wrong costs more than the
+investigation it prevented. Never suppress an inferred bad fact without verifying it
+directly against a fresh environment.
+
+## 2026-07-29 — Probe the stream you are writing to
+
+**By:** Rachael; PR #372
+
+`emit_stats_line` chose its format from `io::stdout().is_terminal()` while writing to
+stderr — inverts under redirection. **Rule:** always probe the destination stream, never a
+convenient nearby one. Stats to stderr → test `stderr().is_terminal()`, not stdout.
+
+**Durable pattern:** Extract testable pure functions. `stats_text()` and
+`needs_trailing_newline()` had to become named pure functions before their branches could
+be unit-tested; inlining had hidden both defects in the production path.
+
+## 2026-07-29 — Run the gate command CI runs, verbatim
+
+**By:** Rachael; PR #372
+
+A package-scoped `cargo fmt --check` passed locally while the entire workspace was
+unformatted. CI's `cargo fmt --all --check` caught it in 37 seconds. **Rule:** use the
+exact gate command that CI uses, not a convenient subset. Local validation with a narrower
+scope is structurally untrustable.
+
+## 2026-07-29 — Terminal behaviour requires PTY-driven tests; piped I/O cannot cover it
+
+**By:** Rachael; PR #372
+
+Two `#[cfg(unix)]` PTY tests written on Windows compiled to zero tests on Windows and
+were reported alongside a green 168-test suite. **Rule:** A `cfg`-gated test is unverified
+until it runs on a platform where the gate admits it. Do not assume compilation equals
+verification. Piped-stdio tests structurally cannot cover PTY-specific behavior (control
+sequences, window size events, terminal probe responses).
+
+## 2026-07-29 — Type-ahead is not lost during generation on Unix or Windows
+
+**By:** Zhora; closes issue #298; PR #393
+
+ConPTY does not echo type-ahead during generation at all, so no REPL repaint can overwrite
+it. This is a terminal characteristic, not a backend bug. **Do not re-open as a
+native-backend issue.** Still unverified: native conhost (not IDE or ConPTY) mid-stream
+type-ahead, which may be cosmetic echo overpaint or real loss — test in a native terminal.
+
+## 2026-07-29 — Standing Operational Rule: Worktree lifecycle and decision merging
+
+**By:** Justin Chu (recorded by Scribe)
+
+Do not delete a worktree before Scribe has merged its decision inbox. `.squad/decisions/inbox/` is gitignored and per-worktree, so removing a worktree destroys any unmerged decision drops in it. Coordination workflow:
+
+1. Agent writes decision to `.squad/decisions/inbox/{agent}-{slug}.md` (in-worktree, gitignored).
+2. PR lands; worktree remains temporarily.
+3. Scribe runs (either same session or next): merges inbox → `.squad/decisions.md`, deletes merged files.
+4. Scribe commits and pushes.
+5. Safe to delete the worktree.
+
+Merging and deleting the inbox files produces no git diff (expected, not a failure). The loss that occurred here: Rachael, Zhora, Leon wrote inbox files in separate worktrees, those worktrees were deleted before Scribe ran, and inbox files were lost. The substance survived in merged `history.md` files and PR descriptions, but the durable-rule fragments did not make it to this ledger — they had to be manually recovered from context.
+
+## 2026-07-29 — All inference/pipeline metadata must be explicit; name guessing is forbidden
+
+**By:** Justin Chu directive #377; Cohaagen, Benny, Melina, Matthias (PRs #380, #382, #377/`squad/377-explicit-metadata`, #412)
+
+ALL inference/pipeline metadata except io-SHAPE must be EXPLICIT and GENERAL. Name
+guessing/historical-name fallback must be replaced by explicit metadata plus a clear ERROR
+naming the missing key. Only io-SHAPE may disambiguate. Do not re-propose deferral.
+
+**Active schema fields (Benny/mobius: emit these names verbatim):**
+- `pipeline.strategy.inner_embedding_output: Option<String>` — nested-AR inner decoder embedding output port. Absent ⇒ ERROR.
+- `model.io.static_cache: Option<StaticCacheIoSpec>` — `write_indices_input`, `kv_sequence_length_input`, per-layer `key/value_cache_inputs/outputs` (equal-length, positional). Inconsistent ⇒ ERROR. **Must be declared; convention-based binding removed (Matthias, PR #412).**
+- Encoder prompt-input role: from `model.encoder.inputs.audio_features` vs `.input_ids`; no port-name string matching.
+- Paged-KV bridge geometry: from `model.io.kv_inputs`/`kv_outputs` only; no metadata ⇒ `Ok(None)`.
+
+**Matthias (PR #412):** `detect_static_cache_by_convention` removed from
+`crates/onnx-genai-ort/src/decode/io.rs`. A TensorScatter static-cache graph without a
+declared `model.io.static_cache` block now fails closed with an error naming the missing
+key — never silently binds by hardcoded `write_indices`/`nonpad_kv_seqlen`/`key_cache.{i}`
+port names. `StaticCacheAbi::classify` stays authoritative and name-agnostic. In-repo
+static-cache fixtures now declare the block explicitly.
+
+**Remaining name path (off-limits scope):** `decode_contract.rs` `KvNamingConvention` — only for #99 speculative proposers; do not remove from this workstream.
+
+## 2026-07-29 — Warmup: shared registry method; error categories preserved at admin boundary
+
+**By:** Lull + Rachael; PR #407
+
+Opt-in `warmup` per-model setting and `POST /v1/admin/models/{id}/warm` both use
+`ModelRegistry::warmup` — one deterministic generated token, idempotent. **Rules:**
+- Share the registry method so configured and on-demand warmups are identical; failures
+  can be retried without corrupting registry state.
+- Return typed errors (absent-model, registry, runtime-failure); the admin endpoint maps
+  them 404 / 500 / 500. A loaded model's failed warmup must not be reported as a 404.
+
+## 2026-07-29 — Decision inbox is a tracked durable queue (not gitignored scratch)
+
+**By:** Scribe (tidy round 1)
+
+**What:** `.squad/decisions/inbox/` is now **tracked in git** rather than ignored.
+`.gitignore` no longer lists it; `inbox/README.md` keeps the directory present and
+documents the semantics. The charter's responsibility #2 is updated to match.
+
+**Why:** The inbox was gitignored in the 2026-07-12 "Add squad" commit, grouped with
+runtime scratch (logs, sessions) on the assumption that drops are consumed and cleared
+on the same machine that wrote them. With worktrees deleted before Scribe merges, and
+three teams writing decision logs concurrently on separate machines, that assumption is
+false — drops that live only locally are lost on worktree deletion (four records lost on
+2026-07-29, others earlier) and drops on other machines are invisible here until merged.
+Tracking fixes all three: drops survive worktree deletion, are visible in-flight across
+machines, and concurrent Scribes each add distinct files that git merges without
+conflict (the only overlap, merge-and-delete, is a clean delete/delete). This is the
+structural version of the fix already noted under "Concurrent Scribe runs are a
+structural hazard": assemble `decisions.md` from inbox drops instead of hand-merging.
+
+**Costs accepted (honest accounting):** more churn in git history; drops now appear in
+PR diffs where they previously did not; and we deliberately override a line that had
+been in place since the initial squad scaffolding. That line was not a considered
+inbox-specific decision — it was a bulk "ignore runtime state" grouping — and its one
+real premise (drops are transient and cleared) still holds: Scribe still deletes drops
+after merge. Only the durability assumption was wrong, so tracking is compatible with
+the original intent rather than a reversal of a deliberate choice.
+
+## Testing discipline — standing rules (distilled from reasoning-fixture review, PRs #410/#411)
+
+The full review narrative is archived (round-2 compaction). These are the binding rules:
+
+- **Assert on what the code did, not a summary of what it should have done.** Tests that
+  key on a display/summary line (e.g. `/session`) can stay green while the real path
+  (`resolve_sampling_defaults`) is broken. Instrument the boundary you care about and
+  assert on that — surface the resolved policy into `--stats`/`--profile` and check it.
+- **Run a new test in isolation before believing it.** A single green in a full parallel
+  suite can be a stderr-timestamp/interleave artifact; run it alone (a real fix survived
+  15/15 isolated runs that the suite hid).
+- **A fixture whose every assertion is "the turn was dropped" cannot distinguish correct
+  behaviour from total breakage.** Make the success path reachable so a regression fails.
+- **A near-deterministic fixture cannot witness sampling.** At low temperature/top_k decode
+  is effectively greedy; a token-stream assertion is ~95% false-fail — raising run count or
+  seeds does not rescue it. Assert on the resolved policy object, not sampled tokens.
+- **One policy resolved at two sites is the defect.** A summary that can disagree with what
+  generation did is a latent bug; resolve once via a shared helper both paths call, reading
+  the live backend on demand (no cache, no staleness across `/reload`/`/ep`/`/backend`).
+
+## 2026-07-30 — Scribe tidy round 3: what to check next
+
+**By:** Scribe (tidy round 2, post-merge)
+
+Round 2 compacted `decisions.md` from 40,477 → ~30 KB and then had to **merge a concurrent
+compaction**: PR #427 ("consolidate CUDA parity 161 state") rewrote the same file down to
+14,913 bytes in the same minutes, while I was pushing. Both were merged by property (union of
+standing rules live; disagreements resolved live). **The concurrent-Scribe collision is now
+observed, not predicted — the window was minutes, not days.** Two conflicting resolutions of a
+single hand-merged file is exactly the failure the tracked inbox was meant to remove but does
+not: the inbox stopped drop-loss, not the hand-merge rewrite. For round 3:
+
+- **Adopt the round-2 Task-D recommendation.** The cheap fix is structural: keep the live file
+  for **standing rules only** (rarely edited, low collision) and route **all dated wave/
+  changelog records** through inbox drops that Scribe files **straight into the monthly
+  archive, never into the live file**. #427 kept four CUDA wave records live; round 2 archived
+  the equivalents — that divergence *is* the collision. If wave records never enter the live
+  file, two Scribes cannot disagree about them.
+- **`decisions.md` size / dedup.** Re-measure against tip first. When two compactions race,
+  reconcile by property, keep every rule either side kept live, and dedupe the archive —
+  build it as `base + one clean appendix`, never by concatenating two rewritten tails.
+- **Inbox.** Still tracked. Merge every `*.md` except `README.md`; dedupe against **both** the
+  live file and the archive — another team's Scribe may have merged the same drop on another
+  machine (this round #427 merged `kuato-cuda-parity-4.md` live while I archived it; I had to
+  match prose because drops carry no team/machine attribution). Add attribution to drops.
+- **Histories.** Sweep all `.squad/agents/*/history.md` against the chronicle gate (>8 dated
+  entries, or oldest live entry predating the previous wave measured against that file's newest
+  entry — never against today). deckard/roy re-accumulate fastest.
+- **Do not archive agent directories.** Fail-closed; with three teams active elsewhere,
+  absence of local commits/drops/history proves nothing.
 
 **PR #390 / issue #183 follow-up (Stevens; reviewed by Edgemar; merged `0e62150e`).** `parse_tool_calls` recognizes Qwen/Hermes `<tool_call>` objects, Llama 3 `<|python_tag|>` objects, and Mistral `[TOOL_CALLS]` arrays. A serde `StreamDeserializer::byte_offset()` prefix scanner consumes consecutive complete top-level Llama JSON values (including semicolons inside strings) without naive splitting and terminates safely on malformed input or model terminators. One converter prefers `arguments`, falls back to `parameters`, and assigns sequential IDs. Edgemar independently ran eight parser tests and clean clippy; the roughly 49 local `tests.rs` failures are pre-existing missing-weights-fixture failures.
 

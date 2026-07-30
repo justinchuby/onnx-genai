@@ -381,6 +381,7 @@ async fn run_chat_completion(
         handle.chat_template.as_deref(),
         client_session_id.is_some(),
         placeholder.as_deref(),
+        handle.generation_defaults.as_ref(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -539,6 +540,7 @@ async fn stream_chat_completion(
         handle.chat_template.as_deref(),
         client_session_id.is_some(),
         placeholder.as_deref(),
+        handle.generation_defaults.as_ref(),
     )
     .map_err(|err| ApiError::internal(format!("prompt tokenization failed: {err}")))?;
     if !input_audio.is_empty() {
@@ -657,10 +659,7 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     } else {
-                        send_stream_chunk(&tx, tool_calls_chunk(&id, created, &model, tool_calls))
-                            .await?;
-                        send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
-                            .await?;
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if buffer_for_tool_detection {
                     if !matches!(result.finish_reason, FinishReason::StopSequence { .. }) {
@@ -686,10 +685,7 @@ async fn stream_chat_completion(
                         )
                         .await?;
                     } else {
-                        send_stream_chunk(&tx, tool_calls_chunk(&id, created, &model, tool_calls))
-                            .await?;
-                        send_stream_chunk(&tx, done_chunk(&id, created, &model, "tool_calls"))
-                            .await?;
+                        send_tool_call_deltas(&tx, (&id, created, &model), tool_calls).await?;
                     }
                 } else if wants_constrained_json {
                     if !result.text.is_empty() {
@@ -1112,6 +1108,12 @@ pub(crate) fn prepare_completion(
 ) -> Result<PreparedCompletion, ApiError> {
     let mut options = build_completion_options(request, &handle.tokenizer);
     options.max_context = handle.model_max_context;
+    // Honor the model's declared sampling regime (e.g. a reasoning model that
+    // ships do_sample=true); explicit request fields still win.
+    options.resolve_sampling_defaults(
+        handle.generation_defaults.as_ref(),
+        &completion_sampling_overrides(request),
+    );
     if let Some(suffix) = request.suffix.as_ref() {
         let fim_config = handle
             .fim_config
@@ -1205,6 +1207,34 @@ fn build_completion_options(request: &CompletionRequest, tokenizer: &Tokenizer) 
     options
 }
 
+/// The caller's *explicit* sampling selections for a text completion, feeding
+/// [`GenerateOptions::resolve_sampling_defaults`].
+///
+/// Completions historically decoded greedily by default. `temperature: 0`
+/// keeps that as an explicit greedy request; `min_p > 0` (the only stochastic
+/// knob the completions schema exposes) is an explicit request to sample.
+/// Otherwise the greedy decision is deferred (`None`) so a model that declares
+/// `do_sample: true` samples instead of looping under forced greedy.
+///
+/// `temperature` and `top_p` are passed as explicit values because the
+/// OpenAI-compatible schema always supplies them (with documented defaults) and
+/// has no "unspecified" state, so the API defaults win over any model-declared
+/// temperature/top_p; only the greedy decision defers to the model.
+fn completion_sampling_overrides(request: &CompletionRequest) -> SamplingOverrides {
+    let greedy = if request.temperature == 0.0 {
+        Some(true)
+    } else if request.min_p > 0.0 {
+        Some(false)
+    } else {
+        None
+    };
+    SamplingOverrides {
+        greedy,
+        temperature: Some(request.temperature),
+        top_p: Some(request.top_p),
+        top_k: None,
+    }
+}
 /// The text spelling of this model's image placeholder, if it declares one.
 ///
 /// Decoded from the declared token id rather than hardcoded, so the prompt
@@ -1246,6 +1276,7 @@ fn prepare_generate_request(
     chat_template: Option<&ChatTemplate>,
     session: bool,
     image_placeholder: Option<&str>,
+    generation_defaults: Option<&GenerationDefaults>,
 ) -> anyhow::Result<PreparedGenerateRequest> {
     let prompt = if session && !request.has_tool_context() {
         build_session_prompt(&request.messages, image_placeholder)
@@ -1256,10 +1287,14 @@ fn prepare_generate_request(
         .encode(&prompt)
         .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
     let prompt_tokens = token_ids.len();
+    let mut options = build_generate_options_with_tokenizer(request, tokenizer);
+    // Honor the model's declared sampling regime (e.g. a reasoning model that
+    // ships do_sample=true); explicit request fields still win.
+    options.resolve_sampling_defaults(generation_defaults, &chat_sampling_overrides(request));
     Ok(PreparedGenerateRequest {
         request: GenerateRequest {
             prompt: GeneratePrompt::TokenIds(token_ids),
-            options: build_generate_options_with_tokenizer(request, tokenizer),
+            options,
         },
         prompt_tokens,
     })
@@ -1327,6 +1362,43 @@ fn build_generate_options(request: &ChatCompletionRequest) -> GenerateOptions {
         options.constraint = Some(constraint);
     }
     options
+}
+
+/// The caller's *explicit* sampling selections for a chat completion, feeding
+/// [`GenerateOptions::resolve_sampling_defaults`].
+///
+/// Mirrors [`build_generate_options`]'s greedy heuristic as the *explicit* half
+/// of the precedence contract: `temperature: 0` forces greedy, any exposed
+/// stochastic control (seed, top_k, min_p, top_a, typical_p, mirostat, xtc) is
+/// an explicit request to sample, and a request that carries none of these
+/// defers the greedy decision (`None`) to the model's declared `do_sample`.
+///
+/// `temperature`/`top_p`/`top_k` are passed as explicit values: the
+/// OpenAI-compatible schema always supplies them with documented defaults and
+/// cannot express "unspecified", so the API defaults win over any model-declared
+/// temperature/top_p/top_k, and only the greedy (do_sample) decision defers to
+/// the model.
+fn chat_sampling_overrides(request: &ChatCompletionRequest) -> SamplingOverrides {
+    let requests_sampling = request.seed.is_some()
+        || request.top_k > 0
+        || request.min_p > 0.0
+        || request.top_a > 0.0
+        || request.typical_p < 1.0
+        || request.mirostat > 0
+        || request.xtc_probability > 0.0;
+    let greedy = if request.temperature == 0.0 {
+        Some(true)
+    } else if requests_sampling {
+        Some(false)
+    } else {
+        None
+    };
+    SamplingOverrides {
+        greedy,
+        temperature: Some(request.temperature),
+        top_p: Some(request.top_p),
+        top_k: Some(request.top_k),
+    }
 }
 
 fn response_format_constraint(request: &ChatCompletionRequest) -> Option<GenerateConstraint> {
@@ -1891,10 +1963,111 @@ fn finish_reason_label(reason: &FinishReason) -> &'static str {
     }
 }
 
+async fn send_tool_call_deltas(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    response: (&str, u64, &str),
+    tool_calls: Vec<ChatMessageToolCall>,
+) -> anyhow::Result<()> {
+    let (id, created, model) = response;
+    for chunk in tool_call_delta_chunks(id, created, model, tool_calls) {
+        send_stream_chunk(tx, chunk).await?;
+    }
+    send_stream_chunk(tx, done_chunk(id, created, model, "tool_calls")).await
+}
+
 fn completion_id() -> String {
     format!("chatcmpl-{}", now_unix())
 }
 
 fn text_completion_id() -> String {
     format!("cmpl-{}", now_unix())
+}
+
+#[cfg(test)]
+mod sampling_resolution_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn declared(do_sample: Option<bool>, temperature: Option<f32>) -> GenerationDefaults {
+        GenerationDefaults {
+            do_sample,
+            temperature,
+            top_k: None,
+            top_p: None,
+            repetition_penalty: None,
+            num_beams: None,
+            num_return_sequences: None,
+            min_length: None,
+            max_length: None,
+            length_penalty: None,
+            no_repeat_ngram_size: None,
+            diversity_penalty: None,
+            early_stopping: None,
+        }
+    }
+
+    fn chat_request(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut body = json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}] });
+        let object = body.as_object_mut().unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    // A silent chat request against a model that declares do_sample=true now
+    // samples instead of being forced greedy — the server inherits the fix.
+    #[test]
+    fn silent_chat_request_honors_model_do_sample() {
+        let request = chat_request(json!({}));
+        let mut options = build_generate_options(&request);
+        assert!(options.greedy, "the base chat default is greedy");
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&request),
+        );
+        assert!(!options.greedy, "model do_sample=true must disable greedy");
+        // The OpenAI-compatible temperature default wins over the model's
+        // declared temperature (the schema always supplies a value).
+        assert_eq!(options.temperature, 1.0);
+    }
+
+    // An explicit sampling control keeps its meaning against a greedy model, and
+    // temperature 0 still forces greedy regardless of the model.
+    #[test]
+    fn explicit_chat_controls_win_over_model() {
+        let seeded = chat_request(json!({ "seed": 7 }));
+        let mut options = build_generate_options(&seeded);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(false), None)),
+            &chat_sampling_overrides(&seeded),
+        );
+        assert!(!options.greedy, "an explicit seed requests sampling");
+
+        let cold = chat_request(json!({ "temperature": 0.0 }));
+        let mut options = build_generate_options(&cold);
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &chat_sampling_overrides(&cold),
+        );
+        assert!(options.greedy, "temperature 0 forces greedy over the model");
+    }
+
+    // A silent completion request likewise adopts the model's declared regime.
+    #[test]
+    fn silent_completion_request_honors_model_do_sample() {
+        let request: CompletionRequest =
+            serde_json::from_value(json!({ "model": "m", "prompt": "hi" })).unwrap();
+        let mut options = GenerateOptions {
+            temperature: request.temperature,
+            top_p: request.top_p,
+            ..GenerateOptions::default()
+        };
+        assert!(options.greedy, "completions default to greedy");
+        options.resolve_sampling_defaults(
+            Some(&declared(Some(true), Some(0.6))),
+            &completion_sampling_overrides(&request),
+        );
+        assert!(!options.greedy, "model do_sample=true must disable greedy");
+    }
 }

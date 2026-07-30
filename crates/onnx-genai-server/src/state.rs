@@ -194,6 +194,7 @@ impl AppState {
             id: model_id,
             path: model_dir.to_path_buf(),
             eager: true,
+            warmup: false,
         };
         let registry = ModelRegistry::from_specs(std::slice::from_ref(&spec), config.clone())?;
         Ok(Self {
@@ -263,6 +264,7 @@ impl AppState {
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
             model_max_context,
+            generation_defaults: None,
             fim_config,
             pipeline: false,
             multimodal: None,
@@ -367,6 +369,10 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
     let engine = Engine::from_dir(model_dir, config.engine_config.clone())?;
     let fim_config = engine.fim_config().cloned();
+    // Capture the model author's declared generation defaults before the engine
+    // is moved into the driver, so every request built for this handle can honor
+    // a model that ships `do_sample: true` instead of forcing greedy.
+    let generation_defaults = engine.metadata().generation.clone();
     let engine_driver = EngineDriver::start(engine, DEFAULT_MAX_BATCH, config.max_queue_depth);
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
@@ -375,6 +381,7 @@ pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::R
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,
+        generation_defaults,
         fim_config,
         pipeline: false,
         multimodal: None,
@@ -412,6 +419,10 @@ fn build_pipeline_handle(
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,
+        // A pipeline's sampling is governed by its plan, not a single decoder's
+        // declared `search` block, so it carries no model-level defaults (this
+        // mirrors the CLI, whose `Backend::Pipeline` reports `None`).
+        generation_defaults: None,
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),

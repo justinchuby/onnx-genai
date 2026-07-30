@@ -213,20 +213,59 @@ fn download_prebuilt(target_dir: &Path) {
 
     eprintln!("Downloading ONNX Runtime {ORT_VERSION} from {url}");
 
-    // Use curl for download (available on all CI platforms)
+    // Use curl for download (available on all CI platforms). curl exits 0 on an
+    // HTTP 404 unless told otherwise, so capture the HTTP status via -w and
+    // check it explicitly. Without this a 404 "Not Found" body is saved as the
+    // "archive" and only surfaces later as an opaque tar/zip "unrecognized
+    // format" failure that names neither the URL nor the status (RULES.md #1).
     let download_path = target_dir.parent().unwrap().join(&filename);
-    let status = std::process::Command::new("curl")
-        .args(["-L", "-o"])
+    let output = std::process::Command::new("curl")
+        .args([
+            "-sSL",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "2",
+            "-w",
+            "%{http_code}",
+            "-o",
+        ])
         .arg(&download_path)
         .arg(&url)
-        .status()
+        .output()
         .expect("Failed to run curl. Install curl or set ORT_ROOT manually.");
 
-    if !status.success() {
-        panic!("Failed to download ORT from {url}");
+    let http_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if !output.status.success() {
+        panic!(
+            "curl failed to download ONNX Runtime from {url} \
+             (curl exit {:?}, HTTP status {http_code}). stderr: {}. \
+             Set ORT_ROOT to a local ONNX Runtime {ORT_VERSION} install to skip the download.",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+
+    if http_code != "200" {
+        panic!(
+            "Failed to download ONNX Runtime prebuilt binary: {url} returned HTTP {http_code} \
+             (expected 200). {}. This usually means upstream does not publish a '{filename}' \
+             asset for ORT {ORT_VERSION} on this platform ({os}). Check \
+             https://github.com/microsoft/onnxruntime/releases/tag/v{ORT_VERSION} for the \
+             available assets, then pin a version that ships this platform, drop the platform \
+             from the build matrix, or set ORT_ROOT to a local install.",
+            describe_download(&download_path),
+        );
     }
 
     verify_archive_checksum(&download_path, &filename);
+
+    // Guard against a non-archive body (e.g. an HTML/text error page or a
+    // redirect returned with HTTP 200) reaching tar/zip as an "unrecognized
+    // format". This turns a cryptic extractor error into an actionable one that
+    // names the URL, byte size, and first bytes actually downloaded.
+    verify_archive_magic(&download_path, &url, ext);
 
     // Extract
     let parent_dir = target_dir.parent().unwrap();
@@ -241,7 +280,14 @@ fn download_prebuilt(target_dir: &Path) {
             .status()
             .expect("Failed to run tar");
         if !status.success() {
-            panic!("Failed to extract ORT archive");
+            panic!(
+                "Failed to extract ONNX Runtime archive {} downloaded from {url}. {}. tar \
+                 rejected the file, so it is most likely not a valid gzip tarball (a redirect, \
+                 an HTML/text error page, or a truncated download). Delete it and re-run, or set \
+                 ORT_ROOT to a local ONNX Runtime {ORT_VERSION} install.",
+                download_path.display(),
+                describe_download(&download_path),
+            );
         }
         // Rename extracted directory
         let extracted = parent_dir.join(format!("onnxruntime-{os}-{ORT_VERSION}"));
@@ -269,6 +315,55 @@ fn download_prebuilt(target_dir: &Path) {
 
     // Cleanup
     let _ = std::fs::remove_file(&download_path);
+}
+
+/// Read up to `max` leading bytes of `path`, returning what was read (possibly
+/// fewer bytes, or empty if the file cannot be opened).
+fn read_first_bytes(path: &Path, max: usize) -> Vec<u8> {
+    let mut buf = vec![0_u8; max];
+    match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
+        Ok(n) => {
+            buf.truncate(n);
+            buf
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Human-readable description of a just-downloaded file: its size and a lossy
+/// preview of its first bytes. Used to make download/extract failures name what
+/// actually came back (a 404 body, an HTML error page, a truncated file).
+fn describe_download(path: &Path) -> String {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let head = read_first_bytes(path, 64);
+    let preview = String::from_utf8_lossy(&head);
+    format!(
+        "Saved file is {size} bytes; first bytes: {:?}",
+        preview.trim()
+    )
+}
+
+/// Fail fast if the downloaded file does not start with the magic bytes of the
+/// expected archive format, before handing it to tar/zip. Catches error pages
+/// or redirects that were served with HTTP 200.
+fn verify_archive_magic(path: &Path, url: &str, ext: &str) {
+    let head = read_first_bytes(path, 8);
+    let looks_valid = match ext {
+        // gzip member header.
+        "tgz" => head.starts_with(&[0x1f, 0x8b]),
+        // zip local-file-header signature.
+        "zip" => head.starts_with(b"PK"),
+        _ => true,
+    };
+    if !looks_valid {
+        panic!(
+            "Downloaded file from {url} is not a valid {ext} archive. {}. The download most \
+             likely returned an error page or a redirect instead of the ONNX Runtime binary. \
+             Confirm the asset exists at https://github.com/microsoft/onnxruntime/releases and \
+             re-run, or set ORT_ROOT to a local ONNX Runtime {ORT_VERSION} install.",
+            describe_download(path),
+        );
+    }
 }
 
 /// Extract a `.zip` archive into `dest_dir` using the pure-Rust `zip` crate.

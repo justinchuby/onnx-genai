@@ -127,6 +127,42 @@ fn from_value(component: &str, value: &Value) -> Result<ComponentTensor, Compone
     ComponentTensor::from_raw(dtype, value.shape().to_vec(), bytes)
 }
 
+/// Shared `ComponentSession::run` body over a borrowed ORT [`Session`].
+///
+/// Both the owning [`OrtComponentSession`] and the borrowing
+/// [`OrtComponentSessionRef`] translate the neutral [`ComponentTensor`] boundary
+/// through this single implementation, so the two adapters cannot drift.
+fn run_ort_component(
+    session: &Session,
+    outputs_meta: &[ComponentIo],
+    inputs: &[(&str, &ComponentTensor)],
+) -> Result<Vec<(String, ComponentTensor)>, ComponentError> {
+    // The component name is only available for diagnostics via the first
+    // declared output; fall back to a stable label otherwise.
+    let component = outputs_meta
+        .first()
+        .map(|io| io.name.as_str())
+        .unwrap_or("<ort-component>");
+    let values: Vec<(&str, Value)> = inputs
+        .iter()
+        .map(|(name, tensor)| Ok((*name, to_value(component, tensor)?)))
+        .collect::<Result<_, ComponentError>>()?;
+    let borrowed: Vec<(&str, &Value)> = values.iter().map(|(name, value)| (*name, value)).collect();
+    let outputs = session
+        .run(&borrowed)
+        .map_err(|err: OrtError| ComponentError::Backend {
+            component: component.to_string(),
+            backend: BACKEND,
+            detail: err.to_string(),
+        })?;
+    session
+        .output_names()
+        .iter()
+        .zip(outputs.iter())
+        .map(|(name, value)| Ok((name.clone(), from_value(component, value)?)))
+        .collect()
+}
+
 impl ComponentSession for OrtComponentSession {
     fn inputs(&self) -> &[ComponentIo] {
         &self.inputs
@@ -140,33 +176,50 @@ impl ComponentSession for OrtComponentSession {
         &mut self,
         inputs: &[(&str, &ComponentTensor)],
     ) -> Result<Vec<(String, ComponentTensor)>, ComponentError> {
-        // The component name is only available for diagnostics via the first
-        // declared output/input; fall back to a stable label otherwise.
-        let component = self
-            .outputs
-            .first()
-            .map(|io| io.name.as_str())
-            .unwrap_or("<ort-component>");
-        let values: Vec<(&str, Value)> = inputs
-            .iter()
-            .map(|(name, tensor)| Ok((*name, to_value(component, tensor)?)))
-            .collect::<Result<_, ComponentError>>()?;
-        let borrowed: Vec<(&str, &Value)> =
-            values.iter().map(|(name, value)| (*name, value)).collect();
-        let outputs =
-            self.session
-                .run(&borrowed)
-                .map_err(|err: OrtError| ComponentError::Backend {
-                    component: component.to_string(),
-                    backend: BACKEND,
-                    detail: err.to_string(),
-                })?;
-        self.session
-            .output_names()
-            .iter()
-            .zip(outputs.iter())
-            .map(|(name, value)| Ok((name.clone(), from_value(component, value)?)))
-            .collect()
+        run_ort_component(&self.session, &self.outputs, inputs)
+    }
+}
+
+/// A pipeline component backed by a **borrowed** ONNX Runtime [`Session`].
+///
+/// Behaviour-identical to [`OrtComponentSession`], but borrows a session owned
+/// elsewhere (the pipeline model store keeps its sessions loaded and shared) so
+/// the backend-neutral decode loop can drive an already-loaded ORT component
+/// through the same [`ComponentSession`] seam it uses for native components,
+/// without moving the session out of the store or reloading it per request.
+pub struct OrtComponentSessionRef<'a> {
+    session: &'a Session,
+    inputs: Vec<ComponentIo>,
+    outputs: Vec<ComponentIo>,
+}
+
+impl<'a> OrtComponentSessionRef<'a> {
+    /// Wrap a borrowed ORT [`Session`] as a backend-neutral component.
+    pub fn new(session: &'a Session) -> Self {
+        let inputs = session.inputs().iter().map(component_io).collect();
+        let outputs = session.outputs().iter().map(component_io).collect();
+        Self {
+            session,
+            inputs,
+            outputs,
+        }
+    }
+}
+
+impl ComponentSession for OrtComponentSessionRef<'_> {
+    fn inputs(&self) -> &[ComponentIo] {
+        &self.inputs
+    }
+
+    fn outputs(&self) -> &[ComponentIo] {
+        &self.outputs
+    }
+
+    fn run(
+        &mut self,
+        inputs: &[(&str, &ComponentTensor)],
+    ) -> Result<Vec<(String, ComponentTensor)>, ComponentError> {
+        run_ort_component(self.session, &self.outputs, inputs)
     }
 }
 
@@ -257,5 +310,53 @@ mod tests {
         assert_eq!(tensor.dtype(), ComponentDataType::Float32);
         assert_eq!(tensor.shape(), reference[0].shape());
         assert_eq!(tensor.as_bytes(), reference_bytes.as_slice());
+    }
+
+    #[test]
+    fn borrowing_ref_adapter_matches_owning_adapter() {
+        let path = tiny_whisper_encoder_textproto();
+        if !path.exists() {
+            eprintln!("borrowing_ref_adapter_matches_owning_adapter: fixture absent, skipping");
+            return;
+        }
+        let session = Session::new(
+            test_environment(),
+            &path,
+            SessionOptions::default().with_intra_op_threads(1),
+        )
+        .expect("session");
+
+        let input_bytes: Vec<u8> = vec![0.25f32; 80 * 8]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let input =
+            ComponentTensor::from_raw(ComponentDataType::Float32, vec![1, 80, 8], input_bytes)
+                .expect("component input");
+
+        // The borrowing adapter drives a session owned elsewhere; it must expose
+        // the same metadata and produce the same bytes as the owning adapter.
+        let mut borrowed = OrtComponentSessionRef::new(&session);
+        assert_eq!(borrowed.input_names(), vec!["input_features"]);
+        assert_eq!(borrowed.output_names(), vec!["encoder_hidden_states"]);
+        let borrowed_outputs = borrowed
+            .run(&[("input_features", &input)])
+            .expect("borrowed run");
+
+        let reference = session
+            .run(&[(
+                "input_features",
+                &Value::from_slice_f32(&vec![0.25f32; 80 * 8], &[1, 80, 8]).expect("input"),
+            )])
+            .expect("reference run");
+
+        assert_eq!(borrowed_outputs.len(), 1);
+        assert_eq!(
+            borrowed_outputs[0].1.as_bytes(),
+            reference[0]
+                .to_raw_bytes()
+                .expect("reference bytes")
+                .as_slice()
+        );
     }
 }

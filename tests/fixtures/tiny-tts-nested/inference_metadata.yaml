@@ -10,9 +10,29 @@ pipeline:
       filename: talker.onnx.textproto
       type: decoder
       tokenizer: tokenizer.json
+      io:
+        token_input: decoder_input_ids
+        position_ids_input: position_ids
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
     code_predictor:
       filename: code_predictor.onnx.textproto
       type: decoder
+      io:
+        sequence_source: inputs_embeds
+        inputs_embeds_input: inputs_embeds
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
     vocoder:
       filename: vocoder.onnx.textproto
       type: vocoder
@@ -35,6 +55,7 @@ pipeline:
           kind: nested_autoregressive
           outer: talker
           inner: code_predictor
+          inner_embedding_output: code_embeds
           num_code_groups: 4
           max_tokens: 3
         run_on: every_step

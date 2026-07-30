@@ -4,9 +4,13 @@
 //! matrices. Keep their placement checks in sync with those runtime limits so a
 //! node is never claimed only to fail while constructing or executing a kernel.
 
-use onnx_runtime_ir::{Attribute, DataType, Node};
+use onnx_runtime_ir::{Attribute, DataType, Node, Shape};
 
-pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Option<String> {
+pub(crate) fn unsupported_reason(
+    node: &Node,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Option<String> {
     let result = match node.op_type.as_str() {
         "RMSNormalization" => rms_normalization(node, input_dtypes),
         "RotaryEmbedding" => rotary_embedding(node, input_dtypes),
@@ -27,7 +31,7 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "SpaceToDepth" => space_to_depth(node, input_dtypes),
         "EyeLike" => eye_like(node, input_dtypes),
         "ReduceProd" | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum"
-        | "ReduceLogSumExp" => reduce_f32_only(node, input_dtypes),
+        | "ReduceLogSumExp" => reduce_float(node, input_dtypes),
         "Swish" | "ThresholdedRelu" => float_activation(node, input_dtypes),
         "Sum" | "Mean" => variadic_float(node, input_dtypes),
         "Mod" => mod_op(node, input_dtypes),
@@ -35,11 +39,286 @@ pub(crate) fn unsupported_reason(node: &Node, input_dtypes: &[DataType]) -> Opti
         "DequantizeLinear" => dequantize_linear(node, input_dtypes),
         "Dropout" => dropout(node, input_dtypes),
         "NonZero" => nonzero(node, input_dtypes),
+        "AffineGrid" => affine_grid(node, input_dtypes),
+        "BatchNormalization" => batch_normalization(node, input_dtypes),
+        "Compress" => compress(node, input_dtypes),
+        "DynamicQuantizeLinear" => dynamic_quantize_linear(node, input_dtypes),
+        "GlobalAveragePool" | "GlobalMaxPool" => global_pool(node, input_dtypes),
+        "GlobalLpPool" => global_lp_pool(node, input_dtypes),
+        "LpNormalization" => lp_normalization(node, input_dtypes),
+        "InstanceNormalization" | "GroupNormalization" => normalization(node, input_dtypes),
+        "LpPool" => lp_pool(node, input_dtypes),
+        "CenterCropPad" => center_crop_pad(node, input_dtypes),
+        "Col2Im" => col2im(node, input_dtypes),
+        "QLinearMatMul" => qlinear_matmul(node, input_dtypes),
+        "Resize" => resize(node, input_dtypes),
+        "ConvTranspose" => conv_transpose(node, input_shapes, input_dtypes),
+        "GridSample" => grid_sample(node, input_shapes, input_dtypes),
         _ => return None,
     };
     result
         .err()
         .map(|reason| format!("{}: {reason}", node.op_type))
+}
+
+const CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
+fn affine_grid(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "theta")?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "size")?;
+    bool_attribute(node, "align_corners")
+}
+
+fn batch_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 5, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    for (index, name) in [(1, "scale"), (2, "B"), (3, "input_mean"), (4, "input_var")] {
+        if input_dtypes[index] != input_dtypes[0] {
+            return Err(format!(
+                "input {index} ('{name}') dtype {:?} must match X dtype {:?}",
+                input_dtypes[index], input_dtypes[0]
+            ));
+        }
+    }
+    match node.attr("training_mode") {
+        None => Ok(()),
+        Some(attribute) if attribute.as_int() == Some(0) => Ok(()),
+        Some(_) => Err("attribute 'training_mode' must be 0".into()),
+    }
+}
+
+fn compress(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_fixed_width(input_dtypes, 0, "input")?;
+    require_dtype(input_dtypes, 1, DataType::Bool, "condition")
+}
+
+fn dynamic_quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 3, 3)?;
+    require_dtype(input_dtypes, 0, DataType::Float32, "X")
+}
+
+fn global_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+}
+
+fn global_lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    global_pool(node, input_dtypes)?;
+    match node.attr("p") {
+        None => Ok(()),
+        Some(attribute) if matches!(attribute.as_int(), Some(value) if value > 0 && value <= i32::MAX as i64) => {
+            Ok(())
+        }
+        Some(_) => Err("attribute 'p' must be a positive 32-bit integer".into()),
+    }
+}
+
+fn lp_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    global_pool(node, input_dtypes)?;
+    match node.attr("p") {
+        None => Ok(()),
+        Some(attribute) if matches!(attribute.as_int(), Some(1 | 2)) => Ok(()),
+        Some(_) => Err("attribute 'p' must be 1 or 2".into()),
+    }
+}
+
+fn normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 3, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    if input_dtypes[1] != input_dtypes[0] || input_dtypes[2] != input_dtypes[0] {
+        return Err("scale and bias dtypes must match X".into());
+    }
+
+    Ok(())
+}
+
+fn lp_pool(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 1, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")
+}
+
+fn center_crop_pad(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_fixed_width(input_dtypes, 0, "input")?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "shape")
+}
+
+fn col2im(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 3, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "input")?;
+    require_dtype(input_dtypes, 1, DataType::Int64, "image_shape")?;
+    require_dtype(input_dtypes, 2, DataType::Int64, "block_shape")
+}
+
+fn qlinear_matmul(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    required_arity(node, input_dtypes, 8, 1, 1)?;
+    for (index, name) in [(0, "A"), (3, "B"), (7, "y_zero_point")] {
+        require_one_of(
+            input_dtypes,
+            index,
+            &[DataType::Int8, DataType::Uint8],
+            name,
+        )?;
+    }
+
+    for (index, name) in [(1, "a_scale"), (4, "b_scale"), (6, "y_scale")] {
+        require_dtype(input_dtypes, index, DataType::Float32, name)?;
+    }
+    if input_dtypes[2] != input_dtypes[0] {
+        return Err("a_zero_point dtype must match A".into());
+    }
+    if input_dtypes[5] != input_dtypes[3] {
+        return Err("b_zero_point dtype must match B".into());
+    }
+    Ok(())
+}
+
+fn conv_transpose(
+    node: &Node,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
+    if !(2..=3).contains(&node.inputs.len()) || node.outputs.len() != 1 {
+        return Err("requires X, W, optional B, and one output".into());
+    }
+    metadata_arity(node, input_dtypes)?;
+    if node.inputs.iter().any(Option::is_none) {
+        return Err("all declared inputs must be present".into());
+    }
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    if input_dtypes[1] != input_dtypes[0]
+        || input_dtypes
+            .get(2)
+            .is_some_and(|dtype| *dtype != input_dtypes[0])
+    {
+        return Err("W and optional B must match X dtype".into());
+    }
+    match node.attr("auto_pad").and_then(Attribute::as_str) {
+        None | Some("" | "NOTSET" | "VALID") => {}
+        Some(value) => return Err(format!("auto_pad {value:?} is deferred")),
+    }
+    if node.attr("output_shape").is_some() {
+        return Err("output_shape-driven padding is deferred".into());
+    }
+    require_input_rank(input_shapes, 0, &[3, 4], "X")?;
+    Ok(())
+}
+
+fn grid_sample(
+    node: &Node,
+    input_shapes: &[Shape],
+    input_dtypes: &[DataType],
+) -> Result<(), String> {
+    required_arity(node, input_dtypes, 2, 1, 1)?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    if input_dtypes[1] != input_dtypes[0] {
+        return Err("grid dtype must match X".into());
+    }
+    match node
+        .attr("mode")
+        .and_then(Attribute::as_str)
+        .unwrap_or("linear")
+    {
+        "linear" | "bilinear" | "nearest" => {}
+        value => return Err(format!("mode {value:?} is deferred")),
+    }
+    match node
+        .attr("padding_mode")
+        .and_then(Attribute::as_str)
+        .unwrap_or("zeros")
+    {
+        "zeros" | "border" | "reflection" => {}
+        value => return Err(format!("padding_mode {value:?} unsupported")),
+    }
+    match node.attr("align_corners").and_then(Attribute::as_int) {
+        None | Some(0 | 1) => {}
+        Some(_) => return Err("align_corners must be 0 or 1".into()),
+    }
+    require_input_rank(input_shapes, 0, &[4], "X")
+}
+
+fn require_input_rank(
+    input_shapes: &[Shape],
+    index: usize,
+    supported_ranks: &[usize],
+    name: &str,
+) -> Result<(), String> {
+    let rank = input_shapes
+        .get(index)
+        .ok_or_else(|| format!("missing shape metadata for input {index} ('{name}')"))?
+        .len();
+    if supported_ranks.contains(&rank) {
+        Ok(())
+    } else {
+        Err(format!(
+            "input {index} ('{name}') rank {rank} unsupported; expected one of {supported_ranks:?}"
+        ))
+    }
+}
+
+fn resize(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+    if node.outputs.len() != 1 || node.inputs.is_empty() || node.inputs.len() > 4 {
+        return Err("requires 1..=4 inputs and exactly 1 output".into());
+    }
+    metadata_arity(node, input_dtypes)?;
+    if node.inputs[0].is_none() {
+        return Err("requires present data input".into());
+    }
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
+    match node.attr("mode").and_then(Attribute::as_str) {
+        None | Some("nearest" | "linear") => {}
+        Some(value) => {
+            return Err(format!(
+                "mode {value:?} unsupported; expected nearest or linear"
+            ));
+        }
+    }
+    match node
+        .attr("coordinate_transformation_mode")
+        .and_then(Attribute::as_str)
+    {
+        None | Some("half_pixel" | "align_corners" | "asymmetric") => {}
+        Some(value) => {
+            return Err(format!(
+                "coordinate_transformation_mode {value:?} unsupported"
+            ));
+        }
+    }
+    match node.attr("nearest_mode").and_then(Attribute::as_str) {
+        None | Some("round_prefer_floor" | "round_prefer_ceil" | "floor" | "ceil") => {}
+        Some(value) => return Err(format!("nearest_mode {value:?} unsupported")),
+    }
+    match node.attr("antialias").and_then(Attribute::as_int) {
+        None | Some(0) => {}
+        Some(_) => return Err("antialias=1 unsupported".into()),
+    }
+    match node
+        .attr("keep_aspect_ratio_policy")
+        .and_then(Attribute::as_str)
+    {
+        None | Some("stretch") => {}
+        Some(value) => return Err(format!("keep_aspect_ratio_policy {value:?} unsupported")),
+    }
+    if node.inputs.len() == 2 {
+        if node.inputs[1].is_none() {
+            return Err("opset-10 form requires a present scales input".into());
+        }
+        return require_dtype(input_dtypes, 1, DataType::Float32, "scales");
+    }
+    let scales_present = node.inputs.get(2).is_some_and(Option::is_some);
+    let sizes_present = node.inputs.get(3).is_some_and(Option::is_some);
+    if !scales_present && !sizes_present {
+        return Err("requires a present scales or sizes input".into());
+    }
+    if scales_present {
+        require_dtype(input_dtypes, 2, DataType::Float32, "scales")?;
+    }
+    if sizes_present {
+        require_dtype(input_dtypes, 3, DataType::Int64, "sizes")?;
+    }
+    Ok(())
 }
 
 fn quantize_linear(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
@@ -186,12 +465,14 @@ fn rms_normalization(node: &Node, input_dtypes: &[DataType]) -> Result<(), Strin
     if input_dtypes[0] == DataType::Float32 && input_dtypes[1] != DataType::Float32 {
         return Err("f32 X requires f32 scale".into());
     }
+
     if input_dtypes[0] != DataType::Float32
         && input_dtypes[1] != DataType::Float32
         && input_dtypes[1] != input_dtypes[0]
     {
         return Err("f16/bf16 X requires matching storage dtype or f32 scale".into());
     }
+
     match node.attr("stash_type") {
         None => Ok(()),
         Some(attribute) if attribute.as_int() == Some(1) => Ok(()),
@@ -242,7 +523,7 @@ fn rotary_embedding(node: &Node, input_dtypes: &[DataType]) -> Result<(), String
 
 fn topk(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     required_arity(node, input_dtypes, 2, 2, 2)?;
-    require_dtype(input_dtypes, 0, DataType::Float32, "X")?;
+    require_one_of(input_dtypes, 0, CUDA_FLOAT_DTYPES, "X")?;
     require_dtype(input_dtypes, 1, DataType::Int64, "K")?;
     bool_attribute(node, "largest")?;
     bool_attribute(node, "sorted")
@@ -508,9 +789,9 @@ fn one_hot(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
 }
 
 /// `ReduceProd`/`ReduceSumSquare`/`ReduceL1`/`ReduceL2`/`ReduceLogSum`/
-/// `ReduceLogSumExp`: the NVRTC block-reduction path is f32-only, with an
-/// optional opset-18 int32/int64 `axes` input.
-fn reduce_f32_only(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
+/// `ReduceLogSumExp`: floating-point block reductions with f32 accumulation and
+/// an optional opset-18 int32/int64 `axes` input.
+fn reduce_float(node: &Node, input_dtypes: &[DataType]) -> Result<(), String> {
     if !(1..=2).contains(&node.inputs.len())
         || node.outputs.len() != 1
         || node.inputs.first().is_none_or(Option::is_none)
@@ -522,7 +803,12 @@ fn reduce_f32_only(node: &Node, input_dtypes: &[DataType]) -> Result<(), String>
         ));
     }
     metadata_arity(node, input_dtypes)?;
-    require_dtype(input_dtypes, 0, DataType::Float32, "data")?;
+    require_one_of(
+        input_dtypes,
+        0,
+        &[DataType::Float16, DataType::Float32, DataType::BFloat16],
+        "data",
+    )?;
     if node.inputs.get(1).is_some_and(Option::is_some) {
         require_one_of(input_dtypes, 1, &[DataType::Int32, DataType::Int64], "axes")?;
     }

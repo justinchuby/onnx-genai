@@ -42,6 +42,8 @@ pub mod concat;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod contrib_fused;
+pub mod dense_elementwise;
+pub mod dft;
 pub mod dropout;
 pub mod elementwise;
 pub mod expand;
@@ -73,6 +75,7 @@ pub mod movement_ops;
 pub mod msft_attention;
 pub mod multi_head_attention;
 pub mod onehot;
+pub mod packed_varlen_attention;
 pub mod pad;
 pub mod qlinear_matmul;
 pub mod qmoe;
@@ -418,6 +421,10 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     reg.register(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
         Box::new(varlen_attention::VarlenAttentionFactory),
+    );
+    reg.register(
+        OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
+        Box::new(packed_varlen_attention::PackedVarlenAttentionFactory),
     );
     reg.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
@@ -947,6 +954,7 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
         OpKey::new("BlackmanWindow", "", 17),
         Box::new(window::BlackmanWindowFactory),
     );
+    reg.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
     reg.register(
         OpKey::new("BitwiseAnd", "", 18),
         Box::new(bitwise::BitwiseAndFactory),
@@ -1673,7 +1681,7 @@ mod tests {
         // BitwiseAnd,
         // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
-        // VarlenAttention,
+        // VarlenAttention, PackedVarlenAttention,
         // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
         // private/contrib registrations.
         // CumProd and the three standard window generators add four more
@@ -1693,7 +1701,7 @@ mod tests {
         // `mlas` and the optimized implementation with it.
         // `IsNaN` (opset-9 float NaN predicate) adds one default-domain entry.
         let mlas_registrations = if cfg!(feature = "mlas") { 6 } else { 0 };
-        assert_eq!(reg.len(), PHASE1_OPS.len() + 98 + mlas_registrations);
+        assert_eq!(reg.len(), PHASE1_OPS.len() + 100 + mlas_registrations);
         for op in PHASE1_OPS {
             assert!(reg.lookup(op, "", 21).is_some(), "missing factory for {op}");
         }
@@ -1709,6 +1717,7 @@ mod tests {
         assert!(reg.lookup("HannWindow", "", 17).is_some());
         assert!(reg.lookup("HammingWindow", "", 17).is_some());
         assert!(reg.lookup("BlackmanWindow", "", 17).is_some());
+        assert!(reg.lookup("DFT", "", 17).is_some());
         assert!(reg.lookup("Conv", "", 22).is_some());
         assert!(reg.lookup("LpPool", "", 18).is_some());
         assert!(reg.lookup("GlobalLpPool", "", 2).is_some());
@@ -1730,6 +1739,7 @@ mod tests {
         assert!(reg.lookup("BlockQuantizedMoE", "pkg.nxrt", 1).is_some());
         assert!(reg.lookup("IndexShare", "pkg.nxrt", 1).is_some());
         assert!(reg.lookup("VarlenAttention", "pkg.nxrt", 1).is_some());
+        assert!(reg.lookup("PackedVarlenAttention", "pkg.nxrt", 1).is_some());
         assert!(reg.lookup("SparseKvGather", "pkg.nxrt", 1).is_some());
         assert!(
             reg.lookup("CompressedSparseAttention", "pkg.nxrt", 1)

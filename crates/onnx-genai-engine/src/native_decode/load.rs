@@ -330,6 +330,10 @@ impl NativeDecodeSession {
                 state_pairs.push((pair.output.clone(), pair.input.clone()));
             }
         }
+        let fixed_state_inputs = state_pairs
+            .iter()
+            .map(|(_, input)| input.clone())
+            .collect::<HashSet<_>>();
 
         if kv_inputs.is_empty() || present_outputs.is_empty() {
             bail!(
@@ -424,7 +428,11 @@ impl NativeDecodeSession {
             let attention_mask = attention_mask
                 .as_deref()
                 .context("native CUDA target decode requires a declared attention-mask input")?;
-            let bytes_per_token = DecodeCudaState::kv_bytes_per_token(&session, &present_to_past)?;
+            let bytes_per_token = DecodeCudaState::kv_bytes_per_token(
+                &session,
+                &present_to_past,
+                &fixed_state_inputs,
+            )?;
             let device_memory = cuda_device_memory_snapshot(session.device_id().index as i32).ok();
             let max_len = match cuda_options.kv_max_len {
                 Some(0) => bail!("CUDA KV max length must be greater than zero"),
@@ -444,6 +452,14 @@ impl NativeDecodeSession {
                 device_memory,
             )?;
             let runtime_config = onnx_genai_runtime_config::runtime_config();
+            // Live weight offload is a CUDA-EP feature and is mutually exclusive
+            // with graph capture; when the CUDA EP isn't compiled in there is no
+            // pager, so offload is unconditionally off here.
+            #[cfg(feature = "cuda")]
+            let weight_offload_enabled =
+                onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled;
+            #[cfg(not(feature = "cuda"))]
+            let weight_offload_enabled = false;
             let graph_enabled = resolve_graph_capture_enabled(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,
@@ -452,6 +468,7 @@ impl NativeDecodeSession {
                     device_is_cuda: true,
                     kv_ownership,
                 },
+                weight_offload_enabled,
             );
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
             span.set_arg("max_len", capacity.max_len as u64);
@@ -466,6 +483,7 @@ impl NativeDecodeSession {
                     logits: &logits,
                 },
                 &present_to_past,
+                &fixed_state_inputs,
                 capacity,
                 graph_enabled,
             )?)

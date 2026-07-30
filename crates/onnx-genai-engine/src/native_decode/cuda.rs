@@ -28,7 +28,11 @@ impl GraphCaptureStructuralSafety {
 /// auto-decision.
 ///
 /// Precedence:
-/// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) always wins.
+/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) always wins and forces
+///    capture OFF. The pager's alloc/copy/free ops are capture-illegal, so the
+///    two features are mutually exclusive; offload wins and capture is skipped
+///    with a one-time notice.
+/// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) wins next.
 /// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
 ///    forces ON) is honored next.
 /// 3. When neither is set, auto-decide from `structural` safety: attempt capture
@@ -38,7 +42,12 @@ pub(crate) fn resolve_graph_capture_enabled(
     env_explicit: bool,
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
+    weight_offload_enabled: bool,
 ) -> bool {
+    if weight_offload_enabled {
+        log_weight_offload_capture_exclusion();
+        return false;
+    }
     if let Some(explicit) = programmatic {
         return explicit;
     }
@@ -46,6 +55,15 @@ pub(crate) fn resolve_graph_capture_enabled(
         return env_value;
     }
     structural.is_capture_safe()
+}
+
+/// Emit the offload/capture mutual-exclusion notice at most once per process, so
+/// operators who enable both learn capture was declined without log spam.
+fn log_weight_offload_capture_exclusion() {
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    NOTICE.call_once(|| {
+        tracing::warn!("weight offload is incompatible with CUDA graph capture; capture disabled");
+    });
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -466,9 +484,13 @@ impl DecodeCudaState {
     pub(crate) fn kv_bytes_per_token(
         session: &InferenceSession,
         present_to_past: &HashMap<String, String>,
+        fixed_state_inputs: &HashSet<String>,
     ) -> anyhow::Result<usize> {
         let mut bytes = std::mem::size_of::<i64>();
         for past in present_to_past.values() {
+            if fixed_state_inputs.contains(past) {
+                continue;
+            }
             let meta = session
                 .inputs()
                 .iter()
@@ -520,6 +542,62 @@ impl DecodeCudaState {
                 })?;
         }
         Ok(bytes)
+    }
+
+    pub(crate) fn persistent_state_shapes(
+        name: &str,
+        dtype: DataType,
+        shape: &[Dim],
+        max_len: usize,
+        fixed: bool,
+    ) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
+        if !matches!(dtype, DataType::Float32 | DataType::Float16) {
+            bail!("CUDA decoder state input '{name}' must be f32 or f16, got {dtype:?} {shape:?}");
+        }
+        if !fixed {
+            if shape.len() != 4 {
+                bail!("CUDA KV input '{name}' must be rank-4 f32 or f16, got {dtype:?} {shape:?}");
+            }
+            let mut physical_shape = Vec::with_capacity(4);
+            for (axis, dim) in shape.iter().copied().enumerate() {
+                let value = if axis == 0 {
+                    1
+                } else if axis == 2 {
+                    max_len
+                } else if let Dim::Static(value) = dim {
+                    value
+                } else {
+                    bail!("cannot infer CUDA KV dimension {axis} for '{name}' shape {shape:?}");
+                };
+                physical_shape.push(value);
+            }
+            let mut logical_shape = physical_shape.clone();
+            logical_shape[2] = 0;
+            return Ok((physical_shape, logical_shape));
+        }
+
+        let physical_shape = shape
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(axis, dim)| {
+                if axis == 0 {
+                    Ok(1)
+                } else if let Dim::Static(value) = dim {
+                    Ok(value)
+                } else {
+                    bail!(
+                        "cannot allocate fixed CUDA decoder state '{name}': dimension {axis} in shape {shape:?} is symbolic; export a static recurrent-state geometry"
+                    )
+                }
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        checked_shape_bytes(&physical_shape, dtype).with_context(|| {
+            format!(
+                "fixed CUDA decoder state allocation size overflow for '{name}' shape {physical_shape:?}"
+            )
+        })?;
+        Ok((physical_shape.clone(), physical_shape))
     }
 
     fn capacity_exceeded_error(&self, requested: usize) -> String {
@@ -654,6 +732,7 @@ impl DecodeCudaState {
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
+        fixed_state_inputs: &HashSet<String>,
         capacity: CudaKvCapacity,
         graph_enabled: bool,
     ) -> anyhow::Result<Self> {
@@ -672,50 +751,58 @@ impl DecodeCudaState {
             .map(|(present, past)| (present.clone(), past.clone()))
             .collect::<Vec<_>>();
         pairs.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        pairs.sort_by_key(|(_, past)| fixed_state_inputs.contains(past));
         let mut bindings = Vec::with_capacity(4 + pairs.len());
         bindings.push(mask);
         let kv_start = bindings.len();
-        for (present, past) in pairs {
+        for (present, past) in pairs
+            .iter()
+            .filter(|(_, past)| !fixed_state_inputs.contains(past))
+        {
             let meta = session
                 .inputs()
                 .iter()
-                .find(|meta| meta.name == past)
+                .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
-            {
-                bail!(
-                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
-                    meta.dtype,
-                    meta.shape
-                );
-            }
-            let mut physical_shape = Vec::with_capacity(4);
-            for (axis, dim) in meta.shape.iter().copied().enumerate() {
-                let value = if axis == 0 {
-                    1
-                } else if axis == 2 {
-                    max_len
-                } else if let Dim::Static(value) = dim {
-                    value
-                } else {
-                    bail!(
-                        "cannot infer CUDA KV dimension {axis} for '{past}' shape {:?}",
-                        meta.shape
-                    );
-                };
-                physical_shape.push(value);
-            }
-            let mut logical_shape = physical_shape.clone();
-            logical_shape[2] = 0;
+            let (physical_shape, logical_shape) =
+                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, false)?;
             bindings.push(session.allocate_device_binding(
-                past,
-                Some(present),
+                past.clone(),
+                Some(present.clone()),
                 meta.dtype,
                 physical_shape,
                 logical_shape,
             )?);
         }
         let kv_end = bindings.len();
+        for (present, past) in pairs
+            .iter()
+            .filter(|(_, past)| fixed_state_inputs.contains(past))
+        {
+            let meta = session
+                .inputs()
+                .iter()
+                .find(|meta| meta.name == *past)
+                .with_context(|| format!("missing fixed CUDA state input metadata for '{past}'"))?;
+            let (physical_shape, logical_shape) =
+                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, true)?;
+            let binding = session.allocate_device_binding(
+                past.clone(),
+                Some(present.clone()),
+                meta.dtype,
+                physical_shape.clone(),
+                logical_shape,
+            )?;
+            native_cuda_memset_zero(
+                binding.device_ptr() as usize,
+                checked_shape_bytes(&physical_shape, meta.dtype).with_context(|| {
+                    format!(
+                        "fixed CUDA decoder state allocation size overflow for '{past}' shape {physical_shape:?}"
+                    )
+                })?,
+            )?;
+            bindings.push(binding);
+        }
 
         let logits_meta = session
             .outputs()

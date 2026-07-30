@@ -139,6 +139,7 @@ pub async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
             id: model_id,
             path: model_path,
             eager: true,
+            warmup: false,
         }]
     } else if let Some(models_dir) = args.models_dir {
         from_models_dir(&models_dir)?

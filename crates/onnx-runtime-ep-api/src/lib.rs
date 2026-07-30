@@ -60,8 +60,9 @@ pub use tensor::{
 };
 pub use weight::{
     ExecutionProviderCapabilities, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary,
-    MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, Phase3aHostOnlyBinder,
-    ResidentWeight, ResidentWeightMaterializer, WeightHandle, WeightHandleError,
+    MmapRegionSource, NXRT_WEIGHT_PAGING_CAPABILITY, NegotiatedWeight, PagedWeight,
+    Phase3aHostOnlyBinder, ResidentWeight, ResidentWeightMaterializer, WeightHandle,
+    WeightHandleError,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.

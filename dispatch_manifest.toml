@@ -98,11 +98,11 @@ description = "When BNNS rejects (e.g. unsupported dilation), falls to im2col+GE
 [[claim]]
 op = "Conv"
 variant = "pointwise_1x1_gemm"
-platform = "all"
+platform = "aarch64-apple-darwin"
 minimum_tier = "tier2"
 counter = "CONV_POINTWISE_GEMM_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
-description = "1x1 pointwise Conv with weight > L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm"
+description = "1x1 pointwise Conv with weight > E-core L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm. Apple-only: there is no BNNS to bypass elsewhere."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SDPA — aarch64
@@ -253,3 +253,74 @@ minimum_tier = "tier2"
 counter = "RELU_F32_FAST_TEST_HITS"
 file = "crates/onnx-runtime-ep-cpu/src/kernels/relu.rs"
 description = "Contiguous f32 Relu uses zero-copy NEON SIMD max(x,0) (aarch64) or scalar loop, avoiding allocating to_dense"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Native Session KV — incremental prefill (Phase 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "NativeDecodeSession"
+variant = "incremental_prefill"
+platform = "all"
+minimum_tier = "tier2"
+counter = "NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS"
+file = "crates/onnx-genai-engine/src/native_decode/mod.rs"
+description = "Multi-turn session reuses KV cache and prefills only new tokens instead of full context reset"
+# Dense elementwise infrastructure — shared by Relu/Clip/future unary ops
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Relu"
+variant = "dense_f16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_F16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense f16 elementwise Relu via NEON widen/narrow (aarch64) or scalar widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Relu"
+variant = "dense_bf16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_BF16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense bf16 elementwise Relu via f32 widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Clip"
+variant = "dense_f16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_F16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense f16 elementwise Clip via NEON widen/narrow (aarch64) or scalar widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Clip"
+variant = "dense_bf16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_BF16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense bf16 elementwise Clip via f32 widen/narrow, avoiding full to_dense allocation"
+# DFT — Accelerate vDSP fast path (macOS/iOS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "DFT"
+variant = "vdsp_pow2"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "DFT_VDSP_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
+description = "Power-of-two DFT uses Accelerate vDSP_DFT_zop for hardware-optimized FFT on macOS/iOS"
+
+[[claim]]
+op = "DFT"
+variant = "radix2_fft"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DFT_FFT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
+description = "Power-of-two DFT uses Cooley-Tukey radix-2 FFT when vDSP unavailable"

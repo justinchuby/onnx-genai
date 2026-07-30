@@ -4,13 +4,15 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
+use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_engine::FimConfig;
+use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatTemplate, Tokenizer};
 
 use crate::{
@@ -44,6 +46,13 @@ pub(crate) struct ModelHandle {
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
     pub(crate) model_max_context: Option<usize>,
+    /// The model author's declared generation defaults (`do_sample`,
+    /// `temperature`, `top_p`, `top_k`), or `None` when the package declares
+    /// none or is a pipeline (whose sampling is governed by its plan, not a
+    /// single decoder's `search` block). Resolved into every request's
+    /// `GenerateOptions` so a model that ships `do_sample: true` samples by
+    /// default instead of being forced greedy, matching the CLI.
+    pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     /// Declared image/audio input contracts, or `None` for a single decoder
@@ -58,6 +67,9 @@ pub(crate) struct ModelHandle {
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
+    /// Set only after a warmup generation completes successfully.
+    warmed: AtomicBool,
+    warmup_lock: std::sync::Mutex<()>,
 }
 
 /// Everything needed to construct a [`ModelHandle`].
@@ -71,6 +83,7 @@ pub(crate) struct ModelHandleParts {
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
     pub(crate) model_max_context: Option<usize>,
+    pub(crate) generation_defaults: Option<GenerationDefaults>,
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
@@ -87,6 +100,7 @@ impl ModelHandle {
             tokenizer,
             chat_template,
             model_max_context,
+            generation_defaults,
             fim_config,
             pipeline,
             multimodal,
@@ -100,13 +114,49 @@ impl ModelHandle {
             tokenizer,
             chat_template,
             model_max_context,
+            generation_defaults,
             fim_config,
             pipeline,
             multimodal,
             text_to_image,
             text_to_audio,
             last_request_at: AtomicU64::new(now_millis()),
+            warmed: AtomicBool::new(false),
+            warmup_lock: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Run exactly one deterministic token generation to initialize lazy runtime
+    /// allocations. Repeated calls after a successful warmup are no-ops.
+    fn warmup(&self) -> anyhow::Result<Duration> {
+        if self.warmed.load(Ordering::Acquire) {
+            return Ok(Duration::ZERO);
+        }
+        let _guard = self
+            .warmup_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("model warmup lock poisoned"))?;
+        if self.warmed.load(Ordering::Acquire) {
+            return Ok(Duration::ZERO);
+        }
+        let prompt = self
+            .tokenizer
+            .encode("warmup")
+            .context("failed to tokenize warmup prompt")?;
+        let started = Instant::now();
+        self.engine.warmup(
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt),
+                options: GenerateOptions {
+                    max_new_tokens: 1,
+                    max_context: self.model_max_context,
+                    ..GenerateOptions::default()
+                },
+            },
+            self.pipeline,
+        )?;
+        self.warmed.store(true, Ordering::Release);
+        Ok(started.elapsed())
     }
 }
 
@@ -144,6 +194,33 @@ impl fmt::Display for RegistryError {
 }
 
 impl std::error::Error for RegistryError {}
+
+#[derive(Debug)]
+pub(crate) enum WarmupError {
+    Registry(RegistryError),
+    NotLoaded,
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for WarmupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => error.fmt(formatter),
+            Self::NotLoaded => formatter.write_str("model is not loaded"),
+            Self::Failed(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for WarmupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registry(error) => Some(error),
+            Self::NotLoaded => None,
+            Self::Failed(error) => error.source(),
+        }
+    }
+}
 
 /// Registry of models, providing runtime load / unload / lazy-load with LRU
 /// eviction.
@@ -186,11 +263,16 @@ impl ModelRegistry {
             available.insert(spec.id.clone(), spec.clone());
         }
         let default_id = Some(specs[0].id.clone());
-        let mut inner = RegistryInner {
+        let inner = RegistryInner {
             models: HashMap::new(),
             order: Vec::new(),
             default_id,
             available,
+        };
+        let registry = Self {
+            inner: Arc::new(RwLock::new(inner)),
+            config: Arc::new(config.clone()),
+            load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
         for spec in specs.iter().filter(|s| s.eager) {
             tracing::info!(id = %spec.id, path = %spec.path.display(), "loading model");
@@ -201,13 +283,17 @@ impl ModelRegistry {
                     spec.path.display()
                 )
             })?;
-            inner.insert_loaded(Arc::new(handle));
+            registry.write()?.insert_loaded(Arc::new(handle));
+            if spec.warmup {
+                let warmup_registry = registry.clone();
+                let warmup_id = spec.id.clone();
+                std::thread::spawn(move || warmup_registry.warmup(&warmup_id))
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("model warmup thread panicked"))?
+                    .with_context(|| format!("failed to warm model '{}'", spec.id))?;
+            }
         }
-        Ok(Self {
-            inner: Arc::new(RwLock::new(inner)),
-            config: Arc::new(config),
-            load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        })
+        Ok(registry)
     }
 
     /// Build a registry around a single, already-constructed handle.
@@ -345,7 +431,26 @@ impl ModelRegistry {
             inner.insert_loaded(Arc::clone(&handle));
             inner.enforce_eviction(self.config.max_loaded_models, id);
         }
+        if spec.warmup {
+            let registry = self.clone();
+            let warmup_id = id.to_owned();
+            tokio::task::spawn_blocking(move || registry.warmup(&warmup_id))
+                .await
+                .context("model warmup task panicked")?
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("failed to warm model '{id}'"))?;
+        }
         Ok(handle)
+    }
+
+    /// Warm a currently loaded model. Unknown and unloaded models return an
+    /// error; a successfully warmed model returns a zero duration on repeats.
+    pub(crate) fn warmup(&self, id: &str) -> Result<Duration, WarmupError> {
+        self.get_loaded(id)
+            .map_err(WarmupError::Registry)?
+            .ok_or(WarmupError::NotLoaded)?
+            .warmup()
+            .map_err(WarmupError::Failed)
     }
 
     /// Unload a model: drop its handle from `models`/`order` but keep the spec in
@@ -515,6 +620,15 @@ impl ModelRegistry {
         let new_handle = Arc::new(ModelHandle { fim_config, ..old });
         inner.models.insert(id, new_handle);
     }
+
+    pub(crate) fn is_warmed_for_test(&self, id: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .models
+            .get(id)
+            .is_some_and(|handle| handle.warmed.load(Ordering::Acquire))
+    }
 }
 
 #[cfg(test)]
@@ -549,12 +663,15 @@ mod tests {
             tokenizer,
             chat_template: None,
             model_max_context: None,
+            generation_defaults: None,
             fim_config: None,
             pipeline: false,
             multimodal: None,
             text_to_image: false,
             text_to_audio: false,
             last_request_at: AtomicU64::new(last_request_at),
+            warmed: AtomicBool::new(false),
+            warmup_lock: std::sync::Mutex::new(()),
         })
     }
 

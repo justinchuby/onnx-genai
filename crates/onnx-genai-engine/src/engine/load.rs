@@ -96,7 +96,12 @@ impl Engine {
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
         let kv_model = {
             let _span = onnx_genai_ort::prof_span!("engine.kv_model_info");
-            infer_kv_model_info(&session, config.page_size, config.kv_cache_dtype)?
+            infer_kv_model_info(
+                &session,
+                metadata.model.as_ref().and_then(|model| model.io.as_ref()),
+                config.page_size,
+                config.kv_cache_dtype,
+            )?
         };
 
         // Stage: resource governor and batch scheduler.
@@ -156,6 +161,8 @@ impl Engine {
             session: Some(Box::new(session)),
             #[cfg(feature = "native-backend")]
             native_session: None,
+            #[cfg(feature = "native-backend")]
+            native_session_state: None,
             #[cfg(feature = "native-backend")]
             native_shared_kv_proposer: None,
             draft,
@@ -289,6 +296,7 @@ impl Engine {
             sessions: HashMap::new(),
             session: None,
             native_session: Some(native_session),
+            native_session_state: None,
             native_shared_kv_proposer,
             draft: None,
             mtp: None,
@@ -483,6 +491,7 @@ fn load_draft_model(
             detect_model_decode_path(&draft_session, None, metadata_max_context, None, None, 0)?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
+            draft_io.as_ref(),
             config.page_size,
             onnx_genai_kv::KvDType::F32,
         )?;

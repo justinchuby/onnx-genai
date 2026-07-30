@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "cuda")]
+use onnx_genai_metadata::LoopStatePair;
 use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
 use prost::Message;
@@ -46,9 +48,36 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
         kv_ownership: KvOwnership::Owned,
     };
     assert!(structural.is_capture_safe());
-    // Env unset, no programmatic override -> auto-enable from structure.
+    // Env unset, no programmatic override, offload disabled -> auto-enable from
+    // structure.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, structural
+        None, false, false, structural, false
+    ));
+}
+
+#[test]
+fn weight_offload_forces_graph_capture_off() {
+    let safe = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Owned,
+    };
+    // Offload wins over every other signal: auto-safe structure, an explicit
+    // env=1, and an explicit programmatic request all still resolve to OFF.
+    assert!(!resolve_graph_capture_enabled(
+        None, false, false, safe, true
+    ));
+    assert!(!resolve_graph_capture_enabled(None, true, true, safe, true));
+    assert!(!resolve_graph_capture_enabled(
+        Some(true),
+        true,
+        true,
+        safe,
+        true
+    ));
+    // Sanity: with offload disabled the same safe structure enables capture, so
+    // the exclusion above is genuinely caused by offload.
+    assert!(resolve_graph_capture_enabled(
+        None, false, false, safe, false
     ));
 }
 
@@ -156,7 +185,9 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
         kv_ownership: KvOwnership::Shared,
     };
     assert!(!shared.is_capture_safe());
-    assert!(!resolve_graph_capture_enabled(None, false, false, shared));
+    assert!(!resolve_graph_capture_enabled(
+        None, false, false, shared, false
+    ));
 
     let cpu_owned = GraphCaptureStructuralSafety {
         device_is_cuda: false,
@@ -164,7 +195,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!cpu_owned.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, cpu_owned
+        None, false, false, cpu_owned, false
     ));
 }
 
@@ -179,14 +210,17 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
         kv_ownership: KvOwnership::Shared,
     };
     // ONNX_GENAI_CUDA_GRAPH=0 forces OFF even when structurally safe.
-    assert!(!resolve_graph_capture_enabled(None, true, false, safe));
+    assert!(!resolve_graph_capture_enabled(
+        None, true, false, safe, false
+    ));
     // ONNX_GENAI_CUDA_GRAPH=1 forces ON even when structure would decline
     // (the runtime decline machinery is still the final safety net).
     assert!(resolve_graph_capture_enabled(
         None,
         true,
         true,
-        unsafe_structural
+        unsafe_structural,
+        false
     ));
 }
 
@@ -201,10 +235,17 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         Some(false),
         true,
         true,
-        safe
+        safe,
+        false
     ));
     // Programmatic Some(true) beats explicit env=0.
-    assert!(resolve_graph_capture_enabled(Some(true), true, false, safe));
+    assert!(resolve_graph_capture_enabled(
+        Some(true),
+        true,
+        false,
+        safe,
+        false
+    ));
 }
 
 #[test]
@@ -446,6 +487,7 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
         kv_update: None,
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
+        static_cache: None,
     }
 }
 
@@ -471,6 +513,7 @@ fn tiny_decoder_io() -> ModelIoSpec {
         kv_update: None,
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
+        static_cache: None,
     }
 }
 
@@ -616,6 +659,7 @@ fn proposer_io(sequence_source: SequenceInputKind, kv_ownership: KvOwnership) ->
         kv_update: None,
         state_pairs: None,
         optional_inputs: std::collections::BTreeMap::new(),
+        static_cache: None,
     }
 }
 
@@ -796,6 +840,16 @@ fn build_cuda_decoder(
     max_len: usize,
     aux: AuxOutput,
 ) -> anyhow::Result<NativeDecodeSession> {
+    build_cuda_decoder_with_fixed_state(graph_capture, max_len, aux, false)
+}
+
+#[cfg(feature = "cuda")]
+fn build_cuda_decoder_with_fixed_state(
+    graph_capture: bool,
+    max_len: usize,
+    aux: AuxOutput,
+    fixed_state: bool,
+) -> anyhow::Result<NativeDecodeSession> {
     use prost::Message;
 
     let mut graph = Graph::new();
@@ -838,6 +892,15 @@ fn build_cuda_decoder(
     ] {
         graph.add_input(input);
     }
+    let conv_state = fixed_state.then(|| {
+        let value = graph.create_named_value(
+            "past_key_values.0.conv_state",
+            DataType::Float16,
+            vec![1.into(), 4.into(), 3.into()],
+        );
+        graph.add_input(value);
+        value
+    });
 
     let logits = graph.create_named_value("logits", DataType::Float32, vec![1.into(), 1.into()]);
     insert_op(
@@ -888,6 +951,21 @@ fn build_cuda_decoder(
     for output in [logits, present_key, present_value, auxiliary] {
         graph.add_output(output);
     }
+    if let Some(conv_state) = conv_state {
+        let present_conv_state = graph.create_named_value(
+            "present.0.conv_state",
+            DataType::Float16,
+            vec![1.into(), 4.into(), 3.into()],
+        );
+        insert_op(
+            &mut graph,
+            "Identity",
+            vec![conv_state],
+            present_conv_state,
+            &[],
+        );
+        graph.add_output(present_conv_state);
+    }
 
     let model = onnx_std::Model::new(graph).to_proto()?.encode_to_vec();
     let session = InferenceSession::builder()
@@ -895,14 +973,29 @@ fn build_cuda_decoder(
         .device(DevicePreference::Gpu { index: Some(0) })
         .build()
         .context("build capture-safe CUDA decoder")?;
-    NativeDecodeSession::from_session_with_cuda_options(
-        session,
-        NativeDecodeCudaOptions {
-            kv_max_len: Some(max_len),
-            metadata_max_len: None,
-            graph_capture: Some(graph_capture),
-        },
-    )
+    if fixed_state {
+        let mut io = tiny_decoder_io();
+        io.state_pairs = Some(vec![LoopStatePair {
+            input: "past_key_values.0.conv_state".into(),
+            output: "present.0.conv_state".into(),
+            init: Some("zeros".into()),
+            update: Some("replace".into()),
+        }]);
+        NativeDecodeSession::from_session_with_cuda_kv_max_len_and_io(
+            session,
+            Some(max_len),
+            Some(&io),
+        )
+    } else {
+        NativeDecodeSession::from_session_with_cuda_options(
+            session,
+            NativeDecodeCudaOptions {
+                kv_max_len: Some(max_len),
+                metadata_max_len: None,
+                graph_capture: Some(graph_capture),
+            },
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1042,7 +1135,7 @@ fn native_target_step_preserves_token_driven_binding() {
     assert!(
         !session
             .step_inputs
-            .iter()
+            .iter_mut()
             .any(|binding| binding.source == NativeStepInputSource::Routed)
     );
 
@@ -1276,6 +1369,69 @@ fn persistent_auxiliary_output_shape_is_fixed_and_rejects_strings() {
 }
 
 #[test]
+fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry() {
+    let batch = SymbolId(0);
+    let past = SymbolId(1);
+    let (kv_physical, kv_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.key",
+        DataType::Float16,
+        &[
+            Dim::Symbolic(batch),
+            Dim::Static(4),
+            Dim::Symbolic(past),
+            Dim::Static(256),
+        ],
+        512,
+        false,
+    )
+    .expect("rank-4 growing KV");
+    assert_eq!(kv_physical, [1, 4, 512, 256]);
+    assert_eq!(kv_logical, [1, 4, 0, 256]);
+
+    let (conv_physical, conv_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.conv_state",
+        DataType::Float16,
+        &[Dim::Symbolic(batch), Dim::Static(10_240), Dim::Static(3)],
+        512,
+        true,
+    )
+    .expect("rank-3 fixed convolution state");
+    assert_eq!(conv_physical, [1, 10_240, 3]);
+    assert_eq!(conv_logical, conv_physical);
+
+    let (recurrent_physical, recurrent_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.recurrent_state",
+        DataType::Float16,
+        &[
+            Dim::Symbolic(batch),
+            Dim::Static(48),
+            Dim::Static(128),
+            Dim::Static(128),
+        ],
+        512,
+        true,
+    )
+    .expect("rank-4 fixed recurrent state");
+    assert_eq!(recurrent_physical, [1, 48, 128, 128]);
+    assert_eq!(recurrent_logical, recurrent_physical);
+}
+
+#[test]
+fn cuda_fixed_state_shapes_reject_unbounded_non_batch_dimensions() {
+    let error = DecodeCudaState::persistent_state_shapes(
+        "state",
+        DataType::Float16,
+        &[Dim::Symbolic(SymbolId(0)), Dim::Symbolic(SymbolId(1))],
+        128,
+        true,
+    )
+    .expect_err("non-batch fixed-state dimensions require static bounds");
+    assert!(error.to_string().contains(
+        "dimension 1 in shape [Symbolic(SymbolId(0)), Symbolic(SymbolId(1))] is symbolic"
+    ));
+}
+
+#[test]
 fn unit_symbol_collection_is_structural_and_batch_aware() {
     // input_ids / position_ids are bound to `[1, 1]` at decode, so *every*
     // symbolic axis is a decode-unit (batch or query-seq). attention_mask
@@ -1350,6 +1506,41 @@ fn unresolved_symbolic_axis_flags_only_non_unit_symbols() {
         ),
         Some((1, total))
     );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn native_cuda_binds_rank3_fixed_state_without_changing_growing_kv() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+
+    let mut session = build_cuda_decoder_with_fixed_state(false, 16, AuxOutput::StaticUnit, true)?;
+    let state = session.cuda.as_mut().expect("CUDA state");
+    assert_eq!(state.kv_binding_range.len(), 2);
+    let fixed = state
+        .bindings
+        .iter_mut()
+        .find(|binding| binding.input_name() == "past_key_values.0.conv_state")
+        .expect("rank-3 fixed state binding");
+    assert_eq!(fixed.physical_shape(), &[1, 4, 3]);
+    assert_eq!(fixed.logical_shape(), &[1, 4, 3]);
+    assert!(fixed.read_bytes()?.iter().all(|byte| *byte == 0));
+
+    session.decode(&[7], 0)?;
+    let state = session.cuda.as_mut().expect("CUDA state");
+    for binding in &state.bindings[state.kv_binding_range.clone()] {
+        assert_eq!(binding.logical_shape()[2], 1);
+    }
+    let fixed = state
+        .bindings
+        .iter_mut()
+        .find(|binding| binding.input_name() == "past_key_values.0.conv_state")
+        .expect("rank-3 fixed state binding");
+    assert_eq!(fixed.logical_shape(), &[1, 4, 3]);
+    assert!(fixed.read_bytes()?.iter().all(|byte| *byte == 0));
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]

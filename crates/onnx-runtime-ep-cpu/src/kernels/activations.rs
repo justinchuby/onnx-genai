@@ -334,8 +334,8 @@ fn silu_contiguous_f32(input: &TensorView, output: &mut TensorMut) -> bool {
     if input.dtype != DataType::Float32
         || output.dtype != DataType::Float32
         || input.shape != output.shape
-        || !input.is_contiguous()
-        || !output.is_contiguous()
+        || input.strides != output.strides
+        || !onnx_runtime_ir::is_dense(input.shape, input.strides)
     {
         return false;
     }

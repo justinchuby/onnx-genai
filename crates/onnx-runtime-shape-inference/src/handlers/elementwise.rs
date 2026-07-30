@@ -244,7 +244,7 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("", "Where", 1, where_op);
 
     // com.microsoft elementwise activations (shape-preserving).
-    for op in ["Gelu", "FastGelu", "BiasGelu", "QuickGelu"] {
+    for op in ["Gelu", "FastGelu", "BiasGelu", "QuickGelu", "Silu"] {
         reg.register("com.microsoft", op, 1, unary);
     }
 }

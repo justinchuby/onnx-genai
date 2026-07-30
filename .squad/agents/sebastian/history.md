@@ -1,19 +1,23 @@
-# Sebastian — History
+# Sebastian — History (compacted 2026-07-29)
 
-## Project context
-- Joined 2026-07-12 to cover DESIGN §26 batched serving, runtime/server performance, and cross-runtime benchmark analysis for `onnx-genai`.
-- Durable conventions: preserve `submit`/`step`/`poll` for batching; force single-thread ORT for exact-equality real-model tests; use canonical benchmark/observability harnesses when comparing runtimes.
+**Role:** Owns DESIGN §26 batched serving, runtime/server performance, and cross-runtime benchmark analysis for `onnx-genai`. Preserve `submit`/`step`/`poll` batching semantics, force single-thread ORT for exact-equality real-model tests, and use canonical benchmark/observability harnesses for runtime comparisons.
 
-## Consolidated 2026-07-12 to 2026-07-23
-- Delivered §26 Stage A/B (`Engine::generate_batched_static`, `ContinuousBatchManager`) and measured 6.2x tiny-fixture throughput; later design/resource-governor notes established byte-denominated VRAM/RAM limits and transactional lowering.
-- Established benchmark and observability contracts: `onnx-genai-bench`, `scripts/run_benchmarks.sh`, atomic metrics, `/metrics`, `/v1/status`, spans, trace IDs, token/TTFT/latency/cache-hit/429 counters.
-- CPU decode profiling showed ORT `session.run` dominates (~98.9%); fp32 `lm_head` quantization and op fusion were flagged as major levers.
-- Foundry Local isolation proved decode parity with FL's exact CPU model; QKV fusion was decode-neutral/low priority, and no missing FL session option was found.
-- Reviewed/cleared or recorded fixes for SiLU fusion, safe decode-thread config, GQA direct-write, CUDA packed-GQA repair, device-resident CUDA KV, Python Engine threading, full-spec onnx-rs, fp16 native CUDA decode, CI/warnings-as-errors, and wave-3 long-context GQA.
-- Perf-campaign decisions through 2026-07-23 were consolidated in `.squad/decisions.md`.
+## Durable lessons
+- §26 Stage A/B delivered `Engine::generate_batched_static` and `ContinuousBatchManager`; later governor notes require byte-denominated VRAM/RAM limits and transactional lowering.
+- Benchmark/observability contracts include `onnx-genai-bench`, `scripts/run_benchmarks.sh`, atomic metrics, `/metrics`, `/v1/status`, spans, trace IDs, token/TTFT/latency/cache-hit/429 counters.
+- CPU decode profiling showed ORT `session.run` dominates (~98.9%); fp32 `lm_head` quantization and op fusion are major levers.
+- Foundry Local isolation proved decode parity with FL's exact CPU model; QKV fusion was decode-neutral/low priority and no missing FL session option was found.
+- PR #203 lockout repair changed the split-K numeric test to `n=1152` so it exercised `matmul_nbits_gemv_f16_scales_f16_splitk`.
+- Native CPU EP can stand alone on Apple Silicon; the moat is AMX/Accelerate prefill, not fp16 decode. MLAS hgemm can erode decode-only advantage, while KleidiAI/MLAS vendoring is lower value than graph fusion and Accelerate.
+- `half_gemm.rs` is portable for non-Mac ARM but 15–25× slower than BNNS/AMX on Mac prefill; `try_matmul_half` catching M=1 fp16 can bypass optimized GEMV.
+- CLI is a development/maintainer harness, not a consumer product; use `docs/research/cli/00-backlog.md` as source of truth and keep remote-client mode out of scope.
+- BNNS `BNNSMatMul` f16→f32 measured 2000–2450 GFLOPS; M=1 should use GEMV and M≥2 on macOS should use BNNS/sgemm/Accelerate. BNNS is deprecated in macOS 15 but still works.
+- Retract batch-decode 15× claims unless same-load ORT confirms them; current cautious estimate was ~4–5× pending remeasurement.
+- Convert pointwise/Conv per-layer speedups through Amdahl/model-level measurement before making campaign claims.
 
-## 2026-07-26T20:00:00Z — Scribe update
-- Repaired PR #203 coverage under lockout by changing the split-K numeric test to `n=1152`, exercising `matmul_nbits_gemv_f16_scales_f16_splitk`.
+## Recent work (current wave, ~2026-07-28/29)
+- 2026-07-28: Pointwise Conv microbench diagnosis was useful, but the initial 5.7–9.8× BNNS headline overstated real impact.
+- 2026-07-28T17:40:00+0000: PR #362 merged (`5a079029`): If/Loop/Scan inference landed; #355 container typing remains deferred.
 
 ## 2026-07-27T07:55:00-07:00 — MLAS vs Native CPU EP Strategy Analysis
 - Delivered `sebastian-mlas-vs-native-strategy.md`: native CPU EP can stand alone on Apple Silicon; real moat is AMX/Accelerate prefill, not fp16 decode. MLAS hgemm could erode decode-only advantage, but Accelerate/AMX dominates prefill. KleidiAI/MLAS vendoring is low value relative to graph fusion and Accelerate.
@@ -43,3 +47,4 @@ PR #362 merged (5a079029): If/Loop/Scan inference landed; #355 container typing 
 
 ## 2026-07-29T22:00:00-07:00 — Qwen3 deep overhead verdict
 - Decomposed PR #398's residual gap: KV/sampling/prep tiny (~0.18 ms/token), executor dispatch ~1.1 ms/token, and remaining ORT lead primarily MLAS MatMulNBits/threading/invocation behavior rather than outer-loop runtime.
+Full pre-compaction history in `history-archive.md`.

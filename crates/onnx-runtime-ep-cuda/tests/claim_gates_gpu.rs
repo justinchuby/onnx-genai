@@ -113,6 +113,15 @@ fn glm_standard_claim_gates_reject_runtime_unsupported_input_dtypes() {
         1,
     );
     assert_rejected(&ep, "TopK", 24, &[DataType::Float32, DataType::Int32], 2);
+    for dtype in [DataType::Float16, DataType::BFloat16] {
+        let dtypes = [dtype, DataType::Int64];
+        let (graph, id) = node("TopK", &dtypes, 2, None, &[]);
+        assert!(
+            ep.supports_op(graph.node(id), 24, &[], &dtypes, &[])
+                .is_supported(),
+            "TopK must claim {dtype:?} router values"
+        );
+    }
     assert_rejected(&ep, "CumSum", 24, &[DataType::Float32, DataType::Int32], 1);
     assert_rejected(
         &ep,

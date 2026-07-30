@@ -24,6 +24,7 @@ use crate::runtime::CudaRuntime;
 pub mod activations;
 pub mod argreduce;
 pub mod attention;
+pub mod batch_normalization;
 pub mod bitwise;
 pub mod block_quant;
 pub mod block_quantized_matmul;
@@ -33,10 +34,12 @@ pub mod compressed_sparse_attention;
 pub mod constant;
 pub mod constant_of_shape;
 pub mod conv;
+pub mod conv_transpose;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
 pub mod cumprod;
 pub mod cumsum;
+pub mod data_transform;
 pub(crate) mod device_argmax;
 pub mod dropout;
 pub mod elementwise;
@@ -46,11 +49,15 @@ pub mod fused_gemm;
 pub mod gather;
 pub mod gather_block_quantized;
 pub mod gemm;
+pub mod global_reduction;
 mod gqa_decode;
 mod gqa_decode_fp16;
+pub mod grid_sample;
+pub mod group_normalization;
 pub mod group_query_attention;
 pub mod hardmax;
 pub mod index_share;
+pub mod index_transform;
 pub mod indexing;
 pub mod log_softmax;
 pub mod matmul;
@@ -66,12 +73,14 @@ pub mod pad;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;
+pub mod qlinear_matmul;
 pub mod qmoe;
 mod qmoe_gemm;
 mod qmoe_grouping;
 pub mod quantization;
 pub mod range;
 pub mod reduce;
+pub mod resize;
 pub mod rotary_embedding;
 pub mod shape;
 pub mod size;
@@ -172,6 +181,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Conv",
     "MaxPool",
     "AveragePool",
+    "LpPool",
     "Relu",
     "Sqrt",
     "Erf",
@@ -300,6 +310,22 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "DequantizeLinear",
     "Dropout",
     "NonZero",
+    "AffineGrid",
+    "BatchNormalization",
+    "Compress",
+    "DynamicQuantizeLinear",
+    "GlobalAveragePool",
+    "GlobalLpPool",
+    "GlobalMaxPool",
+    "LpNormalization",
+    "InstanceNormalization",
+    "GroupNormalization",
+    "CenterCropPad",
+    "Col2Im",
+    "QLinearMatMul",
+    "Resize",
+    "ConvTranspose",
+    "GridSample",
 ];
 
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
@@ -403,6 +429,67 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("AffineGrid", "", 20),
+        Box::new(data_transform::AffineGridFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Compress", "", 11),
+        Box::new(data_transform::CompressFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("BatchNormalization", "", 7),
+        Box::new(batch_normalization::BatchNormalizationFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("LpNormalization", "", 1),
+        Box::new(global_reduction::LpNormalizationFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("InstanceNormalization", "", 6),
+        Box::new(group_normalization::InstanceNormalizationFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for since_version in [18, 21] {
+        reg.register(
+            OpKey::new("GroupNormalization", "", since_version),
+            Box::new(group_normalization::GroupNormalizationFactory {
+                runtime: runtime.clone(),
+                since_version,
+            }),
+        );
+    }
+    for (op, kind) in [
+        (
+            "GlobalAveragePool",
+            global_reduction::GlobalPoolKind::Average,
+        ),
+        ("GlobalMaxPool", global_reduction::GlobalPoolKind::Max),
+    ] {
+        reg.register(
+            OpKey::new(op, "", 1),
+            Box::new(global_reduction::GlobalPoolFactory {
+                kind,
+                runtime: runtime.clone(),
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("GlobalLpPool", "", 2),
+        Box::new(global_reduction::GlobalPoolFactory {
+            kind: global_reduction::GlobalPoolKind::Lp(2),
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Pad", "", 1),
         Box::new(pad::PadFactory {
             runtime: runtime.clone(),
@@ -427,6 +514,47 @@ pub fn build_cuda_registry_with_metrics(
             Box::new(quantization::LinearQuantFactory {
                 op: quantization::LinearQuantOp::Dequantize,
                 runtime: runtime.clone(),
+            }),
+        );
+    }
+    reg.register(
+        OpKey::new("DynamicQuantizeLinear", "", 11),
+        Box::new(quantization::DynamicQuantizeLinearFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("QLinearMatMul", "", 10),
+        Box::new(qlinear_matmul::QLinearMatMulFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 10),
+        Box::new(resize::ResizeFactory {
+            runtime: runtime.clone(),
+            since_version: 10,
+        }),
+    );
+    reg.register(
+        OpKey::new("Resize", "", 11),
+        Box::new(resize::ResizeFactory {
+            runtime: runtime.clone(),
+            since_version: 11,
+        }),
+    );
+    reg.register(
+        OpKey::new("ConvTranspose", "", 1),
+        Box::new(conv_transpose::ConvTransposeFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    for since_version in [16_u32, 20] {
+        reg.register(
+            OpKey::new("GridSample", "", u64::from(since_version)),
+            Box::new(grid_sample::GridSampleFactory {
+                runtime: runtime.clone(),
+                since_version,
             }),
         );
     }
@@ -677,6 +805,24 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    reg.register(
+        OpKey::new("LpPool", "", 18),
+        Box::new(pooling::LpPoolFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("CenterCropPad", "", 18),
+        Box::new(index_transform::CenterCropPadFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("Col2Im", "", 18),
+        Box::new(index_transform::Col2ImFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // Elementwise unary activations (NVRTC pointwise). The loop includes the
     // contrib Gelu/Silu forms; standard Gelu is registered separately below so

@@ -325,6 +325,40 @@ fn if_never_memoizes_branch_that_reads_changing_captures() {
 }
 
 #[test]
+fn if_materializes_outer_capture_from_persistent_device_input() {
+    let mut g = new_parent();
+    let cond = input(&mut g, "cond", DataType::Bool, &[1]);
+    let _state = input(&mut g, "X", DataType::Float32, &[2]);
+    let y = g.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let node = control_flow_node(&mut g, "If", vec![Some(cond)], vec![y], &[]);
+    register(&mut g, node, "then_branch", if_branch("Add"));
+    register(&mut g, node, "else_branch", if_branch("Sub"));
+    g.add_output(y);
+
+    let mut session = InferenceSession::from_graph(g).expect("build session");
+    let mut state = session
+        .allocate_device_binding("X", Some("Y"), DataType::Float32, vec![2], vec![2])
+        .expect("state binding");
+    state
+        .write_bytes(0, &f32_bytes(&[5.0, 9.0]))
+        .expect("seed state");
+    let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[1]).unwrap();
+    for expected in [[6.0, 10.0], [7.0, 11.0]] {
+        let outputs = session
+            .run_with_device_bindings(&[("cond", &cond_t)], std::slice::from_mut(&mut state))
+            .expect("run with captured persistent state");
+        assert!(outputs[0].is_none(), "bound output must stay on device");
+        let values = state
+            .read_bytes()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
+    }
+}
+
+#[test]
 fn if_rejects_mismatched_branch_output_counts_before_running_selected_branch() {
     let mut g = new_parent();
     let cond = input(&mut g, "cond", DataType::Bool, &[]);

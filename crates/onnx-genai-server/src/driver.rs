@@ -229,6 +229,43 @@ impl EngineDriver {
         Ok(rx)
     }
 
+    /// Run a small generation while blocking the calling thread. Used only by
+    /// startup and the administrative warmup path, never request generation.
+    pub(crate) fn warmup(&self, request: GenerateRequest, pipeline: bool) -> anyhow::Result<()> {
+        let permit = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
+        let (events, mut receiver) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
+        let command = if pipeline {
+            DriverCommand::GeneratePipeline {
+                request: Box::new(request),
+                input: None,
+                events,
+                permit,
+            }
+        } else {
+            DriverCommand::Generate {
+                session_id: None,
+                request: Box::new(request),
+                events,
+                permit,
+            }
+        };
+        self.commands
+            .blocking_send(command)
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        while let Some(event) = receiver.blocking_recv() {
+            match event {
+                DriverEvent::Token(_) => {}
+                DriverEvent::Finished(_) => return Ok(()),
+                DriverEvent::Error(message) => anyhow::bail!(message),
+            }
+        }
+        anyhow::bail!("generation stream ended before result")
+    }
+
     pub(crate) async fn generate_pipeline(
         &self,
         request: GenerateRequest,

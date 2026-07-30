@@ -20,8 +20,10 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
-    MirostatConfig, MirostatVersion, ResourceLimit, TokenLogprob, XtcConfig, parse_resource_limit,
+    MirostatConfig, MirostatVersion, ResourceLimit, SamplingOverrides, TokenLogprob, XtcConfig,
+    parse_resource_limit,
 };
+use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -34,7 +36,7 @@ use crate::{
     session::SessionRegistry,
     sse::{
         StopBoundaryBuffer, completion_chunk, completion_done_chunk, content_chunk, done_chunk,
-        role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_calls_chunk,
+        role_chunk, send_completion_stream_chunk, send_stream_chunk, tool_call_delta_chunks,
     },
     state::{AppState, ServerConfig},
     types::{
@@ -57,9 +59,9 @@ mod sessions;
 #[cfg(feature = "metrics")]
 pub(crate) use admin::prometheus_metrics;
 pub(crate) use admin::{
-    admin_list_models, admin_load_model, admin_set_vram_limit, admin_unload_model, debug_config,
-    debug_kv, debug_profile, debug_sessions, debug_trace, debug_trace_perfetto, health, models,
-    resources, status,
+    admin_list_models, admin_load_model, admin_set_vram_limit, admin_unload_model,
+    admin_warmup_model, debug_config, debug_kv, debug_profile, debug_sessions, debug_trace,
+    debug_trace_perfetto, health, models, resources, status,
 };
 pub use completions::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
@@ -274,6 +276,13 @@ pub(crate) struct AdminModelsResponse {
 pub(crate) struct AdminLoadResponse {
     id: String,
     loaded: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AdminWarmupResponse {
+    id: String,
+    warmed: bool,
+    duration_ms: u128,
 }
 
 #[derive(Debug, Serialize)]

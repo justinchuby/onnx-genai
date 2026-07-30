@@ -1,7 +1,7 @@
 //! KV model metadata, paged-cache mirroring, and rewind helpers.
 
 use crate::config::SessionId;
-use crate::decode::{DecodeState, is_kv_input, is_present_output, matching_past_input};
+use crate::decode::DecodeState;
 use crate::logits::TokenId;
 use crate::session::{DraftModel, DraftSession, EngineSession};
 use anyhow::Context;
@@ -50,80 +50,196 @@ pub(crate) struct KvLayerIo {
     pub(crate) value_past: String,
 }
 
+/// One self-attention layer's four paged-KV port names, resolved WITHOUT
+/// reading any tensor name. `key_present_info` is the present KEY output's shape
+/// record, the authoritative source of this layer's `num_kv_heads`/`head_dim`
+/// geometry (read structurally from the ONNX shape, never from a name).
+struct ResolvedKvLayer {
+    key_past: String,
+    key_present: String,
+    value_past: String,
+    value_present: String,
+    key_present_info: TensorInfo,
+}
+
 pub(crate) fn infer_kv_model_info(
     session: &Session,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
     page_size: usize,
     dtype: KvDType,
 ) -> anyhow::Result<Option<KvModelInfo>> {
-    let mut key_outputs = Vec::new();
-    let mut value_outputs = Vec::new();
-    for info in session
-        .outputs()
-        .iter()
-        .filter(|info| is_present_output(&info.name))
-    {
-        let lower = info.name.to_ascii_lowercase();
-        if lower.contains("key") {
-            key_outputs.push(info.clone());
-        } else if lower.contains("value") {
-            value_outputs.push(info.clone());
-        }
-    }
-
-    if key_outputs.is_empty() && value_outputs.is_empty() {
+    let Some(resolved_layers) = resolve_kv_layers(session, io)? else {
         return Ok(None);
-    }
-    key_outputs.sort_by_key(|info| kv_layer_index(&info.name).unwrap_or(usize::MAX));
-    value_outputs.sort_by_key(|info| kv_layer_index(&info.name).unwrap_or(usize::MAX));
-    if key_outputs.len() != value_outputs.len() {
-        anyhow::bail!(
-            "model exposes mismatched present key/value outputs: {} keys, {} values",
-            key_outputs.len(),
-            value_outputs.len()
-        );
-    }
+    };
 
+    let key_outputs = resolved_layers
+        .iter()
+        .map(|layer| layer.key_present_info.clone())
+        .collect::<Vec<_>>();
     let layer_configs = layer_configs_from_key_outputs(&key_outputs)?;
     // Representative geometry (layer 0). The paged cache is built from the full
-    // per-layer `layer_configs` below; `tensor_config` remains a single-value
-    // view for uniform-only consumers (connector payloads, num_layers/dtype).
+    // per-layer `layer_configs`; `tensor_config` remains a single-value view for
+    // uniform-only consumers (connector payloads, num_layers/dtype).
     let config = PageTensorConfig {
-        num_layers: key_outputs.len(),
+        num_layers: resolved_layers.len(),
         num_kv_heads: layer_configs[0].num_kv_heads,
         head_dim: layer_configs[0].head_dim,
         page_size,
         dtype,
     };
-    let kv_inputs = session
-        .inputs()
-        .iter()
-        .filter(|info| is_kv_input(&info.name))
-        .map(|info| info.name.clone())
-        .collect::<Vec<_>>();
-    let mut layers = Vec::with_capacity(key_outputs.len());
-    for (key, value) in key_outputs.iter().zip(value_outputs.iter()) {
-        if !is_supported_kv_dtype(key.dtype) || !is_supported_kv_dtype(value.dtype) {
-            anyhow::bail!("KV present outputs must be Float32, Float16, or BFloat16");
-        }
-        let key_past = matching_past_input(&key.name, &kv_inputs)
-            .with_context(|| format!("missing past input for present output '{}'", key.name))?
-            .clone();
-        let value_past = matching_past_input(&value.name, &kv_inputs)
-            .with_context(|| format!("missing past input for present output '{}'", value.name))?
-            .clone();
-        layers.push(KvLayerIo {
-            key_present: key.name.clone(),
-            value_present: value.name.clone(),
-            key_past,
-            value_past,
-        });
-    }
+    let layers = resolved_layers
+        .into_iter()
+        .map(|layer| KvLayerIo {
+            key_present: layer.key_present,
+            value_present: layer.value_present,
+            key_past: layer.key_past,
+            value_past: layer.value_past,
+        })
+        .collect();
 
     Ok(Some(KvModelInfo {
         tensor_config: config,
         layer_configs,
         layers,
     }))
+}
+
+/// Resolve the paged-KV self-attention layer ports strictly from explicit
+/// metadata — the runtime never reads a tensor name to decide which port is
+/// key/value, which layer it belongs to, or how past pairs with present.
+///
+/// `model.io.kv_inputs`/`kv_outputs` are equal-length, positionally paired
+/// past<->present lists ordered as consecutive per-layer `[key_i, value_i]`
+/// pairs (the exporter contract, matching `genai-config` `expand_kv`). Layer `l`
+/// therefore binds index `2*l` (key) and `2*l + 1` (value).
+///
+/// Returns `Ok(None)` when the graph carries no explicitly declared paged KV
+/// pairs: either the I/O metadata declares none (a static-cache or non-KV
+/// graph), or no I/O metadata is present at all. Paged-KV geometry is built
+/// only from an explicit `kv_inputs`/`kv_outputs` declaration — never inferred
+/// from a tensor name or shape, since a growing paged present output is
+/// shape-indistinguishable from a static-cache buffer or a logits/hidden
+/// output. The decode-path resolver (`decode::resolved_io`) independently fails
+/// closed, naming `model.io.kv_inputs`/`kv_outputs`, when a decoder genuinely
+/// carries unpaired KV state without an explicit declaration.
+fn resolve_kv_layers(
+    session: &Session,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> anyhow::Result<Option<Vec<ResolvedKvLayer>>> {
+    let (kv_inputs, kv_outputs) = match io.map(|io| (io.kv_inputs.as_ref(), io.kv_outputs.as_ref()))
+    {
+        Some((Some(inputs), Some(outputs))) => (inputs, outputs),
+        // Metadata is present and explicitly declares no growing KV pairs (a
+        // static-cache or non-KV graph): there is no paged bridge to build.
+        Some((None, None)) => return Ok(None),
+        Some((Some(_), None)) | Some((None, Some(_))) => {
+            anyhow::bail!("model.io.kv_inputs and model.io.kv_outputs must be declared together")
+        }
+        // No I/O metadata at all: never guess KV pairing from tensor names or
+        // shapes. The engine simply builds no paged cache; KV correctness is
+        // enforced by the decode-path resolver, which fails closed on unpaired
+        // KV state and names the exact missing metadata key.
+        None => return Ok(None),
+    };
+
+    let port_layers = pair_kv_ports(kv_inputs, kv_outputs)?;
+    if port_layers.is_empty() {
+        return Ok(None);
+    }
+    let mut layers = Vec::with_capacity(port_layers.len());
+    for ports in port_layers {
+        let key_present_info = require_present_kv_output(session, &ports.key_present)?;
+        require_present_kv_output(session, &ports.value_present)?;
+        require_kv_input(session, &ports.key_past)?;
+        require_kv_input(session, &ports.value_past)?;
+        layers.push(ResolvedKvLayer {
+            key_past: ports.key_past,
+            key_present: ports.key_present,
+            value_past: ports.value_past,
+            value_present: ports.value_present,
+            key_present_info,
+        });
+    }
+    Ok(Some(layers))
+}
+
+/// One layer's four KV port NAMES, before any ONNX-graph lookup.
+#[derive(Debug)]
+struct KvLayerPortNames {
+    key_past: String,
+    key_present: String,
+    value_past: String,
+    value_present: String,
+}
+
+/// Group the flat, positionally-paired `kv_inputs`/`kv_outputs` port lists into
+/// per-layer `[key, value]` quadruples. Pure and name-free: it validates only
+/// list STRUCTURE (equal length, even count) and never inspects the ONNX graph
+/// or a tensor name. Errors name the exact offending metadata key so an
+/// exporter can fix the declaration. An empty (but valid) list yields no layers.
+fn pair_kv_ports(
+    kv_inputs: &[String],
+    kv_outputs: &[String],
+) -> anyhow::Result<Vec<KvLayerPortNames>> {
+    if kv_inputs.len() != kv_outputs.len() {
+        anyhow::bail!(
+            "model.io.kv_inputs ({}) and model.io.kv_outputs ({}) must have equal length",
+            kv_inputs.len(),
+            kv_outputs.len()
+        );
+    }
+    // Each self-attention layer contributes a [key, value] pair, so the flat
+    // positional lists must contain an even number of ports.
+    if !kv_inputs.len().is_multiple_of(2) {
+        anyhow::bail!(
+            "model.io.kv_inputs/kv_outputs declare {} KV ports; a paged self-attention cache \
+             pairs them as per-layer [key, value], which requires an even count",
+            kv_inputs.len()
+        );
+    }
+
+    Ok((0..kv_inputs.len() / 2)
+        .map(|layer| {
+            let key_index = layer * 2;
+            let value_index = key_index + 1;
+            KvLayerPortNames {
+                key_past: kv_inputs[key_index].clone(),
+                key_present: kv_outputs[key_index].clone(),
+                value_past: kv_inputs[value_index].clone(),
+                value_present: kv_outputs[value_index].clone(),
+            }
+        })
+        .collect())
+}
+
+/// Look up a declared present-KV output and validate its element type, returning
+/// its shape record for structural geometry inference. Errors name the exact
+/// missing/invalid `model.io.kv_outputs` port.
+fn require_present_kv_output(session: &Session, name: &str) -> anyhow::Result<TensorInfo> {
+    let info = session
+        .outputs()
+        .iter()
+        .find(|output| output.name == name)
+        .cloned()
+        .with_context(|| {
+            format!("declared model.io.kv_outputs port '{name}' is not exposed by the graph")
+        })?;
+    if !is_supported_kv_dtype(info.dtype) {
+        anyhow::bail!(
+            "KV present output '{name}' must be Float32, Float16, or BFloat16, got {:?}",
+            info.dtype
+        );
+    }
+    Ok(info)
+}
+
+/// Validate that a declared past-KV input exists; errors name the exact missing
+/// `model.io.kv_inputs` port.
+fn require_kv_input(session: &Session, name: &str) -> anyhow::Result<()> {
+    if !session.inputs().iter().any(|input| input.name == name) {
+        anyhow::bail!("declared model.io.kv_inputs port '{name}' is not exposed by the graph");
+    }
+    Ok(())
 }
 
 /// Build the per-layer KV geometry from each exported present-KV output shape.
@@ -680,12 +796,6 @@ pub(crate) fn row_major_strides(shape: &[i64]) -> Vec<usize> {
     strides
 }
 
-pub(crate) fn kv_layer_index(name: &str) -> Option<usize> {
-    name.split(|ch: char| !ch.is_ascii_digit())
-        .find(|part| !part.is_empty())
-        .and_then(|part| part.parse().ok())
-}
-
 // ---------------------------------------------------------------------------
 // Connector KV payload <-> runner-KV conversion (DESIGN §38, K4)
 // ---------------------------------------------------------------------------
@@ -1001,7 +1111,8 @@ mod tests {
     {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let info = infer_kv_model_info(&session, 4, KvDType::F32)?.expect("past/present KV model");
+        let info = infer_kv_model_info(&session, Some(&fixture_io("tiny-llm")?), 4, KvDType::F32)?
+            .expect("past/present KV model");
         assert_eq!(
             info.tensor_config,
             PageTensorConfig {
@@ -1024,7 +1135,38 @@ mod tests {
         );
 
         let (_environment, static_session) = load_session("tiny-llm-scatter")?;
-        assert!(infer_kv_model_info(&static_session, 4, KvDType::F32)?.is_none());
+        assert!(
+            infer_kv_model_info(
+                &static_session,
+                Some(&fixture_io("tiny-llm-scatter")?),
+                4,
+                KvDType::F32
+            )?
+            .is_none()
+        );
+
+        // Without any I/O metadata, the paged resolver never guesses geometry
+        // from tensor names or shapes: it builds no paged cache even for a graph
+        // that clearly carries KV-shaped state inputs (a static-cache scatter
+        // model, or a past/present model whose metadata was simply not loaded).
+        // KV correctness is enforced separately by the decode-path resolver.
+        assert!(
+            infer_kv_model_info(&session, None, 4, KvDType::F32)?.is_none(),
+            "no metadata must yield no paged KV, never a name/shape guess"
+        );
+        assert!(infer_kv_model_info(&static_session, None, 4, KvDType::F32)?.is_none());
+
+        // Declaring only one side of the positional pairing is an actionable
+        // error that names both required keys, never a silent half-guess.
+        let mut half_declared = fixture_io("tiny-llm")?;
+        half_declared.kv_outputs = None;
+        let mismatch = infer_kv_model_info(&session, Some(&half_declared), 4, KvDType::F32)
+            .expect_err("declaring kv_inputs without kv_outputs must fail");
+        assert!(
+            mismatch.to_string().contains("model.io.kv_inputs")
+                && mismatch.to_string().contains("model.io.kv_outputs"),
+            "the error must name both explicit keys: {mismatch}"
+        );
         Ok(())
     }
 
@@ -1090,8 +1232,6 @@ mod tests {
             shape: vec![-1, 2, -1, 8],
         };
         assert_eq!(infer_kv_heads_and_head_dim(&valid).unwrap(), (2, 8));
-        assert_eq!(kv_layer_index(&valid.name), Some(7));
-        assert_eq!(kv_layer_index("present.key"), None);
         assert_eq!(past_shape(&[-1, 2, -1, 8], 3).unwrap(), [1, 2, 3, 8]);
         assert_eq!(row_major_strides(&[1, 2, 3, 4]), [24, 12, 4, 1]);
 
@@ -1125,6 +1265,54 @@ mod tests {
         assert!(past_shape(&[1, 2], 3).is_err());
     }
 
+    /// Helper: build owned `String` port lists from string literals.
+    fn ports(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn pair_kv_ports_groups_interleaved_key_value_by_declared_order() -> anyhow::Result<()> {
+        // Deliberately NON-conventional names prove the pairing is positional,
+        // never derived from a substring like "key"/"value" or a layer index.
+        let layers = pair_kv_ports(
+            &ports(&["in_a", "in_b", "in_c", "in_d"]),
+            &ports(&["out_a", "out_b", "out_c", "out_d"]),
+        )?;
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].key_past, "in_a");
+        assert_eq!(layers[0].key_present, "out_a");
+        assert_eq!(layers[0].value_past, "in_b");
+        assert_eq!(layers[0].value_present, "out_b");
+        assert_eq!(layers[1].key_past, "in_c");
+        assert_eq!(layers[1].value_present, "out_d");
+        Ok(())
+    }
+
+    #[test]
+    fn pair_kv_ports_accepts_empty_lists_as_no_layers() -> anyhow::Result<()> {
+        assert!(pair_kv_ports(&ports(&[]), &ports(&[]))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pair_kv_ports_rejects_unequal_lengths_naming_both_keys() {
+        let error = pair_kv_ports(&ports(&["a", "b"]), &ports(&["x"]))
+            .expect_err("unequal kv_inputs/kv_outputs must fail");
+        let message = error.to_string();
+        assert!(message.contains("model.io.kv_inputs"), "{message}");
+        assert!(message.contains("model.io.kv_outputs"), "{message}");
+    }
+
+    #[test]
+    fn pair_kv_ports_rejects_odd_port_count_naming_the_key() {
+        let error = pair_kv_ports(&ports(&["a", "b", "c"]), &ports(&["x", "y", "z"]))
+            .expect_err("an odd KV port count cannot form [key, value] pairs");
+        assert!(
+            error.to_string().contains("model.io.kv_inputs/kv_outputs"),
+            "the error must name the offending key: {error}"
+        );
+    }
+
     #[test]
     fn extracts_tokens_from_present_tensor_and_reports_bad_layouts() {
         let config = PageTensorConfig {
@@ -1156,7 +1344,8 @@ mod tests {
     fn mirrors_present_append_range_into_paged_cache() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let model = infer_kv_model_info(&session, 2, KvDType::F32)?.unwrap();
+        let model = infer_kv_model_info(&session, Some(&fixture_io("tiny-llm")?), 2, KvDType::F32)?
+            .unwrap();
         let mut cache = PagedKvCache::new_with_tensor_config(model.tensor_config, 4);
         let seq = cache.create_sequence();
 
@@ -1199,7 +1388,8 @@ mod tests {
     fn materializes_past_values_in_model_input_layout() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let model = infer_kv_model_info(&session, 2, KvDType::F32)?.unwrap();
+        let model = infer_kv_model_info(&session, Some(&fixture_io("tiny-llm")?), 2, KvDType::F32)?
+            .unwrap();
         let materialized = onnx_genai_kv::MaterializedKv {
             start_position: 0,
             sink_len: 0,
@@ -1293,7 +1483,8 @@ mod tests {
     fn rewinds_materialized_ort_past_and_handles_edge_branches() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let model = infer_kv_model_info(&session, 2, KvDType::F32)?.unwrap();
+        let model = infer_kv_model_info(&session, Some(&fixture_io("tiny-llm")?), 2, KvDType::F32)?
+            .unwrap();
         let mut cache = PagedKvCache::new_with_tensor_config(model.tensor_config, 8);
         let seq = cache.create_sequence();
         for base in [0.0, 10.0, 20.0] {
@@ -1515,7 +1706,7 @@ mod tests {
 
         // Shape cannot distinguish the three integer sequence inputs, so
         // initialization fails closed and names are not consulted.
-        let convention_err = match DecodeState::new(&session) {
+        let convention_err = match DecodeState::new_with_io(&session, None) {
             Ok(_) => panic!("ambiguous shapes must require metadata"),
             Err(error) => error,
         };
@@ -1627,7 +1818,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
-        let info = infer_kv_model_info(&session, 4, dtype)?
+        let info = infer_kv_model_info(&session, Some(&fixture_io("tiny-llm")?), 4, dtype)?
             .expect("tiny-llm exposes past/present KV outputs");
         assert_eq!(
             info.tensor_config.dtype, dtype,

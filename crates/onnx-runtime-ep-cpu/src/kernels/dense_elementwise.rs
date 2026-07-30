@@ -1,0 +1,638 @@
+//! Shared dense-elementwise SIMD infrastructure for per-element unary ops.
+//!
+//! ## Design
+//!
+//! A per-element operation (Relu, Clip, Abs, Neg, …) does not depend on logical
+//! axis order — only on visiting every element exactly once. The traditional
+//! "contiguity guard" (`is_contiguous()`) unnecessarily rejects dense-but-permuted
+//! tensors (e.g. NHWC layout in an NCHW model). This module provides dispatch
+//! that accepts any tensor whose backing memory is **dense** (all elements packed
+//! without holes) and whose input/output strides match, regardless of logical
+//! layout.
+//!
+//! Three tiers:
+//! 1. **Dense SIMD** — input & output are both dense with matching strides.
+//!    Process the entire backing buffer with NEON/scalar bulk loops.
+//! 2. **Strided** — non-dense strides. Falls to the caller's generic path
+//!    (widen/narrow). Counted for observability.
+//! 3. **Scalar fallback** — last resort (covered by caller's widen path).
+//!
+//! ## Dtype coverage
+//!
+//! - **f32**: NEON `vmaxq_f32` / `vminq_f32` on aarch64, scalar elsewhere.
+//! - **f16**: NEON widen-to-f32 (`vcvt_f32_f16`), process via f32 SIMD, narrow
+//!   back (`vcvt_f16_f32`) — available on ALL aarch64 (no `target_feature = "fp16"`
+//!   required). This gives SIMD throughput for f16 on every Apple Silicon chip.
+//! - **bf16**: Widen-to-f32, compute, narrow-back via scalar (no native bf16
+//!   comparison on NEON).
+//!
+//! ## NaN semantics
+//!
+//! NaN **propagates** on all paths. On NEON: `vmaxq_f32` / `vminq_f32` lower
+//! to `FMAX` / `FMIN` (propagating). On scalar: PartialOrd comparisons (NaN
+//! compares false, passing through unchanged). The f16 path inherits f32
+//! NaN-propagation since it widens through `vcvt_f32_f16` (NaN f16 → NaN f32).
+//!
+//! ## Signed zero
+//!
+//! NEON `FMAX(+0, -0)` returns `+0`; scalar comparison preserves `-0`. This is
+//! an accepted divergence (matches ONNX spec and ORT/MLAS behaviour).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use onnx_runtime_ep_api::{Result, TensorMut, TensorView};
+use onnx_runtime_ir::DataType;
+
+use crate::strided::numel;
+
+// ─── Dispatch counters ──────────────────────────────────────────────────────
+
+/// Counter: dense SIMD path fired for f32.
+#[doc(hidden)]
+pub static DENSE_ELEM_F32_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Counter: dense SIMD path fired for f16 (via widen/narrow NEON).
+#[doc(hidden)]
+pub static DENSE_ELEM_F16_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Counter: dense SIMD path fired for bf16 (via widen/narrow scalar).
+#[doc(hidden)]
+pub static DENSE_ELEM_BF16_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Counter: non-dense input fell through to caller's generic path.
+#[doc(hidden)]
+pub static DENSE_ELEM_NON_DENSE_FALLBACK_HITS: AtomicU64 = AtomicU64::new(0);
+
+// ─── Op trait ───────────────────────────────────────────────────────────────
+
+/// A per-element unary operation that can be applied via SIMD bulk or scalar.
+pub trait ElementwiseOp {
+    /// Apply to a contiguous f32 buffer: `dst[i] = op(src[i])`.
+    fn apply_f32_bulk(&self, src: &[f32], dst: &mut [f32]);
+
+    /// Scalar f32 application for tail/fallback.
+    fn apply_f32_scalar(&self, x: f32) -> f32;
+}
+
+// ─── Dispatch ───────────────────────────────────────────────────────────────
+
+/// Attempt the dense elementwise fast path. Returns `Ok(true)` if handled.
+///
+/// Accepts when:
+/// - Input and output have the same shape.
+/// - Input and output strides match (same memory traversal visits
+///   corresponding elements).
+/// - Both are **dense** (backing memory has no holes).
+/// - Dtype is f32, f16, or bf16.
+/// - No pointer aliasing between input and output (or handled via alloc).
+pub fn try_dense_elementwise(
+    op: &dyn ElementwiseOp,
+    input: &TensorView,
+    output: &mut TensorMut,
+) -> Result<bool> {
+    // Shape must match.
+    if input.shape != output.shape {
+        return Ok(false);
+    }
+
+    // Strides must match (same memory traversal order).
+    if input.strides != output.strides {
+        return Ok(false);
+    }
+
+    // Both must be dense (elements packed without holes).
+    if !onnx_runtime_ir::is_dense(input.shape, input.strides) {
+        DENSE_ELEM_NON_DENSE_FALLBACK_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(false);
+    }
+
+    // Dtype dispatch.
+    match (input.dtype, output.dtype) {
+        (DataType::Float32, DataType::Float32) => {
+            dispatch_dense_f32(op, input, output)?;
+            DENSE_ELEM_F32_HITS.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        (DataType::Float16, DataType::Float16) => {
+            dispatch_dense_f16(op, input, output)?;
+            DENSE_ELEM_F16_HITS.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        (DataType::BFloat16, DataType::BFloat16) => {
+            dispatch_dense_bf16(op, input, output)?;
+            DENSE_ELEM_BF16_HITS.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+// ─── f32 dispatch ───────────────────────────────────────────────────────────
+
+fn dispatch_dense_f32(
+    op: &dyn ElementwiseOp,
+    input: &TensorView,
+    output: &mut TensorMut,
+) -> Result<()> {
+    let len = numel(input.shape);
+
+    // Overlap guard.
+    let input_start = input.data_ptr::<u8>() as usize;
+    let input_end = input_start.saturating_add(input.byte_size());
+    let output_start = output.data_ptr_mut::<u8>() as usize;
+    let output_end = output_start.saturating_add(output.byte_size());
+    if output_start < input_end && input_start < output_end {
+        let src = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), len) }.to_vec();
+        let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), len) };
+        op.apply_f32_bulk(&src, dst);
+        return Ok(());
+    }
+
+    let src = unsafe { std::slice::from_raw_parts(input.data_ptr::<f32>(), len) };
+    let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), len) };
+    op.apply_f32_bulk(src, dst);
+    Ok(())
+}
+
+// ─── f16 dispatch (widen→f32 SIMD→narrow) ───────────────────────────────────
+
+fn dispatch_dense_f16(
+    op: &dyn ElementwiseOp,
+    input: &TensorView,
+    output: &mut TensorMut,
+) -> Result<()> {
+    let len = numel(input.shape);
+
+    let src_u16 = unsafe { std::slice::from_raw_parts(input.data_ptr::<u16>(), len) };
+    let dst_u16 = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<u16>(), len) };
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON widen/narrow path: process 4 f16 values at a time through f32 SIMD.
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { elementwise_f16_neon(op, src_u16, dst_u16) };
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Scalar widen/narrow fallback.
+        for (d, &s) in dst_u16.iter_mut().zip(src_u16.iter()) {
+            let v = half::f16::from_bits(s).to_f32();
+            let r = op.apply_f32_scalar(v);
+            *d = half::f16::from_f32(r).to_bits();
+        }
+    }
+
+    Ok(())
+}
+
+/// NEON f16 path: widen 4 f16→f32, apply op, narrow 4 f32→f16.
+/// Uses `vcvt_f32_f16` / `vcvt_f16_f32` which are available on ALL aarch64.
+///
+/// # Safety
+/// Caller must ensure `src` and `dst` have the same length and do not overlap.
+#[cfg(target_arch = "aarch64")]
+unsafe fn elementwise_f16_neon(op: &dyn ElementwiseOp, src: &[u16], dst: &mut [u16]) {
+    use std::arch::aarch64::*;
+
+    let n = src.len();
+    let mut i = 0usize;
+
+    // Process 16 f16 values per iteration (4×4 f32 vectors).
+    let bulk_end = n & !15;
+    while i < bulk_end {
+        unsafe {
+            let h0 = vld1_u16(src.as_ptr().add(i));
+            let h1 = vld1_u16(src.as_ptr().add(i + 4));
+            let h2 = vld1_u16(src.as_ptr().add(i + 8));
+            let h3 = vld1_u16(src.as_ptr().add(i + 12));
+
+            let f0 = vcvt_f32_f16(vreinterpret_f16_u16(h0));
+            let f1 = vcvt_f32_f16(vreinterpret_f16_u16(h1));
+            let f2 = vcvt_f32_f16(vreinterpret_f16_u16(h2));
+            let f3 = vcvt_f32_f16(vreinterpret_f16_u16(h3));
+
+            let mut src_buf = [0.0f32; 16];
+            let mut dst_buf = [0.0f32; 16];
+            vst1q_f32(src_buf.as_mut_ptr(), f0);
+            vst1q_f32(src_buf.as_mut_ptr().add(4), f1);
+            vst1q_f32(src_buf.as_mut_ptr().add(8), f2);
+            vst1q_f32(src_buf.as_mut_ptr().add(12), f3);
+
+            op.apply_f32_bulk(&src_buf, &mut dst_buf);
+
+            let r0 = vcvt_f16_f32(vld1q_f32(dst_buf.as_ptr()));
+            let r1 = vcvt_f16_f32(vld1q_f32(dst_buf.as_ptr().add(4)));
+            let r2 = vcvt_f16_f32(vld1q_f32(dst_buf.as_ptr().add(8)));
+            let r3 = vcvt_f16_f32(vld1q_f32(dst_buf.as_ptr().add(12)));
+
+            vst1_u16(dst.as_mut_ptr().add(i), vreinterpret_u16_f16(r0));
+            vst1_u16(dst.as_mut_ptr().add(i + 4), vreinterpret_u16_f16(r1));
+            vst1_u16(dst.as_mut_ptr().add(i + 8), vreinterpret_u16_f16(r2));
+            vst1_u16(dst.as_mut_ptr().add(i + 12), vreinterpret_u16_f16(r3));
+        }
+
+        i += 16;
+    }
+
+    // Tail: 4 at a time.
+    while i + 4 <= n {
+        unsafe {
+            let h = vld1_u16(src.as_ptr().add(i));
+            let f = vcvt_f32_f16(vreinterpret_f16_u16(h));
+            let mut src_buf = [0.0f32; 4];
+            let mut dst_buf = [0.0f32; 4];
+            vst1q_f32(src_buf.as_mut_ptr(), f);
+            op.apply_f32_bulk(&src_buf, &mut dst_buf);
+            let r = vcvt_f16_f32(vld1q_f32(dst_buf.as_ptr()));
+            vst1_u16(dst.as_mut_ptr().add(i), vreinterpret_u16_f16(r));
+        }
+        i += 4;
+    }
+
+    // Scalar tail.
+    while i < n {
+        unsafe {
+            let v = half::f16::from_bits(*src.get_unchecked(i)).to_f32();
+            let r = op.apply_f32_scalar(v);
+            *dst.get_unchecked_mut(i) = half::f16::from_f32(r).to_bits();
+        }
+        i += 1;
+    }
+}
+
+// ─── bf16 dispatch (widen→f32→narrow, scalar on all platforms) ──────────────
+
+fn dispatch_dense_bf16(
+    op: &dyn ElementwiseOp,
+    input: &TensorView,
+    output: &mut TensorMut,
+) -> Result<()> {
+    let len = numel(input.shape);
+
+    let src_u16 = unsafe { std::slice::from_raw_parts(input.data_ptr::<u16>(), len) };
+    let dst_u16 = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<u16>(), len) };
+
+    // bf16 has no native NEON comparison ops on current Apple Silicon.
+    // Widen to f32, process in bulk, narrow back.
+    let mut f32_buf: Vec<f32> = src_u16
+        .iter()
+        .map(|&bits| half::bf16::from_bits(bits).to_f32())
+        .collect();
+
+    op.apply_f32_bulk(&f32_buf.clone(), &mut f32_buf);
+
+    for (d, &v) in dst_u16.iter_mut().zip(f32_buf.iter()) {
+        *d = half::bf16::from_f32(v).to_bits();
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Relu operation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Relu: `max(0, x)` — NaN-propagating, uses `vmaxq_f32` (FMAX) on NEON.
+pub struct ReluOp;
+
+impl ElementwiseOp for ReluOp {
+    fn apply_f32_bulk(&self, src: &[f32], dst: &mut [f32]) {
+        relu_f32_simd(src, dst);
+    }
+
+    fn apply_f32_scalar(&self, x: f32) -> f32 {
+        if x < 0.0 { 0.0 } else { x }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Clip operation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Clip: `clamp(x, min, max)` — NaN-propagating, uses `vmaxq_f32`/`vminq_f32`.
+pub struct ClipOp {
+    pub minimum: f32,
+    pub maximum: f32,
+}
+
+impl ElementwiseOp for ClipOp {
+    fn apply_f32_bulk(&self, src: &[f32], dst: &mut [f32]) {
+        clip_f32_simd(src, dst, self.minimum, self.maximum);
+    }
+
+    fn apply_f32_scalar(&self, x: f32) -> f32 {
+        clamp_nan_propagating(x, self.minimum, self.maximum)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// f32 SIMD implementations
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn relu_f32_simd(src: &[f32], dst: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        relu_f32_neon(src, dst);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d = if s < 0.0 { 0.0 } else { s };
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn relu_f32_neon(src: &[f32], dst: &mut [f32]) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    unsafe {
+        let vzero = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        let bulk_end = n & !15;
+        while i < bulk_end {
+            let a0 = vld1q_f32(src.as_ptr().add(i));
+            let a1 = vld1q_f32(src.as_ptr().add(i + 4));
+            let a2 = vld1q_f32(src.as_ptr().add(i + 8));
+            let a3 = vld1q_f32(src.as_ptr().add(i + 12));
+            let r0 = vmaxq_f32(a0, vzero);
+            let r1 = vmaxq_f32(a1, vzero);
+            let r2 = vmaxq_f32(a2, vzero);
+            let r3 = vmaxq_f32(a3, vzero);
+            vst1q_f32(dst.as_mut_ptr().add(i), r0);
+            vst1q_f32(dst.as_mut_ptr().add(i + 4), r1);
+            vst1q_f32(dst.as_mut_ptr().add(i + 8), r2);
+            vst1q_f32(dst.as_mut_ptr().add(i + 12), r3);
+            i += 16;
+        }
+        while i + 4 <= n {
+            let a = vld1q_f32(src.as_ptr().add(i));
+            let r = vmaxq_f32(a, vzero);
+            vst1q_f32(dst.as_mut_ptr().add(i), r);
+            i += 4;
+        }
+        while i < n {
+            let v = *src.get_unchecked(i);
+            *dst.get_unchecked_mut(i) = if v < 0.0 { 0.0 } else { v };
+            i += 1;
+        }
+    }
+}
+
+fn clip_f32_simd(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        clip_f32_neon(src, dst, minimum, maximum);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d = clamp_nan_propagating(s, minimum, maximum);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn clip_f32_neon(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    unsafe {
+        let vmin = vdupq_n_f32(minimum);
+        let vmax = vdupq_n_f32(maximum);
+        let mut i = 0usize;
+        let bulk_end = n & !15;
+        while i < bulk_end {
+            let a0 = vld1q_f32(src.as_ptr().add(i));
+            let a1 = vld1q_f32(src.as_ptr().add(i + 4));
+            let a2 = vld1q_f32(src.as_ptr().add(i + 8));
+            let a3 = vld1q_f32(src.as_ptr().add(i + 12));
+            let c0 = vminq_f32(vmaxq_f32(a0, vmin), vmax);
+            let c1 = vminq_f32(vmaxq_f32(a1, vmin), vmax);
+            let c2 = vminq_f32(vmaxq_f32(a2, vmin), vmax);
+            let c3 = vminq_f32(vmaxq_f32(a3, vmin), vmax);
+            vst1q_f32(dst.as_mut_ptr().add(i), c0);
+            vst1q_f32(dst.as_mut_ptr().add(i + 4), c1);
+            vst1q_f32(dst.as_mut_ptr().add(i + 8), c2);
+            vst1q_f32(dst.as_mut_ptr().add(i + 12), c3);
+            i += 16;
+        }
+        while i + 4 <= n {
+            let a = vld1q_f32(src.as_ptr().add(i));
+            let c = vminq_f32(vmaxq_f32(a, vmin), vmax);
+            vst1q_f32(dst.as_mut_ptr().add(i), c);
+            i += 4;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) =
+                clamp_nan_propagating(*src.get_unchecked(i), minimum, maximum);
+            i += 1;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Scalar helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// NaN-propagating clamp. If `x` is NaN, both comparisons are false and NaN
+/// passes through unchanged. Matches NEON FMAX/FMIN semantics.
+#[inline(always)]
+pub fn clamp_nan_propagating(x: f32, minimum: f32, maximum: f32) -> f32 {
+    let x = if x < minimum { minimum } else { x };
+    if x > maximum { maximum } else { x }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_dense_basic_cases() {
+        // Contiguous is always dense.
+        assert!(onnx_runtime_ir::is_dense(&[2, 3, 4], &[12, 4, 1]));
+        // Column-major [4,3] with strides [1,4] is dense.
+        assert!(onnx_runtime_ir::is_dense(&[4, 3], &[1, 4]));
+        // Row-major [4,3] with strides [3,1] is dense.
+        assert!(onnx_runtime_ir::is_dense(&[4, 3], &[3, 1]));
+        // Strided [4,3] with strides [4,1] has holes — NOT dense.
+        assert!(!onnx_runtime_ir::is_dense(&[4, 3], &[4, 1]));
+        // Scalar is dense.
+        assert!(onnx_runtime_ir::is_dense(&[], &[]));
+        // Size-1 dims have unconstrained strides.
+        assert!(onnx_runtime_ir::is_dense(&[1, 4, 3], &[999, 3, 1]));
+        // Transposed [2,4,3] from [2,3,4] with strides [12,1,4] is dense.
+        assert!(onnx_runtime_ir::is_dense(&[2, 4, 3], &[12, 1, 4]));
+        // Broadcast stride 0 for size > 1 is not dense (repeats elements).
+        assert!(!onnx_runtime_ir::is_dense(&[4, 3], &[0, 1]));
+    }
+
+    #[test]
+    fn relu_f32_nan_propagates() {
+        let op = ReluOp;
+        let src = [f32::NAN, -1.0, 0.0, 1.0];
+        let mut dst = [0.0f32; 4];
+        op.apply_f32_bulk(&src, &mut dst);
+        assert!(dst[0].is_nan());
+        assert_eq!(dst[1], 0.0);
+        assert_eq!(dst[2], 0.0);
+        assert_eq!(dst[3], 1.0);
+    }
+
+    #[test]
+    fn clip_f32_nan_propagates() {
+        let op = ClipOp {
+            minimum: -0.5,
+            maximum: 0.5,
+        };
+        let src = [f32::NAN, -1.0, 0.0, 1.0];
+        let mut dst = [0.0f32; 4];
+        op.apply_f32_bulk(&src, &mut dst);
+        assert!(dst[0].is_nan());
+        assert_eq!(dst[1], -0.5);
+        assert_eq!(dst[2], 0.0);
+        assert_eq!(dst[3], 0.5);
+    }
+
+    #[test]
+    fn relu_f32_boundary_lengths() {
+        let op = ReluOp;
+        for len in [1, 3, 4, 15, 16, 17, 63, 64, 65, 1023] {
+            let src: Vec<f32> = (0..len).map(|i| (i as f32) - (len as f32 / 2.0)).collect();
+            let mut dst = vec![0.0f32; len];
+            op.apply_f32_bulk(&src, &mut dst);
+            for (idx, (&s, &d)) in src.iter().zip(dst.iter()).enumerate() {
+                let expected = if s < 0.0 { 0.0 } else { s };
+                assert_eq!(expected.to_bits(), d.to_bits(), "len={len} idx={idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn clip_f32_boundary_lengths() {
+        let op = ClipOp {
+            minimum: -2.0,
+            maximum: 2.0,
+        };
+        for len in [1, 3, 4, 15, 16, 17, 63, 64, 65] {
+            let src: Vec<f32> = (0..len).map(|i| (i as f32) - (len as f32 / 2.0)).collect();
+            let mut dst = vec![0.0f32; len];
+            op.apply_f32_bulk(&src, &mut dst);
+            for (idx, (&s, &d)) in src.iter().zip(dst.iter()).enumerate() {
+                let expected = clamp_nan_propagating(s, -2.0, 2.0);
+                assert_eq!(expected.to_bits(), d.to_bits(), "len={len} idx={idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn relu_f16_via_widen_narrow() {
+        // Test the full dispatch path for f16.
+        let values_f32 = [f32::NAN, -1.0, 0.0, 1.0, -0.5, 2.0, -3.0, 0.5];
+        let src: Vec<u16> = values_f32
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        let mut dst = vec![0u16; src.len()];
+
+        let op = ReluOp;
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            elementwise_f16_neon(&op, &src, &mut dst);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                let v = half::f16::from_bits(s).to_f32();
+                *d = half::f16::from_f32(op.apply_f32_scalar(v)).to_bits();
+            }
+        }
+
+        let results: Vec<f32> = dst
+            .iter()
+            .map(|&bits| half::f16::from_bits(bits).to_f32())
+            .collect();
+        assert!(results[0].is_nan(), "NaN must propagate through f16 path");
+        assert_eq!(results[1], 0.0);
+        assert_eq!(results[2], 0.0);
+        assert_eq!(results[3], 1.0);
+        assert_eq!(results[4], 0.0);
+        assert_eq!(results[5], 2.0);
+        assert_eq!(results[6], 0.0);
+        assert_eq!(results[7], 0.5);
+    }
+
+    #[test]
+    fn clip_f16_via_widen_narrow() {
+        let values_f32 = [f32::NAN, -1.0, 0.0, 1.0, -0.5, 2.0, -3.0, 0.5];
+        let src: Vec<u16> = values_f32
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_bits())
+            .collect();
+        let mut dst = vec![0u16; src.len()];
+
+        let op = ClipOp {
+            minimum: -0.5,
+            maximum: 0.5,
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            elementwise_f16_neon(&op, &src, &mut dst);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                let v = half::f16::from_bits(s).to_f32();
+                *d = half::f16::from_f32(op.apply_f32_scalar(v)).to_bits();
+            }
+        }
+
+        let results: Vec<f32> = dst
+            .iter()
+            .map(|&bits| half::f16::from_bits(bits).to_f32())
+            .collect();
+        assert!(results[0].is_nan(), "NaN must propagate through f16 Clip");
+        assert_eq!(results[1], -0.5);
+        assert_eq!(results[2], 0.0);
+        assert_eq!(results[3], 0.5);
+        assert_eq!(results[4], -0.5);
+        assert_eq!(results[5], 0.5);
+        assert_eq!(results[6], -0.5);
+        assert_eq!(results[7], 0.5);
+    }
+
+    #[test]
+    fn relu_bf16_via_widen_narrow() {
+        let values_f32 = [f32::NAN, -1.0, 0.0, 1.0];
+        let src: Vec<u16> = values_f32
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let mut dst = vec![0u16; src.len()];
+
+        let op = ReluOp;
+        // Use dispatch_dense_bf16 logic manually.
+        let mut f32_buf: Vec<f32> = src
+            .iter()
+            .map(|&bits| half::bf16::from_bits(bits).to_f32())
+            .collect();
+        let f32_src = f32_buf.clone();
+        op.apply_f32_bulk(&f32_src, &mut f32_buf);
+        for (d, &v) in dst.iter_mut().zip(f32_buf.iter()) {
+            *d = half::bf16::from_f32(v).to_bits();
+        }
+
+        let results: Vec<f32> = dst
+            .iter()
+            .map(|&bits| half::bf16::from_bits(bits).to_f32())
+            .collect();
+        assert!(results[0].is_nan());
+        assert_eq!(results[1], 0.0);
+        assert_eq!(results[2], 0.0);
+        assert_eq!(results[3], 1.0);
+    }
+}

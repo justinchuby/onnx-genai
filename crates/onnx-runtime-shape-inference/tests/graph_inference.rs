@@ -1201,6 +1201,207 @@ fn scan_opset_eight_is_not_modelled_and_leaves_outputs_unresolved() {
     assert!(report.unresolved.contains(&scan_out));
 }
 
+/// A `Scan` body with one state and two scan slices:
+/// `(state, slice_a, slice_b) -> (state_out, scan_a_out, scan_b_out)`, all
+/// passed straight through so shapes come purely from seeding + axis handling.
+fn scan_two_input_body() -> Graph {
+    let mut body = Graph::new();
+    let names = ["state", "slice_a", "slice_b"];
+    let inputs: Vec<ValueId> = names
+        .iter()
+        .map(|name| {
+            let v = body.create_named_value(*name, DataType::Float32, Shape::new());
+            body.mark_value_type_unknown(v);
+            body.mark_value_shape_unknown(v);
+            body.add_input(v);
+            v
+        })
+        .collect();
+    for (i, (src, out_name)) in inputs
+        .iter()
+        .zip(["state_out", "scan_a_out", "scan_b_out"])
+        .enumerate()
+    {
+        let out = body.create_named_value(out_name, DataType::Float32, Shape::new());
+        body.insert_node(node(i as u32, "Identity", vec![Some(*src)], vec![out]));
+        body.add_output(out);
+    }
+    body
+}
+
+#[test]
+fn scan_two_scan_inputs_strip_and_reinsert_per_input_axes() {
+    let mut graph = Graph::new();
+    let state = graph.create_named_value("state_init", DataType::Float32, vec![Dim::Static(2)]);
+    graph.add_input(state);
+    // scan_a scanned on axis 0 (sequence length 5, per-iter slice [4]).
+    let scan_a = graph.create_named_value(
+        "scan_a",
+        DataType::Float32,
+        vec![Dim::Static(5), Dim::Static(4)],
+    );
+    graph.add_input(scan_a);
+    // scan_b scanned on axis 1 (sequence length 5, per-iter slice [3]).
+    let scan_b = graph.create_named_value(
+        "scan_b",
+        DataType::Float32,
+        vec![Dim::Static(3), Dim::Static(5)],
+    );
+    graph.add_input(scan_b);
+
+    let outs: Vec<ValueId> = ["state_out", "scan_a_out", "scan_b_out"]
+        .iter()
+        .map(|name| {
+            let v = graph.create_named_value(*name, DataType::Float32, Shape::new());
+            graph.mark_value_type_unknown(v);
+            graph.mark_value_shape_unknown(v);
+            v
+        })
+        .collect();
+
+    let mut scan_node = node(
+        0,
+        "Scan",
+        vec![Some(state), Some(scan_a), Some(scan_b)],
+        outs.clone(),
+    );
+    scan_node
+        .attributes
+        .insert("num_scan_inputs".into(), Attribute::Int(2));
+    scan_node
+        .attributes
+        .insert("scan_input_axes".into(), Attribute::Ints(vec![0, 1]));
+    scan_node
+        .attributes
+        .insert("scan_output_axes".into(), Attribute::Ints(vec![0, 1]));
+    let scan_id = graph.insert_node(scan_node);
+    graph
+        .subgraphs
+        .insert((scan_id, "body".into()), scan_two_input_body());
+    for out in &outs {
+        graph.add_output(*out);
+    }
+    graph.opset_imports.insert(String::new(), 16);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Scan with two scan inputs");
+
+    // Final state keeps its shape.
+    assert_eq!(graph.value(outs[0]).shape, vec![Dim::Static(2)]);
+    // scan_a_out: per-iter [4], sequence axis (5) re-inserted at output axis 0.
+    assert_eq!(
+        graph.value(outs[1]).shape,
+        vec![Dim::Static(5), Dim::Static(4)]
+    );
+    // scan_b_out: per-iter [3], sequence axis (5) re-inserted at output axis 1.
+    assert_eq!(
+        graph.value(outs[2]).shape,
+        vec![Dim::Static(3), Dim::Static(5)]
+    );
+}
+
+/// A `Loop` body with two loop-carried deps, each also emitted as a scan output:
+/// `(iter, cond_in, v1, v2) -> (cond_out, v1_out, v2_out, scan1, scan2)`.
+fn loop_two_carried_body() -> Graph {
+    let mut body = Graph::new();
+    let iter = body.create_named_value("iter", DataType::Int64, Shape::new());
+    body.add_input(iter);
+    let cond_in = body.create_named_value("cond_in", DataType::Bool, Shape::new());
+    body.add_input(cond_in);
+    let v1 = body.create_named_value("v1", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(v1);
+    body.mark_value_shape_unknown(v1);
+    body.add_input(v1);
+    let v2 = body.create_named_value("v2", DataType::Float32, Shape::new());
+    body.mark_value_type_unknown(v2);
+    body.mark_value_shape_unknown(v2);
+    body.add_input(v2);
+
+    let cond_out = body.create_named_value("cond_out", DataType::Bool, Shape::new());
+    body.insert_node(node(0, "Identity", vec![Some(cond_in)], vec![cond_out]));
+    body.add_output(cond_out);
+    for (id, name, src) in [
+        (1, "v1_out", v1),
+        (2, "v2_out", v2),
+        (3, "scan1", v1),
+        (4, "scan2", v2),
+    ] {
+        let out = body.create_named_value(name, DataType::Float32, Shape::new());
+        body.insert_node(node(id, "Identity", vec![Some(src)], vec![out]));
+        body.add_output(out);
+    }
+    body
+}
+
+#[test]
+fn loop_multiple_carried_and_scan_outputs_share_one_trip_count() {
+    let mut graph = Graph::new();
+    let m = graph.create_named_value("M", DataType::Int64, Shape::new());
+    graph.add_input(m);
+    let cond = graph.create_named_value("cond", DataType::Bool, Shape::new());
+    graph.add_input(cond);
+    let v1 = graph.create_named_value(
+        "v1",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Static(3)],
+    );
+    graph.add_input(v1);
+    let v2 = graph.create_named_value("v2", DataType::Float32, vec![Dim::Static(4)]);
+    graph.add_input(v2);
+
+    let outs: Vec<ValueId> = ["v1_final", "v2_final", "scan1_out", "scan2_out"]
+        .iter()
+        .map(|name| {
+            let v = graph.create_named_value(*name, DataType::Float32, Shape::new());
+            graph.mark_value_type_unknown(v);
+            graph.mark_value_shape_unknown(v);
+            v
+        })
+        .collect();
+
+    let loop_node = graph.insert_node(node(
+        0,
+        "Loop",
+        vec![Some(m), Some(cond), Some(v1), Some(v2)],
+        outs.clone(),
+    ));
+    graph
+        .subgraphs
+        .insert((loop_node, "body".into()), loop_two_carried_body());
+    for out in &outs {
+        graph.add_output(*out);
+    }
+    graph.opset_imports.insert(String::new(), 21);
+
+    let registry = InferenceRegistry::default_registry();
+    let opsets = graph.opset_imports.clone();
+    registry
+        .infer_graph(&mut graph, &opsets, MergePolicy::Permissive)
+        .expect("infer Loop with two carried deps");
+
+    // Both loop-carried finals keep their seeded operand shapes.
+    assert_eq!(
+        graph.value(outs[0]).shape,
+        vec![Dim::Static(2), Dim::Static(3)]
+    );
+    assert_eq!(graph.value(outs[1]).shape, vec![Dim::Static(4)]);
+
+    // Each scan output gains a symbolic leading trip-count axis over its
+    // per-iteration body shape.
+    let scan1 = graph.value(outs[2]).shape.clone();
+    let scan2 = graph.value(outs[3]).shape.clone();
+    assert!(matches!(scan1[0], Dim::Symbolic(_)), "scan1 {scan1:?}");
+    assert!(matches!(scan2[0], Dim::Symbolic(_)), "scan2 {scan2:?}");
+    assert_eq!(scan1[1..], [Dim::Static(2), Dim::Static(3)]);
+    assert_eq!(scan2[1..], [Dim::Static(4)]);
+    // All scan outputs share a single iteration count, so their leading axis is
+    // the *same* symbol.
+    assert_eq!(scan1[0], scan2[0], "scan outputs must share one trip count");
+}
+
 #[test]
 fn loop_body_with_nested_if_resolves_through_both_subgraph_levels() {
     let mut body = Graph::new();

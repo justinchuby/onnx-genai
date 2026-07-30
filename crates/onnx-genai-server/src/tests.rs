@@ -6,6 +6,8 @@ use crate::{
     models_config::ModelSpec,
     routes::{CompletionGeneration, collect_generation_result, prepare_completion},
     sse::StopBoundaryBuffer,
+    sse::{content_chunk, done_chunk, tool_call_delta_chunks},
+    types::{ChatMessageToolCall, ChatMessageToolCallFunction},
 };
 use axum::{
     body::{Body, to_bytes},
@@ -13,7 +15,7 @@ use axum::{
 };
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
@@ -62,6 +64,98 @@ fn sse_json_events(body: &[u8]) -> Vec<Value> {
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()
+}
+
+fn sse_events_from_chunks(
+    chunks: impl IntoIterator<Item = crate::sse::ChatCompletionChunk>,
+) -> Vec<Value> {
+    let body = chunks
+        .into_iter()
+        .map(|chunk| format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()))
+        .collect::<String>();
+    sse_json_events(body.as_bytes())
+}
+
+fn test_tool_call(id: &str, name: &str, arguments: &str) -> ChatMessageToolCall {
+    ChatMessageToolCall {
+        id: id.to_string(),
+        kind: "function".to_string(),
+        function: ChatMessageToolCallFunction {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    }
+}
+
+#[test]
+fn tool_call_stream_deltas_emit_metadata_arguments_and_distinct_indices() {
+    let calls = vec![
+        test_tool_call("call_weather", "weather", r#"{"city":"Paris"}"#),
+        test_tool_call("call_time", "time", r#"{"timezone":"UTC"}"#),
+    ];
+    let mut chunks = tool_call_delta_chunks("chatcmpl-test", 1, "test", calls.clone());
+    chunks.push(done_chunk("chatcmpl-test", 1, "test", "tool_calls"));
+    let events = sse_events_from_chunks(chunks);
+
+    let tool_deltas = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
+        .map(|calls| &calls[0])
+        .collect::<Vec<_>>();
+    let metadata = tool_deltas
+        .iter()
+        .filter(|call| call["function"]["name"].is_string())
+        .collect::<Vec<_>>();
+    assert_eq!(metadata.len(), calls.len());
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(metadata[index]["index"], index);
+        assert_eq!(metadata[index]["id"], call.id);
+        assert_eq!(metadata[index]["type"], "function");
+        assert_eq!(metadata[index]["function"]["name"], call.function.name);
+        assert_eq!(metadata[index]["function"]["arguments"], "");
+    }
+
+    let mut arguments_by_index = BTreeMap::new();
+    for call in tool_deltas
+        .iter()
+        .filter(|call| call["function"]["name"].is_null())
+    {
+        let index = call["index"].as_u64().unwrap() as usize;
+        arguments_by_index
+            .entry(index)
+            .or_insert_with(String::new)
+            .push_str(call["function"]["arguments"].as_str().unwrap());
+        assert!(call.get("id").is_none());
+        assert!(call.get("type").is_none());
+    }
+    for (index, call) in calls.iter().enumerate() {
+        assert_eq!(arguments_by_index[&index], call.function.arguments);
+    }
+    assert_eq!(
+        events.last().unwrap()["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+}
+
+#[test]
+fn content_only_stream_deltas_remain_content_with_stop_finish_reason() {
+    let events = sse_events_from_chunks([
+        content_chunk(
+            "chatcmpl-test",
+            1,
+            "test",
+            "normal content".to_string(),
+            None,
+        ),
+        done_chunk("chatcmpl-test", 1, "test", "stop"),
+    ]);
+
+    assert_eq!(
+        events[0]["choices"][0]["delta"]["content"],
+        "normal content"
+    );
+    assert!(events[0]["choices"][0]["delta"]["tool_calls"].is_null());
+    assert_eq!(events[1]["choices"][0]["finish_reason"], "stop");
 }
 
 fn tiny_png_data_uri() -> String {
@@ -1026,6 +1120,7 @@ async fn sidecar_free_compatibility_package_builds_server_pipeline_and_preproces
             id: "compat-vlm".to_owned(),
             path: model_dir,
             eager: true,
+            warmup: false,
         },
         &ServerConfig::default(),
     )
@@ -1961,11 +2056,13 @@ fn two_model_state() -> AppState {
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
+            warmup: false,
         },
         ModelSpec {
             id: "model-b".to_string(),
             path: path.clone(),
             eager: true,
+            warmup: false,
         },
     ];
     AppState::load_from_specs(specs, ServerConfig::default()).expect("load two tiny-llm fixtures")
@@ -2169,11 +2266,13 @@ fn lazy_state(config: ServerConfig) -> AppState {
             id: "model-a".to_string(),
             path: path.clone(),
             eager: true,
+            warmup: false,
         },
         ModelSpec {
             id: "model-b".to_string(),
             path: path.clone(),
             eager: false,
+            warmup: false,
         },
     ];
     AppState::load_from_specs(specs, config).expect("load lazy two-model state")
@@ -2249,6 +2348,108 @@ async fn admin_load_then_route_to_lazy_model() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_warmup_loaded_model_returns_success_and_is_idempotent() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+
+    let first_response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-a/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = json_body(first_response).await;
+    assert_eq!(first_body["id"], "model-a");
+    assert_eq!(first_body["warmed"], true);
+    assert!(first_body["duration_ms"].is_number());
+
+    let second_response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-a/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = json_body(second_response).await;
+    assert_eq!(second_body["duration_ms"], 0);
+}
+
+#[tokio::test]
+async fn admin_warmup_unknown_model_returns_404() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        ..ServerConfig::default()
+    });
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/no-such-model/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_warmup_loaded_model_generation_failure_returns_500() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        max_queue_depth: 1,
+        ..ServerConfig::default()
+    });
+    let handle = state.registry.resolve("model-a").unwrap().unwrap();
+    let _occupied = handle
+        .engine
+        .generation_capacity
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/models/model-a/warm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn configured_warmup_runs_when_an_eager_model_loads() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_from_specs(
+        vec![ModelSpec {
+            id: "model-a".to_string(),
+            path,
+            eager: true,
+            warmup: true,
+        }],
+        ServerConfig::default(),
+    )
+    .expect("load and warm tiny model");
+    assert!(state.registry.is_warmed_for_test("model-a"));
 }
 
 #[tokio::test]
@@ -2440,6 +2641,7 @@ async fn admin_endpoints_return_404_when_gate_is_off() {
     for (method, uri) in [
         ("GET", "/v1/admin/models"),
         ("POST", "/v1/admin/models/model-b/load"),
+        ("POST", "/v1/admin/models/model-a/warm"),
         ("DELETE", "/v1/admin/models/model-a"),
         ("POST", "/v1/admin/resources/vram-limit"),
     ] {

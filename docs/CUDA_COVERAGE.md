@@ -66,6 +66,8 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 |----|--------|--------|---------|-----------------------|
 | `MaxPool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | 2-D NCHW f32/f16/bf16; kernel, strides, symmetric explicit padding, `VALID`, and symmetric `SAME_UPPER`/`SAME_LOWER`. `ceil_mode=1`, dilated pooling, `storage_order`, asymmetric padding, and the optional ONNX Indices output are rejected explicitly. |
 | `AveragePool` | `` | ✅ | **cuDNN** `cudnnPoolingForward` | Same geometry/dtypes; `count_include_pad` maps to cuDNN include/exclude-padding modes. `ceil_mode=1`, dilation, `storage_order`, and asymmetric padding are rejected explicitly. |
+| `LpPool` | `` | ✅ | **NVRTC-custom** | Arbitrary-rank NCHW-style f32/f16/bf16 Lp window reduction with positive integer `p`, strides, dilation, explicit/automatic padding, and `ceil_mode`; accumulation widens to f32 (`pooling.rs`). |
+| `GlobalAveragePool`, `GlobalMaxPool`, `GlobalLpPool` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank NCHW-style f32/f16/bf16 global spatial reduction. Average, max, and integer-`p` Lp semantics match the CPU EP (`global_reduction.rs`). |
 
 ### Elementwise — unary / activations
 
@@ -102,6 +104,9 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `SkipLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `LayerNorm(input + skip + bias)·γ + β` — the residual add is fused into the norm, saving a whole tensor round-trip. Optional `beta`/`bias` inputs, optional `mean`/`inv_std`/`input_skip_bias_sum` outputs (`normalization.rs`). f32. |
 | `SkipSimplifiedLayerNormalization` | `com.microsoft` | ✅ | **NVRTC-custom** (fused) | `RMSNorm(input + skip + bias)·γ` with no mean subtraction. Right-aligned broadcast `skip`, optional `bias`, and optional mean/inverse-RMS/residual-sum outputs (`normalization.rs`). f32. |
 | `RMSNormalization` / `SimplifiedLayerNormalization` | `` / `com.microsoft` | ✅ | **NVRTC-custom** (fused) | Root-mean-square scale, no mean subtraction (LLaMA-family norm). Optional `InvStdDev` output, arbitrary `axis` (`normalization.rs`). f32. |
+| `BatchNormalization` | `` | ✅ | **NVRTC-custom** | Inference-mode channel-wise normalization for contiguous f32/f16/bf16 NCHW-style tensors; custom epsilon and per-channel scale/bias/mean/variance (`batch_normalization.rs`). |
+| `InstanceNormalization`, `GroupNormalization` | `` | ✅ | **NVRTC block reduction** | Arbitrary-rank contiguous NCHW-style f32/f16/bf16 normalization. Instance normalization reduces per `(N,C)` slice; group normalization supports opset-18 per-group and opset-21 per-channel affine parameters with float stash semantics (`group_normalization.rs`). |
+| `LpNormalization` | `` | ✅ | **NVRTC block reduction** | Axis-wise p=1/p=2 normalization for f32/f16/bf16, including negative and interior axes with CPU-matched tiny-norm clamping (`global_reduction.rs`). |
 | `ReduceMean` | `` | ✅ | **cuDNN** `cudnnReduceTensor` | See reductions below. |
 
 ### Reductions
@@ -168,80 +173,52 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `GatherND` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic indexed copy with Int32/Int64 indices, negative index wrapping, arbitrary tuple depth, and `batch_dims`; eager execution validates indices before launch and graph capture uses the device error latch (`structural.rs`). |
 | `SpaceToDepth` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic NCHW spatial-block rearrangement with runtime `blocksize`, including multi-channel and empty-batch tensors (`structural.rs`). |
 | `EyeLike` | `` | ✅ | **NVRTC-custom** | Rank-2 identity-like construction with positive/negative diagonal offsets and the full CPU numeric/bool dtype set, including dtype override (`structural.rs`). |
+| `AffineGrid` | `` | ✅ | **NVRTC-custom** | Two- and three-dimensional sampling-grid construction for f32/f16/bf16 theta, including `align_corners` and singleton spatial dimensions (`data_transform.rs`). |
+| `Compress` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width selection with omitted-axis flattening, positive/negative axes, and short conditions (`data_transform.rs`). |
+| `DynamicQuantizeLinear` | `` | ✅ | **NVRTC-custom** | Float32 per-tensor dynamic uint8 quantization; one block derives min/max, scale, and ties-to-even zero point before quantizing (`quantization.rs`). |
 | `Pad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic constant/reflect/edge/wrap padding, negative-pad cropping, and opset-18 subset/negative axes (`pad.rs`). |
 | `Range` | `` | ✅ | **NVRTC-custom** | Scalar-driven f32/f16/bf16/Int64 sequence construction with positive/negative steps and CPU-matched output-count validation (`range.rs`). |
 | `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
+| `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
+| `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 
-## Source-derived coverage audit (2026-07-27)
+## Source-derived coverage audit (2026-07-29)
 
 This snapshot is derived directly from `build_cpu_registry`,
-`build_cuda_registry`, and `CUDA_COVERED_OPS`, rather than the historical wave
-counts. The denominators have grown substantially since the 2026-07-15 snapshot
-(103 → 168 CPU pairs) because the CPU EP registry has continued to expand; the
-numbers below reflect the current registries after the issue #67 trig/hyperbolic
-+ shape-movement batch (`Tan`, `Sinh`, `Cosh`, `Asin`, `Acos`, `Atan`, `Asinh`,
-`Acosh`, `Atanh`, `Identity`, `Flatten`, `Size`, `Trilu`):
+`build_cuda_registry`, and `CUDA_COVERED_OPS`. It supersedes the stale
+pre-batch counts retained in the historical wave notes below.
 
 | Measure | Count |
 |---------|------:|
-| CPU registry `(domain, op_type)` pairs | **168** |
-| CPU standard-domain (`ai.onnx`) op types | **141** |
-| CUDA registry `(domain, op_type)` pairs | **118** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **113** |
-| CPU pairs implemented by CUDA in the same domain | **116 / 168** |
-| CPU standard-domain op types implemented by CUDA | **99 / 141** |
+| CPU registry `(domain, op_type)` pairs | **173** |
+| CPU standard-domain (`ai.onnx`) op types | **145** |
+| CUDA registry `(domain, op_type)` pairs | **167** |
+| CUDA advertised op names (`CUDA_COVERED_OPS`) | **161** |
+| CPU pairs implemented by CUDA in the same domain | **165 / 173** |
+| CPU standard-domain op types implemented by CUDA | **143 / 145** |
 
-The **99 shared `ai.onnx` ops** are: `Abs`, `Acos`, `Acosh`, `Add`, `And`, `Asin`,
-`Asinh`, `Atan`, `Atanh`, `Attention`, `AveragePool`, `Cast`, `CastLike`, `Ceil`,
-`Clip`, `Concat`, `Constant`, `ConstantOfShape`, `Cos`, `Cosh`, `CumSum`, `Div`,
-`Elu`, `Equal`, `Erf`, `Exp`, `Expand`, `Flatten`, `Floor`, `Gather`,
-`GatherElements`, `Gelu`, `Gemm`, `Greater`, `GreaterOrEqual`, `HardSigmoid`,
-`Identity`, `LayerNormalization`, `LeakyRelu`, `Less`, `LessOrEqual`, `Log`,
-`MatMul`, `Max`, `MaxPool`, `Mean`, `Min`, `Mod`, `Mul`, `Neg`, `Not`, `OneHot`,
-`Or`, `Pow`, `RMSNormalization`, `Reciprocal`, `ReduceL1`, `ReduceL2`,
-`ReduceLogSum`, `ReduceLogSumExp`, `ReduceMax`, `ReduceMean`, `ReduceMin`,
-`ReduceProd`, `ReduceSum`, `ReduceSumSquare`, `Relu`, `Reshape`, `RotaryEmbedding`,
-`Round`, `ScatterElements`, `Selu`, `Shape`, `Sigmoid`, `Sign`,
-`SimplifiedLayerNormalization`, `Sin`, `Sinh`, `Size`, `Slice`, `Softmax`,
-`Softplus`, `Softsign`, `Split`, `Sqrt`, `Squeeze`, `Sub`, `Sum`, `Swish`, `Tan`,
-`Tanh`, `ThresholdedRelu`, `Tile`, `TopK`, `Transpose`, `Trilu`, `Unsqueeze`,
-`Where`, and `Xor`.
+The **2 remaining CPU `ai.onnx` gaps** are `NonMaxSuppression` and `Unique`.
 
-The **42 CPU `ai.onnx` gaps** are: `AffineGrid`, `ArgMax`, `ArgMin`,
-`BatchNormalization`, `BitShift`, `BitwiseAnd`, `BitwiseNot`, `BitwiseOr`,
-`BitwiseXor`, `BlackmanWindow`, `CenterCropPad`, `Col2Im`, `Compress`,
-`ConvTranspose`, `CumProd`, `DequantizeLinear`, `Dropout`,
-`DynamicQuantizeLinear`, `EyeLike`, `GatherND`, `GlobalAveragePool`,
-`GlobalLpPool`, `GlobalMaxPool`, `GridSample`, `GroupNormalization`,
-`HammingWindow`, `HannWindow`, `Hardmax`, `InstanceNormalization`, `IsInf`,
-`LogSoftmax`, `LpNormalization`, `LpPool`, `NonMaxSuppression`,
-`NonZero`, `PRelu`, `Pad`, `QuantizeLinear`, `Range`, `Resize`,
-`SpaceToDepth`, and `Unique`.
+The decode/transformer-oriented priority set from issue #67 is already covered:
+`LogSoftmax`, `Hardmax`, `PRelu`, `IsInf`, the five bitwise/shift operators,
+`ArgMax`, `ArgMin`, and `EyeLike`. `BiasGelu`, `FastGelu`, and `QuickGelu` were
+also already registered and GPU-tested; they require no kernel change in this
+batch.
 
-> **Note (batch 4, below):** `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`,
-> `BitwiseNot`, `BitShift`, `LogSoftmax`, and `Hardmax` have since moved from the
-> gap list into the shared `ai.onnx` set; the counts above are the pre-batch-4
-> snapshot.
-
-For `com.microsoft`, CUDA matches the CPU pairs `FusedGemm`, `FusedMatMulBias`,
-`Gelu`, `LayerNormalization`, `MatMulNBits`, `SimplifiedLayerNormalization`,
-`SkipLayerNormalization`, and `SkipSimplifiedLayerNormalization`; CPU-only gaps
-are `BiasGelu`, `FastGelu`, `FusedAttention`, and `QuickGelu`. CUDA additionally
-exposes `com.microsoft::Attention`. CUDA standard-domain extras not currently
-registered by the CPU EP are `Conv` (cuDNN).
+For `com.microsoft`, the remaining CPU-only gap is `FusedAttention`;
+`BiasGelu`, `FastGelu`, and `QuickGelu` are covered by `fused_gelu.rs`. CUDA
+additionally exposes `com.microsoft::Attention`. CUDA standard-domain extras not
+currently registered by the CPU EP include `Conv` (cuDNN).
 
 
 ### Library mapping for the remaining CPU gaps
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
-| **cuBLASLt** | `BiasGelu`/`FastGelu`/`QuickGelu` where expressible as an epilogue | GEMM+bias/activation belongs in the matrix multiply epilogue. |
-| **cuDNN** | `GlobalAveragePool`, `GlobalMaxPool`, `LogSoftmax` | Vendor-tuned pooling, normalization/softmax, and reduction primitives. |
-| **CUTLASS / cuDNN SDPA** | standard `Attention`, `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
-| **cub/thrust via NVRTC (CCCL headers)** | `ArgMax`, `ArgMin`, `NonZero` | Select/sort/reduction primitives; cudarc has no dlopen-able cub/thrust API. |
-| **NVRTC-custom** | quantize/dequantize, `Pad`, `Range`, `GatherND` | Pointwise or index-transform work with no suitable runtime library. |
-| **view / memcpy / host** | `Constant`, `ConstantOfShape` | Metadata-only views, raw D2D copies, or small host-generated tensors. |
+| **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
+| **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
+| **deferred heavy operators** | `NonMaxSuppression` | Data-dependent selection deserves a dedicated follow-up wave and focused review. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
@@ -362,6 +339,51 @@ covers signed and unsigned quantization, saturation and ties-to-even rounding,
 multi-output Dropout, multiple ranks, narrow float storage, signed zero, and
 NaN. This raises `CUDA_COVERED_OPS` from **140** to **144** and CPU
 standard-domain parity from **111 / 141** to **115 / 141**.
+
+The issue #67 operator-coverage batch 10 adds `AffineGrid`,
+`BatchNormalization`, `Compress`, `DynamicQuantizeLinear`,
+`GlobalAveragePool`, `GlobalLpPool`, `GlobalMaxPool`, and `LpNormalization`.
+The implementations share three small NVRTC families: fixed-width data
+transforms, channel-wise normalization, and block reductions. GPU parity covers
+two- and three-dimensional affine grids, `align_corners`, negative and omitted
+Compress axes, f32/f16/bf16 normalization and pooling, non-default Lp powers,
+negative/interior normalization axes, and dynamic quantization for mixed-sign,
+constant, and empty inputs. Current source-derived coverage is **152**
+advertised CUDA op names, **157** CUDA `(domain, op_type)` pairs, and
+**134 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 11 adds `InstanceNormalization` and
+`GroupNormalization`; batch 12 adds `LpPool`, `CenterCropPad`, and `Col2Im`.
+The latter shares a general N-D pooling geometry path and a fixed-width index
+transform module. GPU parity covers p=1/p=2, asymmetric padding, strides,
+dilation, `ceil_mode`, mixed crop/pad with odd differences and selected axes,
+and overlapping Col2Im accumulation with both stride/padding and dilation.
+Current source-derived coverage is **157** advertised CUDA op names, **162**
+CUDA `(domain, op_type)` pairs, and **139 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 13 adds `QLinearMatMul` and `Resize`.
+`QLinearMatMul` preserves the CPU reference's wrapping i32 accumulation,
+ties-to-even requantization, and per-tensor/per-row/per-column quantization for
+Int8 and Uint8. `Resize` supports nearest and N-D linear interpolation with
+`half_pixel`, `align_corners`, and `asymmetric` coordinates, scales or sizes,
+selected axes, and all four standard nearest rounding modes. Cubic,
+`pytorch_half_pixel`, `tf_crop_and_resize`, `half_pixel_symmetric`, antialiasing,
+and non-stretch aspect policies remain fail-closed at the claim gate. GPU parity
+covers quantized signed/unsigned and batched per-axis cases plus nearest/linear
+upsampling and downsampling across the supported coordinate and control modes.
+Current source-derived coverage is **159** advertised CUDA op names, **164**
+CUDA `(domain, op_type)` pairs, and **141 / 145** CPU standard-domain op types.
+
+The issue #67 operator-coverage batch 14 adds `ConvTranspose` and `GridSample`.
+`ConvTranspose` covers 1-D/2-D f32/f16/bf16 overlap-add with strides, asymmetric
+pads, dilations, output padding, bias, groups, and depthwise geometry.
+`GridSample` covers 4-D bilinear/nearest sampling for zeros, border, and
+reflection padding with either `align_corners` setting. ConvTranspose
+`SAME_UPPER`/`SAME_LOWER` and output-shape-driven padding, plus cubic/bicubic and
+volumetric GridSample, remain explicitly fail-closed. GPU parity covers the
+supported narrow storage types and out-of-bounds sampling. Current source-derived
+coverage is **161** advertised CUDA op names, **167** CUDA `(domain, op_type)`
+pairs, and **143 / 145** CPU standard-domain op types.
 
 ---
 

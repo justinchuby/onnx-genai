@@ -41,7 +41,11 @@ pub use paged_gqa::{
     paged_gqa_decode_step,
 };
 pub(crate) use proposer::NativeProposerSession;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tensor::*;
+
+/// Counter proving the incremental-prefill fast path fires.
+pub static NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Device requested for a native decode session.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -327,6 +331,58 @@ impl NativeDecodeSession {
             pending_tokens: prompt_tokens.to_vec(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
+        run_decode_loop(
+            &mut backend,
+            &mut state,
+            options,
+            chain,
+            tokenizer,
+            options.max_context,
+            callback,
+        )
+    }
+
+    /// Generate incrementally: reuse KV state up to `resume_from` and only
+    /// prefill `prompt_tokens[resume_from..]`. The caller must ensure that
+    /// `prompt_tokens[..resume_from]` matches the tokens already in the KV cache.
+    ///
+    /// If `resume_from > current_len`, behaves like full generation from 0.
+    /// If `resume_from < current_len`, rewinds the KV cache to `resume_from`.
+    pub(crate) fn generate_incremental_with_callback(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        resume_from: usize,
+        options: &GenerateOptions,
+        chain: &ProcessorChain,
+        tokenizer: &Tokenizer,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        if prompt_tokens.is_empty() {
+            bail!("native generation requires at least one prompt token");
+        }
+        let resume_from = resume_from.min(prompt_tokens.len());
+        if resume_from == 0 || resume_from > self.current_len {
+            // Full reset path — no valid KV prefix to reuse.
+            return self.generate_with_callback(prompt_tokens, options, chain, tokenizer, callback);
+        }
+        // Rewind KV to resume_from if we've advanced beyond it (e.g. diverged prefix).
+        if self.current_len > resume_from {
+            self.rewind(resume_from)?;
+        }
+        NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+
+        let new_tokens = &prompt_tokens[resume_from..];
+        if new_tokens.is_empty() {
+            bail!(
+                "incremental generation requires at least one new token beyond the cached prefix"
+            );
+        }
+        let mut backend = NativeLoopAdapter {
+            session: self,
+            prompt_tokens: prompt_tokens.to_vec(),
+            pending_tokens: new_tokens.to_vec(),
+        };
+        let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
         run_decode_loop(
             &mut backend,
             &mut state,

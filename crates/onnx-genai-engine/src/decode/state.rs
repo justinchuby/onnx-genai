@@ -27,10 +27,6 @@ pub(crate) struct DecodeState {
 }
 
 impl DecodeState {
-    pub(crate) fn new(session: &Session) -> anyhow::Result<Self> {
-        Self::new_with_io(session, None)
-    }
-
     /// Construct decode state from metadata or unambiguous tensor shapes.
     pub(crate) fn new_with_io(
         session: &Session,
@@ -140,6 +136,7 @@ impl DecodeState {
                     runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
                         stable_session_ref(session),
                         StaticCacheDecodeOptions { batch_size: 1 },
+                        io,
                     )?)),
                     #[cfg(test)]
                     test_runner_marker: false,

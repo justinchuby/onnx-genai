@@ -7,3 +7,7 @@
 ## 2026-07-29T00:45:00+0000 — Name-agnostic core decode path landed
 - PR #380 for #377 merged as `47c3331d` after Cohaagen approved the fix-delta re-review.
 - Removed core decoder/proposer I/O-name guessing: roles require explicit metadata or one unique shape candidate; ambiguous fixtures now declare component decoder I/O.
+
+## 2026-07-30T13:36:00Z — CUDA TopK parity review
+- Independent review of PR #445 (fp16/bf16 CUDA TopK operations); approved and merged.
+- Work advances CUDA standard-domain parity from 159 to 161 ops as part of the tractable wave.

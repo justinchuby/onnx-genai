@@ -45,31 +45,39 @@ impl Kernel for ClipKernel {
     }
 }
 
-/// Fast contiguous f32 Clip without MLAS. Uses NEON SIMD on aarch64,
+/// Fast dense Clip using shared SIMD infrastructure. Uses NEON on aarch64,
 /// plain scalar loop elsewhere. Avoids the `to_dense` allocation that
 /// dominates MobileNetV2 inference (35 Clip nodes × large spatial tensors).
+///
+/// Accepts any **dense** tensor (strides are a permutation of contiguous strides),
+/// not just strictly row-major contiguous. For per-element Clip, logical layout
+/// is irrelevant — only memory density matters.
+///
+/// Handles f32, f16, and bf16 inputs. Bounds are read as f32 regardless of
+/// their storage dtype (ONNX Clip requires homogeneous types, but we widen
+/// the bounds since we compute in f32 anyway for f16/bf16).
 fn clip_contiguous_f32_fast(
     kernel: &ClipKernel,
     inputs: &[TensorView],
     output: &mut TensorMut,
 ) -> Result<bool> {
-    if inputs[0].dtype != DataType::Float32
-        || output.dtype != DataType::Float32
-        || inputs[0].shape != output.shape
-        || !inputs[0].is_contiguous()
-        || !output.is_contiguous()
-    {
+    let input_dtype = inputs[0].dtype;
+    // Only handle float types we have SIMD for.
+    if !matches!(
+        input_dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
         return Ok(false);
     }
+
+    // Resolve bounds — read as f32 regardless of bound tensor dtype.
     let minimum = if inputs.len() > 1 && !inputs[1].is_absent() {
-        require_same_dtype("Clip", &inputs[1], DataType::Float32)?;
-        scalar_typed::<f32>("Clip min", &inputs[1])?
+        read_scalar_as_f32(&inputs[1])?
     } else {
         kernel.min.unwrap_or(f32::NEG_INFINITY)
     };
     let maximum = if inputs.len() > 2 && !inputs[2].is_absent() {
-        require_same_dtype("Clip", &inputs[2], DataType::Float32)?;
-        scalar_typed::<f32>("Clip max", &inputs[2])?
+        read_scalar_as_f32(&inputs[2])?
     } else {
         kernel.max.unwrap_or(f32::INFINITY)
     };
@@ -79,26 +87,44 @@ fn clip_contiguous_f32_fast(
         ));
     }
 
-    let len = numel(inputs[0].shape);
-    // Overlap guard: if input and output alias, fall back to the generic path
-    // which allocates a separate buffer. This crate previously shipped a rescue
-    // block that silently returned zeros on aliasing — no appetite for that class.
-    let input_start = inputs[0].data_ptr::<u8>() as usize;
-    let input_end = input_start.saturating_add(inputs[0].byte_size());
-    let output_start = output.data_ptr_mut::<u8>() as usize;
-    let output_end = output_start.saturating_add(output.byte_size());
-    if output_start < input_end && input_start < output_end {
-        return Ok(false);
+    use super::dense_elementwise::{ClipOp, try_dense_elementwise};
+    let op = ClipOp { minimum, maximum };
+    let handled = try_dense_elementwise(&op, &inputs[0], output)?;
+    if handled {
+        CLIP_F32_FAST_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    Ok(handled)
+}
 
-    // SAFETY: validated contiguous Float32 views — `len` elements are accessible,
-    // and the overlap check above proves the ranges are disjoint.
-    let src = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<f32>(), len) };
-    let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<f32>(), len) };
-
-    clip_f32_bulk(src, dst, minimum, maximum);
-    CLIP_F32_FAST_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(true)
+/// Read a scalar tensor as f32, regardless of its storage dtype.
+fn read_scalar_as_f32(view: &TensorView) -> Result<f32> {
+    match view.dtype {
+        DataType::Float32 => scalar_typed::<f32>("Clip bound", view),
+        DataType::Float16 => {
+            let v = scalar_typed::<half::f16>("Clip bound", view)?;
+            Ok(v.to_f32())
+        }
+        DataType::BFloat16 => {
+            let v = scalar_typed::<half::bf16>("Clip bound", view)?;
+            Ok(v.to_f32())
+        }
+        DataType::Float64 => {
+            let v = scalar_typed::<f64>("Clip bound", view)?;
+            Ok(v as f32)
+        }
+        _ => {
+            // Integer bounds: try i64 then i32.
+            if let Ok(v) = scalar_typed::<i64>("Clip bound", view) {
+                Ok(v as f32)
+            } else if let Ok(v) = scalar_typed::<i32>("Clip bound", view) {
+                Ok(v as f32)
+            } else {
+                Err(EpError::KernelFailed(
+                    "Clip: unsupported bound dtype for fast path".into(),
+                ))
+            }
+        }
+    }
 }
 
 /// Dispatch counter proving the fast Clip path fires.
@@ -109,74 +135,6 @@ pub static CLIP_F32_FAST_TEST_HITS: std::sync::atomic::AtomicU64 =
 /// Bulk f32 clamp: dst[i] = clamp(src[i], minimum, maximum).
 /// Uses NEON fmax/fmin on aarch64; scalar loop elsewhere.
 #[inline]
-fn clip_f32_bulk(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        clip_f32_neon(src, dst, minimum, maximum);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        clip_f32_scalar(src, dst, minimum, maximum);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn clip_f32_neon(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
-    use std::arch::aarch64::*;
-    debug_assert_eq!(src.len(), dst.len());
-    let n = src.len();
-    // SAFETY: NEON is always available on aarch64. We process 16 elements per
-    // iteration (4 lanes × 4 registers) for throughput, then handle the tail.
-    unsafe {
-        let vmin = vdupq_n_f32(minimum);
-        let vmax = vdupq_n_f32(maximum);
-        let mut i = 0usize;
-        let bulk_end = n & !15; // round down to multiple of 16
-        while i < bulk_end {
-            let a0 = vld1q_f32(src.as_ptr().add(i));
-            let a1 = vld1q_f32(src.as_ptr().add(i + 4));
-            let a2 = vld1q_f32(src.as_ptr().add(i + 8));
-            let a3 = vld1q_f32(src.as_ptr().add(i + 12));
-            let c0 = vminq_f32(vmaxq_f32(a0, vmin), vmax);
-            let c1 = vminq_f32(vmaxq_f32(a1, vmin), vmax);
-            let c2 = vminq_f32(vmaxq_f32(a2, vmin), vmax);
-            let c3 = vminq_f32(vmaxq_f32(a3, vmin), vmax);
-            vst1q_f32(dst.as_mut_ptr().add(i), c0);
-            vst1q_f32(dst.as_mut_ptr().add(i + 4), c1);
-            vst1q_f32(dst.as_mut_ptr().add(i + 8), c2);
-            vst1q_f32(dst.as_mut_ptr().add(i + 12), c3);
-            i += 16;
-        }
-        // Tail: process remaining elements 4 at a time, then scalar.
-        while i + 4 <= n {
-            let a = vld1q_f32(src.as_ptr().add(i));
-            let c = vminq_f32(vmaxq_f32(a, vmin), vmax);
-            vst1q_f32(dst.as_mut_ptr().add(i), c);
-            i += 4;
-        }
-        while i < n {
-            dst[i] = clamp_nan_propagating(src[i], minimum, maximum);
-            i += 1;
-        }
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn clip_f32_scalar(src: &[f32], dst: &mut [f32], minimum: f32, maximum: f32) {
-    for (d, &s) in dst.iter_mut().zip(src.iter()) {
-        *d = clamp_nan_propagating(s, minimum, maximum);
-    }
-}
-
-/// NaN-propagating clamp matching the old `clip_typed<T>` PartialOrd semantics
-/// and the aarch64 NEON `FMAX`/`FMIN` instruction behaviour. If `x` is NaN,
-/// both comparisons are false and NaN passes through unchanged.
-#[inline(always)]
-fn clamp_nan_propagating(x: f32, minimum: f32, maximum: f32) -> f32 {
-    let x = if x < minimum { minimum } else { x };
-    if x > maximum { maximum } else { x }
-}
-
 #[cfg(feature = "mlas")]
 fn clip_contiguous_f32(
     kernel: &ClipKernel,

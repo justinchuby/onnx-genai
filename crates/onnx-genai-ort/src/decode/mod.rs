@@ -138,7 +138,7 @@ impl Default for DecodeSessionOptions {
 }
 
 mod io;
-use io::{KvPair, detect_static_cache, infer_kv_pairs};
+use io::{KvPair, StaticCacheAbi, StaticCacheInputRole, detect_static_cache, infer_kv_pairs};
 
 mod static_cache;
 pub use static_cache::{BatchedStaticCacheDecodeSession, StaticCacheDecodeSession};

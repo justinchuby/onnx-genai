@@ -2,7 +2,7 @@
 
 use crate::decode::{
     DecodeState, apply_paged_sliding_window, clone_value, extract_next_token_logits_with_io,
-    is_present_output, run_decode_step_with_extra,
+    run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
@@ -25,7 +25,7 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
-    AbsentInputKind, DataflowEdge, PhaseRunOn, PipelineSpec, PipelineStrategy,
+    AbsentInputKind, DataflowEdge, ModelIoSpec, PhaseRunOn, PipelineSpec, PipelineStrategy,
     PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, TensorDimension,
 };
 use onnx_genai_ort::{
@@ -365,7 +365,76 @@ fn build_native_pipeline_components(
     Ok(components)
 }
 
-/// Components whose graphs contain only deterministic operators.
+/// Every_step components the operator explicitly requested be run on the native
+/// nxrt backend, from `ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS` (a
+/// comma-separated list of component names). Empty/unset means all every_step
+/// components run on the default ORT backend, so the ORT decode path is
+/// unchanged. This is the injection seam for the native multi-component inc1
+/// hybrid: it drives named every_step components natively inside an
+/// otherwise-ORT pipeline decode loop, proving the value-type seam.
+fn native_step_component_set() -> BTreeSet<String> {
+    std::env::var("ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the backend-neutral [`ComponentSession`](onnx_genai_metadata::ComponentSession)
+/// for one every_step component.
+///
+/// By default this borrows the already-loaded ORT session
+/// ([`OrtComponentSessionRef`]) so the ORT decode path is behaviour-identical.
+/// A component named in `native_components` is instead loaded and driven through
+/// the native nxrt backend, so the same decode loop drives both backends through
+/// the trait with no forked code path.
+fn build_step_component_session<'a>(
+    models: &'a PipelineModels,
+    component: &str,
+    native_components: &BTreeSet<String>,
+) -> anyhow::Result<Box<dyn onnx_genai_metadata::ComponentSession + 'a>> {
+    if native_components.contains(component) {
+        #[cfg(feature = "native-backend")]
+        {
+            let path = models
+                .directory
+                .model_paths
+                .get(component)
+                .with_context(|| {
+                    format!("native every_step component '{component}' has no model path")
+                })?;
+            // The every_step slice (inc1) stages tensors through the host
+            // `ComponentTensor` seam, so the native component runs on CPU; device
+            // placement of the pipeline decoder is the later (inc2/inc3) work.
+            let native = crate::native_component::NativeComponentSession::load(
+                path,
+                crate::native_decode::NativeDecodeDevice::Cpu,
+            )
+            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
+            return Ok(Box::new(native));
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            anyhow::bail!(
+                "every_step component '{component}' was requested on the native backend via \
+                 ONNX_GENAI_PIPELINE_NATIVE_STEP_COMPONENTS, but this build was compiled without \
+                 the 'native-backend' feature. Rebuild with `--features native-backend`."
+            );
+        }
+    }
+    let session = models
+        .session(component)
+        .with_context(|| format!("pipeline every_step component '{component}' was not loaded"))?;
+    Ok(Box::new(onnx_genai_ort::OrtComponentSessionRef::new(
+        session,
+    )))
+}
+
 ///
 /// Read once at load, because a component's declared phase says when it runs,
 /// never that it is pure — a graph with `RandomNormal` in it would otherwise be
@@ -505,8 +574,18 @@ impl PipelineEngine {
                 let decoder = models
                     .session(&ar.decoder)
                     .with_context(|| format!("pipeline decoder '{}' was not loaded", ar.decoder))?;
-                let kv_model =
-                    infer_kv_model_info(decoder, config.page_size, config.kv_cache_dtype)?;
+                let decoder_io = models
+                    .directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                let kv_model = infer_kv_model_info(
+                    decoder,
+                    decoder_io,
+                    config.page_size,
+                    config.kv_cache_dtype,
+                )?;
                 let fixed_state_budget_bytes =
                     resolved_host_ram_budget(&config, kv_model.as_ref())?;
                 // A zero page size makes `div_ceil` panic and the page-boundary
@@ -1130,6 +1209,23 @@ struct NestedAutoregressivePlan {
     outer_hidden_output: String,
     /// Inner decoder input port that receives the seed / threaded embedding.
     inner_embeds_input: String,
+    /// Inner decoder OUTPUT port carrying the per-code embedding threaded into
+    /// the next inner step's `inputs_embeds` seed. Declared explicitly via
+    /// `pipeline.strategy.inner_embedding_output`; never inferred by tensor name.
+    inner_embedding_output: String,
+    /// Outer decoder logits output port, from the outer component's explicit
+    /// `io.logits_output`. Argmax reads exactly this port; never name-guessed.
+    outer_logits_output: String,
+    /// Inner decoder logits output port, from the inner component's explicit
+    /// `io.logits_output`. Argmax reads exactly this port; never name-guessed.
+    inner_logits_output: String,
+    /// Outer decoder explicit I/O metadata, threaded into decode-state resolution
+    /// so token/position/KV ports come from declared metadata rather than a
+    /// tensor-shape guess. `None` only when the component declares no `io` block.
+    outer_io: Option<ModelIoSpec>,
+    /// Inner decoder explicit I/O metadata, threaded into decode-state resolution
+    /// for the same reason as `outer_io`.
+    inner_io: Option<ModelIoSpec>,
     /// Prompt-phase components (`prompt_only`), run once before the outer loop.
     prompt_components: Vec<String>,
     /// Post-decode components (`final_only`, e.g. a vocoder), run once after the
@@ -1274,6 +1370,46 @@ fn coerce_value_to_dtype(value: &Value, target: DataType) -> anyhow::Result<Valu
         }
         _ => clone_value(value),
     }
+}
+
+/// Convert a pool ORT [`Value`] into a backend-neutral [`ComponentTensor`] for
+/// the [`ComponentSession`](onnx_genai_metadata::ComponentSession) seam.
+///
+/// This is the pipeline side of the value-type seam: the decode-loop pool holds
+/// ORT `Value`s, but every_step components run through the backend-neutral trait
+/// whose boundary is a host-resident `ComponentTensor` (raw little-endian element
+/// bytes). The copy is `numel * dtype.size_of()` bytes; for the small every_step
+/// embedding outputs this is negligible relative to the decoder step.
+fn value_to_component_tensor(
+    value: &Value,
+) -> anyhow::Result<onnx_genai_metadata::ComponentTensor> {
+    let dtype = onnx_genai_metadata::ComponentDataType::from(value.dtype());
+    let bytes = value.to_raw_bytes()?;
+    onnx_genai_metadata::ComponentTensor::from_raw(dtype, value.shape().to_vec(), bytes)
+        .map_err(Into::into)
+}
+
+/// Convert a [`ComponentTensor`] produced by a component back into a pool ORT
+/// [`Value`]. Inverse of [`value_to_component_tensor`].
+fn component_tensor_to_value(
+    tensor: &onnx_genai_metadata::ComponentTensor,
+) -> anyhow::Result<Value> {
+    let dtype = DataType::from(tensor.dtype());
+    Value::from_raw_bytes(tensor.as_bytes().to_vec(), tensor.shape(), dtype).map_err(Into::into)
+}
+
+/// Build the running-token seed as a neutral `int64` [`ComponentTensor`] of shape
+/// `[1, seq]`, matching the ORT `Value::from_slice_i64` the loop previously fed.
+fn token_seed_component_tensor(
+    ids: &[i64],
+) -> anyhow::Result<onnx_genai_metadata::ComponentTensor> {
+    let bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+    onnx_genai_metadata::ComponentTensor::from_raw(
+        onnx_genai_metadata::ComponentDataType::Int64,
+        vec![1, ids.len() as i64],
+        bytes,
+    )
+    .map_err(Into::into)
 }
 
 #[derive(Debug, Clone)]
@@ -1433,10 +1569,31 @@ impl PipelinePlan {
         let outer_hidden_output = outer_hidden_output.to_string();
         let inner_embeds_input = inner_embeds_input.to_string();
 
-        // The inner decoder threads its own per-code embedding on later steps;
-        // its exact output port is resolved from the loaded session in the driver
-        // (the sole non-logits, non-KV output), since sessions are not available
-        // at plan-build time.
+        // The inner decoder threads its own per-code embedding on later steps.
+        // The exact output port is declared explicitly (it is shape-indistinguish-
+        // able from other float outputs); a missing declaration is an actionable
+        // error rather than a tensor-name guess.
+        let inner_embedding_output = nested.inner_embedding_output.clone().context(
+            "nested_autoregressive strategy is missing \
+                 'inner_embedding_output' (the inner decoder output port threaded \
+                 across inner steps)",
+        )?;
+        if inner_embedding_output.is_empty() {
+            anyhow::bail!("nested_autoregressive 'inner_embedding_output' must not be empty");
+        }
+
+        // Both decoders' logits ports are read by argmax each step. A logits
+        // output is shape-indistinguishable from other float outputs, so each
+        // port is taken from the component's explicit `io.logits_output`; a
+        // missing declaration is an actionable error, never a name guess.
+        let outer_logits_output = require_component_logits_output(spec, &outer)?;
+        let inner_logits_output = require_component_logits_output(spec, &inner)?;
+
+        // Explicit I/O metadata for each decoder, threaded into decode-state
+        // resolution so token/position/KV ports are read from declared metadata
+        // instead of an ambiguous tensor-shape guess.
+        let outer_io = spec.models.get(&outer).and_then(|model| model.io.clone());
+        let inner_io = spec.models.get(&inner).and_then(|model| model.io.clone());
 
         // Optional pre-embedder driving the outer talker via `inputs_embeds`
         // (materialized codec-sum embedder) instead of `input_ids`. When set it
@@ -1568,6 +1725,11 @@ impl PipelinePlan {
             max_frames,
             outer_hidden_output,
             inner_embeds_input,
+            inner_embedding_output,
+            outer_logits_output,
+            inner_logits_output,
+            outer_io,
+            inner_io,
             prompt_components,
             post_decode_components,
             pre_embedder,
@@ -1944,6 +2106,33 @@ fn nested_autoregressive_strategy(strategy: &PipelineStrategy) -> Option<&Pipeli
     }
 }
 
+/// Resolve a pipeline component's explicitly declared logits output port.
+///
+/// A logits output is shape-ambiguous against other float outputs (hidden
+/// states, embeddings), so the nested-AR loop reads the exact port declared in
+/// `models.{component}.io.logits_output`. A missing or empty declaration is an
+/// actionable error naming the key, never a tensor-name guess.
+fn require_component_logits_output(spec: &PipelineSpec, component: &str) -> anyhow::Result<String> {
+    let logits_output = spec
+        .models
+        .get(component)
+        .and_then(|model| model.io.as_ref())
+        .and_then(|io| io.logits_output.clone())
+        .with_context(|| {
+            format!(
+                "nested_autoregressive decoder '{component}' is missing an explicit logits \
+                 output; declare 'models.{component}.io.logits_output'"
+            )
+        })?;
+    if logits_output.is_empty() {
+        anyhow::bail!(
+            "nested_autoregressive decoder '{component}' declares an empty \
+             'models.{component}.io.logits_output'"
+        );
+    }
+    Ok(logits_output)
+}
+
 fn component_phase(spec: &PipelineSpec, component: &str, decoder: &str) -> PhaseRunOn {
     spec.phases
         .get(component)
@@ -2013,6 +2202,118 @@ mod tests {
             tokenizer: None,
             io: None,
         }
+    }
+
+    /// A decoder component whose explicit `io` block is built from a JSON value
+    /// (`ModelIoSpec` has no `Default`, and constructing it from JSON keeps the
+    /// test focused on just the declared ports).
+    fn decoder_with_io(io: serde_json::Value) -> PipelineComponentSpec {
+        PipelineComponentSpec {
+            filename: "decoder.onnx".to_string(),
+            role: "decoder".to_string(),
+            device_preference: None,
+            tokenizer: None,
+            io: Some(serde_json::from_value(io).expect("valid ModelIoSpec JSON")),
+        }
+    }
+
+    /// A minimal `nested_autoregressive` (multi-decoder TTS) spec with the
+    /// required outer→inner per-frame hidden binding. `inner_embedding_output`
+    /// is threaded through so both the missing and declared cases can be tested.
+    /// Both decoders declare an explicit `io.logits_output`.
+    fn nested_autoregressive_spec(inner_embedding_output: Option<String>) -> PipelineSpec {
+        PipelineSpec {
+            models: BTreeMap::from([
+                (
+                    "talker".to_string(),
+                    decoder_with_io(serde_json::json!({ "logits_output": "talker_logits" })),
+                ),
+                (
+                    "code_predictor".to_string(),
+                    decoder_with_io(serde_json::json!({ "logits_output": "code_logits" })),
+                ),
+            ]),
+            dataflow: vec![DataflowEdge {
+                from: "talker.last_hidden_state".to_string(),
+                to: "code_predictor.inputs_embeds".to_string(),
+                dtype: None,
+                device_transfer: None,
+            }],
+            strategy: PipelineStrategy {
+                kind: PipelineStrategyKind::NestedAutoregressive,
+                outer: Some("talker".to_string()),
+                inner: Some("code_predictor".to_string()),
+                num_code_groups: Some(4),
+                max_tokens: Some(8),
+                inner_embedding_output,
+                ..PipelineStrategy::default()
+            },
+            ..PipelineSpec::default()
+        }
+    }
+
+    #[test]
+    fn nested_autoregressive_requires_explicit_inner_embedding_output() {
+        let error = PipelinePlan::from_spec(
+            &nested_autoregressive_spec(None),
+            &SchedulerRegistry::builtin(),
+        )
+        .expect_err("a nested_autoregressive plan without the inner-embedding contract must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("inner_embedding_output"),
+            "the error must name the missing key: {message}"
+        );
+    }
+
+    #[test]
+    fn nested_autoregressive_rejects_empty_inner_embedding_output() {
+        let error = PipelinePlan::from_spec(
+            &nested_autoregressive_spec(Some(String::new())),
+            &SchedulerRegistry::builtin(),
+        )
+        .expect_err("an empty inner_embedding_output must fail");
+        assert!(
+            error.to_string().contains("inner_embedding_output"),
+            "the error must name the offending key: {error}"
+        );
+    }
+
+    #[test]
+    fn nested_autoregressive_carries_declared_inner_embedding_output() -> anyhow::Result<()> {
+        let plan = PipelinePlan::from_spec(
+            &nested_autoregressive_spec(Some("code_embeds".to_string())),
+            &SchedulerRegistry::builtin(),
+        )?;
+        match plan {
+            PipelinePlan::NestedAutoregressive(nested) => {
+                assert_eq!(nested.inner_embedding_output, "code_embeds");
+                assert_eq!(nested.outer_logits_output, "talker_logits");
+                assert_eq!(nested.inner_logits_output, "code_logits");
+            }
+            other => panic!("expected a nested_autoregressive plan, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_autoregressive_requires_explicit_logits_output() {
+        // A fully-formed spec whose inner decoder omits its explicit
+        // `io.logits_output` must fail closed, naming the missing key rather
+        // than falling back to a `"logits"` substring match.
+        let mut spec = nested_autoregressive_spec(Some("code_embeds".to_string()));
+        spec.models.get_mut("code_predictor").unwrap().io = None;
+        let error = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())
+            .expect_err("a missing inner logits output must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("io.logits_output"),
+            "the error must name the missing key: {message}"
+        );
+        assert!(
+            message.contains("code_predictor"),
+            "the error must name the offending component: {message}"
+        );
     }
 
     #[cfg(not(feature = "native-backend"))]
@@ -2130,6 +2431,7 @@ pipeline:
                 inner: None,
                 num_code_groups: None,
                 pre_embedder: None,
+                inner_embedding_output: None,
                 prefill_embedder: None,
                 stages: vec![
                     PipelineStrategyStage {
@@ -2157,6 +2459,7 @@ pipeline:
                             inner: None,
                             num_code_groups: None,
                             pre_embedder: None,
+                            inner_embedding_output: None,
                             prefill_embedder: None,
                             stages: vec![],
                         }),
@@ -2187,6 +2490,7 @@ pipeline:
                             inner: None,
                             num_code_groups: None,
                             pre_embedder: None,
+                            inner_embedding_output: None,
                             prefill_embedder: None,
                             stages: vec![],
                         }),
@@ -2252,6 +2556,7 @@ pipeline:
             inner: None,
             num_code_groups: None,
             pre_embedder: None,
+            inner_embedding_output: None,
             prefill_embedder: None,
             stages: vec![],
         }

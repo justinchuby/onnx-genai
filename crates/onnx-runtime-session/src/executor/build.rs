@@ -349,21 +349,31 @@ pub(super) fn build_lazy_weight_handles(
         return Ok(HashMap::new());
     }
 
-    let boundary = LazyWeightBoundary::BlockQuantizedMoe;
     let mut handles = HashMap::new();
     for (&value, weight) in &graph.initializers {
         let graph_value = graph.value(value);
         let consumers = graph.consumers(value);
+        // A weight is offload-eligible only if it feeds exclusively into offload
+        // boundary ops (BlockQuantizedMoE, QMoE, or MatMulNBits) and nothing
+        // else. Capture the boundary from the first consumer so the lazy handle
+        // carries the right binding site.
+        let mut boundary = None;
         let lazy_only = graph_value.producer.is_none()
             && !graph.outputs.contains(&value)
             && !consumers.is_empty()
             && consumers.into_iter().all(|consumer| {
                 let node = graph.node(consumer);
-                boundary.matches(&node.domain, &node.op_type)
+                match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
+                    Some(found) => {
+                        boundary.get_or_insert(found);
+                        true
+                    }
+                    None => false,
+                }
             });
-        if !lazy_only {
+        let Some(boundary) = boundary.filter(|_| lazy_only) else {
             continue;
-        }
+        };
         let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
             continue;
         };
@@ -376,7 +386,7 @@ pub(super) fn build_lazy_weight_handles(
         let shape = weight.dims().to_vec();
         let weight = weight.clone();
         let store = Arc::clone(weights);
-        let lazy = LazyWeight::block_quantized_moe(dtype, shape.clone(), vec![region], move || {
+        let lazy = LazyWeight::new(boundary, dtype, shape.clone(), vec![region], move || {
             let bytes = store.bytes(&weight).ok_or_else(|| {
                 onnx_runtime_ep_api::WeightHandleError::InvalidResident(
                     "external weight bytes are no longer available".into(),
