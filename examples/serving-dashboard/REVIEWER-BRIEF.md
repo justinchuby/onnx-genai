@@ -207,7 +207,49 @@ signal; `hot_evictions` is the real pressure signal.
 
 ---
 
-## 5. What we refused to ship, and why
+## 5. Two servers is a design decision, not a workaround
+
+The demo runs **two server processes on two ports**, one per model. This looks
+like something we failed to clean up. It is load-bearing.
+
+All metrics live in one process-global struct with **no per-model dimension**
+(`5650597c`):
+
+```
+crates/onnx-genai-server/src/metrics.rs   static REGISTRY: Registry { ... }
+  13 fields: requests, prompt_tokens, completion_tokens, ttft, e2e,
+  active_sessions, pending, batch_size, prefix_cache_hits,
+  prefix_cache_hit_tokens, prefix_cache_lookups, rejections, trace_ids
+
+grep -cE 'with_label_values|const_label|LabelPair'  ->  0
+  (control: 'fn ' -> 24 in the same file, so the zero is a real absence)
+```
+
+Under one server serving both models, **every one of those 13 fields sums the
+two populations**. A latency histogram fed by a batching model and a dynamic
+model is not a noisy measurement of one thing; it is a blend of two
+distributions with no physical referent.
+
+Two of those fields — `ttft` and `e2e` — are the inputs to the headline
+number, and that baseline was taken single-server, single-model, with nothing
+else resident. One server would not have made it noisier, it would have
+invalidated the conditions it was measured under, **from inside the
+instrument**, where a back-to-back A/B protocol cannot detect it.
+
+> Two processes give all 13 fields a model dimension enforced by the operating
+> system, instead of by thirteen fields' worth of reviewer vigilance. We chose
+> the topology that makes the bug unrepresentable over the one that makes it
+> forbidden.
+
+Note the interaction with the request-path `model:` badge: the badge is
+accurate — the request really did go to that model — but `/metrics` and the
+global registry are **not on the request path**. Under one server the badge
+would be a true label beside a blended number, which is worse than no label,
+because checking it succeeds and ends the investigation.
+
+---
+
+## 6. What we refused to ship, and why
 
 **The prefix-cache hit rate is withheld.** Both of its terms are broken: the
 numerator counts a hit that saved no work, and the denominator is completed
@@ -241,16 +283,38 @@ itself, and it is why the scenario ships the half we can demonstrate.
 
 ---
 
-## 6. Current state of the JavaScript suite
+## 7. Current state of the JavaScript suite
 
 ```
 cd examples/serving-dashboard && node --test
-pass 471   fail 0        (43eff6fd, run twice, tree=8 both times)
+pass 479   fail 1        (2582f5fb)
 ```
 
-**Green.** The `ok` → `measured` field-state migration has fully landed; the
-red counts you may see referenced in older messages (3 failing of 435) predate
-it. Two notes for anyone re-running:
+**The single failure is a new check catching real defects, not a regression.**
+Do not make it pass by weakening it:
+
+```
+check-source-citations.test.js:357
+  "a cited line still sits beside the symbol the prose names"
+  3 citation(s) name a symbol that is no longer at the cited line:
+    README cites driver.rs:717 for handle_or_defer_during_batch -> now :734, :752
+    README cites driver.rs:794 for handle_driver_command        -> now :581, :626, :829
+    README cites driver.rs:816 for run_fallback_generation      -> now :851, :935
+```
+
+An older version of this check verified only that the cited line number fit
+inside the file, so it caught a citation going *short* and never one going
+*stale*. This one resolves the symbol. It went red on its first run and found
+three. Fix the three citations in `README.md`; the assertion is correct.
+
+For context, the field-state suite was `pass 471 / fail 0` at `43eff6fd`
+(run twice, same tree state). The `ok` → `measured` migration is fully landed:
+`FIELD_STATES.MEASURED` evaluates to `'measured'`, `FIELD_STATES.OK` is
+`undefined`, and `styles/shell.css:163` is `[data-state='measured']`. Any
+message or document telling you otherwise predates the migration — including
+`demo-spec.md`, see below.
+
+Two notes for anyone re-running:
 
 - Node prints `ℹ pass` / `ℹ fail`, not `# pass`. A summary grep anchored on
   `^#` matches nothing and produces an empty summary next to a non-zero exit,
