@@ -452,12 +452,26 @@ was being written. An earlier design exposed a control that lowered the budget t
 force eviction. First it turned out not to work: lowering the limit moves the
 accounting *ceiling* only, resident KV is never released, and the repository's own
 test says so in its name (`reconfigure_lower_reports_overage_without_evicting`).
-Then it turned out the control could not exist at all — the budget is not
-settable at runtime *or* at launch. `EngineConfig::from_yaml` is the only code
-that can set a KV limit or enable runtime override, and **it has no callers
-outside its own unit tests**; the server assembles its config from two fields
-plus defaults (`cli.rs:127-133`), and no flag, config file, or environment
-variable reaches the rest.
+Then it turned out the control **cannot succeed**, which is a different and
+more interesting claim. There *is* a route — `POST /v1/admin/vram-limit`
+(`lib.rs:124`) — and reaching for it is the natural thing to do. It fails at
+three independent points, any one of which is sufficient:
+
+1. It is **admin-gated**, and the demo deliberately ships without
+   `--enable-admin-endpoints`, so it is a **404**.
+2. With the flag, the governor refuses: `governor.rs:168` returns
+   `RuntimeOverrideDisabled` unless `allow_runtime_override` is set — a **403**.
+3. That flag is **unsettable**. `EngineConfig::from_yaml` is the only code that
+   can enable it, and **it has no callers outside its own unit tests**; the
+   server assembles its config from two fields plus defaults
+   (`cli.rs:127-133`). No CLI flag, config file, or environment variable
+   reaches it. (`--models-config` looks like it should, but carries only a list
+   of models.)
+
+And even past all three, the code says so itself: `set_vram_limit` carries a
+`TODO` noting that the returned eviction order is never executed. The allocator
+computes a plan and discards it — which is why the repository's own test is
+named `reconfigure_lower_reports_overage_without_evicting`.
 
 So the slider would have been a **fabricated interaction** — the same failure as
 a fabricated number, wearing a costume you can drag. Instead the demo fills the
