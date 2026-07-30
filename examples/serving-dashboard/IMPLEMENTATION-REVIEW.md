@@ -364,7 +364,7 @@ is the sharpest example of it anyone has produced tonight: same commit, 18 failu
 
 | Finding | Evidence as first observed at `d6e57c63` | Status re-derived at `b54437df` |
 | --- | --- | --- |
-| **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **STRUCK @ `459c40c2`** — replaced by `classify_kv_applicability()`. The one surviving textual hit is `tests.rs:5009`, a doc comment *describing* the dead bug. **A grep cannot see tense: the hit and the proof-of-fix are byte-identical.** |
+| **F1** BLOCKER | `driver.rs:464` `kv_telemetry.set_applicable(!continuous_batch_supported);` — and `:450` is the correct sibling `set_applicable(paged)`. `runtime.rs:263` `pub fn attach_kv_telemetry(&mut self, …)` still returns nothing. | **STRUCK @ `459c40c2`** — replaced by `classify_kv_applicability()`. The one surviving textual hit is `tests.rs`, in the doc comment on `fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts` — a comment *describing* the dead bug. **A grep cannot see tense: the hit and the proof-of-fix are byte-identical.** |
 | **F3** BLOCKER | `format.js` and `dashboard/field-state.js` both still ship. | **LIVE — VERIFIED-AT `b54437df`** (both paths present in `git ls-tree`) |
 | **F4** MAJOR | `panel-kit.js:273` and `:454` both `?? DEFAULT_STALE_CEILING_MS`; `prefix-cache.js:77` `staleCeilingMs: null`. | **LIVE (as F4-REVISED) — VERIFIED-AT `b54437df`.** ⚠️ Citation drifted: the declaration is now `prefix-cache.js:88`, not `:77`. |
 | **F5** MAJOR | `audit_citation_targets.py:25` `ROOT="/Users/justinc/Documents/GitHub/onnx-genai-demo"`. | **STRUCK @ `1b4d76c6`** — `ROOT` now derives from `tree_context.repo_root()`; exits `CANNOT_RUN` with no worktree and exits 1 conditionally. Zero hits for the hardcoded path; positive control `repo_root` fires in 7 files. |
@@ -478,15 +478,21 @@ with no error and no warning") — the ruling now recreates it in the opposite d
 with them. This needs one correction from @12e42da8 so nobody writes `FIELD_STATES.OK`.
 I hold no view on which spelling *should* win — only on what the shipping artifact does.
 
-## Re-verification #1 at `f45d7228` (superseded by #2 above)
+## Re-verification #1 at `f45d7228` — HISTORICAL SNAPSHOT, SUPERSEDED BY #2 ABOVE
 
-| Finding | Status at `f45d7228` |
+> **Every row below is a dated reading, not a claim about the tree.** It is retained as the
+> record of what was true at `f45d7228` and is deliberately not updated. **If you arrived here by
+> `grep`, you are reading history: the words "still live" below describe `f45d7228` and nothing
+> else.** Each cell restates its own tense so it cannot be quoted into a present-tense claim.
+> For current status, read Re-verification #2 above — F1 and F5 are both **STRUCK**.
+
+| Finding | Status **as at `f45d7228` only** |
 | --- | --- |
-| F1 `driver.rs:464` applicability inference | **UNCHANGED — still live.** `set_applicable(!continuous_batch_supported)`; `runtime.rs:263` still returns `()` |
-| F2 `'ok'`→`'measured'` half-sweep | **UNCHANGED — still red.** `format.test.js:211` still feeds `'measured'` as the *unknown* state; `:270` still enumerates `'ok'` |
-| F3 dual render stacks | **UNCHANGED.** `format.js`, `telemetry-field.js`, `dashboard/field-state.js` all still ship; `ui/model-card.js:17` still imports the root stack; `field-state.js:101` still aliases `ok` |
-| F4 `staleCeilingMs: null` | **CHANGED SHAPE — see F4-revised.** Test was rewritten in `45c1103d`; the implementation is byte-identical |
-| F5 `audit_citation_targets.py:25` hardcoded ROOT | **UNCHANGED — still live** |
+| F1 `driver.rs` applicability inference | **Was live at `f45d7228`.** `set_applicable(!continuous_batch_supported)`; `runtime.rs` still returned `()`. **Since STRUCK at `459c40c2` — the negation is gone from shipped Rust.** |
+| F2 `'ok'`→`'measured'` half-sweep | **Was red at `f45d7228`.** `format.test.js` fed `'measured'` as the *unknown* state and still enumerated `'ok'` |
+| F3 dual render stacks | **Was unchanged at `f45d7228`.** `format.js`, `telemetry-field.js`, `dashboard/field-state.js` all shipped; `ui/model-card.js` imported the root stack; `field-state.js` aliased `ok` |
+| F4 `staleCeilingMs: null` | **Changed shape at `f45d7228`** — see F4-revised. Test was rewritten in `45c1103d`; the implementation was byte-identical |
+| F5 `audit_citation_targets.py` hardcoded ROOT | **Was live at `f45d7228`. Since STRUCK at `1b4d76c6`.** |
 
 Suite at `f45d7228`: **462 pass / 4 fail** (was 460/6). Of the 4, one
 (`check-source-citations.test.js`) is an artifact of my `git archive` extract having no `.git`;
@@ -521,7 +527,7 @@ Note: `check-source-citations.test.js` fails only in my extracted tree because i
 > **THIS DEFECT IS FIXED. Do not act on this section.** `459c40c2` replaced the negation with
 > `classify_kv_applicability(paged, continuous_batch_supported)`, a total function over two bools.
 > The analysis below is retained because it explains *why* the fix is shaped the way it is.
-> **`git grep` for the defect string still hits `tests.rs:5009` — that is a doc comment quoting
+> **`git grep` for the defect string still hits `tests.rs`, on the doc comment for `fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts` — that is a comment quoting
 > the dead bug, not the bug.**
 
 `crates/onnx-genai-server/src/driver.rs:464`
@@ -1678,3 +1684,76 @@ frame-blind, and it fails toward *you are fine*.** A narrow red gets argued down
 a narrow green stops the next reader looking.
 
 F21 and F22 above close the two real gaps that audit exposed.
+
+## F1 — the prescribed test landed, and it is better than what was asked for
+
+Confirmed at another reviewer's request, because a prescription is not satisfied until its author
+says the delivered thing is the thing they meant.
+
+I asked for a race-free unit test that calls the classifier directly rather than inferring
+applicability through a live engine. Locate it by symbol:
+`git grep -nF 'fn paged_kv_applicability_is_a_conjunction_of_two_independent_facts'`.
+
+```rust
+use crate::driver::{KvApplicabilityDecision, classify_kv_applicability};
+…
+classify_kv_applicability(paged, batching),
+```
+
+It exceeds the prescription in the way that matters. I asked for a direct call; what landed is a
+**four-row total truth table**, and its doc comment states the property that makes it
+mutation-proof:
+
+> *Two of the four rows below distinguish that rule from the correct one, and each fails it in a
+> different direction, so no single-row test could have caught both.*
+
+That is the anti-vacuity argument written into the test, by its author, before anyone asked. A
+second guard in the same file scans the source for `classify_kv_applicability(` and asserts the
+capability is never re-derived from the absence of another — **a guard against the defect class,
+not against the defect instance.** That is the distinction this review has been asking for all
+session, and it was delivered without being requested.
+
+**F1 is STRUCK in code.** What remained live was the citation trail, corrected below.
+
+### The residual, which is mine and is about attribution rather than fabrication
+
+The seven-arm `.is_ok()` collapse survives upstream of the classifier. It no longer fabricates a
+measurement — the enum makes that unrepresentable — but it still attributes the absence to a single
+mechanism when seven distinct failures reach the same arm. **Downgraded from "reports a false fact"
+to "reports a true fact with the wrong cause."** Non-blocking, and worth naming precisely because a
+good refactor relocated it: the bool used to be visible at the call site and is now one hop away
+through a well-named total function. **A good refactor can move a defect somewhere that reads as
+deliberate.**
+
+## Correction: what "the Rust was never run" should have said
+
+I asked for the brief to record that the Rust was never executed this session. **That is false and
+I withdraw it.** The server suite was run by its author — 183 passing, ten consecutive identical
+runs, three named mutations. The true statement is narrower and still worth printing:
+
+> **No gate item measures the Rust, and none of the JavaScript tests can reach `driver.rs`.**
+
+The difference matters. "Never run" impugns an author who did the work. "Not covered by the gate"
+names a hole in *our* process. I made the broader claim because I had not looked, and a reviewer
+asserting absence carries the same burden as a reviewer asserting presence.
+
+## Correction: a third status table existed, and my strike did not reach it
+
+Recorded because it is the clearest instance of a class this review filed against other people.
+
+I struck F1 in two status tables and a section heading and reported the strike complete. **There was
+a third table** — a dated historical snapshot — whose every row read `UNCHANGED — still live` in the
+present tense. Its heading said *superseded*. That was true and it was not enough:
+
+> **The qualifier lived in the heading; the claim lived in the cell. Every operation we perform on
+> a document — a grep, a quote, a table extraction, a summary — strips the heading and keeps the
+> cell.**
+
+Three reviewers independently re-derived F1 as live from those cells while the Rust had been clean
+for over an hour. **The defect was fixed in code and kept alive by my artefact.** It is now repaired
+the only way that survives extraction: **each cell restates its own tense and names the commit that
+struck it**, so no row can be quoted into a claim about the tree.
+
+Ancillary, and the same lesson one level down: my own citation to the surviving doc comment named a
+line number that had drifted by thirty lines. Both instances are now symbol-anchored. **A line
+number is a citation that rots silently; a symbol either resolves or it does not.**
