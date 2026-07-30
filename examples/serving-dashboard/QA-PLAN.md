@@ -366,10 +366,31 @@ how it behaves here more than on the happy path.
       real effect is far too large to hide in noise on a quiet machine — if it is not obvious,
       it is not there.
 
-## 6. Scenario C — dynamic origin
+## 6. Scenario C — dynamic origin (paged-KV pressure)
 
 - [ ] **6.1** Executes per spec; all §7 honesty checks apply.
 - [ ] **6.2** Eviction/sharing behaviour visible where the design claims it.
+
+### 6.3 🔴 STAGE PRESSURE WITH SESSIONS AND REPEATED PREFIXES — **NOT** CONCURRENCY
+
+Supersedes the earlier "raise concurrency and prompt length" instruction, which is **wrong on
+this origin**. The dynamic server **serialises generations** (`driver.rs:696`): concurrent
+requests do **not** overlap, they **queue**.
+
+- [ ] **6.3a Drive the pool with SEQUENTIAL requests** that (i) reuse `X-Session-Id` sessions,
+      (ii) share long leading prefixes so the prefix trie has something to reuse, and
+      (iii) carry long prompts so blocks are actually allocated.
+- [ ] **6.3b Do NOT script a concurrency ramp here, and do not ship a concurrency slider on
+      this scenario.** Raising concurrency on the dynamic origin produces a **queue**, not block
+      sharing — **the paged-KV panels stay flat and read as broken.** We would be handing a
+      visitor a repeatable way to *disprove* a feature that works.
+- [ ] **6.3c Concurrency-driven pressure demonstrates something only on the SCATTER origin**,
+      which does no paged-KV work at all. **This is the batching ⊥ paged-KV exclusivity biting
+      for the fourth time** — the two axes of pressure belong to opposite servers, and each is
+      inert on the other.
+- [ ] **6.3d Regression guard:** a flat block table under sequential repeated-prefix load is a
+      real defect; a flat block table under a concurrency ramp is **the tester staging the wrong
+      pressure.** Record which was used, or the result cannot be interpreted.
 
 ## 7. Honesty audit — NAME vs QUANTITY (the highest-value section)
 
@@ -614,7 +635,9 @@ broken that we already know is not built. Each item below is verified absent, wi
   `allow_runtime_override: false` (so it 403s), and `ByteBudget::reconfigure`
   (`byte_budget.rs:180-190`) sets `state.limit` but never touches `state.used` — the repo's own
   test is named `reconfigure_lower_reports_overage_without_evicting`. **To fill the KV pool
-  honestly, raise concurrency and prompt length until it genuinely fills.**
+  honestly, use sequential requests with repeated prefixes, persistent sessions and long
+  prompts — see §6.3. NOT concurrency: the dynamic server serialises generations
+  (`driver.rs:696`), so a concurrency ramp fills a queue, not the pool.**
 - **11.5 Preemption is structurally disabled on the batching path** — `batched.rs:757` hardcodes
   `PreemptionPolicy::Disabled` (see the `:713-717` comment). The preemption counter is
   `not-applicable` on Profile S, not broken.
