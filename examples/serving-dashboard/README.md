@@ -616,14 +616,34 @@ INFO onnx_genai_server::driver: continuous batch driver enabled max_batch=4
 INFO onnx_genai_server::driver: continuous batch driver disabled; using per-request engine path
 ```
 
-- The **scatter server (`:8123`)** takes the first branch. That is the path the
-  lab record in [`perf-baseline.md`](perf-baseline.md) was captured on, and its
-  harness protocol requires that line to appear **before** measuring: *if it is
-  absent the run is invalid*, because the per-request path is a different code
-  path entirely rather than a slower version of the same one.
-- The **dynamic server (`:8124`)** takes the second branch **by design**, not by
-  failure. Batching and paged KV are mutually exclusive here, which is why there
-  are two servers at all.
+- The **scatter server (`:8123`, `qwen2.5-0.5b-scatter-v2`)** takes the first
+  branch. That is the path the lab record in
+  [`perf-baseline.md`](perf-baseline.md) was captured on, and its harness
+  protocol requires that line to appear **before** measuring: *if it is absent
+  the run is invalid*, because the per-request path is a different code path
+  entirely rather than a slower version of the same one.
+- The **dynamic server (`:8124`, `qwen2.5-0.5b`)** takes the second branch. It
+  runs **one row wide**.
+
+**And that is measured, not inferred from the log.** `perf-baseline.md` §11
+drove four concurrent completions at each pane and sampled `batch_in_flight`
+every 500 ms: the scatter pane peaks at **4 rows**, the dynamic pane at **1**.
+The scatter arm is a **positive control** — without an arm the measurement
+could have failed on, "it reports 1" is indistinguishable from "it reports 1
+always."
+
+> **🔴 The two panes do not differ only in the variable the demo names.** One
+> batches and the other does not, so **any comparison you draw across the two
+> panes — throughput, latency, occupancy, scheduling behaviour — is confounded
+> by the presence or absence of the headline feature itself.** The pane labelled
+> *dynamic* is the one where dynamic batching does not happen. Read each pane on
+> its own terms; the demo does not license a head-to-head.
+>
+> **Why the dynamic model has no continuous-batch manager is NOT YET
+> EXPLAINED.** It has been *measured* not to engage; the cause has not been
+> established, and we are not going to infer one from a model's name. Stated
+> here rather than left for you to discover, because it bounds what the
+> side-by-side layout can be used to argue.
 
 **You do not have to trust the log for this, because the number is on the
 page.** The fallback path is one row wide however large the configured ceiling
@@ -633,7 +653,20 @@ field is therefore its own execution-path witness** — a capacity of 1 next to 
 `max_batch` of 4 means you are reading the per-request path, whatever you
 expected to be running.
 
+> **That witness is younger than the bug it catches.** Until `d08d44b8` the
+> server published the configured *ceiling* rather than the width it would
+> actually run, so the dynamic pane advertised `batch_capacity: 4` while running
+> a single row — **the scheduling panel rendered "of 4 max" over a driver one
+> row wide, on the pane named after the capability.** If you are reading an
+> older build, the capacity field is not a witness; it is the thing being
+> witnessed.
+
 > **The limit of that evidence, stated because it bounds every claim above.**
+> The decision is `engine.continuous_batch_manager(max_batch).is_ok()` — the
+> reason is discarded one line before it could be logged. So the log and the
+> capacity field tell you **which** path ran; **neither can tell you why**. A
+> run that unexpectedly reports capacity 1 is a fact you can act on and not yet
+> a diagnosis, and no log we currently ship will close that gap for you.
 > The decision is `engine.continuous_batch_manager(max_batch).is_ok()` — the
 > reason is discarded one line before it could be logged. So the log and the
 > capacity field tell you **which** path ran; **neither can tell you why**. A

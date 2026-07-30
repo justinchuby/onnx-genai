@@ -909,3 +909,69 @@ test('every driver log line the README quotes still exists in the server source'
       'witness. The branch that makes it true is gone from driver.rs.',
   );
 });
+
+// ---------------------------------------------------------------------------
+// THE README'S PER-PANE ROW COUNTS ARE COPIED FROM perf-baseline.md §11.
+//
+// A number maintained in two places is a number that will disagree with itself.
+// The house rule is COMPUTED FROM THE ARTIFACT OR DELETED, and these two counts
+// cannot be computed at doc-build time -- they came off a live server. So the
+// next best thing: pin them to the record they were copied from, and fail when
+// the record moves.
+//
+// These particular counts matter more than most, because they are what licenses
+// the README's warning that the two panes are NOT COMPARABLE. If the record is
+// ever revised to show both panes batching, the warning becomes false and the
+// demo's central side-by-side becomes legitimate again -- a change nobody would
+// think to propagate into a paragraph phrased as a caveat.
+test('the README per-pane row counts match the measurement record', () => {
+  const readme = shipped('README.md');
+  const record = shipped('perf-baseline.md');
+
+  // The reproduce block is the most stable anchor in §11: it is executable, so
+  // it cannot drift from the table above it without someone noticing.
+  const expectations = [...record.matchAll(/qa-batch-width\.py\s+\d+\s+(\S+)\s*#\s*expect peak in_flight (\d+)/g)]
+    .map((m) => ({ pane: m[1], peak: m[2] }));
+
+  assert.equal(
+    expectations.length,
+    2,
+    `expected two reproduce lines in perf-baseline.md §11, found ${expectations.length}. ` +
+      `The record's shape changed and the README's row counts are no longer pinned ` +
+      `to anything.`,
+  );
+
+  const scatter = expectations.find((e) => /scatter/.test(e.pane));
+  const dynamic = expectations.find((e) => /dynamic/.test(e.pane));
+  assert.ok(scatter && dynamic, 'could not identify the scatter and dynamic arms in the record');
+
+  // The README states these as "peaks at N rows" / "at N". Assert the DIGITS the
+  // record expects actually appear in the paragraph that draws the conclusion,
+  // rather than anywhere in the file -- a match elsewhere would prove nothing.
+  const para = readme
+    .split(/\n\s*\n/)
+    .find((p) => /batch_in_flight/.test(p) && /peaks at/.test(p));
+
+  assert.ok(
+    para,
+    'the README paragraph reporting sampled batch_in_flight peaks is gone; the ' +
+      'confound warning below it is now unsupported by any stated measurement',
+  );
+
+  for (const [name, e] of [['scatter', scatter], ['dynamic', dynamic]]) {
+    assert.ok(
+      new RegExp(`\\*\\*${e.peak}(?: rows?)?\\*\\*`).test(para),
+      `the record expects the ${name} pane to peak at ${e.peak} rows, and the ` +
+        `README paragraph does not state that number:\n  ${para.replace(/\s+/g, ' ').slice(0, 200)}`,
+    );
+  }
+
+  // The confound warning is the reader-facing consequence of those two counts.
+  // It must not survive them silently.
+  assert.ok(
+    scatter.peak !== dynamic.peak,
+    'the record now shows both panes running the same width, so the README\'s ' +
+      '"any comparison across the panes is confounded" warning is FALSE and must ' +
+      'be withdrawn. A caveat that outlives its cause is a claim, not a caution.',
+  );
+});
