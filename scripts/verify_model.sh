@@ -95,6 +95,68 @@ EOF
   exit 1
 fi
 
+# Returns 0 if something is already listening on the port.
+#
+# This matters far more than it looks. If the port is taken, our server dies
+# with "Address already in use" while the OTHER process keeps answering
+# /health -- so the readiness probe below succeeds instantly and every check
+# then runs against a server that never loaded MODEL_DIR. The failure is
+# symmetric: against an unhealthy stranger this reports a false FAIL, and
+# against a healthy one it reports PASS and tells you to promote a model it
+# never opened. A verifier that certifies an artifact it never examined is
+# worse than no verifier, so this is a hard error rather than a warning.
+#
+# curl is already required, so this needs no new dependency: exit code 7 is
+# "failed to connect", i.e. nothing is listening.
+port_is_busy() {
+  # curl's exit code is DATA here, not failure, so capture it rather than
+  # letting `set -e` abort on a perfectly expected non-zero.
+  local rc=0
+  curl -s --connect-timeout 2 -o /dev/null "http://127.0.0.1:$1/" 2>/dev/null || rc=$?
+  [ "$rc" -ne 7 ]
+}
+
+find_free_port() {
+  local candidate=$1 limit=$(($1 + 40))
+  while [ "$candidate" -lt "$limit" ]; do
+    if ! port_is_busy "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    candidate=$((candidate + 1))
+  done
+  return 1
+}
+
+if port_is_busy "$PORT"; then
+  # A failing command substitution in an assignment trips `set -e` and kills
+  # the script BEFORE any of this explanation prints -- which is how the first
+  # version of this guard exited 1 completely silently. `lsof` legitimately
+  # exits non-zero when it matches nothing, so it must not be load-bearing.
+  owner=""
+  if command -v lsof >/dev/null 2>&1; then
+    owner="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null \
+      | awk 'NR==2 {print $1" (pid "$2")"}' || true)"
+  fi
+  printf 'error: port %s is already in use%s\n\n' \
+    "$PORT" "${owner:+ by $owner}" >&2
+  cat >&2 <<EOF
+Refusing to continue. The existing server would answer this script's health
+check, and every result below would describe THAT server rather than:
+
+  $MODEL_DIR
+
+Re-run on a free port:
+EOF
+  if suggestion="$(find_free_port $((PORT + 1)))"; then
+    printf '\n  %s %s --port %s\n' \
+      "$0" "$MODEL_DIR" "$suggestion" >&2
+  else
+    printf '\n  %s %s --port <FREE_PORT>\n' "$0" "$MODEL_DIR" >&2
+  fi
+  exit 1
+fi
+
 MODEL_ID="verify-$$"
 LOG_FILE="$(mktemp -t verify_model_log)"
 SERVER_PID=""
@@ -141,6 +203,25 @@ done
 
 if [ -z "$ready" ]; then
   printf '\nerror: server did not become ready within %ss. Log:\n\n' "$TIMEOUT" >&2
+  cat "$LOG_FILE" >&2
+  exit 1
+fi
+
+# Third layer, and the one that closes the race the pre-flight check cannot.
+# The liveness probe at the top of the loop runs BEFORE the curl, so on the
+# first iteration our child has been forked but has not yet failed to bind --
+# it passes, the curl reaches whoever already owns the port, and we break out
+# believing we are ready. Re-assert AFTER readiness, and read the log rather
+# than trusting the process state alone.
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  printf '\nerror: /health answered but OUR server is not running -- the reply\n' >&2
+  printf '       came from a different process on port %s. Log:\n\n' "$PORT" >&2
+  cat "$LOG_FILE" >&2
+  exit 1
+fi
+if grep -qi 'address already in use' "$LOG_FILE"; then
+  printf '\nerror: our server failed to bind port %s; /health was answered by\n' "$PORT" >&2
+  printf '       another process. Re-run with --port on a free port. Log:\n\n' >&2
   cat "$LOG_FILE" >&2
   exit 1
 fi

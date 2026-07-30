@@ -122,5 +122,98 @@ else
   fail "treats finish_reason=length as a failure"
 fi
 
+# --- port occupancy -------------------------------------------------------
+#
+# Regression test for the worst defect this script has had: it probed /health,
+# got an instant 200 from a server another agent had left on the port, and ran
+# every check against a process that never loaded the model. It reported FAIL
+# that time -- but against a HEALTHY stranger it reports PASS and tells you to
+# promote a model it never opened.
+fake_bin="$tmp/fake-server"
+printf '#!/bin/sh\nsleep 60\n' >"$fake_bin"
+chmod +x "$fake_bin"
+
+# A stand-in for "another agent's server": anything that accepts a connection.
+# A raw socket rather than http.server keeps this dependency-light and, more
+# importantly, tests the guard's ACTUAL contract -- "something is listening" --
+# instead of the narrower "something serves HTTP". It self-terminates so the
+# suite never leaks a listener.
+cat >"$tmp/listener.py" <<'PYEOF'
+import socket, sys, time
+
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+
+# The listener MUST actually accept and close, not just bind. A socket that
+# binds but never accepts fills its backlog after a handful of probes, after
+# which the OS REFUSES new connections -- and a refused connection is exactly
+# what "nothing is listening" looks like. An earlier version of this test slept
+# instead of accepting, so the first probe saw the port as busy and every later
+# one saw it as FREE, which made the guard look broken when it was correct.
+s.settimeout(0.5)
+deadline = time.time() + 45
+while time.time() < deadline:
+    try:
+        conn, _ = s.accept()
+        conn.close()
+    except (socket.timeout, OSError):
+        pass
+PYEOF
+python3 "$tmp/listener.py" 8271 >/dev/null 2>&1 &
+
+# Probe with the same semantics the guard uses: curl exit 7 means "nothing is
+# listening". Asserting exit 0 here would be wrong -- a bare socket never
+# speaks HTTP -- and that mismatch is what made the first version of this test
+# report a spurious failure.
+squatter_ready=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  probe_rc=0
+  curl -s --connect-timeout 1 -o /dev/null "http://127.0.0.1:8271/" 2>/dev/null || probe_rc=$?
+  if [ "$probe_rc" -ne 7 ]; then
+    squatter_ready=1
+    break
+  fi
+  sleep 0.3
+done
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ -z "$squatter_ready" ]; then
+  fail "could not start a listener on 8271 to test port-occupancy detection"
+else
+  pass "test listener is up on 8271"
+
+  output="$(SERVER_BIN="$fake_bin" "$VERIFY" "$tmp/model" --port 8271 2>&1 || true)"
+
+  assert_contains "refuses to run when the port is already in use" \
+    "$output" "port 8271 is already in use"
+  # The danger is silent misattribution, so the message must name the model
+  # that would NOT have been verified.
+  assert_contains "names the model that would not have been verified" \
+    "$output" "$tmp/model"
+  assert_contains "explains that results would describe the other server" \
+    "$output" "rather than"
+  assert_contains "offers a concrete free port rather than just complaining" \
+    "$output" "--port 827"
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if SERVER_BIN="$fake_bin" "$VERIFY" "$tmp/model" --port 8271 >/dev/null 2>&1; then
+    fail "exits non-zero when the port is occupied"
+  else
+    pass "exits non-zero when the port is occupied"
+  fi
+fi
+
+# The post-readiness re-check exists because the liveness probe runs BEFORE the
+# curl and loses the race on the first iteration.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "address already in use" "$VERIFY" &&
+  grep -q "came from a different process" "$VERIFY"; then
+  pass "re-asserts our own process owns the port after readiness"
+else
+  fail "re-asserts our own process owns the port after readiness"
+fi
+
 printf '\n%d tests, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 [ "$TESTS_FAILED" -eq 0 ]
