@@ -172,15 +172,31 @@ dynamic_pid=$!
 wait_until_ready "${SCATTER_PORT}" "static-cache" "${scatter_pid}"
 wait_until_ready "${DYNAMIC_PORT}" "dynamic" "${dynamic_pid}"
 
+SCATTER_ORIGIN="http://${BIND_HOST}:${SCATTER_PORT}"
+DYNAMIC_ORIGIN="http://${BIND_HOST}:${DYNAMIC_PORT}"
+
+# The page must not hard-code a port, and must never assume its peer sits on a
+# conventional one. Guessing would make a scenario poll the wrong engine and
+# render that engine's structural zeros as measurements -- the exact failure
+# this demo exists to argue against. THIS is the process that bound the ports,
+# so it passes both addresses in the URL it prints; scenario-origins.js reads
+# them and carries them across scenario navigations.
+TOPOLOGY="scatter-origin=${SCATTER_ORIGIN}&dynamic-origin=${DYNAMIC_ORIGIN}"
+
 cat <<EOF
 
-  Open the demo:  http://${BIND_HOST}:${SCATTER_PORT}/demo/
+  Open the demo:  ${SCATTER_ORIGIN}/demo/?${TOPOLOGY}
 
   Both servers serve the page. Each scenario reads telemetry from the server
   that can actually measure it, and switching scenarios moves you between them:
 
-    continuous batching          http://${BIND_HOST}:${SCATTER_PORT}/demo/
-    paged KV / prefix caching    http://${BIND_HOST}:${DYNAMIC_PORT}/demo/
+    continuous batching   ${SCATTER_ORIGIN}/demo/?${TOPOLOGY}&scenario=continuous-batching
+    paged KV block table  ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=paged-kv
+    prefix caching        ${DYNAMIC_ORIGIN}/demo/?${TOPOLOGY}&scenario=prefix-cache
+
+  Opening /demo/ without those parameters still works. The scenarios backed by
+  the other server then report that it is not configured, rather than quietly
+  reporting this server's numbers under the other server's name.
 
   Ctrl-C stops both servers.
 

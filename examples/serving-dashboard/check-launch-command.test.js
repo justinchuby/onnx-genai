@@ -92,10 +92,22 @@ test('the demo URL the visitor is told to open is the same in every source', () 
     );
   }
 
-  assert.equal(DEMO_URL, `http://${DEFAULT_SERVER_ADDRESS}/demo`);
+  // Trailing slash: this assertion previously demanded the SHORT form while
+  // the trailing-slash test below demanded the long one, so the two could not
+  // both pass. The long form is the ruled one.
+  assert.equal(DEMO_URL, `http://${DEFAULT_SERVER_ADDRESS}/demo/`);
+
+  // run-demo.sh builds its printed URL from the bound host and port rather
+  // than a literal, via SCATTER_ORIGIN. Assert the DERIVATION, not one
+  // particular spelling of it -- the script also appends the topology query
+  // parameters that tell the page where the peer server landed.
   assert.ok(
-    runDemoCode.includes('${BIND_HOST}:${SCATTER_PORT}/demo'),
-    'run-demo.sh must print the /demo URL built from the same host and port',
+    runDemoCode.includes('SCATTER_ORIGIN="http://${BIND_HOST}:${SCATTER_PORT}"'),
+    'run-demo.sh must build its origin from the host and port it actually bound',
+  );
+  assert.ok(
+    runDemoCode.includes('${SCATTER_ORIGIN}/demo/'),
+    'run-demo.sh must print the /demo/ URL built from that origin',
   );
 });
 

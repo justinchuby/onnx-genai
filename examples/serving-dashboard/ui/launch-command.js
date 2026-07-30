@@ -40,8 +40,14 @@ export const LAUNCH_COMMAND = [
   '  --enable-debug-endpoints',
 ].join('\n');
 
-/** Where the visitor opens the demo once the server is up. */
-export const DEMO_URL = `http://${DEFAULT_SERVER_ADDRESS}/demo`;
+/**
+ * Where the visitor opens the demo once the server is up.
+ *
+ * The trailing slash is load-bearing, not cosmetic. `/demo` is served as a
+ * redirect to `/demo/`, so the short form costs a round-trip AND breaks any
+ * byte-exact comparison between this constant, the README and index.html.
+ */
+export const DEMO_URL = `http://${DEFAULT_SERVER_ADDRESS}/demo/`;
 
 /**
  * Why the `-scatter-v2` model specifically. Shown in the failure states so a
