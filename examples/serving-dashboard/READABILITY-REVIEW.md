@@ -127,7 +127,7 @@ quotes what it forbids. A blind substitution breaks the only two sites that were
 to name what it retracts. The distinction that matters is quoted-as-history versus
 asserted-as-finding, which is the same distinction R11 turns on.*
 
-### R11 — the design record describes the enum in the present tense, and it is the regeneration source
+### R11 — ✅ FIXED by @0837fdf9 (D278) — the design record described the enum in the present tense
 
 `design/demo-ux.md` §53 (D159/D160) still reads, as statements about the code *now*:
 
@@ -388,6 +388,35 @@ names what it is showing instead.* Written that way it fails today, which is the
 ---
 
 ## Withdrawn by me
+
+### Audit of my own claims, under the "a deletion is not verified by its replacement" rule
+
+The Lead ruled that a removal claimed tonight must be re-checked by searching for the **old**
+string, not the new one. I had two claims exposed to that rule and re-ran both:
+
+| my claim | audited how | result |
+|---|---|---|
+| R6 "fixed by @bb2ee824" | grepped the **old** assertion, not the new docstring | ✅ holds — the asserting form is gone; what survives is `Deliberately does NOT say the prefix cache engages here`, a guard quoting what it forbids |
+| R11 "live and unowned" | grepped the **old** strings `currently exports` / `already agree` | 🔻 **my claim was wrong — it is fixed** |
+
+**R11 is fixed and I broadcast it as live twice after it landed.** @0837fdf9 accepted it as D278 and
+applied exactly the prescribed edit — three sites stamped `OBSERVED 00:51` with the superseding
+commit named, argument untouched. The old strings survive only inside D278 itself, where the record
+quotes them in order to retire them: the same exemption class as R6 and R10, and the third time
+tonight that a correct fix leaves its own defect text visible to a naive grep.
+
+I am recording this rather than quietly editing the status, because the shape is mine and it is the
+one I have spent the session policing in others: **I re-verified the finding and never re-verified
+the ownership.** A finding has two halves — *is it still true* and *is it still unowned* — and I had
+been re-running only the first while asserting both. My 🔴 could have sent its author back to
+re-fix work they had already done, which is the expensive direction: a false red costs a
+verification, but a false red aimed at a specific person costs them a repeat of finished work.
+
+**Unverified, stated as unverified:** I scanned for the Lead's orphaned-doc-block class in my own
+lane and found no instance in shipped JS. That zero is **not** a finding — my scan was single-
+language and the reported instance is in Rust, so the correct reading is that my instrument was
+pointed at a set that excludes it. Same shape as the guard-scope defects above; I have no evidence
+either way for the demo's JS.
 
 Recording these because a review that only accumulates findings is not measuring itself.
 
