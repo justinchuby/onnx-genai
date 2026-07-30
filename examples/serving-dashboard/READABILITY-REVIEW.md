@@ -1075,3 +1075,60 @@ The operational form is three words: **publish the list, not the percentage.** A
 checked row by row by someone who was not there. A percentage cannot be checked at all, and
 it over-credits every row it never examined. My own instrument scored me 5-of-6 when the
 truth was 3-of-6, and it flattered me precisely because it reported a ratio.
+
+---
+
+## R28 🔴 NEW — a pinned gate SHA turns every document in the tree into a stale read, and a freshness guard cannot save you from it
+
+**Measured at `8eaebfb8`.** The release gate scores items 3–10 at `1bca52a8` and its
+reasoning is **correct** — I checked it before writing this, because the claim was travelling
+on my own commit:
+
+```
+git merge-base --is-ancestor 1133a874 1bca52a8   -> YES   (04:12:26 -> 04:12:41, 15 s)
+reverse                                          -> NO    strict order, no ambiguity
+delta                                            -> 1 file, READABILITY-REVIEW.md, 0 .js
+```
+
+The suite result transfers because **the delta cannot reach the thing measured** — not
+because the gap is short. That is the right test and I have nothing to add to it.
+
+**⛔ The defect is downstream of a correct decision.** `1bca52a8` is a commit to *my review
+document*. Naming it on the board makes it the canonical read-point for the whole tree, and a
+reader who checks it out to reproduce the score also reads every document there:
+
+| | at `1bca52a8` | at HEAD |
+|---|---|---|
+| lines in `READABILITY-REVIEW.md` | 566 | **1077** |
+| R25 · R26 · R27 · repo preamble · comment laws | **0** | present |
+| `MEASURED-AT` marker | **absent** | `8230060c` |
+
+**Half the document did not exist yet.** A reader arriving there sees a shorter, cleaner,
+entirely plausible review with no indication that anything is missing — **and absence is the
+one defect no reading can detect.**
+
+> **A score is a property of a commit. A review is a property of the tree it describes.**
+> Pinning both to one SHA serves the first correctly and silently breaks the second. The two
+> artefacts have opposite freshness requirements and the board gives them one coordinate.
+
+**☠️ And the part that indicts my own guard.** `check-review-freshness.test.js` exists to stop
+exactly this. **It cannot fire here, because at `1bca52a8` the guard does not exist either** —
+and neither does the `MEASURED-AT` marker it reads. The reader gets no warning, no red, no
+marker: **the guard fails *absent* rather than *red*, and absent is indistinguishable from
+clean.** That is the sixth instance tonight of *a scan that matches nothing and a tree with no
+defects are byte-identical from here* — arriving, this time, on the instrument built to
+prevent it.
+
+> **A freshness guard is only ever as fresh as the commit you read it from.** It protects the
+> branch tip and nothing else. Any pinned, archived, extracted or detached read is outside its
+> reach **by construction**, and those are precisely the reads reviewers perform.
+
+**✅ The fix is one line on the board, and it costs nothing:** when a gate cites a SHA, say
+what it is a claim about. *"Items 3–10 scored at `1bca52a8`; **documents in that checkout are
+stale — read prose at the branch tip.**"* The score stays reproducible; the reader stops
+inheriting a six-hour-old review as though it were current.
+
+**⚖️ To be scrupulous about what this is not:** it is not a criticism of the gate, whose
+delta-transfer discriminator is the best measurement instrument published tonight, and it is
+not an argument against pinning. **It is the cost of pinning, stated once, so nobody pays it
+without knowing.**
