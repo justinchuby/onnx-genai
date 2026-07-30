@@ -1,5 +1,9 @@
 # `onnx-genai` — HTML Demo + Live Debug Dashboard
 
+> ⚠️ **HISTORICAL RECORD. IMPERATIVES HERE ARE NOT LIVE ORDERS AND LINE CITATIONS ARE NOT VALID AT HEAD.**
+> Every section below was true when written and is dated by the SHA beside it. **An instruction in the present tense is a record of what was ordered then, never an order now**, and a `file:line` coordinate resolves only at the revision it was taken at. Verify against `git show HEAD:` before acting on anything here.
+
+
 MEASURED-AT: eca213ec
 
 > **What that marker means, and what it deliberately does NOT mean.** Every measurement in this
