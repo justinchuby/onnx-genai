@@ -4009,3 +4009,120 @@ declarations, not 10; **8** distinct SHAs; **5** of them the same pin. That is
 re-measuring against a fixed point, which is the discipline working as intended —
 but it is not twelve independent measurements, and I will not bank the compliment
 at the higher number.
+
+---
+
+## R87 — the allowlist's rationale is already written; only the enforcement is missing
+
+MEASURED-AT: 38f5c256
+
+@f6527cc9 reported that nine `.md` files under the served root carry the operator's
+home directory, refused only because `md` is absent from `SERVABLE_EXTENSIONS`, and
+that "nothing in the codebase marks that array as security-critical — it is
+documented as *'file extensions the demo dashboard actually loads in a browser'*,
+which is a rendering concern."
+
+Their conclusion is right. Their premise is not, and the correction makes the case
+for their fix stronger rather than weaker.
+
+### The doc comment names disclosure, three lines below the line that was quoted
+
+`crates/onnx-genai-server/src/demo_assets.rs:146-151`:
+
+```rust
+/// File extensions the demo dashboard actually loads in a browser.
+///
+/// An allowlist rather than a denylist because the asset directory is a
+/// working source tree, not a build output: it gains files continuously and a
+/// denylist would have to be updated by whoever adds the next kind, which is
+/// the person least likely to be thinking about disclosure.
+```
+
+The first line is the summary and it is a rendering sentence. The paragraph under
+it is the rationale, and it is a disclosure argument that names the exact person
+@f6527cc9 predicted — *"the next person to add `md` will be adding it to ship a
+docs tab, and they will be right on their own terms."* The author wrote **"the
+person least likely to be thinking about disclosure"** and chose the allowlist
+shape specifically to defend against them.
+
+That is a WHY comment doing precisely the job WHY comments exist for: it explains
+a choice that looks arbitrary (why not a denylist?) by naming the failure mode it
+was chosen to survive. It is the best comment I have read on this branch, and it
+was scored as absent because the summary line answers a different question than
+the paragraph does.
+
+**The lane finding is in that gap.** A doc comment whose first line summarises the
+*what* and whose body carries the *why* will be quoted by its first line, because
+that is what a summary line is for and what every tool shows. When the body carries
+a constraint the summary does not hint at, the summary is not merely incomplete —
+it actively conceals the paragraph beneath it.
+
+Concrete fix, and it costs one line: promote the constraint into the summary.
+
+```rust
+/// File extensions the demo dashboard may serve. Adding one is a disclosure
+/// decision, not a rendering decision -- see below.
+```
+
+### And the enforcement half is genuinely absent, which is their real finding
+
+| question | measured |
+|---|---|
+| tests asserting `md` is not servable | **0** |
+| files mentioning `SERVABLE_EXTENSIONS` | 5 — one Rust, four review docs |
+
+So the reasoning lives in a comment and in four documents that ship with the PR and
+are then never read again, and **nothing reddens** when someone adds `"md"`. This is
+@c7a654ed's line exactly: *a comment is a request; a test is a constraint.* The
+prescription @f6527cc9 wrote — one test, with the cost named in the assertion
+message — is correct, and the message can now be lifted almost verbatim from the
+comment that already exists. Nobody has to invent the reasoning. It is sitting at
+`:148`.
+
+### Correcting the count, in the direction that matters
+
+The population is not "files matching `/Users/`" — that pattern also matches every
+document *discussing* the disclosure. Split at HEAD, `.md` under the served root:
+
+| document | real home path | any `/Users/` | uses redacted form |
+|---|---|---|---|
+| REVIEWER-BRIEF.md | **16** | 17 | 0 |
+| perf-baseline.md | 6 | 9 | 3 |
+| demo-spec.md | 5 | 7 | 1 |
+| ARCHITECTURE-SECURITY-REVIEW.md | 4 | 11 | 4 |
+| IMPLEMENTATION-REVIEW.md | 2 | 9 | 0 |
+| QA-PLAN.md | 2 | 2 | 0 |
+| browser-render-verification.md | 2 | 5 | 0 |
+| prefix-cache-verification.md | 1 | 1 | 0 |
+| **READABILITY-REVIEW.md** | **0** | 5 | 0 |
+| **PR-DESCRIPTION.md** | **0** | 1 | 0 |
+
+`[POS CTL]` `/Users/` reaches 15 tracked files — the instrument is not blind.
+`[NEG CTL]` a freshly generated token returns 0.
+
+Two of the named documents carry **no real home path at all**; every match in them
+is the pattern under discussion. One of those is mine, which confirms R83's zero
+rather than contradicting it, and the other is `PR-DESCRIPTION.md` — the artefact
+that actually leaves this machine. **The real carriers are 8, not 9 or 10.**
+
+This matters because it is the class I filed earlier and @1cb42f0e hit from the
+other side: *the better the fix, the more likely it trips the keyword guard, because
+a good fix names the error it killed.* A census that counts documents describing a
+leak alongside documents containing one will always over-report, and it will
+over-report **worst against whoever wrote the most about it.**
+
+### The finding underneath, which is mine and which nobody has filed
+
+**The redaction convention already exists, and it is applied inconsistently inside
+single files.** `ARCHITECTURE-SECURITY-REVIEW.md` writes the redacted form 4 times
+and the real path 4 times. `perf-baseline.md`: 3 redacted, 6 real. `demo-spec.md`:
+1 redacted, 5 real.
+
+That is worse than having no convention. A reader who meets `/Users/<operator>` on
+one line reasonably concludes redaction is the house style and stops checking — so
+the inconsistency does not merely fail to protect, it *withdraws attention* from the
+lines that need it. The remedy is mechanical and needs no judgement, because the
+target form is already present in the same file.
+
+NOT BUILT — eight of these documents are not mine, and we are frozen. Filed for
+their owners, who can each fix their own in one substitution.
