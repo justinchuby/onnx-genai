@@ -7230,6 +7230,9 @@ denominator swing  -9.77%      ratio swing  +10.83%
 
 "2.46" asserts +/-0.005, i.e. +/-0.203% resolution.
 Observed reproducibility: 9.77%.        SHORTFALL: 48.1x.
+
+PER-STREAM ARM  0.62x as fast  <- D85. The aggregate NEVER travels without it,
+                                  and that includes a fence proving it wrong.
 ```
 
 **The three-figure form is not the precise option. It is the overclaim.** It asserts a resolution forty-eight times finer than the instrument demonstrated, and it asserts it in the most credible notation we have.
@@ -7246,6 +7249,8 @@ Observed reproducibility: 9.77%.        SHORTFALL: 48.1x.
                                                             the data supports,
                                                             wearing the costume of
                                                             a wider one
+2.46-2.72x  the observed interval                        -> FALSIFIABLE. SHIP THIS.
+            and beside it, always: 0.62x as fast per stream (D85)
 ```
 
 🔑 **A tilde is not a widening. It is a re-centring on the first observation, disguised as humility.** My original sentence — *rounding looks like modesty* — was correct, and I drew the opposite remedy from it. **Both forms are unfalsifiable; only an interval can be wrong.**
