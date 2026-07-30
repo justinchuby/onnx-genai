@@ -1,0 +1,188 @@
+/* Copyright (c) Microsoft Corporation. */
+
+/*
+ * Design tokens for the onnx-genai serving dashboard.
+ *
+ * WHY THIS FILE EXISTS
+ * --------------------
+ * Two developers build this page in parallel — one owns the shell and the
+ * scenario modules, the other owns dashboard/*.js panels. Without a single
+ * shared source of visual truth, a page assembled from two sides converges on
+ * fifteen slightly-different greys and four different notions of "small text".
+ * Every colour, space, size, and duration used anywhere in the demo is defined
+ * here and referenced by custom property.
+ *
+ * RULES
+ * -----
+ * 1. No stylesheet outside this file may define a raw colour, spacing value,
+ *    or font size. If a value you need is not here, that is a design request,
+ *    not a local decision.
+ * 2. The --og-unavail-* / --og-pending-* / --og-simulated-* tokens are
+ *    load-bearing for the demo's honesty guarantees. Their entire value is
+ *    that they look identical on every panel. Do not restyle them locally.
+ * 3. The sequence palette is Okabe-Ito (colourblind-safe). Colour NEVER
+ *    carries meaning alone — every sequence also has a fill pattern and a
+ *    shape marker. See demo-ux.md section 2.1 and section 9.1.
+ *
+ * Full specification: designer artifact `demo-ux.md`.
+ */
+
+:root {
+  /* ── SURFACE ───────────────────────────────────────────────────────────
+     Dark-first. A telemetry page is looked at for a long time, often on a
+     projector; dark reduces emitted-light area and lets the Okabe-Ito hues
+     sit at their intended saturation instead of fighting white.           */
+  --og-bg: #0d1117;
+  --og-bg-raised: #151b23;
+  --og-bg-sunken: #090c10;
+  --og-bg-hover: #1c232b;
+  --og-bg-active: #232b35;
+
+  --og-border: #2a323d;
+  --og-border-strong: #3d4855;
+  --og-border-subtle: #1e242c;
+
+  /* ── FOREGROUND ────────────────────────────────────────────────────────
+     Contrast against --og-bg-raised (#151b23):
+       --og-fg 17.4:1   --og-fg-muted 8.1:1   --og-fg-subtle 4.6:1
+     All clear WCAG AA. --og-fg-faint is 1.9:1 and is DECORATIVE ONLY:
+     hairlines, grid texture, hatch. Text in --og-fg-faint is a bug.       */
+  --og-fg: #e6edf3;
+  --og-fg-muted: #9aa7b4;
+  --og-fg-subtle: #6e7d8c;
+  --og-fg-faint: #3d4855;
+
+  /* ── SEMANTIC ──────────────────────────────────────────────────────────
+     Derived from Okabe-Ito rather than the default web red/green, because
+     red/green is precisely the pair that ~8% of men cannot separate.      */
+  --og-ok: #009e73;
+  --og-warn: #e69f00;
+  --og-bad: #d55e00;
+  --og-info: #56b4e9;
+  --og-accent: #0072b2;
+  --og-accent-fg: #ffffff;
+
+  /* ── UNAVAILABLE / PENDING / PROVENANCE ────────────────────────────────
+     The server returns documented zeros for metrics it cannot yet measure.
+     Rendering one as a measurement is a silent, plausible lie. These tokens
+     give "not measurable yet" a consistent, dignified treatment that is
+     instantly distinguishable from a real measured zero.                  */
+  --og-unavail-fg: #5a6673;
+  --og-unavail-rule: #3d4855;
+  --og-unavail-hatch: #212932;
+  --og-unavail-bg: #131920;
+  --og-unavail-label: #6e7d8c;
+  --og-pending-fg: #4a5560;
+  /* `stale` — a value that WAS genuinely measured but which the latest poll
+     did not refresh. It is not fabricated and not absent, so it gets neither
+     the em-dash nor full contrast. It must always render with a visible AGE
+     SUFFIX as well as this colour: rendering a 12-second-old number as
+     current is the same class of error as rendering a fabricated one, and
+     colour alone fails grayscale and colourblindness. */
+  --og-stale-fg: #7a8794;
+  --og-stale-rule: #4a5560;
+  --og-simulated-fg: #e69f00;
+  --og-simulated-rule: #e69f00;
+  --og-estimated-fg: #9aa7b4;
+
+  /* ── SEQUENCE PALETTE — Okabe-Ito, 8 stable slots ──────────────────────
+     Assigned round-robin by arrival index, stable for the life of a
+     scenario. The same sequence is the same colour AND the same pattern in
+     the swimlanes, the block grid, and the request table: that
+     cross-surface identity is what makes "sequence" and "memory" read as
+     one concept instead of two panels.                                    */
+  --og-seq-0: #0072b2; /* blue           · pattern solid      · marker circle   */
+  --og-seq-1: #e69f00; /* orange         · pattern diag45     · marker triangle */
+  --og-seq-2: #009e73; /* bluish green   · pattern diag135    · marker square   */
+  --og-seq-3: #cc79a7; /* reddish purple · pattern dots       · marker diamond  */
+  --og-seq-4: #56b4e9; /* sky blue       · pattern horizontal · marker bar      */
+  --og-seq-5: #d55e00; /* vermillion     · pattern vertical   · marker pentagon */
+  --og-seq-6: #f0e442; /* yellow         · pattern crosshatch · marker cross    */
+  --og-seq-7: #b0b8c1; /* neutral        · pattern checker    · marker star     */
+
+  /* ── SPACING — 4px base. Nine values, no exceptions. ─────────────────── */
+  --og-space-0: 0;
+  --og-space-1: 2px;
+  --og-space-2: 4px;
+  --og-space-3: 8px;
+  --og-space-4: 12px;
+  --og-space-5: 16px;
+  --og-space-6: 24px;
+  --og-space-7: 32px;
+  --og-space-8: 48px;
+  --og-space-9: 64px;
+
+  /* ── TYPE ──────────────────────────────────────────────────────────────
+     Mono for every number, identifier, path, and command. Proportional
+     digits jitter in width as they update, and at 4 Hz that constant
+     jitter reads as instability.                                          */
+  --og-font-ui: ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+  --og-font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, monospace;
+
+  --og-type-hero: 44px;
+  --og-type-xl: 28px;
+  --og-type-lg: 20px;
+  --og-type-md: 15px;
+  --og-type-sm: 13px;
+  --og-type-xs: 11px;
+  --og-type-2xs: 9px;
+
+  --og-leading-tight: 1.15;
+  --og-leading-body: 1.55;
+
+  --og-weight-light: 300;
+  --og-weight-normal: 400;
+  --og-weight-medium: 500;
+  --og-weight-bold: 650;
+
+  --og-tracking-caps: 0.08em;
+
+  /* ── SHAPE / DEPTH ─────────────────────────────────────────────────────
+     Shadows are nearly absent by design. This page should read as a
+     technical drawing, not a stack of cards; hairlines and surface value
+     survive a projector, soft shadows do not.                             */
+  --og-radius-sm: 3px;
+  --og-radius-md: 6px;
+  --og-radius-lg: 10px;
+  --og-radius-pill: 999px;
+  --og-shadow-popover: 0 8px 24px rgb(0 0 0 / 0.45);
+
+  /* ── MOTION ────────────────────────────────────────────────────────────
+     All durations flow through these tokens so prefers-reduced-motion can
+     zero them in exactly one place (see the media query below).           */
+  --og-dur-fast: 90ms;
+  --og-dur-base: 160ms;
+  --og-dur-slow: 260ms;
+  --og-ease: cubic-bezier(0.2, 0, 0.2, 1);
+
+  /* ── FOCUS — one ring, everywhere, never removed ─────────────────────── */
+  --og-focus-ring: 2px solid #56b4e9;
+  --og-focus-offset: 2px;
+
+  /* ── GRID TEXTURE — page substrate, also used behind failure states ──── */
+  --og-grid-alpha: 0.35;
+  --og-grid-size: 8px;
+
+  /* ── LAYOUT ────────────────────────────────────────────────────────────
+     Design target is 1280x720 — the resolution of a shared screen in a
+     meeting, which is where this will most often be seen.                 */
+  --og-rail-h: 56px;
+  --og-hero-h: 92px;
+  --og-activity-h: 72px;
+  --og-content-max: 1680px;
+  --og-panel-min: 340px;
+
+  /* Reserved width for a value slot. An unavailable value must occupy the
+     same space its real value would, so that nothing reflows on the day the
+     server learns to measure it. Layout shift on data arrival makes a page
+     feel unreliable at exactly the moment it becomes more reliable. */
+  --og-value-slot: 5ch;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --og-dur-fast: 0ms;
+    --og-dur-base: 0ms;
+    --og-dur-slow: 0ms;
+  }
+}

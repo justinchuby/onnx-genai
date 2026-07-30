@@ -1,0 +1,464 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation. -->
+<!--
+  DESIGN REFERENCE — NOT THE SHIPPING PAGE.
+
+  This file exists so the two developers building the demo can SEE the layout
+  contract, the design tokens, and (most importantly) the unavailable-data
+  design language rendered in a browser, rather than inferring them from prose.
+
+  It is deliberately static: no JS, no fetch, no data. Every value shown here
+  is placeholder text illustrating a *treatment*. Nothing in this file may be
+  copied into the shipping page as data — copy the CSS patterns, not the
+  numbers.
+
+  The shipping page is ../index.html (demo dev) + ../dashboard/*.js (dashboard
+  dev). Full specification: designer artifact `demo-ux.md`.
+
+  Open it directly in a browser: no server needed.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>onnx-genai demo — design reference</title>
+<link rel="stylesheet" href="../styles/tokens.css">
+<style>
+  /* ── Reference-only styles. The shipping page's base.css / layout.css /
+       panels.css are owned by the developers; this sheet demonstrates the
+       treatments those files must implement. ───────────────────────────── */
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: var(--og-bg);
+    color: var(--og-fg);
+    font: var(--og-weight-normal) var(--og-type-md)/var(--og-leading-body) var(--og-font-ui);
+    /* The page substrate: an 8px technical-drawing grid. Also shows through
+       behind the blocking failure states, so an error never sits on a void. */
+    background-image:
+      linear-gradient(var(--og-border-subtle) 1px, transparent 1px),
+      linear-gradient(90deg, var(--og-border-subtle) 1px, transparent 1px);
+    background-size: var(--og-grid-size) var(--og-grid-size);
+    background-blend-mode: normal;
+  }
+  .wrap { max-width: var(--og-content-max); margin: 0 auto; padding: 0 var(--og-space-6); }
+
+  :focus-visible { outline: var(--og-focus-ring); outline-offset: var(--og-focus-offset); }
+
+  code, .num { font-family: var(--og-font-mono); font-variant-numeric: tabular-nums; }
+
+  .caps {
+    font-size: var(--og-type-xs); text-transform: uppercase;
+    letter-spacing: var(--og-tracking-caps); color: var(--og-fg-subtle);
+    font-weight: var(--og-weight-medium);
+  }
+
+  /* ── APP RAIL ───────────────────────────────────────────────────────── */
+  .rail {
+    height: var(--og-rail-h); display: flex; align-items: center;
+    gap: var(--og-space-5); border-bottom: 1px solid var(--og-border);
+    background: var(--og-bg-raised);
+  }
+  .brand { font-weight: var(--og-weight-bold); letter-spacing: -0.01em; }
+  .brand span { color: var(--og-fg-subtle); font-weight: var(--og-weight-normal); }
+  .rail__spacer { flex: 1; }
+  .modelcard {
+    display: flex; align-items: center; gap: var(--og-space-3);
+    font-family: var(--og-font-mono); font-size: var(--og-type-sm);
+    background: var(--og-bg-sunken); border: 1px solid var(--og-border);
+    border-radius: var(--og-radius-pill); padding: var(--og-space-2) var(--og-space-4);
+    color: var(--og-fg-muted); cursor: pointer;
+  }
+  .modelcard strong { color: var(--og-fg); font-weight: var(--og-weight-medium); }
+
+  /* Connection chip: state is carried by GLYPH SHAPE as well as colour, so it
+     survives grayscale and colourblindness. See demo-ux.md section 9.1. */
+  .chip {
+    display: inline-flex; align-items: center; gap: var(--og-space-2);
+    font-size: var(--og-type-xs); font-family: var(--og-font-mono);
+    color: var(--og-fg-muted);
+  }
+  .chip__glyph { font-size: var(--og-type-sm); }
+  .chip--live   .chip__glyph { color: var(--og-ok); }
+  .chip--slow   .chip__glyph { color: var(--og-warn); }
+  .chip--offline .chip__glyph { color: var(--og-bad); }
+
+  /* ── HERO ───────────────────────────────────────────────────────────── */
+  .hero {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--og-space-4); padding: var(--og-space-5) 0;
+  }
+  .tile {
+    background: var(--og-bg-raised); border: 1px solid var(--og-border);
+    border-radius: var(--og-radius-md); padding: var(--og-space-4) var(--og-space-5);
+  }
+  .tile__num {
+    font-family: var(--og-font-mono); font-variant-numeric: tabular-nums;
+    font-size: var(--og-type-hero); font-weight: var(--og-weight-light);
+    line-height: var(--og-leading-tight); letter-spacing: -0.02em;
+  }
+  .tile__unit { font-size: var(--og-type-lg); color: var(--og-fg-muted); margin-left: var(--og-space-2); }
+  .tile__label { margin-top: var(--og-space-2); }
+
+  /* ── THE FOUR VALUE STATES ──────────────────────────────────────────────
+     This is the single most important visual contract in the demo:
+     a measured zero and a fabricated zero must never look the same. */
+  .value { display: inline-flex; align-items: baseline; gap: var(--og-space-2); }
+  .value__num { font-family: var(--og-font-mono); font-variant-numeric: tabular-nums; }
+  .value__unit { font-size: var(--og-type-xs); color: var(--og-fg-subtle); }
+  .value__src {
+    font-size: var(--og-type-2xs); color: var(--og-fg-subtle);
+    text-decoration: none; cursor: help; vertical-align: super;
+  }
+  .value[data-state="unavailable"] .value__num {
+    color: var(--og-unavail-fg);
+    border-bottom: 1px dashed var(--og-unavail-rule);
+    cursor: help;
+  }
+  .value[data-state="pending"] .value__num {
+    color: var(--og-pending-fg); letter-spacing: 0.12em;
+  }
+  .value[data-state="estimated"] .value__num { color: var(--og-estimated-fg); }
+  .badge-sim {
+    font-size: var(--og-type-2xs); font-family: var(--og-font-mono);
+    text-transform: uppercase; letter-spacing: var(--og-tracking-caps);
+    color: var(--og-simulated-fg); border: 1px dashed var(--og-simulated-rule);
+    border-radius: var(--og-radius-sm); padding: 0 var(--og-space-2);
+  }
+
+  /* ── UNAVAILABLE SERIES ─────────────────────────────────────────────────
+     NEVER a flat line at zero. A flat zero line implies duration: it claims
+     "we watched this for 60 seconds and it was zero the whole time." */
+  .well {
+    position: relative; height: 64px; border-radius: var(--og-radius-sm);
+    background: var(--og-bg-sunken); border: 1px solid var(--og-border-subtle);
+    display: grid; place-items: center; overflow: hidden;
+  }
+  .well--unavailable {
+    background-color: var(--og-unavail-bg);
+    background-image: repeating-linear-gradient(
+      45deg,
+      var(--og-unavail-hatch) 0 1px,
+      transparent 1px 6px
+    );
+    cursor: help;
+  }
+  .well--pending { }
+  .well__caption {
+    font-size: var(--og-type-xs); text-transform: uppercase;
+    letter-spacing: var(--og-tracking-caps); color: var(--og-unavail-label);
+    background: var(--og-unavail-bg); padding: 0 var(--og-space-3);
+    border-bottom: 1px dashed var(--og-unavail-rule);
+  }
+  .well__caption--pending { color: var(--og-pending-fg); border-bottom: 0; background: transparent; }
+  .well__baseline { position: absolute; left: 0; right: 0; bottom: 8px; border-top: 1px solid var(--og-fg-faint); }
+
+  /* ── PANEL GRID — auto-fill means any panel can be removed with no hole ── */
+  .panels {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--og-panel-min), 1fr));
+    gap: var(--og-space-4); padding-bottom: var(--og-space-8);
+  }
+  .panel {
+    background: var(--og-bg-raised); border: 1px solid var(--og-border);
+    border-radius: var(--og-radius-md); overflow: hidden;
+  }
+  .panel[data-span="2"] { grid-column: span 2; }
+  @media (max-width: 1120px) { .panel[data-span="2"] { grid-column: span 1; } }
+  .panel__head {
+    display: flex; align-items: center; gap: var(--og-space-3);
+    padding: var(--og-space-3) var(--og-space-5);
+    border-bottom: 1px solid var(--og-border-subtle);
+  }
+  .panel__title { margin: 0; font-size: var(--og-type-sm); font-weight: var(--og-weight-medium); }
+  .panel__tools { margin-left: auto; color: var(--og-fg-subtle); font-size: var(--og-type-xs); }
+  /* Panels size themselves against their own width, never the viewport: a
+     panel is 340px in one column and ~700px in two. */
+  .panel__body { container-type: inline-size; padding: var(--og-space-5); }
+
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: var(--og-space-2) var(--og-space-4); font-size: var(--og-type-sm); }
+  .kv dt { color: var(--og-fg-muted); }
+  .kv dd { margin: 0; text-align: right; }
+
+  /* ── SWIMLANE (static sketch) ───────────────────────────────────────────
+     Segment phase is carried by SHAPE: hollow+hatched vs solid+patterned.
+     The hatch is the same 45deg hatch as an unavailable chart well, and that
+     reuse is deliberate: hatch means "we cannot see inside here", which is
+     literally true of the sent -> first-token interval from a browser. */
+  .lanes { background: var(--og-bg-sunken); border-radius: var(--og-radius-sm); padding: var(--og-space-4); }
+  .lane { display: grid; grid-template-columns: 132px 1fr; align-items: center; height: 22px; }
+  .lane__label { font-family: var(--og-font-mono); font-size: var(--og-type-xs); color: var(--og-fg-muted); }
+  .lane__track { position: relative; height: 14px; }
+  .seg { position: absolute; top: 0; height: 14px; border-radius: 2px; }
+  .seg--pre {
+    border: 1px solid currentColor; background-image: repeating-linear-gradient(
+      45deg, currentColor 0 1px, transparent 1px 5px);
+    opacity: .8;
+  }
+  .seg--stream { background: currentColor; }
+  .seg--dead {
+    background-color: var(--og-unavail-bg);
+    background-image: repeating-linear-gradient(45deg, var(--og-unavail-hatch) 0 1px, transparent 1px 6px);
+    border: 1px dashed var(--og-warn);
+  }
+  .s0 { color: var(--og-seq-0); } .s1 { color: var(--og-seq-1); }
+  .s2 { color: var(--og-seq-2); } .s3 { color: var(--og-seq-3); }
+  .s4 { color: var(--og-seq-4); } .s5 { color: var(--og-seq-5); }
+
+  /* ── BLOCK GRID (static sketch, "compact" density) ──────────────────────
+     free = empty + dotted (minimum ink) · owned = filled + pattern
+     shared = ring + corner dog-ear · partial = fill HEIGHT
+     Every state is a shape, not just a hue. */
+  .grid { display: grid; grid-template-columns: repeat(32, 12px); gap: 2px; }
+  .cell { width: 12px; height: 12px; border-radius: 1px; position: relative; }
+  .cell--free { border: 1px dotted var(--og-fg-faint); }
+  .cell--owned { background: currentColor; }
+  .cell--partial { background: linear-gradient(to top, currentColor 55%, transparent 55%); border: 1px dotted var(--og-fg-faint); }
+  .cell--shared { background: currentColor; box-shadow: 0 0 0 1.5px var(--og-fg); }
+  .cell--shared::after {
+    content: ""; position: absolute; top: 0; right: 0;
+    border-width: 0 5px 5px 0; border-style: solid;
+    border-color: transparent var(--og-bg-raised) transparent transparent;
+  }
+  .cell--demoted { background: currentColor; opacity: .35; }
+  .cell--demoted::after {
+    content: ""; position: absolute; left: 0; right: 0; top: 50%;
+    border-top: 1px solid var(--og-fg);
+  }
+
+  .ribbon { display: flex; height: 20px; border-radius: var(--og-radius-sm); overflow: hidden; border: 1px solid var(--og-border); }
+  .ribbon > i { display: block; }
+
+  /* ── BLOCKING FAILURE STATE ─────────────────────────────────────────── */
+  .blocker {
+    display: grid; place-items: center; text-align: center;
+    padding: var(--og-space-9) var(--og-space-6);
+    border: 1px solid var(--og-border); border-radius: var(--og-radius-lg);
+    background: color-mix(in srgb, var(--og-bg-raised) 88%, transparent);
+  }
+  .blocker__mark { color: var(--og-fg-subtle); margin-bottom: var(--og-space-5); }
+  .blocker h2 { margin: 0 0 var(--og-space-4); font-size: var(--og-type-xl); font-weight: var(--og-weight-medium); }
+  .blocker p { margin: 0 auto var(--og-space-5); max-width: 52ch; color: var(--og-fg-muted); }
+  .cmd {
+    display: flex; align-items: flex-start; gap: var(--og-space-4);
+    background: var(--og-bg-sunken); border: 1px solid var(--og-border);
+    border-radius: var(--og-radius-md); padding: var(--og-space-4) var(--og-space-5);
+    font-family: var(--og-font-mono); font-size: var(--og-type-sm);
+    text-align: left; color: var(--og-fg); white-space: pre;
+  }
+  .retry { margin-top: var(--og-space-5); font-family: var(--og-font-mono); font-size: var(--og-type-sm); color: var(--og-warn); }
+
+  .note {
+    border-left: 2px solid var(--og-info); padding: var(--og-space-3) var(--og-space-5);
+    background: var(--og-bg-raised); color: var(--og-fg-muted);
+    font-size: var(--og-type-sm); margin: var(--og-space-6) 0;
+  }
+  h3.sec { margin: var(--og-space-8) 0 var(--og-space-4); font-size: var(--og-type-lg); font-weight: var(--og-weight-medium); }
+</style>
+</head>
+<body>
+
+<header class="rail" role="banner">
+  <div class="wrap" style="display:flex;align-items:center;gap:var(--og-space-5);width:100%">
+    <div class="brand">onnx-genai <span>demo</span></div>
+    <button class="modelcard" aria-expanded="false">
+      ◈ <strong>qwen2.5-0.5b-scatter-v2</strong> · cpu · 4096 ctx ▾
+    </button>
+    <div class="rail__spacer"></div>
+    <span class="chip chip--live"><span class="chip__glyph" aria-hidden="true">●</span> live · 4 Hz</span>
+    <span class="chip"><span aria-hidden="true">⌨</span> ?</span>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <p class="note">
+    <strong>Design reference, not the shipping page.</strong> Every number below is
+    placeholder text illustrating a <em>treatment</em>. Copy the CSS patterns,
+    never the values. Full spec: <code>demo-ux.md</code>.
+  </p>
+
+  <!-- ── HERO ─────────────────────────────────────────────────────────── -->
+  <h3 class="sec">Hero strip <span class="caps">— auto-fit, so removing a tile leaves no hole</span></h3>
+  <section class="hero">
+    <div class="tile">
+      <div class="tile__num">98.7<span class="tile__unit">tok/s</span></div>
+      <div class="tile__label caps">aggregate output <abbr class="value__src" title="Derived: sum of SSE token deltas over a 2 s sliding window">ᴰ</abbr></div>
+    </div>
+    <div class="tile">
+      <div class="tile__num">0.0<span class="tile__unit">%</span></div>
+      <div class="tile__label caps">prefix hit rate <abbr class="value__src" title="Server counter · prefix_cache_hits / lookups · 250 ms">ˢ</abbr></div>
+    </div>
+    <div class="tile">
+      <div class="tile__num value" data-state="unavailable">
+        <span class="value__num" title="KV page statistics are computed by the engine but not yet exposed over HTTP. Engine::page_usage() exists; the server does not call it.">—</span><span class="tile__unit">%</span>
+      </div>
+      <div class="tile__label caps">KV block utilization</div>
+    </div>
+    <div class="tile">
+      <div class="tile__num">6<span class="tile__unit">/ 2</span></div>
+      <div class="tile__label caps">running / waiting <abbr class="value__src" title="Server counters · batch_size_current, requests_waiting">ˢ</abbr></div>
+    </div>
+  </section>
+
+  <p class="note">
+    Tiles two and three are the entire thesis of this design, side by side.
+    <strong>0.0 %</strong> is a <em>real measurement</em> — the prefix cache genuinely
+    did not hit, and we say so at full contrast. <strong>—</strong> is an
+    <em>absence</em> — the server cannot measure KV utilization yet, and rendering
+    the documented zero it returns would be a silent lie. Same glyph shape, opposite
+    meanings; they must never be confused.
+  </p>
+
+  <!-- ── THE FOUR STATES ──────────────────────────────────────────────── -->
+  <h3 class="sec">The four value states</h3>
+  <div class="panels">
+    <section class="panel" data-panel-id="states">
+      <header class="panel__head"><h2 class="panel__title">Value states</h2><div class="panel__tools">⊞ table  ⓘ  ▾</div></header>
+      <div class="panel__body">
+        <dl class="kv">
+          <dt>measured</dt>
+          <dd><span class="value" data-state="ok"><span class="value__num">318</span><span class="value__unit">blocks</span><abbr class="value__src" title="Server counter · PageUsage.in_use · 250 ms">ˢ</abbr></span></dd>
+
+          <dt>measured, and really zero</dt>
+          <dd><span class="value" data-state="ok"><span class="value__num">0</span><span class="value__unit">count</span><abbr class="value__src" title="Server counter · rejections_total. Measured. The value really is zero.">ˢ</abbr></span></dd>
+
+          <dt>no samples yet</dt>
+          <dd><span class="value" data-state="pending"><span class="value__num">···</span><span class="value__unit">ms</span></span></dd>
+
+          <dt>not measurable yet</dt>
+          <dd><span class="value" data-state="unavailable" tabindex="0"
+                   aria-label="Preemptions: not measurable yet. The scheduler performs preemption but keeps no counter for it."><span
+                   class="value__num" title="The scheduler performs preemption but keeps no counter for it. Not measurable today.">—</span><span class="value__unit">count</span></span></dd>
+
+          <dt>estimated, not measured</dt>
+          <dd><span class="value" data-state="estimated"><span class="value__num">~340</span><span class="value__unit">ms</span><abbr class="value__src" title="Estimated, not measured: skipped tokens × observed per-token prefill cost">ᴱ</abbr></span></dd>
+
+          <dt>simulated <span class="caps">(should never appear)</span></dt>
+          <dd><span class="badge-sim">sim</span></dd>
+        </dl>
+      </div>
+    </section>
+
+    <section class="panel" data-panel-id="series">
+      <header class="panel__head"><h2 class="panel__title">Unavailable series</h2><div class="panel__tools">60 s  ⓘ  ▾</div></header>
+      <div class="panel__body">
+        <div class="well well--unavailable" tabindex="0" role="img"
+             aria-label="Preemptions per minute: not measurable yet. The scheduler keeps no preemption counter.">
+          <span class="well__caption">not measurable yet</span>
+        </div>
+        <p class="caps" style="margin:var(--og-space-3) 0 var(--og-space-5)">preemptions / min</p>
+        <div class="well well--pending">
+          <span class="well__baseline"></span>
+          <span class="well__caption well__caption--pending">awaiting data</span>
+        </div>
+        <p class="caps" style="margin:var(--og-space-3) 0 0">inter-token latency — run a scenario</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- ── SWIMLANES ────────────────────────────────────────────────────── -->
+  <h3 class="sec">Swimlanes <span class="caps">— static above, continuous below, one locked X scale</span></h3>
+  <div class="panels">
+    <section class="panel" data-span="2" data-panel-id="lanes">
+      <header class="panel__head"><h2 class="panel__title">Static · B=4</h2><div class="panel__tools">makespan 18.4 s ᶜ</div></header>
+      <div class="panel__body">
+        <div class="lanes">
+          <div class="lane s0"><div class="lane__label">● #1  1 024 tok</div><div class="lane__track"><i class="seg seg--pre" style="left:0;width:3%"></i><i class="seg seg--stream" style="left:3%;width:24%"></i></div></div>
+          <div class="lane s1"><div class="lane__label">▲ #2  1 024 tok</div><div class="lane__track"><i class="seg seg--pre" style="left:0;width:3%"></i><i class="seg seg--stream" style="left:3%;width:15%"></i></div></div>
+          <div class="lane s2"><div class="lane__label">■ #3  straggler</div><div class="lane__track"><i class="seg seg--pre" style="left:0;width:3%"></i><i class="seg seg--stream" style="left:3%;width:42%"></i></div></div>
+          <div class="lane s3"><div class="lane__label">◆ #4  1 024 tok</div><div class="lane__track"><i class="seg seg--pre" style="left:0;width:3%"></i><i class="seg seg--stream" style="left:3%;width:18%"></i></div></div>
+          <div class="lane s4"><div class="lane__label">◇ #5  wave 2</div><div class="lane__track"><i class="seg seg--dead" style="left:21%;width:24%" title="head-of-line blocking · 2.4 s"></i><i class="seg seg--pre" style="left:45%;width:3%"></i><i class="seg seg--stream" style="left:48%;width:20%"></i></div></div>
+          <div class="lane s5"><div class="lane__label">★ #6  wave 2</div><div class="lane__track"><i class="seg seg--dead" style="left:18%;width:27%" title="head-of-line blocking · 2.4 s"></i><i class="seg seg--pre" style="left:45%;width:3%"></i><i class="seg seg--stream" style="left:48%;width:16%"></i></div></div>
+        </div>
+      </div>
+    </section>
+    <section class="panel" data-span="2" data-panel-id="lanes-cont">
+      <header class="panel__head"><h2 class="panel__title">Continuous</h2><div class="panel__tools">makespan 7.9 s ᶜ</div></header>
+      <div class="panel__body">
+        <div class="lanes">
+          <div class="lane s0"><div class="lane__label">● #1  1 024 tok</div><div class="lane__track"><i class="seg seg--pre" style="left:0;width:3%"></i><i class="seg seg--stream" style="left:3%;width:24%"></i></div></div>
+          <div class="lane s1"><div class="lane__label">▲ #2  1 024 tok</div><div class="lane__track"><i class="seg seg--pre" style="left:1%;width:2%"></i><i class="seg seg--stream" style="left:3%;width:15%"></i></div></div>
+          <div class="lane s2"><div class="lane__label">■ #3  straggler</div><div class="lane__track"><i class="seg seg--pre" style="left:2%;width:2%"></i><i class="seg seg--stream" style="left:4%;width:42%"></i></div></div>
+          <div class="lane s3"><div class="lane__label">◆ #4  1 024 tok</div><div class="lane__track"><i class="seg seg--pre" style="left:3%;width:2%"></i><i class="seg seg--stream" style="left:5%;width:18%"></i></div></div>
+          <div class="lane s4"><div class="lane__label">◇ #5  joined</div><div class="lane__track"><i class="seg seg--pre" style="left:5%;width:2%"></i><i class="seg seg--stream" style="left:7%;width:20%"></i></div></div>
+          <div class="lane s5"><div class="lane__label">★ #6  joined</div><div class="lane__track"><i class="seg seg--pre" style="left:7%;width:2%"></i><i class="seg seg--stream" style="left:9%;width:16%"></i></div></div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <p class="note">
+    Hollow + hatched = <strong>sent → first token</strong>. Solid = <strong>streaming</strong>.
+    Only two segments, because a browser cannot separate queue wait from prefill —
+    drawing that split from client timing would be invisible fabrication. The hatched
+    blocks in wave 2 are named in the UI: <em>head-of-line blocking · 2.4 s</em>.
+    Naming the dead time is what turns a chart into an argument.
+  </p>
+
+  <!-- ── BLOCK GRID ───────────────────────────────────────────────────── -->
+  <h3 class="sec">Paged KV block table <span class="caps">— compact density</span></h3>
+  <div class="panels">
+    <section class="panel" data-span="2" data-panel-id="kv">
+      <header class="panel__head"><h2 class="panel__title">Paged KV block table</h2><div class="panel__tools">ⓘ ▾</div></header>
+      <div class="panel__body">
+        <p style="margin-top:0;color:var(--og-fg-muted);font-size:var(--og-type-sm)">
+          Visualizes the paged KV <strong>allocator</strong> — real block allocation,
+          copy-on-write sharing, tiering, and eviction. Paged-<strong>attention
+          kernels</strong> are not yet implemented in this runtime; attention still
+          runs over materialized KV. We show what exists.
+        </p>
+        <div class="ribbon" aria-label="222 owned, 96 shared, 194 free of 512 blocks">
+          <i style="background:var(--og-seq-0);width:43%"></i>
+          <i style="background:var(--og-seq-2);width:19%"></i>
+          <i style="background:var(--og-bg-sunken);width:38%"></i>
+        </div>
+        <p class="caps" style="margin:var(--og-space-2) 0 var(--og-space-5)">owned 222 · shared 96 · free 194 · 512 × 16 tok</p>
+        <div class="grid" role="img" aria-label="512 KV blocks: 222 owned across 3 sequences, 96 shared, 194 free.">
+          <i class="cell cell--owned s0"></i><i class="cell cell--owned s0"></i><i class="cell cell--owned s0"></i><i class="cell cell--shared s0"></i>
+          <i class="cell cell--owned s1"></i><i class="cell cell--owned s1"></i><i class="cell cell--shared s1"></i><i class="cell cell--partial s1"></i>
+          <i class="cell cell--owned s2"></i><i class="cell cell--shared s2"></i><i class="cell cell--demoted s2"></i><i class="cell cell--partial s2"></i>
+          <i class="cell cell--free"></i><i class="cell cell--free"></i><i class="cell cell--free"></i><i class="cell cell--free"></i>
+          <i class="cell cell--owned s3"></i><i class="cell cell--owned s3"></i><i class="cell cell--partial s3"></i><i class="cell cell--free"></i>
+          <i class="cell cell--owned s4"></i><i class="cell cell--shared s4"></i><i class="cell cell--free"></i><i class="cell cell--free"></i>
+          <i class="cell cell--owned s5"></i><i class="cell cell--partial s5"></i><i class="cell cell--free"></i><i class="cell cell--free"></i>
+          <i class="cell cell--free"></i><i class="cell cell--free"></i><i class="cell cell--free"></i><i class="cell cell--free"></i>
+        </div>
+        <p class="caps" style="margin-top:var(--og-space-4)">
+          free = empty + dotted · owned = filled · partial = fill height ·
+          shared = ring + corner dog-ear · demoted = strike
+        </p>
+      </div>
+    </section>
+  </div>
+  <p class="note">
+    Squint, or screenshot this in grayscale: every state is still readable, because
+    every state is a <strong>shape</strong>. Colour only ever answers
+    “<em>which sequence</em>”, never “<em>what state</em>”.
+  </p>
+
+  <!-- ── BLOCKING FAILURE STATE ───────────────────────────────────────── -->
+  <h3 class="sec">Blocking failure state <span class="caps">— what a first-time visitor most likely sees</span></h3>
+  <section class="blocker">
+    <svg class="blocker__mark" width="64" height="64" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+      <circle cx="32" cy="32" r="22" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 6"/>
+      <path d="M24 24 L40 40 M40 24 L24 40" stroke="currentColor" stroke-width="1.5"/>
+    </svg>
+    <h2>Can't reach the onnx-genai server</h2>
+    <p>
+      Nothing is running at <code>http://127.0.0.1:8080</code>. This page is served by
+      the server itself, so if you're reading this, the server was up a moment ago and
+      has since stopped.
+    </p>
+    <div class="cmd">./target/release/onnx-genai-server \
+  --model models/qwen2.5-0.5b-scatter-v2 \
+  --enable-debug-endpoints<span style="margin-left:auto;color:var(--og-fg-subtle)">⧉</span></div>
+    <div class="retry">◌ Retrying in 3s…  ·  attempt 4  ·  last success 00:41 ago</div>
+    <p style="margin-top:var(--og-space-4);color:var(--og-fg-subtle)">
+      Reconnects automatically. Nothing you were doing is lost.
+    </p>
+  </section>
+
+</main>
+</body>
+</html>
