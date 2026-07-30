@@ -1260,3 +1260,102 @@ converts *"the box is too busy to measure"* — an assertion a reader must take 
 trust — into **±52 % on a known-zero effect against a ±2 % gate**, which a
 reader can check. **The strongest artefact I produced tonight is a measurement
 of my own inability to measure.**
+
+---
+
+# §9 — REBUILD, ARM IDENTITY, AND A CORRECTION TO THE IDENTITY RULE ITSELF
+
+**Author:** QA Tester (@fc8b5d97) · 02:27–02:35 PDT
+
+## 9.1 The build has a name, because drift was made impossible rather than detected
+
+The working tree carried **one uncommitted Rust change** at build time. A build
+started there yields a binary matching **no commit**. I did not stash it —
+stashing silently appropriates another agent's in-progress work — and I did not
+build around it.
+
+Instead I built from a **detached worktree pinned to an explicit SHA**:
+
+    pin           5d77ec14   (detached, unshared, dirty=0 at BOTH ends)
+    binary sha256 ab175ea1cd44158520310a845a427c9d
+    size          29,509,024 bytes      built 02:29:18 in 43.09 s
+    flags         --max-batch ✅  --demo-assets-dir ✅  --cors-allow-origin absent ✅
+
+> **@d7cf9b84's bracketing rule says: capture SHA before and after, and rebuild
+> if the ends disagree. A pinned detached worktree is strictly stronger — THE
+> ENDS CANNOT DISAGREE, BECAUSE NOTHING CAN WRITE TO IT. Detection is a rule you
+> must remember to apply; impossibility is a property of the checkout. Prefer
+> the construction that removes the failure over the check that catches it.**
+
+## 9.2 🔴 THE RATIFIED IDENTITY CHECK IS NECESSARY BUT **NOT SUFFICIENT**, AND IT CLEARS THREE PRE-FIX SERVERS
+
+The instruction was: *the models endpoint must show the three post-fix fields.*
+Applied to every listening arm, alongside the governor family:
+
+    port   loaded is_default path | governor | verdict
+    9241     1       1        1   |    3     | ✅ POST-FIX  (this build)
+    9242     1       1        1   |    3     | ✅ POST-FIX  (this build)
+    9231/2   1       1        1   |    3     | ✅ POST-FIX
+    8133/4   1       1        1   |    3     | ✅ POST-FIX
+    8123     1       1        1   |    0     | ⛔ PRE-FIX — PASSES THE RATIFIED CHECK
+    8124     1       1        1   |    0     | ⛔ PRE-FIX — PASSES THE RATIFIED CHECK
+    8152     1       1        1   |    0     | ⛔ PRE-FIX — PASSES THE RATIFIED CHECK
+    8151     0       0        0   |    0     | ⛔ PRE-FIX (fails both — trivially caught)
+
+**⚠️ THE WARNING NAMED `:8151` AS THE DANGEROUS ARM. IT IS THE SAFEST ONE — IT
+FAILS EVERY CHECK WE OWN. THE ACTUAL TRAP IS `:8123`, `:8124` AND `:8152`, WHICH
+PASS THE RATIFIED CHECK COMPLETELY AND ARE PRE-FIX.** Had I applied the
+instruction literally and stopped, I would have certified three pre-fix servers
+as valid arms and attributed AC33 to code they do not contain.
+
+**🔑 ROOT CAUSE, AND IT GENERALISES TO EVERY IDENTITY CHECK WE WILL EVER WRITE:**
+
+    models-endpoint fields  <- dates an EARLY server commit
+    governor family         <- dates 2a104dcc, 02:01:36
+
+> **A BINARY IS NOT "OLD" OR "NEW". IT SITS AT A POINT ON A COMMIT SEQUENCE, AND
+> A SINGLE-COMMIT PROBE ONLY TELLS YOU WHICH SIDE OF *ITS OWN* COMMIT YOU ARE
+> ON. Any binary built between two fixes passes the earlier probe and fails the
+> later one, and both readings are correct.**
+>
+> **THE RULE: AN IDENTITY CHECK MUST PROBE THE *LATEST* BEHAVIOUR-CHANGING
+> COMMIT YOUR MEASUREMENT DEPENDS ON — NOT ANY POST-FIX COMMIT. "Post-fix" is
+> not a property of a binary; it is a property of a binary *relative to a named
+> commit*, and the name must be stated.**
+
+I made the inverse of this error twice tonight — reading a `created`-timestamp
+probe as binary identity, then reporting these two probes as *contradicting*
+each other when they were dating different commits. **Twice I treated a one-bit
+probe as a date.**
+
+## 9.3 🟢 THE P0 RE-VERIFIES ON THE PINNED BINARY — AT THE WORST LOAD OF THE SESSION
+
+    arm :9242 (dynamic, paged KV) · binary ab175ea1 · pin 5d77ec14
+    LOADAVG AT RUN START: 109.58   <- the highest reading all night, 11x cores
+
+    endpoint          n   median    worst
+    /health           6    2.2 ms   4.8 ms
+    /metrics          6    3.2 ms   6.3 ms
+    /v1/resources     6    2.7 ms   4.4 ms   <- pre-fix: 1 probe, 51,010 ms
+    /v1/debug/kv      6    2.2 ms   4.6 ms
+
+**Every probe answered. Nothing blocked.**
+
+> **THIS IS THE ONE MEASUREMENT TONIGHT THAT LOAD MAKES *STRONGER*, AND THAT IS
+> WHY IT IS ADMISSIBLE WHEN AC33 IS NOT. Contention can only push an endpoint
+> TOWARD blocking. A pass at load 109.58 is therefore a pass at every load below
+> it — the noise pushes against the conclusion instead of toward it. Choose
+> instruments whose error direction opposes your claim, and a hostile machine
+> becomes a free stress test rather than a reason to wait.**
+
+## 9.4 ⛔ AC33 TIMING: REFUSED, ON MEASURED GROUNDS
+
+    load during this window: 41.56 -> 15.03 -> 48.40 -> 109.58   (10 cores)
+
+Per §8, a **known-zero** effect on this box measured between **−40.17 %** and
+**+52.30 %** against a **±2 %** band, at loads *below* these. I am not taking a
+throughput number here, and per the standing order I am saying so and stopping
+rather than producing one.
+
+**The refusal is not a lack of data. It is a result: §8 states the floor, and
+the floor exceeds the signal by more than an order of magnitude.**
