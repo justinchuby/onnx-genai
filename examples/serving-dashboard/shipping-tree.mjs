@@ -239,7 +239,10 @@ export function announceShippingRef() {
     process.stderr.write(
       `⚠️  working tree is NOT clean: ${dirty.length} path(s).\n` +
         dirty.map((d) => `#     ${d}\n`).join('') +
-        `#   Checks that read HEAD via shipped()/shippedPaths() are unaffected.\n` +
+        `#   Checks that read HEAD via shipped()/shippedPaths() scored the\n` +
+        `#   COMMITTED bytes. A PASS therefore says NOTHING about uncommitted\n` +
+        `#   edits to the paths above: mutate one and the green will not move,\n` +
+        `#   so a control run against the desk cannot fire. Commit, then re-run.\n` +
         `#   Checks that readFileSync the desk are scoring THESE bytes, not the branch.\n`,
     );
   }
