@@ -333,8 +333,10 @@ enforce it:**
 - **And the reason we were slow to see that is worth more than the incident.**
   For hours this was described — in this document's own earlier draft — as
   processes *"started from a sibling checkout."* **There is no sibling
-  checkout.** There are **nine working trees of one repository**, sharing a
-  single object store: `git rev-parse --show-toplevel` returns a **different**
+  checkout.** There are **many working trees of one repository** — the count
+  was measured as 6, 8 and 9 by three people inside fifteen minutes, all
+  correct when taken, which is why **the number is not the finding and is
+  deliberately not printed here** — all sharing a single object store: `git rev-parse --show-toplevel` returns a **different**
   path in each, while `--git-common-dir` returns the **same** one in all of
   them. **Everyone ran the first command, correctly, and got the correct
   answer; nobody ran the second.** *An instrument that answers "which directory
