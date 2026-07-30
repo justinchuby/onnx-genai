@@ -329,6 +329,62 @@ compensates with distinct glyphs, so the information is not colour-dependent —
 but a reader scanning for "which of these is stale" is working from the glyph
 alone, and that was never a deliberate decision.
 
+### The model path can still reach a client through the error channel
+
+The dashboard no longer renders the model path, and the server no longer sends
+it in the models response. A third route is open, and it is the one nobody
+looks at, because it is not a display surface at all — it is a 500 body.
+
+```
+registry.rs:283, :430   .with_context(|| format!("failed to load model '{}' from '{}'",
+                                                 spec.id, spec.path.display()))
+routes/mod.rs:750       .map_err(|err| ApiError::internal(
+routes/admin.rs:505         format!("failed to load model '{id}': {err}")))
+```
+
+`with_context` makes the path string the *outermost* context, and plain `{err}`
+prints exactly that. **`{err:#}` would be the loud mistake; `{err}` looks
+restrained and discloses anyway.** Request a configured-but-unloadable model and
+the error body carries an absolute filesystem path.
+
+This is read from source and **has not been put on a wire**. One command settles
+it against a running server:
+
+```
+curl -s localhost:$PORT/v1/models/<configured-but-broken-id> | grep -c /Users
+```
+
+The correct pattern already exists 41 lines above the leak, in the same file:
+`map_registry_error` logs the detail for the operator and returns a **static**
+string to the client. It *replaces* rather than *wraps*. Two sibling functions,
+one error family, opposite disclosure policies, and the reachable path is the
+leaky one.
+
+The structural fix is a signature, not a sweep: make `internal` take
+`&'static str` so it cannot interpolate at all, and leave `bad_request` dynamic.
+The split is principled — `bad_request` describes the caller's own input back to
+them and discloses nothing they did not send; `internal` describes our state,
+which is entirely new information to a stranger. **That makes the class
+unrepresentable and lets the compiler catch the site nobody reviewed.**
+
+### Our prose is not searchable by phrase
+
+```
+lines ending in a string-concatenation join, telemetry-provenance.js .... 112
+file length ............................................................ 1035
+[negative control, freshly generated token] ............................. 0
+```
+
+Long explanations hit the line-length limit and get split across string
+concatenations, so a phrase that reads perfectly on screen returns zero to a
+search. **The density is highest in the file whose entire job is human-readable
+explanations of why we trust each number** — the defect is proportional to the
+virtue. Template literals keep the sentence contiguous at identical runtime cost.
+
+This one is worth stating plainly because it silently weakens every audit
+performed against this tree: a phrase-search zero here is not evidence of
+absence. Token searches are unaffected — a single token never spans a join.
+
 ### The path-ban guard's predicate is wrong in both directions
 
 One test inspects field *values* — not field names — and asserts none of them
