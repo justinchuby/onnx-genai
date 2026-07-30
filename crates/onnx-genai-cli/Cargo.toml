@@ -62,7 +62,6 @@ ctrlc = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 reedline = "0.49.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
