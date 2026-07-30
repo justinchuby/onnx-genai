@@ -42,10 +42,23 @@ fn main() {
     // freezes at whatever commit was checked out the first time the crate was
     // compiled. Ask git for the directory instead of constructing the path.
     if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
+        // Changes on branch SWITCH. It does not change on commit: on a branch
+        // this file holds the constant text `ref: refs/heads/<name>`, so
+        // watching it alone leaves the stamp frozen across every commit -- as
+        // it did, which is how this was found. Necessary, not sufficient.
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
-        // Branch tips live in the shared store, which is a different directory
-        // from the worktree's git dir when worktrees are in use.
+
         if let Some(common) = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+            // The file that actually moves on every commit: the loose ref that
+            // HEAD points at, in the SHARED store rather than this worktree's
+            // git dir. Resolve it symbolically instead of parsing the HEAD
+            // file, so a detached HEAD (no symbolic ref) correctly yields
+            // nothing here and falls back to the two watches above.
+            if let Some(head_ref) = git(&["symbolic-ref", "--quiet", "HEAD"]) {
+                println!("cargo:rerun-if-changed={common}/{head_ref}");
+            }
+            // Covers the case the line above cannot: once a ref is packed, the
+            // loose file stops existing and the tip moves inside packed-refs.
             println!("cargo:rerun-if-changed={common}/packed-refs");
         }
     }

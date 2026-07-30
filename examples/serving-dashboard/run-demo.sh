@@ -254,11 +254,54 @@ require_static_cache "${SCATTER_MODEL}"
 require_free_port "${SCATTER_PORT}" "static-cache (scatter)"
 require_free_port "${DYNAMIC_PORT}" "dynamic"
 
-if [[ ! -x "${SERVER_BIN}" ]]; then
-  printf 'building onnx-genai-server (release)...\n'
-  ( cd "${REPO_ROOT}" && cargo build --release -p onnx-genai-server )
-fi
+# Always build. Do NOT branch on whether the binary exists.
+#
+# This was `if [[ ! -x "${SERVER_BIN}" ]]`, and `-x` tests a MODE BIT: it
+# answers "is this file executable", never "which tree was it compiled from".
+# A binary built from a checkout that lacks tonight's fixes satisfies it
+# exactly as well as a correct one, and the launcher then runs the stale
+# binary and prints nothing. That is not hypothetical: servers started from a
+# sibling checkout ran for five hours disclosing the operator's home directory
+# from `/v1/models` while the fix sat committed and unshipped, and the source
+# read as fixed the entire time.
+#
+# `cargo build` is a no-op when the tree is already fresh, which is the whole
+# argument -- cargo ALREADY tracks the thing the `-x` test was guessing at, so
+# the branch bought nothing and cost the demo its correctness. Let the tool
+# that tracks source freshness answer the question about source freshness.
+printf 'building onnx-genai-server (release)...\n'
+( cd "${REPO_ROOT}" && cargo build --release -p onnx-genai-server )
 [[ -x "${SERVER_BIN}" ]] || fail "the server binary is missing after the build: ${SERVER_BIN}"
+
+# Refuse to launch a binary that cannot say which commit built it, and refuse
+# one that disagrees with this checkout.
+#
+# Rebuilding unconditionally makes the binary fresh with respect to REPO_ROOT.
+# It cannot make it fresh with respect to the tree the operator THINKS they are
+# running, because CARGO_TARGET_DIR is shared across worktrees here: two
+# checkouts write the same path, so `${SERVER_BIN}` names a directory rather
+# than a history. The build above closes the stale-binary hole; this closes the
+# wrong-tree hole, and they are different holes.
+#
+# The server stamps its own build commit into /v1/status (build.rs ->
+# ONNX_GENAI_BUILD_SHA). Comparing that against HEAD is the only check here
+# that reads the binary's PROVENANCE rather than its file metadata.
+EXPECTED_SHA="$(cd "${REPO_ROOT}" && git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+# `--version` reports the build commit and short-circuits before clap validates
+# required args, so this needs no --model and starts no server.
+BUILT_SHA="$("${SERVER_BIN}" --version 2>/dev/null | awk '{print $NF}')"
+if [[ -z "${BUILT_SHA}" || "${BUILT_SHA}" == "unknown" ]]; then
+  # Not fatal: the stamp is newer than some binaries, and refusing here would
+  # make an older-but-fine checkout unlaunchable. Say so out loud instead --
+  # silence is what let the stale binaries run.
+  printf 'warning: this server cannot report its build commit; provenance is unverifiable\n' >&2
+elif [[ "${BUILT_SHA}" != "${EXPECTED_SHA}" ]]; then
+  fail "the server binary was built from ${BUILT_SHA} but this checkout is at ${EXPECTED_SHA};
+  ${SERVER_BIN} is shared between worktrees, so a rebuild here does not
+  guarantee it came from here. Build in this checkout, or point
+  CARGO_TARGET_DIR somewhere this checkout owns."
+fi
+printf 'server binary provenance: %s (checkout %s)\n' "${BUILT_SHA:-unreadable}" "${EXPECTED_SHA}"
 
 # --enable-debug-endpoints carries the KV and prefix-cache fields (/v1/debug/kv)
 # and the context length shown on the model card (/v1/debug/config). The
