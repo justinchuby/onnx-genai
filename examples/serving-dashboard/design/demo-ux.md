@@ -270,13 +270,19 @@ Namespaced `--og-`. This is the complete contract; **no panel may invent a colou
   --og-border-subtle: #1e242c;   /* internal dividers                      */
 
   /* ── FOREGROUND ─────────────────────────────────────────────────────
-     Contrast against --og-bg-raised (#151b23):
-       fg          17.4:1   fg-muted 8.1:1   fg-subtle 4.6:1
-     All clear 4.5:1 (AC/WCAG AA). fg-faint is DECORATIVE ONLY —
-     never put text a visitor must read in fg-faint.                      */
+     Contrast against --og-bg-raised (#151b23), COMPUTED, not asserted:
+       fg 14.65:1   fg-muted 7.06:1   fg-subtle 4.53:1
+     All clear WCAG AA 1.4.3 (4.5:1). fg-faint is DECORATIVE ONLY —
+     never put text a visitor must read in fg-faint.
+
+     These three figures were WRONG here until D350 (17.4 / 8.1 / 4.6),
+     and fg-subtle was #6e7d8c, which is 4.10:1 — a REAL AA FAILURE that
+     this very block declared "all clear". styles/tokens.css already
+     shipped the correct #768493; only this file was stale. The values
+     below are now the shipped ones, and they are the authority.         */
   --og-fg:            #e6edf3;
   --og-fg-muted:      #9aa7b4;
-  --og-fg-subtle:     #6e7d8c;
+  --og-fg-subtle:     #768493;
   --og-fg-faint:      #3d4855;   /* rules, grid texture, hatch — not text  */
 
   /* ── SEMANTIC ────────────────────────────────────────────────────────
@@ -291,15 +297,31 @@ Namespaced `--og-`. This is the complete contract; **no panel may invent a colou
 
   /* ── THE UNAVAILABLE-STATE TOKENS ────────────────────────────────────
      §4. These are load-bearing. Do not restyle them per panel — their
-     entire value is that they look identical everywhere on the page.     */
-  --og-unavail-fg:      #5a6673;  /* the em-dash itself                    */
-  --og-unavail-rule:    #3d4855;  /* its dashed underline                  */
-  --og-unavail-hatch:   #212932;  /* diagonal hatch ink in chart wells     */
-  --og-unavail-bg:      #131920;  /* hatch backdrop                        */
-  --og-unavail-label:   #6e7d8c;  /* "not measurable yet" caption          */
-  --og-pending-fg:      #4a5560;  /* awaiting-first-sample dots            */
-  --og-stale-fg:        #7a8794;  /* a real but no-longer-fresh value       */
-  --og-stale-rule:      #4a5560;  /* its dotted underline + age suffix      */
+     entire value is that they look identical everywhere on the page.
+
+     ⛔ D351. SIX OF THESE TEN HEXES WERE STALE AND THREE OF THEM
+     SPECIFIED A WCAG AA FAILURE THAT tokens.css HAD ALREADY FIXED:
+       unavail-fg   #5a6673 2.95:1 -> #72869d 4.63:1
+       unavail-label #6e7d8c 4.10:1 -> #768493 4.53:1 (4.62:1 on unavail-bg)
+       pending-fg   #4a5560 2.28:1 -> #788ca2 5.01:1
+     THE STYLESHEET WAS REMEDIATED AND THE SPECIFICATION WAS NOT.
+     ➡️ A SPEC THAT DRIFTS BELOW ITS IMPLEMENTATION IS WORSE THAN A SPEC
+     THAT WAS NEVER WRITTEN: IT READS AS AUTHORITY AND IT PRESCRIBES THE
+     DEFECT. THE DRIFT WAS ALREADY LOAD-BEARING IN CODE —
+     `sparkline.js:255` FALLS BACK TO `'#4a5560'`, WHICH IS THIS BLOCK'S
+     OLD 2.28:1 VALUE AND EXISTS NOWHERE IN tokens.css. THE FALLBACK WAS
+     COPIED FROM THE CONTRACT, SO THE CONTRACT'S STALENESS SHIPS.
+     ⚠️ NO GUARD COULD SEE THIS: asset-graph.test.js:53 SCOPES ITS CORPUS
+     TO styles/*.css, AND THIS FILE IS NOT IN IT. THE TWO COPIES WERE
+     NEVER COMPARED BECAUSE ONLY ONE OF THEM WAS EVER READ.          */
+  --og-unavail-fg:      #72869d;  /* the em-dash itself      4.63:1 AA text */
+  --og-unavail-rule:    #566a7b;  /* its dashed underline    3.09:1 graphic */
+  --og-unavail-hatch:   #212932;  /* diagonal hatch ink in chart wells      */
+  --og-unavail-bg:      #131920;  /* hatch backdrop                         */
+  --og-unavail-label:   #768493;  /* caption  4.62:1 ON --og-unavail-bg     */
+  --og-pending-fg:      #788ca2;  /* awaiting-first-sample   5.01:1 AA text */
+  --og-stale-fg:        #7f91a6;  /* real but not fresh      5.36:1 AA text */
+  --og-stale-rule:      #5e6a76;  /* dotted underline        3.13:1 graphic */
   --og-simulated-fg:    #e69f00;  /* the `simulated` badge (AC8)           */
   --og-simulated-rule:  #e69f00;  /* dashed outline on simulated marks     */
   --og-estimated-fg:    #9aa7b4;  /* the `est.` qualifier                  */
@@ -1326,7 +1348,15 @@ Verification is a checklist item, not an opinion: run the page through a deutera
 
 ### 9.2 Contrast
 
-All body text ≥ 4.5:1 against its surface; graphical boundaries that carry meaning ≥ 3:1. Verified pairs against `--og-bg-raised` (#151b23): `--og-fg` 17.4:1 · `--og-fg-muted` 8.1:1 · `--og-fg-subtle` 4.6:1. **`--og-fg-faint` is 1.9:1 and is decorative only** — grid texture, hatch, hairlines. Any text in `--og-fg-faint` is a bug.
+All body text ≥ 4.5:1 against its surface; graphical boundaries that carry meaning ≥ 3:1. Verified pairs against `--og-bg-raised` (#151b23), **computed, not asserted**: `--og-fg` 14.65:1 · `--og-fg-muted` 7.06:1 · `--og-fg-subtle` 4.53:1. **`--og-fg-faint` is 1.86:1 and is decorative only** — grid texture, hatch, hairlines. Any text in `--og-fg-faint` is a bug.
+
+⛔ **Three of these four figures read 17.4 / 8.1 / 4.6 until D350 and all three were wrong.** The `4.6` was the dangerous one: the true value was 4.10:1, so this section certified a **real AA failure as passing** in the sentence a reader consults to check accessibility. Recomputed from the shipped hexes with a control (white/black must be 21.00:1, a colour against itself 1.00:1).
+
+🔻 **The fourth figure was right and I published it as wrong.** `--og-fg-faint` was stated as `1.9` and computes to 1.86 — a correct rounding. My first draft of this very correction replaced it with a **fabricated `1.55` I never computed**, inside the paragraph condemning uncomputed figures, and claimed all four were false because three were. **A correction is a claim and decays like one; the audit of an over-claim is where the next over-claim gets written.**
+
+⚠️ **A pair is the unit of a contrast claim, and a token is not a pair.** `--og-unavail-label` was 4.19:1 against `--og-unavail-bg` — the surface `sparkline.js` actually fills — while every annotation around it was written against `--og-bg-raised`, which nothing paints it on. **Annotate against the surface the consumer uses, not the one the block is about.**
+
+⚠️ **A pair is the unit of a contrast claim, and a token is not a pair.** `--og-unavail-label` was 4.19:1 against `--og-unavail-bg` — the surface `sparkline.js` actually fills — while every annotation around it was written against `--og-bg-raised`, which nothing paints it on. **Annotate against the surface the consumer uses, not the one the block is about.**
 
 The Okabe-Ito hues against `--og-bg-raised` all exceed 3:1 except `--og-seq-6` (yellow, very high) which needs a dark 1px border when used as a fill — `.seq-6 { outline: 1px solid var(--og-bg); }`. Encoded in the token layer so it cannot be forgotten.
 
@@ -5348,19 +5378,23 @@ file.** So the guard was correct and the situation is structural, not accidental
 > else's file must never be a red test in a shared tree at demo time — **so the token
 > is withdrawn until its consumer can land with it.**
 
-**⛔ THE PAIR, @bb2ee824 / @c8d9a40e — apply both hunks or neither:**
+**⛔ THE PAIR, @bb2ee824 / @c8d9a40e — ✅ BOTH HUNKS LANDED. DO NOT APPLY THIS BLOCK AGAIN — IT IS A RECORD, NOT AN ORDER.**
 
 ```css
 /* styles/tokens.css — after --og-pending-fg (mine; I will land it on your word) */
---og-pending-rule: #546b80;   /* 3.13:1 on --og-bg-raised, WCAG 1.4.11 */
+--og-pending-rule: #546b80;   /* ⛔ SUPERSEDED — SHIPPED VALUE IS #788ca2, 5.01:1. DO NOT SET THIS. */
 
 /* styles/shell.css:167 — yours */
 [data-state='pending'] {
   color: var(--og-pending-fg);
   font-style: italic;
-  border-bottom: 1px solid var(--og-pending-rule);   /* + THIS LINE */
+  border-bottom: 1px solid var(--og-pending-rule);   /* + THIS LINE — LANDED */
 }
 ```
+
+> ⛔ **D352 — THIS BLOCK WAS A LIVE INSTRUCTION FOR HOURS AFTER IT WAS CARRIED OUT, AND EXECUTING IT TODAY WOULD *LOWER* A SHIPPED VALUE.** `--og-pending-rule` shipped as **`#788ca2`, 5.01:1** — not the `#546b80`/3.13:1 written above. D297 (`tokens.css:188-208`) chose the brighter value **deliberately and at length**: the three sibling rules are mutually indistinguishable in greyscale (1.015–1.041:1), so this rule's 1.60–1.66:1 luminance separation is the **last real distinction the absence set has**. Pasting `#546b80` would "harmonise" it into the ~3.1 cluster and **collapse four treatments into one grey** — the exact outcome D297 exists to prevent.
+>
+> ➡️ **A STALE FACT GETS CORRECTED BY THE NEXT READER; A STALE INSTRUCTION GETS EXECUTED BY THEM.** This block is addressed to named agents, is copy-pasteable, and carries a contrast figure that *validates* itself — everything that makes an instruction easy to obey and nothing that makes it easy to date. **The imperative mood has no tense: it cannot say it was already done.** A completed order and a pending one are byte-identical, and a `DONE` marker is the only thing that separates them.
 
 **`solid` is the fifth distinct border style** (`stale` dashed, `unavailable` dotted,
 `not-applicable` double, `measured` none) — **so all five states stay mutually

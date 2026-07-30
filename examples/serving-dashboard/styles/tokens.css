@@ -172,7 +172,17 @@
   --og-unavail-rule: #566a7b;  /* 3.09:1 on --og-bg-raised, WCAG 1.4.11 */
   --og-unavail-hatch: #212932;
   --og-unavail-bg: #131920;
-  --og-unavail-label: #6e7d8c;
+  --og-unavail-label: #768493;  /* 4.62:1 on --og-unavail-bg, WCAG AA 1.4.3 */
+  /* D350. This token was #6e7d8c = 4.19:1 on the surface it is ACTUALLY
+     painted on (--og-unavail-bg, named by sparkline.js:241 and :498), a real
+     AA failure on the caption that announces an unavailable measurement --
+     the one element this whole design exists for. It was the ONLY token in
+     this block carrying NO contrast annotation, and that is why it survived:
+     `every written contrast annotation is arithmetically true` can only
+     falsify a claim that was made. Silence was exempt.
+     Reuses the shipped --og-fg-subtle value rather than minting a ninth
+     near-identical grey. Siblings above annotate against --og-bg-raised;
+     this one names the surface its consumer actually fills.               */
   --og-pending-fg: #788ca2;  /* 5.01:1 on --og-bg-raised, WCAG AA 1.4.3 */
   /* D297. `pending` was the ONLY state drawing its rule from its own TEXT
      token: shell.css said `border-bottom: 1px solid var(--og-pending-fg)`.
