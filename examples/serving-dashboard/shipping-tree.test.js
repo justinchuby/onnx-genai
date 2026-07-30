@@ -31,7 +31,17 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
-import { SHIPPING_BRANCH, SHIPPING_REF, describeTree, shipped } from './shipping-tree.mjs';
+import {
+  DIVERGENCE_PHRASES,
+  SHIPPING_BRANCH,
+  SHIPPING_REF,
+  describeTree,
+  divergenceReport,
+  divergenceSummary,
+  divergentPaths,
+  parsePorcelain,
+  shipped,
+} from './shipping-tree.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -288,5 +298,134 @@ describe('a failure report names the tree it actually scored', () => {
     // somebody else's porcelain assertion, and the resulting red would be
     // attributed to their diff rather than to this test. A control that
     // corrupts the measurement it shares is not a control.
+  });
+});
+
+describe('a check discloses which tree it actually read', () => {
+  // The asymmetry this closes: `WORKTREE_DIVERGENCE` existed in three Python
+  // scripts and in ZERO JavaScript. Every JS guard here reads the working tree
+  // and none of them said so, which is not wrong but is UNFALSIFIABLE — nobody
+  // reading the result later can tell which tree it described.
+  //
+  // Note what is NOT done: the guards are not repointed at `git show HEAD:`.
+  // That would false-red the ordinary commit which adds a symbol and cites it
+  // in the same change, and a guard that reddens on correct work gets deleted.
+  // Disclose the tree you read; do not silently switch it.
+
+  it('classifies the three ways a desk can disagree with a commit', () => {
+    const d = parsePorcelain([' M edited.js', '?? brand-new.js', ' D removed.js'].join('\n'));
+
+    assert.deepEqual(d.modified, ['edited.js']);
+    assert.deepEqual(d.untracked, ['brand-new.js']);
+    assert.deepEqual(d.deleted, ['removed.js']);
+  });
+
+  it('does not trim the status columns — a LEADING SPACE is data, not noise', () => {
+    // The bug this pins. The shared `git()` helper in shipping-tree.mjs trims,
+    // and reusing it here would have turned ` M path` into `M path`, shifting
+    // every later offset by one. The status would still classify as modified,
+    // so the buckets look right, and only the NAME is quietly wrong — it comes
+    // back as `ath` and matches no file on earth. A green-looking corruption.
+    const d = parsePorcelain(' M examples/kept.js');
+
+    assert.deepEqual(d.modified, ['examples/kept.js'], 'the name must survive intact');
+    assert.equal(d.modified[0].startsWith('e'), true, 'no leading character was eaten');
+  });
+
+  it('follows a rename to the name that now exists', () => {
+    // `R  old -> new` in Python lands in `modified` under the literal string
+    // "old -> new", which is not a path and matches nothing. Deliberate,
+    // disclosed divergence from the original: take the destination.
+    const d = parsePorcelain('R  old-name.js -> new-name.js');
+
+    assert.deepEqual(d.modified, ['new-name.js']);
+  });
+
+  it("reports paths in THIS directory's coordinate system, never the repo root's", () => {
+    // `git status --porcelain` prints repo-root-relative names while every
+    // other function in shipping-tree.mjs speaks in paths relative to THIS
+    // directory. shippedPaths() calls mixing the two "the whole hazard", so a
+    // caller that passed `app.js` must not be handed back
+    // `examples/serving-dashboard/app.js` — it would match nothing they hold.
+    const d = parsePorcelain(' M examples/serving-dashboard/app.js', 'examples/serving-dashboard/');
+
+    assert.deepEqual(d.modified, ['app.js'], 'the prefix must be stripped');
+  });
+
+  it('leaves a path outside this directory alone rather than mangling it', () => {
+    // The negative half of the rule above: only strip a prefix that is there.
+    const d = parsePorcelain(' M crates/server/src/main.rs', 'examples/serving-dashboard/');
+
+    assert.deepEqual(d.modified, ['crates/server/src/main.rs']);
+  });
+
+  it('an empty porcelain is AGREEMENT, and produces no disclosure lines', () => {
+    const d = parsePorcelain('');
+
+    assert.deepEqual(d, { modified: [], untracked: [], deleted: [] });
+    assert.deepEqual(divergenceReport([]), [], 'empty means agreement, not "unchecked"');
+  });
+
+  it('speaks on the GREEN run too — "0 of 0", never silence', () => {
+    // A banner that appears only beside failures teaches readers that agreement
+    // is the silent case, which is the same reflex that lets a vacuous OK pass
+    // for a real one. And a missing banner is indistinguishable from one that
+    // could not be computed.
+    const summary = divergenceSummary([]);
+
+    assert.match(summary, /WORKTREE_DIVERGENCE/);
+    assert.match(summary, /differ on 0 of 0 file\(s\) read by this run/);
+  });
+
+  it('always states BOTH numerator and denominator for a real query', () => {
+    // Shape, not value: whether this file is dirty right now depends on who is
+    // mid-edit, so asserting "0" here would be a test of the crew's timing.
+    // What must always hold is that the count names what it counted.
+    const summary = divergenceSummary(['shipping-tree.mjs']);
+
+    assert.match(summary, /differ on \d+ of 1 file\(s\) read by this run/);
+    assert.match(summary, new RegExp(SHIPPING_REF), 'the caption must name the ref compared against');
+  });
+
+  it('says it COULD NOT COMPUTE rather than reporting zero divergence', () => {
+    // The one place this mirror deliberately refuses to copy the Python
+    // original. There, a failed `git status` returns an empty result, which
+    // renders as "differ on 0 of N" — a false all-clear, and the exact defect
+    // its own docstring warns about. An instrument that cannot run must say so.
+    const d = divergentPaths(['/definitely/not/inside/this/repository']);
+
+    assert.equal(d.computed, false, 'a git failure must be visible as a failure');
+    const summary = divergenceSummary(['/definitely/not/inside/this/repository']);
+    assert.match(summary, /could not be computed/);
+    assert.ok(!/differ on 0 of/.test(summary), 'a failure must never render as agreement');
+    assert.match(divergenceReport(['/definitely/not/inside/this/repository'])[0], /could not be computed/);
+  });
+
+  it('emits the same vocabulary as scripts/tree_context.py, which is the definition of record', () => {
+    // Two agents defined this concept in two languages inside ten minutes.
+    // This is what stops them drifting: one `git grep WORKTREE_DIVERGENCE`
+    // must keep finding both, saying the same thing.
+    const pythonSource = git('show', `${SHIPPING_REF}:scripts/tree_context.py`);
+    // Join Python's implicitly-concatenated string literals before searching.
+    // Without this the check fails on a phrase that IS present: tree_context.py
+    // wraps the "modified" message across two adjacent f-strings, so the
+    // contiguous sentence exists only at runtime and never in the source.
+    // That is the line-break blind spot this crew has hit four times tonight,
+    // arriving inside the very test written to stop two languages drifting.
+    const python = pythonSource.replace(/"\s*f?"/g, '').replace(/\s+/g, ' ');
+
+    for (const [klass, phrase] of Object.entries(DIVERGENCE_PHRASES)) {
+      assert.ok(
+        python.includes(phrase),
+        `the JS "${klass}" wording has drifted from tree_context.py: ${phrase}`,
+      );
+    }
+    assert.ok(python.includes('WORKTREE_DIVERGENCE'), 'the shared token must be in both');
+    // Negative control: prove this instrument can say NO. Without it, a
+    // `includes()` against a file that failed to load passes for everything.
+    assert.ok(
+      !python.includes('zzz-phrase-that-was-never-written-1cb'),
+      'the cross-language check cannot distinguish present from absent',
+    );
   });
 });

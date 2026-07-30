@@ -421,6 +421,194 @@ export function shippedPaths() {
 }
 
 /**
+ * Path from the repo root down to THIS directory, e.g. `examples/serving-dashboard/`.
+ *
+ * Needed because `git status --porcelain` prints names relative to the REPO
+ * ROOT while every other function here speaks in paths relative to THIS
+ * directory. `shippedPaths()` documents mixing those two coordinate systems as
+ * "the whole hazard", so the divergence helpers below translate rather than
+ * leak a second system into callers that already use the first.
+ */
+const HERE_PREFIX = git('rev-parse', '--show-prefix');
+
+/**
+ * Classify `git status --porcelain` output. Pure — no git, no disk, no clock.
+ *
+ * Split out from `divergentPaths()` so the risky part can be tested without
+ * writing into the shared tree. This directory's own norm forbids that: a test
+ * that creates a file here to prove a point trips somebody else's `porcelain 0`
+ * assertion, and the red is attributed to their diff rather than to this test.
+ * So the I/O stays in the caller and the CLASSIFICATION — which is where every
+ * plausible bug lives — is exercised on synthetic input.
+ *
+ * @param {string} raw stdout of `git status --porcelain`, UNTRIMMED.
+ * @param {string} prefix repo-root-to-here path, e.g. `examples/serving-dashboard/`.
+ * @returns {{modified: string[], untracked: string[], deleted: string[]}}
+ */
+export function parsePorcelain(raw, prefix = '') {
+  const result = { modified: [], untracked: [], deleted: [] };
+
+  for (const line of String(raw).split('\n')) {
+    if (!line.trim()) continue;
+    // Columns 0-1 ARE the status and a leading space is DATA, so this slices
+    // from the untrimmed line. Trimming ` M path` to `M path` shifts every
+    // subsequent offset by one and yields a name that matches no file.
+    const code = line.slice(0, 2);
+    let name = line.slice(3).trim().replace(/^"|"$/g, '');
+    // `R  old -> new` — the destination is the path that now exists.
+    if (name.includes(' -> ')) name = name.slice(name.lastIndexOf(' -> ') + 4);
+    if (prefix && name.startsWith(prefix)) name = name.slice(prefix.length);
+
+    if (code === '??') result.untracked.push(name);
+    else if (code.includes('D')) result.deleted.push(name);
+    else result.modified.push(name);
+  }
+  return result;
+}
+
+/**
+ * Which of `rels` disagree between the desk and the commit this run reads.
+ *
+ * @param {string[]} rels paths relative to THIS directory — the same coordinate
+ *   system `shipped()` and `shippedPaths()` use.
+ * @returns {{modified: string[], untracked: string[], deleted: string[],
+ *   computed: boolean}} `computed: false` means git could not answer.
+ *
+ * SCOPED TO WHAT THE CALLER ACTUALLY READ, NOT THE TREE AT LARGE
+ * -------------------------------------------------------------
+ * A checker that reads six files does not care that a seventh is dirty. This
+ * branch has carried a non-zero global porcelain for most of its life, so a
+ * whole-tree banner is a constant, and a constant carries no information.
+ * Scoping the question to the inputs is what turns it back into a signal.
+ *
+ * TWO DELIBERATE DIVERGENCES FROM scripts/tree_context.py, BOTH DISCLOSED
+ * ----------------------------------------------------------------------
+ * The Python original is the definition of record and this is its mirror; the
+ * message strings and bucket names are copied verbatim so one
+ * `git grep WORKTREE_DIVERGENCE` finds both languages. Two things are not
+ * copied, on purpose:
+ *
+ *  1. ON GIT FAILURE PYTHON RETURNS AN EMPTY RESULT, which renders as
+ *     "differ on 0 of N" — a false all-clear that is indistinguishable from
+ *     real agreement. That contradicts its own docstring ("a missing banner is
+ *     indistinguishable from a banner that could not be computed"), so here a
+ *     failure is reported AS a failure. An instrument that cannot run must say
+ *     so; it must never say "clean".
+ *  2. A RENAME (`R  old -> new`) would land in Python's `modified` bucket under
+ *     the literal name `old -> new`, which is not a path and matches nothing.
+ *     Here the destination name is taken.
+ */
+export function divergentPaths(rels) {
+  const result = { modified: [], untracked: [], deleted: [], computed: true };
+  if (!Array.isArray(rels) || rels.length === 0) return result;
+
+  let raw;
+  try {
+    // NOT the shared `git()` helper: it trims, and porcelain's first two
+    // columns ARE the status — a leading space is data. Trimming ` M path`
+    // to `M path` shifts every subsequent slice by one and mangles the name.
+    raw = execFileSync('git', ['status', '--porcelain', '--', ...rels], {
+      cwd: HERE,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    return { ...result, computed: false };
+  }
+
+  return { ...parsePorcelain(raw, HERE_PREFIX), computed: true };
+}
+/**
+ * Human-readable disclosure lines. EMPTY MEANS AGREEMENT, not "unchecked".
+ *
+ * Callers print these alongside their verdict. A result that quietly measured
+ * uncommitted bytes is not wrong — it is UNFALSIFIABLE, which is worse, because
+ * nobody can tell later which tree it described.
+ *
+ * @param {string[]} rels paths relative to THIS directory.
+ * @returns {string[]}
+ */
+/**
+ * The wording each divergence class uses, shared with `scripts/tree_context.py`.
+ *
+ * Exported so a test can assert the two languages still say the same thing. The
+ * Python module is the definition of record; this is its mirror. A shared
+ * concept with two spellings is two concepts, and the whole point of the token
+ * `WORKTREE_DIVERGENCE` is that ONE `git grep` finds every disclosure in the
+ * repo no matter which language emitted it.
+ */
+export const DIVERGENCE_PHRASES = Object.freeze({
+  modified: 'read from the working tree, which differs from',
+  untracked: 'untracked. Absent from',
+  deleted: 'deleted on disk but present in',
+});
+
+export function divergenceReport(rels) {
+  const d = divergentPaths(rels);
+  if (!d.computed) {
+    return [
+      'WORKTREE_DIVERGENCE could not be computed: git status failed. This run '
+        + 'does not know whether it read committed bytes or not.',
+    ];
+  }
+
+  const lines = [];
+  for (const name of [...d.modified].sort()) {
+    lines.push(
+      `WORKTREE_DIVERGENCE ${name}: ${DIVERGENCE_PHRASES.modified} `
+        + `${SHIPPING_REF}. This result describes uncommitted bytes.`,
+    );
+  }
+  for (const name of [...d.untracked].sort()) {
+    lines.push(
+      `WORKTREE_DIVERGENCE ${name}: ${DIVERGENCE_PHRASES.untracked} ${SHIPPING_REF} `
+        + 'entirely -- it is on one desk and is not part of what we ship.',
+    );
+  }
+  for (const name of [...d.deleted].sort()) {
+    lines.push(
+      `WORKTREE_DIVERGENCE ${name}: ${DIVERGENCE_PHRASES.deleted} `
+        + `${SHIPPING_REF}. Any result about it describes a file that is going away.`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * One line: how many of the files this run READ disagree with the shipping ref.
+ *
+ * The per-file lines above are correct and nobody counts them. An aggregate is
+ * what a reader absorbs, and it must be printed on the GREEN run too — a
+ * banner that appears only next to failures teaches people that agreement is
+ * the silent case, which is the reflex that lets a vacuous OK pass for a real
+ * one. Says "0 of N" rather than going quiet, because a missing banner is
+ * indistinguishable from one that could not be computed.
+ *
+ * WHY THIS DISCLOSES INSTEAD OF SWITCHING TO `git show HEAD:`
+ * ----------------------------------------------------------
+ * Repointing a desk-reading guard at committed bytes false-reds the ordinary
+ * commit that adds a symbol and cites it in the same change — the citation is
+ * correct on disk and absent from HEAD until the moment it lands. A guard that
+ * reddens on correct work gets deleted, and then we have neither the guard nor
+ * the disclosure. Say which tree you read; do not silently change it.
+ *
+ * @param {string[]} rels paths relative to THIS directory.
+ * @returns {string}
+ */
+export function divergenceSummary(rels) {
+  const total = Array.isArray(rels) ? rels.length : 0;
+  const d = divergentPaths(rels);
+  if (!d.computed) {
+    return `WORKTREE_DIVERGENCE could not be computed for ${total} file(s) read by this run`;
+  }
+  const n = d.modified.length + d.untracked.length + d.deleted.length;
+  return (
+    `WORKTREE_DIVERGENCE tree and ${SHIPPING_REF} differ on ${n} of ${total} `
+    + 'file(s) read by this run'
+  );
+}
+
+/**
  * Fail loudly unless this file lives in the tree we ship.
  *
  * Call this FIRST, before any other assertion in a check file. A check that
