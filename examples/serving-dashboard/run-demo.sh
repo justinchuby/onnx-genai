@@ -116,6 +116,37 @@ wait_until_ready() {
   fail "the ${label} server did not become ready within ${READY_TIMEOUT_SECONDS}s."
 }
 
+require_static_cache() {
+  local dir="$1" metadata="$1/inference_metadata.yaml"
+
+  # The directory check above is name-based, and a name cannot describe
+  # content. A model exported WITHOUT STATIC_CACHE=1 into a directory called
+  # `-scatter-v2` passes it while being the wrong kind of model entirely --
+  # and that is the failure worth catching here, because it does not look like
+  # a failure. The server starts, loads it, serves it, and reports the
+  # batching path as not-applicable, so the batching scenario correctly shows
+  # that it never batches. Nothing is fabricated and nothing errors; the demo
+  # simply cannot demonstrate the thing it exists to demonstrate, and the
+  # honest `n/a` is indistinguishable from the feature being absent.
+  [[ -f "${metadata}" ]] && grep -q 'static_cache' "${metadata}" && return 0
+
+  fail "the static-cache (scatter) model has no static-cache declaration: ${dir}" \
+    "" \
+    "The directory exists, but ${metadata##*/} does not declare" \
+    "model.io.static_cache -- so it was exported WITHOUT STATIC_CACHE=1." \
+    "" \
+    "This would not have failed loudly. The server would start and serve it," \
+    "and the batching scenario would honestly report that this path never" \
+    "batches -- which looks exactly like continuous batching not existing." \
+    "" \
+    "Rebuild it, including STATIC_CACHE=1:" \
+    "" \
+    "  STATIC_CACHE=1 MAX_SEQ_LEN=4096 OUT_DIR=${dir} \\" \
+    "    scripts/build_qwen.sh" \
+    "" \
+    "See examples/serving-dashboard/README.md, 'Getting the models'."
+}
+
 command -v curl >/dev/null 2>&1 || fail "curl is required to check server readiness."
 
 # Check the models BEFORE building. The build is slow, and being told about a
@@ -124,6 +155,7 @@ require_model "${SCATTER_MODEL}" "static-cache (scatter)" \
   "Continuous batching engages ONLY on static-cache models, so this one drives the batching scenario."
 require_model "${DYNAMIC_MODEL}" "dynamic" \
   "The paged KV allocator and the prefix cache live on the dynamic path, so this one drives those scenarios."
+require_static_cache "${SCATTER_MODEL}"
 
 if [[ ! -x "${SERVER_BIN}" ]]; then
   printf 'building onnx-genai-server (release)...\n'

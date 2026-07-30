@@ -93,6 +93,16 @@ to check your environment is wired up before committing to a 2 GB export.
 > looks for `-scatter-v2` so a stale artifact can never be mistaken for a fresh
 > one.
 
+> **`STATIC_CACHE=1` is required, not optional.** Continuous batching engages
+> *only* on static-cache models, so a scatter directory built without it
+> produces the demo's quietest failure: the server starts, loads it, and serves
+> it, and the batching scenario correctly reports that this path never batches.
+> Nothing errors and nothing is fabricated — but an honest `n/a` on Scenario A
+> is indistinguishable from continuous batching not existing. `run-demo.sh` now
+> reads `inference_metadata.yaml` and refuses to start unless the declaration is
+> actually there, because checking the directory *name* cannot detect this: the
+> wrong model in a correctly-named directory passes a name check every time.
+
 **Three traps that used to live here are now fixed in the script**, and they are
 worth a sentence because you may still meet them in older notes:
 
