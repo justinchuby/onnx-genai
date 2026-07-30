@@ -332,3 +332,221 @@ to engine/native unit tests; Cohaagen's fix-delta re-review ran the gate success
 ## 2026-07-29 — Tool-call parser handles Qwen, Llama, and Mistral formats
 
 **PR #390 / issue #183 follow-up (Stevens; reviewed by Edgemar; merged `0e62150e`).** `parse_tool_calls` recognizes Qwen/Hermes `<tool_call>` objects, Llama 3 `<|python_tag|>` objects, and Mistral `[TOOL_CALLS]` arrays. A serde `StreamDeserializer::byte_offset()` prefix scanner consumes consecutive complete top-level Llama JSON values (including semicolons inside strings) without naive splitting and terminates safely on malformed input or model terminators. One converter prefers `arguments`, falls back to `parameters`, and assigns sequential IDs. Edgemar independently ran eight parser tests and clean clippy; the roughly 49 local `tests.rs` failures are pre-existing missing-weights-fixture failures.
+
+
+## 2026-07-29 — Qwen3 native CPU reached ORT peak parity
+
+**Branch/PR:** `qwen3-perf-followups` / PR #398. **Agents:** Resch, Batty, Deckard support.
+
+- Profile before the final wave: per-token native CPU was dominated by `MatMulNBits`
+  (197 calls, ~8.6 ms, 79-88% of time). Secondary costs were `Reshape` (~0.86 ms from
+  113 no-op dispatches ORT eliminates), GQA (~0.56 ms), norms (~0.57 ms), and
+  `FusedSiluMul` (~0.17 ms).
+- Banked path to parity: KAI packed-SDOT made native viable; MLAS QNBit SPMD sharding fixed
+  the threadpool integration gap; residual GQA/norm/Silu fusion reduced non-GEMV overhead;
+  kernel preselection (`348c39a6`) cached MLAS packed-B plus reusable SQNBit workspace and
+  skipped per-call route/kernel selection, improving best MatMulNBits bucket ~8.6 -> 7.3 ms.
+- Batty's no-op reshape elimination (`76f116cf`) removes provably no-op `Reshape`/`Identity`
+  from the load-time plan; `Reshape` disappears from the profile instead of spending 113
+  calls / ~0.86 ms per token.
+- Resch's decode work-stealing prototype (`fe54dd9d`) regressed under this design (best/median
+  ~95/82 tok/s vs fixed SPMD ~105/100), so fixed SPMD stays default. Do not reintroduce
+  naive per-op atomic tile stealing as the median fix.
+- Result: native CPU moved from ~66% of ORT (~69 tok/s) to peak/p90 parity. Best native
+  measured ~110.2-110.6 tok/s vs ORT ~109.3-111.1; native p90 ~108.5-109.2 vs ORT p90
+  ~110.5. ORT still leads median by ~5% (native ~102.5-103.9 vs ORT ~108.8) because fixed
+  SPMD is contention-sensitive on the shared host; good native runs match ORT, slow runs drag
+  the median. Remaining robust-median lever is a low-overhead Eigen-parity/whole-step
+  work-stealing pool, not another local MatMulNBits kernel.
+
+## 2026-07-29 — Work-stealing wave ended at ORT parity, not beyond it
+
+**Branch/PR:** `qwen3-perf-followups` / PR #398. **Agents:** Deckard, Resch, Batty.
+
+- Deckard's Eigen-style `WorkStealingThreadPool` prototype (`8fad4915`) cleared the isolated dispatch gate: p50/p90 dispatch 2.3/2.6 us vs fixed-SPMD 29.2/65.9 us and Rayon 49.8/87.7 us.
+- Resch's decode integration (`542f2ebd`) regressed real Qwen3 decode: work-stealing best/median 97/90 tok/s vs fixed-SPMD 106/99, with ORT 109/100. This was the second work-stealing attempt to regress; isolated dispatch latency does not predict decode throughput. Fixed-SPMD's cache locality and lower coordination remain the default; `ONNX_GENAI_CPU_DECODE_SCHEDULE=steal` stays opt-in only.
+- **Windows exe-naming rule:** Deckard's admin blocker (`ec062ebb`) was benign. Windows UAC installer detection flagged the unsigned benchmark name `threadpool_dispatch` because `dispatch` contains `patch`, causing `ERROR_ELEVATION_REQUIRED` 740 before `main()`. The same binary renamed ran non-admin; pool, MLAS, and CLI all run non-admin. Never name generated binaries/exes with installer words or substrings: `patch`, `dispatch`, `setup`, `install`, `update`.
+- Final result: native CPU EP reached practical ORT parity from ~66% / ~69 tok/s at session start. Final window: fixed-SPMD best/p90/median 106.0/105.2/99.4 vs ORT 108.9/107.3/99.8, tying median and landing best/p90 within ~2-3%. Cleanly beating ORT now likely requires a kernel faster than KleidiAI hand-tuned asm, which is large and uncertain.
+
+## 2026-07-29T22:00:00-07:00 — Deep overhead investigation final verdict
+
+**Branch/PR:** `qwen3-perf-followups` / PR #398. **Agents:** Sebastian, Resch, Deckard, Batty.
+
+- Sebastian's overhead decomposition (`dcd3dda3`) found native `MatMulNBits` at about 7.45 ms in the static-SPMD bucket, while calibrated ORT attribution put its `MatMulNBits` around 7.2 ms; ORT's Chrome profiler distorted raw ORT kernel time toward ~6.0 ms. Native executor dispatch costs about 1.1 ms/token (~2.3 us/node), while KV, sampling, logits fetch, and input prep are tiny (~0.18 ms/token). The remaining gap is kernel invocation/threading plus small executor overhead, not KV or sampling.
+- ORT deep research explains the shape of the gap: ORT calls `MlasQNBitGemmBatch` once at full width, MLAS partitions N with `LoopCounter` dynamic load balance on the Eigen intra-op pool, `SequentialExecutor` keeps per-node overhead near zero with memory planning/no per-token allocation, and ORT benefits from `SkipSimplifiedLayerNorm`/`MatMulNBits` fusions plus GQA flash decode (`MlasFlashAttentionGQA`). The three follow-up priorities were: (1) try full-width MLAS, (2) trim native executor hot-path overhead, and (3) audit available fusions.
+- Priority 1 was a negative result. Resch's full-width MLAS experiment (`9a48b46d`) regressed on our pool: `MatMulNBits` median 8.07 ms versus static 7.45 ms, and throughput around 93 tok/s versus 106 tok/s. Static-SPMD remains the default; full-width MLAS stays opt-in only through `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1`.
+- Deckard's MLAS pool backend (`aef9dfd7`) still matters as infrastructure: MLAS standalone threading hooks now route to the persistent `WorkStealingThreadPool` instead of Rayon. That made the experiment clean, but did not make full-width decode faster than static-SPMD.
+- Priority 2/3 was useful but not decisive. Batty's executor cleanup (`aa5b67e6`) deferred tensor-view construction, reduced bookkeeping, and kept output buffers resident; subspans improved, `Reshape` remained eliminated, and no Qwen3 `Add -> SkipSimplifiedLayerNormalization` fusion existed to add. Final benchmark: native best/p90/median 106.5/106.2/101.0 tok/s versus ORT 109.5/109.3/107.3.
+- Final standing lesson: native CPU EP is now about 97% of ORT, up from ~66%. The last gap is small and diffuse: ORT drives the same MLAS kernel slightly better through a mature Eigen pool and leaner `SequentialExecutor`. Every tested pool variant (Rayon, Eigen-style work stealing, full-width MLAS) regressed versus fixed static-SPMD. Runtime overhead is competitive rather than the main problem; closing the last ~3% likely means reproducing ORT's exact threadpool/executor tuning, a multi-week effort with diminishing returns.
+
+
+### 2026-07-30: Replicate ORT QNBit dynamic partitioning in mlas-sys
+**By:** Deckard
+**What:** `WorkStealingThreadPool::parallel_for` now mirrors ORT's `ParallelForFixedBlockSizeScheduling`: fixed-size blocks, up to one claimant per pool lane, up to eight cache-line-separated `LoopCounter` shards, and atomic dynamic block claiming from a home shard before scanning other shards. The MLAS standalone hook runs each `MlasTrySimpleParallel` work item through that dynamic block claim path.
+
+**Why:** ORT's QNBit path computes `TargetThreadCount = M*N*K*BatchN / 65536 + 1`, caps it at `MlasGetMaximumThreadCount(ThreadPool) * 8`, aligns the N split to `MLAS_QGEMM_STRIDEN_THREAD_ALIGN` (16 in our vendored MLAS), then calls `MlasTrySimpleParallel(ThreadPool, ThreadsPerGemm * BatchN, ...)`. ORT's `SimpleParallelFor` maps that to dynamic `LoopCounter::ClaimIterations`, avoiding the fixed-SPMD barrier tail. For Qwen3 decode-style `M=1,K=1024,BlkLen=128`, the resulting 8-thread partitions are: N=1024 => strideN=64/16 tiles; N=2048 => 64/32; N=3072 => 64/48; N=5120 => 80/64; N=8192 => 128/64. On 6 threads: N=1024 => 64/16; N=2048 => 64/32; N=3072 => 64/48; N=5120 => 112/46; N=8192 => 176/47. ORT claimants/shards are min(pool_threads, tiles) and min(8, pool_threads, tiles).
+
+**Sources:** ORT `threadpool.cc` has `LoopCounter` and `ParallelForFixedBlockSizeScheduling` dynamic claiming (raw main lines ~271, 413-473) plus cost-model `CalculateParallelForBlock`/`ParallelFor` (lines ~565-632). ORT `threadpool.h` documents `TrySimpleParallelFor` and `TryBatchParallelFor` (lines ~296-347) and calls out `LoopCounter::ClaimIterations` dynamic balancing (lines ~84-87). ORT MLAS `threading.cpp` routes `MlasTrySimpleParallel` and `MlasTryBatchParallel` to those threadpool APIs (lines ~62-130). ORT `qnbitgemm.cpp` computes QNBit complexity/stride/tile count and calls `MlasTrySimpleParallel` (lines ~1718-1776).
+
+
+## 2026-07-30 — MLAS SQNBit full-width dynamic partition is not the default
+
+Context: Deckard wired ORT-style dynamic block claiming into `mlas-sys`. I briefly
+added a CPU EP toggle `ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH=1` so constant
+`MatMulNBits` weights could bypass the static SPMD N-shard path and run a single
+full-width `sqnbit_gemm_into_with_workspace(..., multithread=true)` call through
+the cached full-width MLAS pack/workspace.
+
+Measurement host was `aarch64-pc-windows-msvc` on a contended Windows machine;
+`cargo check -p onnx-runtime-ep-cpu --features mlas --target
+x86_64-pc-windows-msvc` passes, but these are not x86 throughput numbers.
+
+Qwen3 0.6B CPU int4 steady decode (`--tokens 96 --runs 15`, decode skip 8):
+
+| path | tok/s best | tok/s p90 | tok/s median | MatMulNBits ms/token |
+|---|---:|---:|---:|---:|
+| native static-SPMD | 110.32 | 109.76 | 97.61 | 8.93 |
+| native full-width dynamic | 91.72 | 91.64 | 81.65 | 8.29 |
+| ORT CPU | 106.16 | 106.03 | 104.89 | n/a here |
+
+Correctness: full-width and static native emitted identical 96 generated token
+ids in the decode check. ORT emitted a different sequence on this model/backend.
+
+Verdict: do **not** make full-width dynamic the default. The MLAS-only portion
+improved on one profiled run (8.93 -> 8.29 ms/token) but end-to-end steady
+decode lost badly and 15-run full-width processes intermittently hung/stalled
+after several measured runs.
+
+Follow-up: the live `ONNX_GENAI_CPU_MM_MLAS_FULLWIDTH` product/test toggle was
+reverted. Its process-global `OnceLock` env cache polluted in-process ARM64
+tests that also mutate MatMulNBits routing env vars, making the suite
+order-dependent. Keep the negative result as the artifact; keep the product on
+the previously-green static-SPMD default and use isolated subprocess harnesses
+for any future full-width A/B experiments.
+
+Test hygiene follow-up: ARM64 QNBit/KAI route tests now avoid using shared hit
+counters to infer the path taken after execution; they inspect the kernel's own
+cache instead, so concurrent tests cannot make an MLAS run look like a KAI run.
+The work-stealing parity child explicitly requests two steal tiles per worker
+when it asserts extra dynamic segments; the production default remains one tile
+per worker.
+
+
+### 2026-07-28: CI tiering rejected; run full coverage on PRs
+**By:** Pris
+**What:** CI has two parallel PR signals: a Linux-only uninstrumented `Fast (Linux x86_64)` job in `ci.yml` for early feedback, and the full coverage gate. PRs, `main` pushes, nightly schedules, and manual dispatch still run the full signal: quality checks, security audit, coverage-instrumented offline crate tests across Linux x86_64 / Windows x86_64 / macOS arm64, uninstrumented Windows ARM64 offline crate tests, Linux-only MLAS coverage, Linux/Windows CLI ORT coverage, and CUDA compile lanes. Rule: run tests on every platform; instrument for coverage only where the coverage is informative. The fast lane is deliberately duplicated work, has no `needs`, and does not gate or serialize the full lane; passing it alone is not merge-ready. The `ci:full` label trigger was removed because it became a no-op. Codecov carryforward remains disabled because PRs upload the same four flags as `main`.
+**Why:** Tiering was tried to reduce PR cost. The first split had the axis wrong: platforms are signal in this repo, while instrumentation is cost. Justin then decided the coverage runtime is acceptable too, and subsequently requested a Linux-only no-coverage fast lane for fail-fast ergonomics (`覆盖率都打开吧 我可以接受这个运行时间`), so the conscious final choice is to pay the full cost rather than risk reintroducing blind spots. Keep this rationale visible so a future slow-CI discussion starts from the fact that platform and coverage reductions were considered and rejected.
+
+### 2026-07-28: CI timing measurements for fast lane and ARM64 coverage tradeoff
+**By:** Pris
+**What:** Warm-cache measurement shows the fast lane is earlier but not a ~3 minute lane. Run 30387825072 restored the fast `target` cache and completed `Fast (Linux x86_64)` in 5m43s. Step breakdown: target restore 43s, build 1m26s, tests 1m35s, clippy 1m30s, plus setup/cache overhead. The prior no-target-cache run 30386077420 took 8m12s; the first cold run 30382113387 took 9m09s.
+
+Full-gate clean run 30386077420 passed in 18m27s with per-job timings: `Rust coverage (Windows ARM64)` 18m22s; `CLI ORT (Windows x86_64)` 18m06s; `Rust coverage (Windows x86_64)` 13m36s; `Rust coverage (macOS arm64)` 12m41s; `CLI ORT (Linux x86_64)` 6m52s; `Rust quality` 6m48s; `Rust coverage (Linux x86_64)` 5m36s; `CUDA compile (Windows x86_64)` 3m37s; `CUDA compile (Linux x86_64)` 1m35s. Earlier full run 30382113387 was 21m27s with `Rust coverage (Windows ARM64)` at 21m20s, and run 30383978159 showed ARM64 variance at 26m19s.
+
+**Why:** The fast lane is not missing because of a stale cache key once the cache exists: the target key hit in 30387825072 (`...-fast-rust-1.97.1-...`), and the remaining time is the full Linux offline build/test/clippy workload plus restoring a ~3GB target cache. It still surfaces Linux failures 12-20 minutes before the slowest full-gate completion, but it does not meet the hoped-for ~3 minute target. Windows ARM64 coverage owns the full-gate critical path. Replacing ARM64 coverage instrumentation with uninstrumented ARM64 tests would keep the platform signal and likely save the difference between the observed 18-26m ARM64 instrumented job and the historical ~6-7m uninstrumented ARM64 job; wall-clock savings depend on the next-slowest job, ranging from ~0-3m on the clean success runs where Windows CLI was also slow, up to ~16m when the other jobs are warm/fast. This is an option for Justin, not a change made here.
+
+### 2026-07-28: Drop Windows ARM64 coverage, keep Windows ARM64 tests
+**By:** Pris
+**What:** Removed the `Rust coverage (Windows ARM64)` job and replaced it with `Rust (Windows ARM64)`, which runs the same offline crate tests and clippy without coverage instrumentation or Codecov upload. The ARM64 job had uploaded under the shared `offline` flag, so no Codecov flag disappears: `offline` is still uploaded by Linux, Windows x86_64, and macOS; `mlas`, `cli-ort-linux`, and `cli-ort-windows` are unchanged.
+**Why:** Durable rule: run tests on every platform; instrument for coverage only where the coverage is informative. Windows ARM64 platform execution catches real platform bugs, but coverage for these pure-Rust crates duplicates x64/macOS coverage while owning the full-gate critical path. Justin chose to drop ARM64 coverage after seeing the timings.
+
+
+
+### 2026-07-28: Windows ARM64 coverage removal verified
+**By:** Pris
+**What:** Verified run 30390299025 after removing ARM64 coverage. Full CI passed in 18m54s wall-clock. New critical path is `CLI ORT (Windows x86_64)` at 18m50s, followed by uninstrumented `Rust (Windows ARM64)` at 15m12s, `Rust coverage (Windows x86_64)` at 14m38s, `Rust coverage (macOS arm64)` at 9m32s, `Fast (Linux x86_64)` at 9m21s, `Rust coverage (Linux x86_64)` at 8m34s, `CLI ORT (Linux x86_64)` at 7m16s, `Rust quality` at 6m29s, `CUDA compile (Windows x86_64)` at 1m37s, and `CUDA compile (Linux x86_64)` at 0m48s.
+
+Codecov consequence: no flag disappeared. The removed ARM64 job did not have its own flag; it had only contributed to the shared `offline` flag. In run 30390299025, Codecov uploads succeeded for `offline` from Linux, Windows x86_64, and macOS; `mlas` from Linux; `cli-ort-linux`; and `cli-ort-windows`. Carryforward remains disabled. Open question for the first post-merge `main` run: whether removing one contributor to the shared `offline` flag causes Codecov to report a project-wide coverage change against historical commits. This branch dispatch proved the remaining uploads happen, but the post-merge Codecov comparison behavior is still unverified.
+**Why:** Dropping ARM64 coverage alone did not materially reduce this measured wall-clock because Windows CLI ORT was nearly as slow as the old ARM64 critical path and became the new critical path. The durable rule still stands: run tests on every platform; instrument for coverage only where coverage is informative.
+
+
+# Decision: Multi-turn and batch benchmarks reveal structural native deficit
+
+**Date:** 2026-07-28
+**Author:** Pris
+**Status:** Active
+**Affects:** Iran, Deckard (native backend architecture)
+
+## Context
+
+PR #351 established native's cold-start advantage (2.47–4.63× faster process
+start → first token). Justin flagged that real usage is multi-turn: load once,
+prefill every turn. We needed to know whether ORT's pre-packing cost amortises
+across a session — and if so, what the fix is.
+
+## Findings
+
+All measurements taken under exclusive bench lock at load 1.5–3.6 on Apple M1 Max.
+Corroborated with second runs at comparable load.
+
+### Multi-turn LLM
+
+| Model | Break-even turn | ORT overall advantage (10 turns) |
+|---|---|---|
+| TinyStories-33M (f32) | 2 | 2.1× |
+| Qwen2.5-0.5B (f16) | 8 | 1.18× |
+
+**Root cause: NOT pre-packing amortisation.** The native backend has no
+session-persistent KV cache. Each turn re-prefills the entire conversation
+(O(context_length)). ORT's session API preserves KV, so each turn prefills only
+new tokens (O(new_tokens)). At turn 10, native TTFT is 6–8× its turn-1 value
+while ORT TTFT stays flat.
+
+### Steady-state per-prefill (turns 3–10)
+
+| Model | Native TTFT ms | ORT TTFT ms | Ratio |
+|---|---|---|---|
+| TinyStories-33M | 93 | 28 | 3.4× ORT faster |
+| Qwen2.5-0.5B-f16 | 463 | 150 | 3.1× ORT faster |
+
+### Batch vision (MobileNetV2)
+
+- Batch=1: native 0.50× ORT (11.6 ms vs 5.8 ms)
+- Batch>1: **native crashes (segfault)** — correctness bug
+- ORT scales 2.2× from batch=1→16
+
+### Cache survival (PR #353)
+
+Weight transpose caches ARE correctly reused across turns:
+- Qwen f16: 168 entries at load, stable across all turns
+- TinyStories f32: lazily fills to 25 entries, then stable
+
+This is NOT the cause of the deficit.
+
+## Should we pre-pack?
+
+**No — pre-packing would not address the dominant issue.**
+
+The multi-turn deficit is caused by the absence of persistent KV, not by
+slower per-token computation. Pre-packing could narrow the per-prefill gap at
+equal context length (estimated 1.5–2× improvement), but it cannot eliminate
+the O(context_length) vs O(new_tokens) structural disadvantage.
+
+If persistent KV sessions are added to the native backend, THEN pre-packing
+should be revisited to close any remaining per-prefill gap. The load-time cost
+of pre-packing (estimated +200–400 ms for Qwen-0.5B-f16, based on ORT's 1.8 s
+vs native's 340 ms load) would be acceptable for long-lived servers but
+unacceptable for cold-start use cases — an opt-in mode would be needed.
+
+## Decisions for Iran/Deckard
+
+1. **Session-persistent KV for native backend** is the #1 priority for
+   multi-turn competitiveness. Without it, no kernel optimization can close
+   the gap beyond 3 turns.
+2. **Batch>1 vision segfault** is a correctness bug that should be filed and
+   fixed before any batch benchmark claims.
+3. **Pre-packing** should be deferred until after persistent KV lands, then
+   re-evaluated.
+
+## Published conclusion changes
+
+The PR #351 cold-start advantage **remains valid for one-shot use**. For
+multi-turn sessions (≥3 turns on small models, ≥5–8 on large), ORT is
+cumulatively faster. This is now documented in `examples/profiles/README.md`
+with the multi-turn framing section.
+
+## 2026-07-30T08:20:00-07:00 — ORT cost-model partitioning is not the native Qwen3 default
+
+**By:** Scribe
+**What:** Native static-SPMD CPU EP now matches or slightly beats ORT on best-case and p90 Qwen3 decode throughput on the contended Windows ARM64 host: native 110.3/109.8 tok/s versus ORT 106.2/106.0 tok/s. Native still trails ORT on median because fixed-SPMD has higher variance on the shared host.
+**Why:** Matching ORT's dynamic `ParallelForFixedBlockSizeScheduling`/`LoopCounter` partitioning helps the isolated full-width QNBit kernel (23.5 us mean / 18.9 us p50 versus static split 89.7 / 87.8 us), but loses end-to-end once pool park/wake variance is paid across many small ops: full-width dynamic reached only 91.72 tok/s best versus static-SPMD 110.32 and ORT 106.16. The live full-width toggle was abandoned. If this track is pushed further, the next plausible lever is vendoring Eigen `NonBlockingThreadPool` to reduce wakeup variance, with uncertain payoff.

@@ -40,3 +40,6 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 
 ## 2026-07-28T17:40:00+0000
 PR #362 merged (5a079029): If/Loop/Scan inference landed; #355 container typing remains deferred.
+
+## 2026-07-29T22:00:00-07:00 — Qwen3 deep overhead verdict
+- Decomposed PR #398's residual gap: KV/sampling/prep tiny (~0.18 ms/token), executor dispatch ~1.1 ms/token, and remaining ORT lead primarily MLAS MatMulNBits/threading/invocation behavior rather than outer-loop runtime.

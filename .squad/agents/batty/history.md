@@ -93,3 +93,13 @@ Owns PR #283 / #50 fix cycle after Bishop REQUEST-CHANGES; address conditioning_
 - Kept error reporting actionable for true rejection: batch-full vs KV-budget cause, requested/minimum/available/used/limit/shortfall bytes, running/max batch counts, and concrete mitigation hints.
 - Added model-free scheduler tests for full-context ceiling capping, long multi-turn ceiling growth, repeated-turn accounting non-leakage, and error text; added an engine unit test locking that ORT generate uses the scheduler while native generate bypasses it.
 - Follow-up review fixes: `budget_cap` remains attached to a sequence across swap-out/swap-in; capped reservation now computes and reserves the adjusted byte amount atomically under the shared `ByteBudget` lock; mismatched scheduler admission cleanup cancels both the admitted request and the originally enqueued request.
+
+
+## 2026-07-29T18:35:00-07:00 — Qwen3 no-op reshape elimination for ORT parity
+
+- On `qwen3-perf-followups` / PR #398, landed no-op `Reshape`/`Identity` elimination (`76f116cf`) at graph optimization/load-time planning.
+- The native profile lost the `Reshape` row entirely (previously 113 calls / ~0.86 ms per token), closing a graph-optimizer advantage ORT already had.
+- This executor cleanup combined with Resch's kernel/threadpool work to move native CPU to ORT peak/p90 parity; median still depends on a future low-overhead work-stealing/threadpool lever.
+
+## 2026-07-29T22:00:00-07:00 — Executor cleanup final
+- Cleaned deferred TensorView/bookkeeping/output-buffer churn (`aa5b67e6`); subspans improved but final native 106.5/106.2/101.0 tok/s stayed behind ORT 109.5/109.3/107.3, confirming no single executor hotspot remained.

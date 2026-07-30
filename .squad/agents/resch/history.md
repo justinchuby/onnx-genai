@@ -81,3 +81,23 @@ catches `cfg(target_os)` gating errors that the `x86_64-apple-darwin` recipe mis
 - Guard-break proofs: (1) renamed POOL_BNNS_TEST_HITS → lint failed naming MaxPool/aarch64/tier1; (2) added fake counter → inverse check failed naming file and counter.
 - 973 CPU EP tests pass; all 4 lints green; cargo fmt clean.
 - Filed to `.squad/decisions/inbox/resch-manifest-backfill.md`.
+
+
+## 2026-07-29T18:35:00-07:00 — Qwen3 native CPU ORT peak-parity wave
+
+- On `qwen3-perf-followups` / PR #398, consolidated the profile-driven path from ~69 tok/s native CPU (about 66% of ORT) to peak/p90 parity around 110 tok/s.
+- Key Resch contributions: KAI packed-SDOT trajectory, MLAS QNBit SPMD sharding, residual GQA/norm/Silu fusion, and kernel preselection (`348c39a6`) that cached MLAS packed-B plus reusable SQNBit workspace and improved the best MatMulNBits bucket ~8.6 -> 7.3 ms.
+- Negative result is binding: naive per-op work stealing (`fe54dd9d`) regressed (best/median ~95/82 vs fixed SPMD ~105/100), so fixed SPMD remains default. Remaining median lever is a lower-overhead Eigen-parity/whole-step work-stealing pool.
+
+## 2026-07-29T21:00:00-07:00 — Work-stealing decode verdict
+- Integrated work-stealing decode behind `ONNX_GENAI_CPU_DECODE_SCHEDULE=steal` (`542f2ebd`) and proved it should stay opt-in: real decode regressed to best/median 97/90 tok/s vs fixed-SPMD 106/99, while ORT was 109/100.
+- Final PR #398 result is ORT parity, not a clean ORT beat: fixed-SPMD 106.0/105.2/99.4 best/p90/median vs ORT 108.9/107.3/99.8. Dispatch microbench wins did not predict token throughput; fixed-SPMD locality and lower coordination dominate.
+
+## 2026-07-29T22:00:00-07:00 — Full-width MLAS negative result
+- Tested ORT-style full-width MLAS QNBit on the work-stealing backend; it regressed (8.07 ms MatMulNBits, ~93 tok/s) versus static-SPMD (7.45 ms, ~106 tok/s). Keep static-SPMD default and `ONNX_GENAI_CPU_MM_MLAS_NO_SHARD=1` diagnostic-only.
+
+## 2026-07-30T08:20:00-07:00 — ORT-costmodel tuning verdict
+
+- Native static-SPMD CPU EP now matches/slightly beats ORT on Qwen3 best-case and p90 throughput (110.3/109.8 tok/s vs ORT 106.2/106.0), but still trails median on the contended host because variance is higher.
+- ORT-style dynamic block claiming helps the isolated full-width QNBit kernel, but loses end-to-end: full-width dynamic 91.72 tok/s best vs static-SPMD 110.32 and ORT 106.16, with stalls from pool park/wake variance across many small ops.
+- Full-width path is abandoned as a live toggle. If pushed further, the next candidate lever is vendoring Eigen `NonBlockingThreadPool` for lower wakeup variance, with uncertain payoff.
