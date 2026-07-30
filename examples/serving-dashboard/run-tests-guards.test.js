@@ -31,7 +31,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, cpSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -96,11 +96,19 @@ function scratchRepo(files) {
  * Run the real runner inside a scratch repo with the floors lowered to suit a
  * fixture-sized suite.
  *
+ * `baseline` seeds the count ratchet's baseline file before the run. It is the
+ * ONLY way to reach the ratchet's drop path from a test: without it every
+ * scratch repo starts with no baseline, which is the seed-and-pass case. An
+ * earlier design disabled the ratchet whenever the floors were overridden --
+ * which is every case in this file -- and so the ratchet was never once
+ * executed by the suite that exists to execute it.
+ *
  * @param {string} root
- * @param {{args?: string[], minTests?: number, minFiles?: number}} [options]
+ * @param {{args?: string[], minTests?: number, minFiles?: number,
+ *          baseline?: string, allowDrop?: string}} [options]
  */
 function runRunner(root, options = {}) {
-  const { args = [], minTests = 4, minFiles = 1 } = options;
+  const { args = [], minTests = 4, minFiles = 1, baseline, allowDrop } = options;
   // NODE_TEST_CONTEXT IS INHERITED AND IT DISARMS THE CHILD. Node sets it for
   // every process it runs tests in; a nested `node --test` sees it, prints
   // "run() is being called recursively ... skipping running files", and emits NO
@@ -110,12 +118,20 @@ function runRunner(root, options = {}) {
   // The CAN RUN control is what caught it.
   const env = { ...process.env, MIN_TESTS: String(minTests), MIN_FILES: String(minFiles) };
   delete env.NODE_TEST_CONTEXT;
+  if (baseline !== undefined) writeFileSync(join(root, 'test-count.baseline'), `${baseline}\n`);
+  if (allowDrop !== undefined) env.ALLOW_TEST_COUNT_DROP = allowDrop;
   const result = spawnSync('bash', ['./run-tests.sh', ...args], {
     cwd: root,
     encoding: 'utf8',
     env,
   });
   return { status: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+}
+
+/** The baseline the runner wrote into a scratch repo, or null if it wrote none. */
+function baselineIn(root) {
+  const path = join(root, 'test-count.baseline');
+  return existsSync(path) ? readFileSync(path, 'utf8').trim() : null;
 }
 
 /** Two healthy files, eight passing tests. The shape every case starts from. */
@@ -266,4 +282,84 @@ test('a failing test is named LAST, so a piped run keeps the diagnosis', () => {
     /a uniquely named failing case/,
     `the failing test name must survive \`| tail\`, but the last lines were:\n${tail}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// THE TEST-COUNT RATCHET.
+//
+// The floor (MIN_TESTS) is an anti-vacuity guard and is blind to silent
+// shrinkage: it passes at 595 when the true count is 600. The ratchet is the
+// guard for that, and these are the arms that prove it can actually say no.
+//
+// Every case below seeds a baseline explicitly. That is deliberate and it is
+// the whole reason this section exists: the first version of the ratchet
+// switched itself off whenever the floors were overridden, and since this
+// harness overrides the floors in every case, the guard was unreachable from
+// here. It would have shipped green forever without executing once.
+// ---------------------------------------------------------------------------
+
+test('RATCHET CAN RUN: with no baseline the runner seeds one and passes', () => {
+  const root = repo(healthyFiles());
+  const { status, out } = runRunner(root);
+  assert.equal(status, 0, out);
+  assert.match(out, /no baseline yet; seeded/);
+  // The seeded number must be the count actually observed, not the floor.
+  assert.equal(baselineIn(root), '8');
+});
+
+test('a DROP below the baseline fails the run even though every test passed', () => {
+  const root = repo(healthyFiles());
+  const { status, out } = runRunner(root, { baseline: '99' });
+  assert.equal(status, 1, out);
+  assert.match(out, /test count DROPPED 99 -> 8 \(91 fewer\)/);
+});
+
+test('a drop with ZERO failures says the tests never RAN, not that a test broke', () => {
+  // The two diagnoses are different and only this one points at a load failure,
+  // which is the defect the ratchet exists for: 588 -> 435 with nothing red.
+  const { out } = runRunner(repo(healthyFiles()), { baseline: '99' });
+  assert.match(out, /NO TEST FAILED/);
+  assert.match(out, /tests\s+that never ran/);
+  assert.doesNotMatch(out, /Do not assume one explains the/);
+});
+
+test('a drop WITH failures refuses to let one number explain the other', () => {
+  const root = repo({ ...healthyFiles(), 'broken.test.js': FAILING_SUITE });
+  const { status, out } = runRunner(root, { baseline: '99', args: ['--allow-untracked'] });
+  assert.equal(status, 1, out);
+  assert.match(out, /Do not assume one explains the/);
+  assert.doesNotMatch(out, /NO TEST FAILED/);
+});
+
+test('the drop override must name the EXACT new count; a truthy value is refused', () => {
+  // ALLOW_TEST_COUNT_DROP=1 would be typed once and then wave through every
+  // later drop. Naming the count makes the permission expire by itself.
+  const { status, out } = runRunner(repo(healthyFiles()), { baseline: '99', allowDrop: '1' });
+  assert.equal(status, 1, out);
+  assert.match(out, /test count DROPPED/);
+});
+
+test('the drop override named exactly accepts the drop and lowers the baseline', () => {
+  const root = repo(healthyFiles());
+  const { status, out } = runRunner(root, { baseline: '99', allowDrop: '8' });
+  assert.equal(status, 0, out);
+  assert.match(out, /allowed by/);
+  assert.equal(baselineIn(root), '8');
+});
+
+test('a baseline file that holds no number FAILS rather than becoming no ratchet', () => {
+  const root = repo(healthyFiles());
+  const { status, out } = runRunner(root, { baseline: 'not-a-number' });
+  assert.equal(status, 1, out);
+  assert.match(out, /holds no number/);
+});
+
+test('a RED run never seeds a baseline, and says out loud that it declined to', () => {
+  // A guard that declined to arm itself must not look like one that armed and
+  // was satisfied.
+  const root = repo({ ...healthyFiles(), 'broken.test.js': FAILING_SUITE });
+  const { status, out } = runRunner(root, { args: ['--allow-untracked'] });
+  assert.equal(status, 1, out);
+  assert.match(out, /ratchet: NOT seeded/);
+  assert.equal(baselineIn(root), null);
 });
