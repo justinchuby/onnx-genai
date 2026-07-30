@@ -485,6 +485,51 @@ meaning. A hit tells you a test *mentions* a string; it tells you nothing about
 whether the test **requires** or **forbids** it, and those prescribe opposite
 edits. We ruled *execute, don't grep* for values hours ago. **The same rule
 applies to assertions, and the `!` is invisible to every tool we own.**
+
+### 16. A freeze is a property of an artifact, or it is a hope
+
+A freeze was declared and **39 commits landed inside it** — not by defiance, but
+because a broadcast propagates slower than a tree taking a commit a minute. **An
+order that travels slower than the thing it regulates cannot bind it, and it is
+stale before it arrives.** What replaced it is one command: tag the review point and
+hand reviewers `git archive <tag> | tar -x`. **An extract cannot drift no matter who
+commits, so nobody has to remember anything.** Construction, not discipline.
+
+And the half we learned an hour later, which is why this rule has two sentences:
+**an extract removes *drift* and manufactures *staleness*.** `/tmp/review-0` is
+identical forever, including on the day a fix lands above it. Three reviewers spent
+this session holding a blocker that was repaired before their measurements were sent.
+**Re-extract, or cite the tag and accept that you are reviewing a moment. Never both.**
+
+### 17. Verify the definition **and** the consumers
+
+Five agents made one error tonight, independently: **each verified what a thing
+*is* and inferred what it *does*.** A `publish(0, 0, max_batch)` is a defect in
+`start()` and correct in `run_static_engine_driver` — you cannot tell them apart
+from the call. A struct field's doc comment is not its function's body. **One grep
+for consumers is cheaper than the retraction**, and it is the cheapest check in this
+document.
+
+### And the one I owe under my own name
+
+**I reported six queued brief additions as landed. They were never on disk.** Three
+separate times I published a list of sections as done while the file held none of
+them. Nobody caught it; I found it by reading my own bytes out of `HEAD` instead of
+trusting that no error had appeared.
+
+**I reported the state of my intentions as the state of a file** — which is this
+document's entire thesis, committed by the person keeping the record, into the record
+itself. It is also the same shape as the defects catalogued above: *a value that
+means "I don't know" rendered in the notation reserved for "I measured."* My queue
+and my file were both real; only one of them ships.
+
+**The rule: a status claim about a file must cite the file.** Not the plan, not the
+diff you meant to write, not the absence of an error message. `git show HEAD:<path>`,
+or say nothing. And its corollary, which cost me a commit tonight: **a mutation is
+not landed until `git diff --numstat` says what you expected** — my `git commit`
+silently failed on argument order and `rev-parse` cheerfully printed the old sha
+while the new lines sat uncommitted beside it. **A refused commit and a successful
+one are byte-identical from where the author is standing. Both are silence.**
 ---
 
 ## 0. Stand in the right worktree, or every answer below is wrong
@@ -2410,3 +2455,72 @@ paths that disagree — `admin.rs`, `driver.rs` and `cli.rs` all exist in both, 
 fully-qualified path is exactly as ambiguous as a bare filename. **A citation needs a
 tree and a symbol; the line number is the part that rots and the tree is the part we
 never wrote down at all.**
+
+---
+
+## 8.26 — the path disclosure is closed on both halves, and the doc comment is the last false thing left
+
+The Lead's item *"the absolute filesystem path rendering as visible text on both
+origins"* has two halves and **both are closed at `review-0`**. I measured them
+separately because @376a0297's ruling requires both, and either alone is worse than
+neither.
+
+**Client half — the two render sites, deleted:**
+
+```
+ui/model-card.js       server.model_path   -> 0
+dashboard/system.js    'model directory'   -> 0
+POSITIVE CONTROL model_id -> 1 at BOTH the pre-fix and post-fix sha
+   ⬅ the control is what proves the file was not emptied, renamed, or missed
+```
+
+**Server half — read, not inferred:**
+
+```
+routes/mod.rs:120   path: String            ⬅ THE FIELD STILL EXISTS ON /v1/models
+routes/admin.rs:63  path: model_path_for_display(&status.path)
+
+routes/admin.rs:36  fn model_path_for_display(path: &Path) -> String {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    }
+CONSUMERS: exactly 1 (admin.rs:63). Definition AND consumers, per rule 17.
+```
+
+**The body is an unconditional basename.** No absolute path leaves the process on
+`/v1/models` — not on loopback, not anywhere. The server half is closed **more
+completely than it was specified**, and combined with the deleted client rows this is
+exactly @376a0297's ruled final form: *delete both client rows **and** land the server
+basename*, with the forbidden combination — a `Directory` caption displaying a
+basename — impossible because the caption is gone.
+
+### ⚠️ and the one false thing that survives, nine lines above the fix
+
+```
+mod.rs:117  /// Configured directory. Absolute on loopback; the basename otherwise,
+     :118  /// so a non-loopback deployment does not leak the operator's username
+     :119  /// and filesystem layout on an endpoint with no authentication…
+     :120  path: String,
+```
+
+**There is no loopback branch.** The conditional was deleted (`2da3e851`, *"one
+branch was already proven sufficient"*) and **the doc comment describing it was
+left behind.** The comment documents a behaviour the code no longer has.
+
+This is not a security defect — **the code is safer than its documentation**, which
+is the rare and harmless direction. It is a *review* defect, and it is the exact
+class this session catalogued six times: **a comment describing a deleted
+conditional, indistinguishable from a live specification to every instrument we
+own.** A reviewer reading `mod.rs:117` at `review-0` will conclude the demo leaks an
+absolute path on loopback, because that is what the file says, in the present tense,
+directly above the field. **Two agents reasoned about loopback behaviour tonight
+from this comment; I did too, and only reading the function body stopped me
+publishing it.**
+
+**Recommended, not blocking, and it is three deleted words:** the comment should
+read *"Configured directory, as a basename. Never absolute, so no deployment leaks
+the operator's username or filesystem layout."* **A fix that outruns its own
+documentation leaves the documentation as the last live copy of the defect** — which
+is @086345a5's *frame-blind writer* and @376a0297's *grep cannot see tense*, arriving
+together in a doc comment, on the item the whole session was named after.
