@@ -949,3 +949,64 @@ test('no field claims to count prefix cache lookups', () => {
     );
   }
 });
+
+test('static endpoints are not re-fetched every poll (AC33 overhead budget)', async () => {
+  // Six endpoints at the 250 ms dashboard cadence is 24 req/s, and most of it
+  // re-fetches values that cannot have changed: model context length is fixed
+  // for the process lifetime, resource limits are configuration. @d7cf9b84
+  // has a <2% server overhead budget and this is the client's share of it.
+  let clock = 1_000_000;
+  const counts = {};
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      const path = url.slice(BASE_URL.length);
+      counts[path] = (counts[path] ?? 0) + 1;
+      return fakeFetch(routes)(url);
+    },
+  });
+
+  // Four polls, one second of wall clock at the dashboard's 250 ms cadence.
+  for (let i = 0; i < 4; i += 1) {
+    await store.pollOnce();
+    clock += 250;
+  }
+
+  assert.equal(counts[ENDPOINTS.STATUS], 4, 'live counters poll every cycle');
+  assert.equal(counts[ENDPOINTS.DEBUG_KV], 4, 'batch/KV occupancy is the live signal');
+  assert.equal(counts[ENDPOINTS.METRICS], 2, '/metrics is the largest payload; 500 ms');
+  assert.equal(counts[ENDPOINTS.DEBUG_CONFIG], 1, 'model config cannot change');
+  assert.equal(counts[ENDPOINTS.RESOURCES], 1, 'resource limits are configuration');
+
+  const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+  assert.ok(total <= 16, `expected <= 16 requests in one second, got ${total}`);
+});
+
+test('a reused response never claims to be fresher than it is', async () => {
+  // If a cached body took this poll's timestamp, a value fetched 30 s ago would
+  // look as fresh as one fetched now, and staleness would become
+  // unrepresentable for precisely the fields most likely to be stale.
+  let clock = 1_000_000;
+  const routes = healthyRoutes();
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    now: () => clock,
+    fetchImpl: fakeFetch(routes),
+  });
+
+  await store.pollOnce();
+  const firstObservedAt = store.field('server.context_length').observedAtMs;
+
+  clock += 250;
+  await store.pollOnce();
+
+  const field = store.field('server.context_length');
+  assert.equal(field.state, FIELD_STATES.MEASURED);
+  assert.equal(
+    field.observedAtMs,
+    firstObservedAt,
+    'a reused /v1/debug/config body must keep the timestamp of the request that produced it',
+  );
+});

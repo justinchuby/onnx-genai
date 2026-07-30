@@ -52,6 +52,30 @@ export const CONNECTION_STATES = Object.freeze({
   NO_MODEL: 'no-model',
 });
 
+/**
+ * PER-ENDPOINT POLL CADENCE.
+ *
+ * Polling six endpoints every 250 ms is 24 requests/second, which eats into the
+ * server's <2% overhead budget (AC33) to re-fetch values that cannot have
+ * changed. Model context length is fixed for the life of the process; resource
+ * LIMITS are configuration. Only the live counters need the full rate.
+ *
+ * A cadence of 0 means "every poll". Anything else is the minimum gap between
+ * requests to that endpoint; in between, the last response is reused and its
+ * fields keep the timestamp of the request that actually produced them, so a
+ * reused body never claims to be fresher than it is.
+ *
+ * @type {Readonly<Record<string, number>>}
+ */
+const ENDPOINT_CADENCE_MS = Object.freeze({
+  [ENDPOINTS.HEALTH]: 0,      // liveness probe; must not lag a server going away
+  [ENDPOINTS.STATUS]: 0,      // queue depth moves per request
+  [ENDPOINTS.DEBUG_KV]: 0,    // batch and KV occupancy are the live signal
+  [ENDPOINTS.METRICS]: 500,   // by far the largest payload; still within spec
+  [ENDPOINTS.RESOURCES]: 1000,
+  [ENDPOINTS.DEBUG_CONFIG]: 30000, // model_max_context/pipeline cannot change
+});
+
 /** Poll cadence bounds. The spec fixes the dashboard at 250-500 ms. */
 export const MIN_POLL_INTERVAL_MS = 100;
 export const DEFAULT_POLL_INTERVAL_MS = 250;
@@ -152,6 +176,12 @@ export function createTelemetryStore({
    * noise. @type {Map<string, {retryAtMs: number, result: SourceResult}>}
    */
   const suppressedEndpoints = new Map();
+
+  // Last SUCCESSFUL response per endpoint, for cadence reuse. Failures are not
+  // cached here -- they go through suppressedEndpoints, which has its own retry
+  // window and its own explanation for the visitor.
+  /** @type {Map<string, SourceResult>} */
+  const lastSuccessfulFetch = new Map();
 
   /**
    * Previous sample of the cumulative token counter, for deriving a rate.
@@ -313,6 +343,15 @@ export function createTelemetryStore({
   async function fetchSource(path) {
     const isText = TEXT_ENDPOINTS.includes(path);
 
+    // Not due yet: reuse the last response rather than asking again for a value
+    // that cannot have changed. The cached result keeps its original
+    // fetchedAtMs, so fields built from it report their true observation time.
+    const cadenceMs = ENDPOINT_CADENCE_MS[path] ?? 0;
+    const cached = lastSuccessfulFetch.get(path);
+    if (cached && cadenceMs > 0 && now() - cached.fetchedAtMs < cadenceMs) {
+      return cached;
+    }
+
     // Replay a recent HTTP failure rather than re-issuing a request we already
     // know will fail. The visitor still sees the same explanation; DevTools
     // does not fill with identical errors.
@@ -341,13 +380,16 @@ export function createTelemetryStore({
         return result;
       }
       suppressedEndpoints.delete(path);
-      return {
+      const result = {
         ok: true,
         body: isText ? parsePrometheusText(await response.text()) : await response.json(),
         status: response.status,
         serverMessage: null,
         transportError: null,
+        fetchedAtMs: now(),
       };
+      lastSuccessfulFetch.set(path, result);
+      return result;
     } catch (error) {
       // Transport failures are handled by the whole-cycle backoff, not here:
       // suppressing them per-endpoint would delay recovery when the server
@@ -564,7 +606,13 @@ export function createTelemetryStore({
         continue;
       }
 
-      fields[key] = measuredField(rawValue, { ...fieldMeta(entry), observedAtMs: timestampMs });
+      // A reused body must not claim this poll's timestamp -- otherwise a value
+      // fetched 30 s ago looks as fresh as one fetched now, and staleness
+      // becomes unrepresentable for exactly the fields most likely to be stale.
+      fields[key] = measuredField(rawValue, {
+        ...fieldMeta(entry),
+        observedAtMs: source.fetchedAtMs ?? timestampMs,
+      });
     }
     addDerivedThroughput(fields, timestampMs);
     suppressUndefinedHitRate(fields);

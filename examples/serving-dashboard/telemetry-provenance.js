@@ -186,8 +186,25 @@ export const PROVENANCE = Object.freeze({
     path: 'active_sessions',
     classification: 'MEASURED',
     unit: 'sessions',
-    evidence: 'crates/onnx-genai-server/src/routes/admin.rs:61 (snapshot.active_sessions)',
-    label: 'Active sessions',
+    evidence:
+      'crates/onnx-genai-server/src/routes/admin.rs:61 (snapshot.active_sessions). The counter ' +
+      'is driven ONLY by the X-Session-Id registry: session.rs:73 is the single caller of ' +
+      'metrics::active_sessions_added, and it fires when a client_id is inserted into the ' +
+      'session map. Nothing about a generation touches it.',
+    // NOT "Active sessions". It does not count in-flight work, and during
+    // Scenario A's concurrent requests it reads 0 -- a visitor watching four
+    // lanes stream next to "Active sessions: 0" concludes the page is broken.
+    //
+    // It is also mutually exclusive with the headline claim: driver.rs:500-508
+    // routes X-Session-Id requests down the per-request engine path, BYPASSING
+    // ContinuousBatchManager. Making this number non-zero would switch off the
+    // continuous batching Scenario A exists to demonstrate.
+    //
+    // Use batch.active_size for concurrency; that one is genuinely in-flight.
+    label: 'Persistent sessions',
+    caveat:
+      'Counts long-lived X-Session-Id sessions, not in-flight requests. Stateless requests ' +
+      'never increment it, and session requests bypass continuous batching entirely.',
   },
   'sessions.paused': {
     source: ENDPOINTS.STATUS,
