@@ -773,6 +773,47 @@ if let Some(handle) = state.registry.resolve("")?
 
 ---
 
+### 8.12 Fields whose **names** are wrong while their **values** are correct ⚠️
+
+This is the highest-value table in this document for a new contributor, and it is the one class of
+defect against which **every mechanism described in §4 and §5 gives no signal at all**.
+
+A fabricated value can be found: it is a literal, so it is greppable, and a zero invites suspicion.
+**A correctly-computed value under a misleading name has no tell.** It is live, it moves when you
+exercise the system, it is internally consistent, and it survives code review, unit tests, and a
+careful reading of the struct definition — because nothing about it is *broken*. The only way to
+catch one is to read the increment site and ask what actually causes it to move.
+
+> **The rule this yields:** provenance is not *"is this field computed?"* — it is
+> **"does this field mean what its name says?"** Trace every displayed number to the line that
+> *changes* it, not to the struct that *declares* it.
+
+| Field | What the name implies | What it actually counts | Evidence |
+|---|---|---|---|
+| `prefix_cache_lookups` | cache lookups | **completed generations** — `fetch_add(1)` is unconditional in `GenerationMetrics::result()` | **Verified** — `metrics.rs:133-135` |
+| `prefix_cache_hits` | cache hits | **generations with *any* prefix overlap ≥1 token** (`if prefix_cache_hit_len > 0`) — a shared chat template alone satisfies it | **Verified** — `metrics.rs:136-137` |
+| `prefix_cache_hit_rate` | hits ÷ lookups | **hits ÷ generations** — a real, useful per-generation rate, but not a hit rate | **Verified** (both terms above) |
+| `batch_size_current` | the engine's decode batch | **live `GenerationMetrics` guards** — incremented in `start()`, decremented in `Drop`. On the dynamic server this is structurally ≤1 (§5.15); on the scatter server it is requests in flight, not decode rows. **It is never the batch size on either server.** | **Verified** — `metrics.rs:112`, `:145` |
+| `vram` / `host_ram` (on `/v1/resources`) | memory used | **ceilings only** — sourced from `configured_limits` / `resolved_limits`. There is no consumption term anywhere in the payload, so **any utilisation ratio drawn from it invents its own numerator.** | **Verified** — `admin.rs:434-443` |
+| `active_sessions` | concurrent requests | persistent `X-Session-Id` sessions — reads `0` at the busiest moment of a batching run, correctly | **Reported** (Lead), not independently verified here |
+| `kv_usage` (on `/v1/status`) | KV utilisation | hardcoded `0.0`. **Not demo-only:** `RoutingPolicy::LeastKvUsage` sorts on it (`router.rs:247`), so the comparison cannot discriminate and the weighted policy silently loses its 30% term. | **Reported** (@d7cf9b84), traced cross-crate |
+
+**Two things to take from the shape of this table rather than its contents.**
+
+**First, the failures are not independent — five of the seven concern one subsystem** (prefix
+caching and batching), because that is where §5.6.1's mutual exclusion lives. A field name written when
+a capability was designed keeps its name after the execution path routes around the capability.
+**The name records an intention; the increment site records what shipped.**
+
+**Second, a guard derived from one of these incidents tends to be shaped like the incident rather
+than like the fault.** The rule *"`hit_rate` must be unavailable when `lookups == 0`"* is correct and
+does not fire here, because the denominator is the half that *works* — `135` really is 135
+generations. The lie is in the numerator, and **no threshold on the denominator can ever detect
+it.** When a ratio is suspect, audit its numerator and denominator **separately**: they usually have
+different provenance, and here one is a live count and the other is a compile-time constant.
+
+---
+
 ## 9. Where to look first
 
 ---
