@@ -2246,3 +2246,39 @@ The execution provider is **true, harmless, and the single most interpretively l
 **One correction to the filing, measured:** `execution_provider` appears in **9** JSON captures with a live negative control. The `NOT_PLUMBED` classification may itself be stale. Anyone acting on this must re-derive the classification first — **acting on a stale label is how the last four hours were spent.**
 
 **And the sweep's own finding is worth more than its proposal, so it is recorded here:** a filter scoped to *what the wire carries today* would have exempted `server.model_path` itself, because arrival is precisely when the catalogue is stale. **A guard scoped to today's wire is blind by construction to every future instance of the defect it was written for.**
+
+- [ ] **AC207 — 🔴 THE TWO ORIGINS ARE NAMED AFTER THEIR *INTERNAL MECHANISM*, AND THE NAMES INVERT THEIR *CAPABILITIES*. FOUR AGENTS WHO BUILT THIS SYSTEM READ THEM BACKWARDS TONIGHT. DO NOT RENAME — CAPTION AT THE POINT OF DISPLAY.**
+
+  **Filed by @d7cf9b84, verified by me on the wire and in committed bytes at `dd04f50f`.**
+
+  ```
+  IDENTIFIER (what the model card shows)  ACTUAL CAPABILITY
+  qwen-scatter   :8123 / :8133            continuous batching **ON**; paging N/A
+  qwen-dynamic   :8124 / :8134            **PAGED KV**; batching **OFF, max 1 by construction**
+
+  live /v1/models  ->  :8123 "id":"qwen-scatter"   :8124 "id":"qwen-dynamic"
+  NEG CONTROL qwen-zzq -> 0
+  ```
+
+  **The words `scatter` and `dynamic` name the KV cache implementation. They are accurate to an engine author and actively misleading to everybody else.** `dynamic` reads as *adaptive, modern, feature-rich*; `scatter` reads as *unstructured, naive*. **The truth is the reverse on the axis a visitor came here to see: the origin whose name sounds feature-rich is the one that cannot batch at all.**
+
+  **THE EVIDENCE THAT THIS IS A PRODUCT DEFECT AND NOT A NITPICK IS THE STRONGEST USABILITY DATUM AVAILABLE TO US, AND WE GENERATED IT BY ACCIDENT: four members of the crew that *built this server* — named in @d7cf9b84's broadcast — benchmarked the wrong origin.** They had the source, the flags and hours of context. **A visitor has a model card and thirty seconds.** If the people who wrote it read the label backwards, the label is wrong. **This is the only usability test this project has ever run, it had n=4, and the failure rate was 100%.**
+
+  **BINDING — THE FIX IS NOT A RENAME, AND THE MEASUREMENT SAYS SO:**
+
+  ```
+  qwen-scatter / qwen-dynamic, tree-wide census, no pathspec:
+    17 + 11 files · 75 occurrences · 3 JSON captures · 4 test files
+  ```
+
+  **A rename mid-freeze would rewrite 75 sites and invalidate 3 captured JSON fixtures — and a capture that no longer matches the wire is precisely the staleness class that has consumed this entire session. We would be curing a comprehension defect by manufacturing a provenance defect.** *Do not trade a label problem for a truth problem.*
+
+  **What is required instead, and it is one line of copy each, beside the identifier, at the point of display:**
+
+  1. **The model card must render the capability, not only the id.** `qwen-dynamic` alone is not a description of anything a visitor can act on. `qwen-dynamic — paged KV cache · single-stream (no batching)` is. **The id stays the id; the caption carries the meaning.** This is `AC200` applied to a new field: **when an identifier and a caption disagree in what they imply, the caption governs, and the caption must be present.**
+  2. **Any panel that shows a batching metric for `qwen-dynamic` must state that its ceiling is 1 by construction.** A batch-occupancy widget reading `1/1` on that origin is *correct output that reads as a broken feature*, and it is `AC203`'s rule arriving on a third surface: **a structural bound and a disappointing result must not render as the same pixels.**
+  3. **The launch banners already say `(continuous batching)` and `(paged KV)` and they are correct.** They are also **terminal output that scrolls away before the browser opens.** **Transient correct copy does not discharge a persistent wrong label.** *The console is not a caption; nobody reads the console while looking at the screen.*
+
+  **ACCEPTANCE — and it deliberately cannot be satisfied by editing this spec:** open each origin's model card with no prior knowledge and answer *"can this one batch?"* from the screen alone. **Two origins, two correct answers, zero source reading.** Until that holds, this demo's central claim — that we do continuous batching and paged KV — is being demonstrated on two boxes a visitor cannot tell apart, and the one they will assume is our flagship is the one that proves the opposite.
+
+  **⚠️ AND THE CLASS, WHICH IS NEW AND IS NOT STALENESS:** every defect this session has turned on a statement that was *true when written and outlived its tree*. **This one was wrong the moment it was typed and has never been anything else.** It survived six hours, forty-one commits, four reviewers and two green suites **because no instrument we own can see it: it is not false, not stale, not uncited and not untested — `qwen-dynamic` genuinely IS the dynamic-KV build.** *It is accurate and it misinforms.* **We have eleven controls against overclaiming, one against staleness, and none at all against a name that is correct to its author and backwards to its reader.**
