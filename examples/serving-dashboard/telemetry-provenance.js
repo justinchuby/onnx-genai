@@ -385,24 +385,6 @@ export const PROVENANCE = Object.freeze({
       'Not exposed to the HTTP layer; the field is omitted, not zeroed. Sharing is ' +
       'page-granular, so even when this is plumbed a zero will not mean "no reuse happened".',
   },
-  'kv.introspection': {
-    source: ENDPOINTS.DEBUG_KV,
-    path: 'engine_kv_introspection',
-    // This one carries a sentence rather than a number, and the exact wording is
-    // not worth pinning: what makes it a placeholder is the "unavailable:" prefix.
-    isStub: (value) => typeof value === 'string' && value.startsWith('unavailable'),
-    classification: 'NOT_PLUMBED',
-    unit: null,
-    evidence:
-      'crates/onnx-genai-server/src/routes/admin.rs:140 returns the string ' +
-      '"unavailable: engine does not yet expose KV page statistics", while ' +
-      'Engine::page_usage()/page_stats() already compute it ' +
-      '(crates/onnx-genai-kv/src/page_table.rs:564-613).',
-    label: 'KV page table',
-    reason:
-      'The engine computes full page statistics, but no driver command carries them to the ' +
-      'HTTP layer yet. The block table stays empty rather than showing invented blocks.',
-  },
 
   // ---------------------------------------------------------------- prefix cache
   //

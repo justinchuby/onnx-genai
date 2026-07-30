@@ -237,7 +237,6 @@ describe('store adapter — capability', () => {
       fields: {
         'kv.pages_used': unavailableField('The server sends a documented zero.', { source: '/v1/status' }),
         'kv.pages_total': unavailableField('The server sends a documented zero.', { source: '/v1/status' }),
-        'kv.introspection': unavailableField('Stubbed at admin.rs:140.', { source: '/v1/debug/kv' }),
       },
     });
     const adapter = adaptStore(store);
@@ -252,7 +251,6 @@ describe('store adapter — capability', () => {
       fields: {
         'kv.pages_used': unavailableField('documented zero', { source: '/v1/status' }),
         'kv.pages_total': measuredField(512, { source: '/v1/debug/kv' }),
-        'kv.introspection': unavailableField('stubbed', { source: '/v1/debug/kv' }),
       },
     });
     const adapter = adaptStore(store);

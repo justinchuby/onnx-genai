@@ -72,7 +72,6 @@ function debugKvBody(overrides = {}) {
     pending_queue_depth: 3,
     available_admission_slots: 253,
     rejected_requests: 0,
-    engine_kv_introspection: 'unavailable: engine does not yet expose KV page statistics',
     ...overrides,
   };
 }

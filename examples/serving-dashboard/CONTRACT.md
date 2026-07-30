@@ -219,7 +219,7 @@ totals are genuine, so the rate is recoverable. It carries
 first poll because a rate needs two samples.
 
 Unavailable today (documented zeros / not plumbed): `kv.usage`, `kv.pages_used`,
-`kv.pages_total`, `kv.pages_shared`, `kv.introspection`, `batch.utilization`,
+`kv.pages_total`, `kv.pages_shared`, `batch.utilization`,
 `throughput.tokens_per_second`, `sessions.paused`, `prefix_cache.hashes`,
 `server.execution_provider`, `batch.effective_size`.
 

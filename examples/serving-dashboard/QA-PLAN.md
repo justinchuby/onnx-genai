@@ -688,8 +688,14 @@ The most expensive thing a tester can do on this project is spend an hour provin
 broken that we already know is not built. Each item below is verified absent, with the reason.
 **If you find one of these, the correct action is to confirm it degrades honestly — not to file it.**
 
-- **11.1 Scenario C's block-table grid has no data source.** Confirmed live on a running server:
-  `engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics"`.
+- **11.1 Scenario C's block-table grid has no data source.** The server no longer publishes ANY
+  page-table field: `/v1/debug/kv` carries nine keys and none of them describes page usage
+  (`fixtures/captures/{scatter,dynamic}.json`, recorded from live origins). It once answered
+  `engine_kv_introspection: "unavailable: ..."`, and that string is quoted in older reports;
+  the server retired it at `17d1f895` when it replaced stale "not yet implemented" claims with
+  structured `FieldUnavailable::pending` entries. **The absence is now total rather than
+  self-declared, which makes this item MORE true, not less** -- but a tester grepping for the
+  old string will find nothing and must not read that as the grid having gained a source.
   `SequenceUsage` (`page_table.rs:867-875`) consumes `Vec<PageId>` into a length, and the raw map
   is behind a private `Engine.kv_cache`. **Test that the panel says so honestly; do not test the grid.**
   *(Scenario B is NOT in this category — @376a0297 measured it working.)*

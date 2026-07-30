@@ -433,7 +433,7 @@ export function adaptStore(telemetryStore, options = {}) {
  * for the first 250 ms and flicker into existence.
  */
 const CAPABILITY_KEYS = Object.freeze({
-  'kv-pages': ['kv.pages_used', 'kv.pages_total', 'kv.introspection'],
+  'kv-pages': ['kv.pages_used', 'kv.pages_total'],
   // 'prefix-cache' is DELIBERATELY ABSENT. Its panel binds no telemetry at all
   // — the counters were ruled unshippable because the hit counter cannot
   // distinguish reuse from no-reuse: twelve requests, six of them deliberately
