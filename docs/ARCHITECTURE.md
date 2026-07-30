@@ -261,8 +261,8 @@ The fork, and everything downstream of it:
 flowchart TD
     A["run_engine_driver()<br/>driver.rs"] --> B{"engine.continuous_batch_manager(max_batch).is_ok()<br/>driver.rs"}
 
-    B -- "Ok — STATIC-CACHE model" --> C["run_static_engine_driver()<br/>driver.rs"]
-    B -- "Err — DYNAMIC-cache model<br/>⚠ the else-branch of that match" --> D["run_fallback_engine_driver()<br/>driver.rs"]
+    B -- "Ok — manager built<br/>STATIC-CACHE, or shared-buffer with known max_len" --> C["run_static_engine_driver()<br/>driver.rs"]
+    B -- "Err — manager NOT built<br/>⚠ two distinct causes, see below" --> D["run_fallback_engine_driver()<br/>driver.rs"]
 
     C --> C1["run_static_batch_until_idle()<br/>driver.rs"]
     C1 --> C2["manager.step() — ONE batched<br/>forward pass over all rows<br/>driver.rs"]
@@ -283,7 +283,16 @@ flowchart TD
 
 **Read this diagram as the map of what is available where.** The dotted line is the whole story: the batched path never reaches the KV cache, so paged allocation, prefix reuse, and preemption are all absent on it — not broken, just never invoked (§5.6).
 
-> ⚠️ **The most commonly missed line in this file is `crates/onnx-genai-server/src/driver.rs::resource_snapshot`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every dynamic-cache model takes the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
+**The `Err` branch does not tell you the model is dynamic-cache.** Two structurally different failures land in the same branch, produce the same fallback, and log almost identically:
+
+| | what happened | where it is decided |
+|---|---|---|
+| (a) | the model's decode path is `PastPresent` (non-shared-buffer) or `Legacy` — genuinely not batchable | the catch-all arm in `crates/onnx-genai-engine/src/batched.rs::continuous_batch_manager`, which bails with *"continuous batching requires a STATIC-CACHE or shared-buffer past/present model"* |
+| (b) | the model **is** batch-capable — it matched `PastPresent { shared_buffer: true }` — and then failed *inside* that arm because `max_len` was `None`, i.e. `inference_metadata.yaml` omitted one field | the same function, `.context("shared-buffer continuous batching requires a known max_len")?` |
+
+Case (b) is the one to watch, and it is not a rejection: the model reached the *capable* arm and fell out of it over missing metadata, not missing capability. Labelling the `Err` branch "dynamic-cache model" would infer a property of the **model** from an **error arm** — the same inference defect this project has hit before, and the reason the branch label above states only that the manager was not built.
+
+> ⚠️ **The most commonly missed line in this file is `crates/onnx-genai-server/src/driver.rs::resource_snapshot`** — the `else` branch. It is easy to read `run_engine_driver` and see only the batching path, because that is the one with the interesting code. But every model that takes the `Err` branch — for *either* reason above — goes through the `else`, and *all* paged-KV and prefix-cache behaviour lives there. Instrumentation, logging, or error handling added only to the batch path silently does nothing for an entire class of models.
 
 ### 3.4 The decode step loop (continuous batch path)
 
