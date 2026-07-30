@@ -339,6 +339,74 @@ retraction.**
 `serde(default)` fields as growing "10 → 14." The 14 are byte-identical at merge-base;
 my "10" counted numerics only. **Two different questions wearing one number.**
 
+## 9. TRIPLE REVIEW — PASS 1, CRITICAL-REVIEWER ARM
+
+Measured in a clean detached worktree at **`review-1` = `fca13038`**, resolved repo root
+`/private/tmp/rv1-crit`, porcelain 0, `run-tests.sh` **raw unpiped exit 0 · 627 tests ·
+94 suites · 0 fail · 47 files discovered · provenance 0 untracked / 0 missing**.
+(The dispatch quoted 599/91 at this same immutable SHA; my count comes from the canonical
+runner in a clean tree. The difference is the instrument, not the artifact.)
+
+**P1-A — The provenance schema demands evidence to say "I don't know" and demands nothing
+to say "this is real."** Executed against the module itself, all 10 `byOrigin` overrides:
+
+```
+OVERRIDES TO A SUPPRESSED STATE   5 of 5 carry a documented reason   ✅
+OVERRIDES TO 'MEASURED'           5 of 5 carry ONLY the word itself  ⛔
+  prefix_cache.hits · prefix_cache.lookups · prefix_cache.hit_rate ·
+  metrics.prefix_cache_hits · metrics.prefix_cache_lookups   keys={classification}
+```
+
+A perfect 5/5 split is a mechanism, not an oversight. **This is the branch's own stated
+failure shape — a default that degrades toward confidence — sitting in the data model of
+the honesty layer itself**, not in the CSS where it was first found.
+
+`resolveForOrigin()` makes it worse: `{ ...entry, ...override }` means an upgraded
+override **inherits the parent's evidence string**, which was written about the
+un-upgraded claim. Executed:
+
+```
+prefix_cache.hit_rate resolved for 'dynamic'
+  classification: MEASURED
+  reason:         (none)
+  evidence:       "...emits a literal 0.0 when lookups == 0, so an undefined rate and
+                   a genuine 0% are the same bytes."
+```
+
+**The entry carries its own refutation and nothing reconciles the two.** Fixing the one
+entry now in flight leaves the mechanism, and the next override will do this again.
+`scripts/check_provenance.py` — 310 lines, the main guard — contains **zero** occurrences
+of `byOrigin`. It cannot see the mechanism at all.
+
+**Fix: require `reason` on any override that raises confidence, and forbid an override
+from inheriting `evidence` it does not restate.** Cheapest form: make the guard assert
+`reason` present on every `byOrigin` entry whose classification is `MEASURED`, with a
+non-zero floor on the override count so it cannot pass vacuously (denominator today: 10).
+
+**P1-B — Cross-package contract drift: three fields claim MEASURED and their producer was
+renamed out from under them.** `/v1/debug/kv` on the dynamic arm returns HTTP 200 and does
+not contain any of the three keys the catalogue reads:
+
+```
+CATALOGUE READS (path:)        WIRE ACTUALLY SERVES
+  prefix_cache_hits              generations_with_prefix_reuse
+  prefix_cache_lookups           generations_completed
+  prefix_cache_hit_rate          prefix_tokens_reused
+telemetry-store.js:1228  readPath(body, entry.path)   -- no alias map anywhere in JS
+```
+
+`generations_with_prefix_reuse` appears in `routes/admin.rs`, `routes/mod.rs`, `tests.rs`,
+`docs/ARCHITECTURE.md`, `README.md` and `demo-spec.md` — and in **zero JavaScript files**.
+**Every artifact in the repository tracked the rename except the one whose entire job is
+to state what is real.** The store degrades honestly (`"responded, but carried no value"`),
+so the visible harm is limited — but the footer's "what's real, what's not" table is
+built from `allFieldKeys()` and will list all three as MEASURED.
+
+**Disclosed instrument failure, mine:** my first pass also flagged `throughput.observed` as
+MEASURED-without-producer. **False positive — it is `derived: true` by design and carries
+no `metric` key.** My predicate was wrong for derived entries. 1 false positive in 5; I
+caught it by opening the hit instead of banking it.
+
 **8.5 — C11 elevated: the router's fabricated zero is not a display defect, it is a
 traffic-routing decision, and it fails toward *send everything here*.**
 
