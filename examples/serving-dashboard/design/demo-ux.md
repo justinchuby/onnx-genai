@@ -2208,14 +2208,16 @@ The 400 ms threshold is the standard perceptual boundary for "did that work?" Th
 ```
       4 concurrent requests vs 1
 
-      TOTAL  82.130 tok/s   2.46× faster
+      TOTAL  82.130 tok/s   2.46–2.72× faster
       EACH   20.7   tok/s   0.62× as fast
 
       Batching does not make any single request faster.
-      n=15 · CV 1.98% · CPU EP · max_batch from payload · one machine
+      Range spans 2 occasions · CPU EP · max_batch from payload · one machine
 ```
 
-Rules: **never `~2.5×`** — a rounded benchmark figure with no interval is strictly less honest than the precise one, because rounding *looks* like modesty while actually discarding the only evidence of precision we have. Never a bare percentage. If `n` and `CV` aren't available for a number, it is not a benchmark result and must not be styled as one. **And never `2.46×` without `0.62×` at identical type size — see §29.1: type size is a claim about which number matters, so a caveat set smaller is still the lie, told more quietly.**
+> 🔴 **THE SKETCH ABOVE PREVIOUSLY READ `2.46× faster` AND `n=15 · CV 1.98%`. BOTH WERE STRUCK IN §101 AND THE CORRECTION IS SHOWN RATHER THAN SILENTLY APPLIED.** A byte-identical binary put the denominator **9.77% lower** 75 minutes later, moving the ratio to **2.72×**. `2.46` asserts ±0.203% resolution against **9.77% observed — a 48.1× shortfall**. **And `CV 1.98%` was the within-run spread of ONE ARM, not the dispersion of the RATIO — a correct statistic attached to the wrong quantity, which manufactures support rather than reporting it (D342).**
+
+Rules: **never a rounded point figure — report the observed interval.** ⛔ **Not `2.46×`**, which claims 48× the resolution the instrument demonstrated; ⛔ **and not `~2.5×`**, which implies 2.45–2.55 and therefore **excludes the 2.72 observation entirely** — a *narrower* claim than the data supports, wearing the costume of a wider one. **A tilde is not a widening; it is a re-centring on the first observation, disguised as humility. Only an interval can be falsified (D341).** Never a bare percentage. If `n` and a dispersion figure **for that exact quantity** aren't available, it is not a benchmark result and must not be styled as one — **for a ratio, that means the dispersion of the ratio, never of one arm (D342).** **And never the TOTAL without `0.62×` at identical type size — see §29.1: type size is a claim about which number matters, so a caveat set smaller is still the lie, told more quietly.**
 
 > **`max_batch` is read FROM THE PAYLOAD** (@e00032a4's 3-line emit, ruled by @12e42da8) — **never from `state.rs:25`.** The condition line of a benchmark is the last place a compile-time constant may pose as a measured run parameter: **it is the part of the display whose whole job is to say how the measurement was taken.**
 
@@ -2436,6 +2438,8 @@ This one is worse than `x/4`, because a *ratio* against a suspicious denominator
 
 @12e42da8: aggregate decode is **2.46×** at 4 concurrent, but **per-stream throughput falls to ~0.62×** (~20.7 tok/s). Both ship together, everywhere. *"A tradeoff presented as a pure win is a lie told with true numbers."*
 
+> ⚠️ **THE POINT FIGURE IN THAT QUOTE IS SUPERSEDED BY D341 AND THE QUOTE IS LEFT INTACT BECAUSE IT IS SOMEBODY ELSE'S SENTENCE.** The aggregate arm is withdrawn as a point value and restated as **2.46–2.72×** — a byte-identical binary moved the denominator 9.77% between occasions, and three significant figures assert 48× more resolution than that. **The ruling this section exists for is untouched: the tradeoff is the hero, and both arms ship together at identical weight. Only the number of digits changed, and it changed in the direction that admits more.**
+
 ### 29.1 Equal weight, because hierarchy is an argument
 
 The obvious implementation is `2.46×` large with `0.62×` small beside it. **That still tells the lie**, just more quietly: **type size is a claim about which number matters.** A big number with a small one next to it reads as *the result, with a caveat* — and the caveat is the half an engineer in the audience most needs.
@@ -2447,13 +2451,17 @@ Same principle as D83 (*layout space is a claim about significance*), one level 
 ```
         4 concurrent requests vs 1
 
-  TOTAL    82.130 tok/s     2.46× faster
+  TOTAL    82.130 tok/s     2.46–2.72× faster
   EACH     20.7   tok/s     0.62× as fast
 
   Batching does not make any single request faster.
   It trades per-stream latency for total throughput.
-  n=15 · CV 1.98% · CPU EP · max_batch=4 · one machine, not a performance claim
+  Range spans 2 occasions · CPU EP · max_batch from payload · not a performance claim
 ```
+
+> 🔴 **THIS SKETCH READ `2.46× faster`, `n=15 · CV 1.98%` AND `max_batch=4` UNTIL §101. ALL THREE WERE WRONG AND EACH WAS FORBIDDEN BY A RULE ALREADY WRITTEN IN §24.2** — the point figure by D341, the misattributed dispersion by D342, and the literal `max_batch=4` by §24.2's own closing note that *a compile-time constant may not pose as a measured run parameter* on the one line whose job is to say how the measurement was taken.
+>
+> ⛔ **I wrote that rule and this sketch, and I never checked this sketch against that rule.** D343 says a rule set is a conjunction whose clauses go unchecked against each other; **this is the same defect one level up — a rule is checked against the sketch beside it and never against sketches in other sections.** The two canonical benchmark forms in this document disagreed with each other for the entire session, and **§24.2's rule cites §29.1 by name**, so the citation pointed at the counterexample.
 
 The sentence is the hero; the numbers are its evidence. **This is a stronger demo than `2.46×` alone** — anyone who has run a server knows this tradeoff exists, so omitting it wouldn't have flattered us, it would have made us look naive to exactly the audience we most want to convince.
 
@@ -7207,3 +7215,89 @@ live sites.
 | D338 | Contrast is scored from USAGE (`color: var(--og-*)`), never from a token list | The list is written by whoever forgot the annotation; `--og-bad` failed AA unannotated for the whole session |
 | D339 | Score text against the background its own rule declares, not the page background | `--og-accent` at 3.34:1 is correct as a background; the chip declares its own — a single-background guard reds correct work |
 | D340 | A decorative exemption names a SELECTOR and must be asserted to still match | Exempting a token exempts every future use; an exemption that outlives its selector is an invisible permanent hole |
+
+---
+
+## §101 — My precision rule was inverted by the instrument, and the CV beside the hero measures the wrong thing
+
+🔴 **§24.2 says: *never `~2.5×`* — rounding "looks like modesty while discarding the only evidence of precision we have."** @376a0297 measured the premise and it is false. **The digits were never evidence of precision. There was no precision for the rounding to discard.**
+
+```
+82.130 / 33.415 = 2.4579   <- shipped as 2.46x
+82.130 / 30.151 = 2.7240   <- SAME numerator. Denominator re-measured 75 min
+                              later on a BYTE-IDENTICAL binary (@fc8b5d97).
+denominator swing  -9.77%      ratio swing  +10.83%
+
+"2.46" asserts +/-0.005, i.e. +/-0.203% resolution.
+Observed reproducibility: 9.77%.        SHORTFALL: 48.1x.
+```
+
+**The three-figure form is not the precise option. It is the overclaim.** It asserts a resolution forty-eight times finer than the instrument demonstrated, and it asserts it in the most credible notation we have.
+
+### 101.1 D341 — Significant figures are a claim about the instrument, not a typographic choice
+
+**Every digit printed is a statement that the digit is reproducible.** I treated digit count as a *style* question — precise reads honest, rounded reads evasive — and reasoned entirely about how the number would be *read*. **Nobody asked what the instrument could *resolve*.** That question sits between design and measurement, which is exactly why it had no owner: the designer rules on how it looks, the engineer rules on how it was taken, and *how many digits survive the taking* belongs to neither.
+
+⛔ **And the correction is not "round it," because my rule was right about the tilde and wrong about why:**
+
+```
+2.46x   claims 48x more resolution than we have          -> UNFALSIFIABLE, too tight
+~2.5x   IMPLIES 2.45-2.55 and therefore EXCLUDES 2.72    -> a NARROWER claim than
+                                                            the data supports,
+                                                            wearing the costume of
+                                                            a wider one
+```
+
+🔑 **A tilde is not a widening. It is a re-centring on the first observation, disguised as humility.** My original sentence — *rounding looks like modesty* — was correct, and I drew the opposite remedy from it. **Both forms are unfalsifiable; only an interval can be wrong.**
+
+**D341: report the interval actually observed, never a rounded point.** `2.46×–2.72×` across two occasions. It is falsifiable, it contains every number we measured, and it is the only form that gets *worse-looking* when the measurement gets noisier — which is the property that makes a display honest.
+
+### 101.2 D342 — A dispersion figure printed beside a number must be the dispersion OF that number
+
+**The sketch in §24.2 CARRIED `n=15 · CV 1.98%` until this section struck it. That CV is real, correctly computed, and honestly named — and it is not the dispersion that governs the digits of `2.46×`.**
+
+- `CV 1.98%` is the **within-run** spread of one arm on one occasion.
+- `2.46×` is a **ratio of two arms**, and its reproducibility is dominated by **between-occasion** variation in the denominator: **9.77%**, five times the printed CV.
+
+⛔ **So the hero carries a precision annotation that measures something other than what its digits claim.** That is @bb2ee824's `MISATTRIBUTED` — *computes a real number, but not the quantity its name denotes* — arriving in **typography** rather than in telemetry, in the one block of this document whose entire job is to stop exactly this.
+
+**D342: a `CV`/`n` printed beside a figure asserts it is the dispersion of THAT figure.** For a derived quantity, print the derived dispersion or print none. **A correct statistic attached to the wrong quantity is worse than no statistic, because it converts an unsupported number into an apparently-supported one.**
+
+### 101.3 D343 — My own rule contained its correction, one sentence too late
+
+The same paragraph reads: *"If `n` and `CV` aren't available for a number, it is not a benchmark result and must not be styled as one."*
+
+✅ **That sentence is correct and it forbids `2.46×`.** No `CV` was ever available *for the ratio*. **My first sentence mandated the precise form; my third sentence forbade styling it as a benchmark at all. The rule contradicted itself for the whole session and the correct half was already written down.**
+
+🔑 **A rule set is not a list, it is a conjunction, and nobody reads it as one.** Each clause was checked against the sketch; **no clause was checked against its neighbours.** ⚖️ This is §100's defect in the register above it: there, the annotated set was the measured set; **here, the checked clause was the clause somebody happened to be looking at.**
+
+### 101.4 The instrument that cannot see this
+
+⛔ **None of my six guards can catch any of the above.** They read CSS, module identifiers and shipped HTML. **`2.46×` is prose in a design document, and D158 has now landed on this file for the fourth time: a cut or qualified figure still bound in prose that instructs.** A sketch is a build instruction, and this one instructed for three significant figures.
+
+**This is not fixable by a test I own, and I am not going to pretend otherwise by shipping one that greps for `×`.** The honest closure is D341–D343 stated at the point of use, plus the interval in the sketch itself — **so that a developer building from §24.2 in isolation builds the interval, which is the only reader this document has ever actually had.**
+
+### 101.5 D344 — The guard that exists to catch this listed my file as DEFERRED, and the deferral's reason expired at 02:45
+
+**`check-perf-claims.test.js` passes 17/17 and says nothing whatsoever about this document.** `DEFERRED` carries:
+
+```
+'design/demo-ux.md': 'owned by the designer; edited 02:45, live at the time of the freeze'
+```
+
+⛔ **The hero number lived in the one file the hero-number guard was told to skip, for the entire session.** That is why an inverted precision rule, a misattributed `CV`, a forbidden literal `max_batch=4` and two mutually contradictory canonical sketches all survived every sweep: **no instrument was ever pointed at them.** ⚖️ @376a0297 said it first about their own file — ***that green is silence, not clearance*** — and it is truer here, because **the deferral names me as the reason it exists.**
+
+🔑 **The deferral is still CORRECT and its REASON is now false, and those come apart:**
+- ✅ Correct — the document does still state the figure, legitimately, inside retractions and raw quotations.
+- ⛔ False — *"editing them would collide with a live author"* was written at 02:45. **I am that author, and I have now finished.** The premise discharged itself and nothing noticed, because **the entry's self-expiry only fires in the direction where the document goes CLEAN.** It cannot fire when the *justification* dies.
+
+**D344: a deferral must expire on its REASON, not only on its subject.** An entry justified by *"a live author is mid-edit"* is a claim about a person and a clock, and it should carry the condition that ends it. **A self-expiring exemption that only watches its subject is half an instrument — it detects the gap closing and is blind to the excuse dissolving**, which is the direction that lets a blind spot outlive the emergency that created it.
+
+⚠️ **I am NOT retiring the entry unilaterally at this hour, and the measurement says why.** Simulating the guard's exact predicate — fences stripped, ±600-character retraction window — leaves **8 uncovered matches**, and six of them are *cross-references* (`the panel carrying the 2.46× number`) that identify **which** panel rather than asserting a value. **Deleting the deferral tonight would either redden the gate on correct prose or pressure me into degrading six accurate sentences to satisfy a matcher.** ➡️ **That is D340 pointing at my own document: the right closure is a LINE-SCOPED exemption naming the passages where the figure legitimately survives, exactly as @376a0297 requested for `demo-spec.md` — and it is the follow-up I am handing over rather than rushing.**
+
+| # | Decision | Rationale |
+|---|---|---|
+| D341 | Significant figures are a claim about the instrument; report the observed interval, never a rounded point | `2.46×` asserts 48× the resolution demonstrated; `~2.5×` excludes the 2.72 observation. Only an interval can be falsified |
+| D342 | A `CV`/`n` beside a figure is a claim about THAT figure's dispersion | `CV 1.98%` is within-run for one arm; the ratio's reproducibility is 9.77% between occasions. A correct statistic on the wrong quantity manufactures false support |
+| D343 | A rule set is a conjunction — check every clause against its neighbours, not only against the example | My own third clause forbade what my first clause mandated, and both shipped |
+| D344 | A deferral expires on its REASON, not only on its subject | `'edited 02:45, live at the time of the freeze'` was discharged hours ago; an entry that only watches its subject is blind to its excuse dissolving |
