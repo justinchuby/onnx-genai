@@ -138,7 +138,13 @@ const servedButNotNeeded = classified.filter(
 // `frame-metadata.test.js` -- the census asserting every store frame carries
 // its catalogue caption -- makes it 84. A visitor may have that one: it
 // contains no credential, no path, and no fixture, only assertions about
-// captions the page already paints in front of them. Recording
+// captions the page already paints in front of them. And
+// `check-test-basenames.test.js` -- the census forbidding two test files from
+// sharing a basename, so that a red names one file rather than two -- makes it
+// 85. A visitor may have that one too, for a stronger reason than the others:
+// its entire content is a list of THIS REPOSITORY'S OWN TEST FILENAMES, which
+// are already fetchable by name from this same origin. It discloses nothing
+// that is not already served. Recording
 // that rather than quietly pinning the pre-existing number: a ratchet whose
 // author exempts their own contribution is not a ratchet, and the first
 // exemption is the one that teaches everyone else the number is negotiable.
@@ -146,7 +152,7 @@ const servedButNotNeeded = classified.filter(
 // Raising it is therefore a NORMAL and expected part of adding a guard, and it
 // is not the same act as raising it to accommodate a new document or fixture.
 // The diff shows which one you did.
-const MAX_SERVED_BUT_NOT_NEEDED = 84;
+const MAX_SERVED_BUT_NOT_NEEDED = 85;
 
 describe('the served surface is a closed set', () => {
   it('CAN RUN: the corpus and the launcher both loaded', () => {
