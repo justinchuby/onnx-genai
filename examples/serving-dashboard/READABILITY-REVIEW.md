@@ -340,7 +340,7 @@ longer exists anywhere in the catalogue (`grep -c 'admin.rs:178'` → **0**; con
 state, and rewriting a number inside a quotation to satisfy a citation checker falsifies the
 quote.*
 
-**And the coordinate never resolved, which is measured, not assumed — `crates/onnx-genai-server/src/routes/admin.rs:178`
+**And the coordinate never resolved, which is measured, not assumed — `crates/onnx-genai-server/src/routes/admin.rs:178` (`"paused_sessions"`)
 is `"paused_sessions",`.** The real `batch_capacity` sites in that file are `:122`, `:231`, `:232`
 and `:240`; the file is 714 lines, so `:178` is **in range and simply wrong**. That is the
 strongest possible argument against "repairing" it: re-anchoring the number would invent an
@@ -830,7 +830,7 @@ reason two other tasks in my queue were *not* done.
 
 ### R1 🟢 FIXED — the `PanelModule` typedef was the lone outlier, and the brief's reason for it was wrong
 
-`dashboard/index.js:59` declared:
+`dashboard/index.js:59` (`@property {(root: HTMLElement`) declared:
 
 ```js
  * @property {(root: HTMLElement, store: object) => {destroy: () => void}} mount
@@ -1281,7 +1281,7 @@ the case I described as hypothetical forty minutes ago:
 
 | pole | what pass 2 gets at `review-2` | consequence |
 | --- | --- | --- |
-| over-read | `index.js:59` still says `destroy` | **a reviewer re-derives R1 as LIVE — correctly for that tree, wrongly for the branch** |
+| over-read | `index.js:59` (`@property {(root: HTMLElement`) still says `destroy` | **a reviewer re-derives R1 as LIVE — correctly for that tree, wrongly for the branch** |
 | under-read | my document lacks R25–R31 and the preamble | **the correction that would have warned them is not in the tree they are reading** |
 
 > **The frozen tree contains the defect and not its retraction, because a fix and its
@@ -1296,7 +1296,7 @@ the case I described as hypothetical forty minutes ago:
 2. **Read *prose* at the branch tip.** Code at the extract, prose at the tip — the same split
    the gate secretary applied to their own brief when they noted a document cannot contain the
    announcement of its own SHA.
-3. **Do not re-file `dashboard/index.js:59`.** It is fixed at `ee8542d2`, verified by presence
+3. **Do not re-file `dashboard/index.js:59` (`@property {(root: HTMLElement`).** It is fixed at `ee8542d2`, verified by presence
    of the bytes in `HEAD`. If your pass finds it, **your tree is older than the fix, not newer
    than the finding.**
 
@@ -1344,7 +1344,7 @@ anchor that cannot wrap** — a finding id, a heading, a four-word phrase — **
 
 ---
 
-## Caption precedence (`panel-kit.js:266`) 🟢 CLOSED — CLEAN. @c0de4c2e was right not to score it, and I was wrong to suspect it.
+## Caption precedence (`panel-kit.js:266` (`const label = options.label`)) 🟢 CLOSED — CLEAN. @c0de4c2e was right not to score it, and I was wrong to suspect it.
 
 **Re-derived at `7b12c962`, toplevel asserted.** @c0de4c2e listed this row `VERIFIED AT 6ecd9183 · NOT
 RE-RUN · NOT SCORING IT`. **Declining to score a row you did not measure is the correct call and I
@@ -1406,7 +1406,7 @@ top-level declaration**, and state the boundary and how it was found in the find
 `renderField = 264..454, next decl metricRow at :455`. **A window with an unstated end is an
 unfalsifiable measurement.**
 
-## R33 🔴 NEW — `run-tests.sh:3` calls itself *"the one way to run this suite"* and runs zero Rust
+## R33 🔴 NEW — `run-tests.sh:3` (`# The one way to run this suite.`) calls itself *"the one way to run this suite"* and runs zero Rust
 
 **@12e42da8's correction — *we have two suites and one word for them* — has a specific, one-line
 site, and it is a naming defect, which puts it in my lane.**
@@ -1594,7 +1594,7 @@ non-self carriers, named rather than counted:** `check-perf-claims.test.js`,
 > both SHAs.**
 
 **✅ And the one shipped-JS carrier of the retracted 9.8 % floor is named and owned:**
-`scenario-origins.js:94` — @bb2ee824's declared, expiring deferral. **Not mine, and correctly
+`scenario-origins.js:94` (`a byte-identical binary swung 9.8%`) — @bb2ee824's declared, expiring deferral. **Not mine, and correctly
 disclosed by its owner before I found it.**
 
 ## ✅ @c7a654ed's co-location ruling, tested against my own document — it PASSES, and here is the measurement rather than my word
@@ -1774,3 +1774,115 @@ mine claimed `porcelain 0` on a directory I never created, **it is not in the de
 cannot retract what I cannot find.** ➡️ ***That asymmetry is itself the finding: the durable
 artifact is auditable and the chat is not, which is exactly why the deliverable — not the
 broadcast — has to carry every claim you want to be held to.***
+
+---
+
+## R38 🟢 **PASS-2 SELF-AUDIT: I ran the Lead's ① and ⑤ against my own guard, declined the scope ruling that exempted me, and repaired the thing it would have let me disclaim**
+
+**Run at `35b0ad48`, toplevel `/Users/justinc/Documents/GitHub/onnx-genai-demo` asserted.**
+**⚠️ The branch moved four times while I measured — `b4636338 → 8df58c11 → 35b0ad48 → b3a7af32`.
+Every figure below names the SHA it was taken at, because on this branch "HEAD" is not a noun.**
+
+### ⑤ against my own guard — NOT a stale-figure pump, and here is the separating test
+
+**`check-review-freshness.test.js` asserts a marker must be PRESENT, which is the shape the Lead
+just condemned. It survives, and the reason generalises:**
+
+> **A guard is a PUMP if the action that turns it green is one you would not otherwise take.**
+> A stale-figure pump goes green only while the error persists — **correcting it is what breaks it.**
+> **My guard goes green when you RE-MEASURE, and red when you do nothing while the branch moves.**
+> ➡️ ***Its gradient points at the action the process already wants. That, not "does it assert
+> presence", is the test.***
+
+**🔻 BUT ONE ARM OF IT IS A PUMP, AND IT IS MINE, AND I FOUND IT ONLY BECAUSE ⑤ MADE ME LOOK:**
+the anti-vacuity floor `adopters.length >= 1` requires **at least one document to keep using
+`MEASURED-AT:`**. ⛔ **If the crew adopts something better — annotated tags, which *I myself
+recommended to the Lead* — my guard goes RED ON THE IMPROVEMENT.** The only way to keep it green
+is to keep my convention alive. ➡️ ***A guard that cannot be retired by its own success is a
+ratchet on the TOOL, not on the QUALITY.*** **Its failure message must name the retirement path,
+not only the satisfaction path. Logged against my own file, unfixed, owned.**
+
+### ① against my own guard — a real depth limit, and a census proving it is latent, not live
+
+**`readdirSync(HERE)` reads ONE directory level. That is precisely `*/*.js`'s defect in another
+alphabet.** So I ran the census the Lead asked for rather than reasoning about it:
+
+```
+FULL-TREE (git ls-files, no glob, no depth cap)   MY GUARD'S SURFACE
+  ARCHITECTURE-SECURITY-REVIEW.md   depth 0   ✅ seen
+  IMPLEMENTATION-REVIEW.md          depth 0   ✅ seen
+  READABILITY-REVIEW.md             depth 0   ✅ seen
+  REVIEWER-BRIEF.md                 depth 0   ✅ seen
+  REVIEW-POINT.md                   depth 0   (deliberately excluded)
+                       CONTROL zznosuch-token -> 0
+➡️ 5 of 5 AT DEPTH ZERO. COVERAGE TODAY IS 100%. THE DEFECT IS LATENT, NOT LIVE.
+```
+**⚖️ I am reporting a NEGATIVE result with its denominator because "my guard is fine" and "my guard
+is fine *because every document happens to sit at depth 0*" are the same green and different facts.
+The first survives someone adding `ui/UI-REVIEW.md`. The second does not.**
+**⚠️ And my own census instrument failed once mid-run: `git ls-files … | grep -v /` returned EMPTY,
+because ls-files prints toplevel-relative paths and every one contains a slash. An empty result
+that reads as "zero documents discovered". *An empty is not a zero* — my own rule, failing on me
+for the second time tonight.**
+
+### THE SCOPE RULING — it exempts me, and I decline the exemption, because the variable is N
+
+**Measured in my document at `8df58c11`: 11 positional citations, 2 anchored.** By the Lead's
+ruling I am the uniformly-positional case, where @73e77d95's document-wide disclaimer is
+*"correct and free."* **I am not taking it.**
+
+> **🔑 The ruling sorts documents by KIND — anchored vs positional. The decision variable is COUNT.**
+> **A disclaimer is a FIXED-COST remedy applied to a VARIABLE-COST problem.** At N=90 it is the only
+> affordable move. **At N=11 it buys, for the same price, a permanent admission you could have
+> retired in four minutes.** ➡️ ***The question is never "is my document positional." It is "is N
+> small enough that repair is cheaper than the disclaimer's permanent cost."***
+
+**✅ SO I REPAIRED IT. 7 distinct citations anchored inline — beside the claim, not in an index,
+because a citation index is reference data separated from its source of truth and that is the exact
+antipattern this lane exists to flag. EACH VERIFIED TO RESOLVE AT `35b0ad48`:**
+```
+dashboard/index.js:59      = "@property {(root: HTMLElement"      ✅
+panel-kit.js:266           = "const label = options.label"        ✅
+run-tests.sh:3             = "# The one way to run this suite."   ✅
+scenario-origins.js:94     = "a byte-identical binary swung 9.8%" ✅
+admin.rs:178               = "\"paused_sessions\""                ✅
+NEGATIVE CONTROL  run-tests.sh:3 = "zzq7-never-written-token"     ⛔ MISSES ✅
+ANCHORED IN MY DOCUMENT:  2 -> 9
+```
+
+**🎖️ AND THE RESULT THAT MATTERS MOST IS THE BORING ONE: ALL 11 POSITIONAL CITATIONS ALREADY
+RESOLVED, AND EVERY ONE POINTED AT ITS INTENDED CONTENT. ZERO ROT.**
+> **⛔ That is not a reason to have left them. *Accurate-right-now* is the state every rotted
+> citation occupies until the moment it rots.** ➡️ ***The defect in a positional citation was never
+> INACCURACY. It is UNFALSIFIABILITY: a wrong one and a right one are byte-identical to the reader,
+> so the reader cannot check it and therefore does not.*** **An anchored citation carries its own
+> refutation and checks itself. I did not repair 11 wrong citations tonight. I repaired 11 citations
+> that nobody — including me — had any way to know were right.**
+
+### ⚠️ THE RULING'S OWN DENOMINATOR — third independent measurement, and it does not reconcile
+
+**The ruling states `ARCHITECTURE.md: 180 ANCHORED / 0 POSITIONAL`. @73e77d95 could not reproduce
+180 under any predicate and got 6. I measured it myself at `b3a7af32`, blind to their method:**
+```
+docs/ARCHITECTURE.md   '<!-- cite:' -> **6**   positional file:NNN -> **0**
+                        1193 lines   CONTROL zzq7-fresh -> 0
+```
+**✅ TWO INDEPENDENT AGENTS GET 6. NOBODY HAS REPRODUCED 180.**
+**⚖️ AND THE RULING SURVIVES COMPLETELY, WHICH IS WHY THIS IS A CORRECTION AND NOT A CHALLENGE:
+0 positional is 0 positional. The document IS uniformly anchored and the disclaimer WOULD be
+destructive there. **The KIND is right and the MAGNITUDE is off thirtyfold — and the kind is the
+only part the ruling actually uses.** ➡️ **Fifth reconciliation of this shape tonight. Publish the
+predicate under the number and this costs somebody four minutes instead of an argument.**
+
+### 🔻 AND MY VERIFIER WAS DEFECTIVE WHILE VERIFYING — caught by an absurd output, not by a control
+```
+scenario-origins.js  ->  ⛔ "does NOT carry [...]"    <- READS AS: THE CITATION IS ROTTEN
+REAL CAUSE: I guessed the path as dashboard/scenario-origins.js. It lives at
+            examples/serving-dashboard/scenario-origins.js. THE FILE WAS ABSENT.
+```
+**⛔ My checker emitted THE SAME ⛔ for *file does not exist* and *symbol is not on that line* —
+one symbol for a broken citation and for a broken checker. I split it into `ABSENT-FILE` vs
+`WRONG-LINE` and re-ran; it resolves. **A verifier whose failure modes are indistinguishable
+cannot tell you whether the subject or the instrument failed, and it will always be read as the
+subject.** ➡️ **Also noted: my bare-filename citations are ambiguous across directories — that is
+the second, quieter argument for symbol anchors, which are unique where filenames are not.**
