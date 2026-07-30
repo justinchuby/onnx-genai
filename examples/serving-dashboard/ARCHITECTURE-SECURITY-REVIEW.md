@@ -1885,3 +1885,73 @@ combined.**
 
 The real finding underneath survives and I am not weakening it: **`dotfile` in
 the spec is genuinely 0**, and C19, C20 and C21 are 0 there too.
+
+---
+
+## §28 — C22: THE SOURCE GUARDS ENUMERATE THEIR OWN CORPUS, SO EVERY FILE NOBODY THOUGHT OF IS EXEMPT BY DEFAULT
+
+Measured at `66352434`. @c0de4c2e found the instance; this is the structure.
+
+### The measurement
+
+    .rs files under crates/onnx-genai-server/src : 23
+    include_str! sites in tests.rs               :  8
+    the disclosure guard's hardcoded corpus      :  3   (state.rs, routes/admin.rs, cli.rs)
+
+`no_configuration_can_re_enable_full_path_disclosure` hand-lists three files.
+**Twenty of twenty-three source files are outside it.**
+
+### 🆕 C22 (🔴 non-blocking, structural) — this is deny-by-default inverted
+
+The Lead ratified **allowlist, never denylist** an hour ago, on exactly the
+argument that *"a denylist must be updated by whoever adds the next kind: the
+person least likely to be thinking about disclosure."*
+
+> **A SOURCE GUARD THAT ENUMERATES THE FILES IT READS IS A DENYLIST WEARING AN
+> ALLOWLIST'S CLOTHES. THE THREE NAMED FILES ARE NOT THE PROTECTED SET — THEY
+> ARE THE *ONLY* SET, AND EVERY FILE NOT NAMED IS EXEMPT WITHOUT ANYONE
+> DECIDING TO EXEMPT IT.**
+>
+> **ADDING A NEW SOURCE FILE SILENTLY REDUCES THIS GUARD'S COVERAGE, AND THE
+> GUARD STAYS GREEN WHILE IT HAPPENS.**
+
+This is the Lead's *drained corpus* class with a worse origin: that corpus
+drained through individually-justified exemptions. **This one never had to
+drain. It started at 3 of 23 and every file added since has widened the gap.**
+
+### The proposed fix is a patch to the instance, not the defect
+
+The circulating remedy is *"add `routes/mod.rs` to the `include_str!` list."*
+That closes the one file we happened to find and leaves nineteen exempt. **It
+also re-arms the identical failure for the next file anybody creates.**
+
+**The structural fix:** walk `src/` at test time from `env!("CARGO_MANIFEST_DIR")`
+and assert over every `.rs` found, with the file count itself asserted non-zero
+so an empty walk fails loudly rather than passing vacuously.
+
+    include_str! list : a new file is EXEMPT      -> guard silently weakens
+    read_dir walk     : a new file is IN SCOPE    -> guard goes RED on arrival
+
+That is the difference between a guard that encodes *what we checked once* and
+one that encodes *the property*. **Only the second survives its author.**
+
+### Two corrections to the record, both dating rather than disputing
+
+**① The defect the guard missed is gone.** `routes/mod.rs` `loopback` at HEAD =
+**0** (CONTROL `fn ` = 22). The quoted `:117 /// Absolute on loopback` was
+removed with the whole `path` field at `b7f83e72`. **The guard-blindness finding
+is correct and the live-defect half is stale — the structure outlived the bug,
+which is precisely why it is worth filing.**
+
+**② The decorative loop is still live at HEAD.** `lazy_two_model_router()` is
+declared at `:2402` taking **no parameters** and is called at `:4238` inside a
+`for bind in [...]` loop. Both iterations remain byte-identical. @c0de4c2e's
+finding, confirmed at HEAD, not re-filed.
+
+### Why this one matters more than its severity suggests
+
+No shipped code is affected and nothing reaches a visitor, so it is not a
+blocker. But **it is the mechanism that let a documented, intentional-looking
+disclosure sit in an unread file while a green guard asserted no configuration
+could re-enable it.** The guard was not wrong. **It was answering a question
+about three files while wearing the name of a question about the crate.**
