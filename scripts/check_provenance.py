@@ -54,6 +54,19 @@ PROVENANCE_JS = "examples/serving-dashboard/telemetry-provenance.js"
 # are added; do not lower it to make a red go away.
 MIN_ENTRIES = 36
 
+# Vacuity floor. A checker that finds nothing to check must fail, not pass.
+#
+# This is not a hypothetical either: breaking the quote matcher so it matched
+# nothing made this script print "0 quotations verified against source" and
+# then "all provenance quotations still occur in the source they cite" and exit
+# 0. Both sentences were true and the conjunction was worthless. A checker with
+# no input is indistinguishable from a checker with nothing wrong, and it gets
+# MORE trusted with every green run because nobody re-reads a passing tool.
+#
+# We have spent this session asking whether checks catch a bad value and never
+# whether they notice they have nothing to look at.
+MIN_QUOTES_CHECKED = 8
+
 # Entries whose absence would be most expensive: each one annotates a field
 # that a panel renders, so losing the entry silently promotes an unmeasured
 # number to an unlabelled one.
@@ -151,20 +164,28 @@ def check(repo: Path) -> tuple[list[str], dict]:
             cache[rel] = normalise(path.read_text(errors="replace"))
         haystack = cache[rel]
 
-        for quote in BACKTICKED.findall(evidence):
-            q = normalise(quote)
-            # Skip bare identifiers: they are prose references, not quotations
-            # of a source line, and demanding they appear verbatim would flag
-            # correct English. A phrase is not a claim.
-            if len(q) < 8 or not re.search(r"[:(=]", q):
-                continue
-            stats["quotes_checked"] += 1
-            if q not in haystack:
-                failures.append(
-                    f"{key}: provenance quotes `{quote}` as coming from {rel}, "
-                    f"but that text is no longer in the file. The record may be "
-                    f"describing behaviour the source no longer has."
-                )
+        # A `reason` is shown to a VISITOR to explain why a number is absent, so
+        # it is an assertion about the system exactly as much as the evidence is
+        # -- and it is the least audited prose we produce, because a reader
+        # treats it as an apology rather than as a claim. A wrong number gets
+        # challenged; a wrong explanation gets sympathy. So any source text it
+        # quotes is held to the identical standard.
+        for field_name in ("evidence", "reason"):
+            text = e[field_name]
+            for quote in BACKTICKED.findall(text):
+                q = normalise(quote)
+                # Skip bare identifiers: they are prose references, not
+                # quotations of a source line, and demanding they appear
+                # verbatim would flag correct English. A phrase is not a claim.
+                if len(q) < 8 or not re.search(r"[:(=]", q):
+                    continue
+                stats["quotes_checked"] += 1
+                if q not in haystack:
+                    failures.append(
+                        f"{key}: the {field_name} quotes `{quote}` as coming from "
+                        f"{rel}, but that text is no longer in the file. The record "
+                        f"may be describing behaviour the source no longer has."
+                    )
 
         # Directional guard: an entry classified as never-measured must not be
         # describing a field the source now computes for real. This is the
@@ -177,6 +198,14 @@ def check(repo: Path) -> tuple[list[str], dict]:
                     f"evidence quotes a non-stub value `{field.group(1)}: {field.group(2)}`"
                 )
 
+    if stats["quotes_checked"] < MIN_QUOTES_CHECKED:
+        failures.append(
+            f"only {stats['quotes_checked']} quotation(s) were checked, floor is "
+            f"{MIN_QUOTES_CHECKED}. The checker found almost nothing to verify, "
+            f"which means its matcher is broken or the evidence stopped quoting "
+            f"source -- not that the table is correct. A check with no input is "
+            f"indistinguishable from a check with nothing wrong."
+        )
     return failures, stats
 
 
