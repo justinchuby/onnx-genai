@@ -9,10 +9,72 @@ Every claim below is stamped with the short HEAD it was verified at, read via
 The tree moved under us repeatedly while this was written, which is why the
 stamps differ between sections. A stamp makes a claim **dated, not true**.
 
-Verify in the worktree whose `git rev-parse --show-toplevel` ends in
-`onnx-genai-demo`. Several sibling checkouts of this repo exist on the build
-box and do not contain `examples/serving-dashboard` at all; a check run in one
-of those reports every file in this demo as absent.
+---
+
+## 0. Stand in the right worktree, or every answer below is wrong
+
+Everything in this document refers to one checkout:
+
+```
+/Users/justinc/Documents/GitHub/onnx-genai-demo      branch: feat/genai-demo-dashboard
+```
+
+**More than one checkout of this repository exists on the build box.** They are
+registered git worktrees on unrelated branches, each with its own
+`crates/onnx-genai-server/src/lib.rs` at different contents. One of them is
+parked on an older commit and does not contain `examples/serving-dashboard`
+at all.
+
+This matters more than it sounds. A command run in the wrong checkout does not
+error — it answers, confidently, in the correct format, about a different
+universe. A parked checkout produced false negatives for five separate people
+in one evening, and each command looked clean and well-formed. Some of those
+answers were false *positives*: the parked tree still contains files that were
+deleted here.
+
+Put this at the top of any command block before you trust its output:
+
+```bash
+git rev-parse --abbrev-ref HEAD    # must print: feat/genai-demo-dashboard
+```
+
+Two more command shapes that silently re-anchor to wherever you are standing:
+
+- `git diff <sha>..HEAD` — in a checkout parked at `<sha>` this diffs a commit
+  against itself and returns a clean, confident, reassuring **empty**. Name both
+  endpoints instead: `git diff <sha> <branch> -- <paths>`.
+- Existence checks. `ls` and bare `grep` answer about a directory. `git ls-files
+  <path>` answers about the repository, and survives being run in the wrong one.
+
+## 0a. Cite symbols, not line numbers
+
+Every instruction passed around this session that carried a **line number**
+regenerated — several of them four to eight times, each honest when written.
+Every instruction that carried a **symbol name** landed once and stayed.
+
+This document is the longest-lived thing we are producing, so it is where
+position-addressing rots fastest. Where a line number survives below, treat the
+**symbol as authoritative and the number as a hint**. If they disagree, the
+number is stale. Section 2 prints the `grep -n` that regenerates its own
+citations for exactly this reason.
+
+The same rule applies to counts. Do not quote the length of the specification,
+the number of acceptance criteria, or a test tally you read in a message. The
+spec is a file; read the file. Thirteen different acceptance-criteria counts
+circulated as fact in one evening, every one of them honest when taken.
+
+The specification is **append-only**, so identifiers are stable even though
+ranges are not: cite `AC52`, never "the last ten ACs."
+
+## 0b. A sha does not identify what you tested
+
+Recording the sha is necessary and not sufficient. Six consecutive runs of the
+JavaScript suite at one fixed HEAD, minutes apart, produced three different
+results — not flakiness, but uncommitted work appearing and disappearing in a
+shared working tree.
+
+Quote `git status --porcelain` alongside the sha, or you have dated a claim
+without identifying its subject.
 
 ---
 
@@ -446,3 +508,120 @@ the same token is correct for the script and rejected by the binary.
 Pass `--demo-assets-dir` as an **absolute** path — its default is relative, so
 a bare launch serves a healthy API with a dead `/demo` from any other
 directory.
+
+---
+
+## 8. Six things we learned building this, in the order they will bite you
+
+### 8.1 The commit log will tell you the opposite of the truth in at least four places
+
+**Read diffstats. Never read subjects.** Commit subjects misdescribed their own
+contents repeatedly in this session, and the reviewers most likely to be misled
+are the careful ones reconstructing history from `git log --oneline`.
+
+The clearest specimen, reproducible today:
+
+```
+$ git log -1 --format='%h %s' 54d8ba5a
+54d8ba5a docs(demo): state the five field states plainly, dropping the hedge
+
+$ git show --stat 54d8ba5a
+ crates/onnx-genai-server/src/cors.rs | 212 -----------------------------
+ examples/serving-dashboard/README.md |   7 +-
+ 2 files changed, 5 insertions(+), 214 deletions(-)
+```
+
+A commit announcing itself as a documentation wording change deleted a
+212-line router-wired Rust module and its tests. Another commit describing a
+docstring fix carried several hundred insertions of Rust KV telemetry across
+two crates.
+
+The mechanism was `git add -A` in a worktree shared by several people: it
+sweeps whatever is in the index, so **the commit message and the diff can come
+from two different authors**. Nobody mislabelled anything; the label was applied
+by someone who never saw the change.
+
+Two consequences for you. Searching the log for a feature by name will fail
+even when the change is present — a deleted file's history needs
+`git log --diff-filter=D -- <path>`, which you would only run if you already
+suspected the answer. And a bisect will land you on a docs commit.
+
+### 8.2 Run the thing; do not test for the artefact
+
+The single highest-yield habit here. One module import settled in about a second
+a question that filesystem checks got wrong in *both* directions across an hour:
+
+```bash
+node -e "import('./telemetry-field.js').then(m => console.log(m.FIELD_STATES))"
+```
+
+Grep was wrong in both directions because the file contains comments *about* an
+old bug, quoting the very strings being searched for. Executing the module reads
+what the program reads.
+
+The general failure: an existence check answers a question next to the one you
+asked. A file can exist and never be requested by the page. A stylesheet can be
+present and unlinked. A health probe can return success from **someone else's
+server on the same port** while yours is dead.
+
+### 8.3 Prove the mutation landed
+
+A check that has never been seen red is indistinguishable from a check that
+cannot fail — both produce a green line. So break it deliberately, watch it
+fail, restore, and **state the mutation you applied**.
+
+Extend this to the checker itself. An audit that silently under-matches returns
+a clean bill of health, which is the one failure mode an audit must not have and
+the one that looks exactly like success. Run a positive control before believing
+any zero: search for something you know is present, and confirm the tool reaches
+the files at all.
+
+### 8.4 Nothing here enforces prose
+
+Our tests cover code, field names and wire values. They do not cover design
+specs, READMEs, meta tags, doc comments, commit subjects, or approvals given in
+conversation — and prose is where the last of the false claims were found,
+because it names features in plain English rather than as identifiers.
+
+Doc comments are the sharpest case: they sit inside source files and inherit the
+authority of code while being unable to fail. One comment reading *"the engine
+does not yet expose KV page statistics"* was false when written and caused work
+to be **skipped** rather than merely misread. Nobody audits the absence of code.
+
+When you check a corrected fact, grep the **shipping copy** — the page, the
+README, the strings a visitor sees — and the tests that quote it. A correction
+that lands where the argument happened, rather than where the text ships, leaves
+the only sentence a human reads still wrong.
+
+### 8.5 Fabricated doubt is as serious as fabricated confidence
+
+Every honesty mechanism in this project points one way: it guards against
+claiming a capability we lack. Nothing guarded against overclaiming that
+something is **absent**, and a strong false negative walked into the lead of our
+own honesty document unchallenged.
+
+Nobody argues with the person claiming less, so conservative errors receive a
+fraction of the scrutiny — and they cost the same credibility. An expert who
+greps a symbol, finds it wired with a test asserting its counter rises, and then
+reads "so this never happens" concludes we did not read our own code, in the one
+sentence whose whole job is proving that we did.
+
+Correcting an overclaim by installing the opposite underclaim is the same error
+with the sign flipped, and it is harder to spot because it sounds modest.
+
+### 8.6 A measurement is a claim about a binary, and binaries do not expire loudly
+
+Two people independently measured a working feature, correctly, from a binary
+built during the four minutes that feature existed in the tree. The results were
+real. The subject was gone.
+
+So when you report a runtime result, **cite the commit you built, not the time
+you built it**. This has one consequence worth stating plainly, because it is the
+place it would do the most damage: a performance comparison whose "after" arm was
+built before the instrumentation landed returns a genuine, arithmetically
+correct, beautifully tight **0% overhead** — the answer everyone is hoping for,
+which is why nobody would question it.
+
+The same applies to observations of a running system. A dashboard checked at rest
+is checked in the one state where several defects are invisible; peak-zero — zero
+at maximum load, not zero at idle — is the observation that finds them.
