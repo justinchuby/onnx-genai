@@ -264,6 +264,21 @@ export function renderField(field, options = {}) {
         text: 'n/a',
         attrs: { 'aria-hidden': 'true' },
       }),
+      // THE ONLY STATE WHOSE EXPLANATION RENDERS ON SCREEN RATHER THAN BEHIND
+      // A HOVER (demo-ux.md §17). Every other state can afford a tooltip; this
+      // one cannot, for two reasons.
+      //
+      // First, a fact nobody hovers over is a fact nobody learns, and this is
+      // the fact the demo most wants read: that continuous batching and the
+      // paged KV cache are mutually exclusive execution paths. Behind a hover
+      // it is invisible in a screenshot, on a projector, and on touch.
+      //
+      // Second, `n/a` alone is INDISTINGUISHABLE FROM A BROKEN PANEL. Under
+      // two servers this state is the NORMAL case, not the exception, so a
+      // visitor's first run would otherwise show a dashboard half-covered in
+      // apparent breakage — rendering our single most interesting finding as
+      // a bug.
+      element('span', { className: 'value__na-caption', text: reason }),
     );
     return wrapper;
   }

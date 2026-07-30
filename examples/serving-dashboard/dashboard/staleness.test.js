@@ -256,7 +256,20 @@ describe('AC43 — "not applicable" is not "unavailable"', () => {
 
     const node = renderField(field, { label: 'KV pages used' });
     assert.equal(node.getAttribute('data-state'), 'not-applicable');
-    assert.equal(node.textContent, 'n/a');
+    assert.match(node.textContent, /^n\/a/);
+
+    // THE REASON MUST BE ON SCREEN, NOT BEHIND A HOVER (demo-ux.md §17).
+    // A bare `n/a` is indistinguishable from a broken panel, and under two
+    // servers this state is the NORMAL case rather than the exception — so
+    // hiding the explanation renders the demo's single most interesting
+    // finding as a dashboard half-covered in apparent breakage. A fact nobody
+    // hovers over is also a fact nobody learns: it is invisible in a
+    // screenshot, on a projector, and on touch.
+    assert.match(
+      node.textContent,
+      /never touches engine\.kv_cache/,
+      'the not-applicable explanation must render on screen, not only in a tooltip',
+    );
     assert.match(node.getAttribute('aria-label'), /not applicable here/);
     assert.match(node.getAttribute('aria-label'), /never touches engine\.kv_cache/);
     assert.doesNotMatch(

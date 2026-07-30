@@ -899,8 +899,21 @@
    "still loading" is exactly the misunderstanding the demo exists to correct.
    ───────────────────────────────────────────────────────────────────────────*/
 
+.value[data-state='not-applicable'] {
+  /* The caption sits BELOW the glyph, so this one state wraps. Everything else
+     stays on a single baseline. */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--og-space-1);
+}
+
 .value__num--not-applicable {
-  color: var(--og-unavail-fg);
+  /* --og-na-*, NOT --og-unavail-*. The na set is deliberately BRIGHTER: an
+     unavailable value is our gap and reads apologetically, whereas this is an
+     architectural fact and a teaching surface. Same colour for both would
+     merge the two most important messages on the page into one. */
+  color: var(--og-na-fg);
   font-family: var(--og-font-ui);
   font-size: var(--og-type-2xs);
   letter-spacing: var(--og-tracking-caps);
@@ -908,6 +921,27 @@
   /* No dashed rule: unlike the em-dash, "n/a" is already legible as a
      deliberate statement rather than a missing glyph. */
   border-bottom: none;
+}
+
+/* The on-screen explanation. This is the ONLY state whose reason is rendered
+   rather than hidden behind a `title`, and that is deliberate: a fact nobody
+   hovers over is a fact nobody learns, and this is the fact the demo most
+   wants read. A tooltip is also invisible in a screenshot, on a projector and
+   on touch — i.e. in every way this demo is actually shown.
+
+   It is NOT dimmed to the level of a footnote. Under two servers this state is
+   the normal case, not an exception, so a whisper here reads as a page full of
+   broken panels. */
+.value__na-caption {
+  color: var(--og-na-note);
+  font-family: var(--og-font-ui);
+  font-size: var(--og-type-2xs);
+  line-height: var(--og-leading-body);
+  max-width: 34ch;
+  text-transform: none;
+  letter-spacing: normal;
+  border-left: 2px solid var(--og-na-rule);
+  padding-left: var(--og-space-2);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────

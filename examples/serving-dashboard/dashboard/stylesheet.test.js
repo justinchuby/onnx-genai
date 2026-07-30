@@ -203,6 +203,16 @@ function barrenStore() {
   return createFakeStore({ requests: [] });
 }
 
+/**
+ * Remove CSS comments so a lint reads declarations rather than prose.
+ *
+ * @param {string} source
+ * @returns {string}
+ */
+function stripCssComments(source) {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
 describe('stylesheet contract', () => {
   it('exercises every field path the panels actually request', () => {
     // The class-coverage tests below are only meaningful if the fixture drives
@@ -285,8 +295,20 @@ describe('stylesheet contract', () => {
     // `--og-value-slot` is deliberately undefined: demo-ux.md §4.1 introduces it
     // with a `5ch` fallback so a panel can widen a reserved slot locally without
     // the designer having to anticipate every value width.
+    // Scan only what the BROWSER parses. This file's comments discuss token
+    // FAMILIES as prose ("the --og-na-* set"), and a raw scan reads those as
+    // literal token names, so the lint fails naming tokens nobody wrote. That
+    // false positive is worse than no lint: the fix that makes it pass is to
+    // reword a comment, which teaches everyone to treat it as noise, and the
+    // next real invented token gets waved through with it.
+    const styleSource = stripCssComments(css);
     const declared = new Set(
-      [...css.matchAll(/--og-[a-z0-9-]+/g)].map((match) => match[0]),
+      // Case-INSENSITIVE on purpose. A lowercase-only scan still fails on an
+      // uppercase typo, but it truncates the name at the first bad character
+      // and reports "--og-na-" — sending the reader hunting a token that is
+      // fine. An error message that names the wrong thing is worse than a
+      // terse one, because it is confidently wrong.
+      [...styleSource.matchAll(/var\(\s*(--og-[a-z0-9-]+)/gi)].map((match) => match[1]),
     );
     assert.ok(declared.size > 30, 'expected the stylesheet to actually use tokens');
 
