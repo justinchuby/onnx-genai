@@ -181,10 +181,50 @@ test('the prefix-cache counters are not certified as measured on the batching se
 // rots, and a rendered table is where it rots unseen: a visitor cannot
 // re-resolve it, and unlike a code comment nobody re-reads it against the tree.
 
-/** The render-time citation transform, applied by app.js to every evidence cell. */
+// app.js is a browser entry with load-time side effects, so it cannot be
+// imported here. The previous version of this file coped by COPYING the
+// transform's regex, which made this suite a second implementation of the
+// thing it audits: deleting `rs` from the shipped regex left every `.rs:511`
+// citation rendering its line number to a visitor and all 8 tests still
+// passed, because they were exercising the copy. So the pattern is LIFTED
+// from app.js's source text instead. It cannot drift, because there is only
+// one of it.
+const SHIPPED_STRIPPER = (() => {
+  // Anchored on the trailing `, '$1')` rather than on the closing delimiter:
+  // the pattern contains an unescaped `/` inside its own character class, so a
+  // non-greedy scan to the first `/` truncates it into an invalid expression.
+  const match = appSource.match(/evidence\s*\.replace\(\s*\/(.+)\/([gimsuy]*)\s*,\s*'\$1'\)/);
+  assert.ok(
+    match,
+    'Could not locate the citation stripper in app.js. This assertion is the ' +
+      'non-vacuity guard for every citation test below: if the transform is ' +
+      'renamed or restructured, they must fail loudly rather than silently ' +
+      'auditing a regex that no longer ships.',
+  );
+  try {
+    return new RegExp(match[1], match[2] || '');
+  } catch (cause) {
+    throw new Error(
+      `Extracted an unusable pattern from app.js: /${match[1]}/${match[2]}. ` +
+        'The extractor, not the shipped transform, is what needs fixing here.',
+      { cause },
+    );
+  }
+})();
+
+/** The render-time citation transform, as app.js actually ships it. */
 function citationForVisitor(evidence) {
-  return evidence.replace(/([A-Za-z0-9_\-/.]+\.(?:rs|js|toml|md)):\d+(?:-\d+)?/g, '$1');
+  return evidence.replace(SHIPPED_STRIPPER, '$1');
 }
+
+// Deliberately NOT the stripper's extension list. A detector built from the
+// same assumption as the thing it checks is blind in exactly the same place:
+// the stripper knows rs|js|toml|md, so a `build_qwen.sh:99` citation — a form
+// this repository actually uses — would sail past both and reach the visitor
+// with the test still green. This matches any file-looking token followed by a
+// line number, which makes it strictly stronger than the stripper: a citation
+// in a NEW extension now goes red instead of shipping.
+const ANY_FILE_AND_LINE = /[A-Za-z0-9_\-/.]+\.[A-Za-z]{1,6}:\d+/;
 
 test('no source citation reaches a visitor with a line number', () => {
   const offenders = [];
@@ -193,7 +233,7 @@ test('no source citation reaches a visitor with a line number', () => {
       const { evidence } = resolveForOrigin(PROVENANCE[key], origin);
       if (!evidence) continue;
       const rendered = citationForVisitor(evidence);
-      if (/\.(?:rs|js|toml|md):\d/.test(rendered)) offenders.push(`${key} @ ${origin ?? 'base'}`);
+      if (ANY_FILE_AND_LINE.test(rendered)) offenders.push(`${key} @ ${origin ?? 'base'}`);
     }
   }
   assert.deepEqual(
@@ -217,6 +257,28 @@ test('stripping a line number keeps the file and the prose', () => {
   assert.match(rendered, /hits\/lookups, but emits 0\.0\./);
   assert.ok(!rendered.includes(':126-130'), 'the volatile range should be gone');
   assert.equal(citationForVisitor('a rate of 0.9375 and 12 hits'), 'a rate of 0.9375 and 12 hits');
+});
+
+test('the citation detector is stronger than the stripper, not equal to it', () => {
+  // The control that makes the sweep above worth running. The stripper knows
+  // four extensions; the detector must not, or the two share a blind spot and
+  // the sweep reports green on exactly the citations nobody thought to handle.
+  // `.sh` is not hypothetical here: build_qwen.sh:99 is cited by name in this
+  // repository's own gate discussion.
+  for (const unknown of ['build_qwen.sh:99', 'gen.py:12', 'capture.mjs:7', 'cfg.yaml:3']) {
+    const rendered = citationForVisitor(`see ${unknown}`);
+    assert.equal(rendered, `see ${unknown}`, `${unknown} is outside the stripper's extension set`);
+    assert.ok(
+      ANY_FILE_AND_LINE.test(rendered),
+      `A ${unknown} citation would reach a visitor unstripped and this sweep ` +
+        'would call it green. Widen the stripper in app.js, not this detector.',
+    );
+  }
+
+  // And it must still not fire on the prose the register is made of, or the
+  // sweep becomes unpassable and someone will weaken it back.
+  assert.ok(!ANY_FILE_AND_LINE.test('a rate of 0.9375 and 12 hits'));
+  assert.ok(!ANY_FILE_AND_LINE.test('hits/lookups, but emits 0.0.'));
 });
 
 test('app.js applies the citation transform rather than the raw evidence', () => {
