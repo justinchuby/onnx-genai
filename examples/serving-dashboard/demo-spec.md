@@ -2218,3 +2218,29 @@ This answers why the 9 unresolvable citations in this document survived unnotice
 **The rule:** **we guard the artifact that is easiest to guard, not the one whose rot costs most.** That is the default outcome every time, because a corpus is chosen once, silently, by whoever wrote the guard — and nothing afterwards ever asks what it excluded.
 
 **Acceptance:** the citation guard's corpus must be widened to every rank-1 and rank-2 document. **Expect it to go red on this file.** A guard that goes red on the spec is the guard working, and an exemption granted to the document that defines the quality bar is the worst possible place to grant one.
+
+### AC206 — `server.execution_provider` is NOT the `model_path` case. Do not delete it.
+
+@1cb42f0e's sweep correctly found that `server.execution_provider` shares the `model_path` **profile**: string-typed, classified `NOT_PLUMBED`, bound to a live surface. They declined to act and escalated it as a product call. The escalation was right. **The answer is the opposite one, and the reason is the whole ruling.**
+
+```
+BOUND AT           system.js:90 · system.js:286 · ui/model-card.js:26
+CONTROL            server.model_id, identical form → 3 files ✅
+VALUE VOCABULARY   "CPUExecutionProvider" · "CUDAExecutionProvider" · "CoreML…"
+                   ⬅ A CLOSED SET OF PUBLIC CONSTANTS. NOT OPERATOR DATA.
+IN .json CAPTURES  9      NEG CONTROL 'zzqq_field' → 0 ✅
+```
+
+**Why `model_path` had to go and this must stay: they fail different tests.**
+
+The model directory was **true, useless to the audience, and harmful to the operator** — an absolute home path that names a human being. It failed on *harm*, and harm is not negotiable against usefulness.
+
+The execution provider is **true, harmless, and the single most interpretively load-bearing field on the card**. It is the fact that tells a viewer how to read every latency number on the page. Delete it and the throughput figures become unanchored — the same defect AC201 names, arriving by subtraction instead of by mislabelling.
+
+**The rule: a field's disposition is decided by what its VALUE is, never by which defect profile it resembles.** `model_path` and `execution_provider` are the same *shape* — string, unplumbed, rendered — and opposite *cases*. A sweep keyed on shape will always propose the same remedy for both, and **for exactly one of them that remedy is a regression.**
+
+**What IS wrong here is the mechanism, and it should be fixed as a mechanism:** a stale-provenance branch that can promote a never-verified value to `state='measured'`. That is a defect in the promotion path, not a reason to remove a meaningful field. **Fix the branch; keep the fact.**
+
+**One correction to the filing, measured:** `execution_provider` appears in **9** JSON captures with a live negative control. The `NOT_PLUMBED` classification may itself be stale. Anyone acting on this must re-derive the classification first — **acting on a stale label is how the last four hours were spent.**
+
+**And the sweep's own finding is worth more than its proposal, so it is recorded here:** a filter scoped to *what the wire carries today* would have exempted `server.model_path` itself, because arrival is precisely when the catalogue is stale. **A guard scoped to today's wire is blind by construction to every future instance of the defect it was written for.**
