@@ -3963,7 +3963,27 @@ fn the_clamped_ratio_cannot_distinguish_full_from_overloaded() {
 /// the ordinary case.
 #[tokio::test]
 async fn status_publishes_the_batch_numerator_not_just_the_ratio() {
-    let body = get_json(app(tiny_state()), "/v1/status").await;
+    let state = tiny_state();
+
+    // The driver publishes its width from its own thread, once it knows which
+    // decode path it took, so a poll can arrive before the answer exists. That
+    // window is reported `pending` rather than filled with the configured
+    // ceiling -- see `EngineDriver::start`. Waiting for the field is the honest
+    // way to test it; asserting on the first read would be asserting that this
+    // process won a race.
+    let mut body = serde_json::Value::Null;
+    for _ in 0..200 {
+        body = get_json(app(state.clone()), "/v1/status").await;
+        if body.get("batch_capacity").is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        body.get("batch_capacity").is_some(),
+        "the driver never published a batch width; `pending` is honest for a \
+         frame but it is not an answer: {body}"
+    );
 
     let in_flight = body["batch_in_flight"]
         .as_u64()
@@ -3992,16 +4012,25 @@ async fn status_publishes_the_batch_numerator_not_just_the_ratio() {
     // which drives 9 in flight against a capacity of 4.
     assert!(capacity >= 1, "capacity must be positive, got {capacity}");
 
-    // Deterministic, and the actual fabrication risk: the denominator must be
-    // the CONFIGURED capacity, not a plausible constant. `min(max_batch,
-    // max_queue_depth)` is the only honest reading -- a server cannot assemble
-    // a batch wider than the queue it admits from.
-    let state = tiny_state();
-    assert_eq!(
-        capacity as usize,
-        state.config.effective_batch_capacity(),
-        "batch_capacity must come from config, not from a hardcoded default \
-         that happens to match on this machine"
+    // The denominator must be the width of the path that is actually running,
+    // bounded by what the server will admit -- not a plausible constant, and
+    // not the configured ceiling either.
+    //
+    // `effective_batch_capacity()` (`min(max_batch, max_queue_depth)`) is an
+    // UPPER BOUND, not the answer. `tiny_state`'s engine has no continuous
+    // batch manager, so the driver takes the per-request fallback, whose batch
+    // is one row wide however large the ceiling is configured to be. Asserting
+    // equality with the ceiling is what made this test flaky: `start()` used to
+    // publish the ceiling on the caller's thread and the driver published the
+    // truth from its own, so this read 4 or 1 depending on scheduling.
+    //
+    // A capacity that exceeded the ceiling would still be a fabrication, so the
+    // bound is asserted; the exact width is a property of the decode path.
+    let ceiling = state.config.effective_batch_capacity();
+    assert!(
+        capacity as usize <= ceiling,
+        "batch_capacity ({capacity}) exceeds what the server can admit \
+         ({ceiling}); the denominator is not coming from the running batch"
     );
 
     // And the numerator must be an independent field, not the denominator

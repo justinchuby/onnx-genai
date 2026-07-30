@@ -131,20 +131,47 @@ impl EngineDriver {
         // Taken BEFORE the engine moves to the driver thread: this is the only
         // point at which the server can still touch it.
         let governor = Some(engine.governor_handle());
+        // Decided BEFORE the engine moves, on the caller's thread, for the same
+        // reason the governor handle is taken here: it is the last point at
+        // which the server can still ask the engine anything. Deciding it here
+        // means the width published below is the width that will actually run,
+        // so there is one publisher and one decision rather than a fast wrong
+        // answer racing a slow right one.
+        let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
         let owner = EngineOwner(EngineBackend::Single(Box::new(engine)));
         let kv_telemetry = Arc::new(KvTelemetry::default());
         let driver_telemetry = Arc::clone(&kv_telemetry);
         let batch_telemetry = Arc::new(BatchTelemetry::default());
-        // Published here, on the caller's thread, rather than from the driver
-        // loop. The width is already known at construction, and publishing it
-        // from the spawned thread would race the first `/v1/status`: the
-        // fields would be present or absent depending on scheduling, which is
-        // the same class of defect as a test that races driver startup.
-        batch_telemetry.publish(0, 0, max_batch);
+        // `max_batch` is the configured CEILING, not the width this driver will
+        // run at: the per-request fallback is one row wide however large the
+        // ceiling is. Publishing the ceiling here while the driver thread
+        // published the truth made `/v1/status` return 4 or 1 depending on
+        // scheduling -- a capacity published before the decode path is known is
+        // a guess wearing a measurement's name.
+        //
+        // Publishing synchronously is still right: an absent field costs every
+        // reader a `pending` frame. What was wrong was publishing a value we
+        // had not yet earned. Now the path is known first, so the field is both
+        // immediate and true.
+        let published_capacity = if continuous_batch_supported {
+            max_batch
+        } else {
+            1
+        };
+        batch_telemetry.publish(0, 0, published_capacity);
         let driver_batch = Arc::clone(&batch_telemetry);
         thread::Builder::new()
             .name("onnx-genai-batch-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, max_batch, driver_telemetry, driver_batch))
+            .spawn(move || {
+                run_engine_driver(
+                    owner,
+                    rx,
+                    max_batch,
+                    continuous_batch_supported,
+                    driver_telemetry,
+                    driver_batch,
+                )
+            })
             .expect("failed to spawn onnx-genai engine driver");
         Self {
             commands,
@@ -213,13 +240,16 @@ impl EngineDriver {
         let kv_telemetry = Arc::new(KvTelemetry::default());
         let driver_telemetry = Arc::clone(&kv_telemetry);
         let batch_telemetry = Arc::new(BatchTelemetry::default());
-        // Pipeline engines run one generation at a time; their batch is one
-        // row wide by construction.
+        // A pipeline runs one generation at a time, so its batch is one row
+        // wide BY CONSTRUCTION -- nothing needs to be asked of the engine and
+        // no decode path has to be chosen first. Published synchronously, on
+        // the caller's thread, so the field is never absent, and published only
+        // here so there is exactly one publisher of this pool's width.
         batch_telemetry.publish(0, 0, 1);
         let driver_batch = Arc::clone(&batch_telemetry);
         thread::Builder::new()
             .name("onnx-genai-pipeline-driver".to_string())
-            .spawn(move || run_engine_driver(owner, rx, 1, driver_telemetry, driver_batch))
+            .spawn(move || run_engine_driver(owner, rx, 1, false, driver_telemetry, driver_batch))
             .expect("failed to spawn onnx-genai pipeline driver");
         Self {
             commands,
@@ -584,6 +614,11 @@ fn run_engine_driver(
     owner: EngineOwner,
     rx: mpsc::Receiver<DriverCommand>,
     max_batch: usize,
+    // Decided by the caller, before the engine moved, and already published as
+    // the batch width. Passed rather than recomputed: two evaluations of the
+    // same predicate is a divergence waiting to happen, and the published
+    // capacity would be the thing that diverged.
+    continuous_batch_supported: bool,
     kv_telemetry: Arc<KvTelemetry>,
     batch_telemetry: Arc<BatchTelemetry>,
 ) {
@@ -600,7 +635,6 @@ fn run_engine_driver(
             return;
         }
     };
-    let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
 
     // Attach either way. The pool's capacity is a real number even when the
     // mechanism is inactive; what must not be guessed is whether it will move.
