@@ -1134,26 +1134,111 @@ test('a superseded slow response cannot publish or poison cadence reuse after st
 
     clock = 2_000;
     await store.pollOnce();
-    const afterNew = store.field('server.context_length').value;
+    const afterNew = store.field('server.context_length');
 
     clock = 3_000;
     releaseOldConfig(jsonResponse(200, configBody(111)));
     await new Promise((resolve) => setImmediate(resolve));
-    const afterOld = store.field('server.context_length').value;
+    const afterOld = store.field('server.context_length');
 
     clock = 3_001;
     await store.pollOnce();
-    const afterCadenceReuse = store.field('server.context_length').value;
+    const afterCadenceReuse = store.field('server.context_length');
 
+    assert.equal(afterNew.state, FIELD_STATES.MEASURED);
+    assert.equal(afterOld.state, FIELD_STATES.MEASURED);
+    assert.equal(afterCadenceReuse.state, FIELD_STATES.MEASURED);
     assert.deepEqual(
-      { afterNew, afterOld, afterCadenceReuse, configRequests },
+      {
+        afterNew: afterNew.value,
+        afterOld: afterOld.value,
+        afterCadenceReuse: afterCadenceReuse.value,
+        configRequests,
+      },
       {
         afterNew: 222,
         afterOld: 222,
         afterCadenceReuse: 222,
         configRequests: 2,
       },
-      'superseded DEBUG_CONFIG content published or replaced the newer cadence cache',
+      'superseded DEBUG_CONFIG content published or replaced the newer cadence cache: ' +
+        `${afterNew.value}@${afterNew.observedAtMs} -> ` +
+        `${afterOld.value}@${afterOld.observedAtMs} -> ` +
+        `${afterCadenceReuse.value}@${afterCadenceReuse.observedAtMs}`,
+    );
+  } finally {
+    store.stop();
+  }
+});
+
+test('a superseded slow response cannot rewind during steady-state overlap', async () => {
+  let clock = 1_000;
+  let configRequests = 0;
+  let releaseOldConfig;
+  let markOldConfigStarted;
+  const oldConfigStarted = new Promise((resolve) => {
+    markOldConfigStarted = resolve;
+  });
+  const oldConfigResponse = new Promise((resolve) => {
+    releaseOldConfig = resolve;
+  });
+  const routes = healthyRoutes();
+  const configBody = (modelMaxContext) => ({
+    node_id: 'node-0',
+    pipeline: false,
+    max_batch_size: 8,
+    max_output_tokens: 512,
+    max_sessions: 256,
+    max_queue_depth: 64,
+    model_max_context: modelMaxContext,
+  });
+  const store = createTelemetryStore({
+    baseUrl: BASE_URL,
+    pollIntervalMs: 60_000,
+    now: () => clock,
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname;
+      if (path !== ENDPOINTS.DEBUG_CONFIG) {
+        return fakeFetch(routes)(url);
+      }
+      configRequests += 1;
+      if (configRequests === 1) {
+        markOldConfigStarted();
+        return oldConfigResponse;
+      }
+      return jsonResponse(200, configBody(222));
+    },
+  });
+
+  try {
+    store.start();
+    await oldConfigStarted;
+
+    clock = 2_000;
+    await store.pollOnce();
+    const afterNew = store.field('server.context_length');
+
+    clock = 3_000;
+    releaseOldConfig(jsonResponse(200, configBody(111)));
+    await new Promise((resolve) => setImmediate(resolve));
+    const afterOld = store.field('server.context_length');
+
+    assert.equal(afterNew.state, FIELD_STATES.MEASURED);
+    assert.equal(afterOld.state, FIELD_STATES.MEASURED);
+    assert.deepEqual(
+      {
+        afterNew: afterNew.value,
+        afterOld: afterOld.value,
+        configRequests,
+      },
+      {
+        afterNew: 222,
+        afterOld: 222,
+        configRequests: 2,
+      },
+      'superseded steady-state DEBUG_CONFIG content published: ' +
+        `${afterNew.value}@${afterNew.observedAtMs} -> ` +
+        `${afterOld.value}@${afterOld.observedAtMs}`,
     );
   } finally {
     store.stop();
