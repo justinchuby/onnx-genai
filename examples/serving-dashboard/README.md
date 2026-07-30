@@ -220,8 +220,8 @@ places:
 
 | path | handler | borrow | behaviour |
 |---|---|---|---|
-| batching (`:8123`) | `driver.rs:678` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
-| dynamic (`:8124`) | `driver.rs:755` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
+| batching (`:8123`) | `driver.rs:717` `handle_or_defer_during_batch` | **`&Engine`** — shared | answered **inline, during the batch loop**. Fixed. |
+| dynamic (`:8124`) | `driver.rs:794` `handle_driver_command` | **`&mut Engine`** — exclusive | generation runs inline under the borrow, so the command channel is not serviced until it finishes. **Still stalls.** |
 
 The shared-vs-exclusive borrow *is* the fix — nothing else differs.
 
@@ -533,40 +533,68 @@ denominator's. **That is the two-server ruling paying for itself in a place
 nobody chose it for**, and it is worth noticing that the guarantee comes from
 the process boundary rather than from anyone remembering this caveat.
 
-**What the numbers looked like on one machine.** Measured on this repository
-before the dashboard existed, CPU execution provider, `qwen2.5-0.5b-scatter-v2`,
-512-token generations, median of 15 iterations:
+**What the numbers looked like on one machine.** Full method, raw per-run
+values, hardware, binary and model SHA-256s, and the git state at capture are in
+[`perf-baseline.md`](perf-baseline.md) — measured on this repository before the
+dashboard existed, CPU execution provider, `qwen2.5-0.5b-scatter-v2`, 512-token
+generations:
 
-| | median | spread |
-|---|---|---|
-| Single request, decode | 33.415 tok/s | CV 1.98 % |
-| 4 concurrent, aggregate decode | 82.130 tok/s | CV 2.93 % |
-| 4 concurrent, wall-clock throughput | 52.506 tok/s | CV 1.93 % |
-| Time to first token | 2141 ms | σ 137 ms |
+| | median | spread | n |
+|---|---|---|---|
+| Single request, decode | 33.415 tok/s | CV 1.98 % | 15 |
+| 4 concurrent, aggregate decode | 82.130 tok/s | CV 2.93 % | **4** |
+| 4 concurrent, wall-clock throughput | 52.506 tok/s | CV 1.93 % | **4** |
+| Time to first token | 2141 ms | σ 137 ms | 15 |
 
-Read that honestly: four concurrent requests produced about **2.46× the
-aggregate decode throughput** of one, while **per-stream throughput fell to
-about 0.62×** of solo (~20.7 tok/s). Batching does not make any single request
-faster — it trades per-stream latency for total throughput. That trade *is* the
-lesson of the scenario, and a demo that showed only the 2.46× would be telling
-you half of it.
+Read that honestly: four concurrent requests produced roughly **2.5×** the
+aggregate decode throughput of one — **95 % CI [2.35, 2.59]** — while
+**per-stream throughput fell to about 0.62×** of solo (~20.7 tok/s). Batching
+does not make any single request faster; it trades per-stream latency for total
+throughput. That trade *is* the lesson of the scenario, and a demo showing only
+the speedup would be telling you half of it.
 
-These are one machine's numbers on a CPU, at a generation length chosen because
-shorter runs were too noisy to be conclusive (at 128 tokens the coefficient of
-variation was 4.95 %, and two runs of an identical binary differed by 1.98 % —
-enough to manufacture a false result). They are **not** a performance claim about
-onnx-genai, and yours will differ. The page measures your machine; that is the
-only number that should persuade you.
+> **Why this says `~2.5×` and not `2.46×`, which is what the raw division
+> gives.** The concurrent arm is **n = 4**, so the interval around that ratio is
+> about **±0.12**. Writing `2.46×` claims the quantity is known to ±0.005 — it is
+> known to ±0.12, and **the third significant figure is arithmetic from the
+> division, not resolution from the data.** The number is not wrong; the
+> *precision* is invented. That is the same defect as rendering a 4-slot batch as
+> `75 %`: **a format is a claim about how finely a quantity can be known**, and
+> here the claim was 24× finer than the measurement.
 
-**How much they differ is itself worth knowing.** The *byte-identical* binary,
-re-run on the *same* machine 75 minutes later, produced **30.151 tok/s instead
-of 33.415 — a 9.8 % drop caused entirely by background load** (a backup running,
-an indexer at 91 % CPU). That is nearly five times the margin anyone would treat
-as a meaningful regression. So a number from this table is not a target to hit,
-and a lower number on your machine is not evidence of anything until you have
-measured the spread. It is also why the demo re-measures rather than shipping a
-recorded baseline: **a stored number is a claim about a machine that no longer
-exists.**
+**Why the ratio survives the noise floor, when a single number would not.** The
+*byte-identical* binary, re-run on the *same* machine 75 minutes later, produced
+**30.151 tok/s instead of 33.415 — a 9.8 % drop caused entirely by background
+load** (a backup running, an indexer at 91 % CPU). That is nearly five times the
+margin anyone would treat as a meaningful regression, and it is why **no absolute
+figure in that table should be treated as reproducible.**
+
+The speedup is a different kind of claim, and it is worth being precise about
+why it is sturdier rather than waving at the same caveat twice:
+
+| | |
+|---|---|
+| what the 9.8 % measures | drift of an **absolute** number **across time**, under changing load |
+| how the two arms here were captured | **within one 20-minute window**, one binary SHA-256, one model SHA-256, clean tree ([`perf-baseline.md`](perf-baseline.md) §4c) |
+| effect size of the speedup | **+147 %** |
+| **effect ÷ noise floor** | **≈ 15×** |
+
+Load that moves both arms together largely cancels in a ratio, and an effect
+fifteen times the drift is not something drift can manufacture. **So the honest
+split is: the speedup is real and roughly two and a half fold; the absolute
+tok/s figures are one machine's afternoon.** Applying the cross-time noise floor
+to the within-window ratio would be **a guard shaped like the incident rather
+than like the fault** — the same error, mirrored, as trusting a single number
+because it came out of a careful-looking table.
+
+These are still one machine's numbers on a CPU, at a generation length chosen
+because shorter runs were too noisy to be conclusive (at 128 tokens the
+coefficient of variation was 4.95 %, and two runs of an identical binary differed
+by 1.98 % — enough to manufacture a false result). They are **not** a performance
+claim about onnx-genai, and yours will differ. The page measures your machine;
+that is the only number that should persuade you. It is also why the demo
+re-measures rather than shipping a recorded baseline: **a stored number is a
+claim about a machine that no longer exists.**
 
 ### Scenario B — paged KV page allocation *(dynamic profile, `:8124`)*
 
@@ -831,7 +859,7 @@ to stage, and every stall you see actually happened.
 
 > **Concurrency is not the lever here, and that is a fact about this runtime
 > rather than a staging preference.** The dynamic server runs generation
-> *inline* on the driver thread (`driver.rs:696`), so concurrent requests
+> *inline* on the driver thread (`run_fallback_generation`, `driver.rs:816`), so concurrent requests
 > **queue rather than overlap** — raising concurrency against the paged-KV
 > server adds waiting, not pressure. Concurrency drives Scenario A, on the
 > scatter server, which has no block table at all. Pressure on the pool comes

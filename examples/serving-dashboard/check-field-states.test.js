@@ -123,3 +123,50 @@ test('the envelope documented in the README matches what measuredField returns',
       `  Keys the README claims but the code does not return: ${invented.join(', ') || '(none)'}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// The README prints the GLYPH for each state, and a glyph is the one part of a
+// state machine a reader copies into their own mental model. It was wrong here
+// for over an hour: the table said `not-applicable` renders an em-dash, while
+// panel-kit.js has rendered `n/a` and collapsed whole panel bodies since the
+// design ruling that superseded it.
+//
+// Nothing could catch that. The wire VALUES were bound to the constants by the
+// tests above, and they stayed green throughout, because the value and the glyph
+// are different facts and only one of them was pinned. A state's identity on the
+// wire and its appearance on screen drift independently.
+test('the glyph the README prints for not-applicable is the one the code renders', () => {
+  const panelKit = readFileSync(join(HERE, 'dashboard', 'panel-kit.js'), 'utf8');
+
+  const rendered = panelKit.match(/value__num--not-applicable'\],\s*\n\s*text: '([^']+)'/);
+  assert.ok(
+    rendered,
+    'Could not find the not-applicable field text in dashboard/panel-kit.js. ' +
+      'If that render path moved, this test must follow it rather than be deleted.',
+  );
+
+  const row = README.match(/\|\s*\*\*`([^`]+)`[^|]*\*\*\s*\*not applicable\*/);
+  assert.ok(
+    row,
+    'README.md no longer has a "not applicable" row in its state table naming a ' +
+      'glyph in backticks.',
+  );
+
+  assert.equal(
+    row[1],
+    rendered[1],
+    `README.md shows '${row[1]}' for not-applicable; panel-kit.js renders ` +
+      `'${rendered[1]}'. The em-dash was the ratified treatment once and stopped ` +
+      `being it, and the README kept printing it for an hour after the code changed.`,
+  );
+
+  // MUTATION: README row set back to `—` -> red, naming both sides. Render text
+  // changed to 'N/A' in panel-kit.js -> red from the other direction.
+  assert.ok(
+    /collapseNotApplicableBody/.test(README),
+    'README.md no longer mentions collapseNotApplicableBody. The panel-level ' +
+      'collapse is what makes `unavailable` and `not-applicable` impossible to ' +
+      'confuse -- they render at different SCALES -- and a reader who does not ' +
+      'know the panel body gets replaced will read a collapsed panel as broken.',
+  );
+});

@@ -1,0 +1,972 @@
+# AC33 — Clean-Tree Decode Throughput Baseline
+
+**Author:** QA Tester (@fc8b5d97)
+**Date:** 2026-07-29 22:46 – 23:07 PDT (2026-07-30 05:46 – 06:07 UTC)
+**Status:** ✅ COMPLETE — baseline captured, server stopped, tree unmodified by me
+**Purpose:** Reference measurement for the acceptance criterion *"telemetry adds <2% decode overhead."*
+This measurement is **unrecoverable** once instrumentation lands.
+
+---
+
+## 0. READ THIS FIRST — the headline finding
+
+> **The acceptance criterion "<2% decode overhead" is NOT testable with a naive
+> before/after comparison at the originally-planned workload.**
+
+I measured the noise floor empirically. Two runs of the **identical, unmodified binary**,
+back-to-back, at 128-token generations, differed by:
+
+| | rep 1 (n=15) | rep 2 (n=15) | delta |
+|---|---|---|---|
+| median decode | 33.925 tok/s | 33.452 tok/s | **−1.40 %** |
+| mean decode | 33.547 tok/s | 32.882 tok/s | **−1.98 %** |
+
+Welch t = 1.108 → statistically indistinguishable, exactly as it must be for the same
+binary. **But a −1.98 % apparent "regression" appeared from pure noise.** Anyone who runs
+128-token generations before and after the telemetry PR and compares means has a coin-flip
+chance of manufacturing a phantom 2 % regression — or of hiding a real one.
+
+**Fix (validated, §5):** measure with **512-token** generations. This cuts CV from 4.95 %
+to 1.98 % and drops the sample count needed to resolve 2 % from **97 per arm to 13 per arm**.
+The primary baseline below is captured at 512 tokens for exactly this reason.
+
+**A negative result worth knowing:** I also tested an interleaved paired A/B design (the
+usual remedy for drift). **It does not help here** — the noise is high-frequency
+per-request jitter, not slow drift, so pairing adjacent samples roughly doubles the
+variance of the difference. Null A/B with 12 pairs gave mean delta −1.23 % with a 95 % CI
+of [−5.68 %, +3.23 %]. Do **not** waste time on pairing; increase generation length instead.
+
+---
+
+## 1. PRIMARY BASELINE (reference numbers — see §5.0 before comparing against these)
+
+> ⚠️ **Do not use these as the comparison baseline for the acceptance test.** The clean
+> binary has been preserved; §5.1 requires a back-to-back A/B against it. I measured the
+> byte-identical binary reading **9.8 % lower** 75 minutes later purely from machine load.
+> These numbers are a sanity reference, not the gate.
+
+Workload: `max_tokens=512`, `temperature=0`, greedy, streaming SSE, single model instance.
+Decode rate excludes prefill (see §3).
+
+### 1.1 Single-request decode throughput — **THE headline number**
+
+| statistic | value (tok/s) |
+|---|---|
+| **median** | **33.415** |
+| mean | 33.576 |
+| min | 32.233 |
+| p25 | 33.113 |
+| p75 | 34.102 |
+| max | 34.651 |
+| stdev | 0.665 |
+| **CV** | **1.98 %** |
+| IQR | 0.989 |
+| n | 15 (+1 warmup discarded) |
+
+Raw (tok/s), in order:
+```
+34.177 32.889 33.415 33.161 33.405 32.233 33.004 33.887
+33.243 34.196 33.900 33.071 34.393 34.651 34.031
+```
+
+### 1.2 Four-concurrent decode throughput (max_batch=4)
+
+| statistic | aggregate decode (tok/s) | wall-clock throughput (tok/s) |
+|---|---|---|
+| **median** | **82.130** | **52.506** |
+| mean | 82.847 | 52.814 |
+| min | 80.997 | 51.951 |
+| max | 86.131 | 54.292 |
+| stdev | 2.425 | 1.020 |
+| CV | 2.93 % | **1.93 %** |
+| n | 4 rounds (+1 warmup discarded) | 4 rounds |
+
+Per-round raw:
+
+| round | aggregate tok/s | per-stream tok/s | wall s | wall tput tok/s |
+|---|---|---|---|---|
+| 1 | 81.03 | 20.26 | 29.9 | 51.95 |
+| 2 | 81.00 | 20.25 | 29.6 | 52.55 |
+| 3 | 83.23 | 20.81 | 29.6 | 52.46 |
+| 4 | 86.13 | 21.53 | 28.6 | 54.29 |
+
+**Batching speedup: 82.13 / 33.41 = 2.46×** aggregate decode at batch 4.
+Per-stream decode degrades to ~20.7 tok/s (0.62× of solo), i.e. batching trades
+per-stream latency for 2.46× aggregate throughput. Continuous batching is genuinely
+engaging — confirmed by the startup log line
+`continuous batch driver enabled max_batch=4`.
+
+> **Recommended acceptance metric:** `wall_throughput_tps` for the concurrent case
+> (CV 1.93 %) and single-request median decode (CV 1.98 %). Avoid
+> `aggregate_decode_tps` as the gate — it is the noisiest of the three (CV 2.93 %).
+
+---
+
+## 2. SECONDARY BASELINE (128-token workload, for cross-validation only)
+
+Captured first, before I discovered the variance problem. Retained because it
+cross-validates the primary numbers and documents the noise floor.
+
+| metric | median | mean | stdev | CV | n |
+|---|---|---|---|---|---|
+| single decode tok/s (rep 1) | 33.925 | 33.547 | 1.643 | 4.90 % | 15 |
+| single decode tok/s (rep 2) | 33.452 | 32.882 | 1.647 | 5.01 % | 15 |
+| single decode, pooled | 33.788 | 33.214 | 1.651 | 4.97 % | 30 |
+| single TTFT ms | 2141.3 | 2139.6 | 137.5 | 6.42 % | 15 |
+| 4-conc aggregate tok/s | 83.534 | 81.834 | 7.121 | 8.70 % | 8 |
+| 4-conc wall tput tok/s | 33.139 | 33.237 | 0.825 | 2.48 % | 8 |
+
+**Cross-validation:** single-request decode is 33.788 tok/s @128 vs 33.415 tok/s @512
+(1.1 % apart); 4-concurrent aggregate is 83.53 @128 vs 82.13 @512 (1.7 % apart). The two
+independently-captured workloads agree, which is good evidence the measurement is sound
+and not an artifact of generation length.
+
+**Prefill (TTFT) baseline:** median **2141 ms**, mean 2140 ms, stdev 137 ms (n=15) for the
+standard prompt. Note prefill is ~2.1 s vs ~3.8 s of decode for 128 tokens — prefill is a
+large fraction of e2e at short lengths, which is precisely why it must be excluded from a
+decode-overhead measurement.
+
+---
+
+## 3. Methodology
+
+### What "decode throughput" means here
+The server is driven over **streaming SSE** and every content delta is timestamped at
+arrival. Then:
+
+```
+decode_tps = (n_tokens - 1) / (t_last_token - t_first_token)
+```
+
+The interval starts at the **first** token, so the prefill/TTFT phase is excluded by
+construction. This matters: `total_tokens / e2e_time` would blend prefill into the number
+and dilute any decode-path regression by roughly 35 % at 128 tokens, making the 2 % gate
+even harder to trip. **A later re-run must use this same decode-only definition** or the
+comparison is meaningless.
+
+### Controls applied
+- `temperature = 0` (greedy) → deterministic token stream, identical work every iteration.
+- `max_tokens` fixed and **every single iteration returned `finish_reason: "length"` with
+  exactly the requested token count** (128/128 or 512/512, verified on all 60+ requests).
+  No early EOS, so every iteration did exactly equal work. This is a hard guarantee, not
+  an assumption.
+- Warmup iterations executed and **discarded** (3 for the 128 phases, 1 for each 512 phase).
+- One server process for the entire session — no reload/JIT/page-cache confounds mid-run.
+- Concurrent phase uses **distinct prompts per stream** (`variant 0..3`) so nothing can be
+  served from a shared cache.
+- ORT thread pool is derived from P-core count (`ThreadPoolRecommendation::from_topology`,
+  `crates/onnx-runtime-cpuinfo/src/lib.rs:445`) and is therefore **fixed at 8 on this M1 Max
+  with no env override needed** — one less source of run-to-run variation.
+
+### Statistics
+Median and IQR are reported as primary (robust to the outliers this noisy machine
+produces — e.g. the 128-token concurrent round 2 at 64.6 vs ~83 tok/s). Mean/stdev/CV are
+reported for power analysis. Power computed as
+`n = 2(z_{0.975}+z_{0.80})^2 σ² / δ²` (two-sample, 80 % power, α=0.05).
+
+---
+
+## 4. EXACT REPRODUCTION RECIPE
+
+### Provenance of this baseline
+
+| item | value |
+|---|---|
+| Worktree | `/Users/justinc/Documents/GitHub/onnx-genai-demo` |
+| Branch | `feat/genai-demo-dashboard` |
+| Git SHA at start | `f55e459b7dd6862deab8407c5c81eee1796cb92a` |
+| Git SHA at end | `9f3f5d9419dae2810fff6d3adaba8147bd5cfbfb` |
+| **Rust/Cargo files changed between them** | **NONE — verified, see §6** |
+| Server binary SHA-256 | `d49d3c8fe1b8a98e1a06720870e30524a8ac970192e3b08e99661a40e1c31ec7` |
+| Server binary mtime | 2026-07-29 22:30 (predates all crew commits in the window) |
+| Binary size | 29,033,360 bytes |
+| rustc | 1.97.0 (2d8144b78 2026-07-07) |
+| ONNX Runtime | 1.27.0 (API 27), from conda miniconda base |
+| Model | `/Users/justinc/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b-scatter-v2` |
+| `model.onnx` SHA-256 | `d3de664691405f4b636579de5c49f119d2baa1f4fee5488ab3a56b072cd0d8c4` |
+| EP | `ONNX_GENAI_EP=cpu` |
+| Machine | Apple M1 Max, 10 cores (8P/2E), 32 GiB |
+| OS | macOS (Darwin), uptime 3 d 16 h |
+| Batch driver | `continuous batch driver enabled max_batch=4` (hardcoded `DEFAULT_MAX_BATCH`, `src/state.rs:25`) |
+
+### Deployment shape — SINGLE-SERVER (explicit, do not assume)
+
+This baseline was captured against **one server, one model, nothing else resident**. Stated
+explicitly because it is otherwise an invisible assumption that would silently break the
+later comparison:
+
+| condition | value |
+|---|---|
+| server processes | **exactly 1** |
+| models loaded | **exactly 1** (`qwen-scatter`) |
+| model dir | `/Users/justinc/Documents/GitHub/onnx-genai/models/qwen2.5-0.5b-scatter-v2` |
+| bind address | `127.0.0.1:8123` |
+| second server / router / dynamic-KV server | **none running** |
+| dashboard | **not running** for §1/§2; running at 4 Hz for the §6b.1 arm only |
+| debug endpoints | enabled (`--enable-debug-endpoints`) |
+| admin endpoints | disabled |
+
+**Why this matters now:** the demo was re-scoped to a **two-server** shape (a scatter server
+for continuous batching plus a dynamic server for paged KV + prefix caching, side by side)
+*after* this baseline was captured. See §4b.
+
+### 4b. The two-server demo change — does NOT invalidate this baseline
+
+**Assessment: the baseline stands, and the acceptance measurement should stay single-server.**
+
+1. **The back-to-back protocol absorbs it.** Because the clean binary is preserved (§5.0),
+   both arms run in the *same session under the same ambient conditions*. Whatever else is
+   resident — a second server, other agents' builds, Time Machine — perturbs both arms
+   equally and cancels in the delta. This is exactly the property preserving the binary
+   bought us, and it is why the re-scope is not a problem.
+
+2. **The AC measurement should isolate ONE server.** AC33 asks whether *telemetry* adds
+   <2 % decode overhead. Measuring the full two-server demo would conflate telemetry cost
+   with **deployment resource contention** — a second server competing for the same CPU is
+   a large effect (§5.0 shows ambient load alone moves decode by 9.8 %) and would swamp the
+   2 % signal, almost certainly yielding INCONCLUSIVE under §5.3.
+
+   > **Recommendation:** run the acceptance A/B **single-server**, apples-to-apples with
+   > this baseline, with telemetry active and a dashboard polling that one server at 4 Hz.
+   > If a deployment-cost number for the two-server demo is wanted, measure it as a
+   > **separate** exercise and do not let it contaminate the <2 % gate.
+
+3. **If the AC is ever re-scoped to the two-server shape**, this baseline is not the right
+   BEFORE arm — but the fix is cheap and available: re-run the preserved clean binary in
+   the two-server configuration to generate a matched two-server BEFORE. That option exists
+   *only* because the binary was preserved.
+
+---
+
+### 4c. Independently verifiable git state at measurement time
+
+Requested by @d7cf9b84 so a reviewer can audit the A/B rather than take it on assertion.
+Verbatim, as captured:
+
+**At baseline start (22:45, before any measurement):**
+```
+$ git rev-parse HEAD
+f55e459b7dd6862deab8407c5c81eee1796cb92a
+$ git branch --show-current
+feat/genai-demo-dashboard
+$ git status --short
+(no output — tree completely clean)
+```
+
+**At baseline end (23:05):**
+```
+$ git rev-parse HEAD
+9f3f5d9419dae2810fff6d3adaba8147bd5cfbfb
+$ git status --short
+ M examples/serving-dashboard/CONTRACT.md
+ M examples/serving-dashboard/telemetry-field.js
+ M examples/serving-dashboard/telemetry-store.js
+ M examples/serving-dashboard/telemetry-store.test.js
+?? examples/serving-dashboard/app.js
+?? examples/serving-dashboard/css/
+?? examples/serving-dashboard/dashboard/
+?? examples/serving-dashboard/index.html
+?? examples/serving-dashboard/ui/
+```
+
+**Audit of that drift — why it does not invalidate the numbers:**
+```
+$ git diff --name-only f55e459b HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock'
+(no output — zero Rust or Cargo files changed)
+$ git status --porcelain -- '*.rs'
+(no output — zero uncommitted Rust)
+```
+All drift was frontend JS/CSS/HTML/MD. The measured binary (`d49d3c8f…`, mtime 22:30)
+predates every one of those commits, and is now preserved (§5.0) so this is checkable
+forever rather than asserted.
+
+> **⚠️ Standing hazard for anyone re-running this.** Builds happen **from the shared
+> worktree**. If in-progress Rust is sitting in `crates/` when someone rebuilds, it lands in
+> the supposedly-"clean" binary **with no cargo command from its author at all**, and
+> telemetry overhead would measure ~0 % for entirely the wrong reason — a **false PASS**.
+> @d7cf9b84 is correctly staging their Rust as drafts *outside* the worktree; anyone
+> touching Rust before sign-off must do the same.
+>
+> **Fully mitigated for the BEFORE arm:** use the preserved binary (§5.0) and do not rebuild
+> it. That is precisely why it was preserved.
+
+### 4d. Commands (copy-paste)
+
+> To reproduce the **exact** BEFORE arm, skip `cargo build` and run the preserved binary
+> `clean-binary/onnx-genai-server-clean-d49d3c8` instead — see §5.0. Building from source
+> later will *not* reproduce this binary once the telemetry changes land.
+
+```bash
+cd /Users/justinc/Documents/GitHub/onnx-genai-demo
+export CARGO_TARGET_DIR=/Users/justinc/Documents/GitHub/onnx-genai/target
+
+cargo build --release -p onnx-genai-server
+
+ONNX_GENAI_EP=cpu $CARGO_TARGET_DIR/release/onnx-genai-server \
+  --model ../onnx-genai/models/qwen2.5-0.5b-scatter-v2 --model-id qwen-scatter \
+  --addr 127.0.0.1:8123 --enable-debug-endpoints
+```
+
+Confirm this line appears in the log before measuring — **if it is absent the run is
+invalid**, because the non-batched per-request path is a different code path entirely:
+```
+INFO onnx_genai_server::driver: continuous batch driver enabled max_batch=4
+```
+
+Then run the harness (archived at `harness/qa_baseline_harness.py`, next to this file):
+```bash
+python3 harness/qa_baseline_harness.py /tmp/rerun.json
+```
+
+### Fixed workload parameters — a re-run MUST match all of these
+
+| parameter | value |
+|---|---|
+| endpoint | `POST /v1/chat/completions`, `stream: true` |
+| model id | `qwen-scatter` |
+| prompt | `Write a detailed explanation of how a hash table works, including collision resolution.` |
+| concurrent prompts | same prompt + `" (variant N)"`, N = 0..3 |
+| `max_tokens` | **512** (primary) / 128 (secondary) |
+| `temperature` | `0.0` |
+| concurrency | 1 (single) and 4 (concurrent) |
+| warmup | ≥1 at 512, discarded |
+| iterations | ≥15 single, ≥4 concurrent rounds |
+| decode formula | `(n_tokens - 1) / (t_last - t_first)` |
+
+---
+
+## 5. WHAT A LATER RE-RUN MUST MATCH — the acceptance test
+
+### 5.0 ⛔ MANDATORY PROTOCOL CHANGE — do NOT compare against the numbers in §1
+
+**The clean-tree binary has been preserved.** This changes the correct protocol entirely,
+and supersedes any instruction to "match conditions" against the numbers in §1.
+
+```
+clean-binary/onnx-genai-server-clean-d49d3c8
+SHA-256 d49d3c8fe1b8a98e1a06720870e30524a8ac970192e3b08e99661a40e1c31ec7
+```
+Verified: byte-identical to the binary that produced §1, boots correctly, logs
+`continuous batch driver enabled max_batch=4`, and produces coherent 512/512-token output.
+
+**Why comparing against §1's numbers is invalid — measured, not theorised.** I re-ran the
+*byte-identical preserved binary* ~75 minutes after the baseline, same machine, same model,
+same prompt, same workload. Only the background load differed (crew now active: load avg
+9.70, `mediaanalysisd` at 91 %, Time Machine copying):
+
+| | median decode tok/s | machine load (1-min) |
+|---|---|---|
+| §1 baseline (22:46–23:07) | 33.415 | ~5–8 |
+| identical binary re-run (23:22) | **30.151** | 9.70 |
+| **difference** | **−9.8 %** | — |
+
+**A −9.8 % swing from an identical binary — five times the entire 2 % acceptance
+threshold.** Any protocol that compares a later "after" run against §1's absolute numbers
+will be dominated by machine state and will produce a meaningless verdict.
+
+### 5.1 THE REQUIRED PROTOCOL — back-to-back matched A/B
+
+At telemetry sign-off, run **both binaries in the same session, on the same machine, within
+the same few minutes**, alternating in blocks:
+
+1. **BEFORE arm** — `clean-binary/onnx-genai-server-clean-d49d3c8`
+2. **AFTER arm** — the telemetry build
+3. Alternate in **blocks of 5** (`A A A A A / B B B B B / A A A A A / …`) until ≥15 per arm.
+   Blocks, not per-request alternation — see the §0 null-A/B result.
+4. **Both arms** run with the dashboard polling at **4 Hz with a scenario running**
+   (the amended AC33 condition). Both arms — not just the after arm. See §5.2.
+5. Report **median, spread (IQR/CV), n, and the 95 % CI of the delta** per arm, plus raw
+   per-run numbers.
+
+This design cancels machine state, thermal drift, and background load, because both arms
+experience them equally. It is the only design that can resolve 2 % on this hardware.
+
+> The numbers in §1/§2 remain valuable as a **sanity reference** — if the BEFORE arm at
+> sign-off reads wildly different from 33.4 tok/s, the environment has changed in some way
+> that needs explaining before anyone trusts the comparison. They are a cross-check, **not
+> the comparison baseline**.
+
+### 5.2 ⚠️ Arm-matching trap in the amended criterion
+
+The amendment says *"same workload in both halves"* but specifies 4 Hz polling only for the
+**after** run. Taken literally that is not a matched A/B: it would compare
+`no-polling BEFORE` against `polling AFTER`, folding the polling load into the measured
+"telemetry overhead."
+
+**Both arms must poll at 4 Hz.** The clean-tree polling arm in §6b.1 exists for exactly
+this reason: if a back-to-back run is somehow impossible, the correct BEFORE reference is
+the **POLL-ON** figure (**median 32.759 tok/s**, n=8), *not* the no-polling 33.415 in §1.
+
+Good news from §6b.1: polling costs no measurable decode throughput on the clean tree
+(+1.45 % median, SEM ±1.53 %), so this correction is small — but getting it backwards
+biases the result in the *permissive* direction, which is the dangerous direction.
+
+### 5.3 Pass / fail thresholds and required sample size
+
+**Gate:** the AFTER arm's median decode throughput must be **≥ 98 %** of the BEFORE arm's
+median, both measured in the same back-to-back session under identical polling.
+
+**Required n — this is not optional.**
+
+| workload | measured CV | n per arm to resolve 2 % @80 % power |
+|---|---|---|
+| 512-token, no polling, quiet machine | 1.98 % | **13** |
+| 512-token, 4 Hz polling, contended machine | 3.38 % | **45** |
+| 128-token | 4.95 % | 97 ❌ |
+
+Use **512-token generations**. Budget **≥15 per arm** on a quiesced machine, or **~45 per
+arm** if the machine is busy. Quiescing the machine is far cheaper than collecting 45
+samples per arm — see §6 P1.
+
+**Inconclusive-result rule (binding, per amended AC33).** If the 95 % CI of the delta spans
+±2 %, the result is **INCONCLUSIVE — NOT a pass**. Report it that way in plain language and
+collect more samples or quiesce the machine. Do not round a noisy result down to "fine."
+§0 is the reason this clause exists: two runs of the *same* binary differed by 1.98 %, and
+§5.0 shows load alone moves the number 9.8 %. A bare point estimate near the threshold is
+never a pass.
+
+**Reporting requirement.** Publish median, IQR/CV, n, 95 % CI of the delta, raw per-run
+numbers, and the full condition block from §4 — for **both** arms. Never a bare percentage.
+
+---
+
+---
+
+## 6. THREATS TO VALIDITY — read before trusting a comparison
+
+Ranked by how much they could distort a re-run.
+
+**P1 — The machine was NOT quiescent.** This is the dominant error source.
+- Load average rose from 5.22 at start to 8.04 (1-min) / 16.67 (5-min) by the end.
+- A Time Machine backup was running at 68 % CPU with 79,572 changed items when I started.
+  I stopped it with `tmutil stopbackup` (reversible; TM reschedules itself — I did **not**
+  disable Time Machine). **It restarted before the end of the session** (`Running = 1` at
+  23:05), so later phases ran with it active again.
+- `mediaanalysisd` was observed at 99.5 % CPU, `mds_stores` at 17.6 %.
+- Other crew agents were active throughout (VS Code helpers at 65 % and 52 % CPU).
+- **Mitigation for the re-run:** before measuring, confirm `tmutil status` shows
+  `Running = 0` and 1-min load average is comparable to this run. Record both. This is a
+  CPU execution provider — every competing core directly steals decode throughput.
+
+**P1 — Other agents were working during the measurement window** despite the freeze.
+Git HEAD advanced `f55e459 → 9f3f5d9` mid-session (8 files, +2515 lines).
+**Impact on validity: none for the binary, real for the timing.**
+- Verified `git diff --name-only f55e459 HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock'` → **empty**.
+- Verified `git status --porcelain -- '*.rs'` → **empty**. Zero uncommitted Rust.
+- All changes were `examples/serving-dashboard/` JS/CSS/HTML/MD.
+- The binary under test (mtime 22:30, SHA `d49d3c8…`) was built **before** any of it.
+- **So the numbers are a valid clean-Rust baseline**, but they were taken under CPU
+  contention and are therefore likely a mild *under*-estimate of quiet-machine throughput.
+  Since the gate is a *relative* comparison, this is acceptable **provided the re-run is
+  performed under similarly loaded conditions or, better, both are re-run quiet.**
+
+**P2 — Thermal state.** M1 Max under sustained CPU inference will throttle. The session ran
+~20 minutes continuously; later phases (the 512-token ones, i.e. the primary baseline) ran
+warmer than early ones. A re-run starting from a cold machine may read slightly *high*.
+Mitigation: run the warmup, and prefer comparing runs of similar duration and ordering.
+
+**P2 — `DEFAULT_MAX_BATCH` is hardcoded** at `src/state.rs:25`; there is no CLI flag. If
+anyone adds `--max-batch` (the architect flags this as likely, recon §4), the concurrent
+baseline is invalidated unless the value is still 4. **Re-run must confirm `max_batch=4`
+in the startup log.**
+
+**P3 — Prefix cache is inert on this path (but NOT because of this reading).** `/v1/debug/kv`
+after the full session read `prefix_cache_hits: 0, prefix_cache_lookups: 135`.
+⚠️ **DO NOT CITE THIS RATIO AS EVIDENCE — BOTH NUMBERS ARE COMPILE-TIME CONSTANTS.**
+`prefix_cache_hit_len` is a hardcoded literal `0` (`batched.rs:262`, `:486` — first arg of
+`DecodeLoopState::with_rng`, per `decode_loop.rs:39-43`), so the `> 0` test at `metrics.rs:135`
+can never be true; and `prefix_cache_lookups` increments unconditionally on every completed
+generation (`metrics.rs:130-132`), so the `135` is **135 finished generations** and would read
+135 with the prefix cache deleted from the source tree. **`0/135` is a literal divided by a
+mislabelled counter; it can neither confirm nor deny anything about the cache.**
+The conclusion is nonetheless correct — prefix reuse genuinely is bypassed on the
+continuous-batch path — but it is established **by reading the source**
+(`ContinuousBatchManager`, `batched.rs:101-110`, holds no `kv_cache` and no page table),
+**not by this ratio.** *For this baseline the conclusion is actually
+helpful* — it means repeated identical prompts got no caching advantage, so iterations are
+comparable. But if someone *fixes* prefix caching before the telemetry PR, these numbers
+become invalid and the baseline must be recaptured.
+
+---
+
+## 6b. ADDENDUM — 4 Hz dashboard-polling arm (added after AC33 was tightened)
+
+The tightened AC33 requires the *after* run to have the dashboard polling at **4 Hz with a
+scenario running**. My primary baseline was captured with **zero polling**, which would have
+made the later delta equal *(instrumentation cost + polling load)* — potentially a **false
+FAIL** from polling alone. Because the clean tree is unrecoverable, I captured the missing
+arm immediately.
+
+### 6b.1 Does 4 Hz polling cost decode throughput? — **No, not measurably**
+
+Design: alternating blocks of 4 iterations, POLL-OFF / POLL-ON / POLL-OFF / POLL-ON, one
+session, `max_tokens=512`. Poller hit `/metrics`, `/v1/status`, `/v1/debug/kv`,
+`/v1/resources` at 4 Hz. Blocking (not per-request alternation) per the §0 finding.
+
+| arm | median tok/s | mean | stdev | CV | n |
+|---|---|---|---|---|---|
+| polling OFF | 32.292 | 32.526 | 0.859 | 2.64 % | 8 |
+| polling ON (4 Hz) | 32.759 | 32.677 | 1.104 | 3.38 % | 8 |
+
+**Delta: +1.45 % median / +0.46 % mean, with SEM of the difference = ±1.53 %.**
+
+The delta is **statistically indistinguishable from zero**, and its *positive* sign is
+physically meaningless — polling cannot accelerate decode — confirming it is pure noise.
+
+> **Conclusion:** 4 Hz polling of the existing endpoints imposes **no measurable decode
+> cost**. The tightened acceptance rule is therefore safe: the polling requirement will not
+> by itself consume the 2 % budget or manufacture a false FAIL.
+>
+> **Caveat:** this holds because today's endpoints are cheap (`/v1/status` and
+> `/v1/debug/kv` return stubbed constants). Once telemetry makes them do *real* work, the
+> polling cost becomes real — which is exactly what the after-run must measure.
+
+### 6b.2 🚨 P0 — `/metrics` and `/v1/resources` stall for the ENTIRE generation
+
+Found while validating the poller: it logged 12 errors in 52 requests. Not a harness bug —
+a real server defect. Measured with one **independent thread per endpoint** so requests
+could not queue behind one another, during a 384-token generation:
+
+| endpoint | idle median | during generation (median) | during generation (max) | polls completed |
+|---|---|---|---|---|
+| `/metrics` | 0.8 ms | 2.5 ms | **14,784 ms** | **5** |
+| `/v1/resources` | 0.8 ms | 4.7 ms | **14,785 ms** | **5** |
+| `/v1/status` | 0.9 ms | 1.8 ms | 18.1 ms | 61 |
+| `/v1/debug/kv` | 0.8 ms | 1.9 ms | 21.2 ms | 61 |
+| `/health` | 1.6 ms | 1.8 ms | 25.5 ms | 61 |
+
+`/metrics` and `/v1/resources` complete **5 polls where the others complete 61** — they
+block for the full generation duration (~14.8 s ≈ the whole 384-token run). All endpoints
+are fast (<2 ms) when the server is idle, so this only manifests under load — i.e. exactly
+in the demo scenario.
+
+**Severity: P1 for the server, P0 for the demo** — the dashboard is planned to poll
+`/metrics`, and it would freeze on every generation.
+
+**Root cause (traced through the code, not guessed):**
+1. `routes/admin.rs:396` — `prometheus_metrics` awaits `state.…engine.resource_snapshot()`.
+2. `driver.rs:383-386` — `resource_snapshot()` sends `DriverCommand::ResourceSnapshot` over
+   a channel and awaits a `oneshot` reply.
+3. The driver loop is occupied running the decode loop for the whole generation, so the
+   command waits in the queue until generation completes.
+4. `/v1/resources` uses the identical path, hence identical behaviour.
+
+`crate::metrics::encode_prometheus()` is an atomic-registry read and is *not* the problem —
+it is the driver round-trip that blocks. `/v1/status`, `/v1/debug/kv` and `/health` are fast
+**precisely because they never touch the driver** — which is also why they return stubbed
+zeros (§7).
+
+**Reproduction:**
+```bash
+# terminal 1: start server (see §4), then
+python3 harness/qa_baseline_harness.py   # or any 384-token streaming request
+# terminal 2, during the generation:
+time curl -s localhost:8123/metrics > /dev/null   # ~15 s
+time curl -s localhost:8123/v1/status > /dev/null # ~2 ms
+```
+
+### 6b.3 ⚠️ This invalidates the planned telemetry design — read before implementing
+
+Recon §8 item 2 proposes adding a `DriverCommand::KvSnapshot` and wiring it into
+`/v1/status` and `/v1/debug/kv` to replace the stubbed zeros.
+
+**Those two endpoints are currently the only fast ones.** Routing them through a
+`DriverCommand` would give them the same driver-queue dependency as `/metrics` and convert
+them from 1.8 ms into ~15 s stalls under load. The dashboard would freeze during every
+generation — breaking the demo in precisely the scenario it exists to showcase.
+
+**Recommendation:** do not put KV/batch telemetry behind a driver round-trip. Have the
+decode loop **push** state into shared atomics or an `ArcSwap` snapshot that HTTP handlers
+read lock-free — the pattern `metrics.rs` already uses, and the reason
+`encode_prometheus()` costs 0.8 ms. Write-side push, not read-side request.
+
+A fix for `/metrics` itself follows the same shape: serve `resource_snapshot` from a
+periodically-refreshed cached snapshot rather than round-tripping the driver.
+
+---
+
+## 7. Incidental findings (not blocking, filed for the team)
+
+- **P2 — `/v1/status` reports zeros for everything interesting.** After 135 requests and
+  28,659 completion tokens: `kv_usage: 0.0, kv_pages_used: 0, kv_pages_total: 0,
+  tokens_per_second: 0.0, batch_utilization: 0.0`. Confirms recon §7 — these are stubs, not
+  a runtime bug. Note that `tokens_per_second: 0.0` means **the dashboard cannot currently
+  source tokens/sec from the server**; it must derive it client-side, or the stub must be
+  filled.
+- **P2 — `/v1/debug/kv` returns the literal string** `"unavailable: engine does not yet
+  expose KV page statistics"`. Also a known stub.
+- **P3 — Prefix cache is bypassed on the continuous-batch path.** See §6 P3. ⚠️ Established
+  from source, **not** from the `0/135` reading — both sides of that ratio are compile-time
+  constants and it would read identically with the cache deleted. Worth a real investigation;
+  note the panel itself still ships per the 🔒 ruling, rendering `not-applicable`.
+- **Working correctly:** `/metrics` emits real data — `onnx_genai_completion_tokens_total
+  28659`, `onnx_genai_tokens_generated_total 34879`,
+  `onnx_genai_time_to_first_token_seconds_{sum 681.69, count 135}`. TTFT histogram is live
+  and trustworthy.
+- **Output quality is good.** The model produced coherent text
+  (`"A hash table is a data structure that allows for efficient storage and retrieval…"`),
+  not gibberish. `qwen2.5-0.5b-scatter-v2` is confirmed usable for the demo.
+
+---
+
+## 8. Raw data
+
+Archived next to this file:
+
+| file | contents |
+|---|---|
+| `raw/qa-baseline-primary.json` | **primary** — single-512 n=15, concurrent-512 n=4 |
+| `raw/qa-baseline-raw.json` | 128-token phase: single n=15 + concurrent n=8, full per-iteration records |
+| `raw/qa-baseline-rep2.json` | independent replicate of the 128-token single phase |
+| `raw/qa-baseline-long512.json` | first 512-token variance probe (n=8) |
+| `raw/qa-baseline-nullab.json` | null interleaved A/B (12 pairs, same binary) |
+| `raw/qa-baseline-polling.json` | **4 Hz polling arm** — POLL-OFF vs POLL-ON blocks (§6b.1) |
+| `raw/qa-endpoint-latency.json` | endpoint latency, idle vs during generation (§6b.2) |
+| `raw/qa-endpoint-latency-indep.json` | **per-endpoint independent pollers** — the P0 evidence (§6b.2) |
+| `raw/qa-preserved-validation.json` | preserved-binary validation run — the −9.8 % load-drift evidence (§5.0) |
+| **`clean-binary/onnx-genai-server-clean-d49d3c8`** | **the preserved clean-tree server binary — the BEFORE arm (§5.0)** |
+| `raw/qa-baseline-server.log` | server startup log incl. the `max_batch=4` line |
+| `harness/qa_baseline_harness.py` | the measurement harness (stdlib only) |
+
+---
+
+## 9. Sign-off
+
+- ✅ Baseline captured at two independent generation lengths that cross-validate to 1.1 %.
+- ✅ Server stopped; `curl localhost:8123/health` refused; zero stray
+  `onnx-genai-server` processes.
+- ✅ **I modified no Rust source and no repository file.** Harness and raw data live in
+  my artifact directory only. `git status -- '*.rs'` is clean.
+- ⚠️ The acceptance criterion as originally worded is not testable without the protocol in
+  §5. **Whoever runs the post-telemetry comparison must read §5 and §6 first.**
+- 🚨 **§6b.3 is a blocking design warning for the telemetry implementation.** The currently
+  planned `DriverCommand::KvSnapshot` approach would turn the dashboard's only two fast
+  endpoints into 15-second stalls. Read it before writing code.
+- ✅ All four tightened-AC33 requirements satisfied: ≥3 runs (15 single / 4+8 concurrent),
+  raw per-run numbers published (§1, §2, §8), conditions recorded as a first-class
+  deliverable (§4), and the inconclusive-result rule plus 4 Hz polling condition folded
+  into the acceptance spec (§5, §6b).
+- 🔒 **The clean-tree binary is preserved and validated** (§5.0). This largely defuses the
+  "unrecoverable measurement" premise of this task: the BEFORE arm can now be re-run on
+  demand, at any time, against the telemetry build in the same session. That is a strictly
+  better comparison than any recorded number, because it cancels machine state — which I
+  measured moving the result by **9.8 %**, five times the acceptance threshold.
+- ⚠️ **§5.2 corrects an arm-matching trap in the amendment:** it specifies 4 Hz polling for
+  the after run only. Both arms must poll, or the polling load is charged to telemetry.
+- 🔀 **Two-server demo re-scope assessed (§4b): baseline stands.** The back-to-back protocol
+  absorbs ambient conditions, so a second resident server does not invalidate it. The
+  acceptance A/B should stay **single-server** to isolate telemetry cost from deployment
+  contention; measure two-server deployment cost separately. Deployment shape is now
+  recorded explicitly in §4 rather than left as an unstated assumption.
+
+---
+
+## 6c. 🔴 PROTOCOL DEFECT — THE `<2%` CRITERION CANNOT BE SETTLED BY ONE RUN PER ARM
+
+**Raised by @c0de4c2e; investigated and CONFIRMED, but the proposed remedy does not fix it.**
+
+The challenge: HEAD advanced mid-window (8 files, +2515 lines), so the baseline arm carried CPU
+contention that a post-telemetry arm in a quiet tree would not. Contention present in one arm and
+absent in the other is a **systematic offset in the mean, and no sample count fixes bias.** Correct
+concern. I had cleared it on the grounds that zero Rust changed and the binary predates the commits
+— that argument is airtight **for the binary** and irrelevant **for the timing environment.**
+
+I had the per-sample data to settle it, so I did.
+
+### 6c.1 Is there drift within the headline arm? — YES, and it exceeds the criterion
+
+`single512`, n=15, in temporal order:
+
+| statistic | value |
+|---|---|
+| first-half mean (samples 1–7) | 33.182 tok/s |
+| second-half mean (samples 9–15) | 33.926 tok/s |
+| **drift, second vs first** | **+2.24%** |
+| Spearman ρ vs sample order | +0.475 |
+| permutation p (N=200 000) | 0.076 |
+
+p = 0.076 is not conventionally significant, **and that does not rescue the arm.** For a
+threats-to-validity judgment the relevant quantity is the *magnitude* of a plausible bias, not
+whether it clears p<0.05: a **+2.24% within-arm trend is larger than the entire ±2% acceptance
+band.** Demanding significance before acknowledging a bias of criterion-exceeding size is exactly
+backwards — it is the failure mode where an underpowered test licenses the thing it failed to detect.
+
+### 6c.2 Is `loadavg` a usable proxy for "quiet"? — NO. This kills remedy option 1
+
+The 128-token arm captured `loadavg` **per sample**, so this is directly testable:
+
+| test | result |
+|---|---|
+| Spearman ρ(loadavg, decode_tps) | **+0.079** |
+| permutation p | **0.785** |
+
+**Load average has no relationship to our throughput at all** — and the sign is *positive*, i.e. if
+anything the machine read busier while running faster. This is expected on reflection: `loadavg` is
+a 1-minute exponentially-weighted count of runnable threads machine-wide, far too slow and too
+coarse to track contention on the specific cores in our decode path.
+
+⇒ **"Re-baseline in a quiet window" is not executable, because we have no instrument that certifies
+a window was quiet.** We would simply be relabelling an unverified condition as a controlled one.
+That is worse than the status quo: it converts an acknowledged threat into an invisible assumption.
+
+### 6c.3 Is the drift a consistent direction? — NO. It is low-frequency wander, not a fixed bias
+
+| run (identical binary) | first-half → second-half |
+|---|---|
+| 512-token primary | **+2.24%** |
+| 128-token arm | **+3.07%** |
+| 512-token replicate 2 | **−5.05%** |
+
+The direction **flips**. So this is not "the machine steadily got faster as work drained" — it is
+**autocorrelated wander on the timescale of a run (~8 min)**. Each arm therefore carries a random
+offset of a few percent that **more samples within that arm cannot reduce**, because the samples are
+not independent with respect to it.
+
+### 6c.4 The decisive number: two runs of a BYTE-IDENTICAL binary differ by more than the criterion
+
+| run (same preserved clean binary, same protocol) | mean | within-run CV |
+|---|---|---|
+| primary (n=15) | 33.576 tok/s | 1.98% |
+| replicate 2 (n=15) | 32.882 tok/s | 5.01% |
+| **between-run delta** | **−2.07%** | — |
+
+**A binary compared against itself fails the `<2%` criterion.** The within-run CV of 1.98% that I
+reported as evidence the protocol was sound measures **dispersion of samples inside one run**; the
+quantity the criterion actually depends on is **dispersion of run means**, which is at least the
+same order and is completely unconstrained by n-per-run.
+
+**This is my own §5 acceptance protocol failing on its own data, and it supersedes my earlier
+"n=15 at 512 tokens is sufficient" conclusion. That conclusion was right about the wrong variance
+component.**
+
+### 6c.5 Corrected protocol — interleave at the RUN level, not the request level
+
+**Unit of analysis is the run mean, not the sample.**
+
+1. Alternate binaries **run by run**: A B A B A B A B A B — **≥5 runs per arm**, 15×512-token
+   samples each.
+2. Compute one mean per run ⇒ 5 numbers per arm. Compare arms with a test on those 10 run means
+   (Welch or exact permutation on run labels).
+3. Report the CI **of the run-mean difference**. Report n_runs, not just n_samples.
+4. Non-overlapping CI required to claim a regression *or* to claim `<2%`.
+5. **Do not gate on "quiet machine"** — §6c.2 shows we cannot verify it. Run-level interleaving
+   makes wander a shared nuisance across both arms instead of a confound, which is the point.
+
+**Cost: ~80 min unattended for the full matrix.** Cheap for the project's only quantitative
+acceptance criterion, and it is *unattended* — no code freeze, no coordination, since the clean
+binary is preserved.
+
+### 6c.6 Relation to my earlier NEGATIVE result — these are consistent, not contradictory
+
+I previously tested and **rejected** interleaved paired A/B, because pairing *doubled* the variance
+of the delta (paired stdev **7.01 pp**, SEM 2.02 pp on n=12 — see `raw/qa-baseline-nullab.json`).
+That result stands. The reconciliation is the **timescale of the noise versus the granularity of
+the interleaving**:
+
+- **Request-level** interleaving attacks *drift* but is defeated by **high-frequency per-request
+  jitter** — pairing two adjacent noisy requests sums two independent jitters into every delta.
+- **Run-level** interleaving averages that jitter away *within* each run (n=15), then attacks the
+  **low-frequency wander** that is the actual confound between arms.
+
+**Rule: interleave at the granularity that matches the noise you are fighting, and average below
+it.** Interleaving finer than the noise timescale imports variance without removing bias.
+
+### 6c.7 Status of the existing baseline
+
+The headline **33.415 tok/s median (n=15, CV 1.98%)** stands as a **descriptive** figure and the
+raw data is unaffected. What does **not** stand is using it as a **single-run reference arm for a
+±2% verdict**. The preserved clean binary means the corrected matrix can be run at any time; the
+baseline does not need re-capturing so much as **re-framing plus 4 more runs per arm.**
+
+---
+
+## 6d. NULL TEST EXECUTED — the `<2%` criterion is an EQUIVALENCE claim, and my §6c.5 rule was wrong
+
+**10 consecutive runs of the preserved clean binary against ITSELF**, sham-labelled A/B/A/B…,
+15×512-token samples per run, single server, no restart, no treatment of any kind.
+**Any difference found is by construction 100% noise.** 55 min. Raw: `raw/qa-runlevel-null.json`,
+conditions in `raw/qa-runlevel-null-conditions.txt`, harness `harness/qa_runlevel_null.py`.
+
+Conditions were *not* quiet — another agent's `verify_model.sh` ran concurrently and loadavg
+ranged 11.6 → 43.7. That is the realistic shared-machine condition, and it is the condition the
+telemetry A/B will actually run in.
+
+### 6d.1 Headline: a binary compared against itself produced a **+6.23%** delta
+
+| quantity | value |
+|---|---|
+| run means (tok/s) | 30.048, 28.644, 28.589, 28.982, 29.480, 30.428, 29.023, 25.887, **18.246**, 29.880 |
+| mean within-run CV | 14.21% |
+| **between-run CV** | **12.98%** |
+| **sham A vs sham B (naive run means)** | **+6.23%** |
+| max pairwise run-to-run delta | **+66.77%** |
+
+**A naive single-number report would have declared a 6.23% regression — 3× the acceptance band —
+from a binary that was not changed.** This is the concrete demonstration that the original
+one-run-per-arm procedure cannot support a ±2% verdict.
+
+### 6d.2 The decision rule WORKS — the point estimate does not
+
+Running the §6c.5 procedure properly on the same data:
+
+| procedure | result |
+|---|---|
+| naive point estimate (run means) | **+6.23%** ❌ misleading |
+| robust point estimate (run **medians**) | **+1.27%** ✅ much better |
+| **exact permutation test on run labels** (all C(10,5)=252 assignments) | **p = 0.643** ✅ correctly *indistinguishable* |
+| bootstrap 95% CI of the delta | **[−5.55%, +28.08%]**, width 33.6 pp |
+
+**The run-level permutation test refused to call a regression that a point estimate would have
+reported.** That is the protocol validating exactly as designed. Two required amendments follow:
+
+1. **Use run MEDIANS, not run means.** One pathological run (run 8: mean 18.246, CV 37.95%,
+   individual samples down to 9.6 tok/s under load 33) dragged the mean-based estimate to +6.23%.
+   Medians gave +1.27% on identical data. **Never report a bare delta of run means.**
+2. Excluding that single pathological run, between-run CV is still **4.58%** and the sham delta
+   **−1.78%** — i.e. **noise alone consumes essentially the entire ±2% budget.**
+
+### 6d.3 🔴 MY §6c.5 RULE WAS WRONG — "CI straddles 0" DOES NOT MEAN "passes `<2%`"
+
+§6c.5 said *"non-overlapping CI required to claim a regression **or** to claim `<2%`."* The second
+half is a category error and I am correcting it.
+
+**`<2%` is an EQUIVALENCE claim, not a difference claim.** A non-significant difference test
+(p = 0.643 above) means *"we could not detect a difference"* — it is **not** evidence that the
+difference is small. With a CI of **[−5.55%, +28.08%]** we manifestly have **not** shown overhead
+is under 2%; a +20% regression sits comfortably inside that interval. Reading p > 0.05 as "passes"
+is the single most likely way this criterion gets falsely certified.
+
+**Correct rule (TOST / equivalence):**
+> To claim `<2%`, the **entire 95% CI of the run-mean-difference must lie inside ±2%.**
+> If the CI is wider than the band, the verdict is **`UNRESOLVED` — re-run with more runs.**
+> `UNRESOLVED` is **not** a pass and must never be reported as one.
+
+Three-state outcome, never two: **REGRESSION** / **EQUIVALENT (`<2%`)** / **UNRESOLVED**.
+
+### 6d.4 This resolves the "you can't certify a quiet machine" objection
+
+§6c.2 showed we have no instrument that certifies a window as quiet (ρ(loadavg, tok/s) = +0.079).
+That looked like a dead end. It is not, because **the CI width adjudicates it after the fact:**
+
+- Do **not** gate on "quiet" in advance — unverifiable, and declaring it invites a false pass.
+- **Let the observed CI width certify the run retrospectively.** Contention inflates between-run
+  variance ⇒ inflates the CI ⇒ the CI fails to fit inside ±2% ⇒ verdict `UNRESOLVED` ⇒ re-run.
+  **A noisy window can no longer produce a confident answer.** The procedure is self-certifying.
+
+### 6d.5 How many runs are actually needed
+
+For the CI half-width to fit the ±2% band, we need SEM ≲ 2/1.96 ≈ 1.02%, so
+n_runs ≈ (between-run CV / 1.02)².
+
+| observed between-run CV | condition | runs needed **per arm** | wall time/arm |
+|---|---|---|---|
+| 12.98% | this test, incl. pathological run | ~162 | infeasible |
+| 4.58% | this test, pathological run dropped | **~20** | ~7 h |
+| ~2% | quiet machine (plausible) | **~4** | ~25 min |
+
+⇒ **The ±2% criterion is cheap on a quiet machine and effectively unaffordable on a busy one.**
+The practical recommendation is unchanged and now quantified: run the A/B when the crew is idle,
+**and let the CI decide whether the window was good enough.** Discard-and-rerun on `UNRESOLVED`
+is legitimate; discarding an *individual* run for looking bad is not — the decision must be made
+on CI width, never by eyeballing which runs to keep.
+
+### 6d.6 Status
+
+- §6c.5's run-level interleaving + permutation test: **VALIDATED** — it correctly returned
+  "indistinguishable" on a null where a point estimate reported +6.23%.
+- §6c.5's acceptance wording: **CORRECTED** to a TOST equivalence rule with a third
+  `UNRESOLVED` state (§6d.3).
+- Aggregate run **medians**, not means (§6d.2).
+
+---
+
+## 6e. THE RATIFIED SIGN-OFF PROCEDURE, TESTED ON NULL DATA — AND WHY AC33 IS THE WRONG SHAPE
+
+The 🔒 ratified procedure is *"both binaries back-to-back in one session, **alternating blocks of
+5**, to **≥15 samples per arm**, both polling at 4 Hz, 512-token generations."* Blocking is a real
+improvement over one-run-per-arm and it removes the perishable-baseline problem entirely.
+
+**But I can now test the instrument instead of reasoning about it.** The null run produced **150
+samples of the same binary in temporal order**. Simulating the ratified procedure across every
+start offset — assigning alternating blocks of 5 to two arms that are *the same binary*, so the
+true difference is exactly **0** — gives its false-verdict rate directly.
+
+### 6e.1 The ratified procedure reports a ≥2% difference between a binary and itself ~2 times in 3
+
+| procedure | n/arm | median \|delta\| | p90 \|delta\| | **false ≥2% verdict** |
+|---|---|---|---|---|
+| **blocks of 5 (ratified)** | **15** | **3.27%** | 11.70% | **64.5%** |
+| blocks of 5 | 30 | 1.33% | 5.40% | 38.5% |
+| blocks of 5 | 60 | 0.98% | 4.44% | 25.8% |
+| blocks of 10 | 30 | 1.49% | 2.60% | 23.9% |
+
+Restricting to the quieter runs (within-run CV < 11%) **does not help** — 73.7% at n=15 — because
+selecting on *within*-run calm does not remove *between*-block wander. **Even at n=60/arm (≈4×
+the ratified cost) the false-verdict rate is still 26%.**
+
+⇒ **A ±2% gate cannot be resolved by this instrument at any practical sample count on this machine.**
+Blocking fixed the *bias* (the perishable baseline). It cannot fix the *variance*.
+
+### 6e.2 The reframe: we are trying to detect a sub-0.01% effect with a ±3% instrument
+
+The telemetry design (reviewed in detail — atomics only, no allocation, no lock, no syscall on the
+decode path) costs a handful of **relaxed atomic stores per decode step**. Against a measured decode
+step of **29.94 ms**:
+
+| telemetry work per decode step | cost | share of a decode step |
+|---|---|---|
+| ~10 relaxed stores (realistic) | 10 ns | **0.000033%** |
+| 100 stores (10× pessimistic) | 100 ns | 0.000334% |
+| 1000 stores (100× pessimistic) | 1 µs | 0.003340% |
+
+| | |
+|---|---|
+| AC33 budget | **2%** |
+| predicted effect | **~0.00003%** |
+| **budget ÷ effect** | **≈ 60,000×** |
+| instrument resolution (measured) | **~3.27%** |
+
+**The thing AC33 measures is ~60,000× smaller than the budget it is measured against, and ~100,000×
+smaller than the noise floor of the instrument.** No sample count closes a gap of that order. **A
+"pass" would be an artifact of rounding, and a "fail" would be someone else's `cargo build`.**
+
+### 6e.3 Recommendation — verify the MECHANISM, bound the magnitude, stop chasing the delta
+
+This is the same move that settled the prefix cache in §9 of `prefix-cache-verification.md`:
+**compute what the effect must be, then compare it to what the instrument can see.** There, the
+predicted effect (−94%) was far *larger* than the noise, so a null result was decisive. Here the
+predicted effect is far *smaller* than the noise, so **a throughput A/B is decisive in neither
+direction — it can only manufacture a verdict.**
+
+**Proposed AC33, restated so it is answerable:**
+1. **Mechanism check (primary, and it is a hard gate).** On the decode path the instrumentation
+   must perform **no allocation, no lock, no syscall, no channel send, and no unbounded work** —
+   verified by inspection and by the absence of those constructs. ✅ **Already verified in my
+   telemetry design review:** `note_block` is one bounds-checked relaxed store, gauges are relaxed
+   stores, the `Vec` allocation is on the HTTP thread. This is the criterion that actually protects
+   the decode loop, and it **cannot be satisfied by luck.**
+2. **Magnitude bound (secondary).** State the arithmetic above: O(10) relaxed stores against a
+   ~30 ms step is bounded well under 0.01% even at 100× pessimism.
+3. **Gross-regression guard (tertiary, cheap).** Keep the blocked A/B, but gate it at a threshold
+   the instrument can actually resolve — **±10%, not ±2%** — with the verdict rendered as
+   **EQUIVALENT / REGRESSION / UNRESOLVED** per §6d.3. Its job is to catch a *blunder* (a lock, an
+   allocation, a snapshot in the loop), which would be tens of percent and trivially visible — not
+   to certify 2%.
+4. **DELETE the absolute thresholds (≥32.75 / ≥51.46 tok/s).** They fail the clean binary **10/10**
+   (§6e.4). Comparisons must be relative and same-session.
+
+**This is stricter than the current AC33, not weaker.** A 2% gate that fires at random is not a
+safety net — it is a coin toss that will eventually be resolved by whoever argues hardest. A
+mechanism gate is binary, cheap, reviewable, and cannot be passed by a quiet machine.
+
+### 6e.4 The absolute thresholds fail the clean binary 10 times out of 10
+
+AC33 lists `≥32.75 tok/s single`. The preserved **clean** binary, unmodified, across the null run:
+
+| runs | 30.05, 28.64, 28.59, 28.98, 29.48, 30.43, 29.02, 25.89, 18.25, 29.88 |
+|---|---|
+| **passing ≥32.75** | **0 / 10** |
+
+**The baseline binary cannot pass the threshold derived from itself.** An absolute threshold silently
+encodes the machine conditions of the ten minutes in which the baseline was captured. Had telemetry
+been A/B'd against it tonight, the PR would have been charged with a ~12% regression it did not cause.
