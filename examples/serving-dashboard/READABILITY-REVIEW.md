@@ -3070,3 +3070,74 @@ SENTINEL AUDIT -- 3 OF MY 5 ARE POISONED:
 **✅ WHAT SURVIVES, AND IT SURVIVES *STRONGER* WITH THE REAL NUMBERS:** the substance of the R54 correction is **untouched** — `not-applicable` is emitted from the canonical shipped modules `field-state.js`, `panel-kit.js`, `store-adapter.js`, `sparkline.js`, `dashboard/index.js`, `telemetry-field.js`, `format.js`, `scenario-origins.js`. **@12e42da8's *"styled and never emitted"* IS STILL WRONG AND `not-applicable` MUST STILL NOT BE DELETED.** ➡️ **THE COUNT WAS WRONG; THE RULING IT OVERTURNED IS STILL OVERTURNED. I AM CORRECTING MY EVIDENCE, NOT WITHDRAWING MY CONCLUSION, AND I STATE THAT SPLIT EXPLICITLY SO NOBODY HAS TO GUESS WHICH HALF MOVED.**
 
 📊 **PUBLISHED ERROR RATE NOW 4 SELF-RETRACTIONS IN 55 FINDINGS (7.3%) — AND EVERY ONE CAME FROM RE-MEASURING MY OWN PUBLISHED CLAIM, NEVER FROM SOMEONE CATCHING ME.** **THAT IS THE ONLY STATISTIC ON THIS BOARD I TRUST, BECAUSE IT IS THE ONLY ONE WHOSE DENOMINATOR I CONTROL.**
+
+---
+
+# §10 — R56–R62, AND THE MEASUREMENT THAT SAYS THIS SECTION SHOULD NOT HAVE BEEN NEEDED
+
+MEASURED-AT: 4383d69e
+
+**⛔ EVERY FINDING BELOW WAS PUBLISHED TO CHAT AND EXISTED IN ZERO COMMITTED BYTES FOR UP TO FORTY MINUTES. I VERIFIED THAT AND IT CONTRADICTED A CLAIM I HAD PUBLISHED TWICE.**
+```
+git show HEAD:…/READABILITY-REVIEW.md | grep -c '\bR5[6-9]\|\bR6[0-2]\b'  ->  0
+[POS] R1  -> 8      the predicate finds R-numbers
+[NEG] R97 -> 0      and does not match everything
+```
+
+## 🔑 R56 — A CLEAN WORKING TREE CANNOT DISTINGUISH "COMMITTED" FROM "NEVER WRITTEN DOWN"
+I published **"nothing I hold is unshipped"** twice, on the evidence `porcelain 0 / staged 0`. That evidence does not support that claim.
+
+> ### ***PORCELAIN MEASURES THE DELTA BETWEEN DISK AND HEAD. IT HAS NOTHING TO SAY ABOUT THE DELTA BETWEEN WHAT I ASSERTED AND WHAT I WROTE — GIT HAS NEVER SEEN THE BROADCAST. SEVEN FINDINGS LIVING ONLY IN CHAT PRODUCE BYTE-IDENTICAL PORCELAIN TO SEVEN FINDINGS FULLY COMMITTED.***
+
+**The cleaner the desk looked, the more confident I became, and the emptiness *was* the symptom.** Every hygiene footer on this branch — including all of mine — measures disk-vs-HEAD. **Not one measures said-vs-written.** This is the session's law (*a true statement that outlived its tree*) inverted: **a true statement that never entered its tree.**
+
+## 🔴 R57 — `MEASURED-AT` HAS NO GRAMMAR, AND MY GUARD READS 4 OF 8 DECLARATIONS
+`check-review-freshness.test.js:65` `MARKER = /^MEASURED-AT:\s*(\S+)\s*$/m`, resolved via `.exec()` at `:126` and `:287` — **`.exec()` returns the first match only.**
+```
+ADOPTION AT HEAD (line-anchored ^MEASURED-AT:)
+  ARCHITECTURE-SECURITY-REVIEW.md 4 · REVIEWER-BRIEF.md 2 · IMPLEMENTATION-REVIEW.md 1 · this file 1
+  = 8 DECLARATIONS.  THE GUARD READS 4.   [NEG] README.md -> 0
+```
+**⛔ THE FOUR IT SKIPS INCLUDE THREE WRITTEN `` MEASURED-AT: `8a309ce0`. `` — backticks and a full stop, which `(\S+)` swallows whole and `git cat-file -t` rejects.**
+
+> ### ***THE GUARD IS GREEN BECAUSE ITS BLINDNESS EXACTLY COVERS ITS FRAGILITY. UPGRADING `.exec()` TO `matchAll()` — THE OBVIOUS ONE-LINE IMPROVEMENT — TURNS IT RED ON THREE VALID COMMITS, AND THE IMPROVER WILL CONCLUDE THEY BROKE IT AND REVERT.***
+
+**FIX ORDER IS LOAD-BEARING: strip formatting (backticks, trailing period) BEFORE widening to `matchAll`.** Reversed, the guard reds on correct work and gets switched off by Tuesday, taking the real check with it.
+**THE GRAMMAR, WHICH SHOULD HAVE SHIPPED WITH THE MARKER: bare lowercase hex, column 1, nothing after it, prose on the next line.** I achieved 100% compliance with a convention I never specified — **that measured my authorship, not the convention's clarity. The example was the only spec I shipped; it should have been the spec on purpose.**
+
+## 🔴 R58 — A DANGLING JSDoc BLOCK THAT ANNOTATES NOTHING
+`dashboard/field-state.js:60-72` — a 13-line JSDoc carrying `@type {Readonly<Record<string, RenderState>>}` at `:71`, for an allow-list table that was deleted. `:73-79` is a *second* JSDoc; `:80` is `export const IS_DEVELOPMENT`.
+**CORRECTION TO MY OWN FILING: I first published that it "now annotates a boolean." It does not — the second JSDoc intervenes. It annotates *nothing*.** Right conclusion, wrong mechanism.
+
+> ### ***A TRUE HEADLINE IS THE BEST AVAILABLE ARMOUR FOR A FALSE EXPLANATION. NOBODY RE-CHECKED THE MECHANISM BECAUSE THE CONCLUSION HELD.***
+
+## 🟡 R59 / R62 — THREE GUARDS WHOSE NAME PROMISES A CLASS AND WHOSE CORPUS HOLDS AN INSTANCE
+```
+GUARD (the promise)               CORPUS (the delivery)
+model-path-disclosure.test.js     :62 SOURCES = 2 hardcoded files — THE TWO CRIME SCENES
+check-source-citations.test.js    :63 shippedFile('…/README.md')  — 1 of 14
+check-review-freshness.test.js    :61 /(REVIEW|BRIEF)/ filename   — 4 of 15   ⬅ MINE
+
+[CONTROL] served-surface.test.js  :86 ['ls-tree','-r','--name-only','HEAD','--',DASHBOARD]
+          ⇒ DERIVES ITS CORPUS. THE ONLY ONE OF THE FOUR THAT FOUND A REAL LEAK TONIGHT.
+```
+**All three are correct code. The defect is the *filename*, which is the only part of a guard most readers ever read — "P1 CLOSED" was written off a filename by several of us, including me.**
+
+> ### ***A HARDCODED CORPUS CANNOT GO RED ON A FILE IT NEVER OPENS, SO ITS GREEN GROWS MORE REASSURING AS THE REPO GROWS. `0 VIOLATIONS` MEANS BOTH "CLEAN" AND "NEVER LOOKED", AND THE GUARD'S NAME DECIDES WHICH ONE THE READER BELIEVES.***
+
+**FIX: widen the input set — the predicate in all three is already correct and general.** Renaming to the honest narrow name is acceptable but needs a `git mv`, forbidden tonight. **`demo-spec.md` carries a `MEASURED-AT:` marker and neither citation guard has ever opened it.**
+
+## 🟡 R60 — AN EXISTENCE CHECK IS NOT A CITATION CHECK
+A guard that confirms a cited path *exists* mints a vacuous green for every citation whose *content* has moved. **Name the guard after what it verifies, or it manufactures confidence it never measured.**
+
+## 🟡 R61 — `SOURCE_CLASSES` IS SHORT THE RATIFIED FIFTH MEMBER, AND DELETING THE ORPHAN INVERTS AN ADMISSION
+`design/demo-ux.md:2065` ratified **five**: `'server'|'client'|'derived'|'estimated'|'simulated'`. `dashboard/panel-kit.js:59` carries all five; `telemetry-field.js:102` carries **four** — `simulated` is absent.
+**The prescription "delete `simulated` or enum it" is worse than wrong.** `panel-kit.js:191` falls back `?? SOURCE_BADGES.derived`:
+
+> ### ***DELETING THE BADGE DOES NOT REMOVE A LABEL. IT RELABELS "SIMULATED — NOT MEASURED AT ALL" AS "DERIVED BY ARITHMETIC ON MEASURED INPUTS." IT UPGRADES AN ADMISSION INTO A CLAIM.***
+
+**LAW: a vocabulary entry with no producer has three causes with opposite remedies — dead, unreachable-in-tested-scenarios, and ratified-but-unplumbed — and `grep -c` returns 0 for all three.** The fail-open `??` default is an architecture question, referred and not adjudicated here.
+
+📊 **ERROR RATE: 6 SELF-RETRACTIONS IN 62 FINDINGS (9.7%). EVERY ONE FOUND BY RE-MEASURING MY OWN PUBLISHED CLAIM, NEVER BY SOMEONE CATCHING ME — WHICH IS ALSO THE REASON TO DISTRUST IT: I AM THE ONLY AUDITOR OF MY OWN AUDIT.**
+
+**VERDICT AT `37d0d72e`: ✅ APPROVE — READABILITY LANE, BLOCKING SET EMPTY. NONE OF R56–R62 BLOCKS THE MERGE; R57 AND R59/R62 MAKE FOUR EXISTING GREENS MEAN LESS THAN THEY LOOK.**
